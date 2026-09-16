@@ -33,7 +33,10 @@ const KNOB_INSET = 18;
 function dedupeModels(ids: string[]): string[] {
   const out: string[] = [];
   for (const id of ids) {
-    if (id && !out.includes(id)) out.push(id);
+    // Dedup on the short label the rows render by, so e.g. e2e/auto and the
+    // current passthrough/auto don't produce two "auto" radio rows.
+    const short = shortModel(id);
+    if (id && !out.some((existing) => shortModel(existing) === short)) out.push(id);
   }
   return out;
 }

@@ -392,7 +392,11 @@ class HubStore {
   /** Apply one transcript-read-back model observation: settles a pending
    *  push-down, records the discovered catalog, and — for a terminal-side
    *  switch — moves the picker selection locally without a configure. */
-  private noteModelObservation(instanceId: Id, observation: Observation): boolean {
+  /** Apply one transcript-read-back model observation. `live` events settle a
+   *  pending push-down and fold terminal-side switches; history replay only
+   *  hydrates effective/catalog state (it must never consume a pending set
+   *  after the replay window started, nor move the optimistic selection). */
+  private noteModelObservation(instanceId: Id, observation: Observation, live: boolean): boolean {
     const parsed = modelFromObservation(observation);
     if (!parsed) return false;
     const current = this.state.modelEffective[instanceId];
@@ -409,22 +413,29 @@ class HubStore {
         [instanceId]: parsed.catalog,
       };
     }
-    if (this.state.modelPending[instanceId]) {
+    if (live && this.state.modelPending[instanceId]) {
       // Our own push-down settled: keep the optimistic selection; the mismatch
       // line renders if the resolved id differs.
       patch.modelPending = { ...this.state.modelPending };
       delete patch.modelPending[instanceId];
-    } else {
-      // Terminal-side switch: fold the observed id into the local selection so
-      // a hand-typed `/model` moves the picker, never calling configure back.
+    } else if (live) {
+      // Live, terminal-side switch: fold the observed id into the local
+      // selection so a hand-typed `/model` moves the picker, never calling
+      // configure back.
+      patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
+    } else if (this.state.models[instanceId] == null) {
+      // History replay on a fresh mount: seed the selection from the observed
+      // id so the picker reflects the resolved model after reload.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     }
     this.emit(patch);
     return true;
   }
 
-  /** Fold one `instance.configure` model lifecycle into the pending map. */
-  private noteModelLifecycle(instanceId: Id, observation: Observation) {
+  /** Fold one `instance.configure` model lifecycle into the pending map. Only
+   *  live lifecycle events settle pending/queued; replayed history hydrates
+   *  nothing here (the observation reducer already carried the edge). */
+  private noteModelLifecycle(instanceId: Id, observation: Observation, live = true) {
     const payload = observation.payload as
       | { type?: string; nativeName?: string; status?: unknown }
       | undefined;
@@ -436,7 +447,7 @@ class HubStore {
           ? (payload.status as { value: unknown }).value
           : undefined;
     const parsed = modelLifecycleStatus(value);
-    if (!parsed) return;
+    if (!parsed || !live) return;
     const pending = { ...this.state.modelPending };
     if (parsed.kind === "queued") {
       pending[instanceId] = { id: parsed.id, queued: true, at: Date.now() };
@@ -839,8 +850,10 @@ class HubStore {
     for (const event of history) {
       this.noteEffortObservation(instanceId, event);
       this.noteEffortLifecycle(instanceId, event);
-      this.noteModelObservation(instanceId, event);
-      this.noteModelLifecycle(instanceId, event);
+      // History replay hydrates observed model state only; it must not settle a
+      // push-down pending or fold the selection (those belong to live events).
+      this.noteModelObservation(instanceId, event, false);
+      this.noteModelLifecycle(instanceId, event, false);
     }
     const read: JournalRead = async (args) => {
       if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
@@ -859,8 +872,8 @@ class HubStore {
         for (const event of fresh) {
           this.noteEffortObservation(instanceId, event);
           this.noteEffortLifecycle(instanceId, event);
-          this.noteModelObservation(instanceId, event);
-          this.noteModelLifecycle(instanceId, event);
+          this.noteModelObservation(instanceId, event, true);
+          this.noteModelLifecycle(instanceId, event, true);
         }
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);

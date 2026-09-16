@@ -58,8 +58,14 @@ const evidenceDir = process.env.REMUDA_EVIDENCE === "1"
   : path.resolve("test-results/evidence");
 
 async function openModelList(page: Page) {
+  // The chip toggles the effort popover; the list view inside is a second
+  // click. Re-open from a clean state so a previous list/dialog doesn't wedge
+  // the toggle.
+  await page.keyboard.press("Escape").catch(() => undefined);
   await page.getByTestId("model-effort-chip").click();
-  await page.getByTestId("effort-open-list").click();
+  const open = page.getByTestId("effort-open-list");
+  await open.waitFor({ state: "visible", timeout: 10_000 });
+  await open.click();
   await expect(page.getByTestId("effort-list")).toBeVisible();
 }
 
@@ -113,8 +119,11 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
   await page.getByTestId("model-option-fast").click();
   const payload = (await request).postDataJSON().payload;
   expect(payload.model).toBe("e2e/fast");
+  // Reopen (the click closed the list) and poll until the verdict read-back
+  // settles: pending clears and the current model becomes fast.
   await openModelList(page);
-  await expect(panel).toHaveAttribute("data-model-current", "fast");
+  await expect(panel).toHaveAttribute("data-model-pending", "0", { timeout: 10_000 });
+  await expect(panel).toHaveAttribute("data-model-current", "fast", { timeout: 10_000 });
   await expect(page.getByTestId("model-option-fast")).toHaveAttribute("data-selected", "1");
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "0");
 });
@@ -160,6 +169,7 @@ test("a typed alias resolving to a different id renders the mismatch", async ({ 
 test("a terminal-side /model moves the picker without posting configure", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Terminal model fold");
+  await clearApprovals(page, instanceId);
 
   let configurePosts = 0;
   await page.route("**/v1/instances/*/commands", async (route) => {
@@ -187,6 +197,7 @@ test("a terminal-side /model moves the picker without posting configure", async 
 test("a not-found rejection reverts the selection and toasts", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Model not found revert");
+  await clearApprovals(page, instanceId);
   await postConfigure(page, instanceId, "__notfound__:e2e/ghost");
   // A rejection toast is shown.
   await expect(page.getByText(/模型切换被拒绝/)).toBeVisible();
@@ -199,6 +210,7 @@ test("a not-found rejection reverts the selection and toasts", async ({ page }) 
 test("a queued model switch shows the 排队中 tag", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Model queued tag");
+  await clearApprovals(page, instanceId);
   await postConfigure(page, instanceId, "__queued__:e2e/fast");
   await openModelList(page);
   await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
@@ -211,6 +223,39 @@ test("a queued model switch shows the 排队中 tag", async ({ page }) => {
   );
   await expect(page.getByTestId("model-option-pending")).toContainText("排队中");
 });
+
+async function clearApprovals(page: Page, instanceId: string) {
+  // The create-time approval keeps the composer disabled until answered.
+  await page.evaluate(async (id) => {
+    const list = async () => {
+      const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
+      return (body.items ?? []).filter(
+        (item: { instanceId?: string; state?: string }) =>
+          item.instanceId === id && item.state === "pending",
+      );
+    };
+    const deadline = Date.now() + 10_000;
+    let mine = await list();
+    while (mine.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      mine = await list();
+    }
+    for (const item of mine) {
+      const optionId = item.request?.options?.[0]?.id;
+      if (!optionId) continue;
+      await fetch(`/v1/interactions/${item.interactionId ?? item.id}/answer`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          answer: { kind: "approval", optionId, inputDigest: item.request?.inputDigest ?? "" },
+        }),
+      });
+    }
+  }, instanceId);
+  // Wait for the composer to become editable.
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 15_000 });
+}
 
 test.afterEach(async ({ page }) => {
   for (const id of created.splice(0)) {

@@ -534,6 +534,43 @@ async fn fake_node(
                 // A freshly launched native-PTY agent is mid-turn until the
                 // web drives it; the approval keeps it blocked until answered.
                 append_n = append_native_status(&mut ws, &instance_id, append_n, "working").await?;
+                // §9.1 model-sync: the launch snapshot carries the
+                // gateway-discovered catalog and current model for any claude
+                // carrier (claude-pty emits in its own branch above; shell-pty
+                // and print land here).
+                if kind == "claude" {
+                    let launch_model = spec
+                        .get("modelId")
+                        .or_else(|| spec.get("model"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("e2e/auto")
+                        .to_string();
+                    append_n = append_event(
+                        &mut ws,
+                        &instance_id,
+                        append_n,
+                        "model",
+                        json!({
+                            "requested": launch_model,
+                            "effective": {
+                                "id": launch_model,
+                                "source": "launch",
+                                "observedAt": "2026-09-14T12:00:00.000Z"
+                            },
+                            "catalog": {
+                                "models": [
+                                    "e2e/auto",
+                                    "e2e/fast",
+                                    "e2e/plain",
+                                    "claude-e2e-only"
+                                ],
+                                "source": "gateway-discovery",
+                                "observedAt": "2026-09-14T12:00:00.000Z"
+                            }
+                        }),
+                    )
+                    .await?;
+                }
                 send_rpc_ok(
                     &mut ws,
                     id,

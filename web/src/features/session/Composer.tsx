@@ -38,10 +38,12 @@ import {
 } from "./effortEffective";
 import { useAttachments } from "./useAttachments";
 import { useCodeQuotes } from "./useCodeQuotes";
+import { ContextUsagePopover } from "./ContextUsagePopover";
+import type { UsageRollup } from "./contextUsage";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import css from "./session.module.css";
 
-type MenuId = "effort" | "permission" | null;
+type MenuId = "effort" | "permission" | "usage" | null;
 type Placement = "up" | "down";
 
 type HeldItem = {
@@ -70,6 +72,7 @@ export function Composer({
   effortPending,
   onModel,
   contextLabel,
+  usageRollup,
   effortDisabled,
   phase = "idle",
   capabilities,
@@ -99,6 +102,10 @@ export function Composer({
   effortPending?: { word: string; queued: boolean } | null;
   onModel?: (model: string) => void;
   contextLabel?: string | null;
+  /** context-usage-1: Hub-computed per-session token/context rollup; the chip
+   *  ring and its hover popover read this. The legacy contextLabel prop is
+   *  the fallback (mock harness / older Hub). */
+  usageRollup?: UsageRollup | null;
   /** True when the session cannot take instance.configure (exited / observed-only). */
   effortDisabled?: boolean;
   /** Projected instance phase driving the §6 three-state controls. */
@@ -111,6 +118,10 @@ export function Composer({
   const [placement, setPlacement] = useState<Placement>("down");
   const [held, setHeld] = useState<HeldItem[]>([]);
   const [interrupted, setInterrupted] = useState(false);
+  const hoverCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A click (rather than a hover) pins the panel open: subsequent pointer
+  // leaves must not dismiss it. Reset on every real dismiss path.
+  const usagePinned = useRef(false);
   const rootRef = useRef<HTMLFormElement>(null);
   const images = useAttachments(instanceId);
   const codeQuotes = useCodeQuotes((index) => insertCodeTokenRef.current?.(index));
@@ -134,6 +145,42 @@ export function Composer({
   const ember = isEmberEffort(harness, currentEffort.index, ultraOn);
   const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
   const permLabel = PERMISSION_OPTIONS.find((m) => m.id === permissionMode)?.label ?? permissionMode;
+
+  // context-usage-1: when a Hub rollup exists it is authoritative, including
+  // its explicit null (an output-only Grok turn means context is UNKNOWN —
+  // never fall through to the client-side last-event estimate and paint 0%).
+  // The legacy contextLabel prop only drives mock-harness sessions with no
+  // rollup channel.
+  const contextPct = usageRollup
+    ? (usageRollup.contextPct ?? null)
+    : contextLabel?.endsWith("%")
+      ? Number(contextLabel.slice(0, -1))
+      : null;
+  const contextChipLabel = contextPct == null || !Number.isFinite(contextPct) ? "—" : `${contextPct}%`;
+  const hoverCapable = () =>
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+  // The popover is not a DOM child of the chip, so the cursor crossing the
+  // gap between them must not close the card: leave schedules a short close
+  // that entering the popover cancels.
+  const cancelHoverClose = () => {
+    if (hoverCloseTimer.current != null) {
+      clearTimeout(hoverCloseTimer.current);
+      hoverCloseTimer.current = null;
+    }
+  };
+  const scheduleHoverClose = () => {
+    cancelHoverClose();
+    if (!hoverCapable() || usagePinned.current) return;
+    hoverCloseTimer.current = setTimeout(() => setMenu(null), 140);
+  };
+  const dismissUsage = () => {
+    usagePinned.current = false;
+    cancelHoverClose();
+    setMenu(null);
+  };
+  useEffect(() => () => cancelHoverClose(), []);
 
   const controls = composerState(
     harness,
@@ -361,10 +408,10 @@ export function Composer({
   useEffect(() => {
     if (!menu) return;
     const onDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setMenu(null);
+      if (!rootRef.current?.contains(event.target as Node)) dismissUsage();
     };
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setMenu(null);
+      if (event.key === "Escape") dismissUsage();
     };
     window.addEventListener("pointerdown", onDown);
     window.addEventListener("keydown", onKey);
@@ -388,6 +435,7 @@ export function Composer({
   }, [menu, harness, currentEffort.index, placement]);
 
   const toggle = (id: MenuId) => {
+    if (id !== "usage") usagePinned.current = false;
     setPlacement("down");
     setMenu((cur) => (cur === id ? null : id));
   };
@@ -571,13 +619,45 @@ export function Composer({
           </button>
         ) : null}
         {caps.context ? (
-          <span className={css.chip} data-testid="context-chip">
+          <button
+            type="button"
+            className={css.chip}
+            data-testid="context-chip"
+            data-has-popover={usageRollup ? "1" : "0"}
+            aria-haspopup={usageRollup ? "dialog" : undefined}
+            aria-expanded={menu === "usage"}
+            aria-label={
+              usageRollup
+                ? `上下文用量 ${contextChipLabel}，查看明细`
+                : `上下文用量 ${contextChipLabel}`
+            }
+            onClick={() => {
+              // Idempotent, click-pinned open: mouseenter may already have
+              // opened it on precise pointers, and touch fires no hover.
+              // Pinning means the later pointer leave cannot dismiss the
+              // card; × / outside pointerdown / Escape unpin and close.
+              if (usageRollup) {
+                usagePinned.current = true;
+                cancelHoverClose();
+                setPlacement("down");
+                setMenu("usage");
+              }
+            }}
+            onMouseEnter={() => {
+              if (usageRollup && hoverCapable()) {
+                cancelHoverClose();
+                setPlacement("down");
+                setMenu("usage");
+              }
+            }}
+            onMouseLeave={scheduleHoverClose}
+          >
             <span
               className={css.contextRing}
-              style={{ ["--ctx-pct" as string]: contextLabel?.endsWith("%") ? contextLabel : "0%" }}
+              style={{ ["--ctx-pct" as string]: contextPct == null ? "0%" : `${contextPct}%` }}
             />
-            <span>{contextLabel ?? "—"}</span>
-          </span>
+            <span>{contextChipLabel}</span>
+          </button>
         ) : null}
         {caps.permission ? (
           onPermission ? (
@@ -662,6 +742,17 @@ export function Composer({
           {primaryLabel}
         </button>
       </div>
+      {menu === "usage" && usageRollup ? (
+        <ContextUsagePopover
+          rollup={usageRollup}
+          mobile={mobile}
+          onClose={dismissUsage}
+          anchorUp={!mobile && placement === "up"}
+          panelRef={menuRef}
+          onMouseEnter={cancelHoverClose}
+          onMouseLeave={scheduleHoverClose}
+        />
+      ) : null}
       {menu === "effort" ? (
         <div
           ref={menuRef}

@@ -1895,6 +1895,8 @@ export interface components {
             /** @description Requested launch renderer. Actual mode is reported by tty snapshot altScreen. */
             readonly tui?: components["schemas"]["TuiMode"];
             updatedAt?: string;
+            /** @description Additive per-session token/context rollup (context-usage-1), Hub-computed from the journal's usage observations and refreshed every turn. Absent until the harness has reported at least one usage event; every counter is null until the adapter reports that channel (never a fabricated zero). */
+            readonly usageRollup?: components["schemas"]["InstanceUsageRollup"];
             workspaceId?: string | null;
         } & {
             [key: string]: unknown;
@@ -1906,6 +1908,37 @@ export interface components {
             /** @description Provider profile ids this node may spend (structured grants land with co-supply). */
             supplyGrants?: string[];
             workspaceIds?: string[];
+        };
+        /** @description Per-session token/context rollup for the composer context chip popover (context-usage-1). An additive projection of the journal's usage observations recomputed on read, so the TPM windows never go stale. Every counter is null until at least one usage observation has reported that channel (Codex/Grok adapters report only subsets). */
+        InstanceUsageRollup: {
+            /** @description Sum of prompt-cache creation (write) tokens across the session; null when never reported. */
+            cacheCreationTokens?: number | null;
+            /** @description Sum of prompt-cache read tokens across the session; null when never reported. */
+            cacheReadTokens?: number | null;
+            /** @description contextUsedTokens / contextWindowTokens, rounded and clamped to 0..100; null until both are known. */
+            contextPct?: number | null;
+            /** @description Tokens the next request carries: the last turn's fresh input + cache read + cache creation; null when no component was reported. */
+            contextUsedTokens?: number | null;
+            /** @description Context window size from the [1m] tag, the model catalog, or the harness kind; null for kinds without a known window. */
+            contextWindowTokens?: number | null;
+            /** @description Observed-at timestamp of the most recent usage event. */
+            lastTurnAt?: string | null;
+            /** @description Sum of fresh (uncached) input tokens across the session; null when never reported. */
+            sessionInputTokens?: number | null;
+            /** @description Sum of output tokens across the session; null when never reported. */
+            sessionOutputTokens?: number | null;
+            /** @description Average per-minute input rate over the last 5 minutes (window sum / 5); null when no input-bearing turn lies in the window. */
+            tpmIn5m?: number | null;
+            /** @description Fresh input tokens observed during the last 60 seconds; null when no input-bearing turn lies in the window. */
+            tpmIn60s?: number | null;
+            /** @description Average per-minute output rate over the last 5 minutes (window sum / 5); null when no output-bearing turn lies in the window. */
+            tpmOut5m?: number | null;
+            /** @description Output tokens observed during the last 60 seconds; null when no output-bearing turn lies in the window. */
+            tpmOut60s?: number | null;
+            /** @description Number of usage observations folded (one per model turn for Claude). */
+            turns: number;
+        } & {
+            [key: string]: unknown;
         };
         InteractionAnswerRequest: {
             answer: {

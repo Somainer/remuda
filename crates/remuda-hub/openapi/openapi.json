@@ -1458,6 +1458,11 @@
             "$ref": "#/components/schemas/TuiMode",
             "description": "Requested launch renderer. Actual mode is reported by tty snapshot altScreen.",
             "readOnly": true
+          },
+          "usageRollup": {
+            "$ref": "#/components/schemas/InstanceUsageRollup",
+            "description": "Additive per-session token/context rollup (context-usage-1), Hub-computed from the journal's usage observations and refreshed every turn. Absent until the harness has reported at least one usage event; every counter is null until the adapter reports that channel (never a fabricated zero).",
+            "readOnly": true
           }
         },
         "required": [
@@ -1472,6 +1477,104 @@
           "durableSeq"
         ],
         "type": "object"
+      },
+      "InstanceUsageRollup": {
+        "description": "Per-session token/context rollup for the composer context chip popover (context-usage-1). An additive projection of the journal's usage observations recomputed on read, so the TPM windows never go stale. Every counter is null until at least one usage observation has reported that channel (Codex/Grok adapters report only subsets).",
+        "properties": {
+          "cacheCreationTokens": {
+            "description": "Sum of prompt-cache creation (write) tokens across the session; null when never reported.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cacheReadTokens": {
+            "description": "Sum of prompt-cache read tokens across the session; null when never reported.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "contextPct": {
+            "description": "contextUsedTokens / contextWindowTokens, rounded and clamped to 0..100; null until both are known.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "contextUsedTokens": {
+            "description": "Tokens the next request carries: the last turn's fresh input + cache read + cache creation; null when no component was reported.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "contextWindowTokens": {
+            "description": "Context window size from the [1m] tag, the model catalog, or the harness kind; null for kinds without a known window.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "lastTurnAt": {
+            "description": "Observed-at timestamp of the most recent usage event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sessionInputTokens": {
+            "description": "Sum of fresh (uncached) input tokens across the session; null when never reported.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sessionOutputTokens": {
+            "description": "Sum of output tokens across the session; null when never reported.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tpmIn5m": {
+            "description": "Average per-minute input rate over the last 5 minutes (window sum / 5); null when no input-bearing turn lies in the window.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tpmIn60s": {
+            "description": "Fresh input tokens observed during the last 60 seconds; null when no input-bearing turn lies in the window.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tpmOut5m": {
+            "description": "Average per-minute output rate over the last 5 minutes (window sum / 5); null when no output-bearing turn lies in the window.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tpmOut60s": {
+            "description": "Output tokens observed during the last 60 seconds; null when no output-bearing turn lies in the window.",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "turns": {
+            "description": "Number of usage observations folded (one per model turn for Claude).",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turns"
+        ],
+        "type": "object",
+        "additionalProperties": true
       },
       "InstanceScope": {
         "description": "Delegation-tree resource reach (design \u00a72.5). Empty dimensions mean 'not narrowed'; child scope must be a subset of the parent.",

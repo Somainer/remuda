@@ -271,6 +271,14 @@ pub struct MessagePayload {
     /// field, which clients must read as "human typed, no command".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_id: Option<CommandId>,
+    /// `prompt_mode`; c-steer. Records how a Remuda-queued prompt was meant to
+    /// reach the agent — an ordinary new turn, or a steer that interrupted the
+    /// running turn to jump the queue. It rides the queued user node and its
+    /// Replace revisions so the transcript can distinguish「插队」from a normal
+    /// send. Absent on native-observed user records (those carry no Remuda
+    /// command), exactly like `command_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_mode: Option<PromptMode>,
     /// `status`; protocol §5.2.
     pub status: ContentStatus,
 }

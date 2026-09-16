@@ -9593,6 +9593,17 @@
           "$ref": "#/$defs/MessagePhase",
           "description": "`phase`; protocol §5.2."
         },
+        "promptMode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`prompt_mode`; c-steer. Records how a Remuda-queued prompt was meant to\nreach the agent — an ordinary new turn, or a steer that interrupted the\nrunning turn to jump the queue. It rides the queued user node and its\nReplace revisions so the transcript can distinguish「插队」from a normal\nsend. Absent on native-observed user records (those carry no Remuda\ncommand), exactly like `command_id`."
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "`revision`; protocol §5.2."

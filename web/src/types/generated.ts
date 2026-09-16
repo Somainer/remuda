@@ -2135,6 +2135,7 @@ export type MessagePayload = ({
   "origin"?: (MessageOrigin | (null));
   "parentToolCallId": (Id | (null));
   "phase": MessagePhase;
+  "promptMode"?: (PromptMode | (null));
   "revision": U64;
   "role": MessageRole;
   "status": ContentStatus;

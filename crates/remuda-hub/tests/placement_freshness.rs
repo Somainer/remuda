@@ -120,9 +120,7 @@ where
     }
 }
 
-type NodeWs = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<TcpStream>,
->;
+type NodeWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
 async fn connect_node(
     addr: std::net::SocketAddr,
@@ -185,7 +183,11 @@ fn serve_node(node: NodeWs, reply: Option<Value>) -> tokio::task::JoinHandle<()>
                     "id": id,
                     "result": { "resources": resources }
                 });
-                if node.send(Message::Text(response.to_string().into())).await.is_err() {
+                if node
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -195,11 +197,7 @@ fn serve_node(node: NodeWs, reply: Option<Value>) -> tokio::task::JoinHandle<()>
     })
 }
 
-async fn create(
-    addr: std::net::SocketAddr,
-    cookie: &str,
-    body: Value,
-) -> Result<(u16, Value)> {
+async fn create(addr: std::net::SocketAddr, cookie: &str, body: Value) -> Result<(u16, Value)> {
     let (status, _, rest) = http(
         addr,
         "POST",
@@ -225,20 +223,16 @@ async fn hosts_carry_sampled_at_stamped_by_the_hub() -> Result<()> {
     .await?;
     let _node = serve_node(node, Some(json!({ "cpuPct": 4, "memPct": 30 })));
 
-    let (status, _, body) = http(
-        hub.addr,
-        "GET",
-        "/v1/hosts",
-        &[("Cookie", &cookie)],
-        None,
-    )
-    .await?;
+    let (status, _, body) =
+        http(hub.addr, "GET", "/v1/hosts", &[("Cookie", &cookie)], None).await?;
     assert_eq!(status, 200, "{body}");
     let hosts = serde_json::from_str::<Value>(body.trim())?;
     let resources = &hosts["items"][0]["resources"];
     assert_eq!(resources["cpuPct"], json!(100));
     assert!(
-        resources["sampledAt"].as_str().is_some_and(|s| s.contains('T')),
+        resources["sampledAt"]
+            .as_str()
+            .is_some_and(|s| s.contains('T')),
         "sampledAt must be a stamped RFC3339 time: {resources}"
     );
     Ok(())
@@ -256,7 +250,10 @@ async fn stale_saturated_sample_refreshes_and_auto_placement_admits() -> Result<
         json!({ "cpuPct": 100, "memPct": 40 }),
     )
     .await?;
-    let _node = serve_node(node, Some(json!({ "cpuPct": 6, "memPct": 41, "cpuCount": 14 })));
+    let _node = serve_node(
+        node,
+        Some(json!({ "cpuPct": 6, "memPct": 41, "cpuCount": 14 })),
+    );
 
     // Age the 100% sample beyond the 250 ms freshness window.
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -271,14 +268,8 @@ async fn stale_saturated_sample_refreshes_and_auto_placement_admits() -> Result<
     assert_eq!(response["hostId"], json!(host_id));
 
     // The fresh reading is persisted for the next decision, no restart needed.
-    let (_, _, hosts_body) = http(
-        hub.addr,
-        "GET",
-        "/v1/hosts",
-        &[("Cookie", &cookie)],
-        None,
-    )
-    .await?;
+    let (_, _, hosts_body) =
+        http(hub.addr, "GET", "/v1/hosts", &[("Cookie", &cookie)], None).await?;
     let resources = &serde_json::from_str::<Value>(&hosts_body)?["items"][0]["resources"];
     assert_eq!(resources["cpuPct"], json!(6), "{resources}");
     Ok(())
@@ -309,8 +300,7 @@ async fn stale_sample_that_cannot_be_refreshed_does_not_refuse() -> Result<()> {
     });
     let (status, response) = create(hub.addr, &cookie, body).await?;
     assert_eq!(
-        status,
-        200,
+        status, 200,
         "a stale, unconfirmable sample never 422s: {response}"
     );
     Ok(())

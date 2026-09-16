@@ -858,8 +858,7 @@ pub async fn create_instance(
     )?;
     let project_provider = project.as_ref().map(|project| project.provider.clone());
     let place_spec = crate::placement::PlaceSpec::from_json(&spec);
-    let placement_outcome =
-        crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
+    let placement_outcome = crate::placement::pick_hosts(&state, &placement, &place_spec).await?;
     let mut hosts = placement_outcome.hosts;
     // Pinned-host resource warnings ride the response and get journaled once
     // the instance exists (below). Auto-placement has no warnings by

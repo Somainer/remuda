@@ -14,9 +14,9 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::sync::Semaphore;
 
 /// How to pick a host for an Instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,8 +76,12 @@ pub(crate) fn resource_sample_age(resources: Option<&Value>) -> Option<Duration>
     let raw = resources?.get("sampledAt")?.as_str()?;
     let sampled = OffsetDateTime::parse(raw, &Rfc3339).ok()?;
     // Clamp a future-dated sample (minor clock wobble) to age zero = fresh.
-    let age_ms = (OffsetDateTime::now_utc() - sampled).whole_milliseconds().max(0);
-    Some(Duration::from_millis(u64::try_from(age_ms).unwrap_or(u64::MAX)))
+    let age_ms = (OffsetDateTime::now_utc() - sampled)
+        .whole_milliseconds()
+        .max(0);
+    Some(Duration::from_millis(
+        u64::try_from(age_ms).unwrap_or(u64::MAX),
+    ))
 }
 
 /// Whether a persisted sample is young enough to admit against.
@@ -1119,8 +1123,14 @@ mod tests {
         )
         .expect("pinned saturated host admits");
         let warnings = resource_warnings(&busy);
-        assert!(warnings.iter().any(|w| w.contains("CPU at 100%")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("memory at 95%")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("CPU at 100%")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("memory at 95%")),
+            "{warnings:?}"
+        );
         // Under-limit pins produce no warnings.
         busy.resources = Some(json!({ "cpuPct": 89, "memPct": 89 }));
         assert!(resource_warnings(&busy).is_empty());
@@ -1149,25 +1159,21 @@ mod tests {
         );
         // A pre-freshness row (resources present, no stamp) has no age,
         // an absent sample is treated as fresh-vacuous (never excludes).
-        assert_eq!(
-            sample_is_fresh(
-                &host("h", true, &[], false, 1),
-                Duration::from_secs(60)
-            ),
-            true
-        );
+        assert!(sample_is_fresh(
+            &host("h", true, &[], false, 1),
+            Duration::from_secs(60)
+        ));
         let mut unstamped = host("h", true, &[], false, 1);
         unstamped.resources = Some(json!({ "cpuPct": 100 }));
-        assert_eq!(
-            sample_is_fresh(&unstamped, Duration::from_secs(60)),
-            false,
+        assert!(
+            !sample_is_fresh(&unstamped, Duration::from_secs(60)),
             "unstamped pressure sample cannot be trusted as fresh"
         );
         let mut stamped = host("h", true, &[], false, 1);
         stamped.resources = Some(stale);
-        assert_eq!(sample_is_fresh(&stamped, Duration::from_secs(60)), false);
+        assert!(!sample_is_fresh(&stamped, Duration::from_secs(60)));
         stamped.resources = Some(fresh);
-        assert_eq!(sample_is_fresh(&stamped, Duration::from_secs(60)), true);
+        assert!(sample_is_fresh(&stamped, Duration::from_secs(60)));
     }
 
     #[test]

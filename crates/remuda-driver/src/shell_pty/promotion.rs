@@ -33,6 +33,7 @@ use crate::claude_transcript::{
 };
 use crate::error::{DriverError, DriverResult};
 use crate::promote::{Detected, ProcessTable, ScreenStatus, detect, foreground_pgid};
+use crate::screenlive::{live_status_inactive, live_status_payload, now_utc};
 use crate::tty::{LocalPty as _, logical_keys_to_bytes};
 use remuda_protocol::{
     AgentKind, Completeness, DeadlineSource, DeliveryState, EffortSelection, EntityLifecycle,
@@ -705,6 +706,9 @@ pub(super) fn spawn(
         // it; its verdict is what we both journal and expose via the status
         // slot. Reset on every demotion below.
         let mut screen_latch = remuda_screen::ScreenLatch::new();
+        // Spinner-line projection (verb/tokens/phrase/interruptible), one
+        // observation per distinct reading; reset with the raise latch below.
+        let mut live_latch = remuda_screen::ScreenLiveLatch::new();
         // Sticky hook-tier health for this promoted epoch. A transient
         // `ps` miss (found == None) or a hook relay child taking the sampled
         // row must not read as "no hook tier" and release the raise: the
@@ -762,6 +766,7 @@ pub(super) fn spawn(
             // screen raise/blocked latch — a new foreground starts unraised.
             if saw_demote {
                 screen_latch = remuda_screen::ScreenLatch::new();
+                live_latch = remuda_screen::ScreenLiveLatch::new();
                 hook_ever_live = false;
                 interrupt_pid.store(0, Ordering::SeqCst);
                 if let Some(payload) = bindings.invalidate_picker()
@@ -1007,6 +1012,40 @@ pub(super) fn spawn(
                     // A screen read is not proof; say so in the envelope.
                     Completeness::ScreenDerived,
                     agent_status(status),
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
+            // The spinner status line is richer status than the busy bit:
+            // verb, streamed token estimate, phrase and the interrupt hint.
+            // Status only (design §2.4); the latch itself enforces one
+            // observation per distinct reading and a single clear on leave.
+            // The latched verdict already folds rule 6 (OSC idle while the
+            // hook tier is alive stays Working) and the blocked latch; feed
+            // it as the authoritative working hint so a screen clear can
+            // only land when this carrier itself stopped claiming busy.
+            let known_working = match status {
+                Some(ScreenStatus::Working) => Some(true),
+                Some(ScreenStatus::Idle) | Some(ScreenStatus::Blocked) => Some(false),
+                None => None,
+            };
+            if let Some(change) = live_latch.observe_with(&grid, known_working) {
+                let payload = match change {
+                    remuda_screen::ScreenLiveChange::Active(live) => {
+                        live_status_payload(&live, now_utc())
+                    }
+                    remuda_screen::ScreenLiveChange::Inactive => live_status_inactive(),
+                };
+                if emit(
+                    &events,
+                    &seq,
+                    &ctx,
+                    SourceChannel::Pty,
+                    Completeness::ScreenDerived,
+                    payload,
                 )
                 .await
                 .is_err()

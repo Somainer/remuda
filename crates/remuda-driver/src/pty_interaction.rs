@@ -74,6 +74,11 @@ struct State {
     /// pane is *idle*, which is the only way a first-run wizard is visible at
     /// all; the driver disarms it once the carrier has really started.
     startup_polls_left: u32,
+    /// Spinner-line projection (verb/tokens/phrase/interruptible).
+    live: remuda_screen::ScreenLiveLatch,
+    /// A live spinner reading is currently journaled, so the viewport must
+    /// keep being read until the clear is observed.
+    live_active: bool,
 }
 
 impl Default for State {
@@ -86,6 +91,8 @@ impl Default for State {
             onboarding_attempted: BTreeSet::new(),
             onboarding_reported: BTreeSet::new(),
             startup_polls_left: STARTUP_POLL_BUDGET,
+            live: remuda_screen::ScreenLiveLatch::new(),
+            live_active: false,
         }
     }
 }
@@ -175,6 +182,40 @@ impl PtyInteractions {
         Ok((read.text().to_owned(), truncated))
     }
 
+    /// Project the spinner status line while the pane is working (or a live
+    /// reading has yet to clear). Herdr's own `agent_status` is the working
+    /// authority here — the pane text alone lost the hint phrase in 2.1.270
+    /// (D-2) — so it is handed to the latch as the known-working override.
+    async fn observe_live(&self, state: &mut State, status: AgentStatus) -> DriverResult<()> {
+        if status != AgentStatus::Working && !state.live_active {
+            return Ok(());
+        }
+        let known_working = match status {
+            AgentStatus::Working => Some(true),
+            AgentStatus::Idle | AgentStatus::Done | AgentStatus::Blocked => Some(false),
+            AgentStatus::Unknown => None,
+        };
+        let (screen, _) = self.screen().await?;
+        let grid = ScreenGrid::from_raw(&screen);
+        let Some(change) = state.live.observe_with(&grid, known_working) else {
+            return Ok(());
+        };
+        let active = matches!(change, remuda_screen::ScreenLiveChange::Active(_));
+        let payload = match change {
+            remuda_screen::ScreenLiveChange::Active(mut live) => {
+                // Herdr's working verdict, not the retired hint text.
+                if status == AgentStatus::Working {
+                    live.interruptible = true;
+                }
+                crate::screenlive::live_status_payload(&live, crate::screenlive::now_utc())
+            }
+            remuda_screen::ScreenLiveChange::Inactive => crate::screenlive::live_status_inactive(),
+        };
+        self.emit(payload).await?;
+        state.live_active = active;
+        Ok(())
+    }
+
     async fn refresh(&self, state: &mut State) -> DriverResult<()> {
         let info = self
             .client
@@ -209,6 +250,7 @@ impl PtyInteractions {
             .await?;
             state.status = Some(status);
         }
+        self.observe_live(state, status).await?;
         if status != AgentStatus::Blocked {
             if status != AgentStatus::Unknown {
                 self.clear(state, InteractionState::Resolved, "native-cleared")

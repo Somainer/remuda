@@ -28,4 +28,4 @@ pub use screen::{
     ApprovalView, Dialect, DialectVersion, ScreenMode, View, WorkingPhase, enter, render_grid,
     repaint, teardown,
 };
-pub use script::{ApprovalMode, Scenario, ToolSpec, TurnSpec, UsageSpec};
+pub use script::{ApprovalMode, Scenario, SpinnerSpec, ToolSpec, TurnSpec, UsageSpec};

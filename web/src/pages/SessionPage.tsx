@@ -417,7 +417,11 @@ export function SessionPage({
         )}
       </div>
       {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock}>
-        <LiveStatusStrip events={events} nativeRef={instance.nativeRef} />
+        <LiveStatusStrip
+          events={events}
+          nativeRef={instance.nativeRef}
+          onInterrupt={() => hubStore.cancel(instance.id)}
+        />
         <TaskTrack tasks={tasks} />
         {pending.map((item) =>
           item.kind === "question" ? (

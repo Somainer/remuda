@@ -159,6 +159,9 @@ pub struct View {
     pub alt_screen: bool,
     /// Legacy or 2.1.270 modern screen dialect (claude only).
     pub dialect_version: DialectVersion,
+    /// Scripted spinner row painted verbatim while working (scenario override
+    /// of the dialect's stock line); `None` uses the dialect default.
+    pub status_line: Option<String>,
 }
 
 impl View {
@@ -183,6 +186,7 @@ impl View {
             dir_name,
             alt_screen: true,
             dialect_version: DialectVersion::Legacy,
+            status_line: None,
         }
     }
 
@@ -260,6 +264,9 @@ impl View {
     }
 
     fn working_line(&self) -> String {
+        if let Some(line) = &self.status_line {
+            return line.clone();
+        }
         let elapsed = self.elapsed_secs;
         match self.dialect {
             Dialect::Claude if self.dialect_version.is_modern() => {
@@ -791,6 +798,21 @@ mod tests {
         let text = render_grid(&view, 80, 24).join("\n");
         assert!(text.contains("Yes, I trust this folder"));
         assert!(text.contains("Is this a project you created or one you trust?"));
+    }
+
+    #[test]
+    fn a_scripted_status_line_replaces_the_dialect_line_verbatim() {
+        let mut view = working(Dialect::Claude);
+        view.dialect_version = DialectVersion::Modern;
+        view.status_line = Some(
+            "· Razzmatazzing… (49m 38s · ↓ 66.0k tokens · thinking some more with xhigh effort)"
+                .into(),
+        );
+        let text = render_grid(&view, 120, 40).join("\n");
+        assert!(text.contains("Razzmatazzing…"));
+        assert!(text.contains("↓ 66.0k tokens"));
+        assert!(text.contains("thinking some more with xhigh effort"));
+        assert!(!text.contains("Grooving…"), "the stock line is replaced");
     }
 
     #[test]

@@ -18,9 +18,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-async fn recv_json(
-    ws: &mut NodeSocket,
-) -> Result<Value> {
+async fn recv_json(ws: &mut NodeSocket) -> Result<Value> {
     loop {
         let message = tokio::time::timeout(TIMEOUT, ws.next())
             .await
@@ -48,9 +46,7 @@ async fn http(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     let mut stream = TcpStream::connect(addr).await?;
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n"
-    );
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
     if let Some(bytes) = body {
         if let Some(content_type) = content_type {
             head.push_str(&format!("Content-Type: {content_type}\r\n"));
@@ -248,23 +244,15 @@ fn decode(value: &Value) -> Result<Vec<u8>> {
 async fn authorized_pull_returns_the_object_inline() -> Result<()> {
     let mut fixture = fixture().await?;
     let bytes = b"brief: ship the carrier pull\n".to_vec();
-    let object = upload(
-        fixture.addr,
-        &fixture.cookie,
-        &fixture.instance_id,
-        &bytes,
-    )
-    .await?;
+    let object = upload(fixture.addr, &fixture.cookie, &fixture.instance_id, &bytes).await?;
     let object_id = object["objectId"].as_str().unwrap();
 
-    let (reply, chunks) = pull(
-        &mut fixture.node,
-        "pull-1",
-        object_id,
-        &fixture.instance_id,
-    )
-    .await?;
-    assert!(chunks.is_empty(), "a small object must not be chunked: {reply}");
+    let (reply, chunks) =
+        pull(&mut fixture.node, "pull-1", object_id, &fixture.instance_id).await?;
+    assert!(
+        chunks.is_empty(),
+        "a small object must not be chunked: {reply}"
+    );
     let result = reply
         .get("result")
         .with_context(|| format!("expected result, got {reply}"))?;
@@ -284,13 +272,7 @@ async fn large_object_is_streamed_as_chunks_and_reassembled() -> Result<()> {
     // 900 KiB exceeds the ~768 KiB inline ceiling but stays under the 25 MiB
     // attachment cap, so the Hub must stream it.
     let bytes: Vec<u8> = (0..900 * 1024u32).map(|n| (n % 251) as u8).collect();
-    let object = upload(
-        fixture.addr,
-        &fixture.cookie,
-        &fixture.instance_id,
-        &bytes,
-    )
-    .await?;
+    let object = upload(fixture.addr, &fixture.cookie, &fixture.instance_id, &bytes).await?;
     let object_id = object["objectId"].as_str().unwrap();
 
     let (reply, chunks) = pull(
@@ -300,7 +282,10 @@ async fn large_object_is_streamed_as_chunks_and_reassembled() -> Result<()> {
         &fixture.instance_id,
     )
     .await?;
-    assert!(chunks.len() >= 2, "expected streamed chunks, got {chunks:?}");
+    assert!(
+        chunks.len() >= 2,
+        "expected streamed chunks, got {chunks:?}"
+    );
     assert!(
         reply["result"].get("dataBase64").is_none(),
         "a streamed reply carries metadata only: {reply}"
@@ -322,13 +307,7 @@ async fn large_object_is_streamed_as_chunks_and_reassembled() -> Result<()> {
 async fn pull_is_refused_for_another_host_or_instance() -> Result<()> {
     let mut fixture = fixture().await?;
     let bytes = b"host-scoped bytes\n".to_vec();
-    let object = upload(
-        fixture.addr,
-        &fixture.cookie,
-        &fixture.instance_id,
-        &bytes,
-    )
-    .await?;
+    let object = upload(fixture.addr, &fixture.cookie, &fixture.instance_id, &bytes).await?;
     let object_id = object["objectId"].as_str().unwrap();
 
     // Same host, wrong staging instance: the instance is part of the grant.
@@ -352,13 +331,14 @@ async fn pull_is_refused_for_another_host_or_instance() -> Result<()> {
     let (mut other, _) =
         tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(request)).await??;
     let other_host = HostId::new().as_id().as_str().to_owned();
-    other.send(Message::Text(
-        json!({"jsonrpc":"2.0", "id":"hello-b", "method":"node.hello",
+    other
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0", "id":"hello-b", "method":"node.hello",
             "params":{"hostId": other_host, "nodeVersion":"0.1.0", "label":"pull-node-b"}})
-        .to_string()
-        .into(),
-    ))
-    .await?;
+            .to_string()
+            .into(),
+        ))
+        .await?;
     let hello = recv_json(&mut other).await?;
     anyhow::ensure!(hello.get("result").is_some(), "{hello}");
 

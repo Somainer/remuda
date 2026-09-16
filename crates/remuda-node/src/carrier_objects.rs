@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
@@ -70,7 +70,8 @@ pub(crate) struct CarrierObjectBroker {
 
 impl std::fmt::Debug for CarrierObjectBroker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CarrierObjectBroker").finish_non_exhaustive()
+        f.debug_struct("CarrierObjectBroker")
+            .finish_non_exhaustive()
     }
 }
 
@@ -84,10 +85,7 @@ impl CarrierObjectBroker {
 
     /// Build a broker with a custom per-pull deadline (tests).
     #[cfg(test)]
-    pub(crate) fn new_for_test(
-        outbound: mpsc::Sender<Value>,
-        timeout: Duration,
-    ) -> Arc<Self> {
+    pub(crate) fn new_for_test(outbound: mpsc::Sender<Value>, timeout: Duration) -> Arc<Self> {
         Self::new_with_timeout(outbound, timeout)
     }
 
@@ -127,7 +125,10 @@ impl CarrierObjectBroker {
     pub(crate) fn fail_all(&self, error: NodeError) {
         let mut pulled = Vec::new();
         {
-            let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             state.objects.clear();
             state.in_flight.clear();
             for (_, mut pending) in state.pending.drain() {
@@ -148,13 +149,13 @@ impl CarrierObjectBroker {
         object_id: String,
         instance_id: &InstanceId,
     ) -> Result<(String, PullReceiver), NodeError> {
-        let rpc_id = format!(
-            "objpull-{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        );
+        let rpc_id = format!("objpull-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let (reply, receiver) = oneshot::channel();
         {
-            let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             if !state.in_flight.insert(object_id.clone()) {
                 return Err(NodeError::InvalidRequest(format!(
                     "object {object_id} already has an in-flight pull"
@@ -191,7 +192,10 @@ impl CarrierObjectBroker {
 
     /// Drop a transfer the caller no longer awaits (its deadline elapsed).
     fn cancel(&self, rpc_id: &str) {
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if let Some(pending) = state.pending.remove(rpc_id) {
             state.objects.remove(&pending.object_id);
             state.in_flight.remove(&pending.object_id);
@@ -234,7 +238,10 @@ impl CarrierObjectBroker {
             Ok(seq) => seq,
             Err(_) => return,
         };
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let Some(rpc_id) = state.objects.get(object_id) else {
             tracing::debug!(%object_id, seq, "object.chunk for an unknown transfer; ignored");
             return;
@@ -250,13 +257,17 @@ impl CarrierObjectBroker {
     }
 
     fn handle_reply(&self, frame: &Value) -> bool {
-        let Some(id) = frame
-            .get("id")
-            .and_then(|id| id.as_str().map(str::to_owned).or_else(|| id.as_u64().map(|n| n.to_string())))
-        else {
+        let Some(id) = frame.get("id").and_then(|id| {
+            id.as_str()
+                .map(str::to_owned)
+                .or_else(|| id.as_u64().map(|n| n.to_string()))
+        }) else {
             return false;
         };
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !state.pending.contains_key(&id) {
             return false;
         }
@@ -272,10 +283,7 @@ impl CarrierObjectBroker {
         true
     }
 
-    fn outcome_from_reply(
-        pending: &mut PendingPull,
-        frame: &Value,
-    ) -> Result<Vec<u8>, NodeError> {
+    fn outcome_from_reply(pending: &mut PendingPull, frame: &Value) -> Result<Vec<u8>, NodeError> {
         if let Some(error) = frame.get("error") {
             let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32603);
             let message = error
@@ -331,7 +339,10 @@ impl CarrierObjectBroker {
         let now = Instant::now();
         let mut expired = Vec::new();
         {
-            let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             let due: Vec<String> = state
                 .pending
                 .iter()
@@ -397,7 +408,8 @@ pub(crate) struct CarrierObjectSource {
 
 impl std::fmt::Debug for CarrierObjectSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CarrierObjectSource").finish_non_exhaustive()
+        f.debug_struct("CarrierObjectSource")
+            .finish_non_exhaustive()
     }
 }
 
@@ -445,10 +457,7 @@ impl ObjectSource for CarrierObjectSource {
         Box::pin(async move {
             let mut last_error = None;
             for attempt in 0..2 {
-                match source
-                    .attempt(object_id.clone(), instance_id.clone())
-                    .await
-                {
+                match source.attempt(object_id.clone(), instance_id.clone()).await {
                     Ok(bytes) => return Ok(bytes),
                     // One immediate retry, on a fresh pull, for transport loss
                     // (deadline, closed socket). A refused/unknown object is a
@@ -463,8 +472,7 @@ impl ObjectSource for CarrierObjectSource {
                     Err(error) => return Err(error),
                 }
             }
-            Err(last_error
-                .unwrap_or_else(|| NodeError::Transport("object.pull failed".into())))
+            Err(last_error.unwrap_or_else(|| NodeError::Transport("object.pull failed".into())))
         })
     }
 }
@@ -561,20 +569,13 @@ mod tests {
         async fn start_pull(
             &mut self,
             object_id: &str,
-        ) -> (
-            tokio::task::JoinHandle<Result<Vec<u8>, NodeError>>,
-            Value,
-        ) {
+        ) -> (tokio::task::JoinHandle<Result<Vec<u8>, NodeError>>, Value) {
             let broker = self.broker.clone();
             let instance = self.instance.clone();
             let object_id = object_id.to_owned();
             let expected_id = object_id.clone();
-            let pull = tokio::spawn(async move {
-                broker
-                    .source()
-                    .attempt(object_id, instance)
-                    .await
-            });
+            let pull =
+                tokio::spawn(async move { broker.source().attempt(object_id, instance).await });
             let request = self.outbound.recv().await.expect("object.pull frame");
             assert_eq!(request["method"], METHOD_OBJECT_PULL);
             assert_eq!(request["params"]["objectId"], expected_id);
@@ -612,12 +613,7 @@ mod tests {
         let pull = tokio::spawn({
             let instance = harness.instance.clone();
             let broker = harness.broker.clone();
-            async move {
-                broker
-                    .source()
-                    .attempt("obj_small".into(), instance)
-                    .await
-            }
+            async move { broker.source().attempt("obj_small".into(), instance).await }
         });
         let request = harness.outbound.recv().await.unwrap();
         let id = request["id"].clone();
@@ -643,12 +639,7 @@ mod tests {
         let pull = tokio::spawn({
             let instance = harness.instance.clone();
             let broker = harness.broker.clone();
-            async move {
-                broker
-                    .source()
-                    .attempt("obj_big".into(), instance)
-                    .await
-            }
+            async move { broker.source().attempt("obj_big".into(), instance).await }
         });
         let request = harness.outbound.recv().await.unwrap();
         let id = request["id"].clone();

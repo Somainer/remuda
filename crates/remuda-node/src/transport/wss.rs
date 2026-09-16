@@ -240,8 +240,7 @@ fn attach_object_source(
     };
     match crate::attachments::HubObjectSource::from_ws_url(ws_url, token) {
         Ok(http) => {
-            let source =
-                crate::carrier_objects::FallbackObjectSource::new(http, broker.source());
+            let source = crate::carrier_objects::FallbackObjectSource::new(http, broker.source());
             link.node.set_object_source(Arc::new(source));
         }
         Err(error) => {

@@ -182,7 +182,9 @@ impl ObjectSource for HubObjectSource {
 /// carrier cannot fix a rejected or missing object.
 fn map_http_error(object_id: &str, error: reqwest::Error) -> NodeError {
     if error.is_connect() || error.is_timeout() {
-        NodeError::Transport(format!("attachment {object_id}: Hub HTTP origin unreachable: {error}"))
+        NodeError::Transport(format!(
+            "attachment {object_id}: Hub HTTP origin unreachable: {error}"
+        ))
     } else {
         NodeError::InvalidRequest(format!("attachment {object_id}: {error}"))
     }

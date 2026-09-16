@@ -13,8 +13,8 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use remuda_protocol::hubnode::{
-    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams, TtyModeParams,
-    METHOD_OBJECT_CHUNK,
+    self, HubNodeMethod, JournalAppendParams, METHOD_OBJECT_CHUNK, NodeHelloParams, TtyFrameParams,
+    TtyModeParams,
 };
 use remuda_protocol::{
     ConnectionLease, HeartbeatResult, HelloResult, PROTOCOL_VERSION, TransportLimits, U64,
@@ -683,9 +683,7 @@ pub(crate) async fn handle_node_method(
         }
         "object.pull" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
-            Ok(Some(
-                object_pull(state, host_id, &params, out_tx).await?,
-            ))
+            Ok(Some(object_pull(state, host_id, &params, out_tx).await?))
         }
         other => Err(HubError::BadRequest(format!("unknown method {other}"))),
     }

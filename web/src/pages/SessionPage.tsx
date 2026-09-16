@@ -85,7 +85,7 @@ export function SessionPage({
     const onKey = (event: globalThis.KeyboardEvent) => {
       if (event.key !== "Escape") return;
       // An open composer popover eats the first Esc.
-      if (document.querySelector("[data-testid$='-menu']")) return;
+      if (document.querySelector("[data-testid$='-menu'], [data-testid$='-popover']")) return;
       navigate(backTo, { replace: true });
     };
     window.addEventListener("keydown", onKey, true);
@@ -481,6 +481,7 @@ export function SessionPage({
             const pct = contextPercent(usage, instance.kind);
             return pct == null ? null : `${pct}%`;
           })()}
+          usageRollup={hubStore.usageRollupOf(instance.id)}
           onPermission={
             genericPty
               ? undefined

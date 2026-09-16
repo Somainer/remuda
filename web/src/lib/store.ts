@@ -41,6 +41,7 @@ import {
   effectiveFromRecord,
   type EffortEffectiveView,
 } from "../features/session/effortEffective";
+import type { UsageRollup } from "../features/session/contextUsage";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -166,6 +167,12 @@ export type HubState = {
   effort: Record<string, EffortSelection>;
   /** §9.1 transcript-read-back effective effort per instance; absent = `?`. */
   effortEffective: Record<string, EffortEffectiveView>;
+  /** context-usage-1 Hub-computed token/context rollup per instance.
+   *  Hydrated separately from `instances` for the same reason effort is:
+   *  mergeInstanceSnapshots keeps the local instance while its
+   *  follow-bumped durableSeq is ahead, which would hide the polled row's
+   *  fresh TPM windows. */
+  usageRollup: Record<string, UsageRollup>;
   /** §9.1 a push-down in flight: `queued` while the agent works (applies at
    *  the next idle), `queued:false` on the idle fast path. Cleared when the
    *  effective read-back lands or the switch is rejected. */
@@ -196,6 +203,7 @@ const initial: HubState = {
   permissionMode: {},
   effort: {},
   effortEffective: {},
+  usageRollup: {},
   effortPending: {},
   models: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
@@ -287,6 +295,25 @@ class HubStore {
       }
     }
     if (updated) this.emit({ effortEffective: next });
+  }
+
+  /** context-usage-1: fold Hub-computed usage rollups from polled instances
+   *  into the live map. The polled projection is always fresher than the
+   *  retained one (its TPM windows are recomputed server-side at read
+   *  time), so a rollup with at least as many turns wins. */
+  private hydrateUsageRollups(instances: Instance[]) {
+    let updated = false;
+    const next = { ...this.state.usageRollup };
+    for (const instance of instances) {
+      const rollup = instance.usageRollup;
+      if (!rollup) continue;
+      const current = next[instance.id];
+      if (!current || rollup.turns >= current.turns) {
+        next[instance.id] = rollup;
+        updated = true;
+      }
+    }
+    if (updated) this.emit({ usageRollup: next });
   }
 
   /** Apply one transcript-read-back effort observation to the live map.
@@ -451,6 +478,7 @@ class HubStore {
         interactions,
       });
       this.hydrateEffortEffective(instances.items);
+      this.hydrateUsageRollups(instances.items);
       this.stopWorkspaceFollow?.();
       this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
@@ -629,6 +657,7 @@ class HubStore {
       interactions,
     });
     this.hydrateEffortEffective(instances.items);
+    this.hydrateUsageRollups(instances.items);
   }
 
   async follow(instanceId: Id) {
@@ -1014,6 +1043,16 @@ class HubStore {
   /** §9.1: transcript-read-back effective effort, or `null` when unobserved. */
   effortEffectiveOf(instanceId: Id): EffortEffectiveView | null {
     return this.state.effortEffective[instanceId] ?? null;
+  }
+
+  /** context-usage-1: Hub-computed per-session usage rollup; null until the
+   *  harness has reported at least one usage observation. */
+  usageRollupOf(instanceId: Id): UsageRollup | null {
+    return (
+      this.state.usageRollup[instanceId] ??
+      this.state.instances.find((row) => row.id === instanceId)?.usageRollup ??
+      null
+    );
   }
 
   /** The word the slider last requested for this instance (wire spelling). */

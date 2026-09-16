@@ -242,7 +242,7 @@ pub fn render_question_card(
 ) -> Result<Value, Error> {
     let mut elements = Vec::new();
     for field in fields {
-        elements.push(question_field_element(field)?);
+        elements.extend(question_field_element(field)?);
     }
     elements.push(json!({
         "tag": "button",
@@ -573,40 +573,60 @@ fn validate_form(obj: &Map<String, Value>, path: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn question_field_element(field: &QuestionField) -> Result<Value, Error> {
-    match field.input {
+fn question_field_element(field: &QuestionField) -> Result<Vec<Value>, Error> {
+    let select = |multi: bool| {
+        json!({
+            "tag": if multi { "multi_select_static" } else { "select_static" },
+            "name": field.id,
+            "required": field.required,
+            "placeholder": plain_text(&field.title),
+            "options": field.options.iter().map(|o| {
+                // Feishu select options have no description slot; append it to
+                // the label so the card still shows what the TUI shows.
+                let text = match o.description.as_deref() {
+                    Some(description) if !description.is_empty() => {
+                        format!("{} — {}", o.label, description)
+                    }
+                    _ => o.label.clone(),
+                };
+                json!({ "text": plain_text(&text), "value": o.id })
+            }).collect::<Vec<_>>(),
+        })
+    };
+    let element = match field.input {
         QuestionInput::Text => {
             let input_type = if field.sensitive { "password" } else { "text" };
-            Ok(json!({
+            json!({
                 "tag": "input",
                 "name": field.id,
                 "required": field.required,
                 "input_type": input_type,
                 "label": plain_text(&field.title),
                 "placeholder": plain_text(field.description.as_deref().unwrap_or("")),
-            }))
+            })
         }
-        QuestionInput::SingleSelect => Ok(json!({
-            "tag": "select_static",
-            "name": field.id,
-            "required": field.required,
-            "placeholder": plain_text(&field.title),
-            "options": field.options.iter().map(|o| json!({
-                "text": plain_text(&o.label),
-                "value": o.id
-            })).collect::<Vec<_>>(),
-        })),
-        QuestionInput::MultiSelect => Ok(json!({
-            "tag": "multi_select_static",
-            "name": field.id,
-            "required": field.required,
-            "placeholder": plain_text(&field.title),
-            "options": field.options.iter().map(|o| json!({
-                "text": plain_text(&o.label),
-                "value": o.id
-            })).collect::<Vec<_>>(),
-        })),
+        QuestionInput::SingleSelect => select(false),
+        QuestionInput::MultiSelect => select(true),
+    };
+    let mut elements = vec![element];
+    // AskUserQuestion always offers "Type something" in the TUI; mirror it as a
+    // second input which the answer encoder prefers over the select value.
+    if field.allow_free_text && field.input != QuestionInput::Text {
+        elements.push(json!({
+            "tag": "input",
+            "name": free_text_name(&field.id),
+            "required": false,
+            "input_type": if field.sensitive { "password" } else { "text" },
+            "label": plain_text(&format!("{} · 其他（Type something，可留空）", field.title)),
+            "placeholder": plain_text("填写后优先于上方选择"),
+        }));
     }
+    Ok(elements)
+}
+
+/// Form name of a question field's optional free-text companion input.
+pub(crate) fn free_text_name(field_id: &str) -> String {
+    format!("{field_id}__free")
 }
 
 fn callback_button(label: &str, style: &str, tid: &str, a: &str) -> Value {

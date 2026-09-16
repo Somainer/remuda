@@ -419,10 +419,11 @@ test("native PTY default from the host matrix, with both projections", async ({ 
 });
 
 /**
- * D-028 §6 composer states against the fake Node: working turns the composer
- * into 发送(steer) / 排队 / 打断, the queue chip is removable, Esc cancels.
+ * c-steer composer on a working native session: Enter QUEUES (Remuda-held,
+ * no POST), ⌘/Ctrl+Enter or the 插队 button interrupts and jumps with
+ * mode=steer, Esc plain-interrupts, and held rows flush when the turn ends.
  */
-test("composer steer / queue / interrupt states on a working native session", async ({ page }) => {
+test("composer queue / steer / interrupt states on a working native session", async ({ page }) => {
   test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
   const commands: { operation?: string; payload?: { mode?: string; prompt?: string } }[] = [];
   page.on("request", (request) => {
@@ -446,47 +447,69 @@ test("composer steer / queue / interrupt states on a working native session", as
     timeout: 10_000,
   });
 
-  // Working composer: native steer primary, Remuda-held queue, red interrupt.
-  const send = page.getByTestId("composer-send");
-  await expect(send).toHaveAttribute("data-mode", "steer");
-  await expect(page.getByTestId("composer-queue-btn")).toBeVisible();
-  await expect(page.getByTestId("composer-queue-btn")).toHaveAttribute("data-holder", "remuda");
+  // Working composer: Enter queues (Remuda-held), 插队 and 打断 available.
+  const queue = page.getByTestId("composer-queue");
+  await expect(queue).toHaveAttribute("data-mode", "queue");
+  await expect(queue).toHaveAttribute("data-holder", "remuda");
+  const steer = page.getByTestId("composer-steer");
+  await expect(steer).toBeVisible();
+  await expect(steer).toHaveAttribute("data-provision", "native");
   const interrupt = page.getByTestId("composer-interrupt");
   await expect(interrupt).toBeVisible();
   await expect(interrupt).toHaveAttribute("data-provision", "native");
   await shot(page, "native-pty-web-1-composer-working-1440.png");
 
-  // Steer carries PromptMode=steer on the wire.
-  await page.getByTestId("composer-input").fill("steer mid turn");
-  await send.click();
-  await expect
-    .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
-    .toBeTruthy();
-
-  // Queueing holds a removable chip and sends nothing.
+  // Enter holds a removable chip and sends nothing.
   const before = commands.length;
   await page.getByTestId("composer-input").fill("after this turn");
-  await page.getByTestId("composer-queue-btn").click();
+  await page.getByTestId("composer-input").press("Enter");
   await expect(page.getByTestId("composer-queued-chip")).toBeVisible();
+  await expect(page.getByTestId("composer-queued-chip")).toHaveAttribute("data-ordinal", "1");
   await expect(page.getByTestId("composer-queue-status")).toContainText("1");
+  expect(commands.length).toBe(before);
   await page.getByTestId("composer-queued-remove").click();
   await expect(page.getByTestId("composer-queued-chip")).toHaveCount(0);
-  expect(commands.length).toBe(before);
 
-  // 400px: the three controls still fit.
+  // Re-queue, then 插队: the steer POSTs mode=steer first; the held row flushes
+  // with a plain new-turn POST only after the turn-end (idle) lands.
   await page.getByTestId("composer-input").fill("later");
-  await page.getByTestId("composer-queue-btn").click();
+  await page.getByTestId("composer-input").press("Enter");
   await expect(page.getByTestId("composer-queued-chip")).toBeVisible();
   await page.setViewportSize({ width: 400, height: 840 });
   await shot(page, "native-pty-web-1-composer-working-400.png");
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.getByTestId("composer-queued-remove").click();
+  await page.getByTestId("composer-input").fill("jump now");
+  page.once("dialog", (dialog) => {
+    expect(dialog.message()).toContain("插队");
+    void dialog.accept();
+  });
+  await steer.click();
+  await expect
+    .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
+    .toBeTruthy();
+  // The steer interrupted the turn (badge) and the fake Node reported idle,
+  // which flushes the held row as an ordinary new turn.
+  await expect(page.getByTestId("composer-interrupted-chip")).toBeVisible();
+  await expect
+    .poll(() => commands.filter((c) => c.operation === "instance.send").length)
+    .toBeGreaterThanOrEqual(2);
+  const sends = commands.filter((c) => c.operation === "instance.send");
+  expect(sends[0]?.payload?.mode).toBe("steer");
+  expect(sends.at(-1)?.payload?.prompt).toBe("later");
 
   // Esc while the composer is focused interrupts (with a confirm on desktop).
+  // The flushed queued prompt starts a fresh turn on the fake agent (working).
+  await expect
+    .poll(() => commands.at(-1)?.payload?.prompt)
+    .toBe("later");
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
+    timeout: 10_000,
+  });
   page.once("dialog", (dialog) => {
     expect(dialog.message()).toContain("打断");
     void dialog.accept();
   });
+  await page.getByTestId("composer-input").fill("stop please");
   await page.getByTestId("composer-input").focus();
   await page.keyboard.press("Escape");
   await expect
@@ -496,7 +519,7 @@ test("composer steer / queue / interrupt states on a working native session", as
     timeout: 10_000,
   });
   await expect(page.getByTestId("composer-interrupt")).toHaveCount(0);
-  await expect(page.getByTestId("composer-queue-btn")).toHaveCount(0);
+  await expect(page.getByTestId("composer-steer")).toHaveCount(0);
   await expect(page.getByTestId("composer-send")).toHaveAttribute("data-mode", "new-turn");
 });
 

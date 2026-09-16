@@ -3902,6 +3902,7 @@ fn apply_instance_projection(
         && let Some(effective) = payload.get("effective")
     {
         apply_effective_model_projection(conn, instance_id, effective, payload.get("catalog"))?;
+    }
     if kind == "permission"
         && let Some(effective) = payload.get("effective")
     {
@@ -5632,6 +5633,55 @@ mod tests {
         assert_eq!(
             effective.get("source").and_then(Value::as_str),
             Some("slash")
+        );
+    }
+
+    /// A `permission` journal event persists the transcript-read-back mode as
+    /// `permissionEffective` without the Hub trusting the requested word.
+    #[tokio::test]
+    async fn permission_observation_projects_effective_mode() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .patch_instance_configure(
+                instance.instance_id.clone(),
+                json!({"permissionMode": "auto"}),
+            )
+            .await
+            .expect("configure");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"permission","payload":{
+                    "requested":"auto",
+                    "effective":{"mode":"auto","source":"remuda",
+                        "observedAt":"2026-09-16T12:00:00.000Z"},
+                    "raw":"auto"}}),
+            )
+            .await
+            .expect("permission event");
+        let spec: Value = store
+            .run(move |conn| {
+                let raw: String = conn.query_row(
+                    "SELECT spec_json FROM instances WHERE id = ?1",
+                    params![instance.instance_id.clone()],
+                    |row| row.get(0),
+                )?;
+                Ok(serde_json::from_str::<Value>(&raw).unwrap_or(json!({})))
+            })
+            .await
+            .expect("spec");
+        assert_eq!(spec.get("permissionMode").and_then(Value::as_str), Some("auto"));
+        let effective = spec.get("permissionEffective").expect("permissionEffective stored");
+        assert_eq!(effective.get("mode").and_then(Value::as_str), Some("auto"));
+        assert_eq!(
+            effective.get("source").and_then(Value::as_str),
+            Some("remuda")
         );
     }
 }

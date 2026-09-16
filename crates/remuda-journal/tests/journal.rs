@@ -549,3 +549,75 @@ fn real_21272_reject_records_map_to_no_effort_envelopes() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn claude_permission_mode_records_map_to_permission_observations() -> Result<()> {
+    let (_, _, _, map) = ctx("perm-session");
+    let lines = [
+        serde_json::json!({"type":"mode","mode":"normal","sessionId":"perm-session"}),
+        serde_json::json!({"type":"permission-mode","permissionMode":"default",
+                          "sessionId":"perm-session"}),
+        serde_json::json!({"type":"user","uuid":"p1","sessionId":"perm-session",
+            "message":{"role":"user","content":
+                "<command-name>/plan</command-name><command-message>plan</command-message>"}}),
+        serde_json::json!({"type":"permission-mode","permissionMode":"plan",
+                          "sessionId":"perm-session"}),
+        serde_json::json!({"type":"permission-mode","permissionMode":"auto",
+                          "sessionId":"perm-session"}),
+        serde_json::json!({"type":"permission-mode","permissionMode":"auto",
+                          "sessionId":"perm-session"}),
+    ];
+    let contents = lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let envelopes = map_file(&contents, &map)?;
+    let edges: Vec<_> = envelopes
+        .iter()
+        .filter_map(|env| match &env.body {
+            ObservationPayload::Permission(payload) => Some((
+                payload.effective.mode.clone(),
+                payload.effective.source,
+            )),
+            _ => None,
+        })
+        .collect();
+    // default(manual) — the `mode: normal` render record is not an edge —
+    // plan after /plan is slash-attributed, then auto; the duplicate auto
+    // record is deduped.
+    assert_eq!(
+        edges,
+        vec![
+            ("manual".to_string(), remuda_protocol::PermissionSource::Unknown),
+            ("plan".to_string(), remuda_protocol::PermissionSource::Slash),
+            ("auto".to_string(), remuda_protocol::PermissionSource::Unknown),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn real_21273_permission_walk_replays_every_wheel_mode() -> Result<()> {
+    let (_, _, _, map) = ctx("perm-session-21273");
+    let contents =
+        include_str!("fixtures/permission-21273/permission-walk-21273.jsonl");
+    let envelopes = map_file(contents, &map)?;
+    let modes: Vec<_> = envelopes
+        .iter()
+        .filter_map(|env| match &env.body {
+            ObservationPayload::Permission(payload) => Some(payload.effective.mode.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        modes,
+        vec!["manual", "plan", "acceptEdits", "auto", "manual"]
+    );
+    // Every permission envelope carries a deterministic event id.
+    assert!(envelopes
+        .iter()
+        .filter(|env| matches!(env.body, ObservationPayload::Permission(_)))
+        .all(|env| env.event_id.is_some()));
+    Ok(())
+}

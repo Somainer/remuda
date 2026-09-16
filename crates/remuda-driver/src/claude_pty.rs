@@ -581,6 +581,7 @@ impl ClaudePtyDriver {
             Arc::clone(&model_bridge),
             Arc::clone(&model_queue),
             model_io,
+        );
         let permission_io: Arc<dyn crate::permission::PermissionSwitchIo> =
             Arc::new(HerdrPermissionIo {
                 client: client.clone(),
@@ -715,6 +716,59 @@ impl ClaudePtyDriver {
         let Some(request) = crate::model::ModelRequest::new(model_id) else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /model requires a non-empty id; got {model_id:?}"
+            )));
+        };
+        let (pane_id, session_id, queue, ready, io) = {
+            let inner = self.inner.lock().await;
+            let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+            if live.closed {
+                return Err(DriverError::ControlUnavailable);
+            }
+            require_session_start(live)?;
+            let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
+                .await
+                .is_ok();
+            let io = HerdrEffortIo {
+                client: live.client.clone(),
+                pane_id: live.pane_id.clone(),
+                events: live.events.clone(),
+                seq: Arc::clone(&self.seq),
+                ctx: live.ctx.clone(),
+            };
+            (
+                live.pane_id.clone(),
+                live.session_id.clone(),
+                Arc::clone(&live.model_queue),
+                ready,
+                Arc::new(io) as Arc<dyn crate::model::SwitchIo>,
+            )
+        };
+
+        if ready {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait =
+                std::time::Duration::from_millis(crate::model::MODEL_READBACK_TIMEOUT_MS + 5_000);
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // Bounded window elapsed without a terminal outcome; never
+                // claim applied from this command.
+            }
+        } else {
+            io.journal(
+                crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
+                Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+
+        let mut ack = DriverAck::transport_written();
+        ack.native_ids
+            .insert("sessionId".into(), session_id.clone());
+        ack.native_ids.insert("paneId".into(), pane_id);
+        Ok(ack)
+    }
+
     /// Shift+tab the native permission wheel to `mode` and let the TUI status
     /// line / transcript prove it.
     async fn switch_permission(&self, mode: &str) -> DriverResult<DriverAck> {
@@ -731,13 +785,11 @@ impl ClaudePtyDriver {
                 return Err(DriverError::ControlUnavailable);
             }
             require_session_start(live)?;
-            let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
-                .await
-                .is_ok();
-            let io = HerdrEffortIo {
             // Launch-only modes are an honest refusal, never a keystroke.
-            if !crate::permission::live_reachable(request.mode, live.permission_bridge.bypass_allowed())
-            {
+            if !crate::permission::live_reachable(
+                request.mode,
+                live.permission_bridge.bypass_allowed(),
+            ) {
                 return Err(DriverError::CapabilityUnsupported(format!(
                     "claude permission mode {mode:?} is launch-only for this session"
                 )));
@@ -755,9 +807,6 @@ impl ClaudePtyDriver {
             (
                 live.pane_id.clone(),
                 live.session_id.clone(),
-                Arc::clone(&live.model_queue),
-                ready,
-                Arc::new(io) as Arc<dyn crate::model::SwitchIo>,
                 Arc::clone(&live.permission_queue),
                 ready,
                 Arc::new(io) as Arc<dyn crate::permission::PermissionSwitchIo>,
@@ -767,15 +816,6 @@ impl ClaudePtyDriver {
         if ready {
             let (done, rx_outcome) = tokio::sync::oneshot::channel();
             queue.enqueue(request, Some(done));
-            let wait =
-                std::time::Duration::from_millis(crate::model::MODEL_READBACK_TIMEOUT_MS + 5_000);
-            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
-                // Bounded window elapsed without a terminal outcome; never
-                // claim applied from this command.
-            }
-        } else {
-            io.journal(
-                crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
             let wait = std::time::Duration::from_millis(
                 crate::permission::PERMISSION_READBACK_TIMEOUT_MS + 5_000,
             );
@@ -915,6 +955,7 @@ impl Driver for ClaudePtyDriver {
             && !switch.model_id.is_empty()
         {
             return self.switch_model(&switch.model_id).await;
+        }
         // A permission-bearing switch is a shift+tab wheel walk read back from
         // the status line; a bare model id falls through to the prompt path,
         // which rejects it honestly for this carrier.
@@ -1021,6 +1062,8 @@ impl Driver for ClaudePtyDriver {
         }
         live.model_queue.close();
         if let Some(task) = live.model_worker.take() {
+            task.abort();
+        }
         live.permission_queue.close();
         if let Some(task) = live.permission_worker.take() {
             task.abort();
@@ -1234,6 +1277,7 @@ struct TranscriptModelSync {
     catalog: Option<ModelCatalogInfo>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_transcript_pump(
     transcript_slot: Arc<std::sync::Mutex<Option<String>>>,
     tx: mpsc::Sender<Observation>,

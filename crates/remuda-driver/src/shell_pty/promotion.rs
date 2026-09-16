@@ -1400,8 +1400,15 @@ async fn maintain_binding(
     }
 
     if hydrator.is_none() {
-        *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort, model);
-        *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort, permission_bridge, launch_permission);
+        *hydrator = Hydrator::open(
+            ctx,
+            &binding,
+            effort_bridge,
+            launch_effort,
+            model,
+            permission_bridge,
+            launch_permission,
+        );
     }
     if let Some(active) = hydrator.as_mut() {
         match pump(active, events, seq, ctx).await {
@@ -1578,6 +1585,7 @@ impl Hydrator {
             {
                 pending = observations;
             }
+        }
         if let Some(bridge) = permission_bridge {
             mapper = mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
         }

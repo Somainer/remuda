@@ -865,6 +865,50 @@ impl ShellPtyDriver {
         let Some(request) = crate::model::ModelRequest::new(model_id) else {
             return Err(DriverError::CapabilityUnsupported(format!(
                 "claude /model requires a non-empty id; got {model_id:?}"
+            )));
+        };
+        let state = self.state().await?;
+        if state.closed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        let queue = self.model_queue.lock().await.clone();
+        let events = self
+            .events_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let ctx = self
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
+            state,
+            events,
+            seq: Arc::clone(&self.seq),
+            ctx,
+        });
+        if io.is_idle().await {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait =
+                std::time::Duration::from_millis(crate::model::MODEL_READBACK_TIMEOUT_MS + 5_000);
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // Never claim applied without a terminal outcome.
+            }
+        } else {
+            io.journal(
+                crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
+                remuda_protocol::Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+        Ok(DriverAck::transport_written())
+    }
+
     /// Shift+tab the native permission wheel to `mode` and read it back from
     /// the status line / transcript.
     async fn switch_permission(&self, mode: &str) -> DriverResult<DriverAck> {
@@ -877,7 +921,6 @@ impl ShellPtyDriver {
         if state.closed.load(Ordering::SeqCst) {
             return Err(DriverError::ControlUnavailable);
         }
-        let queue = self.model_queue.lock().await.clone();
         let bridge = self.permission_bridge.lock().await.clone();
         if !crate::permission::live_reachable(request.mode, bridge.bypass_allowed()) {
             return Err(DriverError::CapabilityUnsupported(format!(
@@ -897,7 +940,6 @@ impl ShellPtyDriver {
             .await
             .clone()
             .ok_or(DriverError::ControlUnavailable)?;
-        let io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
         let io: Arc<dyn crate::permission::PermissionSwitchIo> = Arc::new(ShellPermissionIo {
             state,
             events,
@@ -905,18 +947,6 @@ impl ShellPtyDriver {
             ctx,
         });
         if io.is_idle().await {
-            let (done, rx_outcome) = tokio::sync::oneshot::channel();
-            queue.enqueue(request, Some(done));
-            let wait =
-                std::time::Duration::from_millis(crate::model::MODEL_READBACK_TIMEOUT_MS + 5_000);
-            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
-                // Never claim applied without a terminal outcome.
-            }
-        } else {
-            io.journal(
-                crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
-        let ready = io.is_idle().await;
-        if ready {
             let (done, rx_outcome) = tokio::sync::oneshot::channel();
             queue.enqueue(request, Some(done));
             let wait = std::time::Duration::from_millis(
@@ -936,6 +966,7 @@ impl ShellPtyDriver {
         }
         Ok(DriverAck::transport_written())
     }
+
 
     /// Spawn the PTY without an [`InstanceSpec`] (Node fake registry / tests).
     pub async fn spawn(&self) -> DriverResult<RunHandle> {
@@ -2186,6 +2217,7 @@ impl Driver for ShellPtyDriver {
             && !switch.model_id.is_empty()
         {
             return self.switch_model(&switch.model_id).await;
+        }
         if self.session_kind() == Some(AgentKind::Claude)
             && let DriverInput::ModelSwitch(switch) = &input
             && let Some(mode) = switch.permission_mode.as_deref()
@@ -2449,6 +2481,8 @@ impl Driver for ShellPtyDriver {
         }
         self.model_queue.lock().await.close();
         if let Some(worker) = self.model_worker.lock().await.take() {
+            worker.abort();
+        }
         // Same for the permission wheel worker.
         self.permission_queue.lock().await.close();
         if let Some(worker) = self.permission_worker.lock().await.take() {

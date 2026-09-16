@@ -684,7 +684,6 @@ impl Driver for NativeAdapter {
                 DriverRequest::Configure {
                     model,
                     effort,
-                    effort_index: _,
                     effort_index,
                     permission_mode,
                 } => {
@@ -696,17 +695,10 @@ impl Driver for NativeAdapter {
                         effort: effort.clone(),
                         permission_mode: permission_mode.clone(),
                     };
-                    // §9.1: both effort and model switches report their own
-                    // lifecycle from the driver (`effort-applied` /
-                    // `model-applied` / `…-queued` / `…-degraded`) after the
-                    // transcript read-back. A generic "applied" here would
-                    // claim success before the verdict exists.
-                    self.native
-                    // §9.1: an effort or permission-mode switch reports its own
-                    // lifecycle from the driver (`effort-applied` /
-                    // `permission-applied`, plus queued/degraded) after
-                    // read-back. A generic "applied" here would claim it
-                    // before the read-back exists.
+                    // §9.1: an effort/permission switch with no model id reports
+                    // its own lifecycle from the driver after the transcript
+                    // read-back. A generic "applied" here would claim it before
+                    // the verdict exists.
                     let model_empty = model.as_deref().is_none_or(str::is_empty);
                     if model_empty && (effort.is_some() || permission_mode.is_some()) {
                         self.native
@@ -724,12 +716,16 @@ impl Driver for NativeAdapter {
                             .unwrap_or_else(|| "-".into()),
                         permission_mode.as_deref().unwrap_or("-")
                     );
-                    match self
-                        .native
+                    let emissions = vec![crate::driver::DriverEmission::NativeLifecycle {
+                        name: "instance.configure".into(),
+                        status: applied,
+                        severity: remuda_protocol::Severity::Info,
+                    }];
+                    self.native
                         .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
                         .await
                         .map_err(map_driver_error)?;
-                    return Ok(Vec::new());
+                    return Ok(emissions);
                 }
             }
             Ok(Vec::new())

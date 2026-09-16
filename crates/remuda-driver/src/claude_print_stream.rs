@@ -70,6 +70,7 @@ impl Block {
                 // Assistant text is never an injection.
                 origin: Some(MessageOrigin::Human),
                 command_id: None,
+            prompt_mode: None,
                 status,
             })),
             "thinking" | "redacted_thinking" => {

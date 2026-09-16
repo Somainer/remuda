@@ -60,13 +60,17 @@ native-carrier test both failed on it. The Hub host list kept showing
 
 ### Coordination with co-dispatch (`remuda hostcap`)
 
-`remuda hostcap` had not landed on `origin/main` when this finished (it lives
-on `wt/co-dispatch/dispatch-retire-hostcap`, route
-`GET /v1/hosts/{id}/hostcap`). This change stays additive: its handler reads
-`host.resources` verbatim, so `cpuPct`/`memPct` now move on their own, the
-new `sampledAt` key is already present for an age column, and
-`GET /v1/hosts` carries the same field in the meantime. No roster type was
-modified.
+This branch was rebased after co-dispatch merged to `origin/main`
+(`dac89826`, route `GET /v1/hosts/{id}/hostcap`, CLI `remuda hostcap`).
+The integration is additive on both sides:
+
+- hostcap already reads `host.resources` verbatim, so `cpuPct`/`memPct`
+  now move on their own and the co-dispatch-added `loadAvg1`/
+  `diskFreeGb` fields come out of the same fresh sampler;
+- the hostcap response gains `sampledAt` and `sampleAgeSec` so the CLI
+  shows whether the reading is live or a fossil;
+- an explicit `dispatch --host` pin over the ceiling returns
+  `warnings[]` (journaled like the plain create pin) instead of 422.
 
 ## Before/after on this host (2026-09-16)
 

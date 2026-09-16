@@ -1509,6 +1509,13 @@ export interface components {
                 [key: string]: unknown;
             }[];
             running?: number;
+            /** @description Age of the persisted sample in seconds as measured by the Hub; null when the host never reported resources. Placement re-samples past 60 s before refusing. */
+            sampleAgeSec?: number | null;
+            /**
+             * Format: date-time
+             * @description Hub-stamped RFC3339 time of the CPU/mem sample (heartbeat or on-demand refresh).
+             */
+            sampledAt?: string | null;
         };
         HostCli: {
             /** @enum {string} */
@@ -2371,6 +2378,8 @@ export interface components {
         };
         WorkerDispatchResult: {
             instanceId?: string;
+            /** @description Advisory over-limit CPU/mem readings for an explicitly pinned (--host) dispatch target; the worker still launched and each warning is journaled. */
+            warnings?: string[];
             worker: components["schemas"]["WorkerRoster"];
         };
         WorkerPage: {

@@ -3749,6 +3749,13 @@
           "instanceId": {
             "pattern": "^ins_",
             "type": "string"
+          },
+          "warnings": {
+            "description": "Advisory over-limit CPU/mem readings for an explicitly pinned (--host) dispatch target; the worker still launched and each warning is journaled.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -3863,6 +3870,21 @@
           "diskFreeGb": {
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "sampledAt": {
+            "description": "Hub-stamped RFC3339 time of the CPU/mem sample (heartbeat or on-demand refresh).",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "sampleAgeSec": {
+            "description": "Age of the persisted sample in seconds as measured by the Hub; null when the host never reported resources. Placement re-samples past 60 s before refusing.",
+            "type": [
+              "integer",
               "null"
             ]
           },

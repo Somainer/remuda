@@ -243,7 +243,7 @@ async fn dispatch_worker(
         .ok_or(HubError::NotFound)?;
 
     // ── host selection (§3.4) ──────────────────────────────────────────────
-    let host = select_dispatch_host(
+    let (host, placement_warnings) = select_dispatch_host(
         &state,
         &project,
         body.host_id.as_deref(),
@@ -478,6 +478,18 @@ async fn dispatch_worker(
     )
     .await?;
 
+    // An explicit --host pin over its CPU/mem ceiling was admitted, not
+    // refused: journal the saturation so the worker session shows why.
+    for warning in &placement_warnings {
+        crate::ws::publish_hub_diagnostic(
+            &state,
+            &instance.instance_id,
+            "placement_resource_warning",
+            warning,
+        )
+        .await;
+    }
+
     // ── deliver the brief as an object attachment, then prompt ────────────
     let brief_name = body
         .brief_name
@@ -565,17 +577,23 @@ async fn dispatch_worker(
     Ok(Json(json!({
         "worker": row,
         "instanceId": instance.instance_id,
+        "warnings": placement_warnings,
     })))
 }
 
 /// Select the dispatch host per §3.4: explicit host, else project members
 /// filtered/ordered by the local/remote tendency, then least-loaded.
+///
+/// Returns the chosen host plus any pin warnings: an explicit `--host` over
+/// its CPU/mem ceiling is an operator instruction, so it is admitted with a
+/// warning (and the warning is journaled against the spawned instance),
+/// never refused.
 async fn select_dispatch_host(
     state: &AppState,
     project: &remuda_protocol::Project,
     explicit: Option<&str>,
     tendency: Option<&str>,
-) -> Result<HostRecord, HubError> {
+) -> Result<(HostRecord, Vec<String>), HubError> {
     let placement = if let Some(host) = explicit {
         crate::placement::Placement::Host {
             host_id: host.to_string(),
@@ -589,7 +607,9 @@ async fn select_dispatch_host(
         driver: "claude-pty".into(),
         delegation: None,
     };
-    let mut hosts = crate::placement::pick_hosts(state, &placement, &spec).await?;
+    let outcome = crate::placement::pick_hosts(state, &placement, &spec).await?;
+    let mut hosts = outcome.hosts;
+    let warnings = outcome.warnings;
     if explicit.is_none()
         && let Some(wanted) = tendency
     {
@@ -610,6 +630,7 @@ async fn select_dispatch_host(
     hosts
         .into_iter()
         .next()
+        .map(|host| (host, warnings))
         .ok_or_else(|| HubError::Unsatisfiable {
             reasons: vec!["placement returned no host".into()],
         })
@@ -1078,6 +1099,14 @@ async fn host_capacity(
         .filter(|worker| worker.state.is_active())
         .collect::<Vec<_>>();
     let resources = host.resources.clone().unwrap_or(json!({}));
+    let sampled_at = resources
+        .get("sampledAt")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    // Seconds since the Hub stamped the persisted sample, so a caller can tell
+    // a live reading from a fossil without doing its own Rfc3339 clock math.
+    let sample_age_sec = crate::placement::resource_sample_age(Some(&resources))
+        .map(|age| i64::try_from(age.as_secs()).unwrap_or(i64::MAX));
     let max = host.max_instances;
     let port_blocks = active
         .iter()
@@ -1099,6 +1128,8 @@ async fn host_capacity(
         "loadAvg1": resources.get("loadAvg1").cloned().unwrap_or(json!(null)),
         "memPct": resources.get("memPct").cloned().unwrap_or(json!(null)),
         "diskFreeGb": resources.get("diskFreeGb").cloned().unwrap_or(json!(null)),
+        "sampledAt": sampled_at.map(Value::from).unwrap_or(json!(null)),
+        "sampleAgeSec": sample_age_sec.map(Value::from).unwrap_or(json!(null)),
         "maxInstances": max,
         "running": running,
         "freeSlots": (max - running).max(0),

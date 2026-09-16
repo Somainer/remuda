@@ -109,7 +109,7 @@ pub use shell_pty::{
     EMULATOR_ENV, ShellPtyDriver, ShellPtyOptions, default_shell, emulator_enabled,
 };
 pub use tty::{
-    HerdrTty, LocalPty, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge,
+    HerdrTty, LocalPty, ProgressBar, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge,
     logical_keys_to_bytes,
 };
 

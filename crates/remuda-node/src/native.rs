@@ -225,8 +225,9 @@ impl DriverFactory for NativeClaudeFactory {
                 "CLAUDE_CONFIG_DIR must be an absolute path".into(),
             ));
         }
+        let explicit_config_chosen = explicit_config_dir.is_some();
         let inherit_default_config = self.kind != DriverKind::GenericPty
-            && explicit_config_dir.is_none()
+            && !explicit_config_chosen
             && matches!(delegation, Delegation::None);
         let native_home = if let Some(path) = explicit_config_dir {
             path
@@ -413,6 +414,19 @@ impl DriverFactory for NativeClaudeFactory {
                         Some(native_home.clone())
                     };
                     options.pin_native_home = !inherit_default_config;
+                    // Pinned at a Remuda-managed home: seed the launch overlay
+                    // from the launching user's own ~/.claude so gateway model
+                    // config, statusLine, plugins and the rest survive
+                    // (native-config-1). An inherited home or an explicit
+                    // caller-chosen config dir is read natively by the CLI, so
+                    // copying it here would double-fire its hooks.
+                    options.user_settings_home = if inherit_default_config
+                        || explicit_config_chosen
+                    {
+                        None
+                    } else {
+                        Some(default_claude_home()?)
+                    };
                     options.auto_trust_workspace = auto_trust;
                 }
                 if agent_kind.is_none() {

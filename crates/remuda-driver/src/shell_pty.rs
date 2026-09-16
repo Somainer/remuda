@@ -148,6 +148,19 @@ pub struct ShellPtyOptions {
     /// Claude config dir used to locate a promoted session's transcript.
     /// Defaults to `$HOME/.claude`.
     pub claude_home: Option<PathBuf>,
+    /// Launching user's real Claude config dir to seed a scoped native home
+    /// from (native-config-1, 2026-09-16).
+    ///
+    /// When the agent is pinned at a Remuda-managed native home, the harness's
+    /// user-settings layer points at an empty directory; the driver copies the
+    /// user's effective `settings.json` / `settings.local.json` out of this
+    /// dir into the per-instance overlay so gateway models, `statusLine`,
+    /// plugins and friends behave like a plain terminal.
+    ///
+    /// `None` when the child reads its user settings natively — an inherited
+    /// operator home or an explicitly chosen `CLAUDE_CONFIG_DIR` — so hooks
+    /// from a copied layer can never fire twice.
+    pub user_settings_home: Option<PathBuf>,
     /// Hook path for this instance (D-028 §4.2), when `REMUDA_PTY_HOOKS` is on.
     ///
     /// `None` — the P1 default — means no socket, no overlay and no shim: a
@@ -219,6 +232,7 @@ impl ShellPtyOptions {
             rows: DEFAULT_ROWS,
             promote: false,
             claude_home: None,
+            user_settings_home: None,
             hooks: None,
             emulator: emulator_enabled(),
             target: Target::Shell,
@@ -1356,10 +1370,22 @@ fn prepare_launch_blocking(
 ) -> DriverResult<(LaunchRecipe, Option<Arc<crate::launch::HookSession>>)> {
     let recipe = recipe_for_blocking(options, cwd, spec, None)?;
     let native_claude = options.target.agent_kind() == Some(AgentKind::Claude);
-    // The operator-supplied overlay (if any) is the base everything else merges
-    // into. Read it from the audited materialized file so the bytes here are
-    // exactly the ones the recipe recorded.
-    let mut base_settings = if native_claude {
+    // Precedence for the merged overlay (native-config-1, 2026-09-16):
+    // the launching user's effective settings (only when the carrier pinned a
+    // scoped native home), then the operator/request overlay, then Remuda's
+    // hooks and terminal pins applied by the materializer below.
+    let user_settings = if native_claude {
+        match &options.user_settings_home {
+            Some(home) => crate::launch::load_effective_user_settings(home)?,
+            None => None,
+        }
+    } else {
+        None
+    };
+    // The operator-supplied overlay (if any) is read from the audited
+    // materialized file so the bytes here are exactly the ones the recipe
+    // recorded.
+    let operator_settings = if native_claude {
         recipe
             .materialized_files
             .iter()
@@ -1369,6 +1395,20 @@ fn prepare_launch_blocking(
     } else {
         None
     };
+    let mut base_settings = match (user_settings, operator_settings) {
+        (Some(user), Some(operator)) => {
+            Some(crate::launch::merge_settings_layers(&user, &operator))
+        }
+        (user, operator) => user.or(operator),
+    };
+    if let Some(settings) = &base_settings {
+        // Values are masked before they reach the log; the credential bytes
+        // live only in the 0600 instance file.
+        tracing::debug!(
+            settings = ?crate::launch::redact_settings(settings),
+            "user settings merged into the launch overlay"
+        );
+    }
     // A native launch that explicitly requested bypass permissions must not sit
     // on Claude's "WARNING: … Yes, I accept" disclaimer — that screen parks
     // before SessionStart exactly like the trust dialog does.
@@ -1414,16 +1454,17 @@ fn prepare_launch_blocking(
         );
     }
     // Which overlay the recipe argv must carry: the hook session's merged file
-    // when hooks are live, otherwise a bypass-only file we write ourselves.
-    // Neither exists when hooks are off and no setting needed injecting — then
-    // the first recipe already had the right argv (or no --settings at all).
+    // when hooks are live, otherwise the merged user/bypass settings file we
+    // write ourselves. Neither exists when hooks are off and no settings
+    // needed seeding — then the first recipe already had the right argv (or no
+    // --settings at all).
     let settings_overlay = match hooks.as_ref() {
         Some(hooks) => Some(hooks.overlay.path.clone()),
-        None if native_claude && bypass_requested => Some(write_bypass_overlay(
+        None if native_claude && base_settings.is_some() => Some(write_settings_overlay(
             options,
             base_settings
                 .as_ref()
-                .expect("bypass implies a base object"),
+                .expect("base settings presence was just matched"),
         )?),
         None => None,
     };
@@ -1434,8 +1475,10 @@ fn prepare_launch_blocking(
     Ok((recipe, hooks))
 }
 
-/// Write the bypass-acceptance overlay when no hook session owns one.
-fn write_bypass_overlay(
+/// Write the standalone settings overlay (hooks-off path) when no hook
+/// session owns one. This is the user settings seeded into a scoped native
+/// home, possibly with the bypass-acceptance key added.
+fn write_settings_overlay(
     options: &ShellPtyOptions,
     settings: &serde_json::Value,
 ) -> DriverResult<PathBuf> {
@@ -1578,6 +1621,14 @@ impl LocalPty for PtyState {
             .map(|emulator| emulator.alt_screen())
     }
 
+    fn progress(&self) -> Option<remuda_screen::ProgressBar> {
+        self.emulator
+            .as_ref()?
+            .lock()
+            .ok()
+            .and_then(|emulator| emulator.progress())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.output.subscribe()
     }
@@ -1606,6 +1657,7 @@ impl LocalPty for PtyState {
                     bytes: snapshot.bytes,
                     source: snapshot.source,
                     alt_screen: snapshot.alt_screen,
+                    progress: snapshot.progress,
                 }
             }
             Err(_) => {
@@ -2849,7 +2901,240 @@ mod tests {
         );
     }
 
-    /// native-carrier-4: the screen read is the carrier's debugging tool, so
+    /// native-config-1: when the carrier pins a scoped native home the
+    /// launching user's effective settings are copied into the per-instance
+    /// overlay — gateway env (including the credential), model,
+    /// modelSettings, statusLine and the user's own hooks all survive; the
+    /// relay hooks are appended per event and the terminal pins are forced.
+    /// Credential bytes live only in the 0600 instance file.
+    #[tokio::test]
+    async fn a_scoped_native_home_merges_the_users_effective_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_home = dir.path().join("real-claude-home");
+        std::fs::create_dir_all(&user_home).unwrap();
+        std::fs::write(
+            user_home.join("settings.json"),
+            serde_json::json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://gateway.example.invalid",
+                    "ANTHROPIC_AUTH_TOKEN": "gateway-secret-token",
+                    "ANTHROPIC_MODEL": "shared-gateway-model",
+                    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+                },
+                "model": "shared-gateway-model",
+                "modelSettings": [{"name": "model_hub/es1_orange_o48"}],
+                "statusLine": {"type": "command", "command": "echo ready"},
+                "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "user-session-start"}]}]},
+                "theme": "dark"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // settings.local.json wins scalars and merges env per variable.
+        std::fs::write(
+            user_home.join("settings.local.json"),
+            serde_json::json!({
+                "model": "local-gateway-model",
+                "env": {"ANTHROPIC_MODEL": "local-gateway-model", "EXTRA": "kept"},
+                "verbose": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+
+        let build = |hooks_on: bool| {
+            // Fresh instance dir per variant, like production: a hooks-off
+            // launch must never read a previous launch's settings.json.
+            let inst = dir
+                .path()
+                .join(if hooks_on { "instance-hooks" } else { "instance-plain" });
+            let mut options = ShellPtyOptions::agent(
+                dir.path().to_path_buf(),
+                AgentKind::Claude,
+                AgentLaunch {
+                    profile: Box::new(crate::profile::ProviderProfile {
+                        id: spec.provider_profile.id.clone(),
+                        kind: ProviderKind::Anthropic,
+                        base_url: String::new(),
+                        delegation: Delegation::None,
+                        secret_ref: None,
+                        models: vec!["sonnet".into()],
+                        health: crate::profile::ProviderHealth::Healthy,
+                    }),
+                    launch_dir: inst.join("launch"),
+                    native_home: dir.path().join("scoped-native-home"),
+                    binary: Some(PathBuf::from("/bin/sh")),
+                    origin: crate::materializer::LaunchOrigin::Human,
+                    settings_overlay: None,
+                },
+            );
+            options.user_settings_home = Some(user_home.clone());
+            if hooks_on {
+                options.hooks = Some(HookConfig {
+                    instance_dir: inst,
+                    relay_binary: PathBuf::from("/nonexistent/remuda"),
+                    tui: crate::launch::TuiMode::Fullscreen,
+                });
+            }
+            options
+        };
+
+        for hooks_on in [true, false] {
+            let options = build(hooks_on);
+            let ctx = promote_ctx(&options, &spec.cwd, Some(&spec)).unwrap();
+            let (events, _rx) = mpsc::channel(8);
+            let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+            let (recipe, hooks) = prepare_launch_blocking(
+                &options,
+                &spec.cwd,
+                Some(&spec),
+                &ctx,
+                &events,
+                &seq,
+                &interrupt_pid,
+            )
+            .unwrap();
+            let settings_path = recipe
+                .argv
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--settings").then(|| PathBuf::from(&pair[1])))
+                .unwrap_or_else(|| panic!("seeded settings must be carried (hooks={hooks_on})"));
+            let body = std::fs::read_to_string(&settings_path).unwrap();
+            let merged: serde_json::Value = serde_json::from_str(&body).unwrap();
+            // Gateway model config reaches the child exactly like a terminal.
+            assert_eq!(
+                merged["env"]["ANTHROPIC_BASE_URL"],
+                "https://gateway.example.invalid",
+                "hooks={hooks_on}"
+            );
+            assert_eq!(
+                merged["env"]["ANTHROPIC_AUTH_TOKEN"], "gateway-secret-token",
+                "hooks={hooks_on}: the credential is copied from the user's own settings only"
+            );
+            assert_eq!(
+                merged["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1",
+                "hooks={hooks_on}"
+            );
+            assert_eq!(merged["env"]["ANTHROPIC_MODEL"], "local-gateway-model");
+            assert_eq!(merged["env"]["EXTRA"], "kept");
+            assert_eq!(merged["model"], "local-gateway-model");
+            assert_eq!(
+                merged["modelSettings"][0]["name"],
+                "model_hub/es1_orange_o48"
+            );
+            assert_eq!(merged["statusLine"]["command"], "echo ready");
+            assert_eq!(merged["theme"], "dark");
+            assert_eq!(merged["verbose"], true);
+            if hooks_on {
+                let hooks = hooks.expect("hooks requested");
+                assert_eq!(settings_path, hooks.overlay.path);
+                // User hook first, relay appended for every registered event.
+                let session_start = merged["hooks"]["SessionStart"].as_array().unwrap();
+                assert_eq!(
+                    session_start[0]["hooks"][0]["command"], "user-session-start",
+                    "the user's hook keeps its leading position"
+                );
+                assert!(
+                    session_start
+                        .iter()
+                        .any(|matcher| matcher.to_string().contains("hook emit")),
+                    "the relay registration is appended, not replaced"
+                );
+                assert_eq!(merged["tui"], "fullscreen");
+                assert_eq!(merged["terminalProgressBarEnabled"], true);
+            } else {
+                assert!(hooks.is_none(), "the seeded overlay exists without hooks");
+                // The user's own hooks are copied, but no relay registration
+                // is invented on the hooks-off path.
+                if let Some(events) = merged.get("hooks").and_then(|h| h.as_object()) {
+                    assert!(
+                        !events.values().any(|m| m.to_string().contains("hook emit")),
+                        "hooks-off must not register the relay: {events:?}"
+                    );
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "credentials stay in a 0600 instance file"
+                );
+            }
+            // The redaction path masks the token while keeping diagnostics.
+            let redacted = crate::launch::redact_settings(&merged).to_string();
+            assert!(!redacted.contains("gateway-secret-token"), "{redacted}");
+            assert!(redacted.contains("local-gateway-model"), "{redacted}");
+        }
+
+        // The user's own settings files are read, never modified.
+        assert!(
+            std::fs::read_to_string(user_home.join("settings.json"))
+                .unwrap()
+                .contains("gateway-secret-token")
+        );
+    }
+
+    /// native-config-1: an inherited (or explicitly chosen) config dir is read
+    /// natively by the CLI, so no copy is seeded and a plain launch with no
+    /// other needs carries no `--settings` at all.
+    #[tokio::test]
+    async fn an_inherited_native_home_does_not_seed_or_copy_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        let options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: String::new(),
+                    delegation: Delegation::None,
+                    secret_ref: None,
+                    models: vec!["sonnet".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: dir.path().join("instance").join("launch"),
+                native_home: dir.path().join("native-home"),
+                binary: Some(PathBuf::from("/bin/sh")),
+                origin: crate::materializer::LaunchOrigin::Human,
+                settings_overlay: None,
+            },
+        );
+        let ctx = promote_ctx(&options, &spec.cwd, Some(&spec)).unwrap();
+        let (events, _rx) = mpsc::channel(8);
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let (recipe, hooks) = prepare_launch_blocking(
+            &options,
+            &spec.cwd,
+            Some(&spec),
+            &ctx,
+            &events,
+            &seq,
+            &interrupt_pid,
+        )
+        .unwrap();
+        assert!(hooks.is_none());
+        assert!(
+            !recipe.argv.iter().any(|arg| arg == "--settings"),
+            "no overlay may shadow the inherited home's own settings: {:?}",
+            recipe.argv
+        );
+    }
+
+
     /// it has to work on a live PTY and be honest when there is nothing to
     /// read. A driver that has not started must not answer with an empty grid,
     /// which reads as a blank terminal.

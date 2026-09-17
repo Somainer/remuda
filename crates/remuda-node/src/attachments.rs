@@ -68,10 +68,33 @@ pub struct MaterializedAttachment {
 /// rather than silently dropped.
 pub trait ObjectSource: Send + Sync + std::fmt::Debug {
     /// Fetch one object's bytes by id.
+    ///
+    /// Sources that can only pull per-instance (the carrier path) leave this
+    /// default, which fails: the Hub authorizes an `object.pull` for a named
+    /// instance, so a fetch without one is a caller bug.
     fn fetch(
         &self,
         object_id: String,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, NodeError>> + Send + '_>>;
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, NodeError>> + Send + '_>> {
+        Box::pin(async move {
+            Err(NodeError::InvalidRequest(format!(
+                "{object_id}: this object source requires the staging instance"
+            )))
+        })
+    }
+
+    /// Fetch an object staged for a specific instance.
+    ///
+    /// The carrier pull (`object.pull`) must name the instance: the Hub only
+    /// serves objects staged for an instance on the requesting host. Sources
+    /// authenticated per-object (the HTTP path) ignore it by default.
+    fn fetch_for_instance(
+        &self,
+        object_id: String,
+        _instance_id: &InstanceId,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<Vec<u8>, NodeError>> + Send + '_>> {
+        Box::pin(async move { self.fetch(object_id).await })
+    }
 }
 
 /// `GET {hub}/v1/objects/{id}` with the durable host token.
@@ -137,20 +160,33 @@ impl ObjectSource for HubObjectSource {
                 .bearer_auth(&self.token)
                 .send()
                 .await
-                .map_err(|error| {
-                    NodeError::InvalidRequest(format!("attachment {object_id}: {error}"))
-                })?;
+                .map_err(|error| map_http_error(&object_id, error))?;
             let status = response.status();
             if !status.is_success() {
                 return Err(NodeError::InvalidRequest(format!(
                     "attachment {object_id}: Hub returned {status}"
                 )));
             }
-            let bytes = response.bytes().await.map_err(|error| {
-                NodeError::InvalidRequest(format!("attachment {object_id}: {error}"))
-            })?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| map_http_error(&object_id, error))?;
             Ok(bytes.to_vec())
         })
+    }
+}
+
+/// A connect/timeout failure means the Hub HTTP origin is unreachable from
+/// this host (the ssh-stdio case); the caller may fall back to a carrier pull.
+/// Status-level failures stay [`NodeError::InvalidRequest`] — retrying over the
+/// carrier cannot fix a rejected or missing object.
+fn map_http_error(object_id: &str, error: reqwest::Error) -> NodeError {
+    if error.is_connect() || error.is_timeout() {
+        NodeError::Transport(format!(
+            "attachment {object_id}: Hub HTTP origin unreachable: {error}"
+        ))
+    } else {
+        NodeError::InvalidRequest(format!("attachment {object_id}: {error}"))
     }
 }
 
@@ -229,7 +265,9 @@ pub async fn materialize(
     // the same filename in one send get distinct landed paths.
     let mut claimed: BTreeSet<String> = BTreeSet::new();
     for reference in refs {
-        let bytes = source.fetch(reference.object_id.clone()).await?;
+        let bytes = source
+            .fetch_for_instance(reference.object_id.clone(), instance_id)
+            .await?;
         if bytes.is_empty() {
             return Err(NodeError::InvalidRequest(format!(
                 "attachment {} came back empty",

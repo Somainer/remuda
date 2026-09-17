@@ -66,6 +66,16 @@ pub const METHOD_INSTANCE_KEYS: &str = "instance.keys";
 pub const METHOD_TTY_RESIZE: &str = "tty.resize";
 /// Attach (or refresh) a TTY stream; Hub→Node. Snapshot bytes may be in the result.
 pub const METHOD_TTY_ATTACH: &str = "tty.attach";
+/// Node→Hub: pull one staged object's bytes over the node carrier.
+///
+/// The HTTP path (`GET /v1/objects/{id}`) is unreachable from a host enrolled
+/// over the ssh-stdio bridge, so the same host token that authenticates this
+/// socket authorizes an in-band pull. Small objects return inline; larger ones
+/// are preceded by `object.chunk` notifications (protocol.md §7.4 channel 2
+/// reserved the byte path; JSON chunks are what the NDJSON bridge can carry).
+pub const METHOD_OBJECT_PULL: &str = "object.pull";
+/// Hub→Node notification: one base64 chunk of a streamed `object.pull`.
+pub const METHOD_OBJECT_CHUNK: &str = "object.chunk";
 /// Read the current screen as text; Hub→Node. Read-only and side-effect free:
 /// unlike [`METHOD_TTY_ATTACH`] it opens no stream and moves no offset, so it
 /// is safe to call against a session a human is watching.
@@ -178,6 +188,8 @@ pub enum HubNodeMethod {
     TtyAttach,
     /// [`METHOD_TTY_SCREEN`].
     TtyScreen,
+    /// [`METHOD_OBJECT_PULL`] (Node→Hub).
+    ObjectPull,
 }
 
 /// An explicitly sequenced phase of a workspace mutation.
@@ -715,6 +727,40 @@ pub struct TtyAttachParams {
     pub rows: Option<u16>,
 }
 
+/// `object.pull` params (Node→Hub, D-027 carrier fallback).
+///
+/// The Hub answers only when the object is staged for `instance_id` and that
+/// instance lives on the host authenticated by this socket: the instance is
+/// part of the request so a host token cannot read another host's objects by
+/// quoting their id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectPullParams {
+    /// Hub object identity (`obj_…`).
+    pub object_id: String,
+    /// Instance the object was staged for.
+    pub instance_id: String,
+}
+
+/// `object.chunk` notification params (Hub→Node).
+///
+/// Emitted, in `seq` order starting at 0, before the final `object.pull` reply
+/// when the object is larger than the inline threshold. `last` marks the final
+/// chunk; the reply afterwards carries metadata only. Every chunk is one JSON
+/// frame, so each base64 chunk stays well under `maxJsonFrameBytes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectChunkParams {
+    /// Object this chunk belongs to.
+    pub object_id: String,
+    /// Zero-based contiguous chunk sequence.
+    pub seq: u32,
+    /// Chunk bytes, standard base64.
+    pub data_base64: String,
+    /// True on the final chunk of the object.
+    pub last: bool,
+}
+
 /// Batched `journal.append` with an optional sequence watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -858,6 +904,7 @@ impl HubNodeMethod {
             Self::TtyResize => METHOD_TTY_RESIZE,
             Self::TtyAttach => METHOD_TTY_ATTACH,
             Self::TtyScreen => METHOD_TTY_SCREEN,
+            Self::ObjectPull => METHOD_OBJECT_PULL,
         }
     }
 
@@ -890,6 +937,7 @@ impl HubNodeMethod {
             METHOD_TTY_RESIZE => Self::TtyResize,
             METHOD_TTY_ATTACH => Self::TtyAttach,
             METHOD_TTY_SCREEN => Self::TtyScreen,
+            METHOD_OBJECT_PULL => Self::ObjectPull,
             _ => return None,
         })
     }

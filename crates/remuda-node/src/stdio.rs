@@ -9,6 +9,7 @@ use remuda_protocol::{Id, InstanceId, JournalEvent, U64};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -189,6 +190,11 @@ where
     let mut input = BufReader::new(input).lines();
     let (journal_tx, mut journal_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
     let (tty_tx, mut tty_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
+    // Object pulls ride the carrier itself: a stdio-enrolled host usually has
+    // no HTTP route to the Hub, and the ssh bridge forwards JSON only.
+    let (carrier_tx, mut carrier_rx) = mpsc::channel(16);
+    let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
+    node.set_object_source(Arc::new(object_broker.source()));
     spawn_stdio_tty_pump(node.clone(), tty_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
 
@@ -198,6 +204,10 @@ where
                 if let Some(frame) = frame {
                     write_ndjson(&mut output, &frame).await?;
                 }
+            }
+            frame = carrier_rx.recv() => {
+                let Some(frame) = frame else { break; };
+                write_ndjson(&mut output, &frame).await?;
             }
             frame = tty_rx.recv() => {
                 if let Some(frame) = frame {
@@ -237,6 +247,11 @@ where
                         continue;
                     }
                 };
+                // object.pull replies and object.chunk notifications complete
+                // attachment fetches; they never become instance RPCs.
+                if object_broker.handle_frame(&frame) {
+                    continue;
+                }
                 let outcome = handle_stdio_frame(
                     &node,
                     &enrollment,
@@ -255,6 +270,7 @@ where
         }
     }
     stop_pumps(pumps).await;
+    object_broker.fail_all(NodeError::Disconnected);
     Ok(())
 }
 

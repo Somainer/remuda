@@ -3,6 +3,7 @@
 mod adapter_registry;
 mod attachments;
 mod carrier;
+mod carrier_objects;
 mod carrier_recovery;
 mod config;
 #[cfg(unix)]

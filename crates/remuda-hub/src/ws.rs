@@ -13,7 +13,8 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use remuda_protocol::hubnode::{
-    self, HubNodeMethod, JournalAppendParams, NodeHelloParams, TtyFrameParams, TtyModeParams,
+    self, HubNodeMethod, JournalAppendParams, METHOD_OBJECT_CHUNK, NodeHelloParams, TtyFrameParams,
+    TtyModeParams,
 };
 use remuda_protocol::{
     ConnectionLease, HeartbeatResult, HelloResult, PROTOCOL_VERSION, TransportLimits, U64,
@@ -271,25 +272,40 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 let is_hello = kind.is_some_and(HubNodeMethod::is_hello);
                 let is_auth = kind.is_some_and(HubNodeMethod::is_auth);
                 if !hello_done && !is_hello && !is_auth {
+                    // Terminal: write straight to the socket so the frame is
+                    // flushed before this loop drops the connection.
                     if !id.is_null() {
-                        let _ = sink.send(Message::Text(
-                            rpc_err(id, -32000, "runtime.hello required").to_string().into(),
-                        )).await;
+                        let _ = sink
+                            .send(Message::Text(
+                                rpc_err(id, -32000, "runtime.hello required").to_string().into(),
+                            ))
+                            .await;
                     }
                     break;
                 }
                 match handle_node_method(&state, &token, &mut host_id, &mut hello_done, &mut session_generation, method, params, &out_tx, &pending).await {
+                    // Normal replies ride the same FIFO as handler-emitted
+                    // frames (object.pull streams its chunks just before this
+                    // reply), so they are queued rather than written straight
+                    // to the socket — a direct send could overtake queued
+                    // chunks.
                     Ok(Some(result)) => {
                         if !id.is_null() {
-                            let _ = sink.send(Message::Text(rpc_ok(id, result).to_string().into())).await;
+                            let _ = out_tx.send(rpc_ok(id, result)).await;
                         }
                     }
                     Ok(None) => {}
                     Err(err) => {
+                        // Unauthenticated is terminal: flush the error directly
+                        // before closing (a queued frame could be dropped).
                         if !id.is_null() {
-                            let _ = sink.send(Message::Text(
-                                rpc_err(id, rpc_code(&err), &err.to_string()).to_string().into(),
-                            )).await;
+                            let _ = sink
+                                .send(Message::Text(
+                                    rpc_err(id, rpc_code(&err), &err.to_string())
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await;
                         }
                         if matches!(err, HubError::Unauthenticated) {
                             break;
@@ -665,8 +681,103 @@ pub(crate) async fn handle_node_method(
             }
             Ok(Some(json!({ "ok": true })))
         }
+        "object.pull" => {
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            Ok(Some(object_pull(state, host_id, &params, out_tx).await?))
+        }
         other => Err(HubError::BadRequest(format!("unknown method {other}"))),
     }
+}
+
+/// Handle a Node's `object.pull` over the node socket (D-027 carrier path).
+///
+/// Authorized by the host token already authenticated on this socket, and
+/// additionally bound to the staging instance named in the request: the object
+/// must be staged for *an instance on this host* or the pull is refused, so a
+/// host token can never read another host's attachments.
+///
+/// Objects whose base64 form fits one frame return `dataBase64` inline; larger
+/// objects are streamed as `object.chunk` notifications (FIFO on the same
+/// outbound channel, so they cannot overtake this metadata-only reply) and are
+/// capped at the Hub's configured attachment maximum.
+async fn object_pull(
+    state: &AppState,
+    authenticated_host: &str,
+    params: &Value,
+    out_tx: &mpsc::Sender<Value>,
+) -> Result<Value, HubError> {
+    let object_id = params
+        .get("objectId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HubError::BadRequest("object.pull requires objectId".into()))?;
+    let instance_id = params
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| HubError::BadRequest("object.pull requires instanceId".into()))?;
+    let object = state
+        .store
+        .get_object(object_id.to_owned())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    // Same lazy-expiry rule as the HTTP download path.
+    if crate::config::now_rfc3339().as_str() >= object.expires_at.as_str() {
+        return Err(HubError::NotFound);
+    }
+    if object.host_id != authenticated_host || object.instance_id != instance_id {
+        // Do not distinguish "wrong host" from "wrong instance / unknown
+        // object" beyond the status class: both are cross-scope reads.
+        return Err(HubError::Forbidden);
+    }
+    if object.byte_len.max(0) as usize > state.config.attachment_max_bytes {
+        return Err(HubError::BadRequest(format!(
+            "RESOURCE_LIMIT: attachment is {} bytes; the limit is {}",
+            object.byte_len, state.config.attachment_max_bytes
+        )));
+    }
+    let bytes = state
+        .store
+        .read_object_bytes(object_id.to_owned())
+        .await?
+        .ok_or(HubError::NotFound)?;
+    let metadata = json!({
+        "objectId": object.object_id,
+        "mime": object.media_type,
+        "size": bytes.len(),
+        "sha256": object.digest,
+    });
+    let encoded = encode_b64(&bytes);
+    if encoded.len() <= crate::objects::MAX_INLINE_PULL_BASE64 {
+        let mut result = metadata;
+        result["dataBase64"] = Value::String(encoded);
+        return Ok(result);
+    }
+    // Streamed transfer. Each chunk is its own JSON frame; yield after sending
+    // so control/tty traffic sharing this session is not starved while tens of
+    // megabytes queue ahead of it.
+    let chunks = bytes.chunks(crate::objects::PULL_CHUNK_BYTES).count();
+    for (seq, chunk) in bytes.chunks(crate::objects::PULL_CHUNK_BYTES).enumerate() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": METHOD_OBJECT_CHUNK,
+            "params": {
+                "objectId": object_id,
+                "seq": seq as u32,
+                "last": seq + 1 == chunks,
+                "dataBase64": encode_b64(chunk),
+            },
+        });
+        if out_tx.send(frame).await.is_err() {
+            return Err(HubError::Internal(
+                "node session closed during object.pull".into(),
+            ));
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(metadata)
 }
 
 /// Reconcile Hub-side instance rows against what the Node reports at hello.

@@ -102,6 +102,8 @@ fn public_wire_types_are_registered_for_generation() {
         "TtyResizeParams",
         "TtyAttachParams",
         "TtyBinaryEnvelopeSpec",
+        "ObjectPullParams",
+        "ObjectChunkParams",
         // §9.1: pure transcript-mapper state shared between the driver and the
         // journal tailer; it is never serialized on the wire.
         "EffortTracker",

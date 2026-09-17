@@ -41,6 +41,16 @@ pub const MAX_ATTACHMENTS_PER_SEND: usize = 8;
 pub const OBJECT_TTL_SECONDS: i64 = 24 * 60 * 60;
 /// Longest accepted declared MIME string.
 const MAX_MEDIA_TYPE_LEN: usize = 255;
+/// Largest base64 payload that rides inside a single `object.pull` reply.
+///
+/// 768 KiB of bytes encodes to exactly 1 MiB of base64, which would equal
+/// `maxJsonFrameBytes` (protocol.md §7.4) before the JSON envelope is counted
+/// and tear down the stdio session at its 1 MiB NDJSON line cap. Reserve 512
+/// bytes of envelope headroom, so objects up to ~767.6 KiB still inline.
+pub const MAX_INLINE_PULL_BASE64: usize = 1_048_576 - 512;
+/// Raw bytes per streamed `object.chunk` notification: ~345 KiB base64,
+/// comfortably inside one frame and small enough to yield between chunks.
+pub const PULL_CHUNK_BYTES: usize = 256 * 1024;
 
 pub fn routes(max_object_bytes: usize) -> Router<AppState> {
     Router::new()

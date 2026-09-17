@@ -879,9 +879,9 @@ fn select_worker_driver(
                     host.host_id
                 )));
             }
-            if matches!(driver, "claude-pty" | "claude-bg")
-                && host.herdr.as_ref().is_none_or(Value::is_null)
-            {
+            // `claude-pty` is the only allowlisted driver that needs herdr;
+            // `claude-bg` never reaches here (it is not in the match arm above).
+            if driver == "claude-pty" && host.herdr.as_ref().is_none_or(Value::is_null) {
                 return Err(HubError::Conflict(format!(
                     "host {} advertises no herdr, which {driver} requires; dispatch without \
                      --driver to use the native carrier",

@@ -323,11 +323,33 @@ async fn tty_upgrade(
         .into_response())
 }
 
+/// The part of a live TTY frame at `offset` the client has not been shown.
+///
+/// `None` when the snapshot already carried all of it. A frame that straddles
+/// `resume_from` is trimmed to its unseen tail so the client's offset
+/// accounting stays monotonic and no byte is painted twice.
+fn live_tail(offset: u64, payload: &[u8], resume_from: u64) -> Option<(u64, &[u8])> {
+    if offset >= resume_from {
+        return Some((offset, payload));
+    }
+    let skip = usize::try_from(resume_from - offset).ok()?;
+    let tail = payload.get(skip..)?;
+    (!tail.is_empty()).then_some((resume_from, tail))
+}
+
 async fn tty_socket(
     mut socket: WebSocket,
     node: DevNode,
     instance_id: remuda_protocol::InstanceId,
 ) {
+    // Subscribe BEFORE the snapshot, never after. `attach` reads the ring at
+    // one instant; bytes the child writes between that read and the
+    // subscription belong to neither, so this client never sees them and only
+    // a reconnect (whose snapshot is taken later) recovers them. That is the
+    // same ordering `LocalStore::subscribe` documents for the journal, and the
+    // window widens exactly when the machine is loaded — a short-lived process
+    // whose only output lands in it looks like a terminal that printed nothing.
+    let mut events = node.tty().subscribe();
     let attached = match node.tty().attach(&instance_id).await {
         Ok(attached) => attached,
         Err(error) => {
@@ -336,6 +358,9 @@ async fn tty_socket(
         }
     };
     let stream_id = attached.stream_id.clone();
+    // Everything up to here is painted by the snapshot below; a live frame
+    // that straddles the boundary is forwarded from this offset on.
+    let mut resume_from = attached.next_offset;
     if attached.alt_screen.is_some() || attached.progress.is_some() {
         // Alt-screen is included only when observed; progress rides the same
         // notice and is null when the emulator has no OSC 9;4 evidence yet.
@@ -360,7 +385,6 @@ async fn tty_socket(
             Err(error) => tracing::error!(%error, "failed to encode TTY snapshot"),
         }
     }
-    let mut events = node.tty().subscribe();
     loop {
         tokio::select! {
             incoming = socket.recv() => {
@@ -409,7 +433,15 @@ async fn tty_socket(
                     Ok(crate::TtyEvent::Bytes { instance_id: id, stream_id: sid, offset, payload })
                         if id == instance_id =>
                     {
-                        if let Ok(frame) = encode_tty_frame(&sid, offset, &payload)
+                        // Subscribing first means a frame can overlap the
+                        // snapshot; forward only the part the client has not
+                        // been painted yet, and never rewind the offset.
+                        let Some((offset, payload)) = live_tail(offset, &payload, resume_from)
+                        else {
+                            continue;
+                        };
+                        resume_from = offset.saturating_add(payload.len() as u64);
+                        if let Ok(frame) = encode_tty_frame(&sid, offset, payload)
                             && socket.send(Message::Binary(frame.into())).await.is_err()
                         {
                             break;
@@ -1341,6 +1373,24 @@ fn api_response(status: StatusCode, code: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The snapshot/subscription boundary, which the gate's `tty_endpoint`
+    /// failure exercises: `tty_socket` subscribes before it snapshots, so a
+    /// frame can straddle the two and must be trimmed, never dropped and
+    /// never replayed.
+    #[test]
+    fn a_live_frame_straddling_the_snapshot_is_trimmed_to_its_unseen_tail() {
+        // Wholly after the snapshot: forwarded untouched.
+        assert_eq!(live_tail(10, b"abc", 10), Some((10, &b"abc"[..])));
+        assert_eq!(live_tail(12, b"abc", 10), Some((12, &b"abc"[..])));
+        // Wholly inside it: the client already has these bytes.
+        assert_eq!(live_tail(0, b"abc", 3), None);
+        assert_eq!(live_tail(0, b"abc", 99), None);
+        // Straddling: only the tail, anchored at the resume offset.
+        assert_eq!(live_tail(8, b"abcde", 10), Some((10, &b"cde"[..])));
+        // Empty payloads carry nothing either way.
+        assert_eq!(live_tail(0, b"", 0), Some((0, &b""[..])));
+    }
 
     #[test]
     fn access_code_comparison_and_cookie_token_are_deterministic() {

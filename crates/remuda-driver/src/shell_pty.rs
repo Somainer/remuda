@@ -928,7 +928,7 @@ impl ShellPtyDriver {
         // filled in, not the stub the shell path used to emit for everything.
         // Materialization is blocking (`--version`, the ~207 MB binary hash,
         // overlay/shim/hook-socket writes); keep it off the async cores.
-        let (recipe, hooks) = {
+        let (recipe, hooks, provider_note) = {
             let options = self.options.clone();
             let cwd_owned = cwd.to_owned();
             let spec_owned = spec.cloned();
@@ -1116,6 +1116,23 @@ impl ShellPtyDriver {
                 *self.adapters.lock().await =
                     Some(self.spawn_promoted_adapter_watch(&hook_ctx, tx.clone()));
             }
+        }
+        // gateway-carryover-1: state which provider source actually applied,
+        // before anything the session does can be misread as evidence of it.
+        // The channel is already live and `rx` is handed to the caller below,
+        // so this lands ahead of the first hook or screen observation.
+        if let Some(payload) = provider_note
+            && let Err(error) = promotion::emit_payload(
+                &tx,
+                &self.seq,
+                &hook_ctx,
+                remuda_protocol::SourceChannel::Runtime,
+                remuda_protocol::Completeness::Structured,
+                payload,
+            )
+            .await
+        {
+            tracing::debug!(%error, "provider source lifecycle not journaled");
         }
         // §5.5: a crashed agent used to stay `ready` forever, because EOF only
         // broke the read loop. Both witnesses now journal an exit.
@@ -1480,13 +1497,25 @@ fn prepare_launch_blocking(
     events: &mpsc::Sender<remuda_protocol::Observation>,
     seq: &Arc<AtomicU64>,
     interrupt_pid: &Arc<AtomicI32>,
-) -> DriverResult<(LaunchRecipe, Option<Arc<crate::launch::HookSession>>)> {
+) -> DriverResult<(
+    LaunchRecipe,
+    Option<Arc<crate::launch::HookSession>>,
+    Option<remuda_protocol::ObservationPayload>,
+)> {
     let recipe = recipe_for_blocking(options, cwd, spec, None)?;
     let native_claude = options.target.agent_kind() == Some(AgentKind::Claude);
-    // Precedence for the merged overlay (native-config-1, 2026-09-16):
-    // the launching user's effective settings (only when the carrier pinned a
-    // scoped native home), then the operator/request overlay, then Remuda's
-    // hooks and terminal pins applied by the materializer below.
+    // Precedence for the merged overlay (native-config-1, 2026-09-16;
+    // gateway-carryover-1, 2026-09-17): the launching user's effective settings
+    // are the BASE (only when the carrier pinned a scoped native home), the
+    // operator/request overlay goes on top, then Remuda's hooks and terminal
+    // pins applied by the materializer below.
+    //
+    // For `gateway`/`direct` the operator overlay is *authoritative*, not just
+    // higher: see `merge_provider_overlay_over_user`. Being higher was not
+    // enough, because the host describes the provider through env variables
+    // (`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`,
+    // `CLAUDE_CODE_SUBAGENT_MODEL`, …) that Claude honours *over* the overlay's
+    // `model` key, so a plain merge left the session on the host's gateway.
     let user_settings = if native_claude {
         match &options.user_settings_home {
             Some(home) => crate::launch::load_effective_user_settings(home)?,
@@ -1508,12 +1537,37 @@ fn prepare_launch_blocking(
     } else {
         None
     };
+    // Delegation decides who owns the provider. `none` is 跟随主机: the host's
+    // own settings *are* the requested provider and carry over verbatim.
+    let provider_authoritative = native_claude
+        && matches!(
+            options.agent.as_ref().map(|agent| agent.profile.delegation),
+            Some(Delegation::Gateway | Delegation::Direct)
+        );
     let mut base_settings = match (user_settings, operator_settings) {
+        (Some(user), Some(operator)) if provider_authoritative => Some(
+            crate::launch::merge_provider_overlay_over_user(&user, &operator),
+        ),
         (Some(user), Some(operator)) => {
             Some(crate::launch::merge_settings_layers(&user, &operator))
         }
+        // Delegation asked for a gateway/direct provider but no overlay reached
+        // us. The host's settings must still not answer for it: strip its
+        // endpoint/model variables anyway (an empty overlay merges to nothing)
+        // so the session falls back to the harness's own login rather than
+        // silently taking the host's gateway. Otherwise this failure mode is
+        // indistinguishable from the bug being fixed.
+        (Some(user), None) if provider_authoritative => Some(
+            crate::launch::merge_provider_overlay_over_user(&user, &serde_json::json!({})),
+        ),
         (user, operator) => user.or(operator),
     };
+    let provider_note = provider_source_lifecycle(
+        options,
+        &recipe,
+        provider_authoritative,
+        base_settings.as_ref(),
+    );
     if let Some(settings) = &base_settings {
         // Values are masked before they reach the log; the credential bytes
         // live only in the 0600 instance file.
@@ -1585,7 +1639,87 @@ fn prepare_launch_blocking(
         Some(path) => recipe_for_blocking(options, cwd, spec, Some(&path))?,
         None => recipe,
     };
-    Ok((recipe, hooks))
+    Ok((recipe, hooks, provider_note))
+}
+
+/// Native lifecycle name for the provider decision a launch actually made
+/// (gateway-carryover-1).
+pub const NATIVE_PROVIDER_SOURCE: &str = "provider_source_resolved";
+
+/// Build the lifecycle payload that records **which provider source applied**.
+///
+/// The regression this exists for was invisible in the journal: the Hub record
+/// said `gateway` + profile id, and the session ran on the host's own gateway,
+/// with nothing in between to contradict either. One line stating the source
+/// and the effective model makes the transcript able to prove what ran.
+///
+/// `status` is `overlay` or `host-native`. `related_ids` carries the profile id
+/// and delegation, and `model` is the model that will actually answer: the
+/// overlay's own `model` when the overlay applies, else the host's. Only names
+/// and ids — never a token, never a base URL, since a journal is not the 0600
+/// instance file.
+fn provider_source_lifecycle(
+    options: &ShellPtyOptions,
+    recipe: &LaunchRecipe,
+    provider_authoritative: bool,
+    settings: Option<&serde_json::Value>,
+) -> Option<remuda_protocol::ObservationPayload> {
+    if options.target.agent_kind() != Some(AgentKind::Claude) {
+        return None;
+    }
+    let mut related = std::collections::BTreeMap::new();
+    related.insert(
+        "delegation".to_owned(),
+        match recipe.provider.delegation {
+            Delegation::Gateway => "gateway",
+            Delegation::Direct => "direct",
+            Delegation::None => "none",
+        }
+        .to_owned(),
+    );
+    related.insert(
+        "providerProfileId".to_owned(),
+        recipe.provider.profile_id.to_string(),
+    );
+    // The model that will answer. The overlay's `model` is the requested one
+    // when the overlay is authoritative; otherwise whatever the host layer
+    // left in place is the honest answer, and "unset" is honest too.
+    let model = settings
+        .and_then(|settings| settings.get("model"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            Some(recipe.provider.model_requested.clone()).filter(|model| !model.trim().is_empty())
+        });
+    related.insert(
+        "effectiveModel".to_owned(),
+        model.unwrap_or_else(|| "unset".to_owned()),
+    );
+    // Whether the host had provider config at all, so a `host-native` line can
+    // be told apart from "nobody configured anything".
+    related.insert(
+        "hostSettingsSeeded".to_owned(),
+        options.user_settings_home.is_some().to_string(),
+    );
+    Some(remuda_protocol::ObservationPayload::Lifecycle(Box::new(
+        remuda_protocol::LifecyclePayload::Native(Box::new(remuda_protocol::NativeLifecycle {
+            topic: remuda_protocol::LifecycleTopic::Configuration,
+            native_name: NATIVE_PROVIDER_SOURCE.to_owned(),
+            native_id: remuda_protocol::Knowledge::NotApplicable,
+            status: remuda_protocol::Knowledge::Known {
+                value: if provider_authoritative {
+                    "overlay".to_owned()
+                } else {
+                    "host-native".to_owned()
+                },
+            },
+            related_ids: related,
+            data_ref: None,
+            severity: remuda_protocol::Severity::Info,
+            affects_completion: false,
+        })),
+    )))
 }
 
 /// Write the standalone settings overlay (hooks-off path) when no hook
@@ -2821,7 +2955,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(8);
         let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let (recipe, hooks) = prepare_launch_blocking(
+        let (recipe, hooks, _) = prepare_launch_blocking(
             &driver.options,
             &spec.cwd,
             Some(&spec),
@@ -2932,7 +3066,7 @@ mod tests {
             let (events, _rx) = mpsc::channel(8);
             let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
-            let (recipe, hooks) = prepare_launch_blocking(
+            let (recipe, hooks, _) = prepare_launch_blocking(
                 &options,
                 &spec.cwd,
                 Some(&spec),
@@ -3000,7 +3134,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(8);
         let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let (recipe, _) = prepare_launch_blocking(
+        let (recipe, _, _) = prepare_launch_blocking(
             &unpinned_options,
             &spec.cwd,
             Some(&spec),
@@ -3117,7 +3251,7 @@ mod tests {
             let (events, _rx) = mpsc::channel(8);
             let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
-            let (recipe, hooks) = prepare_launch_blocking(
+            let (recipe, hooks, _) = prepare_launch_blocking(
                 &options,
                 &spec.cwd,
                 Some(&spec),
@@ -3212,6 +3346,191 @@ mod tests {
         );
     }
 
+    /// gateway-carryover-1: the whole path, through the real materializer.
+    ///
+    /// The host user has their own gateway configured (base URL, token, model
+    /// and the model env trio); the Hub delivered a different gateway. The
+    /// merged file the child is handed must talk to the Hub's, run the Hub's
+    /// model, keep the user's hooks and permissions, and carry no host provider
+    /// variable at all. The journal line must say so.
+    #[tokio::test]
+    async fn a_gateway_delegation_overrides_the_hosts_provider_and_journals_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_home = dir.path().join("user-claude");
+        std::fs::create_dir_all(&user_home).unwrap();
+        // The host's own settings, as in the owner report.
+        std::fs::write(
+            user_home.join("settings.json"),
+            serde_json::json!({
+                "model": "ark/seed-evolving[1m]",
+                "theme": "dark",
+                "permissions": {"allow": ["Read"], "deny": ["Read(./.env)"]},
+                "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "user-session-start"}]}]},
+                "statusLine": {"type": "command", "command": "echo host"},
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://host-native.example/api",
+                    "ANTHROPIC_AUTH_TOKEN": "host-token-placeholder",
+                    "ANTHROPIC_MODEL": "ark/seed-evolving[1m]",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "ark/host-opus",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "ark/host-sonnet",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ark/host-haiku",
+                    "CLAUDE_CODE_SUBAGENT_MODEL": "ark/host-subagent",
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+                    "HOST_ONLY": "keep-me"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // What the Hub delivered for the chosen gateway profile.
+        let provider_overlay = dir.path().join("provider-settings.json");
+        std::fs::write(
+            &provider_overlay,
+            serde_json::json!({
+                "model": "passthrough/ark/seed-evolving",
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://gateway.example/v1",
+                    "ANTHROPIC_AUTH_TOKEN": "hub-token-placeholder",
+                    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut spec: InstanceSpec =
+            serde_json::from_str(include_str!("../tests/fixtures/instance-spec.json")).unwrap();
+        spec.driver = DriverKind::ShellPty;
+        spec.cwd = dir.path().to_string_lossy().into_owned();
+        let instance = dir.path().join("instance");
+        let mut options = ShellPtyOptions::agent(
+            dir.path().to_path_buf(),
+            AgentKind::Claude,
+            AgentLaunch {
+                profile: Box::new(crate::profile::ProviderProfile {
+                    id: spec.provider_profile.id.clone(),
+                    kind: ProviderKind::Anthropic,
+                    base_url: "https://gateway.example/v1".into(),
+                    delegation: Delegation::Gateway,
+                    secret_ref: None,
+                    models: vec!["passthrough/ark/seed-evolving".into()],
+                    health: crate::profile::ProviderHealth::Healthy,
+                }),
+                launch_dir: instance.join("launch"),
+                native_home: dir.path().join("scoped-native-home"),
+                binary: Some(PathBuf::from("/bin/sh")),
+                origin: crate::materializer::LaunchOrigin::Human,
+                settings_overlay: Some(provider_overlay.clone()),
+            },
+        );
+        options.user_settings_home = Some(user_home.clone());
+        options.pin_native_home = true;
+        options.hooks = Some(HookConfig {
+            instance_dir: instance.clone(),
+            relay_binary: PathBuf::from("/nonexistent/remuda"),
+            tui: crate::launch::TuiMode::Fullscreen,
+        });
+
+        let ctx = promote_ctx(&options, &spec.cwd, Some(&spec)).unwrap();
+        let (events, _rx) = mpsc::channel(8);
+        let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let (recipe, hooks, note) = prepare_launch_blocking(
+            &options,
+            &spec.cwd,
+            Some(&spec),
+            &ctx,
+            &events,
+            &seq,
+            &interrupt_pid,
+        )
+        .unwrap();
+        let settings_path = recipe
+            .argv
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--settings").then(|| PathBuf::from(&pair[1])))
+            .expect("a gateway launch must carry --settings");
+        assert_eq!(settings_path, hooks.expect("hooks requested").overlay.path);
+        let merged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+
+        // The Hub's provider is what the session runs on.
+        assert_eq!(
+            merged["env"]["ANTHROPIC_BASE_URL"], "https://gateway.example/v1",
+            "the host's gateway must not win"
+        );
+        assert_eq!(
+            merged["env"]["ANTHROPIC_AUTH_TOKEN"],
+            "hub-token-placeholder"
+        );
+        assert_eq!(merged["model"], "passthrough/ark/seed-evolving");
+        // No host endpoint or model variable survives anywhere.
+        let rendered = merged.to_string();
+        assert!(!rendered.contains("host-native.example"), "{rendered}");
+        assert!(!rendered.contains("ark/seed-evolving[1m]"), "{rendered}");
+        assert!(!rendered.contains("ark/host-"), "{rendered}");
+        for name in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        ] {
+            assert!(
+                merged["env"].get(name).is_none(),
+                "{name} must be stripped from the merged overlay"
+            );
+        }
+        // The user's own configuration still works.
+        assert_eq!(
+            merged["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "user-session-start"
+        );
+        assert_eq!(merged["permissions"]["deny"][0], "Read(./.env)");
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["statusLine"]["command"], "echo host");
+        assert_eq!(merged["env"]["HOST_ONLY"], "keep-me");
+
+        // The journal line proves which source applied, with no secret in it.
+        let payload = note.expect("a native claude launch journals its provider source");
+        let remuda_protocol::ObservationPayload::Lifecycle(lifecycle) = payload else {
+            panic!("provider source must be a lifecycle payload");
+        };
+        let remuda_protocol::LifecyclePayload::Native(native) = *lifecycle else {
+            panic!("provider source must be a native lifecycle");
+        };
+        assert_eq!(native.native_name, NATIVE_PROVIDER_SOURCE);
+        assert_eq!(native.topic, remuda_protocol::LifecycleTopic::Configuration);
+        assert_eq!(
+            native.status,
+            remuda_protocol::Knowledge::Known {
+                value: "overlay".into()
+            },
+            "the overlay applied, so the line must not say host-native"
+        );
+        assert_eq!(native.related_ids["delegation"], "gateway");
+        assert_eq!(
+            native.related_ids["effectiveModel"], "passthrough/ark/seed-evolving",
+            "the line must name the model that actually answers"
+        );
+        assert_eq!(
+            native.related_ids["providerProfileId"],
+            recipe.provider.profile_id.to_string()
+        );
+        let journaled = format!("{:?}", native.related_ids);
+        assert!(!journaled.contains("token"), "{journaled}");
+        assert!(
+            !journaled.contains("gateway.example"),
+            "a journal is not the 0600 instance file: {journaled}"
+        );
+
+        // The user's own settings are read, never rewritten.
+        assert!(
+            std::fs::read_to_string(user_home.join("settings.json"))
+                .unwrap()
+                .contains("host-native.example")
+        );
+    }
+
     /// native-config-1: an inherited (or explicitly chosen) config dir is read
     /// natively by the CLI, so no copy is seeded and a plain launch with no
     /// other needs carries no `--settings` at all.
@@ -3246,7 +3565,7 @@ mod tests {
         let (events, _rx) = mpsc::channel(8);
         let seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let interrupt_pid = Arc::new(std::sync::atomic::AtomicI32::new(0));
-        let (recipe, hooks) = prepare_launch_blocking(
+        let (recipe, hooks, _) = prepare_launch_blocking(
             &options,
             &spec.cwd,
             Some(&spec),

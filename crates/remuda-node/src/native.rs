@@ -755,6 +755,17 @@ fn provider_profile(
     })
 }
 
+/// Materialise the `--settings` overlay for a Claude launch, if this launch has
+/// one.
+///
+/// `GenericPty` has no settings flag, so it never gets one. Every other carrier
+/// — **including `ShellPty`** — does: a gateway or direct provider the operator
+/// chose on the Hub has to reach the session whichever carrier runs it. That
+/// `ShellPty` was excluded here is the gateway-carryover-1 regression: with no
+/// overlay materialised, the native carrier's only provider config was the host
+/// user's own settings (which commit 3638572a began seeding), so the session
+/// silently ran on the host's gateway as if 跟随主机 had been chosen, while the
+/// Hub record still said `gateway` + the chosen profile id.
 fn resolve_claude_overlay(
     request: &crate::CreateInstanceRequest,
     launch_dir: &Path,
@@ -762,7 +773,7 @@ fn resolve_claude_overlay(
     delegation: Delegation,
     profile: &ProviderProfile,
 ) -> Result<Option<PathBuf>, DriverError> {
-    if matches!(kind, DriverKind::GenericPty | DriverKind::ShellPty) {
+    if matches!(kind, DriverKind::GenericPty) {
         return Ok(None);
     }
     if let Some(overlay) = request.provider_overlay.as_ref() {
@@ -775,13 +786,27 @@ fn resolve_claude_overlay(
         .filter(|path| !path.is_empty())
         .map(resolve_overlay_path)
         .transpose()?;
+    if matches!(delegation, Delegation::None) {
+        return Ok(user);
+    }
+    // Under the native carrier the hook session owns `<launch>/settings.json`
+    // (it writes the merged document the CLI is handed). The provider overlay
+    // is a *separate input* to that merge, so it gets its own file rather than
+    // the one the merge output would clobber.
+    let overlay_dir = match kind {
+        DriverKind::ShellPty => launch_dir.join("provider"),
+        _ => launch_dir.to_path_buf(),
+    };
+    if let Some(path) = try_write_delivered_overlay(request, &overlay_dir)? {
+        return Ok(Some(path));
+    }
+    // Generation is gateway-only: it mints a gateway overlay from the profile's
+    // own env credential. A direct launch with no delivered overlay falls back
+    // to the caller's file, exactly as it did before.
     if delegation != Delegation::Gateway {
         return Ok(user);
     }
-    if let Some(path) = try_write_delivered_overlay(request, launch_dir)? {
-        return Ok(Some(path));
-    }
-    match try_write_generated_gateway_overlay(profile, launch_dir, &request.model) {
+    match try_write_generated_gateway_overlay(profile, &overlay_dir, &request.model) {
         Ok(path) => Ok(Some(path)),
         Err(_) => user
             .ok_or_else(|| missing_gateway_overlay_error(request, profile))
@@ -1981,6 +2006,126 @@ mod tests {
         assert!(
             error.to_string().contains("host-scoped provider"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn a_shell_pty_gateway_launch_materialises_the_hub_overlay_not_the_hosts() {
+        // gateway-carryover-1: the native carrier used to be excluded from
+        // overlay materialisation entirely, so the only provider config a
+        // shell-pty session had was the host user's own settings — it ran on
+        // the host's gateway while the Hub record said `gateway` + profile id.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = HostId::new();
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "shell-pty",
+            "hostId": host,
+            "model": "passthrough/ark/seed-evolving",
+            "delegation": "gateway",
+            "providerProfileId": "pvp_example",
+            "providerOverlay": {
+                "kind": "gateway",
+                "baseUrl": "https://gateway.example/v1",
+                "model": "passthrough/ark/seed-evolving",
+                "scope": format!("host:{}", host.as_id().as_str())
+            },
+            "providerAuthToken": "fake-hub-provider-token"
+        }))
+        .expect("request");
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: String::new(),
+            delegation: Delegation::Gateway,
+            secret_ref: None,
+            models: vec!["passthrough/ark/seed-evolving".into()],
+            health: ProviderHealth::Healthy,
+        };
+        let launch_dir = dir.path().join("launch");
+        let path = resolve_claude_overlay(
+            &request,
+            &launch_dir,
+            DriverKind::ShellPty,
+            Delegation::Gateway,
+            &profile,
+        )
+        .expect("overlay resolves")
+        .expect("the native carrier must get an overlay");
+
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("overlay contents")).expect("json");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"], "https://gateway.example/v1",
+            "the Hub's endpoint is what the session must talk to"
+        );
+        assert_eq!(settings["model"], "passthrough/ark/seed-evolving");
+        // The host's own gateway must be nowhere in the materialised document.
+        let rendered = settings.to_string();
+        assert!(
+            !rendered.contains("host-native.example"),
+            "the host base URL must never reach the launch settings"
+        );
+
+        // It must not clobber the merged file the hook session owns: that file
+        // is the *output* of the merge this overlay is an input to.
+        assert_ne!(
+            path,
+            launch_dir.join("settings.json"),
+            "the provider overlay needs its own file under the native carrier"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("overlay metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "credential-bearing settings stay 0600"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_pty_native_delegation_launch_gets_no_overlay() {
+        // 跟随主机 / 原生登录态 is unchanged: no overlay is written, and the
+        // user's own settings carry over as they always did.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "shell-pty",
+            "model": "sonnet",
+            "delegation": "none",
+            "providerProfileId": "native"
+        }))
+        .expect("request");
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: String::new(),
+            delegation: Delegation::None,
+            secret_ref: None,
+            models: vec!["sonnet".into()],
+            health: ProviderHealth::Healthy,
+        };
+        let launch_dir = dir.path().join("launch");
+        assert_eq!(
+            resolve_claude_overlay(
+                &request,
+                &launch_dir,
+                DriverKind::ShellPty,
+                Delegation::None,
+                &profile,
+            )
+            .expect("native delegation resolves"),
+            None,
+        );
+        assert!(
+            !launch_dir.exists(),
+            "native delegation must not write a provider overlay"
         );
     }
 

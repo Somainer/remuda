@@ -28,6 +28,26 @@
 //! hooks in as well would run them twice. The Node decides which case a launch
 //! is in and passes the user home only for the scoped-home case.
 //!
+//! ## Who wins on the provider (gateway-carryover-1, 2026-09-17)
+//!
+//! The host layer being *lowest* is not enough, because the two layers do not
+//! describe the provider through the same keys. A host `env.ANTHROPIC_MODEL`
+//! outranks the overlay's `model` key inside Claude itself, and a host
+//! `env.ANTHROPIC_BASE_URL` survives an overlay that only sets `model` — so a
+//! plain low-to-high merge still let the host redirect a session the operator
+//! had pointed at a Hub gateway.
+//!
+//! So for `gateway` and `direct` delegation the overlay is **authoritative**,
+//! not merely higher: [`merge_provider_overlay_over_user`] strips the host's
+//! endpoint, credential and model variables ([`is_overridden_provider_env`])
+//! plus its top-level `model` before merging. Everything else the host
+//! configured — hooks, `permissions`, `theme`, `statusLine`, effort, custom
+//! keys, unrelated `env` — is untouched, which is the whole point of keeping
+//! the host layer as the base.
+//!
+//! Delegation `none` (跟随主机 / native login) is unchanged: there the host's
+//! settings *are* the requested provider, and they carry over verbatim.
+//!
 //! ## Credentials
 //!
 //! Gateway credentials reach the overlay only by being copied out of the
@@ -174,6 +194,99 @@ fn merge_hooks_block(lower_map: &mut serde_json::Map<String, Value>, upper_hooks
             None => {
                 events.insert(event.clone(), upper_value.clone());
             }
+        }
+    }
+}
+
+/// Provider-routing env variables the Hub's overlay is authoritative over.
+///
+/// When a `gateway`/`direct` overlay applies, every one of these is removed
+/// from the host user's layer before the overlay is merged on top. Leaving any
+/// of them would let the host redirect a session the Hub pointed elsewhere:
+/// `ANTHROPIC_MODEL` and the `ANTHROPIC_DEFAULT_*_MODEL` trio outrank the
+/// settings `model` key, `CLAUDE_CODE_SUBAGENT_MODEL` re-points subagents, and
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` describes a window the Hub's model may not
+/// have (gateway-carryover-1, 2026-09-17).
+const OVERRIDDEN_ENV: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+];
+
+/// Top-level settings keys the Hub's overlay is authoritative over.
+///
+/// `model` is the only channel a shell-pty launch has for the requested model
+/// (its materializer emits no `--model` argv), so a host `model` left in place
+/// silently wins whenever the overlay happens not to carry one.
+const OVERRIDDEN_KEYS: &[&str] = &["model"];
+
+/// Whether `name` names a provider endpoint/model variable the Hub owns.
+#[must_use]
+pub fn is_overridden_provider_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    OVERRIDDEN_ENV.contains(&upper.as_str())
+}
+
+/// Layer the Hub's provider overlay over the host user's own settings.
+///
+/// This is the three-way precedence the native carrier needs
+/// (gateway-carryover-1). The host layer is the **base**, so hooks,
+/// permissions, theme, `statusLine`, effort and every custom key keep working;
+/// the Hub's `overlay` is **authoritative** on top for where the session talks
+/// and which model answers.
+///
+/// Concretely, before the merge every [`OVERRIDDEN_ENV`] variable and every
+/// [`OVERRIDDEN_KEYS`] entry is stripped from the host layer, so the host
+/// cannot redirect a session the operator pointed at a gateway — not even
+/// through a variable the overlay itself does not set. Anything the overlay
+/// does not claim (the user's own `env` entries, their `permissions`, their
+/// hooks) survives untouched.
+///
+/// Use it only for `gateway`/`direct` delegation. `none` (跟随主机 / native
+/// login) is the case where the host's settings *are* the answer: pass them
+/// through with [`merge_settings_layers`] instead.
+#[must_use]
+pub fn merge_provider_overlay_over_user(user: &Value, overlay: &Value) -> Value {
+    let mut base = user.clone();
+    strip_overridden(&mut base);
+    merge_settings_layers(&base, overlay)
+}
+
+/// Remove the host's provider-routing keys from a settings layer in place.
+fn strip_overridden(settings: &mut Value) {
+    let Some(map) = settings.as_object_mut() else {
+        return;
+    };
+    for key in OVERRIDDEN_KEYS {
+        map.remove(*key);
+    }
+    if let Some(env) = map.get_mut("env").and_then(Value::as_object_mut) {
+        // Case-insensitively: a host that spelled the variable in lower case
+        // still exports it, so matching only the canonical spelling would let
+        // it through.
+        let doomed = env
+            .keys()
+            .filter(|name| is_overridden_provider_env(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in doomed {
+            env.remove(&name);
         }
     }
 }
@@ -401,6 +514,153 @@ mod tests {
             "higher precedence replaces a plain array"
         );
         assert_eq!(merged["enabledPlugins"]["a"], true);
+    }
+
+    /// The launching user's real settings, shaped like the host in the
+    /// gateway-carryover-1 report: their own gateway, their own model, and the
+    /// model env trio that outranks a settings `model` key inside Claude.
+    fn host_settings() -> Value {
+        json!({
+            "model": "ark/seed-evolving[1m]",
+            "theme": "dark",
+            "statusLine": {"type": "command", "command": "echo host"},
+            "permissions": {"allow": ["Read", "Bash(git diff:*)"], "deny": ["Read(./.env)"]},
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "host-stop"}]}]},
+            "enabledPlugins": {"host-plugin": true},
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://host-native.example/api",
+                "ANTHROPIC_AUTH_TOKEN": "host-token-placeholder",
+                "ANTHROPIC_MODEL": "ark/seed-evolving[1m]",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "ark/host-opus",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "ark/host-sonnet",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "ark/host-haiku",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "ark/host-subagent",
+                "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+                "HOST_ONLY": "keep-me"
+            }
+        })
+    }
+
+    /// What the Hub delivers for delegation gateway (profile Doubao AI).
+    fn hub_overlay() -> Value {
+        json!({
+            "model": "passthrough/ark/seed-evolving",
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://gateway.example/v1",
+                "ANTHROPIC_AUTH_TOKEN": "hub-token-placeholder",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"
+            }
+        })
+    }
+
+    #[test]
+    fn host_settings_alone_carry_over_untouched_for_native_delegation() {
+        // 跟随主机 / 原生登录态: nothing is stripped, because here the host's
+        // settings *are* the requested provider.
+        let host = host_settings();
+        let merged = merge_settings_layers(&json!({}), &host);
+        assert_eq!(merged, host, "delegation none must not rewrite the host");
+    }
+
+    #[test]
+    fn the_hub_overlay_wins_the_endpoint_token_and_model_over_the_host() {
+        let merged = merge_provider_overlay_over_user(&host_settings(), &hub_overlay());
+
+        // Where the session talks and who answers is the Hub's decision.
+        assert_eq!(
+            merged["env"]["ANTHROPIC_BASE_URL"], "https://gateway.example/v1",
+            "the host's own gateway must not survive"
+        );
+        assert_eq!(
+            merged["env"]["ANTHROPIC_AUTH_TOKEN"], "hub-token-placeholder",
+            "the host's token must not be what authenticates"
+        );
+        assert_eq!(
+            merged["model"], "passthrough/ark/seed-evolving",
+            "the requested model wins; for shell-pty this key is the only channel"
+        );
+        assert_eq!(
+            merged["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
+            "1"
+        );
+    }
+
+    #[test]
+    fn the_hosts_model_and_endpoint_variables_are_stripped_when_the_overlay_applies() {
+        let merged = merge_provider_overlay_over_user(&host_settings(), &hub_overlay());
+        let env = merged["env"].as_object().expect("env object");
+
+        // Each of these outranks the overlay's `model` key or re-points the
+        // session, so leaving any one of them lets the host redirect the run.
+        for name in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+        ] {
+            assert!(!env.contains_key(name), "{name} must be stripped");
+        }
+        // And no host value survives anywhere in the document.
+        let rendered = merged.to_string();
+        assert!(
+            !rendered.contains("host-native.example"),
+            "the host endpoint leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ark/seed-evolving[1m]"),
+            "the host model leaked: {rendered}"
+        );
+        assert!(!rendered.contains("ark/host-"), "a host model leaked");
+    }
+
+    #[test]
+    fn an_overlay_less_gateway_launch_still_strips_the_host_provider_config() {
+        // Delegation asked for a gateway but nothing was delivered. The host
+        // must not answer for it, or this failure is indistinguishable from the
+        // regression: strip, and let the harness's own login decide.
+        let merged = merge_provider_overlay_over_user(&host_settings(), &json!({}));
+        assert!(merged.get("model").is_none());
+        let env = merged["env"].as_object().expect("env object");
+        assert!(!env.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert_eq!(env["HOST_ONLY"], "keep-me", "unrelated env still survives");
+    }
+
+    #[test]
+    fn the_users_hooks_permissions_and_custom_settings_survive_the_overlay() {
+        let merged = merge_provider_overlay_over_user(&host_settings(), &hub_overlay());
+
+        // The whole reason the host layer is the base rather than discarded.
+        assert_eq!(
+            merged["hooks"]["Stop"][0]["hooks"][0]["command"], "host-stop",
+            "the user's own hooks must keep firing"
+        );
+        assert_eq!(merged["permissions"]["allow"][0], "Read");
+        assert_eq!(merged["permissions"]["allow"][1], "Bash(git diff:*)");
+        assert_eq!(merged["permissions"]["deny"][0], "Read(./.env)");
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["statusLine"]["command"], "echo host");
+        assert_eq!(merged["enabledPlugins"]["host-plugin"], true);
+        assert_eq!(
+            merged["env"]["HOST_ONLY"], "keep-me",
+            "only provider-routing variables are stripped, not the user's env"
+        );
+    }
+
+    #[test]
+    fn a_lowercase_or_mixed_case_host_variable_is_still_stripped() {
+        // The env block is a map, and a host that spelled the variable in
+        // lower case still exports it, so canonical-spelling-only matching
+        // would let the redirect straight through.
+        let host = json!({"env": {"anthropic_base_url": "https://host-native.example", "Anthropic_Model": "m"}});
+        let merged = merge_provider_overlay_over_user(&host, &hub_overlay());
+        let rendered = merged.to_string();
+        assert!(!rendered.contains("host-native.example"), "{rendered}");
+        assert!(is_overridden_provider_env("anthropic_base_url"));
+        assert!(!is_overridden_provider_env("HOST_ONLY"));
     }
 
     #[test]

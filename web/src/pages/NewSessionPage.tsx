@@ -794,7 +794,11 @@ export function NewSessionPage() {
             {delegation === "gateway" ? (
               <span className={css.hint} data-testid="new-session-gateway-profile">
                 {defaultGateway
-                  ? `${defaultGateway.name} · ${defaultGateway.defaultModel || gatewayModels[0]?.id || "model"}`
+                  ? // The model that will actually launch, not the profile's
+                    // default: `launchModel` is what the request carries, so a
+                    // model typed or picked here has to be what this line says.
+                    // Showing `defaultModel` made the line contradict the run.
+                    `${defaultGateway.name} · ${launchModel || "model"}`
                   : "请先在 Provider 页配置网关"}
               </span>
             ) : null}

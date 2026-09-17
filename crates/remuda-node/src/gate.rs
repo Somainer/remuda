@@ -11,15 +11,20 @@
 //! One job runs per lane at a time (backstop to the Hub queue); step results
 //! stream back as Node-originated `gate.event` frames on every carrier, and the
 //! final verdict is both the `gate.run` reply and a `finished` event.
+//!
+//! Every step's output is tailed into bounded rings (see `RunTrace`); a failed
+//! run hands the Hub a `GateRunLog` — the last 400 lines plus an extracted
+//! cargo-test/Playwright summary — which the Hub stores as an `obj_…` log
+//! object so the job row never carries megabytes (evidence: gate-log-1).
 
 use crate::DevNode;
 use crate::NodeError;
 use remuda_protocol::{
-    GateCancelParams, GateEventKind, GateEventParams, GateRunParams, GateRunResult, GateThenParams,
-    GateThenResult,
+    GateCancelParams, GateEventKind, GateEventParams, GateRunLog, GateRunParams, GateRunResult,
+    GateStep, GateThenParams, GateThenResult,
 };
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -40,10 +45,357 @@ const DEFAULT_THEN_TIMEOUT_SECS: u64 = 10 * 60;
 /// Captured output retained in a result.
 const OUTPUT_CAP_BYTES: usize = 16 * 1024;
 
+// Failure-evidence bounds (docs/design/evidence/gate-log-1.md): the lane
+// runner tails every step's output into bounded rings; on failure it extracts
+// a summary and stores only the last [`TAIL_LINES`] lines in the Hub log
+// object.
+const TAIL_LINES: usize = 400;
+const TAIL_CAP_BYTES: usize = 96 * 1024;
+const MAX_LINE_CHARS: usize = 4_096;
+const STEP_RING_LINES: usize = 2_000;
+const STEP_RING_BYTES: usize = 256 * 1024;
+const GLOBAL_RING_LINES: usize = TAIL_LINES;
+const GLOBAL_RING_BYTES: usize = 128 * 1024;
+const FAILURES_SECTION_MAX: usize = 160;
+const STANDALONE_SUMMARY_MAX: usize = 40;
+const PLAYWRIGHT_TITLES_MAX: usize = 20;
+const PLAYWRIGHT_BLOCK_MAX: usize = 100;
+
 /// One live gate run: cancel flag and the process group to kill.
 struct LiveRun {
     cancel: watch::Sender<bool>,
     pgid: std::sync::Mutex<Option<i32>>,
+}
+
+/// Bounded FIFO of text lines. Long runs (a 39-minute cargo-test) stream
+/// megabytes; the ring keeps only the recent tail and counts what it dropped.
+struct LineRing {
+    lines: VecDeque<String>,
+    bytes: usize,
+    seen_lines: usize,
+    line_cap: usize,
+    byte_cap: usize,
+}
+
+impl LineRing {
+    fn new(line_cap: usize, byte_cap: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            bytes: 0,
+            seen_lines: 0,
+            line_cap,
+            byte_cap,
+        }
+    }
+
+    fn push(&mut self, mut line: String) {
+        if line.chars().count() > MAX_LINE_CHARS {
+            let mut head: String = line.chars().take(MAX_LINE_CHARS - 1).collect();
+            head.push('…');
+            line = head;
+        }
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        self.seen_lines += 1;
+        while self.lines.len() > self.line_cap || self.bytes > self.byte_cap {
+            let Some(old) = self.lines.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(old.len());
+        }
+    }
+
+    fn last(&self, max_lines: usize, max_bytes: usize) -> (Vec<String>, bool) {
+        let mut picked: Vec<String> = Vec::new();
+        let mut bytes = 0usize;
+        for line in self.lines.iter().rev().take(max_lines) {
+            if bytes + line.len() > max_bytes && !picked.is_empty() {
+                break;
+            }
+            bytes += line.len();
+            picked.push(line.clone());
+        }
+        picked.reverse();
+        let dropped = self.seen_lines > picked.len() || self.bytes > bytes;
+        (picked, dropped)
+    }
+}
+
+/// Per-step output captured live from the consumed merge CLI's stderr
+/// (gate.sh streams every step there), keyed by its `gate: <step>` markers.
+struct RunTrace {
+    current: Option<String>,
+    by_step: BTreeMap<String, LineRing>,
+    global: LineRing,
+}
+
+impl RunTrace {
+    fn new() -> Self {
+        Self {
+            current: None,
+            by_step: BTreeMap::new(),
+            global: LineRing::new(GLOBAL_RING_LINES, GLOBAL_RING_BYTES),
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        if let Some((name, _retried)) = parse_step_marker(&line) {
+            self.current = Some(name);
+        }
+        if let Some(name) = self.current.clone() {
+            self.by_step
+                .entry(name)
+                .or_insert_with(|| LineRing::new(STEP_RING_LINES, STEP_RING_BYTES))
+                .push(line.clone());
+        }
+        self.global.push(line);
+    }
+}
+
+/// Parse a gate.sh attempt marker: exactly `gate: <name>` or
+/// `gate: <name> (retried)`. Detail lines (`gate: cargo-test: …`) and the
+/// pre-run banner (`gate: Rust tests: …`) keep their colon and never match.
+fn parse_step_marker(line: &str) -> Option<(String, bool)> {
+    let rest = line.strip_prefix("gate: ")?.trim_end();
+    if rest.contains(':') {
+        return None;
+    }
+    let (name, retried) = match rest.strip_suffix(" (retried)") {
+        Some(name) => (name, true),
+        None => (rest, false),
+    };
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return None;
+    }
+    Some((name.to_owned(), retried))
+}
+
+/// Extract the actionable summary from one step's captured output.
+///
+/// * `cargo-test`: every `test <name> … FAILED` line, every `panicked at`
+///   line, and the libtest `failures:` section (which carries the panic
+///   detail); the rest of a thousands-of-lines run is dropped.
+/// * Playwright web steps: the numbered failure titles and the first failure
+///   block (error + expectation + stack head).
+/// * everything else: no extraction — the bounded tail stays the evidence.
+fn extract_summary(step: &str, lines: &[String]) -> Vec<String> {
+    if step == "cargo-test" {
+        cargo_test_summary(lines)
+    } else if step.starts_with("web-") {
+        playwright_summary(lines)
+    } else {
+        Vec::new()
+    }
+}
+
+fn cargo_test_summary(lines: &[String]) -> Vec<String> {
+    let mut section: Vec<String> = Vec::new();
+    let mut standalone: Vec<String> = Vec::new();
+    if let Some(start) = lines.iter().position(|line| line.trim() == "failures:") {
+        let end = lines
+            .get(start + 1..)
+            .and_then(|rest| {
+                rest.iter()
+                    .position(|line| line.starts_with("test result:"))
+                    .map(|offset| start + 1 + offset)
+            })
+            .unwrap_or(lines.len());
+        section = lines
+            .iter()
+            .take(end.min(start + 1 + FAILURES_SECTION_MAX))
+            .skip(start)
+            .cloned()
+            .collect();
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        let failed_name = trimmed.strip_prefix("test ").and_then(|rest| {
+            rest.strip_suffix(" FAILED")
+                .or_else(|| rest.strip_suffix(" ... FAILED"))
+        });
+        let is_panic = trimmed.contains("panicked at ");
+        if (failed_name.is_some() || is_panic) && standalone.len() < STANDALONE_SUMMARY_MAX {
+            standalone.push(line.clone());
+        }
+    }
+    let mut summary = section;
+    let have: HashSet<String> = summary.iter().cloned().collect();
+    for line in standalone {
+        if !have.contains(&line) {
+            summary.push(line);
+        }
+    }
+    summary
+}
+
+/// Match a Playwright numbered failure header, e.g. `  1) [chromium] › …`.
+fn numbered_failure(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let digits: String = trimmed.chars().take_while(char::is_ascii_digit).collect();
+    !digits.is_empty() && trimmed[digits.len()..].starts_with(") ")
+}
+
+fn playwright_summary(lines: &[String]) -> Vec<String> {
+    let headers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| numbered_failure(line))
+        .map(|(index, _)| index)
+        .collect();
+    if headers.is_empty() {
+        return Vec::new();
+    }
+    let mut summary: Vec<String> = Vec::new();
+    for index in headers.iter().take(PLAYWRIGHT_TITLES_MAX) {
+        summary.push(lines[*index].trim().to_owned());
+    }
+    let block_end = headers
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| (headers[0] + 1 + PLAYWRIGHT_BLOCK_MAX).min(lines.len()))
+        .min(headers[0] + 1 + PLAYWRIGHT_BLOCK_MAX);
+    let have: HashSet<String> = summary.iter().cloned().collect();
+    for line in &lines[headers[0]..block_end] {
+        let trimmed = line.trim_end();
+        if !trimmed.trim().is_empty() && !have.contains(trimmed) {
+            summary.push(trimmed.to_owned());
+        }
+    }
+    summary
+}
+
+/// First line of an error string; the job `reason` is one line by contract.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(text)
+        .to_owned()
+}
+
+/// Build the bounded failure log for a failed step from a captured trace.
+fn build_failure_log(
+    trace: &RunTrace,
+    step: &str,
+    attempts: u32,
+    step_error: Option<&str>,
+    extra: Option<&str>,
+) -> GateRunLog {
+    let (tail, source_lines, truncated) = match trace.by_step.get(step) {
+        Some(ring) => {
+            let (tail, dropped) = ring.last(TAIL_LINES, TAIL_CAP_BYTES);
+            let seen = ring.seen_lines;
+            (tail, seen, dropped)
+        }
+        None => {
+            let (tail, dropped) = trace.global.last(TAIL_LINES, TAIL_CAP_BYTES);
+            let seen = trace.global.seen_lines;
+            (tail, seen, dropped)
+        }
+    };
+    let detail = extra
+        .or(step_error)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("failed");
+    let mut headline = format!("{step} failed, {detail}");
+    if attempts > 1 {
+        headline.push_str(&format!(", attempts {attempts}, retried"));
+    }
+    let summary = extract_summary(step, &tail);
+    GateRunLog {
+        step: step.to_owned(),
+        kind: "failed".into(),
+        attempts,
+        headline,
+        summary,
+        tail,
+        captured_lines: source_lines,
+        truncated,
+    }
+}
+
+/// Build the whole-run `kept` log (`--keep-logs`) after a green run.
+fn build_kept_log(trace: &RunTrace, headline: &str) -> GateRunLog {
+    let (tail, truncated) = trace.global.last(TAIL_LINES, TAIL_CAP_BYTES);
+    GateRunLog {
+        step: "*".into(),
+        kind: "kept".into(),
+        attempts: 0,
+        headline: headline.to_owned(),
+        summary: Vec::new(),
+        tail,
+        captured_lines: trace.global.seen_lines,
+        truncated,
+    }
+}
+
+/// Attach the bounded log to a finished verdict: a failed step's evidence on
+/// failure, a runner-level log when the gate died without one, or a `kept`
+/// whole-run log on a green `--keep-logs` run. Passing runs stay cheap.
+fn attach_failure_evidence(
+    result: &mut GateRunResult,
+    trace: &Arc<std::sync::Mutex<RunTrace>>,
+    keep_logs: bool,
+) {
+    let captured = trace.lock().unwrap_or_else(|poison| poison.into_inner());
+    if matches!(result.status.as_str(), "passed" | "landed") {
+        if keep_logs {
+            result.run_log = Some(build_kept_log(
+                &captured,
+                &format!("{}; log retained by --keep-logs", result.status),
+            ));
+        }
+        return;
+    }
+    if result.status == "base-moved" || result.status == "stale-tip" {
+        return;
+    }
+    if let Some(step) = result
+        .steps
+        .iter()
+        .rev()
+        .find(|step| step.status == "failed")
+    {
+        let log = build_failure_log(
+            &captured,
+            &step.name,
+            step.attempts,
+            step.error.as_deref(),
+            None,
+        );
+        result.failed_step = Some(step.name.clone());
+        result.reason = Some(log.headline.clone());
+        result.run_log = Some(log);
+    } else if result.status == "failed" {
+        let step = captured.current.clone().unwrap_or_else(|| "gate".into());
+        let log = build_failure_log(&captured, &step, 0, None, result.error.as_deref());
+        result.failed_step = Some(step);
+        result.reason = Some(log.headline.clone());
+        result.run_log = Some(log);
+    }
+}
+
+/// Ensure every failed verdict carries a one-line `reason` (first error line)
+/// even when the failure happened before the gate produced step evidence.
+fn finalize(mut result: GateRunResult) -> GateRunResult {
+    if result.reason.is_none()
+        && let Some(error) = &result.error
+    {
+        result.reason = Some(first_line(error));
+    }
+    result
+}
+
+/// The step whose marker was seen last in a captured trace.
+fn current_step(trace: &Arc<std::sync::Mutex<RunTrace>>) -> Option<String> {
+    trace
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .current
+        .clone()
 }
 
 /// Lane locks, running jobs and the per-Node event uplink.
@@ -158,7 +510,7 @@ impl DevNode {
         let _ = registry.events.send(GateEventParams {
             job_id: request.job_id.clone(),
             kind: GateEventKind::Finished {
-                result: outcome.clone(),
+                result: Box::new(outcome.clone()),
             },
         });
         Ok(outcome)
@@ -190,11 +542,11 @@ impl DevNode {
         });
         if let Err(error) = block_git(&repo, &["fetch", "-q", "origin"]) {
             result.error = Some(format!("fetch origin: {error}"));
-            return result;
+            return finalize(result);
         }
         if let Err(error) = sync_local_main(&repo, &request.base_branch) {
             result.error = Some(format!("sync {base}: {error}", base = request.base_branch));
-            return result;
+            return finalize(result);
         }
 
         // 2. Fast-forward the branch tip, refusing a stale local tip when a
@@ -205,13 +557,13 @@ impl DevNode {
             // fatal when the branch is absent.
             if block_git(&repo, &["rev-parse", "--verify", &request.branch]).is_err() {
                 result.error = Some(format!("fetch branch: {error}"));
-                return result;
+                return finalize(result);
             }
         }
         if let Err(error) = fast_forward_branch(&repo, &request.branch) {
             result.status = "stale-tip".into();
             result.error = Some(error);
-            return result;
+            return finalize(result);
         }
 
         // 3. Run the consumed merge CLI in the lane checkout.
@@ -290,11 +642,12 @@ impl DevNode {
         command.process_group(0);
 
         let started = Instant::now();
+        let trace = Arc::new(std::sync::Mutex::new(RunTrace::new()));
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
                 result.error = Some(format!("spawn {binary}: {error}"));
-                return result;
+                return finalize(result);
             }
         };
         #[cfg(unix)]
@@ -314,18 +667,25 @@ impl DevNode {
             request.job_id.clone(),
             run_started,
         ));
+        let mut stderr_task: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(stderr) = child.stderr.take() {
             let node = self.clone();
             let job_id = request.job_id.clone();
-            tokio::spawn(async move {
+            let trace = trace.clone();
+            stderr_task = Some(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    {
+                        let mut captured =
+                            trace.lock().unwrap_or_else(|poison| poison.into_inner());
+                        captured.push(line.clone());
+                    }
                     let _ = node.gate_registry().events.send(GateEventParams {
                         job_id: job_id.clone(),
                         kind: GateEventKind::Log { message: line },
                     });
                 }
-            });
+            }));
         }
         let stdout = child.stdout.take();
 
@@ -364,32 +724,52 @@ impl DevNode {
         };
         step_task.abort();
         if canceled {
+            if let Some(task) = stderr_task.take() {
+                task.abort();
+            }
             result.status = "canceled".into();
             result.error = Some("canceled by request; killed step process group".into());
             return result;
         }
         if timed_out {
-            result.error = Some(format!(
-                "gate run exceeded {deadline}s; killed step process group"
-            ));
-            return result;
+            if let Some(task) = stderr_task.take() {
+                task.abort();
+            }
+            let error = format!("gate run exceeded {deadline}s; killed step process group");
+            let step = current_step(&trace).unwrap_or_else(|| "gate".into());
+            let log = build_failure_log(
+                &trace.lock().unwrap_or_else(|poison| poison.into_inner()),
+                &step,
+                0,
+                None,
+                Some(&error),
+            );
+            result.failed_step = Some(step);
+            result.reason = Some(log.headline.clone());
+            result.run_log = Some(log);
+            result.error = Some(error);
+            return finalize(result);
         }
         let Some(output) = output else {
             result.error = Some("gate produced no output".into());
-            return result;
+            return finalize(result);
         };
+        // Let the stderr pump drain the last lines (EOF follows child exit).
+        if let Some(task) = stderr_task.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
 
         let report: Value = match serde_json::from_slice(&output.stdout) {
             Ok(value) => value,
             Err(error) => {
-                result.error = Some(format!(
-                    "parse merge report: {error}; stderr: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                        .chars()
-                        .take(2000)
-                        .collect::<String>()
-                ));
-                return result;
+                let message = format!("parse merge report: {error}");
+                let step = current_step(&trace).unwrap_or_else(|| "gate".into());
+                let log = build_failure_log(&trace.lock().unwrap(), &step, 0, None, Some(&message));
+                result.failed_step = Some(step);
+                result.reason = Some(log.headline.clone());
+                result.run_log = Some(log);
+                result.error = Some(message);
+                return finalize(result);
             }
         };
         result.steps = report
@@ -398,9 +778,7 @@ impl DevNode {
             .map(|steps| {
                 steps
                     .iter()
-                    .filter_map(|step| {
-                        serde_json::from_value::<remuda_protocol::GateStep>(step.clone()).ok()
-                    })
+                    .filter_map(|step| serde_json::from_value::<GateStep>(step.clone()).ok())
                     .collect()
             })
             .unwrap_or_default();
@@ -421,7 +799,8 @@ impl DevNode {
                     .or_else(|| Some(format!("merge status {other:?}")));
             }
         }
-        result
+        attach_failure_evidence(&mut result, &trace, request.keep_logs);
+        finalize(result)
     }
 
     async fn run_gate_then_typed(
@@ -796,6 +1175,7 @@ mod tests {
             timeouts: std::collections::BTreeMap::new(),
             gate_timeout_secs: 0,
             push: false,
+            keep_logs: false,
             binary: Some(fixture.bin.to_string_lossy().into_owned()),
         }
     }
@@ -804,9 +1184,49 @@ mod tests {
 scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 echo '{"name":"cargo-test","status":"ok","durationMs":22,"attempts":1,"retried":false}' >> "$scratch/gate.jsonl"
+echo 'gate: secret-scan' >&2
+echo 'secret scan clean' >&2
+echo 'gate: cargo-test' >&2
+echo 'test result: ok. 312 passed; 0 failed' >&2
 sleep 0.6
 cat <<'JSON'
 {"exitCode":0,"status":"verified","branch":"wt/fake/task","base":"1111111111111111111111111111111111111111","head":"2222222222222222222222222222222222222222","merged":"3333333333333333333333333333333333333333","steps":[{"name":"secret-scan","status":"ok","durationMs":11},{"name":"cargo-test","status":"ok","durationMs":22}]}
+JSON
+"#;
+
+    const FAILING_CARGO_TEST_SCRIPT: &str = r#"
+set +e
+scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
+echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
+emit_fail() {
+    echo 'gate: cargo-test' >&2
+    echo 'running 2 tests' >&2
+    echo 'test remuda::works ... ok' >&2
+    echo 'test remuda::gate::boom ... FAILED' >&2
+    echo 'test remuda::gate::other ... FAILED' >&2
+    echo '' >&2
+    echo 'failures:' >&2
+    echo '' >&2
+    echo '---- remuda::gate::boom stdout ----' >&2
+    echo 'thread "remuda::gate::boom" panicked at crates/remuda-node/src/gate.rs:42:9:' >&2
+    echo 'assertion `left == right` failed' >&2
+    echo 'note: run with `RUST_BACKTRACE=1` environment variable' >&2
+    echo '' >&2
+    echo '' >&2
+    echo 'failures:' >&2
+    echo '    remuda::gate::boom' >&2
+    echo '    remuda::gate::other' >&2
+    echo '' >&2
+    echo 'test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out' >&2
+    echo 'error: test failed, to rerun pass `-p remuda-node --lib gate`' >&2
+}
+emit_fail
+echo 'gate: cargo-test (retried)' >&2
+emit_fail
+echo '{"name":"cargo-test","status":"failed","durationMs":5012,"attempts":2,"retried":true,"error":"exit status 101"}' >> "$scratch/gate.jsonl"
+sleep 0.6
+cat <<'JSON'
+{"exitCode":1,"status":"gate_failed","error":"gate failed or returned an incomplete step report","base":"1111111111111111111111111111111111111111","head":"2222222222222222222222222222222222222222","steps":[{"name":"secret-scan","status":"ok","durationMs":11},{"name":"cargo-test","status":"failed","durationMs":5012,"attempts":2,"retried":true,"error":"exit status 101"}]}
 JSON
 "#;
 
@@ -846,6 +1266,78 @@ JSON
             streamed.iter().any(|name| name == "cargo-test"),
             "{streamed:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_cargo_test_carries_the_extracted_summary() {
+        let fixture = fixture(FAILING_CARGO_TEST_SCRIPT);
+        let result = fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert_eq!(result.failed_step.as_deref(), Some("cargo-test"));
+        let log = result.run_log.expect("failed run carries a bounded log");
+        assert_eq!(log.step, "cargo-test");
+        assert_eq!(log.kind, "failed");
+        assert_eq!(log.attempts, 2);
+        assert!(
+            log.headline.contains("cargo-test failed")
+                && log.headline.contains("exit status 101")
+                && log.headline.contains("attempts 2"),
+            "headline: {}",
+            log.headline
+        );
+        assert_eq!(result.reason.as_deref(), Some(log.headline.as_str()));
+        // The extracted summary names the failing tests and the panic site.
+        let summary = log.summary.join("\n");
+        assert!(
+            summary.contains("test remuda::gate::boom ... FAILED"),
+            "summary:\n{summary}"
+        );
+        assert!(
+            summary.contains("panicked at crates/remuda-node/src/gate.rs:42:9:"),
+            "summary:\n{summary}"
+        );
+        assert!(summary.contains("failures:"), "summary:\n{summary}");
+        // The bounded tail keeps the end of the run, including the libtest
+        // verdict and the cargo rerun hint.
+        let tail = log.tail.join("\n");
+        assert!(tail.contains("test result: FAILED"), "tail:\n{tail}");
+        assert!(
+            tail.contains("error: test failed, to rerun"),
+            "tail:\n{tail}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passing_run_keeps_no_log_without_keep_logs() {
+        let fixture = fixture(PASSING_SCRIPT);
+        let result = fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        assert_eq!(result.status, "passed");
+        assert!(
+            result.run_log.is_none(),
+            "green runs stay cheap: {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn keep_logs_retains_a_green_run_log() {
+        let fixture = fixture(PASSING_SCRIPT);
+        let mut params = params(&fixture, "verify");
+        params.keep_logs = true;
+        let result = fixture.node.run_gate_typed(params).await.unwrap();
+        assert_eq!(result.status, "passed");
+        let log = result.run_log.expect("--keep-logs retains the tail");
+        assert_eq!(log.kind, "kept");
+        assert_eq!(log.step, "*");
+        assert!(log.headline.contains("--keep-logs"));
+        assert!(!log.tail.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -965,5 +1457,139 @@ echo '{"exitCode":0,"status":"landed","merged":"44444444444444444444444444444444
         assert_eq!(listen, "127.0.0.1:58480");
         assert_eq!(web, "58489");
         assert!(super::port_pair(Some("garbage")).is_none());
+    }
+
+    #[test]
+    fn step_markers_match_only_attempt_banners() {
+        assert_eq!(
+            super::parse_step_marker("gate: cargo-test"),
+            Some(("cargo-test".into(), false))
+        );
+        assert_eq!(
+            super::parse_step_marker("gate: web-hub-e2e (retried)"),
+            Some(("web-hub-e2e".into(), true))
+        );
+        // Detail/banner lines contain a colon and stay attributed to the step.
+        assert!(super::parse_step_marker("gate: cargo-test: timed out").is_none());
+        assert!(super::parse_step_marker("gate: Rust tests: remuda (full)").is_none());
+        assert!(super::parse_step_marker("  gate: cargo-test").is_none());
+        assert!(super::parse_step_marker("gate: Cargo-Test").is_none());
+    }
+
+    #[test]
+    fn cargo_test_failure_summary_extracts_names_panics_and_section() {
+        let lines: Vec<String> = r"
+running 3 tests
+test ok::one ... ok
+test bad::boom ... FAILED
+test bad::other ... FAILED
+
+failures:
+
+---- bad::boom stdout ----
+thread 'bad::boom' panicked at src/lib.rs:9:5:
+assertion failed: `(left == right)`
+
+failures:
+    bad::boom
+    bad::other
+
+test result: FAILED. 1 passed; 2 failed"
+            .trim()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let summary = super::extract_summary("cargo-test", &lines);
+        let text = summary.join("\n");
+        assert!(text.contains("failures:"));
+        assert!(text.contains("bad::boom stdout"));
+        assert!(text.contains("panicked at src/lib.rs:9:5:"));
+        assert!(text.contains("test bad::boom ... FAILED"));
+        assert!(!text.contains("test ok::one ... ok"));
+        // The standalone FAILED lines are appended once each; the panic line
+        // already lives inside the section and is not duplicated.
+        for needle in [
+            "test bad::boom ... FAILED",
+            "test bad::other ... FAILED",
+            "panicked at src/lib.rs:9:5:",
+        ] {
+            assert_eq!(
+                summary.iter().filter(|line| line.contains(needle)).count(),
+                1,
+                "duplicated summary line {needle}: {summary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn playwright_summary_extracts_titles_and_first_block() {
+        let lines: Vec<String> = r"
+
+Running 8 tests across 2 projects
+
+  1) [chromium] › gate.spec.ts:42:1 › failing gate shows evidence
+  2) [chromium] › gate.spec.ts:88:3 › gate log prints the tail
+
+  1 failed
+"
+        .trim()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+        let summary = super::extract_summary("web-hub-e2e", &lines);
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("failing gate shows evidence")),
+            "{summary:?}"
+        );
+        assert!(
+            summary
+                .iter()
+                .any(|line| line.contains("gate log prints the tail")),
+            "{summary:?}"
+        );
+        assert!(super::extract_summary("secret-scan", &lines).is_empty());
+    }
+
+    #[test]
+    fn line_ring_bounds_lines_and_bytes_and_reports_drops() {
+        let mut ring = super::LineRing::new(4, 10_000);
+        for n in 0..10 {
+            ring.push(format!("line {n}"));
+        }
+        assert_eq!(ring.seen_lines, 10);
+        assert_eq!(ring.lines.len(), 4);
+        let (tail, dropped) = ring.last(100, 10_000);
+        assert!(dropped);
+        assert_eq!(tail.first().unwrap(), "line 6");
+        assert_eq!(tail.last().unwrap(), "line 9");
+        // Long lines are clipped before entering the ring.
+        let mut ring = super::LineRing::new(8, 100_000);
+        ring.push("x".repeat(super::MAX_LINE_CHARS * 3));
+        assert!(ring.lines.front().unwrap().chars().count() <= super::MAX_LINE_CHARS);
+    }
+
+    #[test]
+    fn trace_keeps_per_step_rings_following_markers() {
+        let mut trace = super::RunTrace::new();
+        for line in [
+            "gate: Rust tests: full",
+            "gate: cargo-fmt",
+            "fmt detail",
+            "gate: cargo-test",
+            "test bad ... FAILED",
+            "gate: cargo-test (retried)",
+            "still cargo-test",
+        ] {
+            trace.push(line.to_owned());
+        }
+        assert_eq!(trace.current.as_deref(), Some("cargo-test"));
+        let fmt = trace.by_step.get("cargo-fmt").unwrap();
+        assert_eq!(fmt.seen_lines, 2);
+        let test = trace.by_step.get("cargo-test").unwrap();
+        assert_eq!(test.seen_lines, 4);
+        // The banner line belongs to no step, but stays in the global ring.
+        assert!(!trace.by_step.contains_key("Rust tests"));
     }
 }

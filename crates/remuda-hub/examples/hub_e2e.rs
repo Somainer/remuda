@@ -623,11 +623,11 @@ async fn fake_node(
                     // is never `working`, so the composer must not mistake it
                     // for a turn.
                     if prompt.contains("blocked-question") {
-                        append_n =
-                            append_native_status(&mut ws, &instance_id, append_n, "blocked").await?;
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
                     } else {
-                        append_n =
-                            append_native_status(&mut ws, &instance_id, append_n, "working").await?;
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "working")
+                            .await?;
                     }
                     // §9.1 model-sync: the launch snapshot carries the
                     // gateway-discovered catalog and current model for any claude

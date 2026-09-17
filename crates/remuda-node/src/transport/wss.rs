@@ -658,6 +658,9 @@ async fn session_task(
         journal,
         watermarks: watermarks.clone(),
         pumps,
+        cursors: Arc::new(std::sync::Mutex::new(
+            crate::journal_flush::FlushCursor::new(),
+        )),
     });
     // object.pull rides this socket whenever the Hub HTTP origin is
     // unreachable; pending pulls are failed on every reconnect below.

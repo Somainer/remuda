@@ -27,7 +27,7 @@ pub use projection::{
     fold_prepend_backfill,
 };
 pub use source::{ADAPTER_VERSION, FileTail, MapContext, Source, SourceResume};
-pub use store::{Follow, FsyncPolicy, Journal, JournalOptions, Snapshot};
+pub use store::{Follow, FsyncPolicy, Journal, JournalOptions, MAX_PAGE, Page, Snapshot};
 pub use subagent::{
     SubagentKind, SubagentTranscript, SubagentTranscriptMeta, locate_agent_file,
     read_subagent_transcript,

@@ -558,6 +558,26 @@ fn is_auth_establishing(path: &str) -> bool {
     )
 }
 
+/// Whether `path` is the Node-facing host-file staging endpoint
+/// `POST /v1/hosts/{id}/files/objects`. Reached with a *host* token, which is
+/// not a device and must bypass the caller middleware; the route handler
+/// itself verifies the token resolves to the host named in the path.
+fn is_node_host_file_stage(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/v1/hosts/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (Some(id), Some("files"), Some("objects"), None) if !id.is_empty()
+    )
+}
+
 /// Scoped credentials cannot mint operator credentials, answer their own
 /// approvals, mutate host/worktree administration, or use the raw tty socket.
 pub async fn restrict_agent_routes(
@@ -573,7 +593,13 @@ pub async fn restrict_agent_routes(
     // origin is refused there too), so skipping it loses no check.
     let node_object_read =
         request.method() == axum::http::Method::GET && path.starts_with("/v1/objects/");
+    // Host files: a Node stages read file bytes at
+    // `POST /v1/hosts/{id}/files/objects` with the same host token. The
+    // handler verifies the token resolves to the addressed host.
+    let node_host_file_stage =
+        request.method() == axum::http::Method::POST && is_node_host_file_stage(path);
     if !node_object_read
+        && !node_host_file_stage
         && !is_auth_establishing(path)
         && auth::presented_token(request.headers()).is_some()
     {

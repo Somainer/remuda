@@ -9544,7 +9544,226 @@
           }
         }
       }
-    }
+    },
+      "/v1/hosts/{id}/files": {
+        "get": {
+          "tags": [
+            "host-files"
+          ],
+          "operationId": "hostFilesList",
+          "summary": "List one directory on a host under a registered workspace (read-only)",
+          "description": "Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.list RPC; the Node confines the path to a registered workspace root or the /tmp/remuda-* scratch area. Never cached.",
+          "parameters": [
+            {
+              "$ref": "#/components/parameters/IdPath"
+            },
+            {
+              "name": "workspaceId",
+              "in": "query",
+              "required": true,
+              "description": "Registered workspace id, or 'tmp' for the /tmp/remuda-* scratch area on the Node.",
+              "schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "relPath",
+              "in": "query",
+              "required": false,
+              "description": "Workspace-relative path; absent names the workspace root.",
+              "schema": {
+                "type": "string"
+              }
+            }
+          ],
+          "responses": {
+            "200": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object"
+                  }
+                }
+              },
+              "description": "Node answer"
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "409": {
+              "$ref": "#/components/responses/Error"
+            },
+            "422": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      },
+      "/v1/hosts/{id}/files/read": {
+        "post": {
+          "tags": [
+            "host-files"
+          ],
+          "operationId": "hostFilesRead",
+          "summary": "Read one regular file on a host and stage it as a Hub object (read-only)",
+          "description": "Operator (Human/Bot) only; Agent origin is 403. The Node validates containment, reads the regular file, uploads the bytes with its host token, and returns objectId/digest/size. Bytes are fetched separately via GET /v1/objects/{objectId}.",
+          "parameters": [
+            {
+              "$ref": "#/components/parameters/IdPath"
+            }
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "workspaceId"
+                  ],
+                  "properties": {
+                    "workspaceId": {
+                      "type": "string"
+                    },
+                    "relPath": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Staged object reference",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "objectId",
+                      "digest",
+                      "size"
+                    ],
+                    "properties": {
+                      "objectId": {
+                        "type": "string"
+                      },
+                      "digest": {
+                        "type": "string"
+                      },
+                      "size": {
+                        "type": "integer",
+                        "format": "int64"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "409": {
+              "$ref": "#/components/responses/Error"
+            },
+            "413": {
+              "$ref": "#/components/responses/Error"
+            },
+            "422": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      },
+      "/v1/hosts/{id}/files/objects": {
+        "post": {
+          "tags": [
+            "host-files"
+          ],
+          "operationId": "hostFilesStageObject",
+          "summary": "Node-facing: stage bytes read from a host's workspace",
+          "description": "Authenticated with the addressed Node's durable host token (not a device token); a token bound to another host is 403. Raw octet-stream body capped by the Hub's attachmentMaxBytes. Stored as application/octet-stream with nosniff; bytes read back through GET /v1/objects/{objectId}.",
+          "parameters": [
+            {
+              "$ref": "#/components/parameters/IdPath"
+            },
+            {
+              "name": "name",
+              "in": "query",
+              "required": false,
+              "description": "Sanitized basename of the read file.",
+              "schema": {
+                "type": "string"
+              }
+            }
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Staged object reference",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "objectId",
+                      "digest",
+                      "size"
+                    ],
+                    "properties": {
+                      "objectId": {
+                        "type": "string"
+                      },
+                      "digest": {
+                        "type": "string"
+                      },
+                      "size": {
+                        "type": "integer",
+                        "format": "int64"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "413": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      }
   },
   "servers": [
     {

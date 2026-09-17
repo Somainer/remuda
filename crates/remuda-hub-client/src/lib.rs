@@ -147,6 +147,26 @@ impl HubClient {
         self.send(reqwest::Method::GET, path, None).await
     }
 
+    /// `GET` raw bytes — used for `GET /v1/objects/{id}` downloads.
+    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, ClientError> {
+        self.ensure_auth().await?;
+        let url = format!("{}{path}", self.base);
+        let mut request = self.http.get(&url);
+        if let Some(token) = self.current_token()? {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(ClientError::Http {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        Ok(response.bytes().await?.to_vec())
+    }
+
     /// `POST` JSON.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
         self.send(reqwest::Method::POST, path, Some(body)).await

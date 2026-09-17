@@ -501,6 +501,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/{id}/files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List one directory on a host under a registered workspace (read-only)
+         * @description Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.list RPC; the Node confines the path to a registered workspace root or the /tmp/remuda-* scratch area. Never cached.
+         */
+        get: operations["hostFilesList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/hosts/{id}/files/objects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Node-facing: stage bytes read from a host's workspace
+         * @description Authenticated with the addressed Node's durable host token (not a device token); a token bound to another host is 403. Raw octet-stream body capped by the Hub's attachmentMaxBytes. Stored as application/octet-stream with nosniff; bytes read back through GET /v1/objects/{objectId}.
+         */
+        post: operations["hostFilesStageObject"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/hosts/{id}/files/read": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read one regular file on a host and stage it as a Hub object (read-only)
+         * @description Operator (Human/Bot) only; Agent origin is 403. The Node validates containment, reads the regular file, uploads the bytes with its host token, and returns objectId/digest/size. Bytes are fetched separately via GET /v1/objects/{objectId}.
+         */
+        post: operations["hostFilesRead"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/{id}/hostcap": {
         parameters: {
             query?: never;
@@ -3739,6 +3799,116 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             500: components["responses"]["Error"];
+        };
+    };
+    hostFilesList: {
+        parameters: {
+            query: {
+                /** @description Registered workspace id, or 'tmp' for the /tmp/remuda-* scratch area on the Node. */
+                workspaceId: string;
+                /** @description Workspace-relative path; absent names the workspace root. */
+                relPath?: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Node answer */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    hostFilesStageObject: {
+        parameters: {
+            query?: {
+                /** @description Sanitized basename of the read file. */
+                name?: string;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Staged object reference */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        digest: string;
+                        objectId: string;
+                        /** Format: int64 */
+                        size: number;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+        };
+    };
+    hostFilesRead: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    relPath?: string;
+                    workspaceId: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Staged object reference */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        digest: string;
+                        objectId: string;
+                        /** Format: int64 */
+                        size: number;
+                    };
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+            413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
         };
     };
     hostCapacity: {

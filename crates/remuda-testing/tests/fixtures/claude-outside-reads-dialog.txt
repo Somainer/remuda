@@ -1,17 +1,16 @@
- ▐ Claude Code v2.1.274
+ Read outside the working directories
 
-Read outside the working directories
+  Read(/tmp/<home>/remuda-wt/<name>/outside-read-target.txt)
 
-Allow reads outside the working directories?
-Auto mode and the sandbox read outside the working directories without asking.
-Yes or Block settles this question; Ask again asks on the next outside read.
-Block: the file tools refuse reads outside the working directories in every
-project. Sandboxed commands are not changed on this machine (the sandbox is
-off, its filesystem rules are relaxed, a managed read-path lock is on, or the
-working directory name has glob characters). To undo, remove
-permissions.blockReadsOutsideWorkingDirectories from your user settings; file
-tools follow next session, sandboxed commands at once.
+ Auto mode and the sandbox read outside the working directories without asking. Yes or Block
+ settles this question; Ask again asks on the next outside read. Block: the file tools refuse
+ reads outside the working directories in every project. Sandboxed commands are not changed
+ on this machine (the sandbox is off, its filesystem rules are relaxed, a managed read-path
+ lock is on, or the working directory name has glob characters). To undo, remove
+ permissions.blockReadsOutsideWorkingDirectories from your user settings; file tools follow
+ next session, sandboxed commands at once.
 
-❯ Yes, keep allowing reads outside the working directories
-  No, block reads outside the working directories from now on
-  No, ask again next time
+ Allow reads outside the working directories?
+ ❯ 1. Yes, keep allowing reads outside the working directories
+   2. No, block reads outside the working directories from now on
+   3. No, ask again next time

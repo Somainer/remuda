@@ -254,6 +254,14 @@ pub struct ScreenSignals<'a> {
     /// from the mirrored instance journal instead, and the Hub marks the
     /// persisted detail `screen-unavailable`.
     pub screen_available: bool,
+    /// Title of a first-run / native permission dialog detected on the live
+    /// screen (folder trust, auto-mode outside reads, …), if one owns the
+    /// keyboard. Classifies as [`ScreenClass::Blocked`] with the title as
+    /// reason, regardless of reported activity: a dialog makes a worker look
+    /// busy while it is actually parked (dispatch-onboarding-1). The rule is
+    /// deliberately *not* echo-deduped — a modal still on screen stays blocked
+    /// rather than collapsing back to working.
+    pub dialog_title: Option<&'a str>,
     /// Assistant text blocks recovered from the instance journal (transcript
     /// order), used for report/error classification only when
     /// `screen_available` is false.
@@ -701,6 +709,22 @@ pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
             reason: "instance-closed",
         };
     }
+    // A native first-run/permission dialog on the live screen owns the
+    // keyboard: classify blocked with its title, no matter what activity the
+    // carrier guessed mid-boot. This is intentionally below report detection
+    // (a fresh DONE/BLOCKED report is the worker speaking, not a modal) and
+    // above idle/stall heuristics, and it is not echo-deduped — a dialog that
+    // never went away must keep reporting blocked (dispatch-onboarding-1).
+    if signals.screen_available
+        && let Some(title) = signals.dialog_title
+        && !title.trim().is_empty()
+    {
+        let line = title.trim().to_string();
+        return ScreenClass::Blocked {
+            reason: line.clone(),
+            line,
+        };
+    }
     // Idle after API error / connection drop / retry loop. The text source is
     // the live screen when present, otherwise the journaled assistant text.
     let trouble_lines: &[String] = if signals.screen_available {
@@ -1095,6 +1119,7 @@ mod tests {
             known_blocked: None,
             raw: false,
             screen_available: true,
+            dialog_title: None,
             journal_lines: &[],
             turn_error: false,
             tail_error: false,
@@ -1356,6 +1381,67 @@ mod tests {
         let mut p = sig(&placeholder, "ready", "idle");
         p.raw = true;
         assert_eq!(classify_screen(&p), ScreenClass::Working);
+    }
+
+    #[test]
+    fn a_screen_dialog_blocks_with_its_title_even_while_the_carrier_says_busy() {
+        // dispatch-onboarding-1: the incident shape — a parked first-run
+        // dialog with lifecycle ready and activity the classifier would
+        // otherwise treat as busy must report blocked, never working.
+        for (lifecycle, activity) in [
+            ("ready", "idle"),
+            ("ready", "working"),
+            ("running", "busy"),
+            ("starting", ""),
+        ] {
+            let lines = rows(
+                "Welcome to Claude Code!\nQuick safety check:\n\
+                 Is this a project you created or one you trust?\n\
+                 ❯ No, exit\n  Yes, I trust this folder",
+            );
+            let mut s = sig(&lines, lifecycle, activity);
+            s.dialog_title = Some("Is this a project you created or one you trust?");
+            match classify_screen(&s) {
+                ScreenClass::Blocked { reason, line } => {
+                    assert_eq!(reason, "Is this a project you created or one you trust?");
+                    assert_eq!(line, reason);
+                }
+                other => panic!("{lifecycle}/{activity}: {other:?}"),
+            }
+        }
+        let lines = rows(
+            "Allow reads outside the working directories?\n\
+             ❯ Yes, keep allowing reads outside the working directories\n\
+               No, block reads outside the working directories from now on\n\
+               No, ask again next time",
+        );
+        let mut s = sig(&lines, "running", "busy");
+        s.dialog_title = Some("Allow reads outside the working directories?");
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Blocked { ref reason, .. }
+                if reason == "Allow reads outside the working directories?"
+        ));
+    }
+
+    #[test]
+    fn a_screen_dialog_stays_blocked_across_echo_baselines() {
+        // A modal still on screen after the first blocked observation must
+        // not collapse to working like a deduped BLOCKED report does.
+        let lines = rows("Quick safety check:\nIs this a project you created or one you trust?");
+        let mut s = sig(&lines, "ready", "idle");
+        s.dialog_title = Some("Is this a project you created or one you trust?");
+        s.known_blocked = Some("Is this a project you created or one you trust?");
+        assert!(matches!(classify_screen(&s), ScreenClass::Blocked { .. }));
+    }
+
+    #[test]
+    fn a_dialog_title_is_ignored_without_a_live_screen() {
+        // Screenless (print) workers classify from the journal only.
+        let mut s = sig(&[], "ready", "idle");
+        s.screen_available = false;
+        s.dialog_title = Some("Is this a project you created or one you trust?");
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
     }
 
     #[test]

@@ -455,6 +455,10 @@ pub struct ShellPtyDriver {
     model_bridge: Mutex<Arc<crate::model::ModelBridge>>,
     model_queue: Mutex<Arc<crate::model::ModelQueue>>,
     model_worker: Mutex<Option<JoinHandle<()>>>,
+    /// In-session permission-mode switch coordination (shift+tab wheel).
+    permission_bridge: Mutex<Arc<crate::permission::PermissionBridge>>,
+    permission_queue: Mutex<Arc<crate::permission::PermissionQueue>>,
+    permission_worker: Mutex<Option<JoinHandle<()>>>,
     /// Event sender for the current run, retained so an effort switch can
     /// journal `queued`/`degraded` without going through the worker.
     events_tx: Mutex<Option<mpsc::Sender<remuda_protocol::Observation>>>,
@@ -502,6 +506,11 @@ impl ShellPtyDriver {
             model_bridge: Mutex::new(Arc::new(crate::model::ModelBridge::new())),
             model_queue: Mutex::new(Arc::new(crate::model::ModelQueue::new())),
             model_worker: Mutex::new(None),
+            permission_bridge: Mutex::new(Arc::new(crate::permission::PermissionBridge::new(
+                false,
+            ))),
+            permission_queue: Mutex::new(Arc::new(crate::permission::PermissionQueue::new())),
+            permission_worker: Mutex::new(None),
             events_tx: Mutex::new(None),
             promote_ctx: Mutex::new(None),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
@@ -900,6 +909,64 @@ impl ShellPtyDriver {
         Ok(DriverAck::transport_written())
     }
 
+    /// Shift+tab the native permission wheel to `mode` and read it back from
+    /// the status line / transcript.
+    async fn switch_permission(&self, mode: &str) -> DriverResult<DriverAck> {
+        let Some(request) = crate::permission::PermissionRequest::parse(mode) else {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude permission mode {mode:?} is not a valid mode"
+            )));
+        };
+        let state = self.state().await?;
+        if state.closed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        let bridge = self.permission_bridge.lock().await.clone();
+        if !crate::permission::live_reachable(request.mode, bridge.bypass_allowed()) {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude permission mode {mode:?} is launch-only for this session"
+            )));
+        }
+        let queue = self.permission_queue.lock().await.clone();
+        let events = self
+            .events_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let ctx = self
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let io: Arc<dyn crate::permission::PermissionSwitchIo> = Arc::new(ShellPermissionIo {
+            state,
+            events,
+            seq: Arc::clone(&self.seq),
+            ctx,
+        });
+        if io.is_idle().await {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait = std::time::Duration::from_millis(
+                crate::permission::PERMISSION_READBACK_TIMEOUT_MS + 5_000,
+            );
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // The worker keeps running and journals applied/degraded; this
+                // command settles as dispatched, never as applied.
+            }
+        } else {
+            io.journal(
+                crate::permission::SwitchOutcome::Queued.journal_status(request.word(), ""),
+                remuda_protocol::Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+        Ok(DriverAck::transport_written())
+    }
+
     /// Spawn the PTY without an [`InstanceSpec`] (Node fake registry / tests).
     pub async fn spawn(&self) -> DriverResult<RunHandle> {
         let cwd = self.options.cwd.to_string_lossy().into_owned();
@@ -1076,6 +1143,41 @@ impl ShellPtyDriver {
             model_io,
         ));
         *self.model_bridge.lock().await = Arc::clone(&model_bridge);
+        // Permission-mode coordination for this run. The wheel includes
+        // bypassPermissions only for a bypass launch (argv flag) or a session
+        // that started already in bypass.
+        let launch_permission = spec.and_then(crate::claude_pty::launch_claude_permission);
+        let bypass_allowed = recipe.argv.iter().any(|token| {
+            token == "--dangerously-skip-permissions"
+                || token == "--allow-dangerously-skip-permissions"
+        }) || launch_permission
+            == Some(remuda_protocol::ClaudePermissionMode::BypassPermissions);
+        if let Some(worker) = self.permission_worker.lock().await.take() {
+            worker.abort();
+        }
+        let permission_queue = {
+            let mut slot = self.permission_queue.lock().await;
+            slot.close();
+            *slot = Arc::new(crate::permission::PermissionQueue::new());
+            Arc::clone(&slot)
+        };
+        let permission_bridge = Arc::new(crate::permission::PermissionBridge::new(bypass_allowed));
+        if let Some(mode) = launch_permission {
+            permission_bridge.note_launch_mode(mode);
+        }
+        let permission_io: Arc<dyn crate::permission::PermissionSwitchIo> =
+            Arc::new(ShellPermissionIo {
+                state: Arc::clone(&state),
+                events: tx.clone(),
+                seq: Arc::clone(&self.seq),
+                ctx: hook_ctx.clone(),
+            });
+        *self.permission_worker.lock().await = Some(crate::permission::spawn_worker(
+            Arc::clone(&permission_bridge),
+            Arc::clone(&permission_queue),
+            permission_io,
+        ));
+        *self.permission_bridge.lock().await = Arc::clone(&permission_bridge);
         // D-028 P6: file-tail signal adapters for the codex/grok structured
         // channels. They read the shadow home the hook session materialized
         // (which is the same path the child receives via CODEX_HOME /
@@ -1107,6 +1209,8 @@ impl ShellPtyDriver {
                     launch: launch_model,
                     catalog: Some(model_catalog),
                 }),
+                Some(Arc::clone(&permission_bridge)),
+                launch_permission,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1473,6 +1577,30 @@ impl ShellPtyDriver {
             std::mem::replace(&mut *slot, Arc::new(crate::model::ModelQueue::new()))
         };
         *self.model_worker.lock().await = resumed.model_worker.lock().await.take();
+        // Permission switch coordination: adopt queue/worker always and the
+        // bridge when a wheel walk was mid-flight.
+        self.permission_queue.lock().await.close();
+        if let Some(worker) = self.permission_worker.lock().await.take() {
+            worker.abort();
+        }
+        *self.permission_queue.lock().await = {
+            let mut slot = resumed.permission_queue.lock().await;
+            std::mem::replace(
+                &mut *slot,
+                Arc::new(crate::permission::PermissionQueue::new()),
+            )
+        };
+        *self.permission_worker.lock().await = resumed.permission_worker.lock().await.take();
+        if resumed.permission_bridge.lock().await.pending().is_some() {
+            let resumed_bridge = {
+                let mut slot = resumed.permission_bridge.lock().await;
+                std::mem::replace(
+                    &mut *slot,
+                    Arc::new(crate::permission::PermissionBridge::new(false)),
+                )
+            };
+            *self.permission_bridge.lock().await = resumed_bridge;
+        }
         if let (Ok(mut ours), Ok(theirs)) = (self.recipe.lock(), resumed.recipe.lock()) {
             ours.clone_from(&theirs);
         }
@@ -2089,6 +2217,13 @@ impl Driver for ShellPtyDriver {
         {
             return self.switch_model(&switch.model_id).await;
         }
+        if self.session_kind() == Some(AgentKind::Claude)
+            && let DriverInput::ModelSwitch(switch) = &input
+            && let Some(mode) = switch.permission_mode.as_deref()
+            && !mode.is_empty()
+        {
+            return self.switch_permission(mode).await;
+        }
         let text = match input {
             DriverInput::Prompt(prompt) => {
                 let mut text = prompt
@@ -2345,6 +2480,11 @@ impl Driver for ShellPtyDriver {
         }
         self.model_queue.lock().await.close();
         if let Some(worker) = self.model_worker.lock().await.take() {
+            worker.abort();
+        }
+        // Same for the permission wheel worker.
+        self.permission_queue.lock().await.close();
+        if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
         self.events_tx.lock().await.take();
@@ -2899,6 +3039,67 @@ impl crate::effort::EffortSwitchIo for ShellEffortIo {
 /// Read the emulator/screen idle signal without a `&ShellPtyDriver`.
 fn self_state_idle_helper(state: &PtyState) -> bool {
     remuda_screen::screen_status(&state.screen_grid()) == Some(ScreenStatus::Idle)
+}
+
+/// [`crate::permission::PermissionSwitchIo`] for the local PTY carrier.
+struct ShellPermissionIo {
+    state: Arc<PtyState>,
+    events: mpsc::Sender<remuda_protocol::Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: promotion::PromoteCtx,
+}
+
+#[async_trait]
+impl crate::permission::PermissionSwitchIo for ShellPermissionIo {
+    async fn is_idle(&self) -> bool {
+        let rung = send::ready_rung(
+            true,
+            false,
+            self.state.modes(),
+            self_state_idle_helper(&self.state),
+        );
+        matches!(
+            rung,
+            Some(send::ReadyEvidence::Quiescence) | Some(send::ReadyEvidence::Glyph)
+        )
+    }
+
+    async fn send_cycle(&self) -> crate::DriverResult<()> {
+        self.state.write_bytes(b"\x1b[Z").await
+    }
+
+    async fn press_down(&self) -> crate::DriverResult<()> {
+        self.state.write_bytes(b"\x1b[B").await
+    }
+
+    async fn press_enter(&self) -> crate::DriverResult<()> {
+        self.state.write_bytes(b"\r").await
+    }
+
+    async fn press_esc(&self) -> crate::DriverResult<()> {
+        self.state.write_bytes(b"\x1b").await
+    }
+
+    async fn screen_text(&self) -> crate::DriverResult<String> {
+        Ok(self.state.screen_grid().text())
+    }
+
+    async fn journal(&self, status: String, severity: remuda_protocol::Severity) {
+        let payload = promotion::permission_lifecycle(&status, severity);
+        if promotion::emit_payload(
+            &self.events,
+            &self.seq,
+            &self.ctx,
+            SourceChannel::Runtime,
+            Completeness::Structured,
+            payload,
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!("permission lifecycle dropped: event channel closed");
+        }
+    }
 }
 
 #[cfg(test)]

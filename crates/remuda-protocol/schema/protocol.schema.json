@@ -10863,6 +10863,13 @@
         "modelId": {
           "description": "`model_id`; protocol §3.1.",
           "type": "string"
+        },
+        "permissionMode": {
+          "description": "Native permission-mode spelling when the driver supports a runtime\nswitch (Claude PTY: shift+tab cycling). Launch-only modes the carrier\ncannot cycle into are rejected by the driver.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -11890,6 +11897,23 @@
           "type": "object"
         },
         {
+          "description": "`permission` payload; §5.1.",
+          "properties": {
+            "kind": {
+              "const": "permission",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/PermissionPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
           "description": "`raw_tty` payload; §5.1.",
           "properties": {
             "kind": {
@@ -12105,6 +12129,11 @@
         {
           "const": "model",
           "description": "Wire value `model`.",
+          "type": "string"
+        },
+        {
+          "const": "permission",
+          "description": "Wire value `permission`.",
           "type": "string"
         },
         {
@@ -12369,6 +12398,23 @@
             },
             "payload": {
               "$ref": "#/$defs/ModelPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`permission` payload; §5.1.",
+          "properties": {
+            "kind": {
+              "const": "permission",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/PermissionPayload"
             }
           },
           "required": [
@@ -12775,6 +12821,29 @@
         }
       ]
     },
+    "PermissionEffective": {
+      "description": "Effective permission mode, read back from the native TUI status line and\nthe transcript's `permission-mode` records.\n\nMirrors [`EffortEffective`]: this is the *observed* mode, never the\nrequested one. `mode` carries the protocol wire spelling for every harness\n(Claude's TUI/transcript spelling `default` is normalized to `manual` by\nthe observing driver).",
+      "properties": {
+        "mode": {
+          "description": "Observed mode in protocol wire spelling.",
+          "type": "string"
+        },
+        "observedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the observation was made."
+        },
+        "source": {
+          "$ref": "#/$defs/PermissionSource",
+          "description": "What established this mode."
+        }
+      },
+      "required": [
+        "mode",
+        "source",
+        "observedAt"
+      ],
+      "type": "object"
+    },
     "PermissionMode": {
       "description": "PermissionMode; `protocol.md` §4.1.",
       "oneOf": [
@@ -12847,6 +12916,58 @@
             "kind"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "PermissionPayload": {
+      "description": "Emitted whenever the effective permission mode is observed — the native\nTUI status line and the transcript's `permission-mode` records agree.\nUnchanged values are deduped by the observing driver, so the Hub only\nsees edges. The UI renders from this observation — never from the\nrequested mode.",
+      "properties": {
+        "effective": {
+          "$ref": "#/$defs/PermissionEffective",
+          "description": "The mode actually observed."
+        },
+        "raw": {
+          "description": "Native spelling read off the record or status line, kept for\ndiagnostics (an unknown future name normalizes into `mode`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested": {
+          "description": "The mode Remuda asked for (launch argv or an in-session switch), when\nknown on the observing side.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effective"
+      ],
+      "type": "object"
+    },
+    "PermissionSource": {
+      "description": "PermissionSource wire values; `protocol.md` §9.1.",
+      "oneOf": [
+        {
+          "const": "launch",
+          "description": "Wire value `launch`.",
+          "type": "string"
+        },
+        {
+          "const": "slash",
+          "description": "Wire value `slash`.",
+          "type": "string"
+        },
+        {
+          "const": "remuda",
+          "description": "Wire value `remuda`.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Wire value `unknown`.",
+          "type": "string"
         }
       ]
     },

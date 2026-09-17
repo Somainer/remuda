@@ -2378,6 +2378,7 @@ export type ModelSwitchInput = ({
   "effective": ModelEffective;
   "effort"?: (string | null);
   "modelId": (string);
+  "permissionMode"?: (string | null);
   [key: string]: unknown;
 });
 
@@ -2653,6 +2654,10 @@ export type Observation = (({
   "payload": ModelPayload;
   [key: string]: unknown;
 }) | ({
+  "kind": "permission";
+  "payload": PermissionPayload;
+  [key: string]: unknown;
+}) | ({
   "kind": "raw_tty";
   "payload": RawTtyPayload;
   [key: string]: unknown;
@@ -2680,7 +2685,7 @@ export type Observation = (({
 });
 
 /** ObservationKind wire values; `protocol.md` §5.1. */
-export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "model" | "raw_tty" | "opaque");
+export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "model" | "permission" | "raw_tty" | "opaque");
 
 /** ObservationPayload; `protocol.md` §5.1. */
 export type ObservationPayload = (({
@@ -2742,6 +2747,10 @@ export type ObservationPayload = (({
 }) | ({
   "kind": "model";
   "payload": ModelPayload;
+  [key: string]: unknown;
+}) | ({
+  "kind": "permission";
+  "payload": PermissionPayload;
   [key: string]: unknown;
 }) | ({
   "kind": "raw_tty";
@@ -2843,6 +2852,14 @@ export type Parentage = ("known-root" | "linked" | "unknown");
 /** PathStyle wire values; `protocol.md` §2.1. */
 export type PathStyle = ("posix" | "windows");
 
+/** Effective permission mode, read back from the native TUI status line and the transcript's `permission-mode` records.  Mirrors [`EffortEffective`]: this is the *observed* mode, never the requested one. `mode` carries the protocol wire spelling for every harness (Claude's TUI/transcript spelling `default` is normalized to `manual` by the observing driver). */
+export type PermissionEffective = ({
+  "mode": (string);
+  "observedAt": Timestamp;
+  "source": PermissionSource;
+  [key: string]: unknown;
+});
+
 /** PermissionMode; `protocol.md` §4.1. */
 export type PermissionMode = (ClaudePermission & ({
   "kind": "claude";
@@ -2860,6 +2877,17 @@ export type PermissionMode = (ClaudePermission & ({
   "kind": "generic";
   [key: string]: unknown;
 }));
+
+/** Emitted whenever the effective permission mode is observed — the native TUI status line and the transcript's `permission-mode` records agree. Unchanged values are deduped by the observing driver, so the Hub only sees edges. The UI renders from this observation — never from the requested mode. */
+export type PermissionPayload = ({
+  "effective": PermissionEffective;
+  "raw"?: (string | null);
+  "requested"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** PermissionSource wire values; `protocol.md` §9.1. */
+export type PermissionSource = ("launch" | "slash" | "remuda" | "unknown");
 
 /** One placement-ledger row; design §2.2 ⑥/§5.6.  `reasons` / `rejected` are both the audit trail and the future bot card body — the two never diverge because there is no second representation. */
 export type PlacementLedgerRow = ({

@@ -5,12 +5,13 @@ use crate::envelope::Envelope;
 use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_now, unknown};
 use remuda_protocol::{
-    Completeness, ContentBlock, ContentStatus, EffortEffective, EffortPayload, EffortTracker,
-    EventId, FileCursor, Id, Knowledge, LifecyclePayload, LifecycleTopic, MessageOrigin,
-    MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
-    NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource, OpaqueImpact,
-    OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor, TextBlock,
-    ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
+    ClaudePermissionMode, Completeness, ContentBlock, ContentStatus, EffortEffective,
+    EffortPayload, EffortTracker, EventId, FileCursor, Id, Knowledge, LifecyclePayload,
+    LifecycleTopic, LivePermissionTracker, MessageOrigin, MessagePayload, MessagePhase,
+    MessageRole, MutationOperation, NativeLifecycle, NativeRequestKey, NodeMutation,
+    ObservationPayload, ObservationSource, OpaqueImpact, OpaquePayload, OpaqueReason,
+    PermissionEffective, PermissionPayload, ResultStage, Severity, SourceChannel, SourceCursor,
+    TextBlock, ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
     ToolOutcome, ToolResultPayload, U64,
 };
 use serde_json::{Map, Value};
@@ -45,6 +46,8 @@ pub struct NativeIds {
     effort: EffortTracker,
     /// §9.1 effective-model edges across this tail.
     model: remuda_protocol::ModelTracker,
+    /// Effective permission-mode edges across this tail.
+    permission: LivePermissionTracker,
 }
 
 impl NativeIds {
@@ -61,6 +64,7 @@ impl NativeIds {
             phases: HashMap::new(),
             effort: EffortTracker::new(),
             model: remuda_protocol::ModelTracker::new(),
+            permission: LivePermissionTracker::new(),
         }
     }
 
@@ -78,6 +82,12 @@ impl NativeIds {
         name: remuda_protocol::EffortName,
     ) -> EventId {
         remuda_protocol::effort_event_id(&self.scope, assistant_native_id, name)
+    }
+
+    /// Deterministic event id for a permission-mode edge read from a native
+    /// record; stable across the live channel and this file tailer.
+    pub(crate) fn permission_event(&self, native_key: &str, mode: ClaudePermissionMode) -> EventId {
+        remuda_protocol::permission_event_id(&self.scope, native_key, mode)
     }
 
     /// Deterministic id for a native object in this instance's scope.
@@ -322,6 +332,7 @@ pub(crate) fn map_claude_value(
             Completeness::Partial,
             false,
         )?]),
+        "permission-mode" => map_permission_mode(ctx, ids, value, line, cursor),
         "atis-latch" => Ok(vec![opaque(
             ctx,
             cursor,
@@ -371,6 +382,53 @@ pub(crate) fn map_claude_value(
     }
 }
 
+/// Top-level `permission-mode` record → the effective permission-mode edge.
+///
+/// Claude writes one whenever the mode changes (shift+tab, `/plan`, launch).
+/// The record carries no timestamp and repeats per session; the tracker
+/// dedupes edges exactly like the effort channel.
+fn map_permission_mode(
+    ctx: &MapContext,
+    ids: &mut NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+) -> Result<Vec<Envelope>, Error> {
+    let Some(raw) = value
+        .get("permissionMode")
+        .or_else(|| value.get("mode"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(vec![opaque(
+            ctx,
+            cursor,
+            line,
+            "permission-mode",
+            OpaqueReason::Malformed,
+            Completeness::Opaque,
+            native_uuid(value),
+        )?]);
+    };
+    // A durable replay cannot attribute a live Remuda push-down.
+    let Some((mode, source)) = ids.permission.note(raw, None) else {
+        return Ok(Vec::new());
+    };
+    let native = native_uuid(value)
+        .map(|uuid| format!("permission-mode:{uuid}"))
+        .unwrap_or_else(|| format!("permission-mode:{}", cursor.offset.0));
+    Ok(vec![permission_envelope(
+        ctx,
+        ids,
+        value,
+        line,
+        cursor,
+        &native,
+        mode,
+        source,
+        Some(raw),
+    )?])
+}
+
 fn map_user(
     ctx: &MapContext,
     ids: &mut NativeIds,
@@ -385,6 +443,9 @@ fn map_user(
     let text = user_record_text(&content);
     // §9.1: the `/effort` slash record arms attribution; its stdout verdict
     // is what settles the level (the slash record lands even on reject).
+    if text.contains("<command-name>/plan</command-name>") {
+        ids.permission.note_slash();
+    }
     if let Some(word) = remuda_protocol::slash_effort_word(&text) {
         ids.effort.note_slash(&word, false);
     } else if text.contains("<local-command-stdout>") {
@@ -618,6 +679,41 @@ fn model_edge_envelope(
     model_envelope(
         ctx, ids, value, line, cursor, &native, observed, source, raw,
     )
+}
+/// Effective permission-mode envelope for a `permission-mode` record edge.
+#[allow(clippy::too_many_arguments)]
+fn permission_envelope(
+    ctx: &MapContext,
+    ids: &NativeIds,
+    value: &Value,
+    line: &[u8],
+    cursor: &FileCursor,
+    native_key: &str,
+    mode: ClaudePermissionMode,
+    source: remuda_protocol::PermissionSource,
+    raw: Option<&str>,
+) -> Result<Envelope, Error> {
+    let mode_wire = remuda_protocol::permission_mode_wire(mode);
+    let event_id = ids.permission_event(native_key, mode);
+    let mut env = envelope(
+        ctx,
+        cursor,
+        line,
+        value,
+        Completeness::Structured,
+        native_uuid(value).as_deref(),
+        ObservationPayload::Permission(Box::new(PermissionPayload {
+            requested: None,
+            effective: PermissionEffective {
+                mode: mode_wire.to_owned(),
+                source,
+                observed_at: timestamp_now()?,
+            },
+            raw: raw.map(str::to_owned),
+        })),
+    )?;
+    env.event_id = Some(event_id);
+    Ok(env)
 }
 
 /// Plain-text view of a user record's content (string or text-block array).

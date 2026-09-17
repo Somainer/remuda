@@ -67,6 +67,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        permission_mode: None,
                     }
                     .with_configure(&params),
                 )
@@ -91,6 +92,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        permission_mode: None,
                     },
                 )
                 .await?;
@@ -120,6 +122,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        permission_mode: None,
                     },
                 )
                 .await?;
@@ -147,6 +150,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         model: None,
                         effort_name: None,
                         effort_index: None,
+                        permission_mode: None,
                     },
                 )
                 .await?;
@@ -294,6 +298,11 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .and_then(Value::as_str)
             .unwrap_or("manual")
             .to_owned(),
+        sandbox: spec
+            .get("sandbox")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         prompt: prompt_of(params).unwrap_or_default(),
         cwd,
         delegation: None,

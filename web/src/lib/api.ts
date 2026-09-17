@@ -420,6 +420,8 @@ export type InstanceCreateSpec = {
   model: string;
   providerProfileId?: string;
   permissionMode: string;
+  /** Codex sandbox mode (`read-only` / `workspace-write` / `danger-full-access`). */
+  sandbox?: string;
   delegation?: "none" | "gateway";
   prompt: string;
   worktree?: boolean | string;

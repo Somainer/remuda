@@ -2097,6 +2097,7 @@ fn command_parts(
                 model: request.model.clone(),
                 effort: request.effort_name.clone(),
                 effort_index: request.effort_index,
+                permission_mode: request.permission_mode.clone(),
             },
             false,
         )),
@@ -3433,7 +3434,8 @@ mod tests {
                     native.native_name == "instance.configure"
                         && native.status
                             == Knowledge::Known {
-                                value: "applied model=opus effort=ultracode index=3".into(),
+                                value: "applied model=opus effort=ultracode index=3 permission=-"
+                                    .into(),
                             }
                 });
                 if has_command && has_apply {

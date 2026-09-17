@@ -366,6 +366,11 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
             .and_then(Value::as_str)
             .unwrap_or("manual")
             .to_owned(),
+        sandbox: spec
+            .get("sandbox")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         prompt: parsed
             .prompt
             .clone()
@@ -431,6 +436,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             },
         )
         .await?;
@@ -472,6 +478,7 @@ async fn cancel_from_params(
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             },
         )
         .await?;
@@ -509,6 +516,7 @@ async fn close_from_params(
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             },
         )
         .await?;
@@ -571,6 +579,7 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             },
         )
         .await?;
@@ -620,6 +629,7 @@ async fn respond_from_params(
                 model: None,
                 effort_name: None,
                 effort_index: None,
+                permission_mode: None,
             },
         )
         .await?;

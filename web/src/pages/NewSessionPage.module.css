@@ -581,3 +581,21 @@
   word-break: break-all;
   overflow-x: auto;
 }
+
+.permChoice {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.permNative {
+  color: var(--mute);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.choiceOn .permNative,
+.choiceDust .permNative {
+  opacity: 1;
+}

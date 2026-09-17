@@ -5,19 +5,24 @@ import { composing, useWorkbenchViewport } from "../lib/viewport";
 import { readNewSessionPrefs, rememberNewSessionSuccess, sortRecent } from "../lib/prefs";
 import {
   DELEGATION_OPTIONS,
-  PERMISSION_OPTIONS,
   PTY_YOLO_FLAGS,
   TUI_OPTIONS,
   TUI_LAUNCH_HINT,
   YOLO_ACK,
   YOLO_HINT,
   normalizeDelegation,
-  normalizePermissionMode,
   providerLaunchHint,
   providerProfileForDelegation,
   ptyYoloHint,
   type DelegationId,
 } from "../lib/sessionOptions";
+import {
+  codexSandboxTable,
+  defaultPermissionForKind,
+  launchPermissionTable,
+  normalizePermissionMode,
+  type PermissionOption,
+} from "../features/session/permissions";
 import { readDeviceSettings } from "../features/settings";
 import { useNewSessionSpaceDefaults } from "../features/spaces/useNewSessionSpaceDefaults";
 import { spaceKey, spaceStore } from "../features/spaces/store";
@@ -136,8 +141,10 @@ export function NewSessionPage() {
   const [workspaceId, setWorkspaceId] = useState(params.get("workspace") ?? prefs.workspaceId);
   const [model, setModel] = useState(prefs.model || "passthrough/auto");
   const [permissionMode, setPermissionMode] = useState(
-    normalizePermissionMode(prefs.permissionMode || device.permissionDefault),
+    normalizePermissionMode("claude", prefs.permissionMode || device.permissionDefault),
   );
+  // Codex's second axis: the sandbox mode paired with the approval policy.
+  const [codexSandbox, setCodexSandbox] = useState<string>("workspace-write");
   const [yoloAck, setYoloAck] = useState(false);
   const [effort, setEffort] = useState<EffortSelection>(() => {
     // Remembered tier names predate the real --effort levels; map them by name.
@@ -265,6 +272,22 @@ export function NewSessionPage() {
   const activeKind: CreateKind = kindEnabled(kind)
     ? kind
     : (KINDS.find((item) => kindEnabled(item.id))?.id ?? "claude");
+
+  // The launch table for the active harness; terminal has none.
+  const permissionTable: PermissionOption[] =
+    activeKind === "terminal" ? [] : launchPermissionTable(activeKind);
+  // The dangerous/yolo row varies per harness and gates the ack checkbox.
+  const dangerPermission = permissionTable.find((option) => option.danger);
+  const yoloModeActive = Boolean(dangerPermission && permissionMode === dangerPermission.id);
+
+  // Switching harness must never carry a foreign mode id into the create.
+  useEffect(() => {
+    if (activeKind === "terminal") return;
+    if (!launchPermissionTable(activeKind).some((option) => option.id === permissionMode)) {
+      setPermissionMode(defaultPermissionForKind(activeKind));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeKind]);
   const claudeHint = providerLaunchHint({
     kind: activeKind,
     binding: hostView?.providerBinding ?? host?.providerBinding,
@@ -307,7 +330,7 @@ export function NewSessionPage() {
     : launchPreview({
         kind: activeKind as AgentKindId,
         effortName: effortWireName(sessionEffort),
-        yolo: permissionMode === "bypassPermissions",
+        yolo: yoloModeActive,
       });
   // Launch and remember what the picker shows, not a remembered id the
   // catalog has since stopped exposing.
@@ -328,7 +351,8 @@ export function NewSessionPage() {
       if (draft.prompt) setPrompt(draft.prompt);
       if (draft.kind && KINDS.some((item) => item.id === draft.kind)) setKind(draft.kind as CreateKind);
       if (draft.model) setModel(draft.model);
-      if (draft.permissionMode) setPermissionMode(normalizePermissionMode(draft.permissionMode));
+      if (draft.permissionMode)
+        setPermissionMode(normalizePermissionMode(activeKind, draft.permissionMode));
       if (draft.delegation) setDelegation(normalizeDelegation(draft.delegation));
       if (draft.cwdMode === "existing" || draft.cwdMode === "worktree") setCwdMode(draft.cwdMode);
       if (draft.cwdPath !== undefined) setCwdPath(draft.cwdPath);
@@ -446,7 +470,8 @@ export function NewSessionPage() {
                 driver,
                 model: launchModel,
                 providerProfileId: providerProfileForDelegation(delegation, defaultGateway?.id),
-                permissionMode: activeKind === "claude" ? permissionMode : "bypassPermissions",
+                permissionMode: activeKind === "terminal" ? "manual" : permissionMode,
+                sandbox: activeKind === "codex" ? codexSandbox : undefined,
                 delegation: delegation === "host" ? undefined : delegation,
                 prompt,
                 cwd,
@@ -715,20 +740,43 @@ export function NewSessionPage() {
           </div>
           <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
             <legend className={css.label}>权限</legend>
-            <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-perm-row">
-              {PERMISSION_OPTIONS.map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  className={`${css.choice} ${css.permChoice} ${permissionMode === opt.id ? (opt.id === "bypassPermissions" ? css.choiceDust : css.choiceOn) : ""}`}
-                  data-testid={`new-session-perm-${opt.id}`}
-                  onClick={() => setPermissionMode(opt.id)}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-            {permissionMode === "bypassPermissions" && activeKind === "claude" ? (
+            {activeKind !== "terminal" ? (
+              <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-perm-row" data-harness={activeKind}>
+                {permissionTable.map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`${css.choice} ${css.permChoice} ${permissionMode === opt.id ? (opt.danger ? css.choiceDust : css.choiceOn) : ""}`}
+                    data-testid={`new-session-perm-${opt.id}`}
+                    data-danger={opt.danger ? "1" : undefined}
+                    title={opt.description}
+                    onClick={() => setPermissionMode(opt.id)}
+                  >
+                    <span>{opt.label}</span>
+                    <span className={css.permNative}>{opt.native}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {activeKind === "codex" ? (
+              <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-sandbox-row">
+                {codexSandboxTable().map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`${css.choice} ${css.permChoice} ${codexSandbox === opt.native ? (opt.danger ? css.choiceDust : css.choiceOn) : ""}`}
+                    data-testid={`new-session-sandbox-${opt.native}`}
+                    data-danger={opt.danger ? "1" : undefined}
+                    title={opt.description}
+                    onClick={() => setCodexSandbox(opt.native)}
+                  >
+                    <span>{opt.label}</span>
+                    <span className={css.permNative}>{opt.native}</span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {yoloModeActive && activeKind === "claude" ? (
               <div className={css.yolo} data-testid="new-session-yolo-hint">
                 <div className={css.yoloHead}>
                   <span className={css.yoloDot} />

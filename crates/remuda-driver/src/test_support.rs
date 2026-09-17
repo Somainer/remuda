@@ -137,3 +137,66 @@ pub fn mapper_with_model_bridge(
     )
     .with_model_bridge(Arc::clone(&bridge.inner), None, None)
 }
+
+// ── permission switch support ───────────────────────────────────────────────
+
+use crate::permission::{PermissionBridge, Readback as PermissionReadback};
+use remuda_protocol::ClaudePermissionMode;
+
+/// Test handle over one [`PermissionBridge`].
+pub struct PermissionBridgeHandle {
+    pub(crate) inner: Arc<PermissionBridge>,
+}
+
+impl PermissionBridgeHandle {
+    /// Create a bridge; `bypass_allowed` decides whether bypassPermissions is
+    /// reachable in this (fake) session.
+    #[must_use]
+    pub fn new(bypass_allowed: bool) -> Self {
+        Self {
+            inner: Arc::new(PermissionBridge::new(bypass_allowed)),
+        }
+    }
+
+    /// Arm a switch to `mode`; returns its generation token.
+    pub fn arm(&self, mode: ClaudePermissionMode) -> u64 {
+        self.inner.arm(mode)
+    }
+
+    /// Resolve a generation from test code.
+    pub fn resolve(&self, generation: u64, mode: ClaudePermissionMode) {
+        self.inner.resolve(generation, mode);
+    }
+
+    /// Wait for a verdict, mapping Applied to the mode.
+    pub async fn wait(&self, generation: u64, timeout: Duration) -> Option<ClaudePermissionMode> {
+        match self.inner.wait(generation, timeout).await? {
+            PermissionReadback::Applied(mode) => Some(mode),
+            PermissionReadback::Rejected { .. } => None,
+        }
+    }
+
+    pub(crate) fn arc(&self) -> Arc<PermissionBridge> {
+        Arc::clone(&self.inner)
+    }
+}
+
+/// Build a mapper attached to a test permission bridge.
+#[must_use]
+pub fn mapper_with_permission_bridge(
+    bridge: Arc<PermissionBridgeHandle>,
+    session_id: &str,
+    version: &str,
+    launch: Option<ClaudePermissionMode>,
+) -> TranscriptMapper {
+    TranscriptMapper::new(
+        DriverKind::ClaudePty,
+        InstanceId::new(),
+        RunId::new(),
+        Id::new("obj").expect("journal id"),
+        HostId::new(),
+        session_id.to_owned(),
+        version.to_owned(),
+    )
+    .with_permission_bridge(bridge.arc(), launch)
+}

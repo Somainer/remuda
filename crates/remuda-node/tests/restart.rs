@@ -35,6 +35,7 @@ fn create_req(prompt: &str) -> CreateInstanceRequest {
         binary_sha256: None,
         provider_profile_id: "dev-fake".to_owned(),
         permission_mode: "dontAsk".to_owned(),
+        sandbox: None,
         prompt: prompt.to_owned(),
         cwd: None,
         delegation: None,

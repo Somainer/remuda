@@ -7,14 +7,17 @@ export const TUI_OPTIONS = [
 
 export const TUI_LAUNCH_HINT = "启动时使用此渲染方式，会话内可用 /tui 切换";
 
-export const PERMISSION_OPTIONS = [
-  { id: "manual", label: "询问" },
-  { id: "acceptEdits", label: "可改文件" },
-  { id: "dontAsk", label: "全自动" },
-  { id: "bypassPermissions", label: "绕过全部" },
-] as const;
-
-export type PermissionModeId = (typeof PERMISSION_OPTIONS)[number]["id"];
+// Per-harness permission tables live in features/session/permissions.ts;
+// re-exported here so launch code keeps a stable import surface.
+export {
+  launchPermissionTable,
+  runtimePermissionTable,
+  findPermissionOption,
+  isLiveReachable,
+  defaultPermissionForKind,
+  normalizePermissionMode,
+} from "../features/session/permissions";
+export type { PermissionOption } from "../features/session/permissions";
 
 export const DELEGATION_OPTIONS = [
   { id: "host", label: "跟随主机" },
@@ -47,13 +50,6 @@ export function ptyYoloChipLabel(kind: string): string {
   if (kind === "codex") return "bypass";
   if (kind === "agy") return "bypass";
   return "skip-permissions";
-}
-
-export function normalizePermissionMode(value: string | undefined): PermissionModeId {
-  if (value === "bypassPermissions") return "bypassPermissions";
-  if (value === "dontAsk") return "dontAsk";
-  if (value === "acceptEdits") return "acceptEdits";
-  return "manual";
 }
 
 export function normalizeDelegation(value: string | undefined): DelegationId {

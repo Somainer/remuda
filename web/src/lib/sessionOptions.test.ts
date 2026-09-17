@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   DELEGATION_OPTIONS,
-  PERMISSION_OPTIONS,
   YOLO_HINT,
   PTY_YOLO_FLAGS,
   ptyYoloHint,
@@ -10,19 +9,50 @@ import {
   claudeProviderHint,
   normalizeDelegation,
   normalizePermissionMode,
+  launchPermissionTable,
   providerLaunchHint,
   providerProfileForDelegation,
 } from "./sessionOptions";
 
 describe("sessionOptions", () => {
-  it("keeps dontAsk and bypassPermissions as distinct modes", () => {
-    expect(normalizePermissionMode("bypassPermissions")).toBe("bypassPermissions");
-    expect(normalizePermissionMode("dontAsk")).toBe("dontAsk");
-    expect(normalizePermissionMode("manual")).toBe("manual");
-    expect(PERMISSION_OPTIONS.map((o) => o.id)).toEqual(["manual", "acceptEdits", "dontAsk", "bypassPermissions"]);
-    expect(PERMISSION_OPTIONS.some((o) => o.id === "dontAsk" && o.label === "全自动")).toBe(true);
-    expect(PERMISSION_OPTIONS.some((o) => o.id === "bypassPermissions" && o.label === "绕过全部")).toBe(true);
+  it("lists the six real Claude modes and maps native/legacy words", () => {
+    expect(launchPermissionTable("claude").map((o) => o.id)).toEqual([
+      "manual",
+      "acceptEdits",
+      "plan",
+      "auto",
+      "bypassPermissions",
+      "dontAsk",
+    ]);
+    expect(normalizePermissionMode("claude", "default")).toBe("manual");
+    expect(normalizePermissionMode("claude", "bypass")).toBe("bypassPermissions");
+    expect(normalizePermissionMode("claude", "acceptEdits")).toBe("acceptEdits");
+    expect(normalizePermissionMode("claude", "plan")).toBe("plan");
+    expect(normalizePermissionMode("claude", "auto")).toBe("auto");
+    expect(normalizePermissionMode("claude", "dontAsk")).toBe("dontAsk");
+    expect(normalizePermissionMode("claude", undefined)).toBe("manual");
     expect(YOLO_HINT).toMatch(/审批/);
+  });
+
+  it("exposes codex/grok/agy native permission sets", () => {
+    const codex = launchPermissionTable("codex").map((o) => o.id);
+    expect(codex).toContain("untrusted");
+    expect(codex).toContain("on-request");
+    expect(codex).toContain("never");
+    expect(codex).toContain("sandbox:read-only");
+    expect(codex).toContain("sandbox:workspace-write");
+    expect(codex).toContain("sandbox:danger-full-access");
+    expect(launchPermissionTable("grok").map((o) => o.id)).toEqual([
+      "native-prompt",
+      "auto",
+      "always-approve",
+    ]);
+    expect(launchPermissionTable("agy").map((o) => o.id)).toEqual([
+      "native",
+      "accept-edits",
+      "plan",
+      "always-proceed",
+    ]);
   });
 
   it("defaults create to follow-host, not a named gateway vendor", () => {

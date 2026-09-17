@@ -94,6 +94,10 @@ pub struct CreateInstanceRequest {
     /// Permission label; omission defaults to manual.
     #[serde(default = "default_permission")]
     pub permission_mode: String,
+    /// Codex sandbox mode (`read-only` / `workspace-write` /
+    /// `danger-full-access`); Codex creates only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     /// Optional initial prompt delivered through the bounded instance task.
     #[serde(default)]
     pub prompt: String,
@@ -356,6 +360,9 @@ pub struct InstanceCommandRequest {
     /// Native effort index for `instance.configure`.
     #[serde(default)]
     pub effort_index: Option<u32>,
+    /// Native permission-mode word for `instance.configure`.
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 impl InstanceCommandRequest {
@@ -377,6 +384,11 @@ impl InstanceCommandRequest {
                 .and_then(serde_json::Value::as_u64)
                 .map(|n| n as u32);
         }
+        self.permission_mode = params
+            .get("permissionMode")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
         self
     }
 }

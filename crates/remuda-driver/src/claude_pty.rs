@@ -174,6 +174,11 @@ struct PtyLive {
     model_bridge: Arc<crate::model::ModelBridge>,
     model_queue: Arc<crate::model::ModelQueue>,
     model_worker: Option<JoinHandle<()>>,
+    /// In-session permission-mode switch coordination (shift+tab wheel).
+    #[allow(dead_code)]
+    permission_bridge: Arc<crate::permission::PermissionBridge>,
+    permission_queue: Arc<crate::permission::PermissionQueue>,
+    permission_worker: Option<JoinHandle<()>>,
     status_task: Option<JoinHandle<()>>,
     interactions: Arc<PtyInteractions>,
     interaction_task: JoinHandle<()>,
@@ -522,6 +527,16 @@ impl ClaudePtyDriver {
             model_bridge.note_launch_request(model);
         }
         let model_queue = Arc::new(crate::model::ModelQueue::new());
+        // Permission-mode coordination. `bypass_allowed` is whether this
+        // launch argv carries the bypass allowance; without it the wheel can
+        // never reach bypassPermissions at runtime.
+        let launch_permission = launch_claude_permission(&spec);
+        let bypass_allowed = recipe
+            .argv
+            .iter()
+            .any(|token| token == "--dangerously-skip-permissions");
+        let permission_bridge = Arc::new(crate::permission::PermissionBridge::new(bypass_allowed));
+        let permission_queue = Arc::new(crate::permission::PermissionQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
         let transcript_task = spawn_transcript_pump(
@@ -536,6 +551,8 @@ impl ClaudePtyDriver {
                 launch: spec.model_id.clone(),
                 catalog: Some(model_catalog.clone()),
             }),
+            Some(Arc::clone(&permission_bridge)),
+            launch_permission,
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -564,6 +581,19 @@ impl ClaudePtyDriver {
             Arc::clone(&model_queue),
             model_io,
         );
+        let permission_io: Arc<dyn crate::permission::PermissionSwitchIo> =
+            Arc::new(HerdrPermissionIo {
+                client: client.clone(),
+                pane_id: pane_id.clone(),
+                events: tx.clone(),
+                seq: Arc::clone(&self.seq),
+                ctx: ctx.clone(),
+            });
+        let permission_worker = crate::permission::spawn_worker(
+            Arc::clone(&permission_bridge),
+            Arc::clone(&permission_queue),
+            permission_io,
+        );
 
         *self.inner.lock().await = Some(PtyLive {
             ctx,
@@ -586,6 +616,9 @@ impl ClaudePtyDriver {
             model_bridge,
             model_queue,
             model_worker: Some(model_worker),
+            permission_bridge,
+            permission_queue,
+            permission_worker: Some(permission_worker),
             status_task: Some(status_task),
             interactions,
             interaction_task,
@@ -734,6 +767,76 @@ impl ClaudePtyDriver {
         ack.native_ids.insert("paneId".into(), pane_id);
         Ok(ack)
     }
+
+    /// Shift+tab the native permission wheel to `mode` and let the TUI status
+    /// line / transcript prove it.
+    async fn switch_permission(&self, mode: &str) -> DriverResult<DriverAck> {
+        let Some(request) = crate::permission::PermissionRequest::parse(mode) else {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude permission mode {mode:?} is not a valid mode; \
+                 valid: manual, acceptEdits, plan, auto, bypassPermissions, dontAsk"
+            )));
+        };
+        let (pane_id, session_id, queue, ready, io) = {
+            let inner = self.inner.lock().await;
+            let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
+            if live.closed {
+                return Err(DriverError::ControlUnavailable);
+            }
+            require_session_start(live)?;
+            // Launch-only modes are an honest refusal, never a keystroke.
+            if !crate::permission::live_reachable(
+                request.mode,
+                live.permission_bridge.bypass_allowed(),
+            ) {
+                return Err(DriverError::CapabilityUnsupported(format!(
+                    "claude permission mode {mode:?} is launch-only for this session"
+                )));
+            }
+            let ready = crate::pty_interaction::prompt_ready(&live.client, &live.pane_id)
+                .await
+                .is_ok();
+            let io = HerdrPermissionIo {
+                client: live.client.clone(),
+                pane_id: live.pane_id.clone(),
+                events: live.events.clone(),
+                seq: Arc::clone(&self.seq),
+                ctx: live.ctx.clone(),
+            };
+            (
+                live.pane_id.clone(),
+                live.session_id.clone(),
+                Arc::clone(&live.permission_queue),
+                ready,
+                Arc::new(io) as Arc<dyn crate::permission::PermissionSwitchIo>,
+            )
+        };
+
+        if ready {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait = std::time::Duration::from_millis(
+                crate::permission::PERMISSION_READBACK_TIMEOUT_MS + 5_000,
+            );
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // The worker keeps running and journals applied/degraded; this
+                // command settles as dispatched, never as applied.
+            }
+        } else {
+            io.journal(
+                crate::permission::SwitchOutcome::Queued.journal_status(request.word(), ""),
+                Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+
+        let mut ack = DriverAck::transport_written();
+        ack.native_ids
+            .insert("sessionId".into(), session_id.clone());
+        ack.native_ids.insert("paneId".into(), pane_id);
+        Ok(ack)
+    }
 }
 
 #[async_trait]
@@ -852,6 +955,15 @@ impl Driver for ClaudePtyDriver {
         {
             return self.switch_model(&switch.model_id).await;
         }
+        // A permission-bearing switch is a shift+tab wheel walk read back from
+        // the status line; a bare model id falls through to the prompt path,
+        // which rejects it honestly for this carrier.
+        if let DriverInput::ModelSwitch(switch) = &input
+            && let Some(mode) = switch.permission_mode.as_deref()
+            && !mode.is_empty()
+        {
+            return self.switch_permission(mode).await;
+        }
         let text = prompt_text(&input)?;
         let inner = self.inner.lock().await;
         let live = inner.as_ref().ok_or(DriverError::ControlUnavailable)?;
@@ -949,6 +1061,10 @@ impl Driver for ClaudePtyDriver {
         }
         live.model_queue.close();
         if let Some(task) = live.model_worker.take() {
+            task.abort();
+        }
+        live.permission_queue.close();
+        if let Some(task) = live.permission_worker.take() {
             task.abort();
         }
         if let Some(task) = live.status_task.take() {
@@ -1160,6 +1276,7 @@ struct TranscriptModelSync {
     catalog: Option<ModelCatalogInfo>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_transcript_pump(
     transcript_slot: Arc<std::sync::Mutex<Option<String>>>,
     tx: mpsc::Sender<Observation>,
@@ -1168,6 +1285,8 @@ fn spawn_transcript_pump(
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
     model: Option<TranscriptModelSync>,
+    permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
+    launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1234,6 +1353,10 @@ fn spawn_transcript_pump(
                                 tracing::debug!(%error, "launch model snapshot not emitted");
                             }
                         }
+                    }
+                    if let Some(bridge) = &permission_bridge {
+                        mapper =
+                            mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
                     hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
                 }
@@ -1565,6 +1688,106 @@ impl crate::effort::EffortSwitchIo for HerdrEffortIo {
         .is_err()
         {
             tracing::debug!("effort lifecycle dropped: event channel closed");
+        }
+    }
+}
+
+/// [`crate::permission::PermissionSwitchIo`] backed by a Herdr pane.
+///
+/// Keys go as raw bytes through `pane.send_text` — the measured encoding on a
+/// real TTY: shift+tab `ESC [ Z`, down `ESC [ B`, esc `ESC`, enter `CR`.
+struct HerdrPermissionIo {
+    client: Client,
+    pane_id: String,
+    events: mpsc::Sender<Observation>,
+    seq: Arc<AtomicU64>,
+    ctx: ObsCtx,
+}
+
+#[async_trait]
+impl crate::permission::PermissionSwitchIo for HerdrPermissionIo {
+    async fn is_idle(&self) -> bool {
+        let Ok(info) = self.client.agent_get(&self.pane_id).await else {
+            return false;
+        };
+        matches!(
+            info.agent.agent_status,
+            AgentStatus::Idle | AgentStatus::Done
+        ) && info.agent.interactive_ready
+    }
+
+    async fn send_cycle(&self) -> DriverResult<()> {
+        self.client
+            .pane_send_text(self.pane_id.clone(), "\u{1b}[Z")
+            .await
+            .map_err(map_herdr)?;
+        Ok(())
+    }
+
+    async fn press_down(&self) -> DriverResult<()> {
+        self.client
+            .pane_send_text(self.pane_id.clone(), "\u{1b}[B")
+            .await
+            .map_err(map_herdr)?;
+        Ok(())
+    }
+
+    async fn press_enter(&self) -> DriverResult<()> {
+        self.client
+            .pane_send_text(self.pane_id.clone(), "\r")
+            .await
+            .map_err(map_herdr)?;
+        Ok(())
+    }
+
+    async fn press_esc(&self) -> DriverResult<()> {
+        self.client
+            .pane_send_text(self.pane_id.clone(), "\u{1b}")
+            .await
+            .map_err(map_herdr)?;
+        Ok(())
+    }
+
+    async fn screen_text(&self) -> DriverResult<String> {
+        let read = self
+            .client
+            .agent_read(AgentReadParams {
+                target: self.pane_id.clone(),
+                source: ReadSource::Visible,
+                lines: Some(40),
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            })
+            .await
+            .map_err(map_herdr)?;
+        Ok(read.text().to_owned())
+    }
+
+    async fn journal(&self, status: String, severity: Severity) {
+        let payload = ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+            NativeLifecycle {
+                topic: LifecycleTopic::Configuration,
+                native_name: "instance.configure".into(),
+                native_id: Knowledge::NotApplicable,
+                status: Knowledge::Known { value: status },
+                related_ids: BTreeMap::new(),
+                data_ref: None,
+                severity,
+                affects_completion: false,
+            },
+        ))));
+        if emit_obs(
+            &self.events,
+            &self.seq,
+            &self.ctx,
+            SourceChannel::Runtime,
+            Completeness::Structured,
+            payload,
+        )
+        .await
+        .is_err()
+        {
+            tracing::debug!("permission lifecycle dropped: event channel closed");
         }
     }
 }
@@ -1922,6 +2145,16 @@ fn reject_bot_bypass(spec: &InstanceSpec) -> DriverResult<()> {
         return Err(DriverError::BypassNotAllowedForBot);
     }
     Ok(())
+}
+
+/// The Claude permission mode an instance launched with, if pinned.
+pub(crate) fn launch_claude_permission(
+    spec: &InstanceSpec,
+) -> Option<remuda_protocol::ClaudePermissionMode> {
+    match &spec.permission_mode {
+        remuda_protocol::PermissionMode::Claude(claude) => Some(claude.mode),
+        _ => None,
+    }
 }
 
 fn native_ref_for(live: &PtyLive) -> NativeRef {

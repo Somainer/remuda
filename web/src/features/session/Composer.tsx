@@ -10,7 +10,12 @@ import {
   removeAndRenumberFor,
   type AttachmentAnchor,
 } from "../../lib/imageAnchors";
-import { PERMISSION_OPTIONS } from "../../lib/sessionOptions";
+import {
+  isLiveReachable,
+  launchPermissionTable,
+  normalizePermissionMode,
+} from "./permissions";
+import type { PermissionEffectiveView } from "./permissionEffective";
 import { composing } from "../../lib/viewport";
 import type { PromptMode } from "../../types/generated";
 import type { CapabilitySnapshot } from "../../types/nativeRef";
@@ -63,6 +68,9 @@ export function Composer({
   onInterrupt,
   permissionMode = "manual",
   onPermission,
+  launchPermissionMode,
+  permissionEffective = null,
+  permissionPending = null,
   kind = "claude",
   model = "opus",
   models,
@@ -93,6 +101,12 @@ export function Composer({
   onInterrupt?: () => void | Promise<void>;
   permissionMode?: string;
   onPermission?: (mode: string) => void;
+  /** Mode the session launched with; decides whether bypass is live-reachable. */
+  launchPermissionMode?: string;
+  /** Read-back effective mode; the chip renders from this. */
+  permissionEffective?: PermissionEffectiveView | null;
+  /** A wheel walk in flight (chip shows 切换中 / 排队中 until read-back). */
+  permissionPending?: { mode: string; queued: boolean } | null;
   kind?: EffortKind | string;
   model?: string;
   models?: string[];
@@ -150,7 +164,25 @@ export function Composer({
   const ultraOn = currentEffort.ultracode === true;
   const ember = isEmberEffort(harness, currentEffort.index, ultraOn);
   const effortLocked = Boolean(effortDisabled) || !onEffort || table.length === 0;
-  const permLabel = PERMISSION_OPTIONS.find((m) => m.id === permissionMode)?.label ?? permissionMode;
+  // Permission: the chip renders the read-back mode; pending overrides it
+  // with 切换中/排队中. The menu lists the harness's real launch table, with
+  // launch-only rows greyed for the live session.
+  const permOptions = launchPermissionTable(harness);
+  const liveMode = normalizePermissionMode(
+    harness,
+    permissionPending?.mode ?? permissionEffective?.mode ?? permissionMode,
+  );
+  const permOption =
+    permOptions.find((m) => m.id === liveMode) ??
+    permOptions.find((m) => m.id === permissionMode);
+  // Read-only chips (generic-pty / other harnesses) render the native word;
+  // interactive chips render the localized label from the harness table.
+  const permLabel = onPermission ? permOption?.label ?? liveMode : permissionMode;
+  const permTag = permissionPending
+    ? permissionPending.queued
+      ? "排队中"
+      : "切换中"
+    : null;
 
   // context-usage-1: when a Hub rollup exists it is authoritative, including
   // its explicit null (an output-only Grok turn means context is UNKNOWN —
@@ -669,15 +701,24 @@ export function Composer({
           onPermission ? (
             <button
               type="button"
-              className={css.chip}
+              className={`${css.chip} ${permissionPending ? css.chipPending : ""}`}
               data-testid="permission-chip"
+              data-permission={liveMode}
+              data-pending={permissionPending ? (permissionPending.queued ? "queued" : "switching") : undefined}
               aria-expanded={menu === "permission"}
+              title={permOption?.description}
               onClick={() => toggle("permission")}
             >
-              {mobile ? permLabel : `权限 ${permLabel}`} ▾
+              {mobile ? permTag ?? permLabel : `权限 ${permTag ?? permLabel}`} ▾
             </button>
           ) : (
-            <span className={css.chip} data-testid="permission-chip" data-readonly="1">
+            <span
+              className={css.chip}
+              data-testid="permission-chip"
+              data-readonly="1"
+              data-permission={liveMode}
+              title={permOption?.description}
+            >
               {permLabel}
             </span>
           )
@@ -787,22 +828,36 @@ export function Composer({
           data-testid="permission-menu"
           data-placement={placement}
         >
-          {PERMISSION_OPTIONS.map((m) => (
-            <button
-              key={m.id}
-              type="button"
-              className={`${css.effortRow} ${permissionMode === m.id ? css.effortOn : ""}`}
-              data-testid={`permission-option-${m.id}`}
-              onClick={() => {
-                onPermission?.(m.id);
-                setMenu(null);
-              }}
-            >
-              <span className={`${css.radio} ${permissionMode === m.id ? css.radioOn : ""}`} />
-              <span className={css.effortName}>{m.label}</span>
-              <span className={css.effortDesc}>{m.id}</span>
-            </button>
-          ))}
+          {permOptions.map((m) => {
+            const reachable = isLiveReachable(harness, m.id, launchPermissionMode);
+            const active = liveMode === m.id;
+            return (
+              <button
+                key={m.id}
+                type="button"
+                className={`${css.effortRow} ${active ? css.effortOn : ""}`}
+                data-testid={`permission-option-${m.id}`}
+                data-launch-only={m.launchOnly || !reachable ? "1" : undefined}
+                disabled={!reachable}
+                title={!reachable ? "该模式仅能在启动时选择" : m.description}
+                onClick={() => {
+                  if (!reachable) return;
+                  onPermission?.(m.id);
+                  setMenu(null);
+                }}
+              >
+                <span className={`${css.radio} ${active ? css.radioOn : ""}`} />
+                <span className={css.permissionName}>
+                  {m.label}
+                  {m.danger ? <span className={css.permissionDust}> · 危险</span> : null}
+                  {m.launchOnly || !reachable ? (
+                    <span className={css.launchOnlyTag}>仅启动时</span>
+                  ) : null}
+                </span>
+                <span className={css.permissionNative}>{m.native}</span>
+              </button>
+            );
+          })}
         </div>
       ) : null}
     </form>

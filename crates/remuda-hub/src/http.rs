@@ -63,6 +63,10 @@ pub struct CreateInstanceBody {
     provider_profile_id: Option<String>,
     #[serde(rename = "permissionMode")]
     permission_mode: Option<String>,
+    /// Codex sandbox mode (`read-only` / `workspace-write` /
+    /// `danger-full-access`); Codex creates only.
+    #[serde(default, rename = "sandbox")]
+    sandbox: Option<String>,
     title: Option<String>,
     prompt: Option<String>,
     /// Live instance name (stored as title when title is omitted).
@@ -763,6 +767,7 @@ pub async fn create_instance(
         "args": body.args,
         "providerProfileId": body.provider_profile_id,
         "permissionMode": body.permission_mode,
+        "sandbox": body.sandbox,
         "workspaceId": workspace_id,
         "prompt": body.prompt,
         "title": title,

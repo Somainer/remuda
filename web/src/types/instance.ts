@@ -80,6 +80,13 @@ export type Instance = EntityMeta & {
     source: "gateway-discovery" | "settings" | "builtin";
     observedAt: string;
   } | null;
+  /** Effective permission mode read back from the TUI status line /
+   *  transcript; absent = unobserved. The chip renders from this. */
+  permissionEffective?: {
+    mode: string;
+    source: "launch" | "slash" | "remuda" | "unknown";
+    observedAt: string;
+  } | null;
   /** How this instance reached its `kind`; `promoted` = a terminal that an agent CLI took over (D-025). */
   mode?: InstanceMode | null;
   /** When the promotion happened. Only set while `mode` is `promoted`. */

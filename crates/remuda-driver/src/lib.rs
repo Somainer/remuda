@@ -28,6 +28,7 @@ pub mod launch;
 mod materializer;
 pub mod model;
 pub mod model_discovery;
+pub mod permission;
 pub mod presets;
 mod process;
 mod profile;

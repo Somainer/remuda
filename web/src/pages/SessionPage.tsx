@@ -487,6 +487,11 @@ export function SessionPage({
           permissionMode={
             genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)
           }
+          launchPermissionMode={
+            genericPty ? undefined : hubStore.launchPermissionModeOf(instance.id)
+          }
+          permissionEffective={genericPty ? null : hubStore.permissionEffectiveOf(instance.id)}
+          permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
           models={hubStore.modelListOf(instance.id) ?? undefined}
@@ -501,10 +506,10 @@ export function SessionPage({
           })()}
           usageRollup={hubStore.usageRollupOf(instance.id)}
           onPermission={
-            genericPty
+            genericPty || instance.kind !== "claude"
               ? undefined
               : (mode) => {
-                  void hubStore.configure(instance.id, mode);
+                  void hubStore.setPermission(instance.id, mode);
                 }
           }
           effortDisabled={status === "exited" || instance.ownership === "observed-only"}

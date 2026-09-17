@@ -728,6 +728,28 @@ async fn fake_node(
                             append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         continue;
                     }
+                    // Two-way: a mode changed in the terminal itself (a bare
+                    // shift+tab) folds into the chip as source `unknown` — no
+                    // instance.configure goes back, so there is no ping-pong.
+                    if let Some(word) = prompt.strip_prefix("__perm__:") {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n = append_event(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "permission",
+                            json!({
+                                "effective": {
+                                    "mode": word,
+                                    "source": "unknown",
+                                    "observedAt": "2026-09-16T12:00:00.000Z"
+                                },
+                                "raw": word
+                            }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     // §9.1 model-sync: a terminal-side `/model <id>` typed in the
                     // PTY emits the matching model observation attributed to
                     // `slash` (resolved id verbatim), no configure ping-pong.
@@ -1024,6 +1046,48 @@ async fn fake_node(
                                 append_n,
                                 "effort",
                                 event["payload"].clone(),
+                            )
+                            .await?;
+                        }
+                    }
+                    // Permission-mode configure. Test-only sentinels mirror the
+                    // effort ones (the UI sends real mode ids, never these):
+                    //   "__queued__:<mode>"  → permission-queued lifecycle only
+                    //   "__degrade__:<mode>" → permission-degraded lifecycle only
+                    // A real mode id echoes the closed-loop read-back: the fake
+                    // agent cycled the wheel and now reports the effective mode.
+                    if let Some(requested) = params.get("permissionMode").and_then(Value::as_str) {
+                        if let Some(word) = requested.strip_prefix("__queued__:") {
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("permission-queued:{word}"),
+                            )
+                            .await?;
+                        } else if let Some(word) = requested.strip_prefix("__degrade__:") {
+                            append_n = append_configure_status(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("permission-degraded:{word}:no-status-line"),
+                            )
+                            .await?;
+                        } else {
+                            append_n = append_event(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                "permission",
+                                json!({
+                                    "requested": requested,
+                                    "effective": {
+                                        "mode": requested,
+                                        "source": "remuda",
+                                        "observedAt": "2026-09-16T12:00:00.000Z"
+                                    },
+                                    "raw": requested
+                                }),
                             )
                             .await?;
                         }

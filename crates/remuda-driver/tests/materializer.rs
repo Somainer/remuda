@@ -1043,7 +1043,7 @@ mod shell_pty_agent {
         spec
     }
 
-    fn recipe(spec: &InstanceSpec, tmp: &Path, origin: LaunchOrigin) -> LaunchRecipe {
+    pub(crate) fn recipe(spec: &InstanceSpec, tmp: &Path, origin: LaunchOrigin) -> LaunchRecipe {
         let binary = stub_binary(tmp, "1.0.0");
         let home = tmp.join("home");
         fs::create_dir_all(&home).unwrap();
@@ -1660,5 +1660,96 @@ mod binary_override {
             fs::canonicalize(&chosen).unwrap().to_string_lossy()
         );
         assert_ne!(recipe.binary.abs_path, plain.binary.abs_path);
+    }
+}
+
+mod permission_axes {
+    use super::*;
+    use remuda_protocol::{
+        AgentKind, AgyPermissionMode, ApprovalPolicy, ApprovalsReviewer, CodexExecution,
+        CodexPermission, GrokPermission, GrokPermissionMode, SandboxExecution, SandboxMode,
+    };
+
+    fn mut_spec(kind: AgentKind, permission: PermissionMode) -> InstanceSpec {
+        let mut spec = load_spec();
+        spec.kind = kind;
+        spec.driver = DriverKind::ShellPty;
+        spec.permission_mode = permission;
+        spec
+    }
+
+    fn recipe_args(spec: &InstanceSpec) -> Vec<String> {
+        let tmp = tempfile::tempdir().unwrap();
+        super::shell_pty_agent::recipe(spec, tmp.path(), LaunchOrigin::Human).argv
+    }
+
+    #[test]
+    fn codex_approval_and_sandbox_become_native_argv() {
+        let codex = |policy: ApprovalPolicy, sandbox: SandboxMode| {
+            mut_spec(
+                AgentKind::Codex,
+                PermissionMode::Codex(Box::new(CodexPermission {
+                    approval_policy: policy,
+                    approvals_reviewer: ApprovalsReviewer::User,
+                    execution: CodexExecution::Sandbox(SandboxExecution { sandbox }),
+                })),
+            )
+        };
+        let args = recipe_args(&codex(ApprovalPolicy::OnRequest, SandboxMode::ReadOnly));
+        let joined = args.join(" ");
+        assert!(joined.contains("--ask-for-approval on-request"), "{joined}");
+        assert!(joined.contains("--sandbox read-only"), "{joined}");
+
+        let args = recipe_args(&codex(
+            ApprovalPolicy::Untrusted,
+            SandboxMode::WorkspaceWrite,
+        ));
+        let joined = args.join(" ");
+        assert!(joined.contains("--ask-for-approval untrusted"), "{joined}");
+        assert!(joined.contains("--sandbox workspace-write"), "{joined}");
+
+        let args = recipe_args(&codex(ApprovalPolicy::Never, SandboxMode::DangerFullAccess));
+        let joined = args.join(" ");
+        assert!(joined.contains("--ask-for-approval never"), "{joined}");
+        assert!(joined.contains("--sandbox danger-full-access"), "{joined}");
+    }
+
+    #[test]
+    fn grok_and_agy_yolo_modes_only_add_flags_when_requested() {
+        let grok = |mode| {
+            mut_spec(
+                AgentKind::Grok,
+                PermissionMode::Grok(Box::new(GrokPermission { mode })),
+            )
+        };
+        assert!(
+            recipe_args(&grok(GrokPermissionMode::AlwaysApprove))
+                .iter()
+                .any(|token| token == "--always-approve")
+        );
+        assert!(
+            !recipe_args(&grok(GrokPermissionMode::NativePrompt))
+                .iter()
+                .any(|token| token == "--always-approve")
+        );
+
+        let agy = |mode| {
+            let mut spec = mut_spec(
+                AgentKind::Agy,
+                PermissionMode::Agy(Box::new(remuda_protocol::AgyPermission { mode })),
+            );
+            spec.kind = AgentKind::Agy;
+            spec
+        };
+        assert!(
+            recipe_args(&agy(AgyPermissionMode::AlwaysProceed))
+                .iter()
+                .any(|token| token == "--yolo")
+        );
+        assert!(
+            !recipe_args(&agy(AgyPermissionMode::Native))
+                .iter()
+                .any(|token| token == "--yolo")
+        );
     }
 }

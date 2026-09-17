@@ -11,8 +11,9 @@ use crate::recipe::{
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
 };
 use remuda_protocol::{
-    AgentKind, ApprovalAuthority, BoolLiteral, ClaudePermissionMode, CommandOrigin, DriverKind,
-    EnvBinding, Id, InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
+    AgentKind, AgyPermissionMode, ApprovalAuthority, ApprovalPolicy, BoolLiteral,
+    ClaudePermissionMode, CodexExecution, CommandOrigin, DriverKind, EnvBinding,
+    GrokPermissionMode, Id, InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -583,6 +584,20 @@ fn materialize_shell_pty_agent(
     // either repeat it or use the other CLI's vocabulary.
     crate::effort::ensure_no_effort_in_extras(request.spec.kind, &extras)?;
     argv.extend(extras);
+    // Per-harness permission axes: Codex's approval policy + sandbox mode,
+    // Per-harness permission axes ride `permission.extra_flags` from
+    // permission_plan: Codex's --ask-for-approval/--sandbox, Grok/agy yolo
+    // flags. Claude PTY sessions deliberately get NO `--permission-mode`: the
+    // shell/PTY launch inherits its own TUI mode (the wheel manages it in
+    // session), and the flag both constrains a promoted shell and is rejected
+    // by the fake harness. (The print carrier is the only path that emits the
+    // Claude word, via `claude_argv`.) merge_yolo_argv handles the legacy
+    // Claude-bypass spelling on top.
+    for flag in &permission.extra_flags {
+        if !argv.iter().any(|token| token == flag) {
+            argv.push(flag.clone());
+        }
+    }
     crate::presets::merge_yolo_argv(
         &mut argv,
         preset,
@@ -894,10 +909,88 @@ fn permission_plan(
                 authority,
             ))
         }
-        PermissionMode::Codex(_)
-        | PermissionMode::Grok(_)
-        | PermissionMode::Agy(_)
-        | PermissionMode::Generic(_) => Ok((
+        PermissionMode::Codex(codex) => {
+            if codex.approval_policy == ApprovalPolicy::Never
+                && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
+            {
+                return Err(DriverError::BypassNotAllowedForBot);
+            }
+            // Codex's two real CLI axes (`codex --help` 0.x): approval policy
+            // `-a/--ask-for-approval <untrusted|on-request|never>` and sandbox
+            // `-s/--sandbox <read-only|workspace-write|danger-full-access>`.
+            // never + danger-full-access is exactly the vendor yolo flag.
+            let mut extra_flags = vec![
+                "--ask-for-approval".into(),
+                match codex.approval_policy {
+                    ApprovalPolicy::Untrusted => "untrusted".into(),
+                    ApprovalPolicy::OnRequest => "on-request".into(),
+                    ApprovalPolicy::Never => "never".into(),
+                },
+            ];
+            if let CodexExecution::Sandbox(sandbox) = &codex.execution {
+                extra_flags.push("--sandbox".into());
+                extra_flags.push(match sandbox.sandbox {
+                    remuda_protocol::SandboxMode::ReadOnly => "read-only".into(),
+                    remuda_protocol::SandboxMode::WorkspaceWrite => "workspace-write".into(),
+                    remuda_protocol::SandboxMode::DangerFullAccess => "danger-full-access".into(),
+                });
+            }
+            Ok((
+                RecipePermission {
+                    cli_mode: None,
+                    prompts: None,
+                    extra_flags,
+                },
+                vec![],
+                ApprovalAuthority::NativeTty,
+            ))
+        }
+        PermissionMode::Grok(grok) => {
+            if grok.mode == GrokPermissionMode::AlwaysApprove
+                && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
+            {
+                return Err(DriverError::BypassNotAllowedForBot);
+            }
+            // grok agent's yolo argv; the other modes are the ACP default and
+            // `_meta.autoMode` (build-gated by the native CLI), no flag.
+            let extra_flags = if grok.mode == GrokPermissionMode::AlwaysApprove {
+                vec!["--always-approve".into()]
+            } else {
+                vec![]
+            };
+            Ok((
+                RecipePermission {
+                    cli_mode: None,
+                    prompts: None,
+                    extra_flags,
+                },
+                vec![],
+                ApprovalAuthority::NativeTty,
+            ))
+        }
+        PermissionMode::Agy(agy) => {
+            if agy.mode == AgyPermissionMode::AlwaysProceed
+                && matches!(origin, LaunchOrigin::Bot | LaunchOrigin::Agent)
+            {
+                return Err(DriverError::BypassNotAllowedForBot);
+            }
+            let extra_flags = match agy.mode {
+                AgyPermissionMode::AlwaysProceed => vec!["--yolo".into()],
+                AgyPermissionMode::AcceptEdits => vec!["--accept-edits".into()],
+                AgyPermissionMode::Plan => vec!["--plan".into()],
+                AgyPermissionMode::Native => vec![],
+            };
+            Ok((
+                RecipePermission {
+                    cli_mode: None,
+                    prompts: None,
+                    extra_flags,
+                },
+                vec![],
+                ApprovalAuthority::NativeTty,
+            ))
+        }
+        PermissionMode::Generic(_) => Ok((
             RecipePermission {
                 cli_mode: None,
                 prompts: None,

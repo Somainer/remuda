@@ -153,6 +153,7 @@ pub fn schema_document() -> Value {
         GateJobId,
         GateJobState,
         GateMode,
+        GateRunLog,
         GateRunParams,
         GateRunResult,
         GateStep,

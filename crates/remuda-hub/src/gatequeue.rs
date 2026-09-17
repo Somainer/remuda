@@ -10,6 +10,11 @@
 //! Every transition is journaled to `audit_log` (subject = job id, project id
 //! in the detail), so `remuda watch` / `report` render gate rows without a
 //! second event channel; live steps arrive as `gate.event` Node RPCs.
+//!
+//! A failed run's bounded log (last 400 lines + extracted summary) lands in
+//! `gate_log_objects` as an `obj_…` row; the job keeps `failedStep`, the
+//! one-line `reason` and `logObjectId` only. `GET /v1/gate/logs/{gjb|obj}`
+//! reads the evidence (evidence: docs/design/evidence/gate-log-1.md).
 
 use crate::AppState;
 use crate::agent_scope::{caller, caller_project_scope, require_grant};
@@ -38,6 +43,10 @@ const MAX_LAND_ATTEMPTS: u32 = 3;
 const GATE_RUN_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 /// Scheduler tick (also drives the host-lost reaper sweep).
 pub(crate) const SCHEDULE_TICK_MILLIS: u64 = 1000;
+/// How long a bounded gate-failure log stays fetchable.
+const GATE_LOG_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+/// Upper bound for one serialized run log; the Node bounds smaller.
+const GATE_LOG_MAX_BYTES: usize = 512 * 1024;
 
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
@@ -55,7 +64,20 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS gate_jobs_project ON gate_jobs(project_id);
          CREATE INDEX IF NOT EXISTS gate_jobs_state ON gate_jobs(state);
-         CREATE INDEX IF NOT EXISTS gate_jobs_order ON gate_jobs(project_id, queued_at);",
+         CREATE INDEX IF NOT EXISTS gate_jobs_order ON gate_jobs(project_id, queued_at);
+         CREATE TABLE IF NOT EXISTS gate_log_objects (
+            id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            bytes BLOB NOT NULL,
+            byte_len INTEGER NOT NULL,
+            digest TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS gate_log_objects_job ON gate_log_objects(job_id);
+         CREATE INDEX IF NOT EXISTS gate_log_objects_expires ON gate_log_objects(expires_at);",
     )?;
     Ok(())
 }
@@ -73,6 +95,7 @@ pub fn routes() -> Router<AppState> {
             post(cancel_project_job),
         )
         .route("/v1/gate/jobs", get(list_all_jobs))
+        .route("/v1/gate/logs/{id}", get(get_gate_log))
 }
 
 // ── request shapes ─────────────────────────────────────────────────────────
@@ -89,6 +112,8 @@ struct EnqueueBody {
     lane_id: Option<String>,
     #[serde(default)]
     then_command: Option<String>,
+    #[serde(default)]
+    keep_logs: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +228,10 @@ async fn enqueue_job(
         merge_sha: None,
         current_main_sha: None,
         error: None,
+        failed_step: None,
+        reason: None,
+        log_object_id: None,
+        keep_logs: body.keep_logs.unwrap_or(false),
         attempts: 0,
         then_command: body.then_command,
         then_output: None,
@@ -375,6 +404,44 @@ async fn resolve_job(
         return Err(HubError::NotFound);
     }
     Ok(job)
+}
+
+/// `GET /v1/gate/logs/{id}` — bounded failure evidence for one gate run.
+/// Accepts either the `gjb_…` job id (resolves to its latest log) or the
+/// `obj_…` log object id; visible to any caller with project scope.
+async fn get_gate_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    if id.is_empty() || !(id.starts_with("gjb_") || id.starts_with("obj_")) {
+        return Err(HubError::BadRequest(
+            "expected a gjb_ job id or obj_ log object id".into(),
+        ));
+    }
+    let device = caller(&state, &headers).await?;
+    let scope = caller_project_scope(&state, &device).await?;
+    let object = state
+        .store
+        .get_gate_log(&id)
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    if crate::config::now_rfc3339().as_str() >= object.expires_at.as_str() {
+        return Err(HubError::NotFound);
+    }
+    if !scope.allows_project(&object.project_id) {
+        return Err(HubError::Forbidden);
+    }
+    let log: Value = serde_json::from_slice(&object.bytes)
+        .map_err(|error| HubError::Internal(error.to_string()))?;
+    Ok(Json(json!({
+        "objectId": object.object_id,
+        "jobId": object.job_id,
+        "projectId": object.project_id,
+        "expiresAt": object.expires_at,
+        "log": log,
+    })))
 }
 
 fn filter_jobs(
@@ -558,6 +625,7 @@ async fn dispatch(
         timeouts: std::collections::BTreeMap::new(),
         gate_timeout_secs: 0,
         push: true,
+        keep_logs: job.keep_logs,
         binary: None,
     };
     journal(state, &job.requested_by, "gate.running", &job).await;
@@ -614,6 +682,7 @@ async fn fail_rpc(state: &AppState, job_id: &str, error: &Value) {
             }
             row.state = GateJobState::Failed;
             row.finished_at = Some(now_ts());
+            row.reason = Some(message.lines().next().unwrap_or(&message).to_owned());
             row.error = Some(message.clone());
             Some(())
         })
@@ -662,7 +731,7 @@ pub(crate) async fn on_event(
                 })
                 .await;
         }
-        Kind::Finished { result } => apply_result(state, &job_id, result).await,
+        Kind::Finished { result } => apply_result(state, &job_id, *result).await,
     }
     Ok(())
 }
@@ -670,12 +739,38 @@ pub(crate) async fn on_event(
 /// Apply the terminal verdict (event or RPC reply). Idempotent: only a running
 /// job transitions.
 async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
+    // The terminal `finished` event and the `gate.run` reply carry the same
+    // verdict; this read makes the second arrival a no-op before it would
+    // replace the stored log object.
+    let Some(existing) = state.store.get_gate_job(job_id).await.ok().flatten() else {
+        return;
+    };
+    if !matches!(
+        existing.state,
+        GateJobState::Running | GateJobState::Canceling
+    ) {
+        return;
+    }
+    // Persist the bounded evidence out-of-band first; the job row keeps only
+    // the `obj_…` reference. A persistence failure must not lose the verdict.
+    let mut log_object_id: Option<String> = None;
+    if let Some(run_log) = &result.run_log {
+        match persist_run_log(
+            state,
+            existing.project_id.as_id().as_str(),
+            job_id,
+            &existing.requested_by,
+            run_log,
+        )
+        .await
+        {
+            Ok(object_id) => log_object_id = Some(object_id),
+            Err(error) => tracing::warn!(%error, job_id, "could not persist gate log object"),
+        }
+    }
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
-            if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
-                return None;
-            }
             if result.status == "canceled" {
                 row.state = GateJobState::Canceled;
                 row.finished_at = Some(now_ts());
@@ -696,6 +791,11 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
             row.head_sha = result.head_sha.clone().or(row.head_sha.clone());
             row.merge_sha = result.merge_sha.clone().or(row.merge_sha.clone());
             row.current_main_sha = result.current_main_sha.clone();
+            row.failed_step = result.failed_step.clone();
+            row.reason = result.reason.clone();
+            if let Some(object_id) = &log_object_id {
+                row.log_object_id = Some(object_id.clone());
+            }
             if result.status == "passed" && row.mode == GateMode::Verify {
                 row.state = GateJobState::Passed;
                 row.finished_at = Some(now_ts());
@@ -711,6 +811,10 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
                 row.started_at = None;
                 row.host_id = None;
                 row.lane_id = None;
+                // The next attempt produces fresh evidence.
+                row.failed_step = None;
+                row.reason = None;
+                row.log_object_id = None;
             } else {
                 row.state = GateJobState::Failed;
                 row.finished_at = Some(now_ts());
@@ -718,6 +822,11 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
                     .error
                     .clone()
                     .or_else(|| Some(format!("gate ended: {}", result.status)));
+                if row.reason.is_none()
+                    && let Some(error) = &row.error
+                {
+                    row.reason = Some(error.lines().next().unwrap_or(error).to_owned());
+                }
             }
             Some(())
         })
@@ -740,6 +849,31 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     if job.state == GateJobState::Landed {
         run_then_hook(state, &job).await;
     }
+}
+
+/// Serialize and store the bounded run log as an `obj_…` gate log object.
+/// One log per job: a later attempt replaces the previous row.
+async fn persist_run_log(
+    state: &AppState,
+    project_id: &str,
+    job_id: &str,
+    created_by: &str,
+    run_log: &remuda_protocol::GateRunLog,
+) -> Result<String, HubError> {
+    let bytes =
+        serde_json::to_vec(run_log).map_err(|error| HubError::Internal(error.to_string()))?;
+    if bytes.len() > GATE_LOG_MAX_BYTES {
+        return Err(HubError::BadRequest(format!(
+            "gate log is {} bytes; the limit is {GATE_LOG_MAX_BYTES}",
+            bytes.len()
+        )));
+    }
+    let digest = crate::config::sha256_hex(&bytes);
+    state
+        .store
+        .insert_gate_log(project_id, job_id, bytes, digest, created_by)
+        .await
+        .map_err(HubError::Store)
 }
 
 /// `land --then "<cmd>"`: run the post-land command on the project home host.
@@ -939,6 +1073,126 @@ impl Store {
     }
 }
 
+// ── gate log objects ───────────────────────────────────────────────────────
+
+/// One persisted bounded gate log (`obj_…`); bytes are the JSON-serialized
+/// `GateRunLog`. Separate from attachment objects: no instance binding, a
+/// project-scoped reader, and a 30-day TTL.
+pub(crate) struct GateLogObject {
+    pub(crate) object_id: String,
+    pub(crate) job_id: String,
+    pub(crate) project_id: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) expires_at: String,
+}
+
+impl Store {
+    /// Replace and persist the log object for one job run; returns the new
+    /// `obj_…` id.
+    pub(crate) async fn insert_gate_log(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        bytes: Vec<u8>,
+        digest: String,
+        created_by: &str,
+    ) -> Result<String, crate::store::StoreError> {
+        let project_id = project_id.to_owned();
+        let job_id = job_id.to_owned();
+        let created_by = created_by.to_owned();
+        self.run(move |conn| {
+            let now = now();
+            let expires_at = gate_log_expiry(&now);
+            // One log per job: a re-verify attempt replaces the prior row so
+            // `remuda gate log <gjb>` always reads the latest run.
+            conn.execute(
+                "DELETE FROM gate_log_objects WHERE job_id = ?1",
+                params![job_id],
+            )?;
+            let object_id = crate::config::new_id("obj")
+                .map_err(|error| crate::store::StoreError::Id(error.to_string()))?;
+            conn.execute(
+                "INSERT INTO gate_log_objects
+                    (id, job_id, project_id, bytes, byte_len, digest,
+                     created_by, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    object_id,
+                    job_id,
+                    project_id,
+                    bytes,
+                    i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                    digest,
+                    created_by,
+                    now,
+                    expires_at,
+                ],
+            )?;
+            Ok(object_id)
+        })
+        .await
+    }
+
+    /// Load a gate log by either its `obj_…` id or the owning `gjb_…` job id.
+    pub(crate) async fn get_gate_log(
+        &self,
+        id: &str,
+    ) -> Result<Option<GateLogObject>, crate::store::StoreError> {
+        let id = id.to_owned();
+        self.run(move |conn| {
+            let mapper = |row: &rusqlite::Row<'_>| {
+                Ok(GateLogObject {
+                    object_id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    project_id: row.get(2)?,
+                    bytes: row.get(3)?,
+                    expires_at: row.get(4)?,
+                })
+            };
+            let row = if id.starts_with("obj_") {
+                conn.query_row(
+                    "SELECT id, job_id, project_id, bytes, expires_at
+                     FROM gate_log_objects WHERE id = ?1",
+                    params![id],
+                    mapper,
+                )
+                .optional()?
+            } else {
+                conn.query_row(
+                    "SELECT id, job_id, project_id, bytes, expires_at
+                     FROM gate_log_objects WHERE job_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                    params![id],
+                    mapper,
+                )
+                .optional()?
+            };
+            Ok(row)
+        })
+        .await
+    }
+}
+
+/// RFC3339 timestamp `GATE_LOG_TTL_SECS` after `now`, in the same `…Z`
+/// millisecond shape `now_rfc3339` emits so lazy-expiry compares as strings.
+fn gate_log_expiry(now: &str) -> String {
+    let Ok(parsed) =
+        time::OffsetDateTime::parse(now, &time::format_description::well_known::Rfc3339)
+    else {
+        return now.to_owned();
+    };
+    let t = parsed.to_offset(time::UtcOffset::UTC) + time::Duration::seconds(GATE_LOG_TTL_SECS);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        u8::from(t.month()),
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond()
+    )
+}
+
 // ── small helpers ──────────────────────────────────────────────────────────
 
 fn now() -> String {
@@ -962,6 +1216,9 @@ async fn journal(state: &AppState, device: &str, action: &str, job: &GateJob) {
         "state": job.state.as_str(),
         "laneId": job.lane_id,
         "mergeSha": job.merge_sha,
+        "failedStep": job.failed_step,
+        "reason": job.reason,
+        "logObjectId": job.log_object_id,
         "error": job.error,
     });
     if let Err(error) = state

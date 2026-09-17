@@ -85,6 +85,8 @@ async fn spawn_hub() -> Result<Hub> {
                 "gate.run" => {
                     let job = params["jobId"].as_str().unwrap_or("").to_string();
                     let mode = params["mode"].as_str().unwrap_or("verify");
+                    let branch = params["branch"].as_str().unwrap_or("").to_string();
+                    let failed = branch == "wt/cli/fail";
                     // Stream two step notifications.
                     for step in [("secret-scan", "ok", 11u64), ("cargo-test", "ok", 22)] {
                         seq += 1;
@@ -103,21 +105,54 @@ async fn spawn_hub() -> Result<Hub> {
                             return;
                         }
                     }
-                    let (status, sha) = if mode == "land" {
-                        ("landed", "5555555555555555555555555555555555555555")
+                    let result = if failed {
+                        json!({
+                            "jobId": job,
+                            "status": "failed",
+                            "error": "gate failed or returned an incomplete step report",
+                            "failedStep": "cargo-test",
+                            "reason": "cargo-test failed, exit status 101, attempts 2, retried",
+                            "steps": [
+                                {"name": "secret-scan", "status": "ok", "durationMs": 11},
+                                {"name": "cargo-test", "status": "failed", "durationMs": 5012,
+                                 "attempts": 2, "retried": true, "error": "exit status 101"}
+                            ],
+                            "runLog": {
+                                "step": "cargo-test",
+                                "kind": "failed",
+                                "attempts": 2,
+                                "headline": "cargo-test failed, exit status 101, attempts 2, retried",
+                                "summary": [
+                                    "failures:",
+                                    "    remuda::gate::boom",
+                                    "test remuda::gate::boom ... FAILED",
+                                    "thread 'remuda::gate::boom' panicked at crates/remuda-node/src/gate.rs:42:9:"
+                                ],
+                                "tail": [
+                                    "test result: FAILED. 0 passed; 1 failed",
+                                    "error: test failed, to rerun pass `-p remuda-node --lib gate`"
+                                ],
+                                "capturedLines": 84,
+                                "truncated": false
+                            }
+                        })
                     } else {
-                        ("passed", "3333333333333333333333333333333333333333")
+                        let (status, sha) = if mode == "land" {
+                            ("landed", "5555555555555555555555555555555555555555")
+                        } else {
+                            ("passed", "3333333333333333333333333333333333333333")
+                        };
+                        json!({
+                            "jobId": job, "status": status,
+                            "mergeSha": sha,
+                            "baseSha": "1111111111111111111111111111111111111111",
+                            "headSha": "2222222222222222222222222222222222222222",
+                            "steps": [
+                                {"name": "secret-scan", "status": "ok", "durationMs": 11},
+                                {"name": "cargo-test", "status": "ok", "durationMs": 22}
+                            ],
+                        })
                     };
-                    let result = json!({
-                        "jobId": job, "status": status,
-                        "mergeSha": sha,
-                        "baseSha": "1111111111111111111111111111111111111111",
-                        "headSha": "2222222222222222222222222222222222222222",
-                        "steps": [
-                            {"name": "secret-scan", "status": "ok", "durationMs": 11},
-                            {"name": "cargo-test", "status": "ok", "durationMs": 22}
-                        ],
-                    });
                     let reply = json!({"jsonrpc":"2.0","id":id,"result":result});
                     if node
                         .send(Message::Text(reply.to_string().into()))
@@ -265,8 +300,86 @@ async fn gate_help_lists_list_and_cancel() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("list"), "{stdout}");
     assert!(stdout.contains("cancel"), "{stdout}");
+    assert!(stdout.contains("log"), "{stdout}");
+    assert!(stdout.contains("--keep-logs"), "{stdout}");
     let output = hub.run(&["land", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--then"), "{stdout}");
+    assert!(stdout.contains("--keep-logs"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_failure_prints_step_summary_and_log_hint_and_exits_one() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let output = hub.run(&["gate", "wt/cli/fail", "--project", &hub.project]);
+    assert_eq!(output.status.code(), Some(1), "failure exits 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Failed step + one-line reason.
+    assert!(
+        stderr.contains("cargo-test: cargo-test failed, exit status 101"),
+        "{stderr}"
+    );
+    // Extracted summary lines (libtest failures: section + panic).
+    assert!(
+        stderr.contains("test remuda::gate::boom ... FAILED"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("panicked at crates/remuda-node/src/gate.rs:42:9:"),
+        "{stderr}"
+    );
+    // How to fetch the full log, by job and object id.
+    assert!(
+        stderr.contains("full log: remuda gate log gjb_"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("(obj_"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("verify: failed"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_log_prints_the_bounded_evidence_and_list_shows_the_step() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let failed = hub.run(&["gate", "wt/cli/fail", "--project", &hub.project]);
+    assert_eq!(failed.status.code(), Some(1));
+    // Recover the job id from the list endpoint.
+    let list = hub.run(&["gate", "list", "--project", &hub.project, "--json"]);
+    assert!(list.status.success());
+    let jobs: Value = serde_json::from_slice(&list.stdout)?;
+    let job = jobs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["state"] == "failed")
+        .expect("a failed job");
+    let job_id = job["id"].as_str().unwrap().to_owned();
+    assert_eq!(job["failedStep"], "cargo-test", "{job}");
+    assert!(job["logObjectId"].as_str().unwrap().starts_with("obj_"));
+
+    // gate log <gjb> renders summary and the last captured lines.
+    let output = hub.run(&["gate", "log", &job_id]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("== cargo-test (failed) obj_"), "{stdout}");
+    assert!(stdout.contains("-- summary --"), "{stdout}");
+    assert!(
+        stdout.contains("test remuda::gate::boom ... FAILED"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("-- last 2 lines --"), "{stdout}");
+    assert!(stdout.contains("test result: FAILED"), "{stdout}");
+
+    // The text list gained the FAILED_STEP column.
+    let list = hub.run(&["gate", "list", "--project", &hub.project]);
+    let table = String::from_utf8_lossy(&list.stdout);
+    assert!(table.contains("FAILED_STEP"), "{table}");
+    assert!(table.contains("cargo-test"), "{table}");
     Ok(())
 }

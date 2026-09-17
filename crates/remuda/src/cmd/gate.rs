@@ -39,6 +39,9 @@ pub(crate) struct GateArgs {
     /// Enqueue and return immediately without waiting for the verdict.
     #[arg(long)]
     no_wait: bool,
+    /// Retain the bounded step log even when the run passes.
+    #[arg(long)]
+    keep_logs: bool,
     /// Emit the job(s) as JSON instead of the step table.
     #[arg(long)]
     json: bool,
@@ -63,6 +66,13 @@ enum GateCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Print the bounded failure log for a job (`gjb_…` or `obj_…` id).
+    Log {
+        #[command(flatten)]
+        hub: HubOpts,
+        /// Gate job id or log object id.
+        id: String,
+    },
     /// Cancel a queued or running job by `gjb_…` id (or its branch name).
     Cancel {
         #[command(flatten)]
@@ -86,13 +96,14 @@ impl Entrypoint for GateArgs {
                     branch,
                     json,
                 }) => list_jobs(hub, project, state, branch, json).await,
+                Some(GateCommand::Log { hub, id }) => print_log(hub, &id).await,
                 Some(GateCommand::Cancel { hub, job, project }) => {
                     cancel_job(hub, project, job).await
                 }
                 None => {
                     let Some(branch) = self.branch else {
                         anyhow::bail!(
-                            "usage: remuda gate <branch> | remuda gate list | remuda gate cancel <job>"
+                            "usage: remuda gate <branch> | remuda gate list | remuda gate log <gjb> | remuda gate cancel <job>"
                         );
                     };
                     enqueue_and_wait(
@@ -103,6 +114,7 @@ impl Entrypoint for GateArgs {
                             web: self.web,
                             lane: self.lane,
                             no_wait: self.no_wait,
+                            keep_logs: self.keep_logs,
                             json: self.json,
                             then_command: None,
                         },
@@ -139,6 +151,9 @@ pub(crate) struct LandArgs {
     /// Enqueue without waiting for the land.
     #[arg(long)]
     no_wait: bool,
+    /// Retain the bounded step log even when the run passes.
+    #[arg(long)]
+    keep_logs: bool,
     /// Emit the job as JSON.
     #[arg(long)]
     json: bool,
@@ -155,6 +170,7 @@ impl Entrypoint for LandArgs {
                     web: self.web,
                     lane: self.lane,
                     no_wait: self.no_wait,
+                    keep_logs: self.keep_logs,
                     json: self.json,
                     then_command: self.then,
                 },
@@ -173,6 +189,7 @@ struct GateInvocation {
     web: Option<String>,
     lane: Option<String>,
     no_wait: bool,
+    keep_logs: bool,
     json: bool,
     then_command: Option<String>,
 }
@@ -193,6 +210,9 @@ async fn enqueue_and_wait(args: GateInvocation, mode: &str) -> anyhow::Result<i3
     }
     if let Some(then) = &args.then_command {
         body.insert("thenCommand".into(), Value::String(then.clone()));
+    }
+    if args.keep_logs {
+        body.insert("keepLogs".into(), Value::Bool(true));
     }
     let job = client
         .post(
@@ -274,16 +294,19 @@ pub(crate) async fn wait_for_job(
         }
         let state = job.get("state").and_then(Value::as_str).unwrap_or("");
         if is_terminal(state) {
-            if !as_json && let Some(error) = job.get("error").and_then(Value::as_str) {
-                eprintln!("{error}");
-            }
             if as_json {
                 super::hub_client::print_json(&job)?;
             } else if state == "landed" {
                 if let Some(sha) = job.get("mergeSha").and_then(Value::as_str) {
                     println!("landed: {sha}");
                 }
+            } else if state == "failed" {
+                print_failure(client, &job).await?;
+                println!("{mode}: {state}");
             } else {
+                if let Some(reason) = failure_reason(&job) {
+                    eprintln!("{reason}");
+                }
                 println!("{mode}: {state}");
             }
             return Ok(match state {
@@ -296,8 +319,96 @@ pub(crate) async fn wait_for_job(
     }
 }
 
+/// The job's short failure reason: the extracted-summary headline first,
+/// falling back to the raw error.
+fn failure_reason(job: &Value) -> Option<String> {
+    job.get("reason")
+        .and_then(Value::as_str)
+        .or_else(|| job.get("error").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// Fetch a job's bounded log envelope (`GET /v1/gate/logs/{id}`).
+async fn fetch_log(client: &remuda_hub_client::HubClient, id: &str) -> Option<Value> {
+    client
+        .get(&format!("/v1/gate/logs/{id}"))
+        .await
+        .ok()
+        .filter(|value| value.get("log").is_some())
+}
+
+/// Print the failed step, its extracted summary lines, and where to fetch the
+/// full bounded log on a failed gate/land.
+async fn print_failure(client: &remuda_hub_client::HubClient, job: &Value) -> anyhow::Result<()> {
+    let job_id = job.get("id").and_then(Value::as_str).unwrap_or("");
+    let failed_step = job.get("failedStep").and_then(Value::as_str);
+    if let Some(reason) = failure_reason(job) {
+        match failed_step {
+            Some(step) => eprintln!("{step}: {reason}"),
+            None => eprintln!("{reason}"),
+        }
+    }
+    let envelope = fetch_log(client, job_id).await;
+    if let Some(summary) = envelope
+        .as_ref()
+        .and_then(|value| value.get("log"))
+        .and_then(|log| log.get("summary"))
+        .and_then(Value::as_array)
+    {
+        for line in summary.iter().filter_map(Value::as_str) {
+            eprintln!("{line}");
+        }
+    }
+    let object_id = job.get("logObjectId").and_then(Value::as_str);
+    if let Some(object_id) = object_id {
+        eprintln!("full log: remuda gate log {job_id} ({object_id})");
+    } else if job_id.starts_with("gjb_") {
+        eprintln!("full log: remuda gate log {job_id}");
+    }
+    Ok(())
+}
+
 fn is_terminal(state: &str) -> bool {
     matches!(state, "passed" | "failed" | "landed" | "canceled")
+}
+
+/// `remuda gate log <gjb|obj>` — print the bounded failure log (summary and
+/// the last captured lines).
+async fn print_log(hub: HubOpts, id: &str) -> anyhow::Result<i32> {
+    let client = hub.connect()?;
+    let envelope = client.get(&format!("/v1/gate/logs/{id}")).await?;
+    let log = envelope
+        .get("log")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no gate log for {id} (logs are kept for 30 days)"))?;
+    let step = log.get("step").and_then(Value::as_str).unwrap_or("?");
+    let kind = log.get("kind").and_then(Value::as_str).unwrap_or("?");
+    let object_id = envelope
+        .get("objectId")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    if let Some(headline) = log.get("headline").and_then(Value::as_str) {
+        println!("== {step} ({kind}) {object_id} ==");
+        println!("{headline}");
+    }
+    if let Some(summary) = log.get("summary").and_then(Value::as_array)
+        && !summary.is_empty()
+    {
+        println!("\n-- summary --");
+        for line in summary.iter().filter_map(Value::as_str) {
+            println!("{line}");
+        }
+    }
+    if let Some(tail) = log.get("tail").and_then(Value::as_array)
+        && !tail.is_empty()
+    {
+        println!("\n-- last {} lines --", tail.len());
+        for line in tail.iter().filter_map(Value::as_str) {
+            println!("{line}");
+        }
+    }
+    Ok(0)
 }
 
 async fn list_jobs(
@@ -348,8 +459,8 @@ async fn list_jobs(
         return Ok(0);
     }
     println!(
-        "{:<44}  {:<9}  {:<30}  {:<9}  MERGE_SHA",
-        "JOB", "MODE", "BRANCH", "STATE"
+        "{:<44}  {:<9}  {:<30}  {:<9}  {:<14}  MERGE_SHA",
+        "JOB", "MODE", "BRANCH", "STATE", "FAILED_STEP"
     );
     for job in &items {
         let id = job.get("id").and_then(Value::as_str).unwrap_or("?");
@@ -362,12 +473,19 @@ async fn list_jobs(
             .take(30)
             .collect::<String>();
         let state = job.get("state").and_then(Value::as_str).unwrap_or("?");
+        let failed_step = job
+            .get("failedStep")
+            .and_then(Value::as_str)
+            .unwrap_or("-")
+            .chars()
+            .take(14)
+            .collect::<String>();
         let sha = job
             .get("mergeSha")
             .and_then(Value::as_str)
             .map(|sha| sha.chars().take(12).collect::<String>())
             .unwrap_or_else(|| "-".into());
-        println!("{id:<44}  {mode:<9}  {branch:<30}  {state:<9}  {sha}");
+        println!("{id:<44}  {mode:<9}  {branch:<30}  {state:<9}  {failed_step:<14}  {sha}");
     }
     Ok(0)
 }

@@ -187,6 +187,39 @@ pub struct GateStep {
     pub reason: Option<String>,
 }
 
+/// Bounded failure evidence for one gate run, stored by the Hub as an
+/// `obj_…` log object (never inlined into the job row). For a failed run the
+/// Node populates it for the failed step; with `--keep-logs` a green run gets
+/// a `kept` log of the whole-run tail.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateRunLog {
+    /// Step the log belongs to (`cargo-test`, `web-hub-e2e`, …), or `*` for a
+    /// whole-run `kept` log / a runner-level failure before any step marker.
+    pub step: String,
+    /// `failed` (a step or the runner failed) | `kept` (`--keep-logs` green).
+    pub kind: String,
+    /// Attempt ordinal reported for the failed step.
+    #[serde(default)]
+    pub attempts: u32,
+    /// One-line headline, mirrored as the job `reason`.
+    pub headline: String,
+    /// Extracted summary lines: the libtest `failures:` section /
+    /// `test … FAILED` / `panicked at` lines for cargo-test; the numbered
+    /// Playwright failure titles and first failure block for web steps.
+    #[serde(default)]
+    pub summary: Vec<String>,
+    /// Last captured raw lines (combined step output), bounded.
+    #[serde(default)]
+    pub tail: Vec<String>,
+    /// Number of lines attributed to the step before bounding.
+    #[serde(default)]
+    pub captured_lines: usize,
+    /// Whether the tail/summary was cut by the bounds.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 /// One queued gate/land job (Hub document; coordinator-hierarchy.md §8 row 6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -237,6 +270,19 @@ pub struct GateJob {
     /// Failure / cancel reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Name of the step that failed the last run (`cargo-test`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    /// First line of the failure summary (the log headline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Hub object holding the bounded run log (`obj_…`); absent on green runs
+    /// unless `keepLogs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_object_id: Option<String>,
+    /// Retain the bounded run log even when the run passes (`--keep-logs`).
+    #[serde(default)]
+    pub keep_logs: bool,
     /// Number of verify+land attempts (CAS retries).
     #[serde(default)]
     pub attempts: u32,
@@ -278,7 +324,7 @@ pub enum GateEventKind {
     #[serde(rename = "finished")]
     Finished {
         /// Final verdict.
-        result: GateRunResult,
+        result: Box<GateRunResult>,
     },
 }
 
@@ -341,6 +387,9 @@ pub struct GateRunParams {
     /// Land mode pushes main from the lane host when true.
     #[serde(default)]
     pub push: bool,
+    /// Retain the bounded run log even when the run passes (`--keep-logs`).
+    #[serde(default)]
+    pub keep_logs: bool,
     /// Test seam: override the merge binary (defaults to the Node's own exe).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
@@ -376,6 +425,17 @@ pub struct GateRunResult {
     /// Failure text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Name of the step that failed (`cargo-test`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    /// First line of the extracted failure summary (the log headline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Bounded failure evidence (or a `kept` green-run log). The Hub stores
+    /// it as an `obj_…` log object and replaces this field with `logObjectId`
+    /// on the persisted job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_log: Option<GateRunLog>,
 }
 
 /// `gate.cancel` params.

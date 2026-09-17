@@ -191,7 +191,9 @@ async fn run(args: ReportArgs) -> anyhow::Result<i32> {
         })).collect::<Vec<_>>(),
         "hubGateFailures": gate_failures.iter().map(|job| json!({
             "id": job["id"], "branch": job["branch"], "mode": job["mode"],
-            "state": job["state"], "error": job["error"],
+            "state": job["state"], "failedStep": job["failedStep"],
+            "reason": job["reason"], "logObjectId": job["logObjectId"],
+            "error": job["error"],
         })).collect::<Vec<_>>(),
         "verifiedAwaitingLand": verified,
         "gateFailures": gate_failed,
@@ -315,11 +317,25 @@ fn owner_asks(workers: &[Value], reports: &[Value], gate_jobs: &[Value]) -> Vec<
             asks.push(json!({
                 "kind": "gate", "branch": job["branch"],
                 "status": format!("{}-failed", job["mode"].as_str().unwrap_or("verify")),
-                "reason": job["error"],
+                "failedStep": job["failedStep"],
+                "reason": gate_failure_reason(job),
             }));
         }
     }
     asks
+}
+
+/// One-line failure reason for a gate job, prefixed with the failed step when
+/// the Hub carried one (`cargo-test: cargo-test failed, exit status 101, …`).
+fn gate_failure_reason(job: &Value) -> Value {
+    let text = job["reason"]
+        .as_str()
+        .or_else(|| job["error"].as_str())
+        .unwrap_or("failed");
+    match job["failedStep"].as_str() {
+        Some(step) => json!(format!("{step}: {text}")),
+        None => json!(text),
+    }
 }
 
 fn ask_signature(ask: &Value) -> String {
@@ -447,12 +463,20 @@ fn print_digest(digest: &Value) {
     if !hub_failures.is_empty() {
         println!("\n== gate queue failures ==");
         for job in &hub_failures {
-            println!(
-                "  {} [{}] {}",
-                job["branch"].as_str().unwrap_or("?"),
-                job["mode"].as_str().unwrap_or("?"),
-                job["error"].as_str().unwrap_or("failed")
-            );
+            let branch = job["branch"].as_str().unwrap_or("?");
+            let mode = job["mode"].as_str().unwrap_or("?");
+            let reason = job["reason"]
+                .as_str()
+                .or_else(|| job["error"].as_str())
+                .unwrap_or("failed");
+            match job["failedStep"].as_str() {
+                Some(step) => println!("  {branch} [{mode}] {step}: {reason}"),
+                None => println!("  {branch} [{mode}] {reason}"),
+            }
+            if let Some(object_id) = job["logObjectId"].as_str() {
+                let job_id = job["id"].as_str().unwrap_or("");
+                println!("      log: remuda gate log {job_id} ({object_id})");
+            }
         }
     }
     let landed = digest["landedSinceLastReport"]

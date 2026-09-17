@@ -413,3 +413,61 @@ fn truncate(value: String, max: usize) -> String {
         format!("{head}…")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A blocked-with-reason watch row exactly as `/v1/workers/observe`
+    /// persists a screen-classified first-run dialog.
+    fn dialog_row(title: &str) -> Value {
+        json!({
+            "id": "wkr_dialog",
+            "name": "c-dialog",
+            "driver": "shell-pty",
+            "state": {"state": "blocked", "reason": title},
+            "watch": {"status": "blocked", "reason": title, "detail": title},
+        })
+    }
+
+    #[test]
+    fn a_dialog_blocked_row_renders_blocked_with_the_dialog_title() {
+        // dispatch-onboarding-1: `remuda watch` must surface the blocked
+        // status and the dialog title, never fall back to the lifecycle state
+        // or print "working" for a parked first-run modal.
+        for title in [
+            "Is this a project you created or one you trust?",
+            "Allow reads outside the working directories?",
+        ] {
+            let row = dialog_row(title);
+            assert_eq!(label(&row), "blocked");
+            assert_eq!(sha_or_reason(&row), title);
+            assert!(!is_done(&row));
+            // The follow change-signature includes the reason so a worker
+            // entering the modal actually prints a row.
+            assert!(signature(&row).contains(title));
+        }
+    }
+
+    #[test]
+    fn blocked_status_wins_over_any_optimistic_lifecycle_state() {
+        // The point-in-time watch classification is preferred even if the
+        // durable row still says "working" (the incident's shape).
+        let row = json!({
+            "id": "wkr_x",
+            "name": "c-x",
+            "state": {"state": "working"},
+            "watch": {
+                "status": "blocked",
+                "reason": "Is this a project you created or one you trust?",
+            },
+        });
+        assert_eq!(label(&row), "blocked");
+        assert_eq!(
+            sha_or_reason(&row),
+            "Is this a project you created or one you trust?"
+        );
+        assert!(!is_done(&row));
+    }
+}

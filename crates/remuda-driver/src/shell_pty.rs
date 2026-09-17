@@ -506,9 +506,9 @@ impl ShellPtyDriver {
             model_bridge: Mutex::new(Arc::new(crate::model::ModelBridge::new())),
             model_queue: Mutex::new(Arc::new(crate::model::ModelQueue::new())),
             model_worker: Mutex::new(None),
-            permission_bridge: Mutex::new(Arc::new(
-                crate::permission::PermissionBridge::new(false),
-            )),
+            permission_bridge: Mutex::new(Arc::new(crate::permission::PermissionBridge::new(
+                false,
+            ))),
             permission_queue: Mutex::new(Arc::new(crate::permission::PermissionQueue::new())),
             permission_worker: Mutex::new(None),
             events_tx: Mutex::new(None),
@@ -966,7 +966,6 @@ impl ShellPtyDriver {
         }
         Ok(DriverAck::transport_written())
     }
-
 
     /// Spawn the PTY without an [`InstanceSpec`] (Node fake registry / tests).
     pub async fn spawn(&self) -> DriverResult<RunHandle> {

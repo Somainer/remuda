@@ -1056,10 +1056,7 @@ async fn fake_node(
                     //   "__degrade__:<mode>" → permission-degraded lifecycle only
                     // A real mode id echoes the closed-loop read-back: the fake
                     // agent cycled the wheel and now reports the effective mode.
-                    if let Some(requested) = params
-                        .get("permissionMode")
-                        .and_then(Value::as_str)
-                    {
+                    if let Some(requested) = params.get("permissionMode").and_then(Value::as_str) {
                         if let Some(word) = requested.strip_prefix("__queued__:") {
                             append_n = append_configure_status(
                                 &mut ws,

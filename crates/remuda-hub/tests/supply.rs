@@ -720,6 +720,90 @@ async fn dispatch_task_spec_defers_below_min_class_and_writes_ledger() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_pin_refused_on_resolve_and_known_pin_honored() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let _node = enroll_fake_node(&hub, HostId::new().as_id().as_str(), 8).await?;
+
+    let body = json!({
+        "name": "synth-passthrough",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "authToken": "sk-synth-pin-secret-dddd",
+        "models": [
+            {"id": "passthrough/synth/seed-evolving", "family": "synth",
+             "role": "workhorse", "priority": 20},
+            {"id": "passthrough/synth/seed-legacy", "family": "synth",
+             "role": "workhorse", "priority": 10}
+        ]
+    })
+    .to_string();
+    let (status, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &[("Cookie", &cookie), ("Content-Type", "application/json")],
+        Some(&body),
+    )
+    .await?;
+    assert_eq!(status, 200, "{rest}");
+
+    // Unknown pin: the dry-run must refuse (409), the same hard refusal
+    // dispatch returns — never a 200 with a substituted chosen model.
+    let probe = json!({
+        "taskSpec": { "pin": { "model": "synth/seed-evolving[1m]" } }
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/supply/resolve",
+        &[("Cookie", &cookie), ("Content-Type", "application/json")],
+        Some(&probe),
+    )
+    .await?;
+    assert_eq!(status, 409, "expected PIN_REFUSED, got {status} {body}");
+    let error: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(error["code"], "PIN_REFUSED");
+    assert_eq!(error["pin"]["model"], "synth/seed-evolving[1m]");
+    let suggestions = error["suggestions"].as_array().unwrap();
+    assert_eq!(suggestions[0], "passthrough/synth/seed-evolving");
+    assert!(suggestions.len() <= 5);
+    assert!(
+        error["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str().unwrap_or_default().contains("did you mean")),
+        "{error}"
+    );
+
+    // Known pin: 200 and the pinned model is chosen.
+    let probe = json!({
+        "taskSpec": { "pin": { "model": "passthrough/synth/seed-evolving" } }
+    })
+    .to_string();
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/supply/resolve",
+        &[("Cookie", &cookie), ("Content-Type", "application/json")],
+        Some(&probe),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let decision: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(
+        decision["chosen"]["modelId"],
+        "passthrough/synth/seed-evolving"
+    );
+    assert!(decision["deferred"] == false);
+    assert!(decision.get("pinRefusal").is_none());
+    hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usage_events_flow_through_journal_into_aggregation() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let cookie = login(hub.addr, &bootstrap).await?;

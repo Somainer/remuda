@@ -888,6 +888,9 @@ pub async fn create_instance(
             }
         };
         let decision = crate::supply::solve_state(&state, task_spec, &hosts, coordinator).await?;
+        if let Some(refusal) = &decision.pin_refusal {
+            return Err(crate::supply::pin_refused_error(refusal));
+        }
         if decision.deferred {
             return Err(HubError::SupplyDeferred {
                 decision: decision.to_json(),

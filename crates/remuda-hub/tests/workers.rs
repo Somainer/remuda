@@ -497,6 +497,180 @@ async fn dispatch_pin_admits_over_cpu_ceiling_but_auto_dispatch_refuses() {
     );
 }
 
+/// Create a secret-less gateway profile listing synthetic workhorse models.
+async fn create_synth_profile(ctx: &Ctx, models: Value) -> (reqwest::StatusCode, Value) {
+    let body = json!({
+        "name": "synth-relay",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "authToken": "sk-synth-secret-cccc",
+        "models": models,
+    });
+    ctx.request("POST", "/v1/providers", Some(body)).await
+}
+
+const SYNTH_MODELS: &str = "passthrough/synth/seed-evolving";
+
+#[tokio::test]
+async fn dispatch_refuses_unknown_model_pin_without_provisioning() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let project = ctx.create_project(&["58910-58939"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    let (status, profile) = create_synth_profile(
+        &ctx,
+        json!([
+            {"id": SYNTH_MODELS, "family": "synth", "role": "workhorse", "priority": 20}
+        ]),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {profile}");
+    ctx.drain_calls();
+
+    // The 2026-09-17 shape: pin carries a [1m] tag and lacks the
+    // `passthrough/` prefix the catalog id has.
+    let mut pinned = ctx.dispatch_body(project_id);
+    pinned["model"] = json!("synth/seed-evolving[1m]");
+    let (status, body) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(pinned))
+        .await;
+    assert_eq!(status, 409, "expected PIN_REFUSED, got {status} {body}");
+    assert_eq!(body["code"], json!("PIN_REFUSED"));
+    assert_eq!(body["pin"]["model"], json!("synth/seed-evolving[1m]"));
+    let suggestions = body["suggestions"].as_array().unwrap();
+    assert!(suggestions.len() <= 5);
+    assert!(
+        suggestions.iter().any(|s| s == SYNTH_MODELS),
+        "suggestions must name the listed id: {body}"
+    );
+    let reasons = body["reasons"].as_array().unwrap();
+    assert!(
+        reasons.iter().any(|r| r
+            .as_str()
+            .unwrap_or("")
+            .contains("not listed by any provider profile")),
+        "{body}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.as_str().unwrap_or("").contains("never substituted")),
+        "{body}"
+    );
+
+    // Nothing reached the Node: no worktree provisioned, no instance launched.
+    let calls = ctx.drain_calls();
+    assert!(
+        !calls.contains(&"worker.provision".to_string()),
+        "refusal must not provision: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&"instance.create".to_string()),
+        "refusal must not launch: {calls:?}"
+    );
+
+    // The roster gets no row.
+    let (status, workers) = ctx
+        .request("GET", &format!("/v1/workers?project={project_id}"), None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        workers["items"].as_array().unwrap().len(),
+        0,
+        "no roster row on refusal: {workers}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_honors_known_model_pin_and_provisions() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let project = ctx.create_project(&["58940-58969"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    let (status, profile) =
+        create_synth_profile(&ctx, json!([
+            {"id": SYNTH_MODELS, "family": "synth", "role": "workhorse", "priority": 20},
+            {"id": "passthrough/synth/fable-x", "family": "synth", "role": "frontier", "priority": 99},
+        ]))
+        .await;
+    assert!(status.is_success(), "{status} {profile}");
+    ctx.drain_calls();
+
+    let mut pinned = ctx.dispatch_body(project_id);
+    pinned["model"] = json!(SYNTH_MODELS);
+    let (status, body) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(pinned))
+        .await;
+    assert!(
+        status.is_success(),
+        "known pin must dispatch: {status} {body}"
+    );
+    // The pin wins even though the fable row declares priority 99.
+    assert_eq!(body["worker"]["model"], json!(SYNTH_MODELS));
+    assert_eq!(body["worker"]["providerProfileId"], profile["id"], "{body}");
+    let calls = ctx.drain_calls();
+    assert!(calls.contains(&"worker.provision".to_string()), "{calls:?}");
+    assert!(calls.contains(&"instance.create".to_string()), "{calls:?}");
+    // No workhorse warning: the project declares no workhorse.
+    let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("workhorse")),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_warns_when_honored_pin_differs_from_project_workhorse() {
+    let mut ctx = Ctx::spawn().await.unwrap();
+    let project = ctx.create_project(&["58970-58999"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    let (status, profile) =
+        create_synth_profile(&ctx, json!([
+            {"id": SYNTH_MODELS, "family": "synth", "role": "workhorse", "priority": 20},
+            {"id": "passthrough/synth/fable-x", "family": "synth", "role": "frontier", "priority": 99},
+        ]))
+        .await;
+    assert!(status.is_success(), "{status} {profile}");
+
+    // The project speaks model roles: workhorse is the seed model. The API
+    // has no workhorse setter yet, so seed the stored project directly.
+    let patched = ctx
+        .hub
+        .store()
+        .expect("store")
+        .patch_project(project_id.to_string(), |project| {
+            project.model_roles.workhorse = Some(SYNTH_MODELS.into());
+            Ok(())
+        })
+        .await
+        .expect("patch project");
+    assert_eq!(
+        patched.expect("project").model_roles.workhorse.as_deref(),
+        Some(SYNTH_MODELS)
+    );
+    ctx.drain_calls();
+
+    // Pin the non-workhorse model: admitted (warning, not refusal).
+    let mut pinned = ctx.dispatch_body(project_id);
+    pinned["model"] = json!("passthrough/synth/fable-x");
+    let (status, body) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(pinned))
+        .await;
+    assert!(
+        status.is_success(),
+        "honored pin dispatches: {status} {body}"
+    );
+    assert_eq!(body["worker"]["model"], json!("passthrough/synth/fable-x"));
+    let warnings = body["warnings"].as_array().cloned().unwrap_or_default();
+    assert!(
+        warnings.iter().any(|w| {
+            let text = w.as_str().unwrap_or("");
+            text.contains("differs from the project workhorse") && text.contains(SYNTH_MODELS)
+        }),
+        "expected informational workhorse warning: {warnings:?}"
+    );
+}
+
 #[tokio::test]
 async fn dispatch_rejects_brief_and_unknown_project() {
     let ctx = Ctx::spawn().await.unwrap();

@@ -216,6 +216,103 @@ fn run(args: &[&str], hub: &Hub) -> std::process::Output {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_model_pin_refuses_nonzero_with_message() -> Result<()> {
+    let hub = spawn_hub().await?;
+
+    // Project with a member workspace (same setup as the lifecycle test).
+    let output = run(&["project", "create", "--name", "cli-pinrefuse"], &hub);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let project: Value = serde_json::from_slice(&output.stdout)?;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let client =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    client
+        .post(
+            &format!("/v1/projects/{project_id}/members"),
+            &json!({"hostId": hub.host, "workspaceId": hub.workspace, "role": "build"}),
+        )
+        .await?;
+    client
+        .patch(
+            &format!("/v1/projects/{project_id}"),
+            &json!({
+                "hosts": [{
+                    "hostId": hub.host, "maxInstances": 8, "maxBuilding": 4,
+                    "diskBudgetGb": 10, "portBlocks": ["59000-59029"],
+                    "requires": ["toolchain=rust"], "latencyClass": "remote",
+                }],
+            }),
+        )
+        .await?;
+    client
+        .post(
+            "/v1/providers",
+            &json!({
+                "name": "cli-synth-relay",
+                "kind": "gateway",
+                "baseUrl": "http://127.0.0.1:1",
+                "authToken": "sk-cli-synth-secret-eeee",
+                "models": [
+                    {"id": "passthrough/synth/seed-evolving", "family": "synth",
+                     "role": "workhorse", "priority": 20}
+                ]
+            }),
+        )
+        .await?;
+
+    let brief = hub._dir.path().join("pin-brief.md");
+    std::fs::write(
+        &brief,
+        "Complete the trivial task in your worktree.\n\
+         Rules: never run deploy/ scripts or probe tunnels.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+
+    // Dispatch with a pin no profile lists: non-zero exit, refusal reasons on
+    // stderr naming the pin and the closest listed id.
+    let output = run(
+        &[
+            "dispatch",
+            "--project",
+            &project_id,
+            "--brief",
+            brief.to_str().unwrap(),
+            "--model",
+            "synth/seed-evolving[1m]",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success(), "unknown pin must exit non-zero");
+    assert_ne!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pin refused"), "{stderr}");
+    assert!(stderr.contains("synth/seed-evolving[1m]"), "{stderr}");
+    assert!(stderr.contains("never substituted"), "{stderr}");
+    assert!(
+        stderr.contains("passthrough/synth/seed-evolving"),
+        "stderr must carry the suggestion: {stderr}"
+    );
+
+    // `profile probe` shows the same refusal (non-zero), not a 200 dry-run.
+    let output = run(
+        &["profile", "probe", "--pin-model", "synth/seed-evolving[1m]"],
+        &hub,
+    );
+    assert!(!output.status.success(), "probe must refuse the pin");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pin refused"), "{stderr}");
+    assert!(
+        stderr.contains("passthrough/synth/seed-evolving"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_retire_hostcap_cli_lifecycle() -> Result<()> {
     let hub = spawn_hub().await?;
 

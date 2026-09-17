@@ -9,7 +9,7 @@
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 
-use super::hub_client::{HubOpts, block_on, print_json};
+use super::hub_client::{HubOpts, block_on, hub_http_error, print_json};
 
 /// `remuda profile` subcommands.
 #[derive(Args)]
@@ -267,7 +267,10 @@ fn run(hub: HubOpts, command: ProfileCommand) -> anyhow::Result<()> {
                 if let Some(value) = host_id {
                     body["hostId"] = json!(value);
                 }
-                client.post("/v1/supply/resolve", &body).await?
+                client
+                    .post("/v1/supply/resolve", &body)
+                    .await
+                    .map_err(hub_http_error)?
             }
         };
         print_json(&value)

@@ -365,6 +365,22 @@ pub struct ChosenSupply {
     pub fallback: Vec<String>,
 }
 
+/// A hard pin matched no eligible candidate. Admission **refuses**: a pin is
+/// a hard constraint (coordinator-hierarchy.md §4.3), never a preference the
+/// ranker may silently substitute. The 2026-09-17 incident dispatched on
+/// `ark/seed-evolving[1m]` — an id no profile listed — and the ranker launched
+/// the list head instead of failing.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PinRefusal {
+    /// The rejected pin in wire shape (`model` / `supplyId` / `harness`).
+    pub pin: Value,
+    /// Human-readable reasons: the pin itself plus `did you mean` lines.
+    pub reasons: Vec<String>,
+    /// Closest listed ids (≤5): shared-suffix/same-family models or profiles.
+    pub suggestions: Vec<String>,
+}
+
 /// Result of a supply solve; serialized verbatim into the placement ledger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -381,6 +397,10 @@ pub struct SupplyDecision {
     pub deferred: bool,
     /// Earliest cooldown horizon worth retrying at (epoch seconds).
     pub deferred_until: Option<i64>,
+    /// Set when an explicit pin matched no listed candidate. This is a hard
+    /// refusal, not a deferral: the caller must fail, never substitute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_refusal: Option<PinRefusal>,
 }
 
 impl SupplyDecision {
@@ -823,11 +843,205 @@ fn rank_cmp(a: &Evaluated, b: &Evaluated, input: &SolveInput<'_>) -> std::cmp::O
         .then_with(|| ca.model_id.cmp(&cb.model_id))
 }
 
+// ── hard-pin refusal (§4.3) ────────────────────────────────────────────────
+
+/// Split a lowered model id into comparison tokens, e.g.
+/// `passthrough/ark/seed-evolving[1m]` → `{passthrough, ark, seed, evolving, 1m}`.
+/// Caller passes an already-lowercased id (see [`suggestion_score`]).
+fn pin_tokens(lowered: &str) -> HashSet<&str> {
+    lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Drop bracket/colon qualifiers from a path segment so `seed-evolving[1m]`
+/// and `seed-evolving` compare as the same model tail.
+fn loose_tail(segment: &str) -> &str {
+    segment.split(['[', ':']).next().unwrap_or(segment)
+}
+
+/// How strongly a listed id resembles a pinned id. Higher is closer; zero
+/// means no shared structure (the id is not offered as a suggestion).
+///
+/// Signals, strongest first: exact id; listed id ending in the pin
+/// (`ark/seed-evolving` → `passthrough/ark/seed-evolving`); shared `/`
+/// segments from the tail; qualifier-insensitive equal tail; shared
+/// family/name tokens; small Levenshtein term only to break near-ties.
+fn suggestion_score(wanted: &str, listed: &str) -> i64 {
+    let w = wanted.to_ascii_lowercase();
+    let l = listed.to_ascii_lowercase();
+    if l == w {
+        return 10_000;
+    }
+    let mut score = 0;
+    if l.ends_with(&format!("/{w}")) {
+        score += 100;
+    }
+    let wsegs: Vec<&str> = w.split('/').collect();
+    let lsegs: Vec<&str> = l.split('/').collect();
+    let shared_tail = wsegs
+        .iter()
+        .rev()
+        .zip(lsegs.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    score += (shared_tail as i64) * 100;
+    if shared_tail == 0
+        && let (Some(w_last), Some(l_last)) = (wsegs.last(), lsegs.last())
+        && loose_tail(w_last) == loose_tail(l_last)
+    {
+        score += 60;
+    }
+    let wtoks = pin_tokens(&w);
+    let shared_tokens = wtoks.intersection(&pin_tokens(&l)).count() as i64;
+    score += shared_tokens * 10;
+    // Edit similarity only refines ordering between structurally equal hits;
+    // a single shared token (10) always outranks a fuzzy string.
+    let distance = levenshtein(&w, &l) as f64;
+    let similarity = 1.0 - distance / w.len().max(l.len()) as f64;
+    if similarity > 0.5 {
+        score += (similarity * 8.0) as i64;
+    }
+    score
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.chars().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((cur[j] + 1).min(prev[j + 1] + 1).min(prev[j] + cost));
+        }
+        prev = cur;
+    }
+    *prev.last().unwrap_or(&0)
+}
+
+/// Up to five closest listed ids for a pin, ranked by [`suggestion_score`].
+fn suggest_listed(wanted: &str, listed: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut scored: Vec<(i64, String)> = listed
+        .into_iter()
+        .map(|id| (suggestion_score(wanted, &id), id))
+        .filter(|(score, _)| *score >= 10)
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut seen = HashSet::new();
+    scored
+        .into_iter()
+        .map(|(_, id)| id)
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// Build the hard refusal for a pin matched by no candidate.
+///
+/// `candidates` is the full built (pre-filter) candidate set, so the caller
+/// can distinguish "not listed anywhere" from "listed, but not on a profile
+/// eligible for this placement".
+fn build_pin_refusal(input: &SolveInput<'_>, candidates: &[SupplyCandidate]) -> Option<PinRefusal> {
+    let pin = input.task.pin.as_ref()?;
+    if pin.model.is_none() && pin.supply_id.is_none() {
+        return None;
+    }
+    if candidates.iter().any(|candidate| candidate.pinned) {
+        return None;
+    }
+
+    let mut reasons = Vec::new();
+    let enabled_model = |wanted: &str, profile: &ProviderRecord| {
+        profile.models.iter().any(|m| m.enabled && m.id == wanted)
+    };
+    if let Some(wanted) = pin.model.as_deref() {
+        let listed_anywhere = input
+            .profiles
+            .iter()
+            .any(|profile| enabled_model(wanted, profile));
+        reasons.push(if listed_anywhere {
+            format!(
+                "pinned model {wanted:?} is listed but not offered by any profile eligible for \
+this placement — a pin is a hard constraint; dispatch refused, never substituted"
+            )
+        } else {
+            format!(
+                "pinned model {wanted:?} is not listed by any provider profile — a pin is a hard \
+constraint; dispatch refused, never substituted"
+            )
+        });
+    }
+    if let Some(supply) = pin.supply_id.as_deref() {
+        let exists = input.profiles.iter().any(|profile| profile.id == supply);
+        reasons.push(if exists {
+            format!(
+                "pinned supply {supply:?} is not eligible for this placement — dispatch refused"
+            )
+        } else {
+            format!(
+                "pinned supply {supply:?} is not a configured provider profile — dispatch refused"
+            )
+        });
+    }
+
+    // Suggestion pool: all enabled listed models for a model pin, profile ids
+    // for a supply-only pin.
+    let mut suggestions: Vec<String> = Vec::new();
+    if let Some(wanted) = pin.model.as_deref() {
+        let listed = input
+            .profiles
+            .iter()
+            .flat_map(|profile| profile.models.iter())
+            .filter(|model| model.enabled)
+            .map(|model| model.id.clone());
+        suggestions = suggest_listed(wanted, listed);
+    } else if let Some(supply) = pin.supply_id.as_deref() {
+        suggestions = suggest_listed(
+            supply,
+            input.profiles.iter().map(|profile| profile.id.clone()),
+        );
+    }
+    suggestions.truncate(5);
+    if suggestions.is_empty() {
+        reasons.push(
+            "no similar listed ids; run `remuda profile list` for the configured catalog".into(),
+        );
+    } else {
+        for id in &suggestions {
+            reasons.push(format!("did you mean {id:?}?"));
+        }
+    }
+    Some(PinRefusal {
+        pin: serde_json::to_value(pin).unwrap_or_else(|_| json!({})),
+        reasons,
+        suggestions,
+    })
+}
+
+/// Informational warning when an honored pin selects a model other than the
+/// project's declared workhorse. This is **never** a refusal — the pin is the
+/// explicit choice — but operators tracking a Fable-free roster want it loud.
+#[must_use]
+pub fn pin_workhorse_warning(
+    chosen_model: &str,
+    project_workhorse: Option<&str>,
+    explicit_pin: bool,
+) -> Option<String> {
+    let workhorse = project_workhorse?;
+    if !explicit_pin || workhorse == chosen_model {
+        return None;
+    }
+    Some(format!(
+        "pinned model {chosen_model:?} differs from the project workhorse {workhorse:?}; \
+honoring the pin (informational)"
+    ))
+}
+
 /// Run the full §4.4 solve over stored profiles/hosts and a task spec.
 #[must_use]
 pub fn solve(input: SolveInput<'_>) -> SupplyDecision {
     let raw = build_candidates(&input);
     let mut evaluated: Vec<Evaluated> = raw
+        .clone()
         .into_iter()
         .map(|candidate| evaluate(candidate, &input))
         .collect();
@@ -836,19 +1050,35 @@ pub fn solve(input: SolveInput<'_>) -> SupplyDecision {
     // class filters, but still report other candidates in the ledger.
     if let Some(pin) = input.task.pin.as_ref()
         && (pin.model.is_some() || pin.supply_id.is_some())
-        && let Some(pos) = evaluated.iter().position(|ev| ev.candidate.pinned)
     {
-        let winner = evaluated.remove(pos);
-        let others = evaluated
-            .into_iter()
-            .map(|ev| RejectedSupply {
-                profile_id: ev.candidate.profile_id.clone(),
-                profile_name: ev.candidate.profile_name.clone(),
-                model_id: ev.candidate.model_id.clone(),
-                reasons: vec!["not the pinned harness/model/supply".into()],
-            })
-            .collect();
-        return finish(vec![winner], others, &input, true);
+        // No candidate carries the pin: hard refusal (§4.3). No chosen model,
+        // not `deferred` (nothing to retry later) — the request is invalid
+        // against the configured catalog.
+        let refusal = build_pin_refusal(&input, &raw);
+        if let Some(refusal) = refusal {
+            return SupplyDecision {
+                chosen: None,
+                ranked: Vec::new(),
+                rejected: Vec::new(),
+                reasons: refusal.reasons.clone(),
+                deferred: false,
+                deferred_until: None,
+                pin_refusal: Some(refusal),
+            };
+        }
+        if let Some(pos) = evaluated.iter().position(|ev| ev.candidate.pinned) {
+            let winner = evaluated.remove(pos);
+            let others = evaluated
+                .into_iter()
+                .map(|ev| RejectedSupply {
+                    profile_id: ev.candidate.profile_id.clone(),
+                    profile_name: ev.candidate.profile_name.clone(),
+                    model_id: ev.candidate.model_id.clone(),
+                    reasons: vec!["not the pinned harness/model/supply".into()],
+                })
+                .collect();
+            return finish(vec![winner], others, &input, true);
+        }
     }
 
     let mut admitted: Vec<Evaluated> = Vec::new();
@@ -958,6 +1188,7 @@ fn finish(
         reasons,
         deferred,
         deferred_until,
+        pin_refusal: None,
     }
 }
 
@@ -1117,6 +1348,18 @@ pub async fn solve_state(
     }))
 }
 
+/// Build the HTTP 409 refusal for a [`PinRefusal`]; every admission entry
+/// point (dispatch, instance create, supply resolve) returns this verbatim so
+/// an unmatched pin can never diverge into a launch.
+#[must_use]
+pub fn pin_refused_error(refusal: &PinRefusal) -> HubError {
+    HubError::PinRefused {
+        pin: refusal.pin.clone(),
+        reasons: refusal.reasons.clone(),
+        suggestions: refusal.suggestions.clone(),
+    }
+}
+
 /// Routes for supply solving/dry-runs. Per-profile declaration and observed
 /// events live under `/v1/providers/{id}/supply*` (see `providers.rs`).
 pub fn routes() -> Router<AppState> {
@@ -1229,6 +1472,9 @@ async fn resolve_supply_http(
     let hosts = outcome.hosts;
     let coordinator = caller_is_coordinator(&state, &headers).await?;
     let decision = solve_state(&state, &body.task_spec, &hosts, coordinator).await?;
+    if let Some(refusal) = &decision.pin_refusal {
+        return Err(pin_refused_error(refusal));
+    }
     let mut value = decision.to_json();
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
@@ -1845,5 +2091,186 @@ mod tests {
         assert_eq!(wait(2), 300);
         assert_eq!(wait(3), 900);
         assert_eq!(wait(99), 900);
+    }
+
+    fn model_pin(model: &str) -> TaskSpec {
+        TaskSpec {
+            pin: Some(remuda_protocol::TaskPin {
+                harness: None,
+                model: Some(model.into()),
+                supply_id: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn supply_pin(supply_id: &str) -> TaskSpec {
+        TaskSpec {
+            pin: Some(remuda_protocol::TaskPin {
+                harness: None,
+                model: None,
+                supply_id: Some(supply_id.into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unknown_model_pin_is_refused_not_substituted_with_suggestions() {
+        let profiles = vec![profile_with(
+            "pvp_passthrough",
+            "passthrough",
+            remuda_protocol::SupplyProfile::default(),
+            vec![
+                model("passthrough/ark/seed-evolving", "ark", "workhorse", 20),
+                model("passthrough/ark/seed-legacy", "ark", "workhorse", 10),
+                model("gw/totally-unrelated[1m]", "other", "workhorse", 5),
+            ],
+        )];
+        let hosts = [host("hst_a", 8, 0)];
+        // The 2026-09-17 incident shape: the pin carries the [1m] tag the
+        // catalog id omits and lacks the `passthrough/` prefix.
+        let decision = solve(input(
+            &profiles,
+            &hosts,
+            &model_pin("ark/seed-evolving[1m]"),
+            &InFlight::default(),
+        ));
+        let refusal = decision.pin_refusal.as_ref().expect("hard refusal");
+        assert!(decision.chosen.is_none(), "no silent substitution");
+        assert!(
+            !decision.deferred,
+            "a refusal is not a retry-later deferral"
+        );
+        assert_eq!(refusal.suggestions[0], "passthrough/ark/seed-evolving");
+        assert!(
+            refusal
+                .suggestions
+                .contains(&"passthrough/ark/seed-legacy".to_string()),
+            "{refusal:?}"
+        );
+        // The merely `1m`-tag-sharing unrelated id ranks below same-family ids.
+        assert_eq!(
+            refusal.suggestions.last().unwrap(),
+            "gw/totally-unrelated[1m]"
+        );
+        assert!(
+            refusal
+                .reasons
+                .iter()
+                .any(|r| r.contains("not listed by any provider profile"))
+        );
+        assert!(
+            refusal
+                .reasons
+                .iter()
+                .any(|r| r.contains("did you mean \"passthrough/ark/seed-evolving\""))
+        );
+
+        // Exact suffix shape (no [1m] tag) is the strongest possible hint.
+        let decision = solve(input(
+            &profiles,
+            &hosts,
+            &model_pin("ark/seed-evolving"),
+            &InFlight::default(),
+        ));
+        let refusal = decision.pin_refusal.as_ref().unwrap();
+        assert_eq!(refusal.suggestions[0], "passthrough/ark/seed-evolving");
+    }
+
+    #[test]
+    fn refusal_suggestions_are_capped_at_five() {
+        let models: Vec<ProviderModel> = (0..6)
+            .map(|i| model(&format!("passthrough/ark/seed-{i}"), "ark", "workhorse", 10))
+            .collect();
+        let profiles = vec![profile_with(
+            "pvp_passthrough",
+            "passthrough",
+            remuda_protocol::SupplyProfile::default(),
+            models,
+        )];
+        let hosts = [host("hst_a", 8, 0)];
+        let decision = solve(input(
+            &profiles,
+            &hosts,
+            &model_pin("ark/seed-evolving[1m]"),
+            &InFlight::default(),
+        ));
+        let refusal = decision.pin_refusal.as_ref().unwrap();
+        assert_eq!(refusal.suggestions.len(), 5, "{refusal:?}");
+        let did_you_mean = refusal
+            .reasons
+            .iter()
+            .filter(|r| r.starts_with("did you mean"))
+            .count();
+        assert_eq!(did_you_mean, 5);
+    }
+
+    #[test]
+    fn unknown_supply_pin_is_refused() {
+        let profiles = vec![profile_with(
+            "pvp_real",
+            "real",
+            remuda_protocol::SupplyProfile::default(),
+            vec![model("gw/work[1m]", "work", "workhorse", 10)],
+        )];
+        let hosts = [host("hst_a", 8, 0)];
+        let decision = solve(input(
+            &profiles,
+            &hosts,
+            &supply_pin("pvp_does_not_exist"),
+            &InFlight::default(),
+        ));
+        let refusal = decision.pin_refusal.as_ref().expect("hard refusal");
+        assert!(decision.chosen.is_none());
+        assert!(!decision.deferred);
+        assert!(
+            refusal
+                .reasons
+                .iter()
+                .any(|r| r.contains("not a configured provider profile"))
+        );
+    }
+
+    #[test]
+    fn known_pin_is_honored_without_refusal() {
+        let profiles = vec![profile_with(
+            "pvp_passthrough",
+            "passthrough",
+            remuda_protocol::SupplyProfile::default(),
+            vec![
+                model("passthrough/ark/seed-evolving", "ark", "workhorse", 5),
+                model("claude-fable-5.1", "fable", "frontier", 99),
+            ],
+        )];
+        let hosts = [host("hst_a", 8, 0)];
+        let decision = solve(input(
+            &profiles,
+            &hosts,
+            &model_pin("passthrough/ark/seed-evolving"),
+            &InFlight::default(),
+        ));
+        assert!(decision.pin_refusal.is_none());
+        let chosen = decision.chosen.expect("the pin is listed, it wins");
+        assert_eq!(chosen.model_id, "passthrough/ark/seed-evolving");
+        assert_eq!(chosen.profile_id, "pvp_passthrough");
+        // The higher-priority fable row must NOT replace the pin.
+        assert_eq!(decision.ranked.len(), 1);
+    }
+
+    #[test]
+    fn workhorse_warning_is_informational_only() {
+        assert!(
+            pin_workhorse_warning("claude-fable-5.1", Some("claude-sonnet-5"), true)
+                .is_some_and(|w| w.contains("differs from the project workhorse"))
+        );
+        // Same model, no warning.
+        assert!(pin_workhorse_warning("claude-sonnet-5", Some("claude-sonnet-5"), true).is_none());
+        // Auto-selected model (no explicit pin), no warning.
+        assert!(
+            pin_workhorse_warning("claude-fable-5.1", Some("claude-sonnet-5"), false).is_none()
+        );
+        // Project declares no workhorse, no warning.
+        assert!(pin_workhorse_warning("claude-fable-5.1", None, true).is_none());
     }
 }

@@ -303,6 +303,7 @@ pub(crate) async fn dispatch_core(
     let mut provider_profile_id: Option<String> = None;
     let mut delegation: Option<String> = None;
     let mut supply_decision: Option<Value> = None;
+    let mut admission_warnings: Vec<String> = Vec::new();
     let profiles = state.store.list_providers(None).await.map_err(map_store)?;
     let supply_declared = !profiles.is_empty() || project.provider.profile_id.is_some();
     if supply_declared {
@@ -310,6 +311,11 @@ pub(crate) async fn dispatch_core(
         let decision =
             crate::supply::solve_state(&state, &task_spec, std::slice::from_ref(&host), true)
                 .await?;
+        // A pin matched nothing: hard 409 before any name/port allocation or
+        // Node provisioning (§4.3 — refuse, never substitute).
+        if let Some(refusal) = &decision.pin_refusal {
+            return Err(crate::supply::pin_refused_error(refusal));
+        }
         if decision.deferred {
             return Err(HubError::SupplyDeferred {
                 decision: decision.to_json(),
@@ -334,7 +340,16 @@ pub(crate) async fn dispatch_core(
         let chosen = decision
             .chosen
             .as_ref()
-            .expect("non-deferred supply decision has a choice");
+            .expect("non-deferred, non-refused supply decision has a choice");
+        // Informational only: an honored pin that diverges from the project's
+        // declared workhorse (e.g. an explicit frontier on a workhorse task).
+        if let Some(warning) = crate::supply::pin_workhorse_warning(
+            &chosen.model_id,
+            project.model_roles.workhorse.as_deref(),
+            body.model.is_some(),
+        ) {
+            admission_warnings.push(warning);
+        }
         model = Some(chosen.model_id.clone());
         provider_profile_id = Some(chosen.profile_id.clone());
         let profile = state
@@ -589,7 +604,7 @@ pub(crate) async fn dispatch_core(
     Ok(Json(json!({
         "worker": row,
         "instanceId": instance.instance_id,
-        "warnings": placement_warnings,
+        "warnings": placement_warnings.into_iter().chain(admission_warnings).collect::<Vec<_>>(),
     })))
 }
 

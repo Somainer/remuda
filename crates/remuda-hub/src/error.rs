@@ -64,6 +64,18 @@ pub enum HubError {
         /// Machine-readable supply decision for the ledger/bot card.
         decision: serde_json::Value,
     },
+    /// An explicit model/supply pin matched no configured candidate. A pin is
+    /// a hard constraint (coordinator §4.3): the request fails instead of
+    /// silently running a different model.
+    #[error("pin refused: no listed model/supply matches the pin")]
+    PinRefused {
+        /// The rejected pin (`model` / `supplyId` / `harness`).
+        pin: serde_json::Value,
+        /// Human-readable reasons: the pin plus up to five `did you mean` ids.
+        reasons: Vec<String>,
+        /// Closest listed ids (≤5).
+        suggestions: Vec<String>,
+    },
     /// SQLite or journal actor mailbox.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
@@ -87,6 +99,7 @@ impl HubError {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             Self::SupplyDeferred { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Self::PinRefused { .. } => StatusCode::CONFLICT,
             Self::HostOffline { .. } => StatusCode::CONFLICT,
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -105,6 +118,7 @@ impl HubError {
             Self::Unsatisfiable { .. } => "PLACEMENT_UNSATISFIABLE",
             Self::ProviderNotConfigured { .. } => "PROVIDER_NOT_CONFIGURED",
             Self::SupplyDeferred { .. } => "SUPPLY_DEFERRED",
+            Self::PinRefused { .. } => "PIN_REFUSED",
             Self::HostOffline { .. } => "HOST_OFFLINE",
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
@@ -135,6 +149,17 @@ impl IntoResponse for HubError {
             for (key, value) in decision {
                 obj.insert(key.clone(), value.clone());
             }
+        }
+        if let Self::PinRefused {
+            pin,
+            reasons,
+            suggestions,
+        } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("pin".into(), pin.clone());
+            obj.insert("reasons".into(), json!(reasons));
+            obj.insert("suggestions".into(), json!(suggestions));
         }
         if let Self::Superseded { winner } = &self
             && !winner.is_empty()

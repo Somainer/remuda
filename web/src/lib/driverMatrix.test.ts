@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defaultDriver, launchPreview, legacyDrivers, shellPtyAllowed, type HostMatrix } from "./driverMatrix";
+import { DRIVER_LABELS, defaultDriver, launchPreview, legacyDrivers, shellPtyAllowed, type HostMatrix } from "./driverMatrix";
 
 const withCli = (kinds: string[]): HostMatrix => ({
   cli: kinds.map((kind) => ({ kind, installed: true })),
@@ -68,6 +68,33 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
   it("keeps the legacy drivers selectable but secondary", () => {
     expect(legacyDrivers("claude")).toEqual(["claude-pty", "generic-pty", "claude-print"]);
     expect(legacyDrivers("grok")).toEqual(["generic-pty"]);
+  });
+
+  it("never defaults to claude-print for any host shape (D-035)", () => {
+    // A print session ends after one turn and needs a manual resume, so it is a
+    // diagnostic carrier chosen explicitly — never a default and never a
+    // fallback. Every reachable host shape is checked, including the ones that
+    // report print as the only launchable driver.
+    const shapes: HostMatrix[] = [
+      {},
+      { cli: [] },
+      withCli(["claude"]),
+      { ...withCli(["claude"]), capabilities: null },
+      { ...withCli(["claude"]), capabilities: { driverInventory: [] } },
+      { ...withCli(["claude"]), capabilities: { driverInventory: [{ kind: "shell-pty", launchable: true }] } },
+      { ...withCli(["claude"]), capabilities: { driverInventory: [{ kind: "shell-pty", launchable: false }] } },
+      { ...withCli(["claude"]), capabilities: { driverInventory: [{ kind: "claude-print", launchable: true }] } },
+    ];
+    for (const host of shapes) {
+      for (const kind of ["claude", "codex", "grok", "agy"] as const) {
+        expect(defaultDriver(host, kind)).not.toBe("claude-print");
+      }
+      expect(defaultDriver(host, "terminal")).not.toBe("claude-print");
+    }
+  });
+
+  it("labels claude-print as diagnostic so the picker cannot read as a peer carrier", () => {
+    expect(DRIVER_LABELS["claude-print"]).toContain("诊断");
   });
 
   it("previews the materialized argv summary per kind", () => {

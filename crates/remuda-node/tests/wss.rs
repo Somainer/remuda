@@ -1418,7 +1418,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","grants":["dispatch"],"prompt":"human-origin"})),
+        Some(json!({"hostId":host,"driver":"claude-print","claudeConfigDir":claude_config,"permissionMode":"bypassPermissions","grants":["dispatch"],"prompt":"human-origin"})),
         None,
     )
     .await;
@@ -1471,7 +1471,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
     .await;
     assert_eq!(status, 403, "{denied_enrollment}");
 
-    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"claudeConfigDir":claude_config,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
+    let (status, child) = request(hub.addr, agent, "/v1/instances", Some(json!({"hostId":host,"driver":"claude-print","claudeConfigDir":claude_config,"origin":"human","parentInstanceId":"forged","prompt":"agent-origin"})), None).await;
     assert_eq!(status, 200, "{child}");
     assert_eq!(child["instance"]["parentInstanceId"], parent_id);
     assert_eq!(child["command"]["payload"]["origin"], "agent");
@@ -1508,7 +1508,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
             hub.addr,
             agent,
             "/v1/instances",
-            Some(json!({"hostId":host,"permissionMode":mode})),
+            Some(json!({"hostId":host,"driver":"claude-print","permissionMode":mode})),
             None,
         )
         .await;
@@ -1532,7 +1532,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         &human,
         "/v1/instances",
-        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"manual"})),
+        Some(json!({"hostId":host,"driver":"claude-print","claudeConfigDir":claude_config,"permissionMode":"manual"})),
         None,
     )
     .await;
@@ -1749,7 +1749,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         agent,
         "/v1/instances",
-        Some(json!({"hostId":remote_id})),
+        Some(json!({"hostId":remote_id,"driver":"claude-print"})),
         None,
     )
     .await;
@@ -1764,7 +1764,7 @@ async fn wss_authenticated_origin_parent_scope_and_one_shot_human_approval() {
         hub.addr,
         bot,
         "/v1/instances",
-        Some(json!({"hostId":host,"claudeConfigDir":claude_config,"permissionMode":"bypassPermissions"})),
+        Some(json!({"hostId":host,"driver":"claude-print","claudeConfigDir":claude_config,"permissionMode":"bypassPermissions"})),
         None,
     )
     .await;

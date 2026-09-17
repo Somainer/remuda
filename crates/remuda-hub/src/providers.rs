@@ -557,6 +557,14 @@ pub async fn with_launch_secret(
     let Some(profile) = state.store.get_provider(profile_id).await? else {
         return Ok(params);
     };
+    // A `native`-kind profile holds no token by design — the CLI on the host uses
+    // its own login. Checked by kind, not just by the `"native"` alias string,
+    // because a native profile referenced by its real `pvp_…` id passed the alias
+    // guard above and then demanded a secret that cannot exist, failing dispatch
+    // with "provider profile has no stored auth token".
+    if profile.kind == "native" {
+        return Ok(params);
+    }
     if !provider_resolve::secret_release_allowed(&profile, host_id) {
         return Err(HubError::Forbidden);
     }

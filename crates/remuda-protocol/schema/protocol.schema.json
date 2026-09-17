@@ -19189,6 +19189,13 @@
           "$ref": "#/$defs/Timestamp",
           "description": "`created_at`; protocol §1.1."
         },
+        "driver": {
+          "description": "Carrier driver the agent **actually** launched on, as reported back by\nthe Node's create result (`shell-pty` / `claude-pty` / …).\n\nRecorded from the Node's answer rather than from the Hub's request: the\ntwo diverged silently once (a roster row said `claude-pty` while the Node\nran `claude-print`), which made every screen read and nudge on that\nworker inexplicable. Absent on rows written before this field existed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "harness": {
           "description": "Harness kind (`claude` / `codex` / `grok`).",
           "type": "string"

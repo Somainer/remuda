@@ -100,12 +100,10 @@ pub(crate) struct DispatchBody {
     /// `local` / `remote` tendency; resolved against project member hosts.
     #[serde(default)]
     pub(crate) placement: Option<String>,
-    /// Optional explicit driver override. Defaults to the harness/herdr choice
-    /// (claude-pty on a herdr host, claude-print otherwise); `shell-pty` selects
-    /// the Node's native PTY carrier, which serves a readable live screen for
-    /// `remuda watch` (D-028).
-    /// Explicit driver override (`claude-pty` / `shell-pty` / `claude-print`)
-    /// kept from batch 5a; batch 6 adds the higher-level `carrier` preference.
+    /// Optional explicit driver override. Honoured verbatim or refused with a
+    /// reason (409), never silently replaced. The default prefers the Node's
+    /// native `shell-pty` carrier when it reports the carrier launchable, then
+    /// herdr's `claude-pty`; `claude-print` is never a default (D-035).
     #[serde(default)]
     pub(crate) driver: Option<String>,
     /// Carrier preference batch 6 (D-034): `native` (shell-pty), `herdr`, or
@@ -401,6 +399,15 @@ pub(crate) async fn dispatch_core(
     }
     let port_block = allocate_port_block(&state, &project, &host.host_id).await?;
 
+    // ── carrier choice, before anything is provisioned ─────────────────────
+    // An explicit driver/carrier is honoured verbatim or refused; the default
+    // comes from what this host reports it can actually launch. Deciding here
+    // means a refusal costs no worktree, so there is nothing to roll back.
+    let driver = match body.driver.as_deref() {
+        Some(explicit) => select_worker_driver(&harness, explicit, &host)?,
+        None => select_carrier(&harness, &host, body.carrier.as_deref())?,
+    };
+
     // ── provision through the Node (worktree + target dir) ─────────────────
     let provision = crate::http::call_node(
         &state,
@@ -425,10 +432,6 @@ pub(crate) async fn dispatch_core(
         .map(str::to_string);
 
     // ── launch env: per-worker target dir, build cap, port block ───────────
-    let driver = match body.driver.as_deref() {
-        Some(explicit) => select_worker_driver(&harness, explicit)?,
-        None => select_carrier(&harness, &host, body.carrier.as_deref())?,
-    };
     let extra_env = worker_extra_env(target_dir.as_deref(), port_block.as_deref());
     let mut spec = worker_launch_spec(
         &harness,
@@ -484,128 +487,214 @@ pub(crate) async fn dispatch_core(
         task_id: task.as_ref().map(|task| task.meta.id.as_id().to_string()),
         enforce_tree: true,
     };
-    let (instance, command) = crate::placement::spawn_on_host(
-        &state,
-        &host,
-        crate::placement::SpawnRequest {
-            kind: harness.clone(),
-            driver,
-            workspace_id: Some(workspace_id.as_id().to_string()),
-            title: Some(name.clone()),
-            prompt: None,
-            spec: spec.clone(),
-            operation: "instance.create",
-            idempotency_key: None,
-            delegation: delegation_tree,
-        },
-    )
-    .await?;
+    // Capture what a rollback needs before the block below moves these.
+    let rollback_name = name.clone();
+    let rollback_workspace = workspace_id.clone();
+    let requested_driver = driver.clone();
 
-    // An explicit --host pin over its CPU/mem ceiling was admitted, not
-    // refused: journal the saturation so the worker session shows why.
-    for warning in &placement_warnings {
-        crate::ws::publish_hub_diagnostic(
+    // Everything from here on runs with a worktree and target dir already on
+    // the Node. No roster row exists yet, so `remuda retire` cannot reclaim
+    // them — a failure that merely returned would leak both and force manual
+    // cleanup (observed 2026-09-17; D-035). One unwind point covers it.
+    let dispatched = async {
+        let (instance, command) = crate::placement::spawn_on_host(
+            &state,
+            &host,
+            crate::placement::SpawnRequest {
+                kind: harness.clone(),
+                driver,
+                workspace_id: Some(workspace_id.as_id().to_string()),
+                title: Some(name.clone()),
+                prompt: None,
+                spec: spec.clone(),
+                operation: "instance.create",
+                idempotency_key: None,
+                delegation: delegation_tree,
+            },
+        )
+        .await?;
+
+        // An explicit --host pin over its CPU/mem ceiling was admitted, not
+        // refused: journal the saturation so the worker session shows why.
+        for warning in &placement_warnings {
+            crate::ws::publish_hub_diagnostic(
+                &state,
+                &instance.instance_id,
+                "placement_resource_warning",
+                warning,
+            )
+            .await;
+        }
+
+        // ── deliver the brief as an object attachment, then prompt ────────────
+        let brief_name = body
+            .brief_name
+            .as_deref()
+            .map(sanitize_brief_name)
+            .transpose()
+            .map_err(|bad| HubError::BadRequest(format!("invalid brief name {bad}")))?
+            .unwrap_or_else(|| "brief.md".into());
+        let (object_id, send_payload) = stage_brief(
             &state,
             &instance.instance_id,
-            "placement_resource_warning",
-            warning,
+            &host.host_id,
+            &device.id,
+            &body.brief,
+            &brief_name,
         )
-        .await;
+        .await?;
+        let (send_command, _) = state
+            .store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host.host_id.clone(),
+                "instance.send".into(),
+                send_payload,
+                None,
+            )
+            .await
+            .map_err(map_store)?;
+        let live = state.nodes.kind_of(&host.host_id).await.is_some();
+        let _send = crate::http::forward_if_online(&state, send_command, live).await?;
+
+        // What the Node actually built. `spawn_on_host` forwarded the create and
+        // `forward_if_online` reconciled the instance row from the Node's reply, so
+        // re-reading the row is what tells us whether the request was honoured.
+        let ran_driver = state
+            .store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .map_err(map_store)?
+            .map(|record| record.driver)
+            .filter(|driver| !driver.is_empty())
+            .unwrap_or_else(|| requested_driver.clone());
+        if ran_driver != requested_driver {
+            crate::ws::publish_hub_diagnostic(
+                &state,
+                &instance.instance_id,
+                "driver_downgraded",
+                &format!("requested driver {requested_driver} but the node built {ran_driver}"),
+            )
+            .await;
+        }
+
+        // ── roster row ─────────────────────────────────────────────────────────
+        let now = crate::config::now_rfc3339();
+        let worker = WorkerRoster {
+            meta: EntityMeta {
+                id: WorkerRosterId::new(),
+                revision: U64(1),
+                created_at: remuda_protocol::Timestamp::try_from(now.clone())
+                    .map_err(|err| HubError::Internal(err.to_string()))?,
+                updated_at: remuda_protocol::Timestamp::try_from(now)
+                    .map_err(|err| HubError::Internal(err.to_string()))?,
+            },
+            project_id: project.meta.id.clone(),
+            name,
+            instance_id: Some(instance.instance_id.parse().map_err(
+                |err: remuda_protocol::WireValueError| HubError::BadRequest(err.to_string()),
+            )?),
+            host_id: host
+                .host_id
+                .parse()
+                .map_err(|err: remuda_protocol::WireValueError| {
+                    HubError::BadRequest(err.to_string())
+                })?,
+            workspace_id,
+            harness,
+            // The driver the Node reports it actually built, read back from the
+            // instance row `forward_if_online` reconciled from the create reply —
+            // not the one the Hub asked for. These diverged silently before
+            // (D-035; docs/design/evidence/dispatch-driver-1.md).
+            driver: Some(ran_driver),
+            model,
+            provider_profile_id,
+            branch,
+            worktree_path,
+            port_block,
+            target_dir,
+            brief_object_id: Some(object_id),
+            task_id: task.as_ref().map(|task| task.meta.id.clone()),
+            state: WorkerState::Working,
+            watch: None,
+            last_nudge_at: None,
+            resumed_from: None,
+            replace_count: None,
+            supply_decision,
+            reclaimed_bytes: None,
+        };
+        let row = state
+            .store
+            .insert_worker(worker, device.id.clone())
+            .await
+            .map_err(map_store)?;
+        let _ = command;
+        state
+            .store
+            .append_audit(
+                device.id,
+                "worker.dispatch".into(),
+                Some(row.meta.id.as_id().to_string()),
+                json!({ "project": row.project_id.as_id(), "host": row.host_id.as_id() }),
+            )
+            .await
+            .map_err(map_store)?;
+        Ok::<_, HubError>((row, instance))
     }
-
-    // ── deliver the brief as an object attachment, then prompt ────────────
-    let brief_name = body
-        .brief_name
-        .as_deref()
-        .map(sanitize_brief_name)
-        .transpose()
-        .map_err(|bad| HubError::BadRequest(format!("invalid brief name {bad}")))?
-        .unwrap_or_else(|| "brief.md".into());
-    let (object_id, send_payload) = stage_brief(
-        &state,
-        &instance.instance_id,
-        &host.host_id,
-        &device.id,
-        &body.brief,
-        &brief_name,
-    )
-    .await?;
-    let (send_command, _) = state
-        .store
-        .queue_command(
-            None,
-            Some(instance.instance_id.clone()),
-            host.host_id.clone(),
-            "instance.send".into(),
-            send_payload,
-            None,
-        )
-        .await
-        .map_err(map_store)?;
-    let live = state.nodes.kind_of(&host.host_id).await.is_some();
-    let _send = crate::http::forward_if_online(&state, send_command, live).await?;
-
-    // ── roster row ─────────────────────────────────────────────────────────
-    let now = crate::config::now_rfc3339();
-    let worker = WorkerRoster {
-        meta: EntityMeta {
-            id: WorkerRosterId::new(),
-            revision: U64(1),
-            created_at: remuda_protocol::Timestamp::try_from(now.clone())
-                .map_err(|err| HubError::Internal(err.to_string()))?,
-            updated_at: remuda_protocol::Timestamp::try_from(now)
-                .map_err(|err| HubError::Internal(err.to_string()))?,
-        },
-        project_id: project.meta.id.clone(),
-        name,
-        instance_id: Some(instance.instance_id.parse().map_err(
-            |err: remuda_protocol::WireValueError| HubError::BadRequest(err.to_string()),
-        )?),
-        host_id: host
-            .host_id
-            .parse()
-            .map_err(|err: remuda_protocol::WireValueError| {
-                HubError::BadRequest(err.to_string())
-            })?,
-        workspace_id,
-        harness,
-        model,
-        provider_profile_id,
-        branch,
-        worktree_path,
-        port_block,
-        target_dir,
-        brief_object_id: Some(object_id),
-        task_id: task.as_ref().map(|task| task.meta.id.clone()),
-        state: WorkerState::Working,
-        watch: None,
-        last_nudge_at: None,
-        resumed_from: None,
-        replace_count: None,
-        supply_decision,
-        reclaimed_bytes: None,
+    .await;
+    let (row, instance) = match dispatched {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_provisioned(
+                &state,
+                &host.host_id,
+                &rollback_name,
+                &rollback_workspace,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
     };
-    let row = state
-        .store
-        .insert_worker(worker, device.id.clone())
-        .await
-        .map_err(map_store)?;
-    let _ = command;
-    state
-        .store
-        .append_audit(
-            device.id,
-            "worker.dispatch".into(),
-            Some(row.meta.id.as_id().to_string()),
-            json!({ "project": row.project_id.as_id(), "host": row.host_id.as_id() }),
-        )
-        .await
-        .map_err(map_store)?;
     Ok(Json(json!({
         "worker": row,
         "instanceId": instance.instance_id,
         "warnings": placement_warnings.into_iter().chain(admission_warnings).collect::<Vec<_>>(),
     })))
+}
+
+/// Give back the worktree and target dir `worker.provision` created, when a
+/// later dispatch step failed before any roster row existed.
+///
+/// Best effort by construction: the caller is already returning the original
+/// error, and a reclaim that also fails must not replace it with a less useful
+/// one. A failure here is logged so the leak is at least visible, never silent.
+async fn rollback_provisioned(
+    state: &AppState,
+    host_id: &str,
+    name: &str,
+    workspace_id: &remuda_protocol::WorkspaceId,
+    cause: &HubError,
+) {
+    match crate::http::call_node(
+        state,
+        host_id,
+        "worker.remove",
+        json!({ "name": name, "workspaceId": workspace_id.as_id() }),
+    )
+    .await
+    {
+        Ok(_) => tracing::warn!(
+            %host_id, %name, error = %cause,
+            "dispatch failed after provisioning; worktree and target dir reclaimed"
+        ),
+        Err(error) => tracing::error!(
+            %host_id, %name, rollback_error = %error, error = %cause,
+            "dispatch failed after provisioning and the reclaim failed too; \
+             worktree and target dir are leaked on the node"
+        ),
+    }
 }
 
 /// Select the dispatch host per §3.4: explicit host, else project members
@@ -630,8 +719,13 @@ async fn select_dispatch_host(
             project_id: project.meta.id.as_id().to_string(),
         }
     };
+    // Placement must not pre-judge the carrier: `claude-pty` here made
+    // `pick_hosts` reject every host without herdr, including a Node whose
+    // native `shell-pty` carrier can launch perfectly well. `shell-pty` carries
+    // no herdr requirement, so the driver choice stays with `driver_for` /
+    // `select_worker_driver`, which read what the host actually reports.
     let spec = crate::placement::PlaceSpec {
-        driver: "claude-pty".into(),
+        driver: "shell-pty".into(),
         delegation: None,
     };
     let outcome = crate::placement::pick_hosts(state, &placement, &spec).await?;
@@ -683,14 +777,18 @@ fn matches_tendency(
     }
 }
 
-/// Default carrier choice (used by resume, which cannot prompt): prefer the
-/// native shell-pty the Node advertises as launchable, then herdr, and only
-/// fall back to legacy print when neither carrier is available.
-pub(crate) fn driver_for(harness: &str, host: &HostRecord) -> String {
-    select_carrier(harness, host, None).unwrap_or_else(|_| match harness {
-        "codex" | "grok" => "generic-pty".to_string(),
-        _ => "claude-print".to_string(),
-    })
+/// Default carrier choice (used by resume, which cannot prompt): the native
+/// shell-pty the Node advertises as launchable, then herdr.
+///
+/// There is deliberately **no** print fallback. `claude-print` ends its session
+/// after one turn and then needs a manual resume, so a worker on it can never be
+/// nudged, steered or watched: a host that carries neither interactive carrier is
+/// refused with the reason instead of being downgraded into a product nobody
+/// asked for. That silent downgrade is exactly what once put a dispatch on
+/// `claude-print` while the roster said `claude-pty`
+/// (`docs/design/evidence/dispatch-driver-1.md`, D-035).
+pub(crate) fn driver_for(harness: &str, host: &HostRecord) -> Result<String, HubError> {
+    select_carrier(harness, host, None)
 }
 
 /// Whether the Node advertised `shell-pty` as launchable in its hello
@@ -751,11 +849,10 @@ pub(crate) fn select_carrier(
                 Ok("claude-pty".to_string())
             } else {
                 Err(HubError::Unsatisfiable {
-                    reasons: vec![
-                        "no launchable carrier on host (native shell-pty not advertised, no \
-                         herdr); pass --carrier print to select the legacy print carrier"
-                            .into(),
-                    ],
+                    reasons: vec![format!(
+                        "host {} can carry no interactive {harness} driver: it reports no launchable shell-pty (set REMUDA_PTY_CARRIER=native on the Node) and advertises no herdr; claude-print is never a default because it ends the session after one turn (D-035)",
+                        host.host_id
+                    )],
                 })
             }
         }
@@ -765,9 +862,32 @@ pub(crate) fn select_carrier(
 /// Validate an explicit `dispatch --driver` override. Only Claude may pick the
 /// native `shell-pty` / `claude-print` / `claude-pty` carriers; codex and grok
 /// always run on `generic-pty`.
-fn select_worker_driver(harness: &str, explicit: &str) -> Result<String, HubError> {
+fn select_worker_driver(
+    harness: &str,
+    explicit: &str,
+    host: &HostRecord,
+) -> Result<String, HubError> {
     match (harness, explicit) {
         ("claude", driver @ ("claude-pty" | "shell-pty" | "claude-print")) => {
+            // An operator instruction that this host cannot honour is refused
+            // with the reason, never quietly swapped for a carrier that works:
+            // that swap is how a dispatch recorded one product and ran another.
+            if driver == "shell-pty" && !native_carrier_works(host) {
+                return Err(HubError::Conflict(format!(
+                    "host {} does not report shell-pty as launchable; set \
+                     REMUDA_PTY_CARRIER=native on the Node or dispatch without --driver",
+                    host.host_id
+                )));
+            }
+            // `claude-pty` is the only allowlisted driver that needs herdr;
+            // `claude-bg` never reaches here (it is not in the match arm above).
+            if driver == "claude-pty" && host.herdr.as_ref().is_none_or(Value::is_null) {
+                return Err(HubError::Conflict(format!(
+                    "host {} advertises no herdr, which {driver} requires; dispatch without \
+                     --driver to use the native carrier",
+                    host.host_id
+                )));
+            }
             Ok(driver.to_string())
         }
         ("codex" | "grok", "generic-pty") => Ok("generic-pty".to_string()),
@@ -1470,4 +1590,181 @@ fn load_worker(conn: &Connection, id: &str) -> Result<Option<WorkerRoster>, Stor
     raw.map(|raw| serde_json::from_str(&raw))
         .transpose()
         .map_err(StoreError::from)
+}
+
+#[cfg(test)]
+mod driver_choice_tests {
+    use super::{driver_for, select_worker_driver};
+    use crate::error::HubError;
+    use crate::store::HostRecord;
+    use serde_json::json;
+
+    /// One host, described by what it says it can launch.
+    ///
+    /// `native` drives `capabilities.driverInventory[].launchable`, which is the
+    /// only honest report of whether `shell-pty` can run an *agent* here: with
+    /// `REMUDA_PTY_CARRIER` off the same descriptor arrives `launchable: false`,
+    /// because `shell-pty` then launches a login shell instead.
+    fn host(native: Option<bool>, herdr: bool) -> HostRecord {
+        HostRecord {
+            host_id: "hst_01hzzzzzzzzzzzzzzzzzzzzzzz".into(),
+            label: "devbox".into(),
+            state: "online".into(),
+            online: true,
+            last_seen_at: None,
+            node_version: None,
+            cli: json!([]),
+            capabilities: match native {
+                Some(launchable) => json!({
+                    "driverInventory": [{
+                        "kind": "shell-pty",
+                        "launchable": launchable,
+                        "reasonCode": if launchable { "carrier-native" } else { "carrier-not-enabled" },
+                    }]
+                }),
+                // An older Node that cannot describe itself reports nothing at
+                // all — absence means "not reported", never "cannot".
+                None => json!({}),
+            },
+            instance_count: 0,
+            transport: "ssh-stdio".into(),
+            labels: Vec::new(),
+            herdr: herdr.then(|| json!({"version": "0.9.0", "socket": "/tmp/h.sock"})),
+            resources: None,
+            max_instances: 8,
+            hostname: None,
+            ssh: None,
+            last_error: None,
+            provider_binding: "auto".into(),
+            default_launch_args: None,
+            claude_binary_path: None,
+            default_tui: None,
+            workspaces: Vec::new(),
+            workspace_revision: 0,
+        }
+    }
+
+    #[test]
+    fn a_launchable_shell_pty_is_preferred_over_herdr() {
+        // The native carrier serves a readable live screen, which is what
+        // `remuda watch` reads; herdr's blit cannot scroll (D-028).
+        let both = host(Some(true), true);
+        assert_eq!(driver_for("claude", &both).unwrap(), "shell-pty");
+        // codex/grok have only the herdr-backed generic pty driver.
+        assert_eq!(driver_for("codex", &both).unwrap(), "generic-pty");
+        let native_only = host(Some(true), false);
+        assert_eq!(driver_for("claude", &native_only).unwrap(), "shell-pty");
+    }
+
+    #[test]
+    fn herdr_only_falls_back_to_the_pty_drivers_not_to_print() {
+        // The regression this pins: the old default answered `claude-print`
+        // whenever herdr was missing, and picked `claude-pty` without ever
+        // consulting the inventory.
+        let reported_off = host(Some(false), true);
+        assert_eq!(driver_for("claude", &reported_off).unwrap(), "claude-pty");
+        assert_eq!(driver_for("codex", &reported_off).unwrap(), "generic-pty");
+        // And never print, on any harness, however the inventory reads.
+        for reported in [Some(false), None] {
+            for herdr in [true, false] {
+                for harness in ["claude", "codex", "grok"] {
+                    if let Ok(driver) = driver_for(harness, &host(reported, herdr)) {
+                        assert_ne!(driver, "claude-print", "{harness} {reported:?} {herdr}");
+                    }
+                }
+            }
+        }
+        // A Node too old to report an inventory is not treated as a refusal.
+        let unreported = host(None, true);
+        assert_eq!(driver_for("claude", &unreported).unwrap(), "claude-pty");
+    }
+
+    #[test]
+    fn neither_carrier_is_refused_rather_than_downgraded_to_print() {
+        // `claude-print` exits after one turn, so a worker on it can never be
+        // nudged, steered or watched. Refusing with a reason an operator can act
+        // on beats launching a product nobody asked for.
+        for host in [host(Some(false), false), host(None, false)] {
+            let error = driver_for("claude", &host).expect_err("no carrier");
+            let HubError::Unsatisfiable { reasons } = error else {
+                panic!("expected Unsatisfiable, got {error:?}");
+            };
+            let reason = reasons.join(" ");
+            assert!(reason.contains("REMUDA_PTY_CARRIER"), "{reason}");
+            assert!(
+                reason.contains("claude-print is never a default"),
+                "{reason}"
+            );
+        }
+        // codex/grok resolve to generic-pty unconditionally (batch 6), so they
+        // are the one pair that never reaches this refusal.
+        assert_eq!(
+            driver_for("codex", &host(Some(false), false)).unwrap(),
+            "generic-pty"
+        );
+    }
+
+    #[test]
+    fn an_unknown_harness_is_refused_rather_than_answered_with_a_carrier() {
+        // Every harness must resolve to a real product or be refused; nothing
+        // may be answered with a slot machine's default.
+        let host = host(Some(true), true);
+        assert_eq!(driver_for("claude", &host).unwrap(), "shell-pty");
+        // A harness with no launch recipe is a BadRequest, not a silent claude
+        // driver — `select_carrier` treats every non-claude kind as codex/grok,
+        // so the refusal has to come from the explicit-driver path.
+        let error =
+            select_worker_driver("cursor", "shell-pty", &host).expect_err("unknown harness");
+        assert!(
+            matches!(&error, HubError::BadRequest(message) if message.contains("cursor")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_driver_is_honoured_verbatim() {
+        let both = host(Some(true), true);
+        for driver in ["shell-pty", "claude-pty", "claude-print"] {
+            assert_eq!(
+                select_worker_driver("claude", driver, &both).unwrap(),
+                driver
+            );
+        }
+        // print stays selectable for a scripted one-shot even where the native
+        // carrier is available — it is just never reached by default.
+        assert_eq!(
+            select_worker_driver("claude", "claude-print", &host(Some(true), false)).unwrap(),
+            "claude-print"
+        );
+    }
+
+    #[test]
+    fn an_explicit_driver_the_host_cannot_launch_is_refused_not_replaced() {
+        // Silently substituting here is precisely the bug: the operator asked
+        // for one product and a different one ran.
+        let no_native = host(Some(false), true);
+        let error = select_worker_driver("claude", "shell-pty", &no_native).expect_err("refused");
+        assert!(
+            matches!(&error, HubError::Conflict(message) if message.contains("REMUDA_PTY_CARRIER")),
+            "{error:?}"
+        );
+        let no_herdr = host(Some(true), false);
+        let error = select_worker_driver("claude", "claude-pty", &no_herdr).expect_err("refused");
+        assert!(
+            matches!(&error, HubError::Conflict(message) if message.contains("herdr")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_the_harness_cannot_use_is_a_bad_request() {
+        let both = host(Some(true), true);
+        for (harness, driver) in [("codex", "claude-pty"), ("claude", "grok-acp")] {
+            let error = select_worker_driver(harness, driver, &both).expect_err("invalid");
+            assert!(
+                matches!(&error, HubError::BadRequest(message) if message.contains(driver)),
+                "{error:?}"
+            );
+        }
+    }
 }

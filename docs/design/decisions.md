@@ -213,3 +213,54 @@ reverify、FIFO、queued/running cancel、输入校验 8 例）、node gate runn
 （假 merge 二进制 + 真 git fixture：stream/stale-tip/lane-busy/cancel
 killpg/超时/argv）、CLI `tests/gate_cli.rs` 5 例。真实 proof 见
 [gate-lane-1.md](./evidence/gate-lane-1.md)。
+
+## D-035
+
+**2026-09-17 · `claude-print` 降级为「显式指定的诊断 carrier」：禁止作为任何默认或回落值**
+
+| 日期 | 2026-09-17 |
+|---|---|
+| 状态 | adopted |
+| 相关 | D-028、D-028a、D-034、[native-pty-first.md](./native-pty-first.md) §5.1、[coordinator-hierarchy.md](./coordinator-hierarchy.md) §2.4、[dispatch-driver-1.md](./evidence/dispatch-driver-1.md) |
+
+**背景**：2026-09-17 一次 `remuda dispatch --harness claude` 打到 devbox-sg
+（`ssh-stdio` Node，`REMUDA_PTY_CARRIER=native`），roster 行与 Hub instance 记录
+都写 `claude-pty`，Node 却跑 `claude-print`：journal 的 `source.driverKind` 是
+`claude-print`，进程是 `remuda node --stdio` 的直接子进程、argv 为
+`claude -p --input-format stream-json`，且**没有任何 journal 记录说 driver 被换过**。
+owner 判定 print 作为 worker carrier 无用——一个 session 跑完一轮就结束，必须手工
+resume——因此要求把 print 从**每一条**默认与回落路径里剔除，而不只是 `driver_for`。
+
+**根因**（两层，互不依赖）：(a) Hub 的 `worker_launch_spec` 用 `json!` 造 spec，
+未设的 `Option` 全部以显式 `null` 落到线上（`prompt` 在派发路径上恒为 `null`，
+brief 走附件），而 Node 侧 `CreateInstanceRequest` 的 `#[serde(default)]` 只覆盖
+**缺失键**、不覆盖显式 `null`，于是整结构解析失败；(b) `dispatch_create` 的
+`Err(_)` 分支把整个 spec 丢掉、换成硬编码 `driver: ClaudePrint` 的默认请求，而
+`apply_spec_launch_fields` 不回读 `kind`/`driver`，所以请求的 carrier 就此消失。
+同时 `driver_for` 只看 herdr 广播、从不读 `capabilities.driverInventory`，`shell-pty`
+永远不可能成为默认，`else` 分支还把 print 当成默认。
+
+**决策**：**(1) Hub** —— `driver_for` / `select_carrier` 的默认顺序为「宿主
+`driverInventory` 报 `shell-pty` launchable → `shell-pty`；否则 herdr 已广播 →
+`claude-pty`；两者皆无 → 以理由拒绝」；`driver_for` **不再**在 `select_carrier`
+失败后回落 print。显式 `--driver` / `--carrier` 一律照办或以理由拒绝，绝不静默替换。
+`POST /v1/instances` 省略 driver 时回落 `claude-pty`（多轮 TUI，且非 shell driver，
+不改变该请求既有的 agent 审批门槛）。**(2) Node** —— 请求的 carrier 解析/构造失败
+时一律 `instance.create` 带 reason code 拒绝（`unsupported-driver` /
+`unsupported-kind`），**不降级**；拒绝发生在命令被持久接受之前
+（`DriverRegistry::is_registered`），否则 Hub 会留着一行「运行中」而产品从未启动。
+**(3) print 只可显式选中**（`--driver claude-print` / `--carrier print`、web picker
+显式选择），并在该处标注为诊断/legacy；web New Session 默认跟随宿主
+`driverInventory`，`prefs` 空值不再预置 print。**(4) 名册与实例记录一律记录 Node
+create 结果里实际跑起来的 driver**（`reconcile_instance_driver` 在
+`forward_if_online` 里回写），`remuda watch` 打印该列——Hub 请求值与实跑值不允许
+再无声明地分叉。**(5) 派发失败回收** —— 任一步在 `worker.provision` 之后失败时，
+dispatch 对其已 provision 的 worktree / target dir 调 `worker.remove` 回收（该泄漏此前正是因 400 落在 provision 之后、roster 行存在之前而泄漏、只能手工清理）。
+
+**影响**：D-028 的「print 按条件退役」提前落地为「显式才可用」；D-034 的
+`--carrier print` 语义与之一致（print 仅显式可达）。证据
+[dispatch-driver-1.md](./evidence/dispatch-driver-1.md)：本机真实派发在
+`shell-pty` 上端到端成立（roster / instance / journal `driverKind` /
+`remuda watch` / `instance read --source screen` 可读屏），显式 driver 被 409 拒绝且
+CLI 非零退出，`carrier-not-enabled` 的 stdio Node 以 `unsupported-driver` /
+`unsupported-kind` 拒绝而非替换成 print。

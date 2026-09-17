@@ -48,8 +48,12 @@ pub struct CreateInstanceBody {
     workspace_id: Option<String>,
     #[serde(default = "default_kind")]
     kind: String,
-    #[serde(default = "default_driver")]
-    driver: String,
+    /// Carrier driver. Absent falls back to `claude-pty`, which keeps a live
+    /// multi-turn TUI. It used to fall back to `claude-print`, which is never a
+    /// valid default — a print session ends after one turn and needs a manual
+    /// resume (D-035). First-party callers all name one explicitly.
+    #[serde(default)]
+    driver: Option<String>,
     model: Option<String>,
     #[serde(default)]
     args: Vec<String>,
@@ -124,10 +128,6 @@ pub struct CreateInstanceBody {
 fn default_kind() -> String {
     "claude".into()
 }
-fn default_driver() -> String {
-    "claude-print".into()
-}
-
 #[derive(Deserialize)]
 pub struct CommandBody {
     #[serde(rename = "commandId")]
@@ -759,10 +759,28 @@ pub async fn create_instance(
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
     let title = body.title.clone().or(body.name.clone());
+    // A create that names no carrier gets a multi-turn one. This defaulted to
+    // `claude-print`, which is never a valid default: a print session ends after
+    // one turn and needs a manual resume, so a caller who omitted the field
+    // silently got a one-shot session (D-035). `claude-pty` is the conservative
+    // replacement — it keeps a live TUI and, unlike `shell-pty`, is not a shell
+    // driver, so the agent-approval gate for this request is unchanged.
+    //
+    // First-party callers all name a driver (the web New Session picker keys its
+    // default on the host's `driverInventory`; `remuda dispatch` resolves it in
+    // `workers::driver_for`), so this fallback only serves API callers that omit
+    // it. Host-aware selection cannot happen here: placement has not run yet.
+    let driver = body
+        .driver
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("claude-pty")
+        .to_string();
     let workspace_id = body.workspace_id.clone();
     let mut spec = json!({
         "kind": body.kind,
-        "driver": body.driver,
+        "driver": driver,
         "model": body.model,
         "args": body.args,
         "providerProfileId": body.provider_profile_id,
@@ -812,7 +830,7 @@ pub async fn create_instance(
     // Fail fast on a bad flag rather than making the caller wait for the Node
     // to refuse it. Same table the Node uses; the Node re-checks regardless.
     if !body.args.is_empty() {
-        remuda_driver::validate_launch_args(driver_kind_for_args(&body.driver), &body.args)
+        remuda_driver::validate_launch_args(driver_kind_for_args(&driver), &body.args)
             .map_err(|error| HubError::BadRequest(error.to_string()))?;
     }
     let placement =
@@ -993,7 +1011,7 @@ pub async fn create_instance(
         &headers,
         &device,
         &host.host_id,
-        &body.driver,
+        &driver,
         &mut spec,
     )
     .await?;
@@ -1002,7 +1020,7 @@ pub async fn create_instance(
         &host,
         crate::placement::SpawnRequest {
             kind: body.kind,
-            driver: body.driver,
+            driver,
             workspace_id,
             title,
             prompt: body.prompt,
@@ -1624,6 +1642,29 @@ pub(crate) async fn forward_if_online(
         .await
     {
         Ok(Some(response)) if node_accepted(&response, &command.command_id) => {
+            // The Node just told us which driver it really built. Record it
+            // before anything reads the row back: a create that answers
+            // `accepted` with a different driver than the one requested must not
+            // leave the Hub claiming the requested one (D-035; see
+            // docs/design/evidence/dispatch-driver-1.md).
+            if let Some(instance_id) = command.instance_id.as_deref()
+                && matches!(
+                    command.operation.as_str(),
+                    "instance.create" | "instance.resume"
+                )
+            {
+                let result = response.get("result").unwrap_or(&response);
+                if let Some(ran) = result
+                    .pointer("/instance/driver")
+                    .and_then(Value::as_str)
+                    .filter(|driver| !driver.is_empty())
+                {
+                    state
+                        .store
+                        .reconcile_instance_driver(instance_id.to_owned(), ran.to_owned())
+                        .await?;
+                }
+            }
             let accepted = state
                 .store
                 .mark_accepted(command.command_id.clone())

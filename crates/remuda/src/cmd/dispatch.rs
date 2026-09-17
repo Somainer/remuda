@@ -44,8 +44,11 @@ pub(crate) struct DispatchArgs {
     /// Placement tendency: `local` or `remote` (project member latencyClass).
     #[arg(long)]
     placement: Option<String>,
-    /// Carrier driver override (`claude-pty` / `shell-pty` / `claude-print`).
-    /// `shell-pty` is the native, screen-readable carrier for `remuda watch`.
+    /// Carrier driver override (`shell-pty` / `claude-pty` / `claude-print`).
+    /// Honoured verbatim or refused with a reason — never silently replaced.
+    /// The default prefers the Node's native `shell-pty` carrier (screen-readable
+    /// by `remuda watch`), then herdr's `claude-pty`; `claude-print` is never a
+    /// default because print exits after one turn (D-028).
     #[arg(long)]
     driver: Option<String>,
     /// Carrier preference (batch 6): `native` (shell-pty), `herdr`, `print`.

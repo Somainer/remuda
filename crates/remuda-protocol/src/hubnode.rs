@@ -89,6 +89,11 @@ pub const METHOD_HOST_FILES_LIST: &str = "host.files.list";
 /// Hub→Node: read one regular workspace file, stage its bytes through the
 /// objects channel with the host token, and return the resulting object id.
 pub const METHOD_HOST_FILES_READ: &str = "host.files.read";
+/// Hub→Node: bounded read-only file-name or file-content search under a
+/// registered workspace (or the scratch area). Nodes older than this method
+/// answer "unknown method", which the Hub surfaces as a clean 400 instead of
+/// hanging the route.
+pub const METHOD_HOST_FILES_SEARCH: &str = "host.files.search";
 /// Workspace id selecting the Node scratch area (`<tmp>/remuda-*`) for the
 /// read-only host-file routes. Real workspace ids are `ws_…` ids, so `tmp`
 /// can never alias a registration.
@@ -330,6 +335,86 @@ pub struct HostFileReadResult {
     pub digest: String,
     /// File size in bytes.
     pub size: u64,
+}
+
+/// What a `host.files.search` matches against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HostFileSearchMode {
+    /// Match the literal/regex against entry names.
+    #[default]
+    Name,
+    /// Match the literal/regex against decoded file contents, line by line.
+    Content,
+}
+
+/// `host.files.search` params. Same containment rules as list/read; the
+/// operation is read-only and bounded by construction (wall clock, total
+/// bytes, per-file bytes, result count).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFilesSearchParams {
+    /// Registered workspace id, or [`HOST_FILES_SCRATCH_ID`] for the
+    /// `<tmp>/remuda-*` scratch area.
+    pub workspace_id: String,
+    /// Workspace-relative subtree to walk; absent names the workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_path: Option<String>,
+    /// Search needle. Literal by default; a regular expression with `regex`.
+    pub query: String,
+    /// `name` (default) or `content`.
+    #[serde(default)]
+    pub mode: HostFileSearchMode,
+    /// Treat `query` as a regex instead of a literal substring.
+    #[serde(default)]
+    pub regex: bool,
+    /// Optional glob narrowing (`*.rs`, `src/**`; ripgrep-like semantics).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<String>,
+    /// Cap on returned matches; absent means the Node default (200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<u32>,
+}
+
+/// One search hit returned by `host.files.search`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFileSearchMatch {
+    /// Workspace-relative path of the hit, `/`-separated.
+    pub path: String,
+    /// 1-based content line; `0` for a name hit.
+    pub line: u64,
+    /// 1-based byte-ish column of the content hit, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<u64>,
+    /// Capped snippet: the matched line (content) or name (name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+}
+
+/// `host.files.search` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFilesSearchResult {
+    /// The workspace id (or the scratch sentinel) that was searched.
+    pub workspace_id: String,
+    /// Canonical absolute root the walk started at.
+    pub path: String,
+    /// Mode that was applied.
+    pub mode: HostFileSearchMode,
+    /// Query that was applied.
+    pub query: String,
+    /// Matches, up to the requested (or default) cap.
+    pub matches: Vec<HostFileSearchMatch>,
+    /// True when a bound (wall clock, bytes, results) stopped the walk early.
+    pub truncated: bool,
+    /// Which bound was hit; absent when not truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_reason: Option<String>,
+    /// Regular files whose contents (content mode) or names were considered.
+    pub files_scanned: u64,
+    /// Total file bytes read in content mode.
+    pub bytes_scanned: u64,
 }
 
 /// `node.auth` params (stdio first frame).

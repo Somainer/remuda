@@ -190,7 +190,7 @@ fn run_child() {
             // Dispatch always carries bypassPermissions.
             permission_mode: "bypassPermissions".into(),
             sandbox: None,
-            prompt: "ONBOARD probe: run your first tool".into(),
+            prompt: "Run your first tool unattended".into(),
             cwd: Some(worktree.to_string_lossy().into_owned()),
             delegation: None,
             settings_overlay_path: None,

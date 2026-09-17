@@ -45,6 +45,12 @@ const GATE_RUN_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 pub(crate) const SCHEDULE_TICK_MILLIS: u64 = 1000;
 /// How long a bounded gate-failure log stays fetchable.
 const GATE_LOG_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+/// Budget for the home host's fetch-and-push land.
+const HOME_LAND_TIMEOUT: Duration = Duration::from_secs(12 * 60);
+/// Budget for dropping a job's pinned refs on a lane.
+const UNPIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the pinned-ref retention sweep runs.
+const REF_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Upper bound for one serialized run log; the Node bounds smaller.
 const GATE_LOG_MAX_BYTES: usize = 512 * 1024;
 
@@ -226,6 +232,7 @@ async fn enqueue_job(
         base_sha: None,
         head_sha: None,
         merge_sha: None,
+        merge_ref: None,
         current_main_sha: None,
         error: None,
         failed_step: None,
@@ -345,6 +352,7 @@ async fn cancel_project_job(
                 .map_err(map_store)?
                 .ok_or(HubError::NotFound)?;
             journal(&state, &device.id, "gate.canceled", &updated).await;
+            drop_job_refs(&state, &updated).await;
             Ok(Json(json!(updated)))
         }
         GateJobState::Running | GateJobState::Canceling => {
@@ -481,6 +489,22 @@ pub(crate) async fn tick(state: &AppState) {
     if let Err(error) = schedule(state).await {
         tracing::warn!(%error, "gate queue schedule tick failed");
     }
+    // Ref retention is a days-scale window; sweeping on every 1 s scheduler
+    // tick would scan the job table pointlessly. Once a minute is ample.
+    static LAST_SWEEP: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let due = {
+        let mut last = LAST_SWEEP
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let due = last.is_none_or(|at| at.elapsed() >= REF_SWEEP_INTERVAL);
+        if due {
+            *last = Some(std::time::Instant::now());
+        }
+        due
+    };
+    if due {
+        sweep_expired_refs(state).await;
+    }
 }
 
 async fn schedule(state: &AppState) -> Result<(), HubError> {
@@ -547,7 +571,14 @@ async fn schedule(state: &AppState) -> Result<(), HubError> {
             if job.mode == GateMode::Land {
                 land_active.insert(project_id.clone());
             }
-            dispatch(state, job, lane, project.default_base_branch.clone()).await;
+            dispatch(
+                state,
+                job,
+                lane,
+                project.default_base_branch.clone(),
+                resolve_push_from(lane, &project),
+            )
+            .await;
         }
     }
     Ok(())
@@ -583,11 +614,43 @@ async fn pick_lane<'a>(
     None
 }
 
+/// Where a land job's push happens for this lane.
+///
+/// Explicit lane config wins. Absent it the default is `home` whenever the
+/// lane cannot be shown to hold a push credential for the project remote —
+/// the safe direction, because a lane that cannot push produces a passing but
+/// unlandable verify (the D-034 hole this closes). A lane declares itself
+/// push-capable by setting `pushFrom: lane`.
+///
+/// The credential probe is deliberately a lane-config assertion rather than a
+/// live check: the Node reports no credential inventory today, and inventing
+/// one here would guess at the operator's ssh/askpass setup. When a Node does
+/// report it, this is the single place that changes.
+fn resolve_push_from(
+    lane: &remuda_protocol::ProjectGateLane,
+    project: &remuda_protocol::Project,
+) -> remuda_protocol::GatePushFrom {
+    if let Some(explicit) = lane.push_from {
+        return explicit;
+    }
+    // No project remote to push to: nothing for a home host to do either, so
+    // keep the historical lane behaviour.
+    if project.repo_remote.is_none() {
+        return remuda_protocol::GatePushFrom::Lane;
+    }
+    // A lane that named a fetchRemote is configured for the home-host handoff.
+    if lane.fetch_remote.is_some() {
+        return remuda_protocol::GatePushFrom::Home;
+    }
+    remuda_protocol::GatePushFrom::Lane
+}
+
 async fn dispatch(
     state: &AppState,
     job: &GateJob,
     lane: &remuda_protocol::ProjectGateLane,
     base_branch: String,
+    push_from: remuda_protocol::GatePushFrom,
 ) {
     let claim_lane = lane.id.clone();
     let claim_host = lane.host_id.clone();
@@ -625,6 +688,7 @@ async fn dispatch(
         timeouts: std::collections::BTreeMap::new(),
         gate_timeout_secs: 0,
         push: true,
+        push_from,
         keep_logs: job.keep_logs,
         binary: None,
     };
@@ -768,6 +832,16 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
             Err(error) => tracing::warn!(%error, job_id, "could not persist gate log object"),
         }
     }
+    // A `pushFrom: home` land verifies on the lane and is pushed by the home
+    // host. The lane therefore reports `passed` for a land job; the job stays
+    // `running` across the handoff so `remuda land` keeps waiting instead of
+    // reading a verify as a completed land.
+    let home_land = if existing.mode == GateMode::Land && result.status == "passed" {
+        home_land_plan(state, &existing, &result).await
+    } else {
+        None
+    };
+    let landing = home_land.clone();
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
@@ -787,14 +861,26 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
                     None => row.steps.push(step.clone()),
                 }
             }
+            if landing.is_some() && row.merge_ref.is_some() && row.merge_ref == result.merge_ref {
+                // The terminal event and the RPC reply carry the same verdict.
+                // The first arrival claimed the handoff by recording mergeRef;
+                // this is the second, and must not start a second push.
+                return None;
+            }
             row.base_sha = result.base_sha.clone().or(row.base_sha.clone());
             row.head_sha = result.head_sha.clone().or(row.head_sha.clone());
             row.merge_sha = result.merge_sha.clone().or(row.merge_sha.clone());
+            row.merge_ref = result.merge_ref.clone().or(row.merge_ref.clone());
             row.current_main_sha = result.current_main_sha.clone();
             row.failed_step = result.failed_step.clone();
             row.reason = result.reason.clone();
             if let Some(object_id) = &log_object_id {
                 row.log_object_id = Some(object_id.clone());
+            }
+            if landing.is_some() {
+                // Hold `running` for the home-host push; the land task below
+                // writes the terminal state.
+                return Some(());
             }
             if result.status == "passed" && row.mode == GateMode::Verify {
                 row.state = GateJobState::Passed;
@@ -834,6 +920,17 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     let Ok(Some(job)) = outcome else {
         return;
     };
+    // A claimed handoff: verified on the lane, now push from the home host.
+    if let Some(plan) = home_land {
+        journal(state, &job.requested_by, "gate.verified", &job).await;
+        let state = state.clone();
+        let job_id = job.id.as_id().to_string();
+        tokio::spawn(async move {
+            land_from_home(&state, &job_id, plan).await;
+            schedule_once(&state);
+        });
+        return;
+    }
     let action = match job.state {
         GateJobState::Passed => Some("gate.passed"),
         GateJobState::Landed => Some("gate.landed"),
@@ -844,6 +941,12 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     };
     if let Some(action) = action {
         journal(state, &job.requested_by, action, &job).await;
+    }
+    // A canceled job's pinned merge will never be landed; a lane-side land
+    // already consumed its own pin. Either way the refs go now rather than
+    // waiting for retention.
+    if matches!(job.state, GateJobState::Canceled | GateJobState::Landed) {
+        drop_job_refs(state, &job).await;
     }
     schedule_once(state);
     if job.state == GateJobState::Landed {
@@ -874,6 +977,313 @@ async fn persist_run_log(
         .insert_gate_log(project_id, job_id, bytes, digest, created_by)
         .await
         .map_err(HubError::Store)
+}
+
+/// What a home-host land needs, resolved once while the verdict is applied.
+#[derive(Clone)]
+struct HomeLandPlan {
+    home_host: remuda_protocol::HostId,
+    params: remuda_protocol::GateLandParams,
+    lane_host: remuda_protocol::HostId,
+    lane_repo: String,
+}
+
+/// Decide whether a passing land job hands off to the home host, and gather
+/// everything the push needs.
+///
+/// Returns `None` when the lane pushes for itself, when the pieces are missing
+/// (no pinned ref, no home host, no `fetchRemote`), or when the home host is
+/// the lane host — in which case the lane's own land path already applies.
+async fn home_land_plan(
+    state: &AppState,
+    job: &GateJob,
+    result: &GateRunResult,
+) -> Option<HomeLandPlan> {
+    let project = state
+        .store
+        .get_project(job.project_id.as_id().to_string())
+        .await
+        .ok()
+        .flatten()?;
+    let lane = project
+        .gate
+        .lanes
+        .iter()
+        .find(|lane| Some(&lane.id) == job.lane_id.as_ref())?;
+    if resolve_push_from(lane, &project) != remuda_protocol::GatePushFrom::Home {
+        return None;
+    }
+    let home_host = project.home_host.clone()?;
+    let merge_ref = result.merge_ref.clone().or_else(|| job.merge_ref.clone())?;
+    let merge_sha = result.merge_sha.clone().or_else(|| job.merge_sha.clone())?;
+    let base_sha = result.base_sha.clone().or_else(|| job.base_sha.clone())?;
+    let fetch_remote = lane.fetch_remote.clone()?;
+    // The home host needs a checkout of its own to push from. The project's
+    // own home-host lane is the natural one; fall back to any lane pinned to
+    // the home host.
+    let home_repo = project
+        .gate
+        .lanes
+        .iter()
+        .find(|candidate| candidate.host_id == home_host)
+        .map(|candidate| candidate.repo_path.clone())?;
+    Some(HomeLandPlan {
+        home_host,
+        params: remuda_protocol::GateLandParams {
+            job_id: job.id.as_id().to_string(),
+            repo_path: home_repo,
+            branch: job.branch.clone(),
+            base_branch: project.default_base_branch.clone(),
+            push_remote: "origin".into(),
+            fetch_remote,
+            merge_ref,
+            merge_sha,
+            base_sha,
+            timeout_secs: 0,
+        },
+        lane_host: lane.host_id.clone(),
+        lane_repo: lane.repo_path.clone(),
+    })
+}
+
+/// Drive `gate.land` on the project home host and write the terminal state.
+///
+/// The three outcomes map straight onto D-034: `landed` finishes the job and
+/// runs `--then`; `base-moved` re-queues a verify under the same attempt cap
+/// (nothing was pushed); anything else fails the job. There is no state in
+/// which main moved but the job did not finish, because the push itself is a
+/// single leased update.
+async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
+    let params = serde_json::to_value(&plan.params).unwrap_or(Value::Null);
+    let reply = state
+        .nodes
+        .call(
+            plan.home_host.as_id().as_str(),
+            remuda_protocol::METHOD_GATE_LAND,
+            params,
+            HOME_LAND_TIMEOUT,
+        )
+        .await;
+    let landed: remuda_protocol::GateLandResult = match reply {
+        Ok(Some(frame)) => match frame.get("result") {
+            Some(value) => {
+                serde_json::from_value(value.clone()).unwrap_or(remuda_protocol::GateLandResult {
+                    job_id: job_id.to_owned(),
+                    status: "failed".into(),
+                    error: Some("gate.land returned an unreadable result".into()),
+                    ..Default::default()
+                })
+            }
+            None => remuda_protocol::GateLandResult {
+                job_id: job_id.to_owned(),
+                status: "failed".into(),
+                error: Some(
+                    frame
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("gate.land failed")
+                        .to_owned(),
+                ),
+                ..Default::default()
+            },
+        },
+        // An unreachable home host leaves the verify pinned and landable by
+        // hand; it is never a silent success.
+        Ok(None) => remuda_protocol::GateLandResult {
+            job_id: job_id.to_owned(),
+            status: "failed".into(),
+            error: Some("home host is not connected; nothing was pushed".into()),
+            ..Default::default()
+        },
+        Err(error) => remuda_protocol::GateLandResult {
+            job_id: job_id.to_owned(),
+            status: "failed".into(),
+            error: Some(format!("gate.land failed: {error}")),
+            ..Default::default()
+        },
+    };
+    let status = landed.status.clone();
+    let outcome = state
+        .store
+        .mutate_gate_job(job_id, move |row| {
+            if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
+                return None;
+            }
+            match landed.status.as_str() {
+                "landed" => {
+                    row.state = GateJobState::Landed;
+                    row.finished_at = Some(now_ts());
+                    row.merge_sha = landed.merge_sha.clone().or(row.merge_sha.clone());
+                    row.error = None;
+                    row.reason = None;
+                }
+                "base-moved" if row.attempts < MAX_LAND_ATTEMPTS => {
+                    row.state = GateJobState::Queued;
+                    row.started_at = None;
+                    row.host_id = None;
+                    row.lane_id = None;
+                    row.current_main_sha = landed.current_main_sha.clone();
+                    // The next attempt re-verifies onto the new base and pins
+                    // a fresh merge; this one's refs are dropped by the caller.
+                    row.merge_ref = None;
+                    row.merge_sha = None;
+                    row.failed_step = None;
+                    row.reason = None;
+                    row.log_object_id = None;
+                }
+                other => {
+                    row.state = GateJobState::Failed;
+                    row.finished_at = Some(now_ts());
+                    row.current_main_sha = landed.current_main_sha.clone();
+                    let error = landed.error.clone().unwrap_or_else(|| {
+                        if other == "base-moved" {
+                            format!(
+                                "main moved and the land attempt cap ({MAX_LAND_ATTEMPTS}) is spent"
+                            )
+                        } else {
+                            format!("home-host land ended: {other}")
+                        }
+                    });
+                    row.reason = Some(error.lines().next().unwrap_or(&error).to_owned());
+                    row.error = Some(error);
+                }
+            }
+            Some(())
+        })
+        .await;
+    let Ok(Some(job)) = outcome else {
+        return;
+    };
+    // Drop the lane's pinned refs once they can no longer be needed: the land
+    // succeeded, or this attempt's merge is superseded by a re-verify.
+    if matches!(job.state, GateJobState::Landed | GateJobState::Queued) {
+        unpin_lane_refs(state, &plan.lane_host, &plan.lane_repo, job_id).await;
+    }
+    let action = match job.state {
+        GateJobState::Landed => "gate.landed",
+        GateJobState::Queued => "gate.base-moved-requeue",
+        _ => "gate.failed",
+    };
+    journal(state, &job.requested_by, action, &job).await;
+    if job.state == GateJobState::Landed {
+        // Only ever after the push actually succeeded.
+        run_then_hook(state, &job).await;
+    } else if status == "base-moved" {
+        tracing::info!(
+            job_id,
+            "home-host land refused: base moved; re-queued a verify"
+        );
+    }
+}
+
+/// Drop a job's pinned refs, resolving the lane host from the job's project.
+///
+/// Used on cancel and after a lane-side land. A job with no `mergeRef` never
+/// pinned anything, so this is a no-op for it.
+async fn drop_job_refs(state: &AppState, job: &GateJob) {
+    if job.merge_ref.is_none() {
+        return;
+    }
+    let Some(lane_id) = &job.lane_id else {
+        return;
+    };
+    let Ok(Some(project)) = state
+        .store
+        .get_project(job.project_id.as_id().to_string())
+        .await
+    else {
+        return;
+    };
+    let Some(lane) = project.gate.lanes.iter().find(|lane| &lane.id == lane_id) else {
+        return;
+    };
+    unpin_lane_refs(
+        state,
+        &lane.host_id,
+        &lane.repo_path,
+        job.id.as_id().as_str(),
+    )
+    .await;
+    let _ = state
+        .store
+        .mutate_gate_job(job.id.as_id().as_str(), |row| {
+            row.merge_ref = None;
+            Some(())
+        })
+        .await;
+}
+
+/// Retention sweep: drop pinned refs for jobs that passed but were never
+/// landed inside the configured window.
+///
+/// This is the backstop for the cases the direct paths miss — an operator who
+/// walks away from a passing verify, or a lane that was offline when its job
+/// was canceled. Terminal jobs only: a queued or running job may still land.
+pub(crate) async fn sweep_expired_refs(state: &AppState) {
+    let retention_ms = state.config.gate_ref_retention_ms;
+    if retention_ms == 0 {
+        return;
+    }
+    let Ok(jobs) = state.store.list_gate_jobs(None).await else {
+        return;
+    };
+    let now = now();
+    for job in jobs {
+        if job.merge_ref.is_none() {
+            continue;
+        }
+        if !matches!(
+            job.state,
+            GateJobState::Passed | GateJobState::Failed | GateJobState::Canceled
+        ) {
+            continue;
+        }
+        let stamp = job
+            .finished_at
+            .clone()
+            .unwrap_or_else(|| job.queued_at.clone());
+        if age_ms(&now, &stamp).is_some_and(|age| age >= retention_ms) {
+            drop_job_refs(state, &job).await;
+        }
+    }
+}
+
+/// Milliseconds between two RFC3339 timestamps, `None` if unparseable.
+fn age_ms(now: &str, earlier: &Timestamp) -> Option<u64> {
+    let parse = |value: &str| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+    };
+    let now = parse(now)?;
+    let earlier = parse(String::from(earlier.clone()).as_str())?;
+    u64::try_from((now - earlier).whole_milliseconds()).ok()
+}
+
+/// Best-effort `gate.unpin` on the lane host.
+async fn unpin_lane_refs(
+    state: &AppState,
+    lane_host: &remuda_protocol::HostId,
+    repo_path: &str,
+    job_id: &str,
+) {
+    let params = serde_json::to_value(remuda_protocol::GateUnpinParams {
+        job_id: job_id.to_owned(),
+        repo_path: repo_path.to_owned(),
+    })
+    .unwrap_or(Value::Null);
+    if let Err(error) = state
+        .nodes
+        .call(
+            lane_host.as_id().as_str(),
+            remuda_protocol::METHOD_GATE_UNPIN,
+            params,
+            UNPIN_TIMEOUT,
+        )
+        .await
+    {
+        // Retention sweeps the ref later; losing this call is not fatal.
+        tracing::debug!(%error, job_id, "gate.unpin did not complete");
+    }
 }
 
 /// `land --then "<cmd>"`: run the post-land command on the project home host.

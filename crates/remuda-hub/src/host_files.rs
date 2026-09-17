@@ -1,8 +1,10 @@
-//! Read-only host file listing and fetch (the upward counterpart of D-027).
+//! Read-only host file listing, fetch and search (the upward counterpart of D-027).
 //!
-//! Two operator routes proxy to the addressed Node:
+//! Three operator routes proxy to the addressed Node:
 //! - `GET  /v1/hosts/{id}/files?workspaceId=…[&relPath=…]` → `host.files.list`
 //! - `POST /v1/hosts/{id}/files/read` `{workspaceId, relPath}` → `host.files.read`
+//! - `POST /v1/hosts/{id}/files/search` `{workspaceId, relPath?, query, …}` →
+//!   `host.files.search`
 //!
 //! Both require an operator device; Agent origin is refused with 403 here and
 //! is absent from the agent-scope middleware allowlist. The addressed host is
@@ -38,6 +40,7 @@ pub fn routes(max_object_bytes: usize) -> Router<AppState> {
     Router::new()
         .route("/v1/hosts/{id}/files", get(list_files))
         .route("/v1/hosts/{id}/files/read", post(read_file))
+        .route("/v1/hosts/{id}/files/search", post(search_files))
         .route("/v1/hosts/{id}/files/objects", post(stage_object))
         .layer(axum::middleware::from_fn_with_state(
             max_object_bytes,
@@ -105,6 +108,24 @@ struct ReadBody {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SearchBody {
+    workspace_id: String,
+    #[serde(default)]
+    rel_path: Option<String>,
+    query: String,
+    /// `name` (default) or `content`.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    regex: bool,
+    #[serde(default)]
+    glob: Option<String>,
+    #[serde(default)]
+    max_results: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StageQuery {
     /// Basename of the file as read on the Node; sanitised server-side.
     #[serde(default)]
@@ -132,6 +153,65 @@ async fn read_file(
 ) -> Result<Json<Value>, HubError> {
     let node_params = node_params(&body.workspace_id, body.rel_path.as_deref())?;
     proxy_to_host(&state, &headers, &host_id, "host.files.read", node_params).await
+}
+
+/// `POST /v1/hosts/{id}/files/search` — proxy a bounded name/content search.
+async fn search_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(host_id): Path<String>,
+    Json(body): Json<SearchBody>,
+) -> Result<Json<Value>, HubError> {
+    let workspace_id = body.workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Err(HubError::BadRequest("workspaceId is required".into()));
+    }
+    let query = body.query.trim();
+    if query.is_empty() {
+        return Err(HubError::BadRequest("query is required".into()));
+    }
+    if let Some(max) = body.max_results
+        && max == 0
+    {
+        return Err(HubError::BadRequest("maxResults must be at least 1".into()));
+    }
+    let mode = match body.mode.as_deref() {
+        None | Some("name") => "name",
+        Some("content") => "content",
+        Some(other) => {
+            return Err(HubError::BadRequest(format!(
+                "mode must be 'name' or 'content', got {other}"
+            )));
+        }
+    };
+    let mut params = json!({
+        "workspaceId": workspace_id,
+        "query": query,
+        "mode": mode,
+    });
+    if let Some(rel_path) = body
+        .rel_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        params["relPath"] = json!(rel_path);
+    }
+    if body.regex {
+        params["regex"] = json!(true);
+    }
+    if let Some(glob) = body
+        .glob
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        params["glob"] = json!(glob);
+    }
+    if let Some(max) = body.max_results {
+        params["maxResults"] = json!(max);
+    }
+    proxy_to_host(&state, &headers, &host_id, "host.files.search", params).await
 }
 
 fn node_params(workspace_id: &str, rel_path: Option<&str>) -> Result<Value, HubError> {

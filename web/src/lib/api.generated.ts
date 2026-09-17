@@ -561,6 +561,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/hosts/{id}/files/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search file names or contents on a host under a registered workspace (read-only, bounded)
+         * @description Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.search RPC. The Node confines the walk to a registered workspace root or the /tmp/remuda-* scratch area, honours .gitignore, skips binary and irregular files, and bounds the scan by wall clock (10s), total bytes (10 MiB), per-file bytes (1 MiB) and result count (default 200); the reply carries truncated/truncatedReason when a bound is hit. A Node that does not implement the method answers with a JSON-RPC error, surfaced as a clean 400.
+         */
+        post: operations["hostFilesSearch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts/{id}/hostcap": {
         parameters: {
             query?: never;
@@ -3908,6 +3928,81 @@ export interface operations {
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
             413: components["responses"]["Error"];
+            422: components["responses"]["Error"];
+        };
+    };
+    hostFilesSearch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Optional glob narrowing (e.g. *.rs or src/**). */
+                    glob?: string;
+                    /**
+                     * Format: uint32
+                     * @description Cap on returned matches; absent means the Node default (200).
+                     */
+                    maxResults?: number;
+                    /**
+                     * @description name (default) matches entry names; content matches decoded file contents line by line.
+                     * @enum {string}
+                     */
+                    mode?: "name" | "content";
+                    /** @description Literal needle, or a regex when regex=true. */
+                    query: string;
+                    /** @default false */
+                    regex?: boolean;
+                    /** @description Workspace-relative subtree; absent names the workspace root. */
+                    relPath?: string;
+                    workspaceId: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Search result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** Format: uint64 */
+                        bytesScanned: number;
+                        /** Format: uint64 */
+                        filesScanned: number;
+                        matches: {
+                            /** Format: uint64 */
+                            column?: number;
+                            /**
+                             * Format: uint64
+                             * @description 1-based content line; 0 for a name hit.
+                             */
+                            line: number;
+                            path: string;
+                            snippet?: string;
+                        }[];
+                        /** @enum {string} */
+                        mode: "name" | "content";
+                        path: string;
+                        query: string;
+                        truncated: boolean;
+                        truncatedReason?: string;
+                        workspaceId: string;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
             422: components["responses"]["Error"];
         };
     };

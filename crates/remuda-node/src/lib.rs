@@ -18,6 +18,7 @@ mod gate;
 mod identity;
 mod interactions;
 mod inventory;
+pub(crate) mod journal_flush;
 mod model;
 mod native;
 #[cfg(any(target_os = "macos", all(test, unix)))]

@@ -7,7 +7,7 @@ use remuda_protocol::hubnode::{
     HubNodeMethod, InstanceCancelParams, InstanceCreateParams, InstanceRespondParams,
     InstanceSendParams, TtyWriteParams,
 };
-use remuda_protocol::{AgentKind, DriverKind, InstanceId, JournalEvent, U64};
+use remuda_protocol::{AgentKind, DriverKind, InstanceId, JournalEvent};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,13 @@ pub(crate) struct RuntimeLink {
     pub journal: JournalSender,
     pub watermarks: Arc<Mutex<HashMap<String, SeqWatermark>>>,
     pub pumps: Arc<Mutex<HashSet<String>>>,
+    /// Last sequence this session has handed to the Hub per Instance.
+    ///
+    /// `watermarks` records what the Hub has *acknowledged* and is reported
+    /// back on hello; this records the read position, so a flush resumes at the
+    /// tail instead of re-parsing confirmed bytes. Optimisation only — an
+    /// absent cursor replays from the floor (see [`crate::journal_flush`]).
+    pub cursors: Arc<Mutex<crate::journal_flush::FlushCursor>>,
 }
 
 impl RuntimeLink {
@@ -31,6 +38,7 @@ impl RuntimeLink {
             journal: self.journal.clone(),
             watermarks: self.watermarks.clone(),
             pumps: self.pumps.clone(),
+            cursors: self.cursors.clone(),
         }
     }
 }
@@ -54,13 +62,44 @@ pub(crate) fn dispatch_in_background(
 pub(crate) fn resume_runtime_journals(runtime: &RuntimeLink) {
     let runtime = runtime.clone_link();
     tokio::spawn(async move {
-        if let Ok(page) = runtime.node.list_instances() {
-            for instance in page.items {
-                ensure_pump(&runtime, &instance.meta.id);
-                let _ = flush_journal(&runtime, &instance.meta.id).await;
-            }
+        let Ok(page) = runtime.node.list_instances() else {
+            return;
+        };
+        // Seed the cursors from the watermarks `apply_resume_watermarks` just
+        // installed *before* any pump runs: `ensure_pump` replays immediately,
+        // so promoting afterwards would make every reconnected Instance replay
+        // from the floor — correct, but exactly the cost this avoids.
+        promote_cursors_from_watermarks(&runtime);
+        for instance in page.items {
+            // `ensure_pump` already replays once before it starts pumping, so
+            // calling `flush_journal` here too would replay every Instance
+            // twice on every (re)connect.
+            ensure_pump(&runtime, &instance.meta.id);
         }
     });
+}
+
+/// Seed flush cursors from Hub-acknowledged watermarks.
+///
+/// The Hub's word is authoritative about what *it* holds, so the cursor is set
+/// to exactly the reported seq — press or pull: if the Hub has fallen behind
+/// this session's position, the cursor comes back so the events it lost are
+/// replayed. An Instance the Hub has not named keeps replaying from the floor.
+///
+/// A watermark *ahead* of the local journal is not a replay signal: there is
+/// nothing local the Hub is missing, and reading past our own tail returns the
+/// same empty page the old code got. Only an unknown cursor replays from the
+/// floor.
+fn promote_cursors_from_watermarks(runtime: &RuntimeLink) {
+    let marks = snapshot_watermarks(&runtime.watermarks);
+    let mut cursors = lock_cursors(&runtime.cursors);
+    for mark in marks.values() {
+        if let Ok(instance_id) = mark.instance_id.parse::<InstanceId>()
+            && mark.seq > 0
+        {
+            cursors.set(&instance_id, mark.seq as u64);
+        }
+    }
 }
 
 pub(crate) fn apply_resume_watermarks(runtime: &RuntimeLink, hello: &Value) {
@@ -69,6 +108,10 @@ pub(crate) fn apply_resume_watermarks(runtime: &RuntimeLink, hello: &Value) {
             Ok(mut marks) => marks.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
+        // The cursors carry the same risk the watermarks do: this session's
+        // read position was derived from the previous session's acks, so drop
+        // it and let `resume_runtime_journals` re-derive it from the hello.
+        lock_cursors(&runtime.cursors).clear();
     }
     for entry in ["instanceWatermarks", "resumeCursors"]
         .into_iter()
@@ -255,8 +298,10 @@ async fn dispatch_hub(
 }
 
 async fn catch_up(runtime: &RuntimeLink, instance_id: &InstanceId) -> Result<(), NodeError> {
+    // `ensure_pump` replays once before it starts pumping, so awaiting
+    // `flush_journal` here would replay the same Instance a second time.
     ensure_pump(runtime, instance_id);
-    flush_journal(runtime, instance_id).await
+    Ok(())
 }
 
 fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRequest, NodeError> {
@@ -718,6 +763,12 @@ fn prompt_mode_of(params: &Value) -> Option<remuda_protocol::PromptMode> {
 }
 
 fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {
+    // A terminal Instance is *not* skipped here. "Terminal" does not imply
+    // "no further events": `reclaim::reconcile_native_pty` marks an Instance
+    // failed and only then journals the `node-epoch-changed` diagnostic that
+    // explains why, so a pump dropped on the strength of the lifecycle would
+    // strand that event. A caught-up pump costs nothing anyway — its replay
+    // returns without a read and its loop then idles on the broadcast.
     let key = instance_id.as_id().as_str().to_owned();
     {
         let mut pumps = lock_set(&runtime.pumps);
@@ -743,24 +794,52 @@ fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {
 /// serialization. 16 matches the daemon NDJSON uplink's in-flight budget.
 const UPLINK_WINDOW: usize = 16;
 
+/// Page size for one replay read.
+const REPLAY_PAGE: usize = 256;
+
+/// How often a pending replay is considered. The [`crate::journal_flush::FlushBackoff`]
+/// ladder decides whether a given wake actually replays, so this is the floor
+/// of the retry cadence, not the cadence itself.
+const RETRY_TICK: std::time::Duration = crate::journal_flush::RETRY_MIN;
+
+/// Forward everything the Hub is missing, resuming at this session's cursor.
+///
+/// One pass reads at most [`REPLAY_PAGE`] events per iteration and stops as
+/// soon as it is caught up. It never starts a read it can prove is empty: when
+/// the cursor already covers the journal's durable seq the call returns before
+/// touching the reader, which is what keeps a caught-up Instance free. The
+/// cursor is the *read* position, so a bounded window that stalls resumes at
+/// the last confirmed seq instead of re-parsing the tail.
 async fn flush_journal(runtime: &RuntimeLink, instance_id: &InstanceId) -> Result<(), NodeError> {
-    let instance = runtime.node.get_instance(instance_id)?;
     // Replay is also pipelined: fill the window directly from durable rows.
     let mut window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
     loop {
         if window.is_empty() {
-            let after = current_watermark(&runtime.watermarks, instance_id.as_id().as_str());
-            let after_seq = (after > 0).then_some(U64(u64::try_from(after).unwrap_or(0)));
-            let page = runtime
-                .node
-                .read_journal(&instance.journal_id, after_seq, 256)?;
-            if page.events.is_empty() {
-                break;
-            }
-            for event in &page.events {
-                submit_forward(runtime, instance_id, event, &mut window)?;
-                if !window.has_capacity() {
-                    break;
+            match crate::journal_flush::flush_plan(
+                &runtime.node,
+                instance_id,
+                cursor_of(runtime, instance_id),
+            ) {
+                crate::journal_flush::FlushPlan::CaughtUp => break,
+                crate::journal_flush::FlushPlan::Read(from_seq) => {
+                    let page = crate::journal_flush::read_page(
+                        &runtime.node,
+                        instance_id,
+                        from_seq,
+                        REPLAY_PAGE,
+                    )?;
+                    if page.events.is_empty() {
+                        // The durable seq moved between the plan and the read,
+                        // or the page fell entirely behind the floor. Either
+                        // way there is nothing to forward from here.
+                        break;
+                    }
+                    for event in &page.events {
+                        submit_forward(runtime, instance_id, event, &mut window)?;
+                        if !window.has_capacity() {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -777,8 +856,15 @@ async fn pump_live(
     mut rx: broadcast::Receiver<JournalEvent>,
     mut needs_replay: bool,
 ) {
-    let mut retry = tokio::time::interval(std::time::Duration::from_millis(250));
+    // A failing replay used to re-enter on a flat 250 ms tick, which re-parsed
+    // the tail four times a second. The interval is only the *wake*; the
+    // backoff decides whether this tick actually replays, so a stuck Instance
+    // backs off to a few seconds while a live one never waits on it. The arm
+    // stays enabled whenever a replay is pending — a self-disabling timer arm
+    // would leave nothing to wake the loop when the ACK window is empty.
+    let mut retry = tokio::time::interval(RETRY_TICK);
     retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut backoff = crate::journal_flush::FlushBackoff::new();
     let mut window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
     loop {
         // Events are submitted whenever there is window capacity; ACKs drain
@@ -796,6 +882,7 @@ async fn pump_live(
                     tracing::debug!(%error, "journal pump forward failed");
                     window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
                     needs_replay = true;
+                    backoff.arm();
                 }
             }
             event = rx.recv(), if can_send && !needs_replay => {
@@ -806,14 +893,32 @@ async fn pump_live(
                             tracing::debug!(%error, "journal pump forward failed");
                             window = super::uplink::UplinkWindow::new(UPLINK_WINDOW);
                             needs_replay = true;
+                            backoff.arm();
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => needs_replay = true,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        needs_replay = true;
+                        backoff.reset();
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            // One page per due retry: a stuck Instance yields between attempts
+            // rather than spinning, so it cannot starve the others. The arm
+            // stays enabled whenever a replay is pending — disabling it while
+            // the ladder is un-due would leave nothing to wake the loop when
+            // the ACK window is empty, and the pump would never resume.
             _ = retry.tick(), if needs_replay => {
-                needs_replay = flush_journal(runtime, &instance_id).await.is_err();
+                if !backoff.is_due() {
+                    continue;
+                }
+                match flush_journal(runtime, &instance_id).await {
+                    Ok(()) => needs_replay = false,
+                    Err(error) => {
+                        tracing::debug!(%error, "journal replay failed; backing off");
+                        backoff.arm();
+                    }
+                }
                 // Rows appended by live observations during replay are either
                 // already in the window or behind the new watermark; resume
                 // the broadcast.
@@ -879,6 +984,13 @@ fn acknowledge(
         journal_id,
         acked.max(seq),
     );
+    // The forward position only advances on a resolved append, so a frame that
+    // never got an ACK is replayed rather than skipped.
+    record_cursor(
+        runtime,
+        instance_id,
+        u64::try_from(acked.max(seq)).unwrap_or(0),
+    );
     Ok(())
 }
 
@@ -924,6 +1036,26 @@ fn current_watermark(
         .get(instance_id)
         .map(|mark| mark.seq)
         .unwrap_or(0)
+}
+
+/// This session's forward position for one Instance; `None` means "replay from
+/// the floor".
+fn cursor_of(runtime: &RuntimeLink, instance_id: &InstanceId) -> Option<u64> {
+    lock_cursors(&runtime.cursors).last(instance_id)
+}
+
+/// Advance this session's forward position for one Instance.
+fn record_cursor(runtime: &RuntimeLink, instance_id: &InstanceId, seq: u64) {
+    lock_cursors(&runtime.cursors).record(instance_id, seq);
+}
+
+fn lock_cursors(
+    cursors: &Arc<Mutex<crate::journal_flush::FlushCursor>>,
+) -> std::sync::MutexGuard<'_, crate::journal_flush::FlushCursor> {
+    match cursors.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn lock_set(set: &Arc<Mutex<HashSet<String>>>) -> std::sync::MutexGuard<'_, HashSet<String>> {
@@ -982,6 +1114,7 @@ mod tests {
             journal,
             watermarks: watermarks.clone(),
             pumps: Arc::new(Mutex::new(HashSet::new())),
+            cursors: Arc::new(Mutex::new(crate::journal_flush::FlushCursor::new())),
         };
         let (live, receiver) = broadcast::channel(2);
         let instance_id = created.instance.meta.id;

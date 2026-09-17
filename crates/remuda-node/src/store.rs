@@ -139,6 +139,20 @@ pub trait LocalStore: Send + Sync {
         after_seq: Option<U64>,
         limit: usize,
     ) -> Result<EventsReadResult, NodeError>;
+    /// JSONL payload bytes read by [`LocalStore::read_events`] since process
+    /// start, across every journal.
+    ///
+    /// Flush cost is otherwise invisible from outside: a bounded read and an
+    /// unbounded one return the same `EventsReadResult` for a short tail. This
+    /// counter exposes the reader's own byte accounting so a regression test
+    /// can assert that one flush tick costs O(new events), not O(journal).
+    fn journal_bytes_read(&self) -> u64;
+    /// Durable sequence a journal's underlying store has committed.
+    ///
+    /// Read straight from the authority (the journal's own watermark), not
+    /// from the in-memory `Instance.durable_seq` mirror, so a flush tick can
+    /// decide it has nothing to do without touching the reader at all.
+    fn journal_durable_seq(&self, journal_id: &remuda_protocol::Id) -> Result<U64, NodeError>;
     /// Build a projection snapshot at the same in-memory watermark as its entities.
     fn snapshot(
         &self,
@@ -175,6 +189,8 @@ pub struct MemoryStore {
     follow_buffer_capacity: usize,
     durable: Option<DurableJournal>,
     entities: Option<EntityDb>,
+    /// See [`LocalStore::journal_bytes_read`].
+    journal_bytes_read: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -189,11 +205,12 @@ enum JournalJob {
         envelope: Box<Envelope>,
         reply: std_mpsc::SyncSender<Result<Observation, String>>,
     },
-    ReadRange {
+    ReadPage {
         instance_id: InstanceId,
         from_seq: u64,
         to_seq: Option<u64>,
-        reply: std_mpsc::SyncSender<Result<Vec<Observation>, String>>,
+        limit: usize,
+        reply: std_mpsc::SyncSender<Result<remuda_journal::Page, String>>,
     },
     DurableSeq {
         instance_id: InstanceId,
@@ -241,15 +258,16 @@ impl DurableJournal {
                             });
                             let _ = reply.send(result);
                         }
-                        JournalJob::ReadRange {
+                        JournalJob::ReadPage {
                             instance_id,
                             from_seq,
                             to_seq,
+                            limit,
                             reply,
                         } => {
                             let result = runtime.block_on(async {
                                 writer
-                                    .read_range(&instance_id, U64(from_seq), to_seq.map(U64))
+                                    .read_page(&instance_id, U64(from_seq), to_seq.map(U64), limit)
                                     .await
                                     .map_err(|error| error.to_string())
                             });
@@ -290,18 +308,22 @@ impl DurableJournal {
             .map_err(|error| NodeError::Driver(format!("journal append failed: {error}")))
     }
 
-    fn read_range(
+    /// Read one bounded page. The bound reaches the journal reader, so the
+    /// SQL and the JSONL seeks touch at most `limit` rows.
+    fn read_page(
         &self,
         instance_id: &InstanceId,
         from_seq: u64,
         to_seq: Option<u64>,
-    ) -> Result<Vec<Observation>, NodeError> {
+        limit: usize,
+    ) -> Result<remuda_journal::Page, NodeError> {
         let (reply, result) = std_mpsc::sync_channel(1);
         self.jobs
-            .send(JournalJob::ReadRange {
+            .send(JournalJob::ReadPage {
                 instance_id: instance_id.clone(),
                 from_seq,
                 to_seq,
+                limit,
                 reply,
             })
             .map_err(|_| NodeError::Driver("journal writer stopped".to_owned()))?;
@@ -334,6 +356,7 @@ impl MemoryStore {
             follow_buffer_capacity: follow_buffer_capacity.max(1),
             durable: None,
             entities: None,
+            journal_bytes_read: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -394,6 +417,7 @@ impl MemoryStore {
             follow_buffer_capacity: follow_buffer_capacity.max(1),
             durable: Some(durable),
             entities: Some(entities),
+            journal_bytes_read: std::sync::atomic::AtomicU64::new(0),
         };
         for instance in store.list_instances()? {
             if matches!(instance.lifecycle, InstanceLifecycle::Ready) {
@@ -976,12 +1000,20 @@ impl LocalStore for MemoryStore {
             .instance
             .durable_seq;
         let after = after_seq.unwrap_or_default().0;
+        let limit = limit.clamp(1, 256);
         if let Some(durable) = &self.durable {
             drop(state);
-            let observations = durable.read_range(&instance_id, after + 1, None)?;
-            let events = observations
+            // The bound travels with the read. `to_seq = None` would ask the
+            // journal for every observation from `after + 1` to the tail, and
+            // the `take` below would then discard all but the first page —
+            // 20 MB of JSON parsed off a 20 MB journal to move 256 events.
+            let to_seq = Some(after.saturating_add(limit as u64));
+            let page = durable.read_page(&instance_id, after + 1, to_seq, limit)?;
+            self.journal_bytes_read
+                .fetch_add(page.bytes_read, std::sync::atomic::Ordering::Relaxed);
+            let events = page
+                .observations
                 .into_iter()
-                .take(limit.clamp(1, 256))
                 .map(|event| JournalEvent::Instance(Box::new(event)))
                 .collect();
             return Ok(EventsReadResult {
@@ -1008,6 +1040,33 @@ impl LocalStore for MemoryStore {
             floor_seq: U64(1),
             durable_seq: record.instance.durable_seq,
         })
+    }
+
+    fn journal_bytes_read(&self) -> u64 {
+        self.journal_bytes_read
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn journal_durable_seq(&self, journal_id: &remuda_protocol::Id) -> Result<U64, NodeError> {
+        let instance_id = self
+            .state
+            .read()
+            .map_err(|_| NodeError::StorePoisoned)?
+            .journal_instances
+            .get(journal_id)
+            .cloned()
+            .ok_or_else(|| not_found("journal", journal_id.to_string()))?;
+        match &self.durable {
+            Some(durable) => durable.durable_seq(&instance_id),
+            None => Ok(self
+                .state
+                .read()
+                .map_err(|_| NodeError::StorePoisoned)?
+                .instances
+                .get(&instance_id)
+                .map(|record| record.instance.durable_seq)
+                .unwrap_or_default()),
+        }
     }
 
     fn snapshot(
@@ -1257,5 +1316,316 @@ mod tests {
             .expect("persisted observation");
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].event_id, committed.event_id);
+    }
+
+    /// Write `count` observations of roughly `pad` bytes each into a journal's
+    /// JSONL, for a store that has not opened it yet.
+    ///
+    /// The lines are exactly what the writer would have produced, so opening
+    /// the store afterwards indexes them through the normal `recover()` path —
+    /// one linear pass, the same as a real restart. Seeding through
+    /// `Journal::append` instead is quadratic: every append re-serializes the
+    /// whole projection into the checkpoint row, which at ~7000 events is
+    /// minutes of CPU that has nothing to do with the reader under test.
+    fn write_fixture_journal(data_dir: &Path, instance: &Instance, count: usize, pad: usize) {
+        let filler = "x".repeat(pad);
+        let dir = data_dir.join("journal");
+        std::fs::create_dir_all(&dir).expect("fixture journal dir");
+        let path = dir.join(format!("{}.jsonl", instance.meta.id.as_id().as_str()));
+        let mut file = std::fs::File::create(&path).expect("fixture journal");
+        for index in 0..count {
+            let body = crate::driver::message_payload(
+                remuda_protocol::MessageRole::Assistant,
+                remuda_protocol::MessagePhase::Final,
+                format!("{index}-{filler}"),
+                Vec::new(),
+            )
+            .expect("message");
+            let observation = Observation {
+                schema_version: SchemaVersion,
+                event_id: EventId::new(),
+                journal_id: instance.journal_id.clone(),
+                instance_id: instance.meta.id.clone(),
+                run_id: None,
+                host_id: instance.host_id.clone(),
+                process_generation: U64(1),
+                run_generation: None,
+                seq: U64(index as u64 + 1),
+                observed_at: timestamp_now().expect("timestamp"),
+                native_at: unknown("fixture"),
+                source: crate::driver::runtime_source(instance, U64(index as u64 + 1)),
+                completeness: Completeness::Structured,
+                raw_ref: None,
+                evidence_event_ids: Vec::new(),
+                body,
+            };
+            let mut line = serde_json::to_vec(&observation).expect("fixture observation");
+            line.push(b'\n');
+            std::io::Write::write_all(&mut file, &line).expect("write fixture observation");
+        }
+        std::io::Write::flush(&mut file).expect("flush fixture journal");
+    }
+
+    /// Open a journaled store over a fixture journal of `count` events, with
+    /// `pad` bytes of payload each, and bring the instance mirror up to date.
+    fn store_over_fixture(data_dir: &Path, count: usize, pad: usize) -> (MemoryStore, Instance) {
+        let instance = fixture_instance(
+            InstanceId::new(),
+            remuda_protocol::HostId::new(),
+            remuda_protocol::WorkspaceId::new(),
+            remuda_protocol::DriverKind::ClaudePrint,
+        )
+        .expect("fixture instance");
+        write_fixture_journal(data_dir, &instance, count, pad);
+        let store = MemoryStore::open_journaled_with(data_dir, 4, FsyncPolicy::Never)
+            .expect("journaled store");
+        store
+            .insert_instance(instance.clone())
+            .expect("insert instance");
+        // Opening the store recovered the JSONL; the in-memory mirror must
+        // agree with the journal's own watermark.
+        assert_eq!(
+            store
+                .journal_durable_seq(&instance.journal_id)
+                .expect("durable seq"),
+            U64(count as u64)
+        );
+        store
+            .state
+            .write()
+            .expect("state")
+            .instances
+            .get_mut(&instance.meta.id)
+            .expect("instance record")
+            .instance
+            .durable_seq = U64(count as u64);
+        (store, instance)
+    }
+
+    /// Process CPU time (user + system) from `/proc/self/stat`, in ticks.
+    ///
+    /// Wall time would measure the test harness as much as the reader; the
+    /// question the evidence answers is how much CPU one sweep burns.
+    #[cfg(target_os = "linux")]
+    fn cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("self stat");
+        // Fields 14 and 15 (utime, stime) follow the parenthesised comm, which
+        // may itself contain spaces — split after the last ')'.
+        let rest = stat.rsplit_once(')').expect("comm").1;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        let utime: u64 = fields[11].parse().expect("utime");
+        let stime: u64 = fields[12].parse().expect("stime");
+        utime + stime
+    }
+
+    /// Measure one full replay sweep both ways over a ~20 MB journal.
+    ///
+    /// Ignored by default: it is evidence, not a gate. Run with
+    /// `cargo test -p remuda-node --lib replay_sweep_cost -- --ignored --nocapture`.
+    ///
+    /// "Before" is the old shape verbatim — `read_range(after + 1, None)` plus
+    /// `take(256)` — so the numbers are the same work the demo host was doing
+    /// per 250 ms tick. "After" is one bounded page per call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "measurement, not a gate"]
+    async fn replay_sweep_cost_is_linear_in_new_events() {
+        const EVENTS: usize = 7_000;
+        const PAD: usize = 2_800;
+        const PAGE: u64 = 256;
+        /// Matches `UPLINK_WINDOW` in the wss carrier.
+        const UPLINK_WINDOW: usize = 16;
+        let data_dir = tempfile::tempdir().expect("journal data dir");
+        let (store, instance) = store_over_fixture(data_dir.path(), EVENTS, PAD);
+        let journal_id = instance.journal_id.clone();
+        let journal = store.journal().expect("journal handle");
+        let journal_bytes = std::fs::metadata(
+            data_dir
+                .path()
+                .join("journal")
+                .join(format!("{}.jsonl", instance.meta.id.as_id().as_str())),
+        )
+        .expect("journal file")
+        .len();
+
+        // Before: every sweep parses the whole tail, 28 pages per full replay.
+        let pages = EVENTS as u64 / PAGE + 1;
+        let cpu_before_start = cpu_ticks();
+        let started = std::time::Instant::now();
+        let mut parsed = 0u64;
+        for _ in 0..pages {
+            let all = journal
+                .read_range(&instance.meta.id, U64(1), None)
+                .await
+                .expect("unbounded read");
+            parsed += all.len() as u64;
+        }
+        let before = started.elapsed();
+        let before_cpu = cpu_ticks() - cpu_before_start;
+
+        // After: one bounded page per sweep, resuming at the cursor.
+        let started = std::time::Instant::now();
+        let mut cursor = 0u64;
+        let mut moved = 0u64;
+        let mut reads = 0u64;
+        loop {
+            let page = store
+                .read_events(&journal_id, Some(U64(cursor)), PAGE as usize)
+                .expect("bounded read");
+            reads += 1;
+            if page.events.is_empty() {
+                break;
+            }
+            cursor = page.events.last().expect("last").position().1.0;
+            moved += page.events.len() as u64;
+        }
+        let after = started.elapsed();
+        let after_cpu = cpu_ticks() - cpu_before_start - before_cpu;
+        let bytes_read = store.journal_bytes_read();
+
+        // The demo's pathology, isolated: a tick whose ACK window is stuck
+        // early with the whole journal still ahead of it. "Before" parses
+        // everything from the stuck watermark to the tail and keeps 16.
+        let stuck_from = 1u64;
+        let cpu_stuck = cpu_ticks();
+        let started = std::time::Instant::now();
+        let unbounded = journal
+            .read_range(&instance.meta.id, U64(stuck_from + 1), None)
+            .await
+            .expect("stuck unbounded read");
+        let dropped = unbounded.len() - unbounded.len().min(UPLINK_WINDOW);
+        let stuck_before = started.elapsed();
+        let stuck_before_cpu = cpu_ticks() - cpu_stuck;
+        let started = std::time::Instant::now();
+        let bounded = store
+            .read_events(&journal_id, Some(U64(stuck_from)), UPLINK_WINDOW)
+            .expect("stuck bounded read");
+        let stuck_after = started.elapsed();
+        let stuck_after_cpu = cpu_ticks() - cpu_stuck - stuck_before_cpu;
+
+        println!(
+            "journal_bytes={journal_bytes} events={EVENTS}\n\
+             sweep  before: {pages} unbounded pages, {parsed} observations parsed, \
+             wall {before:?}, cpu {before_cpu} ticks\n\
+             sweep  after:  {reads} bounded pages, {moved} observations moved, \
+             {bytes_read} JSONL bytes, wall {after:?}, cpu {after_cpu} ticks\n\
+             stuck  before: wall {stuck_before:?}, cpu {stuck_before_cpu} ticks \
+             to move {UPLINK_WINDOW} events (parsed {}, dropped {dropped})\n\
+             stuck  after:  wall {stuck_after:?}, cpu {stuck_after_cpu} ticks \
+             to move {} events",
+            unbounded.len(),
+            bounded.events.len()
+        );
+        assert_eq!(moved, EVENTS as u64, "every event still moves exactly once");
+        assert_eq!(bounded.events.len(), UPLINK_WINDOW);
+        assert!(
+            bytes_read <= journal_bytes,
+            "a bounded sweep over a tail-only journal reads at most the journal"
+        );
+    }
+
+    /// One flush tick over a ~20 MB journal must cost O(new events).
+    ///
+    /// The pre-fix reader asked for `read_range(after + 1, None)` and dropped
+    /// all but the first page, so reading the one event appended after a
+    /// 7000-event journal deserialized the whole 20 MB again. The bound now
+    /// travels with the read, so the tick's byte cost tracks the new event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_flush_tick_costs_new_bytes_not_the_whole_journal() {
+        const EVENTS: usize = 7_000;
+        const PAD: usize = 2_800;
+        let data_dir = tempfile::tempdir().expect("journal data dir");
+        let (store, instance) = store_over_fixture(data_dir.path(), EVENTS, PAD);
+        let journal_id = instance.journal_id.clone();
+        let instance_id = instance.meta.id.clone();
+
+        let journal_path = data_dir
+            .path()
+            .join("journal")
+            .join(format!("{}.jsonl", instance_id.as_id().as_str()));
+        let journal_bytes = std::fs::metadata(&journal_path)
+            .expect("journal file")
+            .len();
+        assert!(
+            journal_bytes >= 20 * 1024 * 1024,
+            "fixture journal is {journal_bytes} bytes; the test needs ~20 MB"
+        );
+
+        // The one event the Hub is missing.
+        let body = crate::driver::message_payload(
+            remuda_protocol::MessageRole::Assistant,
+            remuda_protocol::MessagePhase::Final,
+            format!("tail-{}", "y".repeat(PAD)),
+            Vec::new(),
+        )
+        .expect("message");
+        store
+            .append_observation(&instance_id, None, Completeness::Structured, body)
+            .expect("append tail observation");
+
+        let before = store.journal_bytes_read();
+        let page = store
+            .read_events(&journal_id, Some(U64(EVENTS as u64)), 256)
+            .expect("flush tick");
+        let cost = store.journal_bytes_read() - before;
+
+        assert_eq!(page.events.len(), 1, "exactly the new event");
+        assert_eq!(page.events[0].position().1, U64(EVENTS as u64 + 1));
+        assert_eq!(page.durable_seq, U64(EVENTS as u64 + 1));
+        assert_eq!(page.floor_seq, U64(1));
+        assert!(
+            cost < journal_bytes / 100,
+            "one flush tick read {cost} bytes off a {journal_bytes}-byte journal; \
+             it must track the new event, not the journal"
+        );
+
+        // Caught up: the next tick reads nothing at all.
+        let before = store.journal_bytes_read();
+        let page = store
+            .read_events(&journal_id, Some(U64(EVENTS as u64 + 1)), 256)
+            .expect("caught-up tick");
+        assert!(page.events.is_empty());
+        assert_eq!(
+            store.journal_bytes_read(),
+            before,
+            "a caught-up tick must not read the journal"
+        );
+    }
+
+    /// A bounded page still pages: a reader behind the tail gets the first
+    /// `limit` events, never the whole journal.
+    #[test]
+    fn a_page_read_is_bounded_by_its_limit() {
+        let data_dir = tempfile::tempdir().expect("journal data dir");
+        let (store, instance) = store_over_fixture(data_dir.path(), 600, 200);
+        let journal_id = instance.journal_id.clone();
+        let journal_path = data_dir
+            .path()
+            .join("journal")
+            .join(format!("{}.jsonl", instance.meta.id.as_id().as_str()));
+        let journal_bytes = std::fs::metadata(&journal_path)
+            .expect("journal file")
+            .len();
+
+        let before = store.journal_bytes_read();
+        let page = store
+            .read_events(&journal_id, None, 16)
+            .expect("bounded page");
+        let cost = store.journal_bytes_read() - before;
+        assert_eq!(page.events.len(), 16, "the limit reaches the reader");
+        assert_eq!(page.events[0].position().1, U64(1));
+        assert_eq!(page.events[15].position().1, U64(16));
+        assert_eq!(page.durable_seq, U64(600), "durable seq is the tail");
+        // 16 events' worth, not the 600-event journal.
+        assert!(
+            cost < journal_bytes / 10,
+            "16-event page read {cost} bytes of a {journal_bytes}-byte journal"
+        );
+
+        // The next page resumes exactly where the first ended.
+        let next = store
+            .read_events(&journal_id, Some(U64(16)), 16)
+            .expect("next page");
+        assert_eq!(next.events.len(), 16);
+        assert_eq!(next.events[0].position().1, U64(17));
     }
 }

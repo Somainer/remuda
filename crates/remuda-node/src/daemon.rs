@@ -664,6 +664,13 @@ async fn forward_journals<W: AsyncWrite + Unpin>(
         }
         let key = instance.meta.id.as_id().to_string();
         let last = sent.get(&key).copied().unwrap_or(0);
+        // This tick runs every 50 ms. Skip the read outright when the journal
+        // is already at (or behind) what this session has sent, so a caught-up
+        // Instance — including a terminal one the Hub is durable at the tail
+        // for — costs one watermark query instead of a page read.
+        if node.journal_durable_seq(&instance.journal_id)?.0 <= last {
+            continue;
+        }
         for event in node
             .read_journal(&instance.journal_id, Some(U64(last)), 16 - pending.len())?
             .events

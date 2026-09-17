@@ -55,6 +55,31 @@ pub struct Snapshot {
     pub projections: Projections,
 }
 
+/// Upper bound on one [`Journal::read_page`], whatever the caller asks for.
+///
+/// The bound is enforced in the reader rather than at its callers because the
+/// cost it prevents is the reader's own: an unbounded range deserializes every
+/// row from the watermark to the tail only for the caller to drop all but the
+/// first page.
+pub const MAX_PAGE: usize = 256;
+
+/// One bounded page of observations and the cost of producing it.
+#[derive(Debug, Clone)]
+pub struct Page {
+    /// Observations in ascending `seq`; at most the requested `limit`.
+    pub observations: Vec<Observation>,
+    /// JSONL payload bytes read to build `observations`.
+    ///
+    /// This is the reader's own account of its cost, so a caller can assert
+    /// that reading a two-event tail does not scale with the journal.
+    pub bytes_read: u64,
+    /// Highest `seq` in `observations`; `None` when the page is empty.
+    pub last_seq: Option<U64>,
+    /// Durable watermark at read time. `last_seq == Some(durable_seq)` means
+    /// the page reached the tail.
+    pub durable_seq: U64,
+}
+
 enum OpKind {
     Append {
         instance: InstanceId,
@@ -64,6 +89,12 @@ enum OpKind {
         instance: InstanceId,
         from_seq: u64,
         to_seq: Option<u64>,
+    },
+    ReadPage {
+        instance: InstanceId,
+        from_seq: u64,
+        to_seq: Option<u64>,
+        limit: usize,
     },
     Snapshot {
         instance: InstanceId,
@@ -88,6 +119,7 @@ enum OpKind {
 enum OpOut {
     Seq(U64),
     Observations(Vec<Observation>),
+    Page(Box<Page>),
     Snapshot(Snapshot),
     Follow {
         history: Vec<Observation>,
@@ -167,6 +199,35 @@ impl Journal {
             .await?
         {
             OpOut::Observations(items) => Ok(items),
+            _ => Err(Error::Closed),
+        }
+    }
+
+    /// Read at most `limit` observations (`limit` clamped to [`MAX_PAGE`]).
+    ///
+    /// Unlike [`Journal::read_range`], the bound is applied inside the reader:
+    /// the SQL selects at most `limit` rows and only those rows' JSONL spans
+    /// are deserialized. A tail read therefore costs O(new events), not
+    /// O(journal). `to_seq = None` reads through the durable watermark, so the
+    /// page simply ends at the tail. [`Page::bytes_read`] reports the JSONL
+    /// cost so callers can assert on it.
+    pub async fn read_page(
+        &self,
+        instance: &InstanceId,
+        from_seq: U64,
+        to_seq: Option<U64>,
+        limit: usize,
+    ) -> Result<Page, Error> {
+        match self
+            .rpc(OpKind::ReadPage {
+                instance: instance.clone(),
+                from_seq: from_seq.0,
+                to_seq: to_seq.map(|s| s.0),
+                limit: limit.max(1),
+            })
+            .await?
+        {
+            OpOut::Page(page) => Ok(*page),
             _ => Err(Error::Closed),
         }
     }
@@ -388,6 +449,14 @@ impl Store {
             } => self
                 .read_range(&instance, from_seq, to_seq)
                 .map(OpOut::Observations),
+            OpKind::ReadPage {
+                instance,
+                from_seq,
+                to_seq,
+                limit,
+            } => self
+                .read_page(&instance, from_seq, to_seq, limit)
+                .map(|page| OpOut::Page(Box::new(page))),
             OpKind::Snapshot { instance } => self.snapshot(&instance).map(OpOut::Snapshot),
             OpKind::Follow { instance, from_seq } => self.follow(&instance, from_seq),
             OpKind::PutResume { instance, resume } => {
@@ -561,17 +630,61 @@ impl Store {
         to_seq: Option<u64>,
     ) -> Result<Vec<Observation>, Error> {
         let durable = self.watermark(instance)?;
+        let (observations, _) = self.read_rows(instance, from_seq, to_seq, durable, None)?;
+        Ok(observations)
+    }
+
+    fn read_page(
+        &mut self,
+        instance: &InstanceId,
+        from_seq: u64,
+        to_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Page, Error> {
+        let durable = self.watermark(instance)?;
+        let limit = limit.clamp(1, MAX_PAGE);
+        let (observations, bytes_read) =
+            self.read_rows(instance, from_seq, to_seq, durable, Some(limit))?;
+        let last_seq = observations.last().map(|obs| obs.seq);
+        Ok(Page {
+            observations,
+            bytes_read,
+            last_seq,
+            durable_seq: U64(durable),
+        })
+    }
+
+    /// Shared reader for [`Self::read_range`] and [`Self::read_page`].
+    ///
+    /// `limit = None` is the unbounded range; `Some(limit)` stops the SQL at
+    /// `limit` rows so neither the query nor the JSONL seeks touch more. The
+    /// second element of the result is the JSONL payload byte count read.
+    fn read_rows(
+        &mut self,
+        instance: &InstanceId,
+        from_seq: u64,
+        to_seq: Option<u64>,
+        durable: u64,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Observation>, u64), Error> {
         let from = from_seq.max(1);
         let to = to_seq.unwrap_or(durable);
         if from > durable || to < from {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
+        // `LIMIT -1` is SQLite's "no limit", so one statement covers both
+        // shapes and the bound is applied where the rows are chosen.
+        let limit_i64 = match limit {
+            Some(limit) => i64::try_from(limit).unwrap_or(i64::MAX),
+            None => -1,
+        };
         let mut stmt = self.conn.prepare(
             "SELECT jsonl_offset, jsonl_length FROM events
-             WHERE instance_id = ?1 AND seq >= ?2 AND seq <= ?3 ORDER BY seq ASC",
+             WHERE instance_id = ?1 AND seq >= ?2 AND seq <= ?3
+             ORDER BY seq ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(
-            params![instance.as_id().as_str(), from as i64, to as i64],
+            params![instance.as_id().as_str(), from as i64, to as i64, limit_i64],
             |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
         )?;
         let mut offsets = Vec::new();
@@ -579,11 +692,13 @@ impl Store {
             offsets.push(row?);
         }
         drop(stmt);
+        let mut bytes_read = 0u64;
         let mut out = Vec::with_capacity(offsets.len());
         for (offset, length) in offsets {
             out.push(self.read_jsonl_at(instance, offset, length)?);
+            bytes_read = bytes_read.saturating_add(length);
         }
-        Ok(out)
+        Ok((out, bytes_read))
     }
 
     fn snapshot(&mut self, instance: &InstanceId) -> Result<Snapshot, Error> {

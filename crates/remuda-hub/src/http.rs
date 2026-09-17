@@ -51,7 +51,7 @@ pub struct CreateInstanceBody {
     /// Carrier driver. Absent falls back to `claude-pty`, which keeps a live
     /// multi-turn TUI. It used to fall back to `claude-print`, which is never a
     /// valid default — a print session ends after one turn and needs a manual
-    /// resume (D-034). First-party callers all name one explicitly.
+    /// resume (D-035). First-party callers all name one explicitly.
     #[serde(default)]
     driver: Option<String>,
     model: Option<String>,
@@ -762,7 +762,7 @@ pub async fn create_instance(
     // A create that names no carrier gets a multi-turn one. This defaulted to
     // `claude-print`, which is never a valid default: a print session ends after
     // one turn and needs a manual resume, so a caller who omitted the field
-    // silently got a one-shot session (D-034). `claude-pty` is the conservative
+    // silently got a one-shot session (D-035). `claude-pty` is the conservative
     // replacement — it keeps a live TUI and, unlike `shell-pty`, is not a shell
     // driver, so the agent-approval gate for this request is unchanged.
     //
@@ -1645,7 +1645,7 @@ pub(crate) async fn forward_if_online(
             // The Node just told us which driver it really built. Record it
             // before anything reads the row back: a create that answers
             // `accepted` with a different driver than the one requested must not
-            // leave the Hub claiming the requested one (D-028; see
+            // leave the Hub claiming the requested one (D-035; see
             // docs/design/evidence/dispatch-driver-1.md).
             if let Some(instance_id) = command.instance_id.as_deref()
                 && matches!(

@@ -100,14 +100,10 @@ pub(crate) struct DispatchBody {
     /// `local` / `remote` tendency; resolved against project member hosts.
     #[serde(default)]
     pub(crate) placement: Option<String>,
-    /// Optional explicit driver override. Defaults to the harness/herdr choice
-    /// (claude-pty on a herdr host, claude-print otherwise); `shell-pty` selects
-    /// the Node's native PTY carrier, which serves a readable live screen for
-    /// `remuda watch` (D-028).
-    /// Explicit driver override (`claude-pty` / `shell-pty` / `claude-print`),
-    /// honoured verbatim or refused with a reason (409), never silently
-    /// replaced. `claude-print` is reachable only by naming it here or via
-    /// `--carrier print`; it is never a default (D-035).
+    /// Optional explicit driver override. Honoured verbatim or refused with a
+    /// reason (409), never silently replaced. The default prefers the Node's
+    /// native `shell-pty` carrier when it reports the carrier launchable, then
+    /// herdr's `claude-pty`; `claude-print` is never a default (D-035).
     #[serde(default)]
     pub(crate) driver: Option<String>,
     /// Carrier preference batch 6 (D-034): `native` (shell-pty), `herdr`, or
@@ -854,12 +850,10 @@ pub(crate) fn select_carrier(
                 Ok("claude-pty".to_string())
             } else {
                 Err(HubError::Unsatisfiable {
-                    reasons: vec![
-                        "no launchable carrier on host (native shell-pty not advertised, no \
-                         herdr); set REMUDA_PTY_CARRIER=native on the Node, or pass \
-                         --carrier print for a one-shot diagnostic session"
-                            .into(),
-                    ],
+                    reasons: vec![format!(
+                        "host {} can carry no interactive {harness} driver: it reports no launchable shell-pty (set REMUDA_PTY_CARRIER=native on the Node) and advertises no herdr; claude-print is never a default because it ends the session after one turn (D-035)",
+                        host.host_id
+                    )],
                 })
             }
         }

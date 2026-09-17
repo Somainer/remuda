@@ -74,7 +74,7 @@ export function shellPtyAllowed(host: HostMatrix | undefined, kind: AgentKindId 
 export function legacyDrivers(kind: AgentKindId): DriverKind[] {
   // claude-pty first: it keeps a multi-turn TUI alive. claude-print is offered
   // last and never defaulted — a print session ends after one turn and needs a
-  // manual resume, so it is a diagnostic carrier only, chosen explicitly (D-034).
+  // manual resume, so it is a diagnostic carrier only, chosen explicitly (D-035).
   if (kind === "claude") return ["claude-pty", "generic-pty", "claude-print"];
   return ["generic-pty"];
 }

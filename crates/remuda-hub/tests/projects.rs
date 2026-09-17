@@ -63,7 +63,7 @@ async fn enroll_node(
                     "maxInstances": max_instances,
                     "resources": resources,
                     "cli": [{"kind":"claude","version":"0.0.0","absolutePath":"/usr/bin/claude","authState":"unknown"}],
-                    // A carrier these hosts can actually run. Before D-034 a
+                    // A carrier these hosts can actually run. Before D-035 a
                     // create with no driver silently meant `claude-print`, so a
                     // host advertising no carrier at all still "worked".
                     "herdr": {"version": "0.9.0", "socket": "/tmp/fake-herdr.sock"},
@@ -194,7 +194,7 @@ impl Ctx {
     /// These tests exercise delegation, scope and fan-out, not carriers, so the
     /// helper names a driver when the case does not. A create must name one:
     /// omitting it used to mean `claude-print`, which is never a valid default
-    /// (a print session ends after one turn; D-034). `claude-pty` keeps the
+    /// (a print session ends after one turn; D-035). `claude-pty` keeps the
     /// pre-existing agent-approval behaviour these cases assert.
     async fn create_instance_with(
         &self,

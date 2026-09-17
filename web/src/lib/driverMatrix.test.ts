@@ -70,7 +70,7 @@ describe("New Session driver default (D-028 §5.1, matrix from the Node, never h
     expect(legacyDrivers("grok")).toEqual(["generic-pty"]);
   });
 
-  it("never defaults to claude-print for any host shape (D-034)", () => {
+  it("never defaults to claude-print for any host shape (D-035)", () => {
     // A print session ends after one turn and needs a manual resume, so it is a
     // diagnostic carrier chosen explicitly — never a default and never a
     // fallback. Every reachable host shape is checked, including the ones that

@@ -24,7 +24,7 @@ const empty: NewSessionPrefs = {
   // falls through to `defaultDriver(host, kind)`, which reads the host's own
   // `driverInventory`. This used to say `claude-print`, which is never a valid
   // default: a print session ends after one turn and needs a manual resume
-  // (D-034; docs/design/evidence/dispatch-driver-1.md).
+  // (D-035; docs/design/evidence/dispatch-driver-1.md).
   driver: "",
   delegation: "none",
   effortIndex: 2,

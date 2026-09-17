@@ -268,7 +268,7 @@ pre-existing mislabel, not part of this change.)
 The owner tightened the rule the same day: `claude-print` is useless as a worker
 carrier — a session ends after one turn and needs a manual resume — so it is
 removed from **every** default and fallback path, not just `driver_for`. That is
-recorded as **D-034** and implemented as:
+recorded as **D-035** and implemented as:
 
 - **Hub.** `driver_for` prefers `shell-pty` when the inventory reports it
   launchable, then `claude-pty` when herdr is advertised, and refuses with a
@@ -288,7 +288,7 @@ recorded as **D-034** and implemented as:
   (`shell-pty` when launchable, else `claude-pty`); its persisted `prefs.driver`
   no longer seeds `claude-print`.
 - **Docs.** `docs/design/protocol.md` (the `DriverKind` block) and
-  `docs/design/native-pty-first.md` (the kind/driver matrix) carry the D-034
+  `docs/design/native-pty-first.md` (the kind/driver matrix) carry the D-035
   ordering note.
 
 ## What this does not do

@@ -267,6 +267,120 @@ async fn agent_origin_is_always_403() -> Result<()> {
     )
     .await?;
     assert_eq!(status, 403);
+    let (status, _) = json_request(
+        fixture.addr,
+        "POST",
+        &format!("/v1/hosts/{}/files/search", fixture.host_id),
+        &[("Authorization", &format!("Bearer {agent}"))],
+        Some(r#"{"workspaceId":"wsp_x","query":"needle","mode":"content"}"#),
+    )
+    .await?;
+    assert_eq!(status, 403);
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn human_operator_gets_search_results() -> Result<()> {
+    let fixture = fixture().await?;
+    let (addr, cookie, host) = (
+        fixture.addr,
+        fixture.cookie.clone(),
+        fixture.host_id.clone(),
+    );
+
+    fixture
+        .hub
+        .test_set_node_reply(
+            &host,
+            Some(json!({"result": {
+                "workspaceId": "wsp_x",
+                "path": "/ws",
+                "mode": "content",
+                "query": "needle",
+                "matches": [
+                    {"path": "src/main.rs", "line": 3, "column": 4,
+                     "snippet": "let needle = 1;"}
+                ],
+                "truncated": false,
+                "filesScanned": 1,
+                "bytesScanned": 17
+            }})),
+        )
+        .await;
+    let (status, body) = json_request(
+        addr,
+        "POST",
+        &format!("/v1/hosts/{host}/files/search"),
+        &[("Cookie", &cookie)],
+        Some(
+            r#"{"workspaceId":"wsp_x","query":"needle","mode":"content",
+                 "regex":false,"glob":"*.rs","maxResults":10}"#,
+        ),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let result = serde_json::from_str::<Value>(body.trim())?;
+    assert_eq!(result["matches"][0]["path"], json!("src/main.rs"));
+    assert_eq!(result["matches"][0]["line"], json!(3));
+    assert_eq!(result["truncated"], json!(false));
+
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_rejects_bad_query_and_unknown_workspace() -> Result<()> {
+    let fixture = fixture().await?;
+    let (addr, cookie, host) = (
+        fixture.addr,
+        fixture.cookie.clone(),
+        fixture.host_id.clone(),
+    );
+
+    // Empty query is refused at the Hub before the Node is called.
+    let (status, body) = json_request(
+        addr,
+        "POST",
+        &format!("/v1/hosts/{host}/files/search"),
+        &[("Cookie", &cookie)],
+        Some(r#"{"workspaceId":"wsp_x","query":"   "}"#),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+
+    // A bad mode is likewise a Hub-side 400.
+    let (status, _) = json_request(
+        addr,
+        "POST",
+        &format!("/v1/hosts/{host}/files/search"),
+        &[("Cookie", &cookie)],
+        Some(r#"{"workspaceId":"wsp_x","query":"x","mode":"contents"}"#),
+    )
+    .await?;
+    assert_eq!(status, 400);
+
+    // The Node's "unknown workspace" JSON-RPC error surfaces as a clean 400,
+    // never a hang or a 5xx.
+    fixture
+        .hub
+        .test_set_node_reply(
+            &host,
+            Some(json!({"error": {"code": -32602,
+                "message": "workspace wsp_missing is not registered on this Node"}})),
+        )
+        .await;
+    let (status, body) = json_request(
+        addr,
+        "POST",
+        &format!("/v1/hosts/{host}/files/search"),
+        &[("Cookie", &cookie)],
+        Some(r#"{"workspaceId":"wsp_missing","query":"needle"}"#),
+    )
+    .await?;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("not registered"), "{body}");
+
     fixture.hub.shutdown().await;
     Ok(())
 }
@@ -285,6 +399,15 @@ async fn missing_and_offline_hosts_are_rejected() -> Result<()> {
     )
     .await?;
     assert_eq!(status, 404);
+    let (status, _) = json_request(
+        fixture.addr,
+        "POST",
+        &format!("/v1/hosts/{ghost}/files/search"),
+        &[("Cookie", &fixture.cookie)],
+        Some(r#"{"workspaceId":"wsp_x","query":"needle"}"#),
+    )
+    .await?;
+    assert_eq!(status, 404);
     // A registered but disconnected host → 409 host offline.
     fixture.hub.test_disconnect_node(&fixture.host_id).await;
     let (status, body) = json_request(
@@ -293,6 +416,15 @@ async fn missing_and_offline_hosts_are_rejected() -> Result<()> {
         &format!("/v1/hosts/{}/files?workspaceId=wsp_x", fixture.host_id),
         &[("Cookie", &fixture.cookie)],
         None,
+    )
+    .await?;
+    assert_eq!(status, 409, "{body}");
+    let (status, body) = json_request(
+        fixture.addr,
+        "POST",
+        &format!("/v1/hosts/{}/files/search", fixture.host_id),
+        &[("Cookie", &fixture.cookie)],
+        Some(r#"{"workspaceId":"wsp_x","query":"needle"}"#),
     )
     .await?;
     assert_eq!(status, 409, "{body}");

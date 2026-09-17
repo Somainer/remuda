@@ -264,9 +264,12 @@ async fn agent_messages_remote_instance_within_scope_and_journals_both_sides() -
     )
     .await?;
     let target_b = create_instance(addr, &cookie, &host_b, json!({}), "receiver-b").await?;
+    // An unscoped (universe) agent never gets the scope bypass for a sibling.
+    let a3 = create_instance(addr, &cookie, &host_a, json!({}), "sender-universe").await?;
 
     let token_wide = hub.test_mint_agent_token("agent-a1", &a1).await?;
     let token_narrow = hub.test_mint_agent_token("agent-a2", &a2).await?;
+    let token_universe = hub.test_mint_agent_token("agent-a3", &a3).await?;
 
     // In-scope cross-host send goes straight through (no human Interaction).
     let (status, body) = http(
@@ -290,6 +293,19 @@ async fn agent_messages_remote_instance_within_scope_and_journals_both_sides() -
     )
     .await?;
     assert_eq!(status, 409, "out-of-scope send {body}");
+    assert!(body.contains("HUMAN_APPROVAL_REQUIRED"), "{body}");
+
+    // A universe-scoped agent is not "in scope of everything": an unowned
+    // sibling still demands the human Interaction.
+    let (status, body) = http(
+        addr,
+        "POST",
+        &format!("/v1/instances/{target_b}/commands"),
+        &[("Authorization", &format!("Bearer {token_universe}"))],
+        Some(&send_body("universe box is not an approval bypass")),
+    )
+    .await?;
+    assert_eq!(status, 409, "universe-scope sibling send {body}");
     assert!(body.contains("HUMAN_APPROVAL_REQUIRED"), "{body}");
 
     // Fleet --all stays banned from Agent origin.

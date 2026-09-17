@@ -34,7 +34,8 @@ pub mod statusline;
 
 pub use ansi::{char_tail, screen_tail, strip_ansi};
 pub use dialog::{
-    SCREEN_BYTES, SCREEN_LINES, ScreenChoice, ScreenRequest, excerpt, screen_request,
+    FirstRunDialog, OUTSIDE_READS_DIALOG_TITLE, SCREEN_BYTES, SCREEN_LINES, ScreenChoice,
+    ScreenRequest, TRUST_DIALOG_TITLE, excerpt, first_run_dialog, screen_request,
     trust_dialog_keys,
 };
 pub use emulator::{DEFAULT_SCROLLBACK_LINES, Emulator, MAX_COLS, MAX_ROWS};

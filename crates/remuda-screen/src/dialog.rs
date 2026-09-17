@@ -231,6 +231,61 @@ pub fn trust_dialog_keys(grid: &ScreenGrid) -> Option<Vec<String>> {
     Some(cursor_keys(yes, selected))
 }
 
+/// A first-run / native permission dialog that parks an agent before (or in
+/// place of) the prompt composer.
+///
+/// Distinct from [`ScreenRequest`]: these are Claude Code's own modal screens,
+/// not a harness permission prompt, and a queued prompt must never be typed
+/// into one. The title is carried verbatim into the watch blocked reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstRunDialog {
+    /// Stable diagnostic name.
+    pub name: &'static str,
+    /// On-screen dialog title/question, used as the human-readable reason.
+    pub title: &'static str,
+}
+
+/// Folder-trust dialog title (dispatch-onboarding-1).
+pub const TRUST_DIALOG_TITLE: &str = "Is this a project you created or one you trust?";
+/// Auto-mode outside-reads dialog title (dispatch-onboarding-1).
+pub const OUTSIDE_READS_DIALOG_TITLE: &str = "Allow reads outside the working directories?";
+
+/// Recognise a first-run/native dialog from a rendered grid.
+///
+/// Every arm requires at least two independent markers: a single stock phrase
+/// can appear in ordinary model output, and classifying a working turn as
+/// blocked over one quoted line would cry wolf — while classifying the dialog
+/// itself as *working* (the bug this guards) sends keystrokes into a modal.
+/// Matches run against the whitespace-flattened screen so a narrow terminal's
+/// soft wrap cannot split a marker (§10 anchor ⑤).
+#[must_use]
+pub fn first_run_dialog(grid: &ScreenGrid) -> Option<FirstRunDialog> {
+    let flat = grid.flat();
+    let has = |needle: &str| flat.contains(needle);
+    // The folder-trust dialog: the heading plus the full question. The
+    // standalone question is already a blocked phrase in `signature.rs`, but
+    // quoted on its own (e.g. these docs) is not evidence of the modal.
+    if has("Quick safety check:") && has(TRUST_DIALOG_TITLE) {
+        return Some(FirstRunDialog {
+            name: "first-run-trust",
+            title: TRUST_DIALOG_TITLE,
+        });
+    }
+    // The auto-mode outside-reads dialog: the question plus one of its three
+    // exact option labels.
+    if has(OUTSIDE_READS_DIALOG_TITLE)
+        && (has("Yes, keep allowing reads outside the working directories")
+            || has("No, block reads outside the working directories from now on")
+            || has("No, ask again next time"))
+    {
+        return Some(FirstRunDialog {
+            name: "first-run-outside-reads",
+            title: OUTSIDE_READS_DIALOG_TITLE,
+        });
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +367,61 @@ mod tests {
             format!("{title}\n❯ No, exit\nYes, I trust this folder\nNo, exit"),
         ] {
             assert!(trust_dialog_keys(&raw(&screen)).is_none(), "{screen}");
+        }
+    }
+
+    #[test]
+    fn first_run_dialogs_are_detected_from_their_fixtures() {
+        let trust = raw(include_str!(
+            "../../remuda-testing/tests/fixtures/claude-trust-dialog.txt"
+        ));
+        let dialog = first_run_dialog(&trust).expect("trust dialog");
+        assert_eq!(dialog.name, "first-run-trust");
+        assert_eq!(dialog.title, TRUST_DIALOG_TITLE);
+
+        let outside = raw(include_str!(
+            "../../remuda-testing/tests/fixtures/claude-outside-reads-dialog.txt"
+        ));
+        let dialog = first_run_dialog(&outside).expect("outside-reads dialog");
+        assert_eq!(dialog.name, "first-run-outside-reads");
+        assert_eq!(dialog.title, OUTSIDE_READS_DIALOG_TITLE);
+    }
+
+    #[test]
+    fn first_run_dialog_survives_a_soft_wrap() {
+        // The question wrapped across two rows on a narrow terminal.
+        let grid = ScreenGrid::from_lines([
+            "❯ earlier",
+            "Quick safety check:",
+            "Is this a project you created",
+            "or one you trust?",
+        ]);
+        assert_eq!(
+            first_run_dialog(&grid).map(|d| d.title),
+            Some(TRUST_DIALOG_TITLE)
+        );
+        let wrapped = ScreenGrid::from_lines([
+            "Allow reads outside the working",
+            "directories?",
+            "❯ Yes, keep allowing reads outside the working directories",
+        ]);
+        assert_eq!(
+            first_run_dialog(&wrapped).map(|d| d.title),
+            Some(OUTSIDE_READS_DIALOG_TITLE)
+        );
+    }
+
+    #[test]
+    fn one_marker_quoted_in_output_is_never_a_dialog() {
+        // Model output / these docs quoting one marker must not classify.
+        for screen in [
+            "The wizard asks: Is this a project you created or one you trust?",
+            "Quick safety check: read the docs before continuing.",
+            "Allow reads outside the working directories? is a prompt you may see.",
+            "Choose: No, ask again next time.",
+            include_str!("../../remuda-testing/tests/fixtures/claude-prompt-composer.txt"),
+        ] {
+            assert_eq!(first_run_dialog(&raw(screen)), None, "{screen:?}");
         }
     }
 }

@@ -275,11 +275,7 @@ impl ClaudeBgDriver {
         let (tx, rx) = mpsc::channel(64);
         self.seq.store(0, Ordering::SeqCst);
         self.closed.store(false, Ordering::SeqCst);
-        let instance_id = self
-            .options
-            .instance_id
-            .clone()
-            .unwrap_or_default();
+        let instance_id = self.options.instance_id.clone().unwrap_or_default();
         let run_id = RunId::new();
         let journal_id = Id::new("obj")?;
         *self.inner.lock().await = Some(BgLive {

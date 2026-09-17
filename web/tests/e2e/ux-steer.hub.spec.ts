@@ -148,11 +148,24 @@ function watchCommands(page: Page): Posted[] {
 
 test("queue two, cancel one, then 插队 jumps ahead of the remaining row", async ({ page }) => {
   const commands = watchCommands(page);
+  page.on("framenavigated", (f) => console.log("NAV:", f.url()));
+  page.on("pageerror", (e) => console.log("PAGEERROR:", e.message, (e as Error).stack ?? ""));
+  page.on("console", (m) => { if (m.type() === "error") console.log("CONSOLE-ERR:", m.text()); });
   const instanceId = await createSession(page, "steer ordering session");
   await answerPending(page, instanceId);
+  // Answering the create approval ends the fake turn (idle). Send the
+  // hold-working sentinel to start a turn the agent stays busy in.
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
+    timeout: 15_000,
+  });
+  await page.getByTestId("composer-input").fill("hold-working run a long tool");
+  await page.getByTestId("composer-send").click();
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 15_000,
   });
+  // Wait for the POST flight to settle: while `sending` the dock is disabled
+  // and an Enter pressed too early would be swallowed by canSubmit().
+  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
 
   const input = page.getByTestId("composer-input");
   // Enter while working holds locally; nothing is POSTed.
@@ -195,9 +208,10 @@ test("queue two, cancel one, then 插队 jumps ahead of the remaining row", asyn
   await expect(page.getByTestId("composer-interrupted-chip")).toBeVisible();
   await expect
     .poll(() => commands.filter((c) => c.operation === "instance.send").length)
-    .toBeGreaterThanOrEqual(2);
+    .toBeGreaterThanOrEqual(3);
   const sends = commands.filter((c) => c.operation === "instance.send");
-  expect(sends[0]?.payload).toMatchObject({ prompt: "jump first", mode: "steer" });
+  expect(sends[0]?.payload).toMatchObject({ prompt: "hold-working run a long tool" });
+  expect(sends[1]?.payload).toMatchObject({ prompt: "jump first", mode: "steer" });
   expect(sends.at(-1)?.payload?.prompt).toBe("queued beta");
   expect(sends.at(-1)?.payload?.mode).toBeFalsy();
   // Delivered rows lose the held tag; nothing remains stuck 排队.
@@ -242,9 +256,12 @@ test("Cmd/Ctrl+Enter is the 插队 gesture", async ({ page }) => {
   const commands = watchCommands(page);
   const instanceId = await createSession(page, "steer keyboard session");
   await answerPending(page, instanceId);
+  await page.getByTestId("composer-input").fill("hold-working long tool again");
+  await page.getByTestId("composer-send").click();
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 15_000,
   });
+  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
 
   const input = page.getByTestId("composer-input");
   await input.fill("keyboard jump");

@@ -292,6 +292,11 @@ test("slow ack: a pending command never reads as success while it is in flight",
   });
 
   const composer = page.getByTestId("composer-input");
+  // c-steer: Enter queues while the answered-approval transition is still
+  // settling; wait for idle so this is one direct POST.
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
+    timeout: 15_000,
+  });
   await composer.fill("slow one");
   await composer.press("Enter");
 
@@ -321,6 +326,11 @@ test("rejection: a refused command surfaces and does not auto-resend", async ({ 
   );
 
   const composer = page.getByTestId("composer-input");
+  // c-steer: Enter while WORKING queues instead of sending; wait for the
+  // answered approval's idle transition so this is a direct POST.
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
+    timeout: 15_000,
+  });
   await composer.fill("rejected one");
   await composer.press("Enter");
   await page.waitForTimeout(1000);

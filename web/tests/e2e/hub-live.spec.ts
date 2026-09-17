@@ -442,10 +442,19 @@ test("composer queue / steer / interrupt states on a working native session", as
   const instanceId = new URL(page.url()).pathname.split("/").pop() as string;
   await answerPendingApprovals(page, instanceId);
 
-  // The fake Node reports the launched agent as working immediately.
+  // Answering the create approval completes the fake turn: the composer is
+  // idle. Start a fresh "hold-working" turn to exercise the working controls.
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
+    timeout: 10_000,
+  });
+  await page.getByTestId("composer-input").fill("hold-working long tool");
+  await page.getByTestId("composer-send").click();
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 10_000,
   });
+  // While `sending` the dock is disabled; wait for the POST flight to
+  // settle before queueing (interrupt is not gated on empty text).
+  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
 
   // Working composer: Enter queues (Remuda-held), 插队 and 打断 available.
   const queue = page.getByTestId("composer-queue");
@@ -492,24 +501,23 @@ test("composer queue / steer / interrupt states on a working native session", as
   await expect(page.getByTestId("composer-interrupted-chip")).toBeVisible();
   await expect
     .poll(() => commands.filter((c) => c.operation === "instance.send").length)
-    .toBeGreaterThanOrEqual(2);
+    .toBeGreaterThanOrEqual(3);
   const sends = commands.filter((c) => c.operation === "instance.send");
-  expect(sends[0]?.payload?.mode).toBe("steer");
+  expect(sends[0]?.payload?.prompt).toBe("hold-working long tool");
+  expect(sends[1]?.payload).toMatchObject({ prompt: "jump now", mode: "steer" });
   expect(sends.at(-1)?.payload?.prompt).toBe("later");
 
-  // Esc while the composer is focused interrupts (with a confirm on desktop).
-  // The flushed queued prompt starts a fresh turn on the fake agent (working).
-  await expect
-    .poll(() => commands.at(-1)?.payload?.prompt)
-    .toBe("later");
+  // Plain Esc interrupts: start another hold-working turn, then cancel it.
+  await page.getByTestId("composer-input").fill("hold-working stop me");
+  await page.getByTestId("composer-send").click();
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 10_000,
   });
+  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
   page.once("dialog", (dialog) => {
     expect(dialog.message()).toContain("打断");
     void dialog.accept();
   });
-  await page.getByTestId("composer-input").fill("stop please");
   await page.getByTestId("composer-input").focus();
   await page.keyboard.press("Escape");
   await expect

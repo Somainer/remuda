@@ -28,6 +28,19 @@ import css from "./session.module.css";
  */
 const KNOB_INSET = 18;
 
+/** Order-preserving de-dup on the full id (the picker keeps a 1m variant and
+ *  its base id distinct). */
+function dedupeModels(ids: string[]): string[] {
+  const out: string[] = [];
+  for (const id of ids) {
+    // Dedup on the short label the rows render by, so e.g. e2e/auto and the
+    // current passthrough/auto don't produce two "auto" radio rows.
+    const short = shortModel(id);
+    if (id && !out.some((existing) => shortModel(existing) === short)) out.push(id);
+  }
+  return out;
+}
+
 function BoltIcon() {
   return (
     <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
@@ -94,6 +107,8 @@ export function EffortSlider({
   kind,
   model,
   models,
+  modelEffective,
+  modelPending,
   index,
   ultracode = false,
   disabled,
@@ -108,6 +123,10 @@ export function EffortSlider({
   /** Undefined when the harness has no model axis (agy), or when the page owns its own model field. */
   model?: string;
   models?: string[];
+  /** Resolved effective model id from read-back (may differ from the alias picked). */
+  modelEffective?: string | null;
+  /** A model switch in flight. */
+  modelPending?: { id: string; queued: boolean } | null;
   index: number;
   /** Claude ultracode workflow flag; the rightmost slider stop sets it. */
   ultracode?: boolean;
@@ -146,7 +165,23 @@ export function EffortSlider({
   const ratio = effortRatio(shown, Math.max(1, stops.length));
   const fallback = effortStopIndex(kind, defaultEffortIndex(kind), false);
   const modelLabel = model ? shortModel(model) : "";
-  const modelList = model ? modelsFor(kind, models ?? [model]) : [];
+  // The current model is the read-back effective id (an alias resolves to a
+  // concrete id); fall back to the requested/instance id until read-back.
+  const currentModel = modelEffective || model || "";
+  // A discovered catalog is the real `/model` picker list; the builtin aliases
+  // are appended only when nothing was discovered (models prop absent).
+  const modelList = currentModel
+    ? models && models.length
+      ? dedupeModels([...models, currentModel])
+      : modelsFor(kind, [currentModel])
+    : [];
+  const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
+  // A mismatch is settled state; while the requested switch is still in flight
+  // (pending) the effective id is simply stale, so don't cry mismatch yet.
+  const modelMismatch =
+    !modelPending && model && modelEffective
+      ? shortModel(model) !== shortModel(modelEffective)
+      : false;
 
   if (stops.length === 0) return null;
 
@@ -313,7 +348,11 @@ export function EffortSlider({
 
   if (list) {
     return (
-      <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}>
+      <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}
+        data-model-current={currentModel ? shortModel(currentModel) : ""}
+        data-model-pending={modelPending ? (modelPending.queued ? "queued" : "switching") : "0"}
+        data-model-mismatch={modelMismatch ? "1" : "0"}
+      >
         <div className={css.effortListHead}>
           <button
             type="button"
@@ -348,23 +387,39 @@ export function EffortSlider({
           {modelList.length ? (
             <>
               <div className={css.effortListTitle}>模型</div>
-              {modelList.map((id) => (
-                <button
-                  key={id}
-                  type="button"
-                  className={css.effortRow + (shortModel(model) === shortModel(id) ? ` ${css.effortOn}` : "")}
-                  data-testid={`model-option-${shortModel(id)}`}
-                  onClick={() => {
-                    onModel?.(id);
-                    setList(false);
-                  }}
-                >
-                  <span
-                    className={`${css.radio} ${shortModel(model) === shortModel(id) ? css.radioOn : ""}`}
-                  />
-                  <span className={css.effortName}>{shortModel(id)}</span>
-                </button>
-              ))}
+              {modelList.map((id) => {
+                const short = shortModel(id);
+                const selected = shortModel(currentModel) === short;
+                const pending = modelPendingShort === short;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    className={css.effortRow + (selected ? ` ${css.effortOn}` : "")}
+                    data-testid={`model-option-${short}`}
+                    data-selected={selected ? "1" : "0"}
+                    data-model-pending={pending ? (modelPending?.queued ? "queued" : "switching") : "0"}
+                    title={id}
+                    onClick={() => {
+                      onModel?.(id);
+                      setList(false);
+                    }}
+                  >
+                    <span className={`${css.radio} ${selected ? css.radioOn : ""}`} />
+                    <span className={css.effortName}>{short}</span>
+                    {pending ? (
+                      <span className={css.effortDesc} data-testid="model-option-pending">
+                        {modelPending?.queued ? "排队中" : "切换中"}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
+              {modelMismatch ? (
+                <div className={css.effortDesc} data-testid="model-option-mismatch">
+                  请求 {shortModel(model)} → 实际 {shortModel(modelEffective ?? undefined)}
+                </div>
+              ) : null}
             </>
           ) : null}
         </div>

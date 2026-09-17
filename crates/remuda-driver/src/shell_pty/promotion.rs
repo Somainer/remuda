@@ -676,6 +676,15 @@ fn retire_payload(
     )))
 }
 
+/// §9.1 model-sync inputs threaded into the promotion hydrator, mirroring the
+/// effort bridge. `launch`/`catalog` seed the launch-time model snapshot the
+/// picker reads its real list from.
+pub(super) struct ModelSync {
+    pub(super) bridge: Arc<crate::model::ModelBridge>,
+    pub(super) launch: Option<String>,
+    pub(super) catalog: Option<remuda_protocol::ModelCatalogInfo>,
+}
+
 /// Spawn the per-instance promotion poller.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
@@ -697,6 +706,7 @@ pub(super) fn spawn(
     seq: Arc<AtomicU64>,
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<remuda_protocol::EffortSelection>,
+    model: Option<ModelSync>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
@@ -1067,6 +1077,7 @@ pub(super) fn spawn(
                         &seq,
                         effort_bridge.as_ref(),
                         launch_effort,
+                        model.as_ref(),
                     )
                     .await;
                 }
@@ -1266,6 +1277,7 @@ async fn maintain_binding(
     seq: &AtomicU64,
     effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
     launch_effort: Option<EffortSelection>,
+    model: Option<&ModelSync>,
 ) {
     // Deterministic channels get first crack at an unbound, healthy epoch.
     if bindings.binding().is_none() && !bindings.degraded() {
@@ -1381,7 +1393,7 @@ async fn maintain_binding(
     }
 
     if hydrator.is_none() {
-        *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort);
+        *hydrator = Hydrator::open(ctx, &binding, effort_bridge, launch_effort, model);
     }
     if let Some(active) = hydrator.as_mut() {
         match pump(active, events, seq, ctx).await {
@@ -1499,6 +1511,8 @@ async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> 
 struct Hydrator {
     tail: TranscriptTail,
     mapper: TranscriptMapper,
+    /// Launch-time observations (model snapshot) emitted on the first pump.
+    pending: Vec<Observation>,
 }
 
 impl Hydrator {
@@ -1508,6 +1522,7 @@ impl Hydrator {
         binding: &TranscriptBinding,
         effort_bridge: Option<&Arc<crate::effort::EffortBridge>>,
         launch_effort: Option<EffortSelection>,
+        model: Option<&ModelSync>,
     ) -> Option<Self> {
         tracing::info!(
             instance_id = %ctx.instance_id.as_id(),
@@ -1527,9 +1542,23 @@ impl Hydrator {
         if let Some(bridge) = effort_bridge {
             mapper = mapper.with_effort_bridge(Arc::clone(bridge), launch_effort);
         }
+        let mut pending = Vec::new();
+        if let Some(model) = model {
+            mapper = mapper.with_model_bridge(
+                Arc::clone(&model.bridge),
+                model.launch.clone(),
+                model.catalog.clone(),
+            );
+            if let Some(id) = model.launch.as_deref().filter(|id| !id.is_empty())
+                && let Ok(observations) = mapper.take_launch_model_snapshot(Some(id))
+            {
+                pending = observations;
+            }
+        }
         Some(Self {
             mapper,
             tail: binding.tail(),
+            pending,
         })
     }
 }
@@ -1545,6 +1574,24 @@ async fn pump(
     seq: &AtomicU64,
     ctx: &PromoteCtx,
 ) -> Result<(), ()> {
+    // Launch snapshot (model list/current model) once, ahead of replayed lines.
+    if !hydrator.pending.is_empty() {
+        for observation in std::mem::take(&mut hydrator.pending) {
+            if emit(
+                events,
+                seq,
+                ctx,
+                SourceChannel::Transcript,
+                observation.completeness,
+                observation.body,
+            )
+            .await
+            .is_err()
+            {
+                return Err(());
+            }
+        }
+    }
     let lines = hydrator.tail.poll().map_err(|_| ())?;
     // The mapper buffers an assistant run until something supersedes it, so
     // the last message of a batch would otherwise sit unseen until the next

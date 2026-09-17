@@ -20,19 +20,19 @@ use remuda_claude_wire::{
 use remuda_protocol::hubnode::AttachmentKind;
 use remuda_protocol::{
     ApprovalRequest, ClaudePermissionMode, Completeness, ContentBlock, ContentStatus, Cost,
-    DecisionEffect, DecisionOption, Digest, DriverInput, DriverKind, EffortEffective,
-    EffortPayload, EventId, HostId, Id, InputAccounting, InputOrigin, InstanceId, InstanceSpec,
-    Interaction, InteractionAnswer, InteractionCarrier, InteractionId, InteractionKind,
-    InteractionRequest, InteractionRequestKey, InteractionState, Knowledge, LifecyclePayload,
-    LifecycleTopic, MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
-    NativeRef, NativeRequestKey, NativeRequestValueType, NodeMutation, Observation,
-    ObservationPayload, ObservationSource, OpaqueImpact, OpaquePayload, OpaqueReason,
-    PermissionMode, QuestionField, QuestionInput, QuestionOption, QuestionRequest, RawRef,
-    Redaction, ResultStage, RunId, RuntimeCursor, SchemaVersion, Severity, SourceChannel,
-    SourceCursor, SourceDelivery, TextBlock, ThoughtPayload, ThoughtRepresentation, Timestamp,
-    ToolCallPayload, ToolCallState, ToolCategory, ToolOutcome, ToolResultPayload, U64, UsageMode,
-    UsagePayload, UsageScope, WorkflowEngine, WorkflowPhasePayload, WorkflowRunPayload,
-    WorkflowState,
+    DecisionEffect, DecisionOption, Digest, DriverInput, DriverKind, EffectiveModel,
+    EffortEffective, EffortPayload, EffortSource, EventId, HostId, Id, InputAccounting,
+    InputOrigin, InstanceId, InstanceSpec, Interaction, InteractionAnswer, InteractionCarrier,
+    InteractionId, InteractionKind, InteractionRequest, InteractionRequestKey, InteractionState,
+    Knowledge, LifecyclePayload, LifecycleTopic, MessagePayload, MessagePhase, MessageRole,
+    ModelPayload, MutationOperation, NativeLifecycle, NativeRef, NativeRequestKey,
+    NativeRequestValueType, NodeMutation, Observation, ObservationPayload, ObservationSource,
+    OpaqueImpact, OpaquePayload, OpaqueReason, PermissionMode, QuestionField, QuestionInput,
+    QuestionOption, QuestionRequest, RawRef, Redaction, ResultStage, RunId, RuntimeCursor,
+    SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, TextBlock,
+    ThoughtPayload, ThoughtRepresentation, Timestamp, ToolCallPayload, ToolCallState, ToolCategory,
+    ToolOutcome, ToolResultPayload, U64, UsageMode, UsagePayload, UsageScope, WorkflowEngine,
+    WorkflowPhasePayload, WorkflowRunPayload, WorkflowState,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -2000,6 +2000,16 @@ pub struct TranscriptMapper {
     effort_bridge: Option<Arc<crate::effort::EffortBridge>>,
     /// Generation the tracker is currently armed with.
     effort_generation: Option<u64>,
+    /// §9.1 effective-model read-back state.
+    model: remuda_protocol::ModelTracker,
+    /// Rendezvous for Remuda-initiated `/model` switches.
+    model_bridge: Option<Arc<crate::model::ModelBridge>>,
+    /// Generation the model tracker is armed with.
+    model_generation: Option<u64>,
+    /// Discovered catalog stamped onto the first model observation.
+    model_catalog: Option<remuda_protocol::ModelCatalogInfo>,
+    /// Whether the launch model snapshot was already emitted.
+    model_launch_emitted: bool,
 }
 
 impl TranscriptMapper {
@@ -2037,6 +2047,11 @@ impl TranscriptMapper {
             effort: remuda_protocol::EffortTracker::new(),
             effort_bridge: None,
             effort_generation: None,
+            model: remuda_protocol::ModelTracker::new(),
+            model_bridge: None,
+            model_generation: None,
+            model_catalog: None,
+            model_launch_emitted: false,
         }
     }
 
@@ -2053,6 +2068,62 @@ impl TranscriptMapper {
         }
         self.effort_bridge = Some(bridge);
         self
+    }
+
+    /// Attach the §9.1 model bridge so this mapper drives `/model` read-back
+    /// and emits `model` observations. `launch` is the `--model` selection the
+    /// process started with; `catalog` is the driver-resolved list the picker
+    /// must show, stamped onto the first model observation.
+    pub(crate) fn with_model_bridge(
+        mut self,
+        bridge: Arc<crate::model::ModelBridge>,
+        launch: Option<String>,
+        catalog: Option<remuda_protocol::ModelCatalogInfo>,
+    ) -> Self {
+        if launch.is_some() {
+            self.model.mark_launch();
+            if let Some(id) = &launch {
+                bridge.note_launch_request(id.clone());
+            }
+        }
+        self.model_bridge = Some(bridge);
+        self.model_catalog = catalog;
+        self
+    }
+
+    /// Emit the launch-time model baseline carrying the discovered catalog, so
+    /// the picker has the real list before the first prompt. Also preloads the
+    /// tracker so the first assistant record with the same id stays deduped.
+    pub(crate) fn take_launch_model_snapshot(
+        &mut self,
+        launch: Option<&str>,
+    ) -> DriverResult<Vec<Observation>> {
+        let Some(id) = launch.filter(|id| !id.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        if self.model_launch_emitted {
+            return Ok(Vec::new());
+        }
+        self.model_launch_emitted = true;
+        // Seed dedup: the same id on the first assistant record is not an edge.
+        self.model.observe(Some(id));
+        self.model.mark_launch();
+        let catalog = self.model_catalog.take();
+        let payload = ObservationPayload::Model(Box::new(ModelPayload {
+            requested: Some(id.to_owned()),
+            effective: EffectiveModel {
+                id: id.to_owned(),
+                source: EffortSource::Launch,
+                observed_at: now()?,
+            },
+            raw: None,
+            catalog,
+        }));
+        Ok(vec![self.mapper.observation(
+            Completeness::Structured,
+            NativeRequestKey::None,
+            payload,
+        )?])
     }
 
     /// Map one transcript line. Blank lines and undecodable JSON yield nothing:
@@ -2152,8 +2223,12 @@ impl TranscriptMapper {
         let mut extra = Vec::new();
         if kind == "assistant" {
             extra = self.map_effort_assistant(&value)?;
+            extra.extend(self.map_model_assistant(&value)?);
         } else if kind == "user" {
             extra = self.note_effort_user(&value)?;
+            extra.extend(self.note_model_user(&value)?);
+        } else if kind == "system" {
+            extra = self.note_model_system(&value)?;
         } else if kind == "attachment" {
             extra = self.note_effort_attachment(&value)?;
         }
@@ -2313,6 +2388,166 @@ impl TranscriptMapper {
             .or(per_turn.filter(|value| !value.is_empty()))
             .map(str::to_owned);
         self.effort_observation(observed, source, raw)
+    }
+
+    // ───────── §9.1 model read-back (same verdict pattern as effort) ─────────
+
+    /// Settle the armed model bridge and emit an edge observation for a
+    /// verdict- or assistant-observed model id.
+    fn model_observation(
+        &mut self,
+        observed: remuda_protocol::ObservedModel,
+        source: EffortSource,
+        raw: Option<String>,
+    ) -> DriverResult<Vec<Observation>> {
+        let requested = self
+            .model_bridge
+            .as_ref()
+            .and_then(|bridge| bridge.requested())
+            .map(|request| request.id);
+        let payload = ObservationPayload::Model(Box::new(ModelPayload {
+            requested,
+            effective: EffectiveModel {
+                id: observed.id,
+                source,
+                observed_at: now()?,
+            },
+            raw,
+            // The catalog rides the launch snapshot; transcript edges never
+            // re-send it.
+            catalog: None,
+        }));
+        Ok(vec![self.mapper.observation(
+            Completeness::Structured,
+            NativeRequestKey::None,
+            payload,
+        )?])
+    }
+
+    /// Read `message.model` off an assistant record; emit an edge when the
+    /// resolved id changes. Assistant records corroborate the verdict but
+    /// never resolve a live switch on their own.
+    fn map_model_assistant(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let model = value.pointer("/message/model").and_then(Value::as_str);
+        let Some((observed, source)) = self.model.observe(model) else {
+            return Ok(Vec::new());
+        };
+        // A post-switch assistant record can only arrive after the verdict; if
+        // the verdict was somehow missed, settle the bridge here (resolved id
+        // is what the next turn used).
+        if let Some(generation) = self.model_generation.take()
+            && let Some(bridge) = &self.model_bridge
+        {
+            bridge.resolve(generation, observed.clone());
+        }
+        self.model_observation(observed, source, model.map(str::to_owned))
+    }
+
+    /// A `/model` accepted on 2.1.272 writes TWO `user` records — slash markup
+    /// and its `<local-command-stdout>` verdict. Same arm/settle split as
+    /// `/effort`.
+    fn note_model_user(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        let Some(message) = value.get("message") else {
+            return Ok(Vec::new());
+        };
+        let text = records::record_text(message);
+        if text.contains("<command-name>/model</command-name>") {
+            let Some(args) = remuda_protocol::slash_model_args(&text) else {
+                return Ok(Vec::new());
+            };
+            let from_remuda = self
+                .model_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.pending())
+                .is_some_and(|request| request.id == args);
+            if from_remuda
+                && let Some(bridge) = &self.model_bridge
+                && let Some((generation, _request)) = bridge.pending_with_gen()
+            {
+                self.model_generation = Some(generation);
+                self.model.arm_awaiting(&args);
+            }
+            self.model.note_slash(&args, from_remuda);
+            return Ok(Vec::new());
+        }
+        if text.contains("<local-command-stdout>") {
+            return self.settle_model_stdout(&extract_local_stdout(&text));
+        }
+        Ok(Vec::new())
+    }
+
+    /// Rejected switches (`Model '<id>' not found`) and a dismissed picker
+    /// (`Kept model as <id>`) are `system` records with a top-level `content`
+    /// string (`subtype: "local_command"`), not `user` records.
+    fn note_model_system(&mut self, value: &Value) -> DriverResult<Vec<Observation>> {
+        if value.get("subtype").and_then(Value::as_str) != Some("local_command") {
+            return Ok(Vec::new());
+        }
+        let Some(text) = value.get("content").and_then(Value::as_str) else {
+            return Ok(Vec::new());
+        };
+        if text.contains("<command-name>/model</command-name>") {
+            let Some(args) = remuda_protocol::slash_model_args(text) else {
+                return Ok(Vec::new());
+            };
+            let from_remuda = self
+                .model_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.pending())
+                .is_some_and(|request| request.id == args);
+            if from_remuda
+                && let Some(bridge) = &self.model_bridge
+                && let Some((generation, _request)) = bridge.pending_with_gen()
+            {
+                self.model_generation = Some(generation);
+                self.model.arm_awaiting(&args);
+            }
+            self.model.note_slash(&args, from_remuda);
+            return Ok(Vec::new());
+        }
+        if text.contains("<local-command-stdout>") {
+            return self.settle_model_stdout(&extract_local_stdout(text));
+        }
+        Ok(Vec::new())
+    }
+
+    /// Shared verdict handling for `user` and `system` stdout records.
+    fn settle_model_stdout(&mut self, stdout: &str) -> DriverResult<Vec<Observation>> {
+        let verdict = remuda_protocol::parse_model_stdout(stdout);
+        let from_remuda = self.model_generation.is_some()
+            || self
+                .model_bridge
+                .as_ref()
+                .and_then(|bridge| bridge.pending())
+                .is_some();
+        match verdict {
+            remuda_protocol::ModelStdout::Accepted(observed) => {
+                let edge = self.model.note_stdout(stdout, from_remuda);
+                if let Some(generation) = self.model_generation.take()
+                    && let Some(bridge) = &self.model_bridge
+                {
+                    bridge.resolve(generation, observed.clone());
+                }
+                if let Some((observed, source)) = edge {
+                    return self.model_observation(observed, source, Some(stdout.to_owned()));
+                }
+            }
+            remuda_protocol::ModelStdout::Kept | remuda_protocol::ModelStdout::NotFound => {
+                self.model.note_stdout(stdout, from_remuda);
+                if let Some(generation) = self.model_generation.take()
+                    && let Some(bridge) = &self.model_bridge
+                {
+                    let reason = if verdict == remuda_protocol::ModelStdout::Kept {
+                        "dialog-kept"
+                    } else {
+                        "not-found"
+                    };
+                    bridge.reject(generation, reason);
+                }
+            }
+            remuda_protocol::ModelStdout::Other => {}
+        }
+        Ok(Vec::new())
     }
 
     /// Buffer an assistant record, flushing the previous run when superseded.

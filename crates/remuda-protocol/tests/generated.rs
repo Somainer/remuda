@@ -121,6 +121,12 @@ fn public_wire_types_are_registered_for_generation() {
         "ScreenSignals",
         "ScreenClass",
         "EncodedKeys",
+        // §9.1: pure transcript-mapper state shared between the driver and the
+        // journal tailer; never serialized on the wire.
+        "ModelTracker",
+        // §9.1: parsed verdict of a /model stdout line — mapper output, not a
+        // wire type.
+        "ModelStdout",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

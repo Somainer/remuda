@@ -26,6 +26,8 @@ pub mod hook_answer;
 pub mod interaction;
 pub mod launch;
 mod materializer;
+pub mod model;
+pub mod model_discovery;
 pub mod presets;
 mod process;
 mod profile;

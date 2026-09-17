@@ -88,6 +88,10 @@ fn an_interleaved_tool_turn_hydrates_every_block_in_order() {
             "other:open",
             // The prompt Claude recorded receiving.
             "message:open",
+            // §9.1: the first assistant record also carries the resolved model
+            // at message.model — an edge emitted before its conversation blocks
+            // (later records repeat the same id and are deduped).
+            "other:open",
             // Commentary text, then the Bash call it introduces. Both blocks
             // share one `message.id` across two records and are reassembled
             // into a single message before mapping.

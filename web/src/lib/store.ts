@@ -42,6 +42,13 @@ import {
   type EffortEffectiveView,
 } from "../features/session/effortEffective";
 import type { UsageRollup } from "../features/session/contextUsage";
+import {
+  catalogFromRecord,
+  modelFromObservation,
+  modelFromRecord,
+  type ModelCatalogView,
+  type ModelEffectiveView,
+} from "../features/session/modelEffective";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -72,6 +79,34 @@ export type EffortPending = {
 
 /** Pending entries older than this without a verdict are dropped. */
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
+
+/** A model switch in flight (mirrors EffortPending). */
+export type ModelPending = {
+  id: string;
+  queued: boolean;
+  at: number;
+};
+
+/** Parse an `instance.configure` model lifecycle status the driver journals. */
+function modelLifecycleStatus(status: unknown):
+  | { kind: "queued" | "applied" | "degraded"; id: string; reason: string }
+  | null {
+  if (typeof status !== "string") return null;
+  if (status.startsWith("model-queued:")) {
+    return { kind: "queued", id: status.slice("model-queued:".length), reason: "" };
+  }
+  if (status.startsWith("model-applied:")) {
+    return { kind: "applied", id: status.slice("model-applied:".length), reason: "" };
+  }
+  const prefix = "model-degraded:";
+  if (status.startsWith(prefix)) {
+    const rest = status.slice(prefix.length);
+    const colon = rest.indexOf(":");
+    if (colon < 0) return { kind: "degraded", id: rest, reason: "" };
+    return { kind: "degraded", id: rest.slice(0, colon), reason: rest.slice(colon + 1) };
+  }
+  return null;
+}
 
 /** Parse an `instance.configure` effort lifecycle status the driver journals. */
 function effortLifecycleStatus(status: unknown):
@@ -178,6 +213,12 @@ export type HubState = {
    *  effective read-back lands or the switch is rejected. */
   effortPending: Record<string, EffortPending>;
   models: Record<string, string>;
+  /** §9.1 transcript-read-back effective model per instance. */
+  modelEffective: Record<string, ModelEffectiveView>;
+  /** §9.1 discovered switchable model list per instance. */
+  modelCatalogs: Record<string, ModelCatalogView>;
+  /** §9.1 a model switch in flight (切换中/排队中 until the verdict lands). */
+  modelPending: Record<string, ModelPending>;
   compact: boolean;
   answering: Record<string, true>;
   screens: Record<string, { lines: string[]; done: boolean }>;
@@ -206,6 +247,9 @@ const initial: HubState = {
   usageRollup: {},
   effortPending: {},
   models: {},
+  modelEffective: {},
+  modelCatalogs: {},
+  modelPending: {},
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
   screens: {},
@@ -314,6 +358,120 @@ class HubStore {
       }
     }
     if (updated) this.emit({ usageRollup: next });
+  }
+
+  /** §9.1: fold Hub-record modelEffective + modelCatalog into the live maps. */
+  private hydrateModels(instances: Instance[]) {
+    const effectiveNext = { ...this.state.modelEffective };
+    const catalogNext = { ...this.state.modelCatalogs };
+    let effUpdated = false;
+    let catUpdated = false;
+    for (const instance of instances) {
+      const view = modelFromRecord(instance.modelEffective);
+      if (view) {
+        const current = effectiveNext[instance.id];
+        if (!current || view.observedAt >= current.observedAt) {
+          effectiveNext[instance.id] = view;
+          effUpdated = true;
+        }
+      }
+      const catalog = catalogFromRecord(instance.modelCatalog);
+      if (catalog) {
+        catalogNext[instance.id] = catalog;
+        catUpdated = true;
+      }
+    }
+    if (effUpdated || catUpdated) {
+      this.emit({
+        ...(effUpdated ? { modelEffective: effectiveNext } : {}),
+        ...(catUpdated ? { modelCatalogs: catalogNext } : {}),
+      });
+    }
+  }
+
+  /** Apply one transcript-read-back model observation: settles a pending
+   *  push-down, records the discovered catalog, and — for a terminal-side
+   *  switch — moves the picker selection locally without a configure. */
+  /** Apply one transcript-read-back model observation. `live` events settle a
+   *  pending push-down and fold terminal-side switches; history replay only
+   *  hydrates effective/catalog state (it must never consume a pending set
+   *  after the replay window started, nor move the optimistic selection). */
+  private noteModelObservation(instanceId: Id, observation: Observation, live: boolean): boolean {
+    const parsed = modelFromObservation(observation);
+    if (!parsed) return false;
+    const current = this.state.modelEffective[instanceId];
+    if (current && parsed.effective.observedAt < current.observedAt) return false;
+    const patch: Partial<HubState> = {
+      modelEffective: {
+        ...this.state.modelEffective,
+        [instanceId]: parsed.effective,
+      },
+    };
+    if (parsed.catalog) {
+      patch.modelCatalogs = {
+        ...this.state.modelCatalogs,
+        [instanceId]: parsed.catalog,
+      };
+    }
+    if (live && this.state.modelPending[instanceId]) {
+      // Our own push-down settled: keep the optimistic selection; the mismatch
+      // line renders if the resolved id differs.
+      patch.modelPending = { ...this.state.modelPending };
+      delete patch.modelPending[instanceId];
+    } else if (live) {
+      // Live, terminal-side switch: fold the observed id into the local
+      // selection so a hand-typed `/model` moves the picker, never calling
+      // configure back.
+      patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
+    } else if (this.state.models[instanceId] == null) {
+      // History replay on a fresh mount: seed the selection from the observed
+      // id so the picker reflects the resolved model after reload.
+      patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
+    }
+    this.emit(patch);
+    return true;
+  }
+
+  /** Fold one `instance.configure` model lifecycle into the pending map. Only
+   *  live lifecycle events settle pending/queued; replayed history hydrates
+   *  nothing here (the observation reducer already carried the edge). */
+  private noteModelLifecycle(instanceId: Id, observation: Observation, live = true) {
+    const payload = observation.payload as
+      | { type?: string; nativeName?: string; status?: unknown }
+      | undefined;
+    if (payload?.type !== "native" || payload.nativeName !== "instance.configure") return;
+    const value =
+      typeof payload.status === "string"
+        ? payload.status
+        : payload.status && typeof payload.status === "object" && "value" in payload.status
+          ? (payload.status as { value: unknown }).value
+          : undefined;
+    const parsed = modelLifecycleStatus(value);
+    if (!parsed || !live) return;
+    const pending = { ...this.state.modelPending };
+    if (parsed.kind === "queued") {
+      pending[instanceId] = { id: parsed.id, queued: true, at: Date.now() };
+      this.emit({ modelPending: pending });
+      return;
+    }
+    if (!pending[instanceId] && parsed.kind === "applied") return;
+    delete pending[instanceId];
+    if (parsed.kind === "degraded") {
+      // Refused: revert the picker to the last observed id (or drop the
+      // optimistic request so the instance default returns).
+      const effective = this.state.modelEffective[instanceId];
+      const models = { ...this.state.models };
+      if (effective) models[instanceId] = effective.id;
+      else delete models[instanceId];
+      const reason =
+        { "not-found": "模型不存在", "dialog-kept": "已取消切换", "no-readback-within-window": "未收到回读" }[
+          parsed.reason
+        ] ?? parsed.reason;
+      this.toast(`模型切换被拒绝：${reason}`);
+      this.emit({ modelPending: pending, models });
+    } else {
+      this.emit({ modelPending: pending });
+    }
   }
 
   /** Apply one transcript-read-back effort observation to the live map.
@@ -479,6 +637,7 @@ class HubStore {
       });
       this.hydrateEffortEffective(instances.items);
       this.hydrateUsageRollups(instances.items);
+      this.hydrateModels(instances.items);
       this.stopWorkspaceFollow?.();
       this.stopWorkspaceFollow = api.hostWorkspaceSubscribe(
         (snapshot) => this.applyWorkspaceSnapshot(snapshot),
@@ -658,6 +817,7 @@ class HubStore {
     });
     this.hydrateEffortEffective(instances.items);
     this.hydrateUsageRollups(instances.items);
+    this.hydrateModels(instances.items);
   }
 
   async follow(instanceId: Id) {
@@ -665,6 +825,9 @@ class HubStore {
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
+    // Fold projected effective state/catalog the single record carries.
+    this.hydrateEffortEffective([instance]);
+    this.hydrateModels([instance]);
     if (this.journals.has(instance.journalId)) return;
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
     const history: Observation[] = [];
@@ -687,6 +850,10 @@ class HubStore {
     for (const event of history) {
       this.noteEffortObservation(instanceId, event);
       this.noteEffortLifecycle(instanceId, event);
+      // History replay hydrates observed model state only; it must not settle a
+      // push-down pending or fold the selection (those belong to live events).
+      this.noteModelObservation(instanceId, event, false);
+      this.noteModelLifecycle(instanceId, event, false);
     }
     const read: JournalRead = async (args) => {
       if (args.journalId === mockJournalIds.journalGap && args.afterSeq && Number(args.afterSeq) > 0) {
@@ -705,6 +872,8 @@ class HubStore {
         for (const event of fresh) {
           this.noteEffortObservation(instanceId, event);
           this.noteEffortLifecycle(instanceId, event);
+          this.noteModelObservation(instanceId, event, true);
+          this.noteModelLifecycle(instanceId, event, true);
         }
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
@@ -992,7 +1161,45 @@ class HubStore {
   }
 
   async setModel(instanceId: Id, model: string) {
-    await this.configure(instanceId, this.permissionModeOf(instanceId), { model });
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    const busy =
+      instance?.activity?.state === "known" ? instance.activity.value === "working" : false;
+    this.emit({
+      modelPending: {
+        ...this.state.modelPending,
+        [instanceId]: { id: model, queued: busy, at: Date.now() },
+      },
+    });
+    try {
+      await this.configure(instanceId, this.permissionModeOf(instanceId), { model });
+    } catch (error) {
+      const pending = { ...this.state.modelPending };
+      delete pending[instanceId];
+      this.emit({ modelPending: pending });
+      throw error;
+    }
+  }
+
+  /** §9.1: pending model switch, if any (stale entries expire). */
+  modelPendingOf(instanceId: Id): ModelPending | null {
+    const pending = this.state.modelPending[instanceId];
+    if (pending && Date.now() - pending.at > EFFORT_PENDING_MAX_AGE_MS) {
+      const next = { ...this.state.modelPending };
+      delete next[instanceId];
+      this.state = { ...this.state, modelPending: next };
+      return null;
+    }
+    return pending ?? null;
+  }
+
+  /** §9.1: transcript-read-back effective model id, or null when unobserved. */
+  modelEffectiveOf(instanceId: Id): ModelEffectiveView | null {
+    return this.state.modelEffective[instanceId] ?? null;
+  }
+
+  /** §9.1: the session's discovered switchable model list, or null. */
+  modelCatalogOf(instanceId: Id): ModelCatalogView | null {
+    return this.state.modelCatalogs[instanceId] ?? null;
   }
 
   async respond(interactionId: Id, answer: InteractionAnswer) {
@@ -1073,11 +1280,28 @@ class HubStore {
 
   modelOf(instanceId: Id, kind?: string): string {
     const instance = this.state.instances.find((row) => row.id === instanceId);
+    // The *requested* selection: optimistic, then the launch/instance record.
+    // The resolved id is `modelEffectiveOf` (an alias resolves to a concrete
+    // id); the picker shows a mismatch when they differ.
     return (
       this.state.models[instanceId] ??
       instance?.model ??
       (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus")
     );
+  }
+
+  /** The real model list for the picker: discovered catalog ids plus the
+   *  current selection; null when nothing has been discovered yet (the slider
+   *  falls back to its built-in aliases). */
+  modelListOf(instanceId: Id): string[] | null {
+    const catalog = this.state.modelCatalogs[instanceId];
+    if (!catalog) return null;
+    const current = this.modelOf(instanceId);
+    const out: string[] = [];
+    for (const id of [...catalog.models, current]) {
+      if (id && !out.includes(id)) out.push(id);
+    }
+    return out;
   }
 
   hostName(hostId: Id) {

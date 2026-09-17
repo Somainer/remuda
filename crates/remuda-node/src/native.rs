@@ -684,7 +684,7 @@ impl Driver for NativeAdapter {
                 DriverRequest::Configure {
                     model,
                     effort,
-                    effort_index,
+                    effort_index: _,
                 } => {
                     let effort = effort.filter(|value| !value.is_empty());
                     let switch = remuda_protocol::ModelSwitchInput {
@@ -692,46 +692,16 @@ impl Driver for NativeAdapter {
                         effective: remuda_protocol::ModelEffective::NextTurn,
                         effort: effort.clone(),
                     };
-                    // §9.1: an effort switch reports its own lifecycle from the
-                    // driver (`effort-applied` / `effort-queued` /
-                    // `effort-degraded`) after transcript read-back. A generic
-                    // "applied" here would claim it before the read-back exists.
-                    let effort_only = model.as_deref().is_none_or(str::is_empty);
-                    if effort.is_some() && effort_only {
-                        self.native
-                            .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
-                            .await
-                            .map_err(map_driver_error)?;
-                        return Ok(Vec::new());
-                    }
-                    let applied = format!(
-                        "model={} effort={} index={}",
-                        model.as_deref().unwrap_or("-"),
-                        effort.as_deref().unwrap_or("-"),
-                        effort_index
-                            .map(|n| n.to_string())
-                            .unwrap_or_else(|| "-".into())
-                    );
-                    match self
-                        .native
+                    // §9.1: both effort and model switches report their own
+                    // lifecycle from the driver (`effort-applied` /
+                    // `model-applied` / `…-queued` / `…-degraded`) after the
+                    // transcript read-back. A generic "applied" here would
+                    // claim success before the verdict exists.
+                    self.native
                         .send(remuda_protocol::DriverInput::ModelSwitch(Box::new(switch)))
                         .await
-                    {
-                        Ok(_) => {
-                            return Ok(vec![crate::driver::DriverEmission::NativeLifecycle {
-                                name: "instance.configure".into(),
-                                status: format!("applied {applied}"),
-                                severity: remuda_protocol::Severity::Info,
-                            }]);
-                        }
-                        Err(error) => {
-                            return Ok(vec![crate::driver::DriverEmission::NativeLifecycle {
-                                name: "instance.configure".into(),
-                                status: format!("accepted-noop: {error}"),
-                                severity: remuda_protocol::Severity::Info,
-                            }]);
-                        }
-                    }
+                        .map_err(map_driver_error)?;
+                    return Ok(Vec::new());
                 }
             }
             Ok(Vec::new())

@@ -451,6 +451,10 @@ pub struct ShellPtyDriver {
     effort_bridge: Mutex<Arc<crate::effort::EffortBridge>>,
     effort_queue: Mutex<Arc<crate::effort::EffortQueue>>,
     effort_worker: Mutex<Option<JoinHandle<()>>>,
+    /// §9.1 `/model` switch coordination, recreated per run like effort.
+    model_bridge: Mutex<Arc<crate::model::ModelBridge>>,
+    model_queue: Mutex<Arc<crate::model::ModelQueue>>,
+    model_worker: Mutex<Option<JoinHandle<()>>>,
     /// Event sender for the current run, retained so an effort switch can
     /// journal `queued`/`degraded` without going through the worker.
     events_tx: Mutex<Option<mpsc::Sender<remuda_protocol::Observation>>>,
@@ -495,6 +499,9 @@ impl ShellPtyDriver {
             effort_bridge: Mutex::new(Arc::new(crate::effort::EffortBridge::new())),
             effort_queue: Mutex::new(Arc::new(crate::effort::EffortQueue::new())),
             effort_worker: Mutex::new(None),
+            model_bridge: Mutex::new(Arc::new(crate::model::ModelBridge::new())),
+            model_queue: Mutex::new(Arc::new(crate::model::ModelQueue::new())),
+            model_worker: Mutex::new(None),
             events_tx: Mutex::new(None),
             promote_ctx: Mutex::new(None),
             interrupt_pid: Arc::new(AtomicI32::new(0)),
@@ -843,6 +850,56 @@ impl ShellPtyDriver {
         Ok(DriverAck::transport_written())
     }
 
+    /// §9.1: queue `/model <id>` for the composer, ready-ladder gated, and wait
+    /// for transcript read-back while the composer is idle.
+    async fn switch_model(&self, model_id: &str) -> DriverResult<DriverAck> {
+        let Some(request) = crate::model::ModelRequest::new(model_id) else {
+            return Err(DriverError::CapabilityUnsupported(format!(
+                "claude /model requires a non-empty id; got {model_id:?}"
+            )));
+        };
+        let state = self.state().await?;
+        if state.closed.load(Ordering::SeqCst) {
+            return Err(DriverError::ControlUnavailable);
+        }
+        let queue = self.model_queue.lock().await.clone();
+        let events = self
+            .events_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let ctx = self
+            .promote_ctx
+            .lock()
+            .await
+            .clone()
+            .ok_or(DriverError::ControlUnavailable)?;
+        let io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
+            state,
+            events,
+            seq: Arc::clone(&self.seq),
+            ctx,
+        });
+        if io.is_idle().await {
+            let (done, rx_outcome) = tokio::sync::oneshot::channel();
+            queue.enqueue(request, Some(done));
+            let wait =
+                std::time::Duration::from_millis(crate::model::MODEL_READBACK_TIMEOUT_MS + 5_000);
+            if tokio::time::timeout(wait, rx_outcome).await.is_err() {
+                // Never claim applied without a terminal outcome.
+            }
+        } else {
+            io.journal(
+                crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
+                remuda_protocol::Severity::Info,
+            )
+            .await;
+            queue.enqueue(request, None);
+        }
+        Ok(DriverAck::transport_written())
+    }
+
     /// Spawn the PTY without an [`InstanceSpec`] (Node fake registry / tests).
     pub async fn spawn(&self) -> DriverResult<RunHandle> {
         let cwd = self.options.cwd.to_string_lossy().into_owned();
@@ -979,6 +1036,46 @@ impl ShellPtyDriver {
             effort_io,
         ));
         *self.effort_bridge.lock().await = Arc::clone(&effort_bridge);
+        // §9.1: /model switch coordination, same ready-ladder worker shape.
+        let launch_model = spec.and_then(|spec| spec.model_id.clone());
+        let model_bridge = Arc::new(crate::model::ModelBridge::new());
+        if let Some(model) = launch_model.clone() {
+            model_bridge.note_launch_request(model);
+        }
+        let host_config_dir =
+            crate::claude_onboarding::HostClaudeConfig::from_env().and_then(|host| {
+                host.user_settings
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            });
+        let model_catalog = crate::model_discovery::resolve_catalog(
+            Some(std::path::Path::new(&recipe.native_home)),
+            host_config_dir.as_deref(),
+            Some(&std::path::Path::new(&recipe.native_home).join("settings.json")),
+            &[],
+            launch_model.as_deref(),
+        );
+        let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
+            state: Arc::clone(&state),
+            events: tx.clone(),
+            seq: Arc::clone(&self.seq),
+            ctx: hook_ctx.clone(),
+        });
+        if let Some(worker) = self.model_worker.lock().await.take() {
+            worker.abort();
+        }
+        let model_queue = {
+            let mut slot = self.model_queue.lock().await;
+            slot.close();
+            *slot = Arc::new(crate::model::ModelQueue::new());
+            Arc::clone(&slot)
+        };
+        *self.model_worker.lock().await = Some(crate::model::spawn_model_worker(
+            Arc::clone(&model_bridge),
+            Arc::clone(&model_queue),
+            model_io,
+        ));
+        *self.model_bridge.lock().await = Arc::clone(&model_bridge);
         // D-028 P6: file-tail signal adapters for the codex/grok structured
         // channels. They read the shadow home the hook session materialized
         // (which is the same path the child receives via CODEX_HOME /
@@ -1005,6 +1102,11 @@ impl ShellPtyDriver {
                 Arc::clone(&self.seq),
                 Some(Arc::clone(&effort_bridge)),
                 spec.and_then(|spec| spec.effort),
+                Some(promotion::ModelSync {
+                    bridge: Arc::clone(&model_bridge),
+                    launch: launch_model,
+                    catalog: Some(model_catalog),
+                }),
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1343,6 +1445,17 @@ impl ShellPtyDriver {
             };
             *self.effort_bridge.lock().await = resumed_bridge;
         }
+        // §9.1: adopt the resumed run's model worker/queue (its bridge starts
+        // fresh; an in-flight model read-back need not survive a resume).
+        self.model_queue.lock().await.close();
+        if let Some(worker) = self.model_worker.lock().await.take() {
+            worker.abort();
+        }
+        *self.model_queue.lock().await = {
+            let mut slot = resumed.model_queue.lock().await;
+            std::mem::replace(&mut *slot, Arc::new(crate::model::ModelQueue::new()))
+        };
+        *self.model_worker.lock().await = resumed.model_worker.lock().await.take();
         if let (Ok(mut ours), Ok(theirs)) = (self.recipe.lock(), resumed.recipe.lock()) {
             ours.clone_from(&theirs);
         }
@@ -1831,8 +1944,16 @@ impl Driver for ShellPtyDriver {
             && let DriverInput::ModelSwitch(switch) = &input
             && let Some(level) = switch.effort.as_deref()
             && !level.is_empty()
+            && switch.model_id.is_empty()
         {
             return self.switch_effort(level).await;
+        }
+        // §9.1: a model switch is `/model <id>` proven by the verdict.
+        if self.session_kind() == Some(AgentKind::Claude)
+            && let DriverInput::ModelSwitch(switch) = &input
+            && !switch.model_id.is_empty()
+        {
+            return self.switch_model(&switch.model_id).await;
         }
         let text = match input {
             DriverInput::Prompt(prompt) => {
@@ -2079,6 +2200,10 @@ impl Driver for ShellPtyDriver {
         // §9.1: stop the effort switch before the PTY it types into goes away.
         self.effort_queue.lock().await.close();
         if let Some(worker) = self.effort_worker.lock().await.take() {
+            worker.abort();
+        }
+        self.model_queue.lock().await.close();
+        if let Some(worker) = self.model_worker.lock().await.take() {
             worker.abort();
         }
         self.events_tx.lock().await.take();

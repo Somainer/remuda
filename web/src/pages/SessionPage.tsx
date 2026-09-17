@@ -478,6 +478,9 @@ export function SessionPage({
           }
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
+          models={hubStore.modelListOf(instance.id) ?? undefined}
+          modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
+          modelPending={hubStore.modelPendingOf(instance.id)}
           effort={hubStore.effortOf(instance.id, instance.kind)}
           effortEffective={hubStore.effortEffectiveOf(instance.id)}
           effortPending={hubStore.effortPendingOf(instance.id)}

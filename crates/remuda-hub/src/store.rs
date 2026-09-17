@@ -389,6 +389,21 @@ pub struct InstanceRecord {
         rename = "effortEffective"
     )]
     pub effort_effective: Option<Value>,
+    /// §9.1 effective model read back from the `/model` verdict / assistant
+    /// records.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "modelEffective"
+    )]
+    pub model_effective: Option<Value>,
+    /// §9.1 discovered session model list (gateway cache / settings / builtin).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "modelCatalog"
+    )]
+    pub model_catalog: Option<Value>,
     /// Native session id reported by the driver, resumable with `--resume` (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
@@ -3770,6 +3785,33 @@ fn migrate_provider_models(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// §9.1: persist the transcript-observed effective model and its discovered
+/// catalog onto the spec.
+fn apply_effective_model_projection(
+    conn: &Connection,
+    instance_id: &str,
+    effective: &Value,
+    catalog: Option<&Value>,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut() {
+        object.insert("modelEffective".into(), effective.clone());
+        if let Some(catalog) = catalog {
+            object.insert("modelCatalog".into(), catalog.clone());
+        }
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// §9.1: persist the transcript-observed effective effort onto the spec.
 fn apply_effective_effort_projection(
     conn: &Connection,
@@ -3806,6 +3848,11 @@ fn apply_instance_projection(
         && let Some(effective) = payload.get("effective")
     {
         apply_effective_effort_projection(conn, instance_id, effective)?;
+    }
+    if kind == "model"
+        && let Some(effective) = payload.get("effective")
+    {
+        apply_effective_model_projection(conn, instance_id, effective, payload.get("catalog"))?;
     }
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;
@@ -5891,6 +5938,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                         .map(|n| n as u32)
                 });
             let effort_effective = spec.get("effortEffective").cloned();
+            let model_effective = spec.get("modelEffective").cloned();
+            let model_catalog = spec.get("modelCatalog").cloned();
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
             let stored: Option<String> = row.get(17)?;
@@ -5953,6 +6002,8 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 effort_ultracode,
                 effort_index,
                 effort_effective,
+                model_effective,
+                model_catalog,
                 native_session_id: spec
                     .get("nativeSessionId")
                     .and_then(Value::as_str)

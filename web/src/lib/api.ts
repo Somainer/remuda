@@ -236,6 +236,12 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
           observedAt?: string;
         }
       | null;
+    modelEffective?:
+      | { id?: string; source?: string; observedAt?: string }
+      | null;
+    modelCatalog?:
+      | { models?: unknown; source?: string; observedAt?: string }
+      | null;
     mode?: string | null;
     promotedAt?: string | null;
     launchedBy?: string | null;
@@ -326,6 +332,33 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
                 ? extra.effortEffective.source
                 : "unknown",
             observedAt: extra.effortEffective.observedAt ?? "",
+          }
+        : null,
+    modelEffective:
+      extra.modelEffective && typeof extra.modelEffective.id === "string"
+        ? {
+            id: extra.modelEffective.id,
+            source:
+              extra.modelEffective.source === "launch" ||
+              extra.modelEffective.source === "slash" ||
+              extra.modelEffective.source === "remuda"
+                ? extra.modelEffective.source
+                : "unknown",
+            observedAt: extra.modelEffective.observedAt ?? "",
+          }
+        : null,
+    modelCatalog:
+      extra.modelCatalog && Array.isArray(extra.modelCatalog.models)
+        ? {
+            models: extra.modelCatalog.models.filter(
+              (m): m is string => typeof m === "string" && !!m,
+            ),
+            source:
+              extra.modelCatalog.source === "gateway-discovery" ||
+              extra.modelCatalog.source === "settings"
+                ? extra.modelCatalog.source
+                : "builtin",
+            observedAt: extra.modelCatalog.observedAt ?? "",
           }
         : null,
     mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,

@@ -797,6 +797,7 @@ wire_enum!(ObservationKind, "5.1", {
     Usage => "usage",
     Artifact => "artifact",
     Effort => "effort",
+    Model => "model",
     RawTty => "raw_tty",
     Opaque => "opaque",
 });

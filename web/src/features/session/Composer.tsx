@@ -66,6 +66,8 @@ export function Composer({
   kind = "claude",
   model = "opus",
   models,
+  modelEffective,
+  modelPending,
   effort,
   onEffort,
   effortEffective,
@@ -94,6 +96,10 @@ export function Composer({
   kind?: EffortKind | string;
   model?: string;
   models?: string[];
+  /** §9.1 transcript-read-back effective model id; null/undefined = unobserved. */
+  modelEffective?: string | null;
+  /** §9.1 a model switch in flight. */
+  modelPending?: { id: string; queued: boolean } | null;
   effort?: EffortSelection;
   onEffort?: (next: EffortSelection) => void;
   /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
@@ -764,6 +770,8 @@ export function Composer({
             kind={harness}
             model={caps.model ? model : undefined}
             models={caps.model ? models : undefined}
+            modelEffective={caps.model ? modelEffective : null}
+            modelPending={caps.model ? modelPending : null}
             index={currentEffort.index}
             ultracode={ultraOn}
             disabled={effortLocked}

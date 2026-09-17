@@ -1940,3 +1940,76 @@ async fn runtime_hello_always_reports_the_instance_inventory() {
     link.shutdown().await;
     hub.shutdown().await;
 }
+
+/// c-wfdrill2 A end to end: Hub HTTP → outbound WSS → Node, on the exact route
+/// the drill-in view calls. Before the fix the carrier's catch-all answered
+/// `{"ok": true}` here, so the web client read `available` as `undefined` and
+/// every workflow member row said 「启动中」 whatever the host actually knew.
+#[tokio::test]
+async fn subagent_drill_in_reaches_the_node_over_the_wss_carrier() {
+    use remuda_node::{DevNode, DevServerConfig};
+
+    let dir = tempfile::tempdir().expect("tmp");
+    let hub = remuda_hub::spawn(HubConfig::for_test(dir.path().join("data")))
+        .await
+        .expect("hub");
+    let node = DevNode::new(
+        &DevServerConfig::loopback(0)
+            .with_workspace_root(dir.path().to_path_buf())
+            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .expect("dev node");
+    let host_id = node.host().meta.id.as_id().as_str().to_owned();
+    let config = WssConfig::loopback(hub.addr, enroll_token(&hub).await, host_id.clone());
+    let link = tokio::time::timeout(TIMEOUT, WssLink::connect_runtime(config, node.clone()))
+        .await
+        .expect("connect timeout")
+        .expect("runtime connect");
+
+    let (cookie, _) = login(hub.addr, &hub.bootstrap_token).await;
+    let (status, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", cookie.as_str())],
+        Some(
+            &json!({
+                "hostId": host_id,
+                "kind": "claude",
+                "driver": "claude-print",
+                "model": "haiku",
+                "prompt": "drill-in"
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim()).expect("create json");
+    let instance = created["instance"]["instanceId"]
+        .as_str()
+        .expect("instanceId")
+        .to_owned();
+
+    let (status, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance}/subagents/aae139d44933cefe2/transcript"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let read: Value = serde_json::from_str(body.trim()).expect("transcript json");
+    // `available` and `reason` are the Node's own answer. A carrier catch-all
+    // can only produce `{"ok": true}`, which carries neither.
+    assert_eq!(read["available"], json!(false), "{read}");
+    assert_eq!(read["reason"], "transcript-unbound", "{read}");
+    assert!(
+        read["events"].as_array().is_some_and(Vec::is_empty),
+        "{read}"
+    );
+
+    link.shutdown().await;
+    hub.shutdown().await;
+}

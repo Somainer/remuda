@@ -37,6 +37,12 @@ export type SubagentMeta = {
 export type SubagentTranscriptResponse = {
   /** False when the agent exists but its transcript has not landed yet. */
   available: boolean;
+  /**
+   * Why the read is unavailable, as the Node named it:
+   * `transcript-unbound` (the owning session has no bound transcript) or
+   * `agent-transcript-pending` (the agent's own sidechain has not landed).
+   */
+  reason?: string;
   meta?: SubagentMeta;
   events: Observation[];
 };
@@ -69,6 +75,11 @@ async function getJson(path: string): Promise<unknown> {
  * Fetch one subagent's transcript. Never rejects on `available:false` — the
  * caller renders 「启动中」. A missing host/route surfaces as an error so the
  * row can distinguish "starting" from "cannot reach the host".
+ *
+ * A 200 that does not carry `available` is that second case, not the first:
+ * a Node carrier with no arm for `subagent.transcript` used to answer
+ * `{"ok": true}`, and reading that as `available:false` left every member row
+ * saying 「启动中」 forever while the host was in fact never asked.
  */
 export async function fetchSubagentTranscript(
   instanceId: Id,
@@ -77,10 +88,24 @@ export async function fetchSubagentTranscript(
   const raw = await getJson(
     `/v1/instances/${encodeURIComponent(instanceId)}/subagents/${encodeURIComponent(agentId)}/transcript`,
   );
-  const rec = (raw ?? {}) as { available?: boolean; meta?: SubagentMeta; events?: unknown[] };
-  if (!rec.available) return { available: false, events: [] };
+  const rec = (raw ?? {}) as {
+    available?: unknown;
+    reason?: unknown;
+    meta?: SubagentMeta;
+    events?: unknown[];
+  };
+  if (typeof rec.available !== "boolean") {
+    throw new HubHttpError(
+      502,
+      "SUBAGENT_UNREADABLE",
+      "该宿主没有回答子会话读取（carrier 未实现 subagent.transcript）",
+    );
+  }
+  const reason = typeof rec.reason === "string" && rec.reason ? rec.reason : undefined;
+  if (!rec.available) return { available: false, ...(reason ? { reason } : {}), events: [] };
   return {
     available: true,
+    ...(reason ? { reason } : {}),
     meta: rec.meta,
     events: coerceObservationList(rec.events ?? [], instanceId, instanceId),
   };

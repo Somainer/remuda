@@ -853,11 +853,9 @@ async fn dispatch_rpc(
         "worktree.list" => node.worktree_rpc(method, &params),
         "worker.provision" => node.provision_worker(&params).await,
         "worker.remove" => node.remove_worker(&params).await,
-        "gate.run" => node.run_gate(&params).await,
-        "gate.cancel" => node.cancel_gate(&params).await,
-        "gate.then" => node.run_gate_then(&params).await,
-        "gate.land" => node.run_gate_land(&params).await,
-        "gate.unpin" => node.run_gate_unpin(&params).await,
+        method if crate::gate::is_gate_method(method) => {
+            node.dispatch_gate_rpc(method, &params).await
+        }
         "host.doctor" => node.doctor().await,
         "host.resources" => {
             let resources = serde_json::to_value(crate::inventory::sample_resources())?;

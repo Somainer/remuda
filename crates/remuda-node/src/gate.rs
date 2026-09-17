@@ -427,6 +427,28 @@ impl GateRegistry {
 }
 
 impl DevNode {
+    /// Dispatch one Hub→Node gate RPC by method name.
+    ///
+    /// The carrier in `server.rs` routes each method directly; this is the
+    /// entry point for callers outside the crate (integration tests that drive
+    /// a real Node over real repositories).
+    pub async fn dispatch_gate_rpc(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, NodeError> {
+        match method {
+            remuda_protocol::METHOD_GATE_RUN => self.run_gate(params).await,
+            remuda_protocol::METHOD_GATE_CANCEL => self.cancel_gate(params).await,
+            remuda_protocol::METHOD_GATE_THEN => self.run_gate_then(params).await,
+            remuda_protocol::METHOD_GATE_LAND => self.run_gate_land(params).await,
+            remuda_protocol::METHOD_GATE_UNPIN => self.run_gate_unpin(params).await,
+            other => Err(NodeError::InvalidRequest(format!(
+                "not a gate method: {other}"
+            ))),
+        }
+    }
+
     /// Handle `gate.run`.
     pub(crate) async fn run_gate(&self, params: &Value) -> Result<Value, NodeError> {
         let request: GateRunParams = serde_json::from_value(params.clone()).map_err(|error| {

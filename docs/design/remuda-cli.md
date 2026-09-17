@@ -221,6 +221,58 @@ remuda merge wt/worker/task --land --onto <base-sha> --no-push --json
 remuda merge --queue wt/a wt/b --gate --no-push --json --lanes 2
 ```
 
+## Host files: list, get, search
+
+`remuda host files` is read-only workstation access through the Hub. Every
+path is confined on the Node to a registered workspace root or the
+`/tmp/remuda-*` scratch area (`tmp`): relative paths only, `..` and symlink
+escapes are refused on the canonical path. Operator devices only — an Agent
+credential gets 403 on every route. The addressed host is always the path
+host; one Node can never answer for another.
+
+```sh
+remuda host files ls   <host> <workspace> [subpath]
+remuda host files get  <host> <workspace> <path> [-o out]
+remuda host files search <host> <workspace> <query> [flags]
+```
+
+`<host>` is an `hst_…` id or a unique registered label. `get` stages the
+bytes through the Hub objects channel and either streams them to stdout or
+writes `-o out`.
+
+`search` walks the workspace without spawning any subprocess:
+
+| Flag | Meaning |
+| --- | --- |
+| `--name` (default) | Match entry names. |
+| `--content` | Match decoded file contents line by line. |
+| `--regex` | Treat the query as a regex instead of a literal substring. |
+| `--glob <pat>` | Narrow paths (`*.rs`, `src/**`); ripgrep-like semantics. |
+| `--max-results N` | Cap returned matches (Node default **200**). |
+| `--path <sub>` | Search a workspace-relative subtree instead of the root. |
+
+`.gitignore` and `.ignore` are honoured (global gitignore and
+`.git/info/exclude` are not), hidden entries and binary files (a NUL byte in
+the first read) are skipped, and symlinks/devices/fifos are never followed.
+The walk is bounded by construction on the Node: **10 s** wall clock,
+**10 MiB** total bytes read, **1 MiB** per file, and the result cap. When a
+bound stops the walk the reply carries `truncated: true` and a
+`truncatedReason` of `time` / `total-bytes` / `per-file-bytes` /
+`max-results`.
+
+Output shape: name mode prints one workspace-relative path per line; content
+mode prints `path:line:snippet` with snippets capped at 240 characters
+centred on the hit. A truncation note goes to stderr, e.g.
+
+```text
+$ remuda host files search hst_a wsp_e2e needle --content --glob '*.rs'
+host-search/sub/beta.rs:1:fn needle() -> u8 { 1 }
+truncated: max-results cap hit after 200 match(es) across 187 file(s); narrow the query or raise --max-results
+```
+
+An old Node that does not implement `host.files.search` answers with a
+JSON-RPC error which the Hub surfaces as a clean 400 — the route never hangs.
+
 ## MCP tools
 
 | Tool | Arguments | Result |

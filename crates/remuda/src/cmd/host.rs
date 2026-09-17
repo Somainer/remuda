@@ -157,7 +157,7 @@ async fn list(client: &HubClient, host: &str, workspace: &str, subpath: &str) ->
         "{}",
         super::table::render(
             &["NAME", "KIND", "SIZE", "MODE", "MODIFIED"],
-            &[36, 8, 10, 6, 24],
+            &[36, 8, 10, 10, 24],
             &rows
         )
     );

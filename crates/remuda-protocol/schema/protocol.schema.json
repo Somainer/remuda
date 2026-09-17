@@ -4777,6 +4777,13 @@
             "null"
           ]
         },
+        "failedStep": {
+          "description": "Name of the step that failed the last run (`cargo-test`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "finishedAt": {
           "anyOf": [
             {
@@ -4810,8 +4817,20 @@
           "$ref": "#/$defs/GateJobId",
           "description": "`gjb_…` id."
         },
+        "keepLogs": {
+          "default": false,
+          "description": "Retain the bounded run log even when the run passes (`--keep-logs`).",
+          "type": "boolean"
+        },
         "laneId": {
           "description": "Pinned lane (chosen at dispatch when not given).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logObjectId": {
+          "description": "Hub object holding the bounded run log (`obj_…`); absent on green runs\nunless `keepLogs`.",
           "type": [
             "string",
             "null"
@@ -4835,6 +4854,13 @@
         "queuedAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "Queue ordering key (RFC3339 enqueue time)."
+        },
+        "reason": {
+          "description": "First line of the failure summary (the log headline).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "requestedBy": {
           "description": "Device that enqueued the job.",
@@ -4892,6 +4918,7 @@
         "state",
         "steps",
         "queuedAt",
+        "keepLogs",
         "attempts"
       ],
       "type": "object"
@@ -4955,6 +4982,69 @@
         }
       ]
     },
+    "GateRunLog": {
+      "description": "Bounded failure evidence for one gate run, stored by the Hub as an\n`obj_…` log object (never inlined into the job row). For a failed run the\nNode populates it for the failed step; with `--keep-logs` a green run gets\na `kept` log of the whole-run tail.",
+      "properties": {
+        "attempts": {
+          "default": 0,
+          "description": "Attempt ordinal reported for the failed step.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capturedLines": {
+          "default": 0,
+          "description": "Number of lines attributed to the step before bounding.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "headline": {
+          "description": "One-line headline, mirrored as the job `reason`.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "`failed` (a step or the runner failed) | `kept` (`--keep-logs` green).",
+          "type": "string"
+        },
+        "step": {
+          "description": "Step the log belongs to (`cargo-test`, `web-hub-e2e`, …), or `*` for a\nwhole-run `kept` log / a runner-level failure before any step marker.",
+          "type": "string"
+        },
+        "summary": {
+          "default": [],
+          "description": "Extracted summary lines: the libtest `failures:` section /\n`test … FAILED` / `panicked at` lines for cargo-test; the numbered\nPlaywright failure titles and first failure block for web steps.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tail": {
+          "default": [],
+          "description": "Last captured raw lines (combined step output), bounded.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "default": false,
+          "description": "Whether the tail/summary was cut by the bounds.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "step",
+        "kind",
+        "attempts",
+        "headline",
+        "summary",
+        "tail",
+        "capturedLines",
+        "truncated"
+      ],
+      "type": "object"
+    },
     "GateRunParams": {
       "description": "`gate.run` params: everything the lane runner needs, derived from the\nproject's `ProjectGateLane` (set once, never re-typed per run).",
       "properties": {
@@ -4992,6 +5082,11 @@
         "jobId": {
           "description": "Hub job id (`gjb_…`); key for cancel and for streamed events.",
           "type": "string"
+        },
+        "keepLogs": {
+          "default": false,
+          "description": "Retain the bounded run log even when the run passes (`--keep-logs`).",
+          "type": "boolean"
         },
         "laneId": {
           "description": "Lane id (Node-side lane lock key).",
@@ -5069,7 +5164,8 @@
         "env",
         "timeouts",
         "gateTimeoutSecs",
-        "push"
+        "push",
+        "keepLogs"
       ],
       "type": "object"
     },
@@ -5097,6 +5193,13 @@
             "null"
           ]
         },
+        "failedStep": {
+          "description": "Name of the step that failed (`cargo-test`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "headSha": {
           "description": "Branch tip sha.",
           "type": [
@@ -5114,6 +5217,24 @@
             "string",
             "null"
           ]
+        },
+        "reason": {
+          "description": "First line of the extracted failure summary (the log headline).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runLog": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GateRunLog"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Bounded failure evidence (or a `kept` green-run log). The Hub stores\nit as an `obj_…` log object and replaces this field with `logObjectId`\non the persisted job."
         },
         "status": {
           "description": "`passed` | `landed` | `failed` | `canceled` | `base-moved` | `stale-tip` | `lane-busy`.",

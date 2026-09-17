@@ -1014,15 +1014,19 @@ export type GateJob = ({
   "branch": (string);
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
+  "failedStep"?: (string | null);
   "finishedAt"?: (Timestamp | (null));
   "headSha"?: (string | null);
   "hostId"?: (HostId | (null));
   "id": GateJobId;
+  "keepLogs": (boolean);
   "laneId"?: (string | null);
+  "logObjectId"?: (string | null);
   "mergeSha"?: (string | null);
   "mode": GateMode;
   "projectId": ProjectId;
   "queuedAt": Timestamp;
+  "reason"?: (string | null);
   "requestedBy": (string);
   "startedAt"?: (Timestamp | (null));
   "state": GateJobState;
@@ -1041,6 +1045,19 @@ export type GateJobState = ("queued" | "running" | "passed" | "failed" | "landed
 /** What the job does: verify only, or verify-then-land. */
 export type GateMode = ("verify" | "land");
 
+/** Bounded failure evidence for one gate run, stored by the Hub as an `obj_…` log object (never inlined into the job row). For a failed run the Node populates it for the failed step; with `--keep-logs` a green run gets a `kept` log of the whole-run tail. */
+export type GateRunLog = ({
+  "attempts": (number);
+  "capturedLines": (number);
+  "headline": (string);
+  "kind": (string);
+  "step": (string);
+  "summary": (((string))[]);
+  "tail": (((string))[]);
+  "truncated": (boolean);
+  [key: string]: unknown;
+});
+
 /** `gate.run` params: everything the lane runner needs, derived from the project's `ProjectGateLane` (set once, never re-typed per run). */
 export type GateRunParams = ({
   "baseBranch": (string);
@@ -1051,6 +1068,7 @@ export type GateRunParams = ({
 });
   "gateTimeoutSecs": (number);
   "jobId": (string);
+  "keepLogs": (boolean);
   "laneId": (string);
   "lockPath"?: (string | null);
   "mode": (string);
@@ -1072,9 +1090,12 @@ export type GateRunResult = ({
   "baseSha"?: (string | null);
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
+  "failedStep"?: (string | null);
   "headSha"?: (string | null);
   "jobId": (string);
   "mergeSha"?: (string | null);
+  "reason"?: (string | null);
+  "runLog"?: (GateRunLog | (null));
   "status": (string);
   "steps": ((GateStep)[]);
   [key: string]: unknown;

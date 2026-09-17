@@ -321,6 +321,21 @@ fn owner_asks(workers: &[Value], reports: &[Value], gate_jobs: &[Value]) -> Vec<
                 "reason": gate_failure_reason(job),
             }));
         }
+        // A verify that passed and pinned a merge is finished work that has not
+        // reached main. It needs an owner to land it (or it expires with the
+        // pinned ref), so it is an ask rather than a quiet success.
+        if job["state"].as_str() == Some("passed")
+            && let Some(merge_ref) = job["mergeRef"].as_str()
+        {
+            let branch = job["branch"].as_str().unwrap_or("?");
+            asks.push(json!({
+                "kind": "land", "branch": job["branch"],
+                "status": "passed-unlanded",
+                "mergeRef": merge_ref,
+                "mergeSha": job["mergeSha"],
+                "reason": format!("verified, not landed: remuda land {branch}"),
+            }));
+        }
     }
     asks
 }

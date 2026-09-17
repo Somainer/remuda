@@ -856,6 +856,8 @@ async fn dispatch_rpc(
         "gate.run" => node.run_gate(&params).await,
         "gate.cancel" => node.cancel_gate(&params).await,
         "gate.then" => node.run_gate_then(&params).await,
+        "gate.land" => node.run_gate_land(&params).await,
+        "gate.unpin" => node.run_gate_unpin(&params).await,
         "host.doctor" => node.doctor().await,
         "host.resources" => {
             let resources = serde_json::to_value(crate::inventory::sample_resources())?;

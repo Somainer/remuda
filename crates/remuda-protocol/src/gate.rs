@@ -20,14 +20,67 @@ pub const METHOD_GATE_CANCEL: &str = "gate.cancel";
 pub const METHOD_GATE_EVENT: &str = "gate.event";
 /// Hub→Node (home host): run the optional `remuda land --then` command.
 pub const METHOD_GATE_THEN: &str = "gate.then";
+/// Hub→Node (home host): fetch a lane's verified merge and CAS-push main.
+pub const METHOD_GATE_LAND: &str = "gate.land";
+/// Hub→Node (lane host): drop a job's persisted merge refs.
+pub const METHOD_GATE_UNPIN: &str = "gate.unpin";
 
 /// Every Hub→Node gate RPC (stdio allowlist predicate helper).
 #[must_use]
 pub fn is_gate_call(method: &str) -> bool {
     matches!(
         method,
-        METHOD_GATE_RUN | METHOD_GATE_CANCEL | METHOD_GATE_THEN
+        METHOD_GATE_RUN
+            | METHOD_GATE_CANCEL
+            | METHOD_GATE_THEN
+            | METHOD_GATE_LAND
+            | METHOD_GATE_UNPIN
     )
+}
+
+/// Ref pinning a passing lane verify's merge commit in the lane repo, so the
+/// commit outlives the scratch worktree and can be fetched by the home host
+/// (evidence: gate-lane-2).
+#[must_use]
+pub fn gate_merge_ref(job_id: &str) -> String {
+    format!("refs/remuda/gate/{job_id}")
+}
+
+/// Companion ref pinning the verified branch tip.
+///
+/// The suffix is `.branch`, not `/branch`: git refuses a ref that is both a
+/// file and a directory, so `refs/remuda/gate/<id>` and
+/// `refs/remuda/gate/<id>/branch` cannot both exist ("cannot lock ref …
+/// exists; cannot create"). A sibling leaf keeps both refs plus the single
+/// `refs/remuda/gate/` prefix sweep used for retention.
+#[must_use]
+pub fn gate_branch_ref(job_id: &str) -> String {
+    format!("refs/remuda/gate/{job_id}.branch")
+}
+
+/// Which host pushes `main` for a land job.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum GatePushFrom {
+    /// The lane host pushes from its own checkout (needs a push credential).
+    #[default]
+    Lane,
+    /// The lane only verifies; the project home host fetches the merge commit
+    /// and pushes it. The policy for lanes holding no project credential.
+    Home,
+}
+
+impl GatePushFrom {
+    /// Wire/CLI spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lane => "lane",
+            Self::Home => "home",
+        }
+    }
 }
 
 // ── Job enums ──────────────────────────────────────────────────────────────
@@ -264,6 +317,10 @@ pub struct GateJob {
     /// Verified / landed merge commit sha.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_sha: Option<String>,
+    /// Ref pinning `mergeSha` in the lane repo after a passing verify, so the
+    /// commit survives the scratch worktree and a home-host land can fetch it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_ref: Option<String>,
     /// Current main when a land lost the compare-and-swap (retry signal).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_main_sha: Option<String>,
@@ -387,6 +444,11 @@ pub struct GateRunParams {
     /// Land mode pushes main from the lane host when true.
     #[serde(default)]
     pub push: bool,
+    /// Where `main` is pushed from for a land job. With `home` the lane runs a
+    /// verify only (never `merge --land`): moving lane-local main here would
+    /// report `landed` while nothing reached the remote.
+    #[serde(default)]
+    pub push_from: GatePushFrom,
     /// Retain the bounded run log even when the run passes (`--keep-logs`).
     #[serde(default)]
     pub keep_logs: bool,
@@ -419,6 +481,9 @@ pub struct GateRunResult {
     /// Merge commit sha.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_sha: Option<String>,
+    /// Ref the lane runner pinned `mergeSha` under (`refs/remuda/gate/<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_ref: Option<String>,
     /// Current main when the land CAS lost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_main_sha: Option<String>,
@@ -475,6 +540,98 @@ pub struct GateThenResult {
     pub exit_code: i32,
     /// Captured stdout/stderr (truncated).
     pub output: String,
+}
+
+/// `gate.land` params: the home host obtains a lane's verified merge commit
+/// and compare-and-swap pushes it to the project's base branch.
+///
+/// This is the `pushFrom: home` half of D-034: the lane host holds no push
+/// credential for the project remote, so a passing verify is landed by the
+/// host that does. For this slice the merge commit arrives by `git fetch` of
+/// `mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the
+/// better shape later, so `fetchRemote` stays the only lane-reachability
+/// input and nothing else assumes ssh.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLandParams {
+    /// Job being landed.
+    pub job_id: String,
+    /// Home-host checkout that owns the push credential.
+    pub repo_path: String,
+    /// Branch being landed (for the log line only).
+    pub branch: String,
+    /// Base branch to advance (`main`).
+    #[serde(default = "default_base_branch")]
+    pub base_branch: String,
+    /// Remote to push to (`origin`).
+    #[serde(default = "default_push_remote")]
+    pub push_remote: String,
+    /// Operator's existing remote/alias on the home host that reaches the lane
+    /// repo, used to fetch `mergeRef`.
+    pub fetch_remote: String,
+    /// Ref in the lane repo pinning the verified merge commit.
+    pub merge_ref: String,
+    /// The verified merge commit; the fetched ref must resolve to exactly this.
+    pub merge_sha: String,
+    /// Base the merge was verified onto. The push is refused unless the
+    /// remote's base branch still equals this (it is the merge's first parent).
+    pub base_sha: String,
+    /// Wall-clock budget (seconds); 0 uses the Node default.
+    #[serde(default)]
+    pub timeout_secs: u64,
+}
+
+fn default_push_remote() -> String {
+    "origin".into()
+}
+
+/// `gate.land` verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateLandResult {
+    /// Job id echoed back.
+    pub job_id: String,
+    /// `landed` | `base-moved` | `failed`.
+    ///
+    /// `base-moved` means the compare-and-swap was refused because the remote
+    /// base branch had advanced; nothing was pushed and the Hub re-queues a
+    /// verify. There is no partial-push outcome: the push is a single
+    /// `--force-with-lease` on the base branch, so the remote either takes the
+    /// whole merge commit or stays exactly where it was.
+    pub status: String,
+    /// Remote base-branch sha observed when the CAS was refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_main_sha: Option<String>,
+    /// Sha now at the remote base branch on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_sha: Option<String>,
+    /// Failure text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Captured git output (truncated), kept as land evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+/// `gate.unpin` params: drop a job's persisted merge refs on the lane host.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateUnpinParams {
+    /// Job whose refs are dropped.
+    pub job_id: String,
+    /// Lane checkout holding the refs.
+    pub repo_path: String,
+}
+
+/// `gate.unpin` result.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GateUnpinResult {
+    /// Job id echoed back.
+    pub job_id: String,
+    /// Refs actually deleted.
+    #[serde(default)]
+    pub removed: Vec<String>,
 }
 
 #[cfg(test)]

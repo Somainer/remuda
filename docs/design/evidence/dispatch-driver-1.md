@@ -2,7 +2,8 @@
 
 Date: 2026-09-17. Scope: `remuda dispatch --harness claude` to an `ssh-stdio` Node
 running with `REMUDA_PTY_CARRIER=native`.
-Design references: [D-028 / D-028a](../decisions.md),
+Design references: [D-035](../decisions.md) (this ruling), [D-028 /
+D-028a](../decisions.md),
 [native PTY first §5.1](../native-pty-first.md), [coordinator hierarchy §2.4](../coordinator-hierarchy.md).
 
 ## Symptom

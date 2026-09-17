@@ -446,6 +446,40 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
             "tui_latch": std::env::var("CLAUDE_CODE_TUI_JUST_SWITCHED").ok(),
         }),
     );
+    // Opt-in emulation of Claude Code's folder-trust gate: when
+    // FAKE_HARNESS_TRUST_GATE=1 the fake consults the scoped global config
+    // exactly like the real CLI — `projects[<cwd>].hasTrustDialogAccepted` in
+    // `<CLAUDE_CONFIG_DIR>/.claude.json`. An accepted cwd mounts the composer
+    // directly; anything else parks on the Trust screen. This is what proves
+    // (dispatch-onboarding-1) that a pre-seeded worker reaches its first tool
+    // call with no keys sent. The forced --trust-dialog flag still wins.
+    let trust_gated = dialect == Dialect::Claude
+        && !opts.trust_dialog
+        && std::env::var("FAKE_HARNESS_TRUST_GATE").as_deref() == Ok("1");
+    if trust_gated {
+        match config_trust_accepted(&engine.home, &cwd) {
+            Some(true) => {
+                engine.event(
+                    "trust_gate",
+                    json!({
+                        "decision": "accepted-from-config",
+                        "cwd": cwd.to_string_lossy(),
+                    }),
+                );
+            }
+            other => {
+                engine.view.mode = ScreenMode::Trust;
+                engine.event(
+                    "trust_gate",
+                    json!({
+                        "decision": "dialog",
+                        "cwd": cwd.to_string_lossy(),
+                        "present": other == Some(false),
+                    }),
+                );
+            }
+        }
+    }
     if opts.trust_dialog {
         engine.view.mode = ScreenMode::Trust;
     }
@@ -494,6 +528,24 @@ fn relaunch_claude(tui: &str, session_id: &str) -> Result<i32, RunError> {
     {
         Ok(command.status()?.code().unwrap_or(1))
     }
+}
+
+/// Read Claude Code's persisted folder-trust decision for `cwd` out of the
+/// scoped global config: `projects[<cwd>].hasTrustDialogAccepted` in
+/// `<home>/.claude.json`.
+///
+/// `Some(true)` = accepted (the composer mounts), `Some(false)` = explicitly
+/// refused/marked, `None` = no decision recorded (the dialog shows). Mirrors
+/// the real CLI's read closely enough for the dispatch-onboarding fixture;
+/// malformed JSON or a non-object project entry count as "no decision".
+fn config_trust_accepted(home: &Path, cwd: &Path) -> Option<bool> {
+    let bytes = std::fs::read(home.join(".claude.json")).ok()?;
+    let config: Value = serde_json::from_slice(&bytes).ok()?;
+    config
+        .get("projects")?
+        .get(cwd.to_string_lossy().as_ref())?
+        .get("hasTrustDialogAccepted")?
+        .as_bool()
 }
 
 fn default_home(dialect: Dialect) -> Option<PathBuf> {

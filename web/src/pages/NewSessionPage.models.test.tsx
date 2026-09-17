@@ -149,3 +149,56 @@ it("groups a wide catalog by id prefix and still offers only enabled models", as
     screen.getByTestId("new-session-model").querySelector('option[value="claude-hidden"]'),
   ).toBeNull();
 });
+
+/**
+ * gateway-carryover-1: the summary line under 模型来源 must name the model that
+ * will actually launch. The screenshot showed the typed
+ * `passthrough/ark/seed-evolving` in the model field while the line read
+ * `Doubao AI · claude-opus-4-8` — the profile default — so the page contradicted
+ * the run it was about to start.
+ */
+it("summarises the model chosen for launch, not the profile default", async () => {
+  vi.spyOn(api, "providerList").mockResolvedValue({ items: [wide] });
+  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  await waitFor(() => expect(screen.getByTestId("new-session-delegation-gateway")).toBeEnabled());
+
+  fireEvent.click(screen.getByTestId("new-session-delegation-gateway"));
+
+  // Before any choice the line may only show the default because that IS what
+  // would launch.
+  await waitFor(() =>
+    expect(screen.getByTestId("new-session-gateway-profile")).toHaveTextContent(
+      `${wide.name} · passthrough/auto`,
+    ),
+  );
+
+  // Pick a different model: the line must follow the choice.
+  fireEvent.change(screen.getByTestId("new-session-model"), {
+    target: { value: "claude-opus-5" },
+  });
+
+  await waitFor(() =>
+    expect(screen.getByTestId("new-session-gateway-profile")).toHaveTextContent(
+      `${wide.name} · claude-opus-5`,
+    ),
+  );
+  expect(screen.getByTestId("new-session-gateway-profile")).not.toHaveTextContent(
+    "passthrough/auto",
+  );
+  // And the field the request reads from agrees with the line.
+  expect(screen.getByTestId("new-session-model")).toHaveValue("claude-opus-5");
+});
+
+it("still points at the Provider page when no gateway is configured", async () => {
+  vi.spyOn(api, "providerList").mockResolvedValue({ items: [] });
+  render(<MemoryRouter><NewSessionPage /></MemoryRouter>);
+  await waitFor(() => expect(screen.getByTestId("new-session-delegation-gateway")).toBeEnabled());
+
+  fireEvent.click(screen.getByTestId("new-session-delegation-gateway"));
+
+  await waitFor(() =>
+    expect(screen.getByTestId("new-session-gateway-profile")).toHaveTextContent(
+      "请先在 Provider 页配置网关",
+    ),
+  );
+});

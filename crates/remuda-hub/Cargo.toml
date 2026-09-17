@@ -24,6 +24,7 @@ base64 = "0.22"
 futures.workspace = true
 remuda-driver.workspace = true
 remuda-protocol.workspace = true
+remuda-screen.workspace = true
 remuda-ssh.workspace = true
 remuda-push.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -145,6 +145,22 @@ async fn observe_workers(
     Ok(Json(json!({ "items": items })))
 }
 
+/// Title of a first-run/native dialog detected on a live screen, if one owns
+/// the keyboard.
+///
+/// Carrier-agnostic: shell-pty and claude-pty both return rows through
+/// `tty.screen`, and the same rule runs over an emulated grid (`raw == false`)
+/// and a raw VT ring tail (`raw == true`); the whitespace-flattened match
+/// tolerates soft wraps in both shapes.
+fn screen_dialog_title(lines: &[String], raw: bool) -> Option<String> {
+    let grid = if raw {
+        remuda_screen::ScreenGrid::from_raw(&lines.join("\n"))
+    } else {
+        remuda_screen::ScreenGrid::from_lines(lines.iter().cloned())
+    };
+    remuda_screen::first_run_dialog(&grid).map(|dialog| dialog.title.to_owned())
+}
+
 /// What the Hub could read of one worker's live screen.
 enum ScreenRead {
     /// Screen rows plus the carrier-reported lifecycle. `raw` is true when the
@@ -315,6 +331,16 @@ async fn observe_one(
     let class = match forced_gone {
         Some(reason) if !hard_failed => remuda_protocol::ScreenClass::Gone { reason },
         _ => {
+            // A first-run/native dialog detected on the live screen (folder
+            // trust, auto-mode outside reads) classifies blocked with its
+            // title, for both carriers and both screen sources — the dialog
+            // is what the Node read, not what the carrier guessed it was
+            // doing (dispatch-onboarding-1).
+            let dialog_title = if screen_available {
+                screen_dialog_title(&lines, raw)
+            } else {
+                None
+            };
             let signals = remuda_protocol::ScreenSignals {
                 lines: &lines,
                 lifecycle: &lifecycle,
@@ -327,6 +353,7 @@ async fn observe_one(
                 known_blocked: known_blocked.as_deref(),
                 raw,
                 screen_available,
+                dialog_title: dialog_title.as_deref(),
                 journal_lines: &hints.assistant_texts,
                 turn_error: hints.turn_error,
                 tail_error: hints.tail_error,

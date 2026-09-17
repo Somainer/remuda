@@ -199,6 +199,21 @@ remuda instance create --kind claude --driver shell-pty --cwd <scratch work dir>
 - 仍有**一个 promoted shell-pty 实例处于 unbound**（由验证者在本轮之前报告）。本轮的两条绑定
   路径（精确 alias + 前台进程组内的 SessionStart 兜底）覆盖的是“检测不到”和“检测迟到”；一个
   在这两条路径之外仍然 unbound 的实例需要单独取证（它的前台进程组一行 + hook binding 的 pid）。
-- `crates/remuda-driver/tests/adapters_parity.rs` 的
-  `codex_and_grok_adapter_dumps_are_journal_diff_parity` 在本机当前负载下失败，且在**未改动的
-  工作树**上同样失败（已用 stash 对照确认），与本轮改动无关。
+- 本机上 `cargo test -p remuda-node -p remuda-driver -p remuda-signal -p remuda-journal`
+  有 10 个测试失败，且**失败集合与未改动的 `ccd9a5dc` 逐字相同**（把这四个 crate 全部
+  `git checkout ccd9a5dc --` 后重跑，`diff` 无输出），与本轮改动无关：
+
+  | 测试 | 本机成因 |
+  |---|---|
+  | `workspace_scm::tests::*`（7 个）+ `gate::tests::verify_passes_and_streams_steps` | macOS 的 `$TMPDIR` 在 `/var/folders/…` 下，而 git 的 `rev-parse --show-toplevel` 回答 `/private/var/folders/…`；`git_toplevel` 要求 toplevel 与注册根**字符串相等**，于是临时仓库被判为 `unsupported` |
+  | `tasktrack_node::foreground_and_background_subagent_rows_close_correctly` | 子进程用 `tempdir_in("/tmp")`，但 `test_workspace_roots!` 只允许 crate 目录与 `$TMPDIR`（`/private/var/folders/…`），于是 `/private/tmp/.tmpXXXX/workspace` 落在允许根之外 |
+  | `shell_pty::lifecycle::tests::a_cooperative_group_stops_at_the_first_rung` | 负载敏感的时序 flake：本机 CPU 100%，第一档 SIGINT 之前就走到了 `Hangup`。在**未改动**的树上 4 次里失败 2 次 |
+  | `adapters_parity`、`prompt_correlation`（3 个）、`live_latency::budgets_and_rule_six_over_a_real_pty` | 同样在未改动的树上失败（真实 PTY / 负载与上述 `/tmp` 归属问题） |
+
+  这些都不在本任务的所有权范围内（`workspace_scm` 的 toplevel 比较、`test_workspace_roots`
+  的根集合），因此本轮不动它们，只如实记录。本轮新增/改动的测试全部通过：
+  `transport::wss::runtime_wss`（7）、`tests/wss.rs`（12 passed / 1 ignored）、
+  `tests/workflow_producer.rs`（2）、`tests/subagent_transcript.rs`（2）、
+  `promote.rs` 的检测表、`shell_pty::tests::promote_ctx_is_scoped_…`；
+  `pnpm --dir web test` 117 files / 1013 tests 全绿；
+  hub e2e `ux-wfdrill.hub.spec.ts` 3 passed（第 4 条是取证截图，默认 skip）。

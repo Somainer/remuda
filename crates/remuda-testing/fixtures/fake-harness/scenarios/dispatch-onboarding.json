@@ -1,0 +1,24 @@
+{
+  "turns": [
+    {
+      "match_prefix": "ONBOARD",
+      "thinking": "Reaching for the first tool without any human keys.",
+      "think_chunks": 1,
+      "text": "ONBOARD_TOOL_DONE",
+      "chunks": 2,
+      "chunk_delay_ms": 5,
+      "tools": [
+        {
+          "name": "Bash",
+          "input": { "command": "pwd" },
+          "approval": "auto",
+          "duration_ms": 20,
+          "exit_code": 0
+        }
+      ],
+      "stop_reason": "end_turn",
+      "usage": { "input_tokens": 40, "output_tokens": 12 }
+    }
+  ],
+  "quit_after_turns": 1
+}

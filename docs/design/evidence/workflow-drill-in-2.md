@@ -217,3 +217,39 @@ remuda instance create --kind claude --driver shell-pty --cwd <scratch work dir>
   `promote.rs` 的检测表、`shell_pty::tests::promote_ctx_is_scoped_…`；
   `pnpm --dir web test` 117 files / 1013 tests 全绿；
   hub e2e `ux-wfdrill.hub.spec.ts` 3 passed（第 4 条是取证截图，默认 skip）。
+
+---
+
+## 门禁回归：两处与本轮改动无关的时序缺陷
+
+第一轮门禁（Linux lane）报 `cargo-test` 失败，第二轮报 `web-hub-e2e` 失败。两次都不是本轮
+三处修复引起的，但都是**真实的时序缺陷**，因此都修了而不是重试。
+
+### 1. `tty_endpoint_emits_protocol_v1_binary_fixture`（cargo-test）
+
+`tty_socket` 先 `attach`（对 ring 的一次瞬时读），**之后**才 `subscribe`。两者之间子进程写出的
+字节两边都不属于，该连接永远看不到；这条 spec 平时能过，只因为它在 4 s 内反复重连，直到某次更
+晚的 snapshot 恰好包含了那些字节。窗口随调度延迟变宽——所以它在**满载的 lane 上失败两次**，
+而在空闲的 Mac 与本地 Linux 容器里都通过（同一 1.94.1 工具链，实测 5/5 与 6/6）。
+
+改为先 `subscribe` 再 `attach`。先订阅不会丢帧，但会出现与 snapshot 重叠的帧，因此
+`live_tail` 只转发客户端尚未被绘制的那一段、且不回退 offset：既不丢字节，也不重绘。门禁那条
+spec 本身未改动，仍然通过。
+
+### 2. `ux-question.hub.spec.ts` 的终端自答（web-hub-e2e）
+
+fake Node 的 `ask-question-terminal` 场景在 **create 时**起一个固定 1200 ms 定时器然后撤掉卡片。
+可 spec 断言的是「表单可见**之后**卡片仍 pending」，而 web store 每 2 s 轮询一次
+`interaction.list`——满载时表单可能还在用上一轮轮询的数据渲染，定时器却已经把卡片撤了，于是
+`pendingCount` 读到 0。
+
+改为**卡片第一次被 list 给客户端时**才起定时器：这样 scripted 答案不可能早于「客户端本可看到
+它」的时刻落地。spec 未做任何弱化（断言、标签、终端自答语义都不变），竞态是被结构消除的，不是
+靠加长延时。本机复跑 5/5，question/approval/hub-live 三组 13/13。
+
+### 本机 hub e2e 的既有失败
+
+`ux-live-view.hub.spec.ts` 与 `ux-livephrase.hub.spec.ts`（都拉起真实 Node + 真实 PTY）在本机
+失败，实例在任何击键之前就 `lifecycle=failed`（journal 只到 seq 5，fake-harness 的
+`native-events.jsonl` 为空）。把四个 crate 与 `web/` 全部 `git checkout 7cd8d854 --` 回到未改动
+状态后**同样失败**（2 failed / 105 passed），因此与本轮无关；在 Linux lane 上这两条是通过的。

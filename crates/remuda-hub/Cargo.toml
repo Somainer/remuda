@@ -50,6 +50,11 @@ webauthn-rs-core = "=0.5.5"
 anyhow.workspace = true
 base64 = "0.22"
 ece = { version = "2.2", default-features = false, features = ["backend-openssl"] }
+# The hub_e2e example's fake Node answers host.files.search with the same
+# walker/glob/gitignore semantics the real remuda-node implementation uses.
+glob = "0.3"
+ignore = "0.4"
+regex = "1"
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"
 serde_cbor_2 = "0.13"

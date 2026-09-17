@@ -657,7 +657,6 @@ pub(crate) async fn dispatch_core(
             return Err(error);
         }
     };
-    let _ = &instance;
     Ok(Json(json!({
         "worker": row,
         "instanceId": instance.instance_id,

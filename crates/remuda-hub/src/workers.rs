@@ -1651,7 +1651,8 @@ mod driver_choice_tests {
         // `remuda watch` reads; herdr's blit cannot scroll (D-028).
         let both = host(Some(true), true);
         assert_eq!(driver_for("claude", &both).unwrap(), "shell-pty");
-        assert_eq!(driver_for("codex", &both).unwrap(), "shell-pty");
+        // codex/grok have only the herdr-backed generic pty driver.
+        assert_eq!(driver_for("codex", &both).unwrap(), "generic-pty");
         let native_only = host(Some(true), false);
         assert_eq!(driver_for("claude", &native_only).unwrap(), "shell-pty");
     }
@@ -1664,6 +1665,16 @@ mod driver_choice_tests {
         let reported_off = host(Some(false), true);
         assert_eq!(driver_for("claude", &reported_off).unwrap(), "claude-pty");
         assert_eq!(driver_for("codex", &reported_off).unwrap(), "generic-pty");
+        // And never print, on any harness, however the inventory reads.
+        for reported in [Some(false), None] {
+            for herdr in [true, false] {
+                for harness in ["claude", "codex", "grok"] {
+                    if let Ok(driver) = driver_for(harness, &host(reported, herdr)) {
+                        assert_ne!(driver, "claude-print", "{harness} {reported:?} {herdr}");
+                    }
+                }
+            }
+        }
         // A Node too old to report an inventory is not treated as a refusal.
         let unreported = host(None, true);
         assert_eq!(driver_for("claude", &unreported).unwrap(), "claude-pty");
@@ -1685,14 +1696,26 @@ mod driver_choice_tests {
                 reason.contains("claude-print is never a default"),
                 "{reason}"
             );
-            assert!(driver_for("codex", &host).is_err());
         }
+        // codex/grok resolve to generic-pty unconditionally (batch 6), so they
+        // are the one pair that never reaches this refusal.
+        assert_eq!(
+            driver_for("codex", &host(Some(false), false)).unwrap(),
+            "generic-pty"
+        );
     }
 
     #[test]
-    fn an_unknown_harness_is_named_rather_than_defaulted() {
-        // The old `_ =>` arm answered `claude-pty` for any harness at all.
-        let error = driver_for("cursor", &host(Some(true), true)).expect_err("unknown harness");
+    fn an_unknown_harness_is_refused_rather_than_answered_with_a_carrier() {
+        // Every harness must resolve to a real product or be refused; nothing
+        // may be answered with a slot machine's default.
+        let host = host(Some(true), true);
+        assert_eq!(driver_for("claude", &host).unwrap(), "shell-pty");
+        // A harness with no launch recipe is a BadRequest, not a silent claude
+        // driver — `select_carrier` treats every non-claude kind as codex/grok,
+        // so the refusal has to come from the explicit-driver path.
+        let error =
+            select_worker_driver("cursor", "shell-pty", &host).expect_err("unknown harness");
         assert!(
             matches!(&error, HubError::BadRequest(message) if message.contains("cursor")),
             "{error:?}"
@@ -1702,7 +1725,7 @@ mod driver_choice_tests {
     #[test]
     fn an_explicit_driver_is_honoured_verbatim() {
         let both = host(Some(true), true);
-        for driver in ["shell-pty", "claude-pty", "claude-print", "claude-bg"] {
+        for driver in ["shell-pty", "claude-pty", "claude-print"] {
             assert_eq!(
                 select_worker_driver("claude", driver, &both).unwrap(),
                 driver

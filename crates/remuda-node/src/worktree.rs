@@ -305,6 +305,35 @@ fn create_record(
     Ok(record)
 }
 
+/// Look up a worktree this Node provisioned (`worker.provision` /
+/// `worktree.create`) whose recorded path is *exactly* `cwd`.
+///
+/// This is the explicit provenance a pre-trust decision needs: the catalog at
+/// `<git-common-dir>/remuda-worktrees.json` is written only by the Node after a
+/// containment-checked `git worktree add` under the managed worktree root, so a
+/// match says "this Node created this checkout" without any path-shape guess.
+/// A record whose directory was removed, a stale/moved path, or a cwd merely
+/// *inside* a recorded worktree all return `None` — the trust decision is for
+/// the exact cwd the agent launches in.
+///
+/// Fails closed: any git/catalog error is treated as "no provenance" rather
+/// than trusting on a best effort.
+#[must_use]
+pub fn provisioned_worktree_named(repo: &Path, cwd: &Path) -> Option<String> {
+    let repo_root = repo_root(Some(repo)).ok()?;
+    let git_common = git_common_dir(&repo_root).ok()?;
+    let catalog = load_catalog(&git_common).ok()?;
+    let want = std::fs::canonicalize(cwd).ok()?;
+    catalog
+        .worktrees
+        .into_iter()
+        .find(|record| {
+            let path = PathBuf::from(&record.path);
+            path.is_dir() && std::fs::canonicalize(&path).is_ok_and(|recorded| recorded == want)
+        })
+        .map(|record| record.name)
+}
+
 /// Resolve a caller-supplied instance `cwd` against the registered workspace.
 ///
 /// An Instance may run in the workspace root or in any worktree beside it
@@ -764,6 +793,39 @@ mod tests {
         let resolved = resolve_instance_cwd(&root, Some(worktree)).expect("worktree cwd");
         assert_eq!(resolved, Path::new(worktree).canonicalize().unwrap());
         drop(keep);
+    }
+
+    #[test]
+    fn provisioned_worktree_named_matches_only_the_exact_recorded_path() {
+        let (keep, root) = init_repo();
+        let created = handle_rpc(&root, "worktree.create", &json!({ "name": "agent1" }))
+            .expect("handled")
+            .expect("create");
+        let worktree = PathBuf::from(created["path"].as_str().unwrap());
+
+        // Exact cwd: provenance.
+        assert_eq!(
+            provisioned_worktree_named(&root, &worktree).as_deref(),
+            Some("agent1")
+        );
+        // The workspace root itself is not a provisioned worktree.
+        assert_eq!(provisioned_worktree_named(&root, &root), None);
+        // A subdirectory of a recorded worktree is not the recorded cwd.
+        let nested = worktree.join("crates");
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(provisioned_worktree_named(&root, &nested), None);
+        // A sibling the Node never provisioned, even under the managed root.
+        let stranger = keep.path().join("remuda-wt").join("hand-created");
+        fs::create_dir_all(&stranger).unwrap();
+        assert_eq!(provisioned_worktree_named(&root, &stranger), None);
+        // A missing directory can never be a live worktree.
+        assert_eq!(
+            provisioned_worktree_named(&root, &worktree.join("does-not-exist")),
+            None
+        );
+        // No catalog at all on an unrelated registered repo: fail closed.
+        let (_other_keep, other) = init_repo();
+        assert_eq!(provisioned_worktree_named(&other, &worktree), None);
     }
 
     #[test]

@@ -296,7 +296,8 @@ impl DriverFactory for NativeClaudeFactory {
                 options.auto_trust_registered_workspace = self
                     .config
                     .auto_trust_registered_workspaces
-                    && cwd_is_registered(&launch.workspace_root, &launch.registered_workspace_root);
+                    && trust_containment(&launch.workspace_root, &launch.registered_workspace_root)
+                        .allowed();
                 // A Node-scoped config dir is fresh on first use, so Claude
                 // would run its first-run wizard instead of mounting a prompt
                 // composer. Seed the flags that gate it, mirroring the host
@@ -344,11 +345,13 @@ impl DriverFactory for NativeClaudeFactory {
                 // what makes §1.0's "the two paths produce one journal" a
                 // property of the design rather than a thing to maintain.
                 let agent_kind = agent_pty_kind(launch.request.kind);
-                // Registered-workspace containment, identical to the
-                // claude-pty gate. Auto-trust must never fire for a cwd outside
-                // a root the operator registered.
+                // Pre-trust containment, identical to the claude-pty gate.
+                // Auto-trust must never fire for a cwd outside an explicitly
+                // recorded boundary: the registered workspace root, or a
+                // worktree the Node itself provisioned (dispatch-onboarding-1).
                 let auto_trust = self.config.auto_trust_registered_workspaces
-                    && cwd_is_registered(&launch.workspace_root, &launch.registered_workspace_root);
+                    && trust_containment(&launch.workspace_root, &launch.registered_workspace_root)
+                        .allowed();
                 // An agent launched into a scoped (non-inherited) native home
                 // gets its first-run flags seeded and its exact cwd pre-trusted
                 // before the process starts, so it mounts the composer instead
@@ -356,19 +359,34 @@ impl DriverFactory for NativeClaudeFactory {
                 // inherited operator home is never edited; there the poller
                 // answers the exact trust dialog on screen (once) instead.
                 if agent_kind.is_some() && !inherit_default_config {
-                    if self.config.seed_claude_onboarding {
-                        let outcome = remuda_driver::seed_scoped_config(
-                            &native_home,
-                            remuda_driver::HostClaudeConfig::from_env().as_ref(),
-                        )
-                        .map_err(map_driver_error)?;
-                        if !outcome.is_noop() {
-                            tracing::debug!("{}", outcome.summary());
-                        }
+                    let seeded = seed_shell_agent_prelaunch(
+                        &native_home,
+                        &launch.workspace_root,
+                        &launch.registered_workspace_root,
+                        inherit_default_config,
+                        self.config.seed_claude_onboarding,
+                        auto_trust,
+                        request_is_bypass(&launch.request),
+                    )?;
+                    if seeded.onboarding_seeded {
+                        tracing::debug!(
+                            "claude onboarding seeded in scoped config before shell-pty launch"
+                        );
                     }
-                    if auto_trust {
-                        remuda_driver::pre_trust_workspace(&native_home, &launch.workspace_root)
-                            .map_err(map_driver_error)?;
+                    // One provenance line naming exactly which recorded
+                    // containment allowed the trust decision.
+                    if let Some(containment) = seeded.trust_containment {
+                        tracing::info!(
+                            cwd = %launch.workspace_root.display(),
+                            containment,
+                            "folder trust pre-accepted before shell-pty launch (dispatch-onboarding-1)"
+                        );
+                    }
+                    if seeded.outside_reads_allowed {
+                        tracing::debug!(
+                            "bypass launch seeded the keep-allowing-outside-reads answer \
+                             before shell-pty launch"
+                        );
                     }
                 }
                 let mut options = match agent_kind {
@@ -531,6 +549,124 @@ fn cwd_is_registered(cwd: &Path, registered_root: &Path) -> bool {
         (Ok(cwd), Ok(root)) => cwd.starts_with(root),
         _ => false,
     }
+}
+
+/// Explicit provenance that allows a launch cwd to be pre-trusted.
+///
+/// "Explicit" means a recorded containment, never a path-shape guess:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrustContainment {
+    /// The cwd canonicalizes inside the operator's registered workspace root.
+    RegisteredWorkspaceRoot,
+    /// The cwd is exactly a worktree this Node provisioned
+    /// (`worker.provision` / `worktree.create`), verified against the
+    /// `<git-common-dir>/remuda-worktrees.json` catalog on disk.
+    ProvisionedWorktree,
+    /// Neither: auto-trust must not fire (dispatch-onboarding-1).
+    None,
+}
+
+impl TrustContainment {
+    fn allowed(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Stable label used in the provenance journal line.
+    fn label(self) -> &'static str {
+        match self {
+            Self::RegisteredWorkspaceRoot => "registered-workspace-root",
+            Self::ProvisionedWorktree => "provisioned-worktree-record",
+            Self::None => "none",
+        }
+    }
+}
+
+/// Decide which recorded containment — if any — allows pre-trusting `cwd`.
+///
+/// The registered-root check stays first: it is the operator's own boundary
+/// and needs no catalog. A dispatch worktree sits *beside* that root by
+/// design (`<repo>/../remuda-wt/<name>`), so it is covered only when the
+/// Node's own provision catalog names it as the exact cwd.
+fn trust_containment(cwd: &Path, registered_root: &Path) -> TrustContainment {
+    if cwd_is_registered(cwd, registered_root) {
+        TrustContainment::RegisteredWorkspaceRoot
+    } else if crate::worktree::provisioned_worktree_named(registered_root, cwd).is_some() {
+        TrustContainment::ProvisionedWorktree
+    } else {
+        TrustContainment::None
+    }
+}
+
+/// Whether the launch request carries the bypass permission posture, in every
+/// spelling the Hub and operators actually send.
+fn request_is_bypass(request: &crate::CreateInstanceRequest) -> bool {
+    matches!(
+        request.permission_mode.as_str(),
+        "bypassPermissions" | "bypass-permissions" | "bypass"
+    )
+}
+
+/// What a shell-pty agent prelaunch wrote into its Node-owned scoped home.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PrelaunchSeed {
+    /// First-run onboarding flags were (re)written.
+    onboarding_seeded: bool,
+    /// Which containment allowed pre-trusting the exact cwd, when it did.
+    trust_containment: Option<&'static str>,
+    /// The bypass "keep allowing outside reads" answer was persisted.
+    outside_reads_allowed: bool,
+}
+
+/// Seed a Node-owned scoped Claude config dir before a shell-pty agent starts.
+///
+/// Three independent launch-intent flags, each gated by its own rule:
+///
+/// - **inherited home** (`inherit_default`): the operator's own config dir —
+///   never edited. Every flag is skipped, leaving the screen poller as the
+///   only auto-trust path, exactly as D-029 laid it down.
+/// - **onboarding** (`seed_onboarding`): skip Claude's first-run wizard, as
+///   D-029 established.
+/// - **trust** (`auto_trust`): pre-accept the folder-trust dialog for exactly
+///   `cwd`, but only when [`trust_containment`] names a recorded containment.
+/// - **outside reads** (`bypass`): persist the "Yes, keep allowing" answer to
+///   the auto-mode outside-reads dialog. The dispatch spec carries
+///   `bypassPermissions`; under any other posture the dialog is left alone and
+///   nothing is widened.
+#[allow(clippy::fn_params_excessive_bools)]
+fn seed_shell_agent_prelaunch(
+    native_home: &Path,
+    cwd: &Path,
+    registered_root: &Path,
+    inherit_default: bool,
+    seed_onboarding: bool,
+    auto_trust: bool,
+    bypass: bool,
+) -> Result<PrelaunchSeed, DriverError> {
+    if inherit_default {
+        return Ok(PrelaunchSeed::default());
+    }
+    let mut summary = PrelaunchSeed::default();
+    if seed_onboarding {
+        let outcome = remuda_driver::seed_scoped_config(
+            native_home,
+            remuda_driver::HostClaudeConfig::from_env().as_ref(),
+        )
+        .map_err(map_driver_error)?;
+        summary.onboarding_seeded = !outcome.is_noop();
+    }
+    if auto_trust {
+        let containment = trust_containment(cwd, registered_root);
+        if containment.allowed() {
+            remuda_driver::pre_trust_workspace(native_home, cwd).map_err(map_driver_error)?;
+            summary.trust_containment = Some(containment.label());
+        }
+    }
+    if bypass
+        && remuda_driver::allow_reads_outside_workspaces(native_home).map_err(map_driver_error)?
+    {
+        summary.outside_reads_allowed = true;
+    }
+    Ok(summary)
 }
 
 fn default_claude_home() -> Result<PathBuf, DriverError> {
@@ -2269,5 +2405,207 @@ mod tests {
             !error.to_string().contains("ANTHROPIC"),
             "errors must not include overlay contents: {error}"
         );
+    }
+
+    // ── dispatch-onboarding-1: prelaunch seeding containment ──────────────
+
+    /// Temp git repo with a fetchable origin, the same fixture shape
+    /// `worker.provision` runs against.
+    fn onboard_init_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "test"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+        run(&["remote", "add", "origin", root.to_str().unwrap()]);
+        run(&["fetch", "-q", "origin"]);
+        run(&["update-ref", "refs/remotes/origin/main", "refs/heads/main"]);
+        (dir, root)
+    }
+
+    fn read_scoped_global(native_home: &Path) -> serde_json::Value {
+        let bytes = std::fs::read(native_home.join(".claude.json")).expect(".claude.json");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    #[test]
+    fn a_provisioned_worktree_cwd_gets_the_trust_flag_and_bypass_answer() {
+        let (_keep, root) = onboard_init_repo();
+        let provisioned = crate::worktree::provision_record(
+            &root,
+            "c-onboard",
+            "wt/c-onboard/task",
+            "origin/main",
+        )
+        .expect("provision");
+        let worktree = PathBuf::from(&provisioned.path);
+
+        let dir = tempfile::tempdir().unwrap();
+        let native_home = dir.path().join("scoped-home");
+        let seeded =
+            seed_shell_agent_prelaunch(&native_home, &worktree, &root, false, true, true, true)
+                .expect("seed");
+        assert_eq!(
+            seeded.trust_containment,
+            Some("provisioned-worktree-record")
+        );
+        assert!(seeded.outside_reads_allowed);
+        let global = read_scoped_global(&native_home);
+        assert_eq!(
+            global["projects"][provisioned.path.as_str()]["hasTrustDialogAccepted"],
+            serde_json::json!(true),
+            "the exact provisioned cwd is pre-trusted"
+        );
+        assert_eq!(
+            global["hasSeenAutoModeOutsideReadPrompt"],
+            serde_json::json!(true),
+            "bypass posture seeds the keep-allowing outside-reads answer"
+        );
+        assert_eq!(
+            global["hasCompletedOnboarding"],
+            serde_json::json!(true),
+            "the wizard seed still runs"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_cwd_gets_no_trust_flag() {
+        let (_keep, root) = onboard_init_repo();
+        let outside = root.parent().unwrap().join("not-a-worktree");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let native_home = dir.path().join("scoped-home");
+        let seeded =
+            seed_shell_agent_prelaunch(&native_home, &outside, &root, false, true, true, true)
+                .expect("seed");
+        assert_eq!(seeded.trust_containment, None, "nothing allowed trust");
+        let global = read_scoped_global(&native_home);
+        assert!(
+            global.get("projects").is_none(),
+            "a cwd with no recorded containment is never pre-trusted: {global}"
+        );
+        // The bypass answer is cwd-independent and still seeds.
+        assert_eq!(
+            global["hasSeenAutoModeOutsideReadPrompt"],
+            serde_json::json!(true)
+        );
+
+        // The registered root itself is still covered.
+        let again =
+            seed_shell_agent_prelaunch(&native_home, &root, &root, false, false, true, false)
+                .expect("seed");
+        assert_eq!(again.trust_containment, Some("registered-workspace-root"));
+        let global = read_scoped_global(&native_home);
+        assert_eq!(
+            global["projects"][root.canonicalize().unwrap().to_string_lossy().as_ref()]["hasTrustDialogAccepted"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn an_inherited_config_dir_is_never_touched() {
+        let (_keep, root) = onboard_init_repo();
+        let provisioned = crate::worktree::provision_record(
+            &root,
+            "c-inherit",
+            "wt/c-inherit/task",
+            "origin/main",
+        )
+        .expect("provision");
+        let dir = tempfile::tempdir().unwrap();
+        let inherited = dir.path().join("operator-home");
+        std::fs::create_dir_all(&inherited).unwrap();
+        let sentinel = inherited.join("do-not-touch.txt");
+        std::fs::write(&sentinel, b"operator").unwrap();
+
+        let seeded = seed_shell_agent_prelaunch(
+            &inherited,
+            Path::new(&provisioned.path),
+            &root,
+            true,
+            true,
+            true,
+            true,
+        )
+        .expect("seed");
+        assert_eq!(seeded, PrelaunchSeed::default());
+        assert!(!inherited.join(".claude.json").exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"operator");
+    }
+
+    #[test]
+    fn outside_reads_answer_is_seeded_for_bypass_only() {
+        let (_keep, root) = onboard_init_repo();
+        let dir = tempfile::tempdir().unwrap();
+        let ask_home = dir.path().join("ask-home");
+        let seeded = seed_shell_agent_prelaunch(&ask_home, &root, &root, false, true, true, false)
+            .expect("seed");
+        assert!(!seeded.outside_reads_allowed);
+        let global = read_scoped_global(&ask_home);
+        assert!(
+            global.get("hasSeenAutoModeOutsideReadPrompt").is_none(),
+            "a non-bypass posture leaves the outside-reads dialog alone: {global}"
+        );
+        for spelling in ["bypass", "bypassPermissions", "bypass-permissions"] {
+            assert!(request_is_bypass(&crate::CreateInstanceRequest {
+                permission_mode: spelling.into(),
+                ..test_create_request()
+            }));
+        }
+        for spelling in ["manual", "acceptEdits", "plan", "auto", ""] {
+            assert!(!request_is_bypass(&crate::CreateInstanceRequest {
+                permission_mode: spelling.into(),
+                ..test_create_request()
+            }));
+        }
+    }
+
+    fn test_create_request() -> crate::CreateInstanceRequest {
+        crate::CreateInstanceRequest {
+            origin: InputOrigin::Human,
+            agent_credential: None,
+            command_id: None,
+            instance_id: None,
+            host_id: None,
+            workspace_id: None,
+            kind: AgentKind::Claude,
+            driver: DriverKind::ShellPty,
+            model: String::new(),
+            args: Vec::new(),
+            binary_path: None,
+            binary_sha256: None,
+            provider_profile_id: String::new(),
+            permission_mode: String::new(),
+            sandbox: None,
+            prompt: String::new(),
+            cwd: None,
+            delegation: None,
+            settings_overlay_path: None,
+            claude_config_dir: None,
+            max_budget_usd: None,
+            provider_overlay: None,
+            provider_auth_token: None,
+            resume_session_id: None,
+            resumed_from: None,
+            effort: None,
+            tui: None,
+            extra_env: std::collections::BTreeMap::new(),
+        }
     }
 }

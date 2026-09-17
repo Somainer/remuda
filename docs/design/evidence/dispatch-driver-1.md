@@ -122,6 +122,9 @@ screen-readable carrier could never be the default. And the `else` arm made
    `shell-pty` when the Node reports it launchable; then `claude-pty` when herdr
    is advertised; and `claude-print` is **never** a default — a host with
    neither is refused as unsatisfiable with a reason, rather than downgraded.
+   (Batch 6's `select_carrier` landed an overlapping preference while this was in
+   review; the two were merged rather than duplicated, so `driver_for` now
+   delegates to it and the print fallback it carried was removed.)
 2. **Hub explicit `--driver`** is honoured verbatim or refused (HTTP 409, non-zero
    CLI exit) with a reason naming what the host can actually launch. It is never
    silently replaced.

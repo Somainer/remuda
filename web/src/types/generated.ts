@@ -3214,6 +3214,7 @@ export type QuestionInput = ("text" | "single-select" | "multi-select");
 
 /** QuestionOption; `protocol.md` §5.4. */
 export type QuestionOption = ({
+  "description": (string | null);
   "id": (string);
   "label": (string);
   [key: string]: unknown;

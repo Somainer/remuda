@@ -14,7 +14,7 @@ export type QuestionField = {
   description: string | null;
   input: "text" | "single-select" | "multi-select";
   required: boolean;
-  options: { id: string; label: string }[];
+  options: { id: string; label: string; description?: string | null }[];
   allowFreeText: boolean;
   sensitive: boolean;
 };

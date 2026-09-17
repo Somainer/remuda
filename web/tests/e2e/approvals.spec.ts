@@ -20,9 +20,14 @@ test.describe("approvals center", () => {
     await bash.getByRole("button", { name: "允许一次" }).click();
     await expect(bash).toHaveCount(0);
 
-    await page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" }).getByRole("link", { name: "去回答" }).click();
-    await expect(page).toHaveURL(/\/s\//);
-    await expect(page.getByTestId("question-form")).toBeVisible();
+    // Hook/control-carried questions are answered inline: options render in
+    // the approvals card itself (no raw JSON, no redirect to the session).
+    const questionRow = page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" });
+    const questionForm = questionRow.getByTestId("question-form");
+    await expect(questionForm).toBeVisible();
+    await questionForm.getByRole("radio", { name: /src\/exec\.cc/ }).click();
+    await questionForm.getByTestId("question-submit").click();
+    await expect(questionRow).toHaveCount(0);
   });
 
   test("focus query highlights a row", async ({ page }) => {

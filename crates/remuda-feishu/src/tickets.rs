@@ -727,6 +727,23 @@ fn encode_answer(
                 .ok_or_else(|| Error::InvalidAnswer("form_value must be an object".into()))?;
             let mut answers = BTreeMap::new();
             for field in &req.fields {
+                // A non-empty free-text companion overrides the select, the
+                // same way "Type something" does in the TUI.
+                let free_text = object
+                    .get(crate::cards::free_text_name(&field.id).as_str())
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty());
+                if let Some(text) = free_text {
+                    answers.insert(
+                        field.id.clone(),
+                        QuestionFieldAnswer {
+                            option_ids: Vec::new(),
+                            text: Some(text.to_owned()),
+                        },
+                    );
+                    continue;
+                }
                 match field_answer(field, object.get(&field.id)) {
                     Ok(ans) => {
                         answers.insert(field.id.clone(), ans);

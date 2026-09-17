@@ -14,9 +14,10 @@ use crate::live::LiveState;
 use crate::map::{Mapped, MappedKind, map_event};
 use crate::socket::SignalSink;
 use remuda_protocol::{
-    Completeness, EventId, HostId, Id, InstanceId, Knowledge, NativeRequestKey, Observation,
-    ObservationPayload, ObservationSource, RunId, RuntimeCursor, SchemaVersion, SourceChannel,
-    SourceCursor, SourceDelivery, Timestamp, U64,
+    CommandId, Completeness, EntityLifecycle, EventId, HostId, Id, InstanceId, Knowledge,
+    LifecycleEntity, LifecyclePayload, NativeRequestKey, Observation, ObservationPayload,
+    ObservationSource, RunId, RuntimeCursor, SchemaVersion, SourceChannel, SourceCursor,
+    SourceDelivery, Timestamp, U64,
 };
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -67,6 +68,11 @@ pub struct SignalBus {
     /// into the decision JSON the harness reads. Keyed by the interaction id,
     /// which is also the decision key.
     parked: std::sync::Mutex<std::collections::HashMap<crate::pending::DecisionKey, ParkedHook>>,
+    /// Open AskUserQuestion cards, keyed the same way. A `PostToolUse` whose
+    /// answers were produced by the TUI closes one of these even when no
+    /// device answered through Remuda.
+    open_questions:
+        std::sync::Mutex<std::collections::HashMap<crate::pending::DecisionKey, OpenQuestion>>,
     blocking_wait: std::time::Duration,
     /// P5 (c-hookgap): turns observed on the hook channel, most recent last,
     /// plus the pid a `Stop`/`Esc` interrupt is aimed at.
@@ -81,11 +87,28 @@ pub struct SignalBus {
 struct ParkedHook {
     /// Suggestions the harness offered; an allow-always answer echoes one.
     suggestions: Vec<crate::PermissionSuggestion>,
+    /// The original permission request, kept while the parked event is an
+    /// AskUserQuestion so a card answer can rebuild `updatedInput.answers`.
+    question: Option<crate::PermissionRequestEvent>,
     /// Receiver for the decision, registered before the card was emitted on
     /// the delivery path; `None` for a direct fold that never blocks.
     decision_rx: Option<tokio::sync::oneshot::Receiver<crate::decision::HookDecision>>,
 }
 
+/// An open AskUserQuestion card that the TUI may answer on its own.
+///
+/// The hook carrier's interaction is normally closed by a device answer. But
+/// claude renders its own form while the hook is pending (measured,
+/// native-pty-5 §5.1), and when the human completes it there the closing
+/// evidence is the `PostToolUse` carrying `answers`. That observation closes
+/// the card here so no banner stays stuck on 「等待操作」.
+#[derive(Clone)]
+struct OpenQuestion {
+    /// The card as emitted; restamped terminal-resolved on close.
+    interaction: remuda_protocol::Interaction,
+    /// The original request, used to validate the observed answers.
+    request: crate::PermissionRequestEvent,
+}
 /// A blocking hook whose card is open and whose process may await a decision.
 ///
 /// Produced by the non-blocking fold and handed to the socket delivery task,
@@ -123,6 +146,7 @@ impl SignalBus {
             binding: std::sync::Mutex::new(None),
             pending: crate::pending::PendingDecisions::new(),
             parked: std::sync::Mutex::new(std::collections::HashMap::new()),
+            open_questions: std::sync::Mutex::new(std::collections::HashMap::new()),
             blocking_wait: crate::BLOCKING_WAIT,
             turn_active: std::sync::Mutex::new(VecDeque::new()),
             live: std::sync::Mutex::new(LiveState::new(live_scope)),
@@ -167,15 +191,15 @@ impl SignalBus {
         answer: &remuda_protocol::InteractionAnswer,
     ) -> crate::Outcome {
         let key = crate::pending::DecisionKey::new(id.as_id().as_str());
-        // Only the suggestions are needed to build the decision; the parked
-        // receiver is owned by the delivery wait and must stay put.
-        let suggestions = self
+        // The parked record carries what the answer needs: suggestions for an
+        // approval echo, the original request for a question rebuild.
+        let parked_record = self
             .parked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-            .map(|parked| parked.suggestions.clone());
-        let Some(suggestions) = suggestions else {
+            .map(|parked| (parked.suggestions.clone(), parked.question.clone()));
+        let Some((suggestions, question_event)) = parked_record else {
             // No parked context: the hook already ended. Still report
             // honestly rather than claiming a delivery we cannot prove.
             return self.pending.resolve(
@@ -185,7 +209,12 @@ impl SignalBus {
                 },
             );
         };
-        let Some(decision) = ParkedHook::to_decision(&suggestions, answer) else {
+        let Some(decision) = (match answer {
+            remuda_protocol::InteractionAnswer::Question(question) => {
+                question_event.and_then(|request| crate::question_decision(&request, question))
+            }
+            other => ParkedHook::to_decision(&suggestions, other),
+        }) else {
             tracing::warn!(?answer, "a hook answer did not match its interaction kind");
             return self.pending.resolve(
                 &key,
@@ -194,7 +223,16 @@ impl SignalBus {
                 },
             );
         };
-        self.pending.resolve(&key, decision)
+        let outcome = self.pending.resolve(&key, decision);
+        // A device answer wins the question outright: the terminal cannot
+        // answer the same card a moment later and emit a second resolution.
+        if matches!(answer, remuda_protocol::InteractionAnswer::Question(_)) {
+            self.open_questions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+        }
+        outcome
     }
 
     /// Retire every parked hook, denying them; called when the instance stops.
@@ -210,6 +248,10 @@ impl SignalBus {
             self.pending.retire(&key, crate::RetireReason::Shutdown);
         }
         self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.open_questions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -453,6 +495,11 @@ impl SignalBus {
                 }
             }
         }
+        // An AskUserQuestion the human answered in the agent's own TUI closes
+        // here: the hook was not answered through Remuda, but the closing
+        // PostToolUse proves the dialog is done. Journaled after the tool
+        // result above so the row closes and the banner clears together.
+        self.close_terminal_answered(&event).await;
         // A blocking event opens its interaction card and parks the hook in
         // the same pass. The fold does not await the decision — it hands the
         // handle back so the socket delivery task can.
@@ -480,8 +527,13 @@ impl SignalBus {
             );
             return None;
         };
-        let suggestions = crate::decision::PermissionRequestEvent::from_event(event)
-            .map(|request| request.suggestions)
+        let permission_request = crate::decision::PermissionRequestEvent::from_event(event);
+        let is_question = permission_request
+            .as_ref()
+            .is_some_and(crate::question::is_ask_user_question);
+        let suggestions = permission_request
+            .as_ref()
+            .map(|request| request.suggestions.clone())
             .unwrap_or_default();
         // Register BOTH the decision waiter and the parked record BEFORE the
         // card becomes visible. A device that answers the instant it receives
@@ -499,9 +551,28 @@ impl SignalBus {
                 key.clone(),
                 ParkedHook {
                     suggestions,
+                    question: if is_question {
+                        permission_request.clone()
+                    } else {
+                        None
+                    },
                     decision_rx,
                 },
             );
+        if is_question && let Some(request) = permission_request {
+            // The TUI can answer this card itself; remember it so the closing
+            // PostToolUse resolves the banner even with no device answer.
+            self.open_questions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    key.clone(),
+                    OpenQuestion {
+                        interaction: interaction.clone(),
+                        request,
+                    },
+                );
+        }
         if !self.emit_interaction(interaction).await {
             // Nobody can see a card that never reached the journal. Answering
             // it is impossible, so the relay must not park for the full TTL.
@@ -510,6 +581,10 @@ impl SignalBus {
             // deny, and avoids leaving a dead entry for the instance lifetime.
             tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
             self.parked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            self.open_questions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
@@ -582,7 +657,11 @@ impl SignalBus {
         let interaction = match event.name.as_str() {
             "PermissionRequest" => {
                 let request = crate::decision::PermissionRequestEvent::from_event(event)?;
-                crate::approval::approval_interaction(&request, &context).ok()?
+                if crate::question::is_ask_user_question(&request) {
+                    crate::question::question_interaction(&request, &context).ok()?
+                } else {
+                    crate::approval::approval_interaction(&request, &context).ok()?
+                }
             }
             "Elicitation" => crate::approval::elicitation_interaction(event, &context).ok()?,
             _ => return None,
@@ -591,6 +670,101 @@ impl SignalBus {
             interaction,
             crate::pending::DecisionKey::new(interaction_id.as_id().as_str()),
         ))
+    }
+
+    /// Close an AskUserQuestion card that was answered in the agent's own TUI.
+    ///
+    /// Evidence: a `PostToolUse(AskUserQuestion)` carrying an `answers` object.
+    /// The card Remuda showed was never answered through the broker, but the
+    /// harness has moved on — leaving it pending would strand the
+    /// 「等待操作」 banner forever and keep the structured tool row running.
+    /// So journal a terminal-sourced resolved entity (with the chosen labels)
+    /// and drop the parked hook: a device answer arriving afterwards must find
+    /// nothing to double-answer.
+    async fn close_terminal_answered(&self, event: &HookEvent) {
+        if event.name != "PostToolUse" || event.text("tool_name") != Some(crate::ASK_USER_QUESTION)
+        {
+            return;
+        }
+        let Some(tool_input) = event.payload.get("tool_input") else {
+            return;
+        };
+        let Some(questions) = tool_input.get("questions") else {
+            return;
+        };
+        let Some(raw_answers) = tool_input.get("answers").or_else(|| {
+            event
+                .payload
+                .get("tool_response")
+                .and_then(|r| r.get("answers"))
+        }) else {
+            return;
+        };
+        let found = {
+            let mut table = self
+                .open_questions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            // Score by how many answer keys are questions on the card; an
+            // exact, non-empty match wins. With one open card this is trivial,
+            // but two questions in flight must not close each other's cards.
+            let mut best: Option<(crate::pending::DecisionKey, OpenQuestion, usize)> = None;
+            for (key, open) in table.iter() {
+                let score = answer_overlap(open, raw_answers);
+                let total = raw_answers.as_object().map_or(0, |o| o.len());
+                if score > 0
+                    && score == total
+                    && best.as_ref().is_none_or(|b: &(_, _, usize)| score > b.2)
+                {
+                    best = Some((key.clone(), open.clone(), score));
+                }
+            }
+            best.and_then(|(key, _, _)| table.remove(&key).map(|open| (key, open)))
+        };
+        let Some((key, open)) = found else {
+            return;
+        };
+        let Some(answers) = crate::answer_from_harness(questions, raw_answers) else {
+            // Not one of our cards' questions; put it back so another close
+            // attempt can match.
+            self.open_questions
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(key, open);
+            return;
+        };
+        self.parked
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&key);
+        self.pending.retire(&key, crate::RetireReason::Deadline);
+        let Some(now) = now_ts() else {
+            return;
+        };
+        let resolved =
+            crate::resolved_in_terminal(open.interaction, answers, now.clone(), CommandId::new());
+        let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let observation = self.build_payload(
+            seq,
+            now,
+            ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Entity(Box::new(
+                EntityLifecycle {
+                    entity_id: resolved.meta.id.as_id().clone(),
+                    revision: resolved.meta.revision,
+                    previous_state: Some("pending".into()),
+                    state: "resolved".into(),
+                    reason_code: "terminal-answered".into(),
+                    evidence_event_ids: Vec::new(),
+                    entity_value: LifecycleEntity::Interaction(Box::new(resolved)),
+                },
+            )))),
+            self.binding().map(|binding| binding.session_id).as_ref(),
+            Completeness::Structured,
+            None,
+        );
+        if self.events.send(observation).await.is_err() {
+            tracing::debug!("terminal answer resolution not journaled");
+        }
     }
 
     /// Journal `interaction.requested`. False when the channel is gone.
@@ -821,6 +995,34 @@ impl ParkedHook {
             InteractionAnswer::Question(_) | InteractionAnswer::PlanReview(_) => None,
         }
     }
+}
+
+/// Count of `raw_answers` keys that are question texts on an open card.
+///
+/// PermissionRequests carry no correlation id of their own (the payload has
+/// no `tool_use_id`), so a terminal close matches by content: the answers
+/// object is keyed by question text, and every key must be one of the card's
+/// questions. Zero means this PostToolUse does not close that card.
+fn answer_overlap(open: &OpenQuestion, raw_answers: &serde_json::Value) -> usize {
+    let Some(card_questions) = open
+        .request
+        .tool_input
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return 0;
+    };
+    let Some(answer_keys) = raw_answers.as_object() else {
+        return 0;
+    };
+    answer_keys
+        .keys()
+        .filter(|key| {
+            card_questions.iter().any(|question| {
+                question.get("question").and_then(serde_json::Value::as_str) == Some(key.as_str())
+            })
+        })
+        .count()
 }
 
 /// `ObservationPayload` accessor used by the Node's fold; keeps the match on
@@ -1415,5 +1617,266 @@ mod tests {
             .handle(envelope("PermissionRequest", permission_request()))
             .await;
         assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+    }
+
+    fn ask_user_question_request() -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [
+                {"question": "下一步做什么？", "header": "下一步", "multiSelect": false,
+                 "options": [
+                    {"label": "继续排查", "description": "继续"},
+                    {"label": "回到 GravityDB", "description": "切回"}]},
+                {"question": "保存什么？", "header": "记忆", "multiSelect": true,
+                 "options": [
+                    {"label": "保存端口", "description": "端口"},
+                    {"label": "保存环境变量", "description": "变量"}]}
+            ]}
+        })
+    }
+
+    fn post_tool_use_answers() -> serde_json::Value {
+        serde_json::json!({
+            "tool_name": "AskUserQuestion",
+            "tool_input": {"questions": [
+                {"question": "下一步做什么？", "header": "下一步", "multiSelect": false,
+                 "options": [{"label": "继续排查"}, {"label": "回到 GravityDB"}]},
+                {"question": "保存什么？", "header": "记忆", "multiSelect": true,
+                 "options": [{"label": "保存端口"}, {"label": "保存环境变量"}]}
+            ], "answers": {
+                "下一步做什么？": "继续排查",
+                "保存什么？": ["保存端口", "保存环境变量"]
+            }},
+            "tool_response": {"answers": {
+                "下一步做什么？": "继续排查",
+                "保存什么？": ["保存端口", "保存环境变量"]
+            }}
+        })
+    }
+
+    async fn next_interaction(
+        rx: &mut mpsc::Receiver<Observation>,
+    ) -> remuda_protocol::Interaction {
+        loop {
+            let observation = rx.recv().await.expect("an observation");
+            if let ObservationPayload::InteractionRequested(payload) = &observation.body {
+                return payload.interaction.clone();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_askuserquestion_hook_opens_a_question_card_not_an_approval() {
+        let (bus, mut rx) = bus();
+        let handle = tokio::spawn(async move {
+            bus.handle(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        assert_eq!(card.kind, remuda_protocol::InteractionKind::Question);
+        assert_eq!(
+            card.carrier,
+            remuda_protocol::InteractionCarrier::HarnessHook
+        );
+        let remuda_protocol::InteractionRequest::Question(request) = &card.request else {
+            panic!("expected a question");
+        };
+        assert_eq!(request.fields.len(), 2);
+        assert_eq!(request.fields[0].description.as_deref(), Some("下一步"));
+        assert_eq!(
+            request.fields[0].input,
+            remuda_protocol::QuestionInput::SingleSelect
+        );
+        assert_eq!(
+            request.fields[1].input,
+            remuda_protocol::QuestionInput::MultiSelect
+        );
+        // The TUI always offers free text; so must the card.
+        assert!(request.fields.iter().all(|field| field.allow_free_text));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_device_question_answer_reaches_the_hook_as_updated_input_answers() {
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let delivery = Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            delivery
+                .deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        let answer = remuda_protocol::InteractionAnswer::Question(Box::new(
+            remuda_protocol::QuestionAnswer {
+                answers: std::collections::BTreeMap::from([
+                    (
+                        "q0".into(),
+                        remuda_protocol::QuestionFieldAnswer {
+                            option_ids: vec!["回到 GravityDB".into()],
+                            text: None,
+                        },
+                    ),
+                    (
+                        "q1".into(),
+                        remuda_protocol::QuestionFieldAnswer {
+                            option_ids: vec!["保存端口".into(), "保存环境变量".into()],
+                            text: None,
+                        },
+                    ),
+                ]),
+            },
+        ));
+        assert_eq!(
+            bus.resolve_answer(&card.meta.id, &answer),
+            crate::Outcome::Answered
+        );
+        let reply = handle.await.expect("handler");
+        let json = reply.to_hook_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        assert_eq!(
+            json["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["下一步做什么？"],
+            serde_json::json!("回到 GravityDB")
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["保存什么？"],
+            serde_json::json!(["保存端口", "保存环境变量"])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_question_answer_denies_the_hook() {
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let delivery = Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            delivery
+                .deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        let answer = remuda_protocol::InteractionAnswer::Question(Box::new(
+            remuda_protocol::QuestionAnswer {
+                answers: std::collections::BTreeMap::new(),
+            },
+        ));
+        assert_eq!(
+            bus.resolve_answer(&card.meta.id, &answer),
+            crate::Outcome::Answered
+        );
+        let json = handle.await.expect("handler").to_hook_json();
+        assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "deny");
+    }
+
+    #[tokio::test]
+    async fn a_terminal_answer_resolves_the_card_and_clears_the_wait() {
+        // The human answers in the TUI: no device answer ever arrives, but the
+        // closing PostToolUse must resolve the interaction with source
+        // terminal and leave nothing a late device answer could hit.
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let delivery = Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            delivery
+                .deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        assert!(bus.is_parked(&card.meta.id));
+        bus.handle(envelope("PostToolUse", post_tool_use_answers()))
+            .await;
+        // Retiring the parked hook must let the delivery finish rather than
+        // sitting out the full 15-minute wait.
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("delivery unblocked")
+            .expect("task");
+        assert_eq!(
+            reply.to_hook_json()["hookSpecificOutput"]["decision"]["behavior"],
+            "deny",
+            "nobody answered through the hook: fail closed"
+        );
+
+        // The terminal resolution is journaled as an entity lifecycle.
+        let mut resolved = None;
+        while let Ok(observation) = rx.try_recv() {
+            if let ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Entity(entity) = payload.as_ref()
+                && let remuda_protocol::LifecycleEntity::Interaction(interaction) =
+                    &entity.entity_value
+                && interaction.meta.id == card.meta.id
+            {
+                resolved = Some(interaction.clone());
+            }
+        }
+        let resolved = resolved.expect("a resolved interaction entity");
+        assert_eq!(resolved.state, remuda_protocol::InteractionState::Resolved);
+        let remuda_protocol::Knowledge::Known { value: committed } = &resolved.answer else {
+            panic!("the terminal answer must be recorded");
+        };
+        assert_eq!(
+            committed.actor.actor_type,
+            remuda_protocol::ActorType::Human
+        );
+        assert_eq!(committed.actor.device_id, None, "no device answered");
+        let remuda_protocol::InteractionAnswer::Question(question) = &committed.value else {
+            panic!("expected a question answer");
+        };
+        assert_eq!(
+            question.answers["q0"].option_ids,
+            vec!["继续排查".to_owned()]
+        );
+        assert_eq!(
+            question.answers["q1"].option_ids,
+            vec!["保存端口".to_owned(), "保存环境变量".to_owned()]
+        );
+        assert_eq!(
+            resolved.resolution,
+            remuda_protocol::Knowledge::Known {
+                value: remuda_protocol::InteractionResolution {
+                    reason: remuda_protocol::InteractionResolutionReason::Answered,
+                    event_ids: Vec::new(),
+                }
+            }
+        );
+        // The parked hook is gone: a late device answer cannot land.
+        assert!(!bus.is_parked(&card.meta.id));
+        let late = remuda_protocol::InteractionAnswer::Question(Box::new(
+            remuda_protocol::QuestionAnswer {
+                answers: std::collections::BTreeMap::new(),
+            },
+        ));
+        assert_eq!(
+            bus.resolve_answer(&card.meta.id, &late),
+            crate::Outcome::Abandoned
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_posttooluse_does_not_close_the_question() {
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let delivery = Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            delivery
+                .deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        // A Write finishing has nothing to do with the open question.
+        bus.handle(envelope(
+            "PostToolUse",
+            serde_json::json!({
+                "tool_name": "Write",
+                "tool_response": {"stdout": "ok"}
+            }),
+        ))
+        .await;
+        assert!(bus.is_parked(&card.meta.id), "the question stays open");
+        handle.abort();
     }
 }

@@ -4,6 +4,7 @@ import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
 import { Button } from "../components/Button";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
+import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
@@ -426,6 +427,16 @@ export function SessionPage({
         {pending.map((item) =>
           item.kind === "question" ? (
             <QuestionForm
+              key={item.id}
+              interaction={item}
+              busy={sending}
+              onRespond={(answer) => {
+                setSending(true);
+                void hubStore.respond(item.id, answer).finally(() => setSending(false));
+              }}
+            />
+          ) : item.kind === "elicitation" ? (
+            <ElicitationCard
               key={item.id}
               interaction={item}
               busy={sending}

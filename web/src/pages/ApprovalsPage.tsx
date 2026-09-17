@@ -2,6 +2,8 @@ import { useMemo } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { StateDot } from "../components/StateDot";
 import { PtyQuestionAnswers } from "../components/PtyQuestionAnswers";
+import { QuestionForm } from "../features/approvals/QuestionForm";
+import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { formatClock } from "../lib/format";
 import { hubStore, useHub } from "../lib/store";
 import { projectStatus } from "../lib/status";
@@ -14,7 +16,7 @@ import {
 import css from "./ApprovalsPage.module.css";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 
-const KIND_FILTERS = ["all", "approval", "question", "plan-review"] as const;
+const KIND_FILTERS = ["all", "approval", "question", "plan-review", "elicitation"] as const;
 
 function preview(item: Interaction): string {
   if (item.request.kind === "approval") return item.request.description;
@@ -90,7 +92,7 @@ export function ApprovalsPage() {
         <div className={css.seg}>
           {KIND_FILTERS.map((id) => (
             <button key={id} type="button" className={`${css.segBtn} ${kind === id ? css.segOn : ""}`} onClick={() => setKind(id)}>
-              {id === "all" ? "全部" : id === "approval" ? "审批" : id === "question" ? "提问" : "计划"}
+              {id === "all" ? "全部" : id === "approval" ? "审批" : id === "question" ? "提问" : id === "elicitation" ? "表单" : "计划"}
             </button>
           ))}
         </div>
@@ -161,6 +163,12 @@ export function ApprovalsPage() {
                 {item.carrier === "harness-hook" ? <p className={css.terminalNote}>来自工具钩子 · 回答直接决定工具是否执行</p> : null}
                 {!item.answerable ? <p className={css.terminalNote}>请打开会话查看完整终端提示</p> : null}
                 {paused ? <p className={css.note}>主机离线，交互暂停</p> : null}
+                {item.kind === "question" && item.carrier !== "native-tty" && !answering ? (
+                  <QuestionForm key={item.id} interaction={item} busy={paused || !item.answerable} onRespond={(answer) => respond(item, answer)} />
+                ) : null}
+                {item.kind === "elicitation" && !answering ? (
+                  <ElicitationCard key={item.id} interaction={item} busy={paused || !item.answerable} onRespond={(answer) => respond(item, answer)} />
+                ) : null}
               </div>
               <div className={css.actions}>
                 {answering ? (
@@ -191,11 +199,6 @@ export function ApprovalsPage() {
                 {!answering && item.kind === "question" && item.carrier === "native-tty" ?
                   <PtyQuestionAnswers item={item} disabled={paused || !item.answerable}
                     onAnswer={(answer) => respond(item, answer)} /> : null}
-                {!answering && item.kind === "question" && item.carrier !== "native-tty" ? (
-                  <Link to={`/s/${item.instanceId}`} className={`${css.btn} ${css.btnDust}`}>
-                    去回答
-                  </Link>
-                ) : null}
                 {!answering && item.kind === "plan-review" && item.request.kind === "plan-review"
                   ? item.request.options.map((opt) => (
                       <button

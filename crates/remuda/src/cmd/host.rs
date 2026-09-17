@@ -230,8 +230,7 @@ async fn get(
         .await
         .with_context(|| format!("downloading {object_id}"))?;
     if let Some(out) = output {
-        std::fs::write(&out, &bytes)
-            .with_context(|| format!("writing {}", out.display()))?;
+        std::fs::write(&out, &bytes).with_context(|| format!("writing {}", out.display()))?;
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({

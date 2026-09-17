@@ -16,8 +16,8 @@ use crate::NodeError;
 use crate::attachments::MAX_ATTACHMENT_BYTES;
 use remuda_protocol::Workspace;
 use remuda_protocol::hubnode::{
-    HostFileEntry, HostFileKind, HostFileReadResult, HostFilesListResult, HostFilesParams,
-    HOST_FILES_SCRATCH_ID,
+    HOST_FILES_SCRATCH_ID, HostFileEntry, HostFileKind, HostFileReadResult, HostFilesListResult,
+    HostFilesParams,
 };
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -216,7 +216,9 @@ fn resolve_contained(anchor: &Anchor, rel_path: &str) -> Result<PathBuf, NodeErr
         }
     }
     let canonical = std::fs::canonicalize(&joined).map_err(|error| {
-        NodeError::InvalidRequest(format!("host file path {rel_path} cannot be resolved: {error}"))
+        NodeError::InvalidRequest(format!(
+            "host file path {rel_path} cannot be resolved: {error}"
+        ))
     })?;
     if !canonical.starts_with(anchor.base()) {
         return Err(NodeError::InvalidRequest(format!(
@@ -227,10 +229,12 @@ fn resolve_contained(anchor: &Anchor, rel_path: &str) -> Result<PathBuf, NodeErr
         let allowed = canonical
             .strip_prefix(anchor.base())
             .ok()
-            .and_then(|rest| rest.components().find_map(|component| match component {
-                Component::Normal(name) => Some(name),
-                _ => None,
-            }))
+            .and_then(|rest| {
+                rest.components().find_map(|component| match component {
+                    Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+            })
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("remuda-"));
         if !allowed {
@@ -468,9 +472,8 @@ mod tests {
             &'a self,
             name: String,
             bytes: Vec<u8>,
-        ) -> Pin<
-            Box<dyn std::future::Future<Output = Result<StagedHostFile, NodeError>> + Send + 'a>,
-        > {
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<StagedHostFile, NodeError>> + Send + 'a>>
+        {
             Box::pin(async move {
                 let digest = format!("{:x}", Sha256::digest(&bytes));
                 self.staged.lock().unwrap().push((name, bytes.clone()));
@@ -493,7 +496,10 @@ mod tests {
         node.set_host_file_stager(Some(Arc::new(FakeStager::default())));
 
         let listing = node
-            .host_files_rpc("host.files.list", params(&workspace.meta.id.as_id().to_string(), None))
+            .host_files_rpc(
+                "host.files.list",
+                params(&workspace.meta.id.as_id().to_string(), None),
+            )
             .await
             .unwrap();
         let names: Vec<String> = listing["entries"]
@@ -503,7 +509,10 @@ mod tests {
             .map(|entry| entry["name"].as_str().unwrap().to_owned())
             .collect();
         assert_eq!(names, vec!["notes.txt", "sub"]);
-        assert_eq!(listing["path"], json!(fs::canonicalize(root.path()).unwrap()));
+        assert_eq!(
+            listing["path"],
+            json!(fs::canonicalize(root.path()).unwrap())
+        );
         let sub = node
             .host_files_rpc(
                 "host.files.list",
@@ -539,7 +548,10 @@ mod tests {
                 "host.files.read",
                 params(
                     &workspace.meta.id.as_id().to_string(),
-                    Some(&format!("../{}/secret", outside.path().file_name().unwrap().to_string_lossy())),
+                    Some(&format!(
+                        "../{}/secret",
+                        outside.path().file_name().unwrap().to_string_lossy()
+                    )),
                 ),
             )
             .await
@@ -554,11 +566,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::write(outside.path().join("secret"), b"x").unwrap();
-        std::os::unix::fs::symlink(
-            outside.path().join("secret"),
-            root.path().join("evil-link"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.path().join("evil-link"))
+            .unwrap();
         let (node, workspace) = workspace_node(root.path());
         let error = node
             .host_files_rpc(
@@ -583,11 +592,7 @@ mod tests {
             .unwrap();
         let outside = tempfile::tempdir().unwrap();
         // Symlinks are irregular even when their target is inside.
-        symlink(
-            root.path().join("a-fifo"),
-            root.path().join("link-to-fifo"),
-        )
-        .unwrap();
+        symlink(root.path().join("a-fifo"), root.path().join("link-to-fifo")).unwrap();
         let _ = outside;
         let (node, workspace) = workspace_node(root.path());
         for path in ["a-fifo", "link-to-fifo"] {
@@ -603,7 +608,10 @@ mod tests {
         }
         // Listing shows them with their real kinds rather than following.
         let listing = node
-            .host_files_rpc("host.files.list", params(&workspace.meta.id.as_id().to_string(), None))
+            .host_files_rpc(
+                "host.files.list",
+                params(&workspace.meta.id.as_id().to_string(), None),
+            )
             .await
             .unwrap();
         let kinds: std::collections::HashMap<String, String> = listing["entries"]
@@ -655,11 +663,7 @@ mod tests {
         let nested = scratch.join("nested");
         assert!(resolve_contained(&anchor, &path_rel(&tmp, &nested)).is_ok());
         // Another remuda-* directory is a scratch area too (prefix match).
-        assert!(resolve_contained(
-            &anchor,
-            &path_rel(&tmp, &other.join("x"))
-        )
-        .is_ok());
+        assert!(resolve_contained(&anchor, &path_rel(&tmp, &other.join("x"))).is_ok());
         // Plain /tmp path without a remuda-* first component is refused.
         let error = resolve_contained(&anchor, &path_rel(&tmp, &unrelated)).unwrap_err();
         assert!(error.to_string().contains("scratch area"), "{}", error);

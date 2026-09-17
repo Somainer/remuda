@@ -99,7 +99,10 @@ async fn login(addr: std::net::SocketAddr, bootstrap: &str, name: &str) -> Resul
         .position(|window| window == b"\r\n\r\n")
         .context("header terminator")?;
     let head = String::from_utf8_lossy(&buf[..split]).to_string();
-    anyhow::ensure!(head.lines().next().unwrap_or_default().contains(" 200 "), "{head}");
+    anyhow::ensure!(
+        head.lines().next().unwrap_or_default().contains(" 200 "),
+        "{head}"
+    );
     cookie_from(head).context("set-cookie")
 }
 
@@ -140,7 +143,14 @@ async fn fixture() -> Result<Fixture> {
     let cookie = login(addr, &bootstrap, "host-files-phone").await?;
 
     // Mint + use an enroll token exactly like the objects harness.
-    let (_, rest) = json_request(addr, "POST", "/v1/hosts/enroll-token", &[("Cookie", &cookie)], Some("{}")).await?;
+    let (_, rest) = json_request(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", &cookie)],
+        Some("{}"),
+    )
+    .await?;
     let enroll = serde_json::from_str::<Value>(rest.trim())?["token"]
         .as_str()
         .context("enroll token")?
@@ -180,7 +190,11 @@ async fn fixture() -> Result<Fixture> {
 #[tokio::test]
 async fn human_operator_gets_list_and_read_results() -> Result<()> {
     let fixture = fixture().await?;
-    let (addr, cookie, host) = (fixture.addr, fixture.cookie.clone(), fixture.host_id.clone());
+    let (addr, cookie, host) = (
+        fixture.addr,
+        fixture.cookie.clone(),
+        fixture.host_id.clone(),
+    );
 
     // Script the Node's list/read answers through the live transport.
     fixture
@@ -388,15 +402,16 @@ async fn staging_rejects_oversize_and_unsanitized_names() -> Result<()> {
         .unwrap();
     let head_text = String::from_utf8_lossy(&buf[..split]).to_string();
     assert!(head_text.contains(" 413 "), "{head_text}");
-    assert!(
-        String::from_utf8_lossy(&buf[split + 4..]).contains("RESOURCE_LIMIT")
-    );
+    assert!(String::from_utf8_lossy(&buf[split + 4..]).contains("RESOURCE_LIMIT"));
 
     // A traversal-shaped name is refused rather than stored.
     let (status, _) = raw(
         fixture.addr,
         "POST",
-        &format!("/v1/hosts/{}/files/objects?name=..%2Fescape", fixture.host_id),
+        &format!(
+            "/v1/hosts/{}/files/objects?name=..%2Fescape",
+            fixture.host_id
+        ),
         &[
             ("Authorization", &format!("Bearer {}", fixture.node_token)),
             ("Content-Type", "application/octet-stream"),
@@ -410,12 +425,16 @@ async fn staging_rejects_oversize_and_unsanitized_names() -> Result<()> {
 }
 
 /// Enroll a second Node against the same Hub and return its durable token.
-async fn fixture_other_node(
-    hub: &remuda_hub::RunningHub,
-    cookie: String,
-) -> Result<String> {
+async fn fixture_other_node(hub: &remuda_hub::RunningHub, cookie: String) -> Result<String> {
     let addr = hub.addr;
-    let (_, token_json) = json_request(addr, "POST", "/v1/hosts/enroll-token", &[("Cookie", &cookie)], Some("{}")).await?;
+    let (_, token_json) = json_request(
+        addr,
+        "POST",
+        "/v1/hosts/enroll-token",
+        &[("Cookie", &cookie)],
+        Some("{}"),
+    )
+    .await?;
     let enroll = serde_json::from_str::<Value>(token_json.trim())?["token"]
         .as_str()
         .context("enroll token")?

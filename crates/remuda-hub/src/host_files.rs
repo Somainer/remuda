@@ -203,7 +203,12 @@ async fn stage_object(
             body.len()
         )));
     }
-    let original_name = match query.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+    let original_name = match query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+    {
         None => None,
         // The Node already sends a bare basename; sanitise again in depth.
         Some(name) => Some(

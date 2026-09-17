@@ -16,6 +16,7 @@ import type {
   ProviderTestResult,
 } from "../features/providers";
 import { PROVIDER_PROFILES } from "../features/providers/fixtures";
+import { coerceUsageRollup } from "../features/session/contextUsage";
 import type { components, paths } from "./api.generated";
 import { printCapabilities, ptyCapabilities, agentPtyCapabilities } from "./capabilities";
 import type { JournalRead } from "./journal";
@@ -240,6 +241,7 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     launchedBy?: string | null;
     signalTier?: string | null;
     lastError?: string | null;
+    usageRollup?: unknown;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
   const capabilities =
@@ -328,6 +330,7 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
         : null,
     mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,
     promotedAt: typeof extra.promotedAt === "string" ? extra.promotedAt : null,
+    usageRollup: coerceUsageRollup(rec.usageRollup ?? extra.usageRollup),
   };
 }
 

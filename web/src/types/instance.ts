@@ -1,6 +1,7 @@
 import type { CapabilitySnapshot, DriverKind, NativeRef, ProcessRef } from "./nativeRef";
 import type { EntityMeta, Id, Knowledge, Timestamp, U64 } from "./wire";
 import type { RegisteredWorkspace } from "./workspace";
+import type { UsageRollup } from "../features/session/contextUsage";
 
 export type Kind = "claude" | "codex" | "grok" | "agy" | "generic" | "terminal";
 
@@ -73,6 +74,8 @@ export type Instance = EntityMeta & {
   promotedAt?: string | null;
   /** Who ran the launch command (D-028 §1.0 rule 4). Provenance only — never a capability level. */
   launchedBy?: "remuda" | "user" | null;
+  /** context-usage-1: additive per-session token/context rollup from the Hub; absent until the harness reports usage. */
+  usageRollup?: UsageRollup | null;
 };
 
 export type HostTransport = "outbound-wss" | "ssh-dev";

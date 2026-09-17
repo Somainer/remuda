@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
 import { effortAt } from "./effort";
 
@@ -393,5 +393,128 @@ describe("Composer shortcuts", () => {
     expect(screen.getByTestId("harness-chip")).toHaveTextContent(/Grok/i);
     expect(screen.getByTestId("model-effort-chip")).toBeVisible();
     expect(screen.getByTestId("context-chip")).toBeVisible();
+  });
+});
+
+describe("Composer context usage chip", () => {
+  const rollup = {
+    contextUsedTokens: 35_839,
+    contextWindowTokens: 200_000,
+    contextPct: 18,
+    sessionInputTokens: 7_856,
+    sessionOutputTokens: 589,
+    cacheReadTokens: 97_704,
+    cacheCreationTokens: 0,
+    turns: 3,
+    tpmIn60s: 1_223,
+    tpmOut60s: 144,
+    tpmIn5m: 612,
+    tpmOut5m: 66,
+    lastTurnAt: new Date().toISOString(),
+  };
+
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+  });
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("drives the ring percentage from the rollup and opens the popover on click", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_rollup" mobile={false} onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("18%");
+    expect(chip).toHaveAttribute("data-has-popover", "1");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    const ring = chip.querySelector("[class*='contextRing']") as HTMLElement;
+    expect(ring.style.getPropertyValue("--ctx-pct")).toBe("18%");
+
+    await user.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "true");
+    const popover = screen.getByTestId("context-usage-popover");
+    expect(popover).toHaveAttribute("data-mobile", "0");
+    expect(screen.getByTestId("context-usage-headline")).toHaveTextContent("35.8k/200.0k (18%)");
+
+    // The close affordance dismisses.
+    await user.click(screen.getByTestId("context-usage-close"));
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("opens the popover on hover for precise pointers and closes on leave", async () => {
+    const user = userEvent.setup();
+    const matchMedia = vi.fn((query: string) => ({
+      matches: query.includes("hover: hover"),
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+    render(
+      <Composer instanceId="ins_hover" mobile={false} onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+    await user.hover(chip);
+    expect(screen.getByTestId("context-usage-popover")).toBeInTheDocument();
+    await user.unhover(chip);
+    // Close is debounced 140 ms so the cursor can cross into the panel.
+    await vi.waitFor(() =>
+      expect(screen.queryByTestId("context-usage-popover")).toBeNull(),
+    );
+  });
+
+  it("click-pins the panel so pointer leave keeps it open until dismissed", async () => {
+    const user = userEvent.setup();
+    const matchMedia = vi.fn((query: string) => ({
+      matches: query.includes("hover: hover"),
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    }));
+    vi.stubGlobal("matchMedia", matchMedia);
+    render(
+      <Composer instanceId="ins_pin" mobile={false} onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    const chip = screen.getByTestId("context-chip");
+    await user.click(chip);
+    expect(screen.getByTestId("context-usage-popover")).toBeInTheDocument();
+    await user.unhover(chip);
+    // Pinned: a hover leave must not close a panel the click opened.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(screen.getByTestId("context-usage-popover")).toBeInTheDocument();
+    // Pointerdown outside the composer un-pins and closes.
+    fireEvent.pointerDown(document.body, { bubbles: true });
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+  });
+
+  it("renders the dash when usage is unknown and offers no popover", async () => {
+    const user = userEvent.setup();
+    render(<Composer instanceId="ins_none" mobile={false} onSend={vi.fn()} />);
+    const chip = screen.getByTestId("context-chip");
+    expect(chip).toHaveTextContent("—");
+    expect(chip).toHaveAttribute("data-has-popover", "0");
+    await user.click(chip);
+    expect(screen.queryByTestId("context-usage-popover")).toBeNull();
+  });
+
+  it("renders a sheet on touch widths", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_touch" mobile onSend={vi.fn()} usageRollup={rollup} />,
+    );
+    await user.click(screen.getByTestId("context-chip"));
+    expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
   });
 });

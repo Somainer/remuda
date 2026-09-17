@@ -148,9 +148,6 @@ function watchCommands(page: Page): Posted[] {
 
 test("queue two, cancel one, then 插队 jumps ahead of the remaining row", async ({ page }) => {
   const commands = watchCommands(page);
-  page.on("framenavigated", (f) => console.log("NAV:", f.url()));
-  page.on("pageerror", (e) => console.log("PAGEERROR:", e.message, (e as Error).stack ?? ""));
-  page.on("console", (m) => { if (m.type() === "error") console.log("CONSOLE-ERR:", m.text()); });
   const instanceId = await createSession(page, "steer ordering session");
   await answerPending(page, instanceId);
   // Answering the create approval ends the fake turn (idle). Send the
@@ -163,13 +160,16 @@ test("queue two, cancel one, then 插队 jumps ahead of the remaining row", asyn
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 15_000,
   });
-  // Wait for the POST flight to settle: while `sending` the dock is disabled
-  // and an Enter pressed too early would be swallowed by canSubmit().
-  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
-
+  // Baseline: the hold-working setup POST is real; held rows must add none.
+  const baselineSends = commands.filter((c) => c.operation === "instance.send").length;
+  const sendsSince = () => commands.filter((c) => c.operation === "instance.send").length - baselineSends;
   const input = page.getByTestId("composer-input");
-  // Enter while working holds locally; nothing is POSTed.
+  // Type first: while the previous POST is in flight `sending` disables the
+  // queue button even with text, so its enablement marks the settled moment —
+  // Enter before that would be swallowed by canSubmit().
   await input.fill("queued alpha");
+  await expect(page.getByTestId("composer-queue")).toBeEnabled({ timeout: 10_000 });
+  // Enter while working holds locally; nothing is POSTed.
   await input.press("Enter");
   await expect(page.locator('[data-testid="optimistic-bubble"][data-held="turn"]')).toHaveCount(1);
   await expect(page.getByTestId("held-queue-tag").first()).toContainText("第 1 条");
@@ -178,7 +178,7 @@ test("queue two, cancel one, then 插队 jumps ahead of the remaining row", asyn
   await input.press("Enter");
   await expect(page.locator('[data-testid="optimistic-bubble"][data-held="turn"]')).toHaveCount(2);
   await expect(page.getByTestId("held-queue-tag").nth(1)).toContainText("第 2 条");
-  expect(commands.filter((c) => c.operation === "instance.send")).toHaveLength(0);
+  expect(sendsSince()).toBe(0);
 
   // Per-message cancel: alpha is dropped; beta keeps its place (now ordinal 1).
   await page
@@ -190,7 +190,7 @@ test("queue two, cancel one, then 插队 jumps ahead of the remaining row", asyn
   await expect(
     page.locator('[data-testid="optimistic-bubble"][data-held="turn"]', { hasText: "queued beta" }),
   ).toBeVisible();
-  expect(commands.filter((c) => c.operation === "instance.send")).toHaveLength(0);
+  expect(sendsSince()).toBe(0);
 
   // 插队 the third message: visible button + confirm.
   await input.fill("jump first");
@@ -206,9 +206,7 @@ test("queue two, cancel one, then 插队 jumps ahead of the remaining row", asyn
     .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
     .toBeTruthy();
   await expect(page.getByTestId("composer-interrupted-chip")).toBeVisible();
-  await expect
-    .poll(() => commands.filter((c) => c.operation === "instance.send").length)
-    .toBeGreaterThanOrEqual(3);
+  await expect.poll(() => sendsSince()).toBeGreaterThanOrEqual(2);
   const sends = commands.filter((c) => c.operation === "instance.send");
   expect(sends[0]?.payload).toMatchObject({ prompt: "hold-working run a long tool" });
   expect(sends[1]?.payload).toMatchObject({ prompt: "jump first", mode: "steer" });
@@ -261,14 +259,14 @@ test("Cmd/Ctrl+Enter is the 插队 gesture", async ({ page }) => {
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 15_000,
   });
-  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
+  await page.getByTestId("composer-input").fill("keyboard jump");
+  await expect(page.getByTestId("composer-queue")).toBeEnabled({ timeout: 10_000 });
 
-  const input = page.getByTestId("composer-input");
-  await input.fill("keyboard jump");
   page.once("dialog", (dialog) => {
     expect(dialog.message()).toContain("插队");
     void dialog.accept();
   });
+  const input = page.getByTestId("composer-input");
   await input.press("Control+Enter");
   await expect
     .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))

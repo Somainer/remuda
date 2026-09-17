@@ -452,9 +452,11 @@ test("composer queue / steer / interrupt states on a working native session", as
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "working", {
     timeout: 10_000,
   });
-  // While `sending` the dock is disabled; wait for the POST flight to
-  // settle before queueing (interrupt is not gated on empty text).
-  await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
+  // While `sending` the dock is disabled; type the held text first so the
+  // queue button's enablement marks the settled POST flight (it is also
+  // disabled on empty text, so it can only be enabled with text present).
+  await page.getByTestId("composer-input").fill("after this turn");
+  await expect(page.getByTestId("composer-queue")).toBeEnabled({ timeout: 10_000 });
 
   // Working composer: Enter queues (Remuda-held), 插队 and 打断 available.
   const queue = page.getByTestId("composer-queue");
@@ -470,7 +472,6 @@ test("composer queue / steer / interrupt states on a working native session", as
 
   // Enter holds a removable chip and sends nothing.
   const before = commands.length;
-  await page.getByTestId("composer-input").fill("after this turn");
   await page.getByTestId("composer-input").press("Enter");
   await expect(page.getByTestId("composer-queued-chip")).toBeVisible();
   await expect(page.getByTestId("composer-queued-chip")).toHaveAttribute("data-ordinal", "1");

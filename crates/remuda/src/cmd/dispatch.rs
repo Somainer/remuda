@@ -10,7 +10,7 @@ use clap::Args;
 use serde_json::json;
 
 use super::brief::lint_brief;
-use super::hub_client::{HubOpts, block_on, print_json};
+use super::hub_client::{HubOpts, block_on, hub_http_error, print_json};
 use super::registry::Entrypoint;
 
 /// `remuda dispatch` arguments.
@@ -100,7 +100,10 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "placement": args.placement,
         "driver": args.driver,
     });
-    let value = client.post("/v1/workers/dispatch", &body).await?;
+    let value = client
+        .post("/v1/workers/dispatch", &body)
+        .await
+        .map_err(hub_http_error)?;
     print_json(&value)?;
     Ok(0)
 }

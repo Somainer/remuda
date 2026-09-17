@@ -213,6 +213,30 @@ pub(crate) fn print_json(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Render a Hub refusal (e.g. 409 `PIN_REFUSED`) with its `reasons[]` lines
+/// on stderr instead of an opaque JSON body, so the operator sees both the
+/// rejected pin and the did-you-mean suggestions. Other HTTP errors pass
+/// through unchanged.
+pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
+    if let ClientError::Http { status, body } = &err
+        && let Ok(value) = serde_json::from_str::<Value>(body)
+        && value.get("code").and_then(Value::as_str) == Some("PIN_REFUSED")
+    {
+        let headline = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("pin refused");
+        let mut lines = vec![format!("hub HTTP {status}: {headline}")];
+        if let Some(reasons) = value.get("reasons").and_then(Value::as_array) {
+            for reason in reasons.iter().filter_map(Value::as_str) {
+                lines.push(format!("  - {reason}"));
+            }
+        }
+        return anyhow::anyhow!(lines.join("\n"));
+    }
+    anyhow::Error::new(err)
+}
+
 pub(crate) fn block_on<T>(
     fut: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {

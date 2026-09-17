@@ -571,7 +571,9 @@ async fn land_losing_the_cas_is_reverified_onto_new_main_then_lands() -> Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fifo_order_is_preserved_on_one_lane() -> Result<()> {
     let ctx = Ctx::spawn(1).await?;
-    // A lingers; B and C must queue behind it in that order.
+    // A lingers; B and C must queue behind it in that order. B holds until
+    // canceled (rather than racing a fixed delay) so the "C still queued
+    // behind a running B" assertion is deterministic under host load.
     ctx.scripts[0].script(
         "wt/a/fifo",
         RunSpec {
@@ -579,15 +581,21 @@ async fn fifo_order_is_preserved_on_one_lane() -> Result<()> {
             ..RunSpec::default()
         },
     );
-    for branch in ["wt/b/fifo", "wt/c/fifo"] {
-        ctx.scripts[0].script(
-            branch,
-            RunSpec {
-                delay_ms: 800,
-                ..RunSpec::default()
-            },
-        );
-    }
+    ctx.scripts[0].script(
+        "wt/b/fifo",
+        RunSpec {
+            wait_cancel: true,
+            status: "canceled",
+            ..RunSpec::default()
+        },
+    );
+    ctx.scripts[0].script(
+        "wt/c/fifo",
+        RunSpec {
+            delay_ms: 200,
+            ..RunSpec::default()
+        },
+    );
     let a = ctx.enqueue(json!({"branch":"wt/a/fifo"})).await;
     let b = ctx.enqueue(json!({"branch":"wt/b/fifo"})).await;
     let c = ctx.enqueue(json!({"branch":"wt/c/fifo"})).await;
@@ -598,14 +606,31 @@ async fn fifo_order_is_preserved_on_one_lane() -> Result<()> {
     assert_eq!(ctx.job(b["id"].as_str().unwrap()).await["state"], "queued");
     assert_eq!(ctx.job(c["id"].as_str().unwrap()).await["state"], "queued");
     let _ = ctx.wait_state(a["id"].as_str().unwrap(), &["passed"]).await;
-    // B must start (and pass) before C starts.
+    // B must be running while C is still queued — B holds until canceled, so
+    // this ordering cannot be missed between two scheduler polls.
     let _ = ctx
-        .wait_state(b["id"].as_str().unwrap(), &["running", "passed"])
+        .wait_state(b["id"].as_str().unwrap(), &["running"])
         .await;
     assert_eq!(ctx.job(c["id"].as_str().unwrap()).await["state"], "queued");
-    let _ = ctx.wait_state(b["id"].as_str().unwrap(), &["passed"]).await;
+    // Release B; C starts only after B's dispatch ended.
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!(
+                "/v1/projects/{}/gate/jobs/{}/cancel",
+                ctx.project,
+                b["id"].as_str().unwrap()
+            ),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success());
+    let _ = ctx
+        .wait_state(b["id"].as_str().unwrap(), &["canceled"])
+        .await;
     let _ = ctx.wait_state(c["id"].as_str().unwrap(), &["passed"]).await;
-    // Arrival order at the Node.
+    // Arrival order at the Node (B's gate.run was dispatched even though it
+    // was canceled while running).
     let arrivals = ctx.scripts[0].arrivals.lock().unwrap();
     let branches: Vec<&str> = arrivals
         .iter()

@@ -175,6 +175,7 @@ async fn live_tasktrack_fg_and_bg_agent() {
         auto_trust_registered_workspace: false,
         seed_onboarding: true,
         host_claude_config: remuda_driver::HostClaudeConfig::from_env(),
+        instance_id: None,
     });
 
     let mut handle = driver

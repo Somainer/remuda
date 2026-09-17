@@ -69,6 +69,14 @@ pub struct ClaudeBgOptions {
     pub inherit_default_config: bool,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
+    /// The Node instance this driver serves, when a Node built it.
+    ///
+    /// Observation payloads carry ids derived under this scope
+    /// (`Id::derive("obj", <instance id>, <native id>)`), and the store's
+    /// append rewrites envelope identity but not those. A throwaway id here
+    /// therefore makes the driver's own nodes unaddressable by anything the
+    /// Node derives for the same session (c-wfdrill2 C). `None` outside a Node.
+    pub instance_id: Option<InstanceId>,
 }
 
 impl ClaudeBgOptions {
@@ -94,6 +102,7 @@ impl ClaudeBgOptions {
             setting_sources: None,
             inherit_default_config: false,
             settings_overlay_path: None,
+            instance_id: None,
         }
     }
 }
@@ -266,7 +275,11 @@ impl ClaudeBgDriver {
         let (tx, rx) = mpsc::channel(64);
         self.seq.store(0, Ordering::SeqCst);
         self.closed.store(false, Ordering::SeqCst);
-        let instance_id = InstanceId::new();
+        let instance_id = self
+            .options
+            .instance_id
+            .clone()
+            .unwrap_or_default();
         let run_id = RunId::new();
         let journal_id = Id::new("obj")?;
         *self.inner.lock().await = Some(BgLive {

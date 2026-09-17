@@ -115,6 +115,14 @@ pub struct ClaudePtyOptions {
     pub host_claude_config: Option<crate::claude_onboarding::HostClaudeConfig>,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
+    /// The Node instance this driver serves, when a Node built it.
+    ///
+    /// Observation payloads carry ids derived under this scope
+    /// (`Id::derive("obj", <instance id>, <native id>)`), and the store's
+    /// append rewrites envelope identity but not those. A throwaway id here
+    /// therefore makes the driver's own nodes unaddressable by anything the
+    /// Node derives for the same session (c-wfdrill2 C). `None` outside a Node.
+    pub instance_id: Option<InstanceId>,
 }
 
 impl ClaudePtyOptions {
@@ -144,6 +152,7 @@ impl ClaudePtyOptions {
             auto_trust_registered_workspace: false,
             seed_onboarding: true,
             host_claude_config: None,
+            instance_id: None,
         }
     }
 }
@@ -411,7 +420,11 @@ impl ClaudePtyDriver {
             .await
             .map_err(map_herdr)?;
 
-        let instance_id = InstanceId::new();
+        let instance_id = self
+            .options
+            .instance_id
+            .clone()
+            .unwrap_or_default();
         let run_id = RunId::new();
         let journal_id = Id::new("obj")?;
         let (tx, rx) = mpsc::channel(64);

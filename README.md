@@ -22,20 +22,28 @@ materialization, and the remote UI.
 
 ## Status
 
-**Pre-alpha. Milestone M0 is in progress.** Libraries, protocol types, wire
-adapters, a Web skeleton, and deploy *templates* exist. They are not a
-shipped product.
+**Pre-alpha, but the runtime runs.** `remuda dev` starts a loopback Hub and a
+local native Node that share one access code; `remuda hub` and `remuda node`
+start the standalone services. The coordinator verbs are implemented —
+`project`, `task`, `own`, `profile`, `dispatch`, `watch`, `worker`, `report`,
+`retire`, and `brief` — and `gate` / `land` verify and merge through a
+per-project lane on a Node (D-034). A Feishu dispatcher routes owner messages
+to workers. The React/PWA surface renders live structured sessions, a workflow
+tree, effort tiers, permission modes, in-session model switch, context-usage
+popover, file attachments, and steer/queue on the composer. This is developer
+plumbing under active change, not a shipped product.
 
 Honest gaps:
 
-- `remuda hub`, `remuda node`, and `remuda dev` still print placeholders and
-  do not start services.
-- No production Hub, enrollment, or bot dispatcher.
-- Interaction broker, fleet placement, and Codex/Grok promotion are later
-  milestones.
+- Public-internet exposure is still pending (D-031). The intranet Caddy config
+  under `deploy/` is the only supported reachability path.
+- The Feishu dispatcher runs and routes, but the owner-facing card flow
+  (placement / outcome cards, in-card approvals) is a later batch.
+- Codex and Grok remain secondary drivers; native Claude is the promoted
+  carrier and `claude-print` is now an explicit-only diagnostic (D-035).
 - Wire v1 is an implementation draft, not a released protocol.
 
-Do not point a phone or a bot at this tree yet.
+Do not point a phone or a bot at a public address yet.
 
 ## Architecture
 
@@ -95,16 +103,24 @@ to **1.94.1** (`rust-toolchain.toml`). Edition 2024.
 
 | Path | Role |
 | --- | --- |
-| `crates/remuda-protocol` | Versioned entities, commands, observations, Hub–Node envelopes |
+| `crates/remuda-protocol` | Versioned entities (Project, Task, gate), commands, observations, Hub–Node envelopes |
 | `crates/remuda-claude-wire` | Claude `-p` stream-json framing and control protocol |
-| `crates/remuda-acp-wire` | Grok ACP client (stdio / serve WebSocket) |
+| `crates/remuda-codex-wire` | Codex app-server JSON-RPC client (stdio NDJSON) |
+| `crates/remuda-acp-wire` | Grok ACP client (stdio newline-delimited JSON-RPC) |
 | `crates/remuda-herdr` | Herdr JSON-RPC client and terminal observe/control bridge |
-| `crates/remuda-driver` | Driver trait, launch materializer, Claude print/pty/bg |
+| `crates/remuda-screen` | Screen signatures, dialog parsers, PTY terminal emulator |
+| `crates/remuda-signal` | Harness signal adapters (hook/file/OSC/screen ranking) |
+| `crates/remuda-rules` | Screen-signal rule engine for agent-state detection |
+| `crates/remuda-driver` | Driver trait, launch materializer, Claude print/pty/bg, `shell-pty` |
 | `crates/remuda-journal` | Append-only observation journal and blob store |
-| `crates/remuda-node` | Node instance manager, local HTTP/WSS, outbound link |
-| `crates/remuda-hub` | Hub HTTP/WSS, auth, host registry, embedded Web |
-| `crates/remuda-testing` | `fake-claude` / `fake-herdr` and captured fixtures |
-| `crates/remuda` | Composition root: `remuda hub\|node\|dev\|version` |
+| `crates/remuda-node` | Node instance manager, local HTTP/WSS, outbound link, gate lane runner |
+| `crates/remuda-hub` | Hub HTTP/WSS, auth, host registry, projects/tasks/supply/gate queue, embedded Web |
+| `crates/remuda-hub-client` | Device-authenticated Hub HTTP/WS client |
+| `crates/remuda-ssh` | SSH remote transport via the system `ssh` binary |
+| `crates/remuda-push` | Web Push notifications for the Hub |
+| `crates/remuda-feishu` | Feishu channel adapter and dispatcher |
+| `crates/remuda-testing` | `fake-claude` / `fake-harness` / `fake-herdr` and captured fixtures |
+| `crates/remuda` | Composition root: `hub`, `node`, `dev`, coordinator and gate verbs |
 | `web/` | React + TypeScript + Vite PWA |
 | `deploy/` | Dockerfile, compose, intranet Caddy, Node unit; public exposure pending (D-031) |
 | `scripts/` | Acceptance and CI helpers |
@@ -127,7 +143,7 @@ pnpm --dir web test
 pnpm --dir web lint
 
 cargo run --locked -p remuda -- version
-just dev            # placeholder; does not start Hub+Node yet
+just dev            # loopback Hub + local native Node, shared access code
 
 just accept-m0      # fake-claude NDJSON stub (no live model)
 just secret-scan

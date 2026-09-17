@@ -304,7 +304,10 @@ async fn arm_steer_interrupt(
     steer: &PendingPrompt,
 ) -> Result<(), NodeError> {
     let mut related = std::collections::BTreeMap::new();
-    related.insert("origin".into(), format!("{:?}", steer.origin).to_lowercase());
+    related.insert(
+        "origin".into(),
+        format!("{:?}", steer.origin).to_lowercase(),
+    );
     related.insert("reason".into(), "user-steer".into());
     related.insert("commandId".into(), steer.command_id.as_id().to_string());
     let (status, severity) = match tokio::time::timeout(
@@ -313,9 +316,18 @@ async fn arm_steer_interrupt(
     )
     .await
     {
-        Ok(Ok(_)) => ("esc-dispatched".to_string(), remuda_protocol::Severity::Info),
-        Ok(Err(error)) => (format!("esc-failed: {error}"), remuda_protocol::Severity::Warning),
-        Err(_) => ("esc-timeout".to_string(), remuda_protocol::Severity::Warning),
+        Ok(Ok(_)) => (
+            "esc-dispatched".to_string(),
+            remuda_protocol::Severity::Info,
+        ),
+        Ok(Err(error)) => (
+            format!("esc-failed: {error}"),
+            remuda_protocol::Severity::Warning,
+        ),
+        Err(_) => (
+            "esc-timeout".to_string(),
+            remuda_protocol::Severity::Warning,
+        ),
     };
     let diagnostic = DriverEmission::NativeLifecycle {
         name: "turn-interrupted".into(),
@@ -475,7 +487,10 @@ async fn deliver(
             // native harness emitting anything.
             if prompt.mode == remuda_protocol::PromptMode::Steer {
                 let mut related = std::collections::BTreeMap::new();
-                related.insert("origin".into(), format!("{:?}", prompt.origin).to_lowercase());
+                related.insert(
+                    "origin".into(),
+                    format!("{:?}", prompt.origin).to_lowercase(),
+                );
                 related.insert("reason".into(), "interrupted-current-turn".into());
                 related.insert("commandId".into(), prompt.command_id.as_id().to_string());
                 let steer_event = DriverEmission::NativeLifecycle {
@@ -485,7 +500,8 @@ async fn deliver(
                 };
                 if let Ok(mut payload) = steer_event.into_payload() {
                     if let ObservationPayload::Lifecycle(lifecycle) = &mut payload
-                        && let remuda_protocol::LifecyclePayload::Native(native) = lifecycle.as_mut()
+                        && let remuda_protocol::LifecyclePayload::Native(native) =
+                            lifecycle.as_mut()
                     {
                         native.related_ids = related;
                     }

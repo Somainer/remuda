@@ -712,12 +712,9 @@ fn prompt_of(params: &Value) -> Option<String> {
 /// c-steer: parse the optional `mode` of an `instance.send`; unknown values
 /// degrade to a plain new turn (see the same helper in `runtime_link.rs`).
 fn prompt_mode_of(params: &Value) -> Option<remuda_protocol::PromptMode> {
-    params
-        .get("mode")
-        .and_then(Value::as_str)
-        .and_then(|raw| {
-            serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()
-        })
+    params.get("mode").and_then(Value::as_str).and_then(|raw| {
+        serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()
+    })
 }
 
 fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {

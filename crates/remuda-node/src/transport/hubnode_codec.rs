@@ -447,10 +447,10 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
         Some(prompt),
         // c-steer: carry the web's `mode` ("steer" jumps the queue); an
         // unknown value degrades to a plain new turn.
-        params
-            .get("mode")
-            .and_then(Value::as_str)
-            .and_then(|raw| serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()),
+        params.get("mode").and_then(Value::as_str).and_then(|raw| {
+            serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned()))
+                .ok()
+        }),
         parsed.attachments(),
         parsed.command_id.as_deref(),
         parsed.run_id.as_deref(),

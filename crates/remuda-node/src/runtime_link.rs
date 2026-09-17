@@ -388,8 +388,7 @@ fn prompt_of(params: &Value) -> Option<String> {
 /// than rejecting the command — delivery mode is metadata, never an authz
 /// decision, and an older/newer client's vocabulary must not wedge the queue.
 fn prompt_mode_of(params: &Value) -> Option<remuda_protocol::PromptMode> {
-    params
-        .get("mode")
-        .and_then(Value::as_str)
-        .and_then(|raw| serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok())
+    params.get("mode").and_then(Value::as_str).and_then(|raw| {
+        serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()
+    })
 }

@@ -174,14 +174,19 @@ fn messages(
 /// The CURRENT revision of each user message: the journal keeps every Queued →
 /// Complete/Interrupted Replace as its own event, so [`messages`] counts
 /// stale revisions. Fold by message id, keeping the highest revision.
-fn folded_messages(
-    node: &DevNode,
-    created: &CreateInstanceResponse,
-) -> Vec<MessagePayload> {
+fn folded_messages(node: &DevNode, created: &CreateInstanceResponse) -> Vec<MessagePayload> {
     let mut by_id = std::collections::BTreeMap::<_, MessagePayload>::new();
-    for event in node.read_journal(&created.instance.journal_id, None, 256).unwrap().events {
-        let JournalEvent::Instance(observation) = event else { continue };
-        let ObservationPayload::Message(message) = observation.body else { continue };
+    for event in node
+        .read_journal(&created.instance.journal_id, None, 256)
+        .unwrap()
+        .events
+    {
+        let JournalEvent::Instance(observation) = event else {
+            continue;
+        };
+        let ObservationPayload::Message(message) = observation.body else {
+            continue;
+        };
         if message.role != MessageRole::User {
             continue;
         }
@@ -705,9 +710,14 @@ async fn steer_interrupts_the_running_turn_then_jumps_the_queue() {
     // while the turn is still Working.
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(*driver.sent.lock().unwrap(), ["first"]);
-    assert_eq!(folded_with_status(&node, &created, ContentStatus::Queued).len(), 3);
     assert_eq!(
-        node.get_instance(&created.instance.meta.id).unwrap().activity,
+        folded_with_status(&node, &created, ContentStatus::Queued).len(),
+        3
+    );
+    assert_eq!(
+        node.get_instance(&created.instance.meta.id)
+            .unwrap()
+            .activity,
         Knowledge::Known {
             value: Activity::Working
         }
@@ -718,7 +728,15 @@ async fn steer_interrupts_the_running_turn_then_jumps_the_queue() {
     fold_status(&node, &created, "idle").await;
     // The STEER itself lands on the first delivery tick after turn-ended;
     // measure that, not the FIFO prompts draining on later ticks.
-    wait(|| driver.sent.lock().unwrap().iter().any(|text| text == "jump")).await;
+    wait(|| {
+        driver
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|text| text == "jump")
+    })
+    .await;
     let steer_delivered = started.elapsed();
     wait(|| driver.sent.lock().unwrap().len() == 4).await;
     let delivered_at = started.elapsed();
@@ -730,7 +748,10 @@ async fn steer_interrupts_the_running_turn_then_jumps_the_queue() {
         steer_delivered.saturating_sub(idle_at)
     );
     assert!(delivered_at < Duration::from_secs(3));
-    assert_eq!(*driver.sent.lock().unwrap(), ["first", "jump", "second", "third"]);
+    assert_eq!(
+        *driver.sent.lock().unwrap(),
+        ["first", "jump", "second", "third"]
+    );
     assert_eq!(
         *driver.sent_modes.lock().unwrap(),
         [
@@ -742,14 +763,23 @@ async fn steer_interrupts_the_running_turn_then_jumps_the_queue() {
     );
     assert_eq!(
         *driver.order.lock().unwrap(),
-        ["send:first", "cancel", "send:jump", "send:second", "send:third"]
+        [
+            "send:first",
+            "cancel",
+            "send:jump",
+            "send:second",
+            "send:third"
+        ]
     );
 
     // Ledger: the interrupted turn, then the steer delivery, both attributed.
     let interrupted = native_lifecycles(&node, &created, "turn-interrupted");
     assert_eq!(interrupted.len(), 1);
     assert_eq!(interrupted[0].0, "esc-dispatched");
-    assert_eq!(interrupted[0].1.get("reason").map(String::as_str), Some("user-steer"));
+    assert_eq!(
+        interrupted[0].1.get("reason").map(String::as_str),
+        Some("user-steer")
+    );
     assert_eq!(
         interrupted[0].1.get("commandId").map(String::as_str),
         Some(jump.command_id.as_id().as_str())
@@ -808,7 +838,9 @@ async fn steer_waits_behind_a_pending_interaction_without_firing_esc() {
     node.inner.interactions.ingest(&event).await.unwrap();
     fold_status(&node, &created, "blocked").await;
     assert_eq!(
-        node.get_instance(&created.instance.meta.id).unwrap().activity,
+        node.get_instance(&created.instance.meta.id)
+            .unwrap()
+            .activity,
         Knowledge::Known {
             value: Activity::WaitingInteraction
         }
@@ -823,7 +855,9 @@ async fn steer_waits_behind_a_pending_interaction_without_firing_esc() {
     wait(|| folded_with_status(&node, &created, ContentStatus::Queued).len() == 1).await;
     // The queued follow-up must not blur the pending question into "working".
     assert_eq!(
-        node.get_instance(&created.instance.meta.id).unwrap().activity,
+        node.get_instance(&created.instance.meta.id)
+            .unwrap()
+            .activity,
         Knowledge::Known {
             value: Activity::WaitingInteraction
         }
@@ -839,7 +873,10 @@ async fn steer_waits_behind_a_pending_interaction_without_firing_esc() {
     // No Esc at a dialog; nothing written; both prompts stay queued.
     assert!(!driver.order.lock().unwrap().contains(&"cancel".to_string()));
     assert_eq!(*driver.sent.lock().unwrap(), ["first"]);
-    assert_eq!(folded_with_status(&node, &created, ContentStatus::Queued).len(), 2);
+    assert_eq!(
+        folded_with_status(&node, &created, ContentStatus::Queued).len(),
+        2
+    );
     assert!(native_lifecycles(&node, &created, "turn-interrupted").is_empty());
 
     // The question is answered through the interaction broker: the dialog
@@ -909,7 +946,17 @@ async fn two_consecutive_steers_each_interrupt_and_keep_order() {
         serde_json::json!({"operation": "send", "prompt": "jump1", "mode": "steer"}),
     )
     .await;
-    wait(|| driver.order.lock().unwrap().iter().filter(|o| *o == "cancel").count() == 1).await;
+    wait(|| {
+        driver
+            .order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| *o == "cancel")
+            .count()
+            == 1
+    })
+    .await;
     let j2 = submit(
         &node,
         &created,
@@ -922,10 +969,23 @@ async fn two_consecutive_steers_each_interrupt_and_keep_order() {
     fold_status(&node, &created, "idle").await;
     wait(|| driver.sent.lock().unwrap().iter().any(|t| t == "jump1")).await;
     // jump1's send marks Working again; the second Esc follows on its own.
-    wait(|| driver.order.lock().unwrap().iter().filter(|o| *o == "cancel").count() == 2).await;
+    wait(|| {
+        driver
+            .order
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| *o == "cancel")
+            .count()
+            == 2
+    })
+    .await;
     fold_status(&node, &created, "idle").await;
     wait(|| driver.sent.lock().unwrap().len() == 4).await;
-    assert_eq!(*driver.sent.lock().unwrap(), ["first", "jump1", "jump2", "after"]);
+    assert_eq!(
+        *driver.sent.lock().unwrap(),
+        ["first", "jump1", "jump2", "after"]
+    );
     assert_accepted(&node, &j1);
     assert_accepted(&node, &j2);
     assert!(folded_with_status(&node, &created, ContentStatus::Queued).is_empty());

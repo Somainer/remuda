@@ -2051,7 +2051,9 @@ fn command_parts(
                     origin: request.origin,
                     // c-steer: a steer carries through to the PTY queue; an
                     // ordinary send and an unmarked older client are new turns.
-                    mode: request.prompt_mode.unwrap_or(remuda_protocol::PromptMode::NewTurn),
+                    mode: request
+                        .prompt_mode
+                        .unwrap_or(remuda_protocol::PromptMode::NewTurn),
                 },
                 false,
             ))

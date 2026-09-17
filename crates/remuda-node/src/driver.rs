@@ -595,7 +595,7 @@ pub(crate) fn message_payload(
         // queued prompt, the fake driver's reply), never an injected record.
         origin: Some(remuda_protocol::MessageOrigin::Human),
         command_id: None,
-            prompt_mode: None,
+        prompt_mode: None,
         status: ContentStatus::Complete,
     })))
 }

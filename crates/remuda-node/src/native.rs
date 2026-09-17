@@ -1490,7 +1490,12 @@ mod tests {
     #[test]
     fn native_prompt_preserves_each_submitting_origin() {
         for origin in [InputOrigin::Human, InputOrigin::Bot, InputOrigin::Agent] {
-            let DriverInput::Prompt(prompt) = prompt_input("new input".into(), &[], origin, remuda_protocol::PromptMode::NewTurn) else {
+            let DriverInput::Prompt(prompt) = prompt_input(
+                "new input".into(),
+                &[],
+                origin,
+                remuda_protocol::PromptMode::NewTurn,
+            ) else {
                 panic!("prompt expected")
             };
             assert_eq!(prompt.origin, origin);

@@ -234,7 +234,7 @@ impl Driver for FakeDriver {
                 // Assistant output; never an injected user record.
                 origin: Some(remuda_protocol::MessageOrigin::Human),
                 command_id: None,
-            prompt_mode: None,
+                prompt_mode: None,
                 status: ContentStatus::Complete,
             }));
             for (index, payload) in [lifecycle, message].into_iter().enumerate() {

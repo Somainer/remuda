@@ -13,4 +13,6 @@ account data.
 | `claude-onboarding-terminal-setup.txt` | 2.1.270 `terminal-setup` step (`Use Claude Code's terminal setup?`), non-Apple-Terminal wording (`Shift+Enter for newlines`). |
 | `claude-onboarding-login.txt` | 2.1.270 `Select login method:` step with the subscription/Console choices. |
 | `claude-bypass-disclaimer.txt` | 2.1.270 `BypassPermissionsModeDialog` (`WARNING: Claude Code running in Bypass Permissions mode`), cancel-first option order. |
+| `claude-trust-dialog.txt` | 2.1.274 folder-trust dialog (`Quick safety check:` / `Is this a project you created or one you trust?`, `No, exit` / `Yes, I trust this folder`); matches the fake-harness Trust screen row for row. |
+| `claude-outside-reads-dialog.txt` | 2.1.274 auto-mode `auto_mode_outside_reads` dialog, reconstructed from the shipped bundle: title `Read outside the working directories`, question `Allow reads outside the working directories?`, the full explainer naming `permissions.blockReadsOutsideWorkingDirectories`, and the `allow`/`block`/`ask_again` option labels in source order. |
 | `claude-prompt-composer.txt` | An ordinary ready composer, so the detectors can be shown not to fire on it. |

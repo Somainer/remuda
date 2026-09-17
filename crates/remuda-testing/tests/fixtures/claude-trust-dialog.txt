@@ -1,0 +1,9 @@
+ ▐ Claude Code v2.1.274
+
+Welcome to Claude Code!
+
+Quick safety check:
+Is this a project you created or one you trust?
+
+❯ No, exit
+  Yes, I trust this folder

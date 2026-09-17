@@ -405,7 +405,11 @@ async fn handle_stdio_frame(
             || crate::worktree::is_worktree_method(request.method.as_str())
             || crate::worker::is_worker_method(request.method.as_str())
             || crate::gate::is_gate_method(request.method.as_str())
-            || crate::workspace_scm::is_scm_method(request.method.as_str()) =>
+            || crate::workspace_scm::is_scm_method(request.method.as_str())
+            // Drill-in read of one subagent's sidechain transcript. Without
+            // this row the ssh-stdio carrier refuses it, and the web row can
+            // only say 「启动中」 forever.
+            || crate::subagent::is_subagent_method(request.method.as_str()) =>
         {
             let result =
                 hubnode_codec::dispatch_method(node, request.method.as_str(), params).await;

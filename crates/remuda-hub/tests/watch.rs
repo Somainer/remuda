@@ -23,6 +23,8 @@ use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 struct ScreenState {
     supported: bool,
     lifecycle: String,
+    /// `emulator` (row grid) or `raw-ring` (ANSI-stripped tail).
+    source: String,
     lines: Vec<String>,
 }
 
@@ -31,6 +33,7 @@ impl Default for ScreenState {
         Self {
             supported: true,
             lifecycle: "ready".to_string(),
+            source: "emulator".to_string(),
             lines: Vec::new(),
         }
     }
@@ -175,7 +178,7 @@ async fn enroll_node(
                             "lifecycle": state.lifecycle,
                             "driver": "claude-pty",
                             "cols": 80, "rows": 24,
-                            "source": "emulator",
+                            "source": state.source,
                             "lines": state.lines,
                         })
                     }
@@ -206,6 +209,17 @@ impl FakeNode {
         *self.screen.lock().unwrap() = ScreenState {
             supported: true,
             lifecycle: lifecycle.to_string(),
+            source: "emulator".to_string(),
+            lines: lines.iter().map(|line| (*line).to_string()).collect(),
+        };
+    }
+
+    /// Serve a headless raw VT ring tail instead of an emulated row grid.
+    fn set_screen_raw(&self, lines: &[&str], lifecycle: &str) {
+        *self.screen.lock().unwrap() = ScreenState {
+            supported: true,
+            lifecycle: lifecycle.to_string(),
+            source: "raw-ring".to_string(),
             lines: lines.iter().map(|line| (*line).to_string()).collect(),
         };
     }
@@ -216,6 +230,7 @@ impl FakeNode {
         *self.screen.lock().unwrap() = ScreenState {
             supported: false,
             lifecycle: lifecycle.to_string(),
+            source: "emulator".to_string(),
             lines: Vec::new(),
         };
     }
@@ -224,6 +239,7 @@ impl FakeNode {
         *self.screen.lock().unwrap() = ScreenState {
             supported: false,
             lifecycle: "closed".to_string(),
+            source: "emulator".to_string(),
             lines: Vec::new(),
         };
     }
@@ -430,6 +446,83 @@ async fn blocked_dialog_is_classified_and_echo_suppressed() {
     );
     let observed = ctx.observe().await;
     assert_eq!(observed["items"][0]["watch"]["status"], "working");
+}
+
+#[tokio::test]
+async fn first_run_dialog_screens_classify_blocked_with_their_titles() {
+    // dispatch-onboarding-1: watch must never print "working" for a parked
+    // first-run dialog. Both dialog layouts, emulated grid and raw ring tail.
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "58630-58659",
+            &[
+                "Welcome to Claude Code!",
+                "",
+                "Quick safety check:",
+                "Is this a project you created or one you trust?",
+                "",
+                "❯ No, exit",
+                "  Yes, I trust this folder",
+            ],
+            "Is this a project you created or one you trust?",
+        ),
+        (
+            "58660-58689",
+            &[
+                "Read outside the working directories",
+                "Allow reads outside the working directories?",
+                "❯ Yes, keep allowing reads outside the working directories",
+                "  No, block reads outside the working directories from now on",
+                "  No, ask again next time",
+            ],
+            "Allow reads outside the working directories?",
+        ),
+    ];
+    for (range, screen, title) in cases {
+        let ctx = Ctx::spawn().await.unwrap();
+        let project = project_with_enrolled_workspace(&ctx, "watch-dialog", range).await;
+        ctx.dispatch(&project, "c-dialog", range).await;
+        // The carrier guesses "ready/idle"; the dialog text must win anyway.
+        ctx.node.set_screen(screen, "ready");
+        let observed = ctx.observe().await;
+        let row = &observed["items"][0];
+        assert_eq!(row["watch"]["status"], "blocked", "{title}: {row}");
+        assert_eq!(row["watch"]["reason"], *title, "{title}");
+        assert_eq!(row["state"]["state"], "blocked");
+        // Unlike a worker BLOCKED report, a modal still on screen is not an
+        // echo: the second observation keeps reporting blocked.
+        let observed = ctx.observe().await;
+        assert_eq!(
+            observed["items"][0]["watch"]["status"], "blocked",
+            "{title} must not collapse to working while still on screen"
+        );
+    }
+}
+
+#[tokio::test]
+async fn first_run_dialog_classifies_from_a_raw_ring_tail() {
+    // The headless carrier (no live viewer) returns a raw VT ring tail; the
+    // dialog rule must fire there too, for both carriers' screens.
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-dialog-raw", "58690-58719").await;
+    ctx.dispatch(&project, "c-dialog-raw", "58690-58719").await;
+    ctx.node.set_screen_raw(
+        &[
+            "❯ probe                                                              ",
+            "Quick safety check:                                                  ",
+            "Is this a project you created or one you trust?                      ",
+            "❯ No, exit                                                           ",
+            "  Yes, I trust this folder                                           ",
+        ],
+        "ready",
+    );
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(row["watch"]["status"], "blocked", "{row}");
+    assert_eq!(
+        row["watch"]["reason"],
+        "Is this a project you created or one you trust?"
+    );
 }
 
 #[tokio::test]

@@ -79,6 +79,9 @@ const BLOCKED_PHRASES: &[&str] = &[
     "Do you want to",
     "Is this a project you created or one you trust?",
     "Yes, I trust this folder",
+    // Auto-mode outside-reads dialog (dispatch-onboarding-1): a first-run
+    // modal the Hub watch classifier must not mistake for a working turn.
+    "Allow reads outside the working directories?",
 ];
 
 /// Phrase the TUI shows only while a turn is in flight.
@@ -275,6 +278,17 @@ mod tests {
         // A prompt typed here would silently answer the dialog (D-022).
         let screen = "\u{276f} earlier\nQuick safety check:\nIs this a project you created or one you trust?\n\u{276f} Yes, I trust this folder\n";
         assert_eq!(screen_status(&raw(screen)), Some(ScreenStatus::Blocked));
+    }
+
+    #[test]
+    fn the_outside_reads_dialog_reads_as_blocked() {
+        // dispatch-onboarding-1: the auto-mode outside-reads first-run modal
+        // must not read as working even with the composer glyph on screen.
+        let screen = format!(
+            "\u{276f} probe\n{}",
+            include_str!("../../remuda-testing/tests/fixtures/claude-outside-reads-dialog.txt")
+        );
+        assert_eq!(screen_status(&raw(&screen)), Some(ScreenStatus::Blocked));
     }
 
     #[test]

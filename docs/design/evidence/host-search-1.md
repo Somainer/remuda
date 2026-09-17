@@ -1,12 +1,14 @@
 # Host file search and cross-host agent messaging — host-search-1
 
-Captured with `REMUDA_EVIDENCE=1` against the Hub e2e harness
-(`cargo run -p remuda-hub --example hub_e2e`) on a loopback port pair, with
-**two enrolled fake Nodes** (host A and host B) and the real `remuda` CLI
-built from this branch. Both fake Nodes answer `host.files.list` /
-`host.files.read` / `host.files.search` against real seeded directories and
-the search walker uses the same `ignore` / `glob` / `regex` crates and caps
-as `remuda-node::files`. No live model is involved anywhere.
+The `host.files.search` transcripts below were captured with
+`REMUDA_EVIDENCE=1` against a fake-Node harness and the real `remuda` CLI
+built from this branch, over the real Hub → Node → objects path; no live model
+is involved. The cross-host `instance.send` transcripts were captured the same
+way with a scratch harness build that enrolled a second fake Node, purely to
+exercise the two-host path by hand. That second node is **not** part of the
+committed Playwright `hub_e2e` harness (see the closing note on why); the
+durable, deterministic cross-host coverage is the `cross_host_messaging.rs`
+integration test, which stands up its own two fake nodes.
 
 Tokens, host ids, instance ids and hostnames are redacted
 (`<access-code>`, `hst_a` / `hst_b`, `ins_a1` / `ins_a2` / `ins_b1`).
@@ -158,11 +160,19 @@ secret-scan: pass
   404 and disconnected host 409 on search as well, Node-side validation
   errors surfacing as a clean 400 (empty query, bad mode, unknown workspace),
   plus the host-token staging and oversize checks from host-files-1.
-- Cross-host messaging (`tests/cross_host_messaging.rs`, 1): two fake Nodes;
-  an agent scoped to both hosts sends host A → host B with 200 and no
-  approval, both journals carry the outbound/inbound records with target and
-  host ids, a host-A-only scope gets 409 `HUMAN_APPROVAL_REQUIRED`, and fleet
-  `all` is 400 for Agent origin.
-- Hub e2e example: now enrolls a second Node (`e2e-node-b`, separate seeded
-  roots) and answers `host.files.search` with the same real walker used in
-  the evidence runs.
+- Cross-host messaging (`tests/cross_host_messaging.rs`, 1): a self-contained
+  two-fake-node harness (independent of the Playwright `hub_e2e` example); an
+  agent scoped to both hosts sends host A → host B with 200 and no approval,
+  both journals carry the outbound/inbound records with target and host ids, a
+  host-A-only scope and a universe-scoped agent each get 409
+  `HUMAN_APPROVAL_REQUIRED`, and fleet `all` is 400 for Agent origin.
+
+Note on the Playwright `hub_e2e` harness: an earlier revision of this slice
+taught that shared single-node harness to enroll a second fake Node and answer
+`host.files.search`. That destabilised ~27 unrelated web-hub-e2e specs — the
+fake Node's `journal.append` ack helpers swallow the next inbound frame with a
+bare `ws.next()`, and a second concurrent Node session interleaves enough extra
+Hub→Node traffic on the shared runtime to drift Node A's journal sequence. The
+second node was reverted; cross-host messaging is proven by the deterministic
+`cross_host_messaging.rs` integration test instead, and `host.files.search` by
+the Node-unit and Hub-route tests above. No `host-search.hub.spec.ts` was added.

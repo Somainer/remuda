@@ -20,29 +20,6 @@ const LISTEN: &str = "127.0.0.1:18787";
 /// Fake Anthropic-Messages gateway for provider discovery.
 const UPSTREAM_LISTEN: &str = "127.0.0.1:18788";
 
-/// Per-host profile for the two scripted Nodes: label and seeded roots.
-#[derive(Clone, Copy)]
-struct FakeNodeProfile {
-    label: &'static str,
-    root: &'static str,
-    second_root: &'static str,
-}
-
-const FAKE_NODE_A: FakeNodeProfile = FakeNodeProfile {
-    label: "e2e-fake-node",
-    root: "/tmp/remuda-e2e",
-    second_root: "/tmp/remuda-e2e-second",
-};
-
-const FAKE_NODE_B: FakeNodeProfile = FakeNodeProfile {
-    // Deliberately not a superstring of "e2e-fake-node": existing web specs
-    // select host A by label and must keep resolving a single option after a
-    // second enrolled node joins the harness.
-    label: "e2e-node-b",
-    root: "/tmp/remuda-e2e-b",
-    second_root: "/tmp/remuda-e2e-b-second",
-};
-
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -110,40 +87,10 @@ async fn main() -> Result<()> {
             .context("mint node enroll token")?,
     };
     let host_id = HostId::new();
-    // A second enrolled Node (host B) so cross-host placement, fleet fan-out
-    // and agent-to-agent messaging exercises two live links.
-    let host_b_id = HostId::new();
     let pending: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-    let pending_b: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
     let (ready_tx, ready_rx) = oneshot::channel();
-    let node = tokio::spawn(fake_node(
-        addr,
-        enroll,
-        host_id.clone(),
-        FAKE_NODE_A,
-        pending,
-        ready_tx,
-    ));
+    let node = tokio::spawn(fake_node(addr, enroll, host_id.clone(), pending, ready_tx));
     ready_rx.await.context("fake node hello")?;
-    let enroll_b = match &hub {
-        Some(hub) => hub
-            .mint_enroll_token(DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
-            .await
-            .context("mint second node enroll token")?,
-        None => mint_enroll_via_device(addr, BOOTSTRAP)
-            .await
-            .context("mint second node enroll token")?,
-    };
-    let (ready_b_tx, ready_b_rx) = oneshot::channel();
-    let node_b = tokio::spawn(fake_node(
-        addr,
-        enroll_b,
-        host_b_id.clone(),
-        FAKE_NODE_B,
-        pending_b,
-        ready_b_tx,
-    ));
-    ready_b_rx.await.context("second fake node hello")?;
     // A stand-in Anthropic-Messages gateway so provider discovery has a real
     // /v1/models to read without reaching any live endpoint.
     let upstream_listen =
@@ -157,16 +104,12 @@ async fn main() -> Result<()> {
         "hub": format!("http://{addr}"),
         "token": BOOTSTRAP,
         "hostId": host_id.as_id().as_str(),
-        "hostBId": host_b_id.as_id().as_str(),
-        "hostLabel": FAKE_NODE_A.label,
-        "hostBLabel": FAKE_NODE_B.label,
         "upstream": format!("http://{upstream_addr}"),
     });
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
     tokio::signal::ctrl_c().await.ok();
     node.abort();
-    node_b.abort();
     upstream_task.abort();
     drop(hub);
     Ok(())
@@ -293,7 +236,6 @@ async fn fake_node(
     addr: SocketAddr,
     enroll: String,
     host_id: HostId,
-    profile: FakeNodeProfile,
     pending: Arc<Mutex<HashMap<String, Value>>>,
     ready: oneshot::Sender<()>,
 ) -> Result<()> {
@@ -309,8 +251,8 @@ async fn fake_node(
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
     let host = host_id.as_id().as_str();
     let workspaces = json!([
-        { "workspaceId": "wsp_e2e", "hostId": host, "root": profile.root },
-        { "workspaceId": "wsp_e2e_second", "hostId": host, "root": profile.second_root },
+        { "workspaceId": "wsp_e2e", "hostId": host, "root": "/tmp/remuda-e2e" },
+        { "workspaceId": "wsp_e2e_second", "hostId": host, "root": "/tmp/remuda-e2e-second" },
         // G2 files-view synthetic scenarios (docs/design/files-view-contract.md §3.6).
         { "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" },
         { "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" },
@@ -327,9 +269,9 @@ async fn fake_node(
             "params": {
                 "hostId": host_id.as_id().as_str(),
                 "nodeVersion": "0.1.0-e2e",
-                "label": profile.label,
+                "label": "e2e-fake-node",
                 "host": {
-                    "hostname": format!("{}.local", profile.label),
+                    "hostname": "e2e-fake-node.local",
                     "workspaceRevision": 1,
                     "workspaces": workspaces,
                     "labels": { "role": "e2e" },
@@ -401,7 +343,7 @@ async fn fake_node(
         .unwrap_or(&enroll)
         .to_owned();
     let _ = ready.send(());
-    seed_host_file_fixtures(profile)?;
+    seed_host_file_fixtures()?;
     let mut append_n = 0u64;
     // Minimal PTY harness for the xterm e2e specs. A terminal session is
     // registered on create, tty.attach returns its stable per-instance stream
@@ -1307,10 +1249,8 @@ async fn fake_node(
                     let result = g2_scm_answer(method, &params);
                     send_rpc_ok(&mut ws, id, result).await?;
                 }
-                "host.files.list" | "host.files.read" | "host.files.search" => {
-                    match host_files_answer(method, &params, addr, host, &durable_token, profile)
-                        .await
-                    {
+                "host.files.list" | "host.files.read" => {
+                    match host_files_answer(method, &params, addr, host, &durable_token).await {
                         Ok(result) => send_rpc_ok(&mut ws, id, result).await?,
                         Err(error) => send_rpc_error(&mut ws, id, &error.to_string()).await?,
                     }
@@ -3622,73 +3562,43 @@ fn fake_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Valu
 }
 
 // ---------------------------------------------------------------------------
-// Read-only host files fixture (host-files.hub.spec.ts / host-search evidence).
+// Read-only host files fixture (host-files.hub.spec.ts / evidence).
 //
-// A deliberately small, real-filesystem implementation of the three Node RPCs:
-// it lists actual seeded directories, walks and reads them for search, and
-// uploads actual bytes to the Hub with the durable token, so the specs
-// exercise the full Hub -> Node -> objects -> Hub loop rather than scripted
-// answers. The search walk uses the same `ignore`/`glob`/`regex` crates and
-// the same bounds as remuda-node::files.
+// A deliberately small, real-filesystem implementation of the two Node RPCs:
+// it lists actual seeded directories and uploads actual bytes to the Hub with
+// the durable host token, so the spec exercises the full Hub -> Node ->
+// objects -> Hub loop rather than scripted answers.
 // ---------------------------------------------------------------------------
 
+const HOST_FILES_WORKSPACE_ROOT: &str = "/tmp/remuda-e2e";
+const HOST_FILES_SECOND_ROOT: &str = "/tmp/remuda-e2e-second";
 const HOST_FILES_SCRATCH_DIR: &str = "remuda-hostfiles-e2e";
 
-/// Search bounds mirrored from remuda-node::files.
-const SEARCH_DEFAULT_MAX_RESULTS: usize = 200;
-const SEARCH_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(10);
-const SEARCH_TOTAL_BYTES: u64 = 10 * 1024 * 1024;
-const SEARCH_PER_FILE_BYTES: u64 = 1024 * 1024;
-const SEARCH_SNIPPET_CHARS: usize = 240;
-
-/// Seed the directories the host-files/host-search specs and evidence read.
-fn seed_host_file_fixtures(profile: FakeNodeProfile) -> Result<()> {
-    let root = std::path::Path::new(profile.root);
+/// Seed the directories the host-files spec and evidence read.
+fn seed_host_file_fixtures() -> Result<()> {
+    let root = std::path::Path::new(HOST_FILES_WORKSPACE_ROOT);
     std::fs::create_dir_all(root.join("host-files-dir"))?;
     std::fs::write(root.join("host-files-e2e.txt"), b"remuda host files e2e\n")?;
     std::fs::write(
         root.join("host-files-dir").join("inside.txt"),
         b"nested entry\n",
     )?;
-    let second = std::path::Path::new(profile.second_root);
+    let second = std::path::Path::new(HOST_FILES_SECOND_ROOT);
     std::fs::create_dir_all(second)?;
     std::fs::write(second.join("other.txt"), b"second workspace\n")?;
     let scratch = std::env::temp_dir().join(HOST_FILES_SCRATCH_DIR);
     std::fs::create_dir_all(&scratch)?;
     std::fs::write(scratch.join("scratch.txt"), b"scratch area\n")?;
-
-    // Host-search tree under host A: text hits, a gitignored hit, a binary
-    // file and several same-pattern names for the truncation run.
-    let search = root.join("host-search");
-    std::fs::create_dir_all(search.join("sub"))?;
-    std::fs::write(
-        search.join("alpha.txt"),
-        b"the hostsearch needle lands here\nan unremarkable line\nNEEDLE in caps\n",
-    )?;
-    std::fs::write(
-        search.join("sub").join("beta.rs"),
-        b"fn needle() -> u8 { 1 }\n",
-    )?;
-    std::fs::write(search.join("ignored.ignored"), b"needle but gitignored\n")?;
-    std::fs::write(search.join(".gitignore"), b"*.ignored\n")?;
-    std::fs::write(search.join("binary.bin"), b"needle\x00\x01binary\n")?;
-    for name in ["match-a.txt", "match-b.txt", "match-c.txt"] {
-        std::fs::write(search.join(name), b"plain text\n")?;
-    }
     Ok(())
 }
 
 /// Resolve the workspace/relPath selector the same way the real Node does:
 /// lexical `..`/absolute refusal, then canonical containment under the root
 /// (or a `remuda-*` first component under /tmp).
-fn host_files_resolve(
-    profile: FakeNodeProfile,
-    workspace_id: &str,
-    rel_path: &str,
-) -> Result<(std::path::PathBuf, bool)> {
+fn host_files_resolve(workspace_id: &str, rel_path: &str) -> Result<std::path::PathBuf> {
     let (anchor, scratch) = match workspace_id {
-        "wsp_e2e" => (std::fs::canonicalize(profile.root)?, false),
-        "wsp_e2e_second" => (std::fs::canonicalize(profile.second_root)?, false),
+        "wsp_e2e" => (std::fs::canonicalize(HOST_FILES_WORKSPACE_ROOT)?, false),
+        "wsp_e2e_second" => (std::fs::canonicalize(HOST_FILES_SECOND_ROOT)?, false),
         "tmp" => (std::fs::canonicalize(std::env::temp_dir())?, true),
         other => {
             return Err(anyhow!("workspace {other} is not registered on this Node"));
@@ -3742,276 +3652,7 @@ fn host_files_resolve(
             "host file path {rel_path} is outside the remuda-* scratch area"
         ));
     }
-    Ok((canonical, scratch))
-}
-
-/// Literal substring or regex needle, same two-mode semantics as the Node.
-enum SearchNeedle {
-    Literal(String),
-    Regex(regex::Regex),
-}
-
-impl SearchNeedle {
-    fn compile(query: &str, use_regex: bool) -> Result<Self> {
-        if use_regex {
-            Ok(Self::Regex(regex::Regex::new(query)?))
-        } else {
-            Ok(Self::Literal(query.to_owned()))
-        }
-    }
-
-    fn find(&self, line: &str) -> Option<(usize, usize)> {
-        match self {
-            SearchNeedle::Literal(needle) => line
-                .find(needle.as_str())
-                .map(|start| (start, needle.len())),
-            SearchNeedle::Regex(pattern) => pattern.find(line).map(|hit| (hit.start(), hit.len())),
-        }
-    }
-
-    fn is_match(&self, text: &str) -> bool {
-        match self {
-            SearchNeedle::Literal(needle) => text.contains(needle.as_str()),
-            SearchNeedle::Regex(pattern) => pattern.is_match(text),
-        }
-    }
-}
-
-/// Optional `--glob` narrowing.
-struct SearchGlob {
-    basename: Option<glob::Pattern>,
-    anywhere: Vec<glob::Pattern>,
-}
-
-impl SearchGlob {
-    fn compile(raw: &str) -> Result<Self> {
-        let pattern = raw.trim().trim_start_matches('/');
-        if pattern.contains('/') {
-            let mut anywhere = vec![glob::Pattern::new(pattern)?];
-            if !pattern.starts_with("**/") {
-                anywhere.push(glob::Pattern::new(&format!("**/{pattern}"))?);
-            }
-            Ok(SearchGlob {
-                basename: None,
-                anywhere,
-            })
-        } else {
-            Ok(SearchGlob {
-                basename: Some(glob::Pattern::new(pattern)?),
-                anywhere: Vec::new(),
-            })
-        }
-    }
-
-    fn matches(&self, rel_path: &str, basename: &str) -> bool {
-        match &self.basename {
-            Some(pattern) => pattern.matches(basename),
-            None => self
-                .anywhere
-                .iter()
-                .any(|pattern| pattern.matches(rel_path)),
-        }
-    }
-}
-
-fn cap_snippet(line: &str, byte_column: usize) -> String {
-    let total = line.chars().count();
-    if total <= SEARCH_SNIPPET_CHARS {
-        return line.to_owned();
-    }
-    let hit_char = line
-        .char_indices()
-        .position(|(index, _)| index == byte_column)
-        .unwrap_or(0);
-    let half = SEARCH_SNIPPET_CHARS / 2;
-    let mut start = hit_char.saturating_sub(half);
-    if total - start < SEARCH_SNIPPET_CHARS {
-        start = total - SEARCH_SNIPPET_CHARS;
-    }
-    let end = (start + SEARCH_SNIPPET_CHARS).min(total);
-    let window: String = line.chars().skip(start).take(end - start).collect();
-    format!(
-        "{}{}{}",
-        if start > 0 { "…" } else { "" },
-        window,
-        if end < total { "…" } else { "" }
-    )
-}
-
-/// Bounded read-only search; mirrors remuda-node::files::search_files.
-fn host_files_search(params: &Value, profile: FakeNodeProfile) -> Result<Value> {
-    let workspace_id = params
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let rel_path = params.get("relPath").and_then(Value::as_str).unwrap_or("");
-    let query = params
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_owned();
-    if query.is_empty() {
-        return Err(anyhow!("search query is empty"));
-    }
-    let mode = params.get("mode").and_then(Value::as_str).unwrap_or("name");
-    let content = mode == "content";
-    if mode != "name" && mode != "content" {
-        return Err(anyhow!("mode must be 'name' or 'content', got {mode}"));
-    }
-    let use_regex = params
-        .get("regex")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let max_results = params
-        .get("maxResults")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
-        .unwrap_or(SEARCH_DEFAULT_MAX_RESULTS);
-    let glob = match params.get("glob").and_then(Value::as_str) {
-        Some(raw) if !raw.trim().is_empty() => Some(SearchGlob::compile(raw)?),
-        _ => None,
-    };
-    let needle = SearchNeedle::compile(&query, use_regex)?;
-    let (target, _scratch) = host_files_resolve(profile, workspace_id, rel_path)?;
-    let anchor = if workspace_id == "tmp" {
-        std::fs::canonicalize(std::env::temp_dir())?
-    } else if workspace_id == "wsp_e2e" {
-        std::fs::canonicalize(profile.root)?
-    } else {
-        std::fs::canonicalize(profile.second_root)?
-    };
-
-    let mut matches: Vec<Value> = Vec::new();
-    let mut files_scanned = 0u64;
-    let mut bytes_scanned = 0u64;
-    let mut truncated = false;
-    let mut reason: Option<&str> = None;
-    let deadline = std::time::Instant::now() + SEARCH_WALL_CLOCK;
-    let mark = |truncated: &mut bool, reason: &mut Option<&str>, why: &'static str| {
-        *truncated = true;
-        if reason.is_none() {
-            *reason = Some(why);
-        }
-    };
-
-    for item in ignore::WalkBuilder::new(&target)
-        .follow_links(false)
-        .hidden(true)
-        .parents(true)
-        .ignore(true)
-        .git_ignore(true)
-        .require_git(false)
-        .git_global(false)
-        .git_exclude(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .build()
-    {
-        if std::time::Instant::now() >= deadline {
-            mark(&mut truncated, &mut reason, "time");
-            break;
-        }
-        let Ok(entry) = item else { continue };
-        if entry.depth() == 0 {
-            continue;
-        }
-        let Some(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        // Canonical containment is re-verified per entry, like the real Node.
-        let Ok(canonical) = std::fs::canonicalize(entry.path()) else {
-            continue;
-        };
-        if !canonical.starts_with(&anchor) {
-            continue;
-        }
-        let rel = canonical
-            .strip_prefix(&anchor)?
-            .components()
-            .filter_map(|component| match component {
-                std::path::Component::Normal(segment) => {
-                    Some(segment.to_string_lossy().into_owned())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("/");
-        let basename = canonical
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if glob
-            .as_ref()
-            .is_some_and(|pattern| !pattern.matches(&rel, basename))
-        {
-            continue;
-        }
-        if !content {
-            files_scanned += 1;
-            if needle.is_match(basename) {
-                matches.push(json!({
-                    "path": rel, "line": 0, "column": null, "snippet": basename,
-                }));
-                if matches.len() >= max_results {
-                    mark(&mut truncated, &mut reason, "max-results");
-                    break;
-                }
-            }
-            continue;
-        }
-        let metadata = std::fs::symlink_metadata(&canonical)?;
-        if !metadata.file_type().is_file() {
-            continue;
-        }
-        if metadata.len() > SEARCH_PER_FILE_BYTES {
-            mark(&mut truncated, &mut reason, "per-file-bytes");
-            continue;
-        }
-        if bytes_scanned.saturating_add(metadata.len()) > SEARCH_TOTAL_BYTES {
-            mark(&mut truncated, &mut reason, "total-bytes");
-            break;
-        }
-        let bytes = std::fs::read(&canonical)?;
-        if bytes.contains(&0) {
-            continue;
-        }
-        files_scanned += 1;
-        bytes_scanned = bytes_scanned.saturating_add(bytes.len() as u64);
-        let text = String::from_utf8_lossy(&bytes);
-        for (index, raw_line) in text.split('\n').enumerate() {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-            if let Some((column, _len)) = needle.find(line) {
-                matches.push(json!({
-                    "path": rel,
-                    "line": index as u64 + 1,
-                    "column": column as u64 + 1,
-                    "snippet": cap_snippet(line, column),
-                }));
-                if matches.len() >= max_results {
-                    mark(&mut truncated, &mut reason, "max-results");
-                    break;
-                }
-            }
-        }
-        if truncated {
-            break;
-        }
-    }
-
-    Ok(json!({
-        "workspaceId": workspace_id,
-        "path": target.display().to_string(),
-        "mode": if content { "content" } else { "name" },
-        "query": query,
-        "matches": matches,
-        "truncated": truncated,
-        "truncatedReason": reason,
-        "filesScanned": files_scanned,
-        "bytesScanned": bytes_scanned,
-    }))
+    Ok(canonical)
 }
 
 async fn host_files_answer(
@@ -4020,19 +3661,13 @@ async fn host_files_answer(
     hub: SocketAddr,
     host: &str,
     token: &str,
-    profile: FakeNodeProfile,
 ) -> Result<Value> {
-    if method == "host.files.search" {
-        // The walker is synchronous and bounded; run inside the async answer
-        // without blocking on anything but local disk.
-        return tokio::task::block_in_place(|| host_files_search(params, profile));
-    }
     let workspace_id = params
         .get("workspaceId")
         .and_then(Value::as_str)
         .unwrap_or("");
     let rel_path = params.get("relPath").and_then(Value::as_str).unwrap_or("");
-    let (target, _scratch) = host_files_resolve(profile, workspace_id, rel_path)?;
+    let target = host_files_resolve(workspace_id, rel_path)?;
     if method == "host.files.list" {
         let metadata = std::fs::symlink_metadata(&target)?;
         if !metadata.is_dir() {

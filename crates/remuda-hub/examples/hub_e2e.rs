@@ -1051,11 +1051,17 @@ async fn fake_node(
                         } else {
                             None
                         };
-                    // Journal the harness continuation DURABLY (wait for each
-                    // append ack) before answering the RPC, exactly as a real Node
-                    // applies the owner answer first: the HTTP caller may read the
-                    // journal immediately afterwards. Frames that are not the ack
-                    // we wait for are queued for the main dispatch loop.
+                    // Reply to the answer RPC FIRST (the Hub gives the Node only
+                    // a short RPC budget); journal the harness continuation
+                    // afterwards, like the real Node applying owner answers.
+                    // The spec waits for the journal record rather than a fixed
+                    // sleep, so the late append is observed deterministically.
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({ "ok": true, "state": "answer-committed" }),
+                    )
+                    .await?;
                     if let Some(card) = removed
                         && card.get("kind").and_then(Value::as_str) == Some("question")
                         && let Some(answered_instance) =
@@ -1065,7 +1071,7 @@ async fn fake_node(
                             .get("answers")
                             .map(question_answer_summary)
                             .unwrap_or_default();
-                        let assistant_seq = append_journal(
+                        append_n = append_journal(
                             &mut ws,
                             answered_instance,
                             append_n,
@@ -1073,21 +1079,10 @@ async fn fake_node(
                             &format!("AskUserQuestion answered via hook: {summary}"),
                         )
                         .await?;
-                        wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{assistant_seq}"))
-                            .await?;
-                        append_n = assistant_seq;
-                        let idle_seq =
+                        append_n =
                             append_native_status(&mut ws, answered_instance, append_n, "idle")
                                 .await?;
-                        wait_frame_ack(&mut ws, &mut frame_queue, &format!("j{idle_seq}")).await?;
-                        append_n = idle_seq;
                     }
-                    send_rpc_ok(
-                        &mut ws,
-                        id,
-                        json!({ "ok": true, "state": "answer-committed" }),
-                    )
-                    .await?;
                 }
                 "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
                     let result = g2_scm_answer(method, &params);

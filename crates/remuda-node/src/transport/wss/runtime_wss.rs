@@ -1315,6 +1315,7 @@ mod tests {
             journal,
             watermarks: Arc::new(Mutex::new(HashMap::new())),
             pumps: Arc::new(Mutex::new(HashSet::new())),
+            cursors: Arc::new(Mutex::new(crate::journal_flush::FlushCursor::new())),
         }
     }
 

@@ -324,19 +324,33 @@ pub fn apply_to_spec(spec: &mut Value, resolved: &ResolvedProvider) {
             obj.remove("providerOverlay");
         }
         ResolvedProvider::Profile { profile, .. } => {
-            let delegation = if profile.kind == "direct" {
-                "direct"
-            } else {
-                "gateway"
+            // A `native` profile is a named account row the Hub holds *no* token
+            // for: the CLI on the host uses its own login. So it delegates to
+            // nothing, exactly like the alias forms above — the profile id is
+            // still recorded (supply admitted it as a pin, and its model ids are
+            // the reason it exists), but no launch secret is ever demanded for
+            // it. Classifying it as `gateway` is what made dispatch fail with
+            // "provider profile has no stored auth token" for a profile that by
+            // design has none (docs/design/evidence/dispatch-driver-1.md).
+            let delegation = match profile.kind.as_str() {
+                "direct" => "direct",
+                "native" => "none",
+                _ => "gateway",
             };
             let model = obj.get("model").and_then(Value::as_str).map(str::to_string);
             obj.insert("delegation".into(), json!(delegation));
             obj.insert("providerProfileId".into(), json!(profile.id));
             obj.insert("providerScope".into(), json!(profile.scope));
-            obj.insert(
-                "providerOverlay".into(),
-                profile.overlay_spec(model.as_deref()),
-            );
+            if profile.kind == "native" {
+                // No gateway to point at and no token to carry: an overlay here
+                // would only describe a base URL the native login does not use.
+                obj.remove("providerOverlay");
+            } else {
+                obj.insert(
+                    "providerOverlay".into(),
+                    profile.overlay_spec(model.as_deref()),
+                );
+            }
         }
     }
 }

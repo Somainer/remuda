@@ -491,6 +491,18 @@ impl DevNode {
         }
         let payload_digest = digest_json(&request)?;
         validate_kind_driver(request.kind, request.driver)?;
+        // Refuse a driver this Node has no adapter for, here, before the command
+        // is durably accepted — never downgrade to one it does have. Building
+        // runs later off the accept path, so an unregistered driver would
+        // otherwise be answered "accepted" and then die in the worker, leaving
+        // the Hub with a running row for a product that never started
+        // (docs/design/evidence/dispatch-driver-1.md).
+        if !self.inner.drivers.is_registered(request.driver) {
+            return Err(NodeError::InvalidRequest(format!(
+                "unsupported-driver: no {:?} adapter is registered on this node",
+                request.driver
+            )));
+        }
         validate_text(&request.prompt, "prompt")?;
 
         let host_id = request

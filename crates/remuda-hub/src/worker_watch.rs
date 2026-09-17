@@ -1175,7 +1175,13 @@ async fn relaunch_instance(
         }
         None => None,
     };
-    let driver = driver_for(&worker.harness, &host);
+    // A respawn keeps the carrier the worker was actually running on, so
+    // `worker resume` cannot silently move it to a different product. Rows
+    // written before the roster recorded a driver fall back to the host default.
+    let driver = match worker.driver.as_deref() {
+        Some(recorded) => recorded.to_string(),
+        None => driver_for(&worker.harness, &host)?,
+    };
     let extra_env = worker_extra_env(worker.target_dir.as_deref(), worker.port_block.as_deref());
     let mut spec = worker_launch_spec(
         &worker.harness,

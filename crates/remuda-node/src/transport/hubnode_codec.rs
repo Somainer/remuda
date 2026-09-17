@@ -322,9 +322,35 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
         if obj.get("driver").and_then(Value::as_str) == Some("pty") {
             obj.insert("driver".into(), json!("generic-pty"));
         }
+        // `#[serde(default)]` fills a *missing* key; an explicit `null` is a
+        // present value of the wrong type and fails the whole struct. The Hub
+        // builds specs with `json!`, so every unset `Option` arrives as `null` —
+        // and `prompt` is unconditionally `null` on the dispatch path, because
+        // the brief travels as an attachment. Dropping nulls here is what lets a
+        // valid dispatch spec parse at all; without it the request fell through
+        // to the tolerant arm below and silently became `claude-print`
+        // (docs/design/evidence/dispatch-driver-1.md).
+        obj.retain(|_, value| !value.is_null());
     }
+    // The product this request names, read straight off the raw spec. Whatever
+    // happens to the rest of the parse, these two must never be swapped for
+    // something else behind the caller's back.
+    let requested_kind = spec.get("kind").and_then(Value::as_str).map(str::to_owned);
+    let requested_driver = spec
+        .get("driver")
+        .and_then(Value::as_str)
+        .map(|raw| match raw {
+            "pty" => "generic-pty",
+            other => other,
+        })
+        .map(str::to_owned);
     let mut request: CreateInstanceRequest = match serde_json::from_value(spec_for_request) {
         Ok(request) => request,
+        // A spec this Node cannot fully parse still launches — an older or
+        // partial Hub spec should not be a hard failure. But the tolerance stops
+        // at the fields that decide *which product runs*: `kind` and `driver` are
+        // recovered from the raw spec below and, if either is present and
+        // unrecognized, the create is refused rather than quietly replaced.
         Err(_) => CreateInstanceRequest {
             origin: remuda_protocol::InputOrigin::Agent,
             agent_credential: None,
@@ -358,6 +384,27 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             extra_env: std::collections::BTreeMap::new(),
         },
     };
+    // Honour the requested product or refuse it. An unrecognized kind/driver is
+    // a reason code back to the Hub, never a downgrade: a create that answers
+    // "accepted" must run what was asked for, because the Hub records this
+    // request as the worker's carrier and every later screen read assumes it.
+    if let Some(raw) = requested_kind.as_deref() {
+        request.kind = serde_json::from_value(json!(raw)).map_err(|_| {
+            NodeError::InvalidRequest(format!(
+                "unsupported-kind: this node cannot launch kind {raw}"
+            ))
+        })?;
+    }
+    if let Some(raw) = requested_driver.as_deref() {
+        request.driver = match raw {
+            "shell" | "terminal" | "shell-pty" => DriverKind::ShellPty,
+            other => serde_json::from_value(json!(other)).map_err(|_| {
+                NodeError::InvalidRequest(format!(
+                    "unsupported-driver: this node has no driver {other}"
+                ))
+            })?,
+        };
+    }
     request.apply_spec_launch_fields(&spec);
     if request.workspace_id.is_none() {
         request.workspace_id = spec

@@ -835,6 +835,15 @@ pub struct WorkerRoster {
     pub workspace_id: WorkspaceId,
     /// Harness kind (`claude` / `codex` / `grok`).
     pub harness: String,
+    /// Carrier driver the agent **actually** launched on, as reported back by
+    /// the Node's create result (`shell-pty` / `claude-pty` / …).
+    ///
+    /// Recorded from the Node's answer rather than from the Hub's request: the
+    /// two diverged silently once (a roster row said `claude-pty` while the Node
+    /// ran `claude-print`), which made every screen read and nudge on that
+    /// worker inexplicable. Absent on rows written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
     /// Model id the agent launched with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

@@ -393,6 +393,19 @@ impl DriverRegistry {
         Ok(())
     }
 
+    /// Whether an adapter for `kind` is registered on this Node.
+    ///
+    /// Lets `instance.create` refuse a driver it could never construct *before*
+    /// it durably accepts the command. Building happens later, off the accept
+    /// path, so without this check a create for an unregistered driver answers
+    /// "accepted" and then dies in the worker — leaving the Hub holding a
+    /// running row for a product that never started.
+    pub fn is_registered(&self, kind: DriverKind) -> bool {
+        self.drivers
+            .read()
+            .is_ok_and(|drivers| drivers.contains_key(&kind))
+    }
+
     /// Construct one driver or fail closed when no adapter is registered.
     pub fn build(
         &self,

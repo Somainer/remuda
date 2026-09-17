@@ -340,6 +340,14 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
         name: "STATUS",
         cells: Vec::new(),
     };
+    // The carrier the agent is actually running on, as the Node reported it at
+    // launch. Shown because a worker on the wrong driver misbehaves in ways the
+    // status column cannot explain — a `claude-print` worker looks idle forever,
+    // since print exits after one turn.
+    let mut driver = Col {
+        name: "DRIVER",
+        cells: Vec::new(),
+    };
     let mut evidence = Col {
         name: "SHA/REASON",
         cells: Vec::new(),
@@ -356,6 +364,12 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
                 .to_string(),
         );
         status.cells.push(label(row));
+        driver.cells.push(
+            row.get("driver")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string(),
+        );
         evidence.cells.push(truncate(sha_or_reason(row), 40));
         detail.cells.push(truncate(
             row.get("watch")
@@ -366,7 +380,7 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
             48,
         ));
     }
-    let cols = [&name, &status, &evidence, &detail];
+    let cols = [&name, &status, &driver, &evidence, &detail];
     let widths: Vec<usize> = cols
         .iter()
         .map(|col| {
@@ -384,8 +398,9 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
     for i in 0..rows.len() {
         print!("{:<width$}  ", name.cells[i], width = widths[0]);
         print!("{:<width$}  ", status.cells[i], width = widths[1]);
-        print!("{:<width$}  ", evidence.cells[i], width = widths[2]);
-        print!("{:<width$}", detail.cells[i], width = widths[3]);
+        print!("{:<width$}  ", driver.cells[i], width = widths[2]);
+        print!("{:<width$}  ", evidence.cells[i], width = widths[3]);
+        print!("{:<width$}", detail.cells[i], width = widths[4]);
         println!();
     }
 }

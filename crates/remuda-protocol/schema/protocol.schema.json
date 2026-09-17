@@ -6158,6 +6158,57 @@
       ],
       "type": "object"
     },
+    "HostFileSearchMatch": {
+      "description": "One search hit returned by `host.files.search`.",
+      "properties": {
+        "column": {
+          "description": "1-based byte-ish column of the content hit, when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "line": {
+          "description": "1-based content line; `0` for a name hit.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "path": {
+          "description": "Workspace-relative path of the hit, `/`-separated.",
+          "type": "string"
+        },
+        "snippet": {
+          "description": "Capped snippet: the matched line (content) or name (name).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "line"
+      ],
+      "type": "object"
+    },
+    "HostFileSearchMode": {
+      "description": "What a `host.files.search` matches against.",
+      "oneOf": [
+        {
+          "const": "name",
+          "description": "Match the literal/regex against entry names.",
+          "type": "string"
+        },
+        {
+          "const": "content",
+          "description": "Match the literal/regex against decoded file contents, line by line.",
+          "type": "string"
+        }
+      ]
+    },
     "HostFilesListResult": {
       "description": "`host.files.list` result: the canonical directory and its entries.",
       "properties": {
@@ -6201,6 +6252,121 @@
       },
       "required": [
         "workspaceId"
+      ],
+      "type": "object"
+    },
+    "HostFilesSearchParams": {
+      "description": "`host.files.search` params. Same containment rules as list/read; the\noperation is read-only and bounded by construction (wall clock, total\nbytes, per-file bytes, result count).",
+      "properties": {
+        "glob": {
+          "description": "Optional glob narrowing (`*.rs`, `src/**`; ripgrep-like semantics).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "maxResults": {
+          "description": "Cap on returned matches; absent means the Node default (200).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/HostFileSearchMode",
+          "default": "name",
+          "description": "`name` (default) or `content`."
+        },
+        "query": {
+          "description": "Search needle. Literal by default; a regular expression with `regex`.",
+          "type": "string"
+        },
+        "regex": {
+          "default": false,
+          "description": "Treat `query` as a regex instead of a literal substring.",
+          "type": "boolean"
+        },
+        "relPath": {
+          "description": "Workspace-relative subtree to walk; absent names the workspace root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "description": "Registered workspace id, or [`HOST_FILES_SCRATCH_ID`] for the\n`<tmp>/remuda-*` scratch area.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "query",
+        "mode",
+        "regex"
+      ],
+      "type": "object"
+    },
+    "HostFilesSearchResult": {
+      "description": "`host.files.search` result.",
+      "properties": {
+        "bytesScanned": {
+          "description": "Total file bytes read in content mode.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "filesScanned": {
+          "description": "Regular files whose contents (content mode) or names were considered.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "matches": {
+          "description": "Matches, up to the requested (or default) cap.",
+          "items": {
+            "$ref": "#/$defs/HostFileSearchMatch"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/HostFileSearchMode",
+          "description": "Mode that was applied."
+        },
+        "path": {
+          "description": "Canonical absolute root the walk started at.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Query that was applied.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "True when a bound (wall clock, bytes, results) stopped the walk early.",
+          "type": "boolean"
+        },
+        "truncatedReason": {
+          "description": "Which bound was hit; absent when not truncated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "description": "The workspace id (or the scratch sentinel) that was searched.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "path",
+        "mode",
+        "query",
+        "matches",
+        "truncated",
+        "filesScanned",
+        "bytesScanned"
       ],
       "type": "object"
     },

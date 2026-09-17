@@ -1336,6 +1336,18 @@ export type HostFileReadResult = ({
   [key: string]: unknown;
 });
 
+/** One search hit returned by `host.files.search`. */
+export type HostFileSearchMatch = ({
+  "column"?: (number | null);
+  "line": (number);
+  "path": (string);
+  "snippet"?: (string | null);
+  [key: string]: unknown;
+});
+
+/** What a `host.files.search` matches against. */
+export type HostFileSearchMode = ("name" | "content");
+
 /** `host.files.list` result: the canonical directory and its entries. */
 export type HostFilesListResult = ({
   "entries": ((HostFileEntry)[]);
@@ -1347,6 +1359,32 @@ export type HostFilesListResult = ({
 /** Shared selector for the read-only host-file RPCs: a registered workspace plus a workspace-relative path. */
 export type HostFilesParams = ({
   "relPath"?: (string | null);
+  "workspaceId": (string);
+  [key: string]: unknown;
+});
+
+/** `host.files.search` params. Same containment rules as list/read; the operation is read-only and bounded by construction (wall clock, total bytes, per-file bytes, result count). */
+export type HostFilesSearchParams = ({
+  "glob"?: (string | null);
+  "maxResults"?: (number | null);
+  "mode": HostFileSearchMode;
+  "query": (string);
+  "regex": (boolean);
+  "relPath"?: (string | null);
+  "workspaceId": (string);
+  [key: string]: unknown;
+});
+
+/** `host.files.search` result. */
+export type HostFilesSearchResult = ({
+  "bytesScanned": (number);
+  "filesScanned": (number);
+  "matches": ((HostFileSearchMatch)[]);
+  "mode": HostFileSearchMode;
+  "path": (string);
+  "query": (string);
+  "truncated": (boolean);
+  "truncatedReason"?: (string | null);
   "workspaceId": (string);
   [key: string]: unknown;
 });

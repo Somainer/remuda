@@ -22,6 +22,12 @@ use crate::DevNode;
 use crate::LocalStore;
 use crate::NodeError;
 
+/// `available:false` because the owning session has no bound transcript.
+pub const TRANSCRIPT_UNBOUND: &str = "transcript-unbound";
+
+/// `available:false` because this agent's own sidechain file has not landed.
+pub const AGENT_PENDING: &str = "agent-transcript-pending";
+
 /// Methods handled by this module.
 #[must_use]
 pub fn is_subagent_method(method: &str) -> bool {
@@ -73,9 +79,17 @@ pub fn read_for_store(
         .as_deref()
         .and_then(session_dir_from_transcript)
     else {
-        // No bound transcript path yet (pre-SessionStart, driver without file
-        // evidence): the member is still starting.
-        return Ok(json!({ "available": false, "events": [] }));
+        // The session's own transcript is not bound, so there is no session
+        // directory to read a sidechain from. That is a fact about the
+        // *session*, not about this member — name it, so the row can say the
+        // host has not bound the session rather than implying the subagent is
+        // still starting (c-wfdrill2 B: a promoted shell-pty whose SessionStart
+        // never reached the binding stays here).
+        return Ok(json!({
+            "available": false,
+            "reason": TRANSCRIPT_UNBOUND,
+            "events": [],
+        }));
     };
 
     let ctx = MapContext::claude_file(
@@ -95,7 +109,11 @@ pub fn read_for_store(
     else {
         // The agent is registered but its transcript has not landed yet —
         // the UI shows 「启动中」 rather than a dead row.
-        return Ok(json!({ "available": false, "events": [] }));
+        return Ok(json!({
+            "available": false,
+            "reason": AGENT_PENDING,
+            "events": [],
+        }));
     };
 
     let host_id = instance.host_id.clone();

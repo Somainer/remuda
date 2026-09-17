@@ -1,7 +1,7 @@
 //! Dispatch Hub `instance.*` RPCs into [`crate::DevNode`] and stream journals.
 
 use super::JournalSender;
-pub(crate) use crate::transport::hubnode::SeqWatermark;
+pub(crate) use crate::transport::hubnode::{MethodFrame, SeqWatermark};
 use crate::{CommandAction, CreateInstanceRequest, DevNode, InstanceCommandRequest, NodeError};
 use remuda_protocol::hubnode::{
     HubNodeMethod, InstanceCancelParams, InstanceCreateParams, InstanceRespondParams,
@@ -51,8 +51,15 @@ pub(crate) fn dispatch_in_background(
     reply: mpsc::Sender<super::HubReply>,
 ) {
     let runtime = runtime.clone_link();
+    // A null id is a notification: nothing is waiting for the reply, so an
+    // unhandled method there stays tolerant rather than erroring.
+    let frame = if id.is_null() {
+        MethodFrame::Notification
+    } else {
+        MethodFrame::Request
+    };
     tokio::spawn(async move {
-        let result = dispatch_hub(&runtime, &method, params).await;
+        let result = dispatch_hub(&runtime, &method, params, frame).await;
         if !id.is_null() {
             let _ = reply.send(super::HubReply { id, result }).await;
         }
@@ -154,6 +161,7 @@ async fn dispatch_hub(
     runtime: &RuntimeLink,
     method: &str,
     params: Value,
+    frame: MethodFrame,
 ) -> Result<Value, NodeError> {
     #[cfg(unix)]
     let _controller = match &runtime.controller {
@@ -293,7 +301,14 @@ async fn dispatch_hub(
         _ if method == "gate.run" => runtime.node.run_gate(&params).await,
         _ if method == "gate.cancel" => runtime.node.cancel_gate(&params).await,
         _ if method == "gate.then" => runtime.node.run_gate_then(&params).await,
-        _ => Ok(json!({ "ok": true })),
+        // Everything this carrier does not need bookkeeping for goes to the
+        // one dispatch table, which owns the methods and the honest "I do not
+        // handle that". The `{"ok": true}` that used to live here answered for
+        // every method nobody had added an arm for — `subagent.transcript`
+        // (drill-in read as `available: undefined`, so every member row said
+        // 「启动中」) and `workspace.scm.*` (files/changes dead) were both
+        // reported successful by every WSS host, bound or not.
+        _ => crate::transport::hubnode::dispatch_frame(&runtime.node, method, params, frame).await,
     }
 }
 
@@ -1285,5 +1300,153 @@ mod tests {
         )
         .expect_err("numeric argv must fail closed");
         assert!(error.to_string().contains("args must be strings"));
+    }
+
+    /// Build a `RuntimeLink` around `node` with a journal channel nothing
+    /// drains — these tests dispatch, they do not mirror.
+    fn link(node: &DevNode) -> RuntimeLink {
+        let (journal, jobs, _) = super::super::journal_channel(4);
+        // Keep the receiver alive for the link's lifetime.
+        std::mem::forget(jobs);
+        RuntimeLink {
+            controller: None,
+            hub_url: "http://127.0.0.1:1".into(),
+            node: node.clone(),
+            journal,
+            watermarks: Arc::new(Mutex::new(HashMap::new())),
+            pumps: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// c-wfdrill2 A. The catch-all that used to end this dispatcher answered
+    /// `{"ok": true}` for every method nobody had written an arm for. On a
+    /// real WSS host that made `subagent.transcript` look successful with no
+    /// `available` field (every workflow member row said 「启动中」) and
+    /// `workspace.scm.*` look successful with no changes (files/changes dead).
+    ///
+    /// Both assertions are on fields a fabricated success cannot carry.
+    #[tokio::test]
+    async fn the_wss_runtime_answers_drill_in_and_scm_reads_itself() {
+        let dir = tempfile::tempdir().expect("data directory");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).expect("repo tree");
+        std::fs::write(repo.join("tracked.txt"), "base\n").expect("tracked file");
+        for args in [
+            ["init", "-q"].as_slice(),
+            ["symbolic-ref", "HEAD", "refs/heads/main"].as_slice(),
+            ["config", "user.email", "test@example.com"].as_slice(),
+            ["config", "user.name", "test"].as_slice(),
+            ["add", "."].as_slice(),
+            ["commit", "-qm", "init"].as_slice(),
+        ] {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        std::fs::write(repo.join("tracked.txt"), "base\nedited\n").expect("edit");
+        let repo = repo.canonicalize().expect("canonical repo");
+
+        let node = crate::compose(&crate::ServeConfig::fake(
+            DevServerConfig::loopback(0)
+                .with_workspace_root(repo.clone())
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+            dir.path().join("node"),
+        ))
+        .expect("node");
+        let runtime = link(&node);
+
+        let created = node
+            .create_instance(
+                serde_json::from_value(json!({"prompt": "drill-in"})).expect("request"),
+            )
+            .await
+            .expect("create");
+        let instance_id = created.instance.meta.id.as_id().to_string();
+
+        let drill = dispatch_hub(
+            &runtime,
+            remuda_protocol::hubnode::METHOD_SUBAGENT_TRANSCRIPT,
+            json!({ "instanceId": instance_id, "agentId": "aae139d44933cefe2" }),
+            MethodFrame::Request,
+        )
+        .await
+        .expect("the drill-in read is dispatched");
+        assert_eq!(
+            drill["available"],
+            json!(false),
+            "the Node answers the contract; a catch-all leaves `available` absent: {drill}"
+        );
+        assert_eq!(
+            drill["reason"], "transcript-unbound",
+            "and says why, so the row can tell an unbound session from a starting agent"
+        );
+
+        let workspace_id = node
+            .workspaces()
+            .expect("workspaces")
+            .into_iter()
+            .find(|workspace| std::path::Path::new(&workspace.root_path) == repo)
+            .expect("the repo is registered")
+            .meta
+            .id;
+        let changes = dispatch_hub(
+            &runtime,
+            "workspace.scm.status",
+            json!({ "workspaceId": workspace_id.as_id().as_str() }),
+            MethodFrame::Request,
+        )
+        .await
+        .expect("the scm read is dispatched");
+        assert_eq!(changes["availability"], "ok");
+        let entries = changes["entries"].as_array().expect("entries");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["path"] == "tracked.txt" && entry["kind"] == "modified"),
+            "the real working-tree change must be in the reply: {changes}"
+        );
+        node.shutdown().await.expect("shutdown");
+    }
+
+    /// The other half of the same fix: an unhandled method must be an error
+    /// when someone is waiting for the answer, and must stay tolerant when
+    /// nobody is (a Hub that gained a notification an older Node never learned).
+    #[tokio::test]
+    async fn an_unknown_method_fails_a_request_and_is_tolerated_as_a_notification() {
+        let dir = tempfile::tempdir().expect("data directory");
+        let node = crate::compose(&crate::ServeConfig::fake(
+            DevServerConfig::loopback(0)
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+            dir.path().to_path_buf(),
+        ))
+        .expect("node");
+        let runtime = link(&node);
+
+        let error = dispatch_hub(
+            &runtime,
+            "instance.teleport",
+            json!({}),
+            MethodFrame::Request,
+        )
+        .await
+        .expect_err("an unknown request method must not report success");
+        assert!(
+            matches!(error, NodeError::InvalidRequest(ref message) if message.contains("instance.teleport")),
+            "{error:?}"
+        );
+
+        let tolerated = dispatch_hub(
+            &runtime,
+            "instance.teleport",
+            json!({}),
+            MethodFrame::Notification,
+        )
+        .await
+        .expect("an unknown notification is dropped, not raised");
+        assert_eq!(tolerated, json!({ "ok": true }));
+        node.shutdown().await.expect("shutdown");
     }
 }

@@ -42,6 +42,39 @@ running from the repo root, the committed mcp-config works with no edits.
 
 Optional env (not committed): `REMUDA_DATA_DIR`, `REMUDA_HUB`, `REMUDA_TOKEN`.
 
+## Reaching remote instances
+
+The same tools drive an instance regardless of which enrolled host runs it;
+the Hub routes each call Hub → Node → instance over the Node's outbound
+link, so there is no per-host transport to configure.
+
+| Tool | Reaches a remote instance as |
+| --- | --- |
+| `remuda_instance_send` | A new prompt on the named `instanceId` (any host). |
+| `remuda_instance_list` / `remuda_instance_read` / `remuda_instance_wait` | Inventory, journal/screen and state for instances in scope. |
+| `remuda_instance_respond` / `remuda_instance_keys` / `remuda_instance_stop` / `remuda_instance_rm` | Interactions, logical keys and lifecycle on the named instance. |
+| `remuda_fleet_send` / `remuda_fleet_keys` | Label/host-filtered broadcasts (never `all` from Agent origin). |
+
+**Project-scope messaging rule.** An Agent-origin `remuda_instance_send`
+needs no per-message human approval when the target instance is inside the
+caller's *explicitly narrowed* delegation scope — at least one of the
+caller's `projectIds`, `hostIds` or `workspaceIds` is set, and each set
+dimension admits the target on its matching attribute. An instance with
+every dimension empty (universe scope) keeps the ownership-only rule, so an
+ordinary agent a human launched without a delegation box still needs the
+one-shot Interaction for an unowned sibling. Host identity is deliberately
+irrelevant once the box admits the target: an agent on host A can message an
+in-scope instance on host B with no prompt. The send is journaled on both
+sides (an `outbound` message on the sender naming target instance/host, an
+`inbound` message on the receiver naming the sender). Everything else keeps
+the one-shot human Interaction: out-of-scope targets, `remuda_instance_keys`
+/ raw `tty.write`, shell-driver targets, and an explicit
+`x-remuda-require-approval` header. `fleet --all` stays banned from Agent
+origin, and an Agent can never answer an Interaction itself.
+
+Host **file** tools are intentionally absent from MCP: `host files ls/get/
+search` are operator-only routes and an Agent token always receives 403.
+
 Headless print:
 
 ```sh

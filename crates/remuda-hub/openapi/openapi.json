@@ -9688,6 +9688,169 @@
           }
         }
       },
+      "/v1/hosts/{id}/files/search": {
+        "post": {
+          "tags": [
+            "host-files"
+          ],
+          "operationId": "hostFilesSearch",
+          "summary": "Search file names or contents on a host under a registered workspace (read-only, bounded)",
+          "description": "Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.search RPC. The Node confines the walk to a registered workspace root or the /tmp/remuda-* scratch area, honours .gitignore, skips binary and irregular files, and bounds the scan by wall clock (10s), total bytes (10 MiB), per-file bytes (1 MiB) and result count (default 200); the reply carries truncated/truncatedReason when a bound is hit. A Node that does not implement the method answers with a JSON-RPC error, surfaced as a clean 400.",
+          "parameters": [
+            {
+              "$ref": "#/components/parameters/IdPath"
+            }
+          ],
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "workspaceId",
+                    "query"
+                  ],
+                  "properties": {
+                    "workspaceId": {
+                      "type": "string"
+                    },
+                    "relPath": {
+                      "type": "string",
+                      "description": "Workspace-relative subtree; absent names the workspace root."
+                    },
+                    "query": {
+                      "type": "string",
+                      "description": "Literal needle, or a regex when regex=true."
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "name",
+                        "content"
+                      ],
+                      "description": "name (default) matches entry names; content matches decoded file contents line by line."
+                    },
+                    "regex": {
+                      "type": "boolean",
+                      "default": false
+                    },
+                    "glob": {
+                      "type": "string",
+                      "description": "Optional glob narrowing (e.g. *.rs or src/**)."
+                    },
+                    "maxResults": {
+                      "type": "integer",
+                      "format": "uint32",
+                      "minimum": 1,
+                      "description": "Cap on returned matches; absent means the Node default (200)."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Search result",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "object",
+                    "required": [
+                      "workspaceId",
+                      "path",
+                      "mode",
+                      "query",
+                      "matches",
+                      "truncated",
+                      "filesScanned",
+                      "bytesScanned"
+                    ],
+                    "properties": {
+                      "workspaceId": {
+                        "type": "string"
+                      },
+                      "path": {
+                        "type": "string"
+                      },
+                      "mode": {
+                        "type": "string",
+                        "enum": [
+                          "name",
+                          "content"
+                        ]
+                      },
+                      "query": {
+                        "type": "string"
+                      },
+                      "matches": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "path",
+                            "line"
+                          ],
+                          "properties": {
+                            "path": {
+                              "type": "string"
+                            },
+                            "line": {
+                              "type": "integer",
+                              "format": "uint64",
+                              "description": "1-based content line; 0 for a name hit."
+                            },
+                            "column": {
+                              "type": "integer",
+                              "format": "uint64"
+                            },
+                            "snippet": {
+                              "type": "string"
+                            }
+                          }
+                        }
+                      },
+                      "truncated": {
+                        "type": "boolean"
+                      },
+                      "truncatedReason": {
+                        "type": "string"
+                      },
+                      "filesScanned": {
+                        "type": "integer",
+                        "format": "uint64"
+                      },
+                      "bytesScanned": {
+                        "type": "integer",
+                        "format": "uint64"
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "400": {
+              "$ref": "#/components/responses/Error"
+            },
+            "401": {
+              "$ref": "#/components/responses/Error"
+            },
+            "403": {
+              "$ref": "#/components/responses/Error"
+            },
+            "404": {
+              "$ref": "#/components/responses/Error"
+            },
+            "409": {
+              "$ref": "#/components/responses/Error"
+            },
+            "422": {
+              "$ref": "#/components/responses/Error"
+            }
+          }
+        }
+      },
       "/v1/hosts/{id}/files/objects": {
         "post": {
           "tags": [

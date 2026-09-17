@@ -1377,7 +1377,144 @@ pub async fn post_command(
     }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();
     let command = forward_if_online(&state, command, live).await?;
+    if command.operation == "instance.send" {
+        journal_agent_message(
+            &state,
+            &device,
+            device.instance_id.as_deref(),
+            &instance,
+            &command.payload,
+        )
+        .await;
+    }
     Ok(Json(json!({ "command": command, "replayed": false })))
+}
+
+/// Maximum message text copied into a journal record (the full text still
+/// travels on the queued command).
+const JOURNAL_MESSAGE_TEXT_CHARS: usize = 4096;
+
+/// Pull the prompt text off an `instance.send` payload in every shape the CLI,
+/// MCP tools and worker briefs build.
+fn send_message_text(payload: &Value) -> Option<String> {
+    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = payload.get("prompt").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    let blocks = payload.pointer("/input/blocks")?.as_array()?;
+    let mut parts = Vec::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(text) = block.get("text").and_then(Value::as_str)
+        {
+            parts.push(text);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn journal_text(text: &str) -> String {
+    if text.chars().count() <= JOURNAL_MESSAGE_TEXT_CHARS {
+        return text.to_owned();
+    }
+    let capped: String = text.chars().take(JOURNAL_MESSAGE_TEXT_CHARS).collect();
+    format!("{capped}…")
+}
+
+/// Journal both sides of an agent-to-agent `instance.send`: the sender records
+/// the outbound message with target instance/host, the receiver the inbound
+/// one. Best effort, like the resume-link records — the queued command is the
+/// durable fact; a journal failure must not fail the send. Human/Bot callers
+/// have no instance journal of their own, and the receiving Node already
+/// journals an operator-delivered prompt, so only Agent-origin sends get the
+/// paired records.
+async fn journal_agent_message(
+    state: &AppState,
+    device: &crate::store::Device,
+    sender_id: Option<&str>,
+    target: &crate::store::InstanceRecord,
+    payload: &Value,
+) {
+    let Some(sender_id) = sender_id else {
+        return;
+    };
+    if crate::agent_scope::origin(device) != remuda_protocol::InputOrigin::Agent {
+        return;
+    }
+    let Some(text) = send_message_text(payload) else {
+        return;
+    };
+    let now = crate::config::now_rfc3339();
+    let text = journal_text(&text);
+    let Some(sender) = state
+        .store
+        .get_instance(sender_id.to_owned())
+        .await
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    if sender_id != target.instance_id {
+        let outbound = json!({
+            "kind": "message",
+            "observedAt": now,
+            "payload": {
+                "role": "user",
+                "origin": "agent",
+                "direction": "outbound",
+                "text": text,
+                "relatedIds": {
+                    "instanceId": target.instance_id,
+                    "hostId": target.host_id,
+                },
+            },
+        });
+        if let Err(error) = state
+            .store
+            .append_journal(
+                sender.host_id.clone(),
+                sender.instance_id.clone(),
+                None,
+                outbound,
+            )
+            .await
+        {
+            tracing::warn!(%error, instance_id = %sender.instance_id, "outbound message journal append failed");
+        }
+    }
+    let inbound = json!({
+        "kind": "message",
+        "observedAt": now,
+        "payload": {
+            "role": "user",
+            "origin": "agent",
+            "direction": "inbound",
+            "text": text,
+            "relatedIds": {
+                "instanceId": sender.instance_id,
+                "hostId": sender.host_id,
+            },
+        },
+    });
+    if let Err(error) = state
+        .store
+        .append_journal(
+            target.host_id.clone(),
+            target.instance_id.clone(),
+            None,
+            inbound,
+        )
+        .await
+    {
+        tracing::warn!(%error, instance_id = %target.instance_id, "inbound message journal append failed");
+    }
 }
 
 /// `GET /v1/worktrees` — catalog from the Node (`worktree.list`).

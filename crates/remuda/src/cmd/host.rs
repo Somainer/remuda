@@ -63,6 +63,33 @@ enum FilesCommand {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },
+    /// Search file names or contents under a workspace (bounded, read-only).
+    Search {
+        /// Host id (`hst_…`) or registered label.
+        host: String,
+        /// Workspace id (`wsp_…`), or `tmp` for the /tmp/remuda-* area.
+        workspace: String,
+        /// Literal query; a regular expression with --regex.
+        query: String,
+        /// Match entry names (the default).
+        #[arg(long, group = "search-mode")]
+        name: bool,
+        /// Match file contents line by line.
+        #[arg(long, group = "search-mode")]
+        content: bool,
+        /// Treat the query as a regular expression.
+        #[arg(long)]
+        regex: bool,
+        /// Narrow paths with a glob (`*.rs`, `src/**`).
+        #[arg(long)]
+        glob: Option<String>,
+        /// Cap the number of returned matches (default 200).
+        #[arg(long)]
+        max_results: Option<u32>,
+        /// Search a workspace-relative subtree instead of the workspace root.
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 fn run(hub: HubOpts, command: HostCommand) -> Result<()> {
@@ -81,6 +108,32 @@ fn run(hub: HubOpts, command: HostCommand) -> Result<()> {
                     path,
                     output,
                 } => get(&client, &host, &workspace, &path, output).await,
+                FilesCommand::Search {
+                    host,
+                    workspace,
+                    query,
+                    name: _,
+                    content,
+                    regex,
+                    glob,
+                    max_results,
+                    path,
+                } => {
+                    search(
+                        &client,
+                        SearchArgs {
+                            host: &host,
+                            workspace: &workspace,
+                            query: &query,
+                            mode: if content { "content" } else { "name" },
+                            regex,
+                            glob: glob.as_deref(),
+                            max_results,
+                            subpath: path.as_deref(),
+                        },
+                    )
+                    .await
+                }
             },
         }
     })
@@ -242,6 +295,82 @@ async fn get(
         );
     } else {
         std::io::stdout().write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+/// Arguments for one `host files search` invocation.
+struct SearchArgs<'a> {
+    host: &'a str,
+    workspace: &'a str,
+    query: &'a str,
+    mode: &'a str,
+    regex: bool,
+    glob: Option<&'a str>,
+    max_results: Option<u32>,
+    subpath: Option<&'a str>,
+}
+
+async fn search(client: &HubClient, args: SearchArgs<'_>) -> Result<()> {
+    if args.query.trim().is_empty() {
+        bail!("search requires a query");
+    }
+    let host_id = resolve_host(client, args.host).await?;
+    let mut body = json!({
+        "workspaceId": args.workspace,
+        "query": args.query,
+        "mode": args.mode,
+    });
+    if args.regex {
+        body["regex"] = json!(true);
+    }
+    if let Some(glob) = args.glob.map(str::trim).filter(|value| !value.is_empty()) {
+        body["glob"] = json!(glob);
+    }
+    if let Some(max) = args.max_results {
+        body["maxResults"] = json!(max);
+    }
+    if let Some(subpath) = args
+        .subpath
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        body["relPath"] = json!(subpath);
+    }
+    let result = client
+        .post(&format!("/v1/hosts/{host_id}/files/search"), &body)
+        .await?;
+    let matches = result
+        .get("matches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let content_mode = args.mode == "content";
+    let mut stdout = std::io::stdout();
+    for hit in &matches {
+        let path = hit.get("path").and_then(Value::as_str).unwrap_or("");
+        let line = hit.get("line").and_then(Value::as_u64).unwrap_or(0);
+        let snippet = hit.get("snippet").and_then(Value::as_str).unwrap_or("");
+        if content_mode && line > 0 {
+            writeln!(stdout, "{path}:{line}:{snippet}")?;
+        } else {
+            writeln!(stdout, "{path}")?;
+        }
+    }
+    if result.get("truncated").and_then(Value::as_bool) == Some(true) {
+        let reason = result
+            .get("truncatedReason")
+            .and_then(Value::as_str)
+            .unwrap_or("limit");
+        let scanned = result
+            .get("filesScanned")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        writeln!(
+            std::io::stderr(),
+            "truncated: {reason} cap hit after {} match(es) across {scanned} file(s); narrow the query or raise --max-results",
+            matches.len()
+        )?;
     }
     Ok(())
 }

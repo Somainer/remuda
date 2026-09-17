@@ -362,9 +362,20 @@ pub async fn authorize_command(
         ) {
             return Err(HubError::Forbidden);
         }
+        // D-031 follow-up (host-search-1): an Agent may message an instance
+        // inside its own project scope with no per-message human approval; the
+        // host the target runs on is irrelevant. Everything else keeps the
+        // one-shot Interaction: keys/tty writes, shell-driver targets,
+        // out-of-scope instances, and an explicit require-approval header.
+        let owns_target = owns(state, device, &instance.instance_id).await?;
+        let scoped_target = if operation == "instance.send" {
+            target_in_caller_scope(state, device, instance).await?
+        } else {
+            false
+        };
         if matches!(operation, "tty.write" | "instance.keys")
             || (operation == "instance.send" && shell_driver(&instance.driver))
-            || !owns(state, device, &instance.instance_id).await?
+            || (!owns_target && !scoped_target)
             || headers.contains_key("x-remuda-require-approval")
         {
             require_approval(
@@ -377,6 +388,30 @@ pub async fn authorize_command(
         }
     }
     Ok(())
+}
+
+/// True when the addressed instance lies inside the caller's delegation scope.
+///
+/// The scope's project/host/workspace dimensions must each admit the target;
+/// an empty dimension on the caller means "not narrowed" on that dimension.
+/// Host identity is deliberately irrelevant: that is what lets an agent message
+/// a sibling instance running on another enrolled host without a human prompt.
+pub async fn target_in_caller_scope(
+    state: &AppState,
+    device: &Device,
+    target: &crate::store::InstanceRecord,
+) -> Result<bool, HubError> {
+    let scope = caller_project_scope(state, device).await?;
+    let project_ok = target
+        .project_id
+        .as_deref()
+        .is_none_or(|project| scope.allows_project(project));
+    let host_ok = scope.allows_host(&target.host_id);
+    let workspace_ok = target
+        .workspace_id
+        .as_deref()
+        .is_none_or(|workspace| scope.allows_workspace(workspace));
+    Ok(project_ok && host_ok && workspace_ok)
 }
 
 pub async fn require_approval(

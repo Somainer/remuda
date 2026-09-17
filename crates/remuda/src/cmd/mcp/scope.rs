@@ -116,7 +116,14 @@ pub(super) fn mcp_requires_approval(
             Ok(false)
         }
         "remuda_instance_keys" | "remuda_fleet_keys" => Ok(true),
-        "remuda_instance_send" | "remuda_instance_stop" | "remuda_instance_rm" => {
+        // D-031 follow-up (host-search-1): the Hub decides whether an
+        // instance.send needs a human Interaction — own instances and any
+        // target inside the caller's project scope go straight through, and
+        // the Hub answers 409 HUMAN_APPROVAL_REQUIRED for the rest. A
+        // client-side owns() test here would force the require-approval
+        // header for every cross-host sibling and veto the scope rule.
+        "remuda_instance_send" => Ok(false),
+        "remuda_instance_stop" | "remuda_instance_rm" => {
             Ok(!caller.owns(required_str(args, "instanceId")?))
         }
         "remuda_instance_create" if opt_str(args, "worktree").is_some() => bail!(
@@ -230,11 +237,9 @@ mod scope_tests {
     #[test]
     fn instance_scope_is_self_and_direct_children_only() {
         let caller = agent();
-        for tool in [
-            "remuda_instance_send",
-            "remuda_instance_stop",
-            "remuda_instance_rm",
-        ] {
+        // Stop/close keep the ownership-only client gate; an Agent cannot
+        // cancel or close a sibling without a human Interaction.
+        for tool in ["remuda_instance_stop", "remuda_instance_rm"] {
             for target in ["self", "child"] {
                 assert!(
                     !mcp_requires_approval(&caller, tool, &json!({"instanceId":target})).unwrap()
@@ -245,6 +250,19 @@ mod scope_tests {
                     mcp_requires_approval(&caller, tool, &json!({"instanceId":target})).unwrap()
                 );
             }
+        }
+        // instance.send never forces approval client-side: the Hub owns the
+        // owns/project-scope decision and answers 409 when an Interaction is
+        // actually required.
+        for target in ["self", "child", "sibling", "parent", "grandchild"] {
+            assert!(
+                !mcp_requires_approval(
+                    &caller,
+                    "remuda_instance_send",
+                    &json!({"instanceId": target})
+                )
+                .unwrap()
+            );
         }
         assert!(
             !mcp_requires_approval(&caller, "remuda_instance_create", &json!({"host":"host-a"}))
@@ -335,7 +353,7 @@ mod scope_tests {
         assert!(
             mcp_requires_approval(
                 &agent(),
-                "remuda_instance_send",
+                "remuda_instance_stop",
                 &json!({"origin":"human","instanceId":"sibling","parentInstanceId":"self"})
             )
             .unwrap()

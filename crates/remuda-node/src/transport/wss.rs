@@ -242,6 +242,16 @@ fn attach_object_source(
         Ok(http) => {
             let source = crate::carrier_objects::FallbackObjectSource::new(http, broker.source());
             link.node.set_object_source(Arc::new(source));
+            // Read-only host-file fetches upload through the same Hub HTTP
+            // origin and host token (the files slice's upward half).
+            let host_id = link.node.host().meta.id.as_id().as_str().to_owned();
+            match crate::files::HubHostFileStager::from_ws_url(ws_url, host_id, token.to_owned()) {
+                Ok(stager) => link.node.set_host_file_stager(Some(Arc::new(stager))),
+                Err(error) => {
+                    tracing::warn!(%error, "Node cannot derive a host-file upload URL");
+                    link.node.set_host_file_stager(None);
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -249,6 +259,7 @@ fn attach_object_source(
                 "Node cannot derive a Hub object URL; pulling attachments over the carrier"
             );
             link.node.set_object_source(Arc::new(broker.source()));
+            link.node.set_host_file_stager(None);
         }
     }
 }

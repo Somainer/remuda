@@ -13,6 +13,7 @@ mod driver;
 mod enroll;
 mod entity;
 mod error;
+mod files;
 mod gate;
 mod identity;
 mod interactions;

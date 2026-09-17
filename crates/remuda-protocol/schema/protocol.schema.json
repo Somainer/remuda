@@ -5885,6 +5885,141 @@
       ],
       "type": "object"
     },
+    "HostFileEntry": {
+      "description": "One directory entry returned by `host.files.list`.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/HostFileKind",
+          "description": "`file`, `dir`, `symlink`, or `other`."
+        },
+        "mode": {
+          "description": "Unix permission bits, e.g. `0o644` serializes as `420`; `0` off unix.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mtime": {
+          "description": "Modified time as Unix epoch seconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "description": "Bare entry name; never a path.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Size in bytes (`lstat`, so a symlink reports its own length).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "kind",
+        "size",
+        "mtime",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "HostFileKind": {
+      "description": "Kind of one [`HostFileEntry`], from `lstat` (symlinks are not followed).",
+      "oneOf": [
+        {
+          "const": "file",
+          "description": "Regular file.",
+          "type": "string"
+        },
+        {
+          "const": "dir",
+          "description": "Directory.",
+          "type": "string"
+        },
+        {
+          "const": "symlink",
+          "description": "Symbolic link (target not followed or inspected).",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "Fifo, socket, device, or anything else.",
+          "type": "string"
+        }
+      ]
+    },
+    "HostFileReadResult": {
+      "description": "`host.files.read` result. Bytes stay behind `GET /v1/objects/{objectId}`.",
+      "properties": {
+        "digest": {
+          "description": "Lowercase hex SHA-256 of the file bytes.",
+          "type": "string"
+        },
+        "objectId": {
+          "description": "Staged Hub object id (`obj_…`), bound to the reading host.",
+          "type": "string"
+        },
+        "size": {
+          "description": "File size in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "objectId",
+        "digest",
+        "size"
+      ],
+      "type": "object"
+    },
+    "HostFilesListResult": {
+      "description": "`host.files.list` result: the canonical directory and its entries.",
+      "properties": {
+        "entries": {
+          "description": "Directory entries, sorted by name.",
+          "items": {
+            "$ref": "#/$defs/HostFileEntry"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "Canonical absolute directory that was actually listed.",
+          "type": "string"
+        },
+        "workspaceId": {
+          "description": "The workspace id (or the scratch sentinel) the listing resolved to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "path",
+        "entries"
+      ],
+      "type": "object"
+    },
+    "HostFilesParams": {
+      "description": "Shared selector for the read-only host-file RPCs: a registered workspace\nplus a workspace-relative path.",
+      "properties": {
+        "relPath": {
+          "description": "Path relative to the workspace root. Absent or empty names the root;\nabsolute paths and `..` components are refused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "description": "Registered workspace id, or [`HOST_FILES_SCRATCH_ID`] for the\n`<tmp>/remuda-*` scratch area.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspaceId"
+      ],
+      "type": "object"
+    },
     "HostId": {
       "pattern": "^(hst)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"

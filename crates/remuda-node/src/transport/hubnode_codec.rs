@@ -183,6 +183,9 @@ pub async fn dispatch_method(
     if crate::workspace::is_workspace_method(method) {
         return node.workspace_rpc(method, params);
     }
+    if crate::files::is_host_files_method(method) {
+        return node.host_files_rpc(method, params).await;
+    }
     if method == "host.doctor" {
         return node.doctor().await;
     }

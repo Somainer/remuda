@@ -82,6 +82,17 @@ pub const METHOD_OBJECT_CHUNK: &str = "object.chunk";
 pub const METHOD_TTY_SCREEN: &str = "tty.screen";
 /// On-demand bounded read of one subagent's sidechain transcript (drill-in).
 pub const METHOD_SUBAGENT_TRANSCRIPT: &str = "subagent.transcript";
+/// Hub→Node: list one directory under a registered workspace (read-only
+/// host files). Nodes older than this method answer "unknown method", which
+/// the Hub surfaces as a clean 400 instead of failing the route.
+pub const METHOD_HOST_FILES_LIST: &str = "host.files.list";
+/// Hub→Node: read one regular workspace file, stage its bytes through the
+/// objects channel with the host token, and return the resulting object id.
+pub const METHOD_HOST_FILES_READ: &str = "host.files.read";
+/// Workspace id selecting the Node scratch area (`<tmp>/remuda-*`) for the
+/// read-only host-file routes. Real workspace ids are `ws_…` ids, so `tmp`
+/// can never alias a registration.
+pub const HOST_FILES_SCRATCH_ID: &str = "tmp";
 /// HTTP Authorization scheme for `GET /v1/node`.
 pub const WS_AUTHORIZATION_SCHEME: &str = "Bearer";
 /// `params.scheme` on [`METHOD_NODE_AUTH`].
@@ -245,6 +256,80 @@ pub struct WorkspaceRegistryResult {
     /// `prepared` or `settled`; absent on reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+}
+
+/// Shared selector for the read-only host-file RPCs: a registered workspace
+/// plus a workspace-relative path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFilesParams {
+    /// Registered workspace id, or [`HOST_FILES_SCRATCH_ID`] for the
+    /// `<tmp>/remuda-*` scratch area.
+    pub workspace_id: String,
+    /// Path relative to the workspace root. Absent or empty names the root;
+    /// absolute paths and `..` components are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel_path: Option<String>,
+}
+
+/// `host.files.list` params.
+pub type HostFilesListParams = HostFilesParams;
+
+/// `host.files.read` params.
+pub type HostFileReadParams = HostFilesParams;
+
+/// Kind of one [`HostFileEntry`], from `lstat` (symlinks are not followed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum HostFileKind {
+    /// Regular file.
+    File,
+    /// Directory.
+    Dir,
+    /// Symbolic link (target not followed or inspected).
+    Symlink,
+    /// Fifo, socket, device, or anything else.
+    Other,
+}
+
+/// One directory entry returned by `host.files.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFileEntry {
+    /// Bare entry name; never a path.
+    pub name: String,
+    /// `file`, `dir`, `symlink`, or `other`.
+    pub kind: HostFileKind,
+    /// Size in bytes (`lstat`, so a symlink reports its own length).
+    pub size: u64,
+    /// Modified time as Unix epoch seconds.
+    pub mtime: u64,
+    /// Unix permission bits, e.g. `0o644` serializes as `420`; `0` off unix.
+    pub mode: u32,
+}
+
+/// `host.files.list` result: the canonical directory and its entries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFilesListResult {
+    /// The workspace id (or the scratch sentinel) the listing resolved to.
+    pub workspace_id: String,
+    /// Canonical absolute directory that was actually listed.
+    pub path: String,
+    /// Directory entries, sorted by name.
+    pub entries: Vec<HostFileEntry>,
+}
+
+/// `host.files.read` result. Bytes stay behind `GET /v1/objects/{objectId}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFileReadResult {
+    /// Staged Hub object id (`obj_…`), bound to the reading host.
+    pub object_id: String,
+    /// Lowercase hex SHA-256 of the file bytes.
+    pub digest: String,
+    /// File size in bytes.
+    pub size: u64,
 }
 
 /// `node.auth` params (stdio first frame).

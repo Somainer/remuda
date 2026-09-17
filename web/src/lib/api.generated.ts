@@ -375,6 +375,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/gate/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List gate jobs across in-scope projects (batch 6) */
+        get: operations["gateJobsList"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts": {
         parameters: {
             query?: never;
@@ -917,6 +934,71 @@ export interface paths {
         head?: never;
         /** Update project settings; D-031 enforced policy is immutable */
         patch: operations["projectSet"];
+        trace?: never;
+    };
+    "/v1/projects/{id}/gate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        /** List a project's gate jobs */
+        get: operations["projectGateList"];
+        put?: never;
+        /** Enqueue a verify or land job on a project lane */
+        post: operations["projectGateEnqueue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{id}/gate/jobs/{jobId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        /** Get one gate job */
+        get: operations["projectGateJobGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/projects/{id}/gate/jobs/{jobId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel a queued or running gate job */
+        post: operations["projectGateJobCancel"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/projects/{id}/members": {
@@ -3338,6 +3420,60 @@ export interface operations {
             };
         };
     };
+    gateJobsList: {
+        parameters: {
+            query?: {
+                state?: string;
+                active?: boolean;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Jobs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items?: ({
+                            branch?: string;
+                            error?: string | null;
+                            finishedAt?: string | null;
+                            hostId?: string | null;
+                            id?: string;
+                            laneId?: string | null;
+                            mergeSha?: string | null;
+                            /** @enum {string} */
+                            mode?: "verify" | "land";
+                            projectId?: string;
+                            queuedAt?: string;
+                            requestedBy?: string;
+                            startedAt?: string | null;
+                            /** @enum {string} */
+                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            steps?: {
+                                [key: string]: unknown;
+                            }[];
+                            /** @enum {string} */
+                            web?: "auto" | "always" | "never";
+                        } & {
+                            [key: string]: unknown;
+                        })[];
+                        nextCursor?: Record<string, never> | null;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
     hostList: {
         parameters: {
             query?: never;
@@ -4430,6 +4566,237 @@ export interface operations {
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    projectGateList: {
+        parameters: {
+            query?: {
+                state?: string;
+                branch?: string;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Jobs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        items?: ({
+                            branch?: string;
+                            error?: string | null;
+                            finishedAt?: string | null;
+                            hostId?: string | null;
+                            id?: string;
+                            laneId?: string | null;
+                            mergeSha?: string | null;
+                            /** @enum {string} */
+                            mode?: "verify" | "land";
+                            projectId?: string;
+                            queuedAt?: string;
+                            requestedBy?: string;
+                            startedAt?: string | null;
+                            /** @enum {string} */
+                            state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                            steps?: {
+                                [key: string]: unknown;
+                            }[];
+                            /** @enum {string} */
+                            web?: "auto" | "always" | "never";
+                        } & {
+                            [key: string]: unknown;
+                        })[];
+                        nextCursor?: Record<string, never> | null;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    projectGateEnqueue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    branch: string;
+                    laneId?: string;
+                    /** @enum {string} */
+                    mode?: "verify" | "land";
+                    thenCommand?: string;
+                    /** @enum {string} */
+                    web?: "auto" | "always" | "never";
+                };
+            };
+        };
+        responses: {
+            /** @description Enqueued job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch?: string;
+                        error?: string | null;
+                        finishedAt?: string | null;
+                        hostId?: string | null;
+                        id?: string;
+                        laneId?: string | null;
+                        mergeSha?: string | null;
+                        /** @enum {string} */
+                        mode?: "verify" | "land";
+                        projectId?: string;
+                        queuedAt?: string;
+                        requestedBy?: string;
+                        startedAt?: string | null;
+                        /** @enum {string} */
+                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        steps?: {
+                            [key: string]: unknown;
+                        }[];
+                        /** @enum {string} */
+                        web?: "auto" | "always" | "never";
+                    } & {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    projectGateJobGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch?: string;
+                        error?: string | null;
+                        finishedAt?: string | null;
+                        hostId?: string | null;
+                        id?: string;
+                        laneId?: string | null;
+                        mergeSha?: string | null;
+                        /** @enum {string} */
+                        mode?: "verify" | "land";
+                        projectId?: string;
+                        queuedAt?: string;
+                        requestedBy?: string;
+                        startedAt?: string | null;
+                        /** @enum {string} */
+                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        steps?: {
+                            [key: string]: unknown;
+                        }[];
+                        /** @enum {string} */
+                        web?: "auto" | "always" | "never";
+                    } & {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    projectGateJobCancel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description prj_… id */
+                id: string;
+                /** @description gjb_… id */
+                jobId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Canceled/canceling job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        branch?: string;
+                        error?: string | null;
+                        finishedAt?: string | null;
+                        hostId?: string | null;
+                        id?: string;
+                        laneId?: string | null;
+                        mergeSha?: string | null;
+                        /** @enum {string} */
+                        mode?: "verify" | "land";
+                        projectId?: string;
+                        queuedAt?: string;
+                        requestedBy?: string;
+                        startedAt?: string | null;
+                        /** @enum {string} */
+                        state?: "queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled";
+                        steps?: {
+                            [key: string]: unknown;
+                        }[];
+                        /** @enum {string} */
+                        web?: "auto" | "always" | "never";
+                    } & {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
     projectMemberAdd: {

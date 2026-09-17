@@ -19,6 +19,7 @@ mod config;
 mod devices;
 mod error;
 mod fleet;
+mod gatequeue;
 mod hosts;
 mod http;
 mod instances;
@@ -407,6 +408,9 @@ async fn spawn_inner(
     // A Hub restart must not inherit yesterday's unacknowledged creates: they
     // would keep holding placement slots with no Node that can ever settle them.
     expire_stale_requested(&state, config.requested_grace_ms).await;
+    // Batch 6: jobs left running by a previous Hub process re-enter the queue.
+    crate::gatequeue::reconcile(&state).await;
+    crate::gatequeue::tick(&state).await;
     let reaper_state = state.clone();
     let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -424,7 +428,9 @@ async fn spawn_inner(
         .with_graceful_shutdown(shutdown)
         .into_future();
         tokio::pin!(server);
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            crate::gatequeue::SCHEDULE_TICK_MILLIS,
+        ));
         loop {
             tokio::select! {
                 result = &mut server => {
@@ -436,6 +442,7 @@ async fn spawn_inner(
                         tracing::error!(error = %err, "host-lost sweep failed");
                     }
                     expire_stale_requested(&reaper_state, config.requested_grace_ms).await;
+                    crate::gatequeue::tick(&reaper_state).await;
                 }
             }
         }
@@ -502,6 +509,7 @@ pub fn router(state: AppState) -> Router {
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(workers::routes())
+        .merge(gatequeue::routes())
         .merge(worker_watch::routes())
         .merge(bot::routes());
     if let Some(push) = state.push.clone() {

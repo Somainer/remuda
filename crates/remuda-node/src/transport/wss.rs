@@ -716,7 +716,8 @@ async fn session_task(
 
     let (tty_tx, mut tty_rx) = mpsc::channel::<TtyWire>(64);
     if let Some(runtime) = runtime.as_ref() {
-        spawn_wss_tty_pump(runtime.node.clone(), tty_tx);
+        spawn_wss_tty_pump(runtime.node.clone(), tty_tx.clone());
+        spawn_wss_gate_pump(runtime.node.clone(), tty_tx);
     }
 
     loop {
@@ -908,6 +909,32 @@ fn spawn_wss_tty_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
                     }
                     Err(_) => continue,
                 },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+fn spawn_wss_gate_pump(node: crate::DevNode, tx: mpsc::Sender<TtyWire>) {
+    tokio::spawn(async move {
+        let mut events = node.gate_registry().subscribe();
+        loop {
+            let event = tokio::select! {
+                _ = tx.closed() => break,
+                event = events.recv() => event,
+            };
+            match event {
+                Ok(event) => {
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "method": remuda_protocol::METHOD_GATE_EVENT,
+                        "params": event,
+                    });
+                    if tx.send(TtyWire::Json(frame)).await.is_err() {
+                        break;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

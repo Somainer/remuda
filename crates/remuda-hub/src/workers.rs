@@ -104,8 +104,15 @@ pub(crate) struct DispatchBody {
     /// (claude-pty on a herdr host, claude-print otherwise); `shell-pty` selects
     /// the Node's native PTY carrier, which serves a readable live screen for
     /// `remuda watch` (D-028).
+    /// Explicit driver override (`claude-pty` / `shell-pty` / `claude-print`)
+    /// kept from batch 5a; batch 6 adds the higher-level `carrier` preference.
     #[serde(default)]
     pub(crate) driver: Option<String>,
+    /// Carrier preference batch 6 (D-034): `native` (shell-pty), `herdr`, or
+    /// `print`. Default order is native → herdr; print is only ever picked on
+    /// this explicit request, never silently.
+    #[serde(default)]
+    pub(crate) carrier: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -405,7 +412,7 @@ pub(crate) async fn dispatch_core(
     // ── launch env: per-worker target dir, build cap, port block ───────────
     let driver = match body.driver.as_deref() {
         Some(explicit) => select_worker_driver(&harness, explicit)?,
-        None => driver_for(&harness, &host),
+        None => select_carrier(&harness, &host, body.carrier.as_deref())?,
     };
     let extra_env = worker_extra_env(target_dir.as_deref(), port_block.as_deref());
     let mut spec = worker_launch_spec(
@@ -661,19 +668,82 @@ fn matches_tendency(
     }
 }
 
+/// Default carrier choice (used by resume, which cannot prompt): prefer the
+/// native shell-pty the Node advertises as launchable, then herdr, and only
+/// fall back to legacy print when neither carrier is available.
 pub(crate) fn driver_for(harness: &str, host: &HostRecord) -> String {
-    match harness {
-        "claude" => {
-            // Pty drivers require an advertised herdr; fall back to print.
-            let has_herdr = host.herdr.as_ref().is_some_and(|value| !value.is_null());
-            if has_herdr {
-                "claude-pty".to_string()
+    select_carrier(harness, host, None).unwrap_or_else(|_| match harness {
+        "codex" | "grok" => "generic-pty".to_string(),
+        _ => "claude-print".to_string(),
+    })
+}
+
+/// Whether the Node advertised `shell-pty` as launchable in its hello
+/// `capabilities.driverInventory` (D-028 §5.1).
+pub(crate) fn native_carrier_works(host: &HostRecord) -> bool {
+    host.capabilities
+        .get("driverInventory")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("shell-pty"))
+        .any(|item| item.get("launchable").and_then(Value::as_bool) == Some(true))
+}
+
+/// Batch 6 carrier preference (`remuda dispatch --carrier`):
+/// default native when the Node reports the native carrier works, else herdr
+/// when advertised; `print` is never selected unless explicitly requested.
+pub(crate) fn select_carrier(
+    harness: &str,
+    host: &HostRecord,
+    explicit: Option<&str>,
+) -> Result<String, HubError> {
+    if harness != "claude" {
+        // codex/grok only have the herdr-backed generic pty driver.
+        return Ok("generic-pty".to_string());
+    }
+    let has_herdr = host.herdr.as_ref().is_some_and(|value| !value.is_null());
+    let native = || native_carrier_works(host);
+    match explicit {
+        Some("native") | Some("shell-pty") => {
+            if native() {
+                Ok("shell-pty".to_string())
             } else {
-                "claude-print".to_string()
+                Err(HubError::Unsatisfiable {
+                    reasons: vec![
+                        "host Node does not advertise a launchable native shell-pty carrier".into(),
+                    ],
+                })
             }
         }
-        "codex" | "grok" => "generic-pty".to_string(),
-        _ => "claude-pty".to_string(),
+        Some("herdr") | Some("claude-pty") => {
+            if has_herdr {
+                Ok("claude-pty".to_string())
+            } else {
+                Err(HubError::Unsatisfiable {
+                    reasons: vec!["host does not advertise herdr".into()],
+                })
+            }
+        }
+        Some("print") | Some("claude-print") => Ok("claude-print".to_string()),
+        Some(other) => Err(HubError::BadRequest(format!(
+            "carrier must be native|herdr|print, got {other:?}"
+        ))),
+        None => {
+            if native() {
+                Ok("shell-pty".to_string())
+            } else if has_herdr {
+                Ok("claude-pty".to_string())
+            } else {
+                Err(HubError::Unsatisfiable {
+                    reasons: vec![
+                        "no launchable carrier on host (native shell-pty not advertised, no \
+                         herdr); pass --carrier print to select the legacy print carrier"
+                            .into(),
+                    ],
+                })
+            }
+        }
     }
 }
 

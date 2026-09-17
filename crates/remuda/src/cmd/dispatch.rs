@@ -48,6 +48,11 @@ pub(crate) struct DispatchArgs {
     /// `shell-pty` is the native, screen-readable carrier for `remuda watch`.
     #[arg(long)]
     driver: Option<String>,
+    /// Carrier preference (batch 6): `native` (shell-pty), `herdr`, `print`.
+    /// Default is native when the host Node advertises it, else herdr;
+    /// `print` is used only on this explicit request.
+    #[arg(long)]
+    carrier: Option<String>,
     /// Skip the local brief lint gate (not recommended; gate still scans).
     #[arg(long)]
     force_lint: bool,
@@ -99,6 +104,7 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "hostId": args.host,
         "placement": args.placement,
         "driver": args.driver,
+        "carrier": args.carrier,
     });
     let value = client.post("/v1/workers/dispatch", &body).await?;
     print_json(&value)?;

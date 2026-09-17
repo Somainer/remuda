@@ -665,6 +665,14 @@ pub(crate) async fn handle_node_method(
             }
             Ok(Some(json!({ "ok": true })))
         }
+        "gate.event" => {
+            // Batch 6 co-lanes: streamed lane-runner events. The frame rides
+            // the Node's authenticated session; the queue re-checks that the
+            // job's lane host matches.
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            crate::gatequeue::on_event(state, host_id.as_str(), params).await?;
+            Ok(Some(json!({ "ok": true })))
+        }
         "instance.create"
         | "instance.send"
         | "instance.configure"

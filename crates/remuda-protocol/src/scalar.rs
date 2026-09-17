@@ -8,7 +8,7 @@ use uuid::{Builder as UuidBuilder, Uuid, Variant};
 
 const ID_PREFIXES: &[&str] = &[
     "hst", "wsp", "wkt", "ins", "run", "cmd", "int", "evt", "dev", "prn", "pvp", "cred", "obj",
-    "sub", "tty", "launch", "epoch", "hook", "prj", "tsk", "plc", "wkr",
+    "sub", "tty", "launch", "epoch", "hook", "prj", "tsk", "plc", "wkr", "gjb",
 ];
 
 /// Deserialize a required field whose explicit wire value may be null; §1.1.
@@ -186,6 +186,7 @@ branded_id!(EventId, "evt");
 branded_id!(ProjectId, "prj");
 branded_id!(TaskId, "tsk");
 branded_id!(WorkerRosterId, "wkr");
+branded_id!(GateJobId, "gjb");
 
 /// UTC RFC3339 with exactly three fractional digits, serialized as text; §1.1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

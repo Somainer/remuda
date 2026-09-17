@@ -101,6 +101,11 @@ enum ProjectCommand {
         /// Set `policy.configurable.allowMultipleDispatchers`.
         #[arg(long)]
         allow_multiple_dispatchers: Option<bool>,
+        /// Replace the whole gate configuration from a JSON document
+        /// (`{lanes:[{id,hostId,repoPath,targetDir,ports,env,lockPath,
+        /// pwEndpoint,toolchainPath}], web, affected}`) or `@file.json`.
+        #[arg(long)]
+        gate: Option<String>,
     },
     /// Add a `(hostId, workspaceId)` member.
     AddMember {
@@ -182,6 +187,7 @@ fn run(hub: HubOpts, command: ProjectCommand) -> anyhow::Result<()> {
                 max_delegation_depth,
                 coordinator_fan_out,
                 allow_multiple_dispatchers,
+                gate,
             } => {
                 let mut body = json!({});
                 put(&mut body, "name", name);
@@ -216,6 +222,12 @@ fn run(hub: HubOpts, command: ProjectCommand) -> anyhow::Result<()> {
                 }
                 if configurable.as_object().is_some_and(|map| !map.is_empty()) {
                     body["policy"] = json!({ "configurable": configurable });
+                }
+                if let Some(raw) = gate {
+                    let text = raw
+                        .strip_prefix('@')
+                        .map_or(Ok(raw.clone()), std::fs::read_to_string)?;
+                    body["gate"] = serde_json::from_str::<Value>(text.trim())?;
                 }
                 client.patch(&format!("/v1/projects/{id}"), &body).await?
             }

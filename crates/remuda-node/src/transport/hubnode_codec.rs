@@ -201,6 +201,16 @@ pub async fn dispatch_method(
     if method == "worker.remove" {
         return node.remove_worker(&params).await;
     }
+    // Batch 6 co-lanes: lane gate runner over ssh-stdio and the WSS runtime.
+    if method == "gate.run" {
+        return node.run_gate(&params).await;
+    }
+    if method == "gate.cancel" {
+        return node.cancel_gate(&params).await;
+    }
+    if method == "gate.then" {
+        return node.run_gate_then(&params).await;
+    }
     if crate::workspace_scm::is_scm_method(method) {
         return crate::workspace_scm::handle_rpc(node, method, &params);
     }

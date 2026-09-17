@@ -62,6 +62,17 @@ async fn run(args: ReportArgs) -> anyhow::Result<i32> {
         .as_deref()
         .map(load_merge_reports)
         .unwrap_or_default();
+    // Batch 6: the Hub gate queue is the source of truth for lane gating.
+    let gate_path = match &args.project {
+        Some(project) => format!("/v1/projects/{project}/gate?"),
+        None => "/v1/gate/jobs?limit=100&".to_owned(),
+    };
+    let gate_jobs: Vec<Value> = client
+        .get(&gate_path)
+        .await
+        .ok()
+        .and_then(|value| value.get("items").and_then(Value::as_array).cloned())
+        .unwrap_or_default();
     let marker_path = common
         .as_ref()
         .map(|dir| dir.join("remuda/coordinator/last-report.json"));
@@ -72,7 +83,7 @@ async fn run(args: ReportArgs) -> anyhow::Result<i32> {
         .unwrap_or_else(|| json!({}));
 
     if args.for_owner {
-        let asks = owner_asks(&workers, &reports);
+        let asks = owner_asks(&workers, &reports, &gate_jobs);
         let previous = marker
             .get("owner")
             .and_then(Value::as_object)
@@ -102,6 +113,19 @@ async fn run(args: ReportArgs) -> anyhow::Result<i32> {
     }
 
     // Full digest.
+    let last_landed = gate_jobs
+        .iter()
+        .filter(|job| job["state"].as_str() == Some("landed"))
+        .max_by_key(|job| job.get("finishedAt").and_then(Value::as_str).unwrap_or(""))
+        .cloned();
+    let active_gate: Vec<&Value> = gate_jobs
+        .iter()
+        .filter(|job| matches!(job["state"].as_str(), Some("queued") | Some("running")))
+        .collect();
+    let gate_failures: Vec<&Value> = gate_jobs
+        .iter()
+        .filter(|job| job["state"].as_str() == Some("failed"))
+        .collect();
     let landed = reports
         .iter()
         .filter(|report| report["status"].as_str() == Some("landed"))
@@ -160,11 +184,20 @@ async fn run(args: ReportArgs) -> anyhow::Result<i32> {
     let digest = json!({
         "counts": fleet_counts(&workers),
         "landedSinceLastReport": new_landed,
+        "lastLandedSha": last_landed.and_then(|job| job.get("mergeSha").cloned()),
+        "activeGateJobs": active_gate.iter().map(|job| json!({
+            "id": job["id"], "branch": job["branch"], "mode": job["mode"],
+            "state": job["state"], "laneId": job["laneId"],
+        })).collect::<Vec<_>>(),
+        "hubGateFailures": gate_failures.iter().map(|job| json!({
+            "id": job["id"], "branch": job["branch"], "mode": job["mode"],
+            "state": job["state"], "error": job["error"],
+        })).collect::<Vec<_>>(),
         "verifiedAwaitingLand": verified,
         "gateFailures": gate_failed,
         "needsAttention": attention,
         "doneAwaitingLand": done,
-        "ownerAsks": owner_asks(&workers, &reports),
+        "ownerAsks": owner_asks(&workers, &reports, &gate_jobs),
         "activeWorkers": active.iter().map(|worker| json!({
             "name": worker["name"], "status": status_of(worker),
             "branch": worker["branch"], "evidence": evidence(worker),
@@ -239,7 +272,7 @@ fn attention_workers(workers: &[Value]) -> Vec<Value> {
 /// Only items the owner can resolve: formal BLOCKED, stalled, gone (a lost
 /// worker the coordinator cannot silently resume around), and hard gate
 /// failures. A post-429 idle worker just needs a nudge, so it is excluded.
-fn owner_asks(workers: &[Value], reports: &[Value]) -> Vec<Value> {
+fn owner_asks(workers: &[Value], reports: &[Value], gate_jobs: &[Value]) -> Vec<Value> {
     let mut asks: Vec<Value> = Vec::new();
     for worker in workers {
         let name = worker["name"].clone();
@@ -268,6 +301,16 @@ fn owner_asks(workers: &[Value], reports: &[Value]) -> Vec<Value> {
             asks.push(json!({
                 "kind": "gate", "branch": report["branch"],
                 "status": report["status"], "base": report["base"],
+            }));
+        }
+    }
+    // Hub queue failures (batch 6 co-lanes).
+    for job in gate_jobs {
+        if job["state"].as_str() == Some("failed") {
+            asks.push(json!({
+                "kind": "gate", "branch": job["branch"],
+                "status": format!("{}-failed", job["mode"].as_str().unwrap_or("verify")),
+                "reason": job["error"],
             }));
         }
     }
@@ -373,6 +416,40 @@ fn write_marker(path: Option<&Path>, marker: &Value) {
 fn print_digest(digest: &Value) {
     println!("== fleet ==");
     println!("{}", digest["counts"]);
+    if let Some(sha) = digest["lastLandedSha"].as_str() {
+        println!("last landed main: {}", short(sha));
+    }
+    let active = digest["activeGateJobs"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !active.is_empty() {
+        println!("\n== gate queue ==");
+        for job in &active {
+            println!(
+                "  {} [{}] {} ({})",
+                job["branch"].as_str().unwrap_or("?"),
+                job["mode"].as_str().unwrap_or("?"),
+                job["state"].as_str().unwrap_or("?"),
+                job["laneId"].as_str().unwrap_or("-")
+            );
+        }
+    }
+    let hub_failures = digest["hubGateFailures"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if !hub_failures.is_empty() {
+        println!("\n== gate queue failures ==");
+        for job in &hub_failures {
+            println!(
+                "  {} [{}] {}",
+                job["branch"].as_str().unwrap_or("?"),
+                job["mode"].as_str().unwrap_or("?"),
+                job["error"].as_str().unwrap_or("failed")
+            );
+        }
+    }
     let landed = digest["landedSinceLastReport"]
         .as_array()
         .cloned()

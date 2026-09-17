@@ -503,7 +503,7 @@ async fn authorize_read(
 /// Resolve a Bearer token to a host, reusing the same prefix index and Argon2
 /// verification the `/v1/node` handshake uses. Returns `None` when the token
 /// is not a host token, so the device path can still run.
-async fn authenticated_host(
+pub(crate) async fn authenticated_host(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, HubError> {
@@ -513,7 +513,7 @@ async fn authenticated_host(
     Ok(state.store.find_host_by_token(token, verify_secret).await?)
 }
 
-fn map_object_error(error: StoreError) -> HubError {
+pub(crate) fn map_object_error(error: StoreError) -> HubError {
     match &error {
         StoreError::Id(message) if message.starts_with("RESOURCE_LIMIT") => {
             HubError::BadRequest(message.clone())

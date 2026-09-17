@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod fleet;
 mod gate;
 pub mod hook;
+mod host;
 mod hostcap;
 pub mod hub;
 pub mod hub_client;
@@ -72,6 +73,7 @@ commands! {
     Report(report::ReportArgs),
     Retire(retire::RetireArgs),
     Hostcap(hostcap::HostcapArgs),
+    Host(host::Args),
     Brief(brief::BriefArgs),
     Fleet(fleet::Args),
     Worktree(worktree::Args),

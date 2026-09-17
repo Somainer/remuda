@@ -343,6 +343,7 @@ async fn fake_node(
         .unwrap_or(&enroll)
         .to_owned();
     let _ = ready.send(());
+    seed_host_file_fixtures()?;
     let mut append_n = 0u64;
     // Minimal PTY harness for the xterm e2e specs. A terminal session is
     // registered on create, tty.attach returns its stable per-instance stream
@@ -1212,6 +1213,12 @@ async fn fake_node(
                 "workspace.scm.status" | "workspace.scm.diff" | "workspace.scm.file" => {
                     let result = g2_scm_answer(method, &params);
                     send_rpc_ok(&mut ws, id, result).await?;
+                }
+                "host.files.list" | "host.files.read" => {
+                    match host_files_answer(method, &params, addr, host, &durable_token).await {
+                        Ok(result) => send_rpc_ok(&mut ws, id, result).await?,
+                        Err(error) => send_rpc_error(&mut ws, id, &error.to_string()).await?,
+                    }
                 }
                 "subagent.transcript" => {
                     let agent_id = params.get("agentId").and_then(Value::as_str).unwrap_or("");
@@ -3517,4 +3524,185 @@ fn fake_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Valu
         "delivery": "not-sent",
         "resolution": { "state": "not-applicable" }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Read-only host files fixture (host-files.hub.spec.ts / evidence).
+//
+// A deliberately small, real-filesystem implementation of the two Node RPCs:
+// it lists actual seeded directories and uploads actual bytes to the Hub with
+// the durable host token, so the spec exercises the full Hub -> Node ->
+// objects -> Hub loop rather than scripted answers.
+// ---------------------------------------------------------------------------
+
+const HOST_FILES_WORKSPACE_ROOT: &str = "/tmp/remuda-e2e";
+const HOST_FILES_SECOND_ROOT: &str = "/tmp/remuda-e2e-second";
+const HOST_FILES_SCRATCH_DIR: &str = "remuda-hostfiles-e2e";
+
+/// Seed the directories the host-files spec and evidence read.
+fn seed_host_file_fixtures() -> Result<()> {
+    let root = std::path::Path::new(HOST_FILES_WORKSPACE_ROOT);
+    std::fs::create_dir_all(root.join("host-files-dir"))?;
+    std::fs::write(root.join("host-files-e2e.txt"), b"remuda host files e2e\n")?;
+    std::fs::write(
+        root.join("host-files-dir").join("inside.txt"),
+        b"nested entry\n",
+    )?;
+    let second = std::path::Path::new(HOST_FILES_SECOND_ROOT);
+    std::fs::create_dir_all(second)?;
+    std::fs::write(second.join("other.txt"), b"second workspace\n")?;
+    let scratch = std::env::temp_dir().join(HOST_FILES_SCRATCH_DIR);
+    std::fs::create_dir_all(&scratch)?;
+    std::fs::write(scratch.join("scratch.txt"), b"scratch area\n")?;
+    Ok(())
+}
+
+/// Resolve the workspace/relPath selector the same way the real Node does:
+/// lexical `..`/absolute refusal, then canonical containment under the root
+/// (or a `remuda-*` first component under /tmp).
+fn host_files_resolve(workspace_id: &str, rel_path: &str) -> Result<std::path::PathBuf> {
+    let (anchor, scratch) = match workspace_id {
+        "wsp_e2e" => (std::fs::canonicalize(HOST_FILES_WORKSPACE_ROOT)?, false),
+        "wsp_e2e_second" => (std::fs::canonicalize(HOST_FILES_SECOND_ROOT)?, false),
+        "tmp" => (std::fs::canonicalize(std::env::temp_dir())?, true),
+        other => {
+            return Err(anyhow!("workspace {other} is not registered on this Node"));
+        }
+    };
+    let rel_path = rel_path.trim();
+    let mut joined = anchor.clone();
+    if !rel_path.is_empty() {
+        let rel = std::path::Path::new(rel_path);
+        if rel.is_absolute() {
+            return Err(anyhow!(
+                "host file path must be relative to the workspace root"
+            ));
+        }
+        for component in rel.components() {
+            use std::path::Component;
+            match component {
+                Component::Normal(segment) => joined.push(segment),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(anyhow!(
+                        "host file path {rel_path} escapes the workspace: '..' is not allowed"
+                    ));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!(
+                        "host file path must be relative to the workspace root"
+                    ));
+                }
+            }
+        }
+    }
+    let canonical = std::fs::canonicalize(&joined)?;
+    if !canonical.starts_with(&anchor) {
+        return Err(anyhow!(
+            "host file path {rel_path} escapes the workspace root"
+        ));
+    }
+    if scratch
+        && !canonical
+            .strip_prefix(&anchor)?
+            .components()
+            .find_map(|component| match component {
+                std::path::Component::Normal(name) => Some(name),
+                _ => None,
+            })
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("remuda-"))
+    {
+        return Err(anyhow!(
+            "host file path {rel_path} is outside the remuda-* scratch area"
+        ));
+    }
+    Ok(canonical)
+}
+
+async fn host_files_answer(
+    method: &str,
+    params: &Value,
+    hub: SocketAddr,
+    host: &str,
+    token: &str,
+) -> Result<Value> {
+    let workspace_id = params
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let rel_path = params.get("relPath").and_then(Value::as_str).unwrap_or("");
+    let target = host_files_resolve(workspace_id, rel_path)?;
+    if method == "host.files.list" {
+        let metadata = std::fs::symlink_metadata(&target)?;
+        if !metadata.is_dir() {
+            return Err(anyhow!("{} is not a directory", target.display()));
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&target)? {
+            let entry = entry?;
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            let file_type = entry.file_type()?;
+            let kind = if file_type.is_symlink() {
+                "symlink"
+            } else if file_type.is_dir() {
+                "dir"
+            } else if file_type.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::MetadataExt;
+                meta.mode() & 0o7777
+            };
+            #[cfg(not(unix))]
+            let mode = 0u32;
+            let mtime = meta
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            entries.push(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "kind": kind,
+                "size": meta.len(),
+                "mtime": mtime,
+                "mode": mode,
+            }));
+        }
+        entries.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        return Ok(json!({
+            "workspaceId": workspace_id,
+            "path": target.display().to_string(),
+            "entries": entries,
+        }));
+    }
+    // host.files.read: regular files only, then a real upload to the Hub.
+    let metadata = std::fs::symlink_metadata(&target)?;
+    if !metadata.file_type().is_file() {
+        return Err(anyhow!("{} is not a regular file", target.display()));
+    }
+    let bytes = std::fs::read(&target)?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("host-file");
+    let response = reqwest::Client::new()
+        .post(format!("http://{hub}/v1/hosts/{host}/files/objects"))
+        .bearer_auth(token)
+        .header("Content-Type", "application/octet-stream")
+        .query(&[("name", name)])
+        .body(bytes)
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "Hub refused host file staging with {status}: {text}"
+        ));
+    }
+    Ok(serde_json::from_str::<Value>(&text)?)
 }

@@ -98,6 +98,9 @@ pub(crate) struct DevNodeInner {
     /// with no Hub link, where a send carrying attachments is refused rather
     /// than silently downgraded to text.
     pub(crate) objects: std::sync::RwLock<Option<Arc<dyn crate::attachments::ObjectSource>>>,
+    /// Uploader for read-only host-file fetches (D-031-era host files slice).
+    /// `None` until the outbound link gives us a Hub HTTP origin and token.
+    pub(crate) host_file_stager: std::sync::RwLock<Option<Arc<dyn crate::files::HostFileStager>>>,
     /// Root for materialized attachments. Set by `compose` from the Node data
     /// dir; `None` on an in-memory Node, where attachments are refused.
     pub(crate) attachment_root: std::sync::RwLock<Option<std::path::PathBuf>>,
@@ -178,6 +181,7 @@ impl DevNode {
                 mutations: Default::default(),
                 herdr_config: None,
                 objects: std::sync::RwLock::new(None),
+                host_file_stager: std::sync::RwLock::new(None),
                 attachment_root: std::sync::RwLock::new(None),
                 queue_capacity: config.instance_queue_capacity,
                 host,

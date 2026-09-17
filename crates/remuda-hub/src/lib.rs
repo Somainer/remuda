@@ -20,6 +20,7 @@ mod devices;
 mod error;
 mod fleet;
 mod gatequeue;
+mod host_files;
 mod hosts;
 mod http;
 mod instances;
@@ -506,6 +507,7 @@ pub fn router(state: AppState) -> Router {
         .merge(supply::routes())
         .merge(agent_scope::routes())
         .merge(objects::routes(state.config.attachment_max_bytes))
+        .merge(host_files::routes(state.config.attachment_max_bytes))
         .merge(attachments::routes())
         .merge(workspaces::routes())
         .merge(workers::routes())

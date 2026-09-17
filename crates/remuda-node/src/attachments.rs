@@ -123,7 +123,7 @@ impl HubObjectSource {
 }
 
 /// Map the Hub dial URL onto its HTTP origin: `wss://h/v1/node` -> `https://h`.
-fn http_base(ws_url: &str) -> Result<String, NodeError> {
+pub(crate) fn http_base(ws_url: &str) -> Result<String, NodeError> {
     let trimmed = ws_url.trim().trim_end_matches('/');
     let (scheme, rest) = if let Some(rest) = trimmed.strip_prefix("wss://") {
         ("https", rest)

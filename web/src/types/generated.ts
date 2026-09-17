@@ -1269,6 +1269,42 @@ export type HostEnv = ({
   [key: string]: unknown;
 });
 
+/** One directory entry returned by `host.files.list`. */
+export type HostFileEntry = ({
+  "kind": HostFileKind;
+  "mode": (number);
+  "mtime": (number);
+  "name": (string);
+  "size": (number);
+  [key: string]: unknown;
+});
+
+/** Kind of one [`HostFileEntry`], from `lstat` (symlinks are not followed). */
+export type HostFileKind = ("file" | "dir" | "symlink" | "other");
+
+/** `host.files.read` result. Bytes stay behind `GET /v1/objects/{objectId}`. */
+export type HostFileReadResult = ({
+  "digest": (string);
+  "objectId": (string);
+  "size": (number);
+  [key: string]: unknown;
+});
+
+/** `host.files.list` result: the canonical directory and its entries. */
+export type HostFilesListResult = ({
+  "entries": ((HostFileEntry)[]);
+  "path": (string);
+  "workspaceId": (string);
+  [key: string]: unknown;
+});
+
+/** Shared selector for the read-only host-file RPCs: a registered workspace plus a workspace-relative path. */
+export type HostFilesParams = ({
+  "relPath"?: (string | null);
+  "workspaceId": (string);
+  [key: string]: unknown;
+});
+
 export type HostId = (string);
 
 /** HostParams; `protocol.md` §7.2. */

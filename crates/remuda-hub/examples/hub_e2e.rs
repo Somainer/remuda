@@ -535,7 +535,7 @@ async fn fake_node(
                                 "name": tier,
                                 "ultracode": ultra,
                                 "source": "slash",
-                                "observedAt": "2026-09-14T12:00:00.000Z"
+                                "observedAt": monotonic_effort_observed_at()
                             },
                             "raw": tier
                         }),
@@ -722,7 +722,7 @@ async fn fake_node(
                         // ultracode reads back as tier xhigh on Claude; a
                         // clamped max reads back xhigh too.
                         let tier = if clamped || ultra { "xhigh" } else { requested };
-                        let observed_at = "2026-09-14T12:00:00.000Z";
+                        let observed_at = monotonic_effort_observed_at();
                         let event = json!({
                             "kind": "effort",
                             "completeness": "structured",
@@ -1642,7 +1642,41 @@ fn workflow_kind(prompt: &str) -> Option<&'static str> {
     })
 }
 
-/// Append one arbitrary observation and drain its RPC result.
+/// Strictly increasing millisecond RFC3339 timestamp for effort read-back
+/// events.
+///
+/// The web store folds `effort` observations newest-wins by `observedAt` and
+/// discards an observation older than the current one. Consecutive switches
+/// (ultracode → high → ultracode) can land in the same millisecond, so a real
+/// clock could make the second event look older. This stamps each event with
+/// at least the current millisecond and a strictly greater value than the
+/// previous one, keeping the exact `YYYY-MM-DDTHH:MM:SS.mmmZ` shape the wire
+/// Timestamp type requires.
+fn monotonic_effort_observed_at() -> String {
+    use std::sync::Mutex;
+    static LAST_MS: Mutex<i128> = Mutex::new(0);
+    let mut last = LAST_MS.lock().expect("effort observed_at lock");
+    let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    let ms = now_ms.max(*last + 1);
+    *last = ms;
+    drop(last);
+    // Format by hand: the wire Timestamp type requires exactly
+    // `YYYY-MM-DDTHH:MM:SS.mmmZ`, while Rfc3339 strips trailing-zero digits
+    // (`.790` renders as `.79`).
+    let t = time::OffsetDateTime::from_unix_timestamp_nanos(ms * 1_000_000)
+        .expect("millisecond in range");
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond(),
+    )
+}
+
 /// Append an `instance.configure` native lifecycle with the given status
 /// (`effort-queued:<word>` / `effort-degraded:<word>:<reason>` / …).
 async fn append_configure_status(

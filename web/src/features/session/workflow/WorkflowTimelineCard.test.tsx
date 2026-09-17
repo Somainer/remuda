@@ -1,8 +1,13 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it } from "vitest";
 import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload, WorkflowState } from "../../../types/generated";
 import { WorkflowTimelineCard } from "./WorkflowTimelineCard";
+
+function renderCard(element: React.ReactElement) {
+  return render(<MemoryRouter initialEntries={["/s/inst_test"]}>{element}</MemoryRouter>);
+}
 
 const known = <T,>(value: T) => ({ state: "known" as const, value });
 const unknownK = { state: "unknown" as const, reason: "not-emitted", evidenceEventIds: [] };
@@ -75,7 +80,7 @@ async function openCardAndPhase() {
 
 describe("WorkflowTimelineCard", () => {
   it("expands while running and shows the live line", () => {
-    render(
+    renderCard(
       <WorkflowTimelineCard
         run={run()}
         phases={[phase()]}
@@ -94,15 +99,17 @@ describe("WorkflowTimelineCard", () => {
       member({ memberId: "a", state: "running", label: known("a"), durationMs: u(130_000), tokens: u(48_000) }),
       member({ memberId: "b", state: "running", label: known("b"), durationMs: u(108_000), tokens: u(39_000) }),
     ];
-    const { rerender } = render(<WorkflowTimelineCard run={run()} phases={[phase()]} members={members} />);
+    const { rerender } = renderCard(<WorkflowTimelineCard run={run()} phases={[phase()]} members={members} />);
     const card = screen.getByTestId("workflow-card");
     expect(card.querySelector("button")).toHaveAttribute("aria-expanded", "true");
     rerender(
-      <WorkflowTimelineCard
-        run={run({ state: "completed" })}
-        phases={[phase("p1", "Review", "completed")]}
-        members={members.map((m) => ({ ...m, state: "completed" }))}
-      />,
+      <MemoryRouter initialEntries={["/s/inst_test"]}>
+        <WorkflowTimelineCard
+          run={run({ state: "completed" })}
+          phases={[phase("p1", "Review", "completed")]}
+          members={members.map((m) => ({ ...m, state: "completed" }))}
+        />
+      </MemoryRouter>,
     );
     // Collapsed: header summary shows agents.
     const head = screen.getByTestId("workflow-card").querySelector("button")!;
@@ -113,7 +120,7 @@ describe("WorkflowTimelineCard", () => {
   });
 
   it("renders killed as 已终止", () => {
-    render(
+    renderCard(
       <WorkflowTimelineCard
         run={run({ state: "cancelled" })}
         phases={[phase("p1", "Verify", "cancelled")]}
@@ -127,7 +134,7 @@ describe("WorkflowTimelineCard", () => {
     const agents = Array.from({ length: 20 }, (_, i) =>
       member({ memberId: `m${i}`, label: known(`gen:${String(i).padStart(2, "0")}`), state: "completed" }),
     );
-    render(<WorkflowTimelineCard run={run({ state: "completed" })} phases={[phase()]} members={agents} />);
+    renderCard(<WorkflowTimelineCard run={run({ state: "completed" })} phases={[phase()]} members={agents} />);
     await openCardAndPhase();
     const toggle = screen.getByText(/还有 8 个/);
     const rowsBefore = screen.getAllByTestId("workflow-agent");
@@ -141,7 +148,7 @@ describe("WorkflowTimelineCard", () => {
       ...Array.from({ length: 14 }, (_, i) => member({ memberId: `d${i}`, label: known(`d:${i}`), state: "completed" })),
       member({ memberId: "boom", label: known("review:boom"), state: "failed" }),
     ];
-    render(<WorkflowTimelineCard run={run({ state: "failed" })} phases={[phase()]} members={agents} />);
+    renderCard(<WorkflowTimelineCard run={run({ state: "failed" })} phases={[phase()]} members={agents} />);
     await openCardAndPhase();
     expect(screen.getByText("review:boom")).toBeTruthy();
     const failedRow = screen.getByText("review:boom").closest("[data-state]")!;
@@ -149,7 +156,7 @@ describe("WorkflowTimelineCard", () => {
   });
 
   it("shows the attempt marker as ×2", async () => {
-    render(
+    renderCard(
       <WorkflowTimelineCard
         run={run({ state: "completed" })}
         phases={[phase()]}
@@ -161,7 +168,7 @@ describe("WorkflowTimelineCard", () => {
   });
 
   it("degrades to a flat row with a note when there is no detail", () => {
-    render(<WorkflowTimelineCard run={run({ note: "daemon 版本较旧，暂无阶段明细" })} phases={[]} members={[]} />);
+    renderCard(<WorkflowTimelineCard run={run({ note: "daemon 版本较旧，暂无阶段明细" })} phases={[]} members={[]} />);
     const card = screen.getByTestId("workflow-card-flat");
     expect(card.textContent).toContain("阶段明细");
     expect(within(card).queryByTestId("workflow-agent")).toBeNull();

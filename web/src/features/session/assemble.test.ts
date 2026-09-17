@@ -547,3 +547,171 @@ describe("stable content identity (batch E)", () => {
     expect(isToolFailure(nodes[0]!)).toBe(true);
   });
 });
+
+describe("assembleTranscript · c-wfdrill subagent grouping", () => {
+  const wfId = "wf_run1" as Id;
+  const wfToolCallId = "toolu_wf_launch" as Id;
+  const agentA = "aae139d44933cefe2";
+
+  function agentObs(seq: number, kind: "tool_call" | "tool_result", payload: unknown, agentId?: string): Observation {
+    const base = obs(seq, kind, payload);
+    if (agentId) {
+      base.source = { ...base.source, channel: "hook", nativeAgentId: known(agentId) };
+    } else {
+      base.source = { ...base.source, channel: "hook" };
+    }
+    return base;
+  }
+
+  function workflowEvents(seqBase: number): Observation[] {
+    return [
+      agentObs(seqBase, "tool_call", { ...call("Workflow", wfToolCallId), category: "workflow" }),
+      obs(seqBase + 1, "workflow.run", {
+        workflowId: wfId,
+        engine: "claude-workflow",
+        nativeRunId: known("wf_x"),
+        nativeTaskId: known("task-1"),
+        toolCallId: wfToolCallId,
+        state: "running",
+        revision: "1",
+        title: known("two-phase"),
+        resultRef: null,
+      }),
+      obs(seqBase + 2, "workflow.phase", {
+        workflowId: wfId,
+        phaseId: "ph1" as Id,
+        nativePhaseId: known("Review"),
+        label: known("Review"),
+        state: "running",
+        revision: "1",
+        parentPhaseId: null,
+      }),
+      obs(seqBase + 3, "workflow.member", {
+        workflowId: wfId,
+        memberId: "mem_a" as Id,
+        nativeAgentId: known(agentA),
+        nativeKey: known("key-a"),
+        attempt: known("1"),
+        phaseId: "ph1" as Id,
+        label: known("review:security"),
+        state: "running",
+        modelRequested: known("claude-opus-5"),
+        modelResolved: known("claude-opus-5"),
+        resultRef: null,
+        revision: "1",
+        latestTool: known("Bash"),
+        tokens: "1000",
+        calls: "1",
+        durationMs: null,
+        startedAt: null,
+        endedAt: null,
+      }),
+    ];
+  }
+
+  it("folds a workflow member's own tool calls under the Workflow row", () => {
+    const events = [
+      ...workflowEvents(1),
+      // Member agent's own Bash call, interleaved in the main hook stream.
+      agentObs(
+        6,
+        "tool_call",
+        { ...call("Bash", "toolu_member_bash"), executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: known(agentA) }) },
+        agentA,
+      ),
+      agentObs(
+        7,
+        "tool_result",
+        {
+          nodeId: "n" as Id, revision: "1", operation: "close", baseRevision: null,
+          toolCallId: "toolu_member_bash" as Id, stage: "final", outcome: "succeeded",
+          blocks: [{ type: "text", text: "pong" }], structuredResult: known({ stdout: "pong" }),
+          exitCode: known(0), changes: [],
+        },
+        agentA,
+      ),
+    ];
+    const nodes = assembleTranscript(events);
+    // The member's Bash row is not at top level.
+    expect(nodes.some((n) => n.id === "toolu_member_bash")).toBe(false);
+    const wfTool = nodes.find((n) => n.type === "tool" && n.id === wfToolCallId);
+    expect(wfTool?.type).toBe("tool");
+    if (wfTool?.type !== "tool") throw new Error("workflow tool row");
+    const bucket = wfTool.workflow?.subagents?.find((s) => s.agentId === agentA);
+    expect(bucket?.kind).toBe("workflow-member");
+    expect(bucket?.nodes.map((n) => n.name)).toEqual(["Bash"]);
+    expect(bucket?.nodes[0]?.result?.outcome).toBe("succeeded");
+  });
+
+  it("keeps main-agent turns and tools at top level when no agent id is present", () => {
+    const events = [
+      ...workflowEvents(1),
+      agentObs(6, "tool_call", call("Bash", "toolu_main")),
+      agentObs(
+        7,
+        "tool_result",
+        {
+          nodeId: "n" as Id, revision: "1", operation: "close", baseRevision: null,
+          toolCallId: "toolu_main" as Id, stage: "final", outcome: "succeeded",
+          blocks: [], structuredResult: known({}), exitCode: known(0), changes: [],
+        },
+      ),
+    ];
+    const nodes = assembleTranscript(events);
+    const main = nodes.find((n) => n.id === "toolu_main");
+    expect(main?.type).toBe("tool");
+    const wfTool = nodes.find((n) => n.type === "tool" && n.id === wfToolCallId);
+    expect(wfTool?.type === "tool" && (wfTool.workflow?.subagents ?? []).length).toBe(0);
+  });
+
+  it("folds a background Task's completion under the parent Task row", () => {
+    const taskToolId = "toolu_task_bg";
+    // Hook fold stamps parentToolCallId on the subagent's own observations.
+    const memberCall = {
+      ...call("Read", "toolu_sub_read"),
+      parentToolCallId: taskToolId as Id,
+      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: known("sub1") }),
+    };
+    const events = [
+      agentObs(1, "tool_call", call("Task", taskToolId)),
+      agentObs(
+        2,
+        "tool_result",
+        {
+          nodeId: "n" as Id, revision: "3", operation: "close", baseRevision: "2",
+          toolCallId: taskToolId as Id, stage: "partial", outcome: "succeeded",
+          blocks: [], structuredResult: known({ isAsync: true, status: "async_launched", agentId: "sub1" }),
+          exitCode: unknownKnowledge("none"), changes: [],
+        },
+      ),
+      agentObs(3, "tool_call", memberCall, "sub1"),
+      agentObs(
+        4,
+        "tool_result",
+        {
+          nodeId: "n" as Id, revision: "1", operation: "close", baseRevision: null,
+          toolCallId: "toolu_sub_read" as Id, stage: "final", outcome: "succeeded",
+          blocks: [{ type: "text", text: "file contents" }], structuredResult: known({}),
+          exitCode: known(0), changes: [],
+        },
+        "sub1",
+      ),
+    ];
+    const nodes = assembleTranscript(events);
+    expect(nodes.some((n) => n.id === "toolu_sub_read")).toBe(false);
+    const parent = nodes.find((n) => n.id === taskToolId);
+    expect(parent?.type).toBe("tool");
+    if (parent?.type !== "tool") throw new Error("task row");
+    const bucket = parent.subagents?.find((s) => s.agentId === "sub1");
+    expect(bucket?.kind).toBe("agent");
+    expect(bucket?.nodes.map((n) => n.name)).toEqual(["Read"]);
+  });
+
+  it("leaves an unattributed subagent row top level rather than guessing a parent", () => {
+    // A subagent tool event with no matching workflow member or Task parent.
+    const orphan = agentObs(1, "tool_call", call("Bash", "toolu_orphan"), "ghost123");
+    const nodes = assembleTranscript([orphan]);
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]?.id).toBe("toolu_orphan");
+  });
+});

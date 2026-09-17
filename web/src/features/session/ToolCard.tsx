@@ -240,6 +240,8 @@ export function ToolCard({
     run: WorkflowRunPayload;
     phases: WorkflowPhasePayload[];
     members: WorkflowMemberPayload[];
+    /** c-wfdrill: per-member folded live tool rows. */
+    subagents?: import("./assemble").SubagentRef[];
   };
   defaultFolded?: boolean;
   settle?: boolean;
@@ -272,7 +274,12 @@ export function ToolCard({
     ) : family === "Workflow" && workflow ? (
       // r-ux-w: the timeline card hangs directly on this tool row, visible by
       // default; the presenter card is the fallback when no run data exists.
-      <WorkflowTimelineCard run={workflow.run} phases={workflow.phases} members={workflow.members} />
+      <WorkflowTimelineCard
+        run={workflow.run}
+        phases={workflow.phases}
+        members={workflow.members}
+        subagents={workflow.subagents}
+      />
     ) : family === "MCP" ? (
       <McpCard call={call} result={shown} />
     ) : (

@@ -32,6 +32,7 @@ pub mod signal;
 pub mod signal_messages;
 mod stdio;
 mod store;
+pub mod subagent;
 mod transport;
 mod tty;
 mod worker;

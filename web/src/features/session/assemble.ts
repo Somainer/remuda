@@ -20,6 +20,29 @@ import { mountLiveThinking } from "./live/liveThinking";
 
 export type DiffState = "proposed" | "applied" | "unknown";
 
+/**
+ * One subagent's folded activity under a parent row.
+ *
+ * Subagents (Workflow members and plain Agent/Task tasks) are Claude
+ * sub-sessions inside the SAME Remuda session — never Remuda instances — so
+ * their own tool calls must not be flattened into the main transcript. The
+ * assembler folds every tool observation whose `nativeAgentId` names a
+ * subagent into that ref, keyed by the native agent id:
+ *
+ * - workflow members join via `workflow.member.nativeAgentId`;
+ * - plain tasks join via the Task launch's `parentToolCallId` stamped by the
+ *   hook fold (background agentId on the launch result, foreground bound at
+ *   SubagentStart).
+ */
+export type SubagentRef = {
+  /** Native agent id; also the drill-in route key. */
+  agentId: string;
+  /** "workflow-member" rows live inside the workflow card; "agent" under Task. */
+  kind: "workflow-member" | "agent";
+  /** The subagent's own tool rows, in journal order. */
+  nodes: ToolNode[];
+};
+
 export type ToolNode = {
   type: "tool";
   id: string;
@@ -31,6 +54,17 @@ export type ToolNode = {
   completeness: Observation["completeness"];
   diffState: DiffState;
   /**
+   * Native agent id when THIS tool observation was made by a subagent (its
+   * hook events carried `agent_id`). Such a node is folded under its parent
+   * instead of staying at the top level.
+   */
+  agentId?: string;
+  /**
+   * Folded subagent activity for a plain Task/Agent parent row. Workflow
+   * members instead ride {@link ToolNode.workflow}.
+   */
+  subagents?: SubagentRef[];
+  /**
    * r-ux-w: workflow timeline data mounted on this tool row when the
    * `workflow.run` observation named this tool call. Batch W owns
    * WorkflowTimelineCard; this hook is the only seam into the E-owned file.
@@ -39,6 +73,8 @@ export type ToolNode = {
     run: WorkflowRunPayload;
     phases: WorkflowPhasePayload[];
     members: WorkflowMemberPayload[];
+    /** c-wfdrill: per-member folded live tool rows. */
+    subagents?: SubagentRef[];
   };
 };
 
@@ -293,6 +329,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       const name = knowledgeValue(call.toolName) ?? "tool";
       const existing = tools.get(call.toolCallId);
       if (!newerMutation(call, existing?.call)) continue;
+      const agentId = knowledgeValue(ev.source.nativeAgentId) ?? existing?.agentId;
       const node: ToolNode = {
         type: "tool",
         id: call.toolCallId,
@@ -303,6 +340,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
         result: existing?.result ?? null,
         completeness: ev.completeness,
         diffState: diffState(call, existing?.result ?? null, ev.completeness),
+        ...(agentId ? { agentId } : {}),
       };
       if (existing) {
         existing.call = call.operation === "append" ? {
@@ -314,6 +352,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
         existing.family = node.family;
         existing.completeness = ev.completeness;
         existing.diffState = diffState(call, existing.result, ev.completeness);
+        if (agentId) existing.agentId = agentId;
       } else {
         pushTool(node);
         anchor(node, ev);
@@ -491,7 +530,76 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   // the authoritative transcript message in the projection (design §2.3).
   // The screen-tier "thinking" hint is the one other live mount: a collapsed
   // thought row while the spinner phrase says reasoning is in progress.
-  return supersedeStreamed(mountLiveThinking(nodes, events), events);
+  // Subagent tool activity is then folded UNDER the Task / workflow-member
+  // parent instead of being flattened into the main transcript.
+  return groupSubagentTools(supersedeStreamed(mountLiveThinking(nodes, events), events));
+}
+
+/**
+ * Move every top-level tool node a subagent produced under its parent row.
+ *
+ * Identity, in priority order:
+ * 1. the typed `parentToolCallId` the hook fold stamps on a subagent's tool
+ *    call (plain Task/Agent launch — background agentId is known at the launch
+ *    result, foreground binds at SubagentStart);
+ * 2. a workflow member's `nativeAgentId`, which joins the Workflow tool row
+ *    the run is mounted on.
+ *
+ * A node whose agent matches neither stays top-level: grouping is an
+ * evidence-backed projection, never a guess.
+ */
+export function groupSubagentTools(nodes: TranscriptNode[]): TranscriptNode[] {
+  const topTools = new Map<string, ToolNode>();
+  for (const node of nodes) {
+    if (node.type === "tool") topTools.set(node.id, node);
+  }
+  // agentId -> Workflow tool row, from mounted member identity.
+  const workflowParent = new Map<string, ToolNode>();
+  for (const node of topTools.values()) {
+    for (const member of node.workflow?.members ?? []) {
+      const id = knowledgeValue(member.nativeAgentId);
+      if (id) workflowParent.set(id, node);
+    }
+  }
+
+  const removed = new Set<ToolNode>();
+  for (const node of nodes) {
+    if (node.type !== "tool" || !node.agentId) continue;
+    const linkedParent = node.call.parentToolCallId
+      ? topTools.get(node.call.parentToolCallId)
+      : undefined;
+    const memberParent = workflowParent.get(node.agentId);
+    const parent = linkedParent ?? memberParent;
+    if (!parent || parent === node) continue;
+    const kind: SubagentRef["kind"] = linkedParent ? "agent" : "workflow-member";
+    if (kind === "agent") {
+      const holder = (parent.subagents ??= []);
+      let bucket = holder.find((entry) => entry.agentId === node.agentId);
+      if (!bucket) {
+        bucket = { agentId: node.agentId, kind, nodes: [] };
+        holder.push(bucket);
+      }
+      bucket.nodes.push(node);
+    } else if (parent.workflow) {
+      const holder = (parent.workflow.subagents ??= []);
+      let bucket = holder.find((entry) => entry.agentId === node.agentId);
+      if (!bucket) {
+        bucket = { agentId: node.agentId, kind, nodes: [] };
+        holder.push(bucket);
+      }
+      bucket.nodes.push(node);
+    }
+    removed.add(node);
+  }
+  if (removed.size === 0) return nodes;
+  return nodes.filter((node) => !(node.type === "tool" && removed.has(node)));
+}
+
+/** Every tool row nested under a parent (Task children / workflow members). */
+export function subagentToolNodes(node: TranscriptNode): ToolNode[] {
+  if (node.type !== "tool") return [];
+  const refs = [...(node.subagents ?? []), ...(node.workflow?.subagents ?? [])];
+  return refs.flatMap((ref) => ref.nodes);
 }
 
 /**

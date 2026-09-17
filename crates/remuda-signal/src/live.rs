@@ -150,6 +150,15 @@ pub struct LiveState {
     /// `Partial` result (the subagent keeps running); a matching
     /// `SubagentStop` — or the transcript's task-notification — closes it.
     bg_agents: std::collections::HashMap<String, String>,
+    /// Foreground (blocking) Task launches keyed the same way, so the
+    /// subagent's own tool observations can name the parent row they fold
+    /// under. Populated at `SubagentStart`, which names the agent while the
+    /// launch call is still open.
+    fg_agents: std::collections::HashMap<String, String>,
+    /// Native ids of Task calls opened but not yet claimed by a
+    /// `SubagentStart` (most recent open is the parent a new foreground
+    /// subagent belongs to).
+    fg_open: Vec<String>,
     /// Native tool ids holding a background launch whose row is still running.
     bg_open: HashSet<String>,
     /// The phase currently latched, so a repeated hook is not a new transition.
@@ -195,6 +204,12 @@ impl LiveState {
         if event.name == "SubagentStop" {
             return self.subagent_stop(event, allowed);
         }
+        // SubagentStart binds a foreground subagent to its still-open Task
+        // launch so the member's tool rows can group under the parent. It is
+        // never turn evidence and emits no content of its own.
+        if event.name == "SubagentStart" {
+            return self.subagent_start(event, allowed);
+        }
         let Some(phase) = phase(event, mapped.kind) else {
             return LiveFold::default();
         };
@@ -205,6 +220,7 @@ impl LiveState {
                 // groups only; each submit is its own transition.
                 self.open.clear();
                 self.finished.clear();
+                self.fg_open.clear();
                 self.last_prompt_id = event.text("prompt_id").map(ToOwned::to_owned);
                 self.phase_tags(event, phase, now, None, &mut fold.related);
                 // Every submit is its own transition even when queued prompts
@@ -265,6 +281,15 @@ impl LiveState {
                     fold.extras.push(payload);
                 }
                 self.open.insert(native_id.to_owned());
+                // A Task/Agent launch stays open across the whole subagent
+                // run (foreground blocks; background is detected at finish).
+                // Remember it so the next SubagentStart can claim its parent.
+                if matches!(event.text("tool_name"), Some("Task" | "Agent")) {
+                    if let Some(at) = self.fg_open.iter().rposition(|id| id == native_id) {
+                        self.fg_open.remove(at);
+                    }
+                    self.fg_open.push(native_id.to_owned());
+                }
                 fold.transition = self.latch(phase, now);
             }
             MappedKind::ToolFinished | MappedKind::ToolFailed => {
@@ -354,13 +379,48 @@ impl LiveState {
             // and remember the agentId so a later SubagentStop closes it.
             self.bg_agents.insert(agent_id, native_id.to_owned());
             self.bg_open.insert(native_id.to_owned());
+            // Background launches are claimed by agentId at finish, not by the
+            // SubagentStart parent bind.
+            if let Some(at) = self.fg_open.iter().rposition(|id| id == native_id) {
+                self.fg_open.remove(at);
+            }
             // Do NOT add to `finished`: another result (SubagentStop /
             // task-notification transcript fold) must close this node.
             fold.transition = self.latch(phase, now);
             return;
         }
+        // A synchronous Task finish: the foreground run already bound the
+        // agent at SubagentStart; the launch id no longer waits to be claimed.
+        if matches!(tool_name, Some("Task" | "Agent"))
+            && let Some(at) = self.fg_open.iter().rposition(|id| id == native_id)
+        {
+            self.fg_open.remove(at);
+        }
         self.finished.insert(native_id.to_owned());
         fold.transition = self.latch(phase, now);
+    }
+
+    /// Bind a foreground subagent to its still-open Task launch.
+    ///
+    /// Workflow members are not bound here: their `workflow-subagent`
+    /// launches run under the Workflow tool and the journal joins member
+    /// identity instead. Emits nothing — the start is diagnostic, the
+    /// subagent's own tool hooks carry every content row.
+    fn subagent_start(&mut self, event: &HookEvent, allowed: bool) -> LiveFold {
+        let fold = LiveFold::default();
+        if !allowed {
+            return fold;
+        }
+        let Some(agent_id) = event.text("agent_id") else {
+            return fold;
+        };
+        if event.text("agent_type") == Some("workflow-subagent") {
+            return fold;
+        }
+        if let Some(native_id) = self.fg_open.pop() {
+            self.fg_agents.insert(agent_id.to_owned(), native_id);
+        }
+        fold
     }
 
     /// Fold a `SubagentStop` into the background task row it closes.
@@ -379,10 +439,12 @@ impl LiveState {
         };
         let Some(native_id) = self.bg_agents.remove(agent_id) else {
             // A foreground subagent's SubagentStop also fires, but its row was
-            // closed normally by the launch result; nothing to do.
+            // closed normally by the launch result; only clear the bind.
+            self.fg_agents.remove(agent_id);
             return fold;
         };
         self.bg_open.remove(&native_id);
+        self.fg_agents.remove(agent_id);
         self.finished.insert(native_id.clone());
         fold.extras
             .push(self.subagent_result(&native_id, agent_id, event));
@@ -455,6 +517,18 @@ impl LiveState {
     ) -> Option<ObservationPayload> {
         let node = tool_node_id(&self.scope, native_id)?;
         let name = tool_name.unwrap_or("unknown");
+        // A subagent's own tool call names the Task launch it runs under, so
+        // the web folds the row under its parent instead of flattening it into
+        // the main transcript. Background launches register the agent at their
+        // async result; foreground ones bind at SubagentStart.
+        let parent_node = event
+            .text("agent_id")
+            .and_then(|agent| {
+                self.bg_agents
+                    .get(agent)
+                    .or_else(|| self.fg_agents.get(agent))
+            })
+            .and_then(|parent| tool_node_id(&self.scope, parent));
         Some(ObservationPayload::ToolCall(Box::new(ToolCallPayload {
             mutation: NodeMutation {
                 node_id: node.clone(),
@@ -463,7 +537,7 @@ impl LiveState {
                 base_revision: None,
             },
             tool_call_id: node,
-            parent_tool_call_id: None,
+            parent_tool_call_id: parent_node,
             tool_name: knowledge(name.to_owned()),
             display_title: knowledge(name.to_owned()),
             category: tool_category(name),

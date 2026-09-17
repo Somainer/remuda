@@ -1,7 +1,9 @@
 import { useLayoutEffect, useRef, useState } from "react";
+import { Link, useParams } from "react-router-dom";
 import type { ToolNode } from "./assemble";
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString } from "../../lib/format";
+import { subagentHref } from "./subagent/SubagentRows";
 import css from "./session.module.css";
 import uiCss from "./transcript.module.css";
 
@@ -46,7 +48,18 @@ function TaskPrompt({ text }: { text: string }) {
   );
 }
 
+/** Resolve the spawned subagent's native id when the launch reported one. */
+function taskAgentId(task: ToolNode): string | undefined {
+  const folded = task.subagents?.[0]?.agentId;
+  if (folded) return folded;
+  // Background launch results carry `{isAsync, agentId}` in the structured result.
+  const structured = task.result?.structuredResult;
+  const result = structured ? asRecord(knowledgeValue(structured)) : null;
+  return asString(result?.agentId) ?? asString(result?.agent_id) ?? undefined;
+}
+
 export function TaskTrack({ tasks }: { tasks: ToolNode[] }) {
+  const { instanceId = "" } = useParams();
   if (!tasks.length) return null;
   return (
     <aside data-testid="task-track" className={css.track}>
@@ -63,6 +76,7 @@ export function TaskTrack({ tasks }: { tasks: ToolNode[] }) {
           const running = !task.result || task.result.stage !== "final";
           const failed = task.result?.outcome === "failed" || task.result?.outcome === "denied";
           const outcomeAttr = background ? "background" : (task.result?.outcome ?? "running");
+          const agentId = taskAgentId(task);
           return (
             <li key={task.id} data-testid="task-track-item" data-task-outcome={outcomeAttr}>
               <TaskPrompt text={taskPrompt(task)} />
@@ -74,6 +88,15 @@ export function TaskTrack({ tasks }: { tasks: ToolNode[] }) {
                     ? "running"
                     : (task.result?.outcome ?? "unknown")}
               </span>
+              {agentId ? (
+                <Link
+                  className={css.openBtn}
+                  to={subagentHref(instanceId, agentId)}
+                  data-testid="task-track-open"
+                >
+                  打开
+                </Link>
+              ) : null}
             </li>
           );
         })}

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { assembleTranscript, collectTasks, compactTranscript } from "./assemble";
-import { memberChildInstanceId } from "./workflow";
 import { mapTaskEvents, mapWorkflowJournal, type NativeTaskEvent, type NativeWorkflowLine } from "./workflowMap";
 import { usageLine } from "./usage";
 import { known, unknownKnowledge } from "../../types/wire";
@@ -25,7 +24,6 @@ describe("workflow journal fixture (control-plane §4)", () => {
     if (wf?.type !== "workflow") return;
     expect(wf.run.state).toBe("completed");
     expect(wf.members.some((m) => m.state === "completed")).toBe(true);
-    expect(wf.members.every((m) => memberChildInstanceId(m) == null)).toBe(true);
   });
 });
 

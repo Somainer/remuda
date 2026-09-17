@@ -1,7 +1,7 @@
-import { Link } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload } from "../../types/generated";
 import { knowledgeValue } from "../../types/command";
-import { memberChildInstanceId } from "./workflow";
+import { subagentHref } from "./subagent/SubagentRows";
 import css from "./session.module.css";
 
 export function WorkflowTree({
@@ -14,7 +14,6 @@ export function WorkflowTree({
   members: WorkflowMemberPayload[];
 }) {
   const open = run.state === "running" || run.state === "failed" || run.state === "unknown";
-  const unphased = members.filter((m) => !m.phaseId || !phases.some((p) => p.phaseId === m.phaseId));
   const running = run.state === "running";
   return (
     <details className={css.tool} open={open} data-testid="workflow-tree">
@@ -23,8 +22,7 @@ export function WorkflowTree({
         <span className={css.path}>{knowledgeValue(run.nativeRunId) ?? run.workflowId}</span>
         <span className={css.toolStatus}>
           {running ? <span className={css.runDot} /> : <span className={css.okDot} />}
-          {knowledgeValue(run.title) ?? run.state}
-          {running ? " · 默认展开" : ""}
+          {memberStateText(run.state)}
         </span>
         <span className={css.spacer} />
         <span className={css.stat}>只画身份与状态，log 进原始事件</span>
@@ -37,7 +35,6 @@ export function WorkflowTree({
               <div className={css.wfPhase}>
                 <span>▾</span>
                 <span>{knowledgeValue(phase.label) ?? phase.phaseId}</span>
-                <span className={css.stat}>· {phaseMembers.length} members</span>
               </div>
               <ul className={css.wfMembers}>
                 {phaseMembers.map((m) => (
@@ -47,9 +44,9 @@ export function WorkflowTree({
             </div>
           );
         })}
-        {unphased.length ? (
+        {unphasedMembers(phases, members).length ? (
           <ul className={css.wfMembers}>
-            {unphased.map((m) => (
+            {unphasedMembers(phases, members).map((m) => (
               <MemberRow key={m.memberId} member={m} />
             ))}
           </ul>
@@ -59,27 +56,39 @@ export function WorkflowTree({
   );
 }
 
+function unphasedMembers(phases: WorkflowPhasePayload[], members: WorkflowMemberPayload[]): WorkflowMemberPayload[] {
+  return members.filter((m) => !m.phaseId || !phases.some((p) => p.phaseId === m.phaseId));
+}
+
+function memberStateText(state: WorkflowMemberPayload["state"]): string {
+  return state;
+}
+
 function MemberRow({ member }: { member: WorkflowMemberPayload }) {
-  const child = memberChildInstanceId(member);
+  const { instanceId = "" } = useParams();
+  // Workflow members are Claude sub-sessions inside THIS session, never
+  // Remuda instances: drill into the agent route keyed by the native agent
+  // id instead of linking a (never-set) child instance.
+  const agentId = knowledgeValue(member.nativeAgentId) ?? member.memberId;
+  const starting = member.state === "queued";
   const model = knowledgeValue(member.modelResolved) ?? knowledgeValue(member.modelRequested);
   const label = knowledgeValue(member.label) ?? member.memberId;
-  const running = member.state === "running";
   return (
-    <li className={css.member} data-testid="workflow-member" data-child={child ? "1" : "0"}>
-      <span className={running ? css.runDot : css.okDot} />
+    <li className={css.member} data-testid="workflow-member" data-state={member.state}>
+      <span className={runningDot(member.state)} />
       <span className={css.memberName}>{label}</span>
       <span className={css.memberMeta}>
         {member.state}
-        {child ? ` · childInstanceId=${child}` : " · 无 childInstanceId，不可点进"}
+        {starting ? " · 启动中" : ""}
         {model ? ` · ${model}` : ""}
       </span>
-      {child ? (
-        <Link className={css.openBtn} to={`/s/${child}`}>
-          打开
-        </Link>
-      ) : (
-        <span className={css.openOff}>打开</span>
-      )}
+      <Link className={css.openBtn} to={subagentHref(instanceId, agentId)} data-testid="workflow-member-open">
+        打开
+      </Link>
     </li>
   );
+}
+
+function runningDot(state: WorkflowMemberPayload["state"]): string {
+  return state === "running" ? css.runDot : css.okDot;
 }

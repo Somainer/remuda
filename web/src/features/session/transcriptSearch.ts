@@ -1,5 +1,5 @@
 import { knowledgeValue } from "../../types/command";
-import type { TranscriptNode } from "./assemble";
+import { subagentToolNodes, type TranscriptNode } from "./assemble";
 
 /**
  * In-transcript search (workbench batch E, §5 P1-2).
@@ -115,8 +115,22 @@ export function findMatches(nodes: readonly TranscriptNode[], query: string, opt
     if (node.type === "compact") {
       for (const child of node.children) {
         emitMatches(child, index, trimmed, caseSensitive, matches);
+        // A Task parent folded into the compact group can itself hold folded
+        // subagent rows — keep them searchable too.
+        if (child.type === "tool") {
+          for (const sub of subagentToolNodes(child)) {
+            emitMatches(sub, index, trimmed, caseSensitive, matches);
+          }
+        }
       }
       return;
+    }
+    // Subagent tool rows folded under Task / workflow-member parents stay
+    // searchable the same way.
+    if (node.type === "tool") {
+      for (const child of subagentToolNodes(node)) {
+        emitMatches(child, index, trimmed, caseSensitive, matches);
+      }
     }
     emitMatches(node, index, trimmed, caseSensitive, matches);
   });

@@ -283,3 +283,9 @@
     min-width: 0;
   }
 }
+
+.main > [data-testid="subagent-view"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}

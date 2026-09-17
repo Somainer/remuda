@@ -392,6 +392,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/gate/logs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Fetch the bounded failure log for a gate run (gjb_ job id or obj_ object id) */
+        get: operations["gateLogGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/hosts": {
         parameters: {
             query?: never;
@@ -3461,15 +3478,19 @@ export interface operations {
                         items?: ({
                             branch?: string;
                             error?: string | null;
+                            failedStep?: string | null;
                             finishedAt?: string | null;
                             hostId?: string | null;
                             id?: string;
+                            keepLogs?: boolean;
                             laneId?: string | null;
+                            logObjectId?: string | null;
                             mergeSha?: string | null;
                             /** @enum {string} */
                             mode?: "verify" | "land";
                             projectId?: string;
                             queuedAt?: string;
+                            reason?: string | null;
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
@@ -3483,6 +3504,51 @@ export interface operations {
                             [key: string]: unknown;
                         })[];
                         nextCursor?: Record<string, never> | null;
+                    };
+                };
+            };
+            400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+        };
+    };
+    gateLogGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description gjb_… job id or obj_… log object id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Gate run log */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        expiresAt?: string;
+                        jobId?: string;
+                        /** @description Bounded gate run failure evidence (GateRunLog). */
+                        log?: {
+                            attempts?: number;
+                            capturedLines?: number;
+                            headline?: string;
+                            /** @enum {string} */
+                            kind?: "failed" | "kept";
+                            step?: string;
+                            summary?: string[];
+                            tail?: string[];
+                            truncated?: boolean;
+                        };
+                        /** @description obj_… log object id */
+                        objectId?: string;
+                        projectId?: string;
                     };
                 };
             };
@@ -4612,15 +4678,19 @@ export interface operations {
                         items?: ({
                             branch?: string;
                             error?: string | null;
+                            failedStep?: string | null;
                             finishedAt?: string | null;
                             hostId?: string | null;
                             id?: string;
+                            keepLogs?: boolean;
                             laneId?: string | null;
+                            logObjectId?: string | null;
                             mergeSha?: string | null;
                             /** @enum {string} */
                             mode?: "verify" | "land";
                             projectId?: string;
                             queuedAt?: string;
+                            reason?: string | null;
                             requestedBy?: string;
                             startedAt?: string | null;
                             /** @enum {string} */
@@ -4657,6 +4727,7 @@ export interface operations {
             content: {
                 "application/json": {
                     branch: string;
+                    keepLogs?: boolean;
                     laneId?: string;
                     /** @enum {string} */
                     mode?: "verify" | "land";
@@ -4676,15 +4747,19 @@ export interface operations {
                     "application/json": {
                         branch?: string;
                         error?: string | null;
+                        failedStep?: string | null;
                         finishedAt?: string | null;
                         hostId?: string | null;
                         id?: string;
+                        keepLogs?: boolean;
                         laneId?: string | null;
+                        logObjectId?: string | null;
                         mergeSha?: string | null;
                         /** @enum {string} */
                         mode?: "verify" | "land";
                         projectId?: string;
                         queuedAt?: string;
+                        reason?: string | null;
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
@@ -4729,15 +4804,19 @@ export interface operations {
                     "application/json": {
                         branch?: string;
                         error?: string | null;
+                        failedStep?: string | null;
                         finishedAt?: string | null;
                         hostId?: string | null;
                         id?: string;
+                        keepLogs?: boolean;
                         laneId?: string | null;
+                        logObjectId?: string | null;
                         mergeSha?: string | null;
                         /** @enum {string} */
                         mode?: "verify" | "land";
                         projectId?: string;
                         queuedAt?: string;
+                        reason?: string | null;
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */
@@ -4787,15 +4866,19 @@ export interface operations {
                     "application/json": {
                         branch?: string;
                         error?: string | null;
+                        failedStep?: string | null;
                         finishedAt?: string | null;
                         hostId?: string | null;
                         id?: string;
+                        keepLogs?: boolean;
                         laneId?: string | null;
+                        logObjectId?: string | null;
                         mergeSha?: string | null;
                         /** @enum {string} */
                         mode?: "verify" | "land";
                         projectId?: string;
                         queuedAt?: string;
+                        reason?: string | null;
                         requestedBy?: string;
                         startedAt?: string | null;
                         /** @enum {string} */

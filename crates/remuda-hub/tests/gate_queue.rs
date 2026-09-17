@@ -25,6 +25,10 @@ struct RunSpec {
     base_sha: Option<&'static str>,
     current_main: Option<&'static str>,
     error: Option<&'static str>,
+    failed_step: Option<&'static str>,
+    reason: Option<&'static str>,
+    run_log: Option<Value>,
+    steps: Option<Value>,
 }
 
 impl Default for RunSpec {
@@ -38,6 +42,10 @@ impl Default for RunSpec {
             base_sha: Some("1111111111111111111111111111111111111111"),
             current_main: None,
             error: None,
+            failed_step: None,
+            reason: None,
+            run_log: None,
+            steps: None,
         }
     }
 }
@@ -175,14 +183,34 @@ async fn enroll(
 }
 
 fn result_json(job_id: &str, spec: &RunSpec) -> Value {
-    json!({
+    let mut result = json!({
         "jobId": job_id,
         "status": spec.status,
         "baseSha": spec.base_sha,
         "mergeSha": spec.merge_sha,
         "currentMainSha": spec.current_main,
         "error": spec.error,
-    })
+        "failedStep": spec.failed_step,
+        "reason": spec.reason,
+        "runLog": spec.run_log,
+        "steps": spec.steps,
+    });
+    // Emit absent fields like a real Node (skip defaults).
+    if let Some(object) = result.as_object_mut() {
+        if spec.failed_step.is_none() {
+            object.remove("failedStep");
+        }
+        if spec.reason.is_none() {
+            object.remove("reason");
+        }
+        if spec.run_log.is_none() {
+            object.remove("runLog");
+        }
+        if spec.steps.is_none() {
+            object.remove("steps");
+        }
+    }
+    result
 }
 
 /// A connected lane Node socket.
@@ -683,6 +711,122 @@ async fn cancel_a_running_job_sends_gate_cancel_and_finishes_canceled() -> Resul
     let done = ctx.wait_state(id, &["canceled", "failed"]).await;
     assert_eq!(done["state"], "canceled", "{done}");
     assert!(!ctx.scripts[0].gate_cancels.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_job_persists_evidence_fields_and_a_fetchable_log_object() -> Result<()> {
+    let ctx = Ctx::spawn(1).await?;
+    let run_log = json!({
+        "step": "cargo-test",
+        "kind": "failed",
+        "attempts": 2,
+        "headline": "cargo-test failed, exit status 101, attempts 2, retried",
+        "summary": [
+            "failures:",
+            "    remuda::gate::boom",
+            "test remuda::gate::boom ... FAILED",
+            "thread 'remuda::gate::boom' panicked at crates/remuda-node/src/gate.rs:42:9:"
+        ],
+        "tail": [
+            "test result: FAILED. 0 passed; 1 failed",
+            "error: test failed, to rerun pass `-p remuda-node --lib gate`"
+        ],
+        "capturedLines": 84,
+        "truncated": false,
+    });
+    ctx.scripts[0].script(
+        "wt/a/broken",
+        RunSpec {
+            delay_ms: 50,
+            status: "failed",
+            error: Some("gate failed or returned an incomplete step report"),
+            failed_step: Some("cargo-test"),
+            reason: Some("cargo-test failed, exit status 101, attempts 2, retried"),
+            run_log: Some(run_log),
+            steps: Some(json!([
+                {"name": "secret-scan", "status": "ok", "durationMs": 11},
+                {"name": "cargo-test", "status": "failed", "durationMs": 5012,
+                 "attempts": 2, "retried": true, "error": "exit status 101"}
+            ])),
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/broken","mode":"verify"}))
+        .await;
+    let id = job["id"].as_str().unwrap().to_owned();
+    let failed = ctx.wait_state(&id, &["failed"]).await;
+    assert_eq!(failed["failedStep"], "cargo-test", "{failed}");
+    assert_eq!(
+        failed["reason"],
+        "cargo-test failed, exit status 101, attempts 2, retried"
+    );
+    let object_id = failed["logObjectId"]
+        .as_str()
+        .expect("failed job names a log object")
+        .to_owned();
+    assert!(object_id.starts_with("obj_"), "{object_id}");
+
+    // Fetch the log through the job id (what the CLI prints).
+    let (status, by_job) = ctx
+        .request("GET", &format!("/v1/gate/logs/{id}"), None)
+        .await;
+    assert_eq!(status, 200, "{by_job}");
+    assert_eq!(by_job["jobId"], id);
+    assert_eq!(by_job["objectId"], object_id);
+    assert_eq!(by_job["log"]["step"], "cargo-test");
+    assert_eq!(by_job["log"]["attempts"], 2);
+    let summary = by_job["log"]["summary"].as_array().unwrap();
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("FAILED"))
+    );
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("panicked at"))
+    );
+    assert!(by_job["expiresAt"].as_str().unwrap().len() > 10);
+
+    // The same envelope is addressable by the obj_ id directly.
+    let (status, by_object) = ctx
+        .request("GET", &format!("/v1/gate/logs/{object_id}"), None)
+        .await;
+    assert_eq!(status, 200, "{by_object}");
+    assert_eq!(by_object["log"]["headline"], by_job["log"]["headline"]);
+
+    // Bad ids are rejected, missing jobs 404, another id prefix 400.
+    let (status, _) = ctx.request("GET", "/v1/gate/logs/not-an-id", None).await;
+    assert_eq!(status, 400);
+    let (status, _) = ctx
+        .request("GET", "/v1/gate/logs/gjb_doesnotexist", None)
+        .await;
+    assert_eq!(status, 404);
+
+    // Passing runs stay cheap: no log object on a green job.
+    ctx.scripts[0].script(
+        "wt/a/green",
+        RunSpec {
+            delay_ms: 20,
+            ..RunSpec::default()
+        },
+    );
+    let green = ctx.enqueue(json!({"branch":"wt/a/green"})).await;
+    let green_done = ctx
+        .wait_state(green["id"].as_str().unwrap(), &["passed"])
+        .await;
+    assert!(green_done["logObjectId"].is_null(), "{green_done}");
+    assert!(green_done["failedStep"].is_null());
+    let (status, _) = ctx
+        .request(
+            "GET",
+            &format!("/v1/gate/logs/{}", green["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    assert_eq!(status, 404);
     Ok(())
 }
 

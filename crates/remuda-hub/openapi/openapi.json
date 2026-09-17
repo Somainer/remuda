@@ -8678,6 +8678,27 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "failedStep": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "logObjectId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "keepLogs": {
+                            "type": "boolean"
                           }
                         }
                       }
@@ -8687,6 +8708,105 @@
                         "object",
                         "null"
                       ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/gate/logs/{id}": {
+      "get": {
+        "operationId": "gateLogGet",
+        "tags": [
+          "gate"
+        ],
+        "summary": "Fetch the bounded failure log for a gate run (gjb_ job id or obj_ object id)",
+        "parameters": [
+          {
+            "description": "gjb_… job id or obj_… log object id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Gate run log",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "objectId": {
+                      "type": "string",
+                      "description": "obj_… log object id"
+                    },
+                    "jobId": {
+                      "type": "string"
+                    },
+                    "projectId": {
+                      "type": "string"
+                    },
+                    "expiresAt": {
+                      "type": "string"
+                    },
+                    "log": {
+                      "type": "object",
+                      "description": "Bounded gate run failure evidence (GateRunLog).",
+                      "properties": {
+                        "step": {
+                          "type": "string"
+                        },
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "failed",
+                            "kept"
+                          ]
+                        },
+                        "attempts": {
+                          "type": "integer"
+                        },
+                        "headline": {
+                          "type": "string"
+                        },
+                        "summary": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "tail": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "capturedLines": {
+                          "type": "integer"
+                        },
+                        "truncated": {
+                          "type": "boolean"
+                        }
+                      }
                     }
                   }
                 }
@@ -8850,6 +8970,27 @@
                               "string",
                               "null"
                             ]
+                          },
+                          "failedStep": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "logObjectId": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "keepLogs": {
+                            "type": "boolean"
                           }
                         }
                       }
@@ -8918,6 +9059,9 @@
                   },
                   "thenCommand": {
                     "type": "string"
+                  },
+                  "keepLogs": {
+                    "type": "boolean"
                   }
                 }
               }
@@ -9017,6 +9161,27 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "failedStep": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "logObjectId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "keepLogs": {
+                      "type": "boolean"
                     }
                   }
                 }
@@ -9161,6 +9326,27 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "failedStep": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "logObjectId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "keepLogs": {
+                      "type": "boolean"
                     }
                   }
                 }
@@ -9313,6 +9499,27 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "failedStep": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "logObjectId": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "keepLogs": {
+                      "type": "boolean"
                     }
                   }
                 }

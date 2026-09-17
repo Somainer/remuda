@@ -724,8 +724,13 @@ async fn select_dispatch_host(
             project_id: project.meta.id.as_id().to_string(),
         }
     };
+    // Placement must not pre-judge the carrier: `claude-pty` here made
+    // `pick_hosts` reject every host without herdr, including a Node whose
+    // native `shell-pty` carrier can launch perfectly well. `shell-pty` carries
+    // no herdr requirement, so the driver choice stays with `driver_for` /
+    // `select_worker_driver`, which read what the host actually reports.
     let spec = crate::placement::PlaceSpec {
-        driver: "claude-pty".into(),
+        driver: "shell-pty".into(),
         delegation: None,
     };
     let outcome = crate::placement::pick_hosts(state, &placement, &spec).await?;
@@ -1592,4 +1597,158 @@ fn load_worker(conn: &Connection, id: &str) -> Result<Option<WorkerRoster>, Stor
     raw.map(|raw| serde_json::from_str(&raw))
         .transpose()
         .map_err(StoreError::from)
+}
+
+#[cfg(test)]
+mod driver_choice_tests {
+    use super::{driver_for, select_worker_driver};
+    use crate::error::HubError;
+    use crate::store::HostRecord;
+    use serde_json::json;
+
+    /// One host, described by what it says it can launch.
+    ///
+    /// `native` drives `capabilities.driverInventory[].launchable`, which is the
+    /// only honest report of whether `shell-pty` can run an *agent* here: with
+    /// `REMUDA_PTY_CARRIER` off the same descriptor arrives `launchable: false`,
+    /// because `shell-pty` then launches a login shell instead.
+    fn host(native: Option<bool>, herdr: bool) -> HostRecord {
+        HostRecord {
+            host_id: "hst_01hzzzzzzzzzzzzzzzzzzzzzzz".into(),
+            label: "devbox".into(),
+            state: "online".into(),
+            online: true,
+            last_seen_at: None,
+            node_version: None,
+            cli: json!([]),
+            capabilities: match native {
+                Some(launchable) => json!({
+                    "driverInventory": [{
+                        "kind": "shell-pty",
+                        "launchable": launchable,
+                        "reasonCode": if launchable { "carrier-native" } else { "carrier-not-enabled" },
+                    }]
+                }),
+                // An older Node that cannot describe itself reports nothing at
+                // all — absence means "not reported", never "cannot".
+                None => json!({}),
+            },
+            instance_count: 0,
+            transport: "ssh-stdio".into(),
+            labels: Vec::new(),
+            herdr: herdr.then(|| json!({"version": "0.9.0", "socket": "/tmp/h.sock"})),
+            resources: None,
+            max_instances: 8,
+            hostname: None,
+            ssh: None,
+            last_error: None,
+            provider_binding: "auto".into(),
+            default_launch_args: None,
+            claude_binary_path: None,
+            default_tui: None,
+            workspaces: Vec::new(),
+            workspace_revision: 0,
+        }
+    }
+
+    #[test]
+    fn a_launchable_shell_pty_is_preferred_over_herdr() {
+        // The native carrier serves a readable live screen, which is what
+        // `remuda watch` reads; herdr's blit cannot scroll (D-028).
+        let both = host(Some(true), true);
+        assert_eq!(driver_for("claude", &both).unwrap(), "shell-pty");
+        assert_eq!(driver_for("codex", &both).unwrap(), "shell-pty");
+        let native_only = host(Some(true), false);
+        assert_eq!(driver_for("claude", &native_only).unwrap(), "shell-pty");
+    }
+
+    #[test]
+    fn herdr_only_falls_back_to_the_pty_drivers_not_to_print() {
+        // The regression this pins: the old default answered `claude-print`
+        // whenever herdr was missing, and picked `claude-pty` without ever
+        // consulting the inventory.
+        let reported_off = host(Some(false), true);
+        assert_eq!(driver_for("claude", &reported_off).unwrap(), "claude-pty");
+        assert_eq!(driver_for("codex", &reported_off).unwrap(), "generic-pty");
+        // A Node too old to report an inventory is not treated as a refusal.
+        let unreported = host(None, true);
+        assert_eq!(driver_for("claude", &unreported).unwrap(), "claude-pty");
+    }
+
+    #[test]
+    fn neither_carrier_is_refused_rather_than_downgraded_to_print() {
+        // `claude-print` exits after one turn, so a worker on it can never be
+        // nudged, steered or watched. Refusing with a reason an operator can act
+        // on beats launching a product nobody asked for.
+        for host in [host(Some(false), false), host(None, false)] {
+            let error = driver_for("claude", &host).expect_err("no carrier");
+            let HubError::Unsatisfiable { reasons } = error else {
+                panic!("expected Unsatisfiable, got {error:?}");
+            };
+            let reason = reasons.join(" ");
+            assert!(reason.contains("REMUDA_PTY_CARRIER"), "{reason}");
+            assert!(
+                reason.contains("claude-print is never a default"),
+                "{reason}"
+            );
+            assert!(driver_for("codex", &host).is_err());
+        }
+    }
+
+    #[test]
+    fn an_unknown_harness_is_named_rather_than_defaulted() {
+        // The old `_ =>` arm answered `claude-pty` for any harness at all.
+        let error = driver_for("cursor", &host(Some(true), true)).expect_err("unknown harness");
+        assert!(
+            matches!(&error, HubError::BadRequest(message) if message.contains("cursor")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_driver_is_honoured_verbatim() {
+        let both = host(Some(true), true);
+        for driver in ["shell-pty", "claude-pty", "claude-print", "claude-bg"] {
+            assert_eq!(
+                select_worker_driver("claude", driver, &both).unwrap(),
+                driver
+            );
+        }
+        // print stays selectable for a scripted one-shot even where the native
+        // carrier is available — it is just never reached by default.
+        assert_eq!(
+            select_worker_driver("claude", "claude-print", &host(Some(true), false)).unwrap(),
+            "claude-print"
+        );
+    }
+
+    #[test]
+    fn an_explicit_driver_the_host_cannot_launch_is_refused_not_replaced() {
+        // Silently substituting here is precisely the bug: the operator asked
+        // for one product and a different one ran.
+        let no_native = host(Some(false), true);
+        let error = select_worker_driver("claude", "shell-pty", &no_native).expect_err("refused");
+        assert!(
+            matches!(&error, HubError::Conflict(message) if message.contains("REMUDA_PTY_CARRIER")),
+            "{error:?}"
+        );
+        let no_herdr = host(Some(true), false);
+        let error = select_worker_driver("claude", "claude-pty", &no_herdr).expect_err("refused");
+        assert!(
+            matches!(&error, HubError::Conflict(message) if message.contains("herdr")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_the_harness_cannot_use_is_a_bad_request() {
+        let both = host(Some(true), true);
+        for (harness, driver) in [("codex", "claude-pty"), ("claude", "grok-acp")] {
+            let error = select_worker_driver(harness, driver, &both).expect_err("invalid");
+            assert!(
+                matches!(&error, HubError::BadRequest(message) if message.contains(driver)),
+                "{error:?}"
+            );
+        }
+    }
 }

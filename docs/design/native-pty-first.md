@@ -160,9 +160,11 @@ New Session = 在一个 Remuda 自持 PTY 里**预填 launch command 并回车**
 | kind | 今天的 driver | D-028 后 | 说明 |
 |---|---|---|---|
 | `terminal` | `shell-pty` | `shell-pty` | 登录 `$SHELL`，D-025 promote 的入口，不变 |
-| `claude` | `claude-print`（默认）/ `claude-pty` | `agent-pty` | print 转 legacy（§12），`claude-pty` 随 herdr 转 optional |
+| `claude` | ~~`claude-print`（默认）~~ / `claude-pty` | `agent-pty` | print **已是显式专用 carrier，绝不再作默认或回落**（D-034）；`claude-pty` 随 herdr 转 optional |
 | `codex` / `grok` / `agy` | `generic-pty`（herdr） | `agent-pty` | 每 kind 一份 recipe + adapter |
 | `generic` | `shell-pty` | `shell-pty` | 未识别 CLI 的 fallback，保留 |
+
+> **D-034：默认 carrier 的选择顺序**（适用于上表所有 agent kind）。宿主 `driverInventory` 报 `shell-pty` launchable → `shell-pty`；否则 herdr 已广播 → `claude-pty`（codex/grok 为 `generic-pty`）；两者皆无 → **以理由拒绝**。`claude-print` 只能显式指定（`--driver claude-print` / web picker 显式选择），并作为诊断 carrier 标注——print 跑完一轮即结束，需要手工 resume，作为 worker carrier 无用。Node 侧请求的 carrier 构造失败时一律 `instance.create` 带 reason code 拒绝，**不降级**；名册与实例记录记录的是 Node 实际跑起来的 driver。
 
 **per-kind launch recipe / preset**（把 `generic_pty.rs` 里的 `PRESETS` / `merge_yolo_argv` 搬出 herdr driver，成为载体无关的表）：
 

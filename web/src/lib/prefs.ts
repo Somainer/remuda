@@ -20,7 +20,12 @@ const empty: NewSessionPrefs = {
   workspaceId: "",
   model: "passthrough/auto",
   permissionMode: "manual",
-  driver: "claude-print",
+  // No remembered carrier yet. Left empty rather than naming one, so the sheet
+  // falls through to `defaultDriver(host, kind)`, which reads the host's own
+  // `driverInventory`. This used to say `claude-print`, which is never a valid
+  // default: a print session ends after one turn and needs a manual resume
+  // (D-034; docs/design/evidence/dispatch-driver-1.md).
+  driver: "",
   delegation: "none",
   effortIndex: 2,
   effortName: "",

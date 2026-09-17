@@ -72,8 +72,9 @@ export function shellPtyAllowed(host: HostMatrix | undefined, kind: AgentKindId 
 
 /** Legacy carriers still offered, secondary to the native PTY. */
 export function legacyDrivers(kind: AgentKindId): DriverKind[] {
-  // claude-pty first: it keeps a multi-turn TUI alive; claude-print is a one-shot legacy
-  // path kept only until D-028 retires it, so it is offered last and never defaulted.
+  // claude-pty first: it keeps a multi-turn TUI alive. claude-print is offered
+  // last and never defaulted — a print session ends after one turn and needs a
+  // manual resume, so it is a diagnostic carrier only, chosen explicitly (D-034).
   if (kind === "claude") return ["claude-pty", "generic-pty", "claude-print"];
   return ["generic-pty"];
 }
@@ -91,7 +92,7 @@ export function defaultDriver(host: HostMatrix | undefined, kind: AgentKindId | 
 
 export const DRIVER_LABELS: Record<DriverKind, string> = {
   "shell-pty": "原生终端 (shell-pty)",
-  "claude-print": "结构化 print (claude-print)",
+  "claude-print": "结构化 print (claude-print) · 诊断用，单轮即结束",
   "claude-pty": "herdr PTY (claude-pty)",
   "generic-pty": "herdr 通用 PTY (generic-pty)",
   "claude-bg": "claude-bg",

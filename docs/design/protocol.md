@@ -434,6 +434,11 @@ stateDiagram-v2
 ~~~typescript
 type DriverKind = "claude-print" | "claude-pty" | "claude-bg" | "codex-appserver"
   | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty";
+// D-034: `claude-print` 是**显式专用**的诊断 carrier，不是任何默认或回落值——
+// 它跑完一轮即结束（需要手工 resume），作为 worker carrier 无用。默认选择顺序：
+// 宿主 driverInventory 报 shell-pty launchable -> shell-pty；否则 herdr 已广播
+// -> claude-pty（codex/grok 为 generic-pty）；两者皆无 -> 以理由拒绝（不回落 print）。
+// Node 侧请求的 carrier 构造失败时一律 `instance.create` 带 reason code 拒绝，不降级。
 type CallContext = {
   commandId: Id; instanceId: Id; runId: Id | null;
   ownerFence: U64; processGeneration: U64; runGeneration: U64 | null;

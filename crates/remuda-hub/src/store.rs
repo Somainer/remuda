@@ -2558,6 +2558,38 @@ impl Store {
         .await
     }
 
+    /// Record the driver the Node reports it actually built for an instance.
+    ///
+    /// The Hub's stored driver is a *request* until the Node answers. When the
+    /// two differ the record must follow the Node, because every later screen
+    /// read, nudge and watch classification assumes the row names the carrier
+    /// that is really running — a roster that said `claude-pty` over a live
+    /// `claude-print` made all of them inexplicable
+    /// (docs/design/evidence/dispatch-driver-1.md).
+    ///
+    /// Returns the driver now on the row, or `None` if the instance is unknown.
+    pub async fn reconcile_instance_driver(
+        &self,
+        instance_id: String,
+        driver: String,
+    ) -> Result<Option<String>, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            conn.execute(
+                "UPDATE instances SET driver = ?1, updated_at = ?2 WHERE id = ?3 AND driver != ?1",
+                params![driver, now, instance_id],
+            )?;
+            conn.query_row(
+                "SELECT driver FROM instances WHERE id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+        .await
+    }
+
     /// Node RPC success → `accepted`.
     pub async fn mark_accepted(&self, command_id: String) -> Result<CommandRecord, StoreError> {
         self.run(move |conn| {

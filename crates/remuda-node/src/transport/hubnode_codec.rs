@@ -923,3 +923,155 @@ mod tests {
         assert_eq!(frame["id"], "hello-1");
     }
 }
+
+/// A create that names a driver either runs that driver or is refused.
+///
+/// The defect these pin: `remuda dispatch --harness claude` recorded
+/// `claude-pty` on the roster while the Node ran `claude-print`. Nothing chose
+/// print. The Hub's spec failed to deserialize — `#[serde(default)]` fills a
+/// *missing* key, not an explicit `null`, and the Hub builds specs with `json!`
+/// so every unset `Option` arrives as `null` (`prompt` unconditionally, because
+/// the brief travels as an attachment) — and the tolerant fallback arm below
+/// substituted a whole request whose `driver` is `ClaudePrint`. No journal entry
+/// recorded the swap. See `docs/design/evidence/dispatch-driver-1.md`.
+#[cfg(test)]
+mod driver_fidelity_tests {
+    use super::*;
+    use crate::{DevNode, DriverRegistry, MemoryStore};
+    use std::sync::Arc;
+
+    /// A Node whose registry holds the fake Claude driver and `shell-pty` —
+    /// deliberately *not* `claude-pty`, so the refusal path is reachable.
+    fn node() -> DevNode {
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        DevNode::with_parts(
+            &config,
+            Arc::new(MemoryStore::new(8)),
+            DriverRegistry::with_fake().expect("registry"),
+        )
+        .expect("node")
+    }
+
+    /// The spec shape the Hub's `worker_launch_spec` really sends: `json!`-built,
+    /// `null` for every field dispatch does not set.
+    fn dispatch_spec(driver: &str) -> Value {
+        json!({
+            "kind": "claude",
+            "driver": driver,
+            "model": null,
+            "providerProfileId": null,
+            "delegation": null,
+            "permissionMode": "bypassPermissions",
+            "cwd": null,
+            "name": "c-probe",
+            "title": "c-probe",
+            "prompt": null,
+            "extraEnv": {},
+            "projectId": "prj_01hzzzzzzzzzzzzzzzzzzzzzzz",
+        })
+    }
+
+    async fn create(node: &DevNode, spec: Value) -> Result<Value, NodeError> {
+        dispatch_create(node, json!({ "spec": spec })).await
+    }
+
+    #[tokio::test]
+    async fn a_hub_spec_full_of_nulls_still_launches_the_driver_it_names() {
+        // The exact regression: before the fix this spec failed to parse and the
+        // Node silently built `claude-print` instead.
+        let node = node();
+        let created = create(&node, dispatch_spec("shell-pty"))
+            .await
+            .expect("create accepted");
+        assert_eq!(
+            created.pointer("/instance/driver").and_then(Value::as_str),
+            Some("shell-pty"),
+            "the node must run the driver the spec named: {created}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_named_driver_is_echoed_back_verbatim() {
+        let node = node();
+        // `claude-print` is legitimate when named explicitly — it is only
+        // illegitimate as a *default*. `shell` / `terminal` are `shell-pty` aliases.
+        for (named, expected) in [
+            ("shell-pty", "shell-pty"),
+            ("shell", "shell-pty"),
+            ("terminal", "shell-pty"),
+            ("claude-print", "claude-print"),
+        ] {
+            let created = create(&node, dispatch_spec(named))
+                .await
+                .unwrap_or_else(|error| panic!("create {named}: {error}"));
+            assert_eq!(
+                created.pointer("/instance/driver").and_then(Value::as_str),
+                Some(expected),
+                "asked for {named}: {created}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_driver_with_no_adapter_is_refused_not_downgraded() {
+        // This registry has no `claude-pty`. Refusal must land on the create
+        // itself: building happens later, off the accept path, so an "accepted"
+        // answer here would leave the Hub holding a running row for a product
+        // that never started.
+        let node = node();
+        let error = create(&node, dispatch_spec("claude-pty"))
+            .await
+            .expect_err("unregistered driver must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported-driver"),
+            "refusal must carry a reason code: {message}"
+        );
+        assert!(
+            message.contains("ClaudePty"),
+            "refusal must name the driver asked for: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_driver_name_is_refused_rather_than_defaulted() {
+        let node = node();
+        let error = create(&node, dispatch_spec("claude-teleport"))
+            .await
+            .expect_err("unknown driver must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("unsupported-driver"),
+            "refusal must carry a reason code: {message}"
+        );
+        assert!(
+            message.contains("claude-teleport"),
+            "refusal must name the driver asked for: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kind_is_refused_rather_than_becoming_claude() {
+        // `kind` was lost by the same fallback that lost `driver`: the
+        // substituted request hardcoded `AgentKind::Claude`.
+        let node = node();
+        let mut spec = dispatch_spec("shell-pty");
+        spec["kind"] = json!("cursor");
+        let error = create(&node, spec)
+            .await
+            .expect_err("unknown kind must be refused");
+        assert!(error.to_string().contains("unsupported-kind"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_spec_that_names_no_driver_still_launches() {
+        // The tolerant path still exists for an older or partial Hub spec — it
+        // just no longer overrides a driver that *was* named.
+        let node = node();
+        let created = create(&node, json!({ "prompt": "hi" }))
+            .await
+            .expect("a spec with no driver still launches");
+        assert!(created.pointer("/instance/driver").is_some(), "{created}");
+    }
+}

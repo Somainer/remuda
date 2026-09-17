@@ -153,4 +153,155 @@ screen-readable carrier could never be the default. And the `else` arm made
 
 ## Evidence: a real dispatch on this host
 
-<!-- EVIDENCE-RUN -->
+Captured on the devbox with `REMUDA_PTY_CARRIER=native`, real Hub, real Node,
+real Claude binary (`2.1.274`). Reproduce with `remuda dev --hub-listen … --listen …`
+plus a project, then the commands below.
+
+### 1. What the host reports it can launch
+
+The Hub's own host view, i.e. what `driver_for` now reads:
+
+```
+herdr advertised: true
+driverInventory: [{"kind": "shell-pty", "launchable": true, "reasonCode": "carrier-native"}]
+```
+
+### 2. `dispatch` with no `--driver` takes the native carrier
+
+```
+$ remuda dispatch --project $PRJ --brief brief.md --name evnat2
+  roster/instance driver = shell-pty
+```
+
+Before this change the same command produced `claude-pty` on the roster (the
+herdr arm, since `driver_for` never read the inventory) and `claude-print` on
+the Node.
+
+### 3. The instance record and the journal agree with the roster
+
+```
+instance.driver = shell-pty
+source.driverKind histogram: {'shell-pty': 4}
+```
+
+The instance row and every journal event carry the driver that actually ran —
+the `driver_downgraded` diagnostic is emitted only when they differ, and here
+they do not.
+
+### 4. `remuda watch` prints it
+
+```
+NAME    STATUS   DRIVER     SHA/REASON  DETAIL
+evnat2  working  shell-pty  -           -
+```
+
+The DRIVER column is new: a worker on the wrong carrier misbehaves in ways the
+status column cannot explain (a print worker looks idle forever, because print
+exits after one turn).
+
+### 5. The screen is readable through `remuda instance read --source screen`
+
+```
+source: screen | screenSource: raw-ring | cols x rows: 80 x 24
+ | ────────────────────────────────────────────────────────────────
+ | Accessingworkspace:
+ | /tmp/…/remuda-wt/evnat2
+ | Quicksafetycheck:Isthisprojectyoucreatedoroneyoutrust?(Likeyour
+ | owncode,awell-knownopensourceproject,orworkfromyourteam).Ifnot,
+ | takeamomenttoreviewwhat'sinthisfolderfirst.
+ | ClaudeCode'llbeabletoread,edit,andexecutefileshere.
+ | Securityguide
+ | ❯No,exit
+ | Yes,Itrustthisfolder
+ | Entertoconfirm·Esctocancel
+```
+
+This is the whole point of preferring `shell-pty`: a live, scrollable screen.
+A `claude-print` worker has none.
+
+### 6. A refusal is a refusal on a stdio Node, not a downgrade
+
+Driving a real `remuda node --stdio` with `REMUDA_PTY_CARRIER` off (the exact
+configuration that used to end in `claude-print`), its inventory reports:
+
+```
+driverInventory: [{"kind": "shell-pty", "launchable": false, "reasonCode": "carrier-not-enabled"}]
+```
+
+and the creates are answered with reason codes:
+
+```
+instance.create driver=claude-teleport → REFUSED: unsupported-driver: this node has no driver claude-teleport
+instance.create kind=cursor            → REFUSED: unsupported-kind: this node cannot launch kind cursor
+instance.create driver=codex-appserver → REFUSED: kind and driver do not describe the same native product
+```
+
+No `accepted` reply, and no substituted driver.
+
+### 7. Explicit `--driver` is honoured or refused
+
+On a host reporting `carrier-not-enabled`:
+
+```
+$ remuda dispatch … --name evref4 --driver shell-pty
+Error: hub HTTP 409: {"error":"host … does not report shell-pty as launchable; set
+REMUDA_PTY_CARRIER=native on the Node or dispatch without --driver"}
+$ echo $?
+1
+```
+
+The same host with no `--driver` picks `claude-pty` (herdr is advertised), never
+print — and `--driver claude-print` still works when an operator names it:
+
+```
+evdef3  working  claude-pty    -  -
+evpr3   working  claude-print  -  -
+```
+
+(Note: the refusal's JSON `code` string reads `COMMAND_ID_CONFLICT` because the
+Hub maps every `Conflict` variant to that discriminant in `error.rs`. The HTTP
+status, 409, and the CLI's non-zero exit are correct; the code string is a
+pre-existing mislabel, not part of this change.)
+
+## Addendum (owner ruling, 2026-09-17): print is explicit-only
+
+The owner tightened the rule the same day: `claude-print` is useless as a worker
+carrier — a session ends after one turn and needs a manual resume — so it is
+removed from **every** default and fallback path, not just `driver_for`. That is
+recorded as **D-034** and implemented as:
+
+- **Hub.** `driver_for` prefers `shell-pty` when the inventory reports it
+  launchable, then `claude-pty` when herdr is advertised, and refuses with a
+  reason when neither exists. `POST /v1/instances` no longer falls back to
+  `claude-print`: an omitted driver defaults to `claude-pty` (multi-turn, and not
+  a shell driver, so the existing agent-approval gate for such a request is
+  unchanged). The dispatch path was also carrying a hardcoded `claude-pty` in its
+  *placement probe*, which rejected every host without herdr before `driver_for`
+  ever ran — it now probes `shell-pty`, which carries no herdr requirement.
+- **Node.** A requested `claude-pty` / `shell-pty` that cannot be constructed
+  refuses `instance.create` with a reason code (`unsupported-driver` /
+  `unsupported-kind`), before the command is durably accepted. It never
+  downgrades. Evidence §6 above is exactly this.
+- **Print stays selectable, labelled.** `--driver claude-print` and the web
+  picker's explicit choice still work; the picker label now reads as a diagnostic
+  carrier. The web New Session default already followed `driverInventory`
+  (`shell-pty` when launchable, else `claude-pty`); its persisted `prefs.driver`
+  no longer seeds `claude-print`.
+- **Docs.** `docs/design/protocol.md` (the `DriverKind` block) and
+  `docs/design/native-pty-first.md` (the kind/driver matrix) carry the D-034
+  ordering note.
+
+## What this does not do
+
+- `shell-pty` selection on the `POST /v1/instances` path (New Session) is left to
+  the caller: that path falls back to `claude-pty` rather than resolving against
+  the chosen host, because resolving it there would collide with the
+  agent-approval gate in `agent_scope.rs` (a `shell-pty` create for an agent
+  caller requires human approval, which the create path cannot request before
+  placement has chosen a host). The web New Session picker already derives its
+  default from `driverInventory`, so first-party callers name the carrier.
+- `driver_kind_for_args` in `http.rs` still falls back to the Claude arg
+  allowlist for an unknown driver. That widens which flags are *validated*
+  locally; the Node re-validates with the real driver, and it never chooses a
+  carrier.
+

@@ -773,6 +773,30 @@ impl DevNode {
         self.inner.store.read_events(journal_id, after_seq, limit)
     }
 
+    /// JSONL payload bytes this Node has read from journals since start.
+    ///
+    /// Instrumentation for the tail-only flush: one flush tick over a caught-up
+    /// Instance should add roughly the size of the newly appended events, not
+    /// the size of the journal.
+    #[must_use]
+    pub fn journal_bytes_read(&self) -> u64 {
+        self.inner.store.journal_bytes_read()
+    }
+
+    /// Durable sequence the journal's own store has committed.
+    pub fn journal_durable_seq(&self, journal_id: &Id) -> Result<U64, NodeError> {
+        self.inner.store.journal_durable_seq(journal_id)
+    }
+
+    /// Durable sequence of an Instance's journal, resolved through its identity.
+    ///
+    /// Flush ticks use this to prove they are caught up without opening the
+    /// reader at all.
+    pub fn current_journal_durable_seq(&self, instance_id: &InstanceId) -> Result<U64, NodeError> {
+        let journal_id = self.get_instance(instance_id)?.journal_id;
+        self.journal_durable_seq(&journal_id)
+    }
+
     /// Resolve a journal to its Instance.
     pub fn instance_for_journal(&self, journal_id: &Id) -> Result<InstanceId, NodeError> {
         self.inner.store.instance_for_journal(journal_id)

@@ -182,6 +182,11 @@ async fn flush(
     for instance in page.items {
         let key = instance.meta.id.as_id().as_str().to_owned();
         let after = watermarks.get(&key).copied().unwrap_or(0);
+        // This runs after every Hub request, so a caught-up Instance must not
+        // cost a page read. The watermark check makes an idle fleet free.
+        if node.journal_durable_seq(&instance.journal_id)?.0 <= u64::try_from(after).unwrap_or(0) {
+            continue;
+        }
         let after_seq = (after > 0).then_some(U64(u64::try_from(after).unwrap_or(0)));
         let events = node.read_journal(&instance.journal_id, after_seq, 256)?;
         for event in events.events {

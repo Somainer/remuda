@@ -635,6 +635,12 @@ async fn forward_backlog(
     mut last: U64,
     output: &mpsc::Sender<Value>,
 ) -> Result<U64, NodeError> {
+    // Nothing to read when the caller is already at the journal's durable seq.
+    // The check costs one watermark query and saves a page read that would
+    // otherwise return empty.
+    if node.journal_durable_seq(journal_id)? <= last {
+        return Ok(last);
+    }
     loop {
         let page = node.read_journal(journal_id, (last.0 > 0).then_some(last), 256)?;
         if page.events.is_empty() {

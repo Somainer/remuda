@@ -32,7 +32,9 @@ use crate::claude_transcript::{
     transcript_belongs_to_cwd,
 };
 use crate::error::{DriverError, DriverResult};
-use crate::promote::{Detected, ProcessTable, ScreenStatus, detect, foreground_pgid};
+use crate::promote::{
+    Detected, LaunchAlias, ProcessRow, ProcessTable, ScreenStatus, detect, foreground_pgid,
+};
 use crate::screenlive::{live_status_inactive, live_status_payload, now_utc};
 use crate::tty::{LocalPty as _, logical_keys_to_bytes};
 use remuda_protocol::{
@@ -710,6 +712,9 @@ pub(super) fn spawn(
     model: Option<ModelSync>,
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+    // The exact executable this launch exec'd, when Remuda launched one
+    // (c-wfdrill2 B). `None` for a login shell.
+    alias: Option<LaunchAlias>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
@@ -745,7 +750,24 @@ pub(super) fn spawn(
             if state.closed.load(Ordering::SeqCst) || events.is_closed() {
                 break;
             }
-            let found = sample(&state, table.as_ref()).await;
+            let Sample { rows, mut found } = sample(&state, table.as_ref(), alias.as_ref()).await;
+            // Detection can still be late: `ps` has not caught the exec yet,
+            // or the agent runs under a name neither the table nor the alias
+            // covers. An authenticated SessionStart whose pid is in this PTY's
+            // foreground group says what the process table has not said yet,
+            // and binding it is what gives the session its nativeId and
+            // transcript (without it `claude --resume` has nothing to resume
+            // and the drill-in read has no session directory).
+            if found.is_none()
+                && let Some(hooks) = hooks.as_ref()
+                && let Some(binding) = hooks.binding()
+            {
+                found = promote_from_hook_binding(
+                    &rows,
+                    &binding,
+                    alias.as_ref().map_or(AgentKind::Claude, |alias| alias.kind),
+                );
+            }
             // `send` reads this to decide bracketed-paste delivery, so it must
             // track the live foreground even between journaled transitions.
             if let Ok(mut slot) = current.lock() {
@@ -1514,8 +1536,21 @@ pub(super) fn permission_lifecycle(status: &str, severity: Severity) -> Observat
     .1
 }
 
+/// One detection sample: the foreground process group and what it matched.
+///
+/// `rows` is kept beside the verdict because a `None` verdict is not the same
+/// as an empty group: a hook report can only be trusted when its pid is
+/// really running in *this* PTY's foreground group, and that is a question
+/// about the rows, not about the match.
+struct Sample {
+    /// Rows of the PTY's foreground process group; empty on the screen path.
+    rows: Vec<ProcessRow>,
+    /// What [`detect`] made of them.
+    found: Option<Detected>,
+}
+
 /// One detection sample: foreground process group first, screen as fallback.
-async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> {
+async fn sample(state: &PtyState, table: &dyn ProcessTable, alias: Option<&LaunchAlias>) -> Sample {
     let pgid = {
         let master = state.master.lock().await;
         // `None` once the stop ladder has released the master (§5.3 step 2).
@@ -1526,13 +1561,46 @@ async fn sample(state: &PtyState, table: &dyn ProcessTable) -> Option<Detected> 
             .and_then(|master| foreground_pgid(master.as_ref()))
     };
     if let Some(pgid) = pgid {
-        return detect(&table.process_group(pgid));
+        let rows = table.process_group(pgid);
+        let found = detect(&rows, alias);
+        return Sample { rows, found };
     }
-    remuda_screen::detect_from_screen(&state.screen_grid()).map(|kind| Detected {
+    Sample {
+        rows: Vec::new(),
+        found: remuda_screen::detect_from_screen(&state.screen_grid()).map(|kind| Detected {
+            kind,
+            pid: 0,
+            session_id: None,
+            hydrates_transcript: kind == AgentKind::Claude,
+        }),
+    }
+}
+
+/// Promote from an authenticated `SessionStart` when detection came up empty.
+///
+/// The gate is the PTY's own foreground process group: the hook's pid must be
+/// one of the rows we just read. That makes this identity evidence rather than
+/// a guess — the process that reported the session is the process this
+/// terminal is running — and it keeps a nested or unrelated claude sharing the
+/// socket from claiming the instance.
+///
+/// `kind` is what the launch started; a login shell that grew an agent has
+/// only claude's overlay on its hook socket, so claude is the honest default.
+fn promote_from_hook_binding(
+    rows: &[ProcessRow],
+    binding: &remuda_signal::SessionBinding,
+    kind: AgentKind,
+) -> Option<Detected> {
+    if binding.pid <= 0 || !rows.iter().any(|row| row.pid == binding.pid) {
+        return None;
+    }
+    Some(Detected {
         kind,
-        pid: 0,
-        session_id: None,
-        hydrates_transcript: kind == AgentKind::Claude,
+        pid: binding.pid,
+        session_id: Some(binding.session_id.clone()),
+        hydrates_transcript: crate::promote::AGENT_TABLE
+            .iter()
+            .any(|entry| entry.kind == kind && entry.hydrates_transcript),
     })
 }
 

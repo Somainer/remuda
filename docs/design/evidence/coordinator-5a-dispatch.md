@@ -185,3 +185,4 @@ with no `worktreePath`; `worker.provision`/`worker.remove` are now dispatched
 there in addition to the loopback server path. The hub-level test fake uses the
 WSS path too, so both paths now have coverage.)
 
+- 2026-09-16: first worker dispatched through remuda dispatch (self-hosted loop)

@@ -303,6 +303,7 @@ impl DriverFactory for NativeClaudeFactory {
                 // user's theme/disclaimer choices but never any credential.
                 options.seed_onboarding = self.config.seed_claude_onboarding;
                 options.host_claude_config = HostClaudeConfig::from_env();
+                options.instance_id = Some(launch.instance.meta.id.clone());
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {
@@ -318,6 +319,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.herdr_binary = self.config.herdr_binary.clone();
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay;
+                options.instance_id = Some(launch.instance.meta.id.clone());
                 Arc::new(ClaudeBgDriver::new(options))
             }
             DriverKind::GenericPty => {
@@ -394,6 +396,13 @@ impl DriverFactory for NativeClaudeFactory {
                     &launch.request.extra_env,
                 ));
                 options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
+                // Unconditional, and deliberately not inside the `pty_hooks`
+                // block below: a promoted shell with hooks off would otherwise
+                // keep a random scope, and every id it derives (transcript
+                // replay included) would be unaddressable from the Node's own
+                // producers. This is the instance whose directory the launch
+                // already writes into.
+                options.instance_id = Some(launch.instance.meta.id.clone());
                 if agent_kind.is_none() {
                     // An agent's argv comes from its recipe (§5.1 step 3), not
                     // from the request; only the shell path forwards args.

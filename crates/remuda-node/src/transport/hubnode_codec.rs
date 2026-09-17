@@ -174,11 +174,48 @@ pub fn decode_request(value: &Value) -> Result<HubNodeRequest, NodeError> {
     HubNodeRequest::from_value(value).map_err(NodeError::from)
 }
 
+/// Which kind of Hub→Node frame carried a method.
+///
+/// The only thing it changes is what an **unhandled** method answers. A
+/// request has a caller waiting on the reply, so "I do not handle that" must
+/// travel back as an error — a fabricated `{"ok": true}` there is how
+/// `subagent.transcript` and `workspace.scm.*` reported success on every WSS
+/// host that had never implemented them. A notification has nobody to tell,
+/// and a Hub that gained a new one must not make older Nodes log errors, so it
+/// stays tolerant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodFrame {
+    /// The frame carried an `id`; the caller is waiting for this result.
+    Request,
+    /// The frame carried no `id`; the result is dropped.
+    Notification,
+}
+
 /// Dispatch `instance.*` (and journal/tty acks) onto the local runtime.
+///
+/// Request semantics: an unknown method is an error. Use
+/// [`dispatch_frame`] for a notification.
 pub async fn dispatch_method(
     node: &DevNode,
     method: &str,
     params: Value,
+) -> Result<Value, NodeError> {
+    dispatch_frame(node, method, params, MethodFrame::Request).await
+}
+
+/// Dispatch one Hub→Node frame onto the local runtime.
+///
+/// This is the single dispatch table every carrier delegates to (ssh-stdio,
+/// the outbound-WSS runtime, and the `WssLink` runtime). Carriers may take
+/// methods they must do extra bookkeeping for — starting a journal pump, say —
+/// but nothing may end in a catch-all of its own: a carrier-local
+/// `{"ok": true}` answers for methods it has never heard of, which is
+/// indistinguishable from the method having worked.
+pub async fn dispatch_frame(
+    node: &DevNode,
+    method: &str,
+    params: Value,
+    frame: MethodFrame,
 ) -> Result<Value, NodeError> {
     if crate::workspace::is_workspace_method(method) {
         return node.workspace_rpc(method, params);
@@ -281,13 +318,20 @@ pub async fn dispatch_method(
         }
         Some(kind) => {
             let name: &str = HubNodeMethod::as_str(kind);
-            Err(NodeError::InvalidRequest(format!(
-                "stdio/wss runtime does not handle {name}"
-            )))
+            unhandled(frame, format!("stdio/wss runtime does not handle {name}"))
         }
-        None => Err(NodeError::InvalidRequest(format!(
-            "unknown hubnode method {method}"
-        ))),
+        None => unhandled(frame, format!("unknown hubnode method {method}")),
+    }
+}
+
+/// What an unhandled method answers, by frame kind.
+fn unhandled(frame: MethodFrame, message: String) -> Result<Value, NodeError> {
+    match frame {
+        MethodFrame::Request => Err(NodeError::InvalidRequest(message)),
+        MethodFrame::Notification => {
+            tracing::debug!(%message, "ignoring an unhandled Hub notification");
+            Ok(json!({ "ok": true }))
+        }
     }
 }
 

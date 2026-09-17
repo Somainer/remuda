@@ -205,6 +205,21 @@ pub struct ShellPtyOptions {
     /// Boxed: it holds a `ProviderProfile`, and `ShellPtyOptions` is cloned
     /// into every driver.
     pub agent: Option<Box<AgentLaunch>>,
+    /// The Node instance this driver serves, when a Node built it.
+    ///
+    /// Every observation this driver mints is scoped to it, and — unlike the
+    /// envelope identity the store rewrites on append — the *derived* node ids
+    /// inside the payloads are not rewritable: `remuda_signal` derives each
+    /// hook tool node as `Id::derive("obj", <instance id>, <tool_use_id>)`,
+    /// and the Node's workflow producer derives `workflow.run.toolCallId` from
+    /// the same native id under the real instance. Minting a throwaway id here
+    /// made those two derivations disagree, so a run could never name a tool
+    /// call that existed and every subagent row stayed outside its Workflow
+    /// row (c-wfdrill2 C).
+    ///
+    /// `None` only for a driver built outside a Node (tests,
+    /// [`ShellPtyDriver::spawn`]), which mints one.
+    pub instance_id: Option<InstanceId>,
 }
 
 /// What the driver needs to stand up this instance's hook path.
@@ -239,7 +254,17 @@ impl ShellPtyOptions {
             pin_native_home: false,
             auto_trust_workspace: false,
             agent: None,
+            instance_id: None,
         }
+    }
+
+    /// Instance identity every observation of this launch is scoped to.
+    ///
+    /// Public because the Node's own producers must derive under the same
+    /// scope; see [`Self::instance_id`].
+    #[must_use]
+    pub fn instance_scope(&self) -> InstanceId {
+        self.instance_id.clone().unwrap_or_default()
     }
 
     /// Launch `kind`'s CLI directly in the PTY instead of a login shell
@@ -1211,6 +1236,14 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
+                // c-wfdrill2 B: the pinned path this launch exec'd, so
+                // detection does not depend on the executable's basename
+                // being one the agent table has heard of. Only for an agent
+                // target — a shell's recipe binary is the login shell, and
+                // aliasing that would promote the shell itself.
+                self.options.target.agent_kind().map(|kind| {
+                    crate::promote::LaunchAlias::new(kind, recipe.binary.abs_path.clone())
+                }),
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native
@@ -1933,19 +1966,8 @@ fn start_hooks_blocking(
         return Ok(None);
     };
     let bus = Arc::new(
-        remuda_signal::SignalBus::new(
-            remuda_signal::BusContext {
-                instance_id: ctx.instance_id.clone(),
-                host_id: ctx.host_id.clone(),
-                journal_id: ctx.journal_id.clone(),
-                run_id: ctx.run_id.clone(),
-                driver_kind: DriverKind::ShellPty,
-                adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
-            },
-            events.clone(),
-            Arc::clone(seq),
-        )
-        .with_interrupt_tracker(Arc::clone(interrupt_pid)),
+        remuda_signal::SignalBus::new(bus_context(ctx), events.clone(), Arc::clone(seq))
+            .with_interrupt_tracker(Arc::clone(interrupt_pid)),
     );
     Ok(Some(Arc::new(crate::launch::HookSession::start(
         &crate::launch::HookSessionOptions {
@@ -1959,13 +1981,57 @@ fn start_hooks_blocking(
     )?)))
 }
 
+/// The hook bus identity for a promotion context.
+fn bus_context(ctx: &promotion::PromoteCtx) -> remuda_signal::BusContext {
+    remuda_signal::BusContext {
+        instance_id: ctx.instance_id.clone(),
+        host_id: ctx.host_id.clone(),
+        journal_id: ctx.journal_id.clone(),
+        run_id: ctx.run_id.clone(),
+        driver_kind: DriverKind::ShellPty,
+        adapter_version: crate::capabilities::ADAPTER_VERSION.to_owned(),
+    }
+}
+
+/// The [`remuda_signal::BusContext`] a shell-pty launch's hook socket folds
+/// under, for `options` running in `cwd`.
+///
+/// Public so a caller that must derive ids for the same session — the Node's
+/// workflow producer, and the integration test that pins the two against each
+/// other — can go through the same `promote_ctx` production uses rather than
+/// restating what it is expected to return.
+///
+/// # Errors
+///
+/// Propagates identity-minting failures from `promote_ctx`.
+pub fn hook_bus_context(
+    options: &ShellPtyOptions,
+    cwd: &str,
+    spec: Option<&InstanceSpec>,
+) -> DriverResult<remuda_signal::BusContext> {
+    Ok(bus_context(&promote_ctx(options, cwd, spec)?))
+}
+
 fn promote_ctx(
     options: &ShellPtyOptions,
     cwd: &str,
     spec: Option<&InstanceSpec>,
 ) -> DriverResult<promotion::PromoteCtx> {
+    let instance_id = options.instance_scope();
+    // The Node derives both from the same id, so a launch that disagrees with
+    // its own instance directory is the c-wfdrill2 C defect coming back.
+    debug_assert!(
+        options.instance_id.is_none()
+            || options.hooks.as_ref().is_none_or(|hooks| {
+                hooks
+                    .instance_dir
+                    .file_name()
+                    .is_none_or(|name| name.to_string_lossy() == instance_id.as_id().as_str())
+            }),
+        "hook instance dir must be the instance the driver is scoped to"
+    );
     Ok(promotion::PromoteCtx {
-        instance_id: InstanceId::new(),
+        instance_id,
         host_id: spec.map_or_else(HostId::new, |spec| spec.host.clone()),
         journal_id: Id::new("obj")?,
         run_id: RunId::new(),
@@ -3117,6 +3183,34 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    /// c-wfdrill2 C. `promote_ctx` minted `InstanceId::new()`, so every id the
+    /// driver derived — hook tool nodes through `remuda_signal`, the
+    /// transcript replay's `TranscriptMapper` — was scoped to an id nothing
+    /// else in the system knew. The Node's own workflow producer derives
+    /// `workflow.run.toolCallId` from the same native tool id under the REAL
+    /// instance, so the two could never name the same node and no subagent row
+    /// could fold under its Workflow row.
+    #[test]
+    fn promote_ctx_is_scoped_to_the_instance_the_node_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = InstanceId::new();
+        let mut options = ShellPtyOptions::login(dir.path().to_path_buf());
+        options.instance_id = Some(instance.clone());
+        let ctx = promote_ctx(&options, &dir.path().to_string_lossy(), None).expect("ctx");
+        assert_eq!(
+            ctx.instance_id, instance,
+            "the driver must derive under the Node's instance, not a throwaway"
+        );
+
+        // Left unset (tests, `ShellPtyDriver::spawn`) it still mints one, and
+        // two contexts never accidentally share it.
+        let anonymous = ShellPtyOptions::login(dir.path().to_path_buf());
+        let first = promote_ctx(&anonymous, &dir.path().to_string_lossy(), None).expect("ctx");
+        let second = promote_ctx(&anonymous, &dir.path().to_string_lossy(), None).expect("ctx");
+        assert_ne!(first.instance_id, second.instance_id);
+        assert_ne!(first.instance_id, instance);
     }
 
     #[tokio::test]

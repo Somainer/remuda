@@ -171,6 +171,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
     fs::write(evidence_path(), "").unwrap();
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch.clone(),
         native_home: isolated_native_home(),
@@ -349,6 +350,7 @@ async fn live_claude_bg_start_prompt_idle_read_close() {
     fs::create_dir_all(&launch).unwrap();
 
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch.clone(),
         native_home: isolated_native_home(),

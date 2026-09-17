@@ -417,6 +417,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
     let claude = stub_claude(tmp.path());
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,
@@ -504,6 +505,7 @@ async fn bg_resume_keeps_settings_attach_after_stop_does_not_wake() {
     fs::create_dir_all(&home).unwrap();
     let claude = stub_bg_claude(tmp.path());
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch.clone(),
         native_home: home.clone(),
@@ -614,6 +616,7 @@ async fn bg_attach_before_dispatch_would_wake() {
     fs::create_dir_all(&home).unwrap();
     let claude = stub_bg_claude(tmp.path());
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,

@@ -29,9 +29,17 @@ import css from "./subagent.module.css";
 
 type LoadState =
   | { status: "loading" }
-  | { status: "starting" }
+  | { status: "starting"; reason?: string }
   | { status: "error"; message: string }
   | { status: "ready"; data: SubagentTranscriptResponse };
+
+/** What the Node's `reason` means for a human reading the row. */
+function startingNote(reason?: string): string {
+  if (reason === "transcript-unbound") {
+    return "宿主尚未绑定这个会话的 transcript，因此还读不到它的子会话。";
+  }
+  return "子会话已创建，它自己的 transcript 尚未落盘。";
+}
 
 function elapsedMs(meta: SubagentMeta): number | undefined {
   if (!meta.startedAt || !meta.endedAt) return undefined;
@@ -99,7 +107,9 @@ export function SubagentView() {
     void fetchSubagentTranscript(instanceId, agentId)
       .then((data) => {
         if (cancelled) return;
-        setState(data.available ? { status: "ready", data } : { status: "starting" });
+        setState(
+          data.available ? { status: "ready", data } : { status: "starting", reason: data.reason },
+        );
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -138,7 +148,7 @@ export function SubagentView() {
       {state.status === "loading" ? <div className={css.notice}>正在读取子会话…</div> : null}
       {state.status === "starting" ? (
         <div className={css.notice} data-testid="subagent-starting">
-          启动中：子会话已创建，它自己的 transcript 尚未落盘。
+          启动中：{startingNote(state.reason)}
         </div>
       ) : null}
       {state.status === "error" ? (

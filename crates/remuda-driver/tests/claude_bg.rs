@@ -125,6 +125,7 @@ async fn stub_bg_start_send_stop_does_not_rm() {
     let claude = stub_claude(tmp.path());
 
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home.clone(),
@@ -220,6 +221,7 @@ async fn live_claude_bg_haiku_once() {
     fs::create_dir_all(&home).unwrap();
 
     let driver = ClaudeBgDriver::new(ClaudeBgOptions {
+        instance_id: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,

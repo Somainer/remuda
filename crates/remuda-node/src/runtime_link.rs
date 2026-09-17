@@ -5,7 +5,7 @@ use crate::{
     CommandAction, CreateInstanceRequest, DevNode, InstanceCommandRequest, NodeError, WssLink,
 };
 use remuda_protocol::{AgentKind, DriverKind, InstanceId, U64};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::HashMap;
 
 /// Serve Hub→Node RPCs on `link` against `node` and mirror journals.
@@ -169,7 +169,11 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
         method if crate::workspace_scm::is_scm_method(method) => {
             crate::workspace_scm::handle_rpc(node, method, &params)
         }
-        _ => Ok(json!({ "ok": true })),
+        // One dispatch table for everything this link does no bookkeeping
+        // for. `attach_runtime` always replies, so an unhandled method is a
+        // request-style error here rather than the `{"ok": true}` that used to
+        // stand in for every method nobody had written an arm for.
+        _ => crate::transport::hubnode::dispatch_method(node, method, params).await,
     }
 }
 

@@ -357,6 +357,10 @@ async fn fake_node(
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
+    // Scripted terminal answers awaiting their first `interaction.list`, keyed
+    // by interaction id -> instance id. See the `ask-question-terminal` arm.
+    let terminal_pending: Arc<Mutex<HashMap<String, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // Frames read while waiting for a journal.append ack (they may be stale
     // append responses or — importantly — unrelated Hub RPCs such as the
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
@@ -576,25 +580,24 @@ async fn fake_node(
                         .await
                         .insert(interaction_id.as_id().as_str().to_string(), card.clone());
                     if terminal_answer {
-                        // Model the human answering in the agent's own TUI: after a
-                        // beat the harness closes the dialog itself (PostToolUse
-                        // with answers), without any interaction.answer RPC.
-                        let tx = close_tx.clone();
-                        let iid = interaction_id.as_id().as_str().to_string();
-                        let terminal_instance = instance_id.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(1200)).await;
-                            let _ = tx
-                            .send((
-                                terminal_instance,
-                                iid,
-                                json!({
-                                    "q0": { "optionIds": ["继续排查 remuda 环境"], "text": null },
-                                    "q1": { "optionIds": ["保存端口"], "text": null }
-                                }),
-                            ))
-                            .await;
-                        });
+                        // Model the human answering in the agent's own TUI: the
+                        // harness closes the dialog itself (PostToolUse with
+                        // answers), with no interaction.answer RPC.
+                        //
+                        // Armed, not started: a fixed delay from *create* raced
+                        // the spec, which asserts the card is pending after the
+                        // form is on screen. The web store polls
+                        // `interaction.list` every 2 s, so on a loaded lane the
+                        // form can still be rendering from a poll while this
+                        // timer has already retired the card — the spec then
+                        // reads 0 pending and fails, exactly as the Linux gate
+                        // saw. Waiting for the first list that carries this card
+                        // means the answer can only land after a client could
+                        // see it, on any machine.
+                        terminal_pending.lock().await.insert(
+                            interaction_id.as_id().as_str().to_string(),
+                            instance_id.clone(),
+                        );
                     }
                     // C2: the create prompt is a command, so its user observation
                     // carries the commandId the Hub forwards in params.
@@ -1164,6 +1167,38 @@ async fn fake_node(
                         .cloned()
                         .collect();
                     send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
+                    // A scripted terminal answer starts its timer here: the
+                    // card has now been listed to a client at least once, so
+                    // the spec's "pending after the form is visible" assertion
+                    // cannot lose the race against it.
+                    let armed: Vec<(String, String)> = {
+                        let mut armed = terminal_pending.lock().await;
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("id").and_then(Value::as_str))
+                            .filter_map(|iid| {
+                                armed
+                                    .remove(iid)
+                                    .map(|instance| (iid.to_string(), instance))
+                            })
+                            .collect()
+                    };
+                    for (iid, terminal_instance) in armed {
+                        let tx = close_tx.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(1200)).await;
+                            let _ = tx
+                                .send((
+                                    terminal_instance,
+                                    iid,
+                                    json!({
+                                        "q0": { "optionIds": ["继续排查 remuda 环境"], "text": null },
+                                        "q1": { "optionIds": ["保存端口"], "text": null }
+                                    }),
+                                ))
+                                .await;
+                        });
+                    }
                 }
                 "interaction.answer" => {
                     let answer = params.get("answer").cloned().unwrap_or(json!({}));

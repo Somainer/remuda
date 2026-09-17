@@ -18,9 +18,9 @@ use remuda_node::{LocalStore, MemoryStore};
 use remuda_protocol::{
     Activity, AgentKind, ClaudeRef, Connectivity, DriverKind, EntityMeta, HostId, Instance,
     InstanceId, InstanceLifecycle, InstanceMode, Knowledge, LaunchedBy, NativeRef, Observation,
-    ObservationPayload, Ownership, ProcessRef, RunId, WorkflowState, WorkspaceId,
+    ObservationPayload, Ownership, ProcessRef, WorkflowState, WorkspaceId,
 };
-use remuda_signal::{BusContext, HookEnvelope, SignalBus};
+use remuda_signal::{HookEnvelope, SignalBus};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -140,15 +140,23 @@ impl Harness {
 
         let instance_id = InstanceId::new();
         let (tx, rx) = mpsc::channel(256);
+        // The bus identity comes from the driver's own `promote_ctx`, exactly
+        // as `start_hooks_blocking` builds it in production — not from a
+        // hand-written `BusContext` that restates the id the producer uses.
+        // That is what makes the `toolCallId` assertion below meaningful:
+        // before c-wfdrill2 C the driver minted `InstanceId::new()` here, so
+        // the hook-derived tool node and the run's `toolCallId` were derived
+        // under different scopes and could never match.
+        let mut options =
+            remuda_driver::shell_pty::ShellPtyOptions::login(tmp.path().to_path_buf());
+        options.instance_id = Some(instance_id.clone());
         let bus = Arc::new(SignalBus::new(
-            BusContext {
-                instance_id: instance_id.clone(),
-                host_id: HostId::new(),
-                journal_id: remuda_protocol::Id::new("obj").unwrap(),
-                run_id: RunId::new(),
-                driver_kind: remuda_protocol::DriverKind::ShellPty,
-                adapter_version: "test".into(),
-            },
+            remuda_driver::shell_pty::hook_bus_context(
+                &options,
+                &tmp.path().to_string_lossy(),
+                None,
+            )
+            .expect("hook bus context"),
             tx,
             Arc::new(AtomicU64::new(0)),
         ));
@@ -232,6 +240,18 @@ fn runs(obs: &[Observation]) -> Vec<&remuda_protocol::WorkflowRunPayload> {
         .collect()
 }
 
+/// The node id of the `tool_name` tool call, as the hook fold minted it.
+fn tool_call_id(obs: &[Observation], tool_name: &str) -> Option<remuda_protocol::Id> {
+    obs.iter().find_map(|obs| match &obs.body {
+        ObservationPayload::ToolCall(call)
+            if matches!(&call.tool_name, Knowledge::Known { value } if value == tool_name) =>
+        {
+            Some(call.tool_call_id.clone())
+        }
+        _ => None,
+    })
+}
+
 fn members(obs: &[Observation]) -> Vec<&remuda_protocol::WorkflowMemberPayload> {
     obs.iter()
         .filter_map(|obs| match &obs.body {
@@ -269,6 +289,26 @@ async fn launch_member_terminal_sequence_and_budgets() {
     )
     .unwrap();
 
+    // The launch's own PreToolUse opens the Workflow tool row (claude fires it
+    // before the call runs); the run snapshot below must name exactly that row.
+    let opened = h
+        .hook(
+            "PreToolUse",
+            serde_json::json!({
+                "tool_name": "Workflow",
+                "tool_use_id": "toolu_vrtx_01WF",
+                "tool_input": { "script": "export const meta = {}" },
+            }),
+        )
+        .await;
+    let launch_call =
+        tool_call_id(&opened, "Workflow").expect("PreToolUse opens the Workflow tool row");
+    assert_eq!(
+        Some(launch_call.clone()),
+        remuda_signal::tool_node_id(h.instance_id.as_id().as_str(), "toolu_vrtx_01WF"),
+        "the hook fold derives the tool node under the Node's instance scope"
+    );
+
     // PostToolUse(Workflow): the first workflow.run must be emitted
     // synchronously inside the budget.
     let started = Instant::now();
@@ -296,7 +336,15 @@ async fn launch_member_terminal_sequence_and_budgets() {
     let run_snapshots = runs(&committed);
     assert_eq!(run_snapshots.len(), 1, "exactly one run snapshot on launch");
     assert_eq!(run_snapshots[0].state, WorkflowState::Running);
-    assert!(run_snapshots[0].tool_call_id.is_some());
+    // c-wfdrill2 C: the run must name the tool call row the SAME hook fold
+    // produced for `toolu_vrtx_01WF`. The web assembler mounts the workflow
+    // card on that row by id; two ids derived under different scopes leave
+    // every member and subagent row outside the Workflow row forever.
+    assert_eq!(
+        run_snapshots[0].tool_call_id.as_ref(),
+        Some(&launch_call),
+        "workflow.run.toolCallId must be the tool call node the hook fold minted"
+    );
     assert!(run_snapshots[0].totals.as_ref().unwrap().total_known);
     assert_eq!(run_snapshots[0].totals.as_ref().unwrap().agents_total.0, 4);
     let elapsed = started.elapsed().as_nanos() / 1_000_000;

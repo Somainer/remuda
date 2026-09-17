@@ -1022,6 +1022,7 @@ export type GateJob = ({
   "keepLogs": (boolean);
   "laneId"?: (string | null);
   "logObjectId"?: (string | null);
+  "mergeRef"?: (string | null);
   "mergeSha"?: (string | null);
   "mode": GateMode;
   "projectId": ProjectId;
@@ -1042,8 +1043,37 @@ export type GateJobId = (string);
 /** Gate job lifecycle: queued → running → passed|failed|landed, with cancel. */
 export type GateJobState = ("queued" | "running" | "passed" | "failed" | "landed" | "canceling" | "canceled");
 
+/** `gate.land` params: the home host obtains a lane's verified merge commit and compare-and-swap pushes it to the project's base branch.  This is the `pushFrom: home` half of D-034: the lane host holds no push credential for the project remote, so a passing verify is landed by the host that does. For this slice the merge commit arrives by `git fetch` of `mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the better shape later, so `fetchRemote` stays the only lane-reachability input and nothing else assumes ssh. */
+export type GateLandParams = ({
+  "baseBranch": (string);
+  "baseSha": (string);
+  "branch": (string);
+  "fetchRemote": (string);
+  "jobId": (string);
+  "mergeRef": (string);
+  "mergeSha": (string);
+  "pushRemote": (string);
+  "repoPath": (string);
+  "timeoutSecs": (number);
+  [key: string]: unknown;
+});
+
+/** `gate.land` verdict. */
+export type GateLandResult = ({
+  "currentMainSha"?: (string | null);
+  "error"?: (string | null);
+  "jobId": (string);
+  "mergeSha"?: (string | null);
+  "output"?: (string | null);
+  "status": (string);
+  [key: string]: unknown;
+});
+
 /** What the job does: verify only, or verify-then-land. */
 export type GateMode = ("verify" | "land");
+
+/** Which host pushes `main` for a land job. */
+export type GatePushFrom = ("lane" | "home");
 
 /** Bounded failure evidence for one gate run, stored by the Hub as an `obj_…` log object (never inlined into the job row). For a failed run the Node populates it for the failed step; with `--keep-logs` a green run gets a `kept` log of the whole-run tail. */
 export type GateRunLog = ({
@@ -1074,6 +1104,7 @@ export type GateRunParams = ({
   "mode": (string);
   "ports"?: (string | null);
   "push": (boolean);
+  "pushFrom": GatePushFrom;
   "pwEndpoint"?: (string | null);
   "repoPath": (string);
   "targetDir": (string);
@@ -1093,6 +1124,7 @@ export type GateRunResult = ({
   "failedStep"?: (string | null);
   "headSha"?: (string | null);
   "jobId": (string);
+  "mergeRef"?: (string | null);
   "mergeSha"?: (string | null);
   "reason"?: (string | null);
   "runLog"?: (GateRunLog | (null));
@@ -1130,6 +1162,20 @@ export type GateThenResult = ({
   "exitCode": (number);
   "jobId": (string);
   "output": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.unpin` params: drop a job's persisted merge refs on the lane host. */
+export type GateUnpinParams = ({
+  "jobId": (string);
+  "repoPath": (string);
+  [key: string]: unknown;
+});
+
+/** `gate.unpin` result. */
+export type GateUnpinResult = ({
+  "jobId": (string);
+  "removed": (((string))[]);
   [key: string]: unknown;
 });
 
@@ -3100,10 +3146,12 @@ export type ProjectGateLane = ({
   "env": ({
   [key: string]: (string);
 });
+  "fetchRemote"?: (string | null);
   "hostId": HostId;
   "id": (string);
   "lockPath"?: (string | null);
   "ports"?: (string | null);
+  "pushFrom"?: (GatePushFrom | (null));
   "pwEndpoint"?: (string | null);
   "remote"?: (string | null);
   "repoPath": (string);

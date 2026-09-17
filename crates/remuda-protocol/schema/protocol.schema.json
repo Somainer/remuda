@@ -4836,6 +4836,13 @@
             "null"
           ]
         },
+        "mergeRef": {
+          "description": "Ref pinning `mergeSha` in the lane repo after a passing verify, so the\ncommit survives the scratch worktree and a home-host land can fetch it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mergeSha": {
           "description": "Verified / landed merge commit sha.",
           "type": [
@@ -4967,6 +4974,115 @@
         }
       ]
     },
+    "GateLandParams": {
+      "description": "`gate.land` params: the home host obtains a lane's verified merge commit\nand compare-and-swap pushes it to the project's base branch.\n\nThis is the `pushFrom: home` half of D-034: the lane host holds no push\ncredential for the project remote, so a passing verify is landed by the\nhost that does. For this slice the merge commit arrives by `git fetch` of\n`mergeRef` over `fetchRemote`; a Node RPC streaming the packfile is the\nbetter shape later, so `fetchRemote` stays the only lane-reachability\ninput and nothing else assumes ssh.",
+      "properties": {
+        "baseBranch": {
+          "default": "main",
+          "description": "Base branch to advance (`main`).",
+          "type": "string"
+        },
+        "baseSha": {
+          "description": "Base the merge was verified onto. The push is refused unless the\nremote's base branch still equals this (it is the merge's first parent).",
+          "type": "string"
+        },
+        "branch": {
+          "description": "Branch being landed (for the log line only).",
+          "type": "string"
+        },
+        "fetchRemote": {
+          "description": "Operator's existing remote/alias on the home host that reaches the lane\nrepo, used to fetch `mergeRef`.",
+          "type": "string"
+        },
+        "jobId": {
+          "description": "Job being landed.",
+          "type": "string"
+        },
+        "mergeRef": {
+          "description": "Ref in the lane repo pinning the verified merge commit.",
+          "type": "string"
+        },
+        "mergeSha": {
+          "description": "The verified merge commit; the fetched ref must resolve to exactly this.",
+          "type": "string"
+        },
+        "pushRemote": {
+          "default": "origin",
+          "description": "Remote to push to (`origin`).",
+          "type": "string"
+        },
+        "repoPath": {
+          "description": "Home-host checkout that owns the push credential.",
+          "type": "string"
+        },
+        "timeoutSecs": {
+          "default": 0,
+          "description": "Wall-clock budget (seconds); 0 uses the Node default.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "jobId",
+        "repoPath",
+        "branch",
+        "baseBranch",
+        "pushRemote",
+        "fetchRemote",
+        "mergeRef",
+        "mergeSha",
+        "baseSha",
+        "timeoutSecs"
+      ],
+      "type": "object"
+    },
+    "GateLandResult": {
+      "description": "`gate.land` verdict.",
+      "properties": {
+        "currentMainSha": {
+          "description": "Remote base-branch sha observed when the CAS was refused.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Failure text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobId": {
+          "description": "Job id echoed back.",
+          "type": "string"
+        },
+        "mergeSha": {
+          "description": "Sha now at the remote base branch on success.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Captured git output (truncated), kept as land evidence.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`landed` | `base-moved` | `failed`.\n\n`base-moved` means the compare-and-swap was refused because the remote\nbase branch had advanced; nothing was pushed and the Hub re-queues a\nverify. There is no partial-push outcome: the push is a single\n`--force-with-lease` on the base branch, so the remote either takes the\nwhole merge commit or stays exactly where it was.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "status"
+      ],
+      "type": "object"
+    },
     "GateMode": {
       "description": "What the job does: verify only, or verify-then-land.",
       "oneOf": [
@@ -4978,6 +5094,21 @@
         {
           "const": "land",
           "description": "Verify when needed, then compare-and-swap and push main.",
+          "type": "string"
+        }
+      ]
+    },
+    "GatePushFrom": {
+      "description": "Which host pushes `main` for a land job.",
+      "oneOf": [
+        {
+          "const": "lane",
+          "description": "The lane host pushes from its own checkout (needs a push credential).",
+          "type": "string"
+        },
+        {
+          "const": "home",
+          "description": "The lane only verifies; the project home host fetches the merge commit\nand pushes it. The policy for lanes holding no project credential.",
           "type": "string"
         }
       ]
@@ -5115,6 +5246,11 @@
           "description": "Land mode pushes main from the lane host when true.",
           "type": "boolean"
         },
+        "pushFrom": {
+          "$ref": "#/$defs/GatePushFrom",
+          "default": "lane",
+          "description": "Where `main` is pushed from for a land job. With `home` the lane runs a\nverify only (never `merge --land`): moving lane-local main here would\nreport `landed` while nothing reached the remote."
+        },
         "pwEndpoint": {
           "description": "Playwright WebSocket endpoint (`PW_TEST_CONNECT_WS_ENDPOINT`).",
           "type": [
@@ -5165,6 +5301,7 @@
         "timeouts",
         "gateTimeoutSecs",
         "push",
+        "pushFrom",
         "keepLogs"
       ],
       "type": "object"
@@ -5210,6 +5347,13 @@
         "jobId": {
           "description": "Job id echoed back.",
           "type": "string"
+        },
+        "mergeRef": {
+          "description": "Ref the lane runner pinned `mergeSha` under (`refs/remuda/gate/<id>`).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "mergeSha": {
           "description": "Merge commit sha.",
@@ -5372,6 +5516,46 @@
         "jobId",
         "exitCode",
         "output"
+      ],
+      "type": "object"
+    },
+    "GateUnpinParams": {
+      "description": "`gate.unpin` params: drop a job's persisted merge refs on the lane host.",
+      "properties": {
+        "jobId": {
+          "description": "Job whose refs are dropped.",
+          "type": "string"
+        },
+        "repoPath": {
+          "description": "Lane checkout holding the refs.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jobId",
+        "repoPath"
+      ],
+      "type": "object"
+    },
+    "GateUnpinResult": {
+      "description": "`gate.unpin` result.",
+      "properties": {
+        "jobId": {
+          "description": "Job id echoed back.",
+          "type": "string"
+        },
+        "removed": {
+          "default": [],
+          "description": "Refs actually deleted.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "jobId",
+        "removed"
       ],
       "type": "object"
     },
@@ -13902,6 +14086,13 @@
           "description": "Extra environment applied to every gate run on this lane\n(`CARGO_HOME`, `PW_CHANNEL`, `RUSTFLAGS`, …).",
           "type": "object"
         },
+        "fetchRemote": {
+          "description": "Operator's existing remote/alias **on the home host** that reaches this\nlane's repo, used to fetch the verified merge commit for a\n`pushFrom: home` land. Required when `pushFrom` resolves to `home`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "hostId": {
           "$ref": "#/$defs/HostId",
           "description": "Host that runs the lane."
@@ -13923,6 +14114,17 @@
             "string",
             "null"
           ]
+        },
+        "pushFrom": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatePushFrom"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which host pushes `main` when a land job runs on this lane. Defaults to\n`lane`; set `home` for a lane whose host holds no push credential for\nthe project `repoRemote` (the policy for the remote lane), and the lane\nthen verifies only while the project home host pushes."
         },
         "pwEndpoint": {
           "description": "Playwright WebSocket endpoint (`PW_TEST_CONNECT_WS_ENDPOINT`).",

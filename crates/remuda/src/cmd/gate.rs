@@ -308,6 +308,9 @@ pub(crate) async fn wait_for_job(
                     eprintln!("{reason}");
                 }
                 println!("{mode}: {state}");
+                if state == "passed" {
+                    print_land_hint(&job);
+                }
             }
             return Ok(match state {
                 "passed" | "landed" => 0,
@@ -316,6 +319,28 @@ pub(crate) async fn wait_for_job(
             });
         }
         tokio::time::sleep(std::time::Duration::from_secs(WAIT_POLL_SECS)).await;
+    }
+}
+
+/// After a passing verify, say where the merge is pinned and exactly what to
+/// run to land it. A pass is not a land: without this the operator is left to
+/// guess the branch spelling and whether the merge still exists.
+fn print_land_hint(job: &Value) {
+    let Some(merge_ref) = job.get("mergeRef").and_then(Value::as_str) else {
+        return;
+    };
+    if let Some(sha) = job.get("mergeSha").and_then(Value::as_str) {
+        println!("mergeRef: {merge_ref} -> {sha}");
+    } else {
+        println!("mergeRef: {merge_ref}");
+    }
+    if let Some(branch) = job.get("branch").and_then(Value::as_str) {
+        let project = job
+            .get("projectId")
+            .and_then(Value::as_str)
+            .map(|id| format!(" --project {id}"))
+            .unwrap_or_default();
+        println!("land it with: remuda land {branch}{project}");
     }
 }
 

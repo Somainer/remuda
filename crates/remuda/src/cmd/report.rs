@@ -321,6 +321,21 @@ fn owner_asks(workers: &[Value], reports: &[Value], gate_jobs: &[Value]) -> Vec<
                 "reason": gate_failure_reason(job),
             }));
         }
+        // A verify that passed and pinned a merge is finished work that has not
+        // reached main. It needs an owner to land it (or it expires with the
+        // pinned ref), so it is an ask rather than a quiet success.
+        if job["state"].as_str() == Some("passed")
+            && let Some(merge_ref) = job["mergeRef"].as_str()
+        {
+            let branch = job["branch"].as_str().unwrap_or("?");
+            asks.push(json!({
+                "kind": "land", "branch": job["branch"],
+                "status": "passed-unlanded",
+                "mergeRef": merge_ref,
+                "mergeSha": job["mergeSha"],
+                "reason": format!("verified, not landed: remuda land {branch}"),
+            }));
+        }
     }
     asks
 }
@@ -588,4 +603,61 @@ fn print_owner_asks(asks: &[&Value]) {
 
 fn short(sha: &str) -> &str {
     sha.get(..12.min(sha.len())).unwrap_or(sha)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A passing verify that pinned a merge is finished work that has not
+    /// reached main, so the owner needs to see it (evidence: gate-lane-2).
+    #[test]
+    fn a_passed_but_unlanded_job_is_an_owner_ask() {
+        let jobs = vec![json!({
+            "id": "gjb_1", "branch": "wt/w/topic", "mode": "verify",
+            "state": "passed",
+            "mergeRef": "refs/remuda/gate/gjb_1",
+            "mergeSha": "a2c00b15a9369ac589a4ef91ce9d60203e62ae55",
+        })];
+        let asks = owner_asks(&[], &[], &jobs);
+        let ask = asks
+            .iter()
+            .find(|ask| ask["kind"] == "land")
+            .unwrap_or_else(|| panic!("expected a land ask: {asks:?}"));
+        assert_eq!(ask["branch"], "wt/w/topic");
+        assert_eq!(ask["mergeRef"], "refs/remuda/gate/gjb_1");
+        // The reason is the command the owner should run.
+        let reason = ask["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("remuda land wt/w/topic"),
+            "the ask should name the command: {reason}"
+        );
+    }
+
+    /// A verify with no pinned ref is not landable, so it must not be an ask —
+    /// otherwise every green run would nag the owner forever.
+    #[test]
+    fn a_passed_job_without_a_pin_is_not_an_ask() {
+        let jobs = vec![json!({
+            "id": "gjb_2", "branch": "wt/w/topic", "mode": "verify",
+            "state": "passed",
+        })];
+        let asks = owner_asks(&[], &[], &jobs);
+        assert!(
+            !asks.iter().any(|ask| ask["kind"] == "land"),
+            "an unpinned pass is not landable: {asks:?}"
+        );
+    }
+
+    /// A landed job is done; it must never appear as an outstanding ask.
+    #[test]
+    fn a_landed_job_is_not_an_ask() {
+        let jobs = vec![json!({
+            "id": "gjb_3", "branch": "wt/w/topic", "mode": "land",
+            "state": "landed",
+            "mergeRef": "refs/remuda/gate/gjb_3",
+        })];
+        let asks = owner_asks(&[], &[], &jobs);
+        assert!(asks.is_empty(), "a landed job is done: {asks:?}");
+    }
 }

@@ -251,6 +251,17 @@ pub struct ProjectGateLane {
     /// SSH remote alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Which host pushes `main` when a land job runs on this lane. Defaults to
+    /// `lane`; set `home` for a lane whose host holds no push credential for
+    /// the project `repoRemote` (the policy for the remote lane), and the lane
+    /// then verifies only while the project home host pushes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_from: Option<crate::GatePushFrom>,
+    /// Operator's existing remote/alias **on the home host** that reaches this
+    /// lane's repo, used to fetch the verified merge commit for a
+    /// `pushFrom: home` land. Required when `pushFrom` resolves to `home`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_remote: Option<String>,
     /// Extra environment applied to every gate run on this lane
     /// (`CARGO_HOME`, `PW_CHANNEL`, `RUSTFLAGS`, …).
     #[serde(default)]

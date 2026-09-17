@@ -119,6 +119,9 @@ pub const WATCH_IDLE_API_ERROR: &str = "idle-api-error";
 pub const WATCH_STALLED: &str = "stalled";
 /// Host offline, instance closed, or no readable live carrier.
 pub const WATCH_GONE: &str = "gone";
+/// Instance lifecycle failed/exited after an errored turn, or the last turn
+/// result itself errored (2026-09-17 watch-failed-1).
+pub const WATCH_FAILED: &str = "failed";
 
 /// Default quiet window before a busy, silent turn is called stalled. The
 /// behaviour spec productised here ("a single API turn running for >30 min
@@ -151,6 +154,14 @@ pub enum WorkerWatchStatus {
     Stalled,
     /// Host offline, instance closed, or carrier gone.
     Gone,
+    /// The instance lifecycle failed (or exited after an errored turn), or the
+    /// last turn result errored. The worker cannot make progress as launched;
+    /// unlike `gone` there is a concrete cause to report.
+    Failed {
+        /// First line of the last assistant error message, else the lifecycle
+        /// reason code.
+        reason: String,
+    },
 }
 
 impl WorkerWatchStatus {
@@ -164,6 +175,7 @@ impl WorkerWatchStatus {
             Self::IdleApiError => WATCH_IDLE_API_ERROR,
             Self::Stalled => WATCH_STALLED,
             Self::Gone => WATCH_GONE,
+            Self::Failed { .. } => WATCH_FAILED,
         }
     }
 
@@ -236,6 +248,28 @@ pub struct ScreenSignals<'a> {
     /// report token is located anywhere in the tail (the `coord-watch-all.sh`
     /// grep semantics) instead of requiring a start-of-line anchor.
     pub raw: bool,
+    /// Whether a live screen was actually read for this observation. Print
+    /// drivers (`claude-print`) and dead carriers have none; when false the
+    /// text signals (`journal_lines`, `last_error_line`, `turn_error`) come
+    /// from the mirrored instance journal instead, and the Hub marks the
+    /// persisted detail `screen-unavailable`.
+    pub screen_available: bool,
+    /// Assistant text blocks recovered from the instance journal (transcript
+    /// order), used for report/error classification only when
+    /// `screen_available` is false.
+    pub journal_lines: &'a [String],
+    /// The last turn result (`lifecycle/turn` `result`) was an error.
+    pub turn_error: bool,
+    /// The instance journal's last assistant text block grades as a hard
+    /// error. Distinguishes a fatal exit after an error from a session that
+    /// hit an error, recovered, reported DONE, and then exited cleanly.
+    pub tail_error: bool,
+    /// First line of the last assistant error message seen in the journal
+    /// (e.g. `API Error: 400 requested model is not available`), if any.
+    pub last_error_line: Option<&'a str>,
+    /// Machine-readable reason code / driver error recorded on the Hub
+    /// instance row, used as the failure reason when no error message exists.
+    pub lifecycle_reason: Option<&'a str>,
 }
 
 /// The classified screen state plus the evidence line.
@@ -271,6 +305,17 @@ pub enum ScreenClass {
     Gone {
         /// Machine-readable why.
         reason: &'static str,
+    },
+    /// The instance failed or exited after an errored turn, or the last turn
+    /// result errored. Distinct from `Gone`: the worker is dead *with a known
+    /// cause*, so a report can say what the owner must fix (watch-failed-1,
+    /// 2026-09-17).
+    Failed {
+        /// First line of the last assistant error message, else the lifecycle
+        /// reason code.
+        reason: String,
+        /// Evidence line (same text as `reason`, truncated).
+        line: String,
     },
 }
 
@@ -342,10 +387,17 @@ fn parse_blocked(line: &str) -> Option<String> {
     Some(truncated)
 }
 
-fn is_terminal_lifecycle(lifecycle: &str) -> bool {
+/// Lifecycles that mean the instance died *with an error* (watch-failed-1).
+fn is_failed_lifecycle(lifecycle: &str) -> bool {
+    lifecycle.eq_ignore_ascii_case("failed")
+}
+
+/// Lifecycles that mean the carrier/process is simply gone, without an error
+/// diagnosis of their own.
+fn is_closed_lifecycle(lifecycle: &str) -> bool {
     matches!(
         lifecycle.to_ascii_lowercase().as_str(),
-        "closed" | "failed" | "terminated" | "exited"
+        "closed" | "terminated"
     )
 }
 
@@ -521,33 +573,143 @@ fn snippet(text: &str, start: usize, consumed: usize) -> String {
     text[begin..end].trim().to_string()
 }
 
+/// First non-empty line of an error message, trimmed and capped the same way
+/// a BLOCKED reason is.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(text.trim());
+    line.chars().take(120).collect()
+}
+
+/// Pick the failure reason per watch-failed-1: first line of the last
+/// assistant error message, else the lifecycle reason code, else a static
+/// fallback derived from what triggered the classification.
+fn failure_reason(signals: &ScreenSignals<'_>, fallback: &'static str) -> (String, String) {
+    if let Some(line) = signals
+        .last_error_line
+        .map(first_line)
+        .filter(|s| !s.is_empty())
+    {
+        return (line.clone(), line);
+    }
+    if let Some(reason) = signals
+        .lifecycle_reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(first_line)
+    {
+        return (reason.clone(), reason);
+    }
+    (fallback.to_string(), fallback.to_string())
+}
+
+/// The bottom-most DONE/BLOCKED report inside journaled assistant text.
+///
+/// Screenless (print) drivers expose no live grid; their final assistant
+/// message is the same `DONE <sha>` / `BLOCKED <reason>` contract line the
+/// screen classifier looks for, so the matching and echo rules are the same —
+/// only the source differs. One journaled text block may span several lines.
+fn journal_report(signals: &ScreenSignals<'_>) -> Option<ScreenClass> {
+    for text in signals.journal_lines.iter().rev() {
+        if is_brief_echo(text) {
+            continue;
+        }
+        for raw in text.lines().rev() {
+            let line = trim_report_line(raw);
+            if is_brief_echo(line) {
+                continue;
+            }
+            if let Some(sha) = parse_done(line) {
+                // Old tip replayed from the transcript: an echo, not a new
+                // report; stop looking, mirroring `bottom_report`.
+                if signals.known_done_sha == Some(sha.as_str()) {
+                    return None;
+                }
+                return Some(ScreenClass::Done {
+                    sha,
+                    line: line.to_string(),
+                });
+            }
+            if let Some(reason) = parse_blocked(line) {
+                if signals.known_blocked == Some(reason.as_str()) {
+                    return None;
+                }
+                return Some(ScreenClass::Blocked {
+                    reason,
+                    line: line.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Classify a worker's visible screen per the coordinator watcher practice:
-/// gone → new DONE/BLOCKED → idle-after-API-error → stalled → working.
+/// failed turn/instance → gone → new DONE/BLOCKED → idle-after-API-error →
+/// stalled → working.
 #[must_use]
 pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
+    let lifecycle = signals.lifecycle.to_ascii_lowercase();
+    // A failed instance, a turn that ended in error, or an exit whose *last*
+    // assistant message was an error — regardless of screen availability. A
+    // *clean* exit is different: a print worker that hit an error, recovered
+    // and reported DONE exits 0, so the fresh journaled DONE below is what
+    // classifies it; an exit with no report falls through to gone.
+    let dead_after_error = lifecycle == "exited" && (signals.turn_error || signals.tail_error);
+    if is_failed_lifecycle(&lifecycle) || dead_after_error {
+        let (reason, line) = failure_reason(signals, "instance-failed");
+        return ScreenClass::Failed { reason, line };
+    }
+    if signals.turn_error {
+        let (reason, line) = failure_reason(signals, "turn-error");
+        return ScreenClass::Failed { reason, line };
+    }
     if !signals.host_online {
         return ScreenClass::Gone {
             reason: "host-offline",
         };
     }
-    if is_terminal_lifecycle(signals.lifecycle) {
+    // A closed/terminated carrier has nothing left to read.
+    if is_closed_lifecycle(&lifecycle) {
         return ScreenClass::Gone {
             reason: "instance-closed",
         };
     }
-    if let Some(report) = bottom_report(signals) {
+    // A fresh DONE/BLOCKED report outranks a clean exit: a print worker's
+    // process exits 0 right after printing its report, and that report is the
+    // classification. (An errored exit was already caught above.)
+    if signals.screen_available {
+        if let Some(report) = bottom_report(signals) {
+            return report;
+        }
+        // Headless raw-ring tail: locate the report token anywhere in the
+        // concatenated repaint (no start-of-line boundary available).
+        if signals.raw
+            && let Some(report) = raw_tail_report(signals)
+        {
+            return report;
+        }
+    } else if let Some(report) = journal_report(signals) {
         return report;
     }
-    // Headless raw-ring tail: locate the report token anywhere in the
-    // concatenated repaint (no start-of-line boundary available).
-    if signals.raw
-        && let Some(report) = raw_tail_report(signals)
-    {
-        return report;
+    // Exited with no fresh report: the process is gone.
+    if lifecycle == "exited" {
+        return ScreenClass::Gone {
+            reason: "instance-closed",
+        };
     }
-    // Idle after API error / connection drop / retry loop.
-    if is_idle(signals.lifecycle, signals.activity) {
-        for raw in signals.lines {
+    // Idle after API error / connection drop / retry loop. The text source is
+    // the live screen when present, otherwise the journaled assistant text.
+    let trouble_lines: &[String] = if signals.screen_available {
+        signals.lines
+    } else {
+        signals.journal_lines
+    };
+    if is_idle(&lifecycle, signals.activity) {
+        for raw in trouble_lines {
             let lower = raw.to_ascii_lowercase();
             if let Some(fragment) = API_ERROR_FRAGMENTS
                 .iter()
@@ -560,7 +722,7 @@ pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
         }
     }
     // A single turn busy with no activity past the stall threshold.
-    if is_busy(signals.lifecycle, signals.activity)
+    if is_busy(&lifecycle, signals.activity)
         && let Some(last) = signals.last_activity_unix
         && signals.stall_mins > 0
     {
@@ -923,6 +1085,12 @@ mod tests {
             known_done_sha: None,
             known_blocked: None,
             raw: false,
+            screen_available: true,
+            journal_lines: &[],
+            turn_error: false,
+            tail_error: false,
+            last_error_line: None,
+            lifecycle_reason: None,
         }
     }
 
@@ -1031,6 +1199,128 @@ mod tests {
                 reason: "instance-closed"
             }
         ));
+    }
+
+    #[test]
+    fn failed_lifecycle_uses_last_assistant_error_line() {
+        let mut s = sig(&[], "failed", "idle");
+        s.last_error_line = Some("API Error: 400 requested model is not available\nretried 3x");
+        assert_eq!(
+            classify_screen(&s),
+            ScreenClass::Failed {
+                reason: "API Error: 400 requested model is not available".into(),
+                line: "API Error: 400 requested model is not available".into(),
+            }
+        );
+        // No error message: the lifecycle reason code is the reason.
+        s.last_error_line = None;
+        s.lifecycle_reason = Some("native-driver-start-failed");
+        match classify_screen(&s) {
+            ScreenClass::Failed { reason, .. } => assert_eq!(reason, "native-driver-start-failed"),
+            other => panic!("{other:?}"),
+        }
+        // Nothing at all: the static fallback.
+        s.lifecycle_reason = None;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Failed { ref reason, .. } if reason == "instance-failed"
+        ));
+    }
+
+    #[test]
+    fn turn_error_fails_even_when_the_carrier_says_ready() {
+        // The exact 2026-09-17 trap: stale "ready" screen lifecycle, errored
+        // turn in the journal.
+        let mut s = sig(&[], "ready", "idle");
+        s.turn_error = true;
+        s.last_error_line = Some("API Error: 400 requested model is not available");
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Failed { ref reason, .. }
+                if reason == "API Error: 400 requested model is not available"
+        ));
+        // A failed turn wins even while the host is briefly unreachable.
+        s.host_online = false;
+        assert!(matches!(classify_screen(&s), ScreenClass::Failed { .. }));
+    }
+
+    #[test]
+    fn exited_after_error_fails_but_clean_exit_is_gone() {
+        let mut s = sig(&[], "exited", "idle");
+        s.turn_error = true;
+        assert!(matches!(classify_screen(&s), ScreenClass::Failed { .. }));
+        s.turn_error = false;
+        // The LAST assistant message was the error: fatal.
+        s.tail_error = true;
+        s.last_error_line = Some("API Error: 429 rate limited");
+        assert!(matches!(classify_screen(&s), ScreenClass::Failed { .. }));
+        // The error happened earlier, the session recovered and its final
+        // message is a DONE report: an old error must not make that a failure.
+        s.tail_error = false;
+        let journal = rows("API Error: 429 rate limited\nDONE 0123456789abcdef");
+        s.journal_lines = &journal;
+        s.screen_available = false;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Done { ref sha, .. } if sha == "0123456789abcdef"
+        ));
+        // A print worker exits 0 with no error tail: gone, not failed.
+        s.journal_lines = &[];
+        s.last_error_line = None;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Gone {
+                reason: "instance-closed"
+            }
+        ));
+    }
+
+    #[test]
+    fn screenless_journal_classifies_done_blocked_and_echo() {
+        let journal = rows("working on it\nDONE 0123456789abcdef");
+        let mut s = sig(&[], "ready", "idle");
+        s.screen_available = false;
+        s.journal_lines = &journal;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Done { ref sha, .. } if sha == "0123456789abcdef"
+        ));
+        // Same sha already known to the roster: echo, not a new DONE.
+        s.known_done_sha = Some("0123456789abcdef");
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
+        // BLOCKED journal text works too.
+        s.known_done_sha = None;
+        let blocked = rows("BLOCKED need credentials");
+        s.journal_lines = &blocked;
+        assert!(matches!(
+            classify_screen(&s),
+            ScreenClass::Blocked { ref reason, .. } if reason == "need credentials"
+        ));
+    }
+
+    #[test]
+    fn screenless_journal_idle_after_api_error() {
+        let journal = rows("API Error: bad gateway, Retrying…");
+        let mut s = sig(&[], "ready", "idle");
+        s.screen_available = false;
+        s.journal_lines = &journal;
+        assert_eq!(
+            classify_screen(&s),
+            ScreenClass::IdleApiError {
+                fragment: "api error".into(),
+            }
+        );
+        // A busy turn is never "idle after error", screen or journal.
+        s.activity = "busy";
+        s.lifecycle = "running";
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
+    }
+
+    #[test]
+    fn screenless_worker_mid_turn_with_no_news_is_working() {
+        let mut s = sig(&[], "ready", "idle");
+        s.screen_available = false;
+        assert_eq!(classify_screen(&s), ScreenClass::Working);
     }
 
     #[test]

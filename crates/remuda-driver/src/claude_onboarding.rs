@@ -333,6 +333,53 @@ pub fn pre_trust_workspace(config_dir: &Path, cwd: &Path) -> DriverResult<()> {
     Ok(())
 }
 
+/// Global-config key Claude Code writes when a human answers the auto-mode
+/// "Allow reads outside the working directories?" dialog with
+/// **"Yes, keep allowing"**.
+///
+/// Verified against the installed Claude Code 2.1.274 bundle: the dialog
+/// (`auto_mode_outside_reads`) is offered only while this key is falsy, and the
+/// `allow` branch runs `set(globalConfig, n => ({…n,
+/// hasSeenAutoModeOutsideReadPrompt: true}))`. The `block` branch instead writes
+/// `permissions.blockReadsOutsideWorkingDirectories: true` to **user**
+/// `settings.json`, which is a machine-wide refusal Remuda must never seed.
+///
+/// This lives in the same global config [`pre_trust_workspace`] writes
+/// (`.claude.json` under `CLAUDE_CONFIG_DIR`), not under `projects` — the
+/// answer is not per cwd.
+pub const OUTSIDE_READS_ALLOW_KEY: &str = "hasSeenAutoModeOutsideReadPrompt";
+
+/// Persist the equivalent of answering **"Yes, keep allowing"** on Claude's
+/// auto-mode "Allow reads outside the working directories?" dialog before the
+/// process starts.
+///
+/// Dispatch carries `bypassPermissions`, where the sandboxed auto mode reads
+/// wherever the task's tools point; a parked outside-reads question stops the
+/// worker exactly like the folder-trust dialog does. Under any other posture
+/// the dialog must be left alone, so callers gate this on the bypass posture
+/// and never call it otherwise.
+///
+/// Same confinement as [`pre_trust_workspace`]: an absolute, Node-owned scoped
+/// config directory only, idempotent. An existing truthy key is left as
+/// written; any other value is upgraded to `true`, exactly like
+/// [`pre_trust_workspace`] — in a Node-scoped dir this flag can only record
+/// this launch's own bypass intent, never a prior human refusal.
+/// Returns whether the file was written.
+pub fn allow_reads_outside_workspaces(config_dir: &Path) -> DriverResult<bool> {
+    if !config_dir.is_absolute() {
+        return Err(DriverError::InvalidLaunchSpec(
+            "claude config dir must be an absolute path".into(),
+        ));
+    }
+    let mut global = read_object(&config_dir.join(".claude.json")).unwrap_or_default();
+    if global.get(OUTSIDE_READS_ALLOW_KEY) == Some(&Value::Bool(true)) {
+        return Ok(false);
+    }
+    global.insert(OUTSIDE_READS_ALLOW_KEY.into(), Value::Bool(true));
+    write_private_json(&config_dir.join(".claude.json"), &global)?;
+    Ok(true)
+}
+
 /// A recognised Claude Code startup screen that is not the prompt composer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartupDialog {
@@ -571,6 +618,65 @@ mod tests {
         ));
         assert!(matches!(
             pre_trust_workspace(&dir.path().join("home"), Path::new("relative/ws")),
+            Err(DriverError::InvalidLaunchSpec(_))
+        ));
+    }
+
+    #[test]
+    fn outside_reads_allow_writes_the_global_flag_once_and_preserves_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("native-home");
+        let cwd = dir.path().join("workspace");
+        // A pre-existing trust decision and an unrelated key must survive.
+        write(
+            &home.join(".claude.json"),
+            json!({
+                "hasCompletedOnboarding": true,
+                "projects": { cwd.to_string_lossy(): {"hasTrustDialogAccepted": true} }
+            }),
+        );
+        assert!(allow_reads_outside_workspaces(&home).unwrap());
+        let global = read_object(&home.join(".claude.json")).unwrap();
+        assert_eq!(global[OUTSIDE_READS_ALLOW_KEY], Value::Bool(true));
+        assert_eq!(global["hasCompletedOnboarding"], Value::Bool(true));
+        assert_eq!(
+            global["projects"][cwd.to_str().unwrap()]["hasTrustDialogAccepted"],
+            Value::Bool(true)
+        );
+        // Idempotent: the second call writes nothing.
+        assert!(!allow_reads_outside_workspaces(&home).unwrap());
+        // An empty scoped dir gets the flag too.
+        let fresh = dir.path().join("fresh-home");
+        assert!(allow_reads_outside_workspaces(&fresh).unwrap());
+        assert_eq!(
+            read_object(&fresh.join(".claude.json")).unwrap()[OUTSIDE_READS_ALLOW_KEY],
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn outside_reads_allow_upgrades_an_explicit_false_like_pre_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("native-home");
+        write(
+            &home.join(".claude.json"),
+            json!({ OUTSIDE_READS_ALLOW_KEY: false }),
+        );
+        // A Node-scoped dir only ever records this launch's own bypass intent,
+        // so the ask-again spelling is upgraded rather than respected — same
+        // rule pre_trust_workspace applies to the trust flag.
+        assert!(allow_reads_outside_workspaces(&home).unwrap());
+        assert_eq!(
+            read_object(&home.join(".claude.json")).unwrap()[OUTSIDE_READS_ALLOW_KEY],
+            Value::Bool(true)
+        );
+        assert!(!allow_reads_outside_workspaces(&home).unwrap());
+    }
+
+    #[test]
+    fn outside_reads_allow_refuses_a_relative_config_dir() {
+        assert!(matches!(
+            allow_reads_outside_workspaces(Path::new("relative/home")),
             Err(DriverError::InvalidLaunchSpec(_))
         ));
     }

@@ -100,6 +100,9 @@ pub struct AppState {
     agent_approvals: agent_approvals::AgentApprovals,
     /// Process-local, single-use WebAuthn ceremony challenges (D-030).
     challenges: passkeys::ChallengeStore,
+    /// When the pinned-ref retention sweep last ran. Per-Hub rather than a
+    /// process static so concurrent instances (tests) never starve each other.
+    gate_ref_swept_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Test-only constructors for types private modules would otherwise hide
@@ -404,6 +407,7 @@ async fn spawn_inner(
         }),
         agent_approvals: agent_approvals::AgentApprovals::new()?,
         challenges: passkeys::ChallengeStore::default(),
+        gate_ref_swept_at: Arc::new(std::sync::Mutex::new(None)),
     };
     store.expire_lost_hosts(config.host_lost_grace_ms).await?;
     // A Hub restart must not inherit yesterday's unacknowledged creates: they

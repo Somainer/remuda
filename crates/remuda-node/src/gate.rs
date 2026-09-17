@@ -20,8 +20,9 @@
 use crate::DevNode;
 use crate::NodeError;
 use remuda_protocol::{
-    GateCancelParams, GateEventKind, GateEventParams, GateRunLog, GateRunParams, GateRunResult,
-    GateStep, GateThenParams, GateThenResult,
+    GateCancelParams, GateEventKind, GateEventParams, GateLandParams, GateLandResult, GateRunLog,
+    GateRunParams, GateRunResult, GateStep, GateThenParams, GateThenResult, GateUnpinParams,
+    GateUnpinResult,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -42,6 +43,8 @@ pub fn is_gate_method(method: &str) -> bool {
 /// Default cap for a whole gate run and for a `--then` command.
 const DEFAULT_GATE_TIMEOUT_SECS: u64 = 60 * 60;
 const DEFAULT_THEN_TIMEOUT_SECS: u64 = 10 * 60;
+/// Default cap for a home-host land (fetch of the merge + leased push).
+const DEFAULT_LAND_TIMEOUT_SECS: u64 = 10 * 60;
 /// Captured output retained in a result.
 const OUTPUT_CAP_BYTES: usize = 16 * 1024;
 
@@ -424,6 +427,28 @@ impl GateRegistry {
 }
 
 impl DevNode {
+    /// Dispatch one Hub→Node gate RPC by method name.
+    ///
+    /// The carrier in `server.rs` routes each method directly; this is the
+    /// entry point for callers outside the crate (integration tests that drive
+    /// a real Node over real repositories).
+    pub async fn dispatch_gate_rpc(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, NodeError> {
+        match method {
+            remuda_protocol::METHOD_GATE_RUN => self.run_gate(params).await,
+            remuda_protocol::METHOD_GATE_CANCEL => self.cancel_gate(params).await,
+            remuda_protocol::METHOD_GATE_THEN => self.run_gate_then(params).await,
+            remuda_protocol::METHOD_GATE_LAND => self.run_gate_land(params).await,
+            remuda_protocol::METHOD_GATE_UNPIN => self.run_gate_unpin(params).await,
+            other => Err(NodeError::InvalidRequest(format!(
+                "not a gate method: {other}"
+            ))),
+        }
+    }
+
     /// Handle `gate.run`.
     pub(crate) async fn run_gate(&self, params: &Value) -> Result<Value, NodeError> {
         let request: GateRunParams = serde_json::from_value(params.clone()).map_err(|error| {
@@ -457,6 +482,69 @@ impl DevNode {
         })?;
         let result = self.run_gate_then_typed(request).await?;
         serde_json::to_value(result).map_err(NodeError::from)
+    }
+
+    /// Handle `gate.land` — the home host fetches a lane's verified merge and
+    /// compare-and-swap pushes the base branch.
+    pub(crate) async fn run_gate_land(&self, params: &Value) -> Result<Value, NodeError> {
+        let request: GateLandParams = serde_json::from_value(params.clone()).map_err(|error| {
+            NodeError::InvalidRequest(format!("invalid gate.land params: {error}"))
+        })?;
+        let result = self.run_gate_land_typed(request).await?;
+        serde_json::to_value(result).map_err(NodeError::from)
+    }
+
+    /// Handle `gate.unpin` — drop a job's pinned merge refs on a lane host.
+    pub(crate) async fn run_gate_unpin(&self, params: &Value) -> Result<Value, NodeError> {
+        let request: GateUnpinParams = serde_json::from_value(params.clone()).map_err(|error| {
+            NodeError::InvalidRequest(format!("invalid gate.unpin params: {error}"))
+        })?;
+        let repo = PathBuf::from(&request.repo_path);
+        let job_id = request.job_id.clone();
+        let removed = tokio::task::spawn_blocking(move || unpin_verified_merge(&repo, &job_id))
+            .await
+            .map_err(|error| NodeError::InvalidRequest(format!("unpin join: {error}")))?;
+        serde_json::to_value(GateUnpinResult {
+            job_id: request.job_id,
+            removed,
+        })
+        .map_err(NodeError::from)
+    }
+
+    /// The `pushFrom: home` land: obtain the verified merge commit from the
+    /// lane repo, then advance the remote base branch under a lease.
+    ///
+    /// The lease is what makes this safe to run while other coordinators are
+    /// landing: `--force-with-lease=<base>:<baseSha>` is a server-side
+    /// compare-and-swap, so a base that moved refuses the whole push rather
+    /// than fast-forwarding partway. Nothing local is mutated on refusal, and
+    /// the caller turns that into a re-queued verify (D-034).
+    async fn run_gate_land_typed(
+        &self,
+        request: GateLandParams,
+    ) -> Result<GateLandResult, NodeError> {
+        let timeout = if request.timeout_secs > 0 {
+            request.timeout_secs
+        } else {
+            DEFAULT_LAND_TIMEOUT_SECS
+        };
+        let job_id = request.job_id.clone();
+        let landed = tokio::time::timeout(
+            Duration::from_secs(timeout),
+            tokio::task::spawn_blocking(move || land_from_home(&request)),
+        )
+        .await
+        .map_err(|_| NodeError::InvalidRequest(format!("gate.land timed out after {timeout}s")))?
+        .map_err(|error| NodeError::InvalidRequest(format!("gate.land join: {error}")))?;
+        Ok(match landed {
+            Ok(result) => result,
+            Err(error) => GateLandResult {
+                job_id,
+                status: "failed".into(),
+                error: Some(error),
+                ..Default::default()
+            },
+        })
     }
 
     async fn run_gate_typed(&self, request: GateRunParams) -> Result<GateRunResult, NodeError> {
@@ -595,8 +683,16 @@ impl DevNode {
         // Both modes verify the merge onto current `main` inside this
         // invocation; land additionally CAS-updates and pushes main. A
         // base-moved result makes the Hub re-queue and re-verify (D-034).
+        //
+        // `pushFrom: home` is the exception: this host holds no push
+        // credential, so the lane must stay a pure verify. Running `--land`
+        // here would advance lane-local main and report `landed` with nothing
+        // on the remote — the half-updated outcome D-034 forbids. The Hub
+        // lands the pinned merge from the home host instead.
+        let lands_here =
+            request.mode == "land" && request.push_from != remuda_protocol::GatePushFrom::Home;
         args.push("--gate".into());
-        if request.mode == "land" {
+        if lands_here {
             args.push("--land".into());
             if !request.push {
                 args.push("--no-push".into());
@@ -797,6 +893,47 @@ impl DevNode {
                 result.status = "failed".into();
                 result.error = string_field(&report, "error")
                     .or_else(|| Some(format!("merge status {other:?}")));
+            }
+        }
+        // Persist a passing verify before the scratch worktree is removed: the
+        // merge commit is otherwise a dangling object in this repo and dies
+        // with the next gc, which is exactly how a green run became unlandable
+        // (evidence: gate-lane-2). The refs are the handoff to a home-host
+        // land, and the Hub drops them on cancel, after a land, or by
+        // retention.
+        if result.status == "passed"
+            && let Some(merge_sha) = result.merge_sha.clone()
+        {
+            match pin_verified_merge(
+                &repo,
+                &request.job_id,
+                &merge_sha,
+                result.head_sha.as_deref(),
+            ) {
+                Ok(merge_ref) => {
+                    emit(GateEventKind::Phase {
+                        phase: "pin".into(),
+                    });
+                    result.merge_ref = Some(merge_ref);
+                }
+                Err(error) => {
+                    // A land needs the pin: without it there is nothing for
+                    // the home host to fetch, so fail rather than report a
+                    // pass that cannot be pushed.
+                    if request.mode == "land" {
+                        result.status = "failed".into();
+                        result.error = Some(format!("pin verified merge: {error}"));
+                    } else {
+                        // A verify's green signal is still true. Leaving
+                        // mergeRef absent already says "not landable" — the
+                        // job simply has to be re-verified to be landed.
+                        tracing::warn!(
+                            %error,
+                            job_id = request.job_id,
+                            "could not pin the verified merge; the pass is not landable"
+                        );
+                    }
+                }
             }
         }
         attach_failure_evidence(&mut result, &trace, request.keep_logs);
@@ -1020,6 +1157,209 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The home-host land, run on a blocking thread.
+///
+/// Order matters: fetch the merge object, re-check the parentage the Hub
+/// asserted, then push under a lease. Every refusal returns before anything is
+/// pushed, so `main` is never left half-updated.
+fn land_from_home(request: &GateLandParams) -> Result<GateLandResult, String> {
+    let repo = PathBuf::from(&request.repo_path);
+    let mut log = String::new();
+    let job_id = request.job_id.clone();
+
+    // 1. Bring the verified merge commit over from the lane repo. For this
+    //    slice that is a plain fetch of the pinned ref over the operator's
+    //    existing remote; a Node RPC streaming the packfile would replace this
+    //    call alone, which is why nothing below depends on how it arrived.
+    let local_ref = format!("refs/remuda/gate/incoming/{job_id}");
+    let refspec = format!("+{}:{}", request.merge_ref, local_ref);
+    log.push_str(&format!("git fetch {} {refspec}\n", request.fetch_remote));
+    run_git(
+        &repo,
+        &["fetch", "--no-tags", &request.fetch_remote, &refspec],
+    )
+    .map_err(|error| format!("fetch {} from lane: {error}", request.merge_ref))?;
+
+    // 2. The fetched ref must be exactly the sha that passed the gate. A
+    //    mismatch means the lane re-pinned under us; refuse rather than push
+    //    an unverified commit.
+    let fetched = git_output(&repo, &["rev-parse", "--verify", &local_ref])
+        .map_err(|error| format!("resolve fetched {local_ref}: {error}"))?;
+    if fetched != request.merge_sha {
+        let _ = run_git(&repo, &["update-ref", "-d", &local_ref]);
+        return Err(format!(
+            "lane ref {} is {fetched}, but the verified merge is {}",
+            request.merge_ref, request.merge_sha
+        ));
+    }
+
+    // 3. Re-derive the merge's first parent here. The Hub passed baseSha, but
+    //    the push guard must come from the object itself.
+    let first_parent = git_output(&repo, &["rev-parse", "--verify", &format!("{fetched}^1")])
+        .map_err(|error| format!("resolve first parent of {fetched}: {error}"))?;
+    if first_parent != request.base_sha {
+        let _ = run_git(&repo, &["update-ref", "-d", &local_ref]);
+        return Err(format!(
+            "verified merge {fetched} has first parent {first_parent}, not the verified base {}",
+            request.base_sha
+        ));
+    }
+
+    // 4. Compare the remote's current base branch before pushing. This is an
+    //    early, clearer BaseMoved than the lease refusal alone would give.
+    let remote_base = git_output(
+        &repo,
+        &[
+            "ls-remote",
+            "--exit-code",
+            &request.push_remote,
+            &format!("refs/heads/{}", request.base_branch),
+        ],
+    )
+    .map_err(|error| {
+        format!(
+            "read {}/{}: {error}",
+            request.push_remote, request.base_branch
+        )
+    })?;
+    let remote_sha = remote_base
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if remote_sha != request.base_sha {
+        let _ = run_git(&repo, &["update-ref", "-d", &local_ref]);
+        log.push_str(&format!(
+            "{}/{} is {remote_sha}, verified base {} — refusing\n",
+            request.push_remote, request.base_branch, request.base_sha
+        ));
+        return Ok(GateLandResult {
+            job_id,
+            status: "base-moved".into(),
+            current_main_sha: Some(remote_sha),
+            output: Some(log),
+            ..Default::default()
+        });
+    }
+
+    // 5. Push under a lease so the remote itself does the compare-and-swap:
+    //    if the base moved between the check above and this call, the push is
+    //    rejected whole and the remote stays exactly where it was. Never
+    //    --force.
+    let lease = format!(
+        "--force-with-lease=refs/heads/{}:{}",
+        request.base_branch, request.base_sha
+    );
+    let target = format!("{fetched}:refs/heads/{}", request.base_branch);
+    log.push_str(&format!(
+        "git push {lease} {} {target}\n",
+        request.push_remote
+    ));
+    let pushed = git_output(&repo, &["push", &lease, &request.push_remote, &target]);
+    let _ = run_git(&repo, &["update-ref", "-d", &local_ref]);
+    match pushed {
+        Ok(output) => {
+            log.push_str(&output);
+            Ok(GateLandResult {
+                job_id,
+                status: "landed".into(),
+                merge_sha: Some(fetched),
+                output: Some(log),
+                ..Default::default()
+            })
+        }
+        Err(error) => {
+            // A lost lease is a moved base, not a failure: re-read the remote
+            // to report where it went, and let the Hub re-queue a verify.
+            let now = git_output(
+                &repo,
+                &[
+                    "ls-remote",
+                    &request.push_remote,
+                    &format!("refs/heads/{}", request.base_branch),
+                ],
+            )
+            .ok()
+            .and_then(|line| line.split_whitespace().next().map(str::to_owned));
+            log.push_str(&error);
+            let stale = error.contains("stale info")
+                || error.contains("fetch first")
+                || error.contains("non-fast-forward")
+                || error.contains("rejected");
+            if stale && now.as_deref() != Some(request.base_sha.as_str()) {
+                return Ok(GateLandResult {
+                    job_id,
+                    status: "base-moved".into(),
+                    current_main_sha: now,
+                    output: Some(log),
+                    ..Default::default()
+                });
+            }
+            Ok(GateLandResult {
+                job_id,
+                status: "failed".into(),
+                current_main_sha: now,
+                error: Some(error),
+                output: Some(log),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+/// Pin a passing verify's merge commit (and the verified branch tip) in the
+/// lane repo so both outlive the scratch worktree.
+///
+/// The merge ref is `refs/remuda/gate/<job id>`; the branch tip rides a
+/// `.branch` sibling because git refuses a ref that is simultaneously a file
+/// and a directory. Both are verified to resolve after writing: a silent
+/// no-op here would surface much later as an unlandable pass.
+fn pin_verified_merge(
+    repo: &Path,
+    job_id: &str,
+    merge_sha: &str,
+    head_sha: Option<&str>,
+) -> Result<String, String> {
+    let merge_ref = remuda_protocol::gate_merge_ref(job_id);
+    // Refuse to pin a commit this repo does not actually have, so the ref can
+    // never advertise an object a later fetch cannot serve.
+    run_git(
+        repo,
+        &["cat-file", "-e", &format!("{merge_sha}^{{commit}}")],
+    )
+    .map_err(|error| format!("merge commit {merge_sha} is not in the lane repo: {error}"))?;
+    run_git(repo, &["update-ref", &merge_ref, merge_sha])?;
+    let pinned = git_output(repo, &["rev-parse", "--verify", &merge_ref])?;
+    if pinned != merge_sha {
+        return Err(format!(
+            "{merge_ref} resolved to {pinned}, expected {merge_sha}"
+        ));
+    }
+    if let Some(head) = head_sha.filter(|sha| !sha.is_empty()) {
+        let branch_ref = remuda_protocol::gate_branch_ref(job_id);
+        run_git(repo, &["update-ref", &branch_ref, head])?;
+    }
+    Ok(merge_ref)
+}
+
+/// Drop a job's pinned refs (`gate.unpin`): cancel, post-land, or retention.
+fn unpin_verified_merge(repo: &Path, job_id: &str) -> Vec<String> {
+    let mut removed = Vec::new();
+    for reference in [
+        remuda_protocol::gate_merge_ref(job_id),
+        remuda_protocol::gate_branch_ref(job_id),
+    ] {
+        // Only delete a ref that exists; -d on a missing ref is an error, and
+        // unpin has to stay idempotent (the Hub may retry it).
+        if git_output(repo, &["rev-parse", "--verify", "--quiet", &reference]).is_ok()
+            && run_git(repo, &["update-ref", "-d", &reference]).is_ok()
+        {
+            removed.push(reference);
+        }
+    }
+    removed
+}
+
 fn block_git(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .current_dir(repo)
@@ -1175,10 +1515,38 @@ mod tests {
             timeouts: std::collections::BTreeMap::new(),
             gate_timeout_secs: 0,
             push: false,
+            push_from: remuda_protocol::GatePushFrom::default(),
             keep_logs: false,
             binary: Some(fixture.bin.to_string_lossy().into_owned()),
         }
     }
+
+    /// Like PASSING_SCRIPT, but builds a *real* merge commit in the lane repo
+    /// the way `merge --onto --gate` does — in a scratch worktree that is then
+    /// removed — and reports its real sha. The commit is left unreferenced, so
+    /// only the runner's own pin can keep it alive.
+    const PASSING_REAL_MERGE_SCRIPT: &str = r#"
+scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
+echo '{"name":"cargo-test","status":"ok","durationMs":22,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
+base=$(git rev-parse main)
+# The shared fixture's branch points at main, so give it a commit of its own;
+# without one `git merge` is a fast-forward no-op and builds no merge commit.
+tip="$scratch/tip"
+git worktree add -q "$tip" wt/fake/task
+echo work > "$tip/branch.txt"
+git -C "$tip" add branch.txt
+git -C "$tip" -c user.email=t@example.com -c user.name=T commit -q -m "branch work"
+git worktree remove --force "$tip"
+head=$(git rev-parse wt/fake/task)
+tree="$scratch/worktree"
+git worktree add -q --detach "$tree" "$base"
+git -C "$tree" -c user.email=t@example.com -c user.name=T merge -q --no-ff --no-edit -m "merge: fake" "$head"
+merged=$(git -C "$tree" rev-parse HEAD)
+git worktree remove --force "$tree"
+cat <<JSON
+{"exitCode":0,"status":"verified","branch":"wt/fake/task","base":"$base","head":"$head","merged":"$merged","steps":[{"name":"cargo-test","status":"ok","durationMs":22}]}
+JSON
+"#;
 
     const PASSING_SCRIPT: &str = r#"
 scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
@@ -1229,6 +1597,184 @@ cat <<'JSON'
 {"exitCode":1,"status":"gate_failed","error":"gate failed or returned an incomplete step report","base":"1111111111111111111111111111111111111111","head":"2222222222222222222222222222222222222222","steps":[{"name":"secret-scan","status":"ok","durationMs":11},{"name":"cargo-test","status":"failed","durationMs":5012,"attempts":2,"retried":true,"error":"exit status 101"}]}
 JSON
 "#;
+
+    /// A passing verify must leave the merge commit reachable in the lane repo
+    /// after the scratch worktree is gone, with `main` as its first parent —
+    /// the property a later home-host land depends on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passing_verify_pins_the_merge_at_a_ref_whose_first_parent_is_main() {
+        let fixture = fixture(PASSING_REAL_MERGE_SCRIPT);
+        let result = fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status,
+            "passed",
+            "{}",
+            result.error.clone().unwrap_or_default()
+        );
+
+        let merge_ref = result.merge_ref.expect("a passing verify reports mergeRef");
+        assert_eq!(merge_ref, "refs/remuda/gate/gjb_test");
+        let merge_sha = result.merge_sha.expect("a passing verify reports mergeSha");
+
+        // The ref resolves to exactly the verified merge…
+        let pinned = git(&fixture.lane, &["rev-parse", "--verify", &merge_ref]);
+        assert_eq!(pinned, merge_sha, "{merge_ref} must pin the verified merge");
+        // …the commit really is a merge of main and the branch…
+        let first_parent = git(&fixture.lane, &["rev-parse", &format!("{merge_sha}^1")]);
+        let main = git(&fixture.lane, &["rev-parse", "main"]);
+        assert_eq!(
+            first_parent, main,
+            "the pinned merge's first parent must be main"
+        );
+        let second_parent = git(&fixture.lane, &["rev-parse", &format!("{merge_sha}^2")]);
+        assert_eq!(
+            second_parent,
+            git(&fixture.lane, &["rev-parse", "wt/fake/task"]),
+            "the pinned merge must contain the verified branch tip"
+        );
+        // …and the branch tip is pinned on the sibling ref.
+        assert_eq!(
+            git(
+                &fixture.lane,
+                &["rev-parse", "--verify", "refs/remuda/gate/gjb_test.branch"]
+            ),
+            second_parent,
+            "the verified branch tip must be pinned too"
+        );
+        // The scratch worktree is gone, so the pin is the only thing keeping
+        // the merge alive: prove it survives a prune+gc.
+        assert!(
+            !git(&fixture.lane, &["worktree", "list"]).contains("remuda-mq-fake"),
+            "the fake merge must have removed its scratch worktree"
+        );
+        git(&fixture.lane, &["worktree", "prune"]);
+        git(&fixture.lane, &["gc", "--prune=now", "--quiet"]);
+        assert_eq!(
+            git(&fixture.lane, &["rev-parse", "--verify", &merge_ref]),
+            merge_sha,
+            "the pinned merge must survive gc"
+        );
+    }
+
+    /// `gate.unpin` drops both refs and is safe to call twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpin_removes_both_refs_and_is_idempotent() {
+        let fixture = fixture(PASSING_REAL_MERGE_SCRIPT);
+        fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        let unpin = serde_json::json!({
+            "jobId": "gjb_test",
+            "repoPath": fixture.lane.to_string_lossy(),
+        });
+        let first = fixture.node.run_gate_unpin(&unpin).await.unwrap();
+        let removed = first["removed"].as_array().cloned().unwrap_or_default();
+        assert_eq!(removed.len(), 2, "both refs are dropped: {first}");
+        assert!(
+            git_output(
+                &fixture.lane,
+                &["rev-parse", "--verify", "refs/remuda/gate/gjb_test"]
+            )
+            .is_err(),
+            "the merge ref must be gone"
+        );
+        // A retry (the Hub may repeat it) reports nothing left, never an error.
+        let second = fixture.node.run_gate_unpin(&unpin).await.unwrap();
+        assert_eq!(
+            second["removed"].as_array().map(Vec::len),
+            Some(0),
+            "unpin must be idempotent: {second}"
+        );
+    }
+
+    /// The home-host land: fetch the lane's pinned merge over `fetchRemote`,
+    /// then push it. `main` must move exactly once, and a base that moved
+    /// under us must be refused as base-moved with nothing pushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn home_host_land_pushes_once_and_refuses_a_moved_base() {
+        let fixture = fixture(PASSING_REAL_MERGE_SCRIPT);
+        let verified = fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        assert_eq!(verified.status, "passed");
+        let merge_sha = verified.merge_sha.clone().unwrap();
+        let base_sha = verified.base_sha.clone().unwrap();
+
+        // A separate home-host checkout of the same origin, with the lane repo
+        // reachable as a plain remote (stands in for the operator's ssh alias).
+        let home = fixture._dir.path().join("home");
+        let origin = fixture._bare.path().join("origin.git");
+        git(
+            fixture._dir.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                home.to_str().unwrap(),
+            ],
+        );
+        git(&home, &["config", "user.email", "t@example.com"]);
+        git(&home, &["config", "user.name", "T"]);
+        git(
+            &home,
+            &["remote", "add", "lane", fixture.lane.to_str().unwrap()],
+        );
+
+        let land = |base: &str| {
+            serde_json::json!({
+                "jobId": "gjb_test",
+                "repoPath": home.to_string_lossy(),
+                "branch": "wt/fake/task",
+                "baseBranch": "main",
+                "pushRemote": "origin",
+                "fetchRemote": "lane",
+                "mergeRef": "refs/remuda/gate/gjb_test",
+                "mergeSha": merge_sha.clone(),
+                "baseSha": base.to_owned(),
+            })
+        };
+
+        // The lane host itself never pushed: origin/main is still the base.
+        assert_eq!(git(&home, &["rev-parse", "origin/main"]), base_sha);
+
+        let result = fixture.node.run_gate_land(&land(&base_sha)).await.unwrap();
+        assert_eq!(
+            result["status"].as_str(),
+            Some("landed"),
+            "land should push: {result}"
+        );
+        let origin_main = git(&origin, &["rev-parse", "main"]);
+        assert_eq!(
+            origin_main, merge_sha,
+            "origin/main must be exactly the verified merge"
+        );
+
+        // Landing again with the now-stale base must refuse and leave main be.
+        let again = fixture.node.run_gate_land(&land(&base_sha)).await.unwrap();
+        assert_eq!(
+            again["status"].as_str(),
+            Some("base-moved"),
+            "a moved base must refuse: {again}"
+        );
+        assert_eq!(
+            again["currentMainSha"].as_str(),
+            Some(origin_main.as_str()),
+            "the refusal reports where main actually is"
+        );
+        assert_eq!(
+            git(&origin, &["rev-parse", "main"]),
+            origin_main,
+            "main must move exactly once"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_passes_and_streams_steps() {
@@ -1360,6 +1906,36 @@ echo '{"exitCode":0,"status":"landed","merged":"44444444444444444444444444444444
         assert!(argv.contains("--land"), "argv: {argv}");
         assert!(argv.contains("--gate"), "argv: {argv}");
         assert!(!argv.contains("--no-push"), "land with push=true: {argv}");
+    }
+
+    /// A `pushFrom: home` land must stay a verify on the lane. Passing --land
+    /// here would move lane-local main and report `landed` while nothing
+    /// reached the remote — the half-updated outcome D-034 forbids.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_from_home_keeps_the_lane_a_verify() {
+        let script = r#"
+echo "$@" > "$(dirname "$0")/args.txt"
+base=$(git rev-parse main)
+cat <<JSON
+{"exitCode":0,"status":"verified","base":"$base","head":"$base","merged":"$base","steps":[]}
+JSON
+"#;
+        let fixture = fixture(script);
+        let mut p = params(&fixture, "land");
+        p.push = true;
+        p.push_from = remuda_protocol::GatePushFrom::Home;
+        let result = fixture.node.run_gate_typed(p).await.unwrap();
+        // The lane reports a pass, not a land: the home host does the push.
+        assert_eq!(result.status, "passed", "{result:?}");
+        let argv = std::fs::read_to_string(fixture.bin.parent().unwrap().join("args.txt")).unwrap();
+        assert!(
+            !argv.contains("--land"),
+            "a credential-less lane must never run --land: {argv}"
+        );
+        assert!(
+            argv.contains("--no-push"),
+            "the lane must be told not to push: {argv}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

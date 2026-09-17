@@ -68,6 +68,10 @@ pub struct HubConfig {
     /// expires to `failed` and stops holding a placement slot (default five minutes).
     #[serde(default = "default_requested_grace_ms")]
     pub requested_grace_ms: u64,
+    /// How long a passing-but-unlanded gate verify keeps its pinned merge refs
+    /// on the lane host before retention drops them (default seven days).
+    #[serde(default = "default_gate_ref_retention_ms")]
+    pub gate_ref_retention_ms: u64,
     /// Per-IP authentication attempt burst budget (login/pair/passkey).
     #[serde(default = "default_auth_ip_burst")]
     pub auth_ip_burst: f64,
@@ -137,6 +141,12 @@ fn default_requested_grace_ms() -> u64 {
     crate::store::REQUESTED_SLOT_WINDOW_MS
 }
 
+/// Seven days: long enough that an operator can land a passing verify by hand
+/// after a weekend, short enough that abandoned merges do not accumulate.
+fn default_gate_ref_retention_ms() -> u64 {
+    7 * 24 * 60 * 60 * 1000
+}
+
 fn default_push_block_ms() -> u64 {
     30_000
 }
@@ -181,6 +191,7 @@ impl Default for HubConfig {
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
+            gate_ref_retention_ms: default_gate_ref_retention_ms(),
             auth_ip_burst: default_auth_ip_burst(),
             auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
             auth_global_burst: default_auth_global_burst(),
@@ -213,6 +224,7 @@ impl HubConfig {
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
+            gate_ref_retention_ms: default_gate_ref_retention_ms(),
             // Keep production rate-limit defaults here so the 429 integration
             // test exercises real budgets; the Playwright harness relaxes them
             // explicitly because it mounts the login page dozens of times from

@@ -616,10 +616,19 @@ async fn fake_node(
                         )
                         .await?;
                     }
-                    // A freshly launched native-PTY agent is mid-turn until the
-                    // web drives it; the approval keeps it blocked until answered.
-                    append_n =
-                        append_native_status(&mut ws, &instance_id, append_n, "working").await?;
+                    // The approval raised below keeps the create blocked on a
+                    // human until answered; answering journals idle (turn
+                    // complete). c-steer: the "blocked-question" sentinel
+                    // instead projects `blocked` directly — a pending question
+                    // is never `working`, so the composer must not mistake it
+                    // for a turn.
+                    if prompt.contains("blocked-question") {
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                    } else {
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "working")
+                            .await?;
+                    }
                     // §9.1 model-sync: the launch snapshot carries the
                     // gateway-discovered catalog and current model for any claude
                     // carrier (claude-pty emits in its own branch above; shell-pty
@@ -902,15 +911,35 @@ async fn fake_node(
                             append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
                                 .await?;
                     }
-                    // D-028 §6: a steer/queue send happens mid-turn; report the
-                    // native agent status so the web composer projects working.
-                    if params.get("mode").and_then(Value::as_str) == Some("new-turn") {
-                        append_n =
-                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
-                    } else {
-                        append_n = append_native_status(&mut ws, &instance_id, append_n, "working")
-                            .await?;
+                    // A prompt containing "hold-working" models an agent that
+                    // is STILL in a long turn after the send (composer keeps
+                    // projecting working); without the sentinel the fake turn
+                    // completes and reports idle, like a harness emitting Stop.
+                    let hold_working = prompt.contains("hold-working");
+                    let mode = params.get("mode").and_then(Value::as_str);
+                    // c-steer: a 插队 ends the running turn before the prompt
+                    // runs. Journal the interrupt (origin + reason, mirroring
+                    // the Node ledger) and report idle, so the web flushes the
+                    // held queue behind it.
+                    if mode == Some("steer") {
+                        append_n = append_steer_interrupt(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            command_id.unwrap_or("unknown"),
+                        )
+                        .await?;
                     }
+                    // A normal turn completes (idle); an explicit queue send
+                    // and the hold-working sentinel keep the composer working.
+                    let next_status =
+                        if mode == Some("queue") || (mode != Some("steer") && hold_working) {
+                            "working"
+                        } else {
+                            "idle"
+                        };
+                    append_n =
+                        append_native_status(&mut ws, &instance_id, append_n, next_status).await?;
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                 }
                 "instance.cancel" => {
@@ -1155,22 +1184,26 @@ async fn fake_node(
                     )
                     .await?;
                     if let Some(card) = removed
-                        && card.get("kind").and_then(Value::as_str) == Some("question")
                         && let Some(answered_instance) =
                             card.get("instanceId").and_then(Value::as_str)
                     {
-                        let summary = answer
-                            .get("answers")
-                            .map(question_answer_summary)
-                            .unwrap_or_default();
-                        append_n = append_journal(
-                            &mut ws,
-                            answered_instance,
-                            append_n,
-                            "assistant",
-                            &format!("AskUserQuestion answered via hook: {summary}"),
-                        )
-                        .await?;
+                        if card.get("kind").and_then(Value::as_str) == Some("question") {
+                            let summary = answer
+                                .get("answers")
+                                .map(question_answer_summary)
+                                .unwrap_or_default();
+                            append_n = append_journal(
+                                &mut ws,
+                                answered_instance,
+                                append_n,
+                                "assistant",
+                                &format!("AskUserQuestion answered via hook: {summary}"),
+                            )
+                            .await?;
+                        }
+                        // c-steer: any human decision ends the dialog; model
+                        // the harness completing the turn and report idle so
+                        // the composer's held messages flush.
                         append_n =
                             append_native_status(&mut ws, answered_instance, append_n, "idle")
                                 .await?;
@@ -2032,6 +2065,47 @@ async fn append_stream_chunks(
         ))
         .await?;
     }
+    Ok(seq)
+}
+
+/// c-steer: journal the turn a 插队 interrupts, mirroring the Node's
+/// `turn-interrupted` native lifecycle (`origin` + `reason` + commandId in
+/// `relatedIds`), so a transcript reader sees WHY the previous turn ended.
+async fn append_steer_interrupt(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    command_id: &str,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{seq}"),
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "native",
+                        "topic": "diagnostic",
+                        "nativeName": "turn-interrupted",
+                        "status": "esc-dispatched",
+                        "severity": "info",
+                        "relatedIds": {
+                            "origin": "human",
+                            "reason": "user-steer",
+                            "commandId": command_id
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
     Ok(seq)
 }
 

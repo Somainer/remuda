@@ -884,6 +884,11 @@ type MessagePayload = NodeMutation & {
   nativeOrigin: Knowledge<string>;
   origin: "human"|"injected-skill"|"injected-command-output"
         |"hook-context"|"tool-result"|"compaction"|"unknown";
+  commandId?: CommandId;
+  // c-steer: how a Remuda-queued prompt reaches the agent. Set on the queued
+  // user node and kept through its revisions; absent on natively-observed
+  // records. "steer" interrupted the running turn and jumped the PTY queue.
+  promptMode?: "new-turn"|"steer"|"queue";
   status: "queued"|"streaming"|"complete"|"interrupted"|"unknown";
 };
 type ThoughtPayload = NodeMutation & {

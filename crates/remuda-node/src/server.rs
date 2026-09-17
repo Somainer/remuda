@@ -1052,6 +1052,7 @@ async fn dispatch_rpc(
                         command_id: optional_id_field(&params, "commandId")?,
                         operation: CommandAction::WriteTty,
                         prompt: None,
+                        prompt_mode: None,
                         attachments: Vec::new(),
                         run_id: None,
                         interaction_id: None,
@@ -1122,6 +1123,7 @@ async fn submit_rpc_command(
                 // those arrive via the Hub (D-027).
                 attachments: Vec::new(),
                 prompt,
+                prompt_mode: None,
                 run_id: optional_id_field(params, "runId")?,
                 interaction_id: None,
                 answer: None,

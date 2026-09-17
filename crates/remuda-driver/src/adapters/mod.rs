@@ -242,6 +242,7 @@ pub fn message_payload(message_id: Id, role: MessageRole, text: String) -> Obser
         // transcript does, so leave origin unclassified (renders as human).
         origin: None,
         command_id: None,
+        prompt_mode: None,
         status: ContentStatus::Complete,
     }))
 }
@@ -266,6 +267,7 @@ pub fn message_chunk(node_id: Id, revision: u64, first: bool, text: String) -> O
         native_origin: Knowledge::NotApplicable,
         origin: None,
         command_id: None,
+        prompt_mode: None,
         status: ContentStatus::Streaming,
     }))
 }
@@ -296,6 +298,7 @@ pub fn message_close(
         native_origin: Knowledge::NotApplicable,
         origin: None,
         command_id: None,
+        prompt_mode: None,
         status,
     }))
 }

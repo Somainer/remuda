@@ -1192,6 +1192,7 @@ fn user_message(
             native_origin: known("claude-jsonl".into()),
             origin: Some(user_origin(value)),
             command_id: None,
+            prompt_mode: None,
             status: ContentStatus::Complete,
         })),
     )
@@ -1238,6 +1239,7 @@ fn assistant_message(
             // Assistant output is never an injected user record.
             origin: Some(MessageOrigin::Human),
             command_id: None,
+            prompt_mode: None,
             status: ContentStatus::Complete,
         })),
     )

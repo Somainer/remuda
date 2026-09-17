@@ -59,6 +59,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         command_id: command_id_of(&params),
                         operation: CommandAction::Configure,
                         prompt: None,
+                        prompt_mode: None,
                         attachments: Vec::new(),
                         run_id: None,
                         interaction_id: None,
@@ -84,6 +85,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         command_id: command_id_of(&params),
                         operation: CommandAction::Send,
                         prompt: Some(prompt_of(&params).unwrap_or_default()),
+                        prompt_mode: prompt_mode_of(&params),
                         attachments: Vec::new(),
                         run_id: None,
                         interaction_id: None,
@@ -114,6 +116,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         command_id: command_id_of(&params),
                         operation: CommandAction::Cancel,
                         prompt: None,
+                        prompt_mode: None,
                         attachments: Vec::new(),
                         run_id: None,
                         interaction_id: None,
@@ -142,6 +145,7 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
                         command_id: command_id_of(&params),
                         operation: CommandAction::RespondInteraction,
                         prompt: None,
+                        prompt_mode: None,
                         attachments: Vec::new(),
                         run_id: None,
                         interaction_id,
@@ -377,4 +381,14 @@ fn prompt_of(params: &Value) -> Option<String> {
         .or_else(|| params.get("text"))
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// c-steer: the web sends `mode: "steer" | "queue" | "new-turn"` on
+/// `instance.send`. An unknown value degrades to an ordinary new turn rather
+/// than rejecting the command — delivery mode is metadata, never an authz
+/// decision, and an older/newer client's vocabulary must not wedge the queue.
+fn prompt_mode_of(params: &Value) -> Option<remuda_protocol::PromptMode> {
+    params.get("mode").and_then(Value::as_str).and_then(|raw| {
+        serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()
+    })
 }

@@ -51,6 +51,11 @@ pub enum DriverRequest {
         attachments: Vec<crate::attachments::MaterializedAttachment>,
         /// Who submitted this input, independent of the instance's creator.
         origin: remuda_protocol::InputOrigin,
+        /// How this input is meant to reach the agent (c-steer): a normal new
+        /// turn, or a steer that interrupted the running turn to jump ahead of
+        /// any queued prompts. The PTY bytes are the same; the mode drives the
+        /// queue's delivery gate and the journal, not the keystrokes.
+        mode: remuda_protocol::PromptMode,
     },
     /// Cancel the current fake turn.
     Cancel,
@@ -590,6 +595,7 @@ pub(crate) fn message_payload(
         // queued prompt, the fake driver's reply), never an injected record.
         origin: Some(remuda_protocol::MessageOrigin::Human),
         command_id: None,
+        prompt_mode: None,
         status: ContentStatus::Complete,
     })))
 }

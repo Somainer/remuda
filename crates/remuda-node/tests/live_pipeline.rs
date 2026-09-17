@@ -363,6 +363,7 @@ impl LiveRun {
                     command_id: None,
                     operation: CommandAction::WriteTty,
                     prompt: None,
+                    prompt_mode: None,
                     attachments: Vec::new(),
                     run_id: None,
                     interaction_id: None,

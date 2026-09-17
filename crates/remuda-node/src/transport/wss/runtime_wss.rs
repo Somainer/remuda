@@ -428,6 +428,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 command_id,
                 operation: CommandAction::Send,
                 prompt: Some(prompt),
+                prompt_mode: prompt_mode_of(&params),
                 attachments,
                 run_id,
                 interaction_id: None,
@@ -470,6 +471,7 @@ async fn cancel_from_params(
                 command_id,
                 operation: CommandAction::Cancel,
                 prompt: None,
+                prompt_mode: None,
                 attachments: Vec::new(),
                 run_id,
                 interaction_id: None,
@@ -508,6 +510,7 @@ async fn close_from_params(
                 command_id,
                 operation: CommandAction::Close,
                 prompt: None,
+                prompt_mode: None,
                 attachments: Vec::new(),
                 run_id: None,
                 interaction_id: None,
@@ -571,6 +574,7 @@ async fn keys_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
                 command_id,
                 operation: CommandAction::WriteTty,
                 prompt: None,
+                prompt_mode: None,
                 attachments: Vec::new(),
                 run_id: None,
                 interaction_id: None,
@@ -621,6 +625,7 @@ async fn respond_from_params(
                 command_id,
                 operation: CommandAction::RespondInteraction,
                 prompt: None,
+                prompt_mode: None,
                 attachments: Vec::new(),
                 run_id: None,
                 interaction_id,
@@ -702,6 +707,14 @@ fn prompt_of(params: &Value) -> Option<String> {
         }
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// c-steer: parse the optional `mode` of an `instance.send`; unknown values
+/// degrade to a plain new turn (see the same helper in `runtime_link.rs`).
+fn prompt_mode_of(params: &Value) -> Option<remuda_protocol::PromptMode> {
+    params.get("mode").and_then(Value::as_str).and_then(|raw| {
+        serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned())).ok()
+    })
 }
 
 fn ensure_pump(runtime: &RuntimeLink, instance_id: &InstanceId) {

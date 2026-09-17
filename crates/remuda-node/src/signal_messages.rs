@@ -169,6 +169,7 @@ impl MessageAssembler {
             },
             origin: Some(MessageOrigin::Human),
             command_id: None,
+            prompt_mode: None,
             status: if delta.final_chunk {
                 ContentStatus::Complete
             } else {

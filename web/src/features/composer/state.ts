@@ -1,11 +1,22 @@
 /**
- * Composer three-state machine (D-028 §6): 发送 / 排队 / 打断.
+ * Composer state machine (c-steer, formerly D-028 §6): 排队 / 插队 / 打断.
  *
- * The layout is decided purely by the session's *reported* capabilities
- * (`steer` / `queue` / `interrupt`, each `native | emulated | unknown`) and
- * the instance phase. Emulated stays visible — never dressed up as native —
- * and `unknown` renders an honest「尚未验证」note instead of a faked
- * enabled/disabled button.
+ * Working semantics after c-steer:
+ *
+ * - **Enter / 排队 button** holds the message until the turn ends
+ *   (`排队中 · 第 n 条 · 回车后送出`, removable). When the harness owns a
+ *   native queue (codex Tab) the hold is posted immediately with `mode:queue`
+ *   and the chip is a ledger mirror; otherwise Remuda holds it client-side and
+ *   posts `new-turn` on the working→idle transition.
+ * - **Cmd/Ctrl+Enter / 插队 button** interrupts the running turn (Esc through
+ *   the driver's own key path) and delivers this message first, ahead of every
+ *   held one. The Node journals origin+reason; provision is reported honestly
+ *   (`native` Esc, `emulated` cancel sequence, `unknown` 尚未验证).
+ * - **打断** ends the turn with no message.
+ * - **blocked** (a question/approval/elicitation/plan review is pending) is
+ *   NOT "working": Enter holds the message with「待回答后送出」and it flushes
+ *   when the interaction resolves; nothing is ever stuck in 排队中 without a
+ *   visible reason.
  */
 import type { Capability, CapabilityProvision, CapabilitySnapshot } from "../../types/nativeRef";
 import type { PromptMode } from "../../types/generated";
@@ -20,8 +31,15 @@ export type CapTriple = {
 
 export type PrimaryAction =
   | { kind: "send"; label: string; mode: Extract<PromptMode, "new-turn"> }
-  | { kind: "steer"; label: string; mode: Extract<PromptMode, "steer"> }
-  | { kind: "queue"; label: string; mode: Extract<PromptMode, "queue"> };
+  | {
+      kind: "queue";
+      label: string;
+      mode: Extract<PromptMode, "queue">;
+      /** Who holds the queued message until the turn ends. */
+      holder: "remuda" | "native";
+      /** Why the message waits; rendered on the pending transcript row. */
+      waitNote: string;
+    };
 
 export type QueueControl =
   | { available: false }
@@ -33,10 +51,12 @@ export type InterruptControl =
 
 export type ComposerState = {
   primary: PrimaryAction;
+  /** Secondary queue action metadata (also carried by the primary while busy). */
   queue: QueueControl;
+  /** Plain 打断 (Esc), no message. */
   interrupt: InterruptControl;
-  /** Working, but no native send-now: sending means cancelling the turn first. */
-  interruptAndSend: boolean;
+  /** 插队: interrupt the turn AND deliver this message first (c-steer). */
+  steer: InterruptControl;
   /** Honest caveat rendered next to the controls (emulation / unverified). */
   note: string | null;
 };
@@ -59,97 +79,76 @@ export function triple(caps: CapabilitySnapshot): CapTriple {
   };
 }
 
-const STEER_LABEL: Record<string, string> = {
-  claude: "发送",
-  codex: "发送",
-  grok: "发送",
-  agy: "发送",
-};
-
-const STEER_HINT: Record<string, string> = {
-  claude: "下一个工具边界插话",
-  codex: "立即插话到当前 turn",
-};
-
 /**
  * @param kind    harness kind (for honest label copy)
  * @param phase   instance phase as projected by the UI
  * @param caps    the live session capability snapshot
  */
-export function composerState(kind: string, phase: Phase, caps: CapabilitySnapshot): ComposerState {
+export function composerState(_kind: string, phase: Phase, caps: CapabilitySnapshot): ComposerState {
   const c = triple(caps);
-  const sendLabel = STEER_LABEL[kind] ?? "发送";
 
-  if (phase === "blocked") {
-    // D-022: while blocked, a send queues for delivery once the turn is ready.
-    return {
-      primary: { kind: "send", label: "发送", mode: "new-turn" },
-      queue: { available: false },
-      interrupt: supportedInterrupt(c.interrupt),
-      interruptAndSend: false,
-      note: null,
-    };
-  }
-
-  if (phase !== "working") {
+  if (phase !== "working" && phase !== "blocked") {
     return {
       primary: { kind: "send", label: "发送", mode: "new-turn" },
       queue: { available: false },
       interrupt: { available: false },
-      interruptAndSend: false,
+      steer: { available: false },
       note: null,
     };
   }
 
-  const steer = provision(c.steer);
   const interrupt = supportedInterrupt(c.interrupt);
+  if (phase === "blocked") {
+    // A pending interaction is a human turn, not a working turn. The message
+    // waits for the interaction to resolve, then goes out as a normal prompt.
+    return {
+      primary: {
+        kind: "queue",
+        label: "排队",
+        mode: "queue",
+        holder: "remuda",
+        waitNote: "待回答后送出",
+      },
+      queue: { available: false },
+      interrupt,
+      // 插队 at a dialog would send Esc into the question — never.
+      steer: { available: false },
+      note: "问题处理中，消息将在回答后送出",
+    };
+  }
 
-  // §6 mapping rule 2: the Remuda-held queue is ALWAYS available while
-  // working. Only codex (native Tab) is marked as harness-native.
+  // Working: Enter queues (Remuda-held, or the harness-native queue when one
+  // is measured — codex Tab). 插队 is the emulated interrupt-and-send and
+  // follows the interrupt key's reported provision.
+  const nativeQueue = isSupported(c.queue) && provision(c.queue) === "native";
   const queueControl: QueueControl = isSupported(c.queue)
-    ? provision(c.queue) === "native"
+    ? nativeQueue
       ? { available: true, holder: "native", label: "排队（原生 Tab）" }
       : { available: true, holder: "remuda", label: "排队（Remuda 代持）" }
-    : { available: false };
-
-  if (steer === "native") {
-    return {
-      primary: { kind: "steer", label: sendLabel, mode: "steer" },
-      queue: queueControl,
-      interrupt,
-      interruptAndSend: false,
-      note: STEER_HINT[kind] ?? null,
-    };
-  }
-
-  if (steer === "emulated") {
-    return {
-      // grok: there is no native send-now; the primary is the honest queue.
-      primary: { kind: "queue", label: "排队", mode: "queue" },
-      queue: queueControl,
-      interrupt,
-      interruptAndSend: true,
-      note: "打断并发送会取消当前 turn",
-    };
-  }
-
-  if (c.steer?.state === "unsupported") {
-    return {
-      primary: { kind: "queue", label: "排队", mode: "queue" },
-      queue: queueControl,
-      interrupt,
-      interruptAndSend: false,
-      note: "该 harness 不支持插话",
-    };
-  }
-
-  // unknown: show「尚未验证」, never a fake-greyed or fake-native button.
+    : { available: true, holder: "remuda", label: "排队（Remuda 代持）" };
+  const holder = nativeQueue ? "native" : "remuda";
   return {
-    primary: { kind: "queue", label: "排队", mode: "queue" },
+    primary: {
+      kind: "queue",
+      label: "排队",
+      mode: "queue",
+      holder,
+      waitNote: "回合结束后送出",
+    },
     queue: queueControl,
     interrupt,
-    interruptAndSend: true,
-    note: "steer 尚未验证：发送将打断当前 turn",
+    steer: interrupt.available
+      ? {
+          available: true,
+          provision: interrupt.provision,
+          label: "插队",
+          note: interrupt.note,
+        }
+      : { available: false },
+    note:
+      holder === "remuda"
+        ? "Enter 排队（Remuda 代持）· ⌘/Ctrl+Enter 插队"
+        : "Enter 原生排队（Tab）· ⌘/Ctrl+Enter 插队",
   };
 }
 

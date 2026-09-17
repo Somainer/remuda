@@ -944,6 +944,7 @@ fn user_text_message(
             // classify. stdout `user` frames are the prompt we just sent.
             origin: Some(remuda_protocol::MessageOrigin::Human),
             command_id: None,
+            prompt_mode: None,
             status: ContentStatus::Complete,
         })),
     )

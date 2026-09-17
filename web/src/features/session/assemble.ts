@@ -109,6 +109,14 @@ export type TranscriptNode =
        * leave it unset.
        */
       commandId?: Id;
+      /**
+       * c-steer: when the row is a Remuda-held queue row (not yet POSTed), why
+       * it waits and its 1-based position among turn-wait held rows.
+       */
+      holdReason?: "turn" | "answer";
+      holdOrdinal?: number;
+      /** c-steer: a delivered 插队 (promptMode carried by the Node journal). */
+      promptMode?: string;
     }
   | { type: "thought"; id: string; text: string; completeness: Observation["completeness"] }
   | ToolNode
@@ -234,6 +242,9 @@ function assembleMessages(events: Observation[], anchors: Map<TranscriptNode, bi
       // C2: carry the delivering command id so the UI can attribute the
       // node and hide the matching optimistic bubble.
       if (payload.commandId != null) node.commandId = payload.commandId;
+      // c-steer: keep the delivery mode of the latest revision (a queued row
+      // that completes as a 插队 keeps the 插队 badge).
+      if (payload.promptMode != null) node.promptMode = payload.promptMode;
       mutation = payload;
     }
     if (node) {
@@ -512,6 +523,14 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       // rule, which never hides an in-flight queued bubble.
       if (bubble.state !== "queued" && seenUser.has(bubble.text)) continue;
     }
+    // c-steer: 1-based position among turn-wait held rows, in queue order.
+    let holdOrdinal: number | undefined;
+    if (bubble.held && bubble.holdReason === "turn") {
+      holdOrdinal =
+        bubbles
+          .slice(0, bubbles.indexOf(bubble))
+          .filter((b) => b.held && b.state === "queued" && b.holdReason !== "answer").length + 1;
+    }
     nodes.push({
       type: "message",
       // The node's local identity is the pre-POST clientRequestId.
@@ -523,6 +542,7 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       origin: "human",
       local: bubble,
       commandId: bubble.commandId ?? undefined,
+      ...(bubble.held ? { holdReason: bubble.holdReason ?? "turn", holdOrdinal } : {}),
     });
   }
 

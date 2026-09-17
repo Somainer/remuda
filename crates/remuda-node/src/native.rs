@@ -647,9 +647,10 @@ impl Driver for NativeAdapter {
                     prompt,
                     attachments,
                     origin,
+                    mode,
                 } => {
                     self.native
-                        .send(prompt_input(prompt, &attachments, origin))
+                        .send(prompt_input(prompt, &attachments, origin, mode))
                         .await
                         .map_err(map_driver_error)?;
                 }
@@ -747,11 +748,12 @@ fn prompt_input(
     prompt: String,
     attachments: &[crate::attachments::MaterializedAttachment],
     origin: InputOrigin,
+    mode: PromptMode,
 ) -> DriverInput {
     let mut blocks = crate::attachments::content_blocks(attachments);
     blocks.push(ContentBlock::Text(Box::new(TextBlock { text: prompt })));
     DriverInput::Prompt(Box::new(PromptInput {
-        mode: PromptMode::NewTurn,
+        mode,
         blocks,
         origin,
         native_client_message_id: uuid::Uuid::now_v7().to_string(),
@@ -1488,7 +1490,12 @@ mod tests {
     #[test]
     fn native_prompt_preserves_each_submitting_origin() {
         for origin in [InputOrigin::Human, InputOrigin::Bot, InputOrigin::Agent] {
-            let DriverInput::Prompt(prompt) = prompt_input("new input".into(), &[], origin) else {
+            let DriverInput::Prompt(prompt) = prompt_input(
+                "new input".into(),
+                &[],
+                origin,
+                remuda_protocol::PromptMode::NewTurn,
+            ) else {
                 panic!("prompt expected")
             };
             assert_eq!(prompt.origin, origin);
@@ -1514,6 +1521,7 @@ mod tests {
             "what colour?".into(),
             std::slice::from_ref(&attachment),
             InputOrigin::Human,
+            remuda_protocol::PromptMode::NewTurn,
         ) else {
             panic!("prompt expected")
         };
@@ -1568,6 +1576,7 @@ mod tests {
             "summarise".into(),
             std::slice::from_ref(&attachment),
             InputOrigin::Human,
+            remuda_protocol::PromptMode::NewTurn,
         ) else {
             panic!("prompt expected")
         };

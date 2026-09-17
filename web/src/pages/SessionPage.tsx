@@ -125,6 +125,9 @@ export function SessionPage({
   }, [resolvedView]);
   const journalStatus = hub.journalStatus[instanceId] ?? (followed ? "live" : "live");
   const bubbles = hub.bubbles.filter((b) => b.instanceId === instanceId && b.state !== "settled");
+  // c-steer: Remuda-held queue rows (Enter while busy / while a question is
+  // pending). Posted in order by flushHeld when the wait ends.
+  const heldBubbles = hubStore.heldBubbles(instanceId);
   // C2: the header label speaks the P0-3 vocabulary while an optimistic
   // bubble is in flight (null commandId + unknown state → 「状态待确认」,
   // never a fake success). With no pending bubble it shows the instance-level
@@ -480,9 +483,32 @@ export function SessionPage({
           instanceId={instance.id}
           mobile={mobile}
           sending={sending}
-          disabled={status === "exited" || pending.length > 0}
+          // c-steer: a pending question no longer hard-disables the composer —
+          // typed messages hold with「待回答后送出」and flush once it resolves.
+          disabled={status === "exited"}
           phase={composerPhase}
           capabilities={instance.capabilities}
+          held={heldBubbles.map((b) => ({
+            id: b.clientRequestId,
+            text: b.text,
+            reason: b.holdReason ?? "turn",
+            holder: "remuda" as const,
+          }))}
+          onHold={(text, reason, refs, staged) => {
+            const previews = staged
+              .filter((item) => item.objectId)
+              .map((item) => ({
+                objectId: item.objectId as string,
+                name: item.name,
+                previewUrl: item.previewUrl,
+                kind: item.kind,
+                mediaType: item.mediaType,
+                size: item.size,
+              }));
+            hubStore.hold(instance.id, text, reason, refs, previews);
+          }}
+          onRetractHeld={(id) => hubStore.retract(id)}
+          onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
             genericPty ? ptyYoloChipLabel(instance.kind) : hubStore.permissionModeOf(instance.id)

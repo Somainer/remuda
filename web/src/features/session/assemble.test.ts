@@ -707,6 +707,33 @@ describe("assembleTranscript · c-wfdrill subagent grouping", () => {
     expect(bucket?.nodes.map((n) => n.name)).toEqual(["Read"]);
   });
 
+  it("folds nothing when the run names a tool call that is not in the transcript", () => {
+    // c-wfdrill2 C in the web layer. The producer derives
+    // `workflow.run.toolCallId` from the launch's native tool id; when that id
+    // was derived under a scope nothing else shared, it named a row that does
+    // not exist. The assembler must then keep the workflow standalone and
+    // leave the member's own tools where they are — it may not fold every
+    // subagent row under a single card because one id failed to resolve.
+    const absent = workflowEvents(1).map((event) =>
+      event.kind === "workflow.run"
+        ? { ...event, payload: { ...event.payload, toolCallId: "toolu_never_journaled" as Id } }
+        : event,
+    );
+    const events = [
+      ...absent,
+      agentObs(6, "tool_call", call("Bash", "toolu_member_bash"), agentA),
+    ];
+    const nodes = assembleTranscript(events);
+    // The Workflow launch row and the workflow card are both still top level…
+    expect(nodes.find((n) => n.type === "tool" && n.id === wfToolCallId)?.type).toBe("tool");
+    const standalone = nodes.find((n) => n.type === "workflow");
+    expect(standalone?.type).toBe("workflow");
+    // …and nothing was folded under either of them.
+    const launchRow = nodes.find((n) => n.type === "tool" && n.id === wfToolCallId);
+    expect(launchRow?.type === "tool" && launchRow.workflow).toBeUndefined();
+    expect(nodes.some((n) => n.id === "toolu_member_bash")).toBe(true);
+  });
+
   it("leaves an unattributed subagent row top level rather than guessing a parent", () => {
     // A subagent tool event with no matching workflow member or Task parent.
     const orphan = agentObs(1, "tool_call", call("Bash", "toolu_orphan"), "ghost123");

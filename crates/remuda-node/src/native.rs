@@ -13,8 +13,7 @@ use remuda_driver::{
 };
 use remuda_protocol::{
     AgentKind, ArgvInputPolicy, BgInputDelivery, CarrierSpec, ClaudeInteractionMode,
-    ClaudePermission,
-    ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
+    ClaudePermission, ClaudePermissionMode, CompletionScope, ContentBlock, DriverInput, DriverKind,
     HerdrRepresentation, HerdrServer, HostId, Id, InputOrigin, InstanceSpec, InteractionAnswer,
     NativeHome, NativeHomeMode, PermissionMode, ProfileRef, PromptInput, PromptMode, PtyBackend,
     PtyCarrier, SchemaVersion, SettingsFormat, SettingsOverlay, TextBlock, U64,
@@ -1122,8 +1121,7 @@ fn build_permission_mode(
 ) -> PermissionMode {
     use remuda_protocol::{
         AgyPermission, AgyPermissionMode, ApprovalPolicy, CodexExecution, CodexPermission,
-        GenericPermission, GenericPermissionMode, GrokPermission, GrokPermissionMode,
-        SandboxMode,
+        GenericPermission, GenericPermissionMode, GrokPermission, GrokPermissionMode, SandboxMode,
     };
     let interaction = if matches!(
         launch.request.driver,
@@ -1134,12 +1132,12 @@ fn build_permission_mode(
         ClaudeInteractionMode::Host
     };
     match launch.request.kind {
-        AgentKind::Claude | AgentKind::Terminal => PermissionMode::Claude(Box::new(
-            ClaudePermission {
+        AgentKind::Claude | AgentKind::Terminal => {
+            PermissionMode::Claude(Box::new(ClaudePermission {
                 mode: claude_mode,
                 interaction,
-            },
-        )),
+            }))
+        }
         AgentKind::Codex => {
             let policy = match launch.request.permission_mode.as_str() {
                 "never" | "no-request" => ApprovalPolicy::Never,
@@ -1160,9 +1158,7 @@ fn build_permission_mode(
             PermissionMode::Codex(Box::new(CodexPermission {
                 approval_policy: policy,
                 approvals_reviewer: remuda_protocol::ApprovalsReviewer::User,
-                execution: CodexExecution::Sandbox(
-                    remuda_protocol::SandboxExecution { sandbox },
-                ),
+                execution: CodexExecution::Sandbox(remuda_protocol::SandboxExecution { sandbox }),
             }))
         }
         AgentKind::Grok => {
@@ -1188,11 +1184,9 @@ fn build_permission_mode(
             };
             PermissionMode::Agy(Box::new(AgyPermission { mode }))
         }
-        AgentKind::Generic => PermissionMode::Generic(Box::new(
-            GenericPermission {
-                mode: GenericPermissionMode::Native,
-            },
-        )),
+        AgentKind::Generic => PermissionMode::Generic(Box::new(GenericPermission {
+            mode: GenericPermissionMode::Native,
+        })),
     }
 }
 

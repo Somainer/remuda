@@ -129,7 +129,10 @@ mod tests {
             normalize_permission_word("bypass"),
             Some(ClaudePermissionMode::BypassPermissions)
         );
-        assert_eq!(normalize_permission_word("plan"), Some(ClaudePermissionMode::Plan));
+        assert_eq!(
+            normalize_permission_word("plan"),
+            Some(ClaudePermissionMode::Plan)
+        );
         assert_eq!(normalize_permission_word("nope"), None);
     }
 
@@ -176,9 +179,21 @@ mod tests {
     #[test]
     fn event_ids_are_stable_and_namespaced() {
         let a = permission_event_id("ins_one", "rec_1", ClaudePermissionMode::Plan);
-        assert_eq!(a, permission_event_id("ins_one", "rec_1", ClaudePermissionMode::Plan));
-        assert_ne!(a, permission_event_id("ins_one", "rec_2", ClaudePermissionMode::Plan));
-        assert_ne!(a, permission_event_id("ins_one", "rec_1", ClaudePermissionMode::Auto));
-        assert_ne!(a, permission_event_id("ins_two", "rec_1", ClaudePermissionMode::Plan));
+        assert_eq!(
+            a,
+            permission_event_id("ins_one", "rec_1", ClaudePermissionMode::Plan)
+        );
+        assert_ne!(
+            a,
+            permission_event_id("ins_one", "rec_2", ClaudePermissionMode::Plan)
+        );
+        assert_ne!(
+            a,
+            permission_event_id("ins_one", "rec_1", ClaudePermissionMode::Auto)
+        );
+        assert_ne!(
+            a,
+            permission_event_id("ins_two", "rec_1", ClaudePermissionMode::Plan)
+        );
     }
 }

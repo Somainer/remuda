@@ -576,10 +576,9 @@ fn claude_permission_mode_records_map_to_permission_observations() -> Result<()>
     let edges: Vec<_> = envelopes
         .iter()
         .filter_map(|env| match &env.body {
-            ObservationPayload::Permission(payload) => Some((
-                payload.effective.mode.clone(),
-                payload.effective.source,
-            )),
+            ObservationPayload::Permission(payload) => {
+                Some((payload.effective.mode.clone(), payload.effective.source))
+            }
             _ => None,
         })
         .collect();
@@ -589,9 +588,15 @@ fn claude_permission_mode_records_map_to_permission_observations() -> Result<()>
     assert_eq!(
         edges,
         vec![
-            ("manual".to_string(), remuda_protocol::PermissionSource::Unknown),
+            (
+                "manual".to_string(),
+                remuda_protocol::PermissionSource::Unknown
+            ),
             ("plan".to_string(), remuda_protocol::PermissionSource::Slash),
-            ("auto".to_string(), remuda_protocol::PermissionSource::Unknown),
+            (
+                "auto".to_string(),
+                remuda_protocol::PermissionSource::Unknown
+            ),
         ]
     );
     Ok(())
@@ -600,8 +605,7 @@ fn claude_permission_mode_records_map_to_permission_observations() -> Result<()>
 #[test]
 fn real_21273_permission_walk_replays_every_wheel_mode() -> Result<()> {
     let (_, _, _, map) = ctx("perm-session-21273");
-    let contents =
-        include_str!("fixtures/permission-21273/permission-walk-21273.jsonl");
+    let contents = include_str!("fixtures/permission-21273/permission-walk-21273.jsonl");
     let envelopes = map_file(contents, &map)?;
     let modes: Vec<_> = envelopes
         .iter()
@@ -615,9 +619,11 @@ fn real_21273_permission_walk_replays_every_wheel_mode() -> Result<()> {
         vec!["manual", "plan", "acceptEdits", "auto", "manual"]
     );
     // Every permission envelope carries a deterministic event id.
-    assert!(envelopes
-        .iter()
-        .filter(|env| matches!(env.body, ObservationPayload::Permission(_)))
-        .all(|env| env.event_id.is_some()));
+    assert!(
+        envelopes
+            .iter()
+            .filter(|env| matches!(env.body, ObservationPayload::Permission(_)))
+            .all(|env| env.event_id.is_some())
+    );
     Ok(())
 }

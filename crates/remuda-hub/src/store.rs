@@ -5676,8 +5676,13 @@ mod tests {
             })
             .await
             .expect("spec");
-        assert_eq!(spec.get("permissionMode").and_then(Value::as_str), Some("auto"));
-        let effective = spec.get("permissionEffective").expect("permissionEffective stored");
+        assert_eq!(
+            spec.get("permissionMode").and_then(Value::as_str),
+            Some("auto")
+        );
+        let effective = spec
+            .get("permissionEffective")
+            .expect("permissionEffective stored");
         assert_eq!(effective.get("mode").and_then(Value::as_str), Some("auto"));
         assert_eq!(
             effective.get("source").and_then(Value::as_str),

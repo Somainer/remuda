@@ -92,10 +92,7 @@ pub(crate) fn parse_indicator(text: &str) -> Option<ClaudePermissionMode> {
 ///
 /// `dontAsk` is never reachable (one press exits it). `bypassPermissions` is
 /// reachable only when the launch carried the bypass allowance.
-pub(crate) fn live_reachable(
-    target: ClaudePermissionMode,
-    bypass_allowed: bool,
-) -> bool {
+pub(crate) fn live_reachable(target: ClaudePermissionMode, bypass_allowed: bool) -> bool {
     match target {
         ClaudePermissionMode::DontAsk => false,
         ClaudePermissionMode::BypassPermissions => bypass_allowed,
@@ -366,7 +363,9 @@ impl PermissionBridge {
             {
                 state.pending = None;
             }
-            state.verdict = Some(Readback::Rejected { reason: reason.into() });
+            state.verdict = Some(Readback::Rejected {
+                reason: reason.into(),
+            });
             state.verdict_gen = generation;
         }
         self.notify.notify_waiters();
@@ -481,10 +480,7 @@ pub(crate) trait PermissionSwitchIo: Send + Sync {
 /// be mistaken for a settled mode.
 async fn stable_indicator(io: &dyn PermissionSwitchIo) -> Option<ClaudePermissionMode> {
     let first = parse_indicator(&io.screen_text().await.ok()?);
-    tokio::time::sleep(std::time::Duration::from_millis(
-        PERMISSION_STABLE_GAP_MS,
-    ))
-    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(PERMISSION_STABLE_GAP_MS)).await;
     let second = parse_indicator(&io.screen_text().await.ok()?);
     first.filter(|mode| Some(*mode) == second)
 }
@@ -517,13 +513,14 @@ pub(crate) async fn perform_switch(
     // + resolve the rendezvous and journal applied: no keystroke means no new
     // transcript edge, so the caller's optimistic pending needs this verdict
     // to settle.
-    if bridge.observed() == Some(request.mode)
-        && stable_indicator(io).await == Some(request.mode)
-    {
+    if bridge.observed() == Some(request.mode) && stable_indicator(io).await == Some(request.mode) {
         let generation = bridge.arm(request.mode);
         bridge.resolve(generation, request.mode);
-        io.journal(SwitchOutcome::Applied.journal_status(word, ""), Severity::Info)
-            .await;
+        io.journal(
+            SwitchOutcome::Applied.journal_status(word, ""),
+            Severity::Info,
+        )
+        .await;
         return SwitchOutcome::Applied;
     }
 
@@ -551,10 +548,7 @@ pub(crate) async fn perform_switch(
             + std::time::Duration::from_millis(PERMISSION_STEP_TIMEOUT_MS);
         let mut landed = None;
         while std::time::Instant::now() < step_deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                PERMISSION_SCREEN_POLL_MS,
-            ))
-            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(PERMISSION_SCREEN_POLL_MS)).await;
             let Ok(screen) = io.screen_text().await else {
                 continue;
             };
@@ -665,10 +659,7 @@ impl PermissionQueue {
     }
 
     fn has_replacements(&self) -> bool {
-        self.pending
-            .lock()
-            .map(|p| p.is_some())
-            .unwrap_or(false)
+        self.pending.lock().map(|p| p.is_some()).unwrap_or(false)
     }
 
     pub(crate) fn close(&self) {
@@ -719,9 +710,7 @@ pub(crate) fn spawn_worker(
                         }
                         None => {
                             let severity = match outcome {
-                                SwitchOutcome::Applied | SwitchOutcome::Queued => {
-                                    Severity::Info
-                                }
+                                SwitchOutcome::Applied | SwitchOutcome::Queued => Severity::Info,
                                 SwitchOutcome::Unsupported => Severity::Warning,
                                 SwitchOutcome::Degraded => Severity::Warning,
                                 SwitchOutcome::ControlUnavailable => Severity::Error,
@@ -755,7 +744,10 @@ mod vocabulary_tests {
             assert_eq!(from_native(wire_word(mode)), Some(mode));
         }
         assert_eq!(from_native("default"), Some(ClaudePermissionMode::Manual));
-        assert_eq!(from_native("bypass"), Some(ClaudePermissionMode::BypassPermissions));
+        assert_eq!(
+            from_native("bypass"),
+            Some(ClaudePermissionMode::BypassPermissions)
+        );
         assert_eq!(from_native("nonsense"), None);
     }
 
@@ -803,14 +795,20 @@ mod vocabulary_tests {
         use ClaudePermissionMode::*;
         let cases = [
             ("  ⏸ manual mode on · ← for agents", Manual),
-            ("⏵⏵ accept edits on(shift+tab to cycle) · ← for agents", AcceptEdits),
+            (
+                "⏵⏵ accept edits on(shift+tab to cycle) · ← for agents",
+                AcceptEdits,
+            ),
             ("  ⏸ plan mode on (shift+tab to cycle) · ← for agents", Plan),
             ("⏵⏵ auto mode on (shift+tab to cycle) · ← for agents", Auto),
             (
                 "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
                 BypassPermissions,
             ),
-            ("⏵⏵ don't ask on (shift+tab to cycle) · ← for agents", DontAsk),
+            (
+                "⏵⏵ don't ask on (shift+tab to cycle) · ← for agents",
+                DontAsk,
+            ),
             // Streaming-scrambled rendering: stray spaces inside the phrase
             // (measured: "plan mode on (shift+tab o cycle) · ←for agents").
             ("⏸ plan mode on (shift+tab o cycle)  · ←for agents", Plan),
@@ -839,9 +837,8 @@ mod vocabulary_tests {
         assert!(bypass_dialog_visible(modal));
         // After acceptance the modal text stays in scrollback, but the settled
         // status line paints BELOW the confirm hint — not the active modal.
-        let settled = format!(
-            "{modal}\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
-        );
+        let settled =
+            format!("{modal}\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents");
         assert!(!bypass_dialog_visible(&settled));
         // The non-blocking auto-mode entry warning must not be mistaken for
         // the bypass disclaimer (no confirm footer).
@@ -890,8 +887,8 @@ mod vocabulary_tests {
 #[cfg(test)]
 mod switch_tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// Scripted PTY: each screen read returns the next fixture screen, and
     /// keystrokes are recorded. Modal screens are served verbatim.
@@ -904,10 +901,19 @@ mod switch_tests {
     }
 
     impl MockIo {
-        fn new(idle: bool, screens: Vec<String>, writes: Arc<StdMutex<Vec<String>>>,
-               journals: Arc<StdMutex<Vec<(String, Severity)>>>) -> Self {
-            Self { screens: StdMutex::new(screens), writes, idle, journals,
-                   read_count: AtomicU32::new(0) }
+        fn new(
+            idle: bool,
+            screens: Vec<String>,
+            writes: Arc<StdMutex<Vec<String>>>,
+            journals: Arc<StdMutex<Vec<(String, Severity)>>>,
+        ) -> Self {
+            Self {
+                screens: StdMutex::new(screens),
+                writes,
+                idle,
+                journals,
+                read_count: AtomicU32::new(0),
+            }
         }
         /// The visible screen follows the number of cycles performed: screen
         /// `n` is what paints after the nth shift+tab, and reads repeat the
@@ -927,18 +933,24 @@ mod switch_tests {
 
     #[async_trait::async_trait]
     impl PermissionSwitchIo for MockIo {
-        async fn is_idle(&self) -> bool { self.idle }
+        async fn is_idle(&self) -> bool {
+            self.idle
+        }
         async fn send_cycle(&self) -> DriverResult<()> {
-            self.writes.lock().unwrap().push("cycle".into()); Ok(())
+            self.writes.lock().unwrap().push("cycle".into());
+            Ok(())
         }
         async fn press_down(&self) -> DriverResult<()> {
-            self.writes.lock().unwrap().push("down".into()); Ok(())
+            self.writes.lock().unwrap().push("down".into());
+            Ok(())
         }
         async fn press_enter(&self) -> DriverResult<()> {
-            self.writes.lock().unwrap().push("enter".into()); Ok(())
+            self.writes.lock().unwrap().push("enter".into());
+            Ok(())
         }
         async fn press_esc(&self) -> DriverResult<()> {
-            self.writes.lock().unwrap().push("esc".into()); Ok(())
+            self.writes.lock().unwrap().push("esc".into());
+            Ok(())
         }
         async fn screen_text(&self) -> DriverResult<String> {
             self.read_count.fetch_add(1, Ordering::Relaxed);
@@ -966,7 +978,8 @@ mod switch_tests {
         "WARNING: Claude Code running in Bypass Permissions mode\n\
          By proceeding, you accept all responsibility for actions taken \
          while running in Bypass Permissions mode.\n\
-         ❯ No, exit\n Yes, I accept\n Enter to confirm · Esc to cancel".into()
+         ❯ No, exit\n Yes, I accept\n Enter to confirm · Esc to cancel"
+            .into()
     }
 
     #[tokio::test]
@@ -974,17 +987,20 @@ mod switch_tests {
         let writes = Arc::new(StdMutex::new(Vec::new()));
         let journals = Arc::new(StdMutex::new(Vec::new()));
         // start: acceptEdits, after press1: plan, press2: auto (target).
-        let screens = vec![
-            settled("acceptEdits"),
-            settled("plan"),
-            settled("auto"),
-        ]; // index = cycles performed
+        let screens = vec![settled("acceptEdits"), settled("plan"), settled("auto")]; // index = cycles performed
         let io = Arc::new(MockIo::new(true, screens, writes.clone(), journals.clone()));
         let bridge = Arc::new(PermissionBridge::new(false));
-        let request = PermissionRequest { mode: ClaudePermissionMode::Auto };
+        let request = PermissionRequest {
+            mode: ClaudePermissionMode::Auto,
+        };
         let outcome = perform_switch(request, &bridge, io.as_ref()).await;
         assert_eq!(outcome, SwitchOutcome::Applied);
-        let cycles = writes.lock().unwrap().iter().filter(|w| w.as_str() == "cycle").count();
+        let cycles = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.as_str() == "cycle")
+            .count();
         assert_eq!(cycles, 2, "two shift+tab presses acceptEdits→plan→auto");
         assert!(journals.lock().unwrap().is_empty(), "applied is silent");
     }
@@ -998,13 +1014,23 @@ mod switch_tests {
         let bridge = Arc::new(PermissionBridge::new(true));
         bridge.note_launch_mode(ClaudePermissionMode::Plan);
         let outcome = perform_switch(
-            PermissionRequest { mode: ClaudePermissionMode::Plan },
-            &bridge, io.as_ref(),
-        ).await;
+            PermissionRequest {
+                mode: ClaudePermissionMode::Plan,
+            },
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
         assert_eq!(outcome, SwitchOutcome::Applied);
         assert!(writes.lock().unwrap().is_empty());
         // The no-op still journals applied so an optimistic pending settles.
-        assert!(journals.lock().unwrap().iter().any(|(s, _)| s == "permission-applied:plan"));
+        assert!(
+            journals
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, _)| s == "permission-applied:plan")
+        );
     }
 
     #[tokio::test]
@@ -1015,25 +1041,45 @@ mod switch_tests {
         let io = Arc::new(MockIo::new(true, screens, writes.clone(), journals.clone()));
         let bridge = Arc::new(PermissionBridge::new(true));
         let outcome = perform_switch(
-            PermissionRequest { mode: ClaudePermissionMode::DontAsk },
-            &bridge, io.as_ref(),
-        ).await;
+            PermissionRequest {
+                mode: ClaudePermissionMode::DontAsk,
+            },
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
         assert_eq!(outcome, SwitchOutcome::Unsupported);
-        assert!(writes.lock().unwrap().is_empty(), "launch-only means no keys");
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "launch-only means no keys"
+        );
         let statuses = journals.lock().unwrap();
-        assert!(statuses.iter().any(|(s, _)| s == "permission-unsupported-in-session:dontAsk"));
+        assert!(
+            statuses
+                .iter()
+                .any(|(s, _)| s == "permission-unsupported-in-session:dontAsk")
+        );
     }
 
     #[tokio::test]
     async fn bypass_without_allowance_is_refused() {
         let writes = Arc::new(StdMutex::new(Vec::new()));
         let journals = Arc::new(StdMutex::new(Vec::new()));
-        let io = Arc::new(MockIo::new(true, vec![settled("plan")], writes.clone(), journals.clone()));
+        let io = Arc::new(MockIo::new(
+            true,
+            vec![settled("plan")],
+            writes.clone(),
+            journals.clone(),
+        ));
         let bridge = Arc::new(PermissionBridge::new(false));
         let outcome = perform_switch(
-            PermissionRequest { mode: ClaudePermissionMode::BypassPermissions },
-            &bridge, io.as_ref(),
-        ).await;
+            PermissionRequest {
+                mode: ClaudePermissionMode::BypassPermissions,
+            },
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
         assert_eq!(outcome, SwitchOutcome::Unsupported);
         assert!(writes.lock().unwrap().is_empty());
     }
@@ -1053,12 +1099,19 @@ mod switch_tests {
         let io = Arc::new(MockIo::new(true, screens, writes.clone(), journals.clone()));
         let bridge = Arc::new(PermissionBridge::new(true));
         let outcome = perform_switch(
-            PermissionRequest { mode: ClaudePermissionMode::BypassPermissions },
-            &bridge, io.as_ref(),
-        ).await;
+            PermissionRequest {
+                mode: ClaudePermissionMode::BypassPermissions,
+            },
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
         assert_eq!(outcome, SwitchOutcome::Applied);
         let all = writes.lock().unwrap().clone();
-        assert!(all.contains(&"down".to_string()), "the modal defaults to No,exit");
+        assert!(
+            all.contains(&"down".to_string()),
+            "the modal defaults to No,exit"
+        );
         assert!(all.contains(&"enter".to_string()));
         // down/enter each happen at most once per modal.
         assert_eq!(all.iter().filter(|w| w.as_str() == "down").count(), 1);
@@ -1074,15 +1127,27 @@ mod switch_tests {
         let io = Arc::new(MockIo::new(true, screens, writes.clone(), journals.clone()));
         let bridge = Arc::new(PermissionBridge::new(false));
         let outcome = perform_switch(
-            PermissionRequest { mode: ClaudePermissionMode::Auto },
-            &bridge, io.as_ref(),
-        ).await;
+            PermissionRequest {
+                mode: ClaudePermissionMode::Auto,
+            },
+            &bridge,
+            io.as_ref(),
+        )
+        .await;
         assert_eq!(outcome, SwitchOutcome::Degraded);
-        let cycles = writes.lock().unwrap().iter().filter(|w| w.as_str() == "cycle").count();
+        let cycles = writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.as_str() == "cycle")
+            .count();
         assert_eq!(cycles, PERMISSION_MAX_PRESSES);
         let statuses = journals.lock().unwrap();
-        assert!(statuses.iter().any(|(s, sev)| {
-            s.starts_with("permission-degraded:auto:") && *sev == Severity::Warning
-        }), "degraded journals a warning: {statuses:?}");
+        assert!(
+            statuses.iter().any(|(s, sev)| {
+                s.starts_with("permission-degraded:auto:") && *sev == Severity::Warning
+            }),
+            "degraded journals a warning: {statuses:?}"
+        );
     }
 }

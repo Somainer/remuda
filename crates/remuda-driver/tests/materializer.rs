@@ -1666,8 +1666,8 @@ mod binary_override {
 mod permission_axes {
     use super::*;
     use remuda_protocol::{
-        AgentKind, AgyPermissionMode, ApprovalsReviewer, ApprovalPolicy, CodexExecution,
-        CodexPermission, GrokPermissionMode, GrokPermission, SandboxExecution, SandboxMode,
+        AgentKind, AgyPermissionMode, ApprovalPolicy, ApprovalsReviewer, CodexExecution,
+        CodexPermission, GrokPermission, GrokPermissionMode, SandboxExecution, SandboxMode,
     };
 
     fn mut_spec(kind: AgentKind, permission: PermissionMode) -> InstanceSpec {
@@ -1700,7 +1700,10 @@ mod permission_axes {
         assert!(joined.contains("--ask-for-approval on-request"), "{joined}");
         assert!(joined.contains("--sandbox read-only"), "{joined}");
 
-        let args = recipe_args(&codex(ApprovalPolicy::Untrusted, SandboxMode::WorkspaceWrite));
+        let args = recipe_args(&codex(
+            ApprovalPolicy::Untrusted,
+            SandboxMode::WorkspaceWrite,
+        ));
         let joined = args.join(" ");
         assert!(joined.contains("--ask-for-approval untrusted"), "{joined}");
         assert!(joined.contains("--sandbox workspace-write"), "{joined}");
@@ -1719,12 +1722,16 @@ mod permission_axes {
                 PermissionMode::Grok(Box::new(GrokPermission { mode })),
             )
         };
-        assert!(recipe_args(&grok(GrokPermissionMode::AlwaysApprove))
-            .iter()
-            .any(|token| token == "--always-approve"));
-        assert!(!recipe_args(&grok(GrokPermissionMode::NativePrompt))
-            .iter()
-            .any(|token| token == "--always-approve"));
+        assert!(
+            recipe_args(&grok(GrokPermissionMode::AlwaysApprove))
+                .iter()
+                .any(|token| token == "--always-approve")
+        );
+        assert!(
+            !recipe_args(&grok(GrokPermissionMode::NativePrompt))
+                .iter()
+                .any(|token| token == "--always-approve")
+        );
 
         let agy = |mode| {
             let mut spec = mut_spec(
@@ -1734,11 +1741,15 @@ mod permission_axes {
             spec.kind = AgentKind::Agy;
             spec
         };
-        assert!(recipe_args(&agy(AgyPermissionMode::AlwaysProceed))
-            .iter()
-            .any(|token| token == "--yolo"));
-        assert!(!recipe_args(&agy(AgyPermissionMode::Native))
-            .iter()
-            .any(|token| token == "--yolo"));
+        assert!(
+            recipe_args(&agy(AgyPermissionMode::AlwaysProceed))
+                .iter()
+                .any(|token| token == "--yolo")
+        );
+        assert!(
+            !recipe_args(&agy(AgyPermissionMode::Native))
+                .iter()
+                .any(|token| token == "--yolo")
+        );
     }
 }

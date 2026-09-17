@@ -3434,7 +3434,8 @@ mod tests {
                     native.native_name == "instance.configure"
                         && native.status
                             == Knowledge::Known {
-                                value: "applied model=opus effort=ultracode index=3 permission=-".into(),
+                                value: "applied model=opus effort=ultracode index=3 permission=-"
+                                    .into(),
                             }
                 });
                 if has_command && has_apply {

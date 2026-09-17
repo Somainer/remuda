@@ -4,13 +4,11 @@
 //! fixture records under `fixtures/permission-21273/` are verbatim lines
 //! captured from a real claude 2.1.273 PTY (evidence permission-modes-1.md).
 
-use remuda_driver::test_support::{
-    PermissionBridgeHandle, mapper_with_permission_bridge,
-};
 use remuda_driver::TranscriptMapper;
+use remuda_driver::test_support::{PermissionBridgeHandle, mapper_with_permission_bridge};
 use remuda_protocol::{
-    ClaudePermissionMode, DriverKind, HostId, Id, InstanceId, ObservationPayload,
-    PermissionSource, RunId,
+    ClaudePermissionMode, DriverKind, HostId, Id, InstanceId, ObservationPayload, PermissionSource,
+    RunId,
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -204,9 +202,7 @@ fn verbatim_21273_walk_fixture_replays_every_mode() {
 fn verbatim_21273_records_cover_all_six_modes() {
     // Every mode word the binary actually writes, captured verbatim across
     // boot (`--permission-mode dontAsk`) and wheel sessions.
-    let raw = include_str!(
-        "fixtures/permission-21273/permission-records-verbatim-21273.jsonl"
-    );
+    let raw = include_str!("fixtures/permission-21273/permission-records-verbatim-21273.jsonl");
     let mut modes = std::collections::BTreeSet::new();
     for line in raw.lines() {
         let value: Value = serde_json::from_str(line).expect("json");
@@ -222,9 +218,7 @@ fn verbatim_21273_records_cover_all_six_modes() {
 
 #[test]
 fn dontask_launch_fixture_records_the_launch_mode() {
-    let raw = include_str!(
-        "fixtures/permission-21273/permission-launch-dontask-21273.jsonl"
-    );
+    let raw = include_str!("fixtures/permission-21273/permission-launch-dontask-21273.jsonl");
     let handle = Arc::new(PermissionBridgeHandle::new(false));
     let mut mapper = mapper_with(&handle, Some(ClaudePermissionMode::DontAsk));
     let mut seen = Vec::new();

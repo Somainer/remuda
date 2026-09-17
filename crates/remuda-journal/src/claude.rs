@@ -5,13 +5,13 @@ use crate::envelope::Envelope;
 use crate::source::{FileTail, MapContext, Source, SourceResume};
 use crate::util::{known, parse_timestamp, timestamp_now, unknown};
 use remuda_protocol::{
-    Completeness, ContentBlock, ContentStatus, EffortEffective, EffortPayload, EffortTracker,
-    LivePermissionTracker, PermissionEffective, PermissionPayload, ClaudePermissionMode,
-    EventId, FileCursor, Id, Knowledge, LifecyclePayload, LifecycleTopic, MessageOrigin,
-    MessagePayload, MessagePhase, MessageRole, MutationOperation, NativeLifecycle,
-    NativeRequestKey, NodeMutation, ObservationPayload, ObservationSource, OpaqueImpact,
-    OpaquePayload, OpaqueReason, ResultStage, Severity, SourceChannel, SourceCursor, TextBlock,
-    ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
+    ClaudePermissionMode, Completeness, ContentBlock, ContentStatus, EffortEffective,
+    EffortPayload, EffortTracker, EventId, FileCursor, Id, Knowledge, LifecyclePayload,
+    LifecycleTopic, LivePermissionTracker, MessageOrigin, MessagePayload, MessagePhase,
+    MessageRole, MutationOperation, NativeLifecycle, NativeRequestKey, NodeMutation,
+    ObservationPayload, ObservationSource, OpaqueImpact, OpaquePayload, OpaqueReason,
+    PermissionEffective, PermissionPayload, ResultStage, Severity, SourceChannel, SourceCursor,
+    TextBlock, ThoughtPayload, ThoughtRepresentation, ToolCallPayload, ToolCallState, ToolCategory,
     ToolOutcome, ToolResultPayload, U64,
 };
 use serde_json::{Map, Value};
@@ -86,11 +86,7 @@ impl NativeIds {
 
     /// Deterministic event id for a permission-mode edge read from a native
     /// record; stable across the live channel and this file tailer.
-    pub(crate) fn permission_event(
-        &self,
-        native_key: &str,
-        mode: ClaudePermissionMode,
-    ) -> EventId {
+    pub(crate) fn permission_event(&self, native_key: &str, mode: ClaudePermissionMode) -> EventId {
         remuda_protocol::permission_event_id(&self.scope, native_key, mode)
     }
 
@@ -421,7 +417,15 @@ fn map_permission_mode(
         .map(|uuid| format!("permission-mode:{uuid}"))
         .unwrap_or_else(|| format!("permission-mode:{}", cursor.offset.0));
     Ok(vec![permission_envelope(
-        ctx, ids, value, line, cursor, &native, mode, source, Some(raw),
+        ctx,
+        ids,
+        value,
+        line,
+        cursor,
+        &native,
+        mode,
+        source,
+        Some(raw),
     )?])
 }
 

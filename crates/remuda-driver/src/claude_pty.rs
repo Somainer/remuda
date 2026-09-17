@@ -535,8 +535,7 @@ impl ClaudePtyDriver {
             .argv
             .iter()
             .any(|token| token == "--dangerously-skip-permissions");
-        let permission_bridge =
-            Arc::new(crate::permission::PermissionBridge::new(bypass_allowed));
+        let permission_bridge = Arc::new(crate::permission::PermissionBridge::new(bypass_allowed));
         let permission_queue = Arc::new(crate::permission::PermissionQueue::new());
         // The TUI's tool calls exist only in the native transcript; follow it as
         // soon as the hook names the file (D-025's mapper, claude-pty's carrier).
@@ -1356,10 +1355,8 @@ fn spawn_transcript_pump(
                         }
                     }
                     if let Some(bridge) = &permission_bridge {
-                        mapper = mapper.with_permission_bridge(
-                            Arc::clone(bridge),
-                            launch_permission,
-                        );
+                        mapper =
+                            mapper.with_permission_bridge(Arc::clone(bridge), launch_permission);
                     }
                     hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
                 }

@@ -83,6 +83,7 @@ fn effort_switch(word: &str) -> DriverInput {
         model_id: String::new(),
         effective: ModelEffective::NextTurn,
         effort: Some(word.to_owned()),
+        permission_mode: None,
     }))
 }
 

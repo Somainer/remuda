@@ -1060,7 +1060,7 @@ async fn dispatch_rpc(
                         model: None,
                         effort_name: None,
                         effort_index: None,
-                permission_mode: None,
+                        permission_mode: None,
                     },
                 )
                 .await?;

@@ -11,9 +11,9 @@ use crate::recipe::{
     MaterializedFile, RecipePermission, RecipeProvider, TECH_DEBT_M0_PERM_01,
 };
 use remuda_protocol::{
-    AgentKind, ApprovalAuthority, AgyPermissionMode, ApprovalPolicy, BoolLiteral,
-    ClaudePermissionMode, CodexExecution, CommandOrigin, DriverKind, GrokPermissionMode,
-    EnvBinding, Id, InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
+    AgentKind, AgyPermissionMode, ApprovalAuthority, ApprovalPolicy, BoolLiteral,
+    ClaudePermissionMode, CodexExecution, CommandOrigin, DriverKind, EnvBinding,
+    GrokPermissionMode, Id, InputDelivery, InputOrigin, InstanceSpec, PermissionMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -934,9 +934,7 @@ fn permission_plan(
                 extra_flags.push(match sandbox.sandbox {
                     remuda_protocol::SandboxMode::ReadOnly => "read-only".into(),
                     remuda_protocol::SandboxMode::WorkspaceWrite => "workspace-write".into(),
-                    remuda_protocol::SandboxMode::DangerFullAccess => {
-                        "danger-full-access".into()
-                    }
+                    remuda_protocol::SandboxMode::DangerFullAccess => "danger-full-access".into(),
                 });
             }
             Ok((

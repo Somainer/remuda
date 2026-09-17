@@ -169,11 +169,7 @@ impl PermissionBridgeHandle {
     }
 
     /// Wait for a verdict, mapping Applied to the mode.
-    pub async fn wait(
-        &self,
-        generation: u64,
-        timeout: Duration,
-    ) -> Option<ClaudePermissionMode> {
+    pub async fn wait(&self, generation: u64, timeout: Duration) -> Option<ClaudePermissionMode> {
         match self.inner.wait(generation, timeout).await? {
             PermissionReadback::Applied(mode) => Some(mode),
             PermissionReadback::Rejected { .. } => None,

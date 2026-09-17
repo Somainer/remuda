@@ -2744,8 +2744,8 @@ impl TranscriptMapper {
             .as_ref()
             .and_then(|bridge| bridge.armed())
             .map(|(_, target)| crate::permission::wire_word(target).to_owned());
-        let payload = ObservationPayload::Permission(Box::new(
-            remuda_protocol::PermissionPayload {
+        let payload =
+            ObservationPayload::Permission(Box::new(remuda_protocol::PermissionPayload {
                 requested,
                 effective: remuda_protocol::PermissionEffective {
                     mode: crate::permission::wire_word(mode).to_owned(),
@@ -2753,8 +2753,7 @@ impl TranscriptMapper {
                     observed_at: now()?,
                 },
                 raw,
-            },
-        ));
+            }));
         Ok(vec![self.mapper.observation(
             Completeness::Structured,
             NativeRequestKey::None,

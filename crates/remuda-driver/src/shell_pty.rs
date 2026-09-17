@@ -1151,7 +1151,8 @@ impl ShellPtyDriver {
         let bypass_allowed = recipe.argv.iter().any(|token| {
             token == "--dangerously-skip-permissions"
                 || token == "--allow-dangerously-skip-permissions"
-        }) || launch_permission == Some(remuda_protocol::ClaudePermissionMode::BypassPermissions);
+        }) || launch_permission
+            == Some(remuda_protocol::ClaudePermissionMode::BypassPermissions);
         if let Some(worker) = self.permission_worker.lock().await.take() {
             worker.abort();
         }
@@ -1161,8 +1162,7 @@ impl ShellPtyDriver {
             *slot = Arc::new(crate::permission::PermissionQueue::new());
             Arc::clone(&slot)
         };
-        let permission_bridge =
-            Arc::new(crate::permission::PermissionBridge::new(bypass_allowed));
+        let permission_bridge = Arc::new(crate::permission::PermissionBridge::new(bypass_allowed));
         if let Some(mode) = launch_permission {
             permission_bridge.note_launch_mode(mode);
         }

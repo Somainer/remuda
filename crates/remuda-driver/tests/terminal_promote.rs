@@ -233,7 +233,10 @@ fn a_permission_mode_record_emits_an_effective_edge_and_a_lifecycle() {
         .iter()
         .filter(|observation| matches!(observation.body, ObservationPayload::Lifecycle(_)))
         .count();
-    assert!(lifecycles >= 1, "the mode/permission lifecycles are retained");
+    assert!(
+        lifecycles >= 1,
+        "the mode/permission lifecycles are retained"
+    );
 }
 
 #[test]

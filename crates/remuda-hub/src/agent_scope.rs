@@ -392,25 +392,34 @@ pub async fn authorize_command(
 
 /// True when the addressed instance lies inside the caller's delegation scope.
 ///
-/// The scope's project/host/workspace dimensions must each admit the target;
-/// an empty dimension on the caller means "not narrowed" on that dimension.
-/// Host identity is deliberately irrelevant: that is what lets an agent message
-/// a sibling instance running on another enrolled host without a human prompt.
+/// The scope must be *explicitly narrowed* (at least one non-empty dimension):
+/// a universe-scoped instance keeps the ownership-only rule, so an ordinary
+/// agent a human launched without a delegation box cannot message a sibling
+/// without the one-shot Interaction. Each narrowed dimension must admit the
+/// target on a matching attribute; an empty dimension is not narrowed.
+/// Host identity is deliberately irrelevant once the box admits the target:
+/// that is what lets an agent message an in-scope sibling on another enrolled
+/// host without a human prompt.
 pub async fn target_in_caller_scope(
     state: &AppState,
     device: &Device,
     target: &crate::store::InstanceRecord,
 ) -> Result<bool, HubError> {
     let scope = caller_project_scope(state, device).await?;
-    let project_ok = target
-        .project_id
-        .as_deref()
-        .is_none_or(|project| scope.allows_project(project));
-    let host_ok = scope.allows_host(&target.host_id);
-    let workspace_ok = target
-        .workspace_id
-        .as_deref()
-        .is_none_or(|workspace| scope.allows_workspace(workspace));
+    if scope.is_universe() {
+        return Ok(false);
+    }
+    let project_ok = scope.project_ids.is_empty()
+        || target
+            .project_id
+            .as_deref()
+            .is_some_and(|project| scope.allows_project(project));
+    let host_ok = scope.host_ids.is_empty() || scope.allows_host(&target.host_id);
+    let workspace_ok = scope.workspace_ids.is_empty()
+        || target
+            .workspace_id
+            .as_deref()
+            .is_some_and(|workspace| scope.allows_workspace(workspace));
     Ok(project_ok && host_ok && workspace_ok)
 }
 

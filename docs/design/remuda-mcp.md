@@ -57,16 +57,20 @@ link, so there is no per-host transport to configure.
 
 **Project-scope messaging rule.** An Agent-origin `remuda_instance_send`
 needs no per-message human approval when the target instance is inside the
-caller's own delegation scope — the caller's `projectIds`, `hostIds` and
-`workspaceIds` must each admit the target (an empty dimension means
-"not narrowed"). Host identity is deliberately irrelevant: an agent on host A
-can message an in-scope instance on host B with no prompt. The send is
-journaled on both sides (an `outbound` message on the sender naming target
-instance/host, an `inbound` message on the receiver naming the sender).
-Everything else keeps the one-shot human Interaction: out-of-scope targets,
-`remuda_instance_keys` / raw `tty.write`, shell-driver targets, and an
-explicit `x-remuda-require-approval` header. `fleet --all` stays banned from
-Agent origin, and an Agent can never answer an Interaction itself.
+caller's *explicitly narrowed* delegation scope — at least one of the
+caller's `projectIds`, `hostIds` or `workspaceIds` is set, and each set
+dimension admits the target on its matching attribute. An instance with
+every dimension empty (universe scope) keeps the ownership-only rule, so an
+ordinary agent a human launched without a delegation box still needs the
+one-shot Interaction for an unowned sibling. Host identity is deliberately
+irrelevant once the box admits the target: an agent on host A can message an
+in-scope instance on host B with no prompt. The send is journaled on both
+sides (an `outbound` message on the sender naming target instance/host, an
+`inbound` message on the receiver naming the sender). Everything else keeps
+the one-shot human Interaction: out-of-scope targets, `remuda_instance_keys`
+/ raw `tty.write`, shell-driver targets, and an explicit
+`x-remuda-require-approval` header. `fleet --all` stays banned from Agent
+origin, and an Agent can never answer an Interaction itself.
 
 Host **file** tools are intentionally absent from MCP: `host files ls/get/
 search` are operator-only routes and an Agent token always receives 403.

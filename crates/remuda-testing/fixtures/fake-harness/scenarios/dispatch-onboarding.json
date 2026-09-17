@@ -1,7 +1,6 @@
 {
   "turns": [
     {
-      "match_prefix": "ONBOARD",
       "thinking": "Reaching for the first tool without any human keys.",
       "think_chunks": 1,
       "text": "ONBOARD_TOOL_DONE",

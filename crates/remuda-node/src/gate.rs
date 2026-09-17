@@ -705,35 +705,20 @@ impl DevNode {
             args.push("--web-e2e".into());
         }
 
+        // The child gets an explicitly built environment, never the Node's
+        // own: the Node may itself run under its REMUDA_PTY_* carrier flags,
+        // which must not leak into cargo and every test binary (gate-lane-3).
+        let child_env = gate_run_child_env(request, &host_env_snapshot());
         let mut command = Command::new(&binary);
         command
             .args(&args)
             .current_dir(&repo)
-            .envs(request.env.iter().map(|(k, v)| (k.clone(), v.clone())))
-            .env("CARGO_TARGET_DIR", &request.target_dir)
-            .env("CARGO_INCREMENTAL", "0")
-            .env("VITE_NO_WATCH", "1")
+            .env_clear()
+            .envs(&child_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
-        prepend_path(&mut command, request.toolchain_path.as_deref());
-        if let Some(endpoint) = &request.pw_endpoint {
-            command.env("PW_TEST_CONNECT_WS_ENDPOINT", endpoint);
-            command.env("PW_CHANNEL", "chromium");
-        }
-        if let Some(lock) = &request.lock_path {
-            command.env("REMUDA_E2E_LOCK", lock);
-        }
-        if let Some((listen, web_port)) = port_pair(request.ports.as_deref()) {
-            command.env("HUB_E2E_LISTEN", listen);
-            command.env("HUB_E2E_WEB_PORT", web_port);
-        }
-        if !request.timeouts.is_empty()
-            && let Ok(json) = serde_json::to_string(&request.timeouts)
-        {
-            command.env("REMUDA_GATE_STEP_TIMEOUTS", json);
-        }
         #[cfg(unix)]
         command.process_group(0);
 
@@ -946,11 +931,17 @@ impl DevNode {
     ) -> Result<GateThenResult, NodeError> {
         let (_, workspace_root) = self.resolve_workspace_cwd(None, None)?;
         let cwd = request.cwd.map(PathBuf::from).unwrap_or(workspace_root);
+        // The post-land command gets the same explicitly built environment as
+        // the gate child: no REMUDA_PTY_* carrier flags leak from the Node
+        // (gate-lane-3). It has no toolchain PATH prefix or port block of its
+        // own, so only the lane env, the build passthrough and a base PATH.
+        let child_env = gate_then_child_env(&request.env, &host_env_snapshot());
         let mut command = Command::new("bash");
         command
             .args(["-lc", &request.command])
             .current_dir(&cwd)
-            .envs(request.env.iter().map(|(k, v)| (k.clone(), v.clone())))
+            .env_clear()
+            .envs(&child_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1125,18 +1116,120 @@ fn fast_forward_branch(repo: &Path, branch: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn prepend_path(command: &mut Command, prefix: Option<&str>) {
-    if let Some(prefix) = prefix
-        && !prefix.is_empty()
-    {
-        let current = std::env::var_os("PATH");
-        let mut value = std::ffi::OsString::from(prefix);
-        if let Some(current) = current {
-            value.push(":");
-            value.push(current);
+/// Whitelisted base `PATH` for a gate child. A lane must be reproducible from
+/// its own config, so the base never comes from the Node's ambient `PATH`; the
+/// toolchain prefix (`request.toolchain_path`) is composed ahead of it, and a
+/// lane that sets `PATH` in its env replaces this default (gate-lane-3).
+const GATE_BASE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Host environment a build legitimately needs, read once from the Node's
+/// process env. Only this whitelist crosses into a gate child; every other
+/// inherited variable — the Node's own `REMUDA_PTY_CARRIER`/`_EMULATOR`/`_HOOKS`
+/// carrier flags included — is dropped by `env_clear` so a lane host and the
+/// coordinator ssh gate present the child with the same environment
+/// (gate-lane-3).
+fn host_env_snapshot() -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for key in ["HOME", "USER", "SHELL", "TMPDIR", "LANG", "SSH_AUTH_SOCK"] {
+        if let Some(value) = std::env::var_os(key)
+            && let Ok(value) = value.into_string()
+        {
+            env.insert(key.to_owned(), value);
         }
-        command.env("PATH", value);
     }
+    env
+}
+
+/// The environment shared by every gate child (the merge CLI and the
+/// `gate.then` bash step), built from scratch so no ambient Node variable
+/// leaks. Precedence, lowest first:
+/// 1. `TERM=dumb` plus the host passthrough whitelist ([`host_env_snapshot`]);
+/// 2. the lane env from the request (`ProjectGateLane::env`) — the only channel
+///    that may (re)introduce a `REMUDA_PTY_*` variable, and the only one that
+///    may override `PATH`'s base or the passthrough.
+///
+/// `PATH` is finalized by the caller so the toolchain prefix can lead it.
+fn gate_child_base_env(
+    lane_env: &BTreeMap<String, String>,
+    host: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("TERM".to_owned(), "dumb".to_owned());
+    for (key, value) in host {
+        env.insert(key.clone(), value.clone());
+    }
+    for (key, value) in lane_env {
+        env.insert(key.clone(), value.clone());
+    }
+    env
+}
+
+/// Compose `PATH` for a gate child: the toolchain prefix, when present, ahead
+/// of `base` (the lane's own `PATH` or [`GATE_BASE_PATH`]).
+fn compose_gate_path(prefix: Option<&str>, base: &str) -> String {
+    match prefix.filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => format!("{prefix}:{base}"),
+        None => base.to_owned(),
+    }
+}
+
+/// Build the explicit environment for the merge child (`remuda merge --gate`).
+///
+/// Final key set: the shared base ([`gate_child_base_env`]); the derived keys
+/// the runner sets (`CARGO_TARGET_DIR`, `CARGO_INCREMENTAL`, `VITE_NO_WATCH`,
+/// and — when the request carries them — `PW_TEST_CONNECT_WS_ENDPOINT` +
+/// `PW_CHANNEL`, `REMUDA_E2E_LOCK`, `HUB_E2E_LISTEN` + `HUB_E2E_WEB_PORT`,
+/// `REMUDA_GATE_STEP_TIMEOUTS`); and `PATH` as the toolchain prefix ahead of
+/// the whitelisted base.
+fn gate_run_child_env(
+    request: &GateRunParams,
+    host: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = gate_child_base_env(&request.env, host);
+    env.insert("CARGO_TARGET_DIR".to_owned(), request.target_dir.clone());
+    env.insert("CARGO_INCREMENTAL".to_owned(), "0".to_owned());
+    env.insert("VITE_NO_WATCH".to_owned(), "1".to_owned());
+    if let Some(endpoint) = &request.pw_endpoint {
+        env.insert("PW_TEST_CONNECT_WS_ENDPOINT".to_owned(), endpoint.clone());
+        env.insert("PW_CHANNEL".to_owned(), "chromium".to_owned());
+    }
+    if let Some(lock) = &request.lock_path {
+        env.insert("REMUDA_E2E_LOCK".to_owned(), lock.clone());
+    }
+    if let Some((listen, web_port)) = port_pair(request.ports.as_deref()) {
+        env.insert("HUB_E2E_LISTEN".to_owned(), listen);
+        env.insert("HUB_E2E_WEB_PORT".to_owned(), web_port);
+    }
+    if !request.timeouts.is_empty()
+        && let Ok(json) = serde_json::to_string(&request.timeouts)
+    {
+        env.insert("REMUDA_GATE_STEP_TIMEOUTS".to_owned(), json);
+    }
+    let base = env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| GATE_BASE_PATH.to_owned());
+    env.insert(
+        "PATH".to_owned(),
+        compose_gate_path(request.toolchain_path.as_deref(), &base),
+    );
+    env
+}
+
+/// Build the explicit environment for the `gate.then` bash step: the shared
+/// base plus a `PATH` (the lane's own or the whitelisted base). It carries no
+/// toolchain prefix, cargo target or port block of its own.
+fn gate_then_child_env(
+    lane_env: &BTreeMap<String, String>,
+    host: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env = gate_child_base_env(lane_env, host);
+    let base = env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| GATE_BASE_PATH.to_owned());
+    env.insert("PATH".to_owned(), base);
+    env
 }
 
 /// Derive `(HUB_E2E_LISTEN, HUB_E2E_WEB_PORT)` from a `58480-58489` block.
@@ -2033,6 +2126,230 @@ JSON
         assert_eq!(listen, "127.0.0.1:58480");
         assert_eq!(web, "58489");
         assert!(super::port_pair(Some("garbage")).is_none());
+    }
+
+    /// A bare `GateRunParams` with only the identity fields set; env-shaping
+    /// tests fill the pieces they exercise.
+    fn bare_run_params() -> GateRunParams {
+        GateRunParams {
+            job_id: "gjb_env".into(),
+            lane_id: "lane1".into(),
+            repo_path: "/tmp/lane".into(),
+            target_dir: "/tmp/target-lane".into(),
+            branch: "wt/fake/task".into(),
+            base_branch: "main".into(),
+            mode: "verify".into(),
+            web: "auto".into(),
+            env: BTreeMap::new(),
+            lock_path: None,
+            pw_endpoint: None,
+            toolchain_path: None,
+            ports: None,
+            timeouts: BTreeMap::new(),
+            gate_timeout_secs: 0,
+            push: false,
+            keep_logs: false,
+            binary: None,
+            push_from: remuda_protocol::GatePushFrom::default(),
+        }
+    }
+
+    #[test]
+    fn gate_child_env_drops_ambient_pty_flags_and_composes_path() {
+        // A representative host snapshot standing in for the Node's process
+        // env: the carrier flags the lane Node runs under (which must NOT
+        // leak) plus a legitimate passthrough var. host_env_snapshot() itself
+        // only ever selects the whitelist, so the carrier flags never appear
+        // in it — but assert on an explicit map so the test does not depend on
+        // this process's ambient environment.
+        let host: BTreeMap<String, String> = [
+            ("HOME", "/home/lane"),
+            ("USER", "lane"),
+            ("PATH", "/opt/leaky/bin:/usr/bin"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+
+        let mut request = bare_run_params();
+        request.toolchain_path = Some("/opt/toolchain/bin".into());
+        request.env.insert("CARGO_BUILD_JOBS".into(), "8".into());
+
+        let child = super::gate_run_child_env(&request, &host);
+
+        // No REMUDA_PTY_* variable is present unless the lane env set it.
+        for key in child.keys() {
+            assert!(
+                !key.starts_with("REMUDA_PTY_"),
+                "carrier flag leaked into gate child: {key}"
+            );
+        }
+        // The derived build keys are set.
+        assert_eq!(
+            child.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("/tmp/target-lane")
+        );
+        assert_eq!(
+            child.get("CARGO_INCREMENTAL").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(child.get("VITE_NO_WATCH").map(String::as_str), Some("1"));
+        assert_eq!(child.get("CARGO_BUILD_JOBS").map(String::as_str), Some("8"));
+        // TERM is forced to dumb; the passthrough whitelist crosses.
+        assert_eq!(child.get("TERM").map(String::as_str), Some("dumb"));
+        assert_eq!(child.get("HOME").map(String::as_str), Some("/home/lane"));
+        assert_eq!(child.get("USER").map(String::as_str), Some("lane"));
+        // PATH leads with the toolchain prefix and derives its base from the
+        // explicit env, not a captured ambient PATH.
+        let path = child.get("PATH").expect("PATH set");
+        assert!(
+            path.starts_with("/opt/toolchain/bin:"),
+            "toolchain prefix must lead PATH: {path}"
+        );
+        assert!(
+            path.contains("/opt/leaky/bin:/usr/bin"),
+            "the lane's own PATH is the composed base: {path}"
+        );
+    }
+
+    #[test]
+    fn gate_child_path_falls_back_to_whitelisted_base() {
+        // With no lane PATH and no toolchain prefix, PATH is exactly the
+        // whitelisted base — reproducible from config, never the Node's.
+        let host = BTreeMap::new();
+        let request = bare_run_params();
+        let child = super::gate_run_child_env(&request, &host);
+        assert_eq!(
+            child.get("PATH").map(String::as_str),
+            Some(super::GATE_BASE_PATH)
+        );
+    }
+
+    #[test]
+    fn lane_env_is_the_only_channel_for_a_pty_flag() {
+        // A lane that deliberately sets a carrier flag in its config is honored
+        // (the escape hatch); nothing else introduces one.
+        let host = BTreeMap::new();
+        let mut request = bare_run_params();
+        request.env.insert("REMUDA_PTY_EMULATOR".into(), "1".into());
+        let child = super::gate_run_child_env(&request, &host);
+        assert_eq!(
+            child.get("REMUDA_PTY_EMULATOR").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn host_env_snapshot_selects_only_the_whitelist() {
+        // Even with a carrier flag genuinely exported into this test process,
+        // the snapshot never carries it — env_clear plus this whitelist is
+        // what keeps the gate child clean (gate-lane-3). The test only reads
+        // the ambient env; it does not mutate it (unsafe set_var is forbidden
+        // workspace-wide), so it asserts the shape rather than a specific
+        // sentinel.
+        let snapshot = super::host_env_snapshot();
+        for key in snapshot.keys() {
+            assert!(
+                !key.starts_with("REMUDA_PTY_"),
+                "whitelist must never include a carrier flag: {key}"
+            );
+            assert!(
+                ["HOME", "USER", "SHELL", "TMPDIR", "LANG", "SSH_AUTH_SOCK"]
+                    .contains(&key.as_str()),
+                "unexpected key in host snapshot: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_then_child_env_is_lane_env_plus_base_path() {
+        let host: BTreeMap<String, String> = [("HOME", "/home/lane")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let mut lane_env = BTreeMap::new();
+        lane_env.insert("DEPLOY_TAG".to_owned(), "v1".to_owned());
+        let child = super::gate_then_child_env(&lane_env, &host);
+        assert_eq!(child.get("DEPLOY_TAG").map(String::as_str), Some("v1"));
+        assert_eq!(child.get("TERM").map(String::as_str), Some("dumb"));
+        assert_eq!(child.get("HOME").map(String::as_str), Some("/home/lane"));
+        // No toolchain prefix, cargo target or port block of its own.
+        assert_eq!(
+            child.get("PATH").map(String::as_str),
+            Some(super::GATE_BASE_PATH)
+        );
+        assert!(!child.contains_key("CARGO_TARGET_DIR"));
+        for key in child.keys() {
+            assert!(!key.starts_with("REMUDA_PTY_"), "leak: {key}");
+        }
+    }
+
+    /// Inner half of [`ambient_pty_flag_never_reaches_the_gate_child`]: run in a
+    /// re-exec'd process that has `REMUDA_PTY_EMULATOR=1` genuinely exported.
+    /// It builds the gate child env through the real [`host_env_snapshot`] —
+    /// the code path a live lane runner takes — and proves the ambient flag
+    /// does not survive `env_clear` + whitelist. `#[ignore]` keeps it out of a
+    /// normal run; the outer test drives it with the sentinel set.
+    #[test]
+    #[ignore = "re-exec'd by ambient_pty_flag_never_reaches_the_gate_child with the sentinel set"]
+    fn gate_child_env_from_real_process_env() {
+        assert_eq!(
+            std::env::var("REMUDA_PTY_EMULATOR").ok().as_deref(),
+            Some("1"),
+            "guard: the outer test must export the sentinel before re-exec"
+        );
+        let mut request = bare_run_params();
+        request.toolchain_path = Some("/opt/toolchain/bin".into());
+        let child = super::gate_run_child_env(&request, &super::host_env_snapshot());
+        assert!(
+            !child.contains_key("REMUDA_PTY_EMULATOR"),
+            "ambient REMUDA_PTY_EMULATOR leaked into the gate child: {child:#?}"
+        );
+        for key in child.keys() {
+            assert!(
+                !key.starts_with("REMUDA_PTY_"),
+                "carrier flag leaked: {key}"
+            );
+        }
+        let path = child.get("PATH").expect("PATH set");
+        assert!(
+            path.starts_with("/opt/toolchain/bin:"),
+            "toolchain prefix must lead PATH: {path}"
+        );
+    }
+
+    #[test]
+    fn ambient_pty_flag_never_reaches_the_gate_child() {
+        // set_var is forbidden workspace-wide, so export the sentinel by
+        // re-exec'ing this binary with REMUDA_PTY_EMULATOR=1 and running the
+        // ignored inner test against the real process environment.
+        let exe = std::env::current_exe().expect("test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "gate::tests::gate_child_env_from_real_process_env",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("REMUDA_PTY_EMULATOR", "1")
+            .env("REMUDA_PTY_CARRIER", "native")
+            .env("REMUDA_PTY_HOOKS", "1")
+            .output()
+            .expect("re-exec the gate env test");
+        assert!(
+            output.status.success(),
+            "gate child inherited an ambient carrier flag\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // Guard against the inner test silently not running.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the inner env test did not run: {stdout}"
+        );
     }
 
     #[test]

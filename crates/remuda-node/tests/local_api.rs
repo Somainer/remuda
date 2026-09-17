@@ -570,6 +570,16 @@ async fn tty_endpoint_emits_protocol_v1_binary_fixture() {
         DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
     )
     .await;
+    let frame = first_binary_tty_frame(server.address).await;
+    assert_protocol_v1_frame(&frame);
+}
+
+/// Connect to an instance's TTY endpoint and return the first binary frame,
+/// ignoring any leading `tty.mode` (or other) text notice. With the emulator
+/// on, `tty_socket` sends a JSON mode notice before the snapshot; the fixture
+/// asserts the binary protocol-v1 framing, not the absence of that notice
+/// (gate-lane-3).
+async fn first_binary_tty_frame(address: SocketAddr) -> Vec<u8> {
     let body = serde_json::json!({
         "kind": "terminal",
         "driver": "shell-pty",
@@ -577,31 +587,91 @@ async fn tty_endpoint_emits_protocol_v1_binary_fixture() {
         "prompt": ""
     })
     .to_string();
-    let created = http_json(server.address, "POST", "/v1/instances", Some(&body), &[]).await;
+    let created = http_json(address, "POST", "/v1/instances", Some(&body), &[]).await;
     let instance_id = created.body["instance"]["id"]
         .as_str()
         .expect("instance id");
-    let url = format!("ws://{}/v1/instances/{instance_id}/tty", server.address);
+    let url = format!("ws://{address}/v1/instances/{instance_id}/tty");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-    let mut bytes = None;
     while tokio::time::Instant::now() < deadline {
         let Ok((mut tty, _)) = connect_async(&url).await else {
             tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
-        match tokio::time::timeout(Duration::from_millis(400), tty.next()).await {
-            Ok(Some(Ok(Message::Binary(frame)))) => {
-                bytes = Some(frame);
-                break;
+        // Read frames until the first binary one; skip text notices such as
+        // tty.mode. A closed socket or a lull means reconnect.
+        loop {
+            match tokio::time::timeout(Duration::from_millis(400), tty.next()).await {
+                Ok(Some(Ok(Message::Binary(frame)))) => return frame.to_vec(),
+                Ok(Some(Ok(Message::Text(_)))) => continue,
+                Ok(Some(Ok(_))) => continue,
+                _ => break,
             }
-            _ => tokio::time::sleep(Duration::from_millis(50)).await,
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let bytes = bytes.expect("expected binary TTY frame");
+    panic!("expected binary TTY frame");
+}
+
+/// Assert the 32-byte protocol-v1 header, the `1,1,0,0` prefix and the payload
+/// length field.
+fn assert_protocol_v1_frame(bytes: &[u8]) {
     assert!(bytes.len() > 32);
     assert_eq!(&bytes[..4], &[1, 1, 0, 0]);
     assert_eq!(
         u32::from_be_bytes(bytes[28..32].try_into().expect("payload length")) as usize,
         bytes.len() - 32
     );
+}
+
+/// Ignored inner test: drive the TTY endpoint in whatever emulator state the
+/// ambient env sets (the production default `ShellPtyOptions::login` reads),
+/// and assert a protocol-v1 binary frame still arrives. The outer regression
+/// re-execs this once with `REMUDA_PTY_EMULATOR=1` and once with it unset, so
+/// the mode-notice-first case (emulator on) and the notice-absent case are
+/// both covered without `set_var` (forbidden workspace-wide). gate-lane-3.
+#[tokio::test]
+#[ignore = "re-exec'd by tty_fixture_survives_emulator_on_and_off with the flag set/unset"]
+async fn tty_binary_frame_under_ambient_emulator_state() {
+    let server = spawn_server(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+    )
+    .await;
+    let frame = first_binary_tty_frame(server.address).await;
+    assert_protocol_v1_frame(&frame);
+}
+
+#[test]
+fn tty_fixture_survives_emulator_on_and_off() {
+    for emulator_on in [true, false] {
+        let exe = std::env::current_exe().expect("test binary");
+        let mut command = std::process::Command::new(exe);
+        command.args([
+            "--exact",
+            "tty_binary_frame_under_ambient_emulator_state",
+            "--ignored",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ]);
+        if emulator_on {
+            command.env("REMUDA_PTY_EMULATOR", "1");
+        } else {
+            command.env_remove("REMUDA_PTY_EMULATOR");
+        }
+        let output = command.output().expect("re-exec the tty fixture");
+        assert!(
+            output.status.success(),
+            "no protocol-v1 binary frame with emulator {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            if emulator_on { "on" } else { "off" },
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "inner tty fixture did not run (emulator {}): {stdout}",
+            if emulator_on { "on" } else { "off" }
+        );
+    }
 }

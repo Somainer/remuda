@@ -627,3 +627,65 @@ fn real_21273_permission_walk_replays_every_wheel_mode() -> Result<()> {
     );
     Ok(())
 }
+
+/// `read_page` bounds the work in the reader, not at its callers.
+///
+/// This is the property the Node's flush depends on: an unbounded range read
+/// deserializes every row from `from_seq` to the tail, so a 256-event page off
+/// a large journal pays for the whole journal. `Page::bytes_read` is the
+/// reader's own accounting, which is what makes the claim checkable without a
+/// profiler.
+#[tokio::test]
+async fn read_page_touches_only_its_limit() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (_, instance, _, map) = ctx("page-session");
+    let journal = open_journal(tmp.path())?;
+
+    // Two events to page over, so the bound is observable at a small size.
+    let envelopes = map_file(include_str!("fixtures/claude-transcript-ok.jsonl"), &map)?;
+    for envelope in envelopes {
+        journal.append(&instance, envelope).await?;
+    }
+    let durable = journal.durable_seq(&instance).await?;
+    assert!(durable.0 >= 4, "fixture has {durable:?} events");
+
+    // One event, from the floor. The byte count is that event's JSONL line,
+    // which the page also reports as the only row it touched.
+    let page = journal.read_page(&instance, U64(1), None, 1).await?;
+    assert_eq!(page.observations.len(), 1);
+    assert_eq!(page.last_seq, Some(U64(1)));
+    assert_eq!(page.durable_seq, durable);
+    let whole = journal.read_page(&instance, U64(1), None, 256).await?;
+    assert!(page.bytes_read > 0);
+    assert!(
+        page.bytes_read < whole.bytes_read,
+        "a one-event page ({}) must read less than the whole journal ({})",
+        page.bytes_read,
+        whole.bytes_read
+    );
+
+    // A page from the tail reads one event even though the journal is larger.
+    let tail = journal.read_page(&instance, durable, None, 256).await?;
+    assert_eq!(tail.observations.len(), 1, "the last event only");
+    assert_eq!(tail.last_seq, Some(durable));
+
+    // Past the tail is an empty page, not an error, and reads nothing.
+    let past = journal
+        .read_page(&instance, U64(durable.0 + 10), None, 256)
+        .await?;
+    assert!(past.observations.is_empty());
+    assert_eq!(past.bytes_read, 0);
+    assert_eq!(past.last_seq, None);
+    assert_eq!(past.durable_seq, durable);
+
+    // An explicit `to_seq` still bounds the range.
+    let bounded = journal
+        .read_page(&instance, U64(1), Some(U64(2)), 256)
+        .await?;
+    assert_eq!(bounded.observations.len(), 2);
+
+    // The unbounded range read is unchanged, so existing callers keep working.
+    let all = journal.read_range(&instance, U64(1), None).await?;
+    assert_eq!(all.len(), durable.0 as usize);
+    Ok(())
+}

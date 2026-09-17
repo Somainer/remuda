@@ -1,25 +1,40 @@
 //! Per-session `--settings` overlay (D-028 §4.2 materializer, §9.2 pinning).
 //!
-//! One merged settings file per session, under the instance directory, holding
-//! exactly two things: the hook registrations that point at the relay, and the
-//! three terminal keys §9.2 requires be pinned. It is handed to the harness
-//! with `--settings`, which layers *on top of* the user's own configuration
-//! rather than replacing it.
+//! One merged settings file per session, under the instance directory. When
+//! the carrier pinned a Remuda-managed native home the Node seeds it with the
+//! launching user's effective settings (see [`crate::launch::user`]), so the
+//! final document is, low to high precedence:
 //!
-//! Three rules this module exists to keep:
+//! ```text
+//! user settings.json ⊕ user settings.local.json
+//!   ⊕ operator/request overlay
+//!   ⊕ Remuda hook registrations (per event, appended after user hooks)
+//!   ⊕ the §9.2 terminal-key pins
+//! ```
 //!
-//! 1. **Merge, never overwrite.** If the caller passes an existing overlay we
-//!    keep every key and every hook in it and append ours. A user who has
-//!    their own `SessionStart` hook keeps it — verified against claude 2.1.270,
-//!    where both hooks fire.
+//! It is handed to the harness with `--settings`, which layers *on top of*
+//! the harness's other configuration rather than replacing it.
+//!
+//! Four rules this module exists to keep:
+//!
+//! 1. **Merge, never overwrite.** User keys survive (`statusLine`,
+//!    `enabledPlugins`, `theme`, `permissions`, `env`, `model`,
+//!    `modelSettings`, `verbose`, …) and a user's own `hooks` are kept, with
+//!    Remuda's relay entries appended per event. Verified against claude
+//!    2.1.270, where both user and relay hooks fire.
 //! 2. **Never touch the user's own config.** The only file written is under
-//!    `<instance dir>/launch/`. `~/.claude/settings.json` is read by the
-//!    harness through its normal configuration layers and never by us.
+//!    `<instance dir>/launch/`. `~/.claude/settings.json` is only ever *read*
+//!    (by [`crate::launch::user`], to seed a scoped home), never written.
 //! 3. **Pin both directions.** `tui` is written whether it is `fullscreen` or
 //!    `default`; §9.2 is explicit that leaving it unset lets the host's own
 //!    settings leak in through the user layer and makes the renderer
 //!    non-deterministic across machines. After authenticated SessionStart,
 //!    only this renderer pin is released so `/tui` can relaunch normally.
+//! 4. **Credentials are the user's, never Remuda's.** Gateway creds reach this
+//!    file only by being copied out of the user's own settings; nothing here
+//!    invents a credential. Values stay in the 0600 instance file and never
+//!    reach the journal, the logs (see [`crate::launch::redact_settings`]) or
+//!    the web.
 
 use crate::binary::hash_bytes;
 use crate::error::{DriverError, DriverResult};
@@ -319,44 +334,25 @@ pub fn merge_explicit_settings(overlay: &Path, argv: &mut Vec<String>) -> Driver
         } else {
             std::fs::read(explicit)?
         };
-        let mut settings: Value = serde_json::from_slice(&bytes)?;
-        if !settings.is_object() {
+        let explicit_doc: Value = serde_json::from_slice(&bytes)?;
+        if !explicit_doc.is_object() {
             return Err(DriverError::SettingsIsolationUnavailable(
                 "--settings must contain a JSON object".into(),
             ));
         }
         let generated: Value = serde_json::from_slice(&std::fs::read(overlay)?)?;
-        // The generated overlay owns hook registration and the three terminal
-        // keys; all other user settings, including env and own hooks, survive.
-        if let Some(hooks) = generated.get("hooks").and_then(Value::as_object) {
-            let target = settings
-                .as_object_mut()
-                .ok_or_else(|| {
-                    DriverError::SettingsIsolationUnavailable("settings must be an object".into())
-                })?
-                .entry("hooks")
-                .or_insert_with(|| json!({}))
-                .as_object_mut()
-                .ok_or_else(|| {
-                    DriverError::SettingsIsolationUnavailable("hooks must be an object".into())
-                })?;
-            for (event, matchers) in hooks {
-                let entries = target
-                    .entry(event.clone())
-                    .or_insert_with(|| json!([]))
-                    .as_array_mut()
-                    .ok_or_else(|| {
-                        DriverError::SettingsIsolationUnavailable(format!(
-                            "{event} hooks must be an array"
-                        ))
-                    })?;
-                for matcher in matchers.as_array().into_iter().flatten() {
-                    if !entries.contains(matcher) {
-                        entries.push(matcher.clone());
-                    }
-                }
-            }
-        }
+        // The generated overlay already holds the user's own effective
+        // settings (copied when the native home is scoped), the union of user
+        // and relay hooks, and the forced terminal keys. The explicit file
+        // layers on top of all of that: every generated key survives unless
+        // the explicit file overrides it, hooks concatenate per event, and
+        // the terminal pins are re-forced afterwards.
+        let mut settings = if generated.is_object() {
+            generated.clone()
+        } else {
+            json!({})
+        };
+        crate::launch::user::merge_explicit_on_top(&mut settings, &explicit_doc);
         for key in [
             "tui",
             "showStatusInTerminalTab",

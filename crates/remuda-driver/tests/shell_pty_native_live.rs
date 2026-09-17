@@ -239,6 +239,115 @@ async fn real_claude_through_native_shell_pty() {
     Driver::close(&driver).await.unwrap();
 }
 
+/// native-config-1 live check: a scoped native home must see the launching
+/// user's gateway model configuration exactly like a plain terminal. The
+/// overlay seeds the user's effective ~/.claude settings (env + model +
+/// modelSettings, discovery flag included), so opening `/model` lists the
+/// gateway models. The token rides the 0600 instance file, never argv.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: scoped native home must list the user's gateway models in /model"]
+async fn scoped_home_lists_gateway_models_in_model_picker() {
+    let owned_dir;
+    let root: PathBuf = match std::env::var("REMUDA_NATIVE_LIVE_ROOT") {
+        Ok(path) => {
+            let base = PathBuf::from(path);
+            std::fs::create_dir_all(&base).unwrap();
+            let d = tempfile::tempdir_in(base).unwrap();
+            let p = d.path().to_path_buf();
+            std::mem::forget(d); // keep launch/ artifacts for the evidence doc
+            owned_dir = None;
+            p
+        }
+        Err(_) => {
+            owned_dir = Some(tempfile::tempdir().unwrap());
+            owned_dir.as_ref().unwrap().path().to_path_buf()
+        }
+    };
+    let _ = &owned_dir;
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let instance_dir = root.join("instance");
+    let native_home = root.join("scoped-native-home");
+    std::fs::create_dir_all(&native_home).unwrap();
+
+    let host_claude_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".claude"))
+        .expect("HOME");
+    // Mirror the Node: seed onboarding flags and pre-trust the exact cwd
+    // before launch, so the picker is reached without a human at the dialog.
+    let host_config = remuda_driver::HostClaudeConfig::from_env();
+    let outcome =
+        remuda_driver::seed_scoped_config(&native_home, host_config.as_ref()).expect("seed");
+    eprintln!("onboarding seed: {}", outcome.summary());
+    remuda_driver::pre_trust_workspace(&native_home, &workspace).expect("pre-trust");
+
+    let mut options = ShellPtyOptions::agent(
+        workspace.clone(),
+        AgentKind::Claude,
+        AgentLaunch {
+            profile: Box::new(profile()),
+            launch_dir: instance_dir.join("launch"),
+            native_home: native_home.clone(),
+            binary: Some(which_claude()),
+            origin: LaunchOrigin::Human,
+            settings_overlay: None,
+        },
+    );
+    options.emulator = true;
+    options.cols = 120;
+    options.rows = 36;
+    options.pin_native_home = true;
+    options.claude_home = Some(native_home.clone());
+    // The line under test: copy the launching user's settings into the merge.
+    options.user_settings_home = Some(host_claude_home);
+    options.hooks = Some(HookConfig {
+        instance_dir: instance_dir.clone(),
+        relay_binary: relay_bin(),
+        tui: remuda_driver::TuiMode::Default,
+    });
+
+    let driver = ShellPtyDriver::new(options);
+    let spec = spec_for(&workspace);
+    let _events = driver.start(spec).await.expect("start").into_events();
+
+    // Wait for the composer, then open the model picker with raw keystrokes.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(40) {
+        if Driver::wait_control(&driver).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let Some(bridge) = driver.tty_bridge().await else {
+        panic!("driver never exposed its tty bridge");
+    };
+    let remuda_driver::tty::TtyBridge::Local(pty) = &bridge else {
+        panic!("native carrier expected a local pty bridge");
+    };
+    pty.write_bytes(b"/model\r").await.expect("type /model");
+
+    // Discovery is a network round trip; poll the rendered grid for the
+    // gateway model id from the user's settings (ANTHROPIC_*_MODEL).
+    let gateway_model = "model_hub";
+    let mut saw = false;
+    let mut last_screen = String::new();
+    while start.elapsed() < Duration::from_secs(60) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        last_screen = screen_text(&driver).await;
+        if last_screen.contains(gateway_model) {
+            saw = true;
+            break;
+        }
+    }
+    eprintln!("final screen:\n{last_screen}");
+    Driver::close(&driver).await.unwrap();
+    assert!(
+        saw,
+        "/model did not list the gateway model `{gateway_model}` under the scoped native home"
+    );
+}
+
 fn which_claude() -> PathBuf {
     if let Ok(path) = std::env::var("REMUDA_NATIVE_LIVE_CLAUDE") {
         return PathBuf::from(path);

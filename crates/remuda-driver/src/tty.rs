@@ -64,7 +64,7 @@ fn map_term(err: remuda_herdr::Error) -> DriverError {
     DriverError::Io(std::io::Error::other(err.to_string()))
 }
 
-pub use remuda_screen::SnapshotSource;
+pub use remuda_screen::{ProgressBar, SnapshotSource};
 
 /// An attach snapshot plus the provenance Node reports and logs.
 ///
@@ -81,6 +81,10 @@ pub struct PtySnapshot {
     /// `?1049` was active when the snapshot was taken. Always false on the
     /// raw-ring path, which has no way to know.
     pub alt_screen: bool,
+    /// Parsed `OSC 9;4` progress when the snapshot came from an emulator, for
+    /// the terminal header bar. `None` on the raw-ring path and before the
+    /// harness first reports progress (native-config, 2026-09-16).
+    pub progress: Option<ProgressBar>,
 }
 
 impl PtySnapshot {
@@ -91,6 +95,7 @@ impl PtySnapshot {
             bytes,
             source: SnapshotSource::RawRing,
             alt_screen: false,
+            progress: None,
         }
     }
 }
@@ -113,6 +118,12 @@ pub trait LocalPty: Send + Sync {
     /// Current emulator mode without synthesizing a repaint for every chunk.
     /// None means this carrier has no trustworthy mode observation.
     fn alt_screen(&self) -> Option<bool> {
+        None
+    }
+    /// Current parsed `OSC 9;4` progress for the terminal header bar.
+    /// None means the carrier has no emulator observation or the harness has
+    /// not reported progress yet.
+    fn progress(&self) -> Option<ProgressBar> {
         None
     }
     /// Write raw bytes (keyboard and mouse sequences).

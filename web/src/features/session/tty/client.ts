@@ -21,6 +21,41 @@ import { bytesFromBase64, toBytes } from "./ids";
 
 export type TtyStatus = "connecting" | "live" | "reconnecting" | "failed";
 
+/** ConEmu `OSC 9;4` states the terminal header progress bar understands. */
+export type TtyProgressState = "done" | "percent" | "error" | "indeterminate" | "paused";
+
+/** Parsed `OSC 9;4` progress carried by a `tty.mode` notice. */
+export type TtyProgress = {
+  state: Exclude<TtyProgressState, "done">;
+  percent?: number;
+};
+
+const PROGRESS_STATES: readonly TtyProgressState[] = [
+  "done",
+  "percent",
+  "error",
+  "indeterminate",
+  "paused",
+];
+
+/** Validate the additive `progress` field; null means the bar must hide. */
+function readProgress(value: unknown): TtyProgress | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object") return undefined;
+  const rec = value as Record<string, unknown>;
+  const state = rec.state;
+  if (typeof state !== "string" || !PROGRESS_STATES.includes(state as TtyProgressState)) {
+    return undefined;
+  }
+  if (state === "done") return null;
+  const active = state as TtyProgress["state"];
+  const percent =
+    typeof rec.percent === "number" && Number.isFinite(rec.percent)
+      ? Math.min(100, Math.max(0, rec.percent))
+      : undefined;
+  return percent === undefined ? { state: active } : { state: active, percent };
+}
+
 export type TtyHandlers = {
   /**
    * `replay` marks bytes the hub re-sent from the PTY ring buffer (attach
@@ -47,6 +82,14 @@ export type TtyHandlers = {
    * undefined so a previous renderer observation cannot remain current.
    */
   onAltScreen?: (altScreen: boolean | undefined) => void;
+  /**
+   * The attached session's parsed `OSC 9;4` progress for the header bar.
+   *
+   * `null` is an explicit "no progress" (state 0 / attach with no evidence)
+   * and hides the bar; the field simply being absent means the Node has no
+   * observation and the bar stays as it was (native-config, 2026-09-16).
+   */
+  onProgress?: (progress: TtyProgress | null) => void;
 };
 
 export type TtySession = {
@@ -237,7 +280,14 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       : event;
     if (typeof params.instanceId === "string" && params.instanceId !== instance.id) return;
     const mode = params.altScreen;
-    if (typeof mode !== "boolean" && !(attached && mode === null)) return;
+    const hasMode = typeof mode === "boolean" || (attached && mode === null);
+    // `progress` rides the same tty.mode notice (native-config). The key being
+    // present is meaningful on its own: explicit null hides, absence leaves
+    // the bar untouched (older Node / progress-less carrier).
+    const hasProgressKey = Object.prototype.hasOwnProperty.call(params, "progress");
+    const progress = hasProgressKey ? readProgress(params.progress) : undefined;
+    const hasProgress = hasProgressKey && progress !== undefined;
+    if (!hasMode && !hasProgress) return;
     const sid = extractStreamId(event);
     if (attached) {
       // The direct notice accompanies a fresh Hub attach. It may replace the
@@ -252,7 +302,12 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
         setStream(sid);
       }
     } else if (!sid || !streamId || sid !== streamId) return;
-    handlers.onAltScreen?.(typeof mode === "boolean" ? mode : undefined);
+    if (hasMode) {
+      handlers.onAltScreen?.(typeof mode === "boolean" ? mode : undefined);
+    }
+    if (hasProgress) {
+      handlers.onProgress?.(progress as TtyProgress | null);
+    }
   };
 
   const handleJson = (raw: string) => {
@@ -273,6 +328,7 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       replayNext = true;
       handlers.onSnapshot?.();
       handlers.onAltScreen?.(undefined);
+      handlers.onProgress?.(null);
       streamId = "";
       streamUuid = null;
       const sid = extractStreamId(msg);

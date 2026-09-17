@@ -39,7 +39,7 @@ pub use dialog::{
 };
 pub use emulator::{DEFAULT_SCROLLBACK_LINES, Emulator, MAX_COLS, MAX_ROWS};
 pub use grid::{ModeSet, OscState, ScreenGrid};
-pub use osc::{OscStatus, progress_active, progress_state};
+pub use osc::{OscStatus, ProgressBar, progress_active, progress_state};
 pub use signature::{HookHealth, ScreenLatch, ScreenStatus, detect_from_screen, screen_status};
 pub use statusline::{
     ScreenElapsed, ScreenLive, ScreenLiveChange, ScreenLiveLatch, ScreenTokens, screen_live,
@@ -80,6 +80,10 @@ pub struct Snapshot {
     /// stop treating the viewport as scrollable (§4.6). Always false on the
     /// raw-ring path, which cannot know.
     pub alt_screen: bool,
+    /// Parsed `OSC 9;4` state at snapshot time, for the terminal header's
+    /// progress bar. `None` when the harness never reported progress or the
+    /// snapshot is a raw-ring slice (native-config, 2026-09-16).
+    pub progress: Option<ProgressBar>,
 }
 
 /// Build an attach snapshot, preferring the emulator's repaint.
@@ -96,6 +100,7 @@ pub fn snapshot(emulator: Option<&Emulator>, fallback: Vec<u8>) -> Snapshot {
             bytes: fallback,
             source: SnapshotSource::RawRing,
             alt_screen: false,
+            progress: None,
         };
     };
     let repaint = emulator.repaint();
@@ -107,12 +112,14 @@ pub fn snapshot(emulator: Option<&Emulator>, fallback: Vec<u8>) -> Snapshot {
             bytes: fallback,
             source: SnapshotSource::RawRing,
             alt_screen: false,
+            progress: None,
         };
     }
     Snapshot {
         bytes: repaint,
         source: SnapshotSource::Repaint,
         alt_screen: emulator.alt_screen(),
+        progress: emulator.progress(),
     }
 }
 

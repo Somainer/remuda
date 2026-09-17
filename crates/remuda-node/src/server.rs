@@ -336,9 +336,14 @@ async fn tty_socket(
         }
     };
     let stream_id = attached.stream_id.clone();
-    if let Some(alt_screen) = attached.alt_screen {
-        let notice = json!({"type": "tty.mode", "instanceId": instance_id,
-            "streamId": stream_id, "altScreen": alt_screen});
+    if attached.alt_screen.is_some() || attached.progress.is_some() {
+        // Alt-screen is included only when observed; progress rides the same
+        // notice and is null when the emulator has no OSC 9;4 evidence yet.
+        let mut notice = json!({"type": "tty.mode", "instanceId": instance_id,
+            "streamId": stream_id, "progress": attached.progress.map(crate::tty::progress_json)});
+        if let Some(alt_screen) = attached.alt_screen {
+            notice["altScreen"] = json!(alt_screen);
+        }
         if socket
             .send(Message::Text(notice.to_string().into()))
             .await
@@ -387,6 +392,16 @@ async fn tty_socket(
                     {
                         let notice = json!({"type": "tty.mode", "instanceId": id,
                             "streamId": sid, "altScreen": alt_screen});
+                        if socket.send(Message::Text(notice.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(crate::TtyEvent::Progress { instance_id: id, stream_id: sid, progress })
+                        if id == instance_id =>
+                    {
+                        let notice = json!({"type": "tty.mode", "instanceId": id,
+                            "streamId": sid,
+                            "progress": crate::tty::progress_json(progress)});
                         if socket.send(Message::Text(notice.to_string().into())).await.is_err() {
                             break;
                         }

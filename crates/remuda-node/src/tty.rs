@@ -1,7 +1,9 @@
 //! TTY binary framing and per-instance PTY bridges.
 
 use crate::NodeError;
-use remuda_driver::{HerdrTty, LocalPty, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge};
+use remuda_driver::{
+    HerdrTty, LocalPty, ProgressBar, PtySnapshot, SnapshotSource, TTY_SNAPSHOT_MAX, TtyBridge,
+};
 use remuda_protocol::{BinaryChannel, Id, InstanceId, StreamUuid, U64, encode_binary_frame};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -74,6 +76,26 @@ pub enum TtyEvent {
         /// Whether DEC alternate screen is currently active.
         alt_screen: bool,
     },
+    /// `OSC 9;4` progress observed by the local terminal emulator
+    /// (native-config, 2026-09-16). Emitted on edges only.
+    Progress {
+        /// Instance that owns the stream.
+        instance_id: InstanceId,
+        /// Stream identity.
+        stream_id: Id,
+        /// Parsed progress state.
+        progress: ProgressBar,
+    },
+}
+
+/// Wire spelling of a [`ProgressBar`] for the additive `progress` field.
+#[must_use]
+pub(crate) fn progress_json(progress: ProgressBar) -> Value {
+    let mut value = json!({ "state": progress.state_str() });
+    if let Some(percent) = progress.percent() {
+        value["percent"] = json!(percent);
+    }
+    value
 }
 
 /// Result of [`TtyRegistry::attach`].
@@ -97,13 +119,17 @@ pub struct TtyAttach {
     /// at a full-screen TUI and must not hijack the wheel for local scrollback
     /// (D-028 §4.6). None on raw-ring fallback: that path cannot know the mode.
     pub alt_screen: Option<bool>,
+    /// Parsed `OSC 9;4` progress at snapshot time for the header bar. None on
+    /// carriers without an emulator and before the harness reports progress.
+    pub progress: Option<ProgressBar>,
 }
 
 impl TtyAttach {
     /// JSON-RPC result body (includes `snapshotBase64` when non-empty).
     ///
-    /// D-016 wire format is unchanged; `altScreen` is the one additive field
-    /// (D-028 §4.6), so an older client simply ignores it.
+    /// D-016 wire format is unchanged; `altScreen` and `progress` are the
+    /// additive fields (D-028 §4.6, native-config), so an older client simply
+    /// ignores them.
     pub fn into_json(self) -> Result<Value, NodeError> {
         let snapshot_b64 = if self.snapshot.is_empty() {
             None
@@ -123,6 +149,7 @@ impl TtyAttach {
             "cols": self.cols,
             "rows": self.rows,
             "altScreen": self.alt_screen,
+            "progress": self.progress.map(progress_json),
         }))
     }
 }
@@ -317,6 +344,12 @@ impl TtyRegistry {
             Backend::Herdr { alt_screen, .. } => Some(alt_screen.load(Ordering::SeqCst)),
             Backend::Local(_) => None,
         };
+        // OSC 9;4 is parsed by the local carrier's emulator. The herdr relay
+        // sees rendered damage frames (no OSC), so it contributes nothing.
+        let local_progress = match &session.backend {
+            Backend::Local(local) => local.progress(),
+            Backend::Herdr { .. } => None,
+        };
         let next_offset = session.offset.load(Ordering::SeqCst);
         // A repaint is synthesized, not a slice of the stream, so it occupies
         // no offset range of its own. Anchoring it at `next_offset` keeps the
@@ -344,6 +377,7 @@ impl TtyRegistry {
             alt_screen: herdr_alt_screen.or_else(|| {
                 (snapshot.source == SnapshotSource::Repaint).then_some(snapshot.alt_screen)
             }),
+            progress: local_progress,
         })
     }
 
@@ -509,19 +543,35 @@ fn spawn_local_pump(
 ) {
     tokio::spawn(async move {
         let mut last_mode = None;
+        let mut last_progress = None;
         loop {
             match rx.recv().await {
                 Ok(bytes) if !bytes.is_empty() => {
-                    if let Backend::Local(local) = &session.backend
-                        && let Some(alt_screen) = local.alt_screen()
-                        && last_mode != Some(alt_screen)
-                    {
-                        last_mode = Some(alt_screen);
-                        let _ = events.send(TtyEvent::Mode {
-                            instance_id: instance_id.clone(),
-                            stream_id: session.stream_id.clone(),
-                            alt_screen,
-                        });
+                    if let Backend::Local(local) = &session.backend {
+                        if let Some(alt_screen) = local.alt_screen()
+                            && last_mode != Some(alt_screen)
+                        {
+                            last_mode = Some(alt_screen);
+                            let _ = events.send(TtyEvent::Mode {
+                                instance_id: instance_id.clone(),
+                                stream_id: session.stream_id.clone(),
+                                alt_screen,
+                            });
+                        }
+                        // OSC 9;4 edges, the channel c-ttymode used for
+                        // alt-screen: published before the bytes that carry
+                        // the sequence so the header updates ahead of paint.
+                        let progress = local.progress();
+                        if progress != last_progress {
+                            last_progress = progress;
+                            if let Some(progress) = progress {
+                                let _ = events.send(TtyEvent::Progress {
+                                    instance_id: instance_id.clone(),
+                                    stream_id: session.stream_id.clone(),
+                                    progress,
+                                });
+                            }
+                        }
                     }
                     push_output(&session, &instance_id, &events, &bytes).await;
                 }

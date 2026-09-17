@@ -179,11 +179,63 @@ fn renderer_mode_requires_observed_boolean_and_both_stream_identities() {
         "altScreen": false,
     });
     let mode: TtyModeParams = serde_json::from_value(value.clone()).unwrap();
-    assert!(!mode.alt_screen);
+    assert_eq!(mode.alt_screen, Some(false));
+    assert_eq!(mode.progress, None);
     assert_eq!(serde_json::to_value(mode).unwrap(), value);
     value["altScreen"] = Value::Null;
     assert!(serde_json::from_value::<TtyModeParams>(value.clone()).is_err());
     value["altScreen"] = json!(true);
     value.as_object_mut().unwrap().remove("streamId");
     assert!(serde_json::from_value::<TtyModeParams>(value).is_err());
+}
+
+#[test]
+fn renderer_mode_carries_osc94_progress_as_an_independent_additive_field() {
+    use remuda_protocol::hubnode::{METHOD_TTY_MODE, TtyModeParams};
+    use serde_json::json;
+
+    let _ = METHOD_TTY_MODE;
+    // A progress-only edge omits altScreen entirely.
+    let edge = json!({
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "streamId": "tty_01993ab0-0000-7000-8000-000000000007",
+        "progress": {"state": "indeterminate"}
+    });
+    let mode: TtyModeParams = serde_json::from_value(edge.clone()).unwrap();
+    assert_eq!(mode.alt_screen, None);
+    assert_eq!(
+        mode.progress.unwrap().state,
+        remuda_protocol::hubnode::TtyProgressState::Indeterminate
+    );
+    assert_eq!(serde_json::to_value(mode).unwrap(), edge);
+
+    // Percent rides alongside; malformed states are rejected.
+    let mode: TtyModeParams = serde_json::from_value(json!({
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "streamId": "tty_01993ab0-0000-7000-8000-000000000007",
+        "altScreen": false,
+        "progress": {"state": "percent", "percent": 50}
+    }))
+    .unwrap();
+    assert_eq!(mode.alt_screen, Some(false));
+    let progress = mode.progress.unwrap();
+    assert_eq!(
+        progress.state,
+        remuda_protocol::hubnode::TtyProgressState::Percent
+    );
+    assert_eq!(progress.percent, Some(50));
+    for bad in [
+        json!({"state": "napping"}),
+        json!({"percent": 10}),
+        json!("3"),
+    ] {
+        assert!(
+            serde_json::from_value::<TtyModeParams>(json!({
+                "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+                "streamId": "tty_01993ab0-0000-7000-8000-000000000007",
+                "progress": bad
+            }))
+            .is_err()
+        );
+    }
 }

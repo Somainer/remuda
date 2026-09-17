@@ -809,6 +809,8 @@ async fn fake_node(
                         // Trustworthy current mode, the way the Node's
                         // byte-stream scanner reports it for a herdr pane.
                         "altScreen": tty.alt_screen,
+                        // Current OSC 9;4 state, or null before any sequence.
+                        "progress": tty.progress,
                     }),
                 )
                 .await?;
@@ -826,10 +828,10 @@ async fn fake_node(
                     .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
                     .unwrap_or_default();
                 let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
-                // Scripted alt-screen transition: the sentinel produces the
-                // raw DEC frame (so xterm paints the switched buffer) and a
-                // tty.mode notice exactly like the Node's scanner relay.
-                if let Some((frame, alt_screen)) = tty.note_input(&bytes) {
+                // Scripted alt-screen/progress transition: the sentinel
+                // produces the raw frame (so xterm paints it) and a tty.mode
+                // notice exactly like the Node's emulator/scanner relay.
+                if let Some(scripted) = tty.note_input(&bytes) {
                     ws.send(Message::Text(
                         json!({
                             "jsonrpc": "2.0",
@@ -838,22 +840,28 @@ async fn fake_node(
                                 "instanceId": instance_id,
                                 "streamId": tty.stream_id,
                                 "dataBase64": base64::engine::general_purpose::STANDARD
-                                    .encode(&frame),
+                                    .encode(&scripted.frame),
                             },
                         })
                         .to_string()
                         .into(),
                     ))
                     .await?;
+                    let mut params = json!({
+                        "instanceId": instance_id,
+                        "streamId": tty.stream_id,
+                    });
+                    if let Some(alt_screen) = scripted.alt_screen {
+                        params["altScreen"] = json!(alt_screen);
+                    }
+                    if let Some(progress) = scripted.progress {
+                        params["progress"] = progress;
+                    }
                     ws.send(Message::Text(
                         json!({
                             "jsonrpc": "2.0",
                             "method": "tty.mode",
-                            "params": {
-                                "instanceId": instance_id,
-                                "streamId": tty.stream_id,
-                                "altScreen": alt_screen,
-                            },
+                            "params": params,
                         })
                         .to_string()
                         .into(),
@@ -1070,6 +1078,16 @@ struct TtyFake {
     line: Vec<u8>,
     /// Current DEC alt-screen mode reported at attach and on `tty.mode`.
     alt_screen: bool,
+    /// Current parsed OSC 9;4 progress reported at attach and on edges.
+    progress: Option<Value>,
+}
+
+/// A scripted renderer notice: the raw frame xterm paints, plus whichever
+/// `tty.mode` fields changed (alt screen and/or OSC 9;4 progress).
+struct ScriptedFrame {
+    frame: Vec<u8>,
+    alt_screen: Option<bool>,
+    progress: Option<Value>,
 }
 
 /// Typing this line (followed by Enter) scripts the fake harness into the
@@ -1077,6 +1095,14 @@ struct TtyFake {
 /// ASCII sentinels a Playwright keyboard can type into xterm.
 const TTY_ALT_ON_SENTINEL: &[u8] = b"TTYMODE_ALT_ON";
 const TTY_ALT_OFF_SENTINEL: &[u8] = b"TTYMODE_ALT_OFF";
+
+/// OSC 9;4 progress sentinels (native-config, 2026-09-16). Each emits the raw
+/// ConEmu sequence plus a `tty.mode` notice carrying the parsed progress,
+/// exactly like the Node's local emulator pump.
+const TTY_PROGRESS_INDET_SENTINEL: &[u8] = b"TTYPROG_INDET";
+const TTY_PROGRESS_PERCENT_SENTINEL: &[u8] = b"TTYPROG_PERCENT";
+const TTY_PROGRESS_ERROR_SENTINEL: &[u8] = b"TTYPROG_ERROR";
+const TTY_PROGRESS_DONE_SENTINEL: &[u8] = b"TTYPROG_DONE";
 
 impl TtyFake {
     fn new() -> Self {
@@ -1086,12 +1112,13 @@ impl TtyFake {
             received: Vec::new(),
             line: Vec::new(),
             alt_screen: false,
+            progress: None,
         }
     }
 
     /// Scripted sentinels ride the raw input channel. Returns the frame bytes
-    /// to push when a sentinel completed this write, plus the new mode.
-    fn note_input(&mut self, bytes: &[u8]) -> Option<(Vec<u8>, bool)> {
+    /// to push when a sentinel completed this write, plus the changed notices.
+    fn note_input(&mut self, bytes: &[u8]) -> Option<ScriptedFrame> {
         self.received.extend_from_slice(bytes);
         let mut tail: Vec<u8> = self
             .received
@@ -1110,13 +1137,52 @@ impl TtyFake {
             self.alt_screen = true;
             let frame = b"\x1b[?1049h\x1b[2J\x1b[HFULLSCREEN_FAKE_HARNESS\r\n".to_vec();
             self.screen.extend_from_slice(&frame);
-            return Some((frame, true));
+            return Some(ScriptedFrame {
+                frame,
+                alt_screen: Some(true),
+                progress: None,
+            });
         }
         if tail.ends_with(TTY_ALT_OFF_SENTINEL) && self.alt_screen {
             self.alt_screen = false;
             let frame = b"\x1b[?1049lINLINE_FAKE_HARNESS\r\n$ ".to_vec();
             self.screen.extend_from_slice(&frame);
-            return Some((frame, false));
+            return Some(ScriptedFrame {
+                frame,
+                alt_screen: Some(false),
+                progress: None,
+            });
+        }
+        for (sentinel, sequence, notice) in [
+            (
+                TTY_PROGRESS_INDET_SENTINEL,
+                b"\x1b]9;4;3;\x07".as_slice(),
+                json!({"state": "indeterminate"}),
+            ),
+            (
+                TTY_PROGRESS_PERCENT_SENTINEL,
+                b"\x1b]9;4;1;50\x07".as_slice(),
+                json!({"state": "percent", "percent": 50}),
+            ),
+            (
+                TTY_PROGRESS_ERROR_SENTINEL,
+                b"\x1b]9;4;2;\x07".as_slice(),
+                json!({"state": "error"}),
+            ),
+            (
+                TTY_PROGRESS_DONE_SENTINEL,
+                b"\x1b]9;4;0;\x07".as_slice(),
+                json!({"state": "done"}),
+            ),
+        ] {
+            if tail.ends_with(sentinel) && self.progress.as_ref() != Some(&notice) {
+                self.progress = Some(notice.clone());
+                return Some(ScriptedFrame {
+                    frame: sequence.to_vec(),
+                    alt_screen: None,
+                    progress: Some(notice),
+                });
+            }
         }
         None
     }

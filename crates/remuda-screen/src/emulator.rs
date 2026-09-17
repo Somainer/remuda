@@ -178,6 +178,19 @@ impl Emulator {
         }
     }
 
+    /// Parsed `OSC 9;4` progress the PTY last reported, for the terminal
+    /// header's progress bar. `None` until the harness emits a recognisable
+    /// sequence — distinct from [`ProgressBar::Done`](crate::ProgressBar::Done),
+    /// which is an explicit state-0 hide.
+    #[must_use]
+    pub fn progress(&self) -> Option<crate::ProgressBar> {
+        self.parser
+            .callbacks()
+            .progress
+            .as_deref()
+            .and_then(crate::ProgressBar::parse)
+    }
+
     /// The rendered screen as a [`ScreenGrid`].
     ///
     /// This is what the §10 rule table and the signature matchers consume when
@@ -290,6 +303,25 @@ mod tests {
         // OSC 2 sets the title too.
         let emulator = fed(b"\x1b]2;later\x07");
         assert_eq!(emulator.osc().title.as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn progress_follows_the_latest_osc_9_4_state_through_done() {
+        // The header's data source: busy on state 3, percent on state 1,
+        // hidden again on the explicit state-0 done.
+        let mut emulator = Emulator::new(40, 6);
+        assert_eq!(emulator.progress(), None, "no OSC yet is not Done");
+        emulator.feed(b"\x1b]9;4;3;\x07");
+        assert_eq!(emulator.progress(), Some(crate::ProgressBar::Indeterminate));
+        emulator.feed(b"\x1b]9;4;1;50\x07");
+        assert_eq!(
+            emulator.progress(),
+            Some(crate::ProgressBar::Percent(Some(50)))
+        );
+        emulator.feed(b"\x1b]9;4;2;\x07");
+        assert_eq!(emulator.progress(), Some(crate::ProgressBar::Error));
+        emulator.feed(b"\x1b]9;4;0;\x07");
+        assert_eq!(emulator.progress(), Some(crate::ProgressBar::Done));
     }
 
     #[test]

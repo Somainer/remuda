@@ -1242,12 +1242,18 @@ async fn send_tty_snapshot(
                 // Null means this snapshot has no emulator-backed observation
                 // (or an older Node omitted it); it clears a prior true/false
                 // rather than making stale mode evidence look current.
-                let notice = json!({
+                // Additive OSC 9;4 state for the header bar; an explicit null
+                // clears a stale bar, an older Node that omits the key leaves
+                // it as is.
+                let mut notice = json!({
                     "type": "tty.mode",
                     "instanceId": instance_id,
                     "streamId": cached_stream_id,
                     "altScreen": result.get("altScreen").and_then(Value::as_bool),
                 });
+                if let Some(progress) = result.get("progress") {
+                    notice["progress"] = progress.clone();
+                }
                 out_tx
                     .send(FollowMsg::Text(notice.to_string()))
                     .await

@@ -40,6 +40,13 @@ use time::OffsetDateTime;
 
 /// Screen-read budget per worker (the Node answers from an in-memory grid).
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many journal events a watch observation scans for the last assistant
+/// message / turn result. A single turn's tail is far smaller than this; the
+/// cap bounds work on long-lived instances.
+const JOURNAL_TAIL_EVENTS: i64 = 256;
+/// Detail marker when a classification came from the journal rather than a
+/// readable live screen.
+const SCREEN_UNAVAILABLE: &str = "screen-unavailable";
 /// Pacing of the `switch-model` confirmation dance.
 const KEY_SETTLE: Duration = Duration::from_millis(150);
 const MODEL_SETTLE: Duration = Duration::from_millis(700);
@@ -142,10 +149,13 @@ async fn observe_workers(
 enum ScreenRead {
     /// Screen rows plus the carrier-reported lifecycle. `raw` is true when the
     /// rows are a raw VT ring tail rather than an emulated grid.
+    /// `screen_available` is false for a print driver / dead pty carrier that
+    /// answered `supported=false`: classification then comes from the journal.
     Screen {
         lines: Vec<String>,
         lifecycle: String,
         raw: bool,
+        screen_available: bool,
     },
     /// Carrier unreachable / gone.
     Gone(&'static str),
@@ -182,12 +192,14 @@ async fn read_worker_screen(state: &AppState, worker: &WorkerRoster) -> ScreenRe
                 .to_string();
             if !supported {
                 // A print driver legitimately has no screen; leave rows empty
-                // (lifecycle alone then decides). A dead pty carrier reports
-                // supported=false with a terminal lifecycle → gone below.
+                // (lifecycle alone then decides, with the journal supplying
+                // text). A dead pty carrier reports supported=false with a
+                // terminal lifecycle → gone below.
                 return ScreenRead::Screen {
                     lines: Vec::new(),
                     lifecycle,
                     raw: false,
+                    screen_available: false,
                 };
             }
             let raw = result
@@ -207,6 +219,7 @@ async fn read_worker_screen(state: &AppState, worker: &WorkerRoster) -> ScreenRe
                 lines,
                 lifecycle,
                 raw,
+                screen_available: true,
             }
         }
         Ok(Some(_)) => ScreenRead::Gone("screen-error"),
@@ -224,6 +237,8 @@ async fn observe_one(
     // Hub-authoritative instance lifecycle/activity, if the instance exists.
     let mut activity = String::new();
     let mut instance_updated: Option<String> = None;
+    let mut record_lifecycle = String::new();
+    let mut lifecycle_reason: Option<String> = None;
     if let Some(instance_id) = worker.instance_id.as_ref()
         && let Some(record) = state
             .store
@@ -233,26 +248,36 @@ async fn observe_one(
     {
         activity = record.activity;
         instance_updated = Some(record.updated_at);
+        record_lifecycle = record.lifecycle;
+        lifecycle_reason = record.last_error;
     }
 
-    let (lines, mut lifecycle, forced_gone, raw) = match read_worker_screen(state, &worker).await {
-        ScreenRead::Screen {
-            lines,
-            lifecycle,
-            raw,
-        } => (lines, lifecycle, None, raw),
-        ScreenRead::Gone(reason) => (Vec::new(), String::new(), Some(reason), false),
-    };
+    let (lines, mut lifecycle, forced_gone, raw, screen_available) =
+        match read_worker_screen(state, &worker).await {
+            ScreenRead::Screen {
+                lines,
+                lifecycle,
+                raw,
+                screen_available,
+            } => (lines, lifecycle, None, raw, screen_available),
+            ScreenRead::Gone(reason) => (Vec::new(), String::new(), Some(reason), false, false),
+        };
+    // The Hub row is authoritative once the instance is terminal: a stale or
+    // absent "ready" from a disconnected screen carrier must not mask a
+    // failed/exited instance (the 2026-09-17 watch-failed-1 trap). Otherwise
+    // the live carrier lifecycle wins, falling back to the row when empty.
     if lifecycle.is_empty()
-        && let Some(instance_id) = worker.instance_id.as_ref()
-        && let Some(record) = state
-            .store
-            .get_instance(instance_id.as_id().to_string())
-            .await
-            .map_err(map_store)?
+        || matches!(
+            record_lifecycle.as_str(),
+            "failed" | "exited" | "closed" | "terminated"
+        )
     {
-        lifecycle = record.lifecycle;
+        lifecycle.clone_from(&record_lifecycle);
     }
+
+    // Screenless carriers (claude-print, a dropped pty) classify from the
+    // mirrored journal tail: last assistant texts and the last turn result.
+    let hints = journal_hints(state, worker.instance_id.as_ref()).await?;
 
     let prior = worker.watch.clone();
     let digest =
@@ -281,22 +306,35 @@ async fn observe_one(
             _ => None,
         });
 
-    let class = if let Some(reason) = forced_gone {
-        remuda_protocol::ScreenClass::Gone { reason }
-    } else {
-        let signals = remuda_protocol::ScreenSignals {
-            lines: &lines,
-            lifecycle: &lifecycle,
-            activity: &activity,
-            host_online: true,
-            now_unix: now,
-            last_activity_unix,
-            stall_mins,
-            known_done_sha: known_done_sha.as_deref(),
-            known_blocked: known_blocked.as_deref(),
-            raw,
-        };
-        classify_screen(&signals)
+    // A hard failure known to the Hub (failed row / errored turn / exit whose
+    // last assistant message was an error) classifies even when the carrier is
+    // unreachable.
+    let hard_failed = hints.turn_error
+        || record_lifecycle == "failed"
+        || (record_lifecycle == "exited" && hints.tail_error);
+    let class = match forced_gone {
+        Some(reason) if !hard_failed => remuda_protocol::ScreenClass::Gone { reason },
+        _ => {
+            let signals = remuda_protocol::ScreenSignals {
+                lines: &lines,
+                lifecycle: &lifecycle,
+                activity: &activity,
+                host_online: forced_gone.is_none(),
+                now_unix: now,
+                last_activity_unix,
+                stall_mins,
+                known_done_sha: known_done_sha.as_deref(),
+                known_blocked: known_blocked.as_deref(),
+                raw,
+                screen_available,
+                journal_lines: &hints.assistant_texts,
+                turn_error: hints.turn_error,
+                tail_error: hints.tail_error,
+                last_error_line: hints.error_line.as_deref(),
+                lifecycle_reason: lifecycle_reason.as_deref(),
+            };
+            classify_screen(&signals)
+        }
     };
 
     let mut next_state: Option<WorkerState> = None;
@@ -337,7 +375,29 @@ async fn observe_one(
             detail = Some(reason.to_string());
             (WorkerWatchStatus::Gone, None, None)
         }
+        remuda_protocol::ScreenClass::Failed { reason, line } => {
+            detail = Some(line);
+            (
+                WorkerWatchStatus::Failed {
+                    reason: reason.clone(),
+                },
+                None,
+                None,
+            )
+        }
     };
+    // No live screen: the classification came from the journal (or the
+    // instance row), so the detail column must say where — a screen reader is
+    // not possible for this worker (watch-failed-1). The marker leads so it
+    // survives the CLI table's 48-char detail truncation.
+    if !screen_available {
+        detail = Some(match detail {
+            Some(text) if text != SCREEN_UNAVAILABLE => {
+                format!("{SCREEN_UNAVAILABLE}; {text}")
+            }
+            _ => SCREEN_UNAVAILABLE.to_string(),
+        });
+    }
 
     let watch = WorkerWatch {
         status,
@@ -370,6 +430,126 @@ async fn observe_one(
         .map_err(map_store)?
         .ok_or(HubError::NotFound)?;
     serde_json::to_value(row).map_err(|err| HubError::Internal(err.to_string()))
+}
+
+/// What a journal tail tells a screenless observation: the assistant text in
+/// transcript order, whether the last turn result errored, and the first line
+/// of the last error-grade assistant message.
+#[derive(Default)]
+struct JournalHints {
+    assistant_texts: Vec<String>,
+    turn_error: bool,
+    /// The final assistant text block grades as a hard error. Used to tell a
+    /// fatal exit-after-error apart from a session that errored, recovered and
+    /// reported DONE before exiting.
+    tail_error: bool,
+    error_line: Option<String>,
+}
+
+/// Read the instance journal tail and extract the signals a screenless
+/// classification needs. Mirrors what `remuda instance read --source screen`
+/// falls back to for a print driver: assistant messages and turn results.
+async fn journal_hints(
+    state: &AppState,
+    instance_id: Option<&remuda_protocol::InstanceId>,
+) -> Result<JournalHints, HubError> {
+    let Some(instance_id) = instance_id else {
+        return Ok(JournalHints::default());
+    };
+    let events = state
+        .store
+        .read_journal_tail(instance_id.as_id().to_string(), JOURNAL_TAIL_EVENTS)
+        .await
+        .map_err(map_store)?;
+    Ok(scan_journal(&events))
+}
+
+/// Pure fold over raw journal event JSON (the same payload shape the Node
+/// mirrors with `journal.append`). Kept tolerant: an observation missing a
+/// field is ignored, not fatal.
+fn scan_journal(events: &[Value]) -> JournalHints {
+    let mut hints = JournalHints::default();
+    for event in events {
+        if event.get("kind").and_then(Value::as_str) != Some("lifecycle")
+            && event.get("kind").and_then(Value::as_str) != Some("message")
+        {
+            continue;
+        }
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        match event.get("kind").and_then(Value::as_str) {
+            Some("message") => {
+                if payload.get("role").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                let Some(blocks) = payload.get("blocks").and_then(Value::as_array) else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) == Some("text")
+                        && let Some(text) = block.get("text").and_then(Value::as_str)
+                        && !text.trim().is_empty()
+                    {
+                        hints.assistant_texts.push(text.to_string());
+                        if let Some(line) = error_line(text) {
+                            hints.error_line = Some(line);
+                        }
+                    }
+                }
+            }
+            Some("lifecycle") if payload.get("type").and_then(Value::as_str) == Some("native") => {
+                // The print/pty drivers journal a turn result as native
+                // lifecycle topic=turn, name=result, status error|turn_done.
+                let is_turn_result = payload.get("topic").and_then(Value::as_str) == Some("turn")
+                    && payload.get("nativeName").and_then(Value::as_str) == Some("result");
+                if is_turn_result && let Some(status) = knowledge_string(payload.get("status")) {
+                    hints.turn_error = status == "error";
+                }
+            }
+            _ => {}
+        }
+    }
+    // Only the final assistant text decides the "exited after an error"
+    // heuristic; an older error that the session recovered from does not.
+    hints.tail_error = hints
+        .assistant_texts
+        .last()
+        .is_some_and(|text| error_line(text).is_some());
+    hints
+}
+
+/// First line of an assistant text that grades as a hard error. Transient
+/// retry noise (`Retrying…`) is intentionally excluded — that is the
+/// idle-api-error class, not a failure.
+fn error_line(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    const HARD_ERROR_FRAGMENTS: &[&str] = &["api error", "connection closed"];
+    HARD_ERROR_FRAGMENTS
+        .iter()
+        .any(|needle| lower.contains(needle))
+        .then(|| {
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or(text.trim())
+                .chars()
+                .take(120)
+                .collect()
+        })
+}
+
+/// Read a `Knowledge<String>`-shaped field that may serialize either as a bare
+/// string or as `{"value": "…"}`.
+fn knowledge_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(|value| {
+        value.as_str().map(str::to_string).or_else(|| {
+            value
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    })
 }
 
 /// Decide the unix time of the worker's last real activity. The first

@@ -1426,6 +1426,12 @@ mod tests {
     /// "Before" is the old shape verbatim — `read_range(after + 1, None)` plus
     /// `take(256)` — so the numbers are the same work the demo host was doing
     /// per 250 ms tick. "After" is one bounded page per call.
+    ///
+    /// Linux-only because the CPU figure comes from `/proc/self/stat`; the
+    /// helper it calls is gated the same way, so without this the whole test
+    /// module fails to compile on macOS (`cpu_ticks` not found) and takes
+    /// `cargo check/clippy --all-targets` with it.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "measurement, not a gate"]
     async fn replay_sweep_cost_is_linear_in_new_events() {

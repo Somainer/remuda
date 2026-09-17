@@ -4315,6 +4315,10 @@ export type WorkerWatch = (({
 }) | ({
   "status": "gone";
   [key: string]: unknown;
+}) | ({
+  "reason": (string);
+  "status": "failed";
+  [key: string]: unknown;
 })) & ({
   "detail"?: (string | null);
   "lastActivityAt"?: (Timestamp | (null));
@@ -4345,6 +4349,10 @@ export type WorkerWatchStatus = (({
   [key: string]: unknown;
 }) | ({
   "status": "gone";
+  [key: string]: unknown;
+}) | ({
+  "reason": (string);
+  "status": "failed";
   [key: string]: unknown;
 }));
 

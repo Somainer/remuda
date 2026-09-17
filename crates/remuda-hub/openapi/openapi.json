@@ -4030,7 +4030,8 @@
           "blocked",
           "idle-api-error",
           "stalled",
-          "gone"
+          "gone",
+          "failed"
         ]
       },
       "WorkerWatch": {
@@ -4046,7 +4047,7 @@
           },
           "reason": {
             "type": "string",
-            "description": "Present when status is blocked."
+            "description": "Present when status is blocked or failed."
           },
           "observedAt": {
             "format": "date-time",

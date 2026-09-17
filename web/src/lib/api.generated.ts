@@ -2769,14 +2769,14 @@ export interface components {
             lastScreenDigest?: string;
             /** Format: date-time */
             observedAt: string;
-            /** @description Present when status is blocked. */
+            /** @description Present when status is blocked or failed. */
             reason?: string;
             /** @description Present when status is done. */
             sha?: string;
             status: components["schemas"]["WorkerWatchStatus"];
         };
         /** @enum {string} */
-        WorkerWatchStatus: "working" | "done" | "blocked" | "idle-api-error" | "stalled" | "gone";
+        WorkerWatchStatus: "working" | "done" | "blocked" | "idle-api-error" | "stalled" | "gone" | "failed";
         WorktreeCreate: {
             /** @description Start-point (default main). */
             base?: string;

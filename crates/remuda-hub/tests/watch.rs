@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 /// Scripted screen the fake Node serves to `tty.screen`.
@@ -41,6 +42,10 @@ struct FakeNode {
     _task: tokio::task::JoinHandle<()>,
     screen: Arc<Mutex<ScreenState>>,
     calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Queued Node→Hub JSON-RPC frames (scripted `journal.append` events),
+    /// drained by the node task right before its next RPC reply.
+    feed: mpsc::UnboundedSender<Value>,
+    feed_seq: Arc<AtomicU64>,
 }
 
 impl Drop for FakeNode {
@@ -67,6 +72,8 @@ async fn enroll_node(
     let screen = Arc::new(Mutex::new(ScreenState::default()));
     let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
     let counter = Arc::new(AtomicU64::new(1));
+    let (feed_tx, mut feed_rx) = mpsc::unbounded_channel::<Value>();
+    let feed_seq = Arc::new(AtomicU64::new(1));
 
     let enroll = hub
         .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
@@ -113,6 +120,22 @@ async fn enroll_node(
             let Ok(frame) = recv_json(&mut node).await else {
                 break;
             };
+            // Flush scripted node→hub frames before answering this RPC: while
+            // the hub awaits this reply it issues no other RPC on the
+            // connection, so every inbound frame here is an append ack, and
+            // the journal is committed before the hub reads it post-reply.
+            while let Ok(feed) = feed_rx.try_recv() {
+                if node
+                    .send(Message::Text(feed.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if recv_json(&mut node).await.is_err() {
+                    break;
+                }
+            }
             if let Some(id) = frame.get("id")
                 && let Some(method) = frame.get("method").and_then(Value::as_str)
             {
@@ -173,6 +196,8 @@ async fn enroll_node(
         _task: task,
         screen,
         calls,
+        feed: feed_tx,
+        feed_seq,
     })
 }
 
@@ -185,12 +210,38 @@ impl FakeNode {
         };
     }
 
+    /// A print/dead driver: `tty.screen` answers unsupported, so the Hub must
+    /// classify from the instance record and journal.
+    fn set_print(&self, lifecycle: &str) {
+        *self.screen.lock().unwrap() = ScreenState {
+            supported: false,
+            lifecycle: lifecycle.to_string(),
+            lines: Vec::new(),
+        };
+    }
+
     fn set_gone(&self) {
         *self.screen.lock().unwrap() = ScreenState {
             supported: false,
             lifecycle: "closed".to_string(),
             lines: Vec::new(),
         };
+    }
+
+    /// Queue `journal.append` events for an instance; they flush on the next
+    /// hub→node RPC.
+    fn append_journal(&self, instance_id: &str, events: &[Value]) {
+        for event in events {
+            let seq = self.feed_seq.fetch_add(1, Ordering::SeqCst);
+            self.feed
+                .send(json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("feed-{seq}"),
+                    "method": "journal.append",
+                    "params": { "instanceId": instance_id, "event": event },
+                }))
+                .unwrap();
+        }
     }
 
     fn payloads(&self, method: &str) -> Vec<Value> {
@@ -437,6 +488,199 @@ async fn gone_when_carrier_reports_closed() {
     ctx.node.set_gone();
     let observed = ctx.observe().await;
     assert_eq!(observed["items"][0]["watch"]["status"], "gone");
+}
+
+// ── failed first turn (watch-failed-1) ─────────────────────────────────────
+
+/// An assistant message observation carrying the harness's API error text.
+fn assistant_error_event(message: &str) -> Value {
+    json!({
+        "kind": "message",
+        "payload": {
+            "role": "assistant",
+            "phase": "final",
+            "blocks": [{ "type": "text", "text": message }],
+        },
+    })
+}
+
+/// The print driver's turn-result frame: `result` with status `error` (this is
+/// the event that also drives the Hub instance lifecycle to `failed`).
+fn turn_error_event() -> Value {
+    json!({
+        "kind": "lifecycle",
+        "payload": {
+            "type": "native",
+            "topic": "turn",
+            "nativeName": "result",
+            "status": { "value": "error" },
+            "affectsCompletion": true,
+            "relatedIds": { "resultIndex": "1", "numTurns": "1" },
+        },
+    })
+}
+
+#[tokio::test]
+async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-failed", "58960-58989").await;
+    ctx.dispatch(&project, "c-failed", "58960-58989").await;
+
+    // The print worker has no screen; the node even reports a stale "ready".
+    ctx.node.set_print("ready");
+    let instance_id = {
+        let observed = ctx.observe().await;
+        observed["items"][0]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    ctx.node.append_journal(
+        &instance_id,
+        &[
+            assistant_error_event("API Error: 400 requested model is not available"),
+            turn_error_event(),
+        ],
+    );
+
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(
+        row["watch"]["status"], "failed",
+        "a failed first turn must not read as working: {row}"
+    );
+    assert_eq!(
+        row["watch"]["reason"],
+        "API Error: 400 requested model is not available"
+    );
+    let detail = row["watch"]["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("screen-unavailable"),
+        "detail must disclose the missing screen: {detail}"
+    );
+    // Failed is a watch-only state: the durable lifecycle is untouched.
+    assert_eq!(row["state"]["state"], "working");
+    assert!(row["watch"]["observedAt"].is_string(), "{row}");
+
+    // The Hub instance row itself converged to failed from the journal.
+    let (status, instance) = ctx
+        .request("GET", &format!("/v1/instances/{instance_id}"), None)
+        .await;
+    assert_eq!(status, 200, "{instance}");
+    assert_eq!(instance["lifecycle"], "failed");
+
+    // Persisted on the roster, sticky on the next observation, with timestamp.
+    let (_, roster) = ctx.request("GET", "/v1/workers", None).await;
+    let persisted = roster["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == json!("c-failed"))
+        .expect("roster row");
+    assert_eq!(persisted["watch"]["status"], "failed");
+    assert!(persisted["watch"]["observedAt"].is_string());
+    let observed = ctx.observe().await;
+    assert_eq!(observed["items"][0]["watch"]["status"], "failed");
+}
+
+#[tokio::test]
+async fn failed_carrier_lifecycle_classifies_without_journal() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-failed2", "58990-59019").await;
+    ctx.dispatch(&project, "c-failed2", "58990-59019").await;
+
+    // Dead pty carrier: no screen rows, terminal lifecycle failed.
+    ctx.node.set_print("failed");
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(row["watch"]["status"], "failed", "{row}");
+    // No assistant text or driver error: the lifecycle reason code stands in.
+    assert!(
+        row["watch"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("instance-failed"),
+        "{}",
+        row["watch"]["reason"]
+    );
+    assert_eq!(row["state"]["state"], "working");
+}
+
+#[tokio::test]
+async fn screenless_idle_after_api_error_does_not_overstate_failure() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-failed3", "59020-59049").await;
+    ctx.dispatch(&project, "c-idleerr", "59020-59049").await;
+    ctx.node.set_print("ready");
+    let instance_id = {
+        let observed = ctx.observe().await;
+        observed["items"][0]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // Retrying, turn not yet errored: idle-api-error, not failed.
+    ctx.node.append_journal(
+        &instance_id,
+        &[assistant_error_event(
+            "API Error: upstream returned 502, Retrying…",
+        )],
+    );
+    let observed = ctx.observe().await;
+    assert_eq!(
+        observed["items"][0]["watch"]["status"], "idle-api-error",
+        "{}",
+        observed["items"][0]
+    );
+    assert!(
+        observed["items"][0]["watch"]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("screen-unavailable")
+    );
+}
+
+#[tokio::test]
+async fn recovered_error_then_done_before_exit_is_done_not_failed() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-failed4", "59050-59079").await;
+    ctx.dispatch(&project, "c-recover", "59050-59079").await;
+    ctx.node.set_print("ready");
+    let instance_id = {
+        let observed = ctx.observe().await;
+        observed["items"][0]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // The worker hit an API error, the retry succeeded, and its final message
+    // is the DONE report before the process exits 0.
+    ctx.node.append_journal(
+        &instance_id,
+        &[
+            assistant_error_event("API Error: 429 rate limited, Retrying…"),
+            json!({
+                "kind": "message",
+                "payload": {
+                    "role": "assistant", "phase": "final",
+                    "blocks": [{ "type": "text", "text": "DONE 0a10ebf351aa" }],
+                },
+            }),
+            json!({
+                "kind": "lifecycle",
+                "payload": {
+                    "type": "native", "topic": "session", "nativeName": "session",
+                    "status": { "value": "exited" },
+                },
+            }),
+        ],
+    );
+    ctx.node.set_print("exited");
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(row["watch"]["status"], "done", "{row}");
+    assert_eq!(row["watch"]["sha"], "0a10ebf351aa");
+    assert_eq!(row["state"]["state"], "done");
 }
 
 // ── worker verbs ───────────────────────────────────────────────────────────

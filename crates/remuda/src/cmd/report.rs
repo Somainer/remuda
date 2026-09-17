@@ -2,8 +2,8 @@
 //! mergequeue gate/land reports (M1 batch 5b).
 //!
 //! A normal report shows the whole picture: what landed since the previous
-//! report, which workers are done/awaiting-land, and what is blocked, stalled
-//! or gone and why.
+//! report, which workers are done/awaiting-land, and what is blocked, stalled,
+//! failed or gone and why.
 //!
 //! `--for-owner` implements the T1 contract in coordinator-hierarchy.md §5.3:
 //! it emits *only* owner-actionable items and *only on state change* (diffed
@@ -262,7 +262,7 @@ fn attention_workers(workers: &[Value]) -> Vec<Value> {
         .filter(|worker| {
             matches!(
                 status_of(worker).as_str(),
-                "blocked" | "stalled" | "gone" | "idle-api-error"
+                "blocked" | "stalled" | "gone" | "failed" | "idle-api-error"
             )
         })
         .cloned()
@@ -270,7 +270,8 @@ fn attention_workers(workers: &[Value]) -> Vec<Value> {
 }
 
 /// Only items the owner can resolve: formal BLOCKED, stalled, gone (a lost
-/// worker the coordinator cannot silently resume around), and hard gate
+/// worker the coordinator cannot silently resume around), a worker whose
+/// instance failed/died after an errored turn (watch-failed-1), and hard gate
 /// failures. A post-429 idle worker just needs a nudge, so it is excluded.
 fn owner_asks(workers: &[Value], reports: &[Value], gate_jobs: &[Value]) -> Vec<Value> {
     let mut asks: Vec<Value> = Vec::new();
@@ -289,6 +290,10 @@ fn owner_asks(workers: &[Value], reports: &[Value], gate_jobs: &[Value]) -> Vec<
             "gone" => asks.push(json!({
                 "kind": "gone", "name": name, "branch": branch,
                 "reason": detail_of(worker),
+            })),
+            "failed" => asks.push(json!({
+                "kind": "failed", "name": name, "branch": branch,
+                "reason": evidence(worker),
             })),
             _ => {}
         }
@@ -496,12 +501,23 @@ fn print_digest(digest: &Value) {
     if !attention.is_empty() {
         println!("\n== needs attention ==");
         for worker in &attention {
+            let evidence = worker_evidence_text(worker);
+            let detail = detail_of(worker);
+            // A screenless failed worker's detail repeats the reason with a
+            // provenance prefix; render the marker alone rather than the
+            // reason twice.
+            let detail = if detail
+                .strip_prefix("screen-unavailable; ")
+                .is_some_and(|tail| tail == evidence)
+            {
+                "screen-unavailable"
+            } else {
+                detail.as_str()
+            };
             println!(
                 "  {name} ({status}): {evidence} {detail}",
                 name = worker["name"].as_str().unwrap_or("?"),
                 status = status_of(worker),
-                evidence = worker_evidence_text(worker),
-                detail = detail_of(worker),
             );
         }
     }

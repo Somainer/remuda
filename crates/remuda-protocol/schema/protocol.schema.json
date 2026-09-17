@@ -19266,6 +19266,24 @@
             "status"
           ],
           "type": "object"
+        },
+        {
+          "description": "The instance lifecycle failed (or exited after an errored turn), or the\nlast turn result errored. The worker cannot make progress as launched;\nunlike `gone` there is a concrete cause to report.",
+          "properties": {
+            "reason": {
+              "description": "First line of the last assistant error message, else the lifecycle\nreason code.",
+              "type": "string"
+            },
+            "status": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -19406,6 +19424,24 @@
           },
           "required": [
             "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The instance lifecycle failed (or exited after an errored turn), or the\nlast turn result errored. The worker cannot make progress as launched;\nunlike `gone` there is a concrete cause to report.",
+          "properties": {
+            "reason": {
+              "description": "First line of the last assistant error message, else the lifecycle\nreason code.",
+              "type": "string"
+            },
+            "status": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
           ],
           "type": "object"
         }

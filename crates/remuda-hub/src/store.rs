@@ -2808,6 +2808,32 @@ impl Store {
         .await
     }
 
+    /// Read the raw JSON of the instance's last `limit` journal events, in
+    /// ascending seq order. Watch classification only needs the tail (the last
+    /// assistant message / turn result), so this avoids re-reading a whole
+    /// long-lived journal on every observation (watch-failed-1).
+    pub async fn read_journal_tail(
+        &self,
+        instance_id: String,
+        limit: i64,
+    ) -> Result<Vec<Value>, StoreError> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT payload_json FROM (
+                    SELECT payload_json, seq FROM journal
+                    WHERE instance_id = ?1 ORDER BY seq DESC LIMIT ?2
+                 ) ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map(params![instance_id, limit], |row| {
+                let payload: String = row.get(0)?;
+                Ok(serde_json::from_str(&payload).unwrap_or(Value::Null))
+            })?;
+            let values = rows.collect::<Result<Vec<_>, _>>()?;
+            Ok(values)
+        })
+        .await
+    }
+
     /// Operator PATCH of labels / maxInstances / display name / provider binding (does not mark online).
     pub async fn patch_host(
         &self,

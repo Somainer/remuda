@@ -23,7 +23,7 @@ const DEFAULT_INTERVAL_SECS: u64 = 3;
 
 #[derive(Args)]
 #[command(
-    about = "Classify live workers from their screens (working/done/blocked/idle/stalled/gone)."
+    about = "Classify live workers from their screens (working/done/blocked/idle/stalled/gone/failed)."
 )]
 pub(crate) struct WatchArgs {
     #[command(flatten)]

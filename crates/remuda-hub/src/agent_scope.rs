@@ -670,6 +670,19 @@ mod tests {
     }
 
     #[test]
+    fn only_the_node_stage_shape_skips_the_device_middleware() {
+        assert!(is_node_host_file_stage("/v1/hosts/hst_1/files/objects"));
+        // The operator routes never match: only the exact objects segment.
+        assert!(!is_node_host_file_stage("/v1/hosts/hst_1/files"));
+        assert!(!is_node_host_file_stage("/v1/hosts/hst_1/files/read"));
+        assert!(!is_node_host_file_stage(
+            "/v1/hosts/hst_1/files/objects/extra"
+        ));
+        assert!(!is_node_host_file_stage("/v1/hosts//files/objects"));
+        assert!(!is_node_host_file_stage("/v1/objects/obj_1"));
+    }
+
+    #[test]
     fn authenticated_kind_and_instance_binding_determine_origin() {
         let mut device = Device {
             id: "device".into(),

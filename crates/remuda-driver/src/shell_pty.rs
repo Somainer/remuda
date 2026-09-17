@@ -1211,6 +1211,14 @@ impl ShellPtyDriver {
                 }),
                 Some(Arc::clone(&permission_bridge)),
                 launch_permission,
+                // c-wfdrill2 B: the pinned path this launch exec'd, so
+                // detection does not depend on the executable's basename
+                // being one the agent table has heard of. Only for an agent
+                // target — a shell's recipe binary is the login shell, and
+                // aliasing that would promote the shell itself.
+                self.options.target.agent_kind().map(|kind| {
+                    crate::promote::LaunchAlias::new(kind, recipe.binary.abs_path.clone())
+                }),
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native

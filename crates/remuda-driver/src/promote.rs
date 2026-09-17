@@ -63,6 +63,49 @@ pub const AGENT_TABLE: &[AgentSignature] = &[
     },
 ];
 
+/// The exact executable Remuda itself launched in this PTY.
+///
+/// [`AGENT_TABLE`] matches basenames, and a basename is not something every
+/// install has. A native-installer claude lives at
+/// `<home>/.local/share/claude/versions/<semver>`, a grok download at
+/// `<home>/.grok/downloads/grok-<version>-<arch>`, and
+/// [`crate::binary::pin_binary`] copies a persistently-`ETXTBSY` binary onto a
+/// fresh sibling name before pinning it — in all three the process table shows
+/// a name no table row can list, so the launch never promoted and its session
+/// never bound.
+///
+/// The launch already knows both facts this needs: which agent it is starting
+/// and the absolute path it is exec'ing (`BinaryPin::abs_path`, which is the
+/// copy's path when a copy happened). Matching that path exactly is stronger
+/// evidence than any name, and it is not a heuristic — it is the same string
+/// we passed to `exec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchAlias {
+    /// The agent kind this launch started.
+    pub kind: AgentKind,
+    /// Canonical absolute path of the pinned executable.
+    pub path: String,
+}
+
+impl LaunchAlias {
+    /// Alias for `kind` at the pinned `path`.
+    #[must_use]
+    pub fn new(kind: AgentKind, path: impl Into<String>) -> Self {
+        Self {
+            kind,
+            path: path.into(),
+        }
+    }
+}
+
+/// Whether `kind` hydrates a transcript, per [`AGENT_TABLE`].
+#[must_use]
+fn hydrates_transcript(kind: AgentKind) -> bool {
+    AGENT_TABLE
+        .iter()
+        .any(|entry| entry.kind == kind && entry.hydrates_transcript)
+}
+
 /// Shells and wrappers that are never an agent, whatever else is on the line.
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh", "login", "env",
@@ -163,17 +206,29 @@ pub fn parse_ps_rows(stdout: &str) -> Vec<ProcessRow> {
         .collect()
 }
 
-/// Match one process group against [`AGENT_TABLE`].
+/// Match one process group against `alias` and then [`AGENT_TABLE`].
 ///
-/// The first row that names a known agent wins. Shells are skipped so the
-/// login `$SHELL` itself never promotes.
+/// The first row that is the launch's own pinned executable, or that names a
+/// known agent, wins. Shells are skipped so the login `$SHELL` itself never
+/// promotes. `alias` is `None` for a login shell — there is no binary Remuda
+/// launched to compare against, and aliasing the shell would promote it.
 #[must_use]
-pub fn detect(rows: &[ProcessRow]) -> Option<Detected> {
+pub fn detect(rows: &[ProcessRow], alias: Option<&LaunchAlias>) -> Option<Detected> {
     for row in rows {
         let argv = split_argv(&row.args);
         let Some(program) = argv.first() else {
             continue;
         };
+        // Exact identity first: this is the path we exec'd, so no name table
+        // has to have heard of it.
+        if let Some(alias) = alias.filter(|alias| alias.path == *program) {
+            return Some(Detected {
+                kind: alias.kind,
+                pid: row.pid,
+                session_id: session_id_from_argv(&argv),
+                hydrates_transcript: hydrates_transcript(alias.kind),
+            });
+        }
         let base = basename(program);
         if SHELLS.contains(&base.as_str()) {
             continue;
@@ -302,21 +357,88 @@ mod tests {
         // `.../claude-code/bin/claude.exe`. Measured against a live 2.1.221:
         // before this, the launched path never promoted and the hand-typed one
         // did — precisely the divergence rule 5 forbids.
-        let typed = detect(&[ProcessRow {
-            pid: 10,
-            args: "/home/u/.nvm/versions/node/v22.22.2/bin/claude --settings /tmp/o.json".into(),
-        }])
+        let typed = detect(
+            &[ProcessRow {
+                pid: 10,
+                args: "/home/u/.nvm/versions/node/v22.22.2/bin/claude --settings /tmp/o.json"
+                    .into(),
+            }],
+            None,
+        )
         .expect("the shim spelling promotes");
-        let launched = detect(&[ProcessRow {
-            pid: 11,
-            args: "/home/u/.nvm/versions/node/v22.22.2/lib/node_modules/@anthropic-ai/\
+        let launched = detect(
+            &[ProcessRow {
+                pid: 11,
+                args: "/home/u/.nvm/versions/node/v22.22.2/lib/node_modules/@anthropic-ai/\
 claude-code/bin/claude.exe --setting-sources user,project,local"
-                .into(),
-        }])
+                    .into(),
+            }],
+            None,
+        )
         .expect("the pinned-binary spelling must promote too");
         assert_eq!(typed.kind, AgentKind::Claude);
         assert_eq!(launched.kind, AgentKind::Claude);
         assert_eq!(typed.kind, launched.kind);
+
+        // c-wfdrill2 B, measured on this host: the native installer puts the
+        // executable at `<home>/.local/share/claude/versions/<semver>`, whose
+        // basename is a version number. No name table can hold that, and the
+        // ETXTBSY copy (`binary.rs`) renames the file again — so the launch
+        // hands its own pinned path in as an alias.
+        let installer = "/home/u/.local/share/claude/versions/2.1.274";
+        assert_eq!(
+            detect(
+                &[ProcessRow {
+                    pid: 12,
+                    args: format!("{installer} --setting-sources user,project,local"),
+                }],
+                None,
+            ),
+            None,
+            "without the alias a version-numbered basename cannot promote"
+        );
+        let native = detect(
+            &[ProcessRow {
+                pid: 12,
+                args: format!("{installer} --setting-sources user,project,local"),
+            }],
+            Some(&LaunchAlias::new(AgentKind::Claude, installer)),
+        )
+        .expect("the native-installer path promotes through its launch alias");
+        assert_eq!(native.kind, AgentKind::Claude);
+        assert_eq!(native.pid, 12);
+        assert!(
+            native.hydrates_transcript,
+            "an aliased claude still hydrates its transcript"
+        );
+
+        // The same gap, a different spelling: grok's downloader names the file
+        // after its version and arch.
+        let grok_path = "/home/u/.grok/downloads/grok-0.0.42-macos-aarch64";
+        let grok = detect(
+            &[ProcessRow {
+                pid: 13,
+                args: format!("{grok_path} --model grok-4"),
+            }],
+            Some(&LaunchAlias::new(AgentKind::Grok, grok_path)),
+        )
+        .expect("the grok download path promotes through its launch alias");
+        assert_eq!(grok.kind, AgentKind::Grok);
+        assert!(!grok.hydrates_transcript);
+
+        // The alias is an exact path match, never a shape: another program
+        // under a `versions/<semver>` path is not this launch's binary.
+        assert_eq!(
+            detect(
+                &[ProcessRow {
+                    pid: 14,
+                    args: "/opt/tools/versions/2.1.274 --serve".into(),
+                }],
+                Some(&LaunchAlias::new(AgentKind::Claude, installer)),
+            ),
+            None,
+            "an unrelated versions/<semver> path must stay a plain terminal"
+        );
     }
 
     #[test]
@@ -325,10 +447,13 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
         // `claude`, and a shell is still never an agent whatever it is called.
         assert_eq!(basename("/usr/bin/claude.backup"), "claude.backup");
         assert!(
-            detect(&[ProcessRow {
-                pid: 1,
-                args: "/bin/bash -l".into()
-            }])
+            detect(
+                &[ProcessRow {
+                    pid: 1,
+                    args: "/bin/bash -l".into()
+                }],
+                None
+            )
             .is_none()
         );
     }
@@ -359,7 +484,7 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
     fn a_grouped_row_still_detects_the_agent_it_names() {
         // End to end through the real parser: group 2000 is a promoted claude.
         let stdout = "  1000  1000 /bin/bash -l\n  2000  2000 claude\n";
-        let found = detect(&parse_grouped_rows(stdout, 2000)).expect("detects claude");
+        let found = detect(&parse_grouped_rows(stdout, 2000), None).expect("detects claude");
         assert_eq!(found.kind, AgentKind::Claude);
         assert_eq!(found.pid, 2000);
     }
@@ -386,7 +511,7 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
     #[test]
     fn login_shell_alone_does_not_promote() {
         let table = FakeTable(rows(&[(100, "/bin/zsh -l")]));
-        assert_eq!(detect(&table.process_group(100)), None);
+        assert_eq!(detect(&table.process_group(100), None), None);
     }
 
     #[test]
@@ -408,8 +533,8 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
             vec![200, 201]
         );
         assert_eq!(foreground[0].args, "/tmp/claude --model opus");
-        assert_eq!(detect(&foreground).unwrap().pid, 200);
-        assert!(detect(&parse_grouped_rows(output, 100)).is_none());
+        assert_eq!(detect(&foreground, None).unwrap().pid, 200);
+        assert!(detect(&parse_grouped_rows(output, 100), None).is_none());
         assert!(parse_grouped_rows(output, 300).is_empty());
     }
 
@@ -452,7 +577,7 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
                 "/Users/x/.local/bin/claude --model opus --session-id 04b95a78-e876-4212-aa9c-a6482f30f583",
             ),
         ]));
-        let found = detect(&table.process_group(101)).expect("claude detected");
+        let found = detect(&table.process_group(101), None).expect("claude detected");
         assert_eq!(found.kind, AgentKind::Claude);
         assert_eq!(found.pid, 101);
         assert_eq!(
@@ -468,7 +593,7 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
             "claude --resume 04b95a78-e876-4212-aa9c-a6482f30f583",
             "claude --session-id=04b95a78-e876-4212-aa9c-a6482f30f583",
         ] {
-            let found = detect(&rows(&[(7, args)])).expect("detected");
+            let found = detect(&rows(&[(7, args)]), None).expect("detected");
             assert_eq!(
                 found.session_id.as_deref(),
                 Some("04b95a78-e876-4212-aa9c-a6482f30f583"),
@@ -479,7 +604,7 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
 
     #[test]
     fn a_non_uuid_session_argument_is_not_adopted() {
-        let found = detect(&rows(&[(7, "claude --resume latest")])).expect("detected");
+        let found = detect(&rows(&[(7, "claude --resume latest")]), None).expect("detected");
         assert_eq!(found.session_id, None);
     }
 
@@ -490,7 +615,7 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
             ("grok agent", AgentKind::Grok),
             ("agy -p hi", AgentKind::Agy),
         ] {
-            let found = detect(&rows(&[(9, args)])).expect("detected");
+            let found = detect(&rows(&[(9, args)]), None).expect("detected");
             assert_eq!(found.kind, kind, "{args}");
             assert!(!found.hydrates_transcript, "{args}");
         }
@@ -498,9 +623,15 @@ claude-code/bin/claude.exe --setting-sources user,project,local"
 
     #[test]
     fn an_ordinary_foreground_command_is_not_an_agent() {
-        assert_eq!(detect(&rows(&[(5, "vim docs/design/decisions.md")])), None);
+        assert_eq!(
+            detect(&rows(&[(5, "vim docs/design/decisions.md")]), None),
+            None
+        );
         // A path that merely contains the word is not the binary.
-        assert_eq!(detect(&rows(&[(5, "cat /tmp/claude-notes.txt")])), None);
+        assert_eq!(
+            detect(&rows(&[(5, "cat /tmp/claude-notes.txt")]), None),
+            None
+        );
     }
 
     #[test]

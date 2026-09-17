@@ -3852,12 +3852,7 @@ fn apply_instance_projection(
     if kind == "model"
         && let Some(effective) = payload.get("effective")
     {
-        apply_effective_model_projection(
-            conn,
-            instance_id,
-            effective,
-            payload.get("catalog"),
-        )?;
+        apply_effective_model_projection(conn, instance_id, effective, payload.get("catalog"))?;
     }
     let mut lifecycle: Option<&str> = None;
     let mut last_error: Option<String> = None;

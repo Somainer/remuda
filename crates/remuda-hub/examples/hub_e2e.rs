@@ -824,14 +824,14 @@ async fn fake_node(
                         )
                         .await?;
                     } else {
-                        let (requested_id, resolved) =
-                            if let Some(rest) = requested.strip_prefix("__resolve__:")
-                                && let Some((alias, resolved)) = rest.split_once('=')
-                            {
-                                (alias.to_owned(), resolved.to_owned())
-                            } else {
-                                (requested.to_owned(), requested.to_owned())
-                            };
+                        let (requested_id, resolved) = if let Some(rest) =
+                            requested.strip_prefix("__resolve__:")
+                            && let Some((alias, resolved)) = rest.split_once('=')
+                        {
+                            (alias.to_owned(), resolved.to_owned())
+                        } else {
+                            (requested.to_owned(), requested.to_owned())
+                        };
                         append_n = append_event(
                             &mut ws,
                             &instance_id,

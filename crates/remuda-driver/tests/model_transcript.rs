@@ -5,7 +5,9 @@
 //! model-sync-1.md).
 
 use remuda_driver::TranscriptMapper;
-use remuda_protocol::{DriverKind, EffortSource, HostId, Id, InstanceId, ObservationPayload, RunId};
+use remuda_protocol::{
+    DriverKind, EffortSource, HostId, Id, InstanceId, ObservationPayload, RunId,
+};
 use serde_json::json;
 
 fn mapper() -> TranscriptMapper {
@@ -95,10 +97,22 @@ fn model_edges(out: &[remuda_protocol::Observation]) -> Vec<(String, EffortSourc
 #[test]
 fn first_assistant_model_emits_then_identical_dedupes() {
     let mut mapper = mapper();
-    let edges = model_edges(&mapper.map_line(&assistant(Some("claude-opus-5"), 1)).unwrap());
-    assert_eq!(edges, vec![("claude-opus-5".to_string(), EffortSource::Unknown)]);
+    let edges = model_edges(
+        &mapper
+            .map_line(&assistant(Some("claude-opus-5"), 1))
+            .unwrap(),
+    );
+    assert_eq!(
+        edges,
+        vec![("claude-opus-5".to_string(), EffortSource::Unknown)]
+    );
     assert!(
-        model_edges(&mapper.map_line(&assistant(Some("claude-opus-5"), 2)).unwrap()).is_empty()
+        model_edges(
+            &mapper
+                .map_line(&assistant(Some("claude-opus-5"), 2))
+                .unwrap()
+        )
+        .is_empty()
     );
 }
 
@@ -118,15 +132,15 @@ fn accepted_switch_settles_from_the_stdout_verdict_without_an_assistant_record()
         vec![("model_hub/x".to_string(), EffortSource::Slash)]
     );
     // A later assistant record with that id is deduped.
-    assert!(
-        model_edges(&mapper.map_line(&assistant(Some("model_hub/x"), 2)).unwrap()).is_empty()
-    );
+    assert!(model_edges(&mapper.map_line(&assistant(Some("model_hub/x"), 2)).unwrap()).is_empty());
 }
 
 #[test]
 fn alias_resolution_reports_the_resolved_id_not_the_typed_word() {
     let mut mapper = mapper();
-    mapper.map_line(&assistant(Some("model_hub/es1_orange_o48[1m]"), 0)).unwrap();
+    mapper
+        .map_line(&assistant(Some("model_hub/es1_orange_o48[1m]"), 0))
+        .unwrap();
     mapper.map_line(&user_slash("sonnet", 1)).unwrap();
     // The verdict spells the concrete gateway id the alias resolved to.
     let out = mapper
@@ -142,7 +156,9 @@ fn alias_resolution_reports_the_resolved_id_not_the_typed_word() {
 #[test]
 fn env_hint_second_line_does_not_poison_the_resolved_id() {
     let mut mapper = mapper();
-    mapper.map_line(&user_slash("model_hub/es1_orange_o50", 1)).unwrap();
+    mapper
+        .map_line(&user_slash("model_hub/es1_orange_o50", 1))
+        .unwrap();
     let out = mapper
         .map_line(&user_stdout(
             "Set model to `model_hub/es1_orange_o50` and saved as your default for new sessions\n\

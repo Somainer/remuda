@@ -411,9 +411,7 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
     fn accept_is_an_immediate_edge_and_same_id_dedupes() {
         let mut tracker = ModelTracker::new();
         tracker.mark_launch();
-        let first = tracker
-            .observe(Some("claude-opus-5"))
-            .expect("first edge");
+        let first = tracker.observe(Some("claude-opus-5")).expect("first edge");
         assert_eq!(first.0.id, "claude-opus-5");
         assert_eq!(first.1, EffortSource::Launch);
         assert!(tracker.observe(Some("claude-opus-5")).is_none());
@@ -436,11 +434,10 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
         tracker.observe(Some("model_hub/es1_orange_o48[1m]"));
         tracker.note_slash("sonnet", true);
         // `sonnet` resolves through the pinned env back to the same concrete id.
-        let edge = tracker
-            .note_stdout(
-                "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default …",
-                true,
-            );
+        let edge = tracker.note_stdout(
+            "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default …",
+            true,
+        );
         // Same concrete id: no edge, but awaiting attribution is cleared.
         assert!(edge.is_none());
         // A later natural edge must not be credited to Remuda.
@@ -458,9 +455,11 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
         tracker.note_slash("b", true);
         assert!(tracker.note_stdout("Kept model as `a`", true).is_none());
         tracker.note_slash("bogus", true);
-        assert!(tracker
-            .note_stdout("Model 'bogus' not found", true)
-            .is_none());
+        assert!(
+            tracker
+                .note_stdout("Model 'bogus' not found", true)
+                .is_none()
+        );
         assert!(tracker.observe(Some("a")).is_none());
     }
 

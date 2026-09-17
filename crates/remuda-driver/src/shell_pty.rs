@@ -1042,8 +1042,12 @@ impl ShellPtyDriver {
         if let Some(model) = launch_model.clone() {
             model_bridge.note_launch_request(model);
         }
-        let host_config_dir = crate::claude_onboarding::HostClaudeConfig::from_env()
-            .and_then(|host| host.user_settings.parent().map(std::path::Path::to_path_buf));
+        let host_config_dir =
+            crate::claude_onboarding::HostClaudeConfig::from_env().and_then(|host| {
+                host.user_settings
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            });
         let model_catalog = crate::model_discovery::resolve_catalog(
             Some(std::path::Path::new(&recipe.native_home)),
             host_config_dir.as_deref(),

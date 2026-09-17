@@ -2529,11 +2529,7 @@ impl TranscriptMapper {
                     bridge.resolve(generation, observed.clone());
                 }
                 if let Some((observed, source)) = edge {
-                    return self.model_observation(
-                        observed,
-                        source,
-                        Some(stdout.to_owned()),
-                    );
+                    return self.model_observation(observed, source, Some(stdout.to_owned()));
                 }
             }
             remuda_protocol::ModelStdout::Kept | remuda_protocol::ModelStdout::NotFound => {
@@ -2555,7 +2551,8 @@ impl TranscriptMapper {
     }
 
     /// Buffer an assistant record, flushing the previous run when superseded.
-    fn map_assistant_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {        let message = value.get("message").cloned().unwrap_or(Value::Null);
+    fn map_assistant_record(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        let message = value.get("message").cloned().unwrap_or(Value::Null);
         let Some(key) = records::GroupKey::of(&value, &message) else {
             // No `message.id` to group on — replay it on its own rather than
             // dropping a real assistant turn.

@@ -407,9 +407,7 @@ fn map_user(
     // split as effort). Rejects/dismissals are `system` records (map_system).
     if let Some(args) = remuda_protocol::slash_model_args(&text) {
         ids.model.note_slash(&args, false);
-    } else if text.contains("<local-command-stdout>")
-        && text.to_lowercase().contains("model")
-    {
+    } else if text.contains("<local-command-stdout>") && text.to_lowercase().contains("model") {
         let stdout = extract_local_stdout(&text);
         if let Some((observed, source)) = ids.model.note_stdout(&stdout, false) {
             out.push(model_edge_envelope(
@@ -623,7 +621,8 @@ fn model_edge_envelope(
 }
 
 /// Plain-text view of a user record's content (string or text-block array).
-fn user_record_text(content: &Value) -> String {    match content {
+fn user_record_text(content: &Value) -> String {
+    match content {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
             .iter()

@@ -27,10 +27,9 @@ use remuda_protocol::{
     EffortSelection, EventId, HerdrRef, HerdrRepresentation, HerdrServer as HerdrPin, HostId, Id,
     InstanceId, InstanceSpec, InteractionAnswer, InteractionId, Knowledge, LifecyclePayload,
     LifecycleTopic, ModelCatalogInfo, NativeLifecycle, NativeRef, NativeRequestKey,
-    NativeTerminalFrame, Observation,
-    ObservationPayload, ObservationSource, PtyBackend, PtyCarrier, RawRef, Redaction, RunId,
-    SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, Timestamp, TranscriptRef,
-    TtyOutput, TtyRepresentation, U64,
+    NativeTerminalFrame, Observation, ObservationPayload, ObservationSource, PtyBackend,
+    PtyCarrier, RawRef, Redaction, RunId, SchemaVersion, Severity, SourceChannel, SourceCursor,
+    SourceDelivery, Timestamp, TranscriptRef, TtyOutput, TtyRepresentation, U64,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -331,8 +330,8 @@ impl ClaudePtyDriver {
         // session can actually switch to, before the pane exists. The scoped
         // config dir is checked first; the operator's ~/.claude cache backs it
         // up when discovery has not populated the scoped dir yet.
-        let host_config_dir = crate::claude_onboarding::HostClaudeConfig::from_env()
-            .and_then(|host| {
+        let host_config_dir =
+            crate::claude_onboarding::HostClaudeConfig::from_env().and_then(|host| {
                 host.user_settings
                     .parent()
                     .map(std::path::Path::to_path_buf)
@@ -722,8 +721,7 @@ impl ClaudePtyDriver {
             }
         } else {
             io.journal(
-                crate::model::ModelSwitchOutcome::Queued
-                    .journal_status(&request.id, ""),
+                crate::model::ModelSwitchOutcome::Queued.journal_status(&request.id, ""),
                 Severity::Info,
             )
             .await;

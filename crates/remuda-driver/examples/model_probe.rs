@@ -133,7 +133,10 @@ impl Probe {
             {
                 hits.insert(
                     "screen".into(),
-                    (self.t0.elapsed().as_millis().saturating_sub(start), needle.into()),
+                    (
+                        self.t0.elapsed().as_millis().saturating_sub(start),
+                        needle.into(),
+                    ),
                 );
             }
             if let Ok(content) = std::fs::read_to_string(&self.transcript) {
@@ -470,7 +473,11 @@ async fn main() {
         if let Ok(body) = std::fs::read_to_string(cfg.join(rel)) {
             probe.mark(
                 "discovery-cache",
-                &format!("{rel} {} bytes: {}", body.len(), body.chars().take(200).collect::<String>()),
+                &format!(
+                    "{rel} {} bytes: {}",
+                    body.len(),
+                    body.chars().take(200).collect::<String>()
+                ),
             );
         }
     }
@@ -480,7 +487,9 @@ async fn main() {
         .submit("reply with exactly the two characters: ok")
         .await;
     match probe.wait_message_model(90_000).await {
-        Some((dt, model)) => probe.mark("base:assistant", &format!("+{dt}ms message.model={model}")),
+        Some((dt, model)) => {
+            probe.mark("base:assistant", &format!("+{dt}ms message.model={model}"))
+        }
         None => probe.mark("base:assistant", "MISSING"),
     }
     Probe::sleep_ms(1_500).await;
@@ -498,7 +507,10 @@ async fn main() {
     match probe.wait_message_model(120_000).await {
         Some((_, model)) => probe.mark(
             "a:assistant",
-            &format!("submit→record {}ms message.model={model}", probe.t0.elapsed().as_millis() - a_start),
+            &format!(
+                "submit→record {}ms message.model={model}",
+                probe.t0.elapsed().as_millis() - a_start
+            ),
         ),
         None => probe.mark("a:assistant", "MISSING"),
     }
@@ -515,10 +527,7 @@ async fn main() {
     Probe::sleep_ms(300).await;
     probe.submit("reply with exactly: ok").await;
     match probe.wait_message_model(120_000).await {
-        Some((dt, model)) => probe.mark(
-            "b:assistant",
-            &format!("+{dt}ms message.model={model}"),
-        ),
+        Some((dt, model)) => probe.mark("b:assistant", &format!("+{dt}ms message.model={model}")),
         None => probe.mark("b:assistant", "MISSING"),
     }
     Probe::sleep_ms(1_500).await;
@@ -528,9 +537,7 @@ async fn main() {
     let c_start = probe.t0.elapsed().as_millis();
     Probe::sleep_ms(1_200).await;
     probe.dump_screen("c:screen");
-    probe
-        .race(c_start, 2_000, None, "c", &[])
-        .await;
+    probe.race(c_start, 2_000, None, "c", &[]).await;
     probe.write_bytes(b"\x1b");
     Probe::sleep_ms(400).await;
 
@@ -551,9 +558,7 @@ async fn main() {
     Probe::sleep_ms(80).await;
     probe.write_bytes(b"\x1b");
     probe.mark("d:dialog", &saw_dialog.to_string());
-    probe
-        .race(d_start, 3_000, None, "d", &[])
-        .await;
+    probe.race(d_start, 3_000, None, "d", &[]).await;
     Probe::sleep_ms(500).await;
     probe.dump_screen("d:screen-after-esc");
 

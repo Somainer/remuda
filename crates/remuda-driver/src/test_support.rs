@@ -89,11 +89,7 @@ impl ModelBridgeHandle {
     }
 
     /// Wait for the generation's verdict.
-    pub async fn wait(
-        &self,
-        generation: u64,
-        timeout: Duration,
-    ) -> Option<ModelReadback> {
+    pub async fn wait(&self, generation: u64, timeout: Duration) -> Option<ModelReadback> {
         self.inner.wait(generation, timeout).await
     }
 }

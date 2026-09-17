@@ -17,9 +17,7 @@
 //!    `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`.
 //! 3. **builtin** — the alias set the `/model` command always knows.
 
-use remuda_protocol::{
-    ModelCatalogInfo, ModelListSource, Timestamp, parse_gateway_models_json,
-};
+use remuda_protocol::{ModelCatalogInfo, ModelListSource, Timestamp, parse_gateway_models_json};
 
 /// Aliases Claude Code's `/model` resolves without any discovery. Kept in the
 /// protocol vocabulary so the web fallback and the driver agree.
@@ -134,10 +132,9 @@ pub(crate) fn resolve_catalog(
     env: &[(&str, &str)],
     current: Option<&str>,
 ) -> ModelCatalogInfo {
-    let observed_at =
-        crate::claude_pty::now_ts().unwrap_or_else(|_| {
-            Timestamp::try_from("1970-01-01T00:00:00.000Z".to_string()).expect("constant timestamp")
-        });
+    let observed_at = crate::claude_pty::now_ts().unwrap_or_else(|_| {
+        Timestamp::try_from("1970-01-01T00:00:00.000Z".to_string()).expect("constant timestamp")
+    });
 
     // 1. Gateway discovery cache.
     let mut cache_path = config_dir.map(|dir| dir.join("cache").join("gateway-models.json"));
@@ -148,8 +145,7 @@ pub(crate) fn resolve_catalog(
         .map(|body| parse_gateway_models_json(&body))
         .filter(|ids| !ids.is_empty())
         .or_else(|| {
-            cache_path = host_config_dir
-                .map(|dir| dir.join("cache").join("gateway-models.json"));
+            cache_path = host_config_dir.map(|dir| dir.join("cache").join("gateway-models.json"));
             cache_path
                 .as_deref()
                 .map(std::fs::read_to_string)
@@ -221,7 +217,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn tmp(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("remuda-c-modelsync-discovery-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-c-modelsync-discovery-{tag}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -257,8 +256,7 @@ mod tests {
         std::fs::create_dir_all(host.join("cache")).unwrap();
         std::fs::write(
             host.join("cache/gateway-models.json"),
-            serde_json::json!({"models": [{"id": "host/x"}]})
-                .to_string(),
+            serde_json::json!({"models": [{"id": "host/x"}]}).to_string(),
         )
         .unwrap();
         let info = resolve_catalog(Some(&scoped), Some(&host), None, &[], None);
@@ -285,13 +283,22 @@ mod tests {
             Some(&dir),
             None,
             Some(&dir.join("settings.json")),
-            &[("ANTHROPIC_DEFAULT_HAIKU_MODEL", "model_hub/h"), ("PATH", "/bin")],
+            &[
+                ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "model_hub/h"),
+                ("PATH", "/bin"),
+            ],
             None,
         );
         assert_eq!(info.source, ModelListSource::Settings);
         assert!(info.models.contains(&"ark/seed-evolving[1m]".to_string()));
-        assert!(info.models.contains(&"model_hub/es1_orange_o48".to_string()));
-        assert!(info.models.contains(&"model_hub/es1_orange_o48[1m]".to_string()));
+        assert!(
+            info.models
+                .contains(&"model_hub/es1_orange_o48".to_string())
+        );
+        assert!(
+            info.models
+                .contains(&"model_hub/es1_orange_o48[1m]".to_string())
+        );
         assert!(info.models.contains(&"model_hub/h".to_string()));
         assert!(!info.models.iter().any(|m| m == "/bin"));
         let _ = std::fs::remove_dir_all(&dir);

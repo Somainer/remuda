@@ -39,7 +39,10 @@ async fn structured_switch_settles_from_the_stdout_verdict_inside_the_budget() {
         test_support::mapper_with_model_bridge(bridge.clone(), "model-sync", "2.1.272");
     let generation = bridge.arm("model_hub/es1_orange_o50");
 
-    let slash = line_containing(WALK, "<command-args>model_hub/es1_orange_o50</command-args>");
+    let slash = line_containing(
+        WALK,
+        "<command-args>model_hub/es1_orange_o50</command-args>",
+    );
     let stdout = line_containing(WALK, "Set model to `model_hub/es1_orange_o50`");
 
     let started = Instant::now();
@@ -97,8 +100,7 @@ fn terminal_switch_emits_a_slash_attributed_model_edge_without_a_bridge() {
     // The gateway id switch, hand-typed, is attributed to the human.
     assert!(
         ids.iter().any(|(id, source)| {
-            id == "model_hub/es1_orange_o50"
-                && *source == remuda_protocol::EffortSource::Slash
+            id == "model_hub/es1_orange_o50" && *source == remuda_protocol::EffortSource::Slash
         }),
         "o50 slash edge missing: {ids:?}"
     );

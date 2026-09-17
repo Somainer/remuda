@@ -25,8 +25,7 @@ use tokio::sync::{Notify, oneshot};
 /// body/Enter writes, screen read, configure-lifecycle journal).
 pub(crate) use crate::effort::EffortSwitchIo as SwitchIo;
 
-pub(crate) const MODEL_READBACK_TIMEOUT_MS: u64 =
-    crate::effort::EFFORT_READBACK_TIMEOUT_MS;
+pub(crate) const MODEL_READBACK_TIMEOUT_MS: u64 = crate::effort::EFFORT_READBACK_TIMEOUT_MS;
 pub(crate) const MODEL_READBACK_POLL_MS: u64 = crate::effort::EFFORT_READBACK_POLL_MS;
 pub(crate) const MODEL_WRITE_SETTLE_MS: u64 = crate::effort::EFFORT_WRITE_SETTLE_MS;
 
@@ -44,9 +43,7 @@ impl ModelRequest {
         let id = id.trim();
         // A bare `/model` opens the interactive picker, which the driver
         // cannot drive to a choice; never type an empty argument.
-        (!id.is_empty() && !id.contains(['\n', '\r'])).then(|| Self {
-            id: id.to_owned(),
-        })
+        (!id.is_empty() && !id.contains(['\n', '\r'])).then(|| Self { id: id.to_owned() })
     }
 
     pub(crate) fn command_body(&self) -> String {
@@ -131,7 +128,10 @@ impl ModelBridge {
     }
 
     pub(crate) fn pending(&self) -> Option<ModelRequest> {
-        self.lock().pending.as_ref().map(|(_, request)| request.clone())
+        self.lock()
+            .pending
+            .as_ref()
+            .map(|(_, request)| request.clone())
     }
 
     pub(crate) fn pending_with_gen(&self) -> Option<(u64, ModelRequest)> {
@@ -304,8 +304,7 @@ pub(crate) async fn perform_model_switch(
         None => {
             bridge.fail(generation);
             io.journal(
-                ModelSwitchOutcome::Degraded
-                    .journal_status(&id, "no-readback-within-window"),
+                ModelSwitchOutcome::Degraded.journal_status(&id, "no-readback-within-window"),
                 Severity::Warning,
             )
             .await;
@@ -421,16 +420,14 @@ pub(crate) fn spawn_model_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use crate::DriverResult;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn request_validation() {
         assert_eq!(
-            ModelRequest::new("  model_hub/es1_orange_o50 ")
-                .unwrap()
-                .id,
+            ModelRequest::new("  model_hub/es1_orange_o50 ").unwrap().id,
             "model_hub/es1_orange_o50"
         );
         assert!(ModelRequest::new("").is_none());
@@ -561,8 +558,8 @@ mod tests {
             .unwrap()
             .push_str("Switch model?\n1. Yes, switch to x");
         *io.bridge.lock().unwrap() = Some(Arc::clone(&bridge));
-        let outcome = perform_model_switch(ModelRequest::new("x").unwrap(), &bridge, io.as_ref())
-            .await;
+        let outcome =
+            perform_model_switch(ModelRequest::new("x").unwrap(), &bridge, io.as_ref()).await;
         assert_eq!(outcome, ModelSwitchOutcome::Applied);
         assert_eq!(io.writes.lock().unwrap().len(), 3);
     }
@@ -580,12 +577,13 @@ mod tests {
         let outcome =
             perform_model_switch(ModelRequest::new("bogus").unwrap(), &bridge, io.as_ref()).await;
         assert_eq!(outcome, ModelSwitchOutcome::Degraded);
-        assert!(io
-            .journals
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(s, sev)| s.starts_with("model-degraded:bogus:not-found")
-                && *sev == Severity::Warning));
+        assert!(
+            io.journals
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(s, sev)| s.starts_with("model-degraded:bogus:not-found")
+                    && *sev == Severity::Warning)
+        );
     }
 }

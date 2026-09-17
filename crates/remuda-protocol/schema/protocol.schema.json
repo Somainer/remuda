@@ -3181,6 +3181,29 @@
         }
       ]
     },
+    "EffectiveModel": {
+      "description": "The effective-model half of a [`ModelPayload`]: the resolved id plus what\nestablished it.",
+      "properties": {
+        "id": {
+          "description": "Resolved model id.",
+          "type": "string"
+        },
+        "observedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the observation was made."
+        },
+        "source": {
+          "$ref": "#/$defs/EffortSource",
+          "description": "What established this id (launch argv, a terminal slash, a Remuda\nswitch). Same vocabulary as the effort effective observation."
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "observedAt"
+      ],
+      "type": "object"
+    },
     "EffortEffective": {
       "description": "Effective effort, read back from a Claude assistant transcript record\n(`effort` / `perTurnEffort`); D-028 §9.1.\n\nThis is the *observed* tier, never the requested one. Claude reports\n`ultracode` sessions as level `xhigh` and does not repeat the workflow flag\non assistant records, so `ultracode` is `None` unless the observation path\nhas positive evidence (e.g. an immediately preceding `/effort ultracode`\nswitch the driver itself made).",
       "properties": {
@@ -10675,6 +10698,32 @@
         }
       ]
     },
+    "ModelCatalogInfo": {
+      "description": "The model list a session can actually switch to, with its provenance.",
+      "properties": {
+        "models": {
+          "description": "Model ids/aliases, display order, de-duplicated.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "observedAt": {
+          "$ref": "#/$defs/Timestamp",
+          "description": "When the list was resolved."
+        },
+        "source": {
+          "$ref": "#/$defs/ModelListSource",
+          "description": "Where the list came from."
+        }
+      },
+      "required": [
+        "models",
+        "source",
+        "observedAt"
+      ],
+      "type": "object"
+    },
     "ModelClass": {
       "description": "Model capability class used by `TaskSpec.minClass` and the catalog; §4.2.",
       "oneOf": [
@@ -10704,6 +10753,64 @@
           "type": "string"
         }
       ]
+    },
+    "ModelListSource": {
+      "description": "Where the session's model list was discovered.",
+      "oneOf": [
+        {
+          "const": "gateway-discovery",
+          "description": "`<config dir>/cache/gateway-models.json` written by Claude Code's\ngateway model discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`).",
+          "type": "string"
+        },
+        {
+          "const": "settings",
+          "description": "The launch settings/env: `model`, `modelSettings`,\n`ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`.",
+          "type": "string"
+        },
+        {
+          "const": "builtin",
+          "description": "Nothing discovered on disk; the built-in alias set the picker always\nknows (`opus` / `sonnet` / `haiku` / `auto`).",
+          "type": "string"
+        }
+      ]
+    },
+    "ModelPayload": {
+      "description": "ModelPayload; `protocol.md` §5.1 (D-028 §9.1 model sync).\n\nEmitted when the effective model is observed: an assistant record's\n`message.model` or a `/model` command's `<local-command-stdout>` verdict.\nUnchanged ids are deduped by the emitting driver, so the Hub only sees\nedges. The UI renders the current model from this observation — never from\nthe requested switch.",
+      "properties": {
+        "catalog": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelCatalogInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session's switchable model list, carried on the launch snapshot so\nthe picker shows the gateway's discovered models before any switch.\nAbsent on later edges."
+        },
+        "effective": {
+          "$ref": "#/$defs/EffectiveModel",
+          "description": "The id actually observed in the transcript verdict/record."
+        },
+        "raw": {
+          "description": "Native spelling read off the record (the raw verdict line), kept for\ndiagnostics.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested": {
+          "description": "The id Remuda asked for (launch `--model` or an in-session switch),\nwhen known on the observing side.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effective"
+      ],
+      "type": "object"
     },
     "ModelRoles": {
       "description": "Project speaks model roles, not concrete model ids; design §3.2.",
@@ -11773,6 +11880,23 @@
           "type": "object"
         },
         {
+          "description": "`model` payload; §5.1 / D-028 §9.1 model sync.",
+          "properties": {
+            "kind": {
+              "const": "model",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/ModelPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
           "description": "`permission` payload; §5.1.",
           "properties": {
             "kind": {
@@ -12000,6 +12124,11 @@
         {
           "const": "effort",
           "description": "Wire value `effort`.",
+          "type": "string"
+        },
+        {
+          "const": "model",
+          "description": "Wire value `model`.",
           "type": "string"
         },
         {
@@ -12261,6 +12390,23 @@
           "type": "object"
         },
         {
+          "description": "`model` payload; §5.1 / D-028 §9.1 model sync.",
+          "properties": {
+            "kind": {
+              "const": "model",
+              "type": "string"
+            },
+            "payload": {
+              "$ref": "#/$defs/ModelPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
           "description": "`permission` payload; §5.1.",
           "properties": {
             "kind": {
@@ -12399,6 +12545,19 @@
       "required": [
         "name",
         "ultracode"
+      ],
+      "type": "object"
+    },
+    "ObservedModel": {
+      "description": "A model id as read off a transcript (verdict or assistant record).",
+      "properties": {
+        "id": {
+          "description": "Resolved model id; the verdict spells it in backticks (2.1.272) or bold\n(2.1.221), and `message.model` carries it plainly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
       ],
       "type": "object"
     },
@@ -12761,7 +12920,7 @@
       ]
     },
     "PermissionPayload": {
-      "description": "PermissionPayload; `protocol.md` §5.1.\n\nEmitted whenever the effective permission mode is observed — the native\nTUI status line and the transcript's `permission-mode` records agree.\nUnchanged values are deduped by the observing driver, so the Hub only\nsees edges. The UI renders from this observation — never from the\nrequested mode.",
+      "description": "Emitted whenever the effective permission mode is observed — the native\nTUI status line and the transcript's `permission-mode` records agree.\nUnchanged values are deduped by the observing driver, so the Hub only\nsees edges. The UI renders from this observation — never from the\nrequested mode.",
       "properties": {
         "effective": {
           "$ref": "#/$defs/PermissionEffective",

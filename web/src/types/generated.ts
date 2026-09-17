@@ -682,6 +682,14 @@ export type DriverInput = (PromptInput & ({
 /** DriverKind wire values; `protocol.md` §3.1. */
 export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
 
+/** The effective-model half of a [`ModelPayload`]: the resolved id plus what established it. */
+export type EffectiveModel = ({
+  "id": (string);
+  "observedAt": Timestamp;
+  "source": EffortSource;
+  [key: string]: unknown;
+});
+
 /** Effective effort, read back from a Claude assistant transcript record (`effort` / `perTurnEffort`); D-028 §9.1.  This is the *observed* tier, never the requested one. Claude reports `ultracode` sessions as level `xhigh` and does not repeat the workflow flag on assistant records, so `ultracode` is `None` unless the observation path has positive evidence (e.g. an immediately preceding `/effort ultracode` switch the driver itself made). */
 export type EffortEffective = ({
   "name": EffortName;
@@ -2330,11 +2338,31 @@ export type MethodCall = (({
 /** MethodName wire values; `protocol.md` §7.2. */
 export type MethodName = ("runtime.hello" | "runtime.heartbeat" | "host.report" | "host.get" | "host.list" | "driver.list" | "driver.capabilities" | "workspace.register" | "workspace.get" | "workspace.list" | "worktree.create" | "worktree.remove" | "instance.create" | "instance.attach" | "instance.open_terminal" | "instance.resume" | "instance.send" | "instance.configure" | "instance.fork" | "instance.cancel" | "instance.close" | "instance.get" | "instance.list" | "command.get" | "command.list" | "run.get" | "run.list" | "run.wait" | "workflow.wait" | "interaction.list" | "interaction.get" | "interaction.respond" | "events.subscribe" | "events.read" | "events.ack" | "events.unsubscribe" | "reconcile.instance" | "tty.attach" | "tty.detach" | "tty.write" | "tty.resize" | "object.stat" | "object.read" | "object.prepare" | "object.write" | "object.commit");
 
+/** The model list a session can actually switch to, with its provenance. */
+export type ModelCatalogInfo = ({
+  "models": (((string))[]);
+  "observedAt": Timestamp;
+  "source": ModelListSource;
+  [key: string]: unknown;
+});
+
 /** Model capability class used by `TaskSpec.minClass` and the catalog; §4.2. */
 export type ModelClass = ("cheap" | "workhorse" | "frontier");
 
 /** ModelEffective wire values; `protocol.md` §3.1. */
 export type ModelEffective = ("next-turn");
+
+/** Where the session's model list was discovered. */
+export type ModelListSource = ("gateway-discovery" | "settings" | "builtin");
+
+/** ModelPayload; `protocol.md` §5.1 (D-028 §9.1 model sync).  Emitted when the effective model is observed: an assistant record's `message.model` or a `/model` command's `<local-command-stdout>` verdict. Unchanged ids are deduped by the emitting driver, so the Hub only sees edges. The UI renders the current model from this observation — never from the requested switch. */
+export type ModelPayload = ({
+  "catalog"?: (ModelCatalogInfo | (null));
+  "effective": EffectiveModel;
+  "raw"?: (string | null);
+  "requested"?: (string | null);
+  [key: string]: unknown;
+});
 
 /** Project speaks model roles, not concrete model ids; design §3.2. */
 export type ModelRoles = ({
@@ -2622,6 +2650,10 @@ export type Observation = (({
   "payload": EffortPayload;
   [key: string]: unknown;
 }) | ({
+  "kind": "model";
+  "payload": ModelPayload;
+  [key: string]: unknown;
+}) | ({
   "kind": "permission";
   "payload": PermissionPayload;
   [key: string]: unknown;
@@ -2653,7 +2685,7 @@ export type Observation = (({
 });
 
 /** ObservationKind wire values; `protocol.md` §5.1. */
-export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "permission" | "raw_tty" | "opaque");
+export type ObservationKind = ("message" | "thought" | "tool_call" | "tool_result" | "interaction.requested" | "interaction.answered" | "interaction.expired" | "workflow.run" | "workflow.phase" | "workflow.member" | "lifecycle" | "usage" | "artifact" | "effort" | "model" | "permission" | "raw_tty" | "opaque");
 
 /** ObservationPayload; `protocol.md` §5.1. */
 export type ObservationPayload = (({
@@ -2713,6 +2745,10 @@ export type ObservationPayload = (({
   "payload": EffortPayload;
   [key: string]: unknown;
 }) | ({
+  "kind": "model";
+  "payload": ModelPayload;
+  [key: string]: unknown;
+}) | ({
   "kind": "permission";
   "payload": PermissionPayload;
   [key: string]: unknown;
@@ -2747,6 +2783,12 @@ export type ObservationSource = ({
 export type ObservedEffort = ({
   "name": EffortName;
   "ultracode": (boolean | null);
+  [key: string]: unknown;
+});
+
+/** A model id as read off a transcript (verdict or assistant record). */
+export type ObservedModel = ({
+  "id": (string);
   [key: string]: unknown;
 });
 
@@ -2836,7 +2878,7 @@ export type PermissionMode = (ClaudePermission & ({
   [key: string]: unknown;
 }));
 
-/** PermissionPayload; `protocol.md` §5.1.  Emitted whenever the effective permission mode is observed — the native TUI status line and the transcript's `permission-mode` records agree. Unchanged values are deduped by the observing driver, so the Hub only sees edges. The UI renders from this observation — never from the requested mode. */
+/** Emitted whenever the effective permission mode is observed — the native TUI status line and the transcript's `permission-mode` records agree. Unchanged values are deduped by the observing driver, so the Hub only sees edges. The UI renders from this observation — never from the requested mode. */
 export type PermissionPayload = ({
   "effective": PermissionEffective;
   "raw"?: (string | null);

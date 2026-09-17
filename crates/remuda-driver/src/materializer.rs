@@ -585,20 +585,18 @@ fn materialize_shell_pty_agent(
     crate::effort::ensure_no_effort_in_extras(request.spec.kind, &extras)?;
     argv.extend(extras);
     // Per-harness permission axes: Codex's approval policy + sandbox mode,
-    // Grok/agy yolo flags, and for Claude the native --permission-mode word.
-    // merge_yolo_argv only handles the legacy Claude-bypass spelling; the
-    // non-Claude flags ride `permission.extra_flags` computed in
-    // permission_plan, so append them once, de-duplicated.
+    // Per-harness permission axes ride `permission.extra_flags` from
+    // permission_plan: Codex's --ask-for-approval/--sandbox, Grok/agy yolo
+    // flags. Claude PTY sessions deliberately get NO `--permission-mode`: the
+    // shell/PTY launch inherits its own TUI mode (the wheel manages it in
+    // session), and the flag both constrains a promoted shell and is rejected
+    // by the fake harness. (The print carrier is the only path that emits the
+    // Claude word, via `claude_argv`.) merge_yolo_argv handles the legacy
+    // Claude-bypass spelling on top.
     for flag in &permission.extra_flags {
         if !argv.iter().any(|token| token == flag) {
             argv.push(flag.clone());
         }
-    }
-    if let Some(mode) = &permission.cli_mode
-        && !argv.iter().any(|token| token == "--permission-mode")
-    {
-        argv.push("--permission-mode".into());
-        argv.push(mode.clone());
     }
     crate::presets::merge_yolo_argv(
         &mut argv,

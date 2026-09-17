@@ -489,22 +489,8 @@ pub(crate) async fn tick(state: &AppState) {
     if let Err(error) = schedule(state).await {
         tracing::warn!(%error, "gate queue schedule tick failed");
     }
-    // Ref retention is a days-scale window; sweeping on every 1 s scheduler
-    // tick would scan the job table pointlessly. Once a minute is ample.
-    static LAST_SWEEP: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-    let due = {
-        let mut last = LAST_SWEEP
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let due = last.is_none_or(|at| at.elapsed() >= REF_SWEEP_INTERVAL);
-        if due {
-            *last = Some(std::time::Instant::now());
-        }
-        due
-    };
-    if due {
-        sweep_expired_refs(state).await;
-    }
+    // Pinned-ref retention; self-throttled, so this is cheap on every tick.
+    sweep_expired_refs(state).await;
 }
 
 async fn schedule(state: &AppState) -> Result<(), HubError> {
@@ -1220,10 +1206,26 @@ async fn drop_job_refs(state: &AppState, job: &GateJob) {
 /// This is the backstop for the cases the direct paths miss — an operator who
 /// walks away from a passing verify, or a lane that was offline when its job
 /// was canceled. Terminal jobs only: a queued or running job may still land.
+///
+/// Self-throttled: a full scan runs at most once per interval, and the interval
+/// is derived from the retention window so a short window (tests, an operator
+/// tightening retention) is still honoured promptly instead of being rounded up
+/// to the default minute.
 pub(crate) async fn sweep_expired_refs(state: &AppState) {
     let retention_ms = state.config.gate_ref_retention_ms;
     if retention_ms == 0 {
         return;
+    }
+    let interval = REF_SWEEP_INTERVAL.min(Duration::from_millis(retention_ms.max(1)));
+    {
+        let mut last = state
+            .gate_ref_swept_at
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if last.is_some_and(|at| at.elapsed() < interval) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
     }
     let Ok(jobs) = state.store.list_gate_jobs(None).await else {
         return;

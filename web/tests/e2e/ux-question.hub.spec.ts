@@ -110,8 +110,10 @@ async function createSession(page: Page, prompt: string): Promise<string> {
 async function pendingCount(page: Page, instanceId: string): Promise<number> {
   return page.evaluate(async (id) => {
     const res = await fetch("/v1/interactions?instanceId=" + id, { credentials: "include" });
-    const body = (await res.json()) as { items?: { state?: string }[] };
-    return (body.items ?? []).filter((item) => item.state === "pending").length;
+    const body = (await res.json()) as { items?: { state?: string; instanceId?: string }[] };
+    return (body.items ?? []).filter(
+      (item) => item.state === "pending" && item.instanceId === id,
+    ).length;
   }, instanceId);
 }
 

@@ -1039,8 +1039,36 @@ async fn fake_node(
                     }
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                 }
+                "instance.delete" | "instance.purge" => {
+                    // A deleted instance's pending cards can never be answered
+                    // again; purge them like the real Node, so they stop
+                    // leaking into the shared Hub's approvals queue.
+                    pending.lock().await.retain(|_iid, card| {
+                        card.get("instanceId").and_then(Value::as_str) != Some(instance_id.as_str())
+                    });
+                    ttys.remove(&instance_id);
+                    send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
                 "interaction.list" => {
-                    let items: Vec<Value> = pending.lock().await.values().cloned().collect();
+                    // Honour the list filters the real Node applies
+                    // (remuda-node interactions::dispatch_rpc); otherwise
+                    // pending cards from other instances leak into a filtered
+                    // query when many specs share this one fake Node.
+                    let want_instance = params.get("instanceId").and_then(Value::as_str);
+                    let want_kind = params.get("kind").and_then(Value::as_str);
+                    let items: Vec<Value> = pending
+                        .lock()
+                        .await
+                        .values()
+                        .filter(|item| {
+                            want_instance.is_none_or(|id| {
+                                item.get("instanceId").and_then(Value::as_str) == Some(id)
+                            }) && want_kind.is_none_or(|kind| {
+                                item.get("kind").and_then(Value::as_str) == Some(kind)
+                            })
+                        })
+                        .cloned()
+                        .collect();
                     send_rpc_ok(&mut ws, id, json!({ "items": items })).await?;
                 }
                 "interaction.answer" => {

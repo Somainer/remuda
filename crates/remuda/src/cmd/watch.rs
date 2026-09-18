@@ -348,11 +348,11 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
         name: "DRIVER",
         cells: Vec::new(),
     };
-    // The model actually answering. `modelEffective` when an observation
+    // The model actually answering. `modelEffective` when a launch read-back
     // disagreed with the dispatch request, else the requested id. A pinned model
     // that was silently substituted used to be invisible here, because the row
-    // only ever carried the request (model-pin-1); a `>` marks the
-    // divergence so the two can be told apart at a glance.
+    // only ever carried the request (model-pin-1); on a divergence the cell
+    // renders `observed ⇐ requested`, so the two can be told apart at a glance.
     let mut model = Col {
         name: "MODEL",
         cells: Vec::new(),

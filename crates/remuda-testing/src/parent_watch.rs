@@ -137,14 +137,18 @@ fn watch(notify_write_fd: std::os::fd::OwnedFd, stopping: Option<Arc<AtomicBool>
     // "readable" forever and must not be treated as a hangup.
     let stdin = std::io::stdin();
     use std::os::fd::AsFd;
-    // `FAKE_CLAUDE_IGNORE_EOF=1` asks the fake to outlive stdin EOF so the close
-    // ladder can be tested against a child that ignores it. Watching stdin for
-    // POLLHUP would defeat that: the hangup is the spawner *closing stdin*, not
-    // the spawner dying, and treating it as death exits the process before the
-    // ladder ever escalates. Fall back to the getppid() poll, which still reaps
-    // a leaked helper when the test binary really goes away.
-    let watch_stdin = stdin_is_liveness_channel(stdin.as_fd())
-        && !std::env::var("FAKE_CLAUDE_IGNORE_EOF").is_ok_and(|value| value == "1");
+    // Two knobs ask the fake to keep running past stdin closing:
+    // `FAKE_CLAUDE_IGNORE_EOF=1` parks after EOF, and
+    // `FAKE_CLAUDE_STOP_READING=1` stops reading after the handshake (so the
+    // writer channel backs up). In either case watching stdin for POLLHUP would
+    // defeat that: the hangup is the spawner *closing stdin*, not the spawner
+    // dying, and treating it as death exits the process before the close ladder
+    // ever escalates. Fall back to the getppid() poll, which still reaps a
+    // leaked helper when the test binary really goes away.
+    let suppress_stdin_watch = std::env::var("FAKE_CLAUDE_IGNORE_EOF")
+        .is_ok_and(|value| value == "1")
+        || std::env::var("FAKE_CLAUDE_STOP_READING").is_ok_and(|value| value == "1");
+    let watch_stdin = stdin_is_liveness_channel(stdin.as_fd()) && !suppress_stdin_watch;
     let poll_timeout = PollTimeout::try_from(WATCH_INTERVAL).expect("250 ms fits PollTimeout");
 
     loop {

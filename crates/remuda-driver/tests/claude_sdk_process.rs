@@ -489,10 +489,11 @@ async fn a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle() {
 
     let started = std::time::Instant::now();
     driver.close().await.expect("close");
-    // The graceful rung is 60% of a 3s budget, so a cooperative exit is fast.
+    // The first slice is 50% of the 3s budget (1.5s); a cooperative child that
+    // leaves on stdin EOF returns well inside it, before SIGTERM is sent.
     assert!(
         started.elapsed() < Duration::from_secs(2),
-        "a cooperative child should not have waited for the interrupt rung"
+        "a cooperative child should not have waited for the SIGTERM rung"
     );
     assert!(!process_alive(&pid), "child should be reaped");
 
@@ -512,6 +513,13 @@ async fn a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle() {
 /// The cooperative and EOF-ignoring cases above stop at rungs 1 and 2, so
 /// without this the SIGKILL rung would be untested — and that is the rung that
 /// exists for a wedged child holding the workspace open.
+///
+/// This is the regression test for the earlier vacuous version: SIGTERM used to
+/// be blocked on the main thread *after* the parent-watch thread spawned, so the
+/// signal was delivered to that unmasked thread and killed the fake at rung 2.
+/// Deleting the SIGKILL rung, or masking SIGTERM on the wrong thread, must both
+/// fail here — the first by leaving the child alive, the second by returning at
+/// the end of the first slice rather than after both.
 #[tokio::test]
 async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
     let mut env = BTreeMap::new();
@@ -527,20 +535,119 @@ async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
         .clone();
     assert!(process_alive(&pid), "child should be running before close");
 
+    // Harness budget: 3s, split 1.5s / 1.5s between the stdin-EOF and SIGTERM
+    // slices, plus a fixed 2s reap after SIGKILL.
+    const BUDGET: Duration = Duration::from_secs(3);
+    const SLICE: Duration = Duration::from_millis(1500);
     let started = std::time::Instant::now();
     let closed = tokio::time::timeout(Duration::from_secs(20), driver.close()).await;
+    let elapsed = started.elapsed();
     assert!(
         closed.is_ok(),
         "close did not return for a SIGTERM-proof child"
     );
     closed.unwrap().expect("close ack");
+
+    // The child must have outlived BOTH bounded slices. If SIGTERM had killed it
+    // (the wrong-thread-mask bug), close would have returned after one slice.
+    // Tokio deadlines fire at or after their instant, so a real two-slice wait is
+    // never shorter than the sum; 100ms of slack covers scheduling, not a whole
+    // missing 1.5s slice.
     assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "close took {:?}: the ladder is not bounded",
-        started.elapsed()
+        elapsed >= SLICE + SLICE - Duration::from_millis(100),
+        "close returned in {elapsed:?}: the child did not survive the SIGTERM \
+         slice, so rung 3 was never exercised (budget {BUDGET:?})"
+    );
+    assert!(
+        elapsed < BUDGET + Duration::from_secs(3),
+        "close took {elapsed:?}: the ladder is not bounded"
     );
     assert!(
         !process_alive(&pid),
         "pid {pid} survived a close that had to reach SIGKILL"
     );
+}
+
+/// Item 2: the stdin-EOF request itself must be bounded.
+///
+/// When the child stops draining stdin, the driver's writer task blocks on the
+/// pipe and its 64-slot channels fill — so `close_stdin`'s own enqueue blocks,
+/// not just the subsequent `wait`. The old code awaited `close_stdin` *outside*
+/// every timeout, which hung `instance.close` exactly the way the ladder was
+/// meant to prevent. Here the fake stops reading after the handshake, the test
+/// pumps prompts until the driver applies backpressure (channels saturated), and
+/// close must still return inside its bound.
+#[tokio::test]
+async fn close_returns_when_stdin_is_not_drained_and_the_writer_is_saturated() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_STOP_READING".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let _handle = driver.start(spec).await.expect("start");
+
+    // Pump large prompts until enqueueing applies backpressure. One prompt is far
+    // bigger than a pipe buffer, so the writer task blocks on the very first
+    // write and the two 64-slot channels fill after a bounded number of sends;
+    // anything after that parks until the child drains, which it never does.
+    let saturated = async {
+        let big = "x".repeat(256 * 1024);
+        for _ in 0..2_000 {
+            let result =
+                tokio::time::timeout(Duration::from_millis(300), driver.send(prompt(&big))).await;
+            if result.is_err() {
+                return; // backpressure: the writer path is saturated
+            }
+        }
+        panic!("never reached backpressure: the writer was not saturated");
+    };
+    tokio::time::timeout(Duration::from_secs(10), saturated)
+        .await
+        .expect("writer did not saturate within the window");
+
+    // Without the bounded close_stdin this never returns; with it, rung 1 times
+    // out (EOF never enqueued), SIGTERM at rung 2 reaps the non-reading child.
+    let started = std::time::Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(20), driver.close()).await;
+    assert!(closed.is_ok(), "close hung with a saturated writer");
+    closed.unwrap().expect("close ack");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "close took {:?}: close_stdin was not bounded",
+        started.elapsed()
+    );
+}
+
+/// Item 4: a reader from a previous launch must never emit into the next one.
+///
+/// `close` joins or aborts the reader before it returns, and `start` re-arms
+/// `exit_emitted`. Two sequential launch/close cycles on one driver must each
+/// deliver exactly one `exited`, with no stale `exited` from launch A leaking
+/// into launch B's channel.
+#[tokio::test]
+async fn relaunch_after_close_emits_one_exited_per_launch() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+
+    for turn in ["first", "second"] {
+        let mut handle = driver.start(spec.clone()).await.expect("start");
+        driver.send(prompt(turn)).await.expect("send");
+        let _ = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+            turn_done_count(obs) >= 1
+        })
+        .await;
+        driver.close().await.expect("close");
+
+        let mut exits = 0;
+        while let Ok(Some(obs)) =
+            tokio::time::timeout(Duration::from_millis(300), handle.recv()).await
+        {
+            if lifecycle_named(&obs) == Some("session") && lifecycle_status(&obs) == Some("exited")
+            {
+                exits += 1;
+            }
+        }
+        assert_eq!(
+            exits, 1,
+            "launch for {turn:?} produced {exits} `exited` lifecycles; \
+             a reader from a prior launch leaked into this channel"
+        );
+    }
 }

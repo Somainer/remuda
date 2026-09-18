@@ -196,6 +196,12 @@ where
     let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     node.set_object_source(Arc::new(object_broker.source()));
     let (gate_tx, mut gate_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
+    // Long gate methods (run/then/land/unpin) park for minutes; serving them
+    // inline on the input arm freezes every outgoing pump below until the run
+    // ends. They run on their own task and their JSON-RPC reply rides this
+    // channel back to the single writer, interleaving with gate.event, tty and
+    // journal frames in any order.
+    let (long_tx, mut long_rx) = mpsc::channel::<Value>(JOURNAL_QUEUE_CAPACITY);
     spawn_stdio_tty_pump(node.clone(), tty_tx);
     spawn_stdio_gate_pump(node.clone(), gate_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
@@ -217,6 +223,11 @@ where
                 }
             }
             frame = gate_rx.recv() => {
+                if let Some(frame) = frame {
+                    write_ndjson(&mut output, &frame).await?;
+                }
+            }
+            frame = long_rx.recv() => {
                 if let Some(frame) = frame {
                     write_ndjson(&mut output, &frame).await?;
                 }
@@ -257,6 +268,32 @@ where
                 // object.pull replies and object.chunk notifications complete
                 // attachment fetches; they never become instance RPCs.
                 if object_broker.handle_frame(&frame) {
+                    continue;
+                }
+                // Long gate methods (run/then/land/unpin) can park for minutes.
+                // Serving them inline here would starve every outgoing pump in
+                // this select until the run ends — the exact freeze the Hub saw
+                // as `running` with no steps. Hand them to a task that writes the
+                // real JSON-RPC reply back through `long_tx` when the method
+                // returns; every other method keeps its inline path. gate.cancel
+                // is not long, so it stays inline and can kill a running gate.
+                if let Some(method) = frame.get("method").and_then(Value::as_str)
+                    && crate::gate::is_long_gate_method(method)
+                {
+                    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                    let params = frame
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let method = method.to_owned();
+                    let node = node.clone();
+                    let long_tx = long_tx.clone();
+                    tokio::spawn(async move {
+                        let result = node.dispatch_gate_rpc(&method, &params).await;
+                        if let Some(response) = response_for(id, result) {
+                            let _ = long_tx.send(response).await;
+                        }
+                    });
                     continue;
                 }
                 let outcome = handle_stdio_frame(

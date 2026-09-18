@@ -242,14 +242,10 @@ pub async fn dispatch_frame(
         return node.remove_worker(&params).await;
     }
     // Batch 6 co-lanes: lane gate runner over ssh-stdio and the WSS runtime.
-    if method == "gate.run" {
-        return node.run_gate(&params).await;
-    }
-    if method == "gate.cancel" {
-        return node.cancel_gate(&params).await;
-    }
-    if method == "gate.then" {
-        return node.run_gate_then(&params).await;
+    // The whole family (run/cancel/then/land/unpin) routes through the one
+    // entry point that has all five arms — home-host land and unpin included.
+    if crate::gate::is_gate_method(method) {
+        return node.dispatch_gate_rpc(method, &params).await;
     }
     if crate::workspace_scm::is_scm_method(method) {
         return crate::workspace_scm::handle_rpc(node, method, &params);

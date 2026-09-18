@@ -311,8 +311,11 @@ pub enum ScreenClass {
     },
     /// Host offline / instance closed / carrier gone.
     Gone {
-        /// Machine-readable why.
-        reason: &'static str,
+        /// Machine-readable why: a carrier code (`host-offline`,
+        /// `instance-closed`, …) or the instance row's own `lastError`
+        /// (`node-epoch-changed`, `host-lost`, …) when the row is authoritative
+        /// and already says how it died.
+        reason: String,
     },
     /// The instance failed or exited after an errored turn, or the last turn
     /// result errored. Distinct from `Gone`: the worker is dead *with a known
@@ -677,13 +680,13 @@ pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
     }
     if !signals.host_online {
         return ScreenClass::Gone {
-            reason: "host-offline",
+            reason: "host-offline".to_string(),
         };
     }
     // A closed/terminated carrier has nothing left to read.
     if is_closed_lifecycle(&lifecycle) {
         return ScreenClass::Gone {
-            reason: "instance-closed",
+            reason: "instance-closed".to_string(),
         };
     }
     // A fresh DONE/BLOCKED report outranks a clean exit: a print worker's
@@ -703,10 +706,19 @@ pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
     } else if let Some(report) = journal_report(signals) {
         return report;
     }
-    // Exited with no fresh report: the process is gone.
+    // Exited with no fresh report: the process is gone. The row's own
+    // `lastError` is the honest why when it has one — a Hub-settled
+    // `node-epoch-changed` is the reason the worker died, and a bare
+    // `instance-closed` would throw that away and read as if the owner had
+    // stopped it.
     if lifecycle == "exited" {
         return ScreenClass::Gone {
-            reason: "instance-closed",
+            reason: signals
+                .lifecycle_reason
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(first_line)
+                .unwrap_or_else(|| "instance-closed".to_string()),
         };
     }
     // A native first-run/permission dialog on the live screen owns the
@@ -1220,19 +1232,42 @@ mod tests {
         let lines = rows("DONE 0123456789abcdef\n");
         let mut s = sig(&lines, "ready", "idle");
         s.host_online = false;
-        assert!(matches!(
+        assert_eq!(
             classify_screen(&s),
             ScreenClass::Gone {
-                reason: "host-offline"
+                reason: "host-offline".to_string()
             }
-        ));
+        );
         let closed = sig(&lines, "closed", "idle");
-        assert!(matches!(
+        assert_eq!(
             classify_screen(&closed),
             ScreenClass::Gone {
-                reason: "instance-closed"
+                reason: "instance-closed".to_string()
             }
-        ));
+        );
+    }
+
+    /// A row the Hub already settled with a reason classifies gone *with that
+    /// reason*: `node-epoch-changed` is why the worker died, and reporting a
+    /// bare `instance-closed` would read as if its owner had stopped it.
+    #[test]
+    fn gone_survives_the_settled_rows_own_reason() {
+        let mut s = sig(&[], "exited", "idle");
+        s.screen_available = false;
+        assert_eq!(
+            classify_screen(&s),
+            ScreenClass::Gone {
+                reason: "instance-closed".to_string()
+            },
+            "a clean exit with no recorded reason keeps the carrier code"
+        );
+        s.lifecycle_reason = Some("node-epoch-changed");
+        assert_eq!(
+            classify_screen(&s),
+            ScreenClass::Gone {
+                reason: "node-epoch-changed".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1301,12 +1336,12 @@ mod tests {
         // A print worker exits 0 with no error tail: gone, not failed.
         s.journal_lines = &[];
         s.last_error_line = None;
-        assert!(matches!(
+        assert_eq!(
             classify_screen(&s),
             ScreenClass::Gone {
-                reason: "instance-closed"
+                reason: "instance-closed".to_string()
             }
-        ));
+        );
     }
 
     #[test]

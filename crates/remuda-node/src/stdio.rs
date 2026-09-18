@@ -180,6 +180,13 @@ where
         &node_epoch,
         host,
         token.as_deref(),
+        // The inventory is the whole point of the epoch handshake: without it
+        // the Hub sees the epoch change, has nothing to diff, and leaves the
+        // rows of every process that died with the previous Node `running`
+        // forever — holding placement slots nothing can release. Enumerated
+        // after `reconcile_herdr` ran at startup, so a row this Node can no
+        // longer hold is already settled here rather than announced as live.
+        Some(serde_json::to_value(node.list_instances()?.items)?),
     );
     write_ndjson(
         &mut output,

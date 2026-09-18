@@ -853,6 +853,17 @@ pub fn hello_capabilities(host: &Value) -> Option<Value> {
 }
 
 /// Build stdio hello params from a nested host inventory value.
+///
+/// `instances` is this Node's own instance inventory ([`CreateInstanceRequest`]
+/// not required — pass `serde_json::to_value(node.list_instances()?.items)`).
+/// It rides every hello, daemon or not, for the same reason the outbound-WSS
+/// hello does: the Hub reconciles rows this Node no longer owns by diffing it
+/// against the epoch it recorded, and a hello with no `instances` key leaves
+/// those rows `running` forever, holding placement slots nothing can release.
+///
+/// `None` stays a real answer, not an empty one: a Node that cannot enumerate
+/// sends no key at all, and the Hub keeps its current hands-off behaviour
+/// rather than reading silence as "I own nothing".
 #[must_use]
 pub fn stdio_hello_params(
     host_id: &HostId,
@@ -862,6 +873,7 @@ pub fn stdio_hello_params(
     node_epoch: &Id,
     host: Value,
     enrollment_token: Option<&str>,
+    instances: Option<Value>,
 ) -> Value {
     let mut params = json!(NodeHelloParams {
         host_id: Some(host_id.as_id().as_str().to_owned()),
@@ -883,6 +895,11 @@ pub fn stdio_hello_params(
     });
     if let Some(object) = params.as_object_mut() {
         object.insert("host".into(), host);
+        // Additive and optional: absent means "cannot enumerate", never "owns
+        // nothing", so a Node too old to list its rows cannot wipe them.
+        if let Some(instances) = instances {
+            object.insert("instances".into(), instances);
+        }
     }
     params
 }
@@ -941,8 +958,9 @@ mod tests {
             "driverInventory": [{"kind": "shell-pty", "launchable": false,
                                  "reasonCode": "carrier-not-enabled"}],
         });
-        let params =
-            stdio_hello_params(&host_id, "lab", "outbound-wss", "0.1.0", &epoch, host, None);
+        let params = stdio_hello_params(
+            &host_id, "lab", "outbound-wss", "0.1.0", &epoch, host, None, None,
+        );
         assert_eq!(
             params["capabilities"]["driverInventory"][0]["launchable"],
             json!(false)
@@ -951,6 +969,48 @@ mod tests {
             params["capabilities"]["driverInventory"][0]["reasonCode"],
             json!("carrier-not-enabled")
         );
+    }
+
+    /// The stdio hello must announce the instance inventory the same way the
+    /// outbound-WSS hello does. Its absence is the whole of the 2026-09-17
+    /// demo failure: the Hub saw an epoch change, found no `instances` key,
+    /// and left four dead rows `running`.
+    #[test]
+    fn hello_carries_the_instance_inventory() {
+        let epoch = Id::new("epoch").expect("epoch");
+        let host_id = HostId::new();
+        let params = stdio_hello_params(
+            &host_id,
+            "lab",
+            "ssh-stdio",
+            "0.1.0",
+            &epoch,
+            json!({"hostname": "lab"}),
+            None,
+            Some(json!([{"id": "ins_one", "lifecycle": "running"}])),
+        );
+        assert_eq!(params["instances"][0]["id"], json!("ins_one"));
+        assert_eq!(params["instances"][0]["lifecycle"], json!("running"));
+    }
+
+    /// A Node that cannot enumerate sends **no** `instances` key, never `[]`:
+    /// the Hub reads an absent key as "cannot compare" and an empty array as
+    /// "this Node owns nothing", which would settle every row on the host.
+    #[test]
+    fn a_node_that_cannot_enumerate_omits_the_inventory() {
+        let epoch = Id::new("epoch").expect("epoch");
+        let host_id = HostId::new();
+        let params = stdio_hello_params(
+            &host_id,
+            "lab",
+            "ssh-stdio",
+            "0.1.0",
+            &epoch,
+            json!({"hostname": "lab"}),
+            None,
+            None,
+        );
+        assert!(params.get("instances").is_none());
     }
 
     #[test]
@@ -967,6 +1027,7 @@ mod tests {
             "0.1.0",
             &epoch,
             json!({"hostname": "lab"}),
+            None,
             None,
         );
         assert!(params["capabilities"].is_null());

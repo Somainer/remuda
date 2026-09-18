@@ -19,6 +19,7 @@ import {
   type EffortStop,
 } from "./effort";
 import css from "./session.module.css";
+import { compareModelPin } from "./modelEffective";
 
 /**
  * Half the knob, in px — keep in step with `--knob-size` in session.module.css,
@@ -178,9 +179,13 @@ export function EffortSlider({
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
   // A mismatch is settled state; while the requested switch is still in flight
   // (pending) the effective id is simply stale, so don't cry mismatch yet.
+  // Use the alias-aware comparison, not shortModel inequality: a correct
+  // gateway launch resolves a catalog id to an upstream vendor name
+  // (`es1_orange_o50` → `claude-opus-5`), which is not a mismatch
+  // (model-pin-1 §3).
   const modelMismatch =
     !modelPending && model && modelEffective
-      ? shortModel(model) !== shortModel(modelEffective)
+      ? compareModelPin(model, modelEffective, models ?? []) === "mismatch"
       : false;
 
   if (stops.length === 0) return null;

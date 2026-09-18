@@ -1133,6 +1133,29 @@ mod tests {
     }
 
     #[test]
+    fn only_a_worker_still_making_progress_is_in_progress() {
+        // The distinction `fail_workers_holding` turns on: `is_active` is only
+        // "not retired", so a delivered report would be overwritten with
+        // "blocked by a lost session" — telling a coordinator to redo work
+        // that is already done.
+        assert!(WorkerState::Dispatched.is_in_progress());
+        assert!(WorkerState::Working.is_in_progress());
+        assert!(!WorkerState::Done { sha: "x".into() }.is_in_progress());
+        assert!(!WorkerState::Blocked {
+            reason: "need creds".into()
+        }
+        .is_in_progress());
+        assert!(!WorkerState::Retired.is_in_progress());
+        // And every one of those is still "active" except retired, which is
+        // exactly why the narrower predicate is the one callers must reach for.
+        assert!(WorkerState::Done { sha: "x".into() }.is_active());
+        assert!(WorkerState::Blocked {
+            reason: "need creds".into()
+        }
+        .is_active());
+    }
+
+    #[test]
     fn state_update_validation() {
         assert!(WorkerState::from_update("working", None, None).is_ok());
         assert!(WorkerState::from_update("done", Some("abc"), None).is_ok());

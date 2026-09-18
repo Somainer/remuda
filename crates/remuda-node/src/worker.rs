@@ -23,6 +23,11 @@ use std::path::{Path, PathBuf};
 /// Directory name holding per-worker cargo targets beside a repository root.
 pub const TARGET_DIR_NAME: &str = "remuda-target";
 
+/// Deadline for the whole `worker.remove` reclaim (git worktree removal + the
+/// recursive cargo-target delete). A slow or stuck git must surface as an error
+/// rather than owning the blocking thread — or the carrier loop — forever.
+const RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Hub→Node worker RPCs served by every carrier (outbound WSS and ssh-stdio).
 #[must_use]
 pub fn is_worker_method(method: &str) -> bool {
@@ -165,6 +170,14 @@ impl crate::runtime::DevNode {
         request: WorkerRemoveParams,
     ) -> Result<WorkerRemoveResult, NodeError> {
         validate_worker_name(&request.name).map_err(NodeError::InvalidRequest)?;
+        // Retiring an instance this Node does not know must answer not-found
+        // promptly, the way `instance.close` does through the store — never wait
+        // on a git/filesystem reclaim for a worker that isn't here. This is the
+        // resume-over-a-dead-instance park: the Hub retires a row whose instance
+        // left with the previous Node, and the reclaim blocked the loop.
+        if let Some(instance_id) = &request.instance_id {
+            self.get_instance(instance_id)?;
+        }
         // Best-effort carrier teardown first: a live agent pane holds the
         // worktree as its cwd and would keep file handles open.
         if let Some(instance_id) = &request.instance_id
@@ -176,8 +189,29 @@ impl crate::runtime::DevNode {
         }
         let (_, workspace_root) =
             self.resolve_workspace_cwd(request.workspace_id.as_ref(), None)?;
-        let worktree_removed = crate::worktree::remove_record(&workspace_root, &request.name)?;
-        let (target_removed, reclaimed_bytes) = remove_target_dir(&workspace_root, &request.name)?;
+        // The reclaim shells out to `git worktree remove --force` and then does
+        // a recursive std fs remove of the whole cargo target — both blocking,
+        // both unbounded. Run them on a blocking thread under an explicit
+        // deadline so a slow or stuck git can never own an async task or park
+        // the carrier loop (a stuck git here is exactly what froze the ssh-stdio
+        // Node for good).
+        let name = request.name.clone();
+        let (worktree_removed, target_removed, reclaimed_bytes) = tokio::time::timeout(
+            RECLAIM_DEADLINE,
+            tokio::task::spawn_blocking(move || {
+                let worktree_removed = crate::worktree::remove_record(&workspace_root, &name)?;
+                let (target_removed, reclaimed_bytes) = remove_target_dir(&workspace_root, &name)?;
+                Ok::<_, NodeError>((worktree_removed, target_removed, reclaimed_bytes))
+            }),
+        )
+        .await
+        .map_err(|_| {
+            NodeError::InvalidRequest(format!(
+                "worker.remove reclaim exceeded {}s; git or filesystem removal is stuck",
+                RECLAIM_DEADLINE.as_secs()
+            ))
+        })?
+        .map_err(|error| NodeError::Driver(format!("worker.remove reclaim join: {error}")))??;
         Ok(WorkerRemoveResult {
             name: request.name,
             worktree_removed,

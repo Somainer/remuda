@@ -305,9 +305,15 @@ test("screen ends a turn whose Stop hook is lost and flushes the held prompt", a
     await expect(page.getByTestId("live-decided-by")).toHaveAttribute("data-channel", "screen", {
       timeout: 5_000,
     });
-    // The clock is stopped/greyed at the end and the interrupt affordance gone.
+    // The clock freezes on the turn duration (not 0:00, not time-since-end) and
+    // the interrupt affordance is gone.
     const elapsed = page.getByTestId("live-elapsed");
-    await expect(elapsed).toHaveAttribute("data-stale", "1");
+    const firstReading = (await elapsed.textContent()) ?? "";
+    expect(firstReading).toMatch(/^\d+:\d\d$/);
+    expect(firstReading).not.toBe("0:00");
+    await page.waitForTimeout(1_500);
+    // Still the exact same reading ~1.5 s later: stopped on the duration.
+    await expect.poll(async () => elapsed.textContent()).toBe(firstReading);
     await expect(page.getByTestId("live-interrupt")).toHaveCount(0);
 
     // The prompt queued while busy is actually POSTed, exactly once.
@@ -370,6 +376,17 @@ test("an idle_prompt Notification after Stop never reopens the turn and is liste
     await expect(note).toBeVisible({ timeout: 10_000 });
     await expect(note).toHaveAttribute("data-type", "idle_prompt");
     expect(await note.textContent()).toContain("waiting for your input");
+
+    // A cleanly finished session emits no hook-silence reason: the relay is
+    // pinned and the socket still listening, and "no more hook events" after a
+    // Stop is normal, never a false「journal 推送停滞」. Wait past one probe
+    // cycle (8 × 800 ms) plus margin, then assert no reason chip was named.
+    await page.waitForTimeout(8_000);
+    await expect(page.locator("[data-silence]")).toHaveCount(0);
+    const journal = await (await page.request.get(`/v1/instances/${h.instanceId}/journal`)).json() as {
+      events?: Array<{ event?: { payload?: { nativeName?: string } } }>;
+    };
+    expect((journal.events ?? []).some((r) => r.event?.payload?.nativeName === "hook.silence")).toBe(false);
   } finally {
     await teardown(page, h);
   }

@@ -24,8 +24,8 @@ pub use bin_locator::{
     locate_bin_in, locate_workspace_bin, workspace_root,
 };
 pub use client::{
-    FakeClaudeProcess, SpawnOptions, fake_claude_bin, is_control_subtype, is_system_subtype,
-    is_type, spawn_fake_claude, transcript_path,
+    FakeClaudeProcess, SpawnOptions, fake_claude_argv, fake_claude_bin, is_control_subtype,
+    is_system_subtype, is_type, spawn_fake_claude, spawn_fake_claude_sdk, transcript_path,
 };
 pub use fake::{FakeClaudeError, run_fake_claude};
 pub use fake_herdr::{

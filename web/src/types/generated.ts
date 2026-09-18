@@ -680,7 +680,7 @@ export type DriverInput = (PromptInput & ({
 }));
 
 /** DriverKind wire values; `protocol.md` §3.1. */
-export type DriverKind = ("claude-print" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
+export type DriverKind = ("claude-print" | "claude-sdk" | "claude-pty" | "claude-bg" | "codex-appserver" | "grok-acp" | "agy-print" | "generic-pty" | "shell-pty");
 
 /** The effective-model half of a [`ModelPayload`]: the resolved id plus what established it. */
 export type EffectiveModel = ({

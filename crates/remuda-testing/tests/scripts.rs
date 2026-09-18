@@ -1,8 +1,9 @@
 //! Drive bundled `fake-claude` scripts over stream-json NDJSON.
 
 use remuda_testing::{
-    FIXED_SESSION_ID, FakeClaudeProcess, ScriptKind, SpawnOptions, fixtures_dir,
-    is_control_subtype, is_system_subtype, is_type, spawn_fake_claude, transcript_path,
+    FIXED_SESSION_ID, FakeClaudeProcess, ScriptKind, SpawnOptions, fake_claude_argv, fixtures_dir,
+    is_control_subtype, is_system_subtype, is_type, spawn_fake_claude, spawn_fake_claude_sdk,
+    transcript_path,
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -243,6 +244,7 @@ fn captured_fixtures_are_present() {
         "scripts/approval.jsonl",
         "scripts/askuser.jsonl",
         "scripts/workflow.jsonl",
+        "scripts/twoturn.jsonl",
     ] {
         let path = root.join(rel);
         assert!(path.is_file(), "missing {}", path.display());
@@ -262,4 +264,71 @@ fn fake_claude_prints_version_and_exits() {
         stdout.contains("2.1.268"),
         "unexpected --version output: {stdout}"
     );
+}
+
+/// The one flag that separates the carriers. `-p` is "Print response and exit";
+/// the sdk template omits it and is otherwise byte-identical, so the print
+/// spawn keeps working unchanged (`print-replacement.md` §2.1, §3 batch 1).
+#[test]
+fn sdk_spawn_argv_has_no_dash_p_and_print_still_does() {
+    let print = fake_claude_argv(FIXED_SESSION_ID, true);
+    let sdk = fake_claude_argv(FIXED_SESSION_ID, false);
+    assert_eq!(print.first().map(String::as_str), Some("-p"));
+    assert!(!sdk.iter().any(|a| a == "-p" || a == "--print"));
+    assert_eq!(sdk, print[1..].to_vec());
+    // Golden argv: stream-json both ways plus the host permission channel.
+    assert_eq!(
+        sdk,
+        vec![
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "default",
+            "--permission-prompts",
+            "host",
+            "--permission-prompt-tool",
+            "stdio",
+            "--session-id",
+            FIXED_SESSION_ID,
+        ]
+    );
+}
+
+/// The carrier claim: one child, two turns, two results, same session id.
+///
+/// A `-p` child would be gone after the first `result`, which is the whole
+/// reason print cannot be a worker carrier (§2.1, D-035). `ClaudeFlags` still
+/// parses `-p`, so this passes on the sdk argv without changing the fake.
+#[test]
+fn sdk_argv_survives_two_turns_on_one_child() {
+    let mut child = spawn_fake_claude_sdk(SpawnOptions::bundled(ScriptKind::TwoTurn))
+        .expect("spawn fake-claude");
+    child
+        .recv_until(TIMEOUT, |v| is_system_subtype(v, "init"))
+        .expect("system/init");
+
+    child.send_user("first").unwrap();
+    let first = child.recv_until(TIMEOUT, |v| is_type(v, "result")).unwrap();
+    assert_eq!(first.get("result").and_then(Value::as_str), Some("First."));
+    assert_eq!(first.get("result_index").and_then(Value::as_u64), Some(0));
+
+    // Same child, no relaunch and no resume: in-session turns are further
+    // `user` frames on the open stdin (§2.2).
+    child.send_user("second").unwrap();
+    let second = child.recv_until(TIMEOUT, |v| is_type(v, "result")).unwrap();
+    assert_eq!(
+        second.get("result").and_then(Value::as_str),
+        Some("Second.")
+    );
+    assert_eq!(second.get("result_index").and_then(Value::as_u64), Some(1));
+    assert_eq!(
+        second.get("session_id").and_then(Value::as_str),
+        first.get("session_id").and_then(Value::as_str)
+    );
+
+    let status = child.wait().unwrap();
+    assert!(status.success());
 }

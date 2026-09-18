@@ -1,0 +1,6 @@
+{"type":"assistant","message":{"id":"msg_fake_sdk_turn1","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"First."}]},"parent_tool_use_id":null,"session_id":"__SESSION__","uuid":"cccccccc-cccc-4ccc-8ccc-ccccccccccc1"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"result":"First.","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":1,"output_tokens":1},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"cccccccc-cccc-4ccc-8ccc-ccccccccccc2","result_index":0}
+{"turn":"end"}
+{"type":"assistant","message":{"id":"msg_fake_sdk_turn2","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Second."}]},"parent_tool_use_id":null,"session_id":"__SESSION__","uuid":"cccccccc-cccc-4ccc-8ccc-ccccccccccc3"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1,"duration_api_ms":1,"num_turns":2,"result":"Second.","stop_reason":"end_turn","total_cost_usd":0,"usage":{"input_tokens":2,"output_tokens":2},"modelUsage":{},"permission_denials":[],"session_id":"__SESSION__","uuid":"cccccccc-cccc-4ccc-8ccc-ccccccccccc4","result_index":1}
+{"turn":"end"}

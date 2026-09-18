@@ -30,29 +30,41 @@ function parseTs(at: string | null | undefined): number | null {
 }
 
 /**
- * The turn's *start* anchor, read from the event list rather than from the
- * latched phase: once a `turn-ended` tag latches it overwrites the
+ * The current turn's *start* anchor, read from the event list rather than from
+ * the latched phase: once a `turn-ended` tag latches it overwrites the
  * prompt-accepted `since`, and a screen clear drops the spinner `since`, so
  * neither survives into the end frame. The frozen end duration is
- * `endedAt − turnStartAnchor`, which is the turn length the terminal shows —
- * not 0:00 / time-since-end. Earliest of the hook submit tag and an active
- * screen spinner's re-anchor.
+ * `endedAt − turnStartAnchor`, the turn length the terminal shows.
+ *
+ * The current turn begins at the *latest* prompt-accepted (an earlier one
+ * belongs to a prior turn); an active spinner re-anchor at/after that submit
+ * only ever ties or moves it earlier. A screen-only session has no submit tag,
+ * so fall back to its latest active spinner anchor.
  */
 export function turnStartAnchor(events: readonly Observation[]): string | null {
-  let best: { at: number; raw: string } | null = null;
+  let promptSince: string | null = null;
+  let promptAt: number | null = null;
+  let screenSince: string | null = null;
+  let screenAt: number | null = null;
   for (const ev of events) {
     if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
     const tags = ev.payload.relatedIds ?? {};
-    const candidate =
-      ev.payload.nativeName === "live.status" && tags.liveStatus !== "0"
-        ? tags.since
-        : tags.phase === "prompt-accepted"
-          ? tags.since
-          : null;
-    const at = parseTs(candidate);
-    if (at !== null && (best === null || at < best.at)) best = { at, raw: candidate! };
+    if (tags.phase === "prompt-accepted") {
+      const at = parseTs(tags.since);
+      if (at !== null && (promptAt === null || at >= promptAt)) {
+        promptAt = at;
+        promptSince = tags.since ?? null;
+      }
+    } else if (ev.payload.nativeName === "live.status" && tags.liveStatus !== "0") {
+      const at = parseTs(tags.since);
+      if (at !== null && (screenAt === null || at >= screenAt)) {
+        screenAt = at;
+        screenSince = tags.since ?? null;
+      }
+    }
   }
-  return best?.raw ?? null;
+  if (promptSince !== null) return promptSince;
+  return screenSince;
 }
 
 /**

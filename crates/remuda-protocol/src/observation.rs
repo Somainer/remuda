@@ -420,6 +420,10 @@ pub struct WorkflowRunPayload {
     /// Aggregate counters for the card's summary rail; additive r-ux-w.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totals: Option<WorkflowTotals>,
+    /// Run launch instant (wall clock), the queue-wait origin; additive
+    /// c-wfcard. Absent on producers/journals written before the live card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launched_at: Option<Timestamp>,
     /// Live "current phase: agent" line / terminal result line; additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<WorkflowLive>,
@@ -542,6 +546,10 @@ pub struct WorkflowMemberPayload {
     /// Stop timestamp; additive r-ux-w.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<Timestamp>,
+    /// Timestamp of the agent's last transcript progress line; the idle-clock
+    /// origin. Additive c-wfcard; absent on older producers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<Timestamp>,
 }
 
 /// InteractionRequestedPayload; `protocol.md` §5.4.

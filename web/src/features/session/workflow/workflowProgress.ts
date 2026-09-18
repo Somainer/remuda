@@ -47,6 +47,22 @@ export interface WfAgent {
   calls?: number;
   /** Attempt marker; rendered only when > 1. */
   attempt?: number;
+  /** Agent spawn timestamp (epoch ms). */
+  startedAtMs?: number;
+  /** Agent stop timestamp (epoch ms); absent while running. */
+  endedAtMs?: number;
+  /** Newest agent-transcript progress timestamp (epoch ms). */
+  lastProgressAtMs?: number;
+}
+
+/** The three per-agent clocks, defined once for the card and its tests. */
+export interface WfClocks {
+  /** endedAt − startedAt; while running, now − startedAt. */
+  durationMs?: number;
+  /** endedAt (or now while running) − lastProgressAt. */
+  idleMs?: number;
+  /** startedAt − the run's launchedAt. */
+  queueMs?: number;
 }
 
 export interface WfTotals {
@@ -85,6 +101,10 @@ export interface WfPhaseView {
   queued: number;
   /** Span of the phase, last agent end − first agent start. */
   durationMs?: number;
+  /** Summed tokens across the phase's agents; undefined when none reported. */
+  tokens?: number;
+  /** Summed tool calls across the phase's agents; undefined when none reported. */
+  calls?: number;
   /** Header count, e.g. `2/4` or `5/5 完成`. */
   countText: string;
   /** Right-aligned meta, e.g. `1 运行中 · 3m 42s` / `全部排队中`. */
@@ -101,6 +121,8 @@ export interface WfCard {
   status: WfStatus;
   phases: WfPhaseView[];
   totals: WfTotals;
+  /** Run launch instant (epoch ms); the per-agent queue-wait origin. */
+  launchedAtMs?: number;
   /** 0–100 fill for the dotted progress rail. */
   railPct: number;
   /** 「当前 <phase>: <agent>」 while running. */
@@ -136,6 +158,70 @@ export function fmtDuration(ms?: number | null): string {
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${m}m ${String(s).padStart(2, "0")}s`;
+}
+
+/** Parse an RFC3339 wire timestamp to epoch ms; undefined when absent/unparseable. */
+export function tsMs(value?: string | null): number | undefined {
+  if (typeof value !== "string" || value === "") return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+const subMs = (a?: number, b?: number): number | undefined =>
+  typeof a === "number" && typeof b === "number" && a >= b ? a - b : undefined;
+
+/**
+ * The three per-agent clocks (the single definition the card renders):
+ *
+ * - duration = endedAt − startedAt, or now − startedAt while running;
+ * - idle = endedAt (or now while running) − lastProgressAt;
+ * - queue wait = startedAt − the run's launchedAt.
+ *
+ * A missing input leaves the clock `undefined` (rendered as `—`), never 0.
+ */
+export function agentClocks(agent: WfAgent, launchedAtMs: number | undefined, nowMs: number): WfClocks {
+  const running = agent.state === "running";
+  const endAnchor = running ? nowMs : agent.endedAtMs;
+  return {
+    durationMs: subMs(endAnchor, agent.startedAtMs),
+    idleMs: subMs(endAnchor, agent.lastProgressAtMs),
+    queueMs: subMs(agent.startedAtMs, launchedAtMs),
+  };
+}
+
+/**
+ * Honest running header elapsed. Two clocks can bound it and neither alone is
+ * always truthful:
+ *
+ * - `now − launchedAt` — live wall time only when the Node launched the run
+ *   itself. On the discovery path launchedAt is the instant the journal first
+ *   noticed an already-running run, so this UNDER-counts;
+ * - the producer's `totals.elapsedMs` — derived from the earliest agent start,
+ *   correct at emission but frozen between revisions, so it is extrapolated by
+ *   the wall time since the snapshot arrived.
+ *
+ * Take the larger of the two while running; when launchedAt is absent (older
+ * node streaming to the new web) the extrapolated snapshot alone keeps
+ * ticking. Returns 0 when neither clock exists, which the header hides.
+ */
+export function headerElapsed(input: {
+  running: boolean;
+  snapshotMs: number;
+  launchedAtMs?: number;
+  nowMs: number;
+  /** `now` at which snapshotMs was last observed; anchors extrapolation. */
+  snapshotAnchorMs: number;
+}): number {
+  const { running, snapshotMs, launchedAtMs, nowMs, snapshotAnchorMs } = input;
+  if (!running) return snapshotMs;
+  const candidates: number[] = [];
+  if (snapshotMs > 0) {
+    candidates.push(snapshotMs + Math.max(0, nowMs - snapshotAnchorMs));
+  }
+  if (typeof launchedAtMs === "number") {
+    candidates.push(Math.max(0, nowMs - launchedAtMs));
+  }
+  return candidates.length ? Math.max(...candidates) : 0;
 }
 
 /** Compact token count: `9.1k` / `312k` / `2.4M`. */
@@ -220,51 +306,67 @@ export function layoutRows(
   return { rows, foldIndex, folded };
 }
 
-function phaseDuration(agents: WfAgent[]): number | undefined {
-  let start = Infinity;
-  let end = 0;
+/**
+ * Real phase span: the latest agent end minus the earliest agent start.
+ *
+ * A running agent's open end is taken at `nowMs` (the card's one-second hand
+ * passes it while live). Returns undefined when no agent carries a start
+ * timestamp, so the header renders the dash instead of inventing a zero.
+ */
+export function phaseDuration(agents: WfAgent[], nowMs?: number): number | undefined {
+  let start: number | undefined;
+  let end: number | undefined;
   for (const a of agents) {
-    if (typeof a.durationMs === "number" && a.durationMs > 0) {
-      // Per-agent duration is a span; we only carry the span, so accumulate the
-      // phase as the longest observed agent span as a stable lower bound.
-      start = Math.min(start, a.durationMs);
-      end = Math.max(end, a.durationMs);
-    }
+    if (typeof a.startedAtMs !== "number") continue;
+    start = Math.min(start ?? Infinity, a.startedAtMs);
+    const anchor = a.endedAtMs ?? (a.state === "running" ? nowMs : undefined) ?? a.startedAtMs;
+    end = Math.max(end ?? -Infinity, anchor);
   }
-  if (!Number.isFinite(start)) return undefined;
-  return Math.max(start, end);
+  if (start === undefined || end === undefined) return undefined;
+  return Math.max(0, end - start);
 }
 
-function projectPhase(id: string, title: string, agents: WfAgent[]): WfPhaseView {
+/** Sum one agent metric; undefined when no agent reports it. */
+function sumMetric(agents: WfAgent[], pick: (a: WfAgent) => number | undefined): number | undefined {
+  let total: number | undefined;
+  for (const a of agents) {
+    const v = pick(a);
+    if (typeof v === "number") total = (total ?? 0) + v;
+  }
+  return total;
+}
+
+function projectPhase(id: string, title: string, agents: WfAgent[], nowMs?: number): WfPhaseView {
   const counts = countState(agents);
   const grid = agents.length > GRID_THRESHOLD;
   const { folded } = foldAgents(agents);
   const canFold = folded.length > 0;
   const total = agents.length;
   const terminal = counts.done + counts.failed + counts.killed;
+  const duration = phaseDuration(agents, nowMs);
+  const tokens = sumMetric(agents, (a) => a.tokens);
+  const calls = sumMetric(agents, (a) => a.calls);
+
+  const tail: string[] = [];
+  tail.push(fmtDuration(duration));
+  if (tokens !== undefined) tail.push(`${fmtTokens(tokens)} tokens`);
+  if (calls !== undefined) tail.push(`${calls} 次调用`);
 
   let metaText: string;
   if (total > 0 && terminal === total && counts.failed === 0 && counts.killed === 0) {
-    metaText = fmtDuration(phaseDuration(agents));
+    metaText = tail.join(" · ");
   } else if (counts.running > 0) {
-    const parts = [`${counts.running} 运行中`];
-    const d = phaseDuration(agents);
-    if (d) parts.push(fmtDuration(d));
-    metaText = parts.join(" · ");
+    metaText = [`${counts.running} 运行中`, ...tail].join(" · ");
   } else if (counts.failed > 0) {
-    const parts = [`${counts.failed} 已失败`];
-    const d = phaseDuration(agents);
-    if (d) parts.push(fmtDuration(d));
-    metaText = parts.join(" · ");
+    metaText = [`${counts.failed} 已失败`, ...tail].join(" · ");
   } else if (counts.killed > 0) {
-    const parts: string[] = [];
-    if (counts.killed) parts.push(`${counts.killed} 已终止`);
-    if (counts.queued) parts.push(`${counts.queued} 排队中`);
-    metaText = parts.join(" · ") || "已终止";
+    const head: string[] = [`${counts.killed} 已终止`];
+    if (counts.queued) head.push(`${counts.queued} 排队中`);
+    metaText = [...head, ...tail].join(" · ");
   } else if (counts.done === 0 && counts.queued === total) {
     metaText = "全部排队中";
   } else {
-    metaText = fmtDuration(phaseDuration(agents));
+    metaText = tail.join(" · ");
   }
 
   const fullyDone = total > 0 && counts.done === total;
@@ -279,7 +381,9 @@ function projectPhase(id: string, title: string, agents: WfAgent[]): WfPhaseView
     canFold,
     total,
     ...counts,
-    durationMs: phaseDuration(agents),
+    durationMs: duration,
+    tokens,
+    calls,
     countText,
     metaText,
     expandedByDefault: counts.running > 0 || counts.failed > 0 || counts.killed > 0,
@@ -342,10 +446,12 @@ export interface ProjectInput {
   members: WorkflowMemberPayload[];
   /** Phase titles in script order, keyed by phase id, when derived from meta. */
   phaseOrder?: { id: string; title: string }[];
+  /** Current wall time (epoch ms); the running card passes its 1s hand. */
+  nowMs?: number;
 }
 
 /** Build a fully-detailed card view model from protocol observations. */
-export function projectWorkflow({ run, phases, members, phaseOrder }: ProjectInput): WfCard {
+export function projectWorkflow({ run, phases, members, phaseOrder, nowMs }: ProjectInput): WfCard {
   // Decision 6: an explicit producer note (old daemon, missing run dir) means
   // phase detail cannot exist — degrade rather than drawing an empty shell.
   // An observation stream with neither phases nor members is equally flat.
@@ -388,6 +494,9 @@ export function projectWorkflow({ run, phases, members, phaseOrder }: ProjectInp
       tokens: num(u64(m.tokens)),
       calls: num(u64(m.calls)),
       attempt: num(u64(m.attempt)),
+      startedAtMs: tsMs(m.startedAt),
+      endedAtMs: tsMs(m.endedAt),
+      lastProgressAtMs: tsMs(m.lastProgressAt),
     });
   }
 
@@ -398,7 +507,7 @@ export function projectWorkflow({ run, phases, members, phaseOrder }: ProjectInp
     return fromPayload ?? fromOrder ?? `阶段 ${index + 1}`;
   };
 
-  const phaseViews = order.map((id, index) => projectPhase(id, titleOf(id, index), byPhase.get(id) ?? []));
+  const phaseViews = order.map((id, index) => projectPhase(id, titleOf(id, index), byPhase.get(id) ?? [], nowMs));
 
   const allAgents: WfAgent[] = phaseViews.flatMap((p) => [...p.pinned, ...p.head, ...p.folded]);
   const totalsPayload = run.totals;
@@ -441,6 +550,7 @@ export function projectWorkflow({ run, phases, members, phaseOrder }: ProjectInp
     status,
     phases: phaseViews,
     totals,
+    launchedAtMs: tsMs(run.launchedAt),
     railPct,
     live,
     summary: kv(run.live?.summary),

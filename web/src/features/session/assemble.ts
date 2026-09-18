@@ -631,24 +631,41 @@ export function isToolFailure(node: TranscriptNode): boolean {
   return node.type === "tool" && (node.result?.outcome === "failed" || node.result?.outcome === "denied");
 }
 
+/**
+ * A tool row carrying a live workflow timeline card that the reader has NOT
+ * dismissed. Such a row keeps its inline position exactly like a failed tool:
+ * a running or finished workflow must stay a visible live card, and only
+ * per-workflow dismissal (c-wfcard) lets it join the compact fold.
+ */
+export function isKeptWorkflow(node: TranscriptNode, dismissedWorkflowIds?: ReadonlySet<string>): boolean {
+  if (node.type !== "tool" || !node.workflow) return false;
+  return !dismissedWorkflowIds?.has(node.workflow.run.workflowId);
+}
+
 /** Compact only after a turn ends (assistant or usage). In-flight tools stay expanded. */
-export function compactTranscript(nodes: TranscriptNode[], enabled: boolean): TranscriptNode[] {
+export function compactTranscript(
+  nodes: TranscriptNode[],
+  enabled: boolean,
+  dismissedWorkflowIds?: ReadonlySet<string>,
+): TranscriptNode[] {
   if (!enabled) return nodes;
+  // Failed tools and undismissed workflow cards keep their inline position.
+  const staysOutside = (n: TranscriptNode) => isToolFailure(n) || isKeptWorkflow(n, dismissedWorkflowIds);
   const out: TranscriptNode[] = [];
   let pending: TranscriptNode[] = [];
   const compactPending = () => {
-    // Failed tools keep their inline position in `rest`; the fold only
-    // swallows successful/routine tools and thoughts.
-    const tools = pending.filter((n) => n.type === "tool" && !isToolFailure(n));
+    // Failed tools and undismissed workflow cards stay in `rest`; the fold
+    // only swallows routine tools and thoughts.
+    const tools = pending.filter((n) => n.type === "tool" && !staysOutside(n));
     const thoughts = pending.filter((n) => n.type === "thought");
-    const rest = pending.filter((n) => (n.type !== "tool" || isToolFailure(n)) && n.type !== "thought");
+    const rest = pending.filter((n) => (n.type !== "tool" || staysOutside(n)) && n.type !== "thought");
     if (tools.length + thoughts.length >= 2) {
       out.push({
         type: "compact",
         id: `compact:${tools[0]?.id ?? thoughts[0]?.id}`,
         toolCount: tools.length,
         thoughtCount: thoughts.length,
-        children: pending.filter((n) => (n.type === "tool" && !isToolFailure(n)) || n.type === "thought"),
+        children: pending.filter((n) => (n.type === "tool" && !staysOutside(n)) || n.type === "thought"),
       });
       out.push(...rest);
     } else {

@@ -35,8 +35,10 @@ export function formatStaleAge(ageMs: number): string {
  * 运行中 alone is the bug this exists to prevent: the instance header reads the
  * row's lifecycle, which says `running` right up until the Hub settles it, so a
  * frozen frame used to sit under a live-looking header with nothing to say the
- * process was gone. The badge carries the two facts the operator needs — how
- * old the frame is and why it stopped — and never claims liveness.
+ * process was gone. The badge always states the age, states the reason when it
+ * recognises the code, and never claims liveness. An unrecognised code renders
+ * the age alone: a wrong reason is worse than none, because "会话已结束" tells
+ * an operator to give up on a session that may still be running.
  */
 export function StaleScreenBadge({ stale }: { stale: TtyStale }) {
   const reason = stale.reason ? REASON_LABEL[stale.reason] : undefined;

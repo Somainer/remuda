@@ -11,10 +11,10 @@ import {
 } from "./channelHealth";
 import { isActivePhase, livePhase, toolAnchors, toolFingerprint, type LivePhaseName } from "./phase";
 import { liveStatus, phraseIsThinking } from "./liveStatus";
-import { projectTurnDecision } from "./turnDecision";
+import { projectTurnDecision, turnStartAnchor } from "./turnDecision";
 import type { TurnDecision } from "./turnEnd";
 import { usageOutputTokens } from "./liveTokens";
-import { publishToolLive, resetToolLive, useElapsed, useNow, useToolElapsed } from "./useElapsed";
+import { formatElapsed, publishToolLive, resetToolLive, useElapsed, useNow, useToolElapsed } from "./useElapsed";
 import css from "./live.module.css";
 
 /** Chinese status copy; the wire spelling stays in `data-phase`. */
@@ -199,13 +199,22 @@ export function LiveStatusStrip({
             : screenActive
               ? "working"
               : null;
-  // On an end the clock anchors at the deciding channel's end time and stops;
-  // otherwise it anchors at the turn start (hook, then screen), never later.
-  const anchor = ended
-    ? decision.endedAt
-    : earliestAnchor(phase?.since, status?.since);
+  // The clock always anchors at the turn *start* (the submit/spinner re-anchor),
+  // never at the end: on an end it freezes on the duration (endedAt − start),
+  // which is what the terminal shows, instead of collapsing to 0:00 or drifting
+  // as time-since-end on a page opened later.
+  const startAnchor = useMemo(() => turnStartAnchor(events), [events]);
+  const anchor = startAnchor ?? earliestAnchor(phase?.since, status?.since);
   const phaseHealth = phase?.tier ? health.get(phase.tier) : undefined;
-  const elapsed = useElapsed(anchor, active, phaseHealth);
+  const liveElapsed = useElapsed(anchor, active, phaseHealth);
+  const elapsed = useMemo(() => {
+    if (!ended) return liveElapsed;
+    const start = Date.parse(anchor ?? "");
+    const end = Date.parse(decision.endedAt ?? "");
+    if (Number.isNaN(start) || Number.isNaN(end) || end < start) return liveElapsed;
+    const ms = end - start;
+    return { ms, text: formatElapsed(ms), stale: false };
+  }, [ended, liveElapsed, anchor, decision.endedAt]);
   if (!ended && !waiting && !phase && !screenActive && notes.length === 0) return null;
 
   const phaseLabel = ended
@@ -259,12 +268,12 @@ export function LiveStatusStrip({
       ) : null}
       {elapsed ? (
         <span
-          className={elapsed.stale || ended ? css.elapsedStale : css.elapsed}
+          className={elapsed.stale ? css.elapsedStale : css.elapsed}
           data-testid="live-elapsed"
-          data-stale={elapsed.stale || ended ? "1" : "0"}
+          data-stale={elapsed.stale ? "1" : "0"}
           title={
             ended
-              ? "回合结束，计时已停止"
+              ? "回合结束，计时停在该回合时长"
               : elapsed.stale
                 ? "锚定该状态的通道已静默：时间仍在累计，但状态可能已经变化"
                 : "自 harness 报告该状态起经过的时间，本地 1 Hz 计时"

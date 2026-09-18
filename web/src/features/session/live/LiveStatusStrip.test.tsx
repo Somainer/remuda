@@ -211,6 +211,28 @@ describe("LiveStatusStrip", () => {
     expect(elapsed.getAttribute("data-stale")).toBe("1");
   });
 
+  it("freezes the elapsed on the turn duration at a hook end (not 0:00, not stale)", () => {
+    const frame = installRaf();
+    // Turn started 10 s ago and ended now. The latched phase is turn-ended, but
+    // the start anchor survives in the event list; the reading must be the
+    // duration, frozen, not anchored at endedAt (which would read 0:00).
+    const start = new Date(Date.now() - 10_000).toISOString();
+    const end = new Date().toISOString();
+    const events = [
+      turnLiveEvent(1, { phase: "prompt-accepted", since: start }, start),
+      turnLiveEvent(2, { phase: "turn-ended", since: end, outcome: "completed" }, end),
+    ];
+    render(<LiveStatusStrip events={events} nativeRef={ref(["hook"])} />);
+    act(() => {
+      for (let step = 0; step < 63; step += 1) frame();
+    });
+    const elapsed = screen.getByTestId("live-elapsed");
+    expect(elapsed.textContent).toBe("0:10");
+    expect(elapsed.getAttribute("data-stale")).toBe("0");
+    expect(screen.getByTestId("live-decided-by").getAttribute("data-channel")).toBe("hook");
+    expect(screen.queryByTestId("live-interrupt")).toBeNull();
+  });
+
   it("names a never-materialised expected tier explicitly (D-4), never as silence", () => {
     const at = new Date().toISOString();
     const events = [turnLiveEvent(1, { phase: "prompt-accepted", since: at }, at)];

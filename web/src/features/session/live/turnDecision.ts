@@ -23,6 +23,38 @@ function seqOf(ev: Observation): bigint {
   }
 }
 
+function parseTs(at: string | null | undefined): number | null {
+  if (!at) return null;
+  const t = Date.parse(at);
+  return Number.isNaN(t) ? null : t;
+}
+
+/**
+ * The turn's *start* anchor, read from the event list rather than from the
+ * latched phase: once a `turn-ended` tag latches it overwrites the
+ * prompt-accepted `since`, and a screen clear drops the spinner `since`, so
+ * neither survives into the end frame. The frozen end duration is
+ * `endedAt − turnStartAnchor`, which is the turn length the terminal shows —
+ * not 0:00 / time-since-end. Earliest of the hook submit tag and an active
+ * screen spinner's re-anchor.
+ */
+export function turnStartAnchor(events: readonly Observation[]): string | null {
+  let best: { at: number; raw: string } | null = null;
+  for (const ev of events) {
+    if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
+    const tags = ev.payload.relatedIds ?? {};
+    const candidate =
+      ev.payload.nativeName === "live.status" && tags.liveStatus !== "0"
+        ? tags.since
+        : tags.phase === "prompt-accepted"
+          ? tags.since
+          : null;
+    const at = parseTs(candidate);
+    if (at !== null && (best === null || at < best.at)) best = { at, raw: candidate! };
+  }
+  return best?.raw ?? null;
+}
+
 /**
  * The screen latch's own `agent_status` verdict ("idle"/"working"/"blocked"),
  * newest first. Unlike the spinner fold (`liveStatus`) this already carries

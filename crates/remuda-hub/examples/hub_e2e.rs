@@ -237,18 +237,11 @@ async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<Str
 /// `live` is the instance inventory the Node announces. A restart reports what
 /// survived it — nothing, for an in-process carrier — which is what the Hub
 /// diffs against the epoch it recorded. See `NODE_RESTART_SENTINEL`.
-fn node_hello_frame(
-    host_id: &HostId,
-    workspaces: &Value,
-    epoch: u64,
-    live: &[String],
-) -> Value {
+fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[String]) -> Value {
     let host = host_id.as_id().as_str();
     let inventory: Vec<Value> = live
         .iter()
-        .map(|instance_id| {
-            json!({ "id": instance_id, "hostId": host, "lifecycle": "running" })
-        })
+        .map(|instance_id| json!({ "id": instance_id, "hostId": host, "lifecycle": "running" }))
         .collect();
     json!({
         "jsonrpc": "2.0",
@@ -350,7 +343,9 @@ async fn fake_node(
     // "owns nothing", so "no sessions yet" is spelled `[]` deliberately.
     let mut node_epoch = 1u64;
     ws.send(Message::Text(
-        node_hello_frame(&host_id, &workspaces, node_epoch, &[]).to_string().into(),
+        node_hello_frame(&host_id, &workspaces, node_epoch, &[])
+            .to_string()
+            .into(),
     ))
     .await?;
     let hello = match ws.next().await {
@@ -1413,9 +1408,9 @@ async fn fake_node(
                     // would fail them for reasons that have nothing to do with
                     // their subject. What matters to the Hub is the hello's
                     // inventory, not what this fixture believes.
-                    if submitted.as_deref() == Some(
-                        std::str::from_utf8(NODE_RESTART_SENTINEL).unwrap_or_default(),
-                    ) {
+                    if submitted.as_deref()
+                        == Some(std::str::from_utf8(NODE_RESTART_SENTINEL).unwrap_or_default())
+                    {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         node_epoch += 1;
                         let mut survivors: Vec<String> = ttys
@@ -1791,7 +1786,8 @@ const NODE_RESTART_SENTINEL: &[u8] = b"TTYNODE_RESTART";
 /// OSC 9;4 progress sentinels (native-config, 2026-09-16). Each emits the raw
 /// ConEmu sequence plus a `tty.mode` notice carrying the parsed progress,
 /// exactly like the Node's local emulator pump.
-const TTY_PROGRESS_INDET_SENTINEL: &[u8] = b"TTYPROG_INDET";const TTY_PROGRESS_PERCENT_SENTINEL: &[u8] = b"TTYPROG_PERCENT";
+const TTY_PROGRESS_INDET_SENTINEL: &[u8] = b"TTYPROG_INDET";
+const TTY_PROGRESS_PERCENT_SENTINEL: &[u8] = b"TTYPROG_PERCENT";
 const TTY_PROGRESS_ERROR_SENTINEL: &[u8] = b"TTYPROG_ERROR";
 const TTY_PROGRESS_DONE_SENTINEL: &[u8] = b"TTYPROG_DONE";
 

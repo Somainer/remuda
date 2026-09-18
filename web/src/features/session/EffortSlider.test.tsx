@@ -234,3 +234,115 @@ describe("EffortSlider model mismatch (model-pin-1)", () => {
     expect(panel).toHaveAttribute("data-model-mismatch", "0");
   });
 });
+
+describe("EffortSlider tall catalog", () => {
+  const tallCatalog = Array.from({ length: 80 }, (_, i) => `gateway/model-${i}`);
+
+  function mountList() {
+    const onModel = vi.fn();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "gateway/model-0",
+      models: tallCatalog,
+      modelEffective: "gateway/model-0",
+      onModel,
+    });
+    return onModel;
+  }
+
+  it("renders every catalog row inside one scrollable list body", async () => {
+    const user = userEvent.setup();
+    mountList();
+    await user.click(screen.getByTestId("effort-open-list"));
+    const body = screen.getByTestId("effort-list");
+    expect(body).toHaveAttribute("data-popover-scroll", "1");
+    // The first tier row is reachable even though 80 model rows follow.
+    expect(screen.getByTestId("effort-tier-low")).toBeInTheDocument();
+    expect(screen.getByTestId("model-option-model-79")).toBeInTheDocument();
+    expect(body.querySelectorAll("button")).toHaveLength(80 + 6);
+  });
+
+  it("moves roving focus with arrow keys, Home and End", async () => {
+    const user = userEvent.setup();
+    mountList();
+    await user.click(screen.getByTestId("effort-open-list"));
+    // The selected tier row (high, index 2) opens focused.
+    expect(screen.getByTestId("effort-tier-high")).toHaveFocus();
+    await user.keyboard("{ArrowDown}");
+    expect(screen.getByTestId("effort-tier-xhigh")).toHaveFocus();
+    await user.keyboard("{End}");
+    expect(screen.getByTestId("model-option-model-79")).toHaveFocus();
+    await user.keyboard("{Home}");
+    expect(screen.getByTestId("effort-tier-low")).toHaveFocus();
+    await user.keyboard("{ArrowUp}");
+    // Clamps at the first row.
+    expect(screen.getByTestId("effort-tier-low")).toHaveFocus();
+  });
+
+  it("Enter picks the focused model row; Escape closes back to the slider", async () => {
+    const user = userEvent.setup();
+    const onModel = mountList();
+    await user.click(screen.getByTestId("effort-open-list"));
+    await user.keyboard("{End}");
+    await user.keyboard("{Enter}");
+    expect(onModel).toHaveBeenCalledWith("gateway/model-79");
+    expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");
+  });
+
+  it("lets a free-typed id through as the verbatim fallback", async () => {
+    const user = userEvent.setup();
+    const onModel = mountList();
+    await user.click(screen.getByTestId("effort-open-list"));
+    const input = screen.getByTestId("effort-model-type");
+    await user.type(input, "claude-grok-4.6{Enter}");
+    expect(onModel).toHaveBeenCalledWith("claude-grok-4.6");
+  });
+
+  it("renders model rows disabled with a why title when configure is unavailable", async () => {
+    const user = userEvent.setup();
+    const onModel = vi.fn();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "opus",
+      models: ["sonnet"],
+      onModel,
+      modelLockedReason: "会话已退出",
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    const row = screen.getByTestId("model-option-sonnet");
+    expect(row).toBeDisabled();
+    expect(row).toHaveAttribute("aria-disabled", "true");
+    expect(row.getAttribute("title")).toContain("会话已退出");
+    await user.click(row);
+    expect(onModel).not.toHaveBeenCalled();
+    expect(screen.getByTestId("effort-model-type")).toBeDisabled();
+  });
+
+  it("flags the host-fallback catalog with a one-line diagnostic", async () => {
+    const user = userEvent.setup();
+    mount({
+      kind: "claude",
+      index: 2,
+      model: "opus",
+      models: ["claude-grok-4.6"],
+      onModel: vi.fn(),
+      modelCatalog: {
+        models: ["claude-grok-4.6"],
+        source: "gateway-discovery",
+        observedAt: "2026-09-18T10:00:00Z",
+        cache: {
+          scope: "host-fallback",
+          baseUrl: "https://relay.example.invalid/v1",
+          fetchedAt: "2026-09-18T10:00:00Z",
+        },
+        discoveryEnv: true,
+      },
+    });
+    await user.click(screen.getByTestId("effort-open-list"));
+    const note = screen.getByTestId("effort-catalog-note");
+    expect(note).toHaveAttribute("data-reason", "host-fallback");
+    expect(note.textContent).toContain("主机缓存");
+  });
+});

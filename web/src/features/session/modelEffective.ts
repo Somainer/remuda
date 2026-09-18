@@ -10,11 +10,28 @@
 /** Sources the protocol attributes an effective model to. */
 export type ModelEffectiveSource = "launch" | "slash" | "remuda" | "unknown";
 
+/** Whether a Remuda switch picked an id the session's own list offered, or
+ *  typed it verbatim and let the verdict decide. */
+export type ModelSelectionPath = "listed" | "typed";
+
 /** Effective model observation view. */
 export type ModelEffectiveView = {
   id: string;
   source: ModelEffectiveSource;
   observedAt: string;
+  /** Present on a Remuda switch: listed = the id was in the session's own
+   *  resolved catalog; typed = a verbatim `/model <id>` fallback. */
+  selectionPath?: ModelSelectionPath;
+};
+
+/** Which discovery cache file answered. */
+export type ModelCacheScope = "scoped-config-dir" | "host-fallback";
+
+/** Gateway cache provenance recorded with a catalog resolution. */
+export type ModelCacheView = {
+  scope: ModelCacheScope;
+  baseUrl?: string | null;
+  fetchedAt?: string | null;
 };
 
 /** Where the model list came from. */
@@ -25,6 +42,11 @@ export type ModelCatalogView = {
   models: string[];
   source: ModelCatalogSource;
   observedAt: string;
+  /** Present for gateway-discovery answers: which cache file answered. */
+  cache?: ModelCacheView | null;
+  /** Whether CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY was in the launch
+   *  environment, when the driver could tell. */
+  discoveryEnv?: boolean | null;
 };
 
 /** Journal `model` observation payload (kept structural, not codegen-bound). */
@@ -41,8 +63,11 @@ type ModelObservationPayload = {
       models?: unknown;
       source?: string;
       observedAt?: string;
+      cache?: unknown;
+      discoveryEnv?: unknown;
     } | null;
     raw?: string | null;
+    selectionPath?: unknown;
   };
 };
 
@@ -114,6 +139,22 @@ export function modelFromRecord(value: unknown): ModelEffectiveView | null {
     id: record.id,
     source,
     observedAt: typeof record.observedAt === "string" ? record.observedAt : "",
+    selectionPath: selectionPathOf(record.selectionPath),
+  };
+}
+
+function selectionPathOf(value: unknown): ModelSelectionPath | undefined {
+  return value === "listed" || value === "typed" ? value : undefined;
+}
+
+function cacheFromRecord(value: unknown): ModelCacheView | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (record.scope !== "scoped-config-dir" && record.scope !== "host-fallback") return null;
+  return {
+    scope: record.scope,
+    baseUrl: typeof record.baseUrl === "string" ? record.baseUrl : null,
+    fetchedAt: typeof record.fetchedAt === "string" ? record.fetchedAt : null,
   };
 }
 
@@ -132,13 +173,21 @@ export function catalogFromRecord(value: unknown): ModelCatalogView | null {
     models,
     source,
     observedAt: typeof record.observedAt === "string" ? record.observedAt : "",
+    cache: cacheFromRecord(record.cache),
+    discoveryEnv: typeof record.discoveryEnv === "boolean" ? record.discoveryEnv : null,
   };
 }
 
 /** Extract effective model + optional catalog from a `model` observation. */
 export function modelFromObservation(
   observation: unknown,
-): { effective: ModelEffectiveView; catalog: ModelCatalogView | null } | null {
+): {
+  effective: ModelEffectiveView;
+  catalog: ModelCatalogView | null;
+  /** True when the payload explicitly carried a `requested` id (a launch
+   *  snapshot or a switch verdict). A catalog refresh carries none. */
+  hasRequested: boolean;
+} | null {
   const event = observation as { body?: ModelObservationPayload } | null;
   const body = event?.body;
   // Accept both a nested body and a flattened shape defensively.
@@ -146,5 +195,13 @@ export function modelFromObservation(
   if (!payload || payload.kind !== "model" || !payload.payload?.effective) return null;
   const effective = modelFromRecord(payload.payload.effective);
   if (!effective) return null;
-  return { effective, catalog: catalogFromRecord(payload.payload.catalog) };
+  // Observation-level selection path (the driver stamps it outside
+  // `effective`); honour it when the inner object did not carry one.
+  const selectionPath =
+    effective.selectionPath ?? selectionPathOf(payload.payload.selectionPath);
+  return {
+    effective: selectionPath ? { ...effective, selectionPath } : effective,
+    catalog: catalogFromRecord(payload.payload.catalog),
+    hasRequested: typeof payload.payload.requested === "string" && payload.payload.requested.length > 0,
+  };
 }

@@ -126,6 +126,42 @@ cache lands on the relay's own refresh cadence, so discovery falls back to the
 operator's conventional `~/.claude` cache for the scoped dir — the same relay
 serves both.)
 
+### 3.1 Scoped vs host fallback, re-measured 2026-09-18 (c-modelpick)
+
+The promotion-time fallback above was the root of the demo-day failure where
+the picker showed gateway ids the session's own terminal `/model` did not
+list. Measured on the live shell-pty instance:
+
+- the instance's own cache under its scoped native home
+  (`$nativeHome/cache/gateway-models.json`) is written **a beat after the
+  promotion-time resolve**; when it lands it holds **11 ids** —
+  `claude-fable-5-1`, `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`
+  and the dated 4-x ids — with **no** `[1m]` spellings and no `claude-grok-*`;
+- the operator's host fallback cache holds **75 ids** and ends with
+  `grok-4.6`, `claude-grok-4.6`, `claude-fable-5[1m]`,
+  `claude-fable-5-1[1m]`;
+- `ANTHROPIC_BASE_URL` and
+  `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` are present and identical in
+  both environments — the same base URL answers two catalogs, one scoped to
+  the session credentials and one to the operator's. So the env being correct
+  does not make the host-fallback list the session's own.
+
+The catalog therefore records which cache answered
+(`payload.catalog.cache.scope = "scoped-config-dir" | "host-fallback"`, plus
+that file's `baseUrl`/`fetchedAt`) and whether the discovery gate env was
+present (`discoveryEnv`). Both drivers (`shell_pty` promotion and
+`claude_pty`) re-resolve for up to 60 s after launch; when the scoped cache
+lands they emit a catalog-only model observation that replaces the
+frozen-at-promotion answer. The picker shows a one-line warning on a
+host-fallback list, a missing discovery env, or discovery never answering, so
+a list the terminal would reject is never presented as the session's own.
+
+An id the session's own discovery did not list is still switchable: the
+picker's verbatim input types `/model <id>` and the verdict decides, exactly
+as the configure path already did. The verdict observation carries
+`selectionPath: "listed" | "typed"` so the recorded path is visible on the
+current-model row.
+
 Resolution precedence (`remuda-driver/src/model_discovery.rs`,
 `parse_gateway_models_json` is protocol-shared so node tests share it):
 

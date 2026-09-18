@@ -1,4 +1,4 @@
-import { useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import {
   clampEffortIndex,
   defaultEffortIndex,
@@ -18,6 +18,7 @@ import {
   type EffortSelection,
   type EffortStop,
 } from "./effort";
+import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
 import css from "./session.module.css";
 import { compareModelPin } from "./modelEffective";
 
@@ -104,12 +105,52 @@ function ResetIcon() {
  * field. Codex has six native tiers ending in Max (the same static accent)
  * and Ultra (the same strongest ember field), without a workflow flag.
  */
+export type ModelCatalogNote = {
+  /** Stable machine reason, carried on data-reason. */
+  reason: "host-fallback" | "discovery-env-missing" | "discovery-unanswered";
+  /** One-line, human-readable warning. */
+  text: string;
+};
+
+/**
+ * Decide the one-line catalog diagnostic, if any. A list the session's own
+ * terminal `/model` would reject (the operator's host-fallback cache, a
+ * missing discovery gate, or discovery that never answered) is never
+ * presented as the session's own list without a mark.
+ */
+export function catalogNote(catalog: ModelCatalogView | null | undefined): ModelCatalogNote | null {
+  if (!catalog) return null;
+  if (catalog.cache?.scope === "host-fallback") {
+    const base = catalog.cache.baseUrl ? `（relay ${catalog.cache.baseUrl}）` : "";
+    return {
+      reason: "host-fallback",
+      text: `列表来自主机缓存而非本会话的发现${base}，终端 /model 可能拒绝其中的 id；直接输入会交由终端裁决`,
+    };
+  }
+  if (catalog.source === "gateway-discovery" && catalog.discoveryEnv === false) {
+    return {
+      reason: "discovery-env-missing",
+      text: "本会话环境缺少 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY，列表可能不是网关实时发现的",
+    };
+  }
+  if (catalog.source !== "gateway-discovery" && catalog.discoveryEnv === true) {
+    return {
+      reason: "discovery-unanswered",
+      text: "网关发现尚未写入本会话缓存（base URL 暂无应答）；列表来自设置/内置别名",
+    };
+  }
+  return null;
+}
+
 export function EffortSlider({
   kind,
   model,
   models,
   modelEffective,
   modelPending,
+  modelSelectionPath,
+  modelCatalog,
+  modelLockedReason = null,
   index,
   ultracode = false,
   disabled,
@@ -119,6 +160,7 @@ export function EffortSlider({
   footer = EFFORT_MENU_FOOTER,
   onChange,
   onModel,
+  onClose,
 }: {
   kind: EffortKind | string;
   /** Undefined when the harness has no model axis (agy), or when the page owns its own model field. */
@@ -128,6 +170,14 @@ export function EffortSlider({
   modelEffective?: string | null;
   /** A model switch in flight. */
   modelPending?: { id: string; queued: boolean } | null;
+  /** Whether the last Remuda-applied switch used the session's own list or
+   *  typed the id verbatim (read back from the verdict). */
+  modelSelectionPath?: ModelSelectionPath | null;
+  /** Provenance of the rendered catalog; drives the diagnostic note. */
+  modelCatalog?: ModelCatalogView | null;
+  /** When set, model rows cannot be clicked (exited / observed-only / no
+   *  configure cap) and the string says why via the row title. */
+  modelLockedReason?: string | null;
   index: number;
   /** Claude ultracode workflow flag; the rightmost slider stop sets it. */
   ultracode?: boolean;
@@ -141,6 +191,8 @@ export function EffortSlider({
   footer?: string;
   onChange: (next: EffortSelection) => void;
   onModel?: (model: string) => void;
+  /** Popover close (Escape), so focus can return to the trigger. */
+  onClose?: () => void;
 }) {
   const tid = (suffix: string) => `${idPrefix}-${suffix}`;
   const inline = variant === "inline";
@@ -171,11 +223,15 @@ export function EffortSlider({
   const currentModel = modelEffective || model || "";
   // A discovered catalog is the real `/model` picker list; the builtin aliases
   // are appended only when nothing was discovered (models prop absent).
-  const modelList = currentModel
-    ? models && models.length
-      ? dedupeModels([...models, currentModel])
-      : modelsFor(kind, [currentModel])
-    : [];
+  const modelList = useMemo(
+    () =>
+      currentModel
+        ? models && models.length
+          ? dedupeModels([...models, currentModel])
+          : modelsFor(kind, [currentModel])
+        : [],
+    [currentModel, models, kind],
+  );
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
   // A mismatch is settled state; while the requested switch is still in flight
   // (pending) the effective id is simply stale, so don't cry mismatch yet.
@@ -187,6 +243,80 @@ export function EffortSlider({
     !modelPending && model && modelEffective
       ? compareModelPin(model, modelEffective, models ?? []) === "mismatch"
       : false;
+  const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
+
+  // ── List-view roving keyboard navigation ──────────────────────────────
+  type ListRow =
+    | { kind: "tier"; key: string; tierIndex: number; disabled: boolean }
+    | { kind: "model"; key: string; id: string; disabled: boolean };
+  const listRows: ListRow[] = useMemo(() => {
+    const tiers = stops.map((s, i) => ({
+      kind: "tier" as const,
+      key: `tier:${s.name}`,
+      tierIndex: i,
+      disabled: locked,
+    }));
+    const modelsRows = modelList.map((id) => ({
+      kind: "model" as const,
+      key: `model:${id}`,
+      id,
+      disabled: Boolean(modelLockedReason),
+    }));
+    return [...tiers, ...modelsRows];
+  }, [stops, modelList, locked, modelLockedReason]);
+  const [activeRow, setActiveRow] = useState(0);
+  const rowRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  const [typeValue, setTypeValue] = useState("");
+
+  const scrollRowIntoView = (node: HTMLButtonElement) => {
+    // jsdom does not implement scrollIntoView.
+    if (typeof node.scrollIntoView === "function") {
+      node.scrollIntoView({ block: "nearest" });
+    }
+  };
+
+  const focusRow = (index: number) => {
+    setActiveRow(index);
+    const node = rowRefs.current[index];
+    if (node) {
+      node.focus();
+      // Keeps the focused row inside the scroll body with a tall catalog.
+      scrollRowIntoView(node);
+    }
+  };
+
+  // Focus the current selection (selected tier, else current model) once when
+  // the list opens, and scroll it into view.
+  useEffect(() => {
+    if (!list) return;
+    let initial = listRows.findIndex(
+      (row) => row.kind === "tier" && row.tierIndex === shown && !row.disabled,
+    );
+    if (initial < 0 && currentModel) {
+      initial = listRows.findIndex(
+        (row) =>
+          row.kind === "model" &&
+          !row.disabled &&
+          shortModel(row.id) === shortModel(currentModel),
+      );
+    }
+    if (initial < 0) initial = listRows.findIndex((row) => !row.disabled);
+    if (initial < 0) initial = 0;
+    setActiveRow(initial);
+    const handle =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame(() => {
+            rowRefs.current[initial]?.focus();
+            const node = rowRefs.current[initial];
+            if (node) scrollRowIntoView(node);
+          })
+        : null;
+    return () => {
+      if (handle != null) cancelAnimationFrame(handle);
+    };
+    // Re-arm only when the view flips; the row set for a given view is stable.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [list]);
 
   if (stops.length === 0) return null;
 
@@ -351,12 +481,62 @@ export function EffortSlider({
     </div>
   );
 
+  const onListKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const enabled = listRows
+      .map((row, index) => (row.disabled ? -1 : index))
+      .filter((index) => index >= 0);
+    if (enabled.length === 0) return;
+    const position = enabled.indexOf(activeRow);
+    const step = (delta: number) => {
+      event.preventDefault();
+      const current = position < 0 ? (delta > 0 ? -1 : enabled.length) : position;
+      const next = enabled[Math.min(enabled.length - 1, Math.max(0, current + delta))];
+      if (next != null) focusRow(next);
+    };
+    switch (event.key) {
+      case "ArrowDown":
+      case "ArrowRight":
+        step(1);
+        break;
+      case "ArrowUp":
+      case "ArrowLeft":
+        step(-1);
+        break;
+      case "Home":
+        event.preventDefault();
+        focusRow(enabled[0]);
+        break;
+      case "End":
+        event.preventDefault();
+        focusRow(enabled[enabled.length - 1]);
+        break;
+      case "Escape":
+        event.preventDefault();
+        event.stopPropagation();
+        setList(false);
+        onClose?.();
+        break;
+      default:
+        break;
+    }
+  };
+
+  const submitTypedId = () => {
+    const id = typeValue.trim();
+    if (!id || modelLockedReason) return;
+    onModel?.(id);
+    setTypeValue("");
+    setList(false);
+  };
+
   if (list) {
     return (
       <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}
         data-model-current={currentModel ? shortModel(currentModel) : ""}
         data-model-pending={modelPending ? (modelPending.queued ? "queued" : "switching") : "0"}
         data-model-mismatch={modelMismatch ? "1" : "0"}
+        data-model-path={modelSelectionPath ?? ""}
+        data-catalog-source={modelCatalog?.source ?? ""}
       >
         <div className={css.effortListHead}>
           <button
@@ -370,48 +550,98 @@ export function EffortSlider({
           </button>
           <span className={css.effortListTitle}>档位</span>
         </div>
-        <div className={css.effortListBody} data-testid={tid("list")}>
-          {stops.map((s, i) => (
-            <button
-              key={s.name}
-              type="button"
-              className={`${css.effortRow} ${i === shown ? css.effortOn : ""}`}
-              data-testid={tid(`tier-${s.name}`)}
-              data-selected={i === shown ? "1" : "0"}
-              data-effort-look={effortLook(kind, s.index, s.ultracode)}
-              data-ultracode={s.ultracode ? "1" : "0"}
-              title={s.ultracode ? ULTRACODE_HINT : s.description}
-              disabled={locked}
-              onClick={() => pickStop(i)}
+        <div
+          className={css.effortListBody}
+          data-testid={tid("list")}
+          data-popover-scroll="1"
+          role="listbox"
+          aria-label="档位与模型"
+          onKeyDown={onListKeyDown}
+        >
+          {catalogDiagnostic ? (
+            <div
+              className={css.effortCatalogNote}
+              data-testid={tid("catalog-note")}
+              data-reason={catalogDiagnostic.reason}
+              title={
+                modelCatalog?.cache?.fetchedAt
+                  ? `${catalogDiagnostic.text}（fetchedAt ${modelCatalog.cache.fetchedAt}）`
+                  : catalogDiagnostic.text
+              }
             >
-              <span className={`${css.radio} ${i === shown ? css.radioOn : ""}`} />
-              <span className={css.effortName}>{s.label ?? s.name}</span>
-              <span className={css.effortDesc}>{s.description}</span>
-            </button>
-          ))}
+              {catalogDiagnostic.text}
+            </div>
+          ) : null}
+          {stops.map((s, i) => {
+            const rowIndex = i;
+            return (
+              <button
+                key={s.name}
+                ref={(node) => {
+                  rowRefs.current[rowIndex] = node;
+                }}
+                type="button"
+                className={`${css.effortRow} ${i === shown ? css.effortOn : ""}`}
+                data-testid={tid(`tier-${s.name}`)}
+                data-selected={i === shown ? "1" : "0"}
+                data-effort-look={effortLook(kind, s.index, s.ultracode)}
+                data-ultracode={s.ultracode ? "1" : "0"}
+                title={s.ultracode ? ULTRACODE_HINT : s.description}
+                disabled={locked}
+                tabIndex={activeRow === rowIndex ? 0 : -1}
+                onFocus={() => setActiveRow(rowIndex)}
+                onClick={() => pickStop(i)}
+              >
+                <span className={`${css.radio} ${i === shown ? css.radioOn : ""}`} />
+                <span className={css.effortName}>{s.label ?? s.name}</span>
+                <span className={css.effortDesc}>{s.description}</span>
+              </button>
+            );
+          })}
           {modelList.length ? (
             <>
               <div className={css.effortListTitle}>模型</div>
-              {modelList.map((id) => {
+              {modelList.map((id, modelIndex) => {
                 const short = shortModel(id);
                 const selected = shortModel(currentModel) === short;
                 const pending = modelPendingShort === short;
+                const rowIndex = stops.length + modelIndex;
+                const pathTag =
+                  selected && modelSelectionPath
+                    ? modelSelectionPath === "typed"
+                      ? "直输 id"
+                      : "列表内"
+                    : null;
                 return (
                   <button
                     key={id}
+                    ref={(node) => {
+                      rowRefs.current[rowIndex] = node;
+                    }}
                     type="button"
                     className={css.effortRow + (selected ? ` ${css.effortOn}` : "")}
                     data-testid={`model-option-${short}`}
                     data-selected={selected ? "1" : "0"}
                     data-model-pending={pending ? (modelPending?.queued ? "queued" : "switching") : "0"}
-                    title={id}
+                    data-model-path={selected ? (modelSelectionPath ?? "") : ""}
+                    title={modelLockedReason ?? id}
+                    disabled={Boolean(modelLockedReason)}
+                    aria-disabled={Boolean(modelLockedReason)}
+                    tabIndex={activeRow === rowIndex ? 0 : -1}
+                    onFocus={() => setActiveRow(rowIndex)}
                     onClick={() => {
+                      if (modelLockedReason) return;
                       onModel?.(id);
                       setList(false);
                     }}
                   >
                     <span className={`${css.radio} ${selected ? css.radioOn : ""}`} />
                     <span className={css.effortName}>{short}</span>
+                    {pathTag ? (
+                      <span className={css.effortPathTag} data-testid="model-option-path">
+                        {pathTag}
+                      </span>
+                    ) : null}
                     {pending ? (
                       <span className={css.effortDesc} data-testid="model-option-pending">
                         {modelPending?.queued ? "排队中" : "切换中"}
@@ -423,6 +653,37 @@ export function EffortSlider({
               {modelMismatch ? (
                 <div className={css.effortDesc} data-testid="model-option-mismatch">
                   请求 {shortModel(model)} → 实际 {shortModel(modelEffective ?? undefined)}
+                </div>
+              ) : null}
+              {onModel ? (
+                <div className={css.effortTypeRow}>
+                  <input
+                    type="text"
+                    className={css.effortTypeInput}
+                    data-testid={tid("model-type")}
+                    placeholder="直接输入模型 id，回车交由终端裁决"
+                    aria-label="直接输入模型 id"
+                    value={typeValue}
+                    disabled={Boolean(modelLockedReason)}
+                    title={modelLockedReason ?? "未列出的 id：原样发送 /model <id>，由终端裁决"}
+                    onChange={(event) => setTypeValue(event.target.value)}
+                    onKeyDown={(event) => {
+                      // The listbox's arrow nav must not hijack typing.
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        submitTypedId();
+                        return;
+                      }
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        setTypeValue("");
+                        setList(false);
+                        onClose?.();
+                        return;
+                      }
+                      event.stopPropagation();
+                    }}
+                  />
                 </div>
               ) : null}
             </>

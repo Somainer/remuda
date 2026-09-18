@@ -73,12 +73,20 @@ export type Instance = EntityMeta & {
     id: string;
     source: "launch" | "slash" | "remuda" | "unknown";
     observedAt: string;
+    /** Whether a Remuda switch used the session's own list or typed the id. */
+    selectionPath?: "listed" | "typed" | null;
   } | null;
   /** §9.1 discovered switchable model list (gateway cache / settings / builtin). */
   modelCatalog?: {
     models: string[];
     source: "gateway-discovery" | "settings" | "builtin";
     observedAt: string;
+    cache?: {
+      scope: "scoped-config-dir" | "host-fallback";
+      baseUrl?: string | null;
+      fetchedAt?: string | null;
+    } | null;
+    discoveryEnv?: boolean | null;
   } | null;
   /** Effective permission mode read back from the TUI status line /
    *  transcript; absent = unobserved. The chip renders from this. */

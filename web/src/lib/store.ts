@@ -1150,7 +1150,7 @@ class HubStore {
     attachments: AttachmentRef[] = [],
     previews: BubbleAttachment[] = [],
     mode?: PromptMode,
-  ) {
+  ): Promise<boolean> {
     // Anchor mapping (D-027 + image anchors): the manifest carries the
     // [Image #n] index in token order; pair it onto the local bubble's
     // previews so the token renders as an inline thumbnail chip.
@@ -1188,6 +1188,7 @@ class HubStore {
       const events = this.state.events[instanceId] ?? [];
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
       await this.refreshScreen(instanceId).catch(() => undefined);
+      return true;
     } catch {
       // Keep `commandId: null`. The bubble is 「状态待确认」: no command id
       // to query with, and nothing here re-POSTs. Recovering the send is a
@@ -1197,6 +1198,7 @@ class HubStore {
           b.clientRequestId === clientRequestId ? { ...b, state: "unknown" } : b,
         ),
       });
+      return false;
     }
   }
 
@@ -1246,10 +1248,19 @@ class HubStore {
    * working→idle (or blocked→working/idle) transition handler. Each row loses
    * its held tag the moment its POST lands; a failed POST leaves that row as
    * 状态待确认, exactly like a direct send failure, never silently dropped.
+   *
+   * The snapshot is taken for ORDER only: a row is re-read when its turn comes,
+   * because a 插队发送 (steerHeld) or a retract can land while an earlier row's
+   * POST is still in flight — notably the blocked→working answered flush runs
+   * while every remaining row shows an enabled 插队发送. Such a row already has
+   * its own POST in flight, so posting it again here would double-send it; the
+   * fresh `held && queued` check skips it instead.
    */
   async flushHeld(instanceId: Id) {
     const items = this.heldBubbles(instanceId);
     for (const item of items) {
+      const current = this.state.bubbles.find((b) => b.clientRequestId === item.clientRequestId);
+      if (!current || !current.held || current.state !== "queued") continue;
       // Drop the hold marker before the POST so a second transition cannot
       // double-send the same row.
       this.emit({
@@ -1288,12 +1299,16 @@ class HubStore {
    * failed POST leaves the row 状态待确认 exactly like flushHeld's catch, never
    * silently dropped; a second call for the same id finds no held row and is a
    * no-op. The remaining held rows keep their order and their ordinals.
+   *
+   * Resolves `true` only once the steer POST has actually landed (so the UI can
+   * show 已打断 as a receipt rather than an intent); `false` on a no-op or a
+   * failed POST.
    */
-  async steerHeld(instanceId: Id, bubbleId: Id) {
+  async steerHeld(instanceId: Id, bubbleId: Id): Promise<boolean> {
     const item = this.state.bubbles.find(
       (b) => b.clientRequestId === bubbleId && b.instanceId === instanceId && b.held && b.state === "queued",
     );
-    if (!item) return;
+    if (!item) return false;
     this.emit({
       bubbles: this.state.bubbles.map((b) =>
         b.clientRequestId === bubbleId ? { ...b, held: false, promptMode: "steer" as const } : b,
@@ -1309,12 +1324,14 @@ class HubStore {
         ),
       });
       await this.catchup(instanceId);
+      return true;
     } catch {
       this.emit({
         bubbles: this.state.bubbles.map((b) =>
           b.clientRequestId === bubbleId ? { ...b, state: "unknown" } : b,
         ),
       });
+      return false;
     }
   }
 

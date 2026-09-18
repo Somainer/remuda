@@ -2190,6 +2190,13 @@ impl Store {
     /// Hub-owned projection only: the rows move to `exited` with `last_error`
     /// set, and no Node journal seq is forged (the Node stays the authority for
     /// its own cursor, as in [`Store::expire_lost_hosts`]).
+    ///
+    /// `requested` rows are deliberately out of scope. A create in flight is a
+    /// Hub-side intent whose Node has not acknowledged it yet, so a Node that
+    /// restarts in that window reports nothing for it without the row being
+    /// lost — settling it here would kill a create that may yet land. Those
+    /// rows have their own, age-bounded reaper:
+    /// [`Store::expire_stale_requested`].
     pub async fn reconcile_reported_instances(
         &self,
         host_id: String,
@@ -2199,7 +2206,7 @@ impl Store {
         self.run_named("reconcile_reported_instances", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM instances
-                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
+                 WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested')",
             )?;
             let live: Vec<String> = stmt
                 .query_map(params![&host_id], |row| row.get(0))?
@@ -6119,6 +6126,32 @@ mod tests {
             .expect("insert instance")
     }
 
+    /// Seed a row the Node has acknowledged, which is what a restart reconcile
+    /// is about: `insert_instance` alone leaves it `requested` — an intent no
+    /// Node has answered, which is deliberately outside that reconcile's scope.
+    async fn seed_acknowledged_instance(store: &Store, host_id: &str) -> InstanceRecord {
+        let instance = seed_instance(store, host_id).await;
+        store
+            .append_journal(
+                host_id.to_owned(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity", "entityType": "instance", "state": "ready"
+                    }
+                }),
+            )
+            .await
+            .expect("acknowledge");
+        store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row")
+    }
+
     #[tokio::test]
     async fn promoted_hook_activity_is_mirrored_without_screen_or_subagent_override() {
         let (_dir, store, host) = store_with_host("hook-activity").await;
@@ -6352,8 +6385,12 @@ mod tests {
             "a different epoch is a Node restart"
         );
 
-        let kept = seed_instance(&store, &host).await;
-        let lost = seed_instance(&store, &host).await;
+        let kept = seed_acknowledged_instance(&store, &host).await;
+        let lost = seed_acknowledged_instance(&store, &host).await;
+        // A create still in flight: the Node has not answered it, so a restart
+        // in that window says nothing about whether it was lost. Its own
+        // age-bounded reaper is what eventually settles it.
+        let in_flight = seed_instance(&store, &host).await;
         let reconciled = store
             .reconcile_reported_instances(
                 host.clone(),
@@ -6362,7 +6399,11 @@ mod tests {
             )
             .await
             .expect("reconcile");
-        assert_eq!(reconciled, vec![lost.instance_id.clone()]);
+        assert_eq!(
+            reconciled,
+            vec![lost.instance_id.clone()],
+            "only the acknowledged row the node no longer lists is lost"
+        );
         let lost = store
             .get_instance(lost.instance_id)
             .await
@@ -6375,7 +6416,19 @@ mod tests {
             .await
             .expect("get")
             .expect("row");
-        assert_eq!(kept.lifecycle, "requested");
+        assert_eq!(
+            kept.lifecycle, "running",
+            "an acknowledged row the node still lists survives unchanged"
+        );
+        let in_flight = store
+            .get_instance(in_flight.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            in_flight.lifecycle, "requested",
+            "a create in flight is not this reconcile's to settle"
+        );
         store.close().await;
     }
 

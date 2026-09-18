@@ -10,13 +10,23 @@ use std::sync::Mutex;
 /// SQLite-backed instance, command, recipe, and pending-interaction records.
 pub struct EntityDb {
     conn: Mutex<Connection>,
+    /// Whether `node.sqlite` already existed when this process opened it.
+    ///
+    /// The vouch the hello's inventory rests on. An `EntityDb` always has a
+    /// usable connection — `open` creates the file — so the connection alone
+    /// cannot tell "this store is genuinely empty" from "this store was wiped
+    /// or never was here". Only the file having been found before we opened it
+    /// says the empty enumeration is real.
+    found_existing: bool,
 }
 
 impl EntityDb {
     /// Open (or create) `<data_dir>/node.sqlite` with WAL + `synchronous=NORMAL`.
     pub fn open(data_dir: &Path) -> Result<Self, NodeError> {
         std::fs::create_dir_all(data_dir)?;
-        let conn = Connection::open(data_dir.join("node.sqlite"))?;
+        let path = data_dir.join("node.sqlite");
+        let found_existing = path.exists();
+        let conn = Connection::open(&path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(
@@ -47,7 +57,16 @@ impl EntityDb {
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
+            found_existing,
         })
+    }
+
+    /// Whether this data dir already held an instance store when it was opened.
+    ///
+    /// See [`Self::found_existing`] for why a connection is not evidence.
+    #[must_use]
+    pub fn found_existing(&self) -> bool {
+        self.found_existing
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, NodeError> {

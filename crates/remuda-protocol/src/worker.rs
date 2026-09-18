@@ -67,6 +67,18 @@ impl WorkerState {
         !matches!(self, Self::Retired)
     }
 
+    /// True while the worker is still *making progress* — dispatched, or
+    /// working its brief.
+    ///
+    /// Narrower than [`Self::is_active`], which is only "not retired". A
+    /// `done` worker has reported a sha and a `blocked` one has already said
+    /// why, so neither is a live claim that more work is coming; a caller
+    /// asking "should I interrupt this?" wants this predicate, not that one.
+    #[must_use]
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, Self::Dispatched | Self::Working)
+    }
+
     /// True for the `working` state.
     #[must_use]
     pub fn is_working(&self) -> bool {
@@ -161,8 +173,21 @@ pub enum WorkerWatchStatus {
     /// `remuda watch`'s reason column can print it: a settled
     /// `node-epoch-changed` is the one fact that tells the owner the
     /// conversation can still be resumed (2026-09-18 demo).
+    ///
+    /// Defaulted on read, because this enum is persisted verbatim inside
+    /// `worker_roster.doc_json`. Every roster row written before the field
+    /// existed is `{"status":"gone"}` with nothing else, and a required field
+    /// would make those rows fail to deserialize — which takes out the whole
+    /// roster list, and node.hello itself, since the epoch reconcile reads
+    /// worker rows.
     Gone {
         /// Machine-readable why.
+        ///
+        /// Omitted when empty rather than sent as `""`, which is what keeps the
+        /// field honest in the schema: the generator describes the *serialize*
+        /// contract, so a field that is always written is always required there
+        /// no matter how lax its reader is. Only a skip makes the two agree.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         reason: String,
     },
     /// The instance lifecycle failed (or exited after an errored turn), or the

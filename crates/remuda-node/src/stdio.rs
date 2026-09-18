@@ -186,7 +186,9 @@ where
         // forever — holding placement slots nothing can release. Enumerated
         // after `reconcile_herdr` ran at startup, so a row this Node can no
         // longer hold is already settled here rather than announced as live.
-        Some(serde_json::to_value(node.list_instances()?.items)?),
+        // A Node that cannot vouch for its own store sends `None` instead of
+        // an empty list; see `announceable_inventory`.
+        node.announceable_inventory()?,
     );
     write_ndjson(
         &mut output,

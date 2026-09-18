@@ -571,18 +571,36 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 let request = hubnode::decode_request(&frame)?;
                 let id = request.id.unwrap_or(Value::Null);
                 let params = request.params.unwrap_or(json!({}));
-                let _dispatch = shared.dispatch.lock().await;
-                if shared.controller.lock().map_err(|_| NodeError::StorePoisoned)?.generation != generation {return Ok(());}
-                let result = if !ready {
-                    Err(NodeError::InvalidRequest("Hub hello must complete before commands".into()))
-                } else if crate::interactions::is_interaction_method(&request.method) {
-                    node.dispatch_interaction(&request.method,params).await
+                // A live gate parks for minutes; holding the shared dispatch
+                // lease across it serializes every other controller's dispatch
+                // behind the whole run. Take the lease only for the takeover
+                // check, drop it, then run the gate body lease-free. `gate.cancel`
+                // is not long — it stays on the inline path so it can kill a
+                // running gate at once.
+                let long_gate = ready
+                    && !crate::interactions::is_interaction_method(&request.method)
+                    && crate::gate::is_long_gate_method(&request.method);
+                let result = if long_gate {
+                    {
+                        let _dispatch = shared.dispatch.lock().await;
+                        if shared.controller.lock().map_err(|_| NodeError::StorePoisoned)?.generation != generation {return Ok(());}
+                    }
+                    node.dispatch_gate_rpc(&request.method, &params).await
                 } else {
-                    hubnode::dispatch_method(node,&request.method,params).await
+                    let _dispatch = shared.dispatch.lock().await;
+                    if shared.controller.lock().map_err(|_| NodeError::StorePoisoned)?.generation != generation {return Ok(());}
+                    let result = if !ready {
+                        Err(NodeError::InvalidRequest("Hub hello must complete before commands".into()))
+                    } else if crate::interactions::is_interaction_method(&request.method) {
+                        node.dispatch_interaction(&request.method,params).await
+                    } else {
+                        hubnode::dispatch_method(node,&request.method,params).await
+                    };
+                    // A dispatched command settles before takeover; a blocked old
+                    // controller's response pipe must never retain this fence.
+                    drop(_dispatch);
+                    result
                 };
-                // A dispatched command settles before takeover; a blocked old
-                // controller's response pipe must never retain this fence.
-                drop(_dispatch);
                 if !id.is_null() {
                     let response = match result {
                         Ok(value) => hubnode::rpc_ok(id,value),

@@ -297,10 +297,18 @@ async fn dispatch_hub(
         // M1 batch 5a worker lifecycle RPCs over the outbound Hub link.
         Some(HubNodeMethod::WorkerProvision) => runtime.node.provision_worker(&params).await,
         Some(HubNodeMethod::WorkerRemove) => runtime.node.remove_worker(&params).await,
-        // Batch 6 lane gate runner.
-        _ if method == "gate.run" => runtime.node.run_gate(&params).await,
+        // Batch 6 lane gate runner. A live gate parks for minutes; holding the
+        // daemon dispatch lease across it serializes every other WSS dispatch
+        // behind the whole run. Drop the lease before the gate body so unrelated
+        // dispatches keep flowing — the takeover fence still held it long enough
+        // to prove this controller is current. The whole family routes through
+        // the one entry point that owns all five arms.
+        _ if crate::gate::is_long_gate_method(method) => {
+            #[cfg(unix)]
+            drop(_controller);
+            runtime.node.dispatch_gate_rpc(method, &params).await
+        }
         _ if method == "gate.cancel" => runtime.node.cancel_gate(&params).await,
-        _ if method == "gate.then" => runtime.node.run_gate_then(&params).await,
         // Everything this carrier does not need bookkeeping for goes to the
         // one dispatch table, which owns the methods and the honest "I do not
         // handle that". The `{"ok": true}` that used to live here answered for

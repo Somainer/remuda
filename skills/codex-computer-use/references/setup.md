@@ -7,7 +7,7 @@
 | 路径 | 何时用 | 入口 |
 | --- | --- | --- |
 | 原生 MCP | 宿主会话已经暴露 `list_apps` / `get_app_state`，且调用不报未认证 | 宿主 MCP 工具 |
-| cua-repl | 宿主没有这些工具，或工具返回 `Sender process is not authenticated` | [launch-cua-repl.sh](../scripts/launch-cua-repl.sh) |
+| cua-repl | 宿主没有这些工具，或工具返回 `Sender process is not authenticated` | [launch-cua-repl.sh](../scripts/launch-cua-repl.sh)（需 Remuda 按次授权，见下） |
 
 `SkyComputerUseClient mcp` 的 `initialize` / `tools/list` 可以在未认证宿主上成功。随后的 `list_apps` 会失败。不要把元数据探测当成 UI 已通。
 
@@ -39,6 +39,8 @@ Grok 或其他未注入原生 Computer Use 工具的宿主走这条路。Launche
 ```sh
 /bin/sh skills/codex-computer-use/scripts/launch-cua-repl.sh
 ```
+
+**未授权时这条命令会直接拒绝退出**（`REMUDA_CAPABILITY_COMPUTER_USE` 不是 `1`）：它求值任意 JS 并对本机每个应用持有点击、键入、按键绑定，所以只能由 Remuda 的按次授权（`--capability computer-use`）打开。没有交互式绕过；agent 不得自行导出该变量。
 
 需要：
 

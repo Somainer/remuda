@@ -29,6 +29,8 @@ description: 使用本机已安装的 Codex Computer Use 读取或操作 macOS �
 
 这是 stdio MCP（`js`、`js_reset`、`turn_ended`）。`initialize` 时声明 `capabilities.elicitation`。对 `elicitation/create`：仅当目标应用是用户点名的应用时 `accept` 且 `persist: session`；否则不要批准。
 
+**这条路径是桌面控制，默认关闭。** 它求值任意 JS 并对本机每个应用持有 `click` / `typeText` / `pressKey`。只有 Remuda 按次授权（`--capability computer-use`，会向 agent 注入 `REMUDA_CAPABILITY_COMPUTER_USE=1`）时才可用；未授权时 launcher 直接拒绝启动并说明原因，没有交互式绕过。会话没有这个能力时不要重试、不要自己导出该变量，报告需要的能力即可。
+
 用 `tools/call` 的 `js` 执行：
 
 ```js

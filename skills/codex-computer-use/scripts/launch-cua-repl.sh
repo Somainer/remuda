@@ -1,7 +1,21 @@
 #!/bin/sh
 # Codex Computer Use JS surface (cua_repl). Use when the native Sky MCP
 # helper rejects the host as unauthenticated. Does not copy the app.
+#
+# This launcher grants desktop control: the REPL it starts evaluates
+# arbitrary JS with click / typeText / pressKey bindings over every app on
+# the operator's desktop. It therefore refuses to start unless a Remuda
+# launch explicitly requested the capability, which is signalled by
+# injecting REMUDA_CAPABILITY_COMPUTER_USE=1 into the child environment.
 set -eu
+
+if [ "${REMUDA_CAPABILITY_COMPUTER_USE:-}" != "1" ]; then
+  echo 'codex-computer-use: refusing to start the cua-repl desktop-control surface.' >&2
+  echo 'It evaluates arbitrary JS with click/typeText/pressKey over every app on this desktop.' >&2
+  echo 'A Remuda launch grants it with --capability computer-use, which sets' >&2
+  echo 'REMUDA_CAPABILITY_COMPUTER_USE=1 for the agent. There is no interactive bypass.' >&2
+  exit 1
+fi
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo 'codex-computer-use: cua-repl launcher requires macOS.' >&2

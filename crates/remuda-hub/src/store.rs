@@ -1,17 +1,27 @@
-//! Single-writer SQLite actor. Connections never cross `.await`.
+//! Single-writer SQLite actor with a read-only reader pool beside it.
+//!
+//! Writes and short point reads run on one connection on the `remuda-hub-sqlite`
+//! thread, so they serialise and never collide. Reads that can be long — a
+//! journal window, an attachment blob, a list the web boot waits on — run on a
+//! small pool of `SQLITE_OPEN_READ_ONLY` connections instead (hub-store-1).
+//! WAL and a busy timeout already made concurrent readers legal at the SQLite
+//! level; before the pool existed the Hub simply never opened a second
+//! connection, so a one-row `SELECT` queued behind whatever long job was
+//! already running. Connections never cross `.await`.
 
 use crate::config::{new_id, now_rfc3339};
 use crate::provider_models::{self, ProviderModel};
-use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 #[cfg(test)]
 #[path = "store_auth_tests.rs"]
@@ -52,6 +62,40 @@ fn sqlite_is_busy(err: &rusqlite::Error) -> bool {
 
 const BUSY_WAIT: Duration = Duration::from_secs(5);
 
+/// Read-only connections opened beside the writer. Four is enough to keep the
+/// web boot's parallel list reads and a screen envelope off each other without
+/// turning the page cache into a memory problem.
+const READERS: usize = 4;
+
+/// A store job slower than this gets a `warn` naming it. Evidence for the next
+/// stall, not a cancellation: the job still runs to completion.
+const SLOW_JOB: Duration = Duration::from_secs(1);
+
+/// Rows one `read_journal` window may carry.
+pub const JOURNAL_WINDOW_ROWS: i64 = 2_000;
+
+/// Bytes of raw event JSON one `read_journal` window may carry. Trips before
+/// [`JOURNAL_WINDOW_ROWS`] when a busy instance mirrors large payloads.
+pub const JOURNAL_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+
+/// Events folded into one writer job by a multi-event `journal.append` frame.
+/// 64 is roughly 100 ms of projection work and small enough that the writer
+/// reaches the next queued job — a point read, another host's ingest — between
+/// chunks instead of monopolising the connection for a whole 256-event page.
+pub const APPEND_CHUNK_MAX: usize = 64;
+
+/// Log a `warn` when `name` took longer than [`SLOW_JOB`].
+fn note_slow(name: &'static str, kind: &'static str, elapsed: Duration) {
+    if elapsed >= SLOW_JOB {
+        tracing::warn!(
+            job = name,
+            kind,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "hub store job exceeded budget"
+        );
+    }
+}
+
 enum Job {
     Run(Box<dyn FnOnce(&mut Connection) + Send>),
     Stop(std::sync::mpsc::Sender<()>),
@@ -71,10 +115,58 @@ impl Drop for StoreJoin {
     }
 }
 
+/// Read-only connections handed out one at a time under a semaphore.
+///
+/// A connection is created on first use and parked back in `idle` afterwards,
+/// so a Hub that never serves a long read never opens one. `closed` makes the
+/// pool refuse new work after [`Store::close`] has checkpointed the WAL, so a
+/// late reader cannot reopen the file behind the writer's back.
+struct ReaderPool {
+    path: PathBuf,
+    permits: Semaphore,
+    idle: Mutex<Vec<Connection>>,
+    closed: AtomicBool,
+}
+
+impl ReaderPool {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            permits: Semaphore::new(READERS),
+            idle: Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Take an idle connection, or open a fresh read-only one.
+    fn take(&self) -> Result<Connection, StoreError> {
+        if let Ok(mut idle) = self.idle.lock()
+            && let Some(conn) = idle.pop()
+        {
+            return Ok(conn);
+        }
+        open_reader(&self.path).map_err(StoreError::from)
+    }
+
+    /// Park a connection for reuse; a pool at capacity just drops it.
+    fn put(&self, conn: Connection) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(mut idle) = self.idle.lock()
+            && idle.len() < READERS
+        {
+            idle.push(conn);
+        }
+    }
+}
+
 /// Handle to the Hub database writer.
 #[derive(Clone)]
 pub struct Store {
     tx: std::sync::mpsc::Sender<Job>,
+    /// Read-only connections for reads that can be long (hub-store-1).
+    readers: Arc<ReaderPool>,
     /// Joins the writer thread after the last clone drops its channel sender.
     _join: Arc<StoreJoin>,
 }
@@ -1058,21 +1150,32 @@ impl InteractionRecord {
 }
 
 impl Store {
-    /// Open (or create) `hub.sqlite` on a dedicated writer thread.
+    /// Open (or create) `hub.sqlite` on a dedicated writer thread, plus a
+    /// read-only pool for reads that can be long (hub-store-1).
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(data_dir).map_err(|err| StoreError::Id(err.to_string()))?;
         let path = data_dir.join("hub.sqlite");
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        // Readers open `SQLITE_OPEN_READ_ONLY`, which cannot create the file or
+        // the schema. Wait for the writer to finish `open_conn` before handing
+        // back a Store, so the first read cannot race schema creation.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let writer_path = path.clone();
         let thread = thread::Builder::new()
             .name("remuda-hub-sqlite".into())
             .spawn(move || {
-                let mut conn = match open_conn(&path) {
-                    Ok(conn) => conn,
+                let mut conn = match open_conn(&writer_path) {
+                    Ok(conn) => {
+                        let _ = ready_tx.send(Ok(()));
+                        conn
+                    }
                     Err(err) => {
                         tracing::error!(error = %err, "hub sqlite open failed");
+                        let _ = ready_tx.send(Err(err.to_string()));
                         return;
                     }
                 };
+                drop(ready_tx);
                 while let Ok(job) = rx.recv() {
                     match job {
                         Job::Run(work) => work(&mut conn),
@@ -1087,16 +1190,28 @@ impl Store {
                 let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             })
             .map_err(|err| StoreError::Id(err.to_string()))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(StoreError::Id(err)),
+            Err(_) => return Err(StoreError::Closed),
+        }
         Ok(Self {
             tx,
+            readers: Arc::new(ReaderPool::new(path)),
             _join: Arc::new(StoreJoin {
                 thread: Mutex::new(Some(thread)),
             }),
         })
     }
 
-    /// Finish in-flight jobs, checkpoint WAL, and close the writer connection.
+    /// Finish in-flight jobs, checkpoint WAL, and close every connection.
     pub async fn close(&self) {
+        // Readers hold their own file handles, and a live reader keeps the WAL
+        // from truncating. Retire them before asking the writer to checkpoint.
+        self.readers.closed.store(true, Ordering::Release);
+        if let Ok(mut idle) = self.readers.idle.lock() {
+            idle.clear();
+        }
         let (done, rx) = std::sync::mpsc::channel();
         if self.tx.send(Job::Stop(done)).is_err() {
             return;
@@ -1104,18 +1219,64 @@ impl Store {
         let _ = tokio::task::spawn_blocking(move || rx.recv_timeout(BUSY_WAIT)).await;
     }
 
-    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T, StoreError>
+    /// Run one job on the writer thread.
+    ///
+    /// Every job carries a static `name` so the slow-job budget (see
+    /// [`note_slow`]) can name the culprit in a `warn`. Time covers queue wait
+    /// plus execution — queue wait is the stall this exists to expose — so it
+    /// starts at the send, not when the writer picks the job up.
+    pub(crate) async fn run_named<T, F>(&self, name: &'static str, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
+        // Queue wait is the symptom this budget exists to expose, so time from
+        // the send, not from the moment the writer picks the job up.
+        let queued = Instant::now();
         self.tx
             .send(Job::Run(Box::new(move |conn| {
                 let _ = tx.send(f(conn));
             })))
             .map_err(|_| StoreError::Closed)?;
-        rx.await.map_err(|_| StoreError::Closed)?
+        let out = rx.await.map_err(|_| StoreError::Closed)?;
+        note_slow(name, "write", queued.elapsed());
+        out
+    }
+
+    /// Run a read on the read-only pool instead of the writer thread.
+    ///
+    /// For reads that can be long: a journal window, an attachment blob, a list
+    /// the web boot gate waits on. A read here never delays a write, and a
+    /// write never delays it (hub-store-1). Use [`Store::run`] for writes and
+    /// for short point reads that want the writer's own connection.
+    pub(crate) async fn read<T, F>(&self, name: &'static str, f: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        let queued = Instant::now();
+        if self.readers.closed.load(Ordering::Acquire) {
+            return Err(StoreError::Closed);
+        }
+        let permit = self
+            .readers
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| StoreError::Closed)?;
+        let readers = Arc::clone(&self.readers);
+        let out = tokio::task::spawn_blocking(move || {
+            let conn = readers.take()?;
+            let out = f(&conn);
+            readers.put(conn);
+            out
+        })
+        .await
+        .map_err(|_| StoreError::Closed)?;
+        drop(permit);
+        note_slow(name, "read", queued.elapsed());
+        out
     }
 
     /// Insert a device token hash.
@@ -1138,7 +1299,7 @@ impl Store {
         kind: String,
         instance_id: Option<String>,
     ) -> Result<Device, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_device_as", move |conn| {
             let id = new_id("dev").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
             conn.execute(
@@ -1167,7 +1328,7 @@ impl Store {
         };
         let lookup_prefix = prefix.clone();
         let candidate = self
-            .run(move |conn| {
+            .run_named("find_device_by_token", move |conn| {
                 let read_row = |row: &rusqlite::Row<'_>| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 };
@@ -1201,7 +1362,7 @@ impl Store {
         let Some((id, hash)) = verified else {
             return Ok(None);
         };
-        self.run(move |conn| {
+        self.run_named("find_device_by_token", move |conn| {
             // Revocation or hash replacement while verification was in
             // flight must reject. Read scope now, not from the old snapshot.
             let device = conn
@@ -1247,7 +1408,7 @@ impl Store {
     where
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("authenticate_host", move |conn| {
             let prefix = crate::auth::token_prefix(&request.presented);
             let read_row = |row: &rusqlite::Row<'_>| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1324,7 +1485,7 @@ impl Store {
         created_by: String,
         expires_at: String,
     ) -> Result<String, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_enroll_token", move |conn| {
             let prefix = token_prefix;
             let id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
             conn.execute(
@@ -1352,7 +1513,7 @@ impl Store {
     /// instance's quota. Expired rows for that instance are swept first, which
     /// is the whole of the MVP's garbage collection — no cron.
     pub async fn insert_object(&self, new: NewObject) -> Result<ObjectRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_object", move |conn| {
             let now = now_rfc3339();
             let tx = conn.transaction()?;
             tx.execute(
@@ -1429,16 +1590,18 @@ impl Store {
         .await
     }
 
-    /// Attachment metadata without its bytes.
+    /// Attachment metadata without its bytes. On the reader pool: it always
+    /// precedes a blob read, and the pair should not straddle two queues.
     pub async fn get_object(&self, id: String) -> Result<Option<ObjectRecord>, StoreError> {
-        self.run(move |conn| load_object(conn, &id)).await
+        self.read("get_object", move |conn| load_object(conn, &id))
+            .await
     }
 
     /// Record the 1-based `[Image #n]` anchor a send assigned to each object
     /// (2026-09-15). Drives the order `remuda_attachments_list` reports to the
     /// in-session agent. Runs in the same HTTP call that validated the send.
     pub async fn tag_object_anchors(&self, entries: Vec<(String, i64)>) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("tag_object_anchors", move |conn| {
             for (object_id, anchor) in &entries {
                 conn.execute(
                     "UPDATE objects SET anchor = ?1 WHERE id = ?2",
@@ -1450,9 +1613,10 @@ impl Store {
         .await
     }
 
-    /// Staged bytes, or `None` when the row is gone.
+    /// Staged bytes, or `None` when the row is gone. On the reader pool: an
+    /// attachment blob is the longest single read the Hub serves.
     pub async fn read_object_bytes(&self, id: String) -> Result<Option<Vec<u8>>, StoreError> {
-        self.run(move |conn| {
+        self.read("read_object_bytes", move |conn| {
             conn.query_row(
                 "SELECT bytes FROM objects WHERE id = ?1",
                 params![id],
@@ -1475,7 +1639,7 @@ impl Store {
     where
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("find_host_by_token", move |conn| {
             let Some(prefix) = crate::auth::token_prefix(&token) else {
                 return Ok(None);
             };
@@ -1495,7 +1659,7 @@ impl Store {
 
     /// Mark every host offline. Hub restart has no live Node links until hello.
     pub async fn mark_all_hosts_offline(&self) -> Result<(), StoreError> {
-        self.run(|conn| {
+        self.run_named("mark_all_hosts_offline", |conn| {
             conn.execute(
                 // SSH inventory is collected at connect, so last_seen_at may
                 // predate a still-live carrier. Start its lost grace at restart.
@@ -1531,7 +1695,7 @@ impl Store {
 
     /// Mark a host offline when its WS drops.
     pub async fn mark_host_offline(&self, host_id: String) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("mark_host_offline", move |conn| {
             conn.execute(
                 "UPDATE hosts SET state = 'offline', offline_since = ?2 WHERE id = ?1 AND state = 'online'",
                 params![&host_id, now_rfc3339()],
@@ -1548,7 +1712,7 @@ impl Store {
 
     /// Hub-owned projection only: never forge a Node journal cursor or native completion.
     pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
-        self.run(move |conn| {
+        self.run_named("expire_lost_hosts", move |conn| {
             let changed = conn.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
@@ -1574,7 +1738,7 @@ impl Store {
         subject: Option<String>,
         detail: Value,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("append_audit", move |conn| {
             conn.execute(
                 "INSERT INTO audit_log (device_id, action, subject, detail_json, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1593,7 +1757,7 @@ impl Store {
 
     /// Audit rows for one subject, oldest first (tests and support queries).
     pub async fn audit_for(&self, subject: String) -> Result<Vec<Value>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("audit_for", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT device_id, action, subject, detail_json, created_at
                  FROM audit_log WHERE subject = ?1 ORDER BY id",
@@ -1630,7 +1794,7 @@ impl Store {
         aaguid: Option<String>,
         created_by: String,
     ) -> Result<PasskeyRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_passkey", move |conn| {
             let id = new_id("cred").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
             conn.execute(
@@ -1679,7 +1843,7 @@ impl Store {
     /// All registered credentials, newest first. A single-operator Hub keeps
     /// this list short; lookups by credential id are indexed.
     pub async fn list_passkeys(&self) -> Result<Vec<PasskeyRecord>, StoreError> {
-        self.run(|conn| {
+        self.read("list_passkeys", |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, credential_id, public_key, counter, transports, name, aaguid,
                         created_by, created_at, last_used_at
@@ -1699,7 +1863,7 @@ impl Store {
         credential_id: &str,
     ) -> Result<Option<PasskeyRecord>, StoreError> {
         let credential_id = credential_id.to_string();
-        self.run(move |conn| {
+        self.run_named("passkey_by_credential_id", move |conn| {
             conn.query_row(
                 "SELECT id, credential_id, public_key, counter, transports, name, aaguid,
                         created_by, created_at, last_used_at
@@ -1720,7 +1884,7 @@ impl Store {
         public_key: String,
         counter: i64,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("touch_passkey", move |conn| {
             conn.execute(
                 "UPDATE passkeys SET public_key = ?2, counter = ?3, last_used_at = ?4
                  WHERE id = ?1",
@@ -1737,7 +1901,7 @@ impl Store {
         id: String,
         name: String,
     ) -> Result<Option<PasskeyRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("rename_passkey", move |conn| {
             let updated = conn.execute(
                 "UPDATE passkeys SET name = ?2 WHERE id = ?1",
                 params![id, name],
@@ -1762,7 +1926,7 @@ impl Store {
     /// Delete one credential. `false` when it was already gone, keeping
     /// `DELETE` idempotent.
     pub async fn delete_passkey(&self, id: String) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("delete_passkey", move |conn| {
             Ok(conn.execute("DELETE FROM passkeys WHERE id = ?1", params![id])? != 0)
         })
         .await
@@ -1770,7 +1934,7 @@ impl Store {
 
     /// Base64url credential ids for register excludeCredentials.
     pub async fn passkey_credential_ids(&self) -> Result<Vec<String>, StoreError> {
-        self.run(|conn| {
+        self.run_named("passkey_credential_ids", |conn| {
             let mut stmt = conn.prepare("SELECT credential_id FROM passkeys")?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
@@ -1791,7 +1955,7 @@ impl Store {
     /// with it: leaving any of them behind would resurrect the session in a
     /// list view or keep a command queued against an id that no longer exists.
     pub async fn delete_instance(&self, instance_id: String) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("delete_instance", move |conn| {
             let Some(instance) = load_instance(conn, &instance_id)? else {
                 return Ok(false);
             };
@@ -1849,7 +2013,7 @@ impl Store {
         native_name: String,
         message: String,
     ) -> Result<Option<JournalRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("append_hub_diagnostic", move |conn| {
             let Some(instance) = load_instance(conn, &instance_id)? else {
                 return Ok(None);
             };
@@ -1903,7 +2067,7 @@ impl Store {
         host_id: String,
         epoch: Option<String>,
     ) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("record_node_epoch", move |conn| {
             let Some(epoch) = epoch.filter(|value| !value.is_empty()) else {
                 return Ok(false);
             };
@@ -1935,7 +2099,7 @@ impl Store {
         reported: Vec<String>,
         reason: String,
     ) -> Result<Vec<String>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("reconcile_reported_instances", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM instances
                  WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
@@ -1970,7 +2134,7 @@ impl Store {
         &self,
         window_ms: u64,
     ) -> Result<Vec<(String, String)>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("expire_stale_requested", move |conn| {
             let now = now_rfc3339();
             let window = window_ms.min(i64::MAX as u64) as i64;
             let mut stmt = conn.prepare(
@@ -2007,7 +2171,7 @@ impl Store {
         instance_id: String,
         reason: String,
     ) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("settle_instance_exited", move |conn| {
             let changed = conn.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
                     last_error = ?1, updated_at = ?2
@@ -2026,7 +2190,7 @@ impl Store {
         update: crate::inventory::HostInventoryUpdate,
         capabilities: Option<Value>,
     ) -> Result<HostRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("apply_inventory", move |conn| {
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE hosts SET last_seen_at = ?1, state = CASE WHEN EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) THEN state ELSE 'online' END, offline_since = NULL WHERE id = ?2 AND state != 'retired'",
@@ -2114,7 +2278,7 @@ impl Store {
         host_id: String,
         mut resources: Value,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("set_host_resources", move |conn| {
             let now = now_rfc3339();
             stamp_resources_sampled_at(&mut resources, &now);
             conn.execute(
@@ -2128,7 +2292,7 @@ impl Store {
 
     /// All hosts.
     pub async fn list_hosts(&self) -> Result<Vec<HostRecord>, StoreError> {
-        self.run(|conn| {
+        self.read("list_hosts", |conn| {
             let mut stmt = conn.prepare("SELECT id FROM hosts ORDER BY created_at")?;
             let ids: Vec<String> = stmt
                 .query_map([], |row| row.get(0))?
@@ -2146,7 +2310,8 @@ impl Store {
 
     /// One host.
     pub async fn get_host(&self, host_id: String) -> Result<Option<HostRecord>, StoreError> {
-        self.run(move |conn| load_host(conn, &host_id)).await
+        self.run_named("get_host", move |conn| load_host(conn, &host_id))
+            .await
     }
 
     /// Insert an instance index row.
@@ -2183,7 +2348,7 @@ impl Store {
         spec: Value,
         delegation: InstanceDelegation,
     ) -> Result<InstanceRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_instance_delegated", move |conn| {
             let host =
                 load_host(conn, &host_id)?.ok_or_else(|| StoreError::Id("unknown host".into()))?;
             let running: i64 = conn.query_row(
@@ -2267,7 +2432,7 @@ impl Store {
         driver: String,
         session_id: String,
     ) -> Result<Option<InstanceRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("find_resume_child", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM instances
                  WHERE driver = ?1 AND lifecycle NOT IN ('exited', 'failed')
@@ -2306,7 +2471,7 @@ impl Store {
         host_id: String,
         instance_id: String,
     ) -> Result<InstanceRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("ensure_instance", move |conn| {
             if is_deleted_instance(conn, &instance_id)? {
                 return Err(StoreError::Id(format!(
                     "instance {instance_id} was deleted"
@@ -2340,7 +2505,7 @@ impl Store {
         instance_id: String,
         last_error: String,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("fail_instance", move |conn| {
             conn.execute(
                 "UPDATE instances
                  SET lifecycle = 'failed', last_error = ?1, updated_at = ?2
@@ -2352,12 +2517,13 @@ impl Store {
         .await
     }
 
-    /// List instances, optionally filtered by host.
+    /// List instances, optionally filtered by host. On the reader pool: the web
+    /// boot gate waits on this list.
     pub async fn list_instances(
         &self,
         host_id: Option<String>,
     ) -> Result<Vec<InstanceRecord>, StoreError> {
-        self.run(move |conn| {
+        self.read("list_instances", move |conn| {
             let sql = if host_id.is_some() {
                 "SELECT id FROM instances WHERE host_id = ?1 ORDER BY updated_at DESC"
             } else {
@@ -2387,8 +2553,10 @@ impl Store {
         &self,
         instance_id: String,
     ) -> Result<Option<InstanceRecord>, StoreError> {
-        self.run(move |conn| load_instance(conn, &instance_id))
-            .await
+        self.run_named("get_instance", move |conn| {
+            load_instance(conn, &instance_id)
+        })
+        .await
     }
 
     /// Merge model / effort into the instance spec so reload and list rows see them.
@@ -2397,7 +2565,7 @@ impl Store {
         instance_id: String,
         payload: Value,
     ) -> Result<InstanceRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("patch_instance_configure", move |conn| {
             let spec_raw: String = conn.query_row(
                 "SELECT spec_json FROM instances WHERE id = ?1",
                 params![instance_id],
@@ -2473,7 +2641,7 @@ impl Store {
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<(CommandRecord, bool), StoreError> {
-        self.run(move |conn| {
+        self.run_named("queue_command", move |conn| {
             if let Some(key) = idempotency_key.as_ref()
                 && let Some(existing) = load_command_by_key(conn, key)?
             {
@@ -2523,7 +2691,7 @@ impl Store {
 
     /// Persist forward intent. Returns false if already forwarded (do not resend).
     pub async fn mark_forward_intent(&self, command_id: String) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("mark_forward_intent", move |conn| {
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
             };
@@ -2546,7 +2714,7 @@ impl Store {
     /// to the mirrored journal — `unknown → reconciling` — from which the
     /// journaled accept wins and flips resolution back to `clear`.
     pub async fn mark_reconciling(&self, command_id: String) -> Result<CommandRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("mark_reconciling", move |conn| {
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE commands SET resolution = 'reconciling', updated_at = ?1
@@ -2573,7 +2741,7 @@ impl Store {
         instance_id: String,
         driver: String,
     ) -> Result<Option<String>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("reconcile_instance_driver", move |conn| {
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE instances SET driver = ?1, updated_at = ?2 WHERE id = ?3 AND driver != ?1",
@@ -2592,7 +2760,7 @@ impl Store {
 
     /// Node RPC success → `accepted`.
     pub async fn mark_accepted(&self, command_id: String) -> Result<CommandRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("mark_accepted", move |conn| {
             let now = now_rfc3339();
             conn.execute(
                 "UPDATE commands SET state = 'accepted', resolution = 'clear', updated_at = ?1
@@ -2609,7 +2777,7 @@ impl Store {
         &self,
         command_id: String,
     ) -> Result<Option<CommandRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("mark_settlement_timed_out", move |conn| {
             let now = now_rfc3339();
             let changed = conn.execute(
                 "UPDATE commands SET resolution = 'unknown', updated_at = ?1
@@ -2630,7 +2798,7 @@ impl Store {
         command_id: String,
         host_id: String,
     ) -> Result<CommandRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("mark_settled", move |conn| {
             let Some(row) = load_command(conn, &command_id)? else {
                 return Err(StoreError::Id("unknown command".into()));
             };
@@ -2653,7 +2821,8 @@ impl Store {
         &self,
         command_id: String,
     ) -> Result<Option<CommandRecord>, StoreError> {
-        self.run(move |conn| load_command(conn, &command_id)).await
+        self.run_named("get_command", move |conn| load_command(conn, &command_id))
+            .await
     }
 
     /// Append a mirrored event. `seq` None assigns durableSeq+1.
@@ -2662,65 +2831,62 @@ impl Store {
         host_id: String,
         instance_id: String,
         seq: Option<i64>,
-        mut event: Value,
+        event: Value,
     ) -> Result<JournalAppend, StoreError> {
-        self.run(move |conn| {
+        self.run_named("append_journal", move |conn| {
             let inst = load_instance(conn, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
             if inst.host_id != host_id {
                 return Err(StoreError::Id("instance belongs to another host".into()));
             }
-            let next = inst.durable_seq.parse::<i64>().unwrap_or(0) + 1;
-            let seq = seq.unwrap_or(next);
             let durable = inst.durable_seq.parse::<i64>().unwrap_or(0);
-            if let Some(existing) = load_journal_row(conn, &instance_id, seq)? {
-                apply_interaction_event(conn, &host_id, &instance_id, &existing.event)?;
-                return Ok(JournalAppend {
-                    record: existing,
-                    replayed: true,
-                    durable_seq: durable,
-                });
+            let mut cursor = AppendCursor::new(durable, seq);
+            append_loaded_event(conn, &host_id, &instance_id, &mut cursor, event)
+        })
+        .await
+    }
+
+    /// Append one chunk of a frame's events in a single writer job /
+    /// transaction.
+    ///
+    /// The ws layer cuts a multi-event frame into chunks of
+    /// [`APPEND_CHUNK_MAX`] and awaits each call, so a 256-event replay costs a
+    /// handful of short jobs the writer can yield between rather than 256 jobs
+    /// (or one job holding the connection for the whole frame) (hub-store-1).
+    ///
+    /// Per-event sequence checks, replay handling and the watermark are
+    /// identical to [`Store::append_journal`]; the only difference is
+    /// atomicity — a gap on any event rolls the whole chunk back instead of
+    /// leaving a partial prefix durable. Returns one [`JournalAppend`] per
+    /// input event, in seq order.
+    pub async fn append_journal_batch(
+        &self,
+        host_id: String,
+        instance_id: String,
+        first_seq: Option<i64>,
+        events: Vec<Value>,
+    ) -> Result<Vec<JournalAppend>, StoreError> {
+        self.run_named("append_journal_batch", move |conn| {
+            let tx = conn.transaction()?;
+            let inst = load_instance(&tx, &instance_id)?
+                .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
+            if inst.host_id != host_id {
+                return Err(StoreError::Id("instance belongs to another host".into()));
             }
-            if seq != next {
-                return Err(StoreError::Id(format!(
-                    "journal gap: expected {next}, got {seq}"
-                )));
-            }
-            let event_id = event
-                .get("eventId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| new_id("evt").unwrap_or_else(|_| "evt_missing".into()));
-            if let Some(obj) = event.as_object_mut() {
-                obj.entry("eventId".to_string())
-                    .or_insert_with(|| json!(event_id.clone()));
-                obj.entry("seq".to_string())
-                    .or_insert_with(|| json!(seq.to_string()));
-                obj.entry("instanceId".to_string())
-                    .or_insert_with(|| json!(instance_id.clone()));
-            }
-            let now = now_rfc3339();
-            conn.execute(
-                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![instance_id, seq, event_id, event.to_string(), now],
-            )?;
-            apply_instance_projection(conn, &instance_id, &event, seq, &now)?;
-            apply_native_session_projection(conn, &instance_id, &event, &now)?;
-            apply_command_projection(conn, &host_id, &instance_id, &event, &now)?;
-            apply_interaction_event(conn, &host_id, &instance_id, &event)?;
-            apply_instance_lifecycle(conn, &instance_id, &event)?;
-            Ok(JournalAppend {
-                record: JournalRecord {
-                    instance_id,
-                    seq,
-                    event_id,
+            let mut cursor =
+                AppendCursor::new(inst.durable_seq.parse::<i64>().unwrap_or(0), first_seq);
+            let mut out = Vec::with_capacity(events.len());
+            for event in events {
+                out.push(append_loaded_event(
+                    &tx,
+                    &host_id,
+                    &instance_id,
+                    &mut cursor,
                     event,
-                    observed_at: now,
-                },
-                replayed: false,
-                durable_seq: seq,
-            })
+                )?);
+            }
+            tx.commit()?;
+            Ok(out)
         })
         .await
     }
@@ -2730,7 +2896,7 @@ impl Store {
         &self,
         host_id: String,
     ) -> Result<Vec<InstanceWatermark>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_instance_watermarks", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, journal_id, durable_seq FROM instances WHERE host_id = ?1 ORDER BY id",
             )?;
@@ -2748,7 +2914,8 @@ impl Store {
         .await
     }
 
-    /// Pending interactions, optionally filtered.
+    /// Pending interactions, optionally filtered. On the reader pool: the web
+    /// boot gate waits on this list, so it must not queue behind ingest.
     pub async fn list_interactions(
         &self,
         host_id: Option<String>,
@@ -2756,7 +2923,7 @@ impl Store {
         kind: Option<String>,
         pending_only: bool,
     ) -> Result<Vec<InteractionRecord>, StoreError> {
-        self.run(move |conn| {
+        self.read("list_interactions", move |conn| {
             let mut sql = String::from(
                 "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
                  FROM interactions WHERE 1=1",
@@ -2795,8 +2962,10 @@ impl Store {
         &self,
         interaction_id: String,
     ) -> Result<Option<InteractionRecord>, StoreError> {
-        self.run(move |conn| load_interaction(conn, &interaction_id))
-            .await
+        self.run_named("get_interaction", move |conn| {
+            load_interaction(conn, &interaction_id)
+        })
+        .await
     }
 
     /// Mirror a successful Node answer ACK; never decide a winner in the Hub.
@@ -2804,37 +2973,57 @@ impl Store {
         &self,
         interaction_id: String,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("record_interaction_answer", move |conn| {
             conn.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
             Ok(())
         }).await
     }
 
-    /// Journal page from `after_seq` exclusive.
+    /// Journal window from `after_seq` exclusive, on the reader pool.
+    ///
+    /// Bounded by [`JOURNAL_WINDOW_ROWS`] and [`JOURNAL_WINDOW_BYTES`] and
+    /// anchored on the durable tail, so a screen read costs O(window) rather
+    /// than O(journal) (hub-store-1). When the window cannot reach `after_seq`
+    /// the events returned are the newest ones, not the oldest: whoever asks is
+    /// looking at a live session, and the tail is the part that answers them.
+    /// `events[0].seq > after_seq + 1` is the caller's signal that it holds a
+    /// window and should re-page with `afterSeq`.
     pub async fn read_journal(
         &self,
         instance_id: String,
         after_seq: i64,
     ) -> Result<(Vec<JournalRecord>, i64), StoreError> {
-        self.run(move |conn| {
+        self.read("read_journal", move |conn| {
             let durable = load_instance(conn, &instance_id)?
                 .map(|i| i.durable_seq.parse::<i64>().unwrap_or(0))
                 .unwrap_or(0);
+            // Walk back from the tail so the byte cap keeps the NEWEST events;
+            // the rows come out descending and are reversed once capped.
             let mut stmt = conn.prepare(
                 "SELECT seq, event_id, payload_json, observed_at FROM journal
-                 WHERE instance_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+                 WHERE instance_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
             )?;
-            let rows = stmt.query_map(params![instance_id, after_seq], |row| {
+            let mut rows = stmt.query(params![instance_id, after_seq, JOURNAL_WINDOW_ROWS])?;
+            let mut events: Vec<JournalRecord> = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(row) = rows.next()? {
                 let payload: String = row.get(2)?;
-                Ok(JournalRecord {
+                // Always keep the first (newest) row: a single event larger
+                // than the whole budget must still be readable.
+                if !events.is_empty() && bytes.saturating_add(payload.len()) > JOURNAL_WINDOW_BYTES
+                {
+                    break;
+                }
+                bytes = bytes.saturating_add(payload.len());
+                events.push(JournalRecord {
                     instance_id: instance_id.clone(),
                     seq: row.get(0)?,
                     event_id: row.get(1)?,
                     event: serde_json::from_str(&payload).unwrap_or(Value::Null),
                     observed_at: row.get(3)?,
-                })
-            })?;
-            let events = rows.collect::<Result<Vec<_>, _>>()?;
+                });
+            }
+            events.reverse();
             Ok((events, durable))
         })
         .await
@@ -2849,7 +3038,7 @@ impl Store {
         instance_id: String,
         limit: i64,
     ) -> Result<Vec<Value>, StoreError> {
-        self.run(move |conn| {
+        self.read("read_journal_tail", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT payload_json FROM (
                     SELECT payload_json, seq FROM journal
@@ -2881,7 +3070,7 @@ impl Store {
             claude_binary_path,
             default_tui,
         } = launch_defaults;
-        self.run(move |conn| {
+        self.run_named("patch_host", move |conn| {
             if load_host(conn, &host_id)?.is_none() {
                 return Err(StoreError::Id("unknown host".into()));
             }
@@ -2955,7 +3144,7 @@ impl Store {
     /// a Hub-side intent; counting those let stale creates wedge a host at
     /// `maxInstances` forever.
     pub async fn running_count(&self, host_id: String) -> Result<i64, StoreError> {
-        self.run(move |conn| {
+        self.run_named("running_count", move |conn| {
             conn.query_row(LIVE_INSTANCE_COUNT_SQL, params![host_id], |row| row.get(0))
                 .map_err(StoreError::from)
         })
@@ -2968,7 +3157,7 @@ impl Store {
         spec: Value,
         members: Vec<(String, String)>,
     ) -> Result<String, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_fleet", move |conn| {
             let fleet_id = new_id("obj").map_err(|e| StoreError::Id(e.to_string()))?;
             let now = now_rfc3339();
             conn.execute(
@@ -2991,7 +3180,7 @@ impl Store {
         &self,
         fleet_id: String,
     ) -> Result<Option<(Value, Vec<(String, String)>)>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("get_fleet", move |conn| {
             let spec: Option<String> = conn
                 .query_row(
                     "SELECT spec_json FROM fleets WHERE id = ?1",
@@ -3020,7 +3209,7 @@ impl Store {
 
     /// All paired devices (no token hashes).
     pub async fn list_devices(&self) -> Result<Vec<Device>, StoreError> {
-        self.run(|conn| {
+        self.read("list_devices", |conn| {
             let mut stmt = conn
                 .prepare("SELECT id, name, kind, instance_id FROM devices ORDER BY created_at")?;
             let rows = stmt.query_map([], |row| {
@@ -3039,7 +3228,7 @@ impl Store {
 
     /// Remove a device row.
     pub async fn delete_device(&self, device_id: String) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("delete_device", move |conn| {
             let n = conn.execute("DELETE FROM devices WHERE id = ?1", params![device_id])?;
             Ok(n > 0)
         })
@@ -3054,7 +3243,7 @@ impl Store {
         created_by: String,
         expires_at: String,
     ) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_pair_code", move |conn| {
             conn.execute("DELETE FROM pair_codes WHERE used != 0 OR expires_at <= ?1 OR failed_attempts >= ?2",
                 params![now_rfc3339(), crate::auth::MAX_PAIR_FAILURES])?;
             let inserted = conn.execute(
@@ -3077,7 +3266,7 @@ impl Store {
     where
         F: Fn(&str, &str) -> bool + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("consume_pair_code", move |conn| {
             let Some(prefix) = crate::auth::pair_prefix(&presented) else { return Ok(false); };
             let hash = conn.query_row(
                 "SELECT code_hash FROM pair_codes WHERE code_prefix = ?1 AND used = 0 AND expires_at > ?2 AND failed_attempts < ?3",
@@ -3100,7 +3289,7 @@ impl Store {
         &self,
         host_id: Option<String>,
     ) -> Result<Vec<ProviderRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_providers", move |conn| {
             if let Some(host_id) = host_id {
                 let host_scope = format!("host:{host_id}");
                 let mut stmt = conn.prepare(
@@ -3134,7 +3323,8 @@ impl Store {
 
     /// Fetch one profile.
     pub async fn get_provider(&self, id: String) -> Result<Option<ProviderRecord>, StoreError> {
-        self.run(move |conn| load_provider(conn, &id)).await
+        self.run_named("get_provider", move |conn| load_provider(conn, &id))
+            .await
     }
 
     /// The profile marked default gateway in `scope` (`universal` or `host:<id>`).
@@ -3142,7 +3332,7 @@ impl Store {
         &self,
         scope: String,
     ) -> Result<Option<ProviderRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("default_gateway", move |conn| {
             let id: Option<String> = conn
                 .query_row(
                     "SELECT id FROM provider_profiles
@@ -3178,7 +3368,7 @@ impl Store {
         secret_fingerprint: Option<String>,
         supply: remuda_protocol::SupplyProfile,
     ) -> Result<ProviderRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_provider", move |conn| {
             let now = now_rfc3339();
             if default_gateway {
                 conn.execute(
@@ -3233,7 +3423,7 @@ impl Store {
         secret_fingerprint: Option<Option<String>>,
         supply: Option<remuda_protocol::SupplyProfile>,
     ) -> Result<ProviderRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("update_provider", move |conn| {
             let existing = load_provider(conn, &id)?
                 .ok_or_else(|| StoreError::Id("unknown provider".into()))?;
             let next_scope = scope.clone().unwrap_or_else(|| existing.scope.clone());
@@ -3333,7 +3523,7 @@ impl Store {
         ok: bool,
         message: String,
     ) -> Result<ProviderRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("record_provider_test", move |conn| {
             if load_provider(conn, &id)?.is_none() {
                 return Err(StoreError::Id("unknown provider".into()));
             }
@@ -3359,7 +3549,7 @@ impl Store {
         id: String,
         supply: remuda_protocol::SupplyProfile,
     ) -> Result<ProviderRecord, StoreError> {
-        self.run(move |conn| {
+        self.run_named("update_provider_supply", move |conn| {
             if load_provider(conn, &id)?.is_none() {
                 return Err(StoreError::Id("unknown provider".into()));
             }
@@ -3378,7 +3568,7 @@ impl Store {
     /// Read every live instance (same lifecycle set as host counts) for
     /// supply concurrency accounting.
     pub async fn list_live_instances(&self) -> Result<Vec<InstanceRecord>, StoreError> {
-        self.run(|conn| {
+        self.run_named("list_live_instances", |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM instances
                  WHERE lifecycle IN
@@ -3408,7 +3598,7 @@ impl Store {
         host_id: Option<String>,
         decision: Value,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_placement_ledger", move |conn| {
             let now = now_rfc3339();
             let encoded = serde_json::to_string(&decision)?;
             conn.execute(
@@ -3424,7 +3614,7 @@ impl Store {
 
     /// Recent placement ledger rows (newest first); tests/support/CLI read.
     pub async fn list_placement_ledger(&self, limit: i64) -> Result<Vec<Value>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_placement_ledger", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT instance_id, project_id, profile_id, model_id, host_id, decision_json, created_at
                  FROM placement_ledger ORDER BY id DESC LIMIT ?1",
@@ -3462,7 +3652,7 @@ impl Store {
 
     /// Delete a profile row. Caller deletes the vault entry.
     pub async fn delete_provider(&self, id: String) -> Result<Option<ProviderRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("delete_provider", move |conn| {
             let existing = load_provider(conn, &id)?;
             if existing.is_some() {
                 conn.execute("DELETE FROM provider_profiles WHERE id = ?1", params![id])?;
@@ -3524,6 +3714,35 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         scope,
         supply,
     })
+}
+
+/// Open one read-only connection for the reader pool.
+///
+/// `SQLITE_OPEN_READ_ONLY` is the guarantee, not a convention: a read job
+/// cannot write even by accident, so nothing on this path can corrupt the
+/// single-writer discipline. No schema work and no `journal_mode` change — the
+/// writer owns both, and WAL is a property of the database file.
+fn open_reader(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let started = Instant::now();
+    loop {
+        match try_open_reader(path) {
+            Ok(conn) => return Ok(conn),
+            Err(err) if sqlite_is_busy(&err) && started.elapsed() < BUSY_WAIT => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn try_open_reader(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(BUSY_WAIT)?;
+    conn.pragma_update(None, "busy_timeout", BUSY_WAIT.as_millis() as i64)?;
+    Ok(conn)
 }
 
 fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
@@ -5013,7 +5232,7 @@ mod tests {
             let spec = json!({ "effortName": legacy, "effortIndex": 9 }).to_string();
             let reload_id = instance_id.clone();
             store
-                .run({
+                .run_named("legacy_effort_tier_names_normalize_by_name_not_index", {
                     let host = host.clone();
                     move |conn| {
                         conn.execute(
@@ -5132,13 +5351,16 @@ mod tests {
         // which only happens because a person typed the command.
         let promoted_id = instance.instance_id.clone();
         store
-            .run(move |conn| {
-                conn.execute(
-                    "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3 WHERE id = ?4",
-                    params!["claude", "promoted", now_rfc3339(), promoted_id],
-                )?;
-                Ok(())
-            })
+            .run_named(
+                "launched_by_is_derived_from_mode_for_legacy_rows",
+                move |conn| {
+                    conn.execute(
+                        "UPDATE instances SET kind = ?1, mode = ?2, promoted_at = ?3 WHERE id = ?4",
+                        params!["claude", "promoted", now_rfc3339(), promoted_id],
+                    )?;
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         let promoted = store
@@ -5222,7 +5444,7 @@ mod tests {
     async fn backdate_instance(store: &Store, instance_id: &str, minutes: i64) {
         let instance_id = instance_id.to_owned();
         store
-            .run(move |conn| {
+            .run_named("backdate_instance", move |conn| {
                 let then = time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes);
                 let stamp = format!(
                     "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
@@ -5698,14 +5920,17 @@ mod tests {
             .await
             .expect("permission event");
         let spec: Value = store
-            .run(move |conn| {
-                let raw: String = conn.query_row(
-                    "SELECT spec_json FROM instances WHERE id = ?1",
-                    params![instance.instance_id.clone()],
-                    |row| row.get(0),
-                )?;
-                Ok(serde_json::from_str::<Value>(&raw).unwrap_or(json!({})))
-            })
+            .run_named(
+                "permission_observation_projects_effective_mode",
+                move |conn| {
+                    let raw: String = conn.query_row(
+                        "SELECT spec_json FROM instances WHERE id = ?1",
+                        params![instance.instance_id.clone()],
+                        |row| row.get(0),
+                    )?;
+                    Ok(serde_json::from_str::<Value>(&raw).unwrap_or(json!({})))
+                },
+            )
             .await
             .expect("spec");
         assert_eq!(
@@ -6182,6 +6407,103 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
     )
     .optional()
     .map_err(StoreError::from)
+}
+
+/// Append position threaded through one (possibly batched) journal write.
+///
+/// Reproduces exactly how the ws layer fed the old per-event loop: the first
+/// event may carry the frame's `seq` hint; every later event is handed
+/// `previous_recorded_seq + 1` explicitly, whether the previous event was fresh
+/// or a replay. `expected_next` is the independent durable+1 cursor the gap
+/// check compares against; a replay leaves it untouched.
+struct AppendCursor {
+    /// Seq a gap-free fresh append must equal.
+    expected_next: i64,
+    /// Durable seq observed so far; advances as fresh events land.
+    durable: i64,
+    /// Explicit hint for the next event (None means "assign expected_next").
+    next_hint: Option<i64>,
+}
+
+impl AppendCursor {
+    fn new(durable: i64, first_hint: Option<i64>) -> Self {
+        Self {
+            expected_next: durable + 1,
+            durable,
+            next_hint: first_hint,
+        }
+    }
+}
+
+/// Apply one event to an instance the caller has loaded and host-checked.
+///
+/// Shared by the single [`Store::append_journal`] path and the batched
+/// transaction, so the two can never drift. Works on any `&Connection` — the
+/// writer's own connection or an open `Transaction`.
+fn append_loaded_event(
+    conn: &Connection,
+    host_id: &str,
+    instance_id: &str,
+    cursor: &mut AppendCursor,
+    mut event: Value,
+) -> Result<JournalAppend, StoreError> {
+    let seq = cursor.next_hint.unwrap_or(cursor.expected_next);
+    if let Some(existing) = load_journal_row(conn, instance_id, seq)? {
+        apply_interaction_event(conn, host_id, instance_id, &existing.event)?;
+        // A replay hands the next event this existing row's seq + 1, just as
+        // the old per-event loop derived its next hint from the returned
+        // record. The durable cursor does not move.
+        cursor.next_hint = Some(existing.seq.saturating_add(1));
+        return Ok(JournalAppend {
+            record: existing,
+            replayed: true,
+            durable_seq: cursor.durable,
+        });
+    }
+    if seq != cursor.expected_next {
+        return Err(StoreError::Id(format!(
+            "journal gap: expected {}, got {seq}",
+            cursor.expected_next
+        )));
+    }
+    let event_id = event
+        .get("eventId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| new_id("evt").unwrap_or_else(|_| "evt_missing".into()));
+    if let Some(obj) = event.as_object_mut() {
+        obj.entry("eventId".to_string())
+            .or_insert_with(|| json!(event_id.clone()));
+        obj.entry("seq".to_string())
+            .or_insert_with(|| json!(seq.to_string()));
+        obj.entry("instanceId".to_string())
+            .or_insert_with(|| json!(instance_id.to_string()));
+    }
+    let now = now_rfc3339();
+    conn.execute(
+        "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![instance_id, seq, event_id, event.to_string(), now],
+    )?;
+    apply_instance_projection(conn, instance_id, &event, seq, &now)?;
+    apply_native_session_projection(conn, instance_id, &event, &now)?;
+    apply_command_projection(conn, host_id, instance_id, &event, &now)?;
+    apply_interaction_event(conn, host_id, instance_id, &event)?;
+    apply_instance_lifecycle(conn, instance_id, &event)?;
+    cursor.expected_next = seq + 1;
+    cursor.durable = seq;
+    cursor.next_hint = Some(seq.saturating_add(1));
+    Ok(JournalAppend {
+        record: JournalRecord {
+            instance_id: instance_id.to_string(),
+            seq,
+            event_id,
+            event,
+            observed_at: now,
+        },
+        replayed: false,
+        durable_seq: seq,
+    })
 }
 
 fn load_journal_row(

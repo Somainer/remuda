@@ -1388,7 +1388,7 @@ async fn instance_usage_http(
     let usage_id = id.clone();
     let agg = state
         .store
-        .run(move |conn| {
+        .run_named("instance_usage_http", move |conn| {
             crate::usage_store::aggregate_instance(conn, &usage_id)
                 .map_err(crate::store::StoreError::from)
         })

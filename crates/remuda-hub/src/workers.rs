@@ -1448,7 +1448,7 @@ impl Store {
         worker: WorkerRoster,
         created_by: String,
     ) -> Result<WorkerRoster, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_worker", move |conn| {
             let id = worker.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
             let doc = serde_json::to_string(&worker)?;
@@ -1477,7 +1477,7 @@ impl Store {
         &self,
         project_id: Option<String>,
     ) -> Result<Vec<WorkerRoster>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_workers", move |conn| {
             let mut stmt = if project_id.is_some() {
                 conn.prepare(
                     "SELECT id FROM worker_roster WHERE project_id = ?1 ORDER BY created_at",
@@ -1506,14 +1506,15 @@ impl Store {
     }
 
     pub async fn get_worker(&self, id: String) -> Result<Option<WorkerRoster>, StoreError> {
-        self.run(move |conn| load_worker(conn, &id)).await
+        self.run_named("get_worker", move |conn| load_worker(conn, &id))
+            .await
     }
 
     pub async fn find_active_workers_named(
         &self,
         name: String,
     ) -> Result<Vec<WorkerRoster>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("find_active_workers_named", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM worker_roster WHERE name = ?1 AND state_kind != 'retired'",
             )?;
@@ -1534,7 +1535,7 @@ impl Store {
         &self,
         host_id: String,
     ) -> Result<Vec<WorkerRoster>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_workers_for_host", move |conn| {
             let mut stmt = conn.prepare("SELECT id FROM worker_roster WHERE host_id = ?1")?;
             let ids: Vec<String> = stmt
                 .query_map(params![host_id], |row| row.get(0))?
@@ -1557,7 +1558,7 @@ impl Store {
     where
         F: FnOnce(&mut WorkerRoster) -> Result<(), StoreError> + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("mutate_worker", move |conn| {
             let Some(mut worker) = load_worker(conn, &id)? else {
                 return Ok(None);
             };

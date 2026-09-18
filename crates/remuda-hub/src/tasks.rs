@@ -954,7 +954,7 @@ impl Store {
             + Send
             + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("create_task", move |conn| {
             let task = build(&project_id, conn)?;
             insert_task_row(conn, &task, &created_by)?;
             Ok(task)
@@ -972,7 +972,7 @@ impl Store {
     where
         F: FnOnce(&Task, &mut Connection) -> Result<Task, StoreError> + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("split_task", move |conn| {
             let Some(parent) = load_task(conn, &parent_id)? else {
                 return Ok(None);
             };
@@ -996,7 +996,7 @@ impl Store {
     where
         F: FnOnce(&mut Task, &mut Connection) -> Result<(), StoreError> + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("mutate_task", move |conn| {
             let Some(mut task) = load_task(conn, &task_id)? else {
                 return Ok(None);
             };
@@ -1022,7 +1022,7 @@ impl Store {
             + Send
             + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("append_placement", move |conn| {
             let Some(mut task) = load_task(conn, &task_id)? else {
                 return Ok(None);
             };
@@ -1068,12 +1068,13 @@ impl Store {
 
     /// One task.
     pub async fn get_task(&self, task_id: String) -> Result<Option<Task>, StoreError> {
-        self.run(move |conn| load_task(conn, &task_id)).await
+        self.run_named("get_task", move |conn| load_task(conn, &task_id))
+            .await
     }
 
     /// List tasks, optionally within one project, oldest first.
     pub async fn list_tasks(&self, project_id: Option<String>) -> Result<Vec<Task>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_tasks", move |conn| {
             let ids: Vec<String> = match &project_id {
                 Some(project) => {
                     let mut stmt = conn.prepare(
@@ -1102,7 +1103,7 @@ impl Store {
         &self,
         task_id: String,
     ) -> Result<Vec<PlacementLedgerRow>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_placements", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT doc_json FROM placements WHERE task_id = ?1 ORDER BY created_at",
             )?;
@@ -1121,7 +1122,7 @@ impl Store {
         &self,
         project_id: Option<String>,
     ) -> Result<Vec<OwnClaimRow>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_own_claims", move |conn| {
             // Registry rows only exist for non-terminal tasks (released on
             // terminal transition), so no state filter is needed.
             let mut stmt = conn.prepare(

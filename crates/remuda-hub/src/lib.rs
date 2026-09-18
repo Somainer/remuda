@@ -76,8 +76,7 @@ pub use agent_scope::instance_token;
 pub use auth::{bootstrap_issued_at, rotate_bootstrap};
 pub use config::{
     DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
-    DEFAULT_COMMAND_SETTLE_TIMEOUT_MS, DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig,
-    MIN_CREATE_SETTLE_TIMEOUT_MS,
+    DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
 };
 pub use error::HubError;
 pub use maintenance::migrate;
@@ -113,7 +112,8 @@ pub mod store_test_support {
     use std::path::Path;
     use std::time::Duration;
 
-    use crate::store::InstanceDelegation;
+    use crate::store::{CommandRecord, CommandSettlement, InstanceDelegation};
+    use serde_json::{Value, json};
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
@@ -266,6 +266,34 @@ pub mod store_test_support {
             })
             .await
             .expect("tail via writer")
+    }
+
+    /// A fully-populated `CommandRecord` serialized exactly as the
+    /// `/v1/instances/{id}/commands` route emits it (camelCase, internal ledger
+    /// columns skipped, `settlement` present). The OpenAPI test compares this
+    /// against the documented `CommandRecord` properties so a field cannot be
+    /// added to the struct (or renamed) without the spec drifting.
+    pub fn sample_command_record_json() -> Value {
+        let record = CommandRecord {
+            command_id: "cmd_sample".into(),
+            instance_id: Some("ins_sample".into()),
+            host_id: "hst_sample".into(),
+            operation: "instance.send".into(),
+            state: "settled".into(),
+            resolution: "clear".into(),
+            forwarded: true,
+            settlement_outcome: Some("rejected".into()),
+            settlement_reason: Some("node rejected the send".into()),
+            settlement: Some(CommandSettlement {
+                outcome: "rejected".into(),
+                reason: Some("node rejected the send".into()),
+            }),
+            payload: json!({ "input": { "type": "prompt" } }),
+            idempotency_key: Some("idem_sample".into()),
+            created_at: "2026-09-18T00:00:00.000Z".into(),
+            updated_at: "2026-09-18T00:00:01.000Z".into(),
+        };
+        serde_json::to_value(record).expect("command record serializes")
     }
 }
 

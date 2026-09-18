@@ -408,7 +408,7 @@ async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route() -> Result<()> {
+async fn a_send_the_node_rejects_settles_rejected_and_is_listed_by_the_new_route() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let config = HubConfig::for_test(dir.path().join("data"));
     let hub = spawn(config).await?;
@@ -432,8 +432,8 @@ async fn a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route(
     let _ = recv_json(&mut node).await?;
     // Accept the create so the instance is reachable, but reject instance.send
     // exactly the way the ssh-stdio Node did before the fold — with an
-    // invalid-request error, so the Hub must fail the row rather than leave it
-    // queued (docs/design/evidence/instance-send-1.md).
+    // invalid-request error, so the Hub must settle the row with a `rejected`
+    // outcome rather than leave it queued (docs/design/evidence/instance-send-1.md).
     tokio::spawn(async move {
         while let Some(Ok(Message::Text(text))) = node.next().await {
             let Ok(frame) = serde_json::from_str::<Value>(&text) else {
@@ -512,18 +512,28 @@ async fn a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route(
         .to_string();
     assert_eq!(
         body["command"]["state"],
-        json!("failed"),
-        "a rejected send must resolve failed, not queued: {body}"
+        json!("settled"),
+        "a rejected send settles with a rejected outcome, it is not a 4th state: {body}"
     );
-    let reason = body["command"]["reason"]
+    assert_eq!(body["command"]["resolution"], json!("clear"), "{body}");
+    assert_eq!(
+        body["command"]["settlement"]["outcome"],
+        json!("rejected"),
+        "{body}"
+    );
+    let reason = body["command"]["settlement"]["reason"]
         .as_str()
-        .context("failure reason present")?;
+        .context("rejection reason present")?;
     assert!(
         reason.contains("input.text") || reason.contains("input.blocks"),
         "the reason carries the node's message: {reason}"
     );
+    assert!(
+        body["command"].get("reason").is_none(),
+        "no top-level reason field — the reason rides the settlement: {body}"
+    );
 
-    // The new GET route lists the command, newest first, with its resolved state.
+    // The new GET route lists the command, newest first, with its settlement.
     let (status, _, listed) = http(
         hub.addr,
         "GET",
@@ -540,27 +550,32 @@ async fn a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route(
         .find(|row| row["commandId"].as_str() == Some(command_id.as_str()))
         .context("send command listed")?;
     assert_eq!(row["operation"], json!("instance.send"));
-    assert_eq!(row["state"], json!("failed"));
-    assert_eq!(row["resolution"], json!("failed"));
-    assert!(row.get("reason").and_then(Value::as_str).is_some());
+    assert_eq!(row["state"], json!("settled"));
+    assert_eq!(row["resolution"], json!("clear"));
+    assert_eq!(row["settlement"]["outcome"], json!("rejected"));
+    assert!(
+        row["settlement"].get("reason").and_then(Value::as_str).is_some(),
+        "{row}"
+    );
+    assert!(row.get("reason").is_none(), "no top-level reason: {row}");
     assert!(row.get("createdAt").is_some() && row.get("updatedAt").is_some());
     Ok(())
 }
 
-/// The deadline path the reject test does not cover: the Node *receives*
-/// `instance.send` but never replies, so the RPC times out (`reconciling`,
-/// §2.5) and the bounded ack deadline — not an error reply — moves the row to
-/// `failed` with a reason. The node task below answers `runtime.hello` and
-/// `instance.create` but silently drops `instance.send`.
+/// The Node *receives* `instance.send` but never replies, so the RPC times out
+/// and the Hub marks the row `reconciling` (§2.5). Crucially the Hub must **not**
+/// settle it on its own timer: a forward intent exists, so without evidence the
+/// command did not run it cannot be called `rejected` (§2.5, §12.2), and there
+/// is no fourth state. The row rests at `queued` / `reconciling`, forwarded,
+/// with no settlement, until the Node's journal says otherwise. The node task
+/// below answers `runtime.hello` and `instance.create` but silently drops
+/// `instance.send`.
 #[tokio::test]
-async fn a_send_the_node_never_acks_fails_on_the_deadline() -> Result<()> {
+async fn a_send_the_node_never_acks_rests_reconciling_and_is_never_self_failed() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut config = HubConfig::for_test(dir.path().join("data"));
-    // A short accept timeout so the RPC gives up quickly, and a settle deadline
-    // just above it (the clamp requires settle > accept) so the whole path
-    // resolves inside the test window.
+    // A short accept timeout so the RPC gives up quickly.
     config.command_accept_timeout_ms = 200;
-    config.command_settle_timeout_ms = 400;
     let hub = spawn(config).await?;
     let (cookie, _, enroll) = device_and_enroll(hub.addr, &hub.bootstrap_token).await?;
     let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
@@ -595,8 +610,8 @@ async fn a_send_the_node_never_acks_fails_on_the_deadline() -> Result<()> {
                 .get("commandId")
                 .cloned()
                 .unwrap_or_else(|| json!("cmd_test"));
-            // Receive instance.send but never reply — the reconciling→deadline
-            // path. Everything else is accepted so the instance is reachable.
+            // Receive instance.send but never reply — the lost-reply path.
+            // Everything else is accepted so the instance is reachable.
             if method == "instance.send" {
                 continue;
             }
@@ -658,18 +673,15 @@ async fn a_send_the_node_never_acks_fails_on_the_deadline() -> Result<()> {
         .as_str()
         .context("commandId")?
         .to_string();
-    // The POST returns before the deadline: the lost RPC reply marked it
-    // reconciling, still queued.
+    // The lost RPC reply marked it reconciling, still three-state `queued`.
     assert_eq!(body["command"]["state"], json!("queued"), "{body}");
-    assert_eq!(
-        body["command"]["resolution"],
-        json!("reconciling"),
-        "{body}"
-    );
+    assert_eq!(body["command"]["resolution"], json!("reconciling"), "{body}");
+    assert_eq!(body["command"]["forwarded"], json!(true), "{body}");
+    assert!(body["command"].get("settlement").is_none(), "{body}");
 
-    // Poll the new route until the ack deadline fires and fails the row.
-    let mut failed = None;
-    for _ in 0..40 {
+    // Well past where the old ack deadline (400 ms) would have fired, the row is
+    // unchanged: the Hub never self-settles a forwarded command it cannot prove.
+    for _ in 0..12 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let (status, _, listed) = http(
             hub.addr,
@@ -686,22 +698,25 @@ async fn a_send_the_node_never_acks_fails_on_the_deadline() -> Result<()> {
             .and_then(|rows| {
                 rows.iter()
                     .find(|row| row["commandId"].as_str() == Some(command_id.as_str()))
-                    .cloned()
             })
             .context("send command listed")?;
-        if row["state"] == json!("failed") {
-            failed = Some(row);
-            break;
-        }
+        assert!(
+            matches!(
+                row["state"].as_str(),
+                Some("queued" | "accepted" | "settled")
+            ),
+            "never a fourth command state, got {}",
+            row["state"]
+        );
+        assert_ne!(
+            row["state"],
+            json!("settled"),
+            "a never-acked send must not be settled (rejected or otherwise): {row}"
+        );
+        assert!(row.get("settlement").is_none(), "no settlement is invented: {row}");
+        assert!(row.get("reason").is_none(), "no top-level reason field: {row}");
+        assert_eq!(row["forwarded"], json!(true), "{row}");
     }
-    let row = failed.context("the never-acked send never failed on the deadline")?;
-    assert_eq!(row["operation"], json!("instance.send"));
-    assert_eq!(row["resolution"], json!("failed"));
-    let reason = row["reason"].as_str().context("failure reason present")?;
-    assert!(
-        reason.contains("did not acknowledge"),
-        "the reason names the elapsed deadline: {reason}"
-    );
     Ok(())
 }
 

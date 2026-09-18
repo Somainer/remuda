@@ -79,7 +79,6 @@ pub(crate) async fn start(config: &Config) -> anyhow::Result<remuda_hub::Running
         web_root: config.hub.web_root.clone(),
         command_accept_timeout_ms: config.hub.command_accept_timeout_ms,
         create_settle_timeout_ms: config.hub.create_settle_timeout_ms,
-        command_settle_timeout_ms: config.hub.command_settle_timeout_ms,
         host_lost_grace_ms: config.hub.host_lost_grace_ms,
         // 0 means "use the Hub default" (25 MiB, D-027b).
         attachment_max_bytes: if config.hub.attachment_max_bytes == 0 {

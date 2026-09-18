@@ -1696,15 +1696,27 @@ export interface components {
         };
         CommandRecord: {
             commandId: string;
-            createdAt?: string;
-            forwarded?: boolean;
+            createdAt: string;
+            forwarded: boolean;
             hostId: string;
-            instanceId?: string | null;
+            idempotencyKey: string | null;
+            instanceId: string | null;
             operation: string;
-            reason?: string | null;
-            resolution?: string;
-            state: string;
-            updatedAt?: string;
+            payload: {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            resolution: "clear" | "reconciling" | "unknown";
+            settlement?: {
+                /** @enum {string} */
+                outcome: "cancelled" | "completed" | "rejected";
+                reason?: string;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            state: "accepted" | "queued" | "settled";
+            updatedAt: string;
         } & {
             [key: string]: unknown;
         };

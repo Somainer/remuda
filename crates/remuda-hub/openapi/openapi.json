@@ -291,6 +291,12 @@
           "hostId": {
             "type": "string"
           },
+          "idempotencyKey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "instanceId": {
             "type": [
               "string",
@@ -300,16 +306,44 @@
           "operation": {
             "type": "string"
           },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
+          "payload": {
+            "additionalProperties": true,
+            "type": "object"
           },
           "resolution": {
+            "enum": [
+              "clear",
+              "reconciling",
+              "unknown"
+            ],
             "type": "string"
           },
+          "settlement": {
+            "additionalProperties": true,
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "cancelled",
+                  "completed",
+                  "rejected"
+                ],
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "outcome"
+            ],
+            "type": "object"
+          },
           "state": {
+            "enum": [
+              "accepted",
+              "queued",
+              "settled"
+            ],
             "type": "string"
           },
           "updatedAt": {
@@ -318,9 +352,16 @@
         },
         "required": [
           "commandId",
+          "createdAt",
+          "forwarded",
           "hostId",
+          "idempotencyKey",
+          "instanceId",
           "operation",
-          "state"
+          "payload",
+          "resolution",
+          "state",
+          "updatedAt"
         ],
         "type": "object"
       },

@@ -48,6 +48,44 @@ test.beforeEach(async ({ page }) => {
   await login(page);
 });
 
+// The fake harness raises a pending approval on every create, which parks a
+// card over the composer and disables the input; answer it so the picker
+// opens in the normal (idle, card-free) geometry state.
+async function clearApprovals(page: Page, instanceId: string) {
+  await page.evaluate(async (id) => {
+    const list = async () => {
+      const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
+      return (body.items ?? []).filter(
+        (item: { instanceId?: string; state?: string }) =>
+          item.instanceId === id && item.state === "pending",
+      );
+    };
+    const deadline = Date.now() + 10_000;
+    let mine = await list();
+    while (mine.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 100));
+      mine = await list();
+    }
+    for (const item of mine) {
+      const optionId = item.request?.options?.[0]?.id;
+      if (!optionId) continue;
+      await fetch(`/v1/interactions/${item.interactionId ?? item.id}/answer`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          answer: {
+            kind: "approval",
+            optionId,
+            inputDigest: item.request?.inputDigest ?? "",
+          },
+        }),
+      });
+    }
+  }, instanceId);
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 15_000 });
+}
+
 async function openModelList(page: Page) {
   await page.keyboard.press("Escape").catch(() => undefined);
   await page.getByTestId("model-effort-chip").click();
@@ -64,6 +102,7 @@ test("the tall catalog panel anchors to its trigger, fits, scrolls and switches"
   // Apply the persisted launch snapshot before opening the picker.
   await page.reload();
   await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
   await openModelList(page);
 
   // The launch catalog carries the tall, scoped-cache list.
@@ -146,6 +185,7 @@ test("an unlisted typed id still configures, reaches the terminal and settles as
   const instanceId = await createSession(page, "Model picker typed fallback");
   await page.reload();
   await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
   await openModelList(page);
 
   // The id is not in the launch catalog (auto/fast/plain/claude-e2e-only).

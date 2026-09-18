@@ -66,7 +66,8 @@ interface Measured {
   placement: PopoverPlacement;
   left: number;
   top: number;
-  maxHeight: number;
+  /** Undefined when no cap applies (natural height clips the viewport edge). */
+  maxHeight?: number;
 }
 
 const VIEWPORT_FALLBACK = { width: 1024, height: 768 };
@@ -97,29 +98,34 @@ export function computeAnchored(
   const align = options.align ?? "start";
   const maxHeightVh = options.maxHeightVh ?? 0.6;
   const preferUp = options.preferUp ?? true;
-  // The panel top must stay above the trigger by the gap and never cross the
-  // top margin or an obstruction (approval card) plus the gap. Obstruction
-  // bottoms below the trigger do not constrain room above (they are part of
-  // the composer region the panel already avoids); clamp to the trigger edge.
   const obstruction = Math.min(triggerRect.top, Math.max(0, options.avoidBottom ?? 0));
   const upperBoundary = obstruction ? Math.max(margin, obstruction + gap) : margin;
-  const roomAbove = Math.max(0, triggerRect.top - gap - upperBoundary);
+  // Plain viewport room on each side of the trigger.
+  const roomAbove = Math.max(0, triggerRect.top - gap - margin);
   const roomBelow = Math.max(0, viewport.height - triggerRect.bottom - margin - gap);
+  // Room above that ALSO clears the obstruction (the approval card).
+  const roomAboveCleared = Math.max(0, triggerRect.top - gap - upperBoundary);
   const vhCap = Math.floor(viewport.height * maxHeightVh);
+  const need = panel.preferredHeight;
 
-  // Pick the side: honour the preferred direction when the panel's natural
-  // height fits there, otherwise take whichever side has more room.
+  // Side selection:
+  // - an obstruction the preferred (up) side cannot clear → open down,
+  //   matching the shipped dodge (the panel never covers the approval card);
+  // - otherwise open on the roomier side, preferring up.
+  const upBlockedByObstruction = obstruction > 0 && roomAboveCleared < need;
   let placement: PopoverPlacement;
   if (preferUp) {
-    placement = roomAbove >= panel.preferredHeight || roomAbove >= roomBelow ? "up" : "down";
+    placement = upBlockedByObstruction || roomBelow > roomAbove ? "down" : "up";
   } else {
-    placement = roomBelow >= panel.preferredHeight || roomBelow >= roomAbove ? "down" : "up";
+    placement = !upBlockedByObstruction && roomAbove > roomBelow ? "up" : "down";
   }
+  // Cap to plain viewport room (never shrink to the card↔trigger gap — that
+  // collapsed tall catalogs). A down panel with no room clips the edge like
+  // the legacy absolute menu rather than covering the card.
   const room = placement === "up" ? roomAbove : roomBelow;
-  // No floor: a positive minimum would force the panel past an obstruction
-  // (the approval card) when the available gap is smaller.
-  const maxHeight = Math.max(0, Math.min(vhCap, Math.floor(room)));
-  const panelHeight = Math.min(panel.preferredHeight, maxHeight);
+  const cap = Math.max(0, Math.min(vhCap, room));
+  const maxHeight = cap > 0 ? cap : undefined;
+  const panelHeight = Math.min(need, maxHeight ?? need);
 
   // Horizontal alignment against the trigger, then shift inside the viewport.
   let left: number;
@@ -226,7 +232,7 @@ export function useAnchoredPopover(
       current.placement === next.placement &&
       Math.abs(current.left - next.left) < 1 &&
       Math.abs(current.top - next.top) < 1 &&
-      Math.abs(current.maxHeight - next.maxHeight) < 1
+      Math.abs((current.maxHeight ?? -1) - (next.maxHeight ?? -1)) < 1
         ? current
         : next,
     );
@@ -278,7 +284,7 @@ export function useAnchoredPopover(
         position: "fixed",
         left: Math.round(measured.left),
         top: Math.round(measured.top),
-        maxHeight: measured.maxHeight,
+        ...(measured.maxHeight != null ? { maxHeight: measured.maxHeight } : {}),
         margin: 0,
       }
     : { position: "fixed", left: 0, top: 0, maxHeight: "none" };

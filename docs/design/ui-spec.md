@@ -356,6 +356,24 @@ compact（手机）下已结束的普通工具卡默认折成**一行**，点开
 | 实现约束 | 折叠分支**必须在 family 判定之后**才可提前 return。当前 `ToolCard.tsx` 的 `if (folded) return …` 早于 `family === "Workflow"` 分支，一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动——这是本条的验收硬指标，不能只断言「卡可见」，要断言卡头 elapsed 在运行中递增 |
 | 展开态 | 展开后的卡与桌面完全一致（同一组件、同一 testid）；折叠只改默认开合，不改内容 |
 
+**tool result 里的图片 block（[codex-cua.md](./codex-cua.md) §6）**
+
+工具结果里合法带 `image` block（`ContentBlock.Image` + `MediaBlock{objectId,
+mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal 里。渲染规则：
+
+- 图片 block 在**工具卡内部**渲染成一张**有上限的缩略图**：`max-height` 写死在
+  CSS 里（不随卡片高度变化），`loading="lazy"`，`alt` 取 block 的 `name`；
+- **绝不自动展开**：不点不开、不放大、不进灯箱。想看大图是**点击打开**
+  `/v1/objects/{id}`（与附件同一条路，`AttachmentChips.objectUrl`）；
+- 一张工具结果里的多张图按 block 顺序排列，同样受 max-height 约束；
+- **文本部分照旧**：`resultText()` 仍只返回文本，图片走新的 `resultMedia()`，
+  不让任何既有调用方改形状——纯文本结果的外观与行为**逐字节不变**；
+- 拿不到或过大的图已经在 Node 侧退化成一条文本 block（点名 media type 与字节数），
+  所以 UI 不需要一个「图片坏了」的占位分支——它看到的就是一条文本；
+- 不新增 `ObservationKind`，不新增卡片族：CUA 的调用按 MCP 族渲染
+  （`server/tool`，`tool_name` 形如 `mcp__codex-computer-use__<verb>`）。
+
+
 **审批卡（内联）**
 
 钉在 composer 上，同时出现在审批中心。字段：`interactionId`, `type=approval`, `title`, `preview`（命令或补丁摘要）, `risk`, `actions[]`（allow / deny / allow_once）。提交后按钮 disabled，直到 journal `interaction.answered` 或 `expired`。文案：「多台设备同时点，只记第一次。」
@@ -582,6 +600,22 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 | `resources?` | cpu/mem，缺则不画仪表 |
 | `cli[]` | `{kind, version, path, auth: gateway-native\|logged_in\|logged_out\|unknown}` — **绝对路径+版本**，按主机盘点。Claude `gateway-native` 只报布尔，不含 token |
 | `instanceCount` | |
+
+**`computer-use` 行（D-045 / [codex-cua.md](./codex-cua.md) §3.4）**
+
+`computer-use` **就是一行普通 CLI 行**，不是新组件、不是新徽标、不是新面板：
+
+- `kind: "computer-use"`，`path` / `version` / `installed` 按上面同一张表渲染；
+  `auth` 恒为 `unknown`——Remuda **刻意不探测**这个 vendor 的登录态；
+- `installed: false` 渲染为「**未安装**」，与其它 CLI 同一套措辞；
+- **这一行缺席**（老 Node 不上报）渲染为「**未上报**」，**绝不**渲染成
+  「不支持」——这正是 §3.3 的规则在这个字段上的落点：没有数据 ≠ 否；
+- `cliSummary` 的 `<kind>-cli ` 前缀剥离（`web/src/features/hosts/model.ts:89-101`）
+  必须让 `computer-use` **存活**：`kind` 为 `computer-use`、`version` 为裸版本号
+  时它不该被吞掉。测试钉住这一行；
+- 它**只**表示「这台机器上有没有」，**不**表示「本会话有没有被授予」——授予是
+  按会话的事（D-045）。主机页不画会话级状态，也不提供授予开关（本批
+  `/sessions/new` 上没有 CUA 开关；那是后续）。
 
 添加主机第一阶段：登记 Node 出站身份；开发期可填 SSH config 名。Tailcat 不做。
 

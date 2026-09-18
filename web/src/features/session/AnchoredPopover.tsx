@@ -108,16 +108,26 @@ export function computeAnchored(
   const vhCap = Math.floor(viewport.height * maxHeightVh);
   const need = panel.preferredHeight;
 
-  // Side selection:
-  // - an obstruction the preferred (up) side cannot clear → open down,
-  //   matching the shipped dodge (the panel never covers the approval card);
-  // - otherwise open on the roomier side, preferring up.
+  // Side selection (preferred direction wins a tie, since the composer docks
+  // at the bottom):
+  // - an obstruction the preferred (up) side cannot clear → open down;
+  // - otherwise the preferred side unless the other side is strictly roomier.
   const upBlockedByObstruction = obstruction > 0 && roomAboveCleared < need;
   let placement: PopoverPlacement;
   if (preferUp) {
     placement = upBlockedByObstruction || roomBelow > roomAbove ? "down" : "up";
   } else {
     placement = !upBlockedByObstruction && roomAbove > roomBelow ? "up" : "down";
+  }
+  // A flip down must never place the panel past the viewport bottom: when a
+  // down panel (at the height it can actually take) would clip the edge,
+  // stay preferred/up where the body scrolls inside a smaller cap instead.
+  const downHeight = Math.min(need, roomBelow, vhCap);
+  if (
+    placement === "down" &&
+    triggerRect.bottom + gap + downHeight > viewport.height - margin
+  ) {
+    placement = "up";
   }
   // Cap to plain viewport room (never shrink to the card↔trigger gap — that
   // collapsed tall catalogs). A down panel with no room clips the edge like
@@ -268,13 +278,44 @@ export function useAnchoredPopover(
     // The trigger moves on any ancestor scroll (the panel is fixed, the
     // trigger is not), so listen in capture mode for scrolls everywhere.
     window.addEventListener("scroll", scheduleMeasure, true);
+    // Layout shifts that move the trigger without resize/scroll events
+    // (an approval card unmounts, turn events stream in, images load): a
+    // fixed panel does not follow the trigger automatically, so after the
+    // opening measurement settles, compare its box each animation frame and
+    // re-measure on change.
+    let raf = 0;
+    let lastBox = "";
+    let armed = false;
+    const track = () => {
+      if (!armed) {
+        // Skip the opening burst (panel growth itself nudges layout once).
+        armed = true;
+        raf = window.requestAnimationFrame(track);
+        return;
+      }
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const box = [rect.left, rect.top, rect.width, rect.height]
+          .map((n) => Math.round(n * 10) / 10)
+          .join(",");
+        if (box !== lastBox) {
+          lastBox = box;
+          scheduleMeasure();
+        }
+      }
+      raf = window.requestAnimationFrame(track);
+    };
+    if (typeof window !== "undefined" && !resolved.sheet) {
+      raf = window.requestAnimationFrame(track);
+    }
     return () => {
       observer?.disconnect();
       window.removeEventListener("resize", scheduleMeasure);
       window.removeEventListener("scroll", scheduleMeasure, true);
+      if (raf) window.cancelAnimationFrame(raf);
       if (frame.current != null) window.cancelAnimationFrame(frame.current);
     };
-  }, [open, panelRef, resolved.sheet, scheduleMeasure]);
+  }, [open, panelRef, triggerRef, resolved.sheet, scheduleMeasure]);
 
   const style: CSSProperties =
     resolved.sheet ?

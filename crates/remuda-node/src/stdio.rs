@@ -1168,7 +1168,7 @@ mod tests {
         );
 
         assert!(
-            session.is_finished() == false,
+            !session.is_finished(),
             "the stdio session must still be running, not unwound"
         );
         session.abort();

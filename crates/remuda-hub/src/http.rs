@@ -188,6 +188,12 @@ pub struct JournalQuery {
 }
 
 #[derive(Deserialize)]
+pub struct CommandsQuery {
+    /// Max rows, newest first. Defaults to 50, clamped by the store to 200.
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 pub struct WorktreeListQuery {
     #[serde(rename = "hostId")]
     host_id: Option<String>,
@@ -1750,6 +1756,34 @@ pub async fn get_journal(
     })))
 }
 
+/// `GET /v1/instances/{id}/commands`: recent commands for the instance, newest
+/// first, so an operator can see how a send resolved (state, resolution and any
+/// failure reason) rather than only the row returned by the POST.
+pub async fn list_instance_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Query(query): Query<CommandsQuery>,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
+    if state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .is_none()
+    {
+        return Err(HubError::NotFound);
+    }
+    let commands = state
+        .store
+        .list_instance_commands(instance_id.clone(), query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(json!({
+        "instanceId": instance_id,
+        "commands": commands,
+    })))
+}
+
 pub(crate) async fn forward_if_online(
     state: &AppState,
     command: CommandRecord,
@@ -1769,6 +1803,12 @@ pub(crate) async fn forward_if_online(
             .await?
             .ok_or(HubError::NotFound);
     }
+    // A forwarded non-create command now has resolution `unknown`. Arm a bounded
+    // ack deadline so it cannot sit at `queued` forever if neither an accept nor
+    // an error reply lands (a Node that went offline between the online check
+    // and the call, or a hung one). The guarded transition leaves accepted /
+    // reconciling / already-failed rows alone.
+    schedule_command_ack_deadline(state, &command);
     let mut params = command.payload.clone();
     let object = params
         .as_object_mut()
@@ -1958,6 +1998,18 @@ async fn fail_unaccepted_create(
             .await?;
         return Err(HubError::BadRequest(message));
     }
+    // A forwarded non-create command the Node rejected must not sit at `queued`
+    // forever: move it to `failed` carrying the reason so the ledger and the
+    // operator can see why (docs/design/evidence/instance-send-1.md). A row
+    // that already advanced (a journal accept that raced the reply) is left
+    // untouched by the guarded transition.
+    if let Some(failed) = state
+        .store
+        .fail_command(command.command_id.clone(), message.clone())
+        .await?
+    {
+        return Ok(failed);
+    }
     state
         .store
         .get_command(command.command_id.clone())
@@ -2020,6 +2072,46 @@ fn schedule_create_settlement_watch(state: &AppState, command: &CommandRecord) {
                 %command_id,
                 %error,
                 "failed to record create settlement timeout"
+            ),
+        }
+    });
+}
+
+/// Give a forwarded non-create command a bounded ack deadline.
+///
+/// A create already has its own settlement watch and its own failure path, so
+/// this covers the rest (send, steer, cancel, respond, …). If the row is still
+/// `queued` when the deadline elapses — the Node accepted nothing and
+/// error-replied nothing (offline mid-forward, or a hung Node) — it moves to
+/// `failed` with a reason rather than sitting at `queued` forever. A row that
+/// meanwhile advanced to accepted/settled/failed is left untouched by the
+/// guarded transition (docs/design/evidence/instance-send-1.md).
+fn schedule_command_ack_deadline(state: &AppState, command: &CommandRecord) {
+    if command.operation == "instance.create" || command.state != "queued" {
+        return;
+    }
+    let timeout = Duration::from_millis(state.config.command_settle_timeout_ms.max(1));
+    let state = state.clone();
+    let command_id = command.command_id.clone();
+    let operation = command.operation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let reason = format!(
+            "node did not acknowledge {operation} within {} ms",
+            timeout.as_millis()
+        );
+        match state.store.fail_command(command_id.clone(), reason).await {
+            Ok(Some(_)) => tracing::warn!(
+                %command_id,
+                %operation,
+                timeout_ms = timeout.as_millis(),
+                "forwarded command never acknowledged; marked failed"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                %command_id,
+                %error,
+                "failed to record command ack timeout"
             ),
         }
     });

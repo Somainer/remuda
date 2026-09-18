@@ -937,12 +937,15 @@ pub struct CommandRecord {
     pub host_id: String,
     /// Wire operation.
     pub operation: String,
-    /// `queued` / `accepted` / `settled`.
+    /// `queued` / `accepted` / `settled` / `failed`.
     pub state: String,
-    /// `clear` / `unknown`.
+    /// `clear` / `unknown` / `reconciling`.
     pub resolution: String,
     /// True after Hub persisted a forward intent (never resend).
     pub forwarded: bool,
+    /// Failure reason when `state` is `failed`; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Original payload.
     pub payload: Value,
     /// Optional caller idempotency key.
@@ -2880,6 +2883,67 @@ impl Store {
             .await
     }
 
+    /// Recent commands for one instance, newest first, bounded by `limit`.
+    ///
+    /// Backs `GET /v1/instances/{id}/commands`: each row carries operation,
+    /// state, resolution, reason and timestamps so an operator can see why a
+    /// send resolved the way it did.
+    pub async fn list_instance_commands(
+        &self,
+        instance_id: String,
+        limit: usize,
+    ) -> Result<Vec<CommandRecord>, StoreError> {
+        let limit = limit.clamp(1, 200) as i64;
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
+                        payload_json, idempotency_key, created_at, updated_at, reason
+                 FROM commands
+                 WHERE instance_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![instance_id, limit], command_from_row)?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Move a forwarded, still-unresolved command to `failed` with a reason.
+    ///
+    /// Only a row still `queued` with resolution `unknown` is touched, so:
+    /// - an accepted row (`state='accepted'`) settles from the mirrored journal
+    ///   undisturbed;
+    /// - a reconciling row (`resolution='reconciling'`, RPC reply lost) is left
+    ///   for the journal to converge per protocol §2.5 — never failed by a
+    ///   deadline;
+    /// - a row a late journal accept already advanced is left alone.
+    ///
+    /// This is the send/steer path where the Node error-replies or, while
+    /// offline, never acks at all (docs/design/evidence/instance-send-1.md).
+    pub async fn fail_command(
+        &self,
+        command_id: String,
+        reason: String,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        self.run(move |conn| {
+            let now = now_rfc3339();
+            let changed = conn.execute(
+                "UPDATE commands
+                 SET state = 'failed', resolution = 'failed', reason = ?1, updated_at = ?2
+                 WHERE id = ?3 AND state = 'queued' AND resolution = 'unknown'",
+                params![reason, now, command_id],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            load_command(conn, &command_id)
+        })
+        .await
+    }
+
     /// Append a mirrored event. `seq` None assigns durableSeq+1.
     pub async fn append_journal(
         &self,
@@ -4114,6 +4178,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "failed_attempts",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // A forwarded non-create command that the Node rejects or never acks moves
+    // to `failed` carrying this reason, so the operator sees why instead of a
+    // row stuck at `queued` (docs/design/evidence/instance-send-1.md).
+    ensure_column(&conn, "commands", "reason", "TEXT")?;
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS devices_token_prefix ON devices(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
@@ -6630,7 +6698,7 @@ fn load_journal_row(
 fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
-                payload_json, idempotency_key, created_at, updated_at
+                payload_json, idempotency_key, created_at, updated_at, reason
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -6642,7 +6710,7 @@ fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, St
 fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
-                payload_json, idempotency_key, created_at, updated_at
+                payload_json, idempotency_key, created_at, updated_at, reason
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -6939,6 +7007,7 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         state: row.get(4)?,
         resolution: row.get(5)?,
         forwarded: forwarded != 0,
+        reason: row.get(11)?,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
         idempotency_key: row.get(8)?,
         created_at: row.get(9)?,

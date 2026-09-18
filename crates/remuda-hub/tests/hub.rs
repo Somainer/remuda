@@ -408,6 +408,148 @@ async fn instance_configure_is_journaled_and_persisted() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A short ack deadline so the deadline path (a node that never replies)
+    // also resolves inside the test window.
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    config.command_settle_timeout_ms = 300;
+    let hub = spawn(config).await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &hub.bootstrap_token).await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": "h",
+            "method": "runtime.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0", "label": "reject-send" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    // Accept the create so the instance is reachable, but reject instance.send
+    // exactly the way the ssh-stdio Node did before the fold — with an
+    // invalid-request error, so the Hub must fail the row rather than leave it
+    // queued (docs/design/evidence/instance-send-1.md).
+    tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let method = frame["method"].as_str().unwrap_or_default().to_owned();
+            let params = frame.get("params").cloned().unwrap_or(json!({}));
+            let command_id = params
+                .get("commandId")
+                .cloned()
+                .unwrap_or_else(|| json!("cmd_test"));
+            let reply = if method == "instance.send" {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "invalid request: instance.send requires input.text or input.blocks" }
+                })
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "command": { "commandId": command_id, "state": "accepted", "operation": method }
+                    }
+                })
+            };
+            let _ = node.send(Message::Text(reply.to_string().into())).await;
+        }
+    });
+
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "prompt": "hi"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim())?;
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+
+    let send = json!({
+        "operation": "instance.send",
+        "payload": { "input": { "type": "prompt", "blocks": [{ "type": "text", "text": "hello" }] } }
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &[("Cookie", &cookie)],
+        Some(&send),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
+    let command_id = body["command"]["commandId"]
+        .as_str()
+        .context("commandId")?
+        .to_string();
+    assert_eq!(
+        body["command"]["state"], json!("failed"),
+        "a rejected send must resolve failed, not queued: {body}"
+    );
+    let reason = body["command"]["reason"]
+        .as_str()
+        .context("failure reason present")?;
+    assert!(
+        reason.contains("input.text") || reason.contains("input.blocks"),
+        "the reason carries the node's message: {reason}"
+    );
+
+    // The new GET route lists the command, newest first, with its resolved state.
+    let (status, _, listed) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}/commands"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(listed.trim())?;
+    let commands = listed["commands"].as_array().context("commands array")?;
+    let row = commands
+        .iter()
+        .find(|row| row["commandId"].as_str() == Some(command_id.as_str()))
+        .context("send command listed")?;
+    assert_eq!(row["operation"], json!("instance.send"));
+    assert_eq!(row["state"], json!("failed"));
+    assert_eq!(row["resolution"], json!("failed"));
+    assert!(row.get("reason").and_then(Value::as_str).is_some());
+    assert!(row.get("createdAt").is_some() && row.get("updatedAt").is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn auth_reject_http_and_origin() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let (status, _, _) = http(hub.addr, "GET", "/v1/hosts", &[], None).await?;

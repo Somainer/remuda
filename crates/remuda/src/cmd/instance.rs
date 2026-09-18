@@ -460,9 +460,72 @@ pub(crate) async fn send(
         },
         "completionScope": completion_scope,
     });
-    Ok(client
+    let mut body = client
         .post_command(instance_id, "instance.send", payload, command_id)
-        .await?)
+        .await?;
+    resolve_command_state(client, instance_id, &mut body).await;
+    Ok(body)
+}
+
+/// Replace a still-`queued` send row in `body` with its resolved ledger row and
+/// annotate `body` with `resolvedState` / `failureReason`, so the operator sees
+/// how the send actually settled (accepted / failed) rather than only the
+/// queued row the POST returned. Best effort: on any error the queued row
+/// stands (docs/design/evidence/instance-send-1.md).
+pub(crate) async fn resolve_command_state(
+    client: &HubClient,
+    instance_id: &str,
+    body: &mut Value,
+) {
+    let command_id = body
+        .pointer("/command/commandId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(command_id) = command_id else {
+        return;
+    };
+    let mut resolved = body["command"].clone();
+    // The error-reply path resolves synchronously; the ack-deadline path resolves
+    // shortly after. Poll the new commands listing a few times for a terminal
+    // state before giving up on the queued row.
+    for attempt in 0..20 {
+        let state = resolved.get("state").and_then(Value::as_str).unwrap_or("");
+        if matches!(state, "accepted" | "settled" | "failed") {
+            break;
+        }
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let Ok(listing) = client
+            .get(&format!("/v1/instances/{instance_id}/commands?limit=50"))
+            .await
+        else {
+            break;
+        };
+        if let Some(found) = listing
+            .get("commands")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("commandId").and_then(Value::as_str) == Some(command_id.as_str())
+                })
+            })
+        {
+            resolved = found.clone();
+        }
+    }
+    let state = resolved
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("queued")
+        .to_owned();
+    body["command"] = resolved.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("resolvedState".into(), json!(state));
+        if let Some(reason) = resolved.get("reason").and_then(Value::as_str) {
+            obj.insert("failureReason".into(), json!(reason));
+        }
+    }
 }
 
 pub(crate) async fn wait(

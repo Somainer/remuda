@@ -43,9 +43,13 @@ pub(crate) struct ListArgs {
 struct Tail {
     seq: u64,
     line: String,
+    /// False when the REST page carrying this tail was a bounded partial
+    /// window; surfaced in JSON so a consumer knows the last line was picked
+    /// from a window, not the whole journal since the requested cursor.
+    window_complete: bool,
 }
 
-fn sequence(value: &Value) -> u64 {
+pub(crate) fn sequence(value: &Value) -> u64 {
     value
         .as_u64()
         .or_else(|| value.as_str().and_then(|v| v.parse().ok()))
@@ -135,13 +139,27 @@ async fn refresh(
             let after = sequence(&item["durableSeq"]).saturating_sub(32).to_string();
             let client = Arc::clone(client);
             tails.spawn(async move {
-                let page = client.get_journal(&id, Some(&after)).await;
-                let tail = page.ok().map(|page| Tail {
-                    seq: sequence(&page["durableSeq"]),
-                    line: page["events"]
-                        .as_array()
-                        .and_then(|events| events.iter().rev().find_map(last_line))
-                        .unwrap_or_default(),
+                let page = client.get_journal(&id, Some(&after), None).await;
+                let tail = page.ok().map(|page| {
+                    let events = page["events"].as_array();
+                    // Cursor from the last event actually received, never from
+                    // durableSeq: a bounded window could cut rows between the
+                    // cursor and the tail.
+                    let seq = events
+                        .and_then(|events| {
+                            events.iter().rev().find_map(|event| {
+                                let seq = sequence(&event["seq"]);
+                                (seq > 0).then_some(seq)
+                            })
+                        })
+                        .unwrap_or_else(|| sequence(&page["durableSeq"]));
+                    Tail {
+                        seq,
+                        line: events
+                            .and_then(|events| events.iter().rev().find_map(last_line))
+                            .unwrap_or_default(),
+                        window_complete: page["reachedAfterSeq"].as_bool().unwrap_or(true),
+                    }
                 });
                 (id, tail)
             });
@@ -158,6 +176,8 @@ async fn refresh(
             let id = item["instanceId"].as_str().unwrap_or("");
             row["lastLine"] = json!(lines.get(id).map(|tail| tail.line.as_str()).unwrap_or(""));
             row["lastLineAvailable"] = json!(lines.contains_key(id));
+            row["journalWindowComplete"] =
+                json!(lines.get(id).is_none_or(|tail| tail.window_complete));
             row
         })
         .collect();
@@ -201,10 +221,15 @@ fn apply_frame(frame: &Value, lines: &mut BTreeMap<String, Tail>) {
         last_line(&frame["event"])
     };
     if let Some(line) = line {
-        let seq = if frame["type"] == "snapshot" {
-            &frame["asOfSeq"]
+        let (seq, window_complete) = if frame["type"] == "snapshot" {
+            // The snapshot is the same bounded window as GET journal and
+            // carries reachedAfterSeq; live event frames are always whole.
+            (
+                &frame["asOfSeq"],
+                frame["reachedAfterSeq"].as_bool().unwrap_or(true),
+            )
         } else {
-            &frame["seq"]
+            (&frame["seq"], true)
         };
         store_tail(
             lines,
@@ -212,6 +237,7 @@ fn apply_frame(frame: &Value, lines: &mut BTreeMap<String, Tail>) {
             Tail {
                 seq: sequence(seq),
                 line,
+                window_complete,
             },
         );
     }
@@ -345,6 +371,7 @@ mod tests {
             Tail {
                 seq: 20,
                 line: "current".into(),
+                window_complete: true,
             },
         )]);
         apply_frame(

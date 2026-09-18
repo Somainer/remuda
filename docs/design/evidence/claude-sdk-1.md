@@ -5,12 +5,15 @@
 **Design:** [print-replacement.md](../print-replacement.md) §2.1 (process model), §2.2 (resume and session identity), §2.5 (observation table), §2.6 (second carrier). Decision row [D-037](../decisions.md).
 **Scope:** M1 = §3 batch 1 + batch 2 + the registration half of batch 3.
 **Commits:** the live run below was made on branch `wt/c-sdkdriver/b-sdkdriver-md` at
-`56e55988` (the M1 series as first reviewed). The handback round that followed —
-the bounded close ladder, the web driver label and the test fixes — is commits
-`14381315..8993e51b` on the same branch, with this documentation commit last. The
-argv, pids, session id and journal quoted here are from the `56e55988` tree; the
-close ladder changed `Driver::close` after that run, and its behaviour is covered
-by `tests/claude_sdk_process.rs` rather than by a second live session.
+`56e55988` (the M1 series as first reviewed). The handback rounds that followed
+are: round 2 (the bounded close ladder, the web driver label, de-tautologised
+tests) at `14381315..8993e51b`, and round 3 (the real SIGKILL rung, bounding
+`close_stdin`, joining the reader) ending at `955592c5`, on the same branch,
+with this documentation commit last. The argv, pids, session id and journal
+quoted here are from the `56e55988` tree; `Driver::close` was reworked in both
+handback rounds after that run, and its behaviour — including a child that
+ignores stdin EOF, a saturated writer, and a child that ignores SIGTERM — is
+covered by `tests/claude_sdk_process.rs` rather than by a second live session.
 
 `LIVE`: this session spent real Haiku budget on two one-word turns (reported cost
 below, two `result` frames). Everything else in the change is covered by

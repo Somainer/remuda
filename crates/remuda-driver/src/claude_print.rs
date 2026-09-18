@@ -84,12 +84,14 @@ pub struct ClaudePrintOptions {
     pub setting_sources: Option<Vec<String>>,
     /// Initialize handshake timeout.
     pub handshake_timeout: Duration,
-    /// How long [`Driver::close`] waits for the child to leave on its own after
-    /// stdin EOF, before escalating to interrupt and then SIGKILL (§2.3).
+    /// Total bound for [`Driver::close`]. The ladder spends it in two equal
+    /// slices — stdin EOF with a bounded wait, then SIGTERM to the process group
+    /// with a bounded wait — before SIGKILL and a short fixed reap (§2.3).
     ///
-    /// Stdin EOF is a request, not a guarantee: a child mid-turn, or blocked on
-    /// an unanswered `can_use_tool`, can ignore it indefinitely. An unbounded
-    /// wait would hang `instance.close` forever on the long-lived sdk carrier.
+    /// Stdin EOF is a request, not a guarantee: a child mid-turn, blocked on an
+    /// unanswered `can_use_tool`, or one that stopped draining stdin, can ignore
+    /// it indefinitely. An unbounded close would hang forever on the long-lived
+    /// sdk carrier, so the EOF request *and* every wait are inside this bound.
     pub close_timeout: Duration,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
@@ -682,11 +684,29 @@ impl Driver for ClaudePrintDriver {
         }
         *live_guard = None;
         drop(live_guard);
-        // The reader task ends at stdout EOF and calls `emit_exit`, but it races
-        // this close: if it has not run yet, clearing `events` first would drop
-        // the lifecycle entirely. Emit here (idempotent, `exit_emitted`) and
-        // only then close the channel, so `exited` is observed exactly once
-        // whether the child left on its own or was killed by the ladder.
+
+        // Stop this launch's reader before touching the events channel. The
+        // child is already reaped, so its stdout is at EOF and `map_loop` is on
+        // its way out; give it a short bound to finish and deliver the `exited`
+        // lifecycle itself, then abort it if it is still parked.
+        //
+        // The abort is the point. A reader outlives close detached, and a later
+        // `start()` on this driver resets `exit_emitted` for the new launch; a
+        // reader A still parked on `inner.live` at that moment could then emit a
+        // *second* `exited` into launch B's channel. Joining it here (or killing
+        // it) closes that window: by the time `close` returns, no task from this
+        // launch can emit.
+        if let Some(mut reader) = self.reader.lock().await.take()
+            && tokio::time::timeout(Duration::from_millis(500), &mut reader)
+                .await
+                .is_err()
+        {
+            reader.abort();
+        }
+
+        // Whichever path got there first — the reader finishing naturally, or
+        // this call covering an aborted one — emits exactly once
+        // (`exit_emitted`), and only while `events` is still live.
         let _ = emit_exit(&self.inner, "exited").await;
         *self.inner.events.lock().await = None;
         // S5: the child has exited, so the launch overlays can go. The label is
@@ -739,87 +759,115 @@ impl Driver for ClaudePrintDriver {
     }
 }
 
-/// Close the child on a bounded ladder: stdin EOF, then interrupt, then SIGKILL
-/// of the child's process group (`print-replacement.md` §2.3).
+/// Close the child on a bounded ladder: stdin EOF with a bounded wait, SIGTERM
+/// to the process group with a bounded wait, then SIGKILL to the group plus a
+/// bounded reap (`print-replacement.md` §2.3).
 ///
-/// Stdin EOF is only a request. A child mid-turn, or blocked on a `can_use_tool`
-/// nobody answered, can ignore it for as long as it likes — and on the
-/// long-lived sdk carrier the previous unbounded `wait()` turned that into an
-/// `instance.close` that never returned. Each rung gets its own slice of
-/// `timeout`, and the function returns once the child is reaped or the ladder is
-/// exhausted; it never returns while still holding a live child it could kill.
+/// Stdin EOF is only a request. A child mid-turn, blocked on a `can_use_tool`
+/// nobody answered, or one that simply stopped draining stdin, can ignore it
+/// for as long as it likes — and on the long-lived sdk carrier the previous
+/// unbounded `wait()` turned that into an `instance.close` that never returned.
+/// **Every** rung is bounded, including the EOF request itself: when the child
+/// stops reading and the 64-slot writer channel fills, enqueuing the EOF blocks
+/// exactly the way the subsequent wait could. The function never returns while
+/// still holding a live child it could kill.
 async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
     // The group id equals the direct child's pid because `spawn_command` puts it
     // in its own group. Read it before any wait: once reaped, `id()` is `None`.
     let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
 
-    // Rung 1: the graceful path. Stdin EOF is the polite "no more turns", and
-    // most closes end here.
-    let graceful = timeout.mul_f32(0.5);
-    let _ = live.process.close_stdin().await;
-    if tokio::time::timeout(graceful, live.process.wait())
+    // Rung 1: the graceful path. Request stdin EOF, then give the child the
+    // whole first slice to leave. The two steps share one bound: `close_stdin`
+    // enqueues onto the writer channel, and that enqueue can block when the
+    // child stopped draining and the channel is full — so it must sit inside
+    // the timeout, not before it. Most closes end here.
+    let first_slice = timeout.mul_f32(0.5);
+    let request_eof_and_wait = async {
+        let _ = live.process.close_stdin().await;
+        let _ = live.process.wait().await;
+    };
+    if tokio::time::timeout(first_slice, request_eof_and_wait)
         .await
         .is_ok()
     {
         return;
     }
 
-    // Rung 2: SIGTERM-equivalent for this transport would be the native
-    // `interrupt` control request — but that travels over stdin, and
-    // `close_stdin` already shut the writer down (`WriterCmd::Close` breaks its
-    // loop), so nothing further can be written. Interrupting *before* EOF would
-    // mean cancelling in-flight work on every ordinary close, which is not what
-    // `instance.close` promises. So the escalation is straight to signals, and
-    // the interrupt path stays where it belongs: `Driver::cancel`.
+    // Rung 2: SIGTERM to the whole group, then the second slice. The native
+    // `interrupt` control request is not used here: it travels over stdin, which
+    // rung 1 already asked to close, so nothing further can be written — and
+    // interrupting before EOF would cancel in-flight work on every ordinary
+    // close, which `instance.close` does not promise. The interrupt path stays
+    // in `Driver::cancel`.
     //
-    // SIGTERM first, so a child that installs a handler can still flush its
-    // transcript; the group gets it, because a `Bash` tool or MCP server the
-    // child spawned would otherwise outlive the instance.
+    // The group gets the signal so a `Bash` tool or MCP server the child spawned
+    // leaves with it instead of outliving the instance. A child with a handler
+    // can use this slice to flush its transcript.
     debug!(carrier, "close: stdin EOF ignored, terminating the group");
-    if let Some(pgid) = pgid {
-        signal_child_group(pgid, nix::sys::signal::Signal::SIGTERM, carrier);
-    }
-    let after_term = timeout.saturating_sub(graceful);
-    if tokio::time::timeout(after_term, live.process.wait())
+    terminate_group(pgid, carrier);
+    let second_slice = timeout.saturating_sub(first_slice);
+    if tokio::time::timeout(second_slice, live.process.wait())
         .await
         .is_ok()
     {
         return;
     }
 
-    // Rung 3: SIGKILL, which nothing can ignore. `kill` only reaches the direct
-    // child, so signal the group as well.
+    // Rung 3: SIGKILL to the group, which nothing can ignore, then reap so a
+    // zombie cannot survive close. `kill` reaches only the direct child, hence
+    // the group signal first. The reap has a short bound for a child wedged in
+    // uninterruptible kernel IO; such a process cannot be killed by userspace,
+    // but close still returns rather than hanging.
     warn!(carrier, "close: SIGTERM ignored, killing the process group");
-    if let Some(pgid) = pgid {
-        signal_child_group(pgid, nix::sys::signal::Signal::SIGKILL, carrier);
-    }
+    kill_group(pgid, carrier);
     let _ = live.process.kill();
-    // Reap it, so the ladder cannot leave a zombie behind. The child is killed
-    // unignorably; a short bound still keeps `close` from hanging if the process
-    // is wedged in the kernel (uninterruptible IO).
     let _ = tokio::time::timeout(Duration::from_secs(2), live.process.wait()).await;
 }
 
-/// Send `signal` to every member of the child's process group.
+/// SIGTERM every member of the child's process group. Unix only; on other
+/// platforms the child has no group to signal and `kill()` in the ladder is the
+/// fallback, so this is a no-op there. `None` means the pid was already gone.
+#[cfg(unix)]
+fn terminate_group(pgid: Option<i32>, carrier: &str) {
+    if let Some(pgid) = pgid {
+        signal_child_group(pgid, nix::sys::signal::Signal::SIGTERM, carrier);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_group(pgid: Option<i32>, carrier: &str) {
+    let _ = (pgid, carrier);
+}
+
+/// SIGKILL every member of the child's process group. Unix only.
+#[cfg(unix)]
+fn kill_group(pgid: Option<i32>, carrier: &str) {
+    if let Some(pgid) = pgid {
+        signal_child_group(pgid, nix::sys::signal::Signal::SIGKILL, carrier);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(pgid: Option<i32>, carrier: &str) {
+    let _ = (pgid, carrier);
+}
+
+/// Send a signal to every member of process group `pgid`.
 ///
 /// `unsafe` is forbidden workspace-wide, so this goes through `nix` rather than
-/// a raw `libc::killpg`. A group that is already gone (`ESRCH`) is the outcome
-/// being asked for, and `EPERM` means something in it is not ours to signal —
-/// neither is worth failing a close over, so both are logged and swallowed.
+/// a raw `libc::killpg` — the same path `shell_pty/lifecycle.rs` uses. A group
+/// that is already gone (`ESRCH`) is the outcome being asked for, and `EPERM`
+/// means something in it is not ours to signal; neither is worth failing a close
+/// over, so both are logged and swallowed. The `nix` signal type is kept out of
+/// the non-unix callers' signatures so the `cfg(not(unix))` stubs compile.
+#[cfg(unix)]
 fn signal_child_group(pgid: i32, signal: nix::sys::signal::Signal, carrier: &str) {
-    #[cfg(unix)]
-    {
-        if pgid <= 0 {
-            return;
-        }
-        match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), signal) {
-            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(errno) => debug!(carrier, pgid, %errno, "process-group signal failed"),
-        }
+    if pgid <= 0 {
+        return;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (pgid, signal, carrier);
+    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(errno) => debug!(carrier, pgid, %errno, "process-group signal failed"),
     }
 }
 

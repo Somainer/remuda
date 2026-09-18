@@ -29,10 +29,32 @@ pub enum FakeClaudeError {
 
 /// Run the fake until stdin EOF. Returns the process exit code.
 pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
+    // `FAKE_CLAUDE_IGNORE_SIGTERM=1` must take effect **before any thread is
+    // spawned**. SIGTERM is blocked on this thread, so the parent-watch thread
+    // (below) inherits the blocked mask.
+    //
+    // Doing this only after `parent_watch::install` is too late: that watcher
+    // thread would start with SIGTERM unblocked, and the process-directed
+    // SIGTERM the close ladder sends at rung 2 would be delivered *there*,
+    // killing the fake on the default disposition and making the SIGKILL-rung
+    // test vacuous. Real parent death is still caught by the watcher's
+    // `getppid()` poll; blocking the kernel's PDEATHSIG does not disable that.
+    let ignore_sigterm =
+        std::env::var("FAKE_CLAUDE_IGNORE_SIGTERM").is_ok_and(|value| value == "1");
+    #[cfg(unix)]
+    if ignore_sigterm {
+        block_sigterm();
+    }
+
     // Exit with the spawner if the test is killed. The harness hands us a
     // piped stdin, so its death shows up as EOF anyway; pdeathsig and the
     // parent-pid poll cover the cases where stdin was redirected elsewhere.
     let _parent_watch = crate::parent_watch::install();
+    // `FAKE_CLAUDE_STOP_READING=1`: after answering the `initialize` handshake,
+    // never read stdin again. A child that stopped draining wedges the driver's
+    // 64-slot writer channel, which is what made `close_stdin` itself able to
+    // hang — a behaviour the close ladder has to bound.
+    let stop_reading = std::env::var("FAKE_CLAUDE_STOP_READING").is_ok_and(|value| value == "1");
     if std::env::args()
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
@@ -65,6 +87,7 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         cursor: 0,
         last_behavior: None,
         interrupted: false,
+        saw_initialize: false,
         transcript,
     };
     session.emit_init()?;
@@ -78,6 +101,12 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         }
         let incoming: Value = serde_json::from_str(trimmed)?;
         session.handle_incoming(incoming, &mut lines)?;
+        // Handshake done; from here the child never drains stdin. The parent
+        // stdin watch is suppressed for this knob (see parent_watch); the
+        // getppid() poll still reaps us when the test really goes away.
+        if stop_reading && session.saw_initialize {
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        }
     }
     // `FAKE_CLAUDE_IGNORE_EOF=1`: do not leave when stdin closes.
     //
@@ -87,13 +116,6 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // a child that actually behaves that way, so this makes the fake one.
     // Deliberately not driven by a script line: EOF handling is process
     // behaviour, not conversation.
-    // `FAKE_CLAUDE_IGNORE_SIGTERM=1`: also ignore SIGTERM, so a test can force the
-    // ladder all the way to its SIGKILL rung. Without this the fake dies on the
-    // default SIGTERM disposition and rung 3 is never exercised.
-    if std::env::var("FAKE_CLAUDE_IGNORE_SIGTERM").is_ok_and(|value| value == "1") {
-        #[cfg(unix)]
-        block_sigterm();
-    }
     if std::env::var("FAKE_CLAUDE_IGNORE_EOF").is_ok_and(|value| value == "1") {
         // Park, but never forever: the parent-death watch installed above exits
         // with the spawner, and this cap keeps a leaked fake from outliving a
@@ -110,6 +132,9 @@ struct Session {
     cursor: usize,
     last_behavior: Option<String>,
     interrupted: bool,
+    /// The `initialize` control request has been answered; after this the
+    /// `FAKE_CLAUDE_STOP_READING` knob parks without reading more stdin.
+    saw_initialize: bool,
     transcript: Option<File>,
 }
 
@@ -177,6 +202,7 @@ impl Session {
                 Ok(())
             }
             "initialize" => {
+                self.saw_initialize = true;
                 emit(&initialize_success(&request_id))?;
                 Ok(())
             }

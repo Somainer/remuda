@@ -334,8 +334,10 @@ lifecycle，Node 无需 driver 专用代码就把它抬进 `nativeRef`）；id �
 **M1 边界**。已交付：protocol 枚举 + 重生成的 schema/TS、两套 argv 模板（wire 与
 materializer）、driver 本体与参数化的 mapper、能力矩阵、fake 的 turn barrier 与不带
 `-p` 的 spawn、Node 工厂与矩阵、汇编器/进程/矩阵三层测试、真实两轮 live 证据；
-交接复审一轮另补：`Driver::close` 的有界阶梯（stdin → 有界 wait → 原生 interrupt →
-子进程组 SIGKILL，`exited` 恰好一次）与 web 侧的 `claude-sdk` 标签（此前 UI 把 sdk
+交接复审一轮另补：`Driver::close` 的有界阶梯（stdin EOF 内含有界等待 → 子进程组
+SIGTERM 内含有界等待 → 子进程组 SIGKILL 并回收；含 EOF 请求本身——子进程不再读 stdin
+且 writer 通道写满时 `close_stdin` 自己也会阻塞；close 前 join/中止 reader，`exited`
+恰好一次）与 web 侧的 `claude-sdk` 标签（此前 UI 把 sdk
 实例显示成 print，等于告诉操作者"这个会话一轮就结束"）。
 
 **M2 owns**：print 退役（夹具对账变绿之后）、§2.4 的 suggestions 白名单与
@@ -352,6 +354,12 @@ live 证据里第 1 轮报 `false`、第 2 轮报 `true`，两个都不对（第
 `affects_completion`」。M1 没有任何下游在 sdk carrier 上依赖这个字段，所以先记账：
 要修得先定义「对一个长寿子进程而言什么算终结」，那是 M2 的决定，不是同轮改动。
 证据见 [claude-sdk-1.md](./evidence/claude-sdk-1.md) §6。
+
+**close 的残留（复审记账，M2）**：有界阶梯消除了「永不返回」，但 `close` 在整段
+阶梯期间一直持有 `inner.live` 锁，所以这段时间里 `send` / `cancel` /
+`respond_interaction`（它们都要拿同一把锁）仍是阻塞的——只是被 `close_timeout`
+**封顶**而不是消除。要彻底不阻塞，得让 close 不持锁地驱动终止（把 live 取出后在锁外
+跑阶梯、或让控制操作走独立通道），那会动到 `Live` 的所有权形状，超出 M1。
 
 **实测**：[claude-sdk-1.md](./evidence/claude-sdk-1.md) 在一台一次性本地 dev server
 上用真实 CLI 跑了一轮 `LIVE`：`--driver claude-sdk` 被原样转发，进程表里的 argv

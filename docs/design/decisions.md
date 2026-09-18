@@ -373,3 +373,87 @@ live 证据里第 1 轮报 `false`、第 2 轮报 `true`，两个都不对（第
 journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚成
 `Structured` 的最终块，两轮各有自己的 `result` 与 usage/cost。该文档同时列出这轮
 **没有**测到的东西（interrupt、steer、网关、审批活链路），以免 ADR 超额声称。
+## D-038
+
+**2026-09-19 · 会话列表行 = 状态点 + 标题 + 一句下一步；三维 wire 与 `ins_` 退到展开/tooltip；行内遥控收进溢出菜单**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | [ui-spec.md §2.1](./ui-spec.md)（会话列表）、§1.4、[workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.3 / §11.7、D-024 addendum |
+
+**背景**：`web/src/features/session/SessionList.tsx` 把 `lifecycle · activity · connectivity | host / worktree · driver` 渲染成行内 `.meta`，并追加 `shortId(instance.id, 8)`，行内还有 `send…` 与 enter/esc/ctrl+c。而 `ui-spec.md` §2.1 的线框本来就只有「点 + 标题 + 一句」——**当前代码才是偏离规格的那一方**，不是规格要为新建议让路。
+
+**决策**：列表行默认视口只渲染状态点（§2.1 三维投影）、标题、kind 芯片、徽标与一句「下一步」；`lifecycle`/`activity`/`connectivity` 原文三元组、`ins_` 短码、`driver`、`model` 退到每行的 `<details data-testid="session-wire">` 或 `title`。那句「下一步」只**投影**已有字段（`projectStatus` / `Interaction.request.kind|description` / `exitLabel` / screen 终态），不新造状态机、不猜成功；`connectivity ≠ connected` 或 `lifecycle ∈ {unknown,reconciling}` 一律产出「状态待确认」，绝不回落成正向文案。行内遥控收进长按/溢出 `Sheet`（保留既有 testid 与命令路径），「待处理」组在行上保留一个主操作。
+
+**由谁**：coordinator（按 [workbench-ux-plan.md](./workbench-ux-plan.md) §(C) 第 5 条默认值「收进 Sheet，不删能力」落地）。
+
+**依据**：报告 §11.7 的 P0-6 行结论为 **READY（规格反而要求）**——`ui-spec.md` 线框无 wire 串、`:164` 明写状态点是三维投影而非单独 wire 枚举，缺的只是 `nextStep()` 派生（全库不存在）；§11.3 记录 Moshi 在同一位置放的是事件原文与错误文案（`API Error: Request rejected (429)`），支持「一句下一步」而非诊断串。
+
+## D-039
+
+**2026-09-19 · 触控命中只靠热区；`.meta` 统一 `var(--text-aux)`，桌面手机同值；禁止在 `session.module.css` 新增裸像素命中尺寸**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | [ui-spec.md §3.4](./ui-spec.md)、§2.2（Effort）、§1.3、报告 §11.6 / §11.7、D-024 |
+
+**背景**：两条独立的偏差。**(a) 字号**：`.meta` 基础值 11px（`session.module.css:153-159`）、手机媒体查询再降到 10.5px —— 两个值都低于 `tokens.css` type scale 块头注释的 12px 下限，而且**手机字号小于桌面**同一元素，方向是反的。**(b) 命中**：`.back` `width: 20px`（`:25-31`）、`.viewSeg` 25px／手机 30px（`:96-98` / `:2450-2453`）、手机 `.stopBtn` 32×32（`:2398-2403`）都低于 44px。报告 §5-P0-2 的字面写法（「`.back` 20px → `--touch`」）**违反** `ui-spec.md` 既有的 §2.2 条款「手机上触控 ≥ 44px 只靠**热区**，不靠视觉尺寸」——报告自己的正文也写了「可视可以略小，hit slop 必须够」，是标题与正文不一致。
+
+**决策**：命中尺寸一律走**热区**（`::after` / padding），视觉字形尺寸**不变**；新增命中尺寸一律 `var(--touch)`，`session.module.css` 里不得再新增裸像素命中值（该文件全文对 `var(--touch)` 的引用数为 **0**，20/25/27/30/32 全是硬编码，这正是跑偏的原因）。可点区域不得互相重叠。`.meta` 一类辅助/诊断文本**桌面与手机统一** `var(--text-aux)`（12px），用 token 而非字面量；本条只管辅助文本，正文 14px 与输入/强调 16px 不变。compact（布局）判定与 `coarsePointer`（触屏）判定不得混用。
+
+**由谁**：coordinator（规格口径；实现由 c-touchhit 落地）。
+
+**依据**：报告 §11.7 的 P0-2 行判 **NEEDS_DESIGN**，要求按规格改写成热区方案并取正文那句；§11.6 两处措辞修正（桌面 11px / 手机 10.5px；12px 下限的出处是 type scale 块头注释，不是 `--text-label` 的注释）。热区先例在同文件 `.effortIconBtn::after`（44×44，`:2434-2443`）。`var(--touch)` 全库唯一定义在 `styles/tokens.css`。
+
+## D-040
+
+**2026-09-19 · `/s/:id` compact 铬预算：space chips 折成单芯片入顶栏；诊断 meta 进「运行详情」disclosure；分段与 Stop 不得进 ⋯**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | [ui-spec.md §1.3 / §1.4 / §2.2](./ui-spec.md)、报告 §11.7、D-024、D-028 |
+
+**背景**：`ui-spec.md` §1.4 要求「约 400px 手机上显示可横向滚动的 space chips 与 tabs」，且该节自称「只作用于会话工作台」——`/s/:id` 正在其内，所以「收起 chips」原本与规格直接冲突；`ui-spec.md` §1.3 又把 `terminal|structured` 切换列为顶栏必有项，挪进 ⋯ 即违规。另一半：§2.2 把两行 header 画成**规范 wireframe**（第二行就是 `seq 184 · connectivity=connected · $0.12`），而 `:113` 要求主机芯片在顶栏、`:331` 要求 cost 在顶栏——桌面 meta 折叠若不改这张图，代码与规格立刻自相矛盾。
+
+**决策**：**(1)** §1.4 的 400px chips 要求**限定到列表路由**（`/sessions`、`/hosts`、`/projects`、`/approvals` 等）；`/s/:instanceId` 及其子视图在 compact 下允许折成**单枚当前 space 芯片**并入会话顶栏，点击打开同一个抽屉（`spaces-drawer-open` 行为与 testid 不变），切空间能力不降级。**(2)** `terminal|structured` 分段与 Stop **始终留在顶栏，永不进 ⋯ 溢出菜单**。**(3)** §2.2 header 从「规范两行诊断」改为「主行 + 可折叠**运行详情**」，ASCII 图同步重画；主行保留 **host 芯片 + cost + 状态点 + 分段 + Stop**；`driver / delegation / provider / providerSourceHint / lifecycle / seq / connectivity / native / promoted 绑定` 进 disclosure，默认收起、**展开态按设备持久化**（本设备 `localStorage`，不跨设备）；`session-meta` testid 保留在展开内容上以便老断言迁移。
+
+**由谁**：coordinator（按 [workbench-ux-plan.md](./workbench-ux-plan.md) §(C) 第 1、2 条默认值）。
+
+**依据**：报告 §11.7 的 P0-1 与 P0-5 两行均判 **CONFLICTS**，明确「要实施必须先改 `ui-spec.md`」；P0-1 行还指出该建议**与自己矛盾**（P1-8 与 §10-19 要求该开关**更**显眼）。
+
+## D-041
+
+**2026-09-19 · 工具卡默认折叠的豁免集合与折行最小信息量**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | [ui-spec.md §2.2](./ui-spec.md)、报告 §11.7、`web/src/features/session/ToolCard.tsx` |
+
+**背景**：`ui-spec.md` 要求 `workflow.run` **运行中与结束后都展开，只有读者 dismiss 才折叠**，`error` 卡**必须展开**；而 `ToolCard.tsx` 的 `if (folded) return …` 分支在 `family === "Workflow"` 分支**之前** return（约 `:260` vs `:281-292`）。一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动——是**静默杀死功能**，不是视觉问题。另 `ui-spec.md` 要求 Bash「命令一行」，折成裸「Bash」违规。
+
+**决策**：默认折叠**只对 compact 且已 settled、且 family ∉ {Workflow, error}** 的卡生效；`interaction.*` 同样豁免；running / 未 settled 的卡**永不折叠**。折行内容 = **family + 关键参数**（Bash = 命令首行，Edit/Write/Read = 路径），按宽度截断且 `title` 给全文，裸 `Bash` 不合规。**折叠分支必须在 family 判定之后**才可提前 return。桌面默认态不变；展开后的卡与桌面完全一致（同一组件、同一 testid）。
+
+**由谁**：coordinator（按 [workbench-ux-plan.md](./workbench-ux-plan.md) §(C) 第 3 条默认值）。
+
+**依据**：报告 §11.7 的 P1-10 / P1-20 行判 **CONFLICTS**，并点名 `ToolCard.tsx:260` 早于 `:281-292` 的 return 顺序；折行关键参数可由 `toolPresenters.ts:191-203` 的 Bash 分支直接给出。验收硬指标是「卡头 elapsed 在运行中递增」，不是「卡可见」。
+
+## D-042
+
+**2026-09-19 · 手机 composer 单行 + 选项 sheet 的边界：触发器带 mode 词与档名，三态与诚实标注留在外面**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | [ui-spec.md §2.2](./ui-spec.md)、报告 §11.7、D-028a、`web/src/features/session/Composer.tsx` |
+
+**背景**：`ui-spec.md` 要求权限芯片**显示**当前 `permissionMode`、effort 触发器**显示档名**；`permissions.ts` 把 bypass / dontAsk 一类标为 `danger`——把 bypass 态藏进 sheet 是这一片里最响的冲突。D-028a 另要求 composer 呈现发送/排队/打断三态 + 队列 chip + 未验证能力标「尚未验证」。同时 `Composer.tsx` 的 placeholder 写满桌面快捷键，两处 `window.confirm`（插队 / Esc 打断）在 Safari 上会盖住键盘。
+
+**决策**：compact 下 control bar 允许收成**一个选项触发器**，但触发器**必须**同时显示当前 `permissionMode` 的**词**与 effort 的**档名**（形如 `manual · high`），`danger` 模式必须在触发器上就以 danger 样式可见。**可进 sheet**：附件、harness 只读芯片、context 用量、权限选择器、effort 滑杆。**不得进 sheet**：三态按钮、队列 chip、「尚未验证」标注（它们不是「选项」）。placeholder 分平台（手机不写桌面快捷键）。插队与 Esc 打断的 `window.confirm` 换成 `Sheet`（桌面 `popover`、手机 `sheet`，焦点圈定、Esc = 取消、返回焦点到触发器），**确认后的命令语义与 `commandId` 路径完全不变**；桌面布局与 testid 零变化。
+
+**由谁**：coordinator（按 [workbench-ux-plan.md](./workbench-ux-plan.md) §(C) 第 4 条默认值）。
+
+**依据**：报告 §11.7 的 P0-3 行判 **CONFLICTS**（权限与 effort 的可见性、D-028a 三态与诚实标注）；`decisions.md` D-028a 的三态/队列 chip/「尚未验证」要求是本条的边界来源。

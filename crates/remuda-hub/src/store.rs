@@ -990,9 +990,7 @@ impl CommandRecord {
     ) -> Option<CommandSettlement> {
         outcome.map(|outcome| CommandSettlement {
             outcome: outcome.to_owned(),
-            reason: reason
-                .filter(|_| outcome == "rejected")
-                .map(str::to_owned),
+            reason: reason.filter(|_| outcome == "rejected").map(str::to_owned),
         })
     }
 }
@@ -2929,8 +2927,7 @@ impl Store {
                     params![now, command_id],
                 )?;
             }
-            load_command(conn, &command_id)?
-                .ok_or_else(|| StoreError::Id("unknown command".into()))
+            load_command(conn, &command_id)?.ok_or_else(|| StoreError::Id("unknown command".into()))
         })
         .await
     }
@@ -4251,6 +4248,28 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // settlement; they are NULL until the row settles.
     ensure_column(&conn, "commands", "settlement_outcome", "TEXT")?;
     ensure_column(&conn, "commands", "settlement_reason", "TEXT")?;
+    // One-time cleanup of the round-2 shape: a failed delivery was briefly a
+    // fourth `state='failed'` value held in a `reason` column. Fold any rows an
+    // older build persisted into the §2.5 form (`settled` + a `rejected`
+    // settlement carrying that reason), then drop the orphaned column. The
+    // column drop also discards a stale `reason` a pre-fix mark_settled could
+    // have left on a completed row. Bundled SQLite is >= 3.35 (DROP COLUMN).
+    if column_exists(&conn, "commands", "reason")? {
+        let migrated = conn.execute(
+            "UPDATE commands
+             SET state = 'settled', resolution = 'clear',
+                 settlement_outcome = 'rejected', settlement_reason = reason
+             WHERE state = 'failed'",
+            [],
+        )?;
+        if migrated > 0 {
+            tracing::info!(
+                migrated,
+                "folded legacy failed commands into rejected settlements"
+            );
+        }
+        conn.execute("ALTER TABLE commands DROP COLUMN reason", [])?;
+    }
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS devices_token_prefix ON devices(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;
@@ -4777,15 +4796,24 @@ pub(crate) fn ensure_column(
     name: &str,
     decl: &str,
 ) -> Result<(), rusqlite::Error> {
+    if !column_exists(conn, table, name)? {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
+    }
+    Ok(())
+}
+
+/// Whether `table` currently has a column named `name`.
+pub(crate) fn column_exists(
+    conn: &Connection,
+    table: &str,
+    name: &str,
+) -> Result<bool, rusqlite::Error> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(Result::ok)
         .any(|col| col == name);
-    if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
-    }
-    Ok(())
+    Ok(exists)
 }
 
 #[cfg(test)]
@@ -5292,7 +5320,10 @@ mod tests {
             .await
             .expect("reject")
             .expect("row rejected");
-        assert_eq!(rejected.state, "settled", "a rejection settles, never a 4th state");
+        assert_eq!(
+            rejected.state, "settled",
+            "a rejection settles, never a 4th state"
+        );
         assert_eq!(rejected.resolution, "clear");
         let settlement = rejected.settlement.expect("settlement present");
         assert_eq!(settlement.outcome, "rejected");
@@ -5344,9 +5375,136 @@ mod tests {
             "completed"
         );
         assert!(
-            completed.settlement.as_ref().expect("settlement").reason.is_none(),
+            completed
+                .settlement
+                .as_ref()
+                .expect("settlement")
+                .reason
+                .is_none(),
             "a completed settlement never carries a reason"
         );
+    }
+
+    /// A database a round-2 build left behind carries `state='failed'` rows and
+    /// a `reason` column. Reopening folds them into the §2.5 form — `settled`
+    /// with a `rejected` settlement and the preserved reason — and drops the
+    /// orphaned column (which also discards a stale reason on a settled row).
+    #[tokio::test]
+    async fn legacy_failed_rows_and_the_reason_column_are_migrated() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let host_id = new_id("hst").expect("host id");
+        let (failed_id, stale_id) = {
+            let store = Store::open(dir.path()).expect("store");
+            let token = enroll_token(&store, "enroll-legacy").await;
+            let _ = store
+                .authenticate_host(
+                    HostAuthRequest {
+                        presented: token,
+                        hello_host_id: Some(host_id.clone()),
+                        label: Some("legacy-node".into()),
+                        node_version: Some("test".into()),
+                    },
+                    verify_eq,
+                    |_| Ok("test-hash".into()),
+                )
+                .await
+                .expect("host enroll");
+            let instance = store
+                .insert_instance(
+                    host_id.clone(),
+                    None,
+                    "claude".into(),
+                    "shell-pty".into(),
+                    None,
+                    json!({}),
+                )
+                .await
+                .expect("instance");
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let (command, _) = store
+                    .queue_command(
+                        None,
+                        Some(instance.instance_id.clone()),
+                        host_id.clone(),
+                        "instance.send".into(),
+                        json!({"instanceId": instance.instance_id}),
+                        None,
+                    )
+                    .await
+                    .expect("command");
+                ids.push(command.command_id);
+            }
+            (ids[0].clone(), ids[1].clone())
+        };
+
+        // Fabricate the round-2 on-disk shape behind the store's back: the old
+        // `reason` column plus a `failed` row and a settled row with a stale
+        // reason and no recorded settlement outcome.
+        {
+            let conn = Connection::open(dir.path().join("hub.sqlite")).expect("open db");
+            conn.execute_batch("ALTER TABLE commands ADD COLUMN reason TEXT")
+                .expect("legacy reason column");
+            conn.execute(
+                "UPDATE commands
+                 SET state = 'failed', resolution = 'failed', reason = ?1
+                 WHERE id = ?2",
+                params!["node did not acknowledge", failed_id],
+            )
+            .expect("legacy failed row");
+            conn.execute(
+                "UPDATE commands
+                 SET state = 'settled', resolution = 'clear', reason = ?1,
+                     settlement_outcome = NULL, settlement_reason = NULL
+                 WHERE id = ?2",
+                params!["stale reason on a completed row", stale_id],
+            )
+            .expect("legacy settled row");
+        }
+
+        // Reopening runs the migration.
+        let store = Store::open(dir.path()).expect("reopen migrates");
+        let folded = store
+            .get_command(failed_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(folded.state, "settled");
+        assert_eq!(folded.resolution, "clear");
+        let settlement = folded.settlement.as_ref().expect("rejected settlement");
+        assert_eq!(settlement.outcome, "rejected");
+        assert_eq!(
+            settlement.reason.as_deref(),
+            Some("node did not acknowledge")
+        );
+
+        let stale = store
+            .get_command(stale_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(stale.state, "settled");
+        assert!(
+            stale.settlement.as_ref().is_none_or(|s| s.reason.is_none()),
+            "the stale reason on a completed row is discarded: {:?}",
+            stale.settlement
+        );
+        let wire = serde_json::to_value(&folded).expect("serialize");
+        assert!(wire.get("reason").is_none());
+
+        // The orphaned column is physically gone.
+        let conn = Connection::open(dir.path().join("hub.sqlite")).expect("open db");
+        let mut stmt = conn.prepare("PRAGMA table_info(commands)").expect("pragma");
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("cols")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!columns.contains(&"reason".to_string()), "{columns:?}");
+        assert!(columns.contains(&"settlement_outcome".to_string()));
+
+        // Reopening again is a no-op (no `reason` column to migrate).
+        Store::open(dir.path()).expect("idempotent reopen");
     }
 
     /// D-018: an enrolled host re-announces with its own stored node token,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Observation } from "../../../types/generated";
 import type { NativeRef } from "../../../types/nativeRef";
-import { projectTurnDecision } from "./turnDecision";
+import { projectTurnDecision, turnStartAnchor } from "./turnDecision";
 
 /**
  * These reproduce the owner's own incident (journal of ins_01a0b3b2,
@@ -132,5 +132,17 @@ describe("projectTurnDecision — the exact incident event order", () => {
     ];
     const decision = projectTurnDecision(events, hookRef, false, now);
     expect(decision.state).toBe("waiting");
+  });
+
+  it("turnStartAnchor is the LATEST prompt-accepted (current turn), not the first ever", () => {
+    const now = Date.now();
+    const t = (offsetMs: number) => new Date(now + offsetMs).toISOString();
+    const events = [
+      native(1, t(-60_000), "hook", "turn.live", "working", { phase: "prompt-accepted", since: t(-60_000) }),
+      native(2, t(-50_000), "hook", "turn.live", "idle", { phase: "turn-ended", since: t(-50_000) }),
+      native(3, t(-10_000), "hook", "turn.live", "working", { phase: "prompt-accepted", since: t(-10_000) }),
+      native(4, t(0), "hook", "turn.live", "idle", { phase: "turn-ended", since: t(0) }),
+    ];
+    expect(turnStartAnchor(events)).toBe(t(-10_000));
   });
 });

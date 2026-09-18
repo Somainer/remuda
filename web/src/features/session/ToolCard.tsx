@@ -229,6 +229,9 @@ export function ToolCard({
   workflow,
   defaultFolded = false,
   settle = true,
+  workflowDismissed = false,
+  onDismissWorkflow,
+  onUndismissWorkflow,
 }: {
   driverKind: string;
   call: ToolCallPayload;
@@ -245,6 +248,10 @@ export function ToolCard({
   };
   defaultFolded?: boolean;
   settle?: boolean;
+  /** c-wfcard: persisted open/dismissed state of the mounted workflow card. */
+  workflowDismissed?: boolean;
+  onDismissWorkflow?: () => void;
+  onUndismissWorkflow?: () => void;
 }) {
   const [folded, setFolded] = useState(defaultFolded);
   const shown = settle ? result : null;
@@ -279,6 +286,9 @@ export function ToolCard({
         phases={workflow.phases}
         members={workflow.members}
         subagents={workflow.subagents}
+        dismissed={workflowDismissed}
+        onDismiss={onDismissWorkflow}
+        onUndismiss={onUndismissWorkflow}
       />
     ) : family === "MCP" ? (
       <McpCard call={call} result={shown} />

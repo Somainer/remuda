@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MessagePayload, Observation, ToolCallPayload } from "../../types/observation";
+import type { WorkflowRunPayload } from "../../types/generated";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState, isToolFailure, type TranscriptNode } from "./assemble";
 
@@ -395,6 +396,55 @@ describe("compactTranscript", () => {
     );
     expect(done.some((n) => n.type === "compact")).toBe(true);
     expect(done.some((n) => n.type === "message" && n.role === "assistant")).toBe(true);
+  });
+
+  it("keeps an undismissed mounted Workflow row at top level and folds the ordinary tools", () => {
+    const user: TranscriptNode = {
+      type: "message", id: "u", role: "user", text: "q", status: "complete", origin: "human",
+    };
+    const assistant: TranscriptNode = {
+      type: "message", id: "a", role: "assistant", text: "ok", status: "complete", origin: "human",
+    };
+    const wfId = "wf_live";
+    const mkTool = (idVal: string): Extract<TranscriptNode, { type: "tool" }> => ({
+      type: "tool",
+      id: idVal,
+      family: "Bash",
+      name: "Bash",
+      driverKind: "claude-print",
+      call: call("Bash", idVal),
+      result: null,
+      completeness: "structured",
+      diffState: "unknown",
+    });
+    const wfRow: Extract<TranscriptNode, { type: "tool" }> = {
+      ...mkTool("c-wf"),
+      family: "Workflow",
+      name: "Workflow",
+      workflow: {
+        run: { workflowId: wfId } as unknown as WorkflowRunPayload,
+        phases: [],
+        members: [],
+      },
+    };
+    const nodes = [user, wfRow, mkTool("c-1"), mkTool("c-2"), assistant];
+
+    // Undismissed: the workflow row stays visible; only the two ordinary tools
+    // enter the compact group.
+    const visible = compactTranscript(nodes, true);
+    expect(visible.filter((n) => n.type === "tool").map((n) => n.id)).toEqual(["c-wf"]);
+    const group = visible.find((n) => n.type === "compact");
+    expect(group?.type === "compact" && group.children.map((c) => c.id)).toEqual(["c-1", "c-2"]);
+
+    // Dismissed per workflow id: the workflow row joins the fold too.
+    const folded = compactTranscript(nodes, true, new Set([wfId]));
+    expect(folded.some((n) => n.type === "tool")).toBe(false);
+    const groupFolded = folded.find((n) => n.type === "compact");
+    expect(groupFolded?.type === "compact" && groupFolded.children.map((c) => c.id)).toEqual([
+      "c-wf",
+      "c-1",
+      "c-2",
+    ]);
   });
 });
 

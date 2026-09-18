@@ -431,8 +431,8 @@ async fn observe_one(
             (WorkerWatchStatus::Stalled, None, None)
         }
         remuda_protocol::ScreenClass::Gone { reason } => {
-            detail = Some(reason);
-            (WorkerWatchStatus::Gone, None, None)
+            detail = Some(reason.clone());
+            (WorkerWatchStatus::Gone { reason }, None, None)
         }
         remuda_protocol::ScreenClass::Failed { reason, line } => {
             detail = Some(line);

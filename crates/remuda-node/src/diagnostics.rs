@@ -199,6 +199,13 @@ pub fn doctor_snapshot(context: &DoctorContext, env: ProbeEnv) -> DoctorReport {
     report.inventory = snapshot.to_hub_host();
     let mut installed = 0;
     for cli in &snapshot.cli {
+        // `computer-use` is not a PATH binary: it is one stat inside the Codex
+        // app bundle, so it gets its own read-only check below rather than the
+        // PATH wording, and it must not count toward "an agent CLI is
+        // installed" — it cannot launch an agent.
+        if cli.kind == crate::COMPUTER_USE_KIND {
+            continue;
+        }
         if cli.path.is_some() {
             installed += 1;
         }
@@ -250,6 +257,28 @@ pub fn doctor_snapshot(context: &DoctorContext, env: ProbeEnv) -> DoctorReport {
             Value::Null,
         );
     }
+    // Read-only presence check for the vendor Computer Use client
+    // (`docs/design/codex-cua.md` §3.4). It never runs the vendor binary and
+    // it never probes authentication — absence is a warning, not a blocker,
+    // because it only gates an explicitly requested per-launch capability.
+    let computer_use_path = crate::computer_use_client_path(&env);
+    let computer_use = snapshot_computer_use(&snapshot);
+    let computer_use_installed = computer_use.is_some_and(|entry| entry.installed);
+    report.check(
+        "computer-use",
+        if computer_use_installed { "ok" } else { "warning" },
+        if computer_use_installed {
+            "Codex Computer Use client present; authentication is not probed"
+        } else {
+            "Codex Computer Use client not found; `--capability computer-use` will refuse on this host"
+        },
+        json!({
+            "installed": computer_use_installed,
+            "version": computer_use.and_then(|entry| entry.version.clone()),
+            "path": computer_use_path,
+            "auth": "unknown",
+        }),
+    );
     report.check(
         "binary.herdr",
         if snapshot.herdr.path.is_some() {
@@ -342,6 +371,17 @@ pub fn doctor_snapshot(context: &DoctorContext, env: ProbeEnv) -> DoctorReport {
         json!(context.listeners),
     );
     report
+}
+
+/// The `computer-use` row from an inventory, if this Node reported one.
+///
+/// `None` is "this Node version does not report the row", which is distinct
+/// from a reported row with `installed: false`.
+fn snapshot_computer_use(snapshot: &crate::HostSnapshot) -> Option<&crate::CliEntry> {
+    snapshot
+        .cli
+        .iter()
+        .find(|entry| entry.kind == crate::COMPUTER_USE_KIND)
 }
 
 #[cfg(target_os = "macos")]
@@ -544,6 +584,7 @@ mod tests {
             hostname: Some("fixture".into()),
             herdr_socket_env: None,
             xdg_config_home: None,
+            codex_home: None,
         };
         let first = fixture.path().join("first");
         let second = fixture.path().join("second");
@@ -716,6 +757,7 @@ mod tests {
                 hostname: Some("fixture".into()),
                 herdr_socket_env: None,
                 xdg_config_home: None,
+                codex_home: None,
             },
         );
         assert_eq!(report.exit_code, 1);
@@ -780,6 +822,7 @@ mod tests {
             hostname: Some("fixture".into()),
             herdr_socket_env: None,
             xdg_config_home: None,
+            codex_home: None,
         };
         let report = doctor_snapshot(
             &DoctorContext {
@@ -848,6 +891,7 @@ mod tests {
                 hostname: Some("fixture".into()),
                 herdr_socket_env: None,
                 xdg_config_home: None,
+                codex_home: None,
             },
         );
         let encoded = serde_json::to_string(&report).unwrap();
@@ -865,6 +909,124 @@ mod tests {
         assert_eq!(gateway.status, "ok");
         assert_eq!(gateway.details["configured"], true);
         assert_eq!(gateway.details["installed"], true);
+    }
+
+    /// A bin dir with the CLIs every doctor fixture needs, and a bare home.
+    fn doctor_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        let home = dir.join("home");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        for name in ["claude", "herdr", "cargo", "pnpm", "df"] {
+            let path = bin.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nprintf '{name} fixture-1.0\\n'\n"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (bin, home)
+    }
+
+    /// The doctor check is read-only, non-blocking, and names its path.
+    #[test]
+    fn computer_use_check_reports_absence_with_the_path_it_looked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, home) = doctor_fixture(dir.path());
+        let env = ProbeEnv {
+            path: bin.into_os_string(),
+            home,
+            hostname: Some("fixture".into()),
+            herdr_socket_env: None,
+            xdg_config_home: None,
+            codex_home: None,
+        };
+        let report = doctor_snapshot(
+            &DoctorContext {
+                data_dir: None,
+                listeners: Vec::new(),
+            },
+            env,
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "computer-use")
+            .expect("computer-use check");
+        // Absent is a warning, never a blocker: it only gates an explicitly
+        // requested per-launch capability.
+        assert_eq!(check.status, "warning");
+        assert_eq!(check.details["installed"], false);
+        assert_eq!(check.details["auth"], "unknown");
+        assert!(
+            check.details["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("SkyComputerUseClient")),
+            "the check must name the path it looked for: {check:?}"
+        );
+        assert!(
+            check.message.contains("not found"),
+            "absence is reported plainly: {check:?}"
+        );
+    }
+
+    /// A present bundle flips the same check to ok and reports the version.
+    #[test]
+    fn computer_use_check_reports_presence_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, home) = doctor_fixture(dir.path());
+        let probe = ProbeEnv {
+            path: bin.into_os_string(),
+            home: home.clone(),
+            hostname: Some("fixture".into()),
+            herdr_socket_env: None,
+            xdg_config_home: None,
+            codex_home: None,
+        };
+        // Lay down the vendor client and its plist exactly where the probe looks.
+        let client_path = crate::computer_use_client_path(&probe);
+        std::fs::create_dir_all(client_path.parent().unwrap()).unwrap();
+        std::fs::write(&client_path, "#!/bin/sh\nexit 1\n").unwrap();
+        let plist_path = crate::computer_use_plist_path(&probe);
+        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &plist_path,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleShortVersionString</key><string>3.1.4</string>
+</dict></plist>
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&client_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let report = doctor_snapshot(
+            &DoctorContext {
+                data_dir: None,
+                listeners: Vec::new(),
+            },
+            probe,
+        );
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "computer-use")
+            .expect("computer-use check");
+        #[cfg(unix)]
+        assert_eq!(check.status, "ok", "{check:?}");
+        #[cfg(unix)]
+        assert_eq!(check.details["installed"], true);
+        #[cfg(unix)]
+        assert_eq!(check.details["version"], "3.1.4");
+        assert_eq!(check.details["auth"], "unknown");
     }
 }
 #[cfg(target_os = "macos")]

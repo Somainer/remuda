@@ -26,6 +26,18 @@ use std::time::{Duration, Instant};
 /// Native CLIs probed on PATH.
 pub const CLI_KINDS: [&str; 5] = ["claude", "codex", "grok", "agy", "gemini"];
 
+/// `cli[]` kind for the vendor Computer Use client (`docs/design/codex-cua.md`
+/// §3.4). It is a *presence* row, never a PATH entry: the probe stats one
+/// absolute path inside the Codex app bundle.
+pub const COMPUTER_USE_KIND: &str = "computer-use";
+
+/// Bundle-relative path of the Computer Use client, from the Codex install
+/// root (`$CODEX_HOME`, default `~/.codex`).
+const COMPUTER_USE_CLIENT: &str = "computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+
+/// Bundle-relative path of the `Info.plist` that names the client's version.
+const COMPUTER_USE_PLIST: &str = "computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/Info.plist";
+
 /// Default cache lifetime for PATH/--version/sha256/auth probes.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 
@@ -165,6 +177,9 @@ pub struct ProbeEnv {
     pub herdr_socket_env: Option<PathBuf>,
     /// `XDG_CONFIG_HOME` for the default Herdr socket.
     pub xdg_config_home: Option<PathBuf>,
+    /// `CODEX_HOME` when the operator relocated the Codex install. `None`
+    /// means the default `<home>/.codex`, resolved by [`codex_home`].
+    pub codex_home: Option<PathBuf>,
 }
 
 impl ProbeEnv {
@@ -184,6 +199,9 @@ impl ProbeEnv {
                 .map(PathBuf::from)
                 .filter(|p| !p.as_os_str().is_empty()),
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty()),
+            codex_home: std::env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
                 .filter(|p| !p.as_os_str().is_empty()),
         }
@@ -465,7 +483,10 @@ pub fn driver_capability_snapshot(driver: DriverKind) -> CapabilitySnapshot {
 }
 
 fn probe(env: &ProbeEnv) -> ProbeParts {
-    let cli: Vec<CliEntry> = CLI_KINDS.iter().map(|kind| probe_cli(kind, env)).collect();
+    let mut cli: Vec<CliEntry> = CLI_KINDS.iter().map(|kind| probe_cli(kind, env)).collect();
+    // Appended last so every existing index-pinned consumer (hello fixtures,
+    // `cli[0]` assertions) keeps reading the PATH-probed CLIs it always did.
+    cli.push(probe_computer_use(env));
     let herdr_path = find_executable("herdr", &env.path);
     let herdr_version = herdr_path.as_deref().and_then(binary_version);
     if let Some(path) = herdr_path.as_ref() {
@@ -508,6 +529,92 @@ fn probe_cli(kind: &str, env: &ProbeEnv) -> CliEntry {
         native_gateway,
         sha256,
     }
+}
+
+/// The Codex install root: `CODEX_HOME` when set, else `<home>/.codex`.
+fn codex_home(env: &ProbeEnv) -> PathBuf {
+    env.codex_home
+        .clone()
+        .unwrap_or_else(|| env.home.join(".codex"))
+}
+
+/// The absolute path the `computer-use` probe stats.
+///
+/// Public so `remuda doctor` can name the path it looked for when the row is
+/// absent — the operator's retry should not require guessing where Remuda
+/// expected the vendor bundle (`docs/design/codex-cua.md` §4).
+#[must_use]
+pub fn computer_use_client_path(env: &ProbeEnv) -> PathBuf {
+    codex_home(env).join(COMPUTER_USE_CLIENT)
+}
+
+/// The `Info.plist` the probe reads the client's version from.
+///
+/// Same directory contract as [`computer_use_client_path`], kept next to it so
+/// the two never drift.
+#[must_use]
+pub fn computer_use_plist_path(env: &ProbeEnv) -> PathBuf {
+    codex_home(env).join(COMPUTER_USE_PLIST)
+}
+
+/// Presence-only `computer-use` row (`docs/design/codex-cua.md` §3.4).
+///
+/// Two rules make this row honest, and both are load-bearing:
+///
+/// 1. **A file stat and a file read, never an exec.** The `version` comes from
+///    the app bundle's `Info.plist`; running `SkyComputerUseClient --version`
+///    would start a Mach service. No vendor binary is ever spawned here.
+/// 2. **The row is always present.** A host without the app reports
+///    `installed: false` with no path, so the web can tell "no" from "not
+///    reported" — an older Node that omits the row entirely is the latter.
+///
+/// `auth` is deliberately `unknown`: Remuda does not probe this vendor's
+/// login state at all.
+///
+/// `installed` is plain path existence, per the contract table. The vendor
+/// client is macOS-only, so on a Linux host this resolves to `false` with no
+/// path for the honest reason that the bundle is not there — not because the
+/// probe refuses to look.
+fn probe_computer_use(env: &ProbeEnv) -> CliEntry {
+    let root = codex_home(env);
+    let path = root.join(COMPUTER_USE_CLIENT);
+    let installed = is_executable(&path);
+    let version = installed
+        .then(|| plist_version(&root.join(COMPUTER_USE_PLIST)))
+        .flatten();
+    tracing::debug!(
+        kind = COMPUTER_USE_KIND,
+        path = %path.display(),
+        version = version.as_deref(),
+        installed,
+        "computer-use inventory"
+    );
+    CliEntry {
+        kind: COMPUTER_USE_KIND.to_owned(),
+        version,
+        // No path when the bundle is absent: a path that does not resolve is
+        // worse than no path, because the operator would try to use it.
+        path: installed.then_some(path),
+        auth: CliAuth::Unknown,
+        installed,
+        native_gateway: None,
+        sha256: None,
+    }
+}
+
+/// `CFBundleShortVersionString` from a plist, or `None`.
+///
+/// `plist::Value::from_file` sniffs the format, so this handles the binary
+/// plists a real app bundle ships as well as a hand-written XML fixture.
+fn plist_version(path: &Path) -> Option<String> {
+    let value = plist::Value::from_file(path).ok()?;
+    let bundle = value.as_dictionary()?;
+    let version = bundle.get("CFBundleShortVersionString")?.as_string()?;
+    let version = version.trim();
+    if version.is_empty() {
+        return None;
+    }
+    Some(version.chars().take(256).collect())
 }
 
 fn cli_auth(kind: &str, home: &Path, installed: bool, native_gateway: bool) -> CliAuth {
@@ -921,6 +1028,7 @@ mod tests {
             hostname: Some("test-host".to_owned()),
             herdr_socket_env: None,
             xdg_config_home: Some(home.join(".config")),
+            codex_home: Some(home.join(".codex")),
         }
     }
 
@@ -948,7 +1056,7 @@ mod tests {
         assert_eq!(snap.hostname, "test-host");
         assert_eq!(snap.labels.get("region").map(String::as_str), Some("sg"));
         assert_eq!(snap.max_instances, 4);
-        assert_eq!(snap.cli.len(), 5);
+        assert_eq!(snap.cli.len(), 6);
         let claude_ent = snap.cli.iter().find(|c| c.kind == "claude").unwrap();
         assert_eq!(claude_ent.version.as_deref(), Some("claude 9.9.9"));
         assert_eq!(claude_ent.sha256.as_deref(), Some(expected_sha.as_str()));
@@ -1161,10 +1269,215 @@ mod tests {
         assert!(encoded.get("cpuCount").is_some());
     }
 
+    // ── computer-use presence row ──────────────────────────────────────────
+
+    /// The bundle-relative client path, so a test can lay one down.
+    fn client_under(root: &Path) -> PathBuf {
+        root.join(COMPUTER_USE_CLIENT)
+    }
+
+    /// Write a fake vendor client plus the `Info.plist` that names it.
+    ///
+    /// `body` is the script the client runs. Every test here passes a body
+    /// that would fail loudly if executed (`exit 1`), because the probe must
+    /// never spawn it: the version comes from the plist.
+    fn write_fake_bundle(root: &Path, version: Option<&str>, body: &str) {
+        let client = client_under(root);
+        std::fs::create_dir_all(client.parent().unwrap()).unwrap();
+        std::fs::write(&client, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        if let Some(version) = version {
+            let plist_path = root.join(COMPUTER_USE_PLIST);
+            std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+            std::fs::write(&plist_path, plist_xml(version)).unwrap();
+        }
+    }
+
+    fn plist_xml(version: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>{version}</string>
+</dict>
+</plist>
+"#
+        )
+    }
+
+    fn computer_use(snap: &HostSnapshot) -> &CliEntry {
+        snap.cli
+            .iter()
+            .find(|c| c.kind == COMPUTER_USE_KIND)
+            .expect("the computer-use row is always present")
+    }
+
+    /// The whole point of the row: it never runs the vendor binary.
+    ///
+    /// The fake client is a bomb — it exits 1 and drops a sentinel file. If
+    /// the probe ever execs it (to ask `--version`, say, which would start a
+    /// Mach service on a real host), both the sentinel and the exit status
+    /// make this test fail instead of silently passing.
+    #[test]
+    fn computer_use_is_presence_only_and_never_spawns_the_client() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let sentinel = home.path().join("client-was-executed");
+        let root = home.path().join(".codex");
+        write_fake_bundle(
+            &root,
+            Some("1.4.2"),
+            &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", sentinel.display()),
+        );
+
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let entry = computer_use(&snap);
+
+        assert!(entry.installed, "a present bundle reports installed");
+        assert_eq!(entry.version.as_deref(), Some("1.4.2"));
+        assert_eq!(entry.auth, CliAuth::Unknown, "auth is never probed");
+        assert_eq!(entry.sha256, None, "no sha256 for this row");
+        assert_eq!(entry.native_gateway, None);
+        assert!(
+            entry.path.as_deref().is_some_and(|p| p.is_absolute()),
+            "installed row carries its absolute path: {:?}",
+            entry.path
+        );
+        assert!(
+            !sentinel.exists(),
+            "the probe executed the vendor client; it must only stat and read"
+        );
+    }
+
+    /// Absent bundle: still reported, so the web sees "no" not "not reported".
+    #[test]
+    fn computer_use_absent_bundle_reports_installed_false_without_a_path() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let entry = computer_use(&snap);
+        assert!(!entry.installed);
+        assert!(entry.path.is_none(), "no path when nothing is there");
+        assert!(entry.version.is_none());
+        assert_eq!(entry.auth, CliAuth::Unknown);
+        // The row survives serialization, which is what the Hub forwards.
+        let encoded = snap.cli_hub_json();
+        let row = encoded
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == COMPUTER_USE_KIND)
+            .expect("row must reach Hub JSON");
+        assert_eq!(row["installed"], json!(false));
+        assert_eq!(row["auth"], json!("unknown"));
+    }
+
+    /// `CODEX_HOME` pointing at a file must not panic or report installed.
+    #[test]
+    fn computer_use_codex_home_pointing_at_a_file_is_not_installed() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let not_a_dir = home.path().join("codex-home-is-a-file");
+        std::fs::write(&not_a_dir, "not a directory").unwrap();
+        let mut env = env_for(bin.path(), home.path());
+        env.codex_home = Some(not_a_dir);
+        let collector = Collector::new(env, Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let entry = computer_use(&snap);
+        assert!(!entry.installed);
+        assert!(entry.path.is_none());
+        assert!(entry.version.is_none());
+    }
+
+    /// A bundle without a readable `Info.plist` still reports installed.
+    #[test]
+    fn computer_use_bundle_without_a_version_reports_installed_without_version() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex");
+        // Client present, plist deliberately missing.
+        write_fake_bundle(&root, None, "#!/bin/sh\nexit 1\n");
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let entry = computer_use(&snap);
+        assert!(entry.installed, "presence is the stat, not the plist");
+        assert!(entry.version.is_none());
+    }
+
+    /// A binary plist (what a real app bundle ships) parses the same way.
+    #[test]
+    fn computer_use_reads_a_binary_plist() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex");
+        write_fake_bundle(&root, None, "#!/bin/sh\nexit 1\n");
+        let plist_path = root.join(COMPUTER_USE_PLIST);
+        let mut bundle = plist::Dictionary::new();
+        bundle.insert(
+            "CFBundleShortVersionString".to_owned(),
+            plist::Value::String("9.9.9".to_owned()),
+        );
+        plist::Value::Dictionary(bundle)
+            .to_file_binary(&plist_path)
+            .expect("write binary plist");
+
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        assert_eq!(computer_use(&snap).version.as_deref(), Some("9.9.9"));
+    }
+
+    /// A non-executable file at the client path is not an installed client.
+    #[test]
+    fn computer_use_non_executable_file_is_not_installed() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex");
+        write_fake_bundle(&root, Some("1.0.0"), "#!/bin/sh\nexit 1\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(client_under(&root), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let entry = computer_use(&snap);
+        #[cfg(unix)]
+        assert!(!entry.installed, "a non-executable file is not a client");
+        #[cfg(not(unix))]
+        assert!(entry.installed);
+        assert!(entry.path.is_none() || !entry.installed);
+    }
+
+    /// The row must not disturb the PATH-probed CLIs it is appended after.
+    #[test]
+    fn computer_use_row_is_appended_last() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        write_stub(bin.path(), "claude", "claude 9.9.9");
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let kinds: Vec<&str> = snap.cli.iter().map(|c| c.kind.as_str()).collect();
+        assert_eq!(
+            &kinds[..CLI_KINDS.len()],
+            &CLI_KINDS[..],
+            "index-pinned consumers read the PATH CLIs first"
+        );
+        assert_eq!(kinds[CLI_KINDS.len()], COMPUTER_USE_KIND);
+        assert_eq!(snap.cli[0].kind, "claude");
+    }
+
     fn auth_of(snap: &HostSnapshot, kind: &str) -> CliAuth {
         snap.cli.iter().find(|c| c.kind == kind).unwrap().auth
     }
-
     fn hub_auth(snap: &HostSnapshot, kind: &str) -> String {
         snap.cli_hub_json()
             .as_array()

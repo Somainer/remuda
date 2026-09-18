@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
         hostname: Some(LABEL.into()),
         herdr_socket_env: None,
         xdg_config_home: Some(data_dir.join("fixture-config")),
+        codex_home: Some(data_dir.join("fixture-config")),
     };
     let mut inventory = Collector::new(probe, Duration::ZERO).snapshot(&CollectRequest {
         labels: BTreeMap::from([("test".into(), "promoted-hooks".into())]),

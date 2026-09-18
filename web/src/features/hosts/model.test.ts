@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { HOST_FIXTURES } from "./fixtures";
 import {
+  COMPUTER_USE_KIND,
   STALE_OFFLINE_MS,
   carrierOf,
   cliSummary,
   compactCliVersion,
+  computerUseState,
   hostsMatching,
+  installedCli,
   isStaleOffline,
   sortHostsOnlineFirst,
+  type HostCli,
   type Placement,
 } from "./model";
 
@@ -51,5 +55,49 @@ describe("host placement and carriers", () => {
     expect(compactCliVersion("claude", "2.1.269 (Claude Code)")).toBe("claude 2.1.269");
     expect(compactCliVersion("codex", "codex-cli 0.154.0")).toBe("codex 0.154.0");
     expect(compactCliVersion("grok", "grok 1.0.30 (04b7ffed98c6)")).toBe("grok 1.0.30");
+  });
+});
+
+describe("computer-use host capability row (D-045 §3.4)", () => {
+  it("labels an installed row without eating the kind in cliSummary", () => {
+    const installed = { kind: COMPUTER_USE_KIND, version: "2.7.0", path: "/home/x/client", auth: "unknown" as const, installed: true };
+    // The `<kind>-cli ` prefix strip must leave `computer-use` intact rather
+    // than swallowing it: the kind is not a product-name prefix here.
+    expect(compactCliVersion(COMPUTER_USE_KIND, "2.7.0")).toBe("computer-use 2.7.0");
+    expect(cliSummary([installed])).toBe("computer-use 2.7.0");
+    expect(cliSummary([installed])).not.toBe("2.7.0");
+  });
+
+  it("keeps 'no', 'not installed' and 'not reported' distinct", () => {
+    const installed: HostCli = { kind: COMPUTER_USE_KIND, version: "2.7.0", path: "/home/x/client", auth: "unknown", installed: true };
+    const absent: HostCli = { kind: COMPUTER_USE_KIND, auth: "unknown", installed: false };
+    const omitted: HostCli[] = [{ kind: "claude", version: "1", path: "/usr/bin/claude", auth: "unknown" }];
+
+    expect(computerUseState([installed])).toEqual({ reported: true, installed: true, version: "2.7.0", path: "/home/x/client" });
+    expect(computerUseState([absent])).toEqual({ reported: true, installed: false });
+    expect(computerUseState(omitted)).toEqual({ reported: false });
+    expect(computerUseState(undefined)).toEqual({ reported: false });
+  });
+
+  it("drops a reported-absent row from the installed CLI list", () => {
+    const absent: HostCli = { kind: COMPUTER_USE_KIND, auth: "unknown", installed: false };
+    expect(installedCli([absent])).toEqual([]);
+    expect(cliSummary([absent])).toBe("");
+  });
+
+  it("covers all three states across the host fixtures", () => {
+    const states = HOST_FIXTURES.map((host) => computerUseState(host.cli).reported);
+    expect(states).toContain(true);
+    expect(states).toContain(false);
+    const installedHost = HOST_FIXTURES.find((host) => {
+      const state = computerUseState(host.cli);
+      return state.reported && state.installed;
+    });
+    const absentHost = HOST_FIXTURES.find((host) => {
+      const state = computerUseState(host.cli);
+      return state.reported && !state.installed;
+    });
+    expect(installedHost, "a fixture reports the client present").toBeTruthy();
+    expect(absentHost, "a fixture reports it absent").toBeTruthy();
   });
 });

@@ -609,6 +609,10 @@ pub(crate) async fn dispatch_core(
             // (D-035; docs/design/evidence/dispatch-driver-1.md).
             driver: Some(ran_driver),
             model,
+            // Nothing has observed a turn yet at dispatch time, so there is no
+            // effective model to report. The watch pass fills it in if and when
+            // the observed id disagrees with the request (D-036).
+            model_effective: None,
             provider_profile_id,
             branch,
             worktree_path,

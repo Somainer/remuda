@@ -44,6 +44,8 @@ vi.mock("../../lib/store", () => ({
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: () => null,
+    modelOf: () => "model_hub/es1_orange_o50[1m]",
+    modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
     refreshScreens: vi.fn(),
     broadcast: vi.fn(),
     send: vi.fn(),
@@ -54,6 +56,12 @@ vi.mock("../../lib/store", () => ({
 
 const titles: Record<string, string> = {};
 const hostNames: Record<string, string> = { "host-a": "alpha", "host-b": "beta" };
+/// Per-instance effective-model observations the mocked store hands back
+/// (D-036 / model-pin-1). Empty by default: most rows have not read one back.
+const modelEffective: Record<
+  string,
+  { id: string; source: string; observedAt: string }
+> = {};
 
 function host(id: string, label: string) {
   return { id, label, state: "online" };
@@ -241,6 +249,55 @@ describe("SessionList scope and conditions", () => {
 
 /** Space id the real buildSpaces() derives for the fixture host/workspace. */
 const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
+
+describe("SessionList effective-model label (D-036 / model-pin-1)", () => {
+  afterEach(() => {
+    for (const key of Object.keys(modelEffective)) delete modelEffective[key];
+  });
+
+  it("labels the row with the requested id until one is read back", () => {
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
+    expect(label).toHaveAttribute("data-model-effective", "unknown");
+    expect(label).toHaveAttribute("data-model-diverged", "0");
+  });
+
+  it("labels the row with the observed id once the session reports one", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+      modelEffective[id] = {
+        id: "model_hub/es1_orange_o50[1m]",
+        source: "launch",
+        observedAt: "2026-09-18T00:00:00Z",
+      };
+    }
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
+    expect(label).toHaveAttribute("data-model-diverged", "0");
+  });
+
+  // The regression: the pin was requested and something else answered. The row
+  // must show what answered and mark the divergence, because showing only the
+  // request is what made the substituted model invisible.
+  it("shows the observed id and marks a divergence when the pin was not honoured", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+      modelEffective[id] = {
+        id: "claude-opus-4-8",
+        source: "launch",
+        observedAt: "2026-09-18T00:00:00Z",
+      };
+    }
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label).toHaveTextContent("claude-opus-4-8");
+    expect(label).toHaveAttribute("data-model-effective", "claude-opus-4-8");
+    expect(label).toHaveAttribute("data-model-diverged", "1");
+    // Both ids stay legible, so the pin that was asked for is not lost.
+    expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o50[1m]");
+    expect(label.getAttribute("title")).toContain("claude-opus-4-8");
+  });
+});
 
 function renderKeyList() {
   return render(

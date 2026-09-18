@@ -1377,6 +1377,104 @@ mod shell_pty_agent {
             "{error:?}"
         );
     }
+
+    /// D-036 / model-pin-1: an explicit pin must reach the process on **every**
+    /// claude carrier, byte-identical.
+    ///
+    /// The regression this pins down: `claude-print`/`claude-pty` emitted
+    /// `--model` from `claude_argv` while the `shell-pty` agent path emitted no
+    /// model token at all — and still recorded `provider.model_requested`, so
+    /// every audit record and roster row claimed a pin that never reached the
+    /// process (the host's default answered instead).
+    ///
+    /// The `[1m]` suffix is asserted literally: it selects the 1M-context
+    /// variant in the gateway catalog, so trimming or normalising it would pick
+    /// a different model while looking like a cosmetic cleanup.
+    #[test]
+    fn an_explicit_pin_reaches_every_claude_carrier_verbatim() {
+        const PIN: &str = "model_hub/es1_orange_o50[1m]";
+        let tmp = tempfile::tempdir().unwrap();
+
+        for driver in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ShellPty,
+        ] {
+            let mut spec = agent_spec(AgentKind::Claude);
+            spec.driver = driver;
+            spec.model_id = Some(PIN.to_owned());
+            let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+
+            let value = recipe
+                .argv
+                .windows(2)
+                .find(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].clone());
+            assert_eq!(
+                value.as_deref(),
+                Some(PIN),
+                "{driver:?} must carry the pin verbatim on argv: {:?}",
+                recipe.argv
+            );
+            // The audit record and the argv must agree; the bug was precisely
+            // the record claiming a pin the argv did not carry.
+            assert_eq!(
+                recipe.provider.model_requested, PIN,
+                "{driver:?} audit record"
+            );
+        }
+    }
+
+    /// Rule 3: no pin, no token. An instance with no `model_id` keeps the
+    /// pre-D-036 behaviour exactly — the harness picks, and nothing invents a
+    /// default that then looks like a choice somebody made.
+    #[test]
+    fn no_pin_emits_no_model_token_on_any_carrier() {
+        let tmp = tempfile::tempdir().unwrap();
+        for driver in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ShellPty,
+        ] {
+            let mut spec = agent_spec(AgentKind::Claude);
+            spec.driver = driver;
+            spec.model_id = None;
+            let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+            // `claude_argv` resolves the profile's first model for print/pty, so
+            // only shell-pty is asserted token-free; what matters everywhere is
+            // that no *pin* was invented out of an absent request.
+            if driver == DriverKind::ShellPty {
+                assert!(
+                    !recipe.argv.iter().any(|token| token == "--model"),
+                    "{driver:?} must not mint a pin: {:?}",
+                    recipe.argv
+                );
+            }
+            assert!(
+                !recipe.argv.iter().any(|token| token.contains("es1_orange")),
+                "{driver:?} invented a pin: {:?}",
+                recipe.argv
+            );
+        }
+    }
+
+    /// The other kinds keep their own vocabulary: no `--model` is grafted onto
+    /// a CLI that would reject it (agy's interactive launch) or that takes the
+    /// selection through its own config (codex, grok).
+    #[test]
+    fn a_pin_does_not_become_a_model_flag_for_non_claude_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        for kind in [AgentKind::Codex, AgentKind::Grok, AgentKind::Agy] {
+            let mut spec = agent_spec(kind);
+            spec.model_id = Some("model_hub/es1_orange_o50[1m]".to_owned());
+            let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+            assert!(
+                !recipe.argv.iter().any(|token| token == "--model"),
+                "{kind:?} must not receive a claude model flag: {:?}",
+                recipe.argv
+            );
+        }
+    }
 }
 
 /// Binary override: every containment, traversal, and mode rule.

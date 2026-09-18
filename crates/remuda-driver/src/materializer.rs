@@ -554,6 +554,22 @@ fn materialize_shell_pty_agent(
             argv.push(path.to_string_lossy().into_owned());
         }
     }
+    // D-036 / model-pin-1: an explicit pin must reach the process on THIS path
+    // too. It used to reach only `claude_argv` (the print/pty/bg carriers), so a
+    // `dispatch --model` on driver shell-pty was recorded as honoured in
+    // `provider.model_requested` below and in the Hub roster while the host's
+    // own default silently answered every turn.
+    //
+    // Only `spec.model_id` — never `resolve_model`, whose profile fallback would
+    // mint a pin nobody asked for (brief rule 3: no pin, no token). The id is
+    // passed byte-identical: a `[1m]` context suffix is part of the id Claude
+    // parses, so trimming or normalising it would select a different model.
+    if let Some(flag) = preset.model_flag
+        && let Some(model) = pinned_model(request.spec)
+    {
+        argv.push(flag.to_owned());
+        argv.push(model);
+    }
     // §9.1 + composer-slider-5: the selection reaches each CLI in its OWN
     // vocabulary: `--effort` for claude, `-c model_reasoning_effort=…` for
     // codex (a top-level `--effort` is a clap error in codex), canonical
@@ -849,6 +865,31 @@ fn resolve_model(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult
     profile.models.first().cloned().ok_or_else(|| {
         DriverError::InvalidLaunchSpec("no model_id and profile has an empty models list".into())
     })
+}
+
+/// The explicitly pinned model id, if this launch has one.
+///
+/// Deliberately *not* [`resolve_model`]: that falls back to the profile's first
+/// model, which is the right answer for "what will answer this session" but the
+/// wrong one for "what did the requester pin". D-036 / model-pin-1 rule 3 — an
+/// instance with no `model_id` keeps today's behaviour exactly (host default, no
+/// argv token, no strip), so this returns `None` and every caller stays quiet.
+///
+/// The id is returned verbatim. A `[1m]` context-window suffix is part of the id
+/// the gateway catalog lists and Claude parses; trimming it would silently pick
+/// the other variant.
+pub(crate) fn pinned_model(spec: &InstanceSpec) -> Option<String> {
+    spec.model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
+}
+
+/// [`pinned_model`] for callers outside this module (the native carrier's
+/// settings merge), in the shape `Option::and_then` wants.
+pub fn pinned_model_for(spec: &InstanceSpec) -> Option<String> {
+    pinned_model(spec)
 }
 
 fn permission_plan(

@@ -27,8 +27,8 @@ pub use session::{HookSession, HookSessionOptions};
 pub use shadow::{ShadowFile, ShadowHome, ShadowOptions, materialize_codex, materialize_grok};
 pub use shim::{ShimSet, materialize_shims, shim_disabled};
 pub use user::{
-    is_overridden_provider_env, load_effective_user_settings, merge_provider_overlay_over_user,
-    merge_settings_layers, redact_settings,
+    apply_model_pin, is_model_env, is_overridden_provider_env, load_effective_user_settings,
+    merge_provider_overlay_over_user, merge_settings_layers, redact_settings,
 };
 
 /// Environment variable that turns the shim off for a session.

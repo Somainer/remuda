@@ -231,10 +231,79 @@ const OVERRIDDEN_ENV: &[&str] = &[
 
 /// Top-level settings keys the Hub's overlay is authoritative over.
 ///
-/// `model` is the only channel a shell-pty launch has for the requested model
-/// (its materializer emits no `--model` argv), so a host `model` left in place
-/// silently wins whenever the overlay happens not to carry one.
+/// The settings `model` key is one of the two channels a shell-pty launch has
+/// for the requested model (the other is the `--model` argv its materializer
+/// emits since D-036 / model-pin-1), so a host `model` left in place silently
+/// wins whenever neither carries one.
 const OVERRIDDEN_KEYS: &[&str] = &["model"];
+
+/// Env variables that *name a model*, as opposed to describing an endpoint or
+/// carrying a credential.
+///
+/// These are the subset a model pin owns on its own (D-036 / model-pin-1). Each
+/// one outranks the settings `model` key in Claude Code, so leaving any of them
+/// in the host layer lets the host answer for a model the requester pinned —
+/// which is exactly how the 2026-09-18 demo ran every worker on the host's
+/// default while every record claimed the pin.
+///
+/// Endpoint and credential variables are deliberately absent: under delegation
+/// `none` the host still owns *where* the session talks and *as whom*. Only the
+/// model changes hands.
+const MODEL_ENV: &[&str] = &[
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+];
+
+/// Whether `name` names an env variable that selects a model.
+#[must_use]
+pub fn is_model_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    MODEL_ENV.contains(&upper.as_str())
+}
+
+/// Make an explicit model pin authoritative over the host user's own settings.
+///
+/// Belt-and-braces half of D-036 / model-pin-1. Delegation `none` (跟随主机)
+/// legitimately lets the host's settings describe the provider — but it must
+/// stop meaning the host also owns the *model*. When the launch carries an
+/// explicit pin, every host key that names a model is removed from the base
+/// layer and the pin is written into `model`, so the one key Claude reads for a
+/// model says what was asked for whichever way the argv went.
+///
+/// `pin` is written verbatim: a `[1m]` context suffix is part of the id.
+///
+/// The host's endpoint and credentials are untouched — see [`MODEL_ENV`]. Under
+/// `gateway`/`direct`, [`merge_provider_overlay_over_user`] already takes the
+/// whole provider and runs first; this only adds the model on top.
+pub fn apply_model_pin(settings: &mut Value, pin: &str) {
+    let pin = pin.trim();
+    if pin.is_empty() {
+        return;
+    }
+    if !settings.is_object() {
+        *settings = Value::Object(serde_json::Map::new());
+    }
+    let Some(map) = settings.as_object_mut() else {
+        return;
+    };
+    if let Some(env) = map.get_mut("env").and_then(Value::as_object_mut) {
+        // Case-insensitively, for the same reason `strip_overridden` is: a host
+        // that spelled the variable in lower case still exports it.
+        let doomed = env
+            .keys()
+            .filter(|name| is_model_env(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in doomed {
+            env.remove(&name);
+        }
+    }
+    map.insert("model".to_owned(), Value::String(pin.to_owned()));
+}
 
 /// Whether `name` names a provider endpoint/model variable the Hub owns.
 #[must_use]

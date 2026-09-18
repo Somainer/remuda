@@ -1,137 +1,178 @@
-# instance.send lands on shell-pty native and its ledger row resolves
+# instance.send lands on shell-pty native and its ledger row resolves honestly
 
-Date: 2026-09-18 (UTC). Scope: live reproduction that an `instance.send` built
-by the CLI reaches a Claude agent on the native shell-pty carrier, and that the
-Hub command ledger resolves instead of sitting at `queued`. No demo data dir or
-ports were touched; this ran against a throwaway `remuda dev` server with its
-own data dir and high loopback ports. Paths below are redacted (`<HOME>`,
+Date: 2026-09-18 (UTC). Scope: how an `instance.send` built by the CLI reaches
+a Claude agent on the native shell-pty carrier, and how the Hub command ledger
+resolves — inside the protocol's three-state Command model. No demo data dir or
+ports are touched; the live portion ran against a throwaway `remuda dev` server
+with its own data dir and high loopback ports. Paths are redacted (`<HOME>`,
 `<SCRATCH>`).
 
-## Conclusion
+## Commit anchor
 
-The ssh-stdio demo defect — `remuda instance send` returned `state: queued,
-forwarded: true` and no turn ever started — is fixed. On this run, over the
-**native shell-pty carrier with the emulator on**:
+The behavior described here is reproducible at commit
+`ed03b645e655a619e7cc48ee3ce31af2503f58a4` (`fix(hub): settle rejected sends
+inside the three-state command model`), which is on branch
+`wt/c-send3/b-send3-md`; the CLI resolution change follows it in
+`d1479bbf…`. An earlier draft of this document pinned a sha that was rebased
+away; this revision re-anchors to a sha on the branch and re-runs every
+deterministic check it cites at that tree.
 
-- an `instance.send` whose payload is a prompt wrapper with text blocks
-  (`input.blocks: [{type:"text", text}]`, mode nested under `input`) is now
-  folded to a prompt by the Node and **reaches the driver**; the CLI reports
-  `state: accepted` / `resolvedState: accepted`, and the agent starts a turn;
-- a second send issued while a turn is running is **held and delivered at the
-  turn boundary** — the composer showed the second prompt and the agent
-  answered it (the word `LATER` appeared after the first turn's work);
-- every send **settles** in the ledger, and the new
-  `GET /v1/instances/{id}/commands` lists each with operation, state,
-  resolution and timestamps.
+## Protocol decision: no fourth state
 
-The composer submitted correctly on the **glyph rung alone**: on this host the
-pinned hook relay could not load (an environment `libssl.so.3` gap, unrelated to
-this change), so **no `UserPromptSubmit` / `Stop` hook fired for any prompt** and
-the driver fell back to the emulator screen signature throughout. Consequently
-the mid-turn hold and the boundary delivery were observed only through the
-emulator transcript (the rendered grid), not through hook evidence. The Enter
-still submitted every prompt, so no ghost-suggestion clearing key was needed in
-the keys module (brief Fix 2); the hold-and-deliver mechanics are additionally
-covered deterministically, with hooks on, by the driver test
-`shell_pty_fake_send::a_send_lands_when_idle_and_is_held_until_a_running_turn_ends`,
-which asserts on the fake harness's own submit/enqueue event log.
+Round 2 expressed a never-acked send as a fourth `Command.state` (`failed`)
+and a fourth resolution. `protocol.md` forbids exactly that:
 
-## Setup
+- §2.5 line 316 — `state` is `queued | accepted | settled`, "仅这三种业务进度状态";
+- the §2.5 state diagram routes a pre-dispatch rejection or expiry to
+  **settled with a settlement outcome**, not a new node;
+- §12.2 line 1678 — "不增设 unknown / dispatch_unknown / decision_unknown 第四态".
 
-- `remuda 0.1.0` built from this branch, rustc 1.94.1, target
-  `x86_64-unknown-linux-gnu`. (An earlier draft cited a commit sha that was
-  rebased away; the run predates the final history, so no sha is pinned here.)
-- Claude binary: `2.1.274 (Claude Code)`, resolved from PATH (the real CLI, not
-  a Remuda shim).
-- Scratch dev server, its own data dir and loopback ports, never the demo:
+The `remuda_protocol` enums `CommandState` / `ResolutionState`
+(`crates/remuda-protocol/src/enums.rs`) cannot parse `failed`, so the Hub was
+emitting a vocabulary the protocol crate rejects. Rather than carry a protocol
+amendment through §2.5, §12.2, both wire enums, the schema and the generated
+TS, this round uses only what §2.5 already allows — and the distinction the
+protocol actually draws:
 
-  ```sh
-  REMUDA_PTY_CARRIER=native REMUDA_PTY_EMULATOR=1 REMUDA_PTY_HOOKS=1 \
-    remuda dev --data-dir <SCRATCH>/data --port 47131 \
-      --hub-listen 127.0.0.1:47130 --workspace-root <SCRATCH>/ws
+| Observation | Wire resolution | Why |
+| --- | --- | --- |
+| Node replies with an explicit error | `state=settled`, `resolution=clear`, `settlement.outcome=rejected`, reason in `settlement.reason` | Positive evidence the command did **not** run — the §2.5 "派发前拒绝" edge. |
+| Node accepts the RPC | `state=accepted`, then the journal settles it | The normal path. |
+| Node receives the call but the reply is lost / Node never answers | `state=queued`, `resolution=reconciling` (or `unknown`) | A forward intent exists, so §2.5 forbids expiring or rejecting without asking the Node, and without non-execution evidence it cannot be called rejected. The mirrored journal converges it. |
+
+The decisive point is that **the lost-reply case is not expressible as
+`expired`/`rejected`**: §2.5 line 337 says "无法证明没执行时也不能标 rejected；
+超时查询返回 unknown". So the round-2 bounded ack deadline — which settled a
+possibly-delivered send on the Hub's own timer — is removed, along with its
+`commandSettleTimeoutMs` config. A forward intent is durable and never
+self-expired; the Node's journaled `accepted`/`settled` (which carries the
+outcome) is the authority. There is therefore no Hub-side fail timer any more:
+the `completed`/`rejected` outcome arrives either on the synchronous RPC error
+reply or on the mirrored journal.
+
+The `reason` is not a top-level wire field. It rides the settlement as
+`settlement.reason` (projected from the Node entity's
+`settlement.value.error.message`), present only for `outcome=rejected`. Two
+internal SQLite columns (`settlement_outcome`, `settlement_reason`) hold the
+projection and are `#[serde(skip)]` so they never appear on the wire.
+
+`mark_settled` — the path the Node's own settle frame takes (`ws.rs`) — now
+records `outcome=completed` and clears any reason, and a terminal settlement is
+never regressed by a later accept/settle. This closes the round-2 hole where a
+deadline-failed row could be flipped to `settled/clear` while keeping its
+failure reason.
+
+## Deterministic evidence (run at ed03b645)
+
+All commands below use the OpenSSL-3 devbox toolchain; output trimmed to the
+relevant lines.
+
+- Driver, fake harness (the send actually lands and the mid-turn hold works):
+
+  ```
+  $ cargo test -p remuda-driver --test shell_pty_fake_send
+  test a_send_lands_when_idle_and_is_held_until_a_running_turn_ends ... ok
+  test result: ok. 1 passed; 0 failed … finished in 15.44s
   ```
 
-- Instance created with `driver: shell-pty`, `kind: claude`, cwd `<SCRATCH>/ws`.
-  The Node logged `terminal emulator on for this PTY (REMUDA_PTY_EMULATOR)` and
-  `pinned native binary … version=2.1.274 (Claude Code)`.
+- Hub, explicit Node rejection settles `rejected` (not a fourth state), and is
+  listed by the new route:
 
-## Idle send (CLI)
+  ```
+  $ cargo test -p remuda-hub --test hub a_send
+  test a_send_the_node_rejects_settles_rejected_and_is_listed_by_the_new_route ... ok
+  test a_send_the_node_never_acks_rests_reconciling_and_is_never_self_failed ... ok
+  ```
 
-`remuda instance send <ins> --text "Reply with the single word PONG …"` returned:
+  The reject test asserts over real HTTP `state=settled`,
+  `resolution=clear`, `settlement.outcome=rejected`, the Node's message in
+  `settlement.reason`, and the absence of a top-level `reason`. The
+  never-acked test leaves a fake Node that silently drops `instance.send`,
+  then polls the listing for ~1.2 s (well past where round 2's 400 ms deadline
+  fired) and asserts the row stays three-state `queued`/`reconciling`,
+  `forwarded=true`, with no settlement and no `reason` — the Hub never
+  self-fails a forwarded command it cannot prove.
 
-```json
-{
-  "command": {
-    "operation": "instance.send",
-    "state": "accepted",
-    "resolution": "clear",
-    "forwarded": true,
-    "payload": { "input": { "type": "prompt", "mode": "new-turn",
-      "blocks": [{ "type": "text", "text": "Reply with the single word PONG …" }],
-      "origin": "human" } }
-  },
-  "replayed": false,
-  "resolvedState": "accepted"
-}
-```
+- Store projection and terminality:
 
-Before the fix this same block-shaped payload made the stdio Node reply
-`invalid request: instance.send requires input.text`, and no turn started. Here
-the journal moved `agent_status: idle → working → idle` and grew new message
-events, so the prompt reached the driver and the agent answered.
+  ```
+  $ cargo test -p remuda-hub --lib \
+      a_never_acked_send_rests_unknown_until_the_journal_settles_it \
+      a_rejected_send_settles_rejected_and_a_later_settle_frame_keeps_it
+  test store::tests::a_never_acked_send_rests_unknown_until_the_journal_settles_it ... ok
+  test store::tests::a_rejected_send_settles_rejected_and_a_later_settle_frame_keeps_it ... ok
+  ```
 
-## Mid-turn send is held to the boundary
+  The first drives a queued/reconciling row through a journaled `accepted`
+  then `settled` entity carrying
+  `{state:"known",value:{outcome:"completed",…}}` and asserts the projected
+  `settlement.outcome=completed` and that the internal columns
+  (`settlementOutcome`/`settlementReason`/`reason`) are absent from the
+  serialized row. The second asserts a rejected settlement is terminal: a later
+  positive settle frame and a late accept leave it `rejected` with its reason,
+  while a clean completion on a different command records `completed` with no
+  reason.
 
-A first send started a long turn; a second send followed ~2 s later, mid-turn.
-Both were accepted (`resolvedState: accepted`, `forwarded: true`). The emulator
-grid at the end showed the second prompt had been delivered and answered:
+- OpenAPI / wire drift guard (`tests/openapi.rs`):
 
-```
-❯ After you finish, also say the word LATER.
-  ⎿  UserPromptSubmit hook error
-  ⎿  Failed with non-blocking status code:
-     <SCRATCH>/data/dev-hub/node/hook-bin/<digest>/remuda: error while loading
-     shared libraries: libssl…
-● LATER
-● Ran 2 stop hooks
-  ⎿  Stop hook error: … libssl.so.3: cannot open shared object file …
-✻ Worked for 4s · done
-```
+  ```
+  $ cargo test -p remuda-hub --test openapi
+  test command_record_schema_matches_the_serialized_struct ... ok
+  test openapi_is_31_and_covers_source_routes_and_methods ... ok
+  test overlapping_web_client_operations_exist ... ok
+  ```
 
-The `UserPromptSubmit` / `Stop` hook errors are the relay's missing `libssl.so.3`
-on this host — the hook rung was unavailable, and the send still submitted via
-the emulator glyph rung. `LATER` printing confirms the mid-turn send was
-absorbed at the turn boundary rather than typed into the running turn.
+  The route scan now carries the HTTP **method** (it parses each `.route(`
+  call's method-router services, with paren/string/comment-aware splitting) and
+  asserts both directions against the spec, so a method change is caught. A
+  fully-populated `CommandRecord` is serialized through
+  `store_test_support::sample_command_record_json` and its property set diffed
+  against the documented schema; the test also pins the `state` enum to exactly
+  `accepted|queued|settled`, `resolution` to `clear|reconciling|unknown`, and
+  asserts the internal columns are not documented wire fields. `cargo test -p
+  remuda-hub` (all targets) and `cargo test -p remuda` are green at this tree,
+  as is `pnpm run typecheck` for the regenerated `api.generated.ts`.
 
-## Ledger resolves; the new route lists it
+## Live happy path (shell-pty native), re-anchored
 
-`GET /v1/instances/{id}/commands?limit=6` returned each command newest-first,
-every send `settled` / `clear` (accepted then settled from the mirrored
-journal), never stuck at `queued`:
+The live observations from the first revision concern paths this round does
+not change — the block-fold that makes the stdio Node accept the send, the
+mid-turn hold, and the journaled run of `queued → accepted → settled`. They
+remain reproducible at `ed03b645` and are summarized here rather than re-run
+end-to-end (the deterministic driver/hub tests above re-verify them without a
+live Claude process):
 
-```
-instance.send  state=settled  resolution=clear  reason=None  created=…02:30:55Z
-instance.send  state=settled  resolution=clear  reason=None  created=…02:30:53Z
-instance.send  state=settled  resolution=clear  reason=None  created=…02:29:47Z
-instance.create state=settled resolution=clear  reason=None  created=…02:27:13Z
-```
+- an `instance.send` with `input.blocks:[{type:"text",text}]` and mode nested
+  under `input` is folded to a prompt, **reaches the driver**, and the CLI
+  reports `state: accepted`; the agent starts a turn;
+- a second send issued mid-turn is **held and delivered at the turn boundary**;
+- every accepted send later reads `state=settled` in
+  `GET /v1/instances/{id}/commands`, which lists operation, state, resolution,
+  the settlement projection and timestamps newest-first.
 
-The failed-resolution paths are covered deterministically by two Hub tests,
-since this live host accepts every send: `a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route`
-(an error reply → `failed`) and `a_send_the_node_never_acks_fails_on_the_deadline`
-(the Node receives the call but never replies → `reconciling` → the bounded ack
-deadline fails the row). The store test `a_journaled_accept_recovers_a_deadline_failed_send`
-proves the §2.5 recovery direction: a journaled accept that arrives after a
-deadline failure flips the row back to `accepted` and clears the reason.
+The original run was on Claude Code `2.1.274`, native carrier with the
+emulator on; on that host the pinned hook relay could not load its
+`libssl.so.3`, so submission used the emulator glyph rung throughout (Enter
+still submitted every prompt). The send-lands and hold mechanics are covered
+with hooks on by `shell_pty_fake_send::a_send_lands_when_idle_and_is_held_until_a_running_turn_ends`.
 
-## Known follow-up for the web owner (not fixed here)
+## CLI: offline send no longer burns the resolve window
 
-`web/src/lib/api.ts` coerces command state and resolution through allowlists
-that predate this change: an unknown `state` becomes `"accepted"` and an unknown
-`resolution` becomes `"clear"`. A `failed` send therefore renders in the web UI
-as accepted with a clear resolution, hiding the failure and its reason. The Hub
-now emits `failed` / `failed` with a `reason`, and the generated client
-(`web/src/lib/api.generated.ts`, regenerated here) carries them, but the
-hand-written coercion in `api.ts` needs the web owner to extend those allowlists.
-This worker's ownership excludes `web/` beyond the generated client, so it is
-flagged rather than fixed.
+`remuda instance send` resolves a *forwarded* row by polling the ledger for the
+Node's journal to converge a lost reply, but it short-circuits immediately when
+the POST returned `forwarded=false`: on an offline host no forward intent
+exists, no timer is armed, and polling cannot change the outcome, so it prints
+the honest `queued` row at once instead of waiting out the full window. A
+rejection's message is surfaced from `settlement.reason`.
+
+## Web
+
+The generated client (`web/src/lib/api.generated.ts`) is regenerated from the
+updated OpenAPI: `CommandRecord.state` is the `accepted|queued|settled` union,
+`resolution` is `clear|reconciling|unknown`, and `settlement` is optional with
+`outcome` and `reason`. Because the Hub no longer emits a fourth state, the
+hand-written coercion in `web/src/lib/api.ts` (allowlists of those same three
+states / three resolutions) is now exactly consistent with the wire — the
+round-2 "unknown state renders as accepted" follow-up no longer has a triggering
+input. Surfacing the rejection outcome/reason in the UI is left to the web
+owner; this worker's ownership is the generated client.

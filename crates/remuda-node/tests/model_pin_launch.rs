@@ -1,4 +1,4 @@
-//! D-036 / model-pin-1: an explicit model pin survives a real native launch.
+//! model-pin-1: an explicit model pin survives a real native launch.
 //!
 //! The 2026-09-18 demo dispatched every worker with `--model <pinned id>` on
 //! driver `shell-pty` and ran all of them on the host's default: the
@@ -30,6 +30,12 @@ use std::time::Duration;
 const CARRIER_ENV: &str = "REMUDA_PTY_CARRIER";
 const EMULATOR_ENV: &str = "REMUDA_PTY_EMULATOR";
 const RUN_MARKER: &str = "REMUDA_MODEL_PIN_CHILD";
+const HOOKS_ENV: &str = "REMUDA_PTY_HOOKS";
+/// Which case the re-exec'd child runs.
+const CASE_ENV: &str = "REMUDA_MODEL_PIN_CASE";
+/// Makes the fake harness report a model other than the one it was given, to
+/// stand in for a harness that ignores `--model` (the 2026-09-18 substitution).
+const REPORT_MODEL_ENV: &str = "FAKE_HARNESS_REPORT_MODEL";
 
 /// A synthetic pin in the shape a gateway catalog really lists: namespaced, with
 /// a `[1m]` context-window variant. The suffix is load-bearing — it selects a
@@ -42,17 +48,22 @@ const HOST_DEFAULT: &str = "model_hub/es1_orange_o48[1m]";
 #[test]
 fn a_pinned_model_reaches_the_process_on_a_native_shell_pty_launch() {
     if std::env::var(RUN_MARKER).is_err() {
-        re_exec_child();
+        re_exec_child("honoured");
+        re_exec_child("mismatch");
         return;
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("runtime");
-    runtime.block_on(async { assert_pin_reaches_the_harness().await });
+    let mismatch = std::env::var(CASE_ENV).as_deref() == Ok("mismatch");
+    runtime.block_on(async { assert_pin_reaches_the_harness(mismatch).await });
 }
 
-async fn assert_pin_reaches_the_harness() {
+/// `mismatch`: the harness is told to report a model other than the one it was
+/// given, standing in for a harness that ignores `--model`. The pin still
+/// reaches its argv, so this isolates "honoured" from "sent".
+async fn assert_pin_reaches_the_harness(mismatch: bool) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
     let data_dir = root.join("node-data");
@@ -75,11 +86,22 @@ async fn assert_pin_reaches_the_harness() {
 
     let binary = install_fake_claude(&root);
     let mut native = NativeDriverConfig::new(data_dir.clone());
-    native.pty_hooks = false;
+    // Hooks on: the deterministic transcript binding comes from the
+    // SessionStart hook, and without a bound transcript there is no model
+    // read-back channel at all (the session reports `transcript_unbound`).
+    native.pty_hooks = true;
     native.relay_binary = Some(remuda_relay_bin(&root).into());
     native
         .extra_env
         .insert("FAKE_HARNESS_DIALECT_VERSION".into(), "modern".into());
+    if mismatch {
+        // Ignore the pin and answer on the host's default instead — the
+        // 2026-09-18 substitution, in the pin's own namespace so it is
+        // decidable (a bare upstream name would not be; model-pin-1 §3).
+        native
+            .extra_env
+            .insert(REPORT_MODEL_ENV.into(), HOST_DEFAULT.into());
+    }
 
     let config = ServeConfig {
         http: DevServerConfig::loopback(0)
@@ -129,39 +151,86 @@ async fn assert_pin_reaches_the_harness() {
         .await
         .expect("create instance");
 
-    // 1. The launch was not refused: with a channel present the pin check is
-    //    silent, so the instance is not failed with a model-pin error.
-    let instance = node
-        .get_instance(&created.instance.meta.id)
-        .expect("instance row");
-    assert!(
-        !instance
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("model-pin"),
-        "a pin that reached the process must not be refused: {:?}",
-        instance.last_error
-    );
-
-    // 2. The harness's own records say the pin is what it received — the half
-    //    that cannot be faked by the Node. The fake harness parses `--model`
-    //    (`remuda-testing/src/flags.rs`) and echoes it into the transcript it
-    //    writes, so this is evidence about the process, not about our intent.
-    //    Before the fix no `--model` reached it at all and it recorded its own
-    //    default, exactly as the real harness fell back to the host's.
+    // What the harness actually received/reported: the half the Node cannot
+    // fake. The fake harness parses `--model` (`remuda-testing/src/flags.rs`)
+    // and echoes the session model into the transcript it writes.
     let transcript = wait_for_transcript(&home, Duration::from_secs(60)).await;
     let models = transcript_models(&transcript);
-    assert!(
-        models.contains(&PIN.to_owned()),
-        "the harness recorded {models:?}, expected the pin {PIN}"
-    );
-    assert!(
-        !models.iter().any(|model| model == HOST_DEFAULT),
-        "the host's default answered instead of the pin: {models:?}"
-    );
+
+    if mismatch {
+        // The substitution: the process answered on the host's default. The
+        // read-back gate must have stopped the launch, naming both ids.
+        assert!(
+            models.iter().any(|model| model == HOST_DEFAULT),
+            "the mismatch case must report the host default: {models:?}"
+        );
+        let failure =
+            wait_for_model_mismatch(&node, &created.instance.meta.id, Duration::from_secs(60))
+                .await;
+        assert!(
+            failure.contains(PIN),
+            "must name the requested id: {failure}"
+        );
+        assert!(
+            failure.contains(HOST_DEFAULT),
+            "must name the observed id: {failure}"
+        );
+        // And the instance must not be left running on the wrong model.
+        let instance = node
+            .get_instance(&created.instance.meta.id)
+            .expect("instance row");
+        assert_eq!(
+            instance.lifecycle,
+            remuda_protocol::InstanceLifecycle::Failed,
+            "a refused launch must not stay working"
+        );
+    } else {
+        // The pin answered, so the gate stays silent and nothing is failed.
+        assert!(
+            models.contains(&PIN.to_owned()),
+            "the harness recorded {models:?}, expected the pin {PIN}"
+        );
+        assert!(
+            !models.iter().any(|model| model == HOST_DEFAULT),
+            "the host's default answered instead of the pin: {models:?}"
+        );
+        let instance = node
+            .get_instance(&created.instance.meta.id)
+            .expect("instance row");
+        assert!(
+            !instance
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("model-mismatch"),
+            "an honoured pin must not be refused: {:?}",
+            instance.last_error
+        );
+    }
 
     let _ = node;
+}
+
+/// Wait for the Node to record the model-mismatch refusal, returning its reason.
+async fn wait_for_model_mismatch(
+    node: &DevNode,
+    instance_id: &remuda_protocol::InstanceId,
+    budget: Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Ok(instance) = node.get_instance(instance_id)
+            && let Some(error) = instance.last_error.as_deref()
+            && error.contains("model-mismatch")
+        {
+            return error.to_owned();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the node never recorded a model-mismatch refusal"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Every distinct `message.model` the harness wrote.
@@ -247,7 +316,7 @@ fn remuda_relay_bin(root: &Path) -> PathBuf {
     out.join("debug/remuda")
 }
 
-fn re_exec_child() {
+fn re_exec_child(case: &str) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -255,16 +324,18 @@ fn re_exec_child() {
             "--nocapture",
         ])
         .env(RUN_MARKER, "1")
+        .env(CASE_ENV, case)
         .env(CARRIER_ENV, "native")
         .env(EMULATOR_ENV, "1")
+        .env(HOOKS_ENV, "1")
         .output()
         .expect("re-exec model pin child");
     if !output.status.success() {
         panic!(
-            "child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            "{case} child failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    println!("{}", String::from_utf8_lossy(&output.stdout));
+    println!("[{case}] {}", String::from_utf8_lossy(&output.stdout));
 }

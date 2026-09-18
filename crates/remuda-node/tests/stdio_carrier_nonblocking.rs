@@ -128,6 +128,14 @@ struct Node {
     child: Child,
     stdin: std::process::ChildStdin,
     rx: mpsc::Receiver<Value>,
+    /// Frames already read off the wire that no assertion has claimed yet.
+    ///
+    /// Replies to two requests sent back to back arrive in whichever order the
+    /// Node finishes them, and the Node interleaves pumps with replies. Dropping
+    /// a non-matching frame here would lose a reply the next assertion is
+    /// waiting for — and the failure would read as "the carrier stopped
+    /// answering" when it had answered. Hold them instead.
+    held: Vec<Value>,
     _reader: std::thread::JoinHandle<()>,
 }
 
@@ -181,6 +189,7 @@ impl Node {
             stdin,
             rx,
             _reader: reader,
+            held: Vec::new(),
         }
     }
 
@@ -191,7 +200,17 @@ impl Node {
         self.stdin.flush().unwrap();
     }
 
-    fn wait_for(&self, deadline: Instant, mut pred: impl FnMut(&Value) -> bool) -> Option<Value> {
+    fn wait_for(
+        &mut self,
+        deadline: Instant,
+        mut pred: impl FnMut(&Value) -> bool,
+    ) -> Option<Value> {
+        // Anything already read and not yet claimed is fair game first, so a
+        // reply that arrived while the previous assertion was looking for a
+        // different frame is not silently lost.
+        if let Some(index) = self.held.iter().position(&mut pred) {
+            return Some(self.held.remove(index));
+        }
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -202,6 +221,7 @@ impl Node {
                     if pred(&frame) {
                         return Some(frame);
                     }
+                    self.held.push(frame);
                 }
                 Err(_) => return None,
             }
@@ -209,7 +229,7 @@ impl Node {
     }
 
     /// Wait for the Node's `node.hello`, proving it is serving frames.
-    fn await_hello(&self) {
+    fn await_hello(&mut self) {
         let hello = self
             .wait_for(Instant::now() + Duration::from_secs(10), |frame| {
                 frame["method"] == json!("node.hello")
@@ -250,13 +270,18 @@ fn worker_remove_and_a_concurrent_screen_both_answer_within_two_seconds() {
         "params": { "instanceId": UNKNOWN_INSTANCE },
     }));
 
-    let deadline = Instant::now() + Duration::from_secs(2);
     let screen = node
-        .wait_for(deadline, |frame| frame["id"] == json!("screen-1"))
+        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
+            frame["id"] == json!("screen-1")
+        })
         .expect("tty.screen must answer within 2s");
     assert_eq!(screen["id"], "screen-1");
+    // Its own bound, not what is left of the first request's: each must be
+    // prompt on its own, which is the property the fix is about.
     let removed = node
-        .wait_for(deadline, |frame| frame["id"] == json!("remove-unknown"))
+        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
+            frame["id"] == json!("remove-unknown")
+        })
         .expect("worker.remove for an unknown worker must answer within 2s");
     // Unknown worker: nothing removed, but a real (non-hanging) reply.
     assert_eq!(removed["id"], "remove-unknown");
@@ -345,16 +370,21 @@ fn close_and_retire_of_an_instance_not_on_this_node_answer_not_found_promptly() 
         "params": { "name": "c-ghost", "instanceId": UNKNOWN_INSTANCE },
     }));
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Each request gets its own bound: each must be prompt on its own, which is
+    // the property under test, rather than sharing one window between them.
     let close = node
-        .wait_for(deadline, |frame| frame["id"] == json!("close-1"))
+        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
+            frame["id"] == json!("close-1")
+        })
         .expect("instance.close for an unknown instance must answer promptly");
     assert!(
         close.get("error").is_some(),
         "closing an instance not on this Node is a prompt error, not a wait: {close}"
     );
     let removed = node
-        .wait_for(deadline, |frame| frame["id"] == json!("remove-2"))
+        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
+            frame["id"] == json!("remove-2")
+        })
         .expect("worker.remove for an unknown instance must answer promptly");
     assert!(
         removed.get("error").is_some(),

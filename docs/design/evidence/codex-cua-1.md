@@ -4,18 +4,21 @@ Date: 2026-09-19.
 Scope: the `skills/codex-computer-use/` skill that Remuda ships to a
 launched agent, and the machine-state observations that shaped it.
 Source: the skill's own `references/setup.md` verification log, moved here
-verbatim and kept out of the shipped skill, which must stay instruction-only.
+verbatim and kept out of the shipped skill, which is instruction-only.
 
-Design references: [decisions](../decisions.md) D-037 (per-launch
-`computer-use` capability), D-038 (CUA screenshots in the journal);
-plan (B) task `c-cua-skill` and its §3 integration notes.
+Design references: [decisions](../decisions.md) — the per-launch `computer-use`
+capability and the CUA-screenshot contract are proposed as D-037 / D-038 and
+are not yet in that file; until they land, the constraints cited below come
+from [overlay.rs](../../../crates/remuda-driver/src/launch/overlay.rs) (the
+launch path never writes the operator's own config) and
+[recipe.rs](../../../crates/remuda-driver/src/recipe.rs) (the env allowlist).
 
 **The load-bearing consequence first.** A Claude Code host consuming
 Computer Use output — screenshots read back, UI actually operated — is
 **unverified**. What *is* verified is that the stdio metadata handshake
-succeeds and that a Codex-authenticated host can drive the JS surface. Any
-claim in the skill, the plan or a brief that treats "the tools listed" as
-"the UI works" is wrong; see the last two tables below for what was measured.
+succeeds and that a Codex-authenticated host can drive the JS surface. Reading
+"the tools listed" as "the UI works" is wrong on this evidence; see the two
+tables below for what was actually measured.
 
 ## What this skill is
 
@@ -77,9 +80,8 @@ lookup off its default.
   `codex` does not authenticate a native MCP host.
 - **The authenticated-caller row is the only end-to-end success recorded.** It
   was the Codex runtime driving the JS surface, not a Remuda-launched agent.
-  Per the plan's Q1, `c-cua-launch`'s merge is gated on a live probe of a
-  Remuda-launched agent driving `cua-repl`; until that exists, the launch work
-  ships refusals and per-instance materialization only.
+  Until a Remuda-launched agent is recorded doing the same, the launch work
+  stays behind its default: refusals and per-instance materialization only.
 - **No user-level installation happened.** The `用户级 skill 安装…未执行` row is
   the state the repo must keep: a committed skill never writes the operator's
   own config, and no launch path may either.
@@ -96,7 +98,18 @@ lookup off its default.
   every committed skill script, frontmatter `name` == directory name, file
   modes, and a reject list for host-mutating instructions.
 
-## Repository checks (2026-09-19, worktree `wt/c-cua-skill`)
+### How the grant is expected to arrive (not built here)
+
+This batch only makes the desktop-control launcher refuse by default. Granting
+it is a launch-path change: the opt-in `capability computer-use` on the launch
+spec injects `REMUDA_CAPABILITY_COMPUTER_USE=1` into the spawned child. The
+launch path already has the right shape for that — an env allowlist whose
+`Literal` source deliberately does not store values on the recipe
+([recipe.rs](../../../crates/remuda-driver/src/recipe.rs)) — so the capability
+can be granted per launch and recorded as granted without special-casing the
+launcher.
+
+## Repository checks (2026-09-19)
 
 ```
 $ git ls-files skills/codex-computer-use
@@ -136,7 +149,7 @@ REMUDA_CAPABILITY_COMPUTER_USE=1 for the agent. There is no interactive bypass.
 A CUA screenshot can show anything that was on the desktop. Evidence in this
 directory carries **redacted or synthetic** screens only; a real desktop
 screenshot is never committed, and screenshots are never journaled or logged
-inline. See plan (C) Q6 and D-038.
+inline.
 
 ## References
 

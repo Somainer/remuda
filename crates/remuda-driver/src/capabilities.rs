@@ -30,6 +30,13 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
     // that claude's queue-vs-steer semantics and grok/agy's keys are still
     // unmeasured. `unknown` is the truthful answer for all of them; the
     // per-harness measurements land with the worker who implements the keys.
+    //
+    // `claude-sdk` does not get an exception. It *does* route `instance.cancel`
+    // to the native `control_request`/`interrupt` (`print-replacement.md` §2.3),
+    // but the only witness in CI is `fake-claude`, which acks the frame because
+    // its script says to — that proves Remuda writes the request, not that the
+    // real CLI aborts a turn. Wiring a control request is not a measurement, so
+    // the cell stays `unknown` until a live capture shows a turn cut short (D-037).
     if matches!(name, Queue | Interrupt) {
         return MatrixMark::Unknown;
     }
@@ -48,6 +55,22 @@ pub fn capability_matrix(kind: DriverKind, name: CapabilityName) -> MatrixMark {
             }
         }
         (ClaudePrint, Steer | CompletionTask | Queue | Interrupt) => MatrixMark::Unknown,
+        // `claude-sdk` (`print-replacement.md` §2.6). Same native evidence as
+        // print for the structured capabilities, plus multi-turn stdin for
+        // resume. TTY is structurally absent: stdio is not a PTY, so this
+        // carrier has no Terminal view to attach to (§1.11, §2.6).
+        (ClaudeSdk, Resume | ModelSwitch | Fork | StructuredWorkflow | Hooks) => {
+            MatrixMark::SupportedStar
+        }
+        (ClaudeSdk, InteractiveApproval | Question | CompletionNativeTurn) => {
+            MatrixMark::SupportedStar
+        }
+        (ClaudeSdk, Artifact | TtyAttach | LiveAttach) => MatrixMark::NotProvided,
+        // Steer stays unknown until measured on *this* transport: a second
+        // `user` frame mid-turn may be native queue or steer, and we do not
+        // claim which (§2.3, D-028a item 2). Queue and Interrupt are forced
+        // Unknown above for every driver.
+        (ClaudeSdk, _) => MatrixMark::Unknown,
         (ClaudePty, Resume | Fork | StructuredWorkflow | Artifact | TtyAttach | Hooks) => {
             MatrixMark::SupportedStar
         }
@@ -278,6 +301,10 @@ fn slot(set: &mut CapabilitySet, name: CapabilityName) -> &mut Capability {
 fn adapter_transport(kind: DriverKind) -> AdapterTransport {
     match kind {
         DriverKind::ClaudePrint => AdapterTransport::NativeRustWire,
+        // D-003 reserved `ClaudeSdkSidecar` for a Node sidecar speaking the
+        // published SDK; M1 writes the same NDJSON from Rust, so the transport
+        // is the hand-written wire (`print-replacement.md` §2, decision 2).
+        DriverKind::ClaudeSdk => AdapterTransport::NativeRustWire,
         DriverKind::ClaudePty => AdapterTransport::ClaudePtyHerdr,
         DriverKind::ClaudeBg => AdapterTransport::ClaudeBgHerdrAttach,
         DriverKind::CodexAppserver => AdapterTransport::CodexAppserverSpawn,

@@ -112,7 +112,8 @@ impl Block {
                 }))
             }
         };
-        mapper.observation(Completeness::Structured, NativeRequestKey::None, body)
+        let completeness = mapper.content_completeness(self.closed);
+        mapper.observation(completeness, NativeRequestKey::None, body)
     }
 }
 

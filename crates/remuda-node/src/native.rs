@@ -1827,12 +1827,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_constructs_all_three_native_claude_drivers() {
+    fn registry_constructs_every_native_claude_driver() {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
             .expect("registry");
         for (agent, kind) in [
             (AgentKind::Claude, DriverKind::ClaudePrint),
+            // print-replacement.md §2.6, §3 batch 3: registering the factory is
+            // what makes `--driver claude-sdk` reach a driver at all.
+            (AgentKind::Claude, DriverKind::ClaudeSdk),
             (AgentKind::Claude, DriverKind::ClaudePty),
             (AgentKind::Claude, DriverKind::ClaudeBg),
             (AgentKind::Codex, DriverKind::GenericPty),

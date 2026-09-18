@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
@@ -13,6 +13,9 @@ import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { Transcript } from "../features/session/Transcript";
 import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
+import { projectTurnDecision } from "../features/session/live/turnDecision";
+import { useNow } from "../features/session/live/useElapsed";
+import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
@@ -103,10 +106,37 @@ export function SessionPage({
   const events = hub.events[instanceId] ?? [];
   const pending = hub.interactions.filter((i) => i.instanceId === instanceId && i.state === "pending");
   const status = instance ? projectStatus(instance) : "unknown";
+  // The turn-end decision folds every channel (hook latch, screen, transcript
+  // tail, pending interactions), not the hook latch alone — so a turn whose
+  // Stop hook never lands still ends once the screen/pty says idle. It is the
+  // one decision the strip and the composer share, which is what lets a held
+  // prompt flush on the same boundary the clock stops on. A 1 Hz tick drives
+  // the hook-freshness judgement (the deciding signal after a turn goes quiet
+  // is elapsed time, not a new event).
+  const liveNow = useNow(true);
+  const turnDecision = useMemo(
+    () => projectTurnDecision(events, instance?.nativeRef, pending.length > 0, liveNow),
+    [events, instance?.nativeRef, pending.length, liveNow],
+  );
   // D-028 §6 composer phase. `starting` behaves like idle (one send box);
-  // only a live working/blocked turn exposes steer/queue/interrupt.
-  const composerPhase =
-    status === "blocked" ? "blocked" : status === "working" ? "working" : status === "exited" ? "exited" : "idle";
+  // only a live working/blocked turn exposes steer/queue/interrupt. The
+  // multi-channel turn decision outranks the instance projection for the
+  // open/ended call (an ended → idle edge is the held-queue flush boundary);
+  // `unknown` defers to the instance projection instead of collapsing to
+  // either idle or blocked.
+  let composerPhase: "idle" | "working" | "blocked" | "exited";
+  if (status === "exited") {
+    composerPhase = "exited";
+  } else if (turnDecision.state === "ended") {
+    composerPhase = "idle";
+  } else if (turnDecision.state === "waiting") {
+    composerPhase = "blocked";
+  } else if (turnDecision.state === "working") {
+    composerPhase = "working";
+  } else {
+    composerPhase =
+      status === "blocked" ? "blocked" : status === "working" ? "working" : "idle";
+  }
   const nodeRestarted = instance?.lastError === "node-epoch-changed";
   const resolvedView = view === "auto" ? baseView : view;
 
@@ -440,8 +470,11 @@ export function SessionPage({
         <LiveStatusStrip
           events={events}
           nativeRef={instance.nativeRef}
+          hasPending={pending.length > 0}
+          decision={turnDecision}
           onInterrupt={() => hubStore.cancel(instance.id)}
         />
+        <SessionNotifications key={`notes-${instance.id}`} instanceId={instance.id} events={events} />
         <TaskTrack tasks={tasks} />
         {pending.map((item) =>
           item.kind === "question" ? (

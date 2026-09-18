@@ -11,6 +11,8 @@ import {
 } from "./channelHealth";
 import { isActivePhase, livePhase, toolAnchors, toolFingerprint, type LivePhaseName } from "./phase";
 import { liveStatus, phraseIsThinking } from "./liveStatus";
+import { projectTurnDecision } from "./turnDecision";
+import type { TurnDecision } from "./turnEnd";
 import { usageOutputTokens } from "./liveTokens";
 import { publishToolLive, resetToolLive, useElapsed, useNow, useToolElapsed } from "./useElapsed";
 import css from "./live.module.css";
@@ -49,17 +51,49 @@ const HEALTH_COPY: Record<Exclude<TierHealth["reason"], "ok" | "disabled">, stri
   "never-materialised": "该通道始终没有记录",
 };
 
-function HealthNote({ health }: { health: TierHealth }) {
+/**
+ * The Node-side check that explains a quiet hook tier, appended to the amber
+ * note only when the instance actually surfaced one. The spelling is the
+ * stable id from `remuda_node::hook_silence`; absent a check the badge keeps
+ * exactly the copy above.
+ */
+const SILENCE_REASON_COPY: Record<string, string> = {
+  "relay-missing": "钩子 relay 缺失或不可执行",
+  "socket-refused": "钩子 socket 无监听",
+  "link-stalled": "journal 推送停滞",
+};
+
+function HealthNote({ health, silenceReason }: { health: TierHealth; silenceReason?: string | null }) {
   if (health.reason === "ok" || health.reason === "disabled") return null;
+  const detail = silenceReason ? SILENCE_REASON_COPY[silenceReason] : null;
   return (
     <span
       className={health.reason === "stalled" ? css.warnStalled : css.warnMissing}
       data-testid={`live-health-${health.tier}`}
       data-reason={health.reason}
+      data-silence={silenceReason ?? undefined}
     >
       {health.tier} · {HEALTH_COPY[health.reason]}
+      {detail ? ` · ${detail}` : null}
     </span>
   );
+}
+
+/**
+ * The newest Node-reported hook-silence check for this session, if one was
+ * surfaced as a `hook.silence` diagnostic. The web never guesses the cause; it
+ * only names a check the Node actually ran (`relay-missing` / `socket-refused`
+ * / `link-stalled`).
+ */
+function hookSilenceReason(events: readonly Observation[]): string | null {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i]!;
+    if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
+    if (ev.payload.nativeName !== "hook.silence") continue;
+    const reason = ev.payload.relatedIds?.reason;
+    if (reason && reason in SILENCE_REASON_COPY) return reason;
+  }
+  return null;
 }
 
 /** Earliest parseable anchor: hook `since` and the screen re-anchor. */
@@ -89,10 +123,16 @@ export function LiveStatusStrip({
   events,
   nativeRef,
   onInterrupt,
+  hasPending = false,
+  decision: decisionProp,
 }: {
   events: readonly Observation[];
   nativeRef: NativeRef | null | undefined;
   onInterrupt?: () => void;
+  /** A real dialog/permission is pending for this instance. */
+  hasPending?: boolean;
+  /** The folded turn decision; computed internally when not supplied. */
+  decision?: TurnDecision;
 }) {
   const expectedTiers = useMemo(() => expectedTiersFor(nativeRef), [nativeRef]);
   const phase = useMemo(() => livePhase(events), [events]);
@@ -106,6 +146,15 @@ export function LiveStatusStrip({
     () => channelHealth(events, expectedTiers, now),
     [events, expectedTiers, now],
   );
+  // The turn-end decision folds every channel (hook latch, the screen, the
+  // transcript tail, pending interactions); the strip renders it, not the raw
+  // hook latch. SessionPage shares the same reducer so the composer's
+  // working→idle flush boundary is the exact decision painted here.
+  const decision = useMemo(
+    () => decisionProp ?? projectTurnDecision(events, nativeRef, hasPending, now),
+    [decisionProp, events, nativeRef, hasPending, now],
+  );
+  const silenceReason = useMemo(() => hookSilenceReason(events), [events]);
 
   // Feed the running tool cards their anchors. This is the only bridge
   // between the event list and the virtualised transcript rows.
@@ -116,77 +165,110 @@ export function LiveStatusStrip({
 
   const notes = [...health.values()].filter((item) => item.reason !== "ok" && item.reason !== "disabled");
   const screenActive = status?.active === true;
+  const ended = decision.state === "ended";
+  const waiting = decision.state === "waiting";
   // The spinner phrase ("thinking with xhigh effort") distinguishes the
   // reasoning wait from a plain prompt-accepted gap, where hooks emit no
   // thinking phase of their own.
   const thinking =
+    !ended &&
+    !waiting &&
     screenActive &&
     phraseIsThinking(status?.phrase) &&
     (!phase || phase.phase === "thinking" || phase.phase === "prompt-accepted");
-  const active = phase ? isActivePhase(phase.phase) : screenActive;
+  // Whether the turn clock keeps running. On an end it stops at `endedAt`; a
+  // genuinely open (working/waiting) turn ticks; `unknown` falls back to the
+  // last raw evidence so the reading stays visible but greys.
+  const rawActive = phase ? isActivePhase(phase.phase) : screenActive;
+  const active = ended ? false : decision.state === "working" || waiting ? true : rawActive;
   // Hooks have no thinking channel for claude: prompt-accepted stays latched
   // while the model reasons. The screen phrase is the one channel that says
   // so ("thinking with xhigh effort"), so it promotes the label to 思考中
   // (and the transcript gets a live thinking row). Every other phase stays
   // the hook's authoritative word.
-  const pseudoPhase: string | null = thinking
-    ? "thinking"
-    : phase
-      ? phase.phase
-      : screenActive
-        ? "working"
-        : null;
-  // Elapsed stays owned by the 1 Hz clock; the screen's own reading only
-  // re-anchors it (and never later than the hook anchor).
-  const anchor = earliestAnchor(phase?.since, status?.since);
+  const pseudoPhase: string | null = ended
+    ? "turn-ended"
+    : waiting
+      ? "blocked"
+      : thinking
+        ? "thinking"
+        : decision.state === "working"
+          ? (phase?.phase ?? (screenActive ? "working" : null))
+          : phase
+            ? phase.phase
+            : screenActive
+              ? "working"
+              : null;
+  // On an end the clock anchors at the deciding channel's end time and stops;
+  // otherwise it anchors at the turn start (hook, then screen), never later.
+  const anchor = ended
+    ? decision.endedAt
+    : earliestAnchor(phase?.since, status?.since);
   const phaseHealth = phase?.tier ? health.get(phase.tier) : undefined;
   const elapsed = useElapsed(anchor, active, phaseHealth);
-  if (!phase && !screenActive && notes.length === 0) return null;
+  if (!ended && !waiting && !phase && !screenActive && notes.length === 0) return null;
 
-  const phaseLabel =
-    (pseudoPhase && PHASE_LABEL[pseudoPhase as LivePhaseName]) ||
-    SCREEN_LABEL[pseudoPhase ?? "working"] ||
-    "工作中";
+  const phaseLabel = ended
+    ? "回合结束"
+    : (pseudoPhase && PHASE_LABEL[pseudoPhase as LivePhaseName]) ||
+      SCREEN_LABEL[pseudoPhase ?? "working"] ||
+      "工作中";
   const worst = notes[0]?.reason ?? "ok";
 
   // One token count, one source: real usage once it lands, otherwise the
-  // screen's live estimate.
-  const tokenLabel =
-    usageCount != null
+  // screen's live estimate. Hidden once the turn ended.
+  const tokenLabel = ended
+    ? null
+    : usageCount != null
       ? formatTokens({ state: "known", value: String(usageCount) })
       : status?.tokensLabel ?? null;
 
-  const phrase = status?.phrase ?? phase?.phrase ?? null;
-  // While working the TUI takes Esc to interrupt. The screen proves it when
-  // present; absent screen evidence, a hook-active turn is interruptible too.
-  // A blocked dialog is not — the answer keys own that phase.
+  const phrase = ended ? null : status?.phrase ?? phase?.phrase ?? null;
+  // Esc belongs only to a turn we know is live. An ended turn and an unknown
+  // state (a stale hook latch) never show it; a blocked dialog is owned by the
+  // answer keys.
   const canInterrupt =
-    active && phase?.phase !== "blocked" && (status ? status.interruptible : true);
+    decision.state === "working" && phase?.phase !== "blocked" && (status ? status.interruptible : true);
 
   return (
     <div
       className={css.strip}
       data-testid="live-status-strip"
       data-phase={pseudoPhase}
+      data-turn={decision.state}
+      data-decided-by={ended ? decision.decidedBy : undefined}
       data-health={worst}
     >
       <span className={css.phase} data-testid="live-phase">
         <span className={active ? css.liveDot : css.idleDot} aria-hidden />
         {phaseLabel}
-        {phase?.phase === "turn-ended" && phase.outcome ? ` · ${OUTCOME_LABEL[phase.outcome] ?? phase.outcome}` : null}
-        {phase?.toolName ? <span className={css.toolName}>{phase.toolName}</span> : null}
+        {ended && phase?.phase === "turn-ended" && phase.outcome ? ` · ${OUTCOME_LABEL[phase.outcome] ?? phase.outcome}` : null}
+        {!ended && phase?.toolName ? <span className={css.toolName}>{phase.toolName}</span> : null}
       </span>
+      {ended && decision.decidedBy ? (
+        // Names the channel that decided the end (hook / screen / transcript),
+        // so a screen-decided end with no Stop hook is never mistaken for one.
+        <span className={css.chip} data-testid="live-decided-by" data-channel={decision.decidedBy}>
+          {decision.decidedBy}
+        </span>
+      ) : null}
       {status?.verb && active ? (
         <span className={css.verb} data-testid="live-verb">
           {status.verb}…
         </span>
       ) : null}
-      {active && elapsed ? (
+      {elapsed ? (
         <span
-          className={elapsed.stale ? css.elapsedStale : css.elapsed}
+          className={elapsed.stale || ended ? css.elapsedStale : css.elapsed}
           data-testid="live-elapsed"
-          data-stale={elapsed.stale ? "1" : "0"}
-          title={elapsed.stale ? "锚定该状态的通道已静默：时间仍在累计，但状态可能已经变化" : "自 harness 报告该状态起经过的时间，本地 1 Hz 计时"}
+          data-stale={elapsed.stale || ended ? "1" : "0"}
+          title={
+            ended
+              ? "回合结束，计时已停止"
+              : elapsed.stale
+                ? "锚定该状态的通道已静默：时间仍在累计，但状态可能已经变化"
+                : "自 harness 报告该状态起经过的时间，本地 1 Hz 计时"
+          }
         >
           {elapsed.text}
         </span>
@@ -196,7 +278,7 @@ export function LiveStatusStrip({
           ↓ {tokenLabel} tokens
         </span>
       ) : null}
-      {(phase?.tier || screenActive) ? (
+      {!ended && (phase?.tier || screenActive) ? (
         <span className={css.chip} data-testid="live-tier">
           {phase?.tier ?? "screen"}
           {phase?.provision && phase.provision !== "native" ? ` · ${phase.provision}` : null}
@@ -222,7 +304,11 @@ export function LiveStatusStrip({
         </button>
       ) : null}
       {notes.map((item) => (
-        <HealthNote key={item.tier} health={item} />
+        <HealthNote
+          key={item.tier}
+          health={item}
+          silenceReason={item.tier === "hook" ? silenceReason : null}
+        />
       ))}
     </div>
   );

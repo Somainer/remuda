@@ -8,6 +8,7 @@ export {
   carrierOf,
   cliSummary,
   installedCli,
+  absentCli,
   isStaleOffline,
   sortHostsOnlineFirst,
   computerUseState,

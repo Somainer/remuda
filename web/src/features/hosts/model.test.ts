@@ -3,6 +3,7 @@ import { HOST_FIXTURES } from "./fixtures";
 import {
   COMPUTER_USE_KIND,
   STALE_OFFLINE_MS,
+  absentCli,
   carrierOf,
   cliSummary,
   compactCliVersion,
@@ -79,10 +80,29 @@ describe("computer-use host capability row (D-045 §3.4)", () => {
     expect(computerUseState(undefined)).toEqual({ reported: false });
   });
 
-  it("drops a reported-absent row from the installed CLI list", () => {
+  it("drops a reported-absent row from the installed list but keeps it as absent", () => {
     const absent: HostCli = { kind: COMPUTER_USE_KIND, auth: "unknown", installed: false };
     expect(installedCli([absent])).toEqual([]);
     expect(cliSummary([absent])).toBe("");
+    expect(absentCli([absent])).toEqual([absent]);
+  });
+
+  it("treats a flagless legacy row by the path/version heuristic", () => {
+    // A Node that predates `installed` sends neither flag; the heuristic is
+    // what keeps those rows on screen.
+    const legacyPresent: HostCli = { kind: "claude", version: "2.1.268", path: "/usr/bin/claude", auth: "logged_in" };
+    const legacyBare: HostCli = { kind: "claude", auth: "logged_in" };
+    expect(installedCli([legacyPresent])).toEqual([legacyPresent]);
+    expect(installedCli([legacyBare])).toEqual([]);
+    // Neither is "absent": absence is an explicit claim by the Node.
+    expect(absentCli([legacyPresent, legacyBare])).toEqual([]);
+  });
+
+  it("lets `installed: true` win over a missing path", () => {
+    // The flag is authoritative; a path is not required to be installed.
+    const flagged: HostCli = { kind: "computer-use", version: "2.7.0", auth: "unknown", installed: true };
+    expect(installedCli([flagged])).toEqual([flagged]);
+    expect(absentCli([flagged])).toEqual([]);
   });
 
   it("covers all three states across the host fixtures", () => {
@@ -99,5 +119,17 @@ describe("computer-use host capability row (D-045 §3.4)", () => {
     });
     expect(installedHost, "a fixture reports the client present").toBeTruthy();
     expect(absentHost, "a fixture reports it absent").toBeTruthy();
+  });
+
+  it("cannot turn the capability row into a launchable harness kind", () => {
+    // New Session derives `supportedKinds` from installedCli and tests
+    // membership against the harness ids. `computer-use` is not one of them,
+    // so the row may appear in the list without ever enabling a kind — the
+    // reason this capability is a host fact and not a launch option here.
+    const kinds = installedCli(HOST_FIXTURES.flatMap((host) => host.cli)).map((entry) => entry.kind);
+    expect(kinds).toContain(COMPUTER_USE_KIND);
+    for (const harness of ["claude", "codex", "grok", "agy", "terminal"]) {
+      expect(harness).not.toBe(COMPUTER_USE_KIND);
+    }
   });
 });

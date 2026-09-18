@@ -82,8 +82,28 @@ export function isStaleOffline(host: HostSortable, now = Date.now()): boolean {
   return now - at > STALE_OFFLINE_MS;
 }
 
+/**
+ * The CLIs this host reports as actually installed.
+ *
+ * `installed` is authoritative when the Node sent one. The path/version
+ * heuristic only covers rows from a Node that predates the flag — and used
+ * alone it silently dropped a reported-absent row, which carries neither path
+ * nor version, so "未安装" could never be drawn at all (ui-spec §2.6).
+ */
 export function installedCli(cli: HostCli[] | undefined): HostCli[] {
-  return (cli ?? []).filter((entry) => Boolean(entry.path || entry.version));
+  return (cli ?? []).filter((entry) =>
+    entry.installed === undefined ? Boolean(entry.path || entry.version) : entry.installed,
+  );
+}
+
+/**
+ * The CLIs the Node explicitly reported as **not** installed.
+ *
+ * Only an explicit `installed: false` counts: a row with no flag and no path
+ * is a Node that predates the flag, which is "not reported", not "absent".
+ */
+export function absentCli(cli: HostCli[] | undefined): HostCli[] {
+  return (cli ?? []).filter((entry) => entry.installed === false);
 }
 
 export function compactCliVersion(kind: string, version?: string): string {

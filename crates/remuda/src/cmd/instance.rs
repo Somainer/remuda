@@ -566,6 +566,25 @@ fn annotate_resolved(body: &mut Value, resolved: &Value) {
     }
 }
 
+/// A wait condition whose verdict is authoritative from the live snapshot
+/// alone; a bounded/partial journal window must never suppress it. An idle
+/// instance is idle regardless of rows the tail cut.
+fn condition_reads_snapshot_only(condition: &str) -> bool {
+    matches!(condition, "idle" | "blocked")
+}
+
+/// Whether `condition` can only be decided by scanning journal events. The
+/// event-scan verdict is gated on the window being complete for that poll
+/// iteration (but `done`/`run-terminal` also accept a terminal lifecycle from
+/// the snapshot, handled in [`until_met`]).
+fn condition_scans_events(condition: &str) -> bool {
+    condition.starts_with("line:")
+        || matches!(
+            condition,
+            "done" | "observed-update" | "interaction" | "workflow-terminal" | "run-terminal"
+        )
+}
+
 pub(crate) async fn wait(
     client: &HubClient,
     instance_id: &str,
@@ -581,17 +600,17 @@ pub(crate) async fn wait(
     // Dedupe/order by seq: descending pages and repeat polls can otherwise
     // present the same event twice.
     let mut by_seq = std::collections::BTreeMap::new();
-    // Set false for the remainder of the call once a descent cannot cover the
-    // whole range: the condition then must never be declared met on a partial
-    // stream, and the timeout names that.
-    let mut window_complete = true;
     // Mirrors the web client's fillGap bound: ~16 windows of 2000 rows.
     const MAX_FILL_PAGES: u32 = 16;
     loop {
         // First page is the tail of (after, durable]. Further pages descend
         // with beforeSeq = fromSeq - 1 (same after) until reachedAfterSeq.
         let mut before: Option<String> = None;
-        let mut reached = false;
+        // Window completeness is evaluated PER POLL ITERATION, never latched
+        // for the call: a later poll can catch up as durable grows. It gates
+        // only event-scanning predicates — snapshot-only verdicts (idle,
+        // blocked) are authoritative no matter how deep the journal is.
+        let mut window_complete = true;
         for _ in 0..MAX_FILL_PAGES {
             let journal = client
                 .get_journal(instance_id, Some(&after.to_string()), before.as_deref())
@@ -611,15 +630,12 @@ pub(crate) async fn wait(
                 .and_then(Value::as_str)
                 .and_then(|s| s.parse::<u64>().ok());
             if page_reached {
-                reached = true;
                 break;
             }
             // Cursor comes from the last event actually received, never from
             // durableSeq; descend below the window floor first.
             let Some(floor) = from_seq else { break };
             before = Some(floor.saturating_sub(1).to_string());
-        }
-        if !reached {
             window_complete = false;
         }
         after = by_seq.keys().next_back().copied().unwrap_or(after);
@@ -627,7 +643,12 @@ pub(crate) async fn wait(
         let snapshot = instance_snapshot(client, instance_id).await?;
         let lifecycle = snapshot.get("lifecycle").and_then(Value::as_str);
         let activity = snapshot.get("activity").and_then(Value::as_str);
-        if window_complete && until_met(condition, &events, lifecycle, activity)? {
+        // Snapshot-only verdicts are always evaluated; event-scanning verdicts
+        // only when this poll's descent covered the whole queried range.
+        let verdict_allowed = condition_reads_snapshot_only(condition)
+            || !condition_scans_events(condition)
+            || window_complete;
+        if verdict_allowed && until_met(condition, &events, lifecycle, activity)? {
             let matched_line = matching_wait_line(condition, &events);
             return Ok(json!({
                 "reason": "condition-met",
@@ -640,7 +661,8 @@ pub(crate) async fn wait(
                 "matchedLine": matched_line,
                 "eventCount": events.len(),
                 "outstandingWork": false,
-                "windowComplete": true,
+                "windowComplete": window_complete,
+                "reachedAfterSeq": window_complete,
             }));
         }
         if Instant::now() >= deadline {
@@ -654,11 +676,15 @@ pub(crate) async fn wait(
                 "activity": activity,
                 "matchedLine": Value::Null,
                 "eventCount": events.len(),
-                "outstandingWork": true,
-                // False names the bounded-window case: rows below the received
-                // tail were cut and the descent budget could not cover them,
-                // so the condition verdict and event count are partial.
+                // Only an event-scanning verdict blocked by an un-descented
+                // bounded window counts as outstanding; a snapshot-only
+                // condition that timed out did so on the live state.
+                "outstandingWork": condition_scans_events(condition) && !window_complete,
+                // False names the bounded-window case on THIS poll: rows below
+                // the received tail were cut and the descent budget could not
+                // cover them, so an event-scanning verdict would be partial.
                 "windowComplete": window_complete,
+                "reachedAfterSeq": window_complete,
             }));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1414,5 +1440,52 @@ mod tests {
         assert_eq!(row["status"], json!("idle"));
         assert_eq!(row["cwd"], json!("/tmp/wt"));
         assert_eq!(row["host"], json!("box"));
+    }
+
+    /// Cursor 0, journal deeper than the descent budget, `--until idle`:
+    /// snapshot-only verdicts must not be suppressed by a partial window — the
+    /// wait returns condition-met with windowComplete=false.
+    #[tokio::test]
+    async fn wait_idle_met_on_partial_window() {
+        use axum::{Router, extract::Path, response::Json, routing::get};
+
+        // 40_000 rows behind one bounded tail window: the 16-page * 2000-row
+        // descent from cursor 0 cannot reach seq 1, so windowComplete stays
+        // false on every poll.
+        async fn journal(Path(_id): Path<String>) -> Json<Value> {
+            Json(json!({
+                "durableSeq": "40000",
+                "fromSeq": "38001",
+                "reachedAfterSeq": false,
+                "events": (38001..=40000)
+                    .map(|seq| json!({ "seq": seq.to_string() }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
+        async fn instance(Path(_id): Path<String>) -> Json<Value> {
+            Json(json!({ "instanceId": "ins_deep", "lifecycle": "running", "activity": "idle" }))
+        }
+        let app = Router::new()
+            .route("/v1/instances/{id}/journal", get(journal))
+            .route("/v1/instances/{id}", get(instance));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client =
+            HubClient::new(format!("http://{addr}"), Some("test-token".into()), None).unwrap();
+        let result = wait(&client, "ins_deep", "idle", Some("0"), 5_000)
+            .await
+            .expect("wait returns");
+
+        assert_eq!(result["reason"], json!("condition-met"));
+        assert_eq!(result["windowComplete"], json!(false));
+        assert_eq!(result["reachedAfterSeq"], json!(false));
+        assert_eq!(result["outstandingWork"], json!(false));
+        assert_eq!(result["activity"], json!("idle"));
+
+        server.abort();
     }
 }

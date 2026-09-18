@@ -6,8 +6,8 @@
 **Scope:** M1 = §3 batch 1 + batch 2 + the registration half of batch 3.
 **Commits:** the live run below was made on branch `wt/c-sdkdriver/b-sdkdriver-md` at
 `56e55988` (the M1 series as first reviewed). The handback round that followed —
-the bounded close ladder, the web driver label, the test fixes and this
-paragraph — landed on the same branch; its final commit is `HANDBACK_SHA`. The
+the bounded close ladder, the web driver label and the test fixes — is commits
+`14381315..8993e51b` on the same branch, with this documentation commit last. The
 argv, pids, session id and journal quoted here are from the `56e55988` tree; the
 close ladder changed `Driver::close` after that run, and its behaviour is covered
 by `tests/claude_sdk_process.rs` rather than by a second live session.

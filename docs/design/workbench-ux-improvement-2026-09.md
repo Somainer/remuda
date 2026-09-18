@@ -106,7 +106,7 @@ Remuda mock 未连真实 Hub 做完整 agent 回合，也未发送 prompt、未�
 ### 2.3 会话顶栏与 composer
 
 - 观察：← 返回（标题被挤成单字母「s」）、状态「待处理」、Compact、文件、原始事件、32px 停止方块；meta 两行诊断。composer placeholder 仍是桌面快捷键（Enter 排队、⌘ 插队、Esc 打断）。芯片换行后占约半屏。
-- 代码：手机 `stopBtn` 32×32（`session.module.css` `@media max-width: 767px`）；`.meta { font-size: 10.5px }`，低于 tokens「重要状态不低于 12px」（`tokens.css` `--text-label: 11px` 注释）。
+- 代码：手机 `stopBtn` 32×32（`session.module.css` `@media max-width: 767px`）；`.meta` **桌面 11px / 手机 10.5px**（基础值在 `session.module.css:153-159`，10.5px 只在手机媒体查询里），两个值都低于 tokens type scale 的 12px 下限（「Important status never relies on sub-12 px text」，`tokens.css:52-53` 的块头注释，不是 `--text-label` 自己的注释）。
 - 代码：`.back` 宽 20px（`session.module.css`），小于 `--touch`。
 - 代码：文件入口已从 `.deskOnly` 解出（`SessionPage.tsx` 注释）。
 - 代码：`window.confirm` 用于插队/打断（`Composer.tsx`），Safari 上会盖住键盘。
@@ -161,7 +161,7 @@ Remuda mock 未连真实 Hub 做完整 agent 回合，也未发送 prompt、未�
 ### P0 — 手机会话先能读、能批、能说
 
 1. **减铬。** `/s/:id` compact：收起 space chips（空间名并进顶栏一芯片）；顶栏只留 返回 / 标题 / 一个状态 / ⋯。Compact、文件、原始事件、driver/seq/cost/native 进 ⋯。停止按钮 ≥44px。
-2. **修字号与命中。** `.meta` 10.5px → ≥12px；`.back` 20px → `--touch`；`viewSeg` / `stopBtn` 对齐 44px 命中（可视可以略小，hit slop 必须够）。
+2. **修字号与命中。** `.meta` 桌面 11px / 手机 10.5px → 统一 `var(--text-aux)`（12px）；`.back` 20px 字形 → 配 44×44 `::after` 热区（不是把字形撑到 44px，见 §11.7 的 P0-2 行）；`viewSeg` / `stopBtn` 对齐 44px 命中（可视可以略小，hit slop 必须够）。
 3. **Composer 收成一条。** 手机：textarea + 发送；附件/权限/effort/用量一个「选项」sheet。placeholder 不要桌面快捷键。`window.confirm` 换成 `Sheet`。
 4. **审批标题不折字。** 「审批中心」单行或改短名「审批」。
 
@@ -477,7 +477,7 @@ Playwright 实测（`127.0.0.1:57482`，官方 `:24544` 仍未监听，与 §8 �
 |---|---|---|
 | **P0-1** 手机顶栏减铬 | **CONFLICTS** | `ui-spec.md:156` 明确要求「约 400px 手机上显示可横向滚动的 space chips 与 tabs」，且 §1.4 自称「本节只作用于会话工作台」，`/s/:id` 正在其内 —— 收起 chips 与规格直接冲突。另外 `ui-spec.md:113` 把 `terminal|structured` 切换列为顶栏必有项，若挪进 ⋯ 即违规。**本建议还和自己矛盾**：P1-8 与 §10-19 要求该开关**更**显眼。要实施必须先改 `ui-spec.md` §1.4/§1.3。 |
 | **P1-10 / P1-20** ToolCard 默认一行 | **CONFLICTS** | `ui-spec.md:290` 与 `:307`：`workflow.run` **运行中与结束后都展开，只有读者 dismiss 才折叠**；`:292` `error` 卡**必须展开**。代码里 `ToolCard.tsx:260` 的 folded 分支在 Workflow 分支（`:281-292`）**之前** return，一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动。另 `ui-spec.md:303` 要求 Bash「命令一行」—— 折成裸「Bash」违规；折行的 key argument **必须**是命令文本（`toolPresenters.ts:199` 已能给出）。 |
-| **P0-5** 桌面 meta 默认折叠 | **CONFLICTS** | `ui-spec.md:229-236` 把两行 header 画成**规范 wireframe**，第 233 行就是 `seq 184 · connectivity=connected · $0.12`；`:113` 要求主机芯片在顶栏（现在住在 meta 里）；`:331` 要求 cost 在顶栏。要折叠必须同时改 §2.2 的 ASCII 图，否则代码与规格自相矛盾。 |
+| **P0-5** 桌面 meta 默认折叠 | **CONFLICTS** | `ui-spec.md:229-236` 把两行 header 画成**规范 wireframe**，第二行（修订前是第 **235** 行，本节此前误写作 233）就是 `seq 184 · connectivity=connected · $0.12`；`:113` 要求主机芯片在顶栏（现在住在 meta 里）；`:331` 要求 cost 在顶栏。要折叠必须同时改 §2.2 的 ASCII 图，否则代码与规格自相矛盾。 |
 | **P0-2** 字号与命中 | **NEEDS_DESIGN** | 方向对，但 `.back 20px → --touch` 的**字面写法违反** `ui-spec.md:342`「手机上触控 ≥ 44px 只靠**热区**，不靠视觉尺寸」。正确做法是 20px 字形 + 44×44 `::after`（同文件 `:2434-2443` 的 `.effortIconBtn::after` 已是先例）。报告 §5-P0-2 自己也写了「可视可以略小，hit slop 必须够」—— 标题和正文不一致，实施单必须取正文那句。 |
 | **P0-3** 手机 composer 收成一条 | **CONFLICTS** | `ui-spec.md:339-340` 要求 effort 保持可见的收起触发器并显示**档名**；`:337` 要求权限芯片**显示**当前 `permissionMode`（`permissions.ts` 把「绕过全部/不再询问/完全访问」标为 `danger`，把 bypass 态藏进 sheet 是这里最响的冲突）；`decisions.md:57`（D-028a）要求 composer 呈现发送/排队/打断三态 + 队列 chip + 未验证能力标「尚未验证」。若做 options sheet，**触发器必须带 mode 词**，三态与诚实标注不得入 sheet。 |
 | **P0-6** 列表行去 wire 串 | **READY（规格反而要求）** | `ui-spec.md:174-183` 的 wireframe 本来就是「点 + 标题 + 一句」，没有 `ready · waiting-interaction · connected`，也没有 `ins_`；`:164` 明写状态点是三维投影、不是单独 wire 枚举。**当前代码才是偏离。** 缺的是 `nextStep()` —— 全库没有这个派生（`lib/status.ts` 只有 `UI_STATUS_LABEL` / `projectStatus`），建议新建 `features/session/nextStep.ts` + 测试。 |

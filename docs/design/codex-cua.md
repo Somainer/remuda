@@ -88,9 +88,30 @@ instance 继承。每一次授予都是一次独立的、要出现在 `LaunchRec
 
 ### 3.2 腿 (a)：skill 字节 → 受管 native home
 
-**仅当**本次 launch 用的是 Remuda 管理的 native home
-（`inherit_default_config == false`，`native.rs:238-249`）**且**操作员申请了
-能力时，把 skill 目录写进：
+**门不是 `inherit_default_config`。** 那是 `NativeClaudeFactory` 的一个 claude 专属
+标志（`crates/remuda-node/src/native.rs:238-240`：`kind != GenericPty && !explicit_config_chosen
+&& delegation == None`），对一次 **codex** launch 它照样为真——而 codex 的 home 从来
+不是「继承来的」（§3.1）。用它当门会在 codex 上得出错误答案。**门是「本次 launch 的
+native home 是不是 Remuda 管的」，逐 kind 定义如下**：
+
+| kind | 「受管 home」是哪个 | 腿 (a) 是否写 skill 树 |
+|---|---|---|
+| claude | 作用域 config dir（`<instance>/native-home` 或 `REMUDA_CLAUDE_CONFIG_DIR` 或显式 `claudeConfigDir`）；**继承的 `~/.claude` 不算受管** | 受管 → 写；继承 → **不写** |
+| codex | `<launch_dir>/codex-home`（始终受管，`shadow.rs:110-168`） | **不写**（见下） |
+| grok | `<launch_dir>/grok-home`（始终受管，`shadow.rs:172-220`） | **不写**（见下） |
+
+**codex / grok 本批只有腿 (b)，而这是对事实的承认，不是省事。** **仓库里没有任何
+东西、skill 里也没有任何东西表明 codex 或 grok 会读一个 skills 目录**：`skills/` 这个
+概念在本仓库只存在于 claude 侧（`crates/remuda-node/src/native_config_access.rs` 的
+skills 可读性检查、transcript 里的 `Base directory for this skill:` 文本），codex 的
+影子 home 只被 codex 自己当 `CODEX_HOME` 读 `config.toml` / `hooks.json`，grok 同理读
+`GROK_HOME`。往 `codex-home/skills/` 写一棵树**没有任何读者**，那是把字节丢进黑洞还
+谎称投递成功。所以：codex / grok 的投递**就是那一份 per-instance MCP config**，能力
+语义由 MCP server 自己承载；skill 的指令文本对这两个 harness 本批不投递，如实记账。
+（grok 在本批**不是**能力目标：§5.3 的 elicitation 路由对 grok 无落点，且没有证据
+表明 grok 能消费该 MCP server。写 grok 的行只为让「不写」这件事有出处。）
+
+**claude 受管 home 的写路径**：
 
 ```
 <native_home>/skills/codex-computer-use/**      目录 0700，文件 0600
@@ -99,7 +120,7 @@ instance 继承。每一次授予都是一次独立的、要出现在 `LaunchRec
 字节来自**内嵌在 `remuda` 二进制里**的副本（与内嵌 web assets 同形），
 不是从磁盘上的仓库读——一个没有 checkout 的 musl Node 也必须能投递。
 
-**继承来的操作员 home 只读不写。** 当 `inherit_default_config == true` 时，
+**继承来的操作员 home 只读不写。** claude 且 home 是继承的 `~/.claude` 时，
 skill 文件**不写**，本次 launch 只得到腿 (b)。这不是优化，是硬规则，权威表述
 在 `crates/remuda-driver/src/launch/overlay.rs:25-28`：「**Never touch the user's
 own config.** The only file written is under `<instance dir>/launch/`」。
@@ -123,18 +144,59 @@ own config.** The only file written is under `<instance dir>/launch/`」。
 
 | kind | 怎么挂上去 | 依据 |
 |---|---|---|
-| claude / grok / agy | argv 追加 `--mcp-config <path>` | `mcp-config` 早在四族白名单且取值：`crates/remuda-driver/src/flags.rs:64,82,89,333` |
+| claude（本批唯一真正的目标） | argv 追加 `--mcp-config <path>` | `mcp-config` 早在四族白名单且取值：`crates/remuda-driver/src/flags.rs:64,82,89,333` |
+| grok / agy | **本批不授予**（§3.2 末：grok 无 elicitation 落点）。若将来授予，机制与 claude 同（argv），但届时须先证明该 host 能消费这个 MCP server | `crates/remuda-driver/src/flags.rs:82,89` |
 | codex | shadow `config.toml` 追加 `[mcp_servers.codex-computer-use]`，不扰动既有 `[features]` / `[hooks.state.*]` | `crates/remuda-driver/src/launch/shadow.rs:110-168` |
-| `shell-pty` / `generic-pty` | 同 argv 一路：这两族 kind 多态，走最宽的 `EXTRA_CLAUDE` 表，`mcp-config` 因此也在其内 | `crates/remuda-driver/src/flags.rs:100-108` |
+| `shell-pty` / `generic-pty` | **按 `spec.kind` 分派，不看 driver**——见下 | `crates/remuda-driver/src/flags.rs:100-108`、`crates/remuda-driver/src/materializer.rs:208-216` |
 
-codex 是**唯一**不走 argv 的 kind（它拿到的是 shadow home 而非 `--mcp-config`）；
-其余 kind 一律走 argv。两条路各自要有测试钉住，否则「granted but not delivered」
-会是一次静默失败。
+**pty 驱动的规则必须按 `spec.kind` 说，不能按 driver 说。** `shell-pty` 与
+`generic-pty` 是 kind 多态的：同一个 driver 既承载 claude 也承载 codex。它们的 argv
+白名单是 `EXTRA_CLAUDE`（最宽那张，`flags.rs:100-108`），所以从**白名单**看
+`--mcp-config` 对它们合法——但这只回答「这个 flag 不被拒」，不回答「codex 读不读它」。
+
+**因此：**
+
+- **`shell-pty` hosting claude**（**D-036 自托管那一轮就是这条**：`--driver shell-pty`
+  配 harness claude，证据 [self-host-1.md](./evidence/self-host-1.md) 记的是 Claude
+  的 config dir 与两个首运行对话框）→ 与 claude 一路，argv 追加 `--mcp-config`。
+- **`shell-pty` hosting codex** → 与 codex 一路：走 shadow home。`materialize_shell_pty_agent`
+  （`materializer.rs:500`）已经为 codex 挂上 `CODEX_HOME`（preset 的 `home_env`，
+  `materializer.rs:625-632` + `presets.rs:73`），而 `HookSession::start` 为
+  `AgentKind::Codex` 物料化同一棵 `<launch_dir>/codex-home`（`launch/session.rs:99-110`）。
+  **落点在 `config.toml` 的 `[mcp_servers.codex-computer-use]`，不追加 argv。**
+
+一句话规则：**能力怎么挂，取决于 `AgentKind`（claude / codex / …），与 driver 是
+`claude-print` / `claude-pty` / `shell-pty` / `generic-pty` 无关。** 唯一真正不走
+argv 的 kind 是 codex（它拿 shadow home），其余 kind 一律走 argv。两条路各自要有
+测试钉住，否则「granted but not delivered」会是一次静默失败。
 
 **绝不发 `--strict-mcp-config`。** 该 flag 被永久禁用（`flags.rs:15`），而这是
 **对的默认**：Remuda 提供的能力应该**增加** agent 自己的 server，绝不替换。
 `--strict-mcp-config` 会让「授予桌面控制」附带「取消你原有的 MCP 工具」，
 这是两件不该绑在一起的事。
+
+**环境变量握手（与 `c-cua-skill` 的硬化 launcher 对齐）。** 硬化后的 launcher
+（`skills/codex-computer-use/scripts/launch-cua-repl.sh`）在启动前要求子进程环境里有
+`REMUDA_CAPABILITY_COMPUTER_USE=1`，否则直接拒绝并讲明原因——因为它启动的 REPL
+对本机每一个应用持有 `click` / `typeText` / `pressKey`（该脚本顶部注释即此意）。
+合同：
+
+- **`c-cua-launch` 只在能力被授予时**把 `REMUDA_CAPABILITY_COMPUTER_USE=1`
+  注入子进程环境（走既有的 env allowlist，`LaunchRecipe.env_allowlist`，与
+  `CODEX_HOME` / `GROK_HOME` 同一条路）；未授予时**不设该变量**，launcher 自己拒绝。
+- **该变量是信号，不是边界。** 任何能从 shell 里 `export` 它的东西都能绕过它——
+  被启动的 agent 只要有一个 shell 就能自己导出再拉 REPL。所以它**不是**安全边界，
+  只是「Remuda 这次确实授予了」这个事实的传递。**真边界是「没有授予就绝不物料化」**：
+  能力没被授予时，腿 (b) 的 `mcp-cua.json` 根本不存在，agent 没有可指的 launcher
+  路径，也就无从启动它。把这条写清楚是为了让实现者不要误以为那个 env 变量承担了
+  它承担不起的职责。
+- 未授予时 agent 的正确行为是**报告缺少的能力**，不是重试、不是自己导出变量
+  （硬化 skill 已如此要求）。
+
+注意 `launch-mcp.sh`（原生 MCP 那条）**没有**同等的 env 门——它的存在前提是宿主
+已经把自己认证成了一个 Codex 内部会话，而 skill 的验证记录说非 Codex 宿主在这条
+路上会拿到 `Sender process is not authenticated`（§0）。所以本批真正需要授权的
+是 cua-repl 那条；原生 MCP 那条是「宿主本来就允许」的情形。
 
 **记账。** 物料化的 `mcp-cua.json`（以及腿 (a) 的 skill 树）以带 digest 的
 `MaterializedFile` 进 `LaunchRecipe.materialized_files`
@@ -230,12 +292,21 @@ elicitation 走 **MCP 协议本身**；codex shadow 的 `hooks.json` 只注册
 
 ### 5.3 后续（不在本批）
 
-把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。前置是一条
-**MCP 级 elicitation 桥**：为不经过 Claude hook 的 harness 造 producer，并给它
-一个 `InteractionCarrier` 取值——`crates/remuda-protocol/src/enums.rs:241-243`
-今天只有 `ClaudeControl` / `ClaudeHook` / `HarnessHook` 三个，没有第四个可
-表达「stdio MCP server 自己发的 elicitation」。在那座桥存在之前，D-045 的
-bypass 拒绝 +「只批准点名应用」是唯一的边界，且**已知不足**。
+把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。前置是**每个
+harness 各造一个 producer**，把它的 MCP `elicitation/create` 抬进 interaction bus
+——**不需要新的 `InteractionCarrier` 取值**：`crates/remuda-protocol/src/enums.rs:241-247`
+已经有七个（`ClaudeControl` / `ClaudeHook` / `HarnessHook` / `CodexRpc` / `AcpRpc` /
+`NativeTty` / `Unsupported`），要用的那个**按 harness 选**：
+
+| harness | MCP elicitation 会走哪条 | 用哪个既有 carrier |
+|---|---|---|
+| claude | 已经以 `Elicitation` hook 事件浮上来（`crates/remuda-signal/src/event.rs:114-135`），链路已通 | `HarnessHook`——**已经就是它**（`crates/remuda-signal/src/approval.rs:191` 的 `Interaction{kind: Elicitation}` 就带这个 carrier），不需要改 |
+| codex | 经 codex app-server RPC | `CodexRpc`——枚举里有，**今天全仓零 producer** |
+| grok | 经 ACP | `AcpRpc`——同上，零 producer |
+
+所以后续的缺口**不是枚举值，是 producer 位置**：`CodexRpc` / `AcpRpc` 在
+`crates/` 里除枚举定义外**零引用**，claude 那条（`HarnessHook`）是唯一有 producer 的。在那之前，
+D-045 的 bypass 拒绝 +「只批准点名应用」是唯一的边界，且**已知不足**。
 另注：Claude 侧 `Elicitation` 的实机 payload **至今未取得**
 （[native-pty-first.md](./native-pty-first.md) §5 P5 残留），所以连「Claude hook
 那条桥能不能真的覆盖 CUA」也是 UNVERIFIED。
@@ -270,8 +341,9 @@ bypass 拒绝 +「只批准点名应用」是唯一的边界，且**已知不足
 - **缺的是 producer 与 renderer，而这是 bug，不是策略**：今天的每一个 tool-result
   producer 都只发文本——journal 侧把非文本 block 丢掉
   （`crates/remuda-journal/src/claude.rs:1396`、`:1470-1484` 的 `tool_result_text`
-  只 filter `text`），driver 侧同样（`crates/remuda-driver/src/claude_print.rs:939,1029,1102`；
-  `crates/remuda-driver/src/adapters/mod.rs:387-406` 的 `tool_result_payload`
+  只 filter `text`），driver 侧同样（`crates/remuda-driver/src/claude_print.rs:1029` 与 `:1102`——
+`939` 是 **user message** 的 producer（`role: MessageRole::User`），不是 tool-result；
+`crates/remuda-driver/src/adapters/mod.rs:387-406` 的 `tool_result_payload`
   只接一个 `text: Option<String>`），web 侧把 blocks 拼成文本、
   忽略其余（`web/src/features/session/toolPresenters.ts:44-51`、
   `web/src/features/session/ToolCard.tsx:18-23`）。「只发文本」不是「不支持图片」

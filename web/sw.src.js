@@ -1,9 +1,10 @@
-// Service worker source. This file is NOT copied verbatim: the build plugin in
-// vite.config.ts reads it, substitutes __CACHE_NAME__ with a per-build cache
-// name (see cacheNameForBuild in src/lib/swCache.ts), and emits the result as
-// dist/sw.js. Because the cache name carries the build identity the worker's
-// bytes change on every deploy, so the browser's byte-compare update check
-// sees a new worker and the activate sweep below reclaims the old shell.
+// Service worker source. This file is NOT copied verbatim: the build plugin
+// (sw-build.ts, wired from vite.config.ts) stamps the single placeholder token
+// on the const CACHE line below with a per-build cache name (see
+// cacheNameForBuild in src/lib/swCache.ts) and emits the result as dist/sw.js.
+// Because the cache name carries the build identity the worker's bytes change
+// on every deploy, so the browser's byte-compare update check sees a new
+// worker and the activate sweep below reclaims the old shell.
 const CACHE = "__CACHE_NAME__";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg", "/icons/icon-192.png", "/icons/icon-512.png"];
 

@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { cacheNameForBuild } from "../../src/lib/swCache";
 
 /**
  * PWA shell cache identity. A demo refresh that replaces web/dist wholesale
@@ -23,10 +24,10 @@ const repoRoot = path.resolve(webRoot, "..");
 const target = path.resolve(repoRoot, process.env.CARGO_TARGET_DIR ?? "target");
 const serveBin = process.env.HUB_E2E_SERVE_BIN ?? path.join(target, "debug/examples/serve");
 
-/** Real worker source; substitute the build-stamped cache-name token per build. */
+/** Real worker source; stamp it exactly the way sw-build.ts does for dist. */
 async function swFor(build: string): Promise<string> {
   const source = await readFile(path.join(webRoot, "sw.src.js"), "utf8");
-  return source.replaceAll("__CACHE_NAME__", `runtime-shell-${build}`);
+  return source.replaceAll("__CACHE_NAME__", cacheNameForBuild(build));
 }
 
 const PNG_1PX = Buffer.from(

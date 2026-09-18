@@ -296,12 +296,24 @@ impl Driver for FakeDriver {
         Box::pin(async move {
             tokio::task::yield_now().await;
             match request {
-                DriverRequest::Send { prompt, .. } => {
+                DriverRequest::Send { prompt, mode, .. } => {
                     assert!(
                         !self.panic_prompts.contains(&prompt),
                         "intentional fake-driver panic"
                     );
                     let mut emissions = Vec::new();
+                    // c-send: a steer is a distinct delivery mode, not a plain
+                    // new turn. Surfacing it lets a test prove the mode carried
+                    // by the wire (top-level or nested under `input`) actually
+                    // reached the driver; an ordinary new turn stays silent so
+                    // existing event counts are undisturbed.
+                    if mode == remuda_protocol::PromptMode::Steer {
+                        emissions.push(DriverEmission::NativeLifecycle {
+                            name: "fake-driver-mode".to_owned(),
+                            status: "steer".to_owned(),
+                            severity: Severity::Info,
+                        });
+                    }
                     if prompt.contains("can_use_tool")
                         && let Some(instance) = &self.instance
                     {

@@ -67,15 +67,6 @@ async fn main() -> Result<()> {
     };
     // Local acceptance can attach the same fake engine to an isolated remuda
     // dev Hub/Node pair. CI still starts its own disposable real Hub here.
-    // Shrink the follow buffer for specs that need a deterministic
-    // backpressure gap + bounded resync snapshot on a wide burst: network
-    // throttling alone races the OS socket buffers. Production/other specs
-    // keep the default (config::DEFAULT = 256).
-    if let Ok(limit) = std::env::var("HUB_E2E_FOLLOW_BUFFER_EVENTS") {
-        config.follow_buffer_events = limit
-            .parse()
-            .with_context(|| format!("HUB_E2E_FOLLOW_BUFFER_EVENTS={limit}"))?;
-    }
     let addr = config.listen;
     let hub = if std::env::var("HUB_E2E_EXTERNAL").as_deref() == Ok("1") {
         None

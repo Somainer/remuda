@@ -288,9 +288,11 @@ test("a bounded tail window pages older rows and descends a resync gap to live",
   // Wrap the follow WebSocket:
   //  - log control frames (snapshot/gap),
   //  - while __followGate is set, drop EVERY follow frame (events, gaps and
-  //    snapshots): applied stays pinned at the pre-burst cursor. A later small
-  //    burst after reopening forces ONE clean bounded resync snapshot whose
-  //    floor is far above the cursor, which the app fills via beforeSeq.
+  //    snapshots). The browser still drains the socket, so the Hub never
+  //    resyncs, but the app's applied cursor stays pinned at the pre-burst
+  //    seq. When the gate reopens and a fresh burst lands, its first live
+  //    batch starts thousands of seqs above applied -> a real gap the client
+  //    must descend with beforeSeq, independent of hub buffer/socket timing.
   await page.addInitScript(() => {
     const w = window as unknown as {
       __frameLog?: string[];
@@ -423,11 +425,13 @@ test("a bounded tail window pages older rows and descends a resync gap to live",
   await expect(loadEarlier).toBeVisible();
 
   // --- Deterministic bounded resync gap -----------------------------------
-  // The fake Hub runs with HUB_E2E_FOLLOW_BUFFER_EVENTS=8, so a 5000-event
-  // burst on the attached follower deterministically overflows the follow
-  // buffer: the Hub queues a gap frame + bounded resync snapshot. Sample the
-  // session element's journal state into a window global on a fast interval
-  // (the sampler function runs in the browser; a Node-scope array would be
+  // Determinism is entirely client-side: the follow WebSocket wrapper (added
+  // via addInitScript at login) drops every frame while __followGate is set,
+  // so the applied cursor cannot chase the burst regardless of hub buffer
+  // sizes or socket timing. The first live batch after reopening opens a gap
+  // thousands of rows wide, which the client descends with beforeSeq. Sample
+  // the session element's journal state into a window global on a fast
+  // interval (the sampler runs in the browser; a Node-scope array would be
   // undefined there).
   await page.evaluate(() => {
     const w = window as unknown as {
@@ -474,9 +478,9 @@ test("a bounded tail window pages older rows and descends a resync gap to live",
   });
   await burst(driverPage, instanceId, BURST_COUNT);
   await waitDurable(driverPage, instanceId, beforeResyncDurable + BURST_COUNT);
-  // Reopen and trigger ONE clean bounded resync with a small burst: the tail
-  // snapshot floor is thousands of rows above the pinned cursor, forcing a
-  // beforeSeq descent through the missing windows.
+  // Reopen and send a small burst. Its live frames are not replayed from the
+  // gated gap, so the first delivered batch starts far above the pinned
+  // cursor and the client descends the missing windows with beforeSeq.
   await page.evaluate(() => {
     (window as unknown as { __followGate?: boolean }).__followGate = false;
   });

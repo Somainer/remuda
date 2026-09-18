@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { ToolCallPayload } from "../../types/observation";
+import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { known, type Id } from "../../types/wire";
 import { familyFor, registryKey, TOOL_FAMILIES } from "./toolRegistry";
 import { ToolCard } from "./ToolCard";
@@ -21,6 +21,43 @@ function call(toolName: string, input: Record<string, string>): ToolCallPayload 
     state: "running",
     executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
   };
+}
+
+/** A grok call: stable native name, human ACP title, arbitrary native input. */
+function grokCall(name: string, title: string, input: unknown): ToolCallPayload {
+  return {
+    ...call(name, {}),
+    displayTitle: known(title),
+    input: known(input),
+  };
+}
+
+function grokResult(structured: unknown): ToolResultPayload {
+  return {
+    nodeId: "obj_n" as Id,
+    revision: "2",
+    operation: "replace",
+    baseRevision: "1",
+    toolCallId: "obj_c" as Id,
+    stage: "final",
+    outcome: "succeeded",
+    blocks: [],
+    structuredResult: known(structured),
+    exitCode: known(0),
+    changes: [],
+  };
+}
+
+function renderGrok(cardCall: ToolCallPayload, result: ToolResultPayload | null = null) {
+  return render(
+    <ToolCard
+      driverKind="shell-pty"
+      call={cardCall}
+      result={result}
+      completeness="structured"
+      diffState="unknown"
+    />,
+  );
 }
 
 describe("tool registry dispatch", () => {
@@ -71,8 +108,7 @@ describe("tool registry dispatch", () => {
     expect(familyFor("claude-print", "mcp__server__tool")).toBe("MCP");
   });
 
-  it("renders the Bash card for Bash, and a key/value summary for unknown tools", () => {
-    const { rerender } = render(
+  it("renders the Bash card for Bash, and a key/value summary for unknown tools", () => {    const { rerender } = render(
       <ToolCard
         driverKind="claude-print"
         call={call("Bash", { command: "ninja -C build" })}
@@ -97,5 +133,98 @@ describe("tool registry dispatch", () => {
     expect(screen.getByText("NotARealTool")).toBeTruthy();
     expect(screen.getByText("foo")).toBeTruthy();
     expect(screen.getByText("bar")).toBeTruthy();
+  });
+});
+
+/**
+ * Rendered grok cards (driverKind shell-pty). These catch the wiring bugs the
+ * pure presenter tests cannot: the family-specific cards (BashCard, ReadCard,
+ * McpCard) had to learn the grok input fields, and dispatch uses the native
+ * name rather than the display title. Fixture inputs from
+ * crates/remuda-driver/tests/fixtures/grok/tui-updates.jsonl lines 8/37; the
+ * read_file/use_tool input shapes are synthesized [U].
+ */
+describe("rendered grok ToolCards", () => {
+  it("run_terminal_command: human title heading, native label, command, no JSON dump", () => {
+    // Input/title verbatim from fixture line 8.
+    const { container } = renderGrok(
+      grokCall("run_terminal_command", "Execute `printf SPIKE_OK > x.txt`", {
+        variant: "Bash",
+        command: "printf SPIKE_OK > x.txt",
+        description: "Write the marker.",
+        is_background: false,
+      }),
+    );
+    expect(screen.getByText("Execute `printf SPIKE_OK > x.txt`")).toBeTruthy();
+    expect(screen.getByTestId("tool-native-name").textContent).toBe("run_terminal_command");
+    expect(screen.getByText("$ printf SPIKE_OK > x.txt")).toBeTruthy();
+    // The native input keys never reach the card as a key/value dump.
+    expect(screen.queryByText("is_background")).toBeNull();
+    expect(container.textContent).not.toContain("variant");
+  });
+
+  it("run_terminal_command: cwd comes from the completed frame's rawOutput (line 9)", () => {
+    renderGrok(
+      grokCall("run_terminal_command", "Execute `printf x`", { command: "printf x" }),
+      grokResult({ status: "completed", rawOutput: { exit_code: 0, current_dir: "/workspace/grok-spike" } }),
+    );
+    expect(screen.getByText("/workspace/grok-spike")).toBeTruthy();
+  });
+
+  it("read_file: target_file with the offset/limit range, not a literal 'file'", () => {
+    // Synthesized from docs, not captured [U].
+    const { container } = renderGrok(
+      grokCall("read_file", "Read main.rs", { target_file: "/repo/src/main.rs", offset: 10, limit: 40 }),
+    );
+    expect(screen.getByText("Read main.rs")).toBeTruthy();
+    expect(screen.getByTestId("tool-native-name").textContent).toBe("read_file");
+    expect(screen.getByText("/repo/src/main.rs:10-40")).toBeTruthy();
+    expect(screen.queryByText("file")).toBeNull();
+    expect(screen.queryByText("target_file")).toBeNull();
+    expect(container.textContent).not.toContain("offset");
+  });
+
+  it("list_dir: target_directory renders (Read family, grok fields)", () => {
+    // Synthesized from docs, not captured [U].
+    renderGrok(grokCall("list_dir", "List src", { target_directory: "/repo/src" }));
+    expect(screen.getByText("/repo/src")).toBeTruthy();
+    expect(screen.getByTestId("tool-native-name").textContent).toBe("list_dir");
+    expect(screen.queryByText("target_directory")).toBeNull();
+  });
+
+  it("ask_user_question: question + option labels, no raw questions[] JSON", () => {
+    // Input/title verbatim from fixture line 37.
+    const { container } = renderGrok(
+      grokCall("ask_user_question", "Ask: Choose the probe result.", {
+        variant: "AskUserQuestion",
+        questions: [
+          {
+            question: "Choose the probe result.",
+            options: [
+              { label: "Alpha", description: "Record Alpha." },
+              { label: "Beta", description: "Record Beta." },
+            ],
+            multiSelect: null,
+          },
+        ],
+      }),
+    );
+    expect(screen.getByText("Ask: Choose the probe result.")).toBeTruthy();
+    expect(screen.getByTestId("tool-native-name").textContent).toBe("ask_user_question");
+    expect(screen.getByText("Choose the probe result.")).toBeTruthy();
+    expect(screen.getByText("Alpha / Beta")).toBeTruthy();
+    expect(screen.queryByText("questions")).toBeNull();
+    expect(container.textContent).not.toContain("Record Alpha");
+  });
+
+  it("use_tool: qualified server/tool from tool_name, not a 'mcp' server", () => {
+    // Synthesized from docs, not captured [U].
+    const { container } = renderGrok(
+      grokCall("use_tool", "Search drive", { tool_name: "drive__search_files", query: "spec" }),
+    );
+    expect(screen.getByText("drive/search_files")).toBeTruthy();
+    expect(screen.getByTestId("tool-native-name").textContent).toBe("use_tool");
+    expect(screen.queryByText("mcp/use_tool")).toBeNull();
+    expect(container.textContent).not.toContain("mcp/use_tool");
   });
 });

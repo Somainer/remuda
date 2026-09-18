@@ -55,15 +55,21 @@ function status(result: ToolResultPayload | null): ToolPresentation["status"] {
 }
 
 /**
- * Pull `name` / `description` out of a Workflow script's `export const meta`.
+ * Pull `name` / `description` out of a workflow script's meta literal.
  *
  * The tool's only input is the script source, so the title has to come from
  * the literal inside it. Deliberately tolerant: a regex over the source rather
  * than a JS parse, because a script that does not match must degrade to the
  * `description` input, never throw and blank the card.
+ *
+ * Two literal dialects share the brace scan: Claude's
+ * `export const meta = {` (default) and grok's Rhai `let meta = #{`.
  */
-export function parseWorkflowMeta(script: string): { name?: string; description?: string } {
-  const meta = /export\s+const\s+meta\s*=\s*\{/.exec(script);
+export function parseWorkflowMeta(
+  script: string,
+  opts: { opener?: RegExp } = {},
+): { name?: string; description?: string } {
+  const meta = (opts.opener ?? /export\s+const\s+meta\s*=\s*\{/).exec(script);
   if (!meta) return {};
   // Scan to the matching brace so a `phases: [{...}]` inside cannot end it early.
   let depth = 0;
@@ -87,43 +93,24 @@ export function parseWorkflowMeta(script: string): { name?: string; description?
   return { name: field("name"), description: field("description") };
 }
 
-/**
- * Pull `name` / `description` out of a grok Rhai workflow's
- * `let meta = #{ name: "…", description: "…" };`.
- *
- * Rhai map literals open with `#{`, so this is parsed separately from
- * Claude's `export const meta`. Same tolerant contract as
- * {@link parseWorkflowMeta}: no match returns `{}` and the caller degrades to
- * the source kind plus a truncated script, never a blank card.
- */
-export function parseRhaiWorkflowMeta(script: string): { name?: string; description?: string } {
-  const meta = /let\s+meta\s*=\s*#\{/.exec(script);
-  if (!meta) return {};
-  let depth = 0;
-  let end = -1;
-  for (let i = meta.index + meta[0].length - 1; i < script.length; i++) {
-    const ch = script[i];
-    if (ch === "{") depth += 1;
-    else if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        end = i;
-        break;
-      }
-    }
-  }
-  const body = script.slice(meta.index, end < 0 ? script.length : end + 1);
-  const field = (key: string): string | undefined => {
-    const match = new RegExp(`\\b${key}\\s*:\\s*(['"\`])([\\s\\S]*?)\\1`).exec(body);
-    return match?.[2];
-  };
-  return { name: field("name"), description: field("description") };
-}
+/** Grok Rhai workflow meta: `let meta = #{ name: "…", description: "…" };`. */
+export const RHAI_META_OPENER = /let\s+meta\s*=\s*#\{/;
 
 /** Truncate a long script for the no-meta fallback, keeping the card honest. */
 function truncate(text: string, max = 200): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}…`;
+}
+
+/**
+ * Grok carries a shell call's working directory in the completed frame's
+ * `rawOutput.current_dir`, not in the tool input (fixture tui-updates.jsonl
+ * line 9). `structuredResult` holds the whole terminal update frame.
+ */
+function grokResultCwd(result: ToolResultPayload | null): string | null {
+  if (!result) return null;
+  const structured = asRecord(knowledgeValue(result.structuredResult));
+  return asString(asRecord(structured?.rawOutput)?.current_dir);
 }
 
 /** Human copy for a grok workflow `source` discriminator (design §3.1). */
@@ -265,20 +252,24 @@ export function presentTool(
   }
 
   // --- grok native tools (design grok-structural-translation §3.1/§6.4).
-  // Shared shell/read/write/task layouts with the Claude branches above; the
-  // registry key stays the grok native name. Field names are grok's own
+  // `name` is the stable native name; the card heading is the ACP frame's
+  // human `title` (call.displayTitle), with the native name shown as the
+  // card's secondary label by ToolCard. Field names are grok's own
   // (`command`, `target_file`, `file_path`, `questions[]`, …), not Claude's.
+  const grokTitle = (fallback: string): string => knowledgeValue(call.displayTitle) ?? fallback;
 
   if (name === "run_terminal_command") {
     const command = asString(record?.command) ?? "";
     const details: ToolDetail[] = [{ label: "$", value: command, pre: true }];
-    const cwd = asString(record?.current_dir) ?? asString(record?.cwd);
+    // The input has no cwd while the call runs; the completed frame carries
+    // rawOutput.current_dir (fixture line 9).
+    const cwd = asString(record?.current_dir) ?? asString(record?.cwd) ?? grokResultCwd(result);
     if (cwd) details.push({ label: "目录", value: cwd });
     if (record?.is_background === true) details.push({ label: "后台", value: "是" });
     const exit = result ? knowledgeValue(result.exitCode) : undefined;
     if (exit !== undefined && exit !== null) details.push({ label: "exit", value: String(exit) });
     return {
-      title: "Shell",
+      title: grokTitle("Shell"),
       subtitle: asString(record?.description) ?? (command.split("\n")[0] || null),
       status: state,
       details: withResult(details, result, "输出"),
@@ -294,13 +285,13 @@ export function presentTool(
     if (typeof offset === "number" || typeof limit === "number") {
       details.push({ label: "范围", value: `第 ${String(offset ?? 1)} 行起${limit ? `，${String(limit)} 行` : ""}` });
     }
-    return { title: "Read", subtitle: path, status: state, details: withResult(details, result, "内容") };
+    return { title: grokTitle("Read"), subtitle: path, status: state, details: withResult(details, result, "内容") };
   }
 
   if (name === "list_dir") {
     const path = asString(record?.target_directory) ?? asString(record?.path) ?? "dir";
     return {
-      title: "List Dir",
+      title: grokTitle("List Dir"),
       subtitle: path,
       status: state,
       details: withResult([{ label: "目录", value: path }], result, "内容"),
@@ -312,7 +303,7 @@ export function presentTool(
     const details: ToolDetail[] = [{ label: "路径", value: path }];
     const changed = result?.changes.length ?? 0;
     if (changed) details.push({ label: "改动", value: `${changed} 处` });
-    return { title: "Write", subtitle: path, status: state, details };
+    return { title: grokTitle("Write"), subtitle: path, status: state, details };
   }
 
   if (name === "search_replace") {
@@ -323,7 +314,7 @@ export function presentTool(
     }
     const changed = result?.changes.length ?? 0;
     if (changed) details.push({ label: "改动", value: `${changed} 处` });
-    return { title: "Edit", subtitle: path, status: state, details: withResult(details, result) };
+    return { title: grokTitle("Edit"), subtitle: path, status: state, details: withResult(details, result) };
   }
 
   if (name === "spawn_subagent") {
@@ -335,25 +326,26 @@ export function presentTool(
     if (isolation) details.push({ label: "隔离", value: isolation });
     const prompt = asString(record?.prompt);
     if (prompt) details.push({ label: "任务", value: prompt, pre: true, fold: prompt.length > 200 });
-    return { title: "Task", subtitle: description, status: state, details: withResult(details, result) };
+    return { title: grokTitle("Task"), subtitle: description, status: state, details: withResult(details, result) };
   }
 
   if (name === "workflow") {
     // The Rhai run discriminator lives in `source` (name / script /
-    // script_path / resume / pause / stop). Parse the Rhai meta on its own;
-    // without a meta literal the card shows the source kind and a truncated
-    // script — never a blank heading.
+    // script_path / resume / pause / stop). Parse the Rhai meta with the Rhai
+    // opener; without a meta literal the card shows the source kind and a
+    // truncated script — never a blank heading.
     const sourceRec = asRecord(record?.source);
+    const sourceString = typeof record?.source === "string" ? (record.source as string) : null;
     const script = asString(sourceRec?.script) ?? asString(record?.script) ?? "";
     const scriptPath = asString(sourceRec?.script_path);
     const sourceKind = sourceRec
       ? (["resume", "pause", "stop", "name", "script_path", "script"] as const).find(
           (key) => sourceRec[key] !== undefined && sourceRec[key] !== null,
         ) ?? null
-      : typeof record?.source === "string"
+      : sourceString
         ? "name"
         : null;
-    const meta = parseRhaiWorkflowMeta(script);
+    const meta = parseWorkflowMeta(script, { opener: RHAI_META_OPENER });
     const kindLine = sourceKind ? RHAI_SOURCE_COPY[sourceKind] ?? sourceKind : "Rhai 工作流";
     const subtitle =
       meta.description ??
@@ -363,10 +355,22 @@ export function presentTool(
     const details: ToolDetail[] = [];
     if (meta.name) details.push({ label: "工作流", value: meta.name });
     if (sourceKind) details.push({ label: "来源", value: kindLine });
+    // The run identifier: source.name strings the run, and resume/pause/stop
+    // carry the id the control call addresses. Show it so the card names the
+    // run it acts on.
+    const runId = sourceString
+      ? sourceString
+      : sourceRec
+        ? asString(sourceRec.name) ??
+          asString(sourceRec.resume) ??
+          asString(sourceRec.pause) ??
+          asString(sourceRec.stop)
+        : null;
+    if (runId) details.push({ label: "运行", value: runId });
     if (state === "running") details.push({ label: "状态", value: "在后台运行 · /workflows 可查看进度" });
     if (script) details.push({ label: "脚本", value: truncate(script), pre: true, fold: true });
     else if (scriptPath) details.push({ label: "脚本路径", value: scriptPath });
-    return { title: "Workflow", subtitle, status: state, details: withResult(details, result) };
+    return { title: grokTitle("Workflow"), subtitle, status: state, details: withResult(details, result) };
   }
 
   if (name === "ask_user_question") {
@@ -380,11 +384,12 @@ export function presentTool(
       .map((option) => asString(asRecord(option)?.label) ?? null)
       .filter((value): value is string => value !== null);
     const multi = first?.multiSelect === true;
+    // The question text is the card subtitle; body rows carry only what the
+    // subtitle does not (the option labels, and the answer once it lands).
     const details: ToolDetail[] = [];
-    if (questionText) details.push({ label: "问题", value: questionText, pre: questionText.includes("\n") });
     if (labels.length) details.push({ label: multi ? "选项（多选）" : "选项", value: labels.join(" / ") });
     return {
-      title: "Question",
+      title: grokTitle("Question"),
       subtitle: questionText,
       status: state,
       details: withResult(details, result, "回答"),

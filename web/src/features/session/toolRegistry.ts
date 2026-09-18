@@ -53,6 +53,15 @@ function grokFamilyFor(toolName: string): ToolFamily | null {
   return null;
 }
 
+/**
+ * True for a grok native tool name. The dedicated family cards use this to
+ * pick grok input fields (`target_file`, `use_tool.tool_name`, …) and the
+ * human display title instead of the Claude-shaped defaults.
+ */
+export function isGrokTool(toolName: string | undefined | null): boolean {
+  return Boolean(toolName && grokFamilyFor(toolName) !== null);
+}
+
 /** Registry key is driverKind + '.' + nativeToolName, then mapped to a family. */
 export function registryKey(driverKind: string, toolName: string): string {
   return `${driverKind}.${toolName}`;

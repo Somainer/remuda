@@ -108,7 +108,8 @@ describe("tool registry dispatch", () => {
     expect(familyFor("claude-print", "mcp__server__tool")).toBe("MCP");
   });
 
-  it("renders the Bash card for Bash, and a key/value summary for unknown tools", () => {    const { rerender } = render(
+  it("renders the Bash card for Bash, and a key/value summary for unknown tools", () => {
+    const { rerender } = render(
       <ToolCard
         driverKind="claude-print"
         call={call("Bash", { command: "ninja -C build" })}
@@ -178,10 +179,39 @@ describe("rendered grok ToolCards", () => {
     );
     expect(screen.getByText("Read main.rs")).toBeTruthy();
     expect(screen.getByTestId("tool-native-name").textContent).toBe("read_file");
-    expect(screen.getByText("/repo/src/main.rs:10-40")).toBeTruthy();
+    expect(screen.getByText("/repo/src/main.rs")).toBeTruthy();
+    // limit is a line count, not an end line: "from line 10, 40 lines".
+    expect(screen.getByText("第 10 行起，40 行")).toBeTruthy();
+    expect(container.textContent).not.toContain("10-40");
     expect(screen.queryByText("file")).toBeNull();
     expect(screen.queryByText("target_file")).toBeNull();
     expect(container.textContent).not.toContain("offset");
+  });
+
+  it("prints the native name exactly once when displayTitle equals the tool name", () => {
+    // On main the adapter sets display_title = tool_name; the human ACP title
+    // arrives only with the D-043 statusless-update translation. The heading
+    // then is the native name and the secondary label must not duplicate it.
+    const { container } = renderGrok(
+      grokCall("run_terminal_command", "run_terminal_command", { command: "printf x" }),
+    );
+    expect(screen.queryByTestId("tool-native-name")).toBeNull();
+    expect((container.textContent ?? "").match(/run_terminal_command/g)).toHaveLength(1);
+  });
+
+  it("does not duplicate the native name in the folded row either", () => {
+    const { container } = render(
+      <ToolCard
+        driverKind="shell-pty"
+        call={grokCall("read_file", "read_file", { target_file: "/a.rs" })}
+        result={null}
+        completeness="structured"
+        diffState="unknown"
+        defaultFolded
+      />,
+    );
+    expect(screen.queryByTestId("tool-native-name")).toBeNull();
+    expect((container.textContent ?? "").match(/read_file/g)).toHaveLength(1);
   });
 
   it("list_dir: target_directory renders (Read family, grok fields)", () => {

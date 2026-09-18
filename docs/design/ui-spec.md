@@ -330,19 +330,19 @@ Compact：回合结束后把 thinking + 中间 tool 折成「N 次工具 · M �
 
 注册键 = `driverKind + '.' + nativeToolName`，再映射到族。不要把 Codex `commandExecution` 硬叫 Bash（`deepseek-harness.md` §2.2）。
 
-**各 harness 原生名 → 族（注册表按原生名分发，绝不先改名成 Claude 工具名；卡片可共用 shell/read/write/task 布局）。** grok/codex 文件适配器的 `driverKind` 都是 `shell-pty`，身份只由原生名承载。grok 卡片的标题统一是 ACP 帧的人类 `title`（`displayTitle`），稳定原生名一律作为弱化次级标签（`data-testid=tool-native-name`）跟随其后——presenter 按原生名分发，人类 title 只用于标题。grok 这张表与 Rust 侧 adapter 的 name→`ToolCategory` 表是同一张（`grok-structural-translation.md` §3.1），两侧必须同步：
+**各 harness 原生名 → 族（注册表按原生名分发，绝不先改名成 Claude 工具名；卡片可共用 shell/read/write/task 布局）。** grok/codex 文件适配器的 `driverKind` 都是 `shell-pty`，身份只由原生名承载。grok 卡片的标题目标形态是 ACP 帧的人类 `title`（`displayTitle`），稳定原生名作为弱化次级标签（`data-testid=tool-native-name`）跟随其后——presenter 按原生名分发，人类 title 只用于标题。**时效说明：人类 title 要等 D-043（c-grok-toolid，in flight）把 statusless `tool_call_update` 的 `title` 带进 `display_title` 之后才有；在此之前 adapter 对 `display_title` 与 `tool_name` 填同一字符串（`adapters/mod.rs`），所以现网卡片标题就是原生名。** 次级标签在「标题 = 原生名」时一律不渲染（五处卡片共用同一 guard），名字不会印两遍；D-043 落地后两者分叉、标签自动出现，无需再改 web。MCP 卡例外：标题固定为族名 **MCP**（claude/grok 一致），不使用人类 title。grok 这张表与 Rust 侧 adapter 的 name→`ToolCategory` 表是同一张（`grok-structural-translation.md` §3.1），两侧必须同步：
 
 | harness | 原生名 | 族 / 呈现要点 |
 |---|---|---|
 | claude | `Bash` `Edit` `Read` `Write` `Workflow` `Task`/`Agent` | 同名族 |
 | claude | `mcp__server__tool` | MCP |
-| grok | `run_terminal_command` | Bash 布局；读 `command`/`description`/`is_background`，cwd 在 completed 帧的 `rawOutput.current_dir`（运行中输入里没有）。卡片标题 = ACP 人类 title（`displayTitle`，如 `Execute \`printf …\``），稳定原生名以弱化的次级标签渲染（`data-testid=tool-native-name`，值为 `run_terminal_command`）；折叠态同规则 |
-| grok | `read_file` / `list_dir` | Read 布局；路径取 `target_file` / `target_directory`（不是 `file_path`），范围 `offset`/`limit` |
+| grok | `run_terminal_command` | Bash 布局；读 `command`/`description`/`is_background`，cwd 在 completed 帧的 `rawOutput.current_dir`（运行中输入里没有）。标题：D-043 落地后 = ACP 人类 title（`displayTitle`，如 `Execute \`printf …\``），现网 = 原生名；原生名次级标签仅在与标题不同时出现；折叠态同规则 |
+| grok | `read_file` / `list_dir` | Read 布局；路径取 `target_file` / `target_directory`（不是 `file_path`），范围取 `offset`/`limit`（`limit` 是行数不是结束行号，文案「第 N 行起，M 行」） |
 | grok | `write` / `search_replace` | Write / Edit 布局；`file_path` + `old_string`/`new_string` |
 | grok | `grep` `web_search` `web_fetch` `open_page` `open_page_with_find` `x_*` | Generic（Search 样式） |
 | grok | `spawn_subagent` | Task 布局；`prompt`/`description`/`subagent_type`/`isolation` |
 | grok | `workflow` | Workflow 族；解析 Rhai `let meta = #{ name: "…", description: "…" };`，**不**走 Claude `export const meta`；解析失败退回 source 类型（script/script_path/resume/pause/stop/name）+ 截断脚本，永不 blank 卡 |
-| grok | `search_tool` / `use_tool` | MCP；grok 限定名是 `server__tool`（无 `mcp__` 前缀），server/tool 从 `use_tool.tool_name` 取 |
+| grok | `search_tool` / `use_tool` | MCP；标题固定为族名 **MCP**（不用人类 title）；grok 限定名是 `server__tool`（无 `mcp__` 前缀），server/tool 从 `use_tool.tool_name` 取，原生名次级标签照常显示 |
 | grok | `ask_user_question` | Generic 兜底卡（问题 + 选项 labels + multiSelect）；正常应升格为 `interaction` 由 QuestionForm 渲染，卡只是无 interaction 帧时的 fallback |
 
 MCP 启发式收紧：**只有** `mcp__…` 限定名或表中显式 MCP 族才映射到 MCP；未知工具名里裸含 `__` 不再判 MCP（grok 的 `server__tool` 只经 `use_tool` 输入到达）。

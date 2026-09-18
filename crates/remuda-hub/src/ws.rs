@@ -1343,8 +1343,11 @@ async fn send_tty_snapshot(
         .flatten();
     let host_id = record.as_ref().map(|instance| instance.host_id.clone());
     // Why the cached screen is not live, when it reaches the browser. A row
-    // that is already terminal explains itself; otherwise the Hub simply could
-    // not reach the Node, which is the honest thing to say.
+    // that is already terminal explains itself. Otherwise the Hub has no live
+    // screen to show — `tty.attach` went unanswered, or it answered without
+    // bytes — and reporting the link, rather than the session, is the claim
+    // that is actually supported: the session may well be alive on the far
+    // side of a broken link.
     let fallback_reason = match record.as_ref().map(|row| row.lifecycle.as_str()) {
         Some("exited" | "failed" | "closed" | "terminated") => "instance-gone",
         _ => "node-link-unavailable",

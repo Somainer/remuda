@@ -87,6 +87,13 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // a child that actually behaves that way, so this makes the fake one.
     // Deliberately not driven by a script line: EOF handling is process
     // behaviour, not conversation.
+    // `FAKE_CLAUDE_IGNORE_SIGTERM=1`: also ignore SIGTERM, so a test can force the
+    // ladder all the way to its SIGKILL rung. Without this the fake dies on the
+    // default SIGTERM disposition and rung 3 is never exercised.
+    if std::env::var("FAKE_CLAUDE_IGNORE_SIGTERM").is_ok_and(|value| value == "1") {
+        #[cfg(unix)]
+        block_sigterm();
+    }
     if std::env::var("FAKE_CLAUDE_IGNORE_EOF").is_ok_and(|value| value == "1") {
         // Park, but never forever: the parent-death watch installed above exits
         // with the spawner, and this cap keeps a leaked fake from outliving a
@@ -396,4 +403,19 @@ fn rewrite_walk(value: &mut Value, session_id: &str, cwd: &str) {
         }
         _ => {}
     }
+}
+
+/// Block SIGTERM for this process (test knob only).
+///
+/// `nix`'s `signal`/`sigaction` are `unsafe fn` because a *handler function* must
+/// be async-signal-safe, and `unsafe` is forbidden workspace-wide. `sigprocmask`
+/// is safe and, for a process that never unblocks the signal, observably the
+/// same: SIGTERM stays pending and does not kill it, so a close ladder has to
+/// escalate to SIGKILL.
+#[cfg(unix)]
+fn block_sigterm() {
+    let mut set = nix::sys::signal::SigSet::empty();
+    set.add(nix::sys::signal::Signal::SIGTERM);
+    let _ =
+        nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_BLOCK, Some(&set), None);
 }

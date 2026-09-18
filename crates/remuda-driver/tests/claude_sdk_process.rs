@@ -505,3 +505,42 @@ async fn a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle() {
     }
     assert_eq!(exits, 1, "expected exactly one session `exited` lifecycle");
 }
+
+/// The deepest rung: a child that ignores both stdin EOF *and* SIGTERM must
+/// still be gone when `close` returns (§2.3).
+///
+/// The cooperative and EOF-ignoring cases above stop at rungs 1 and 2, so
+/// without this the SIGKILL rung would be untested — and that is the rung that
+/// exists for a wedged child holding the workspace open.
+#[tokio::test]
+async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_IGNORE_EOF".into(), "1".into());
+    env.insert("FAKE_CLAUDE_IGNORE_SIGTERM".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let handle = driver.start(spec).await.expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+    assert!(process_alive(&pid), "child should be running before close");
+
+    let started = std::time::Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(20), driver.close()).await;
+    assert!(
+        closed.is_ok(),
+        "close did not return for a SIGTERM-proof child"
+    );
+    closed.unwrap().expect("close ack");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "close took {:?}: the ladder is not bounded",
+        started.elapsed()
+    );
+    assert!(
+        !process_alive(&pid),
+        "pid {pid} survived a close that had to reach SIGKILL"
+    );
+}

@@ -95,6 +95,8 @@ export function Composer({
   effortDisabled,
   phase = "idle",
   capabilities,
+  interrupted: interruptedProp,
+  onInterruptedChange,
 }: {
   instanceId: string;
   mobile: boolean;
@@ -105,7 +107,7 @@ export function Composer({
     attachments?: AttachmentRef[],
     staged?: Attachment[],
     mode?: PromptMode,
-  ) => Promise<void> | void;
+  ) => Promise<boolean | void> | boolean | void;
   /** D-028 §5.3 instance.cancel — interrupt the turn, process stays alive. */
   onInterrupt?: () => void | Promise<void>;
   /** Held queue rows, oldest first (c-steer). */
@@ -119,8 +121,12 @@ export function Composer({
   ) => void;
   /** Cancel one held row (Remuda-held only). */
   onRetractHeld?: (id: string) => void;
-  /** c-steer 插队发送: interrupt the running turn and send one held row now. */
-  onSteerHeld?: (id: string) => void;
+  /**
+   * c-steer 插队发送: interrupt the running turn and send one held row now.
+   * Resolves `false` when the steer POST did not land, so the 已打断 receipt
+   * is only raised on a real interrupt.
+   */
+  onSteerHeld?: (id: string) => Promise<boolean | void> | boolean | void;
   /** Post every held row in order (the turn-end / answer transition). */
   onFlushHeld?: () => void | Promise<void>;
   permissionMode?: string;
@@ -156,6 +162,13 @@ export function Composer({
   phase?: Phase;
   /** Live capability snapshot; defaults keep idle sends working in fixtures. */
   capabilities?: CapabilitySnapshot;
+  /**
+   * 已打断 receipt, optionally controlled by the parent so a 插队发送 started
+   * from the transcript raises the same chip in the composer. When omitted the
+   * composer owns it internally (standalone unit tests).
+   */
+  interrupted?: boolean;
+  onInterruptedChange?: (interrupted: boolean) => void;
 }) {
   const [text, setText] = useState(() => readDraft(instanceId));
   const [menu, setMenu] = useState<MenuId>(null);
@@ -164,7 +177,14 @@ export function Composer({
   // Tab): the wire owns them, so these chips are display-only and never
   // cancelable here. Remuda-held rows arrive through the `held` prop.
   const [mirrors, setMirrors] = useState<HeldItem[]>([]);
-  const [interrupted, setInterrupted] = useState(false);
+  // 已打断 receipt: controlled when the page owns it (so a 插队发送 clicked in
+  // the transcript raises the same chip), otherwise local (standalone tests).
+  const [internalInterrupted, setInternalInterrupted] = useState(false);
+  const interrupted = interruptedProp ?? internalInterrupted;
+  const setInterrupted = (value: boolean) => {
+    if (onInterruptedChange) onInterruptedChange(value);
+    else setInternalInterrupted(value);
+  };
   // c-steer 插队发送: ids whose steer POST is in flight, so a double click on a
   // queued row's button sends exactly once (the row also leaves the queue as
   // soon as its POST lands, but the guard covers the pre-emit window).
@@ -449,8 +469,11 @@ export function Composer({
     const refs = images.refs(value);
     const staged = images.attachments;
     clearBox();
-    await onSend(value, refs, staged, "steer");
-    setInterrupted(true);
+    // 已打断 is a receipt for an interrupt that actually happened: only raise
+    // it once the steer POST landed (a failure leaves 状态待确认, not a claim
+    // that the turn was interrupted).
+    const landed = await onSend(value, refs, staged, "steer");
+    if (landed !== false) setInterrupted(true);
   };
 
   const removeHeld = (id: string) => {
@@ -460,15 +483,17 @@ export function Composer({
   /**
    * c-steer 插队发送 on a queued row: one click is the whole gesture (the row
    * already shows its text, so no confirm). The in-flight guard makes a double
-   * click send once; the row leaves the queue the moment its POST lands and the
-   * existing 已打断 chip is the receipt. The composer text box is untouched.
+   * click send once; the row leaves the queue the moment its POST lands. The
+   * 已打断 chip is a receipt raised only after the steer POST actually lands
+   * (a failed POST leaves the row 状态待确认 under no such claim). The composer
+   * text box and the other rows are untouched.
    */
-  const steerHeldRow = (id: string) => {
+  const steerHeldRow = async (id: string) => {
     if (!heldSteer.enabled || !onSteerHeld) return;
     if (steeringRef.current.has(id)) return;
     steeringRef.current.add(id);
-    onSteerHeld(id);
-    setInterrupted(true);
+    const landed = await onSteerHeld(id);
+    if (landed !== false) setInterrupted(true);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {

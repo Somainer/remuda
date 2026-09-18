@@ -161,9 +161,6 @@ function TranscriptInner({
   // into the next. The reset runs during render (not in an effect) so React
   // StrictMode's dev-time mount replay cannot wipe a restore set by the
   // passive restore effect.
-  // Row heights are keyed by STABLE NODE ID, never array index: load-earlier
-  // prepends thousands of nodes and would shift every index-keyed
-  // measurement, making padTop for the held anchor jump and never converge.
   const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
   const [instanceEpoch, setInstanceEpoch] = useState(instanceId);
   const restoredRef = useRef(false);
@@ -222,10 +219,9 @@ function TranscriptInner({
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState(720);
-  // Row heights are keyed by STABLE NODE ID (declared with the other per-route
-  // state), never array index: load-earlier prepends thousands of nodes and
-  // would shift every index-keyed measurement, making padTop for the held
-  // anchor jump and never converge.
+  // Row heights keyed by STABLE NODE ID, never array index: load-earlier
+  // prepends thousands of nodes and would shift every index-keyed
+  // measurement, making padTop for the held anchor jump and never converge.
   const sizes = useMemo(
     () => nodes.map((node) => rowHeights.get(node.id) ?? 0),
     [nodes, rowHeights],
@@ -340,10 +336,18 @@ function TranscriptInner({
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
 
+  // Stable per-row size reporter keyed by node id. The identity MUST stay
+  // constant across parent re-renders (scroll fires setScrollTop on every
+  // frame): TranscriptRow's measuring effect depends on it, so an inline
+  // closure would tear down and rebuild a ResizeObserver (and force a layout
+  // read) for every visible row on every scroll frame.
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
+    // Sub-pixel tolerance: measured heights jitter by fractions of a px
+      // between frames; ignore deltas under 1 instead of thrashing state.
     setRowHeights((prev) => {
-      if (prev.get(id) === height) return prev;
+      const last = prev.get(id);
+      if (last !== undefined && Math.abs(last - height) < 1) return prev;
       const next = new Map(prev);
       next.set(id, height);
       return next;
@@ -736,7 +740,7 @@ function TranscriptInner({
                 defaultFolded={defaultFolded}
                 collapseTick={collapseTick}
                 settle={settle}
-                onSize={(h) => setRowSize(node.id, h)}
+                onSize={setRowSize}
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
                 instanceId={instanceId}
@@ -803,7 +807,7 @@ function TranscriptRow({
   defaultFolded: boolean;
   collapseTick: number;
   settle: boolean;
-  onSize: (height: number) => void;
+  onSize: (id: string, height: number) => void;
   searchHit: boolean;
   searchCurrent: boolean;
   expandTick: number;
@@ -819,13 +823,18 @@ function TranscriptRow({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = () => onSize(el.getBoundingClientRect().height + 12);
+    const report = () => onSize(node.id, el.getBoundingClientRect().height + 12);
     report();
     if (typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(report);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [onSize, node, collapseTick, expandTick]);
+    // Depend only on the stable id (and the stable onSize callback): fold /
+    // content changes resize the element, and this ResizeObserver fires for
+    // those automatically. Depending on the `node` object identity would
+    // rebuild the observer on every parent scroll re-render, since the
+    // assembled node list is re-created each render.
+  }, [onSize, node.id]);
   return (
     <div
       ref={ref}

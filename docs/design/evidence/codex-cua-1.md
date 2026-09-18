@@ -94,9 +94,9 @@ lookup off its default.
 - The two tables above were lifted out of `references/setup.md` into this file.
 - `scripts/launch-cua-repl.sh` — desktop control — now refuses to run without
   an explicit capability acknowledgement flag.
-- `scripts/ci/skills-lint.sh` enforces all three going forward: shellcheck on
-  every committed skill script, frontmatter `name` == directory name, file
-  modes, and a reject list for host-mutating instructions.
+- `scripts/ci/skills-lint.sh` enforces all of the above going forward:
+  shellcheck on every committed skill script, frontmatter `name` == directory
+  name, file modes, and a reject list for host-mutating instructions.
 
 ### How the grant is expected to arrive (not built here)
 

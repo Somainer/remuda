@@ -959,7 +959,14 @@ mod tests {
                                  "reasonCode": "carrier-not-enabled"}],
         });
         let params = stdio_hello_params(
-            &host_id, "lab", "outbound-wss", "0.1.0", &epoch, host, None, None,
+            &host_id,
+            "lab",
+            "outbound-wss",
+            "0.1.0",
+            &epoch,
+            host,
+            None,
+            None,
         );
         assert_eq!(
             params["capabilities"]["driverInventory"][0]["launchable"],

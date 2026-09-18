@@ -835,7 +835,10 @@ async fn a_lost_instance_fails_its_worker_and_frees_the_slot() -> Result<()> {
         json!("blocked"),
         "a lost instance must fail the worker holding it: {zombie_worker}"
     );
-    assert_eq!(zombie_worker["state"]["reason"], json!("node-epoch-changed"));
+    assert_eq!(
+        zombie_worker["state"]["reason"],
+        json!("node-epoch-changed")
+    );
 
     // The survivor and its worker are untouched.
     let survivor_row = instance_row(hub.addr, &cookie, &survivor).await?;
@@ -881,7 +884,14 @@ async fn a_node_restart_leaves_another_hosts_rows_alone() -> Result<()> {
 
     // Host A restarts and reports nothing at all — every one of its rows is
     // lost. Host B is still online and still holds its own instance.
-    let _node_a = node_hello(hub.addr, &token_a, &host_a, Some("epoch_two"), Some(json!([]))).await?;
+    let _node_a = node_hello(
+        hub.addr,
+        &token_a,
+        &host_a,
+        Some("epoch_two"),
+        Some(json!([])),
+    )
+    .await?;
 
     let lost_row = instance_row(hub.addr, &cookie, &lost).await?;
     assert_eq!(lost_row["lifecycle"], json!("exited"));

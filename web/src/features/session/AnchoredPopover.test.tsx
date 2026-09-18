@@ -45,8 +45,8 @@ describe("computeAnchored placement math", () => {
   });
 
   it("caps the panel height to the available room and the 60vh bound", () => {
-    // Trigger at the bottom: room below is 60, room above is ~120 → up,
-    // and the panel's natural 900px height is capped to the room.
+    // Trigger at the bottom: room below is 0, room above is ~744 → up,
+    // and the panel's natural 900px height is capped to the 60vh cap.
     const measured = computeAnchored(
       { top: 760, bottom: 792, left: 100, right: 200, width: 100 },
       { preferredHeight: 900, width: 300 },
@@ -58,6 +58,36 @@ describe("computeAnchored placement math", () => {
     expect(measured.top).toBeGreaterThanOrEqual(8);
     // 60vh = 480 is the absolute cap.
     expect(measured.maxHeight).toBeLessThanOrEqual(480);
+  });
+
+  it("never overlaps the approval card on either placement", () => {
+    // Approval bottom 660, trigger 700–730: the usable gap above is ~24px,
+    // below is 162px, so the panel opens down — and still clears the card.
+    const down = computeAnchored(
+      { top: 700, bottom: 730, left: 100, right: 200, width: 100 },
+      { preferredHeight: 190, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 660 },
+    );
+    const downTop = down.placement === "up"
+      ? 700 - 8 - Math.min(190, down.maxHeight)
+      : 738;
+    expect(downTop).toBeGreaterThanOrEqual(668);
+
+    // Fixture-shaped geometry (real mock e2e): trigger at 857, approval
+    // bottom 770, viewport 900. Up is the only roomy side; the panel must
+    // stay under the vh cap and above the card edge.
+    const up = computeAnchored(
+      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { preferredHeight: 190, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 770 },
+    );
+    expect(up.placement).toBe("up");
+    const height = Math.min(190, up.maxHeight);
+    const top = 857 - 8 - height;
+    expect(top).toBeGreaterThanOrEqual(770);
+    expect(up.maxHeight).toBeLessThanOrEqual(540);
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {

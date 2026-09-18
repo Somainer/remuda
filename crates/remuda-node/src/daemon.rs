@@ -469,6 +469,9 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
         &shared.epoch,
         serde_json::to_value(&snapshot)?,
         enrollment.node_token.as_deref(),
+        // The inventory goes on below with the daemon fields, alongside the
+        // watermarks this bridge is authoritative for.
+        None,
     );
     params["bridge"] = json!(true);
     params["daemon"] = json!(true);

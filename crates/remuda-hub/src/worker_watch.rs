@@ -177,6 +177,32 @@ enum ScreenRead {
     Gone(&'static str),
 }
 
+/// The reason a gone worker reports, preferring the settled row's own.
+///
+/// The carrier code says only *that* the Hub could not read a screen
+/// (`host-offline`, `screen-unavailable`, …); the instance row's `lastError`
+/// says how the worker actually died. A Hub-settled `node-epoch-changed` is
+/// the honest answer and must reach the report, so it wins whenever the row
+/// has one — a bare `host-offline` on a session whose process is known dead
+/// tells the owner nothing they can act on.
+fn gone_reason(carrier: &'static str, lifecycle_reason: Option<&str>) -> String {
+    lifecycle_reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .map(first_line)
+        .unwrap_or_else(|| carrier.to_string())
+}
+
+/// First line of a reason code, truncated the way failure reasons are.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(text.trim());
+    line.chars().take(120).collect()
+}
+
 async fn read_worker_screen(state: &AppState, worker: &WorkerRoster) -> ScreenRead {
     let host_id = worker.host_id.as_id().as_str();
     let Some(instance_id) = worker.instance_id.as_ref() else {
@@ -276,7 +302,13 @@ async fn observe_one(
                 raw,
                 screen_available,
             } => (lines, lifecycle, None, raw, screen_available),
-            ScreenRead::Gone(reason) => (Vec::new(), String::new(), Some(reason), false, false),
+            ScreenRead::Gone(reason) => (
+                Vec::new(),
+                String::new(),
+                Some(gone_reason(reason, lifecycle_reason.as_deref())),
+                false,
+                false,
+            ),
         };
     // The Hub row is authoritative once the instance is terminal: a stale or
     // absent "ready" from a disconnected screen carrier must not mask a
@@ -399,7 +431,7 @@ async fn observe_one(
             (WorkerWatchStatus::Stalled, None, None)
         }
         remuda_protocol::ScreenClass::Gone { reason } => {
-            detail = Some(reason.to_string());
+            detail = Some(reason);
             (WorkerWatchStatus::Gone, None, None)
         }
         remuda_protocol::ScreenClass::Failed { reason, line } => {

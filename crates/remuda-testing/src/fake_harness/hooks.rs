@@ -41,6 +41,9 @@ pub enum HookEvent {
     MessageDisplay,
     /// Fires at end of turn.
     Stop,
+    /// Advisory notification (e.g. the idle prompt). Non-blocking; carries
+    /// `notification_type`/`message` and never asks for a decision.
+    Notification,
     /// Fires when the binary exits.
     SessionEnd,
 }
@@ -57,6 +60,7 @@ impl HookEvent {
             Self::PostToolUse => "PostToolUse",
             Self::MessageDisplay => "MessageDisplay",
             Self::Stop => "Stop",
+            Self::Notification => "Notification",
             Self::SessionEnd => "SessionEnd",
         }
     }
@@ -72,6 +76,7 @@ impl HookEvent {
             Self::PostToolUse => "post_tool_use",
             Self::MessageDisplay => "message_display",
             Self::Stop => "stop",
+            Self::Notification => "notification",
             Self::SessionEnd => "session_end",
         }
     }

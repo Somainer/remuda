@@ -76,7 +76,8 @@ pub use agent_scope::instance_token;
 pub use auth::{bootstrap_issued_at, rotate_bootstrap};
 pub use config::{
     DEFAULT_ATTACHMENT_MAX_BYTES, DEFAULT_BOOTSTRAP_TTL_HOURS, DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
-    DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig, MIN_CREATE_SETTLE_TIMEOUT_MS,
+    DEFAULT_COMMAND_SETTLE_TIMEOUT_MS, DEFAULT_ENROLL_TOKEN_TTL_MINUTES, HubConfig,
+    MIN_CREATE_SETTLE_TIMEOUT_MS,
 };
 pub use error::HubError;
 pub use maintenance::migrate;

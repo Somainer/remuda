@@ -310,7 +310,7 @@ Diff 三分态文案：**拟修改** / **已写入** / **结果未知**。未知
 
 只展示身份和状态，不把 script/log 塞进节点（DSH `ui-workflow-run`）。完整 journal 放「原始事件」抽屉。native Workflow member **不是** runtime child Instance。仅当 `childInstanceId` 存在（显式 `instance.create`）才点进 `/s/:childId`；否则只展开本树。冷 child 用 jsonl 投影，composer 禁用除非 driver 能 resume。
 
-三个时钟的唯一定义（行 tooltip 原文）：**用时** = `endedAt − startedAt`，运行中为 `now − startedAt`；**空闲** = `endedAt − lastProgressAt`，运行中为 `now − lastProgressAt`（stall 时用时照走、空闲照涨，不靠 member 的 `durationMs`）；**排队等待** = `startedAt − run.launchedAt`。缺输入一律 `—`。phase 跨度 = 该 phase 最早 `startedAt` 到最晚 `endedAt`（运行中以 now 收口），没时间戳返回 undefined 显示 `—`。运行中的卡每 1s 自己走针（同时驱动卡头 elapsed、每-agent 用时/空闲），不加 fetch 轮询，卡折叠/结束后 interval 立即拆除。
+三个时钟的唯一定义（行 tooltip 原文）：**用时** = `endedAt − startedAt`，运行中为 `now − startedAt`；**空闲** = `endedAt − lastProgressAt`，运行中为 `now − lastProgressAt`（stall 时用时照走、空闲照涨，不靠 member 的 `durationMs`）；**排队等待** = `startedAt − run.launchedAt`。缺输入一律 `—`。注意 `launchedAt` 是 **journal 登记该 run 的时刻**，不是它真正启动的时刻：Remuda 从磁盘发现（attach）一个已经在跑的 run 时，launchedAt 晚于真实启动，`startedAt − launchedAt` 会为负 → 排队等待显示 `—`（这是数据语义，不是 bug）。卡头 elapsed 因此取两者较大值：运行中 = `max(totals.elapsedMs + 距上次快照的墙钟, now − launchedAt)`，旧 Node 没有 `launchedAt` 时单独由快照外推继续每秒走针。phase 跨度 = 该 phase 最早 `startedAt` 到最晚 `endedAt`（运行中以 now 收口），没时间戳返回 undefined 显示 `—`。运行中的卡每 1s 自己走针（同时驱动卡头 elapsed、每-agent 用时/空闲），不加 fetch 轮询，卡折叠/结束后 interval 立即拆除。
 
 **Usage / cost**
 

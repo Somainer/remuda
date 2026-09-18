@@ -12,6 +12,7 @@ import {
   foldAgents,
   fmtDuration,
   fmtTokens,
+  headerElapsed,
   layoutRows,
   memberState,
   phaseDuration,
@@ -504,5 +505,72 @@ describe("degraded card", () => {
     expect(card.detailed).toBe(false);
     expect(card.phases).toHaveLength(0);
     expect(card.note).toContain("阶段明细");
+  });
+});
+
+describe("headerElapsed", () => {
+  const T = Date.UTC(2026, 8, 18, 13, 0, 0);
+
+  it("takes the larger of the launch clock and the extrapolated snapshot while running", () => {
+    // A run this journal launched itself: launchedAt 70 s ago, last snapshot
+    // (60 s old) arrived 0 s ago.
+    expect(
+      headerElapsed({
+        running: true,
+        snapshotMs: 60_000,
+        launchedAtMs: T - 70_000,
+        nowMs: T,
+        snapshotAnchorMs: T,
+      }),
+    ).toBe(70_000);
+  });
+
+  it("never under-counts an attached run: discovery launchedAt loses to the producer snapshot", () => {
+    // Attached (discovered) run: journal registered it 5 s ago, but the
+    // producer's elapsedMs (from the real agent start) already says 60 s.
+    expect(
+      headerElapsed({
+        running: true,
+        snapshotMs: 60_000,
+        launchedAtMs: T - 5_000,
+        nowMs: T,
+        snapshotAnchorMs: T,
+      }),
+    ).toBe(60_000);
+    // Two seconds later both clocks advanced; the snapshot extrapolation is
+    // still the larger honest bound.
+    expect(
+      headerElapsed({
+        running: true,
+        snapshotMs: 60_000,
+        launchedAtMs: T - 5_000,
+        nowMs: T + 2_000,
+        snapshotAnchorMs: T,
+      }),
+    ).toBe(62_000);
+  });
+
+  it("keeps ticking off the snapshot when launchedAt is absent (older node)", () => {
+    expect(
+      headerElapsed({
+        running: true,
+        snapshotMs: 60_000,
+        nowMs: T + 2_000,
+        snapshotAnchorMs: T,
+      }),
+    ).toBe(62_000);
+  });
+
+  it("is static at the snapshot once the run finishes and zero with no clocks", () => {
+    expect(
+      headerElapsed({
+        running: false,
+        snapshotMs: 298_000,
+        launchedAtMs: T - 999_000,
+        nowMs: T + 10_000,
+        snapshotAnchorMs: T,
+      }),
+    ).toBe(298_000);
+    expect(headerElapsed({ running: true, snapshotMs: 0, nowMs: T, snapshotAnchorMs: T })).toBe(0);
   });
 });

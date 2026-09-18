@@ -249,4 +249,62 @@ describe("WorkflowTimelineCard", () => {
     expect(card.textContent).toContain("阶段明细");
     expect(within(card).queryByTestId("workflow-agent")).toBeNull();
   });
+
+  const elapsedTotals = (elapsedMs: string) => ({
+    totalKnown: true,
+    agentsTotal: u(1),
+    agentsDone: u(0),
+    agentsFailed: u(0),
+    agentsKilled: u(0),
+    agentsRunning: u(1),
+    tokens: u(21_000),
+    calls: u(2),
+    elapsedMs,
+  });
+
+  it("keeps the header elapsed ticking off totals.elapsedMs when launchedAt is absent", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-18T13:00:00.000Z"));
+    try {
+      renderCard(
+        <WorkflowTimelineCard
+          run={run({ totals: elapsedTotals(u(60_000)) })}
+          phases={[phase()]}
+          members={[member({ memberId: "a", label: known("review:security"), state: "running" })]}
+        />,
+      );
+      const head = screen.getByTestId("workflow-card-head");
+      expect(head.textContent).toContain("1m 00s");
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(head.textContent).toContain("1m 02s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never under-counts header elapsed on an attached run with a late launchedAt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-18T13:00:00.000Z"));
+    try {
+      renderCard(
+        <WorkflowTimelineCard
+          run={run({ totals: elapsedTotals(u(60_000)), launchedAt: "2026-09-18T12:59:55.000Z" })}
+          phases={[phase()]}
+          members={[member({ memberId: "a", label: known("review:security"), state: "running" })]}
+        />,
+      );
+      const head = screen.getByTestId("workflow-card-head");
+      // launchedAt would claim 5 s; the producer snapshot says 60 s — show 60.
+      expect(head.textContent).toContain("1m 00s");
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      // Extrapolated snapshot (62) beats the launch clock (7).
+      expect(head.textContent).toContain("1m 02s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

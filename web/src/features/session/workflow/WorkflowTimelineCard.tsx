@@ -12,7 +12,7 @@
  * live in the pure projection; this file renders, owns the one-second hand,
  * and forwards dismiss/undismiss.
  */
-import { Fragment, useEffect, useId, useMemo, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type {
   WorkflowMemberPayload,
@@ -28,6 +28,7 @@ import {
   agentClocks,
   fmtDuration,
   fmtTokens,
+  headerElapsed,
   layoutRows,
   projectWorkflow,
   runStatus,
@@ -486,12 +487,24 @@ function DetailedCard({
   const rawId = useId();
   const bodyId = `wf-body-${rawId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
 
-  // Header wall time: launchedAt-based while live (it keeps moving through a
-  // stall); the producer's elapsedMs snapshot otherwise.
-  const elapsedMs =
-    running && card.launchedAtMs !== undefined
-      ? Math.max(0, nowMs - card.launchedAtMs)
-      : card.totals.elapsedMs;
+  // Header wall time. The snapshot anchor is the wall instant at which the
+  // producer's totals.elapsedMs was last observed: between journal revisions
+  // the one-second hand extrapolates from it (including when launchedAt is
+  // absent — an older node streaming to this web). When launchedAt exists it
+  // is the discovery instant on attached runs, not the real launch, so the
+  // elapsed is the LARGER of the two clocks — never an under-count.
+  const snapshotMs = card.totals.elapsedMs;
+  const snapshotAnchorRef = useRef<{ ms: number; at: number } | null>(null);
+  if (snapshotAnchorRef.current === null || snapshotAnchorRef.current.ms !== snapshotMs) {
+    snapshotAnchorRef.current = { ms: snapshotMs, at: nowMs };
+  }
+  const elapsedMs = headerElapsed({
+    running,
+    snapshotMs,
+    launchedAtMs: card.launchedAtMs,
+    nowMs,
+    snapshotAnchorMs: snapshotAnchorRef.current.at,
+  });
 
   const agentsWord = card.totals.totalKnown
     ? `${card.totals.done + card.totals.failed + card.totals.killed}/${card.totals.agentsTotal} agents`

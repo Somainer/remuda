@@ -239,7 +239,7 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
           </div>
         </div>
         <WorkspaceList hostId={host.id} workspaces={workspaces} online={host.online} />
-        <HostDiagnostics hostId={host.id} online={host.online} />
+        <HostDiagnostics hostId={host.id} online={host.online} cli={host.cli} />
         <div className={css.fields}>
           <label className={ui.field}>
             显示名

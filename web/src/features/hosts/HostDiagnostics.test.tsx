@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import * as api from "../../lib/api";
 import type { Id } from "../../types/wire";
 import { HostDiagnostics } from "./HostDiagnostics";
+import { COMPUTER_USE_KIND } from "./model";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -35,4 +36,49 @@ it("shows an explicit error for a successful HTTP response without doctor checks
   expect(await screen.findByRole("alert")).toHaveTextContent("无效的诊断报告");
   expect(fetch).toHaveBeenCalledOnce();
   expect(screen.queryByText("主机检查通过")).not.toBeInTheDocument();
+});
+
+// D-045 §3.4 / ui-spec §2.6: the row is an ordinary CLI row, but the state
+// with no precedent is "not reported" — an older Node omits it entirely, and
+// drawing that as "this host cannot do it" would invent a fact.
+
+it("renders the computer-use row as installed with its version", async () => {
+  vi.spyOn(api, "fetchHostDoctor").mockResolvedValue({ exitCode: 0, checks: [] });
+  render(<HostDiagnostics hostId={"host-fixture" as Id} online cli={[
+    { kind: COMPUTER_USE_KIND, version: "2.7.0", path: "/home/x/client", auth: "unknown", installed: true },
+  ]} />);
+  const row = screen.getByTestId("computer-use-row");
+  expect(row).toHaveAttribute("data-state", "installed");
+  expect(row).toHaveTextContent("已安装");
+  expect(screen.getByTestId("computer-use-detail")).toHaveTextContent("2.7.0");
+});
+
+it("renders a reported-absent row as 未安装, never as unreported", async () => {
+  vi.spyOn(api, "fetchHostDoctor").mockResolvedValue({ exitCode: 0, checks: [] });
+  render(<HostDiagnostics hostId={"host-fixture" as Id} online cli={[
+    { kind: COMPUTER_USE_KIND, auth: "unknown", installed: false },
+  ]} />);
+  const row = screen.getByTestId("computer-use-row");
+  expect(row).toHaveAttribute("data-state", "absent");
+  expect(row).toHaveTextContent("未安装");
+  expect(row).not.toHaveTextContent("未上报");});
+
+it("renders an omitted row as 未上报 without claiming unsupported", async () => {
+  vi.spyOn(api, "fetchHostDoctor").mockResolvedValue({ exitCode: 0, checks: [] });
+  render(<HostDiagnostics hostId={"host-fixture" as Id} online cli={[
+    { kind: "claude", version: "2.1.268", path: "/usr/bin/claude", auth: "logged_in" },
+  ]} />);
+  const row = screen.getByTestId("computer-use-row");
+  expect(row).toHaveAttribute("data-state", "unreported");
+  expect(row).toHaveTextContent("未上报");
+  // The point: none of the three definite claims is made. "未安装" would be
+  // this host saying no, and the installed detail would be it saying yes.
+  expect(row).not.toHaveTextContent("未安装");
+  expect(screen.getByTestId("computer-use-detail")).toHaveTextContent("不代表本机不支持");
+});
+
+it("renders an omitted row the same way when no cli inventory arrived at all", () => {
+  vi.spyOn(api, "fetchHostDoctor").mockResolvedValue({ exitCode: 0, checks: [] });
+  render(<HostDiagnostics hostId={"host-fixture" as Id} online={false} />);
+  expect(screen.getByTestId("computer-use-row")).toHaveAttribute("data-state", "unreported");
 });

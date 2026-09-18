@@ -105,6 +105,29 @@ export function cliSummary(cli: HostCli[] | undefined): string {
   return installed.map((entry) => compactCliVersion(entry.kind, entry.version)).join(" · ");
 }
 
+/** `cli[]` kind of the vendor Computer Use presence row (D-045 §3.4). */
+export const COMPUTER_USE_KIND = "computer-use";
+
+/**
+ * What the host said about desktop control.
+ *
+ * Three states, and the third is the one that matters: a Node that predates
+ * this row reports nothing, which is **not** a claim that the host cannot do
+ * it. Rendering "not reported" as "unsupported" would invent a fact, so the
+ * distinction is carried in the type rather than flattened to a boolean.
+ */
+export type ComputerUseState =
+  | { reported: false }
+  | { reported: true; installed: false }
+  | { reported: true; installed: true; version?: string; path?: string };
+
+export function computerUseState(cli: HostCli[] | undefined): ComputerUseState {
+  const entry = (cli ?? []).find((item) => item.kind === COMPUTER_USE_KIND);
+  if (!entry) return { reported: false };
+  if (entry.installed === false) return { reported: true, installed: false };
+  return { reported: true, installed: true, version: entry.version, path: entry.path };
+}
+
 export function sortHostsOnlineFirst<T extends HostSortable>(hosts: T[], recentIds: string[] = []): T[] {
   const rank = new Map(recentIds.map((id, i) => [id, i]));
   return hosts.slice().sort((a, b) => {

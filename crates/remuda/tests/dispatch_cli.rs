@@ -609,6 +609,10 @@ async fn dispatch_retire_hostcap_cli_lifecycle() -> Result<()> {
     assert_eq!(cap["cores"], 8);
     assert_eq!(cap["diskFreeGb"], 200.0);
     assert_eq!(cap["activeWorkers"], 1);
+    // This fake node's `cli[]` holds only claude, so the capability row is
+    // "not reported" — never a claim that the host cannot do it.
+    assert_eq!(cap["computerUse"]["reported"], false);
+    assert!(cap["computerUse"].get("installed").is_none());
     assert_eq!(cap["portBlocksInUse"][0]["block"], "58600-58609");
 
     // Retire a still-working worker without --force exits non-zero.

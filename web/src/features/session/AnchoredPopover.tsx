@@ -186,6 +186,26 @@ export function useAnchoredPopover(
   const trackRaf = useRef(0);
   const stableFrames = useRef(0);
   const lastBox = useRef("");
+  // The panel's UN-CAPPED natural height, derived read-only each measure.
+  // `.popover` itself is `overflow:hidden`; the only scrolling region is an
+  // inner `[data-popover-scroll]` flex child. That child's `scrollHeight`
+  // reports its FULL content extent even while a max-height clamp shrinks
+  // its rendered offsetHeight (and the panel's own offsetHeight/scrollHeight
+  // along with it). Reading those directly would feed the clamped height
+  // back in as the panel's `need`, flipping placement every observer cycle;
+  // instead reconstruct the natural panel height as the inner content extent
+  // plus the panel's fixed chrome (head/footer/border), which the clamp
+  // shrinks by exactly the same amount it shrinks the inner offsetHeight.
+  // When there is no inner scroll wrapper (the short slider card, which is
+  // never content-clamped) the panel's own offsetHeight is used.
+  const naturalHeightOf = (panel: HTMLElement): number => {
+    const inner = panel.querySelector<HTMLElement>("[data-popover-scroll='1']");
+    if (inner) {
+      const chrome = panel.offsetHeight - inner.offsetHeight;
+      return inner.scrollHeight + chrome;
+    }
+    return panel.offsetHeight;
+  };
 
   const measure = useCallback(() => {
     const trigger = triggerRef.current;
@@ -199,12 +219,7 @@ export function useAnchoredPopover(
       setMeasured(null);
       return;
     }
-    // The panel's natural (un-capped) content height. Reading scrollHeight
-    // does NOT mutate inline style: toggling maxHeight off/on would resize
-    // the panel, fire its own ResizeObserver, and re-enter this function in
-    // a feedback loop whose box never settles. scrollHeight reports the full
-    // content extent even while max-height clamps the rendered offsetHeight.
-    const preferredHeight = Math.max(panel.offsetHeight, panel.scrollHeight);
+    const preferredHeight = naturalHeightOf(panel) || panel.scrollHeight || 0;
     const width = panel.offsetWidth || panel.scrollWidth || 0;
 
     // The prospective horizontal span of the panel at the trigger; only
@@ -314,8 +329,19 @@ export function useAnchoredPopover(
 
     let observer: ResizeObserver | undefined;
     if (typeof ResizeObserver !== "undefined" && panel) {
+      // A panel resize re-measures (the slider→list content flip grows the
+      // inner body); naturalHeightOf reads the inner scroll wrapper's
+      // scrollHeight, which the max-height clamp cannot shrink, so a clamp
+      // cycle does not change `need` and cannot re-trigger placement.
       observer = new ResizeObserver(() => scheduleMeasure());
       observer.observe(panel);
+      // Once settled only scroll/resize/panel resize re-arm tracking. A
+      // parked approval card appearing or unmounting under an open menu is a
+      // layout change none of those cover; observe the avoidance elements too
+      // so the panel follows the trigger/clears the card in that case.
+      for (const ref of resolved.avoidElements) {
+        if (ref.current) observer.observe(ref.current);
+      }
     }
     window.addEventListener("resize", scheduleMeasure);
     // The trigger moves on any ancestor scroll (the panel is fixed, the

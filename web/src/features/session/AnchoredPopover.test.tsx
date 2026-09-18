@@ -205,6 +205,38 @@ function Harness({
   );
 }
 
+function HarnessAvoid({
+  open,
+  avoid,
+  onAnchor,
+}: {
+  open: boolean;
+  avoid: { current: HTMLElement };
+  onAnchor: (anchor: AnchoredStyle) => void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const anchor = useAnchoredPopover(triggerRef, panelRef, open, {
+    preferUp: true,
+    avoidElements: [avoid],
+  });
+  onAnchor(anchor);
+  return (
+    <div>
+      <button ref={triggerRef} data-testid="trigger" style={{ position: "fixed" }}>
+        open
+      </button>
+      {open ? (
+        <div ref={panelRef} data-testid="panel" data-placement={anchor.placement} style={anchor.style}>
+          <div data-popover-scroll="1" data-testid="panel-body">
+            card
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 describe("useAnchoredPopover measured positioning", () => {
   const panelSize = { width: 300, height: 190 };
   const triggerRect = {
@@ -332,26 +364,112 @@ describe("useAnchoredPopover measured positioning", () => {
     expect(after).not.toContain("max-height: none");
   });
 
-  it("stops re-positioning once the trigger box settles", async () => {
-    // Regression: a perpetual rAF tracker (and a max-height toggle that
-    // resized the panel each measurement) kept the panel moving forever, so
-    // Playwright actionability checks saw its buttons as unstable.
-    render(<Harness panel={panelSize} open onAnchor={() => {}} />);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    const styleAt = () => screen.getByTestId("panel").getAttribute("style") ?? "";
-    const first = styleAt();
-    // Let the tracker run well past its settle budget (20 frames).
-    for (let i = 0; i < 30; i++) {
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
-    }
-    expect(styleAt()).toBe(first);
-    // A scroll re-arms tracking, but with the trigger static the style still
-    // converges rather than churning.
+  it("stops scheduling animation frames once the trigger box settles", async () => {
+    // Regression: the trigger tracker ran a perpetual requestAnimationFrame
+    // loop (and a max-height toggle re-measured on every cycle), keeping the
+    // panel moving forever — Playwright actionability saw its buttons as
+    // unstable. Assert frame SCHEDULING stops after the settle budget; a
+    // constant mocked trigger is not enough, the tracker itself must stop.
+    const raf = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        return setTimeout(() => cb(performance.now()), 0) as unknown as number;
+      });
+    const caf = vi
+      .spyOn(window, "cancelAnimationFrame")
+      .mockImplementation((id: number) => {
+        clearTimeout(id as unknown as ReturnType<typeof setTimeout>);
+      });
+    const renderResult = render(<Harness panel={panelSize} open onAnchor={() => {}} />);
+    // The initial layout effect schedules at least one tracker frame.
+    const initial = raf.mock.calls.length;
+    expect(initial).toBeGreaterThan(0);
+    // Drive ~60 frames worth of timers.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const afterSettled = raf.mock.calls.length;
+    // Once settled the tracker cancels itself: a long quiet window must not
+    // schedule further frames beyond the opening burst.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const afterQuiet = raf.mock.calls.length;
+    expect(afterQuiet).toBe(afterSettled);
+    // A scroll re-arms the tracker: it schedules a burst again, then stops.
     window.dispatchEvent(new Event("scroll", { bubbles: true, cancelable: true }));
-    for (let i = 0; i < 30; i++) {
-      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const onScroll = raf.mock.calls.length;
+    expect(onScroll).toBeGreaterThan(afterQuiet);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(raf.mock.calls.length).toBeLessThan(onScroll + 20);
+    // The tracker settles (frame scheduling stops) and unmounting cancels any
+    // pending frame via cancelAnimationFrame rather than leaking it.
+    const { unmount } = renderResult;
+    unmount();
+    expect(caf.mock.calls.length).toBeGreaterThan(0);
+  });
+
+  it("does not flip placement when the panel is measured again under a height clamp", async () => {
+    // Regression for the measurement feedback loop: `.popover` is
+    // overflow:hidden and only an inner child scrolls, so once a max-height
+    // clamp is applied the panel's own offsetHeight shrinks but the inner
+    // body's scrollHeight keeps reporting the full content extent. Reading
+    // the panel box directly fed the clamped height back in as `need`; with
+    // a card bottom at 580 (104px of cleared up room) natural need 190 is
+    // blocked (dodge down) but a clamped 100 would "fit" and flip up, on
+    // every ResizeObserver cycle.
+    //
+    // Geometry: trigger 700-730, card bottom 580, viewport 900 (154 below).
+    const avoid = { current: document.createElement("div") };
+    Object.defineProperty(avoid.current, "getBoundingClientRect", {
+      configurable: true,
+      value: () => new DOMRect(100, 480, 1000, 100), // bottom = 580
+    });
+    let clamped = false;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      if (this.dataset.testid === "trigger") return triggerRect;
+      if (this.dataset.testid === "panel") {
+        const h = clamped ? 100 : 190;
+        return {
+          ...(triggerRect as unknown as Record<string, number>),
+          left: 0, top: 0, right: 300, bottom: h, width: 300, height: h,
+          toJSON: () => ({}),
+        } as DOMRect;
+      }
+      return new DOMRect();
+    });
+    // The inner scroll wrapper: its scrollHeight is the constant CONTENT
+    // extent (180 + 10 chrome ≈ 190) regardless of the clamped offsetHeight.
+    Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        if (this.dataset.testid === "panel") return clamped ? 100 : 190;
+        if (this.dataset.testid === "panel-body") return clamped ? 90 : 180;
+        return 0;
+      },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) {
+        if (this.dataset.testid === "panel-body") return 180;
+        return 0;
+      },
+    });
+    const placements: string[] = [];
+    render(<HarnessAvoid avoid={avoid} open onAnchor={(a) => placements.push(a.placement)} />);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const first = placements[placements.length - 1];
+    // First measure: natural 190, blocked by card (104 cleared), dodges down.
+    expect(first).toBe("down");
+    // The browser applies the clamp; fire repeated panel resize cycles.
+    clamped = true;
+    for (let i = 0; i < 4; i++) {
+      layout.observerInstances.forEach((o) => o.flush());
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    expect(styleAt()).toBe(first);
+    // Despite the panel box now reporting 100px, need stays the inner content
+    // extent: placement does NOT flip to up.
+    expect(placements[placements.length - 1]).toBe("down");
+    expect(new Set(placements).size).toBe(1);
   });
 });
 

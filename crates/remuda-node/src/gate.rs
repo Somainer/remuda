@@ -40,6 +40,17 @@ pub fn is_gate_method(method: &str) -> bool {
     remuda_protocol::is_gate_call(method)
 }
 
+/// Gate RPCs that can park a carrier's request loop for minutes and so must be
+/// dispatched off the read path (spawned on stdio; lease-free on WSS/daemon).
+///
+/// `gate.cancel` is deliberately excluded: it is the escape hatch that kills a
+/// running gate, so it must run inline and immediately — a queued cancel is a
+/// dead cancel.
+#[must_use]
+pub fn is_long_gate_method(method: &str) -> bool {
+    is_gate_method(method) && method != remuda_protocol::METHOD_GATE_CANCEL
+}
+
 /// Default cap for a whole gate run and for a `--then` command.
 const DEFAULT_GATE_TIMEOUT_SECS: u64 = 60 * 60;
 const DEFAULT_THEN_TIMEOUT_SECS: u64 = 10 * 60;

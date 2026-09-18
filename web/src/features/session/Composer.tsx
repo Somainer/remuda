@@ -580,7 +580,17 @@ export function Composer({
       if (!rootRef.current?.contains(event.target as Node)) dismissUsage();
     };
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") dismissUsage();
+      if (event.key !== "Escape") return;
+      // Return focus to the chip that opened the menu before it unmounts.
+      if (menu) {
+        const chipFor: Record<NonNullable<MenuId>, React.RefObject<HTMLElement | null>> = {
+          effort: triggerRefs.effort,
+          permission: triggerRefs.permission,
+          usage: triggerRefs.usage,
+        };
+        chipFor[menu].current?.focus();
+      }
+      dismissUsage();
     };
     window.addEventListener("pointerdown", onDown);
     window.addEventListener("keydown", onKey);
@@ -624,6 +634,11 @@ export function Composer({
   const primaryTestId =
     controls.primary.kind === "queue" ? "composer-queue" : "composer-send";
 
+  const modelLockedReason = caps.model
+    ? effortDisabled
+      ? "会话已退出或为只读会话（observed-only），无法下发 instance.configure"
+      : null
+    : "此会话不支持模型切换（无 instance.configure 能力）";
   return (
     <form
       ref={rootRef}
@@ -961,11 +976,7 @@ export function Composer({
             modelPending={caps.model ? modelPending : null}
             modelSelectionPath={caps.model ? modelSelectionPath : null}
             modelCatalog={caps.model ? (modelCatalog ?? null) : null}
-            modelLockedReason={
-              caps.model && effortDisabled
-                ? "会话已退出或为只读会话（observed-only），无法下发 instance.configure"
-                : null
-            }
+            modelLockedReason={modelLockedReason}
             index={currentEffort.index}
             ultracode={ultraOn}
             disabled={effortLocked}

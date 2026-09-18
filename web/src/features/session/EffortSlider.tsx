@@ -666,12 +666,18 @@ export function EffortSlider({
                     value={typeValue}
                     disabled={Boolean(modelLockedReason)}
                     title={modelLockedReason ?? "未列出的 id：原样发送 /model <id>，由终端裁决"}
-                    onChange={(event) => setTypeValue(event.target.value)}
+                    onChange={(event) => {
+                      setTypeValue(event.target.value);
+                    }}
                     onKeyDown={(event) => {
                       // The listbox's arrow nav must not hijack typing.
                       if (event.key === "Enter") {
                         event.preventDefault();
-                        submitTypedId();
+                        // During an IME composition Enter confirms the
+                        // candidate, not the typed id — do not submit.
+                        if (!(event.nativeEvent as unknown as globalThis.KeyboardEvent).isComposing) {
+                          submitTypedId();
+                        }
                         return;
                       }
                       if (event.key === "Escape") {

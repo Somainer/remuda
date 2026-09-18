@@ -143,14 +143,12 @@ describe("turnEnd", () => {
     expect(out.state).toBe("waiting");
   });
 
-  it("a late hook turn-ended after a screen-decided end changes nothing about the anchor", () => {
+  it("a late hook turn-ended after a screen-decided end wins outright (hook precedence)", () => {
     // The screen decided the end at 17:03; a hook Stop then lands at 17:04.
-    // Because the hook boundary is authoritative it now decides, but the
-    // endedAt is the hook's own since — which the caller latches by the
-    // earliest end it ever saw (idempotence lives in the strip's latch, but
-    // the reducer must at minimum never report a *later* screen anchor once
-    // the hook boundary exists). We assert the hook wins and reports its own
-    // anchor, and that re-running with the screen alone is unchanged.
+    // A hook boundary is the harness's own terminal word, so decidedBy flips
+    // to the hook with the hook anchor. The composer's ended→idle edge is what
+    // is idempotent, so this neither re-flushes nor moves the duration clock
+    // (which anchors at the turn start, not endedAt).
     const withHook = turnEnd(
       input({
         phase: phase("turn-ended", "2026-09-18T17:04:00.000Z"),
@@ -159,10 +157,65 @@ describe("turnEnd", () => {
       }),
     );
     expect(withHook.state).toBe("ended");
-    // Screen anchor (17:03) is earlier than the hook boundary (17:04), so the
-    // earliest-end rule keeps the screen anchor; the turn stays ended.
-    expect(withHook.decidedBy).toBe("screen");
-    expect(withHook.endedAt).toBe("2026-09-18T17:03:00.000Z");
+    expect(withHook.decidedBy).toBe("hook");
+    expect(withHook.endedAt).toBe("2026-09-18T17:04:00.000Z");
+  });
+
+  it("a pending interaction outranks a stale-hook screen end (the parked-dialog case)", () => {
+    // A parked permission hook sends nothing by definition, so after the
+    // hook-stall budget its tier reads stalled and the spinner clears behind
+    // the visible dialog. The turn must stay waiting — never ended.
+    const out = turnEnd(
+      input({
+        phase: phase("blocked", "2026-09-18T17:00:00.000Z"),
+        hookHealth: health("stalled"),
+        screen: screen(false, "2026-09-18T17:03:00.000Z"),
+        hasPending: true,
+      }),
+    );
+    expect(out.state).toBe("waiting");
+    expect(out.endedAt).toBeNull();
+  });
+
+  it("the screen latch's blocked verdict outranks a stale-hook screen end too", () => {
+    const out = turnEnd(
+      input({
+        phase: phase("tool-started", "2026-09-18T17:00:00.000Z"),
+        hookHealth: health("stalled"),
+        screen: screen(false, "2026-09-18T17:03:00.000Z"),
+        screenBlocked: true,
+      }),
+    );
+    expect(out.state).toBe("waiting");
+  });
+
+  it("ignores a stale screen clear older than the latched phase (a previous turn's leave)", () => {
+    // The live.status clear is emitted once per leave and survives into the
+    // next turn. A short turn that never repaints a spinner must not be ended
+    // by last turn's clear anchored before this turn's phase `since`.
+    const out = turnEnd(
+      input({
+        phase: phase("prompt-accepted", "2026-09-18T17:10:00.000Z"),
+        hookHealth: health("stalled"),
+        screen: screen(false, "2026-09-18T17:03:00.000Z"),
+      }),
+    );
+    expect(out.state).toBe("unknown");
+    expect(out.decidedBy).toBeNull();
+  });
+
+  it("accepts a screen clear exactly at the phase anchor as an end", () => {
+    const at = "2026-09-18T17:03:00.000Z";
+    const out = turnEnd(
+      input({
+        phase: phase("tool-finished", at),
+        hookHealth: health("stalled"),
+        screen: screen(false, at),
+      }),
+    );
+    expect(out.state).toBe("ended");
+    expect(out.decidedBy).toBe("screen");
+    expect(out.endedAt).toBe(at);
   });
 
   it("a hook turn-ended wins outright when it is the only end evidence", () => {

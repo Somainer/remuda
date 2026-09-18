@@ -292,10 +292,10 @@ async fn dispatch_hub(
             Ok(result)
         }
         _ if crate::worktree::is_worktree_method(method) => {
-            runtime.node.worktree_rpc(method, &params)
+            runtime.node.worktree_rpc_capped(method, &params).await
         }
         // M1 batch 5a worker lifecycle RPCs over the outbound Hub link.
-        Some(HubNodeMethod::WorkerProvision) => runtime.node.provision_worker(&params).await,
+        Some(HubNodeMethod::WorkerProvision) => runtime.node.provision_worker_capped(&params).await,
         Some(HubNodeMethod::WorkerRemove) => runtime.node.remove_worker(&params).await,
         // Batch 6 lane gate runner. A live gate parks for minutes; holding the
         // daemon dispatch lease across it serializes every other WSS dispatch

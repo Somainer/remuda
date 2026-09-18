@@ -24,9 +24,16 @@ use std::path::{Path, PathBuf};
 pub const TARGET_DIR_NAME: &str = "remuda-target";
 
 /// Deadline for the whole `worker.remove` reclaim (git worktree removal + the
-/// recursive cargo-target delete). A slow or stuck git must surface as an error
-/// rather than owning the blocking thread — or the carrier loop — forever.
-const RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+/// recursive cargo-target delete).
+///
+/// Must stay comfortably under the Hub's own `WORKTREE_RPC_TIMEOUT` of 60s
+/// (remuda-hub/src/http.rs), because a deadline at or above it is worse than no
+/// deadline: the Hub fails the retire first, so the honest error can never reach
+/// it, and a reclaim that then lands between the two windows removes the
+/// worktree *after* the Hub already gave up — leaving the worker row un-retired
+/// against reclaimed disk, which is the one outcome nobody can reconcile. 30s
+/// leaves half the Hub's window for the reply to travel and be recorded.
+const RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Deadline for the best-effort carrier teardown that precedes the reclaim.
 ///
@@ -35,7 +42,11 @@ const RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120
 /// then a re-check per close), and none of them is bounded. This step is
 /// already best-effort — a failure only warns and the reclaim continues — so
 /// waiting on a wedged Herdr forever would be the same park by another door.
-const CARRIER_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+///
+/// Sized with `RECLAIM_DEADLINE` so the worst case still fits inside the Hub's
+/// 60s window: 10 + 30 (`RECLAIM_DEADLINE`) + slack to answer = 40s, leaving
+/// the Hub a fifth of its budget to record the reply.
+const CARRIER_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Hub→Node worker RPCs served by every carrier (outbound WSS and ssh-stdio).
 #[must_use]
@@ -94,6 +105,43 @@ fn remove_target_dir(repo_root: &Path, name: &str) -> Result<(bool, u64), NodeEr
     Ok((true, bytes))
 }
 
+/// Whether this Node has a cargo target dir for `name`. Containment-checked the
+/// same way the removal is, so a probe cannot look outside the scratch root.
+fn target_dir_present(repo_root: &Path, name: &str) -> Result<bool, NodeError> {
+    Ok(target_dir_for(repo_root, name)?.exists())
+}
+
+/// A provision request that has passed validation but has not touched git or
+/// the filesystem yet — the part safe to hand to a blocking thread.
+struct ValidatedProvision {
+    name: String,
+    branch: String,
+    start_point: String,
+    workspace_root: PathBuf,
+}
+
+/// The blocking half of `worker.provision`: create (or reuse) the worktree and
+/// the per-worker target dir.
+///
+/// Free of `&self` so it can run on a blocking thread; it only needs the
+/// already-resolved workspace root.
+fn provision_validated(request: ValidatedProvision) -> Result<WorkerProvisionResult, NodeError> {
+    let provisioned = crate::worktree::provision_record(
+        &request.workspace_root,
+        &request.name,
+        &request.branch,
+        &request.start_point,
+    )?;
+    let target = ensure_target_dir(&request.workspace_root, &request.name)?;
+    Ok(WorkerProvisionResult {
+        name: request.name,
+        branch: provisioned.branch,
+        start_point: provisioned.start_point,
+        worktree_path: provisioned.path,
+        target_dir: target.to_string_lossy().into_owned(),
+    })
+}
+
 /// Best-effort recursive byte count of a directory tree.
 fn dir_size(root: &Path) -> u64 {
     let mut total = 0u64;
@@ -117,20 +165,29 @@ fn dir_size(root: &Path) -> u64 {
 }
 
 impl crate::runtime::DevNode {
-    /// Handle `worker.provision`: product-assigned worktree + target dir.
-    pub(crate) async fn provision_worker(&self, params: &Value) -> Result<Value, NodeError> {
+    /// Validate the request, then run the blocking provisioning under the
+    /// carrier's in-flight cap.
+    ///
+    /// Validation stays here so a malformed request is refused without taking a
+    /// permit or a blocking thread. The body is synchronous and its `git fetch`
+    /// is explicitly unbounded (see `worktree::git_fetch`), so awaiting it
+    /// directly — even from a spawned task — would occupy a runtime worker for
+    /// as long as the fetch takes.
+    pub(crate) async fn provision_worker_capped(&self, params: &Value) -> Result<Value, NodeError> {
         let request: WorkerProvisionParams =
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid worker.provision params: {error}"))
             })?;
-        let result = self.provision_worker_typed(request)?;
+        let validated = self.validate_provision(request)?;
+        let result = crate::gate::run_long_method(move || provision_validated(validated)).await?;
         serde_json::to_value(result).map_err(NodeError::from)
     }
 
-    fn provision_worker_typed(
+    /// Everything in a provision that does not touch git or the filesystem.
+    fn validate_provision(
         &self,
         request: WorkerProvisionParams,
-    ) -> Result<WorkerProvisionResult, NodeError> {
+    ) -> Result<ValidatedProvision, NodeError> {
         validate_worker_name(&request.name).map_err(NodeError::InvalidRequest)?;
         validate_worker_branch(&request.branch).map_err(NodeError::InvalidRequest)?;
         let start_point = request
@@ -147,19 +204,11 @@ impl crate::runtime::DevNode {
         }
         let (_, workspace_root) =
             self.resolve_workspace_cwd(request.workspace_id.as_ref(), None)?;
-        let provisioned = crate::worktree::provision_record(
-            &workspace_root,
-            &request.name,
-            &request.branch,
-            &start_point,
-        )?;
-        let target = ensure_target_dir(&workspace_root, &request.name)?;
-        Ok(WorkerProvisionResult {
+        Ok(ValidatedProvision {
             name: request.name,
-            branch: provisioned.branch,
-            start_point: provisioned.start_point,
-            worktree_path: provisioned.path,
-            target_dir: target.to_string_lossy().into_owned(),
+            branch: request.branch,
+            start_point,
+            workspace_root,
         })
     }
 
@@ -179,38 +228,58 @@ impl crate::runtime::DevNode {
         request: WorkerRemoveParams,
     ) -> Result<WorkerRemoveResult, NodeError> {
         validate_worker_name(&request.name).map_err(NodeError::InvalidRequest)?;
-        // Retiring an instance this Node does not know must answer not-found
-        // promptly, the way `instance.close` does through the store — never wait
-        // on a git/filesystem reclaim for a worker that isn't here. This is the
-        // resume-over-a-dead-instance park: the Hub retires a row whose instance
-        // left with the previous Node, and the reclaim blocked the loop.
-        if let Some(instance_id) = &request.instance_id {
-            self.get_instance(instance_id)?;
-        }
-        // Best-effort carrier teardown first: a live agent pane holds the
-        // worktree as its cwd and would keep file handles open. Bounded, and the
-        // bound is load-bearing: closing the Herdr carrier is several unbounded
-        // round-trips to the Herdr server, this step is already best-effort, and
-        // a wedged Herdr must not hold the retire — and so the carrier loop —
-        // open any longer than the reclaim is allowed to.
-        if let Some(instance_id) = &request.instance_id {
-            let closed = tokio::time::timeout(
-                CARRIER_CLOSE_DEADLINE,
-                self.close_instance_carrier(instance_id.as_id().as_str()),
-            )
-            .await;
-            match closed {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, instance_id = %instance_id.as_id(), "worker carrier close failed; continuing with filesystem reclaim")
-                }
-                Err(_) => {
-                    tracing::warn!(instance_id = %instance_id.as_id(), deadline_secs = CARRIER_CLOSE_DEADLINE.as_secs(), "worker carrier close exceeded its deadline; continuing with filesystem reclaim")
-                }
-            }
+        // Retiring a worker whose instance row this Node has lost must not wait
+        // on that instance — that was the resume-over-a-dead-instance park. It
+        // must still reclaim, though: the worktree and the cargo target are this
+        // Node's disk and nothing else frees them. So an unknown instance only
+        // skips the machinery that needs the row, never the reclaim.
+        let named_instance = request.instance_id.as_ref();
+        let known_instance = match named_instance {
+            Some(instance_id) => match self.get_instance(instance_id) {
+                Ok(instance) => Some(instance),
+                // Only a genuinely absent row is "unknown"; a poisoned store or
+                // any other fault is still a fault.
+                Err(NodeError::NotFound { .. }) => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        // The carrier teardown needs a live row to find the pty resource;
+        // without one there is nothing to close.
+        if let (Some(instance_id), Some(_)) = (named_instance, known_instance.as_ref())
+            && let Err(error) = self.close_worker_carrier(instance_id).await
+        {
+            tracing::warn!(%error, instance_id = %instance_id.as_id(), "worker carrier close failed; continuing with filesystem reclaim");
         }
         let (_, workspace_root) =
             self.resolve_workspace_cwd(request.workspace_id.as_ref(), None)?;
+        // A retire that *named* an instance this Node has lost, and that has
+        // nothing left on disk, is a prompt not-found — there is no row to touch
+        // and nothing to free. Gated on the instance being named because that is
+        // the honest claim being answered ("I do not have this instance"); a
+        // retire with no instance at all is the idempotent form and still
+        // reports what it reclaimed.
+        if let Some(instance_id) = named_instance
+            && known_instance.is_none()
+        {
+            let name = request.name.clone();
+            let probe_root = workspace_root.clone();
+            let present = tokio::task::spawn_blocking(move || {
+                Ok::<_, NodeError>((
+                    crate::worktree::has_record(&probe_root, &name)?,
+                    target_dir_present(&probe_root, &name)?,
+                ))
+            })
+            .await
+            .map_err(|error| NodeError::Driver(format!("worker.remove probe join: {error}")))??;
+            if !present.0 && !present.1 {
+                tracing::debug!(instance_id = %instance_id.as_id(), worker = %request.name, "retire of an instance this Node does not know, with nothing to reclaim");
+                return Err(NodeError::NotFound {
+                    entity: "worker",
+                    id: request.name,
+                });
+            }
+        }
         // The reclaim shells out to `git worktree remove --force` and then does
         // a recursive std fs remove of the whole cargo target — both blocking,
         // both unbounded. Run them on a blocking thread under an explicit
@@ -240,6 +309,28 @@ impl crate::runtime::DevNode {
             target_removed,
             reclaimed_bytes: remuda_protocol::U64(reclaimed_bytes),
         })
+    }
+
+    /// Best-effort teardown of a worker's pty carrier, under its own deadline.
+    ///
+    /// Split out so the caller decides whether a failed or late close is fatal
+    /// (it never is) and so the bound is visible next to the reclaim's.
+    async fn close_worker_carrier(
+        &self,
+        instance_id: &remuda_protocol::InstanceId,
+    ) -> Result<(), NodeError> {
+        match tokio::time::timeout(
+            CARRIER_CLOSE_DEADLINE,
+            self.close_instance_carrier(instance_id.as_id().as_str()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(NodeError::Driver(format!(
+                "worker carrier close exceeded its {}s deadline",
+                CARRIER_CLOSE_DEADLINE.as_secs()
+            ))),
+        }
     }
 }
 

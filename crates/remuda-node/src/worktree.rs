@@ -137,6 +137,19 @@ pub fn provision_record(
 /// Remove a worker's provisioned worktree with `git worktree remove --force`
 /// and drop it from the catalog. The branch itself is kept (gate/land owns
 /// branch deletion); only the working tree is reclaimed.
+/// Whether this Node has a recorded worktree named `name`.
+///
+/// A pure read of the same catalog `remove_record` consults, so a caller can
+/// tell "there is a worker to reclaim" from "this worker was never here"
+/// without performing — or risking — the removal.
+pub fn has_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
+    validate_name(name)?;
+    let repo_root = repo_root(Some(repo))?;
+    let git_common = git_common_dir(&repo_root)?;
+    let catalog = load_catalog(&git_common)?;
+    Ok(catalog.worktrees.iter().any(|row| row.name == name))
+}
+
 pub fn remove_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
     validate_name(name)?;
     let repo_root = repo_root(Some(repo))?;

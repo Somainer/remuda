@@ -163,11 +163,13 @@ async fn dispatch(node: &DevNode, method: &str, params: Value) -> Result<Value, 
         "tty.write" | "instance.keys" | "tty.resize" | "tty.attach" | "tty.screen" => {
             crate::transport::hubnode::dispatch_method(node, method, params).await
         }
-        method if crate::worktree::is_worktree_method(method) => node.worktree_rpc(method, &params),
+        method if crate::worktree::is_worktree_method(method) => {
+            node.worktree_rpc_capped(method, &params).await
+        }
         // Read-only SCM RPCs must be explicit; the catch-all below would
         // otherwise answer `{"ok":true}` and fake a successful read.
         method if crate::workspace_scm::is_scm_method(method) => {
-            crate::workspace_scm::handle_rpc(node, method, &params)
+            crate::workspace_scm::handle_rpc_capped(node, method, &params).await
         }
         // One dispatch table for everything this link does no bookkeeping
         // for. `attach_runtime` always replies, so an unhandled method is a

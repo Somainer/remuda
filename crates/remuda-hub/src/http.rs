@@ -188,6 +188,12 @@ pub struct JournalQuery {
 }
 
 #[derive(Deserialize)]
+pub struct CommandsQuery {
+    /// Max rows, newest first. Defaults to 50, clamped by the store to 200.
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 pub struct WorktreeListQuery {
     #[serde(rename = "hostId")]
     host_id: Option<String>,
@@ -1750,6 +1756,34 @@ pub async fn get_journal(
     })))
 }
 
+/// `GET /v1/instances/{id}/commands`: recent commands for the instance, newest
+/// first, so an operator can see how a send resolved (state, resolution and any
+/// failure reason) rather than only the row returned by the POST.
+pub async fn list_instance_commands(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(instance_id): Path<String>,
+    Query(query): Query<CommandsQuery>,
+) -> Result<Json<Value>, HubError> {
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
+    if state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .is_none()
+    {
+        return Err(HubError::NotFound);
+    }
+    let commands = state
+        .store
+        .list_instance_commands(instance_id.clone(), query.limit.unwrap_or(50))
+        .await?;
+    Ok(Json(json!({
+        "instanceId": instance_id,
+        "commands": commands,
+    })))
+}
+
 pub(crate) async fn forward_if_online(
     state: &AppState,
     command: CommandRecord,
@@ -1769,6 +1803,13 @@ pub(crate) async fn forward_if_online(
             .await?
             .ok_or(HubError::NotFound);
     }
+    // A forwarded non-create command now has resolution `unknown`. There is
+    // deliberately no Hub-side ack deadline that settles it: a forward intent
+    // exists, so §2.5 forbids expiring or rejecting the command without asking
+    // the Node, and without evidence it did not run the Hub cannot call it
+    // rejected. A lost reply rests at `reconciling`; the Node's mirrored
+    // journal converges the row to accepted / settled. Only an *explicit*
+    // Node error reply settles the row (outcome `rejected`, below).
     let mut params = command.payload.clone();
     let object = params
         .as_object_mut()
@@ -1957,6 +1998,18 @@ async fn fail_unaccepted_create(
             .fail_instance(instance_id, message.clone())
             .await?;
         return Err(HubError::BadRequest(message));
+    }
+    // An explicit Node error reply is positive evidence the command did not
+    // run. Settle it the way §2.5 prescribes — `settled` with settlement
+    // outcome `rejected` and the Node's reason — rather than leave it queued or
+    // invent a fourth state. A row that already advanced (a journal accept that
+    // raced the reply) is terminal and returned untouched.
+    if let Some(rejected) = state
+        .store
+        .reject_command(command.command_id.clone(), message.clone())
+        .await?
+    {
+        return Ok(rejected);
     }
     state
         .store

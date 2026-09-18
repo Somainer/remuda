@@ -720,7 +720,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        get: operations["instanceCommands"];
         put?: never;
         post: operations["instanceCommand"];
         delete?: never;
@@ -1696,14 +1696,27 @@ export interface components {
         };
         CommandRecord: {
             commandId: string;
-            createdAt?: string;
-            forwarded?: boolean;
+            createdAt: string;
+            forwarded: boolean;
             hostId: string;
-            instanceId?: string | null;
+            idempotencyKey: string | null;
+            instanceId: string | null;
             operation: string;
-            resolution?: string;
-            state: string;
-            updatedAt?: string;
+            payload: {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            resolution: "clear" | "reconciling" | "unknown";
+            settlement?: {
+                /** @enum {string} */
+                outcome: "cancelled" | "completed" | "expired" | "rejected";
+                reason?: string;
+            } & {
+                [key: string]: unknown;
+            };
+            /** @enum {string} */
+            state: "accepted" | "queued" | "settled";
+            updatedAt: string;
         } & {
             [key: string]: unknown;
         };
@@ -1945,6 +1958,10 @@ export interface components {
         HostWorkspacePath: {
             /** @description Absolute path on the Node, within its configured workspace roots */
             path: string;
+        };
+        InstanceCommands: {
+            commands: components["schemas"]["CommandRecord"][];
+            instanceId: string;
         };
         InstanceCreate: {
             /** @description Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present. */
@@ -4344,6 +4361,33 @@ export interface operations {
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];
             409: components["responses"]["Error"];
+        };
+    };
+    instanceCommands: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                id: components["parameters"]["IdPath"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recent commands for the instance, newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InstanceCommands"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
         };
     };
     instanceCommand: {

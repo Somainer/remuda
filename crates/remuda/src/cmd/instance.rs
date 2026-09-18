@@ -16,6 +16,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 /// Default `read --lines` (herdr-style viewport).
 const DEFAULT_LINES: usize = 120;
+/// How long a *forwarded* `send` polls the command ledger for the Node's
+/// mirrored journal to converge a lost RPC reply (queued + reconciling →
+/// accepted / settled) before printing whatever it has. An offline send
+/// (`forwarded = false`) never polls.
+const SEND_RESOLVE_POLL_MS: u64 = 12_000;
 
 /// `remuda instance` subcommands.
 #[derive(clap::Args)]
@@ -460,9 +465,105 @@ pub(crate) async fn send(
         },
         "completionScope": completion_scope,
     });
-    Ok(client
+    let mut body = client
         .post_command(instance_id, "instance.send", payload, command_id)
-        .await?)
+        .await?;
+    resolve_command_state(client, instance_id, &mut body).await;
+    Ok(body)
+}
+
+/// Replace a still-`queued`, forwarded send row in `body` with its resolved
+/// ledger row and annotate `body` with `resolvedState` / `failureReason`, so the
+/// operator sees how the send actually settled (accepted / settled, or settled
+/// with a `rejected` settlement) rather than only the queued row the POST
+/// returned.
+///
+/// A row that came back `forwarded = false` is short-circuited: the host was
+/// offline, no forward intent exists and therefore no deadline is ever armed —
+/// polling could only burn the whole window before printing the honest
+/// `queued` result. Best effort: on any error the POST's row stands
+/// (docs/design/evidence/instance-send-1.md).
+pub(crate) async fn resolve_command_state(client: &HubClient, instance_id: &str, body: &mut Value) {
+    let command_id = body
+        .pointer("/command/commandId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let Some(command_id) = command_id else {
+        return;
+    };
+    let mut resolved = body["command"].clone();
+    // Offline host: the command was never forwarded, so nothing will converge
+    // it on the Hub and a poll would just wait out the window. Print queued now.
+    if !resolved
+        .get("forwarded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        annotate_resolved(body, &resolved);
+        return;
+    }
+    // A forwarded send reaches accepted / a rejected settlement synchronously
+    // on the RPC reply; only a lost reply rests at queued + reconciling and is
+    // converged later by the Node's mirrored journal. Poll for that convergence,
+    // bounded so a genuinely hung Node still returns rather than hanging.
+    let deadline = Instant::now() + Duration::from_millis(SEND_RESOLVE_POLL_MS);
+    let mut first = true;
+    loop {
+        let state = resolved.get("state").and_then(Value::as_str).unwrap_or("");
+        if matches!(state, "accepted" | "settled") {
+            break;
+        }
+        if !first {
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        first = false;
+        let Ok(listing) = client
+            .get(&format!("/v1/instances/{instance_id}/commands?limit=50"))
+            .await
+        else {
+            break;
+        };
+        if let Some(found) = listing
+            .get("commands")
+            .and_then(Value::as_array)
+            .and_then(|rows| {
+                rows.iter().find(|row| {
+                    row.get("commandId").and_then(Value::as_str) == Some(command_id.as_str())
+                })
+            })
+        {
+            resolved = found.clone();
+        }
+    }
+    annotate_resolved(body, &resolved);
+}
+
+/// Stamp the resolved ledger row back onto the POST body and surface a
+/// rejection's reason from the §2.5 settlement (never a top-level field).
+fn annotate_resolved(body: &mut Value, resolved: &Value) {
+    let state = resolved
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("queued")
+        .to_owned();
+    body["command"] = resolved.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("resolvedState".into(), json!(state));
+        let rejected = resolved
+            .pointer("/settlement/outcome")
+            .and_then(Value::as_str)
+            == Some("rejected");
+        if rejected
+            && let Some(reason) = resolved
+                .pointer("/settlement/reason")
+                .and_then(Value::as_str)
+        {
+            obj.insert("failureReason".into(), json!(reason));
+        }
+    }
 }
 
 pub(crate) async fn wait(

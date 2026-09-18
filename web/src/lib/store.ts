@@ -1279,6 +1279,45 @@ class HubStore {
     await this.catchup(instanceId);
   }
 
+  /**
+   * c-steer 插队发送: take ONE already-held row (see {@link hold}) and send it
+   * NOW as a steer — the Node interrupts the running turn and jumps this
+   * message ahead of the rest of the held queue. The held marker is dropped and
+   * `promptMode` set to steer BEFORE the POST, reusing {@link flushHeld}'s
+   * double-send guard so a transition firing mid-flight cannot re-send it. A
+   * failed POST leaves the row 状态待确认 exactly like flushHeld's catch, never
+   * silently dropped; a second call for the same id finds no held row and is a
+   * no-op. The remaining held rows keep their order and their ordinals.
+   */
+  async steerHeld(instanceId: Id, bubbleId: Id) {
+    const item = this.state.bubbles.find(
+      (b) => b.clientRequestId === bubbleId && b.instanceId === instanceId && b.held && b.state === "queued",
+    );
+    if (!item) return;
+    this.emit({
+      bubbles: this.state.bubbles.map((b) =>
+        b.clientRequestId === bubbleId ? { ...b, held: false, promptMode: "steer" as const } : b,
+      ),
+    });
+    try {
+      const result = await api.instanceSend(instanceId, item.text, item.heldRefs ?? [], "steer");
+      this.emit({
+        bubbles: this.state.bubbles.map((b) =>
+          b.clientRequestId === bubbleId
+            ? { ...b, state: result.command.state, commandId: result.command.commandId }
+            : b,
+        ),
+      });
+      await this.catchup(instanceId);
+    } catch {
+      this.emit({
+        bubbles: this.state.bubbles.map((b) =>
+          b.clientRequestId === bubbleId ? { ...b, state: "unknown" } : b,
+        ),
+      });
+    }
+  }
+
   async close(instanceId: Id) {
     await api.instanceClose(instanceId);
     await this.refresh();

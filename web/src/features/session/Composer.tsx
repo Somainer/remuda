@@ -34,7 +34,7 @@ import {
   type EffortKind,
   type EffortSelection,
 } from "./effort";
-import { composerState, type Phase } from "../composer/state";
+import { composerState, steerHeldControl, type Phase } from "../composer/state";
 import {
   effectiveLabel,
   effortMismatch,
@@ -73,6 +73,7 @@ export function Composer({
   held = [],
   onHold,
   onRetractHeld,
+  onSteerHeld,
   onFlushHeld,
   permissionMode = "manual",
   onPermission,
@@ -118,6 +119,8 @@ export function Composer({
   ) => void;
   /** Cancel one held row (Remuda-held only). */
   onRetractHeld?: (id: string) => void;
+  /** c-steer 插队发送: interrupt the running turn and send one held row now. */
+  onSteerHeld?: (id: string) => void;
   /** Post every held row in order (the turn-end / answer transition). */
   onFlushHeld?: () => void | Promise<void>;
   permissionMode?: string;
@@ -162,6 +165,10 @@ export function Composer({
   // cancelable here. Remuda-held rows arrive through the `held` prop.
   const [mirrors, setMirrors] = useState<HeldItem[]>([]);
   const [interrupted, setInterrupted] = useState(false);
+  // c-steer 插队发送: ids whose steer POST is in flight, so a double click on a
+  // queued row's button sends exactly once (the row also leaves the queue as
+  // soon as its POST lands, but the guard covers the pre-emit window).
+  const steeringRef = useRef<Set<string>>(new Set());
   const hoverCloseTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // A click (rather than a hover) pins the panel open: subsequent pointer
   // leaves must not dismiss it. Reset on every real dismiss path.
@@ -245,6 +252,13 @@ export function Composer({
   useEffect(() => () => cancelHoverClose(), []);
 
   const controls = composerState(
+    harness,
+    phase,
+    capabilities ?? ({ capabilities: {} } as unknown as CapabilitySnapshot),
+  );
+  // c-steer 插队发送 for an already-queued row: same availability rule as the
+  // box's 插队, resolved once here so every queued row shows one honest reason.
+  const heldSteer = steerHeldControl(
     harness,
     phase,
     capabilities ?? ({ capabilities: {} } as unknown as CapabilitySnapshot),
@@ -443,6 +457,20 @@ export function Composer({
     onRetractHeld?.(id);
   };
 
+  /**
+   * c-steer 插队发送 on a queued row: one click is the whole gesture (the row
+   * already shows its text, so no confirm). The in-flight guard makes a double
+   * click send once; the row leaves the queue the moment its POST lands and the
+   * existing 已打断 chip is the receipt. The composer text box is untouched.
+   */
+  const steerHeldRow = (id: string) => {
+    if (!heldSteer.enabled || !onSteerHeld) return;
+    if (steeringRef.current.has(id)) return;
+    steeringRef.current.add(id);
+    onSteerHeld(id);
+    setInterrupted(true);
+  };
+
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (composing(event)) return;
     if (mobile) return;
@@ -578,15 +606,38 @@ export function Composer({
                 <span className={css.queuedTag}>{tag}</span>
                 <span className={css.queuedText}>{item.text}</span>
                 {item.holder === "remuda" ? (
-                  <button
-                    type="button"
-                    className={css.queuedRemove}
-                    data-testid="composer-queued-remove"
-                    aria-label="撤回排队消息"
-                    onClick={() => removeHeld(item.id)}
-                  >
-                    ✕
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className={css.queuedSteer}
+                      data-testid="composer-queued-steer"
+                      disabled={!heldSteer.enabled}
+                      aria-label={
+                        heldSteer.enabled
+                          ? "插队发送这条排队消息"
+                          : `插队发送这条排队消息（不可用：${heldSteer.reason}）`
+                      }
+                      title={
+                        heldSteer.enabled
+                          ? heldSteer.reason
+                            ? `插队发送，打断当前 turn 并立即发送（${heldSteer.reason}）`
+                            : "插队发送，打断当前 turn 并立即发送"
+                          : heldSteer.reason
+                      }
+                      onClick={() => steerHeldRow(item.id)}
+                    >
+                      插队发送
+                    </button>
+                    <button
+                      type="button"
+                      className={css.queuedRemove}
+                      data-testid="composer-queued-remove"
+                      aria-label="撤回排队消息"
+                      onClick={() => removeHeld(item.id)}
+                    >
+                      ✕
+                    </button>
+                  </>
                 ) : null}
               </span>
             );

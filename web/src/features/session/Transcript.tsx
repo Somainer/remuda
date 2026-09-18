@@ -21,7 +21,18 @@ import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "
 import { readShowInjected, writeShowInjected } from "./injectedPref";
 import { readPosition, writePosition } from "./readingPosition";
 import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSearch";
+import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
+
+/**
+ * c-steer 插队发送 from a transcript held row. The page supplies it so the
+ * composer's 已打断 receipt is raised on success; standalone callers fall back
+ * to the store directly. Resolves `false` when the steer POST did not land.
+ */
+export type SteerHeldHandler = (
+  instanceId: string,
+  bubbleId: string,
+) => Promise<boolean | void> | boolean | void;
 
 /** Human-readable name for an injected origin, for the collapsed row. */
 const ORIGIN_LABEL: Record<Exclude<MessageOrigin, "human">, string> = {
@@ -80,6 +91,10 @@ export function Transcript(props: {
   compact?: boolean;
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
+  /** c-steer 插队发送 availability for the held rows shown in the transcript. */
+  steerHeld?: SteerHeldControl;
+  /** c-steer 插队发送 action for a held row; defaults to the store. */
+  onSteerHeld?: SteerHeldHandler;
 }) {
   // SessionPage mounts this inside a route; standalone unit tests do not.
   // useParams throws outside a Router, so only read it when one is present.
@@ -94,6 +109,8 @@ function TranscriptWithRoute(props: {
   compact?: boolean;
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
+  steerHeld?: SteerHeldControl;
+  onSteerHeld?: SteerHeldHandler;
 }) {
   const { instanceId = "" } = useParams();
   return <TranscriptInner {...props} routeInstanceId={instanceId} />;
@@ -106,6 +123,8 @@ function TranscriptInner({
   journalStatus = "live",
   onRetryJournal,
   routeInstanceId,
+  steerHeld,
+  onSteerHeld,
 }: {
   events: Observation[];
   bubbles?: LocalBubble[];
@@ -113,6 +132,8 @@ function TranscriptInner({
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
   routeInstanceId: string;
+  steerHeld?: SteerHeldControl;
+  onSteerHeld?: SteerHeldHandler;
 }) {
   // Per-instance reading position/follow persistence. The id comes from the
   // route (read by the wrapper) so SessionPage needs no new prop; tests that
@@ -137,12 +158,16 @@ function TranscriptInner({
     | { kind: "restore"; anchorId: string; offset: number; tries: number }
     | null
   >(null);
+  // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
+  // click on a held transcript row posts exactly once.
+  const steeringRef = useRef<Set<string>>(new Set());
   if (instanceEpoch !== instanceId) {
     setInstanceEpoch(instanceId);
     restoredRef.current = false;
     pinRef.current = saved ? saved.follow : true;
     scrollTopRef.current = 0;
     pendingScroll.current = null;
+    steeringRef.current.clear();
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
   }
 
@@ -598,6 +623,10 @@ function TranscriptInner({
                 onSize={setRowSize}
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
+                instanceId={instanceId}
+                steerHeld={steerHeld}
+                onSteerHeld={onSteerHeld}
+                steering={steeringRef.current}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
                 hitChildId={
                   node.type === "compact"
@@ -645,6 +674,10 @@ function TranscriptRow({
   searchCurrent,
   expandTick,
   hitChildId,
+  instanceId,
+  steerHeld,
+  onSteerHeld,
+  steering,
 }: {
   node: TranscriptNode;
   index: number;
@@ -657,6 +690,10 @@ function TranscriptRow({
   searchCurrent: boolean;
   expandTick: number;
   hitChildId: string | null;
+  instanceId: string;
+  steerHeld?: SteerHeldControl;
+  onSteerHeld?: SteerHeldHandler;
+  steering: Set<string>;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -696,7 +733,7 @@ function TranscriptRow({
         searchCurrent ? css.rowCurrent : "",
       ].join(" ").trim()}
     >
-      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId })}    </div>
+      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId, instanceId, steerHeld, onSteerHeld, steering })}    </div>
   );
 }
 
@@ -748,7 +785,17 @@ function ToolRow({
 
 function renderNode(
   node: TranscriptNode,
-  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean; expandTick?: number; hitChildId?: string | null },
+  opts: {
+    defaultFolded: boolean;
+    collapseTick: number;
+    settle: boolean;
+    expandTick?: number;
+    hitChildId?: string | null;
+    instanceId?: string;
+    steerHeld?: SteerHeldControl;
+    onSteerHeld?: SteerHeldHandler;
+    steering: Set<string>;
+  },
 ): ReactNode {
   if (node.type === "message") {
     const user = node.role === "user";
@@ -840,13 +887,51 @@ function renderNode(
           <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
         {node.local?.state === "queued" ? (
-          <button
-            className={ui.chip}
-            data-testid="held-queue-cancel"
-            onClick={() => hubStore.retract(node.local!.clientRequestId)}
-          >
-            {node.local.held ? "取消排队" : "撤回"}
-          </button>
+          <div className={session.heldRowActions} data-testid="held-row-actions">
+            {node.local.held ? (
+              <button
+                type="button"
+                className={ui.chip}
+                data-testid="held-queue-steer"
+                disabled={!opts.steerHeld?.enabled}
+                aria-label={
+                  opts.steerHeld?.enabled
+                    ? "插队发送这条排队消息"
+                    : `插队发送这条排队消息（不可用：${opts.steerHeld?.reason ?? "无进行中的回合，回车即送出"}）`
+                }
+                title={
+                  opts.steerHeld?.enabled
+                    ? opts.steerHeld.reason
+                      ? `插队发送，打断当前 turn 并立即发送（${opts.steerHeld.reason}）`
+                      : "插队发送，打断当前 turn 并立即发送"
+                    : opts.steerHeld?.reason ?? "无进行中的回合，回车即送出"
+                }
+                onClick={() => {
+                  if (!opts.steerHeld?.enabled || !opts.instanceId) return;
+                  const bubbleId = node.local!.clientRequestId;
+                  // Same in-flight latch as the composer chip row: a double
+                  // click posts exactly once while the row is still queued.
+                  if (opts.steering.has(bubbleId)) return;
+                  opts.steering.add(bubbleId);
+                  // The page handler raises the composer's 已打断 receipt; the
+                  // standalone fallback drives the store directly.
+                  const steer =
+                    opts.onSteerHeld ??
+                    ((iid: string, bid: string) => hubStore.steerHeld(iid, bid));
+                  void steer(opts.instanceId, bubbleId);
+                }}
+              >
+                插队发送
+              </button>
+            ) : null}
+            <button
+              className={ui.chip}
+              data-testid="held-queue-cancel"
+              onClick={() => hubStore.retract(node.local!.clientRequestId)}
+            >
+              {node.local.held ? "取消排队" : "撤回"}
+            </button>
+          </div>
         ) : null}
         {node.local?.state === "unknown" ? (
           <button className={ui.chip} onClick={() => void hubStore.send(node.local!.instanceId, node.local!.text)}>

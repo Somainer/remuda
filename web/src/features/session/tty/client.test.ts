@@ -275,4 +275,69 @@ describe("follow tty client", () => {
     ).not.toThrow();
     await session.detach();
   });
+
+  /// The 2026-09-18 demo: the Hub fell back to its byte cache and sent the
+  /// bytes as a bare `tty.snapshot`, so the browser painted a frozen 17:36
+  /// frame under a 运行中 header for a session whose process was long dead.
+  it("reports a stamped hub-cache snapshot as stale with its age and reason", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const statuses: Array<{ status: string; stale?: unknown }> = [];
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb21" as const };
+    const session = openTtySession(instance, {
+      onFrame: () => {},
+      onStatus: (status, _message, stale) => statuses.push({ status, stale }),
+    });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const capturedAt = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+    FakeSocket.latest!.emitJson({
+      type: "tty.snapshot",
+      instanceId: instance.id,
+      source: "hub-cache",
+      dataBase64: bytesToBase64(new TextEncoder().encode("frozen-1736")),
+      capturedAt,
+      reason: "instance-gone",
+    });
+    const last = statuses.at(-1);
+    expect(last?.status).toBe("stale");
+    const stale = last?.stale as { ageMs?: number; reason?: string };
+    expect(stale.reason).toBe("instance-gone");
+    // The age is computed against the browser clock with a second of slack for
+    // the round trip through `Date.now()` in the assertion itself.
+    expect(stale.ageMs).toBeGreaterThan(3 * 60 * 1000 - 2000);
+    expect(stale.ageMs).toBeLessThan(3 * 60 * 1000 + 5000);
+    await session.detach();
+  });
+
+  it("leaves a live snapshot alone and never invents an age for an unstamped one", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const statuses: Array<{ status: string; stale?: unknown }> = [];
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb22" as const };
+    const session = openTtySession(instance, {
+      onFrame: () => {},
+      onStatus: (status, _message, stale) => statuses.push({ status, stale }),
+    });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const ws = FakeSocket.latest!;
+    // A live attach: no stamp, so it is live.
+    ws.emitJson({ type: "snapshot", instanceId: instance.id, tty: { streamId: TTY_LAB_STREAM_ID } });
+    expect(statuses.at(-1)?.status).toBe("live");
+    // An older Hub's hub-cache snapshot carries no `capturedAt`. It is stale —
+    // the bytes are still cached, not live — but its age is unknown, and the
+    // badge must say so rather than counting from "now".
+    ws.emitJson({
+      type: "tty.snapshot",
+      instanceId: instance.id,
+      source: "hub-cache",
+      dataBase64: bytesToBase64(new TextEncoder().encode("no-stamp")),
+    });
+    expect(statuses.at(-1)?.status).toBe("stale");
+    expect(statuses.at(-1)?.stale).toEqual({ reason: undefined });
+    await session.detach();
+  });
 });
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}

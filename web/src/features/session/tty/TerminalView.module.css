@@ -37,6 +37,19 @@
   padding: 2px 8px;
 }
 
+/* A stale frame's badge. Deliberately louder than `.modePill`: the renderer
+   pill describes how the terminal draws, this one says the picture is no
+   longer the process. It keeps the pill geometry so the strip stays one row. */
+.staleBadge {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+  border: 1px solid var(--dust);
+  border-radius: 4px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
 .keyOn {
   color: var(--dust) !important;
   border-color: var(--dust) !important;

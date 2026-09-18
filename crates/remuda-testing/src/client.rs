@@ -164,23 +164,50 @@ pub fn fake_claude_bin() -> PathBuf {
 
 /// Spawn `fake-claude` with stream-json flags a real host would pass.
 pub fn spawn_fake_claude(options: SpawnOptions) -> Result<FakeClaudeProcess> {
+    spawn_fake_claude_mode(options, true)
+}
+
+/// [`spawn_fake_claude`] with the `claude-sdk` argv: **no** `-p`.
+///
+/// `-p` is "Print response and exit", so it is the one flag the sdk carrier must
+/// not pass (`print-replacement.md` §2.1, §3 batch 1). `ClaudeFlags::parse`
+/// still accepts both spellings, so the fake does not care which template
+/// spawned it — the assertion that matters is on the argv, not on the fake.
+pub fn spawn_fake_claude_sdk(options: SpawnOptions) -> Result<FakeClaudeProcess> {
+    spawn_fake_claude_mode(options, false)
+}
+
+/// Argv shared by both carriers, gated on whether `-p` leads it.
+pub fn fake_claude_argv(session_id: &str, print: bool) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if print {
+        argv.push("-p".into());
+    }
+    for token in [
+        "--output-format",
+        "stream-json",
+        "--input-format",
+        "stream-json",
+        "--verbose",
+        "--permission-mode",
+        "default",
+        "--permission-prompts",
+        "host",
+        "--permission-prompt-tool",
+        "stdio",
+        "--session-id",
+    ] {
+        argv.push(token.into());
+    }
+    argv.push(session_id.to_owned());
+    argv
+}
+
+fn spawn_fake_claude_mode(options: SpawnOptions, print: bool) -> Result<FakeClaudeProcess> {
     let bin = fake_claude_bin();
     let mut command = Command::new(&bin);
     command
-        .arg("-p")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--input-format")
-        .arg("stream-json")
-        .arg("--verbose")
-        .arg("--permission-mode")
-        .arg("default")
-        .arg("--permission-prompts")
-        .arg("host")
-        .arg("--permission-prompt-tool")
-        .arg("stdio")
-        .arg("--session-id")
-        .arg(&options.session_id)
+        .args(fake_claude_argv(&options.session_id, print))
         .args(&options.extra_args)
         .env("FAKE_CLAUDE_SCRIPT", &options.script)
         .stdin(Stdio::piped())

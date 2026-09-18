@@ -1151,11 +1151,14 @@ async fn switch_worker_model(
         )
         .await
         .map_err(map_store)?;
-    let hint = match (confirmed, rejected) {
-        (_, Some("not-found")) => "model id not found by the CLI; switch not recorded",
-        (_, Some(_)) => "model switch dismissed; previous model kept",
-        (true, _) => "model switched and confirmed",
-        _ => "model applied with no confirmation dialog (verdict read back)",
+    let hint = match (confirmed, rejected, accepted_id.is_some()) {
+        (_, _, true) if confirmed => "model switched and confirmed",
+        (_, _, true) => "model applied with no confirmation dialog (verdict read back)",
+        (_, Some("not-found"), false) => "model id not found by the CLI; switch not recorded",
+        (_, Some(_), false) => "model switch dismissed; previous model kept",
+        _ => {
+            "no confirmation dialog or verdict observed; not sending Enter — answer it with `remuda worker answer <name> enter`"
+        }
     };
     Ok(Json(json!({
         "worker": updated,

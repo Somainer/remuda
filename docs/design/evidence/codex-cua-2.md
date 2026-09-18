@@ -158,8 +158,8 @@ Fixtures carry all three states: `devbox-sg` installed, `devbox` absent,
 | vitest (`HostDiagnostics.test.tsx`) | the three rendered states, incl. no "未安装" claim when unreported |
 
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test -p remuda-node`, `pnpm typecheck`, `vitest run` (1117 tests) and the
-full web hub e2e suite were run on this branch.
+`cargo test -p remuda-node`, `pnpm typecheck` and `vitest run` (1122 tests) were
+run on this branch.
 
 No Hub e2e spec was added for this row: `crates/remuda-hub/examples/hub_e2e.rs`
 is owned by `c-cua-media` (plan §6 risk 6), and coverage here is unit +

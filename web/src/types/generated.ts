@@ -1543,6 +1543,7 @@ export type InstanceCreateParams = ({
 
 /** InstanceCreateResult; `protocol.md` §7.2. */
 export type InstanceCreateResult = ({
+  "apiRoute"?: (ApiRoute | (null));
   "command": Command;
   "instanceId": InstanceId;
   "prepared": (boolean);
@@ -3318,7 +3319,7 @@ export type ProtocolVersion = ({
   [key: string]: unknown;
 });
 
-/** Provider delivery of one profile; `protocol.md` §4.4 (D-047).  The wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling: the sub-mode has nowhere to live in a single keyword. An absent `delivery` is [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a profile row written before this type existed keeps parsing.  Deserialization is strict on the one combination that cannot be honoured (`mode: via` with no host) and on unknown enum values, which are parse errors rather than silent defaults: a typo'd route must not quietly become `auto` and move a session's egress to a machine the operator did not name. */
+/** Provider delivery of one profile; `protocol.md` §4.4 (D-047).  The wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling: the sub-mode has nowhere to live in a single keyword. An absent `delivery` is [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a profile row written before this type existed keeps parsing.  Deserialization is strict on the one combination that cannot be honoured: `mode: via` with no `via_host_id` is a parse error, not a default. Unknown enum values are parse errors too, so a typo'd route cannot quietly become `auto` and move a session's egress to a machine the operator did not name. [`Self::is_valid`] stays as the runtime check for a value built in Rust.  The `serde` attribute is for the **schema** only: `Deserialize` is hand-written below (it must reject `via` with no host), so nothing here reads this attribute at runtime — but schemars does, and without it the generated schema would claim to accept unknown keys when the wire struct refuses them. */
 export type ProviderDelivery = ({
   "mode": ProviderDeliveryMode;
   "route": ApiRouteMode;

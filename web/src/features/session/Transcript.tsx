@@ -21,6 +21,7 @@ import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "
 import { readShowInjected, writeShowInjected } from "./injectedPref";
 import { readPosition, writePosition } from "./readingPosition";
 import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSearch";
+import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
 
 /** Human-readable name for an injected origin, for the collapsed row. */
@@ -80,6 +81,8 @@ export function Transcript(props: {
   compact?: boolean;
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
+  /** c-steer 插队发送 availability for the held rows shown in the transcript. */
+  steerHeld?: SteerHeldControl;
 }) {
   // SessionPage mounts this inside a route; standalone unit tests do not.
   // useParams throws outside a Router, so only read it when one is present.
@@ -94,6 +97,7 @@ function TranscriptWithRoute(props: {
   compact?: boolean;
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
+  steerHeld?: SteerHeldControl;
 }) {
   const { instanceId = "" } = useParams();
   return <TranscriptInner {...props} routeInstanceId={instanceId} />;
@@ -106,6 +110,7 @@ function TranscriptInner({
   journalStatus = "live",
   onRetryJournal,
   routeInstanceId,
+  steerHeld,
 }: {
   events: Observation[];
   bubbles?: LocalBubble[];
@@ -113,6 +118,7 @@ function TranscriptInner({
   journalStatus?: JournalUiStatus;
   onRetryJournal?: () => void;
   routeInstanceId: string;
+  steerHeld?: SteerHeldControl;
 }) {
   // Per-instance reading position/follow persistence. The id comes from the
   // route (read by the wrapper) so SessionPage needs no new prop; tests that
@@ -598,6 +604,8 @@ function TranscriptInner({
                 onSize={setRowSize}
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
+                instanceId={instanceId}
+                steerHeld={steerHeld}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
                 hitChildId={
                   node.type === "compact"
@@ -645,6 +653,8 @@ function TranscriptRow({
   searchCurrent,
   expandTick,
   hitChildId,
+  instanceId,
+  steerHeld,
 }: {
   node: TranscriptNode;
   index: number;
@@ -657,6 +667,8 @@ function TranscriptRow({
   searchCurrent: boolean;
   expandTick: number;
   hitChildId: string | null;
+  instanceId: string;
+  steerHeld?: SteerHeldControl;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -696,7 +708,7 @@ function TranscriptRow({
         searchCurrent ? css.rowCurrent : "",
       ].join(" ").trim()}
     >
-      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId })}    </div>
+      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId, instanceId, steerHeld })}    </div>
   );
 }
 
@@ -748,7 +760,7 @@ function ToolRow({
 
 function renderNode(
   node: TranscriptNode,
-  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean; expandTick?: number; hitChildId?: string | null },
+  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean; expandTick?: number; hitChildId?: string | null; instanceId?: string; steerHeld?: SteerHeldControl },
 ): ReactNode {
   if (node.type === "message") {
     const user = node.role === "user";
@@ -840,13 +852,41 @@ function renderNode(
           <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
         {node.local?.state === "queued" ? (
-          <button
-            className={ui.chip}
-            data-testid="held-queue-cancel"
-            onClick={() => hubStore.retract(node.local!.clientRequestId)}
-          >
-            {node.local.held ? "取消排队" : "撤回"}
-          </button>
+          <div className={session.heldRowActions} data-testid="held-row-actions">
+            {node.local.held ? (
+              <button
+                type="button"
+                className={ui.chip}
+                data-testid="held-queue-steer"
+                disabled={!opts.steerHeld?.enabled}
+                aria-label={
+                  opts.steerHeld?.enabled
+                    ? "插队发送这条排队消息"
+                    : `插队发送这条排队消息（不可用：${opts.steerHeld?.reason ?? "无进行中的回合，回车即送出"}）`
+                }
+                title={
+                  opts.steerHeld?.enabled
+                    ? opts.steerHeld.reason
+                      ? `插队发送，打断当前 turn 并立即发送（${opts.steerHeld.reason}）`
+                      : "插队发送，打断当前 turn 并立即发送"
+                    : opts.steerHeld?.reason ?? "无进行中的回合，回车即送出"
+                }
+                onClick={() => {
+                  if (!opts.steerHeld?.enabled || !opts.instanceId) return;
+                  void hubStore.steerHeld(opts.instanceId, node.local!.clientRequestId);
+                }}
+              >
+                插队发送
+              </button>
+            ) : null}
+            <button
+              className={ui.chip}
+              data-testid="held-queue-cancel"
+              onClick={() => hubStore.retract(node.local!.clientRequestId)}
+            >
+              {node.local.held ? "取消排队" : "撤回"}
+            </button>
+          </div>
         ) : null}
         {node.local?.state === "unknown" ? (
           <button className={ui.chip} onClick={() => void hubStore.send(node.local!.instanceId, node.local!.text)}>

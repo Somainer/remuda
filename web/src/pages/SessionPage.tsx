@@ -7,6 +7,7 @@ import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
+import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
@@ -414,6 +415,7 @@ export function SessionPage({
             bubbles={bubbles}
             compact={hub.compact}
             journalStatus={journalStatus}
+            steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
             onRetryJournal={() => {
               void hubStore.catchup(instance.id);
             }}
@@ -508,6 +510,7 @@ export function SessionPage({
             hubStore.hold(instance.id, text, reason, refs, previews);
           }}
           onRetractHeld={(id) => hubStore.retract(id)}
+          onSteerHeld={(id) => void hubStore.steerHeld(instance.id, id)}
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={

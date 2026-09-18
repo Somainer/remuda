@@ -854,8 +854,8 @@ pub fn hello_capabilities(host: &Value) -> Option<Value> {
 
 /// Build stdio hello params from a nested host inventory value.
 ///
-/// `instances` is this Node's own instance inventory ([`CreateInstanceRequest`]
-/// not required — pass `serde_json::to_value(node.list_instances()?.items)`).
+/// `instances` is this Node's own instance inventory — pass
+/// `serde_json::to_value(node.list_instances()?.items)` from a composed runtime.
 /// It rides every hello, daemon or not, for the same reason the outbound-WSS
 /// hello does: the Hub reconciles rows this Node no longer owns by diffing it
 /// against the epoch it recorded, and a hello with no `instances` key leaves
@@ -979,7 +979,7 @@ mod tests {
     }
 
     /// The stdio hello must announce the instance inventory the same way the
-    /// outbound-WSS hello does. Its absence is the whole of the 2026-09-17
+    /// outbound-WSS hello does. Its absence is the whole of the 2026-09-18
     /// demo failure: the Hub saw an epoch change, found no `instances` key,
     /// and left four dead rows `running`.
     #[test]

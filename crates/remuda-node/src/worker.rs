@@ -28,6 +28,15 @@ pub const TARGET_DIR_NAME: &str = "remuda-target";
 /// rather than owning the blocking thread — or the carrier loop — forever.
 const RECLAIM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// Deadline for the best-effort carrier teardown that precedes the reclaim.
+///
+/// Closing a pty-backed worker's Herdr carrier is several round-trips to the
+/// Herdr server (`owned_workspace_present`, `interrupt_agent`, `owned_panes`,
+/// then a re-check per close), and none of them is bounded. This step is
+/// already best-effort — a failure only warns and the reclaim continues — so
+/// waiting on a wedged Herdr forever would be the same park by another door.
+const CARRIER_CLOSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Hub→Node worker RPCs served by every carrier (outbound WSS and ssh-stdio).
 #[must_use]
 pub fn is_worker_method(method: &str) -> bool {
@@ -179,13 +188,26 @@ impl crate::runtime::DevNode {
             self.get_instance(instance_id)?;
         }
         // Best-effort carrier teardown first: a live agent pane holds the
-        // worktree as its cwd and would keep file handles open.
-        if let Some(instance_id) = &request.instance_id
-            && let Err(error) = self
-                .close_instance_carrier(instance_id.as_id().as_str())
-                .await
-        {
-            tracing::warn!(%error, instance_id = %instance_id.as_id(), "worker carrier close failed; continuing with filesystem reclaim");
+        // worktree as its cwd and would keep file handles open. Bounded, and the
+        // bound is load-bearing: closing the Herdr carrier is several unbounded
+        // round-trips to the Herdr server, this step is already best-effort, and
+        // a wedged Herdr must not hold the retire — and so the carrier loop —
+        // open any longer than the reclaim is allowed to.
+        if let Some(instance_id) = &request.instance_id {
+            let closed = tokio::time::timeout(
+                CARRIER_CLOSE_DEADLINE,
+                self.close_instance_carrier(instance_id.as_id().as_str()),
+            )
+            .await;
+            match closed {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, instance_id = %instance_id.as_id(), "worker carrier close failed; continuing with filesystem reclaim")
+                }
+                Err(_) => {
+                    tracing::warn!(instance_id = %instance_id.as_id(), deadline_secs = CARRIER_CLOSE_DEADLINE.as_secs(), "worker carrier close exceeded its deadline; continuing with filesystem reclaim")
+                }
+            }
         }
         let (_, workspace_root) =
             self.resolve_workspace_cwd(request.workspace_id.as_ref(), None)?;

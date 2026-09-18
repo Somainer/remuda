@@ -813,6 +813,58 @@ Hub 操作面（M1）先落地一个薄的可配置子集：`id, name, kind: gat
 
 换 endpoint/key 分三类：尚未 native 派发的新命令可重选；原生支持且已验收的 credential helper 可在其原生机制内刷新；其它运行中的请求先进入 reconciliation。恢复必须获得原生 session 单 owner lease、确认旧执行已终止、绑定新 generation、显式 native resume，不重投已可能执行的 prompt。失败尝试的 observation 保留，不能通过“换 provider 再跑一次”把已产生的文件修改或 tool effects 隐去。profile 的 ingress 不兼容返回 `PROVIDER_PROTOCOL_MISMATCH`，不临时搭一个有损协议转换器。
 
+#### 4.4.1 模型 API 交付方式与路由（D-047，2026-09-19）
+
+网关凭据是主机绑定的，所以今天「只在一台机器的 relay 上可达的模型」无法交给
+另一台机器上的 worker：把凭据发过去既违背 D-021，也未必有用——那个 origin
+从 worker 主机可能根本不可路由。D-047 加了**一个可选参数**来关闭这个缺口。
+
+~~~typescript
+type ProviderDeliveryMode = "direct" | "via";
+type ApiRouteMode = "auto" | "hub-relay" | "direct-net";
+type ApiRouteKind = "direct-net" | "hub-relay";   // 已决议的路由；没有 auto
+
+type ProviderDelivery = {
+  mode: ProviderDeliveryMode;
+  viaHostId?: HostId | null;   // via 时必填；direct 时无意义
+  route: ApiRouteMode;         // 缺省 auto
+};
+
+type RequestedApiRoute = {     // 请求意图，随实例 spec 下发
+  mode: ProviderDeliveryMode;
+  viaHostId?: HostId | null;
+  route: ApiRouteMode;
+};
+
+type ApiRoute = {              // 观测：Node 回执里实际跑的路由
+  mode: ProviderDeliveryMode;
+  route?: ApiRouteKind | null;
+  viaHostId?: HostId | null;
+  viaHostLabel?: string | null;
+};
+
+type HostRelayBind = { addr: string; allowFrom: string[] };  // Host.relayBind，可选
+type ApiViaOverride = string;  // "<hostId>" | "self" | "none"
+type ApiViaRefusal = "api-via-unknown-host" | "api-via-host-offline"
+                   | "api-via-unsupported" | "api-via-unreachable";
+~~~
+
+* `ProviderProfile.delivery` 缺省是 `{mode: direct, route: auto}`，也就是今天
+  的行为；`InstanceSpec.apiRoute` 缺省是 absent（= 不代理），`Host.relayBind`
+  缺省 absent（listener 只绑 loopback）。三者都是**加性**字段，缺省的旧
+  payload 照常解析。
+* 瀑布：请求 `apiVia` > 项目 > profile `delivery` > `direct`，在**放置之后**
+  解析；`via:<H>` 在 `H == W` 时收敛为 `direct`，且收敛只发生在决议时。
+* `route: auto` 是**请求**值，不是观测值——`ApiRouteKind` 里没有 `auto`，
+  记录里出现 `auto` 就等于在报告「要了什么」而不是「跑了什么」（D-035）。
+* 每个拒绝码的 HTTP 状态由协议层固定：`api-via-unknown-host` 是 400，其余
+  三个冲突是 409。**没有**任何「回落到 direct」的码，因为不存在这样的路径。
+* CLI 的人话拼写是 `provider set --delivery direct|via:<host>` 与
+  `dispatch --api-via <hostId|self|none> [--api-route auto|hub-relay|direct-net]`；
+  线格式是上面的嵌套对象。逐次覆盖 `apiVia` 之所以保持**字符串**，是因为它
+  三个值里有两个是关键字、只有一个带 id。
+* 帧的分层、信用、限额、合并与超时见 §7.6。
+
 ## 5. Observation envelope、payload 与原生映射
 
 ### 5.1 Envelope 与存储顺序
@@ -1481,6 +1533,64 @@ TransportLimits v1 默认建议：`maxJsonFrameBytes=1048576`、`maxBinaryChunkB
 4. 原生已停：读取原生 history/terminal evidence。能确定结果则补充 accepted/settled；不能确定则保持 unknown。需要恢复执行时由新的明确 resume Command 增加 generation，旧 Interaction 全部失效。
 5. 对已经写过/可能写过的 prompt、approval、TTY input 只查询，禁止 replay。即使同一个原生 requestId 再出现，也只有 native 协议明示幂等且同 request 仍待处理时才能重送同一已提交答案；v1 无该证明默认不重送。
 6. Node 与 Hub 按 journal seq 补齐副本；每个实例单独标 recovered/reconciling。一个不可恢复的 optional driver 不阻断其它 Instance 的事件与 Claude 主路径。
+
+### 7.6 `api.*` 带内模型 API 代理流（D-047 / D-048，2026-09-19）
+
+`delivery = via:<H>` 的会话把模型 API 请求交给 H 出去（D-047）。W 的 Node 在
+每实例 loopback 监听器上收到请求后，把它变成这里的七个帧之一，走**既有**
+Hub↔Node 链路——与 `object.pull` 同一条路径、同一套授权、同一个 1 MiB 帧上限，
+理由见 §7.4（ssh-stdio 桥只转发整帧 JSON）。
+
+**全部七个帧都是 notification**，没有 `id`，**永不进入** §7.4 那个 32 槽的
+在途 RPC 上限：每条链路维护自己的 stream 注册表，否则几条热流就会卡住
+`instance.create` 和 `tty.write`。carrier 必须按 `HubNodeMethod::is_api()`
+把它们送进 stream 注册表，而不是 JSON-RPC 派发表。
+
+| 帧 | 方向 | params |
+| --- | --- | --- |
+| `api.open` | W Node→Hub，Hub→H Node | `{instanceId, streamId, method, path, query, headers:[{name,value}], bodyBase64?, bodyChunked, deadlineMs}` |
+| `api.body` | W Node→Hub→H Node | `{streamId, seq, dataBase64, last}` |
+| `api.head` | H→Hub→W Node | `{streamId, status, headers:[{name,value}]}` |
+| `api.chunk` | H→Hub→W Node | `{streamId, seq, dataBase64, last}` |
+| `api.end` | 双向 | `{streamId, error?:{code,message}, bytesUp, bytesDown, ms}` |
+| `api.cancel` | 双向 | `{streamId, reason}` |
+| `api.credit` | 消费者→生产者 | `{streamId, chunks}` |
+
+`headers` 是**列表**而不是 map：HTTP 允许同名重复（`x-stainless-*` 就会），
+折叠成一个值会改变网关看到的请求。`query` 原样转发、从不重新编码；
+`path` 是 profile base path **之下**的路径，不含查询串。
+
+**授权是两重的。** W 的 Node 先在本地校验（loopback 对端、常量时间比较 bearer、
+实例存活、方法属 `{POST, GET}`、路径在 base path 下），Hub 再对着实例与该会话
+已决议的路由校验一遍——和 `object.pull` 一样，Node 的说法不足以放行，而凭据
+只在 H 侧加载。目标 origin 固定为 `profile.baseUrl` 的 origin，请求/响应头
+各有白名单（`set-cookie` 丢弃）。**拒绝码**：`api-via-unknown-host`（400）、
+`api-via-host-offline`（409）、`api-via-unsupported`（409）、
+`api-via-unreachable`（409）；`api.end.error.code` 用稳定小写码
+（`via-host-offline`、`hub-link-lost`、`upstream-timeout`、`instance-gone`、
+`destination-refused`、`cancelled`），监听器把每个映射成 Anthropic 形状的
+HTTP 错误，让 harness 渲染出真正的模型 API 失败而不是传输故障。
+
+**信用与限额。** Hub→Node 出站队列容量 32 且与 tty 帧共享，因此生产者每流最多
+4 个未确认 chunk，消费者边排空边发 `api.credit`，块间 `yield_now()`。
+`TransportLimits` 新增 `maxApiStreams`（默认 8/链路、2/实例）与 `apiChunkBytes`
+（默认 64 KiB 原始 ≈ 87 KiB base64）。两者在读侧都有默认值，所以 D-048 之前的
+`hello.limits`（九键）仍然解析。
+
+**合并与超时。** 每个 token 一帧在 NDJSON/ssh-stdio 上是病态的，所以 H 在
+**≥16 KiB 或 ≥50 ms 或流结束** 时合并成一块，严格保序——body 是不透明字节，
+不按 SSE 解析。超时阶梯：连接 10 s、首字节 60 s、块间空闲 120 s、硬上限
+30 min；越界即向上游 `api.cancel`、向下游 `api.end{error}`，监听器答 `504`。
+
+**为什么不用 channel 2 `BinaryChannel::ObjectChunk`**：与 §7.4 中 `object.pull`
+的理由完全相同——ssh-stdio 桥只逐帧转发 JSON 文本，引入二进制隧道会改变桥的
+全部安全边界。
+
+**这不是隧道（D-031）。** 不装不探隧道二进制、不用 `ssh -L/-R/-D`、默认不在
+非 loopback 接口开端口（只有操作员显式配置 `Host.relayBind` 才会）、到不了
+任意主机。被转发的是一个单一 origin、白名单、实例作用域的应用请求，字节走
+已经授权、已经审计的链路。
+
 
 ## 8. 主 agent 的 MCP / CLI 控制面
 

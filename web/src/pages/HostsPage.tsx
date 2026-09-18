@@ -4,6 +4,7 @@ import {
   AddHostForm,
   HostLaunchDefaults,
   HostProviderBinding,
+  absentCli,
   cliSummary,
   hostRegistry,
   installedCli,
@@ -217,7 +218,9 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
         <div>
           <div className={css.sectionLabel}>CLI · 按本机盘点，绝对路径 + 版本</div>
           <div className={css.cliTable}>
-            {installedCli(host.cli).length === 0 ? <div className={css.cliRow}>尚无盘点</div> : null}
+            {installedCli(host.cli).length === 0 && absentCli(host.cli).length === 0 ? (
+              <div className={css.cliRow}>尚无盘点</div>
+            ) : null}
             {installedCli(host.cli).map((cli) => (
               <div key={`${cli.kind}:${cli.path}`} className={css.cliRow} data-testid="host-cli">
                 <span className={css.cliKind}>
@@ -231,9 +234,25 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
                   {cli.auth}
                 </span>
                 <span className={css.cliVer} data-testid="host-cli-flags">
-                  {cli.installed === false ? "未安装" : "已安装"}
+                  已安装
                   {cli.kind === "claude" ? ` · nativeGateway ${cli.nativeGateway || cli.auth === "gateway-native" ? "true" : "false"}` : ""}
                 </span>
+              </div>
+            ))}
+            {/* A reported-absent row has no path to print, so `installedCli`
+                (correctly) drops it; it still needs a row here, or "未安装"
+                is unreachable and the host reads as if it never answered
+                (ui-spec §2.6). */}
+            {absentCli(host.cli).map((cli) => (
+              <div key={`${cli.kind}:absent`} className={css.cliRow} data-testid="host-cli">
+                <span className={css.cliKind}>{cli.kind}</span>
+                <span className={css.cliPath} />
+                <span className={css.cliVer} />
+                <span className={css.cliAuth}>
+                  <span className={css.dotUnknown} />
+                  {cli.auth}
+                </span>
+                <span className={css.cliVer} data-testid="host-cli-flags">未安装</span>
               </div>
             ))}
           </div>

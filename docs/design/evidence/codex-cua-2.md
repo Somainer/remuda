@@ -169,9 +169,32 @@ Two things were checked rather than assumed:
   `computer-use 2.7.0`, pinned by
   `labels an installed row without eating the kind in cliSummary`.
 - **A reported-absent row does not pollute the installed list.**
-  `installedCli` already filters rows with neither path nor version, so an
-  absent row is dropped from `cliSummary` and from New Session's
-  `supportedKinds` — it can never become a launchable harness kind.
+  `installedCli` drops it, so it can never reach `cliSummary` or New Session's
+  `supportedKinds`.
+
+`installedCli` needed a real fix here, and ui-spec §2.6 calls it out by file
+and line. Its old filter was `Boolean(entry.path || entry.version)`, which
+silently discarded exactly the row this task exists to report — a
+reported-absent CLI has neither path nor version, so "未安装" could never have
+been drawn at all. It now reads `installed` when the Node sent one and falls
+back to the path/version heuristic only for a Node that predates the flag
+(which is "not reported", a third thing again). Both sides are pinned:
+
+| | `installedCli` | `absentCli` |
+|---|---|---|
+| `installed: true` | in | out |
+| `installed: false` | out | in |
+| no flag, has path/version | in | out |
+| no flag, bare | out | out |
+
+A reported-absent row also gets its own row in the `/hosts/:hostId` CLI table
+(`HostsPage`), since the installed list it used to live in can no longer carry
+it and a row that vanishes reads as if the host never answered.
+
+`computer-use` cannot become a launchable harness kind: New Session tests
+membership against the harness ids (`claude`/`codex`/`grok`/`agy`/`terminal`),
+and the capability is not one of them — pinned by
+`cannot turn the capability row into a launchable harness kind`.
 
 Fixtures carry all three states: `devbox-sg` installed, `devbox` absent,
 `runtime-local` / `forge-doloris` omitting the row.
@@ -185,16 +208,45 @@ Fixtures carry all three states: `devbox-sg` installed, `devbox` absent,
 | Rust unit (`hostcap.rs`) | reported-installed / reported-absent / unreported row shaping |
 | Rust integration (`dispatch_cli.rs`) | `remuda hostcap` against a real Hub + fake Node → `computerUse.reported == false` |
 | Rust integration (`wss.rs`) | the row survives a real WSS hello → Hub store → `/v1/hosts` round trip |
-| vitest (`model.test.ts`) | the three states; `cliSummary` label survival; absent row dropped |
+| vitest (`model.test.ts`) | the three states; `cliSummary` label survival; `installedCli`/`absentCli` truth table; not a launchable kind |
 | vitest (`HostDiagnostics.test.tsx`) | the three rendered states, incl. no "未安装" claim when unreported |
 
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test -p remuda-node`, `pnpm typecheck` and `vitest run` (1122 tests) were
-run on this branch.
+`cargo test -p remuda-node` (31 suites, 0 failures), `pnpm typecheck` and
+`vitest run` (1125 tests) were run on this branch, all green.
+
+The full web hub e2e suite was run on this branch as well. One run reported
+**113 passed / 0 failed / 16 skipped** (`rc=0`); the re-run after rebasing onto
+a newer main reported **111 passed / 1 failed**, the single failure being
+`ux-code.hub.spec.ts:158` — `locator.screenshot: Element is not attached to the
+DOM` while capturing an evidence screenshot of the code-block workbench.
+
+That spec is a flake and not attributable to this change, on three grounds:
+
+- the **identical spec at the identical line passed** in the earlier run
+  (`✓ 62 … (8.8s)`) and failed in the later one (`✘ 62 … (8.4s)`), on a tree
+  whose difference for that spec is nil;
+- the failure is a virtualized-row detaching mid-`screenshot()`, which is a
+  timing class of failure, not an assertion about behaviour;
+- the spec touches host inventory only to read `hostId` / `maxInstances` from
+  `/v1/hosts` (`ux-code.hub.spec.ts:41-62`) — it never reads `cli[]`, which is
+  the only surface this change alters.
+
+It was re-run in isolation to confirm; its result is recorded here rather than
+smoothed over.
 
 No Hub e2e spec was added for this row: `crates/remuda-hub/examples/hub_e2e.rs`
 is owned by `c-cua-media` (plan §6 risk 6), and coverage here is unit +
 component by design.
+
+### Run hygiene
+
+Hub e2e runs here use this worker's assigned ports
+(`HUB_E2E_LISTEN=127.0.0.1:59030`, `HUB_E2E_WEB_PORT=59039`,
+`HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59031`). `58980/58989/58981` are the
+**remote gate's own** ports; two earlier runs on them were voided by collision
+with a live gate (`connect ECONNREFUSED 127.0.0.1:58980` mid-suite), and their
+results are not used here.
 
 ## Dependency
 

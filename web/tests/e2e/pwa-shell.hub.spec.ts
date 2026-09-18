@@ -187,6 +187,30 @@ test("a redeployed shell renders on reload with no 404 and no HTML for the modul
       expect(r.status, `${r.url} status`).toBe(200);
       expect(r.type, `${r.url} content-type`).not.toContain("text/html");
     }
+
+    // 4 — the live document must actually refresh the cached shell. The v2
+    // worker is installed but waiting (no skipWaiting), so the v1 worker still
+    // owned that reload navigation: its own cache copy of /index.html must now
+    // be the v2 shell. If the network-first handler clones the response after
+    // respondWith consumes its body, clone() throws into the .catch and the v1
+    // bytes stay frozen here, silently disabling the offline-shell refresh.
+    await expect
+      .poll(
+        async () =>
+          await page.evaluate(async (name) => {
+            const cache = await caches.open(name);
+            const res = await cache.match("/index.html");
+            return res ? await res.text() : null;
+          }, cacheNameForBuild("v1")),
+        { timeout: 10_000 },
+      )
+      .toContain("app-2222bbbb.js");
+    const refreshedShell = await page.evaluate(async (name) => {
+      const cache = await caches.open(name);
+      const res = await cache.match("/index.html");
+      return res ? await res.text() : "";
+    }, cacheNameForBuild("v1"));
+    expect(refreshedShell).not.toContain("app-1111aaaa.js");
   } finally {
     if (hub) await stopChild(hub);
     await rm(dir, { recursive: true, force: true });

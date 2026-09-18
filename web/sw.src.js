@@ -43,15 +43,20 @@ self.addEventListener("fetch", (event) => {
       (async () => {
         try {
           const fresh = await fetch(event.request);
-          // Refresh the cached shell only from a good document, after the
-          // response is already promised: a 502 must never become the offline
-          // shell, and a write that rejects (quota, 206, storage error) happens
-          // in waitUntil rather than discarding the document just delivered.
+          // Refresh the cached shell only from a good document. The clone must
+          // be taken NOW, before fresh is returned to respondWith: afterwards
+          // the browser locks the body to stream the document, and a clone()
+          // deferred into the caches.open callback throws (the .catch below
+          // would silently freeze the cached shell on the old bytes). A 502
+          // must also never become the offline shell, and a write that rejects
+          // (quota, a 206, a storage error) stays inside waitUntil rather than
+          // discarding the document the network just delivered.
           if (fresh.ok) {
+            const copy = fresh.clone();
             event.waitUntil(
               caches
                 .open(CACHE)
-                .then((cache) => cache.put("/index.html", fresh.clone()))
+                .then((cache) => cache.put("/index.html", copy))
                 .catch(() => undefined),
             );
           }

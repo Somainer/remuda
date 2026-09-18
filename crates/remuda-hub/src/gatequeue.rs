@@ -807,6 +807,13 @@ async fn fail_rpc(state: &AppState, job_id: &str, error: &Value) {
             if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
                 return None;
             }
+            // The lane's `gate.run` RPC stays outstanding across a `pushFrom:
+            // home` handoff, so a lane disconnect or timeout can land here
+            // while the home host is mid-push. Stand down: land_from_home owns
+            // the terminal write and records the honest outcome.
+            if row.home_land_in_flight {
+                return None;
+            }
             row.state = GateJobState::Failed;
             row.finished_at = Some(now_ts());
             row.reason = Some(message.lines().next().unwrap_or(&message).to_owned());
@@ -918,6 +925,13 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
         .store
         .mutate_gate_job(job_id, move |row| {
             if is_canceling {
+                // The lane's `gate.run` RPC stays outstanding across a
+                // `pushFrom: home` handoff. If a home push is in flight, stand
+                // down: land_from_home owns the terminal write and records the
+                // honest outcome (landed if it pushed, canceled otherwise).
+                if row.home_land_in_flight {
+                    return None;
+                }
                 // Record the terminal evidence, then resolve the cancel.
                 for step in &result.steps {
                     match row
@@ -1209,6 +1223,11 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
             HOME_LAND_TIMEOUT,
         )
         .await;
+    // Whether the Hub actually knows the push outcome. A read reply (landed /
+    // base-moved / the home host's own failure) is definitive; a timeout or an
+    // unreachable host is not — the push may have completed after we gave up,
+    // so we must not assert main did not move.
+    let mut push_outcome_unknown = false;
     let landed: remuda_protocol::GateLandResult = match reply {
         Ok(Some(frame)) => match frame.get("result") {
             Some(value) => {
@@ -1235,18 +1254,24 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
         },
         // An unreachable home host leaves the verify pinned and landable by
         // hand; it is never a silent success.
-        Ok(None) => remuda_protocol::GateLandResult {
-            job_id: job_id.to_owned(),
-            status: "failed".into(),
-            error: Some("home host is not connected; nothing was pushed".into()),
-            ..Default::default()
-        },
-        Err(error) => remuda_protocol::GateLandResult {
-            job_id: job_id.to_owned(),
-            status: "failed".into(),
-            error: Some(format!("gate.land failed: {error}")),
-            ..Default::default()
-        },
+        Ok(None) => {
+            push_outcome_unknown = true;
+            remuda_protocol::GateLandResult {
+                job_id: job_id.to_owned(),
+                status: "failed".into(),
+                error: Some("home host is not connected; push outcome is unknown".into()),
+                ..Default::default()
+            }
+        }
+        Err(error) => {
+            push_outcome_unknown = true;
+            remuda_protocol::GateLandResult {
+                job_id: job_id.to_owned(),
+                status: "failed".into(),
+                error: Some(format!("gate.land did not return: {error}")),
+                ..Default::default()
+            }
+        }
     };
     let status = landed.status.clone();
     let outcome = state
@@ -1264,7 +1289,9 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
             // A `landed` result is still authoritative — main moved, so record
             // `landed` and note the cancel arrived too late (mirrors the
             // apply_result pushFrom-lane branch: honesty over tidiness). Any
-            // other outcome pushed nothing, so honour the cancel: `canceled`.
+            // other outcome ends `canceled`, keeping the land's own evidence;
+            // when the push outcome is unknown (timeout / unreachable) we say
+            // so rather than assert main did not move.
             if row.state == GateJobState::Canceling {
                 if landed.status == "landed" {
                     row.state = GateJobState::Landed;
@@ -1275,9 +1302,21 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
                 } else {
                     row.state = GateJobState::Canceled;
                     row.finished_at = Some(now_ts());
-                    row.current_main_sha = landed.current_main_sha.clone();
-                    row.error = Some("canceled; the home host did not push main".into());
-                    row.reason = Some("canceled; not landed".into());
+                    row.current_main_sha = landed
+                        .current_main_sha
+                        .clone()
+                        .or(row.current_main_sha.clone());
+                    let base = landed
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("home-host land ended: {}", landed.status));
+                    if push_outcome_unknown {
+                        row.error = Some(format!("canceled; push outcome unknown: {base}"));
+                        row.reason = Some("canceled; push outcome unknown".into());
+                    } else {
+                        row.error = Some(format!("canceled; not landed: {base}"));
+                        row.reason = Some("canceled; the home host did not push main".into());
+                    }
                 }
                 return Some(());
             }
@@ -1541,6 +1580,10 @@ pub(crate) async fn reconcile(state: &AppState) {
         let _ = state
             .store
             .mutate_gate_job(job.id.as_id().as_str(), |row| {
+                // The home push (if any) did not survive the restart: no task
+                // is holding it, so clear the marker or it would wedge the
+                // cancel grace forever on a re-queued or re-cancelable job.
+                row.home_land_in_flight = false;
                 if row.state == GateJobState::Canceling {
                     // A cancel was already requested; do not silently drop it
                     // back into the queue. Finish it canceled.

@@ -1178,14 +1178,19 @@ async fn cancel_during_a_home_push_that_lands_reports_landed() -> Result<()> {
             ..RunSpec::default()
         },
     );
+    // Register the land-started waiter *before* enqueuing: `notify_waiters`
+    // keeps no permit, so a waiter created after the push starts would miss it
+    // and hang until the 8 s timeout. `enable()` arms the future now.
+    let started = ctx.scripts[1].land_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+
     let job = ctx
         .enqueue(json!({"branch":"wt/a/cancel-midpush","mode":"land","laneId":"lane1"}))
         .await;
     let id = job["id"].as_str().unwrap();
 
     // Wait until the home push has genuinely started, then cancel into it.
-    let started = ctx.scripts[1].land_started.notified();
-    tokio::pin!(started);
     tokio::time::timeout(Duration::from_secs(8), &mut started)
         .await
         .expect("home push should start");
@@ -1237,6 +1242,92 @@ async fn cancel_during_a_home_push_that_lands_reports_landed() -> Result<()> {
     Ok(())
 }
 
+/// A hub restart during a home push must not leave `homeLandInFlight` stuck:
+/// reconcile finishes the (canceling) job canceled and clears the flag, so the
+/// cancel grace is not wedged forever afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_during_a_home_push_does_not_wedge_the_cancel_grace() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        2,
+        |body| {
+            body["gate"]["lanes"][0]["pushFrom"] = json!("home");
+            body["gate"]["lanes"][0]["fetchRemote"] = json!("lane-alias");
+        },
+        |config| config.gate_cancel_grace_ms = 200,
+    )
+    .await?;
+    let response = ctx
+        .http
+        .patch(format!(
+            "http://{}/v1/projects/{}",
+            ctx.hub.addr, ctx.project
+        ))
+        .bearer_auth(&ctx.token)
+        .json(&json!({"homeHost": ctx.hosts[1]}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200, "{:?}", response.text().await);
+
+    // Hold the home push open so the job sits with homeLandInFlight set.
+    let release = Arc::new(Notify::new());
+    *ctx.scripts[1].land_gate.lock().unwrap() = Some(release.clone());
+    let started = ctx.scripts[1].land_started.notified();
+    tokio::pin!(started);
+    started.as_mut().enable();
+
+    ctx.scripts[0].script(
+        "wt/a/restart-midpush",
+        RunSpec {
+            status: "passed",
+            merge_sha: Some("3333333333333333333333333333333333333333"),
+            merge_ref: Some("refs/remuda/gate/pinned"),
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/restart-midpush","mode":"land","laneId":"lane1"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(8), &mut started)
+        .await
+        .expect("home push should start");
+
+    // Cancel into the in-flight push: the job is now `canceling` with the flag
+    // set. The grace alone must not finalize it (push still owns it).
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(
+        ctx.job(id).await["state"],
+        "canceled",
+        "the grace must not finalize while the push is in flight"
+    );
+
+    // Restart reconcile runs (as a real restart would): it must finish the job
+    // canceled and clear the stuck flag rather than leave it canceling forever.
+    ctx.hub.test_reconcile().await;
+    let done = ctx.wait_state(id, &["canceled", "landed", "failed"]).await;
+    assert_eq!(
+        done["state"], "canceled",
+        "reconcile finishes a canceling job canceled: {done}"
+    );
+    // The flag is gone: the job is terminal and never serializes the marker
+    // (skip_serializing_if), so a wedged grace is impossible.
+    assert!(
+        done.get("homeLandInFlight").is_none(),
+        "homeLandInFlight is cleared on reconcile: {done}"
+    );
+    Ok(())
+}
+
+/// A run reply that arrives only after the cancel grace has expired changes
+/// nothing: the scheduler already finished the job `canceled`, no push ever
 /// happened, and the late `passed` verdict is ignored rather than applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_run_reply_after_the_cancel_grace_changes_nothing() -> Result<()> {

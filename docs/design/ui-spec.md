@@ -246,8 +246,8 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 ### 2.2 会话页 · 结构化视图 `/s/:instanceId`
 
 ```
-┌  ← 列表   sfe-root / spill  · bolt · claude-print · passthrough/…  ● working   [结构] [■ 停止]
-│  ● bolt  ·  $0.12  ·  ▸ 运行详情
+┌  ← 列表   sfe-root / spill · claude · passthrough/… · bolt · $0.12  ● working   [结构] [■ 停止]
+│  ▸ 运行详情
 ├──────────────────────────────────────────────┬──────────────────┐
 │  You                                      12:01                  │
 │  看 TaskManager spill 这段为啥抖                                │
@@ -276,20 +276,21 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 │  输入提示词…                                    [送出]  权限:询问 │
 └─────────────────────────────────────────────────────────────────┘
 
-「运行详情」展开后（主行不变，第二行变为）：
-│  ● bolt  ·  $0.12  ·  ▾ 运行详情
+「运行详情」展开后（主行不变，第二行的 `▸` 翻成 `▾`，其内容展开）：
+│  ← 列表   sfe-root / spill · claude · passthrough/… · bolt · $0.12  ● working   [结构] [■ 停止]
+│  ▾ 运行详情
 │    driver claude-print · delegation none · provider passthrough · lifecycle ready
 │    seq 184 · connectivity connected · native claude:1a2b · transcript 绑定 hook
 ```
 
 **两行 header（D-040，修订 §11.7 冲突「P0-5」）**
 
-主行 = `← 返回` + `space / 标题` + `harness` + `model` + 状态点 + `terminal|structured` 分段 + Stop。诊断不占主行，但下面的元素**必须留在可见主行**，因为它们回答「这场能不能继续」，不是诊断：
+主行 = `← 返回` + `space / 标题` + `harness` + `model` + `主机芯片` + `cost` + 状态点 + `terminal|structured` 分段 + Stop。诊断不占主行，但下面的元素**必须留在可见主行**，因为它们回答「这场能不能继续」，不是诊断：
 
 - **主机芯片**（§1.3 要求顶栏有主机/项目芯片）。
 - **cost 累积**（§2.2「Usage / cost」要求顶栏 cost；未知标「—」）。
 
-其余诊断字段（`driver` / `delegation` / `provider` / `providerSourceHint` / `lifecycle` / `seq` / `connectivity` / `native` / promoted `transcript 绑定`）进第二行的 **「运行详情」disclosure**：默认收起，展开态**按设备持久化**（本设备 `localStorage`，同 §1.4 的显示名/顺序口径，不跨设备同步）。收起时用 `▸`/`▾` 与可见计数提示「有 N 项运行信息」，不隐藏到无从发现。`session-meta` testid 保留在展开内容上（老断言迁移只需展开一步）。
+其余诊断字段（`driver` / `delegation` / `provider` / `providerSourceHint` / `lifecycle` / `seq` / `connectivity` / `native` / promoted `transcript 绑定`）进第二行的 **「运行详情」disclosure**：第二行**只有这一个触发器**（`▸ 运行详情`，无其他 token），默认收起，展开态**按设备持久化**（本设备 `localStorage`，同 §1.4 的显示名/顺序口径，不跨设备同步）。收起时用 `▸`/`▾` 与可见计数提示「有 N 项运行信息」，不隐藏到无从发现。`session-meta` testid 保留在展开内容上（老断言迁移只需展开一步）。
 
 紧凑（compact）下不新增第三层：「运行详情」在 compact 同样只有一行触发器，展开后按宽度换行。原来「手机字号小于桌面字号」的问题随字号统一（§3.4）消失。
 

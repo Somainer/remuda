@@ -1,19 +1,21 @@
 # workbench UX 报告 · 规格修订（D-038…D-042）
 
-2026-09-19 · `wt/c-uxspec/b-uxspec-md` · 任务 c-uxspec（[workbench-ux-plan.md](../workbench-ux-plan.md) §(B) 1）
+2026-09-19 · `wt/c-uxspec/b-uxspec-md` · 任务 c-uxspec（coordinator dispatch plan workbench-ux, 2026-09-19, section (B) task 1）
 
 本任务只改文档，目的是解除 [workbench-ux-improvement-2026-09.md](../workbench-ux-improvement-2026-09.md) §11.7 列出的「规格与实施单互相矛盾」，使后续实施单不再与 [ui-spec.md](../ui-spec.md) 自相矛盾。**不实施任何代码**，`web/` 与 `crates/` 零改动。
+
+派工计划本身**不在仓库里**（[workbench-ux-plan.md](../workbench-ux-plan.md) 是 2026-09-14 的 A–G 执行计划，没有 (B)/(C) 两节），因此本文件按名字引用它、不建链接；每条决策的**理由**一律指向报告 §11.x 的对应行。
 
 ## 1. 交付物
 
 | 文件 | 变化 |
 |---|---|
-| `docs/design/workbench-ux-improvement-2026-09.md` | 新增（源报告入库）。除 §4 列出的四处外与源文件逐字节相同 |
+| `docs/design/workbench-ux-improvement-2026-09.md` | 新增（源报告入库）。除 §4 列出的七处外与源文件逐字节相同 |
 | `docs/design/ui-spec.md` | 六处修订，见 §2 |
-| `docs/design/decisions.md` | 追加 D-038…D-042，见 §3 |
+| `docs/design/decisions.md` | 追加 D-038…D-042（含顶部索引行），见 §3 |
 | `docs/design/evidence/ux2026-spec-1.md` | 本文件 |
 
-源报告入库时按任务要求把 §11.3 行 423 的个人 workspace 名（原 `remuda-sg`）替换为中性占位 `<workspace>`；同一行的雇主名一并换成 `<workspace-2>`（理由见 §4）。已验证其余各行与源文件完全一致（`diff` 去掉行 423 后只余 §4 记录的三处）。
+源报告入库时按任务要求把 §11.3 行 423 的个人 workspace 名替换为中性占位 `<workspace>`；同一行的非产品名一并替换（理由见 §4）。**修订第二轮**又把全篇其余的个人标识（机器名）中性化。已验证除 §4 记录的各处外，其余各行与源文件逐字节相同。
 
 ## 2. `ui-spec.md` 逐条：旧文 → 新文 → 对应 §11.7 冲突行
 
@@ -86,18 +88,28 @@
 | **D-041** | 工具卡默认折叠的豁免集合与折行最小信息量 | P1-10 / P1-20 |
 | **D-042** | 手机 composer 单行 + 选项 sheet 的边界：触发器带 mode 词与档名，三态与诚实标注留在外面 | P0-3 |
 
-## 4. 源报告的四处修正
+## 4. 源报告的七处修正
 
-报告入库后只改下面四处：任务指定的 §11.3 行 423 占位替换，外加 §11.6 的两处措辞与 §11.7 的一处行号。`diff` 去掉行 423 后只余这三处。
+报告入库后只改下面七处。前三处由任务书的散文授权；其余三处由**派工计划的 ownership 与风险 8** 授权——计划把 `docs/design/workbench-ux-improvement-2026-09.md` 划给本任务独占（「**独占文件**：…`docs/design/workbench-ux-improvement-2026-09.md`（仅修 §11.6 两处措辞与 §11.7 的 `:233`→`:235` 行号）」），风险 8 写明「报告自身有过期处…**c-uxspec 顺手修**，避免后续 worker 照抄错行号」；行 423 的隐私占位由任务书第一段直接指定。两处「只能改行 423」与「顺手修 §11.6/§11.7」的关系是：行 423 之外**仅**计划点名的那三处可动，本表即其完整清单。
+
+**隐私占位（修订第二轮，协调者 handback 第 1 项）**
 
 | 位置 | 旧文 | 新文 |
 |---|---|---|
-| §11.3 行 423 | workspace 芯片 `remuda-sg` / 雇主名 / `hybrid-harness` | **`<workspace>` / `<workspace-2>` / `hybrid-harness`**（个人 workspace 名与雇主名都换中性占位；`hybrid-harness` 是仓库自身目录名，D-001，保留） |
-| §2.3 | `.meta { font-size: 10.5px }`，低于 tokens「重要状态不低于 12px」（`tokens.css --text-label: 11px` 注释） | `.meta` **桌面 11px / 手机 10.5px**（基础值 `session.module.css:153-159`，10.5px 只在手机媒体查询里），两者都低于 type scale 的 12px 下限（`tokens.css:52-53` 块头注释，**不是** `--text-label` 自己的注释） |
+| §8.1 / §8.1 / §11.5 各一处（行 298 / 299 / 452） | 所有者真实机器名（Moshi Desktop「Machines」卡与已连接顶栏引用的主机名） | `<workstation>` |
+| §11.3 行 423 | 一组 workspace 芯片名，含个人 workspace 名与非产品名 | `<workspace>` / `<workspace-2>`（`hybrid-harness` 保留：仓库自身目录名，D-001） |
+
+全篇再扫一遍的结论：机器名只有上述三处（同一字符串），个人 workspace 名只有行 423 一处，路径（`/home/…`、`/Users/…`）零处。其余出现的专名（`astergate`、`GravityDB`、`hybrid-harness`、`remuda-dev`）在 `origin/main` 的既有文档与代码里都有先例（例如 `GravityDB` 在 `crates/remuda-signal/` 的 fixtures 与 `web/` 的测试里），不是本次引入的个人标识，按原样保留。
+
+**计划 §11.6 / §11.7 的措辞与行号**
+
+| 位置 | 旧文 | 新文 |
+|---|---|---|
+| §2.3 | 手机 `.meta` 10.5px 一句，把 12px 下限归给 `--text-label` 的注释 | `.meta` **桌面 11px / 手机 10.5px**（基础值 `session.module.css:153-159`，10.5px 只在手机媒体查询里），两者都低于 type scale 的 12px 下限（`tokens.css:52-53` 块头注释，**不是** `--text-label` 自己的注释） |
 | §5-P0-2 | `.meta` 10.5px → ≥12px；`.back` 20px → `--touch` | `.meta` 桌面 11px / 手机 10.5px → 统一 `var(--text-aux)`；`.back` 20px 字形 → 配 44×44 `::after` 热区（**不是**把字形撑到 44px） |
 | §11.7 P0-5 行 | 「第 **233** 行就是 `seq 184 · connectivity=connected · $0.12`」 | 「第二行（修订前是第 **235** 行，本节此前误写作 233）就是 …」 |
 
-**为何行 423 要换两个名字**：任务点名的「`remuda-sg` 与 `hybrid-harness` 之间的个人 workspace 名」是 `remuda-sg`；同一处并列的中间名是雇主名，命中 `scripts/ci/private-tokens.sha256` 的哈希 denylist —— 留着它会使提交内容被 `scripts/ci/secret-scan.sh` 判为私有令牌（已实测：不改则扫描失败，改成占位后 PASS）。两个名字都是同一份列表里的同一类内容，按任务对行 423 的意图一并中性化，不触碰报告其余任何一行。
+**行 423 为何连非产品名一起换**：非产品名命中 `scripts/ci/private-tokens.sha256` 的哈希 denylist —— 留着它会使提交内容被 `scripts/ci/secret-scan.sh` 判为私有令牌（已实测：不改则扫描失败，改成占位后 PASS）。该名与任务点名的个人 workspace 名并列在同一份芯片列表里、属同一类内容，故按任务对行 423 的意图一并中性化。
 
 已核对：`tokens.css:52-53` 是 `/* Type scale (P1-3): body 14, inputs/emphasis 16, aux 12-13, labels 11.` / `Important status never relies on sub-12 px text. */`，而 `--text-aux` / `--text-label` / `--touch` 分别在 `:57` / `:58` / `:68`——两处措辞的更正都成立。
 
@@ -113,9 +125,10 @@
 
 | 检查 | 结果 |
 |---|---|
-| 源报告逐行比对 | `diff` 去掉 §11.3 行 423 后，与 `/tmp/remuda-agents/briefs/src/workbench-ux-improvement-2026-09.md` 只余 §4 记录的三处（§2.3 / §5-P0-2 / §11.7 P0-5 行）；其余逐字节相同 |
-| 个人标识 | 行 423 的三个 workspace 芯片名里，两个非产品名（个人 workspace 名与雇主名）已替换为中性占位 `<workspace>` / `<workspace-2>`，`hybrid-harness` 保留（仓库自身的目录名，D-001）；提交内容其余部分只含机器名（`bolt` / `devbox-sg`）与产品名，均为仓库既有文档中的既有写法 |
-| `scripts/ci/secret-scan.sh` | PASS — 无私有令牌命中（行 423 的雇主名是本次替换的触发原因） |
-| `scripts/ci/no-tunnel-scan.sh` | PASS — 两份新文档对 D-031 的禁用 token 集合零匹配（本文件表格内不重复拼写这些 token，避免扫描器命中自身） |
-| 文档内引用一致性 | `ui-spec.md` 新增段落引用的 ADR 编号与 `decisions.md` 新增条目一一对应；§2 表格里的「旧文」逐字取自修订前文件 |
+| 源报告逐行比对 | `diff` 去掉 §4 列出的七处后，与 `/tmp/remuda-agents/briefs/src/workbench-ux-improvement-2026-09.md` 逐字节相同 |
+| 个人标识 | 修订第二轮已全篇清扫：机器名三处 → `<workstation>`，行 423 的非产品名 → `<workspace-2>`，个人 workspace 名 → `<workspace>`；路径零处。其余专名（`astergate` / `GravityDB` / `hybrid-harness` / `remuda-dev`）在 `origin/main` 有先例，按原样保留。**注意：哈希 denylist 不覆盖机器名，所以扫描通过不等于清场**——本次是逐个对照 `origin/main` 的先例判断的 |
+| `scripts/ci/secret-scan.sh` | PASS — 无私有令牌命中 |
+| `scripts/ci/no-tunnel-scan.sh` | PASS — 新入库的文档对 D-031 的禁用 token 集合零匹配（本文件表格内不重复拼写这些 token，避免扫描器命中自身） |
+| 文档内引用一致性 | `ui-spec.md` 新增段落引用的 ADR 编号与 `decisions.md` 新增条目（含顶部索引行）一一对应；§2 表格里的「旧文」逐字取自修订前文件（已用 `git show <first-commit>:docs/design/ui-spec.md` 逐条比对） |
+| `ui-spec.md` §2.2 图文一致 | 线框（§2.2 首行 + `▸ 运行详情` 行）与 D-040 正文（主行含 host 芯片 + cost，第二行只有触发器）逐 token 对齐；展开态插图同改 |
 | 全量 web hub e2e | 见本任务 DONE 前的运行记录（docs-only 分支，用于确认没有连带回归） |

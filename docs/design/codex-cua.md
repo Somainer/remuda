@@ -98,7 +98,7 @@ native home 是不是 Remuda 管的」，逐 kind 定义如下**：
 |---|---|---|
 | claude | 作用域 config dir（`<instance>/native-home` 或 `REMUDA_CLAUDE_CONFIG_DIR` 或显式 `claudeConfigDir`）；**继承的 `~/.claude` 不算受管** | 受管 → 写；继承 → **不写** |
 | codex | `<launch_dir>/codex-home`（始终受管，`shadow.rs:110-168`） | **不写**（见下） |
-| grok | `<launch_dir>/grok-home`（始终受管，`shadow.rs:172-220`） | **不写**（见下） |
+| grok | `<launch_dir>/grok-home`（始终受管，`shadow.rs:173-223`） | **不写**（见下） |
 
 **codex / grok 本批只有腿 (b)，而这是对事实的承认，不是省事。** **仓库里没有任何
 东西、skill 里也没有任何东西表明 codex 或 grok 会读一个 skills 目录**：`skills/` 这个
@@ -294,7 +294,7 @@ elicitation 走 **MCP 协议本身**；codex shadow 的 `hooks.json` 只注册
 
 把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。前置是**每个
 harness 各造一个 producer**，把它的 MCP `elicitation/create` 抬进 interaction bus
-——**不需要新的 `InteractionCarrier` 取值**：`crates/remuda-protocol/src/enums.rs:241-247`
+——**不需要新的 `InteractionCarrier` 取值**：`crates/remuda-protocol/src/enums.rs:242-249`
 已经有七个（`ClaudeControl` / `ClaudeHook` / `HarnessHook` / `CodexRpc` / `AcpRpc` /
 `NativeTty` / `Unsupported`），要用的那个**按 harness 选**：
 
@@ -376,7 +376,7 @@ D-045 的 bypass 拒绝 +「只批准点名应用」是唯一的边界，且**�
 | 方案 | 判定 | 理由（可核查） |
 |---|---|---|
 | **(i) 拷进操作员的 `~/.claude/skills`** | **拒绝** | 违反 `overlay.rs:25-28`（唯一被写的文件在 `<instance dir>/launch/` 下），且把一次主机变更泄漏进**每一个**会话——不管该会话有没有申请能力。 |
-| **(ii) 物料化进受管 per-instance home** | **采纳**（§3.2） | 只在该会话、只在该 home 受管时发生；继承来的操作员 home 只读不写。codex/grok 今天也终于有了投递路径。 |
+| **(ii) 物料化进受管 per-instance home** | **采纳**（§3.2），**但只对 claude 生效** | 只在该会话、只在该 home 受管时发生；继承来的操作员 home 只读不写。**codex / grok 不由这条腿投递**：它们没有 skills 目录的读者，本批只拿腿 (iii) 的 per-instance MCP config（§3.2）。 |
 | **(iii) per-instance MCP config（argv / shadow toml）** | **采纳**（§3.3） | 复用早已在白名单里的 `--mcp-config`（`flags.rs:64,82,89`）；不改协议；digest 进 launch 审计；`--strict-mcp-config` 不发，所以 agent 自己的 server 仍在。 |
 | 「把 `.claude/skills/codex-computer-use` 提交进仓库」 | **拒绝** | 把 skill 泄漏进每个项目的每个会话，给 codex/grok **零**东西，且无法按 launch 审计。便宜，但它便宜的正是最该花钱的地方。 |
 

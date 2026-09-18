@@ -99,6 +99,21 @@ pub(super) fn kind_name(kind: AgentKind) -> &'static str {
 const PICKER_FIELD: &str = "transcript";
 /// How often the unbound epoch rescans the slug dir for new candidates.
 const CANDIDATE_RESCAN: Duration = Duration::from_secs(3);
+/// A hook tier that has delivered no record for the foreground pid for this
+/// many polls no longer vouches for a live turn, so the screen's idle edge may
+/// lower busy (rule 6 stays in force while hooks are fresh). A small multiple
+/// of the 800 ms poll cadence — ≈ the web's 3 × 2 s hook-stall budget — rides
+/// a normal event gap (a long tool is quiet for tens of seconds) but releases
+/// a channel that has genuinely stopped: a deleted pinned relay, a stalled
+/// journal pump, or a session that finished without emitting a Stop hook.
+const HOOK_STALL_POLLS: u32 = 8;
+/// Polls between hook-silence probe runs (8 × 800 ms ≈ 6.4 s) — sparse, since a
+/// probe makes a bounded connect to the instance hook socket.
+const HOOK_SILENCE_PROBE_TICKS: u32 = 8;
+/// Consecutive idle screen polls required to lower busy once the hook tier is
+/// stale (3 × 800 ms ≈ 2.4 s). A finished turn shows a stable idle prompt on
+/// every poll; a single missed spinner repaint never closes a live tool.
+const SCREEN_IDLE_CONFIRM_POLLS: u32 = 3;
 
 /// Current promotion state. Transitions are journaled; steady state is silent.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -688,6 +703,41 @@ pub(super) struct ModelSync {
     pub(super) catalog: Option<remuda_protocol::ModelCatalogInfo>,
 }
 
+/// Decide the hook tier's veto strength over the screen's idle edge (rule 6,
+/// design §2.4/§2.6).
+///
+/// `turn_active` is the HookSession's boundary decision (`Some(true)` a live
+/// hook turn, `Some(false)` a hook-confirmed end, `None` no bound turn this
+/// poll); `ever_live` is the sticky "this epoch materialised a hook tier" bit;
+/// `fresh` is whether a hook record from the foreground pid arrived inside the
+/// freshness bound. Only a fresh, still-claimed turn holds the screen at
+/// `working`: a once-live channel that has gone quiet downgrades to
+/// [`HookHealth::Stalled`], letting the screen lower busy when it reads idle —
+/// the missing-Stop hole, without weakening hook precedence while hooks speak.
+fn hook_health_for(
+    turn_active: Option<bool>,
+    ever_live: bool,
+    fresh: bool,
+) -> remuda_screen::HookHealth {
+    use remuda_screen::HookHealth;
+    match turn_active {
+        Some(true) if fresh => HookHealth::Healthy,
+        Some(true) => HookHealth::Stalled,
+        Some(false) => HookHealth::NeverMaterialised,
+        None if ever_live && fresh => HookHealth::Healthy,
+        None if ever_live => HookHealth::Stalled,
+        None => HookHealth::NeverMaterialised,
+    }
+}
+
+/// Files the hook-silence diagnostic probes: the pinned relay the hook execs
+/// and the per-instance hook socket it connects to.
+#[derive(Clone, Debug)]
+pub(super) struct HookSilencePaths {
+    pub relay: std::path::PathBuf,
+    pub socket: std::path::PathBuf,
+}
+
 /// Spawn the per-instance promotion poller.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
@@ -715,6 +765,9 @@ pub(super) fn spawn(
     // The exact executable this launch exec'd, when Remuda launched one
     // (c-wfdrill2 B). `None` for a login shell.
     alias: Option<LaunchAlias>,
+    // Per-instance hook relay/socket paths for the silence diagnostic; absent
+    // on a launch with no hook tier.
+    silence_paths: Option<HookSilencePaths>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut promote = PromoteState::default();
@@ -734,6 +787,13 @@ pub(super) fn spawn(
         // stays live until that pid demotes or a hook confirms the turn end.
         let mut hook_ever_live = false;
         let mut last_status: Option<ScreenStatus> = None;
+        // Once the hook tier is merely *stale*, the screen decides the idle
+        // edge — but one sample is not proof: the emulator can miss the TUI's
+        // 1 s spinner repaint and read a single idle frame during a genuinely
+        // running, hook-quiet tool. Count consecutive idle polls and only lower
+        // busy after a stable idle; a finished turn reads idle every poll and
+        // confirms quickly, a flicker resets and never lowers.
+        let mut screen_idle_confirms: u32 = 0;
         // Last announced binding state, deduping lifecycle emission:
         // None = nothing announced yet this epoch.
         let mut announced: Option<String> = None;
@@ -743,6 +803,12 @@ pub(super) fn spawn(
         // promotion: a relaunched agent that hits the dialog again must not be
         // blocked by an answer spent on the previous foreground pid.
         let mut trust_attempted = false;
+        // Hook-silence diagnostic: probe at a slower cadence than the 800 ms
+        // screen poll, and journal only when the named reason changes, so the
+        // badge copy is an edge, never a per-tick record. `None` = not probed
+        // yet; `Some(None)` = healthy; `Some(Some(r))` = a failed check.
+        let mut silence_ticks: u32 = 0;
+        let mut last_silence: Option<Option<remuda_signal::hook_silence::HookSilenceReason>> = None;
         let mut tick = tokio::time::interval(PROMOTE_POLL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1010,9 +1076,12 @@ pub(super) fn spawn(
             // materialised a hook tier. That "ever materialised" bit is
             // sticky per epoch so a transient process-table miss cannot lower
             // the guard.
-            let turn_state = match (found.as_ref(), hooks.as_ref()) {
-                (Some(found), Some(hooks)) if found.pid > 0 => hooks.turn_active(found.pid),
-                _ => None,
+            let (turn_state, hook_last_seen) = match (found.as_ref(), hooks.as_ref()) {
+                (Some(found), Some(hooks)) if found.pid > 0 => (
+                    hooks.turn_active(found.pid),
+                    hooks.hook_last_seen(found.pid),
+                ),
+                _ => (None, None),
             };
             match turn_state {
                 Some(true) => hook_ever_live = true,
@@ -1024,13 +1093,44 @@ pub(super) fn spawn(
                 }
                 _ => {}
             }
-            let hook_health = match turn_state {
-                Some(true) => remuda_screen::HookHealth::Healthy,
-                Some(false) => remuda_screen::HookHealth::NeverMaterialised,
-                None if hook_ever_live => remuda_screen::HookHealth::Healthy,
-                None => remuda_screen::HookHealth::NeverMaterialised,
+            // Freshness bound: a hook turn that has sent no record within a
+            // small multiple of the poll cadence downgrades Healthy→Stalled so
+            // the screen can lower busy once the turn is actually over. A hook
+            // `Stop` (Some(false)) and a tier that never materialised are
+            // unchanged; only a stuck-but-once-live channel loses its veto.
+            let hook_fresh = hook_last_seen
+                .is_some_and(|at| at.elapsed() <= PROMOTE_POLL.saturating_mul(HOOK_STALL_POLLS));
+            let hook_health = hook_health_for(turn_state, hook_ever_live, hook_fresh);
+            let raw_status = screen_latch.update(&grid, hook_health);
+            // Once the hook tier is merely stale the OSC busy bit alone cannot
+            // end the turn: a long, hook-quiet tool reads that bit as idle
+            // while the TUI is still showing its spinner. Require BOTH that no
+            // spinner line is on screen this poll AND a run of consecutive such
+            // polls (a torn repaint never lowers; a finished turn — idle prompt
+            // on every poll — confirms within a couple of seconds). While hooks
+            // are fresh Healthy already holds Working, and a tier that never
+            // materialised lowers immediately exactly as before.
+            let spinner_present = remuda_screen::screen_live(&grid).is_some();
+            let status = if raw_status == Some(ScreenStatus::Idle)
+                && hook_health == remuda_screen::HookHealth::Stalled
+            {
+                if spinner_present {
+                    screen_idle_confirms = 0;
+                    Some(ScreenStatus::Working)
+                } else {
+                    screen_idle_confirms = screen_idle_confirms.saturating_add(1);
+                    if screen_idle_confirms >= SCREEN_IDLE_CONFIRM_POLLS {
+                        Some(ScreenStatus::Idle)
+                    } else {
+                        Some(ScreenStatus::Working)
+                    }
+                }
+            } else {
+                if raw_status != Some(ScreenStatus::Idle) {
+                    screen_idle_confirms = 0;
+                }
+                raw_status
             };
-            let status = screen_latch.update(&grid, hook_health);
             if let Ok(mut slot) = status_slot.lock() {
                 *slot = status;
             }
@@ -1053,6 +1153,61 @@ pub(super) fn spawn(
                 {
                     return;
                 }
+            }
+            // Why is the hook tier quiet? Only worth naming once the screen
+            // has actually decided the turn is idle: a running-but-hook-quiet
+            // tool still shows its spinner, and there "no events for a few
+            // seconds" is normal, not a broken channel (the plain amber note is
+            // enough). At the screen-decided end, probe — at a slow cadence —
+            // the relay, the socket and the link, and journal the first failed
+            // Node-side check only when it changes. A clean hook Stop leaves
+            // every check healthy (returns None), so no record is emitted.
+            if status == Some(ScreenStatus::Idle)
+                && !hook_fresh
+                && silence_paths.is_some()
+                && found.as_ref().is_some_and(|f| f.pid > 0)
+            {
+                silence_ticks = silence_ticks.saturating_add(1);
+                if silence_ticks >= HOOK_SILENCE_PROBE_TICKS
+                    && let Some(paths) = silence_paths.as_ref()
+                {
+                    silence_ticks = 0;
+                    let reason = remuda_signal::hook_silence::diagnose(
+                        Some(paths.relay.as_path()),
+                        paths.socket.as_path(),
+                        hook_last_seen,
+                        PROMOTE_POLL.saturating_mul(HOOK_STALL_POLLS),
+                    )
+                    .await;
+                    if last_silence != Some(reason) {
+                        last_silence = Some(reason);
+                        if let Some(reason) = reason {
+                            let (_, payload) = native(
+                                LifecycleTopic::Hook,
+                                "hook.silence",
+                                Knowledge::NotApplicable,
+                                "observed",
+                                BTreeMap::from([("reason".into(), reason.as_str().into())]),
+                                Severity::Info,
+                            );
+                            if emit(
+                                &events,
+                                &seq,
+                                &ctx,
+                                SourceChannel::Pty,
+                                Completeness::ScreenDerived,
+                                payload,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else if status != Some(ScreenStatus::Idle) {
+                silence_ticks = 0;
             }
             // The spinner status line is richer status than the busy bit:
             // verb, streamed token estimate, phrase and the interrupt hint.
@@ -1833,6 +1988,35 @@ mod tests {
             cwd: dir.to_path_buf(),
             claude_home: dir.to_path_buf(),
         }
+    }
+
+    #[test]
+    fn a_quiet_hook_tier_loses_its_screen_idle_veto_after_the_bound() {
+        use remuda_screen::HookHealth;
+        // A live hook turn with a fresh record keeps rule 6: the screen's idle
+        // edge is suppressed (the long-tool gap is real but hooks still speak).
+        assert_eq!(hook_health_for(Some(true), true, true), HookHealth::Healthy);
+        // The same live turn once no record has arrived within the bound drops
+        // to Stalled: the screen latch is allowed to lower busy from its own
+        // idle read, so agent_status idles even with no Stop hook.
+        assert_eq!(
+            hook_health_for(Some(true), true, false),
+            HookHealth::Stalled
+        );
+        // The sticky "ever materialised" guard downgrades the same way on a
+        // poll that cannot read the process table but knows hooks went quiet.
+        assert_eq!(hook_health_for(None, true, false), HookHealth::Stalled);
+        // A fresh sticky miss still holds, a hook-confirmed end never holds,
+        // and a tier that never materialised stays exactly that.
+        assert_eq!(hook_health_for(None, true, true), HookHealth::Healthy);
+        assert_eq!(
+            hook_health_for(Some(false), true, true),
+            HookHealth::NeverMaterialised
+        );
+        assert_eq!(
+            hook_health_for(None, false, false),
+            HookHealth::NeverMaterialised
+        );
     }
 
     fn write(path: &Path, body: &str) {

@@ -1244,6 +1244,15 @@ impl ShellPtyDriver {
                 self.options.target.agent_kind().map(|kind| {
                     crate::promote::LaunchAlias::new(kind, recipe.binary.abs_path.clone())
                 }),
+                // The relay this launch exec'd and its per-instance hook socket,
+                // so the poller can name why a quiet hook tier went silent.
+                self.options
+                    .hooks
+                    .as_ref()
+                    .map(|hooks| promotion::HookSilencePaths {
+                        relay: hooks.relay_binary.clone(),
+                        socket: hooks.instance_dir.join("hook.sock"),
+                    }),
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native

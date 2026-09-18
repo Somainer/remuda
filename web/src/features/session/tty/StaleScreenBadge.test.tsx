@@ -22,13 +22,16 @@ describe("stale screen badge", () => {
     expect(badge).toHaveTextContent("Node 连接不可用");
   });
 
-  it("claims only link loss for a reason code it does not know", () => {
-    // An unrecognised code must not be rendered as "the session ended" — that
-    // would tell an operator to give up on a session that may still be alive.
+  it("makes no claim about a reason code it does not know", () => {
+    // An unrecognised code must never be rendered as "the session ended" —
+    // that would tell an operator to give up on a session that may still be
+    // alive. Rendering nothing for it is the safe half of that rule.
     render(<StaleScreenBadge stale={{ ageMs: 1000, reason: "some-future-code" }} />);
     const badge = screen.getByTestId("tty-stale");
     expect(badge).not.toHaveTextContent("会话已结束");
+    expect(badge).not.toHaveTextContent("Node 连接不可用");
     expect(badge).toHaveTextContent("画面已停更");
+    expect(badge).toHaveAttribute("data-stale-reason", "some-future-code");
   });
 
   it("scales the age into the unit an operator would say out loud", () => {

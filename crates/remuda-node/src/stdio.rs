@@ -196,12 +196,16 @@ where
     let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     node.set_object_source(Arc::new(object_broker.source()));
     let (gate_tx, mut gate_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
-    // Long gate methods (run/then/land/unpin) park for minutes; serving them
-    // inline on the input arm freezes every outgoing pump below until the run
-    // ends. They run on their own task and their JSON-RPC reply rides this
-    // channel back to the single writer, interleaving with gate.event, tty and
-    // journal frames in any order.
-    let (long_tx, mut long_rx) = mpsc::channel::<Value>(JOURNAL_QUEUE_CAPACITY);
+    // Long carrier methods park for minutes (a gate run/then/land/unpin, a
+    // worker provision/remove that shells out to git and reclaims a cargo
+    // target, an instance close, a worktree/SCM read): serving them inline on
+    // the input arm freezes every outgoing pump below until the body ends. They
+    // run on their own task through the same `handle_stdio_frame` entry point,
+    // and the resulting frame (plus any journal pump the reply must start) rides
+    // this channel back to the single writer, interleaving with gate.event, tty
+    // and journal frames in any order. gate.cancel and every cheap read stay
+    // inline so the cancel escape hatch fires at once.
+    let (long_tx, mut long_rx) = mpsc::channel::<FrameOutcome>(JOURNAL_QUEUE_CAPACITY);
     spawn_stdio_tty_pump(node.clone(), tty_tx);
     spawn_stdio_gate_pump(node.clone(), gate_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
@@ -228,8 +232,13 @@ where
                 }
             }
             frame = long_rx.recv() => {
-                if let Some(frame) = frame {
-                    write_ndjson(&mut output, &frame).await?;
+                if let Some(outcome) = frame {
+                    if let Some(response) = outcome.response {
+                        write_ndjson(&mut output, &response).await?;
+                    }
+                    if let Some(instance_id) = outcome.pump_instance {
+                        ensure_journal_pump(&node, instance_id, &journal_tx, &mut pumps)?;
+                    }
                 }
             }
             line = input.next_line() => {
@@ -270,28 +279,45 @@ where
                 if object_broker.handle_frame(&frame) {
                     continue;
                 }
-                // Long gate methods (run/then/land/unpin) can park for minutes.
-                // Serving them inline here would starve every outgoing pump in
-                // this select until the run ends — the exact freeze the Hub saw
-                // as `running` with no steps. Hand them to a task that writes the
-                // real JSON-RPC reply back through `long_tx` when the method
-                // returns; every other method keeps its inline path. gate.cancel
-                // is not long, so it stays inline and can kill a running gate.
-                if let Some(method) = frame.get("method").and_then(Value::as_str)
-                    && crate::gate::is_long_gate_method(method)
+                // Long carrier methods can park for minutes: a gate
+                // run/then/land/unpin, a worker.provision/worker.remove that
+                // shells out to `git worktree` and recursively reclaims a cargo
+                // target, an instance.close, or a worktree/SCM read that shells
+                // out to git. Serving any of them inline here would starve every
+                // outgoing pump in this select until the body returns — the
+                // freeze the live demo saw as a job `running` with no steps, and
+                // the same park a `remuda retire` produced with no gate at all.
+                // Hand them to a task that runs the identical `handle_stdio_frame`
+                // path off the loop and sends the outcome (reply + any journal
+                // pump the reply starts) back through `long_tx`; every other
+                // method keeps its inline path. gate.cancel is not long, so it
+                // stays inline and can kill a running gate.
+                if frame
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::gate::is_long_carrier_method)
                 {
-                    let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                    let params = frame
-                        .get("params")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let method = method.to_owned();
                     let node = node.clone();
+                    let enrollment = enrollment.clone();
+                    let data_dir = opts.data_dir.clone();
+                    let transport = opts.transport.clone();
                     let long_tx = long_tx.clone();
                     tokio::spawn(async move {
-                        let result = node.dispatch_gate_rpc(&method, &params).await;
-                        if let Some(response) = response_for(id, result) {
-                            let _ = long_tx.send(response).await;
+                        match handle_stdio_frame(
+                            &node,
+                            &enrollment,
+                            &data_dir,
+                            &transport,
+                            frame,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => {
+                                let _ = long_tx.send(outcome).await;
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "off-loop stdio dispatch failed");
+                            }
                         }
                     });
                     continue;
@@ -347,7 +373,14 @@ async fn handle_stdio_frame(
     frame: Value,
 ) -> Result<FrameOutcome, NodeError> {
     if frame.get("method").is_none() {
-        hubnode_codec::persist_hello_result(data_dir, &frame)?;
+        // Record the Hub's hello result, but never at the cost of the carrier.
+        // This is bookkeeping — the reply is already in hand from the wire —
+        // and the frame is the loop's last chance to read a `?`-free path on
+        // this arm, so a read-only data directory must not be fatal here. A
+        // carrier that exits takes every live Instance's journal with it.
+        if let Err(error) = hubnode_codec::persist_hello_result(data_dir, &frame) {
+            tracing::warn!(%error, "could not persist the hello result");
+        }
         return Ok(FrameOutcome::none());
     }
     let request = match decode_request(&frame) {
@@ -621,6 +654,22 @@ pub(crate) fn spawn_stdio_gate_pump(node: DevNode, output: mpsc::Sender<Value>) 
     })
 }
 
+/// Start forwarding one Instance's journal, if there is one to forward.
+///
+/// Best-effort by construction, and that is load-bearing: a Hub routinely
+/// names an Instance this Node does not know — a row left over from a previous
+/// Node that has since been replaced, a `tty.screen` for a pane the Hub has not
+/// reaped, a retire of a worker whose instance already left. The carrier loop
+/// calls this with `?`, so returning `Err` here does not skip a pump: it
+/// unwinds `serve_stdio` and the whole Node process exits. Live evidence: a
+/// single such request killed the Node, after which journals stopped reaching
+/// the Hub (`durableSeq` frozen) and every later RPC hung until the Hub refused
+/// new ones with "too many in-flight node rpcs" — with no gate running and no
+/// busy thread, because the process was simply gone.
+///
+/// So a missing or already-gone instance is not an error to report to the
+/// caller: the request's own reply already carries not-found, and a pump is
+/// only ever an optimisation that starts streaming. Log it and move on.
 fn ensure_journal_pump(
     node: &DevNode,
     instance_id: InstanceId,
@@ -631,8 +680,16 @@ fn ensure_journal_pump(
     if pumps.contains_key(&instance_id) {
         return Ok(());
     }
-    let receiver = node.subscribe(&instance_id)?;
-    let journal_id = node.get_instance(&instance_id)?.journal_id;
+    let (receiver, journal_id) = match node
+        .subscribe(&instance_id)
+        .and_then(|receiver| Ok((receiver, node.get_instance(&instance_id)?.journal_id)))
+    {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::debug!(%error, instance_id = %instance_id.as_id(), "no journal pump for an instance this Node does not know");
+            return Ok(());
+        }
+    };
     let node = node.clone();
     let output = output.clone();
     let pump_id = instance_id.clone();
@@ -763,7 +820,13 @@ fn env_bootstrap_token() -> Option<String> {
     crate::enroll::enroll_token_from_env()
 }
 
-fn rpc_code(error: &NodeError) -> i64 {
+/// JSON-RPC error code for a dispatch failure.
+///
+/// Shared with the daemon controller so a given `NodeError` carries the same
+/// code on every carrier: a not-found or a bad request is `-32602` (invalid
+/// params) rather than the `-32603` internal class, which the Hub treats as a
+/// Node fault rather than a caller mistake.
+pub(crate) fn rpc_code(error: &NodeError) -> i64 {
     match error {
         NodeError::InvalidRequest(_) | NodeError::NotFound { .. } => -32602,
         NodeError::QueueFull => -32001,
@@ -795,6 +858,29 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.expect("line");
         serde_json::from_str(line.trim()).expect("json")
+    }
+
+    /// Read frames until the reply to `id` arrives, skipping the journal and
+    /// tty frames that interleave with it on the same wire.
+    async fn read_reply<R: tokio::io::AsyncBufRead + Unpin>(
+        from_node: &mut R,
+        id: &str,
+        within: Duration,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "no reply to {id} within {within:?}; the carrier stopped serving"
+            );
+            let frame = tokio::time::timeout(remaining, read_json(from_node))
+                .await
+                .unwrap_or_else(|_| panic!("no reply to {id} within {within:?}"));
+            if frame["id"] == json!(id) {
+                return frame;
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -906,6 +992,192 @@ mod tests {
         }
         assert!(saw_create, "instance.create result");
         assert!(saw_journal, "journal.append from stdio pump");
+        session.abort();
+    }
+
+    /// Wait for the Node's `node.hello` on a fresh stdio session.
+    async fn await_hello<R: tokio::io::AsyncBufRead + Unpin>(
+        from_node: &mut R,
+        enrollment: &Enrollment,
+    ) {
+        let hello = tokio::time::timeout(Duration::from_secs(30), read_json(from_node))
+            .await
+            .expect("hello deadline");
+        assert_eq!(hello["method"], METHOD_NODE_HELLO);
+        assert_eq!(
+            hello["params"]["hostId"],
+            json!(enrollment.host_id.as_id().as_str())
+        );
+    }
+
+    /// The steady state the live Node froze in: several live Instances streaming
+    /// journal events while Hub→Node RPCs keep arriving on the same carrier.
+    ///
+    /// The freeze this pins was fatal, not slow. A request naming an Instance
+    /// the Node does not know — routine after a Node is replaced, since the Hub
+    /// still holds rows for it — made `ensure_journal_pump` return `Err`, whose
+    /// `?` unwound `serve_stdio`. The whole process exited: journals stopped
+    /// reaching the Hub (`durableSeq` frozen for an hour) and every later RPC
+    /// hung until the Hub refused new ones with "too many in-flight node rpcs",
+    /// with no gate running, no busy thread and a low CPU reading.
+    ///
+    /// So: three instances created and streaming, then one unknown-instance
+    /// request, then an unrelated read. Before the fix the byte after that
+    /// request was the Node's last; the assertion that fails is the read
+    /// *after* it, which is why the order here matters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unknown_instance_request_does_not_kill_the_streaming_carrier() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let opts = StdioOptions {
+            data_dir: data_dir.path().to_path_buf(),
+            display_label: Some("stdio-three".into()),
+            transport: "ssh-stdio".into(),
+            ..StdioOptions::default()
+        };
+        let node = compose(&ServeConfig::fake(
+            DevServerConfig::loopback(0)
+                .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+            opts.data_dir.clone(),
+        ))
+        .expect("compose");
+        let enrollment = enroll::load_or_create(&opts.data_dir).expect("enrollment");
+        // Dispatch and journal streaming only; no CLI version/auth probes.
+        let hello = NodeHello {
+            jsonrpc: "2.0".into(),
+            method: METHOD_NODE_HELLO.into(),
+            params: crate::NodeHelloParams {
+                node_epoch: Id::new("epoch").expect("epoch"),
+                protocol: crate::NodeHelloProtocol {
+                    major: 1,
+                    minor: 0,
+                    framing: "ndjson".into(),
+                    max_frame_bytes: MAX_STDIO_FRAME_BYTES,
+                },
+                host: crate::HostInventory {
+                    host_id: enrollment.host_id.clone(),
+                    hostname: "stdio-desync".into(),
+                    driver_inventory: Vec::new(),
+                    labels: BTreeMap::new(),
+                    max_instances: opts.max_instances,
+                    cli: Vec::new(),
+                    herdr: crate::HerdrInventory {
+                        absolute_path: None,
+                        version: None,
+                        socket: None,
+                    },
+                    resources: None,
+                    os: None,
+                    kernel: None,
+                    libc: None,
+                },
+            },
+        };
+        let (client_in, node_out) = duplex(64 * 1024);
+        let (node_in, mut client_out) = duplex(64 * 1024);
+        let session_enrollment = enrollment.clone();
+        let session = tokio::spawn(async move {
+            serve_stdio(
+                node,
+                opts,
+                session_enrollment,
+                None,
+                Some(&hello),
+                node_in,
+                node_out,
+            )
+            .await
+        });
+
+        let mut from_node = BufReader::new(client_in);
+        await_hello(&mut from_node, &enrollment).await;
+
+        // Three live instances, each streaming its own journal.
+        let mut created = Vec::new();
+        for index in 0..3 {
+            let instance_id = InstanceId::new();
+            let create = hubnode_codec::rpc_request(
+                format!("c-{index}"),
+                "instance.create",
+                json!({
+                    "instanceId": instance_id,
+                    "kind": "claude",
+                    "driver": "claude-print",
+                    "prompt": format!("hi from worker {index}"),
+                    "hostId": enrollment.host_id,
+                }),
+            );
+            client_out
+                .write_all(format!("{create}\n").as_bytes())
+                .await
+                .expect("write create");
+            created.push(instance_id);
+        }
+
+        // Every create answers and the carrier is streaming journal for them.
+        let mut answered = 0;
+        let mut journal_appends = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while answered < created.len() || journal_appends < created.len() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "three instances did not answer and stream: {answered} creates, {journal_appends} journal appends"
+            );
+            let frame = read_json(&mut from_node).await;
+            if frame["method"] == METHOD_JOURNAL_APPEND {
+                journal_appends += 1;
+            } else if frame["id"].as_str().is_some_and(|id| id.starts_with("c-"))
+                && frame.get("result").is_some()
+            {
+                answered += 1;
+            }
+        }
+
+        // The request that used to end the process: an instance no one knows.
+        let unknown = "ins_00000000-0000-7000-8000-000000000000";
+        client_out
+            .write_all(
+                format!(
+                    "{}\n",
+                    hubnode_codec::rpc_request(
+                        "screen-1",
+                        "tty.screen",
+                        json!({ "instanceId": unknown }),
+                    )
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write screen");
+        let screen = read_reply(&mut from_node, "screen-1", Duration::from_secs(2)).await;
+        assert_eq!(screen["id"], "screen-1");
+        assert!(
+            screen.get("error").is_some(),
+            "an instance this Node does not know is a not-found reply: {screen}"
+        );
+
+        // The proof it did not die: an unrelated request still answers, and the
+        // instances' journals still reach the wire.
+        client_out
+            .write_all(
+                format!(
+                    "{}\n",
+                    hubnode_codec::rpc_request("after-1", "host.resources", json!({}))
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write after");
+        let after = read_reply(&mut from_node, "after-1", Duration::from_secs(2)).await;
+        assert_eq!(after["id"], "after-1");
+        assert!(
+            after.get("result").is_some(),
+            "the carrier is still serving: {after}"
+        );
+
+        assert!(
+            !session.is_finished(),
+            "the stdio session must still be running, not unwound"
+        );
         session.abort();
     }
 }

@@ -231,12 +231,12 @@ pub async fn dispatch_frame(
         return Ok(serde_json::json!({ "resources": resources }));
     }
     if crate::worktree::is_worktree_method(method) {
-        return node.worktree_rpc(method, &params);
+        return node.worktree_rpc_capped(method, &params).await;
     }
     // `remuda dispatch` / `remuda retire` over the ssh-stdio carrier: the
     // same product-assigned provisioning the outbound-WSS runtime performs.
     if method == "worker.provision" {
-        return node.provision_worker(&params).await;
+        return node.provision_worker_capped(&params).await;
     }
     if method == "worker.remove" {
         return node.remove_worker(&params).await;
@@ -248,7 +248,7 @@ pub async fn dispatch_frame(
         return node.dispatch_gate_rpc(method, &params).await;
     }
     if crate::workspace_scm::is_scm_method(method) {
-        return crate::workspace_scm::handle_rpc(node, method, &params);
+        return crate::workspace_scm::handle_rpc_capped(node, method, &params).await;
     }
     if crate::subagent::is_subagent_method(method) {
         return crate::subagent::handle_rpc(node, method, &params);

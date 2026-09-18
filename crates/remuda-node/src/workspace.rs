@@ -867,7 +867,11 @@ mod tests {
                 .to_string()
                 .contains("(none)")
         );
-        assert!(node.create_worktree(&json!({"name":"agent"})).is_err());
+        assert!(
+            node.worktree_rpc_capped("worktree.create", &json!({"name":"agent"}))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

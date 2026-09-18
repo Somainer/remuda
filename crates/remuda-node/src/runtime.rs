@@ -463,6 +463,34 @@ impl DevNode {
             .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?
     }
 
+    /// `worktree_rpc` with the blocking git work off the async runtime's
+    /// threads, under the carrier's in-flight cap.
+    ///
+    /// `handle_rpc` shells out to git (`worktree create` clones and fetches), so
+    /// awaiting it on a runtime worker — which is all a spawn from the select
+    /// loop would achieve — parks that worker for the duration. On a small host
+    /// with one or two workers, enough of these park the carrier loop itself,
+    /// `gate.cancel` included.
+    pub(crate) async fn worktree_rpc_capped(
+        &self,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, NodeError> {
+        let selected = params
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(str::parse)
+            .transpose()?;
+        let (workspace, _) = self.resolve_workspace_cwd(selected.as_ref(), None)?;
+        let method = method.to_owned();
+        let params = params.clone();
+        crate::gate::run_long_method(move || {
+            crate::worktree::handle_rpc(Path::new(&workspace.root_path), &method, &params)
+                .ok_or_else(|| NodeError::InvalidRequest(format!("unknown method {method}")))?
+        })
+        .await
+    }
+
     /// Durably accept an Instance create, then materialize it in its worker.
     ///
     /// D-028 P2 follow-up: the reply must prove only the durable accept —

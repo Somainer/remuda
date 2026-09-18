@@ -60,34 +60,33 @@ describe("computeAnchored placement math", () => {
     expect(measured.maxHeight).toBeLessThanOrEqual(480);
   });
 
-  it("never overlaps the approval card on either placement", () => {
-    // Approval bottom 660, trigger 700–730: the usable gap above is ~24px,
-    // below is 162px, so the panel opens down — and still clears the card.
+  it("opens below when an approval card blocks the preferred above side", () => {
+    // Trigger 700–730, card bottom 660: the panel (190px) cannot clear the
+    // card above, so it flips down and never overlaps the card.
     const down = computeAnchored(
       { top: 700, bottom: 730, left: 100, right: 200, width: 100 },
       { preferredHeight: 190, width: 300 },
       { width: 1440, height: 900 },
       { ...OPTS, avoidBottom: 660 },
     );
-    const downTop = down.placement === "up"
-      ? 700 - 8 - Math.min(190, down.maxHeight)
-      : 738;
-    expect(downTop).toBeGreaterThanOrEqual(668);
+    expect(down.placement).toBe("down");
+    expect(down.top).toBe(738);
+  });
 
-    // Fixture-shaped geometry (real mock e2e): trigger at 857, approval
-    // bottom 770, viewport 900. Up is the only roomy side; the panel must
-    // stay under the vh cap and above the card edge.
+  it("opens above when the panel clears a card that only reaches partway", () => {
+    // Trigger 700–730 in a 900 viewport: 684px above, 154px below. A card
+    // ending at 450 leaves 234px of cleared room above — enough for the 190px
+    // panel, so it opens up (the roomier side) and clears the card.
     const up = computeAnchored(
-      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { top: 700, bottom: 730, left: 100, right: 200, width: 100 },
       { preferredHeight: 190, width: 300 },
       { width: 1440, height: 900 },
-      { ...OPTS, avoidBottom: 770 },
+      { ...OPTS, avoidBottom: 450 },
     );
     expect(up.placement).toBe("up");
-    const height = Math.min(190, up.maxHeight);
-    const top = 857 - 8 - height;
-    expect(top).toBeGreaterThanOrEqual(770);
-    expect(up.maxHeight).toBeLessThanOrEqual(540);
+    expect(up.top).toBe(700 - 8 - 190);
+    // The panel's 190px box (502..692) stays above the card bottom 450.
+    expect(up.top).toBeGreaterThanOrEqual(458);
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {

@@ -577,36 +577,70 @@ pub(crate) async fn wait(
         bail!("timeout {timeout_ms} exceeds max {MAX_TIMEOUT_MS}");
     }
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    let mut after = after_seq.unwrap_or("0").to_string();
-    let mut events: Vec<Value> = Vec::new();
+    let mut after: u64 = after_seq.and_then(|s| s.parse().ok()).unwrap_or(0);
+    // Dedupe/order by seq: descending pages and repeat polls can otherwise
+    // present the same event twice.
+    let mut by_seq = std::collections::BTreeMap::new();
+    // Set false for the remainder of the call once a descent cannot cover the
+    // whole range: the condition then must never be declared met on a partial
+    // stream, and the timeout names that.
+    let mut window_complete = true;
+    // Mirrors the web client's fillGap bound: ~16 windows of 2000 rows.
+    const MAX_FILL_PAGES: u32 = 16;
     loop {
-        let journal = client.get_journal(instance_id, Some(&after)).await?;
-        if let Some(batch) = journal.get("events").and_then(Value::as_array) {
-            events.extend(batch.iter().cloned());
+        // First page is the tail of (after, durable]. Further pages descend
+        // with beforeSeq = fromSeq - 1 (same after) until reachedAfterSeq.
+        let mut before: Option<String> = None;
+        let mut reached = false;
+        for _ in 0..MAX_FILL_PAGES {
+            let journal = client
+                .get_journal(instance_id, Some(&after.to_string()), before.as_deref())
+                .await?;
+            if let Some(batch) = journal.get("events").and_then(Value::as_array) {
+                for event in batch {
+                    let seq = super::agents::sequence(&event["seq"]);
+                    by_seq.insert(seq, event.clone());
+                }
+            }
+            let page_reached = journal
+                .get("reachedAfterSeq")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let from_seq = journal
+                .get("fromSeq")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok());
+            if page_reached {
+                reached = true;
+                break;
+            }
+            // Cursor comes from the last event actually received, never from
+            // durableSeq; descend below the window floor first.
+            let Some(floor) = from_seq else { break };
+            before = Some(floor.saturating_sub(1).to_string());
         }
-        if let Some(seq) = journal
-            .get("durableSeq")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        {
-            after = seq;
+        if !reached {
+            window_complete = false;
         }
+        after = by_seq.keys().next_back().copied().unwrap_or(after);
+        let events: Vec<Value> = by_seq.values().cloned().collect();
         let snapshot = instance_snapshot(client, instance_id).await?;
         let lifecycle = snapshot.get("lifecycle").and_then(Value::as_str);
         let activity = snapshot.get("activity").and_then(Value::as_str);
-        if until_met(condition, &events, lifecycle, activity)? {
+        if window_complete && until_met(condition, &events, lifecycle, activity)? {
             let matched_line = matching_wait_line(condition, &events);
             return Ok(json!({
                 "reason": "condition-met",
                 "instanceId": instance_id,
                 "until": condition,
                 "condition": condition,
-                "asOfSeq": after,
+                "asOfSeq": after.to_string(),
                 "lifecycle": lifecycle,
                 "activity": activity,
                 "matchedLine": matched_line,
                 "eventCount": events.len(),
                 "outstandingWork": false,
+                "windowComplete": true,
             }));
         }
         if Instant::now() >= deadline {
@@ -615,12 +649,16 @@ pub(crate) async fn wait(
                 "instanceId": instance_id,
                 "until": condition,
                 "condition": condition,
-                "asOfSeq": after,
+                "asOfSeq": after.to_string(),
                 "lifecycle": lifecycle,
                 "activity": activity,
                 "matchedLine": Value::Null,
                 "eventCount": events.len(),
                 "outstandingWork": true,
+                // False names the bounded-window case: rows below the received
+                // tail were cut and the descent budget could not cover them,
+                // so the condition verdict and event count are partial.
+                "windowComplete": window_complete,
             }));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -683,7 +721,7 @@ pub(crate) async fn read(
             "completeness": if truncated { "truncated" } else { "complete" },
         }));
     }
-    let journal = client.get_journal(instance_id, after_seq).await?;
+    let journal = client.get_journal(instance_id, after_seq, None).await?;
     let all_events = journal
         .get("events")
         .and_then(Value::as_array)

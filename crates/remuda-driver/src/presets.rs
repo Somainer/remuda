@@ -38,7 +38,7 @@ pub struct KindPreset {
     /// Flag that carries an explicit model pin, when this CLI takes one on an
     /// interactive launch.
     ///
-    /// D-036 / model-pin-1: the native PTY agent path used to emit no model
+    /// model-pin-1: the native PTY agent path used to emit no model
     /// flag at all, so a dispatch `--model` was recorded in every audit record
     /// and roster row while the host's own default answered every turn. Only
     /// claude is wired here: codex and grok take their model through their own

@@ -233,14 +233,14 @@ const OVERRIDDEN_ENV: &[&str] = &[
 ///
 /// The settings `model` key is one of the two channels a shell-pty launch has
 /// for the requested model (the other is the `--model` argv its materializer
-/// emits since D-036 / model-pin-1), so a host `model` left in place silently
+/// emits since model-pin-1), so a host `model` left in place silently
 /// wins whenever neither carries one.
 const OVERRIDDEN_KEYS: &[&str] = &["model"];
 
 /// Env variables that *name a model*, as opposed to describing an endpoint or
 /// carrying a credential.
 ///
-/// These are the subset a model pin owns on its own (D-036 / model-pin-1). Each
+/// These are the subset a model pin owns on its own (model-pin-1). Each
 /// one outranks the settings `model` key in Claude Code, so leaving any of them
 /// in the host layer lets the host answer for a model the requester pinned —
 /// which is exactly how the 2026-09-18 demo ran every worker on the host's
@@ -267,7 +267,7 @@ pub fn is_model_env(name: &str) -> bool {
 
 /// Make an explicit model pin authoritative over the host user's own settings.
 ///
-/// Belt-and-braces half of D-036 / model-pin-1. Delegation `none` (跟随主机)
+/// Belt-and-braces half of model-pin-1. Delegation `none` (跟随主机)
 /// legitimately lets the host's settings describe the provider — but it must
 /// stop meaning the host also owns the *model*. When the launch carries an
 /// explicit pin, every host key that names a model is removed from the base

@@ -1732,7 +1732,7 @@ fn prepare_launch_blocking(
         ),
         (user, operator) => user.or(operator),
     };
-    // D-036 / model-pin-1, belt and braces: an explicit pin is authoritative on
+    // model-pin-1, belt and braces: an explicit pin is authoritative on
     // its own, whatever the delegation. `none` still means the host owns the
     // endpoint and the credential — it must stop meaning the host owns the
     // model, which is how the 2026-09-18 demo ran every pinned worker on the

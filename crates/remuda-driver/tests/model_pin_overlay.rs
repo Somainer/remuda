@@ -1,4 +1,4 @@
-//! D-036 / model-pin-1: a model pin outranks the host's own settings, even
+//! model-pin-1: a model pin outranks the host's own settings, even
 //! under delegation `none`.
 //!
 //! The 2026-09-18 demo ran every worker on the host's default model while the
@@ -105,7 +105,7 @@ fn a_pin_evicts_every_host_model_key_under_delegation_none() {
 }
 
 /// Rule 3: with no pin, nothing changes. The host's model answers exactly as it
-/// did before D-036 — this brief added a channel for an explicit choice, not a
+/// did before model-pin-1 — this brief added a channel for an explicit choice, not a
 /// new default.
 #[test]
 fn without_a_pin_the_host_model_is_left_alone() {

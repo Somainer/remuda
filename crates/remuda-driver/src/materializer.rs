@@ -554,7 +554,7 @@ fn materialize_shell_pty_agent(
             argv.push(path.to_string_lossy().into_owned());
         }
     }
-    // D-036 / model-pin-1: an explicit pin must reach the process on THIS path
+    // model-pin-1: an explicit pin must reach the process on THIS path
     // too. It used to reach only `claude_argv` (the print/pty/bg carriers), so a
     // `dispatch --model` on driver shell-pty was recorded as honoured in
     // `provider.model_requested` below and in the Hub roster while the host's
@@ -871,7 +871,7 @@ fn resolve_model(spec: &InstanceSpec, profile: &ProviderProfile) -> DriverResult
 ///
 /// Deliberately *not* [`resolve_model`]: that falls back to the profile's first
 /// model, which is the right answer for "what will answer this session" but the
-/// wrong one for "what did the requester pin". D-036 / model-pin-1 rule 3 — an
+/// wrong one for "what did the requester pin". model-pin-1 rule 3 — an
 /// instance with no `model_id` keeps today's behaviour exactly (host default, no
 /// argv token, no strip), so this returns `None` and every caller stays quiet.
 ///

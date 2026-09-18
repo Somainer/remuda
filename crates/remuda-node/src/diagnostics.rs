@@ -1020,11 +1020,8 @@ mod tests {
             .iter()
             .find(|check| check.name == "computer-use")
             .expect("computer-use check");
-        #[cfg(unix)]
         assert_eq!(check.status, "ok", "{check:?}");
-        #[cfg(unix)]
         assert_eq!(check.details["installed"], true);
-        #[cfg(unix)]
         assert_eq!(check.details["version"], "3.1.4");
         assert_eq!(check.details["auth"], "unknown");
     }

@@ -1434,9 +1434,11 @@ mod tests {
         assert_eq!(computer_use(&snap).version.as_deref(), Some("9.9.9"));
     }
 
-    /// A non-executable file at the client path is not an installed client.
+    /// A non-executable file at the client path is the one platform difference
+    /// in this probe: POSIX honours the mode bit, other targets treat any
+    /// regular file as runnable.
     #[test]
-    fn computer_use_non_executable_file_is_not_installed() {
+    fn computer_use_non_executable_file_is_not_a_client_on_posix() {
         let bin = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join(".codex");
@@ -1451,10 +1453,15 @@ mod tests {
         let snap = collector.snapshot(&config_with(&[], None));
         let entry = computer_use(&snap);
         #[cfg(unix)]
-        assert!(!entry.installed, "a non-executable file is not a client");
+        {
+            assert!(!entry.installed, "a non-executable file is not a client");
+            assert!(entry.path.is_none(), "and it reports no path");
+        }
         #[cfg(not(unix))]
-        assert!(entry.installed);
-        assert!(entry.path.is_none() || !entry.installed);
+        assert!(
+            entry.installed,
+            "non-POSIX targets do not check the mode bit"
+        );
     }
 
     /// The row must not disturb the PATH-probed CLIs it is appended after.

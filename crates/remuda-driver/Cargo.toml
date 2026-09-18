@@ -48,6 +48,9 @@ zeroize = "1.9"
 nix = { version = "0.28", features = ["process", "signal"] }
 
 [dev-dependencies]
+# Enable the test-only surface (`StdoutMapper`) for this crate's own
+# integration tests, which do not see `cfg(test)` of the lib target.
+remuda-driver = { path = ".", features = ["test-stub"] }
 remuda-testing.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

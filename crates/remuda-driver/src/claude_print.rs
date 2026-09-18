@@ -2020,6 +2020,55 @@ fn extract_local_stdout(content: &str) -> String {
     body[..end].trim().to_owned()
 }
 
+/// Test-only stdout mapper over the real stream assembler.
+///
+/// The live path is [`ClaudePrintDriver`]'s reader task, whose [`Mapper`] is
+/// private. `tests/claude_sdk_stream.rs` replays recorded NDJSON through the
+/// same `map_outbound` the driver uses, so a fixture assertion is an assertion
+/// about production behaviour rather than a reimplementation of it.
+#[cfg(any(test, feature = "test-stub"))]
+pub struct StdoutMapper {
+    mapper: Mapper,
+}
+
+#[cfg(any(test, feature = "test-stub"))]
+impl StdoutMapper {
+    /// Mapper stamping `driver` on channel `stdout`.
+    #[must_use]
+    pub fn new(driver: DriverKind, session_id: &str) -> Self {
+        Self {
+            mapper: Mapper {
+                stream: stream::StreamState::default(),
+                ids: NativeIds::default(),
+                seq: 0,
+                instance_id: InstanceId::new(),
+                run_id: RunId::new(),
+                journal_id: fallback_obj(),
+                host_id: fallback_host(),
+                session_id: session_id.to_owned(),
+                pin: BinaryPin {
+                    abs_path: String::new(),
+                    version: "fixture".into(),
+                    sha256: dummy_digest(),
+                },
+                driver_kind: driver,
+                channel: SourceChannel::Stdout,
+            },
+        }
+    }
+
+    /// Map one decoded stdout frame, exactly as the reader task does.
+    pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        map_outbound(&mut self.mapper, &Outbound::from_value(value))
+    }
+
+    /// Native session id the mapper has adopted from `system/init`.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.mapper.session_id
+    }
+}
+
 /// Transcript-to-observations mapper for a live claude-pty session.
 pub struct TranscriptMapper {
     mapper: Mapper,

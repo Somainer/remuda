@@ -519,12 +519,63 @@ mod tests {
         assert_eq!(stat.resume.provision, CapabilityProvision::Unknown);
     }
 
+    /// `print-replacement.md` §2.6: the honest `claude-sdk` row. No TTY on this
+    /// carrier, structured capabilities carried over from print, and steer left
+    /// unknown because it has not been measured on this transport.
+    #[test]
+    fn the_sdk_row_reports_no_tty_and_an_unmeasured_steer() {
+        let set = capability_set(DriverKind::ClaudeSdk);
+
+        // Stdio is not a PTY: there is no Terminal view to attach to, and the UI
+        // must not offer one. `unsupported` is a fact here, not a guess.
+        assert_eq!(set.tty_attach.state, CapabilityState::Unsupported);
+        assert_eq!(set.live_attach.state, CapabilityState::Unsupported);
+        assert_eq!(set.tty_attach.reason_code, "not-provided");
+
+        // Same native evidence as print, plus multi-turn stdin for resume.
+        for cap in [
+            &set.resume,
+            &set.interactive_approval,
+            &set.question,
+            &set.completion_native_turn,
+        ] {
+            assert_eq!(cap.state, CapabilityState::Supported);
+            assert_eq!(cap.provision, CapabilityProvision::Native);
+        }
+
+        // A second `user` frame mid-turn may be native queue or steer; we do not
+        // claim which until it is measured (D-028a item 2).
+        assert_eq!(set.steer.state, CapabilityState::Unknown);
+        assert_eq!(set.steer.reason_code, "insufficient-evidence");
+
+        // The transport is the hand-written Rust wire, not the reserved sidecar.
+        assert_eq!(
+            adapter_transport(DriverKind::ClaudeSdk),
+            AdapterTransport::NativeRustWire
+        );
+    }
+
+    /// The signal-tier floor: this carrier has no hook/file/OSC/screen ladder, so
+    /// `None` must add nothing — stdout is not `Hook` (§2.5).
+    #[test]
+    fn signal_tier_none_grants_the_sdk_carrier_nothing() {
+        assert!(tier_capabilities(SignalTier::None).is_empty());
+        assert_eq!(
+            capability_set_with_runtime(
+                DriverKind::ClaudeSdk,
+                Some(&native_ref(Some(SignalTier::None), vec![]))
+            ),
+            capability_set(DriverKind::ClaudeSdk)
+        );
+    }
+
     /// §6: no driver claims queue/interrupt in this task. They are unmeasured
     /// (§14 risks 6 and 7), and `unknown` is what unmeasured means.
     #[test]
     fn queue_and_interrupt_are_unknown_for_every_driver() {
         for kind in [
             DriverKind::ClaudePrint,
+            DriverKind::ClaudeSdk,
             DriverKind::ClaudePty,
             DriverKind::ClaudeBg,
             DriverKind::CodexAppserver,

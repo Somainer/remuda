@@ -64,6 +64,8 @@ pub use claude_onboarding::{
     HostClaudeConfig, SeedOutcome, StartupDialog, allow_reads_outside_workspaces,
     has_login_material, pre_trust_workspace, seed_scoped_config, startup_dialog,
 };
+#[cfg(any(test, feature = "test-stub"))]
+pub use claude_print::StdoutMapper;
 pub use claude_print::TranscriptMapper;
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
 pub use claude_sdk::{ClaudeSdkDriver, ClaudeSdkOptions};

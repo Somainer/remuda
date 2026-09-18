@@ -647,6 +647,22 @@ pub(crate) fn spawn_stdio_gate_pump(node: DevNode, output: mpsc::Sender<Value>) 
     })
 }
 
+/// Start forwarding one Instance's journal, if there is one to forward.
+///
+/// Best-effort by construction, and that is load-bearing: a Hub routinely
+/// names an Instance this Node does not know — a row left over from a previous
+/// Node that has since been replaced, a `tty.screen` for a pane the Hub has not
+/// reaped, a retire of a worker whose instance already left. The carrier loop
+/// calls this with `?`, so returning `Err` here does not skip a pump: it
+/// unwinds `serve_stdio` and the whole Node process exits. Live evidence: a
+/// single such request killed the Node, after which journals stopped reaching
+/// the Hub (`durableSeq` frozen) and every later RPC hung until the Hub refused
+/// new ones with "too many in-flight node rpcs" — with no gate running and no
+/// busy thread, because the process was simply gone.
+///
+/// So a missing or already-gone instance is not an error to report to the
+/// caller: the request's own reply already carries not-found, and a pump is
+/// only ever an optimisation that starts streaming. Log it and move on.
 fn ensure_journal_pump(
     node: &DevNode,
     instance_id: InstanceId,
@@ -657,8 +673,16 @@ fn ensure_journal_pump(
     if pumps.contains_key(&instance_id) {
         return Ok(());
     }
-    let receiver = node.subscribe(&instance_id)?;
-    let journal_id = node.get_instance(&instance_id)?.journal_id;
+    let (receiver, journal_id) = match node
+        .subscribe(&instance_id)
+        .and_then(|receiver| Ok((receiver, node.get_instance(&instance_id)?.journal_id)))
+    {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::debug!(%error, instance_id = %instance_id.as_id(), "no journal pump for an instance this Node does not know");
+            return Ok(());
+        }
+    };
     let node = node.clone();
     let output = output.clone();
     let pump_id = instance_id.clone();

@@ -4410,7 +4410,16 @@ fn apply_instance_projection(
     if kind == "model"
         && let Some(effective) = payload.get("effective")
     {
-        apply_effective_model_projection(conn, instance_id, effective, payload.get("catalog"))?;
+        // The selection path rides the model payload, not EffectiveModel;
+        // merge it into the projected record so the listed/typed marker
+        // survives a page reload.
+        let mut effective = effective.clone();
+        if let Some(object) = effective.as_object_mut()
+            && let Some(path) = payload.get("selectionPath")
+        {
+            object.insert("selectionPath".into(), path.clone());
+        }
+        apply_effective_model_projection(conn, instance_id, &effective, payload.get("catalog"))?;
     }
     if kind == "permission"
         && let Some(effective) = payload.get("effective")

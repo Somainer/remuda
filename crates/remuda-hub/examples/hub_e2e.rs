@@ -133,6 +133,38 @@ fn bulk_catalog() -> String {
     format!(r#"{{"object":"list","data":[{}]}}"#, items.join(","))
 }
 
+/// §9.1 model-sync: the gateway catalog the launch snapshot carries. A prompt
+/// containing `tall-catalog` gets an 81-id catalog (launch + 80 rows) so the
+/// ux-modelpick e2e can prove anchoring, scrolling and read-back with a list
+/// taller than the viewport. Returns the JSON payload fragment and the id
+/// vector (also remembered per instance for listed/typed attribution).
+fn fake_launch_catalog(prompt: Option<&str>) -> (Value, Vec<String>) {
+    let models: Vec<String> = if prompt.is_some_and(|text| text.contains("tall-catalog")) {
+        std::iter::once("e2e/auto".to_owned())
+            .chain((0..80).map(|i| format!("e2e/m-{i:02}")))
+            .collect()
+    } else {
+        vec![
+            "e2e/auto".to_owned(),
+            "e2e/fast".to_owned(),
+            "e2e/plain".to_owned(),
+            "claude-e2e-only".to_owned(),
+        ]
+    };
+    let json = json!({
+        "models": models,
+        "source": "gateway-discovery",
+        "observedAt": "2026-09-14T12:00:00.000Z",
+        "cache": {
+            "scope": "scoped-config-dir",
+            "baseUrl": "https://relay.e2e.invalid/v1",
+            "fetchedAt": "2026-09-14T12:00:00.000Z"
+        },
+        "discoveryEnv": true
+    });
+    (json, models)
+}
+
 /// Serve `/v1/models`, answering **differently per header** the way astergate
 /// does: a plain Bearer GET returns the broad OpenAI-style list, while an
 /// `anthropic-version` GET returns only the short `claude-*` subset. Discovery
@@ -381,6 +413,9 @@ async fn fake_node(
     // A failed Claude launch must not acquire a TTY through lazy attach.
     let mut claude_ptys = HashSet::new();
     let mut instance_kinds: HashMap<String, String> = HashMap::new();
+    // §9.1 model-sync: per-instance catalog ids remembered at launch so a
+    // configure verdict can attribute the switch path (listed vs typed).
+    let mut model_catalogs: HashMap<String, Vec<String>> = HashMap::new();
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
@@ -517,6 +552,12 @@ async fn fake_node(
                             .and_then(Value::as_str)
                             .unwrap_or("e2e/auto")
                             .to_string();
+                        let launch_prompt = spec
+                            .pointer("/initialInput/text")
+                            .or_else(|| spec.get("prompt"))
+                            .and_then(Value::as_str);
+                        let (catalog_json, catalog_ids) = fake_launch_catalog(launch_prompt);
+                        model_catalogs.insert(instance_id.clone(), catalog_ids);
                         append_n = append_event(
                             &mut ws,
                             &instance_id,
@@ -529,16 +570,7 @@ async fn fake_node(
                                     "source": "launch",
                                     "observedAt": "2026-09-14T12:00:00.000Z"
                                 },
-                                "catalog": {
-                                    "models": [
-                                        "e2e/auto",
-                                        "e2e/fast",
-                                        "e2e/plain",
-                                        "claude-e2e-only"
-                                    ],
-                                    "source": "gateway-discovery",
-                                    "observedAt": "2026-09-14T12:00:00.000Z"
-                                }
+                                "catalog": catalog_json
                             }),
                         )
                         .await?;
@@ -671,6 +703,8 @@ async fn fake_node(
                             .and_then(Value::as_str)
                             .unwrap_or("e2e/auto")
                             .to_string();
+                        let (catalog_json, catalog_ids) = fake_launch_catalog(Some(prompt));
+                        model_catalogs.insert(instance_id.clone(), catalog_ids);
                         append_n = append_event(
                             &mut ws,
                             &instance_id,
@@ -683,16 +717,7 @@ async fn fake_node(
                                     "source": "launch",
                                     "observedAt": "2026-09-14T12:00:00.000Z"
                                 },
-                                "catalog": {
-                                    "models": [
-                                        "e2e/auto",
-                                        "e2e/fast",
-                                        "e2e/plain",
-                                        "claude-e2e-only"
-                                    ],
-                                    "source": "gateway-discovery",
-                                    "observedAt": "2026-09-14T12:00:00.000Z"
-                                }
+                                "catalog": catalog_json
                             }),
                         )
                         .await?;
@@ -1014,6 +1039,25 @@ async fn fake_node(
                             } else {
                                 (requested.to_owned(), requested.to_owned())
                             };
+                            // The real driver turns configure into typed
+                            // `/model <id>` bytes; emulate the terminal seeing
+                            // them (a native-typed user node) before the
+                            // verdict lands.
+                            append_n = append_native_user(
+                                &mut ws,
+                                &instance_id,
+                                append_n,
+                                &format!("/model {requested_id}"),
+                            )
+                            .await?;
+                            // Listed vs typed: a configure id the session's own
+                            // launch catalog offered is "listed"; anything else
+                            // (host-fallback rows, free-typed ids) rides the
+                            // typed-id fallback path and the verdict decides.
+                            let listed = model_catalogs
+                                .get(&instance_id)
+                                .is_some_and(|ids| ids.iter().any(|id| id == &requested_id));
+                            let selection_path = if listed { "listed" } else { "typed" };
                             append_n = append_event(
                                 &mut ws,
                                 &instance_id,
@@ -1026,6 +1070,7 @@ async fn fake_node(
                                         "source": "remuda",
                                         "observedAt": "2026-09-14T12:00:00.000Z"
                                     },
+                                    "selectionPath": selection_path,
                                     "raw": resolved
                                 }),
                             )

@@ -575,6 +575,8 @@ export function SessionPage({
           models={hubStore.modelListOf(instance.id) ?? undefined}
           modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
           modelPending={hubStore.modelPendingOf(instance.id)}
+          modelSelectionPath={hubStore.modelEffectiveOf(instance.id)?.selectionPath ?? null}
+          modelCatalog={hubStore.modelCatalogOf(instance.id)}
           effort={hubStore.effortOf(instance.id, instance.kind)}
           effortEffective={hubStore.effortEffectiveOf(instance.id)}
           effortPending={hubStore.effortPendingOf(instance.id)}
@@ -594,9 +596,11 @@ export function SessionPage({
           onEffort={(next) => {
             void hubStore.setEffort(instance.id, next);
           }}
-          onModel={(next) => {
-            void hubStore.setModel(instance.id, next);
-          }}
+          // The store owns the failure mouth: it reverts modelPending and
+          // toasts the Hub/Node reason. Return the promise (never void it) so
+          // a rejected configure is not an unhandled rejection and the
+          // Composer can await it for pending UI.
+          onModel={(next) => hubStore.setModel(instance.id, next)}
           onSend={async (text, attachments, staged, mode) => {
             setSending(true);
             try {

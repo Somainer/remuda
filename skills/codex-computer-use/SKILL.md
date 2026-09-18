@@ -48,7 +48,7 @@ if (shot.screenshot) await nodeRepl.emitImage({ bytes: shot.screenshot, mimeType
 - 绑定对象：`click`、`scroll`、`pressKey`、`typeText`、`setValue`、`performSecondaryAction`。`scroll` 的目标可以是元素索引或 `[x, y]`。
 - `element_index` 在原生 MCP 上按 schema（本机曾为字符串）；在 `cua.*` 绑定对象上是数字。不要混用。
 
-安装与故障见 [连接与验证](references/setup.md)。
+启动、授权与故障见 [连接与验证](references/setup.md)。
 
 ## 观察、操作、回读
 

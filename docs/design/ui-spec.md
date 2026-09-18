@@ -273,7 +273,7 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 | `thought` | 折叠 | 未完成可展开看；`completeness=screen-derived` 时标「从屏幕猜测」 |
 | `tool.*` | 见下 | call/result 配对，`callId` |
 | `interaction.*` | 未决时钉在 composer 上方并接管输入 | 见审批卡 / 表单 |
-| `workflow.run` | running/failed 展开，completed 折叠 | 见树 |
+| `workflow.run` | 运行中与结束后都展开；只有读者 dismiss 才折叠（按 workflowId 持久化于 runtime localStorage）。未 dismiss 的卡永不进 compact 汇总行；dismiss 后折进「N 次工具」行，打开该行仍能到达卡片 | 见树；运行中每 1s 走墙钟 |
 | `usage` | 回合结束后一条 | 缺字段就整条隐藏，不写假合计（DSH `ui-chat` usage 行） |
 | `error` | 展开 | 不推断成功 |
 | `opaque` | 一行「未识别事件」+ 原始 kind | 禁止当终态 |
@@ -290,7 +290,7 @@ Compact：回合结束后把 thinking + 中间 tool 折成「N 次工具 · M �
 | **Edit** | 路径 + DiffBlock | `path`, `oldText?`, `newText?`, `applied: boolean` | 运行中=拟修改（参数）；settled 且 result.diffs=已写入；只有参数没有 result=「结果未知」 |
 | **Read** | 路径 + 行号片段 | `path`, `range?`, `snippet?` | 失败走 Generic |
 | **Write** | 路径 + 拟写入/已写入 | 同 Edit，无 oldText | 同上三分态 |
-| **Workflow** | run → phase → member 树 | `runId`, `phases[].title`, `members[{name,status,childInstanceId?}]` | running/failed/interrupted 默认展开；completed 折叠。member 可点条件：child 在 registry 且 `capabilities.openChild`（DSH 只允许本地 running child，我们要远程+历史，用 `hostId+nativeSessionId+parentRunId`） |
+| **Workflow** | run → phase → member 树 | `runId`, `launchedAt`, `phases[].title`, `members[{name,status,startedAt,endedAt,lastProgressAt,tokens,childInstanceId?}]` | 运行/失败/结束都默认展开，只有用户 dismiss 才折叠（持久化）。member 行依次显示 状态 / 模型 / label / 排队等待 / 用时 / 空闲 / tokens；缺字段显示 `—` 并在 tooltip 点名缺失字段，绝不写 0；phase 头带该 phase 的真实跨度（最早 start 到最晚 end）与 tokens/调用合计。member 可点条件：child 在 registry 且 `capabilities.openChild`（DSH 只允许本地 running child，我们要远程+历史，用 `hostId+nativeSessionId+parentRunId`） |
 | **Task**（native 名 Agent/Task，同一族） | 子 agent 名 + 模型 + 状态 | `taskId`, `model?`, `status`, `childInstanceId?` | 网关模型名只会出现在 Workflow member，不会在 Task（用户已确认）。无 `childInstanceId` 时不可点进 `/s/:id` |
 | **MCP** | `server/tool` + 参数 JSON | `server`, `tool`, `args`, `result?` | 未知 schema → Generic |
 
@@ -309,6 +309,8 @@ Diff 三分态文案：**拟修改** / **已写入** / **结果未知**。未知
 **Workflow 树**
 
 只展示身份和状态，不把 script/log 塞进节点（DSH `ui-workflow-run`）。完整 journal 放「原始事件」抽屉。native Workflow member **不是** runtime child Instance。仅当 `childInstanceId` 存在（显式 `instance.create`）才点进 `/s/:childId`；否则只展开本树。冷 child 用 jsonl 投影，composer 禁用除非 driver 能 resume。
+
+三个时钟的唯一定义（行 tooltip 原文）：**用时** = `endedAt − startedAt`，运行中为 `now − startedAt`；**空闲** = `endedAt − lastProgressAt`，运行中为 `now − lastProgressAt`（stall 时用时照走、空闲照涨，不靠 member 的 `durationMs`）；**排队等待** = `startedAt − run.launchedAt`。缺输入一律 `—`。注意 `launchedAt` 是 **journal 登记该 run 的时刻**，不是它真正启动的时刻：Remuda 从磁盘发现（attach）一个已经在跑的 run 时，launchedAt 晚于真实启动，`startedAt − launchedAt` 会为负 → 排队等待显示 `—`（这是数据语义，不是 bug）。卡头 elapsed 因此取两者较大值：运行中 = `max(totals.elapsedMs + 距上次快照的墙钟, now − launchedAt)`，旧 Node 没有 `launchedAt` 时单独由快照外推继续每秒走针。phase 跨度 = 该 phase 最早 `startedAt` 到最晚 `endedAt`（运行中以 now 收口），没时间戳返回 undefined 显示 `—`。运行中的卡每 1s 自己走针（同时驱动卡头 elapsed、每-agent 用时/空闲），不加 fetch 轮询，卡折叠/结束后 interval 立即拆除。
 
 **Usage / cost**
 

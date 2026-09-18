@@ -1,7 +1,7 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload, WorkflowState } from "../../../types/generated";
 import { WorkflowTimelineCard } from "./WorkflowTimelineCard";
 
@@ -28,6 +28,7 @@ function run(partial: Partial<WorkflowRunPayload> = {}): WorkflowRunPayload {
     totals: partial.totals ?? null,
     live: partial.live ?? null,
     note: partial.note ?? null,
+    launchedAt: partial.launchedAt ?? null,
     resultRef: null,
   };
 }
@@ -62,8 +63,9 @@ function member(m: Partial<WorkflowMemberPayload> & { memberId: string }): Workf
     tokens: m.tokens ?? null,
     calls: m.calls ?? null,
     durationMs: m.durationMs ?? null,
-    startedAt: null,
-    endedAt: null,
+    startedAt: m.startedAt ?? null,
+    endedAt: m.endedAt ?? null,
+    lastProgressAt: m.lastProgressAt ?? null,
   };
 }
 
@@ -93,30 +95,104 @@ describe("WorkflowTimelineCard", () => {
     expect(card.textContent).toContain("Review: review:security");
   });
 
-  it("auto-collapses when the run snapshot becomes completed and expands on click", async () => {
+  it("stays open through the terminal transition; only dismiss collapses it", async () => {
     const user = userEvent.setup();
+    const onDismiss = vi.fn();
+    const onUndismiss = vi.fn();
     const members = [
       member({ memberId: "a", state: "running", label: known("a"), durationMs: u(130_000), tokens: u(48_000) }),
       member({ memberId: "b", state: "running", label: known("b"), durationMs: u(108_000), tokens: u(39_000) }),
     ];
-    const { rerender } = renderCard(<WorkflowTimelineCard run={run()} phases={[phase()]} members={members} />);
-    const card = screen.getByTestId("workflow-card");
-    expect(card.querySelector("button")).toHaveAttribute("aria-expanded", "true");
-    rerender(
-      <MemoryRouter initialEntries={["/s/inst_test"]}>
-        <WorkflowTimelineCard
-          run={run({ state: "completed" })}
-          phases={[phase("p1", "Review", "completed")]}
-          members={members.map((m) => ({ ...m, state: "completed" }))}
-        />
-      </MemoryRouter>,
+    const element = (dismissed: boolean, state: WorkflowState = "running") => (
+      <WorkflowTimelineCard
+        run={run({ state })}
+        phases={[state === "running" ? phase() : phase("p1", "Review", "completed")]}
+        members={state === "running" ? members : members.map((m) => ({ ...m, state: "completed" }))}
+        dismissed={dismissed}
+        onDismiss={onDismiss}
+        onUndismiss={onUndismiss}
+      />
     );
-    // Collapsed: header summary shows agents.
-    const head = screen.getByTestId("workflow-card").querySelector("button")!;
-    expect(head).toHaveAttribute("aria-expanded", "false");
-    expect(head.textContent).toContain("2/2 agents");
-    await user.click(head);
-    expect(head).toHaveAttribute("aria-expanded", "true");
+    const { rerender } = renderCard(element(false));
+    const head = () => screen.getByTestId("workflow-card").querySelector("button")!;
+    expect(head()).toHaveAttribute("aria-expanded", "true");
+
+    // Terminal transition must NOT auto-collapse.
+    rerender(
+      <MemoryRouter initialEntries={["/s/inst_test"]}>{element(false, "completed")}</MemoryRouter>,
+    );
+    expect(head()).toHaveAttribute("aria-expanded", "true");
+
+    // Dismissal is the only thing that closes the card: clicking the head
+    // reports onDismiss, and the persisted dismissed prop then collapses it.
+    await user.click(head());
+    expect(onDismiss).toHaveBeenCalledOnce();
+    rerender(
+      <MemoryRouter initialEntries={["/s/inst_test"]}>{element(true, "completed")}</MemoryRouter>,
+    );
+    expect(head()).toHaveAttribute("aria-expanded", "false");
+    expect(head().textContent).toContain("2/2 agents");
+
+    // Re-opening reports onUndismiss and expands again.
+    await user.click(head());
+    expect(onUndismiss).toHaveBeenCalledOnce();
+    rerender(
+      <MemoryRouter initialEntries={["/s/inst_test"]}>{element(false, "completed")}</MemoryRouter>,
+    );
+    expect(head()).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("renders per-agent duration, idle, queue and tokens with a live clock", async () => {
+    const t = new Date("2026-09-18T12:00:40.000Z").getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(t);
+    try {
+      renderCard(
+        <WorkflowTimelineCard
+          run={run({ launchedAt: "2026-09-18T12:00:00.000Z" })}
+          phases={[phase()]}
+          members={[
+            member({
+              memberId: "a",
+              label: known("review:security"),
+              state: "running",
+              tokens: u(21_000),
+              startedAt: "2026-09-18T12:00:10.000Z",
+              lastProgressAt: "2026-09-18T12:00:30.000Z",
+            }),
+          ]}
+        />,
+      );
+      const row = screen.getByTestId("workflow-agent");
+      expect(within(row).getByTestId("workflow-agent-duration").textContent).toContain("0m 30");
+      expect(within(row).getByTestId("workflow-agent-idle").textContent).toContain("0m 10");
+      expect(within(row).getByTestId("workflow-agent-queue").textContent).toContain("0m 10");
+      expect(within(row).getByTestId("workflow-agent-tokens").textContent).toContain("21k");
+      // The one-second hand advances duration and idle, not the queue wait.
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(within(row).getByTestId("workflow-agent-duration").textContent).toContain("0m 32");
+      expect(within(row).getByTestId("workflow-agent-idle").textContent).toContain("0m 12");
+      expect(within(row).getByTestId("workflow-agent-queue").textContent).toContain("0m 10");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the em dash for missing metrics, never a zero", () => {
+    renderCard(
+      <WorkflowTimelineCard
+        run={run()}
+        phases={[phase()]}
+        members={[member({ memberId: "a", label: known("review:security"), state: "running" })]}
+      />,
+    );
+    const row = screen.getByTestId("workflow-agent");
+    expect(within(row).getByTestId("workflow-agent-duration").textContent).toContain("—");
+    expect(within(row).getByTestId("workflow-agent-idle").textContent).toContain("—");
+    expect(within(row).getByTestId("workflow-agent-queue").textContent).toContain("—");
+    expect(within(row).getByTestId("workflow-agent-tokens").textContent).toContain("—");
   });
 
   it("renders killed as 已终止", () => {
@@ -172,5 +248,63 @@ describe("WorkflowTimelineCard", () => {
     const card = screen.getByTestId("workflow-card-flat");
     expect(card.textContent).toContain("阶段明细");
     expect(within(card).queryByTestId("workflow-agent")).toBeNull();
+  });
+
+  const elapsedTotals = (elapsedMs: string) => ({
+    totalKnown: true,
+    agentsTotal: u(1),
+    agentsDone: u(0),
+    agentsFailed: u(0),
+    agentsKilled: u(0),
+    agentsRunning: u(1),
+    tokens: u(21_000),
+    calls: u(2),
+    elapsedMs,
+  });
+
+  it("keeps the header elapsed ticking off totals.elapsedMs when launchedAt is absent", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-18T13:00:00.000Z"));
+    try {
+      renderCard(
+        <WorkflowTimelineCard
+          run={run({ totals: elapsedTotals(u(60_000)) })}
+          phases={[phase()]}
+          members={[member({ memberId: "a", label: known("review:security"), state: "running" })]}
+        />,
+      );
+      const head = screen.getByTestId("workflow-card-head");
+      expect(head.textContent).toContain("1m 00s");
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(head.textContent).toContain("1m 02s");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never under-counts header elapsed on an attached run with a late launchedAt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-18T13:00:00.000Z"));
+    try {
+      renderCard(
+        <WorkflowTimelineCard
+          run={run({ totals: elapsedTotals(u(60_000)), launchedAt: "2026-09-18T12:59:55.000Z" })}
+          phases={[phase()]}
+          members={[member({ memberId: "a", label: known("review:security"), state: "running" })]}
+        />,
+      );
+      const head = screen.getByTestId("workflow-card-head");
+      // launchedAt would claim 5 s; the producer snapshot says 60 s — show 60.
+      expect(head.textContent).toContain("1m 00s");
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      // Extrapolated snapshot (62) beats the launch clock (7).
+      expect(head.textContent).toContain("1m 02s");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

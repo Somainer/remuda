@@ -32,7 +32,7 @@ use crate::Error;
 use crate::claude::{NativeIds, envelope as file_envelope, opaque};
 use crate::envelope::Envelope;
 use crate::source::{FileTail, MapContext, Source, SourceResume};
-use crate::util::{known, parse_timestamp, timestamp_now, unknown};
+use crate::util::{known, parse_timestamp, timestamp_from_unix_ms, timestamp_now, unknown};
 use remuda_protocol::{
     Completeness, FileCursor, ObservationPayload, OpaqueReason, SourceChannel, Timestamp, U64,
     WorkflowEngine, WorkflowLive, WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload,
@@ -644,6 +644,7 @@ impl WorkflowJournalTailer {
             name,
             description,
             totals: Some(snapshot.totals.clone()),
+            launched_at: snapshot.launched_at.clone(),
             live: Some(WorkflowLive {
                 phase_title: snapshot
                     .live_phase
@@ -739,6 +740,7 @@ impl WorkflowJournalTailer {
             duration_ms: snapshot.duration_ms.map(U64),
             started_at: snapshot.started_at.clone(),
             ended_at: snapshot.ended_at.clone(),
+            last_progress_at: snapshot.last_progress_at.clone(),
         };
         Ok(self.synth_envelope(ObservationPayload::WorkflowMember(Box::new(payload))))
     }
@@ -797,6 +799,8 @@ struct MemberSnapshot {
     duration_ms: Option<u64>,
     started_at: Option<Timestamp>,
     ended_at: Option<Timestamp>,
+    /// `MemberState.last_ts`: timestamp of the newest agent transcript line.
+    last_progress_at: Option<Timestamp>,
 }
 
 impl MemberSnapshot {
@@ -824,6 +828,7 @@ impl MemberSnapshot {
             duration_ms,
             started_at: state.started_at.clone(),
             ended_at,
+            last_progress_at: state.last_ts.clone(),
         }
     }
 
@@ -845,6 +850,7 @@ impl MemberSnapshot {
 struct RunSnapshot {
     state: WorkflowState,
     totals: WorkflowTotals,
+    launched_at: Option<Timestamp>,
     live_phase: Option<String>,
     live_agent: Option<String>,
     summary: Option<String>,
@@ -945,6 +951,7 @@ impl RunSnapshot {
                 calls: U64(calls),
                 elapsed_ms: U64(elapsed_ms.unwrap_or(0)),
             },
+            launched_at: run.launched_ms.and_then(timestamp_from_unix_ms),
             live_phase,
             live_agent,
             summary,

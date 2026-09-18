@@ -1,15 +1,18 @@
 /**
- * Workflow timeline card (workbench batch W).
+ * Workflow timeline card (workbench batch W; c-wfcard live-card metrics).
  *
  * Hangs directly on the Workflow tool row — no outer frame. One structure for
  * the running and finished card: the header doubles as the collapsed summary.
- * While the run is alive it stays expanded and live; on a terminal state it
- * auto-collapses to the header one-liner and expands on click.
+ * The card is OPEN while the run is alive and STAYS open after it finishes;
+ * it collapses only when the reader dismisses it (per-workflow, persisted by
+ * workflowDismiss.ts), and dismissal also lets the transcript compact fold
+ * swallow the row.
  *
- * All rules (states, fold, grid, narrow omissions, degraded fallback) live in
- * the pure projection; this file only renders and owns toggle state.
+ * All rules (states, fold, grid, narrow omissions, degraded fallback, clocks)
+ * live in the pure projection; this file renders, owns the one-second hand,
+ * and forwards dismiss/undismiss.
  */
-import { Fragment, useEffect, useId, useMemo, useState } from "react";
+import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type {
   WorkflowMemberPayload,
@@ -22,10 +25,13 @@ import { isToolFailure } from "../assemble";
 import sessionCss from "../session.module.css";
 import { subagentHref } from "../subagent/SubagentRows";
 import {
+  agentClocks,
   fmtDuration,
   fmtTokens,
+  headerElapsed,
   layoutRows,
   projectWorkflow,
+  runStatus,
   type WfAgent,
   type WfCard,
   type WfPhaseView,
@@ -33,6 +39,16 @@ import {
   type WfStatus,
 } from "./workflowProgress";
 import css from "./workflow.module.css";
+
+/** Clock definitions named verbatim in the row tooltips (c-wfcard rule 4). */
+const T_DURATION = "用时 = endedAt − startedAt（运行中为 now − startedAt）";
+const T_IDLE = "空闲 = endedAt − lastProgressAt（运行中为 now − lastProgressAt）";
+const T_QUEUE = "排队等待 = startedAt − run.launchedAt";
+const T_TOKENS = "tokens = agent transcript usage 合计（input + output + cache）";
+
+function missingTitle(definition: string, field: string): string {
+  return `${definition}；缺少 ${field}，暂不可用`;
+}
 
 const STATUS_WORD: Record<WfStatus, string> = {
   running: "运行中",
@@ -193,19 +209,58 @@ function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
   );
 }
 
+/** One clock/token metric: the value is always rendered (dash when absent),
+ * and the tooltip names the clock definition or the missing field. */
+function Metric({
+  value,
+  title,
+  testId,
+  soft = false,
+  prefix,
+}: {
+  value: string;
+  title: string;
+  testId: string;
+  soft?: boolean;
+  prefix?: string;
+}) {
+  const missing = value === "—";
+  const content = (
+    <>
+      {prefix ? <i className={css.clockTag}>{prefix}</i> : null}
+      <b className={missing ? css.missing : undefined}>{value}</b>
+    </>
+  );
+  return soft ? (
+    <span className={css.soft} data-testid={testId} title={title}>
+      {content}
+    </span>
+  ) : (
+    <span data-testid={testId} title={title}>
+      {content}
+    </span>
+  );
+}
+
 function AgentRow({
   agent,
   rowId,
   memberRef,
   starting,
+  nowMs,
+  launchedAtMs,
 }: {
   agent: WfAgent;
   rowId?: string;
   memberRef?: SubagentRef;
   starting: boolean;
+  nowMs: number;
+  launchedAtMs?: number;
 }) {
   const model = shortModel(agent.model);
   const { instanceId = "" } = useParams();
+  const clocks = agentClocks(agent, launchedAtMs, nowMs);
+  const running = agent.state === "running";
   return (
     <li
       className={css.agent}
@@ -236,8 +291,40 @@ function AgentRow({
           {model ? <span className={`${css.model} ${css.soft}`}>{model}</span> : null}
           {starting ? <span className={css.soft}>启动中</span> : null}
           {!starting && agent.latestTool ? <span className={`${css.tool} ${css.soft}`}>{agent.latestTool}</span> : null}
-          {!starting && typeof agent.durationMs === "number" && agent.durationMs > 0 ? <b>{fmtDuration(agent.durationMs)}</b> : null}
-          {!starting && typeof agent.tokens === "number" && agent.tokens > 0 ? <b>{fmtTokens(agent.tokens)}</b> : null}
+          {!starting ? (
+            <Metric
+              testId="workflow-agent-queue"
+              value={fmtDuration(clocks.queueMs)}
+              title={clocks.queueMs === undefined ? missingTitle(T_QUEUE, "startedAt 或 run.launchedAt") : T_QUEUE}
+              soft
+              prefix="等"
+            />
+          ) : null}
+          {!starting ? (
+            <Metric
+              testId="workflow-agent-duration"
+              value={fmtDuration(clocks.durationMs)}
+              title={
+                clocks.durationMs === undefined
+                  ? missingTitle(T_DURATION, running ? "startedAt" : "startedAt 或 endedAt")
+                  : T_DURATION
+              }
+            />
+          ) : null}
+          {!starting ? (
+            <Metric
+              testId="workflow-agent-idle"
+              value={fmtDuration(clocks.idleMs)}
+              title={clocks.idleMs === undefined ? missingTitle(T_IDLE, "lastProgressAt") : T_IDLE}
+              soft
+              prefix="闲"
+            />
+          ) : null}
+          <Metric
+            testId="workflow-agent-tokens"
+            value={fmtTokens(agent.tokens)}
+            title={agent.tokens === undefined ? missingTitle(T_TOKENS, "tokens（agent transcript 暂无 usage）") : T_TOKENS}
+          />
         </span>
       </Link>
       <span className={css.agentOpenBtn}>
@@ -279,7 +366,17 @@ function FoldToggle({
   );
 }
 
-function PhaseBlock({ phase, refsByAgent }: { phase: WfPhaseView; refsByAgent: Map<string, SubagentRef> }) {
+function PhaseBlock({
+  phase,
+  refsByAgent,
+  nowMs,
+  launchedAtMs,
+}: {
+  phase: WfPhaseView;
+  refsByAgent: Map<string, SubagentRef>;
+  nowMs: number;
+  launchedAtMs?: number;
+}) {
   // Follow `expandedByDefault` until the user toggles, then remember it.
   // Following the prop matters because the phase head mounts before members
   // stream in: an initializer would lock it to "0 agents → collapsed" forever.
@@ -323,6 +420,8 @@ function PhaseBlock({ phase, refsByAgent }: { phase: WfPhaseView; refsByAgent: M
                 agent={agent}
                 memberRef={refsByAgent.get(agent.id)}
                 starting={agent.state === "queued" && !refsByAgent.has(agent.id) && (agent.calls ?? 0) === 0}
+                nowMs={nowMs}
+                launchedAtMs={launchedAtMs}
               />
             </Fragment>
           ))}
@@ -337,6 +436,8 @@ function PhaseBlock({ phase, refsByAgent }: { phase: WfPhaseView; refsByAgent: M
                   agent={agent}
                   memberRef={refsByAgent.get(agent.id)}
                   starting={agent.state === "queued" && !refsByAgent.has(agent.id) && (agent.calls ?? 0) === 0}
+                  nowMs={nowMs}
+                  launchedAtMs={launchedAtMs}
                 />
               ))
             : null}
@@ -346,34 +447,64 @@ function PhaseBlock({ phase, refsByAgent }: { phase: WfPhaseView; refsByAgent: M
   );
 }
 
-/** 1s wall-clock driver for a running expanded card. */
-function useElapsed(active: boolean, snapshotMs: number): number {
-  const [elapsed, setElapsed] = useState(snapshotMs);
-  // A new snapshot is authoritative: snap to it.
-  useEffect(() => setElapsed(snapshotMs), [snapshotMs]);
+/**
+ * 1s wall-clock hand for an open running card. One interval drives both the
+ * card header elapsed time and every per-agent duration/idle clock; it is
+ * armed only while the card is running AND expanded, so it never outlives a
+ * running card.
+ */
+function useNow(active: boolean, snapKey: string): number {
+  const [now, setNow] = useState(() => Date.now());
+  // A new snapshot is authoritative: re-anchor to the wall clock.
+  useEffect(() => setNow(Date.now()), [snapKey]);
   useEffect(() => {
     if (!active) return;
-    const timer = window.setInterval(() => setElapsed((ms) => ms + 1000), 1000);
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [active, snapshotMs]);
-  return elapsed;
+  }, [active, snapKey]);
+  return now;
 }
 
-function DetailedCard({ card, refsByAgent }: { card: WfCard; refsByAgent: Map<string, SubagentRef> }) {
+function DetailedCard({
+  card,
+  refsByAgent,
+  nowMs,
+  dismissed,
+  onDismiss,
+  onUndismiss,
+}: {
+  card: WfCard;
+  refsByAgent: Map<string, SubagentRef>;
+  nowMs: number;
+  dismissed: boolean;
+  onDismiss: () => void;
+  onUndismiss: () => void;
+}) {
   const running = card.status === "running";
-  const [open, setOpen] = useState(running);
+  // Open state is "open unless dismissed"; a finished run never collapses on
+  // its own — only the reader's dismiss does that.
+  const open = !dismissed;
   const rawId = useId();
   const bodyId = `wf-body-${rawId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-  // Auto-collapse when the run reaches a terminal state (once).
-  const [wasRunning, setWasRunning] = useState(running);
-  useEffect(() => {
-    if (wasRunning && !running) {
-      setOpen(false);
-      setWasRunning(false);
-    }
-  }, [running, wasRunning]);
-  // Wall clock while the expanded card is live, snapping to each snapshot.
-  const elapsedMs = useElapsed(running && open, card.totals.elapsedMs);
+
+  // Header wall time. The snapshot anchor is the wall instant at which the
+  // producer's totals.elapsedMs was last observed: between journal revisions
+  // the one-second hand extrapolates from it (including when launchedAt is
+  // absent — an older node streaming to this web). When launchedAt exists it
+  // is the discovery instant on attached runs, not the real launch, so the
+  // elapsed is the LARGER of the two clocks — never an under-count.
+  const snapshotMs = card.totals.elapsedMs;
+  const snapshotAnchorRef = useRef<{ ms: number; at: number } | null>(null);
+  if (snapshotAnchorRef.current === null || snapshotAnchorRef.current.ms !== snapshotMs) {
+    snapshotAnchorRef.current = { ms: snapshotMs, at: nowMs };
+  }
+  const elapsedMs = headerElapsed({
+    running,
+    snapshotMs,
+    launchedAtMs: card.launchedAtMs,
+    nowMs,
+    snapshotAnchorMs: snapshotAnchorRef.current.at,
+  });
 
   const agentsWord = card.totals.totalKnown
     ? `${card.totals.done + card.totals.failed + card.totals.killed}/${card.totals.agentsTotal} agents`
@@ -382,7 +513,7 @@ function DetailedCard({ card, refsByAgent }: { card: WfCard; refsByAgent: Map<st
   const onKey = (event: React.KeyboardEvent) => {
     if (event.key === "Escape" && open) {
       event.stopPropagation();
-      setOpen(false);
+      onDismiss();
     }
   };
 
@@ -393,8 +524,10 @@ function DetailedCard({ card, refsByAgent }: { card: WfCard; refsByAgent: Map<st
         className={css.head}
         aria-expanded={open}
         aria-controls={bodyId}
-        onClick={() => setOpen(!open)}
+        onClick={open ? onDismiss : onUndismiss}
         onKeyDown={onKey}
+        title={open ? "收起卡片（折叠进本回合工具汇总）" : "展开卡片"}
+        data-testid="workflow-card-head"
       >
         <Chevron />
         <WorkflowGlyph />
@@ -439,7 +572,7 @@ function DetailedCard({ card, refsByAgent }: { card: WfCard; refsByAgent: Map<st
           ) : null}
           <div className={css.body}>
             {card.phases.map((phase) => (
-              <PhaseBlock key={phase.id} phase={phase} refsByAgent={refsByAgent} />
+              <PhaseBlock key={phase.id} phase={phase} refsByAgent={refsByAgent} nowMs={nowMs} launchedAtMs={card.launchedAtMs} />
             ))}
           </div>
         </div>
@@ -474,18 +607,37 @@ export function WorkflowTimelineCard(props: {
   members: WorkflowMemberPayload[];
   /** c-wfdrill: live tool rows folded per member, keyed by native agent id. */
   subagents?: SubagentRef[];
+  /** c-wfcard: persisted dismissal state; absent/never-dismissed defaults open. */
+  dismissed?: boolean;
+  onDismiss?: () => void;
+  onUndismiss?: () => void;
 }) {
+  const running = runStatus(props.run.state) === "running";
+  const detailed = !props.run.note && (props.phases.length > 0 || props.members.length > 0);
+  const dismissed = props.dismissed ?? false;
+  // Re-anchor the hand whenever a run/member revision lands.
+  const lastMemberRevision = props.members.at(-1)?.revision;
+  const snapKey = `${props.run.revision}:${props.members.length}:${lastMemberRevision ?? ""}`;
+  const nowMs = useNow(running && detailed && !dismissed, snapKey);
   const card = useMemo(
-    () => projectWorkflow({ run: props.run, phases: props.phases, members: props.members }),
-    [props.run, props.phases, props.members],
+    () => projectWorkflow({ run: props.run, phases: props.phases, members: props.members, nowMs }),
+    [props.run, props.phases, props.members, nowMs],
   );
   const refsByAgent = useMemo(() => {
     const map = new Map<string, SubagentRef>();
     for (const ref of props.subagents ?? []) map.set(ref.agentId, ref);
     return map;
   }, [props.subagents]);
+  const noop = () => {};
   return card.detailed ? (
-    <DetailedCard card={card} refsByAgent={refsByAgent} />
+    <DetailedCard
+      card={card}
+      refsByAgent={refsByAgent}
+      nowMs={nowMs}
+      dismissed={dismissed}
+      onDismiss={props.onDismiss ?? noop}
+      onUndismiss={props.onUndismiss ?? noop}
+    />
   ) : (
     <FlatCard card={card} />
   );

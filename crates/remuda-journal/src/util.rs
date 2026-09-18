@@ -35,6 +35,17 @@ pub(crate) fn timestamp_from_offset(dt: OffsetDateTime) -> Result<Timestamp, Err
     Ok(Timestamp::try_from(text)?)
 }
 
+/// Build a protocol Timestamp from Unix epoch milliseconds (`SystemTime`).
+pub(crate) fn timestamp_from_unix_ms(ms: u128) -> Option<Timestamp> {
+    let secs = i64::try_from(ms / 1000).ok()?;
+    let millis = u16::try_from(ms % 1000).ok()?;
+    let dt = OffsetDateTime::from_unix_timestamp(secs)
+        .ok()?
+        .replace_millisecond(millis)
+        .ok()?;
+    timestamp_from_offset(dt).ok()
+}
+
 /// Parse a native RFC3339 timestamp into `Knowledge`, truncating extra fraction digits.
 pub(crate) fn parse_timestamp(raw: &str) -> Knowledge<Timestamp> {
     let trimmed = raw.trim();

@@ -20329,6 +20329,17 @@
           "$ref": "#/$defs/Knowledge2",
           "description": "`label`; protocol §5.3."
         },
+        "lastProgressAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Timestamp of the agent's last transcript progress line; the idle-clock\norigin. Additive c-wfcard; absent on older producers."
+        },
         "latestTool": {
           "anyOf": [
             {
@@ -20500,6 +20511,17 @@
         "engine": {
           "$ref": "#/$defs/WorkflowEngine",
           "description": "`engine`; protocol §5.3."
+        },
+        "launchedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Run launch instant (wall clock), the queue-wait origin; additive\nc-wfcard. Absent on producers/journals written before the live card."
         },
         "live": {
           "anyOf": [

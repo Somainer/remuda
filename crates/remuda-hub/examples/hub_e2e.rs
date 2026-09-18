@@ -2341,6 +2341,7 @@ fn workflow_kind(prompt: &str) -> Option<&'static str> {
         "fail" => "fail",
         "legacy" => "legacy",
         "drill" => "drill",
+        "live" => "live",
         "demo running" => "demo-running",
         "demo done" => "demo-done",
         _ => "demo",
@@ -2477,6 +2478,26 @@ fn wf_known(value: Value) -> Value {
     json!({ "state": "known", "value": value })
 }
 
+/// c-wfcard: RFC3339-ms timestamp at `now + offset_ms`, as a JSON string.
+/// The workflow fixtures pin real `launchedAt` / `startedAt` / `endedAt` /
+/// `lastProgressAt` values this way so the live card's clocks render instead
+/// of the em dash (the hand-format shape the wire Timestamp requires).
+fn wf_timestamp(offset_ms: i128) -> Value {
+    let ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000 + offset_ms;
+    let t = time::OffsetDateTime::from_unix_timestamp_nanos(ms * 1_000_000)
+        .expect("millisecond in range");
+    json!(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+        t.millisecond(),
+    ))
+}
+
 /// Parse the context-usage-1 sentinel
 /// `usage:<input>,<output>,<cacheRead>,<cacheWrite>`; each field is a
 /// non-negative integer or `-` for a channel the harness never reported.
@@ -2544,6 +2565,9 @@ fn wf_member(
     tokens: Option<u64>,
     calls: Option<u64>,
     duration_ms: Option<u64>,
+    started_at: Value,
+    ended_at: Value,
+    last_progress_at: Value,
 ) -> Value {
     json!({
         "workflowId": workflow_id,
@@ -2562,8 +2586,9 @@ fn wf_member(
         "tokens": tokens.map(|t| json!(t.to_string())),
         "calls": calls.map(|c| json!(c.to_string())),
         "durationMs": duration_ms.map(|d| json!(d.to_string())),
-        "startedAt": null,
-        "endedAt": null,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        "lastProgressAt": last_progress_at,
     })
 }
 
@@ -2593,6 +2618,13 @@ async fn append_workflow_scenario(
         "demo-running" | "demo-done" => "demo",
         "fold-running" => "fold",
         other => other,
+    };
+    // c-wfcard: run launch instant; running fixtures are 222 s old (matching
+    // the pinned elapsedMs), terminal/legacy fixtures anchor at "now".
+    let launched = if kind == "demo-running" || kind == "live" {
+        wf_timestamp(-222_000)
+    } else {
+        wf_timestamp(0)
     };
     let workflow_id = format!("obj_wf_{tag}");
     let tool_id = format!("obj_wft_{tag}");
@@ -2628,7 +2660,12 @@ async fn append_workflow_scenario(
     )
     .await?;
 
-    let run = |state: &str, revision: u64, totals: Value, live: Value, note: Option<&str>| {
+    let run = |state: &str,
+               revision: u64,
+               totals: Value,
+               live: Value,
+               note: Option<&str>,
+               launched_at: Value| {
         json!({
             "workflowId": workflow_id,
             "engine": "claude-workflow",
@@ -2641,6 +2678,7 @@ async fn append_workflow_scenario(
             "name": wf_known(json!(format!("card-{tag}"))),
             "description": wf_known(json!("synthetic timeline card run")),
             "totals": totals,
+            "launchedAt": launched_at,
             "live": live,
             "note": note,
             "resultRef": null,
@@ -2695,6 +2733,7 @@ async fn append_workflow_scenario(
                 json!(null),
                 json!(null),
                 Some("daemon 版本较旧，暂无阶段明细"),
+                launched.clone(),
             ),
         )
         .await?;
@@ -2706,104 +2745,10 @@ async fn append_workflow_scenario(
             .await;
     }
 
-    // Terminal half of the demo scenario (second prompt after "demo running"):
-    // only completion revisions, same workflow/tool ids.
-    if kind == "demo-done" {
-        n = append_event(
-            ws,
-            instance_id,
-            n,
-            "workflow.member",
-            wf_member(
-                &workflow_id,
-                &member(2),
-                &phase(1),
-                "review:security",
-                "completed",
-                2,
-                Some("opus-5[1m]"),
-                Some("Grep"),
-                Some(44_000),
-                Some(8),
-                Some(122_000),
-            ),
-        )
-        .await?;
-        n = append_event(
-            ws,
-            instance_id,
-            n,
-            "workflow.member",
-            wf_member(
-                &workflow_id,
-                &member(3),
-                &phase(2),
-                "verify:auth.ts",
-                "completed",
-                2,
-                Some("haiku-4.5"),
-                Some("Bash"),
-                Some(31_000),
-                Some(5),
-                Some(80_000),
-            ),
-        )
-        .await?;
-        n = append_event(
-            ws,
-            instance_id,
-            n,
-            "workflow.member",
-            wf_member(
-                &workflow_id,
-                &member(4),
-                &phase(2),
-                "verify:api.ts",
-                "completed",
-                2,
-                Some("haiku-4.5"),
-                Some("Read"),
-                Some(27_000),
-                Some(4),
-                Some(65_000),
-            ),
-        )
-        .await?;
-        n = append_event(
-            ws,
-            instance_id,
-            n,
-            "workflow.phase",
-            wf_phase(&workflow_id, &phase(1), "Review", "completed"),
-        )
-        .await?;
-        n = append_event(
-            ws,
-            instance_id,
-            n,
-            "workflow.phase",
-            wf_phase(&workflow_id, &phase(2), "Verify", "completed"),
-        )
-        .await?;
-        n = append_event(
-            ws,
-            instance_id,
-            n,
-            "workflow.run",
-            run(
-                "completed",
-                2,
-                totals(4, 0, 0, 0, 4, true, 412_000, 106, 298_000),
-                live_done("Dynamic workflow \"card-demo\" completed"),
-                None,
-            ),
-        )
-        .await?;
-        return Ok(n);
-    }
-
-    if kind == "demo-running" || kind == "demo" {
-        let running_only = kind == "demo-running";
+    if kind == "live" {
+        // c-wfcard: same live run as demo-running, but the assistant turn is
+        // closed (one ordinary Bash tool + a thought behind it), so dismissal
+        // can be proven to fold the card into the compact summary row.
         n = append_event(
             ws,
             instance_id,
@@ -2815,6 +2760,7 @@ async fn append_workflow_scenario(
                 totals(1, 0, 0, 1, 4, true, 69_000, 5, 222_000),
                 live_running("Review", "review:security"),
                 None,
+                launched.clone(),
             ),
         )
         .await?;
@@ -2851,6 +2797,9 @@ async fn append_workflow_scenario(
                 Some(39_000),
                 Some(4),
                 Some(108_000),
+                wf_timestamp(-222_000),
+                wf_timestamp(-114_000),
+                wf_timestamp(-114_000),
             ),
         )
         .await?;
@@ -2871,6 +2820,9 @@ async fn append_workflow_scenario(
                 Some(21_000),
                 Some(2),
                 Some(62_000),
+                wf_timestamp(-62_000),
+                Value::Null,
+                wf_timestamp(-2_000),
             ),
         )
         .await?;
@@ -2891,6 +2843,9 @@ async fn append_workflow_scenario(
                 None,
                 None,
                 None,
+                Value::Null,
+                Value::Null,
+                Value::Null,
             ),
         )
         .await?;
@@ -2911,13 +2866,82 @@ async fn append_workflow_scenario(
                 None,
                 None,
                 None,
+                Value::Null,
+                Value::Null,
+                Value::Null,
             ),
         )
         .await?;
-        if running_only {
-            return Ok(n);
-        }
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        // One ordinary (successful) Bash tool in the same turn: it joins the
+        // compact fold while the undismissed workflow row stays outside.
+        let bash_id = format!("obj_bash_{tag}");
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "tool_call",
+            json!({
+                "nodeId": bash_id,
+                "revision": "1",
+                "operation": "open",
+                "baseRevision": null,
+                "toolCallId": bash_id,
+                "parentToolCallId": null,
+                "toolName": wf_known(json!("Bash")),
+                "displayTitle": wf_known(json!("Bash")),
+                "category": "shell",
+                "input": wf_known(json!({ "command": "echo workflow-running" })),
+                "inputTextDelta": null,
+                "state": "running",
+                "executor": wf_unknown(),
+            }),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "tool_result",
+            json!({
+                "nodeId": bash_id,
+                "revision": "2",
+                "operation": "close",
+                "baseRevision": "1",
+                "toolCallId": bash_id,
+                "stage": "final",
+                "outcome": "succeeded",
+                "blocks": [{ "type": "text", "text": "ok\n" }],
+                "structuredResult": wf_known(json!({ "stdout": "ok\n" })),
+                "exitCode": wf_known(json!(0)),
+                "changes": [],
+            }),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "thought",
+            json!({
+                "nodeId": format!("obj_thought_{tag}"),
+                "revision": "1",
+                "operation": "close",
+                "baseRevision": null,
+                "thoughtId": format!("obj_thought_{tag}"),
+                "representation": "summary",
+                "text": "plan the workflow run",
+                "partIndex": 0,
+                "status": "complete",
+            }),
+        )
+        .await?;
+        n = append_journal(ws, instance_id, n, "assistant", "workflow 在跑").await?;
+        return Ok(n);
+    }
+
+    // Terminal half of the demo scenario (second prompt after "demo running"):
+    // only completion revisions, same workflow/tool ids.
+    if kind == "demo-done" {
         n = append_event(
             ws,
             instance_id,
@@ -2935,6 +2959,9 @@ async fn append_workflow_scenario(
                 Some(44_000),
                 Some(8),
                 Some(122_000),
+                wf_timestamp(-122_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
             ),
         )
         .await?;
@@ -2955,6 +2982,9 @@ async fn append_workflow_scenario(
                 Some(31_000),
                 Some(5),
                 Some(80_000),
+                wf_timestamp(-80_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
             ),
         )
         .await?;
@@ -2975,6 +3005,9 @@ async fn append_workflow_scenario(
                 Some(27_000),
                 Some(4),
                 Some(65_000),
+                wf_timestamp(-65_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
             ),
         )
         .await?;
@@ -3005,6 +3038,239 @@ async fn append_workflow_scenario(
                 totals(4, 0, 0, 0, 4, true, 412_000, 106, 298_000),
                 live_done("Dynamic workflow \"card-demo\" completed"),
                 None,
+                launched.clone(),
+            ),
+        )
+        .await?;
+        return Ok(n);
+    }
+
+    if kind == "demo-running" || kind == "demo" {
+        let running_only = kind == "demo-running";
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "running",
+                1,
+                totals(1, 0, 0, 1, 4, true, 69_000, 5, 222_000),
+                live_running("Review", "review:security"),
+                None,
+                launched.clone(),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Review", "running"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(2), "Verify", "queued"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(1),
+                &phase(1),
+                "review:perf",
+                "completed",
+                1,
+                Some("haiku-4.5"),
+                Some("Grep"),
+                Some(39_000),
+                Some(4),
+                Some(108_000),
+                wf_timestamp(-222_000),
+                wf_timestamp(-114_000),
+                wf_timestamp(-114_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(2),
+                &phase(1),
+                "review:security",
+                "running",
+                1,
+                Some("opus-5[1m]"),
+                Some("Grep"),
+                Some(21_000),
+                Some(2),
+                Some(62_000),
+                wf_timestamp(-62_000),
+                Value::Null,
+                wf_timestamp(-2_000),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(3),
+                &phase(2),
+                "verify:auth.ts",
+                "queued",
+                1,
+                Some("haiku-4.5"),
+                None,
+                None,
+                None,
+                None,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(4),
+                &phase(2),
+                "verify:api.ts",
+                "queued",
+                1,
+                Some("haiku-4.5"),
+                None,
+                None,
+                None,
+                None,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ),
+        )
+        .await?;
+        if running_only {
+            return Ok(n);
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(2),
+                &phase(1),
+                "review:security",
+                "completed",
+                2,
+                Some("opus-5[1m]"),
+                Some("Grep"),
+                Some(44_000),
+                Some(8),
+                Some(122_000),
+                wf_timestamp(-122_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(3),
+                &phase(2),
+                "verify:auth.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Bash"),
+                Some(31_000),
+                Some(5),
+                Some(80_000),
+                wf_timestamp(-80_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.member",
+            wf_member(
+                &workflow_id,
+                &member(4),
+                &phase(2),
+                "verify:api.ts",
+                "completed",
+                2,
+                Some("haiku-4.5"),
+                Some("Read"),
+                Some(27_000),
+                Some(4),
+                Some(65_000),
+                wf_timestamp(-65_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
+            ),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(1), "Review", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.phase",
+            wf_phase(&workflow_id, &phase(2), "Verify", "completed"),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "workflow.run",
+            run(
+                "completed",
+                2,
+                totals(4, 0, 0, 0, 4, true, 412_000, 106, 298_000),
+                live_done("Dynamic workflow \"card-demo\" completed"),
+                None,
+                launched.clone(),
             ),
         )
         .await?;
@@ -3024,6 +3290,7 @@ async fn append_workflow_scenario(
                 totals(0, 0, 0, 1, 20, true, 0, 0, 1_000),
                 live_running("Gen", "gen:batch-01"),
                 None,
+                launched.clone(),
             ),
         )
         .await?;
@@ -3054,6 +3321,17 @@ async fn append_workflow_scenario(
                     if i == 0 { Some(7_200) } else { None },
                     if i == 0 { Some(1) } else { None },
                     if i == 0 { Some(31_000) } else { None },
+                    if i == 0 {
+                        wf_timestamp(-31_000)
+                    } else {
+                        Value::Null
+                    },
+                    Value::Null,
+                    if i == 0 {
+                        wf_timestamp(-1_000)
+                    } else {
+                        Value::Null
+                    },
                 ),
             )
             .await?;
@@ -3077,6 +3355,9 @@ async fn append_workflow_scenario(
                     Some(58_000 + u64::from(i) * 200),
                     Some(3),
                     Some(75_000),
+                    wf_timestamp(-75_000),
+                    wf_timestamp(0),
+                    wf_timestamp(0),
                 ),
             )
             .await?;
@@ -3100,6 +3381,7 @@ async fn append_workflow_scenario(
                 totals(20, 0, 0, 0, 20, true, 1_180_000, 60, 391_000),
                 live_done("Dynamic workflow \"card-fold\" completed"),
                 None,
+                launched.clone(),
             ),
         )
         .await?;
@@ -3118,6 +3400,7 @@ async fn append_workflow_scenario(
             totals(14, 1, 0, 0, 15, true, 388_000, 94, 361_000),
             live_done("Dynamic workflow \"card-fail\" failed"),
             None,
+            launched.clone(),
         ),
     )
     .await?;
@@ -3147,6 +3430,9 @@ async fn append_workflow_scenario(
                 Some(36_000),
                 Some(3),
                 Some(99_000),
+                wf_timestamp(-99_000),
+                wf_timestamp(0),
+                wf_timestamp(0),
             ),
         )
         .await?;
@@ -3168,6 +3454,9 @@ async fn append_workflow_scenario(
             Some(22_000),
             Some(2),
             Some(72_000),
+            wf_timestamp(-72_000),
+            wf_timestamp(0),
+            wf_timestamp(0),
         ),
     )
     .await?;
@@ -3225,6 +3514,7 @@ async fn append_drill_scenario(
             "name": wf_known(json!("card-drill")),
             "description": wf_known(json!("subagent drill-in spike")),
             "totals": json!(totals_map),
+            "launchedAt": wf_timestamp(-21_572),
             "live": {
                 "phaseTitle": wf_known(json!("Review")),
                 "agentLabel": wf_known(json!("review:security")),
@@ -3266,6 +3556,9 @@ async fn append_drill_scenario(
             "Grep",
             83_319,
             3,
+            wf_timestamp(-12_000),
+            Value::Null,
+            wf_timestamp(-2_000),
         ),
     )
     .await?;
@@ -3284,6 +3577,9 @@ async fn append_drill_scenario(
             "",
             0,
             0,
+            Value::Null,
+            Value::Null,
+            Value::Null,
         ),
     )
     .await?;
@@ -3383,6 +3679,9 @@ fn drill_member(
     latest_tool: &str,
     tokens: u64,
     calls: u64,
+    started_at: Value,
+    ended_at: Value,
+    last_progress_at: Value,
 ) -> Value {
     json!({
         "workflowId": workflow_id,
@@ -3401,8 +3700,9 @@ fn drill_member(
         "tokens": if tokens > 0 { Some(tokens.to_string()) } else { None },
         "calls": if calls > 0 { Some(calls.to_string()) } else { None },
         "durationMs": Value::Null,
-        "startedAt": null,
-        "endedAt": null,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        "lastProgressAt": last_progress_at,
     })
 }
 

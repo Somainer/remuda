@@ -243,7 +243,8 @@ export class JournalClient {
    * are delivered ascending through `onPrepend`; the loaded floor moves down
    * and returns null once seq 1 is held or an older read yields nothing.
    */
-  async loadEarlier(): Promise<U64 | null> {    if (this.loadingEarlier) return null;
+  async loadEarlier(): Promise<U64 | null> {
+    if (this.loadingEarlier) return null;
     if (!Number.isFinite(this.floorSeq) || this.floorSeq <= 1) return null;
     this.loadingEarlier = true;
     try {

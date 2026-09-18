@@ -189,6 +189,41 @@ export function agentClocks(agent: WfAgent, launchedAtMs: number | undefined, no
   };
 }
 
+/**
+ * Honest running header elapsed. Two clocks can bound it and neither alone is
+ * always truthful:
+ *
+ * - `now − launchedAt` — live wall time only when the Node launched the run
+ *   itself. On the discovery path launchedAt is the instant the journal first
+ *   noticed an already-running run, so this UNDER-counts;
+ * - the producer's `totals.elapsedMs` — derived from the earliest agent start,
+ *   correct at emission but frozen between revisions, so it is extrapolated by
+ *   the wall time since the snapshot arrived.
+ *
+ * Take the larger of the two while running; when launchedAt is absent (older
+ * node streaming to the new web) the extrapolated snapshot alone keeps
+ * ticking. Returns 0 when neither clock exists, which the header hides.
+ */
+export function headerElapsed(input: {
+  running: boolean;
+  snapshotMs: number;
+  launchedAtMs?: number;
+  nowMs: number;
+  /** `now` at which snapshotMs was last observed; anchors extrapolation. */
+  snapshotAnchorMs: number;
+}): number {
+  const { running, snapshotMs, launchedAtMs, nowMs, snapshotAnchorMs } = input;
+  if (!running) return snapshotMs;
+  const candidates: number[] = [];
+  if (snapshotMs > 0) {
+    candidates.push(snapshotMs + Math.max(0, nowMs - snapshotAnchorMs));
+  }
+  if (typeof launchedAtMs === "number") {
+    candidates.push(Math.max(0, nowMs - launchedAtMs));
+  }
+  return candidates.length ? Math.max(...candidates) : 0;
+}
+
 /** Compact token count: `9.1k` / `312k` / `2.4M`. */
 export function fmtTokens(tokens?: number | null): string {
   if (!tokens || tokens <= 0) return "—";

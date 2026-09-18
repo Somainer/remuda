@@ -4435,6 +4435,7 @@ export type WorkerRoster = ({
   "instanceId"?: (InstanceId | (null));
   "lastNudgeAt"?: (Timestamp | (null));
   "model"?: (string | null);
+  "modelEffective"?: (string | null);
   "name": (string);
   "portBlock"?: (string | null);
   "projectId": ProjectId;

@@ -6585,6 +6585,40 @@ mod tests {
         );
     }
 
+    /// A `model` journal event persists the observed id as `modelEffective`
+    /// without the Hub trusting the requested pin.
+    #[tokio::test]
+    async fn model_observation_projects_effective_id() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                json!({"kind":"model","payload":{
+                    "requested":"model_hub/es1_orange_o50[1m]",
+                    "effective":{"id":"model_hub/es1_orange_o48[1m]",
+                        "source":"launch","observedAt":"2026-09-18T00:00:00.000Z"},
+                    "raw":"model_hub/es1_orange_o48[1m]"}}),
+            )
+            .await
+            .expect("model event");
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        let effective = row.model_effective.expect("modelEffective stored");
+        assert_eq!(
+            effective.get("id").and_then(Value::as_str),
+            Some("model_hub/es1_orange_o48[1m]")
+        );
+    }
+
     /// A `permission` journal event persists the transcript-read-back mode as
     /// `permissionEffective` without the Hub trusting the requested word.
     #[tokio::test]

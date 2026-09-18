@@ -1124,6 +1124,109 @@ impl DevNode {
     }
 }
 
+/// The explicit pin a launch gate arms from: the recipe's `model_pin`
+/// (`spec.model_id`, no profile fallback), trimmed and empties dropped.
+///
+/// Deliberately not `model_requested`, which is also set to the profile's
+/// default model on an unpinned launch; arming from it would make an unpinned
+/// launch refuseable.
+fn pin_from_recipe(recipe: &Option<remuda_driver::LaunchRecipe>) -> Option<String> {
+    normalize_explicit_pin(recipe.as_ref()?.provider.model_pin.as_deref())
+}
+
+/// Trim a pin and treat a blank/absent one as "no explicit pin".
+fn normalize_explicit_pin(pin: Option<&str>) -> Option<String> {
+    pin.map(str::trim)
+        .filter(|pin| !pin.is_empty())
+        .map(str::to_owned)
+}
+
+/// Post-launch model-pin read-back (`evidence/model-pin-1.md` §3).
+///
+/// model-pin-1: a `--model` pin is sent, but a host layer can still make the
+/// session answer on something else. This gate reads back what actually
+/// answered and refuses a substitution, using the alias-aware comparison in
+/// [`remuda_protocol::compare_model_pin`] so a correct gateway launch
+/// (`model_hub/es1_orange_o50[1m]` answered by `claude-opus-5`) is not flagged.
+///
+/// It is deliberately event-driven and fail-open: it judges only the
+/// **launch-attributed** read-back, once. If no genuine read-back ever arrives
+/// (no assistant message, no verdict), there is no evidence of a substitution,
+/// so the launch is allowed to continue rather than killed on a guess. A later
+/// in-session switch — a human `/model` or a Remuda `configure` — is out of
+/// scope by source attribution and never refused here.
+struct ModelPinGate {
+    /// The requested id. `None` disables the gate entirely: a pin that was
+    /// never requested cannot mismatch.
+    pin: Option<String>,
+    /// The session's discovered model list, from the launch snapshot. Lets an
+    /// un-namespaced observation be recognised as catalog vocabulary.
+    catalog: Vec<String>,
+    /// The launch read-back has been judged; report at most once.
+    settled: bool,
+}
+
+impl ModelPinGate {
+    fn new(pin: Option<String>) -> Self {
+        Self {
+            pin,
+            catalog: Vec::new(),
+            settled: false,
+        }
+    }
+
+    /// Fold one observation. `Some(reason)` means stop this launch.
+    fn observe(&mut self, observation: &remuda_protocol::Observation) -> Option<String> {
+        let pin = self.pin.as_deref()?;
+        let ObservationPayload::Model(payload) = &observation.body else {
+            return None;
+        };
+        // The launch snapshot carries the discovered list; keep it regardless
+        // of whether the observation itself is judged.
+        if let Some(catalog) = payload.catalog.as_ref() {
+            self.catalog = catalog.models.clone();
+        }
+        if self.settled {
+            return None;
+        }
+        // Only the launch read-back is in scope. The driver emits two
+        // launch-sourced model observations:
+        //
+        // * the *snapshot* (`take_launch_model_snapshot`): emitted before the
+        //   process speaks, its `effective.id` is the requested pin itself and
+        //   it has no `raw` transcript spelling. It is a prediction, not a
+        //   read-back — judging it would settle the gate on our own request and
+        //   make the check unfalsifiable;
+        // * the first genuine read-back: an assistant record's `message.model`
+        //   or a launch-settled `/model` verdict. It carries the native spelling
+        //   in `raw`, so `raw.is_some()` is what separates it from the
+        //   snapshot. Its `source` is `Launch` because the launch seeded the
+        //   attribution; later edges (`Unknown`) and human/Remuda switches
+        //   (`Slash`/`Remuda`) are not this gate's business.
+        let is_launch_readback = payload.effective.source == remuda_protocol::EffortSource::Launch
+            && payload.raw.is_some();
+        if !is_launch_readback {
+            return None;
+        }
+        self.settled = true;
+        let observed = payload.effective.id.trim();
+        match remuda_protocol::compare_model_pin(pin, observed, &self.catalog) {
+            remuda_protocol::ModelPinVerdict::Mismatch => Some(format!(
+                "{MODEL_MISMATCH}: requested {pin} but {observed} answered"
+            )),
+            // Honoured (the pin, or its context-suffix spelling) and
+            // Unresolvable (a gateway resolved it to an upstream vendor name —
+            // indistinguishable from a correct launch on this channel) both
+            // pass silently.
+            remuda_protocol::ModelPinVerdict::Honoured
+            | remuda_protocol::ModelPinVerdict::Unresolvable => None,
+        }
+    }
+}
+
+/// Lifecycle error name for a launch whose model pin was not honoured.
+pub const MODEL_MISMATCH: &str = "model-mismatch";
+
 fn spawn_observation_pump(
     store: Arc<dyn LocalStore>,
     interactions: Arc<InteractionRuntime>,
@@ -1144,10 +1247,28 @@ fn spawn_observation_pump(
         let mut workflow = crate::workflow_producer::WorkflowProducer::new(instance_id.clone());
         let mut workflow_tick = tokio::time::interval(crate::workflow_producer::WORKFLOW_POLL);
         workflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // model-pin-1: refuse a launch the explicit pin did not reach. The gate
+        // arms from `model_pin` — `spec.model_id` only, never the
+        // profile-derived default that also populates `model_requested` on an
+        // unpinned launch — so a launch with no pin can never start refusing.
+        let mut model_pin = ModelPinGate::new(pin_from_recipe(&driver.launch_recipe()));
         loop {
             tokio::select! {
                 maybe_observation = observations.recv() => {
                     let Some(observation) = maybe_observation else { break };
+                    // Before the fold, so the refusal does not race the
+                    // observation that proves it into the journal.
+                    if let Some(reason) = model_pin.observe(&observation) {
+                        tracing::error!(%reason, "model pin not honoured; stopping the launch");
+                        // Journal the contradicting observation first: the
+                        // refusal must be explainable from the journal.
+                        let _ = store.append_driver_observation(&instance_id, observation);
+                        if let Err(error) = driver.execute(DriverRequest::Close).await {
+                            tracing::error!(%error, "model-mismatch teardown failed");
+                        }
+                        record_task_exit(store.as_ref(), &instance_id, &reason);
+                        break;
+                    }
                     pump_one_observation(
                         &store,
                         &interactions,
@@ -3673,5 +3794,211 @@ mod tests {
                 .expect("events")
                 .contains("fake-driver-keys")
         );
+    }
+
+    /// model-pin-1: the post-launch pin read-back gate.
+    mod model_pin_gate {
+        use super::*;
+
+        const PIN: &str = "model_hub/es1_orange_o50[1m]";
+
+        /// The driver's synthetic launch snapshot: `source = Launch`, and crucially
+        /// NO `raw` spelling, because the process has not spoken yet.
+        fn launch_snapshot(id: &str, catalog: Option<Vec<String>>) -> remuda_protocol::Observation {
+            model(id, remuda_protocol::EffortSource::Launch, None, catalog)
+        }
+
+        /// The first genuine launch read-back: `source = Launch` (the launch
+        /// seeded attribution) but carrying the native transcript spelling in
+        /// `raw`. An assistant record or a launch-settled `/model` verdict.
+        fn launch_readback(id: &str) -> remuda_protocol::Observation {
+            model(
+                id,
+                remuda_protocol::EffortSource::Launch,
+                Some(id.to_owned()),
+                None,
+            )
+        }
+
+        /// A later, non-launch model edge (human `/model`, a Remuda switch, or
+        /// an unnamed subsequent assistant record).
+        fn later_edge(
+            id: &str,
+            source: remuda_protocol::EffortSource,
+        ) -> remuda_protocol::Observation {
+            model(id, source, Some(id.to_owned()), None)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn model(
+            id: &str,
+            source: remuda_protocol::EffortSource,
+            raw: Option<String>,
+            catalog: Option<Vec<String>>,
+        ) -> remuda_protocol::Observation {
+            let mut observation = native_lifecycle(
+                remuda_protocol::LifecycleTopic::Configuration,
+                "envelope.only",
+                "native-1",
+                &[],
+            );
+            observation.body = ObservationPayload::Model(Box::new(remuda_protocol::ModelPayload {
+                requested: None,
+                effective: remuda_protocol::EffectiveModel {
+                    id: id.to_owned(),
+                    source,
+                    observed_at: timestamp_now().expect("now"),
+                },
+                raw,
+                catalog: catalog.map(|models| remuda_protocol::ModelCatalogInfo {
+                    models,
+                    source: remuda_protocol::ModelListSource::GatewayDiscovery,
+                    observed_at: timestamp_now().expect("now"),
+                }),
+            }));
+            observation
+        }
+
+        /// The substitution, on the launch read-back: a different id in the
+        /// pin's own vocabulary answered. Refuses, naming both ids.
+        #[test]
+        fn a_substituted_model_on_the_launch_readback_refuses_naming_both_ids() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            // The snapshot asserts the pin first; it must not settle anything.
+            assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
+            assert!(!gate.settled);
+            let reason = gate
+                .observe(&launch_readback("model_hub/es1_orange_o48[1m]"))
+                .expect("a namespaced substitution must refuse");
+            assert!(reason.contains(MODEL_MISMATCH), "{reason}");
+            assert!(reason.contains(PIN), "{reason}");
+            assert!(reason.contains("model_hub/es1_orange_o48[1m]"), "{reason}");
+        }
+
+        /// The measured false positive a byte-equality gate would have made: a
+        /// correct gateway launch resolves the pin to an upstream vendor name.
+        #[test]
+        fn a_gateway_resolution_on_the_launch_readback_does_not_refuse() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
+            assert_eq!(gate.observe(&launch_readback("claude-opus-5")), None);
+            assert!(
+                gate.settled,
+                "a real read-back is judged once even when it passes"
+            );
+        }
+
+        /// The pin itself answering is silent.
+        #[test]
+        fn the_pin_answering_is_silent() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            assert_eq!(gate.observe(&launch_readback(PIN)), None);
+            assert!(gate.settled);
+        }
+
+        /// The snapshot alone must never refuse, even though it names a model.
+        /// Judging it was the unfalsifiable hole in the first implementation.
+        #[test]
+        fn the_synthetic_snapshot_is_never_judged() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            assert_eq!(
+                gate.observe(&launch_snapshot("model_hub/es1_orange_o48[1m]", None)),
+                None,
+                "even a snapshot that names a different id is only a prediction"
+            );
+            assert!(!gate.settled);
+        }
+
+        /// After the launch read-back, a later switch is out of scope and cannot
+        /// refuse — even to a different model.
+        #[test]
+        fn a_later_human_or_remuda_switch_never_refuses() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            assert_eq!(gate.observe(&launch_readback(PIN)), None);
+            assert_eq!(
+                gate.observe(&later_edge(
+                    "model_hub/es1_orange_o48[1m]",
+                    remuda_protocol::EffortSource::Slash
+                )),
+                None
+            );
+            assert_eq!(
+                gate.observe(&later_edge(
+                    "ark/seed-evolving",
+                    remuda_protocol::EffortSource::Remuda
+                )),
+                None
+            );
+        }
+
+        /// Fail-open: no genuine read-back (no assistant message, no verdict)
+        /// means no evidence, so the launch is never refused.
+        #[test]
+        fn with_no_read_back_there_is_no_refusal() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
+            assert_eq!(
+                gate.observe(&later_edge(
+                    "model_hub/es1_orange_o48[1m]",
+                    remuda_protocol::EffortSource::Unknown
+                )),
+                None
+            );
+            assert!(!gate.settled);
+        }
+
+        /// A pin that was never requested cannot mismatch.
+        #[test]
+        fn no_pin_never_refuses() {
+            let mut gate = ModelPinGate::new(None);
+            assert_eq!(
+                gate.observe(&launch_readback("model_hub/es1_orange_o48[1m]")),
+                None
+            );
+        }
+
+        /// The gate arms from the *explicit* pin, not the profile-derived
+        /// `model_requested`. Blank/absent explicit pins arm no gate, even
+        /// though an unpinned launch's `model_requested` still carries the
+        /// profile default.
+        #[test]
+        fn an_unpinned_or_blank_pin_arms_no_gate() {
+            assert_eq!(normalize_explicit_pin(None), None);
+            assert_eq!(normalize_explicit_pin(Some("   ")), None);
+            assert_eq!(normalize_explicit_pin(Some("")), None);
+            assert_eq!(
+                normalize_explicit_pin(Some("  model_hub/x[1m] ")),
+                Some("model_hub/x[1m]".to_owned())
+            );
+            assert_eq!(pin_from_recipe(&None), None);
+        }
+        /// The catalog from the snapshot makes an un-namespaced launch read-back
+        /// comparable, upgrading it to a decidable mismatch.
+        #[test]
+        fn a_catalog_makes_an_unnamespaced_substitution_decidable() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            let catalog = vec!["es1_orange_o48".to_owned(), "es1_orange_o50".to_owned()];
+            gate.observe(&launch_snapshot(PIN, Some(catalog)));
+            assert!(
+                gate.observe(&launch_readback("es1_orange_o48"))
+                    .is_some_and(|reason| reason.contains(MODEL_MISMATCH))
+            );
+        }
+
+        /// Non-model observations never decide anything.
+        #[test]
+        fn an_unrelated_observation_is_ignored() {
+            let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
+            assert_eq!(
+                gate.observe(&native_lifecycle(
+                    remuda_protocol::LifecycleTopic::Configuration,
+                    "something.else",
+                    "native-1",
+                    &[],
+                )),
+                None
+            );
+            assert!(!gate.settled);
+        }
     }
 }

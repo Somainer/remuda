@@ -19767,7 +19767,14 @@
           "description": "When the coordinator last nudged this worker (nudge throttle, §3.2\n`policy.configurable.nudgeThrottleMins`)."
         },
         "model": {
-          "description": "Model id the agent launched with.",
+          "description": "Model id the agent was **asked** to launch with (the dispatch pin, or\nthe ranked choice admission made).\n\nThis is a request, not an observation: model-pin-1 found every\nroster row naming a pin that never reached the process. Read\n[`Self::model_effective`] for what actually answered.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelEffective": {
+          "description": "Model id actually observed answering, once it is known to differ from\n[`Self::model`].\n\nPopulated from the instance's `modelEffective` projection (the `/model`\nverdict or an assistant record's `message.model`) during a watch pass,\nand only when it disagrees with the requested id — an agreeing\nobservation adds nothing a reader cannot already see. Absent on rows\nwritten before this field existed, and on rows where nothing diverged.\n\nNote the two ids are not always the same vocabulary: a gateway resolves\na catalog id to an upstream name, so a difference here is a report, not\nby itself a fault (see `docs/design/evidence/model-pin-1.md` §3).",
           "type": [
             "string",
             "null"

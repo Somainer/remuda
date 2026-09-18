@@ -14,6 +14,7 @@ import { useModifierHeld } from "../../lib/useModifierHeld";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
+import { compareModelPin } from "./modelEffective";
 import { LaunchedByMark } from "./LaunchedBy";
 import {
   applyFilters,
@@ -590,6 +591,43 @@ export function SessionList({
                       <span>/ {worktree}</span>
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
+                      {(() => {
+                        // model-pin-1: label the row with the model that
+                        // actually answered, not the one that was requested. A
+                        // pin silently replaced by the host's default used to be
+                        // indistinguishable here from an honoured one, because
+                        // the row only ever showed the request.
+                        //
+                        // The observation comes from `modelEffective.ts` through
+                        // the store, and the divergence test is the same alias
+                        // rule the Node and Hub use (`compareModelPin`), so a
+                        // correct gateway launch — a catalog id resolved to an
+                        // upstream vendor name — is not flagged.
+                        const requested = hubStore.modelOf(instance.id, instance.kind);
+                        const effective = hubStore.modelEffectiveOf(instance.id);
+                        const catalog = hubStore.modelCatalogOf(instance.id)?.models ?? [];
+                        const verdict = effective
+                          ? compareModelPin(requested, effective.id, catalog)
+                          : "honoured";
+                        const diverged = verdict === "mismatch";
+                        return (
+                          <>
+                            <span className={css.sep}>·</span>
+                            <span
+                              data-testid="session-model"
+                              data-model-effective={effective ? effective.id : "unknown"}
+                              data-model-diverged={diverged ? "1" : "0"}
+                              title={
+                                effective
+                                  ? `请求 ${requested} · 实际 ${effective.id}（${effective.source}）`
+                                  : `请求 ${requested} · 实际模型尚未从会话回读`
+                              }
+                            >
+                              {effective ? effective.id : requested}
+                            </span>
+                          </>
+                        );
+                      })()}
                       {(() => {
                         const effort = hubStore.effortOf(instance.id, instance.kind);
                         // §9.1: the list row shows the transcript-read-back

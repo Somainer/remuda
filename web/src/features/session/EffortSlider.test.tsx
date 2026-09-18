@@ -186,3 +186,51 @@ describe("EffortSlider visual ladder", () => {
     expect(screen.getByTestId("effort-tier-ultracode")).toHaveAttribute("data-ultracode", "1");
   });
 });
+
+describe("EffortSlider model mismatch (model-pin-1)", () => {
+  // The mismatch attribute lives on the expanded tier/model panel.
+  async function openPanel(overrides: Partial<SliderProps> & Pick<SliderProps, "kind">) {
+    mount(overrides);
+    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
+    return screen.getByTestId("effort-slider-panel");
+  }
+
+  it("does not flag a gateway resolving the catalog pin to an upstream name", async () => {
+    // Measured: es1_orange_o50 answers as claude-opus-5 on a real gateway.
+    // The strings differ but this is a normal launch, not a substitution.
+    const panel = await openPanel({
+      kind: "claude",
+      model: "model_hub/es1_orange_o50[1m]",
+      modelEffective: "claude-opus-5",
+    });
+    expect(panel).toHaveAttribute("data-model-mismatch", "0");
+  });
+
+  it("flags a different id in the pin's own namespace", async () => {
+    const panel = await openPanel({
+      kind: "claude",
+      model: "model_hub/es1_orange_o50[1m]",
+      modelEffective: "model_hub/es1_orange_o48[1m]",
+    });
+    expect(panel).toHaveAttribute("data-model-mismatch", "1");
+  });
+
+  it("treats a [1m] context-suffix spelling as honoured", async () => {
+    const panel = await openPanel({
+      kind: "claude",
+      model: "ark/seed-evolving[1m]",
+      modelEffective: "ark/seed-evolving",
+    });
+    expect(panel).toHaveAttribute("data-model-mismatch", "0");
+  });
+
+  it("does not flag while a switch is pending even if the id differs", async () => {
+    const panel = await openPanel({
+      kind: "claude",
+      model: "model_hub/es1_orange_o50[1m]",
+      modelEffective: "model_hub/es1_orange_o48[1m]",
+      modelPending: { id: "model_hub/es1_orange_o48[1m]", queued: false },
+    });
+    expect(panel).toHaveAttribute("data-model-mismatch", "0");
+  });
+});

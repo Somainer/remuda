@@ -281,6 +281,15 @@ async fn observe_one(
     let mut instance_updated: Option<String> = None;
     let mut record_lifecycle = String::new();
     let mut lifecycle_reason: Option<String> = None;
+    // model-pin-1: populated ONLY when the id actually observed answering
+    // contradicts the one this worker was dispatched with. A gateway resolving
+    // the pin to an upstream vendor name (`model_hub/…o50[1m]` → `claude-opus-5`)
+    // is a normal launch, not a divergence, and is deliberately not recorded
+    // here — otherwise every correct gateway worker would be flagged.
+    let mut model_effective: Option<String> = None;
+    // Set when the observation is a real mismatch (same vocabulary, different
+    // id), which ends the worker Blocked.
+    let mut model_mismatch: Option<(String, String)> = None;
     if let Some(instance_id) = worker.instance_id.as_ref()
         && let Some(record) = state
             .store
@@ -293,7 +302,6 @@ async fn observe_one(
         record_lifecycle = record.lifecycle;
         lifecycle_reason = record.last_error;
     }
-
     let (lines, mut lifecycle, forced_gone, raw, screen_available) =
         match read_worker_screen(state, &worker).await {
             ScreenRead::Screen {
@@ -310,6 +318,68 @@ async fn observe_one(
                 false,
             ),
         };
+
+    // Evaluate the model read-back AFTER the screen RPC. A live node flushes
+    // journal frames while servicing that call, so reading the instance row
+    // before it — as the activity/lifecycle block above does — sees the model
+    // projection one poll late. The pin refusal must act within the same
+    // observe that learns of it.
+    if let Some(instance_id) = worker.instance_id.as_ref()
+        && let Some(record) = state
+            .store
+            .get_instance(instance_id.as_id().to_string())
+            .await
+            .map_err(map_store)?
+    {
+        // Source-scoped: only the *launch* read-back can prove a dispatch
+        // substitution. A later human `/model` switch is `source = slash`, and a
+        // Remuda `instance.configure` is `source = remuda`; both overwrite
+        // `modelEffective` while `worker.model` keeps the dispatch pin, so
+        // comparing them here would end an intentionally reconfigured worker
+        // Blocked with two ids nobody substituted. Mirrors the Node gate.
+        let source = record
+            .model_effective
+            .as_ref()
+            .and_then(|effective| effective.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_launch_readback = source == "launch";
+        let observed = record
+            .model_effective
+            .as_ref()
+            .and_then(|effective| effective.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|observed| !observed.is_empty());
+        // The session's discovered list, so an un-namespaced observation can be
+        // recognised as catalog vocabulary rather than an upstream name.
+        let catalog: Vec<String> = record
+            .model_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.get("models"))
+            .and_then(Value::as_array)
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if is_launch_readback && let Some(observed) = observed {
+            let requested = worker.model.as_deref().unwrap_or_default();
+            // Only a same-vocabulary disagreement is a divergence. An upstream
+            // gateway resolution (`Unresolvable`) and an agreeing id (`Honoured`)
+            // leave the row showing the request — a correct launch must not be
+            // reported as having diverged.
+            if remuda_protocol::ModelPinVerdict::Mismatch
+                == remuda_protocol::compare_model_pin(requested, observed, &catalog)
+            {
+                model_effective = Some(observed.to_owned());
+                model_mismatch = Some((requested.to_owned(), observed.to_owned()));
+            }
+        }
+    }
     // The Hub row is authoritative once the instance is terminal: a stale or
     // absent "ready" from a disconnected screen carrier must not mask a
     // failed/exited instance (the 2026-09-17 watch-failed-1 trap). Otherwise
@@ -445,6 +515,32 @@ async fn observe_one(
             )
         }
     };
+    // model-pin-1: a launch read-back that names a model the requester did not
+    // ask for is a hard block, outranking every screen classification. The Hub
+    // derives this itself from the projected `source = launch` observation
+    // above; the Node gate independently closes the process and fails the
+    // instance, but the worker row's state is decided here rather than assumed
+    // from the instance lifecycle. `WorkerState` has no `Failed` arm, so
+    // `Blocked` carries the reason naming both ids. A true substitution is
+    // terminal for this dispatch, so the state stays Blocked on later passes; a
+    // reconfigured session never reaches it because non-launch observations
+    // are excluded above.
+    let (status, next_blocked) = match &model_mismatch {
+        Some((requested, observed)) => {
+            let reason = format!("model-mismatch: requested {requested}, observed {observed}");
+            detail = Some(reason.clone());
+            next_state = Some(WorkerState::Blocked {
+                reason: reason.clone(),
+            });
+            (
+                WorkerWatchStatus::Blocked {
+                    reason: reason.clone(),
+                },
+                Some(reason),
+            )
+        }
+        None => (status, next_blocked),
+    };
     // No live screen: the classification came from the journal (or the
     // instance row), so the detail column must say where — a screen reader is
     // not possible for this worker (watch-failed-1). The marker leads so it
@@ -483,6 +579,11 @@ async fn observe_one(
                 row.state = next;
             }
             row.watch = Some(watch);
+            // Report the observed id when it diverged; never clear a divergence
+            // already recorded because this pass could not read the row.
+            if model_effective.is_some() {
+                row.model_effective = model_effective;
+            }
             Ok(())
         })
         .await

@@ -337,9 +337,14 @@ impl Ctx {
     /// Dispatch via the API and return (worker id, name).
     async fn dispatch(&self, project_id: &str, name: &str, range: &str) -> (String, String) {
         let _ = range;
+        // The two model-pin watch cases are dispatched with an explicit pin.
+        let model = match name {
+            "c-modelx" | "c-modelok" | "c-modelswitch" => Some("model_hub/es1_orange_o50[1m]"),
+            _ => None,
+        };
         let body = json!({
             "projectId": project_id, "brief": BRIEF, "briefName": "brief.md",
-            "harness": "claude", "name": name,
+            "harness": "claude", "name": name, "model": model,
         });
         let (status, body) = self
             .request("POST", "/v1/workers/dispatch", Some(body))
@@ -734,6 +739,142 @@ async fn failed_first_turn_on_screenless_worker_is_classified_and_persisted() {
     assert!(persisted["watch"]["observedAt"].is_string());
     let observed = ctx.observe().await;
     assert_eq!(observed["items"][0]["watch"]["status"], "failed");
+}
+
+/// A `model` observation. `source` distinguishes the launch read-back
+/// (`"launch"`) from a later human `/model` (`"slash"`) or a Remuda
+/// `instance.configure` (`"remuda"`).
+fn model_edge_event(effective: &str, source: &str) -> Value {
+    json!({
+        "kind": "model",
+        "payload": {
+            "effective": {
+                "id": effective,
+                "source": source,
+                "observedAt": "2026-09-18T00:00:00Z"
+            },
+            "raw": effective
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_model_mismatch_readback_ends_the_worker_blocked_naming_both_ids() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-modelx", "59020-59049").await;
+    ctx.dispatch(&project, "c-modelx", "59020-59049").await;
+
+    ctx.node.set_screen(&["$ ready"], "ready");
+    let observed = ctx.observe().await;
+    let instance_id = observed["items"][0]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The dispatch pin was o50; the read-back says o48 answered.
+    ctx.node.append_journal(
+        &instance_id,
+        &[model_edge_event("model_hub/es1_orange_o48[1m]", "launch")],
+    );
+
+    // observe() drives a node RPC (tty.screen), which is what flushes the fake
+    // node's queued journal frames before the screen read.
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(row["watch"]["status"], "blocked", "{row}");
+    let reason = row["watch"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("model-mismatch"), "{reason}");
+    assert!(reason.contains("model_hub/es1_orange_o50[1m]"), "{reason}");
+    assert!(reason.contains("model_hub/es1_orange_o48[1m]"), "{reason}");
+    // WorkerState has no Failed arm; a model refusal is a Blocked worker.
+    assert_eq!(row["state"]["state"], "blocked");
+    // The effective id is carried on the roster row.
+    assert_eq!(row["modelEffective"], "model_hub/es1_orange_o48[1m]");
+}
+
+/// A launch honours the pin, and only THEN does the operator reconfigure the
+/// session to another model. The later observation is `slash`/`remuda`-sourced,
+/// so it must not be read back as a dispatch substitution: the worker stays
+/// Working with no model-mismatch reason, even on repeated passes.
+#[tokio::test]
+async fn a_mid_session_model_switch_after_an_honoured_launch_never_blocks() {
+    for source in ["slash", "remuda"] {
+        let ctx = Ctx::spawn().await.unwrap();
+        let project =
+            project_with_enrolled_workspace(&ctx, "watch-modelswitch", "59080-59109").await;
+        ctx.dispatch(&project, "c-modelswitch", "59080-59109").await;
+
+        ctx.node.set_screen(&["$ ready"], "ready");
+        let observed = ctx.observe().await;
+        let instance_id = observed["items"][0]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Launch read-back honours the dispatch pin.
+        ctx.node.append_journal(
+            &instance_id,
+            &[model_edge_event("model_hub/es1_orange_o50[1m]", "launch")],
+        );
+        let observed = ctx.observe().await;
+        assert_eq!(
+            observed["items"][0]["state"]["state"], "working",
+            "honoured launch must be working ({source})"
+        );
+
+        // The operator (slash) or the Hub (configure) then changes the model.
+        ctx.node.append_journal(
+            &instance_id,
+            &[model_edge_event("model_hub/es1_orange_o48[1m]", source)],
+        );
+        // One pass to flush the switch frame through the node RPC and commit
+        // its projection; the watch loop runs continuously in production, so a
+        // classification pass always sees already-committed journal data.
+        let _ = ctx.observe().await;
+        // Two asserting passes: a sticky mismatch would surface on the second.
+        for _ in 0..2 {
+            let observed = ctx.observe().await;
+            let row = &observed["items"][0];
+            assert_ne!(
+                row["watch"]["status"], "blocked",
+                "a {source}-sourced switch is not a substitution: {row}"
+            );
+            assert_eq!(row["state"]["state"], "working", "{row}");
+            let reason = row["watch"]["reason"].as_str().unwrap_or("");
+            assert!(
+                !reason.contains("model-mismatch"),
+                "no model-mismatch reason for a {source}-sourced switch: {reason}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_gateway_resolving_the_pin_to_an_upstream_name_is_not_blocked() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-modelok", "59050-59079").await;
+    ctx.dispatch(&project, "c-modelok", "59050-59079").await;
+
+    ctx.node.set_screen(&["$ ready"], "ready");
+    let observed = ctx.observe().await;
+    let instance_id = observed["items"][0]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A correct gateway launch: catalog pin resolved to the upstream vendor
+    // name. No divergence, no block.
+    ctx.node
+        .append_journal(&instance_id, &[model_edge_event("claude-opus-5", "launch")]);
+
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_ne!(row["watch"]["status"], "blocked", "{row}");
+    assert_eq!(row["state"]["state"], "working");
+    assert!(
+        row.get("modelEffective").is_none(),
+        "an upstream resolution must not be recorded as a divergence: {row}"
+    );
 }
 
 #[tokio::test]

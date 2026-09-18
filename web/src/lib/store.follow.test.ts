@@ -24,7 +24,7 @@ function fixture(suffix: string) {
     journalId: instance.journalId,
     seq: "1",
   };
-  return { instance, event, history: { events: [event], durableSeq: "1", floorSeq: "1" } };
+  return { instance, event, history: { events: [event], durableSeq: "1", windowFromSeq: "1", reachedAfterSeq: true } };
 }
 
 function subscription(instance: Instance): Awaited<ReturnType<typeof api.eventsSubscribe>> {
@@ -32,7 +32,8 @@ function subscription(instance: Instance): Awaited<ReturnType<typeof api.eventsS
     subscriptionId: `sub_${instance.id}`,
     journalId: instance.journalId,
     durableSeq: "1",
-    floorSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
     snapshot: {
       projectionVersion: "v1", projectionEpoch: "epoch_follow_test", asOfSeq: "1", instance,
       runs: [], commands: [], pendingInteractions: [], nodes: [],
@@ -58,7 +59,7 @@ it("shares one journal subscription when concurrent follows finish reading histo
   await Promise.all([first, second]);
 
   expect(subscribe).toHaveBeenCalledTimes(1);
-  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "1", expect.any(Function));
+  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "1", expect.any(Function), expect.any(Function));
   expect(hubStore.getSnapshot().events[instance.id]).toEqual([event]);
 });
 
@@ -85,6 +86,59 @@ it("keeps concurrent follows of distinct journals independent", async () => {
     .toEqual([first.instance.journalId, second.instance.journalId].sort());
   expect(hubStore.getSnapshot().events[first.instance.id]).toEqual([first.event]);
   expect(hubStore.getSnapshot().events[second.instance.id]).toEqual([second.event]);
+});
+
+it("follows a bounded partial tail window without claiming earliestRetainedSeq 1", async () => {
+  // Hub serves a bounded window: seed is a tail whose floor is above 1 and
+  // reachedAfterSeq=false. follow() must not ascend for more pages, must not
+  // claim history complete from seq 1, and must seed the journal client with
+  // the window floor so load-earlier stays available.
+  const suffix = "partial_window";
+  const original = mockDb.instances[0];
+  const instance: Instance = {
+    ...original,
+    id: `ins_follow_${suffix}`,
+    journalId: `obj_follow_${suffix}`,
+    durableSeq: "100",
+  };
+  const windowEvents: Observation[] = Array.from({ length: 10 }, (_, i) => ({
+    ...mockDb.journals.get(original.journalId)![0],
+    eventId: `evt_follow_${suffix}_${i + 91}`,
+    instanceId: instance.id,
+    journalId: instance.journalId,
+    seq: String(i + 91),
+  }));
+  vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
+  const read = vi
+    .spyOn(api, "eventsRead")
+    .mockResolvedValue({ events: windowEvents, durableSeq: "100", windowFromSeq: "91", reachedAfterSeq: false });
+  const subscribe = vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: `sub_${instance.id}`,
+    journalId: instance.journalId,
+    durableSeq: "100",
+    windowFromSeq: "91",
+    reachedAfterSeq: false,
+    snapshot: {
+      projectionVersion: "v1", projectionEpoch: "epoch_follow_partial", asOfSeq: "100", instance,
+      runs: [], commands: [], pendingInteractions: [], nodes: [],
+      history: { earliestRetainedSeq: "91", complete: false },
+    },
+  });
+
+  await hubStore.follow(instance.id);
+
+  // One tail seed, no ascending loop; follow resumes from the window's last row.
+  expect(read).toHaveBeenCalledTimes(1);
+  expect(subscribe).toHaveBeenCalledTimes(1);
+  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "100", expect.any(Function), expect.any(Function));
+  const loaded = hubStore.getSnapshot().events[instance.id];
+  expect(loaded?.map((e) => Number(e.seq))).toEqual(Array.from({ length: 10 }, (_, i) => i + 91));
+  const journals = (hubStore as unknown as { journals: Map<string, { retainedFloorSeq: string }> }).journals;
+  const client = journals.get(instance.journalId)!;
+  expect(client.retainedFloorSeq).toBe("91");
+  // No load-earlier/flag code may ever surface "1" as the retained floor.
+  expect(client.retainedFloorSeq).not.toBe("1");
+  expect(hubStore.getSnapshot().journalStatus[instance.id]).toBe("live");
 });
 
 /** A user-message live batch attributed to `commandId`. */
@@ -164,7 +218,7 @@ it("applies authoritative turn activity from follow immediately and fences an ol
   const fixture_ = fixture("hook_activity");
   const instance: Instance = { ...fixture_.instance, durableSeq: "1", activity: { state: "known", value: "idle" } };
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
-  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "1", floorSeq: "1" });
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "1", windowFromSeq: null, reachedAfterSeq: true });
   let deliver!: Parameters<typeof api.eventsSubscribe>[2];
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_journalId, _after, onBatch) => {
     deliver = onBatch;
@@ -212,7 +266,7 @@ it("applies Node-validated native activity before its full Instance and ignores 
     nativeRef: { ...fixture_.instance.nativeRef, signalTier: "hook" },
   };
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
-  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "1", floorSeq: "1" });
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "1", windowFromSeq: null, reachedAfterSeq: true });
   let deliver!: Parameters<typeof api.eventsSubscribe>[2];
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_journalId, _after, onBatch) => {
     deliver = onBatch;

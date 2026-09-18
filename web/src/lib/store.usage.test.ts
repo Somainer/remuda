@@ -45,13 +45,15 @@ it("hydrates the polled rollup even when the local instance wins the seq merge",
   vi.spyOn(api, "eventsRead").mockResolvedValue({
     events: [],
     durableSeq: "5",
-    floorSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
   } as unknown as History);
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async () => ({
     subscriptionId: "sub_usage_store",
     journalId: instance.journalId,
     durableSeq: "5",
-    floorSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_usage",

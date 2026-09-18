@@ -23,7 +23,7 @@ describe("mock gap journal", () => {
   it("drives JournalClient into gap-backfill then live", async () => {
     const emitted: number[] = [];
     const statuses: string[] = [];
-    const client = new JournalClient(mockJournalIds.journalGap, async ({ afterSeq, limit }) => mockReadJournal(mockJournalIds.journalGap, afterSeq, limit), {
+    const client = new JournalClient(mockJournalIds.journalGap, async (args) => mockReadJournal(mockJournalIds.journalGap, args.afterSeq, args.beforeSeq, args.limit), {
       onEvents: (events) => emitted.push(...events.map((e) => Number(e.seq))),
       onStatus: (status) => statuses.push(status),
     });
@@ -49,7 +49,7 @@ describe("mock gap journal", () => {
   });
 
   it("goes readonly-stale when gap fill throws", async () => {
-    const client = new JournalClient(mockJournalIds.journalStale, async ({ afterSeq, limit }) => mockReadJournal(mockJournalIds.journalStale, afterSeq, limit));
+    const client = new JournalClient(mockJournalIds.journalStale, async (args) => mockReadJournal(mockJournalIds.journalStale, args.afterSeq, args.beforeSeq, args.limit));
     client.applySnapshot({
       projectionVersion: "v1",
       projectionEpoch: "epoch_1" as Id,

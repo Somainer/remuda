@@ -612,11 +612,15 @@ export type HubApi = {
     journalId: Id,
     afterSeq: U64 | null,
     onBatch: (batch: EventsBatch["params"]) => void,
+    onGap?: (windowFloor: U64) => void,
   ): Promise<{
     subscriptionId: Id;
     journalId: Id;
     snapshot: Snapshot;
-    floorSeq: U64;
+    /** Follow-snapshot window floor; null on an empty snapshot. */
+    windowFromSeq: U64 | null;
+    /** False when older rows exist below the snapshot window. */
+    reachedAfterSeq: boolean;
     durableSeq: U64;
   }>;
   eventsAck(subscriptionId: Id, journalId: Id, throughSeq: U64): Promise<{ acknowledgedSeq: U64 }>;
@@ -1058,18 +1062,18 @@ function createMockApi(): HubApi {
       return this.workspaceList(hostId);
     },
     hostWorkspaceSubscribe() { return () => undefined; },
-    eventsRead: async ({ journalId, afterSeq, limit }) => mockReadJournal(journalId, afterSeq, limit),
-    async eventsSubscribe(journalId, _afterSeq, onBatch) {
+    eventsRead: async ({ journalId, afterSeq, beforeSeq, limit }) => mockReadJournal(journalId, afterSeq, beforeSeq, limit),
+    async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap) {
       const instance = mockDb.instances.find((i) => i.journalId === journalId);
       if (!instance) throw new Error("JOURNAL_NOT_FOUND");
       const subscriptionId = id("sub_");
       subs.set(subscriptionId, onBatch);
       const snapshot = mockSnapshot(instance);
-      let page: { events: Observation[]; durableSeq: string };
+      let page: { events: Observation[]; durableSeq: string; windowFromSeq: U64 | null; reachedAfterSeq: boolean };
       try {
-        page = mockReadJournal(journalId, snapshot.asOfSeq, 128);
+        page = mockReadJournal(journalId, snapshot.asOfSeq, undefined, 128);
       } catch {
-        page = { events: [], durableSeq: snapshot.asOfSeq };
+        page = { events: [], durableSeq: snapshot.asOfSeq, windowFromSeq: null, reachedAfterSeq: true };
       }
       if (page.events.length) {
         queueMicrotask(() => {
@@ -1087,7 +1091,8 @@ function createMockApi(): HubApi {
         subscriptionId,
         journalId,
         snapshot,
-        floorSeq: "1",
+        windowFromSeq: page.windowFromSeq,
+        reachedAfterSeq: page.reachedAfterSeq,
         durableSeq: snapshot.asOfSeq,
       };
     },
@@ -1508,24 +1513,36 @@ function createLiveApi(): HubApi {
     },
     eventsRead: async (args) => {
       const instanceId = instanceIdOf(args.journalId);
-      const qs = args.afterSeq ? `?afterSeq=${encodeURIComponent(args.afterSeq)}` : "";
+      const qs = new URLSearchParams();
+      if (args.afterSeq) qs.set("afterSeq", args.afterSeq);
+      if (args.beforeSeq) qs.set("beforeSeq", args.beforeSeq);
+      const suffix = qs.size ? `?${qs}` : "";
       const page = await rest<HubJson<"/v1/instances/{id}/journal", "get">>(
-        `/v1/instances/${instanceId}/journal${qs}`,
+        `/v1/instances/${instanceId}/journal${suffix}`,
       );
       const events = coerceObservationList(page.events, args.journalId, instanceId).slice(0, args.limit);
+      // Pre-window Hubs omit the metadata; their pages always covered the
+      // whole range, so the safe defaults are "complete from the first row".
+      const windowFromSeq = (page.fromSeq ?? events[0]?.seq ?? null) as U64 | null;
+      const reachedAfterSeq = page.reachedAfterSeq ?? true;
       return {
         events,
         durableSeq: page.durableSeq as U64,
-        floorSeq: "1" as U64,
+        windowFromSeq,
+        reachedAfterSeq,
       };
     },
-    async eventsSubscribe(journalId, afterSeq, onBatch) {
+    async eventsSubscribe(journalId, afterSeq, onBatch, onGap) {
       const instanceId = instanceIdOf(journalId);
       follows.get(journalId)?.close();
       const subscriptionId = id("sub_") as Id;
       const ws = new WebSocket(followUrl(instanceId));
       follows.set(journalId, ws);
       followSubs.set(subscriptionId, journalId);
+      const snapshotMeta: { fromSeq: U64 | null; reachedAfterSeq: boolean } = {
+        fromSeq: null,
+        reachedAfterSeq: true,
+      };
       const asOfSeq = await new Promise<U64>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("FOLLOW_SNAPSHOT_TIMEOUT")), 10_000);
         let settled = false;
@@ -1535,6 +1552,50 @@ function createLiveApi(): HubApi {
           clearTimeout(timer);
           resolve(seq);
         };
+        // Coalesce live `event` frames into contiguous batches on a trailing
+        // macrotask. One frame = one store emit + O(n) transcript assembly,
+        // so a burst (thousands of single-event frames) froze the tab for
+        // minutes with an O(n^2) storm. Buffering makes the page cost
+        // O(frames + batches * n) instead; ordering is preserved and a frame
+        // flush is forced before every snapshot/other control frame.
+        let pending: Observation[] = [];
+        let flushScheduled = false;
+        let gapArrived = false;
+        const flushPending = () => {
+          flushScheduled = false;
+          if (!pending.length) return;
+          // Split at seq discontinuities: JournalClient.applyBatch needs each
+          // delivered batch to be a contiguous fromSeq..toSeq run.
+          const runs: Observation[][] = [];
+          let run: Observation[] = [];
+          let expectSeq = -1;
+          for (const ev of pending) {
+            const seq = Number(ev.seq);
+            if (run.length && seq !== expectSeq) {
+              runs.push(run);
+              run = [];
+            }
+            run.push(ev);
+            expectSeq = seq + 1;
+          }
+          if (run.length) runs.push(run);
+          pending = [];
+          for (const group of runs) {
+            onBatch({
+              subscriptionId,
+              journalId,
+              fromSeq: group[0].seq,
+              toSeq: group[group.length - 1].seq,
+              events: group,
+              durableSeq: group[group.length - 1].seq,
+            });
+          }
+        };
+        const scheduleFlush = () => {
+          if (flushScheduled) return;
+          flushScheduled = true;
+          setTimeout(flushPending, 0);
+        };
         ws.addEventListener("error", () => {
           if (settled) return;
           settled = true;
@@ -1543,10 +1604,27 @@ function createLiveApi(): HubApi {
         });
         ws.addEventListener("message", (ev) => {
           if (typeof ev.data !== "string") return;
-          let msg: { type?: string; asOfSeq?: string; seq?: string; events?: unknown; event?: unknown };
+          let msg: { type?: string; asOfSeq?: string; durableSeq?: string; fromSeq?: string | null; reachedAfterSeq?: boolean; seq?: string; events?: unknown; event?: unknown };
           try {
             msg = JSON.parse(ev.data) as typeof msg;
           } catch {
+            return;
+          }
+          if (msg.type === "event") {
+            const obs = coerceObservation(msg.event ?? msg, journalId, instanceId, msg.seq);
+            if (!obs) return;
+            pending.push(obs);
+            scheduleFlush();
+            return;
+          }
+          // Force buffered live events out before a control frame so a
+          // backpressure snapshot never overtakes the frames it follows.
+          if (flushScheduled || pending.length) flushPending();
+          if (msg.type === "gap") {
+            // Hub-side backpressure; the bounded resync snapshot follows.
+            // Remember the signal; the snapshot arm kicks the actual fill with
+            // the hole's real seq bounds.
+            gapArrived = true;
             return;
           }
           if (msg.type === "snapshot") {
@@ -1562,20 +1640,20 @@ function createLiveApi(): HubApi {
                 durableSeq: (msg.asOfSeq ?? from[from.length - 1].seq) as U64,
               });
             }
+            // The follow snapshot is the same bounded window as GET journal:
+            // its floor is a window floor and complete=false means older rows
+            // remain available behind the load-earlier row.
+            const snapshotFloor = (msg.fromSeq ?? from[0]?.seq ?? null) as U64 | null;
+            const snapshotReached = msg.reachedAfterSeq ?? true;
+            snapshotMeta.fromSeq = snapshotFloor;
+            snapshotMeta.reachedAfterSeq = snapshotReached;
+            // A preceding gap + a floor above the first delivered event
+            // defines a hole the app must descend with beforeSeq.
+            if (gapArrived && snapshotFloor) {
+              onGap?.(snapshotFloor);
+            }
+            gapArrived = false;
             finish((msg.asOfSeq ?? afterSeq ?? "0") as U64);
-            return;
-          }
-          if (msg.type === "event") {
-            const obs = coerceObservation(msg.event ?? msg, journalId, instanceId, msg.seq);
-            if (!obs) return;
-            onBatch({
-              subscriptionId,
-              journalId,
-              fromSeq: obs.seq,
-              toSeq: obs.seq,
-              events: [obs],
-              durableSeq: obs.seq,
-            });
           }
         });
       });
@@ -1591,9 +1669,13 @@ function createLiveApi(): HubApi {
           commands: [],
           pendingInteractions: [],
           nodes: [],
-          history: { earliestRetainedSeq: "1", complete: true },
+          history: {
+            earliestRetainedSeq: snapshotMeta.fromSeq ?? "1",
+            complete: snapshotMeta.reachedAfterSeq,
+          },
         },
-        floorSeq: "1" as U64,
+        windowFromSeq: snapshotMeta.fromSeq,
+        reachedAfterSeq: snapshotMeta.reachedAfterSeq,
         durableSeq: asOfSeq,
       };
     },

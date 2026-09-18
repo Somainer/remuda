@@ -571,7 +571,7 @@ fn is_executable(path: &Path) -> bool {
 pub fn default_command(kind: remuda_protocol::DriverKind) -> Option<&'static str> {
     use remuda_protocol::DriverKind::*;
     match kind {
-        ClaudePrint | ClaudePty | ClaudeBg => Some("claude"),
+        ClaudePrint | ClaudeSdk | ClaudePty | ClaudeBg => Some("claude"),
         CodexAppserver => Some("codex"),
         GrokAcp => Some("grok"),
         AgyPrint => Some("agy"),

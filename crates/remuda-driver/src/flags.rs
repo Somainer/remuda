@@ -99,7 +99,10 @@ const EXTRA_AGY: &[&str] = &["effort", "max-budget-usd", "add-dir", "mcp-config"
 /// matters lands on the drivers that do name their CLI.
 fn extra_allowlist(driver: DriverKind) -> &'static [&'static str] {
     match driver {
-        DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => EXTRA_CLAUDE,
+        DriverKind::ClaudePrint
+        | DriverKind::ClaudeSdk
+        | DriverKind::ClaudePty
+        | DriverKind::ClaudeBg => EXTRA_CLAUDE,
         DriverKind::CodexAppserver => EXTRA_CODEX,
         DriverKind::GrokAcp => EXTRA_GROK,
         DriverKind::AgyPrint => EXTRA_AGY,

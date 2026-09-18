@@ -216,7 +216,10 @@ fn materialize_inner(
     }
 
     match request.spec.driver {
-        DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => {
+        DriverKind::ClaudePrint
+        | DriverKind::ClaudeSdk
+        | DriverKind::ClaudePty
+        | DriverKind::ClaudeBg => {
             let user_overlay = match request.settings_overlay_path.as_ref() {
                 Some(path) => Some(validate_settings_overlay(path)?),
                 None => None,
@@ -270,7 +273,9 @@ fn materialize_inner(
                 },
             )?;
             input_delivery = match request.spec.driver {
-                DriverKind::ClaudePrint => InputDelivery::Stdio,
+                // Both stream-json carriers take turns as `user` NDJSON lines on
+                // the child's stdin; sdk simply keeps that stdin open (§2.1).
+                DriverKind::ClaudePrint | DriverKind::ClaudeSdk => InputDelivery::Stdio,
                 DriverKind::ClaudePty => InputDelivery::Tty,
                 DriverKind::ClaudeBg => InputDelivery::DeferredArgv,
                 _ => InputDelivery::Stdio,
@@ -729,7 +734,10 @@ fn validate_spec_profile(spec: &InstanceSpec, profile: &ProviderProfile) -> Driv
 
 fn agent_kind(driver: DriverKind) -> AgentKind {
     match driver {
-        DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => AgentKind::Claude,
+        DriverKind::ClaudePrint
+        | DriverKind::ClaudeSdk
+        | DriverKind::ClaudePty
+        | DriverKind::ClaudeBg => AgentKind::Claude,
         DriverKind::CodexAppserver => AgentKind::Codex,
         DriverKind::GrokAcp => AgentKind::Grok,
         DriverKind::AgyPrint => AgentKind::Agy,
@@ -740,9 +748,10 @@ fn agent_kind(driver: DriverKind) -> AgentKind {
 
 fn provider_matches(driver: DriverKind, kind: ProviderKind) -> bool {
     match driver {
-        DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg => {
-            kind == ProviderKind::Anthropic
-        }
+        DriverKind::ClaudePrint
+        | DriverKind::ClaudeSdk
+        | DriverKind::ClaudePty
+        | DriverKind::ClaudeBg => kind == ProviderKind::Anthropic,
         DriverKind::CodexAppserver => kind == ProviderKind::OpenaiResponses,
         DriverKind::GrokAcp => kind == ProviderKind::Xai || kind == ProviderKind::OpenaiResponses,
         DriverKind::AgyPrint => kind == ProviderKind::Google,
@@ -921,6 +930,25 @@ fn permission_plan(
                     (Some("none".into()), vec![], ApprovalAuthority::Unknown)
                 }
                 DriverKind::ClaudePrint => {
+                    (Some("host".into()), vec![], ApprovalAuthority::RuntimeHost)
+                }
+                // §2.8: sdk takes print's bypass and host paths, but not its M0
+                // `dontAsk` auto-deny debt (`TD-M0-PERM-01`). Silently denying
+                // every tool call is a behaviour no caller asked for, so the new
+                // carrier refuses the mode instead of inheriting the debt.
+                DriverKind::ClaudeSdk if bypass => (
+                    None,
+                    vec!["--allow-dangerously-skip-permissions".into()],
+                    ApprovalAuthority::Unknown,
+                ),
+                DriverKind::ClaudeSdk if dont_ask => {
+                    return Err(DriverError::NativeFeatureDisabled(
+                        "claude-sdk does not implement the dontAsk auto-deny preset \
+                         (TD-M0-PERM-01): use default (host approvals) or explicit bypass"
+                            .into(),
+                    ));
+                }
+                DriverKind::ClaudeSdk => {
                     (Some("host".into()), vec![], ApprovalAuthority::RuntimeHost)
                 }
                 DriverKind::ClaudePty | DriverKind::ClaudeBg if bypass => (
@@ -1241,9 +1269,15 @@ fn claude_argv(driver: DriverKind, inputs: &ClaudeArgv<'_>) -> DriverResult<Vec<
     } = *inputs;
     let mut argv = Vec::new();
     match driver {
-        DriverKind::ClaudePrint => {
+        // One template, two carriers. `-p` is "Print response and exit": it is
+        // the only difference, and it is why print dies after one turn
+        // (`print-replacement.md` §2.1, key decision 3). Non-interactive comes
+        // from piped stdout, not from this flag (§1.3).
+        DriverKind::ClaudePrint | DriverKind::ClaudeSdk => {
+            if driver == DriverKind::ClaudePrint {
+                argv.push("-p".into());
+            }
             argv.extend([
-                "-p".into(),
                 "--input-format".into(),
                 "stream-json".into(),
                 "--output-format".into(),

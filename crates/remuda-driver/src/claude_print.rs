@@ -269,11 +269,23 @@ pub struct ClaudePrintDriver {
     options: ClaudePrintOptions,
     inner: Arc<Inner>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Carrier this object launches and stamps.
+    ///
+    /// `claude-print` and `claude-sdk` are the same transport (stream-json over
+    /// stdio, same handshake, same mapper) differing by one launch flag, so
+    /// `claude_sdk.rs` drives this engine with [`DriverKind::ClaudeSdk`] rather
+    /// than forking ~1000 lines of mapper (`print-replacement.md` §2.5, batch 2).
+    carrier: DriverKind,
 }
 
 impl ClaudePrintDriver {
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePrintOptions) -> Self {
+        Self::with_carrier(options, DriverKind::ClaudePrint)
+    }
+
+    /// [`Self::new`], stamping and launching `carrier` instead of `claude-print`.
+    pub(crate) fn with_carrier(options: ClaudePrintOptions, carrier: DriverKind) -> Self {
         Self {
             options,
             inner: Arc::new(Inner {
@@ -292,7 +304,7 @@ impl ClaudePrintDriver {
                         version: String::new(),
                         sha256: dummy_digest(),
                     },
-                    driver_kind: DriverKind::ClaudePrint,
+                    driver_kind: carrier,
                     channel: SourceChannel::Stdout,
                 }),
                 policy: Mutex::new(PermissionPolicy::Host),
@@ -301,6 +313,7 @@ impl ClaudePrintDriver {
                 last_spec: Mutex::new(None),
             }),
             reader: Mutex::new(None),
+            carrier,
         }
     }
 
@@ -315,10 +328,11 @@ impl ClaudePrintDriver {
     }
 
     async fn launch(&self, spec: InstanceSpec, session: SessionAction) -> DriverResult<RunHandle> {
-        if spec.driver != DriverKind::ClaudePrint {
-            return Err(DriverError::InvalidLaunchSpec(
-                "ClaudePrintDriver requires driverKind claude-print".into(),
-            ));
+        if spec.driver != self.carrier {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "this driver requires driverKind {:?}, got {:?}",
+                self.carrier, spec.driver
+            )));
         }
         reject_bot_bypass(&spec, self.options.origin)?;
         let session_id = session.session_id().to_string();
@@ -393,7 +407,7 @@ impl ClaudePrintDriver {
                 host_id: spec.host.clone(),
                 session_id: session_id.clone(),
                 pin: recipe.binary.clone(),
-                driver_kind: DriverKind::ClaudePrint,
+                driver_kind: self.carrier,
                 channel: SourceChannel::Stdout,
             };
         }
@@ -546,12 +560,7 @@ impl Driver for ClaudePrintDriver {
                 version: "unpinned".into(),
                 sha256: dummy_digest(),
             });
-        Ok(capability_snapshot(
-            DriverKind::ClaudePrint,
-            &pin,
-            U64(1),
-            U64(1),
-        )?)
+        Ok(capability_snapshot(self.carrier, &pin, U64(1), U64(1))?)
     }
 
     async fn start(&self, spec: InstanceSpec) -> DriverResult<RunHandle> {
@@ -591,11 +600,11 @@ impl Driver for ClaudePrintDriver {
                     .as_deref()
                     .is_some_and(|value| !value.is_empty())
                 {
-                    return Err(DriverError::CapabilityUnsupported(
-                        "claude-print cannot switch effort in-session: relaunch with --effort; \
-                         use the claude-pty or shell-pty carrier for /effort"
-                            .into(),
-                    ));
+                    return Err(DriverError::CapabilityUnsupported(format!(
+                        "{:?} cannot switch effort in-session: relaunch with --effort; \
+                         use the claude-pty or shell-pty carrier for /effort",
+                        self.carrier
+                    )));
                 }
                 if !switch.model_id.is_empty() {
                     live.process
@@ -652,7 +661,7 @@ impl Driver for ClaudePrintDriver {
         drop(live_guard);
         // S5: the child has exited, so the launch overlays can go.
         if let Some(recipe) = recipe {
-            crate::recipe::report_launch_cleanup(&recipe, "claude-print");
+            crate::recipe::report_launch_cleanup(&recipe, &format!("{:?}", self.carrier));
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -677,7 +686,7 @@ impl Driver for ClaudePrintDriver {
             .clone()
             .ok_or(DriverError::NativeSessionNotFound)?;
         spec.host = native_ref.host_id.clone();
-        spec.driver = DriverKind::ClaudePrint;
+        spec.driver = self.carrier;
         spec.kind = remuda_protocol::AgentKind::Claude;
         self.launch(spec, SessionAction::Resume { session_id })
             .await
@@ -691,7 +700,7 @@ impl Driver for ClaudePrintDriver {
         if session_id.trim().is_empty() {
             return Err(DriverError::NativeSessionNotFound);
         }
-        spec.driver = DriverKind::ClaudePrint;
+        spec.driver = self.carrier;
         self.launch(spec, SessionAction::Resume { session_id })
             .await
     }
@@ -1329,6 +1338,23 @@ fn map_task_notification(
 }
 
 impl Mapper {
+    /// Completeness for a streamed content block: `Partial` while it is still
+    /// open, `Structured` once the final block closes it.
+    ///
+    /// D-028a item 3 / `print-replacement.md` §2.5: on the sdk carrier a stream
+    /// delta is explicitly a partial observation and the final assistant block
+    /// is the authority. `claude-print` kept every content observation
+    /// `Structured` before this parameter existed, and stays that way — its
+    /// consumers and journal fixtures were built against that, and nothing
+    /// measured on print changed here.
+    fn content_completeness(&self, closed: bool) -> Completeness {
+        if closed || self.driver_kind != DriverKind::ClaudeSdk {
+            Completeness::Structured
+        } else {
+            Completeness::Partial
+        }
+    }
+
     fn observation(
         &mut self,
         completeness: Completeness,
@@ -1855,7 +1881,7 @@ fn refuse_prohibited_argv(argv: &[String]) -> DriverResult<()> {
             )
     }) {
         return Err(DriverError::NativeFeatureDisabled(
-            "refusing prohibited flag on claude-print argv".into(),
+            "refusing prohibited flag on stream-json argv".into(),
         ));
     }
     Ok(())

@@ -2410,6 +2410,11 @@ fn validate_kind_driver(
         (AgentKind::Claude, remuda_protocol::DriverKind::ClaudePrint)
             | (AgentKind::Claude, remuda_protocol::DriverKind::ClaudePty)
             | (AgentKind::Claude, remuda_protocol::DriverKind::ClaudeBg)
+            // print-replacement.md §2.6: a second structured carrier for kind
+            // `claude` — stream-json over stdio with no `-p`, so stdin stays
+            // open across turns. Explicit only; the omitted-driver order in
+            // D-035 is unchanged and never resolves here.
+            | (AgentKind::Claude, remuda_protocol::DriverKind::ClaudeSdk)
             | (
                 AgentKind::Codex,
                 remuda_protocol::DriverKind::CodexAppserver

@@ -14,6 +14,7 @@ pub mod claude_bg;
 pub mod claude_onboarding;
 pub mod claude_print;
 pub mod claude_pty;
+pub mod claude_sdk;
 pub mod claude_transcript;
 pub mod codex_rollout;
 mod driver;
@@ -65,6 +66,7 @@ pub use claude_onboarding::{
 };
 pub use claude_print::TranscriptMapper;
 pub use claude_pty::{ClaudePtyDriver, ClaudePtyOptions};
+pub use claude_sdk::{ClaudeSdkDriver, ClaudeSdkOptions};
 pub use claude_transcript::{
     BindingSource, SessionStartReport, TranscriptBinding, TranscriptCandidate, TranscriptTail,
     bind_by_pid_file, bind_by_session_id, bind_manual, cwd_matches, encode_project_dir,

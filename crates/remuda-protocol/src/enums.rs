@@ -11,6 +11,7 @@ wire_enum!(AgentKind, "1.3", {
 
 wire_enum!(DriverKind, "3.1", {
     ClaudePrint => "claude-print",
+    ClaudeSdk => "claude-sdk",
     ClaudePty => "claude-pty",
     ClaudeBg => "claude-bg",
     CodexAppserver => "codex-appserver",

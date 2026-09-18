@@ -5,6 +5,7 @@ use crate::{
     DriverStartFuture, NodeError,
 };
 use remuda_driver::claude_print::{ClaudePrintDriver, ClaudePrintOptions};
+use remuda_driver::claude_sdk::{ClaudeSdkDriver, ClaudeSdkOptions};
 use remuda_driver::{
     BinarySource, ClaudeBgDriver, ClaudeBgOptions, ClaudeProviderOverlay, ClaudePtyDriver,
     ClaudePtyOptions, Delegation, Driver as NativeDriver, GenericPtyDriver, GenericPtyOptions,
@@ -160,7 +161,8 @@ fn node_herdr_session(data_dir: &Path, configured: Option<String>) -> String {
     })
 }
 
-/// Register `claude-print`, `claude-pty`, and `claude-bg` as per-instance factories.
+/// Register `claude-print`, `claude-sdk`, `claude-pty`, and `claude-bg` as
+/// per-instance factories.
 pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegistry, NodeError> {
     if config
         .claude_native_home
@@ -179,6 +181,10 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
     let registry = DriverRegistry::default();
     for kind in [
         DriverKind::ClaudePrint,
+        // Registering the factory is what makes `--driver claude-sdk` work. It
+        // does not make sdk reachable by default: `driver_for` / the omitted-driver
+        // path are untouched, so this carrier is explicit only (D-035).
+        DriverKind::ClaudeSdk,
         DriverKind::ClaudePty,
         DriverKind::ClaudeBg,
         DriverKind::GenericPty,
@@ -251,7 +257,10 @@ impl DriverFactory for NativeClaudeFactory {
         #[cfg(target_os = "macos")]
         if matches!(
             self.kind,
-            DriverKind::ClaudePrint | DriverKind::ClaudePty | DriverKind::ClaudeBg
+            DriverKind::ClaudePrint
+                | DriverKind::ClaudeSdk
+                | DriverKind::ClaudePty
+                | DriverKind::ClaudeBg
         ) || (self.kind == DriverKind::GenericPty
             && launch.request.kind == remuda_protocol::AgentKind::Claude)
         {
@@ -288,6 +297,24 @@ impl DriverFactory for NativeClaudeFactory {
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
                 Arc::new(ClaudePrintDriver::new(options))
+            }
+            // Same options as print: the carriers differ by one launch flag, so
+            // gateway overlay, isolated/inherited native home, agent MCP context
+            // and the handshake timeout are all shared (`print-replacement.md`
+            // §2.7, §3 batch 3). Explicit only — no default or fallback path
+            // resolves to this kind (D-035).
+            DriverKind::ClaudeSdk => {
+                let mut options = ClaudeSdkOptions::new(profile, launch_dir, native_home, binary);
+                options.extra_env = crate::origin::instance_env(&merge_launch_env(
+                    &self.config.extra_env,
+                    &launch.request.extra_env,
+                ));
+                options.agent_mcp = Some(crate::origin::instance_mcp(&launch));
+                options.origin = launch.request.origin;
+                options.handshake_timeout = self.config.print_handshake_timeout;
+                options.inherit_default_config = inherit_default_config;
+                options.settings_overlay_path = overlay.clone();
+                Arc::new(ClaudeSdkDriver::new(options))
             }
             DriverKind::ClaudePty => {
                 let mut options = ClaudePtyOptions::new(profile, launch_dir, native_home, binary);

@@ -334,6 +334,31 @@ describe("follow tty client", () => {
     expect(statuses.at(-1)?.stale).toEqual({ reason: undefined });
     await session.detach();
   });
+
+  it("retries a stale frame by re-subscribing rather than dropping the socket", async () => {
+    // The socket is *open* when a stale frame arrives — that is how the cached
+    // bytes got here — so `reconnectForTest` returns early and the banner's
+    // button would silently do nothing. Re-subscribing is what makes the Hub
+    // try `tty.attach` again (`send_follow_snapshot`).
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const instance = { ...ttyLabInstance(), id: "ins_01993ab0-0000-7000-8000-00000000bb23" as const };
+    const session = openTtySession(instance, { onFrame: () => {}, onStatus: () => {} });
+    await vi.waitFor(() => expect(FakeSocket.latest?.readyState).toBe(FakeSocket.OPEN));
+    const ws = FakeSocket.latest!;
+    const subscribes = () =>
+      ws.sent.filter(
+        (item): item is string =>
+          typeof item === "string" && item.includes('"subscribe"'),
+      ).length;
+    const before = subscribes();
+    expect(before).toBeGreaterThan(0);
+
+    session.retrySnapshot();
+
+    expect(subscribes()).toBe(before + 1);
+    expect(ws.readyState).toBe(FakeSocket.OPEN);
+    await session.detach();
+  });
 });
 
 function bytesToBase64(bytes: Uint8Array): string {

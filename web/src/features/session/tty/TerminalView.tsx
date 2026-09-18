@@ -623,7 +623,12 @@ export function TerminalView({
               className={css.geo}
               onClick={() => {
                 resetStreamRef.current = true;
-                sessionRef.current?.reconnectForTest();
+                // A stale frame has an open socket (that is how the cached
+                // bytes arrived), so `reconnectForTest` would return without
+                // doing anything. Re-asking the Hub is the retry that can
+                // actually replace the fossil.
+                if (status === "stale") sessionRef.current?.retrySnapshot();
+                else sessionRef.current?.reconnectForTest();
               }}
             >
               重连

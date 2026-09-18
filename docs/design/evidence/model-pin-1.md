@@ -9,6 +9,10 @@ with the fake harness from `crates/remuda-testing`, on an isolated temp root. No
 host, user or path names appear below; every model id is either a synthetic
 stand-in or a host-generic gateway id.
 
+Implementation: branch `wt/c-modelpin/b-modelpin-md`, sha
+`22b4aa4201bd282534b7368454a4396e5be6ef3c` (channel + reporting work; the
+post-launch read-back gate landed in the follow-up revision on the same branch).
+
 ---
 
 ## 1. The launch, the argv, and the transcript
@@ -70,49 +74,42 @@ last_error = None
 
 The pinned id is what answered, and the launch was not refused.
 
-### 1.4 The negative control
+### 1.4 The negative control (argv channel)
 
-The same end-to-end test was re-run with both channels deliberately neutered
-(preset `model_flag` set to `None`, the overlay pin skipped) to confirm it can
-actually fail:
+The argv/overlay half was confirmed able to fail: the end-to-end test was re-run
+with both launch channels deliberately neutered (preset `model_flag` set to
+`None`, the overlay pin skipped). With no `--model` argv and no overlay pin the
+harness never produced a transcript naming the pinned id, so the wait for one
+timed out:
 
 ```
-panicked at crates/remuda-node/tests/model_pin_launch.rs:199:
+panicked at crates/remuda-node/tests/model_pin_launch.rs:
   no harness transcript with a model under <scratch>/claude-home
 test result: FAILED. 0 passed; 1 failed
 ```
 
-With no `--model` argv and no overlay pin the harness never produced a
-transcript naming the pinned id at all, so the wait for one timed out — the
-assertion never got as far as comparing ids. (The fake harness's own default is
-`claude-opus-5`, which is also why the id assertion alone would not have been
-enough; the timeout is the honest failure here.)
-
-With the fix restored the same test passes in 66 s. A test that cannot fail
-proves nothing, so this run is part of the evidence.
+(The fake harness's own default is `claude-opus-5`, which is also why an id
+assertion alone would not have been enough; the timeout is the honest failure.)
+The read-back gate has its own negative control — the §3.4 mismatch case, which
+fails if a substitution is not stopped.
 
 ---
 
 ## 2. Audit: 2026-09-17/18 evidence that reported a pin which was not effective
 
-Every dispatch below ran on driver `shell-pty` with a native profile, which is
-exactly the path that emitted no `--model` argv and left the host's `model` key
-in place. The *pin* each doc records was therefore a request, not an observation,
-and the conclusion each doc drew about the model in effect **must be
-re-verified**:
+The pin each doc records was a *request*, not an observation. But the rows below
+are not all the same class — the launch profile decides whether the argv hole
+even applied — so they are split:
 
-| Document | Lines | What it recorded |
+| Document | Lines | Class |
 |---|---|---|
-| `docs/design/evidence/dispatch-onboarding-1.md` | 8–9, 74 | dispatch `--driver shell-pty --model ark/seed-evolving[1m]` (native profile, delegation none), and a gateway profile pin at :74 |
-| `docs/design/evidence/self-host-1.md` | 28, 63, 78, 80 | profile `defaultModel: ark/seed-evolving[1m]`; two dispatches `--model ark/seed-evolving[1m]`; a roster row echoing `'model': 'ark/seed-evolving[1m]'` |
+| `docs/design/evidence/dispatch-onboarding-1.md` | 8–9 | **native shell-pty** (`--driver shell-pty`, native profile, delegation none): the argv hole applied directly. The dispatch `--model ark/seed-evolving[1m]` reached no model token. Any claim about which model answered must be re-verified. |
+| `docs/design/evidence/self-host-1.md` | 28, 63, 78, 80 | **native shell-pty**, same class: profile `defaultModel: ark/seed-evolving[1m]`; two dispatches `--model ark/seed-evolving[1m]`; the roster row at :80 echoes `'model': 'ark/seed-evolving[1m]'`. That row is the clearest instance of the failure — the Hub wrote the *request* into it. |
+| `docs/design/evidence/dispatch-onboarding-1.md` | 74 | **gateway profile, different class — NOT affected by this bug.** That run used the real binary via a *gateway* provider profile. The generated gateway overlay carried the model in its `model` key, and the gateway strip ran (it was gated on delegation `gateway`/`direct`). The argv was still absent, but the overlay channel the gateway path relied on was present. No re-verification owed on the model. |
 
-Note the roster row at `self-host-1.md:80` is the clearest instance of the
-failure mode: the row named the pin because the Hub wrote the *request* into it,
-which is the reporting hole §5 of this brief closes.
-
-These are not necessarily wrong about their own subjects — onboarding dialogs and
-self-host bring-up — but any statement in them about *which model answered* rests
-on a channel that did not exist.
+These docs are not necessarily wrong about their own subjects — onboarding
+dialogs and self-host bring-up — but any statement in the two **native** rows
+about *which model answered* rested on a channel that did not exist.
 
 ### 2.1 It was recorded once and not acted on
 
@@ -141,13 +138,17 @@ between its request and its observation. Its `message.model` readings stand.
 
 ---
 
-## 3. Why the refusal is on the channel, not on `message.model`
+## 3. The post-launch read-back gate
 
-Brief step 4 asked for the first observed effective model (the transcript's first
-assistant `message.model`) to be compared against the pin, with a mismatch
-stopping the launch. **Measured, that comparison is unsound**, so the refusal was
-built on the launch channel instead. The measurements, taken on this host's real
-gateway and its `cache/gateway-models.json`:
+Brief step 4 asked for the first observed effective model to be compared against
+the pin, with a mismatch stopping the launch and ending the worker Blocked. That
+is now implemented — but the comparison is **not** string equality, and the gate
+judges a real read-back rather than the driver's own launch assertion. This
+section records why.
+
+### 3.1 Why equality on `message.model` is unsound
+
+Measurements on this host's real gateway and its `cache/gateway-models.json`:
 
 | pin (requested) | observed `message.model` | same after normalising? |
 |---|---|---|
@@ -155,40 +156,83 @@ gateway and its `cache/gateway-models.json`:
 | `model_hub/es1_orange_o48[1m]` | `claude-opus-4-8` | no — this is the demo bug |
 | `ark/seed-evolving[1m]` | `ark/seed-evolving` | yes |
 
-Row 1 is a correctly pinned session: the gateway resolves a `model_hub/…` catalog
-id to an upstream name, so the transcript records something that is not the pin
-and never will be. An equality gate — byte, trimmed, or namespace-normalised —
-would refuse that launch.
+Row 1 is a correctly pinned session (it is, in fact, the session this doc was
+written in): the gateway resolves a `model_hub/…` catalog id to an upstream
+vendor name, so the transcript records something that is not the pin and never
+will be. Rows 1 and 2 are **indistinguishable by `message.model`** — neither
+`claude-opus-5` nor `claude-opus-4-8` is in the catalog, while both `model_hub/…`
+pins are. A byte/trimmed/namespace-equality gate would refuse nearly every
+correct gateway launch *and still miss* the substitution.
 
-Worse, rows 1 and 2 are **indistinguishable by that channel**. Catalog membership
-cannot separate them either: neither `claude-opus-5` nor `claude-opus-4-8` is in
-`gateway-models.json`, while both `model_hub/es1_orange_o50[1m]` and
-`model_hub/es1_orange_o48[1m]` are. So the proposed gate would refuse nearly
-every correct gateway launch *and still* miss the substitution it was written to
-catch.
+The codebase already says so: `ModelTracker::note_stdout`
+(`crates/remuda-protocol/src/model.rs`) settles an awaiting pin on the verdict
+regardless of id equality — "the requested alias resolved to this concrete id" —
+and assistant records "corroborate the verdict but never resolve a live switch".
 
-The codebase already encodes this. `ModelTracker::note_stdout`
-(`crates/remuda-protocol/src/model.rs:204-209`) settles an awaiting pin on the
-verdict regardless of id equality, commented "the requested alias resolved to
-this concrete id", and `:239-241` notes that assistant records "corroborate the
-verdict but never resolve a live switch".
+### 3.2 The alias-aware comparison
 
-### 3.1 What is decidable
+`remuda_protocol::compare_model_pin(pin, observed, catalog)` (mirrored in TS by
+`web/src/features/session/modelEffective.ts::compareModelPin`) returns one of:
 
-Whether the pin reached the process at all — which is precisely the 2026-09-18
-failure. A pin with no `--model` argv and no settings `model` key cannot be in
-effect, whatever any later transcript says. That check is local, deterministic,
-needs no network or catalog, and cannot false-positive on a gateway resolution.
+- **Honoured** — equal, or equal apart from a `[1m]` context suffix
+  (`ark/seed-evolving[1m]` ↔ `ark/seed-evolving`);
+- **Mismatch** — a different id **in the pin's own vocabulary**: two namespaced
+  ids that differ (`model_hub/…o50[1m]` vs `model_hub/…o48[1m]`), or two bare
+  aliases that differ (`sonnet` vs `haiku`). This is decidable because both the
+  pin and a `/model` verdict speak the catalog namespace;
+- **Unresolvable** — the pin is namespaced and the observation is an upstream
+  vendor name. Reported silently, **never** refused or flagged as a divergence,
+  because a correct launch and a substituted one are identical there.
 
-`model_pin_channel_error` (`crates/remuda-node/src/native.rs`) reports through
-`startup_error`, so the runtime's existing path tears the process down and fails
-the instance rather than leaving it running on the wrong model. A launch with no
-pin cannot mismatch and is never refused.
+A catalog hit upgrades an un-namespaced observation (`es1_orange_o48` listed in
+the discovered catalog) to comparable, hence `Mismatch`.
 
-The two ids are still both *reported* (§5 of the brief): `WorkerRoster.model` is
-the request, `WorkerRoster.model_effective` the observation when they diverge,
-and `remuda watch` renders `requested>observed`. A divergence is a report, not by
-itself a fault — which is the honest position given the table above.
+### 3.3 What the gate judges — and the unfalsifiable snapshot
+
+The Node pump folds `model` observations through a `ModelPinGate`. The driver
+emits two launch-sourced model observations, and confusing them is the trap the
+first implementation fell into:
+
+- the **launch snapshot** (`take_launch_model_snapshot`) is emitted *before the
+  process speaks*; its `effective.id` is the requested pin itself and it carries
+  no `raw` transcript spelling. It is a prediction. Judging it would settle the
+  gate on our own request and make the check unfalsifiable — which is exactly
+  why the first attempt (a pre-process channel assertion) could never fire once
+  the argv fix populated the channel.
+- the **first genuine read-back** — an assistant record's `message.model`, or a
+  launch-settled `/model` verdict — carries the native spelling in `raw`. The
+  gate judges only this (`source = Launch` **and** `raw.is_some()`).
+
+It is event-driven and **fail-open**: it judges the launch read-back once; if no
+genuine read-back ever arrives (no assistant message, no verdict), there is no
+evidence of a substitution, so the launch continues rather than being killed on a
+guess. Later human `/model` and Remuda `configure` switches (`source =
+Slash`/`Remuda`) are out of scope and can never refuse a launch.
+
+On a `Mismatch` the pump journals the contradicting observation, sends
+`DriverRequest::Close` to stop the process, and records
+`model-mismatch: requested <pin> but <observed> answered`. The Hub watch pass
+then ends the worker **Blocked** with that reason naming both ids
+(`WorkerState` has no `Failed` arm). The instance itself is marked failed by the
+Node; the worker is Blocked by the Hub.
+
+### 3.4 The read-back end to end
+
+`model_pin_launch.rs` runs two cases through a real PTY. The fake harness gained
+`FAKE_HARNESS_REPORT_MODEL` (`crates/remuda-testing/src/fake_harness/engine.rs`)
+so it can stand in for a harness that ignores `--model`: `--model` is still
+parsed and reaches argv, but the session *reports* a different id — separating
+"the pin was sent" from "the pin was honoured".
+
+- **honoured** — pinned `…o50[1m]`, harness reports `…o50[1m]`: instance Ready,
+  no `model-mismatch`;
+- **mismatch** — pinned `…o50[1m]`, harness reports `…o48[1m]` (the host
+  default, same namespace): the launch is stopped, the instance is Failed with a
+  `model-mismatch` error naming both ids, and the worker ends Blocked.
+
+A correct gateway launch (`…o50[1m]` answered by `claude-opus-5`) is not
+reported as diverged in the watch table or the web strip — only a real mismatch
+is.
 
 ---
 
@@ -198,8 +242,13 @@ itself a fault — which is the honest position given the table above.
 |---|---|
 | `remuda-driver/tests/materializer.rs::shell_pty_agent` | the pin on argv verbatim for claude-print / claude-pty / shell-pty; no pin ⇒ no token; no `--model` grafted onto codex/grok/agy |
 | `remuda-driver/tests/model_pin_overlay.rs` | host `model` + `ANTHROPIC_MODEL` evicted under delegation `none`; endpoint/credential kept; blank pin is not a pin; case-insensitive env match |
-| `remuda-node/src/native.rs::tests::model_pin` | the channel refusal: no channel refuses naming the pin; argv or overlay accepted; a suffix-stripped value is not the pin; a host-model overlay still refuses; no pin never refuses |
-| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY: the pinned id is what the harness received, and the host's default did not answer |
-| `remuda/src/cmd/watch.rs::tests` | the MODEL cell: effective id, `requested>observed` on divergence, `-` when unknown |
-| `web/src/features/session/SessionList.test.tsx` | the row label: requested until read back, observed after, divergence marked |
+| `remuda-protocol/src/model.rs::tests` | `compare_model_pin`: suffix-equal Honoured, same-namespace Mismatch, upstream resolution Unresolvable, catalog hit, bare alias, absent pin |
+| `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate: synthetic snapshot never judged, launch read-back mismatch refuses naming both ids, gateway resolution passes, later switches out of scope, no read-back fails open, no pin never refuses |
+| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY, **honoured** and **mismatch** cases: the pinned id is received; a substituted launch is stopped Failed, both ids named |
+| `remuda-hub/tests/watch.rs` | a mismatch read-back ends the worker Blocked naming both ids and sets `modelEffective`; a gateway→upstream resolution is neither blocked nor recorded as a divergence |
+| `remuda-hub/src/store.rs::tests` | a `model` journal event projects the observed id to `modelEffective` |
+| `remuda/src/cmd/watch.rs::tests` | the MODEL cell: observed-first `observed ⇐ requested` on divergence, `-` when unknown, truncation keeps the observed id |
+| `web/src/features/session/modelEffective.test.ts` | the TS `compareModelPin` mirrors the Rust rule, incl. the gateway false positive |
+| `web/src/features/session/SessionList.test.tsx` | the row label: requested until read back; real substitution marked diverged; gateway resolution not marked |
 | `remuda-node/tests/model_pin_evidence.rs` | `#[ignore]` capture tool that produced §1.2–1.3 |
+

@@ -45,9 +45,9 @@
 |---|---|
 | **§11.7 行** | **P0-5 桌面 meta 默认折叠** — **CONFLICTS**：`:229-236` 把两行 header 画成**规范 wireframe**，第二行（修订前 **:235**）就是 `seq 184 · connectivity=connected · $0.12`；`:113` 要求主机芯片在顶栏、`:331` 要求 cost 在顶栏；「要折叠必须同时改 §2.2 的 ASCII 图」 |
 | **旧文（线框）** | `┌  ← 列表   sfe-root / spill  · bolt · claude-print · passthrough/…  ● working   [结构] [■]` / `│  seq 184 · connectivity=connected · $0.12` |
-| **新文（线框）** | 第一行 `[结构] [■ 停止]`；第二行 `│  ● bolt  ·  $0.12  ·  ▸ 运行详情`；并新增「运行详情展开后」的第二张图（`driver claude-print · delegation none · provider passthrough · lifecycle ready` / `seq 184 · connectivity connected · native claude:1a2b · transcript 绑定 hook`） |
-| **新文（正文）** | 新增「**两行 header（D-040，修订 §11.7 冲突「P0-5」）**」：主行 = 返回 + space/标题 + harness + model + 状态点 + 分段 + Stop；**host 芯片与 cost 必须留在可见主行**（保住 `:113` / `:331`）；其余诊断进第二行「运行详情」disclosure，默认收起、展开态**按设备持久化**、`session-meta` testid 保留在展开内容上；compact 不加第三层 |
-| **处理方式** | 旧图与旧文都被替换/增补，不留矛盾表述；同时保留 `:331` 的 cost 与 `:113` 的主机芯片在**主行**，因此这两条既有要求无需修改 |
+| **新文（线框）** | 主行（两态相同）：`← 列表   sfe-root / spill · claude · passthrough/… · bolt · $0.12  ● working   [结构] [■ 停止]` —— `harness`/`model`/主机/`cost` 都在主行；第二行收起态只有 `│  ▸ 运行详情`，展开态翻成 `│  ▾ 运行详情` 并把诊断折行排在下面（`driver claude-print · delegation none · provider passthrough · lifecycle ready` / `seq 184 · connectivity connected · native claude:1a2b · transcript 绑定 hook`）。第二行**不出现任何其他 token**，`driver` 与 `provider` 已从第一行移出 |
+| **新文（正文）** | 新增「**两行 header（D-040，修订 §11.7 冲突「P0-5」）**」：主行 = 返回 + space/标题 + harness + model + **主机芯片** + **cost** + 状态点 + 分段 + Stop；**host 芯片与 cost 必须留在可见主行**（保住 `:113` / `:331`）；其余诊断进第二行「运行详情」disclosure，第二行只有这一个触发器，默认收起、展开态**按设备持久化**、`session-meta` testid 保留在展开内容上；compact 不加第三层 |
+| **处理方式** | 旧图与旧文都被替换/增补，不留矛盾表述；同时保留 `:331` 的 cost 与 `:113` 的主机芯片在**主行**，因此这两条既有要求无需修改。**修订第二轮**把图与正文逐 token 对齐（原图第一行还留着 `claude-print`、第二行还挂着 `● bolt · $0.12`，与正文「诊断进 disclosure、主机与 cost 留在主行」互相打脸，c-sessionchrome 会同时照两者实现） |
 
 ### 2.4 §2.2 工具卡折叠的豁免与最小信息量（新 D-041）
 

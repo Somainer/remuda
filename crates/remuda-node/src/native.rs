@@ -541,18 +541,21 @@ fn agent_pty_kind(kind: remuda_protocol::AgentKind) -> Option<remuda_protocol::A
 ///
 /// A configured override wins verbatim (packaging that splits the relay from
 /// the Node). Otherwise it is the Node-owned **pinned copy** of this process's
-/// executable, resolved once at Node start: naming the live binary here is what
-/// let a rebuild that replaced it in place turn every subsequent hook into
+/// executable, pinned at Node start: naming the live binary here is what let a
+/// rebuild that replaced it in place turn every subsequent hook into
 /// `exec: <path> (deleted): not found`. The pinned copy has its own lifetime
 /// under `<data dir>/hook-bin/<version>/remuda` and survives the source being
-/// replaced.
+/// replaced. A pin failure is not fatal — it degrades to the resolved source
+/// path so the agent still launches (with a possibly broken hook, the pre-pin
+/// behaviour) and the next launch retries the pin. Only a total failure to even
+/// resolve the source (`current_exe` failed) errors the launch.
 fn relay_binary(config: &NativeDriverConfig) -> Result<PathBuf, DriverError> {
     if let Some(path) = &config.relay_binary {
         return Ok(path.as_ref().clone());
     }
     crate::hook_shim::for_data_dir(&config.data_dir)
-        .pinned_path()
-        .map_err(DriverError::Failed)
+        .relay_path()
+        .ok_or_else(|| DriverError::Failed("cannot locate the remuda binary for hooks".into()))
 }
 
 fn cwd_is_registered(cwd: &Path, registered_root: &Path) -> bool {
@@ -1581,6 +1584,118 @@ mod tests {
                 "the pinned copy stays executable"
             );
         }
+    }
+
+    /// A pin failure must not fail instance creation: `build()` succeeds with
+    /// the fallback (source) relay path, and the next launch retries the pin.
+    /// A promoted `terminal` shell with `pty_hooks` on reaches the hook path
+    /// without needing the native carrier, so this exercises `build()` in-proc.
+    #[test]
+    fn a_failed_pin_still_builds_with_the_fallback_and_retries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().join("data");
+        // Stub source is absent, so the pin fails; the fallback is this path.
+        let source = dir.path().join("remuda");
+        crate::hook_shim::register_stub_for_test(&data_dir, &source);
+
+        let mut config = NativeDriverConfig::new(data_dir.clone());
+        config.pty_hooks = true;
+        // Promotion is the terminal shell's precondition for hooks; it is on by
+        // default and does not require the native carrier.
+        assert!(config.promote_terminal_agents);
+        let registry = native_driver_registry(config).expect("registry");
+
+        let build_terminal_shell = || {
+            let instance = fixture_instance(
+                InstanceId::new(),
+                HostId::new(),
+                WorkspaceId::new(),
+                DriverKind::ShellPty,
+            )
+            .expect("instance");
+            let instance_id = instance.meta.id.clone();
+            let request = crate::CreateInstanceRequest {
+                origin: InputOrigin::Human,
+                agent_credential: None,
+                command_id: None,
+                instance_id: Some(instance.meta.id.clone()),
+                host_id: Some(instance.host_id.clone()),
+                workspace_id: Some(instance.workspace_id.clone()),
+                kind: AgentKind::Terminal,
+                driver: DriverKind::ShellPty,
+                model: "haiku".to_owned(),
+                args: Vec::new(),
+                binary_path: None,
+                binary_sha256: None,
+                provider_profile_id: "native".to_owned(),
+                permission_mode: "manual".to_owned(),
+                sandbox: None,
+                prompt: String::new(),
+                cwd: None,
+                delegation: None,
+                settings_overlay_path: None,
+                claude_config_dir: Some(
+                    data_dir
+                        .join("native-config")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                max_budget_usd: None,
+                provider_overlay: None,
+                provider_auth_token: None,
+                resume_session_id: None,
+                resumed_from: None,
+                effort: None,
+                tui: None,
+                extra_env: std::collections::BTreeMap::new(),
+            };
+            registry
+                .build(
+                    DriverKind::ShellPty,
+                    DriverLaunch {
+                        instance,
+                        request,
+                        workspace_root: dir.path().to_path_buf(),
+                        registered_workspace_root: dir.path().to_path_buf(),
+                    },
+                )
+                .expect("build must succeed even when the pin fails");
+            instance_id
+        };
+
+        // First build: the source is absent, the pin fails, build() still
+        // succeeds and records the fallback (source) path for this instance.
+        let first_id = build_terminal_shell();
+        let ref_file = data_dir
+            .join("instances")
+            .join(first_id.as_id().as_str())
+            .join("hook-relay");
+        assert_eq!(
+            std::fs::read_to_string(&ref_file).unwrap(),
+            source.to_string_lossy(),
+            "a failed pin records the fallback source path, not a hook-bin copy"
+        );
+
+        // The source reappears; the next build retries the pin and records a
+        // hook-bin copy — the failure was not cached.
+        std::fs::write(&source, b"#!/bin/sh\ntrue\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let second_id = build_terminal_shell();
+        let recorded = std::fs::read_to_string(
+            data_dir
+                .join("instances")
+                .join(second_id.as_id().as_str())
+                .join("hook-relay"),
+        )
+        .unwrap();
+        assert!(
+            recorded.contains("/hook-bin/"),
+            "the retry pins under hook-bin: {recorded}"
+        );
     }
 
     #[test]

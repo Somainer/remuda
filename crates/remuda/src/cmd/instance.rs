@@ -566,17 +566,8 @@ fn annotate_resolved(body: &mut Value, resolved: &Value) {
     }
 }
 
-/// A wait condition whose verdict is authoritative from the live snapshot
-/// alone; a bounded/partial journal window must never suppress it. An idle
-/// instance is idle regardless of rows the tail cut.
-fn condition_reads_snapshot_only(condition: &str) -> bool {
-    matches!(condition, "idle" | "blocked")
-}
-
-/// Whether `condition` can only be decided by scanning journal events. The
-/// event-scan verdict is gated on the window being complete for that poll
-/// iteration (but `done`/`run-terminal` also accept a terminal lifecycle from
-/// the snapshot, handled in [`until_met`]).
+/// Whether `condition` needs to scan journal events (vs. being decidable from
+/// the live instance snapshot alone).
 fn condition_scans_events(condition: &str) -> bool {
     condition.starts_with("line:")
         || matches!(
@@ -598,19 +589,25 @@ pub(crate) async fn wait(
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut after: u64 = after_seq.and_then(|s| s.parse().ok()).unwrap_or(0);
     // Dedupe/order by seq: descending pages and repeat polls can otherwise
-    // present the same event twice.
-    let mut by_seq = std::collections::BTreeMap::new();
+    // present the same event twice. Only NEW rows are cloned into it (entry /
+    // or_insert_with), so a long wait never deep-copies the whole journal on
+    // every poll.
+    let mut by_seq: std::collections::BTreeMap<u64, Value> = std::collections::BTreeMap::new();
+    // Lowest window floor a descent ever stopped at without reaching the
+    // queried cursor, latched FOR THE LIFE OF THE CALL. Advancing `after` to
+    // the tail makes later `(after, durable]` reads empty, and the Hub reports
+    // reached_after_seq=true for an empty range by construction — so
+    // completeness must never be re-derived from that trivial read. Once a
+    // floor below is un-descended, the scan stays partial for the call.
+    let mut lowest_unreached: Option<u64> = None;
     // Mirrors the web client's fillGap bound: ~16 windows of 2000 rows.
     const MAX_FILL_PAGES: u32 = 16;
     loop {
         // First page is the tail of (after, durable]. Further pages descend
         // with beforeSeq = fromSeq - 1 (same after) until reachedAfterSeq.
         let mut before: Option<String> = None;
-        // Window completeness is evaluated PER POLL ITERATION, never latched
-        // for the call: a later poll can catch up as durable grows. It gates
-        // only event-scanning predicates — snapshot-only verdicts (idle,
-        // blocked) are authoritative no matter how deep the journal is.
-        let mut window_complete = true;
+        let mut poll_reached_bottom = false;
+        let mut last_floor: Option<u64> = None;
         for _ in 0..MAX_FILL_PAGES {
             let journal = client
                 .get_journal(instance_id, Some(&after.to_string()), before.as_deref())
@@ -618,7 +615,7 @@ pub(crate) async fn wait(
             if let Some(batch) = journal.get("events").and_then(Value::as_array) {
                 for event in batch {
                     let seq = super::agents::sequence(&event["seq"]);
-                    by_seq.insert(seq, event.clone());
+                    by_seq.entry(seq).or_insert_with(|| event.clone());
                 }
             }
             let page_reached = journal
@@ -629,60 +626,78 @@ pub(crate) async fn wait(
                 .get("fromSeq")
                 .and_then(Value::as_str)
                 .and_then(|s| s.parse::<u64>().ok());
+            last_floor = from_seq;
             if page_reached {
+                poll_reached_bottom = true;
                 break;
             }
             // Cursor comes from the last event actually received, never from
             // durableSeq; descend below the window floor first.
             let Some(floor) = from_seq else { break };
             before = Some(floor.saturating_sub(1).to_string());
-            window_complete = false;
         }
-        after = by_seq.keys().next_back().copied().unwrap_or(after);
-        let events: Vec<Value> = by_seq.values().cloned().collect();
+        if !poll_reached_bottom {
+            // The descent budget could not reach the queried cursor: latch the
+            // lowest floor whose rows below were never covered. Only extend
+            // the partial region downward; if a later poll reaches the cursor
+            // this remains the honest record of what this call never scanned.
+            if let Some(floor) = last_floor {
+                lowest_unreached = Some(
+                    lowest_unreached
+                        .map_or(floor, |low| low.min(floor))
+                        .min(after),
+                );
+            }
+        }
+        // Highest received seq drives the next tail read and asOfSeq; it
+        // advances even while partial because completeness is tracked
+        // separately in lowest_unreached.
+        let as_of = by_seq.keys().next_back().copied().unwrap_or(after);
+        after = as_of;
+        let window_complete = lowest_unreached.is_none();
         let snapshot = instance_snapshot(client, instance_id).await?;
         let lifecycle = snapshot.get("lifecycle").and_then(Value::as_str);
         let activity = snapshot.get("activity").and_then(Value::as_str);
-        // Snapshot-only verdicts are always evaluated; event-scanning verdicts
-        // only when this poll's descent covered the whole queried range.
-        let verdict_allowed = condition_reads_snapshot_only(condition)
-            || !condition_scans_events(condition)
-            || window_complete;
-        if verdict_allowed && until_met(condition, &events, lifecycle, activity)? {
-            let matched_line = matching_wait_line(condition, &events);
+        // A POSITIVE verdict is authoritative even on a partial window: a
+        // matched line/event, or a terminal lifecycle for done/run-terminal,
+        // is real regardless of rows the tail cut. Only a negative verdict is
+        // qualified by the partial window (reported on timeout below).
+        if until_met(condition, by_seq.values(), lifecycle, activity)? {
+            let matched_line = matching_wait_line(condition, by_seq.values());
             return Ok(json!({
                 "reason": "condition-met",
                 "instanceId": instance_id,
                 "until": condition,
                 "condition": condition,
-                "asOfSeq": after.to_string(),
+                "asOfSeq": as_of.to_string(),
                 "lifecycle": lifecycle,
                 "activity": activity,
                 "matchedLine": matched_line,
-                "eventCount": events.len(),
+                "eventCount": by_seq.len(),
                 "outstandingWork": false,
                 "windowComplete": window_complete,
                 "reachedAfterSeq": window_complete,
             }));
         }
         if Instant::now() >= deadline {
+            // Only an event-scanning condition blocked behind an un-descended
+            // floor is still outstanding. A snapshot-only verdict (idle/
+            // blocked) or a fully-covered event scan timed out on live state.
+            let outstanding_work = condition_scans_events(condition) && !window_complete;
             return Ok(json!({
                 "reason": "timeout",
                 "instanceId": instance_id,
                 "until": condition,
                 "condition": condition,
-                "asOfSeq": after.to_string(),
+                "asOfSeq": as_of.to_string(),
                 "lifecycle": lifecycle,
                 "activity": activity,
                 "matchedLine": Value::Null,
-                "eventCount": events.len(),
-                // Only an event-scanning verdict blocked by an un-descented
-                // bounded window counts as outstanding; a snapshot-only
-                // condition that timed out did so on the live state.
-                "outstandingWork": condition_scans_events(condition) && !window_complete,
-                // False names the bounded-window case on THIS poll: rows below
-                // the received tail were cut and the descent budget could not
-                // cover them, so an event-scanning verdict would be partial.
+                "eventCount": by_seq.len(),
+                "outstandingWork": outstanding_work,
+                // False names the latched bounded-window case: rows below the
+                // received tail were never descended to, so a negative
+                // event-scanning verdict is partial.
                 "windowComplete": window_complete,
                 "reachedAfterSeq": window_complete,
             }));
@@ -977,27 +992,25 @@ pub(crate) fn tty_attach_driver(driver: &str) -> bool {
     )
 }
 
-pub(crate) fn until_met(
+pub(crate) fn until_met<'a>(
     until: &str,
-    events: &[Value],
+    events: impl IntoIterator<Item = &'a Value>,
     lifecycle: Option<&str>,
     activity: Option<&str>,
 ) -> Result<bool> {
+    // Collect references (cheap, no JSON clone) so the match arms below can
+    // scan repeatedly.
+    let events: Vec<&Value> = events.into_iter().collect();
     if let Some(pattern) = until.strip_prefix("line:") {
         let re = regex::Regex::new(pattern)
             .with_context(|| format!("invalid --until regex {pattern:?}"))?;
-        let filtered: Vec<Value> = events
-            .iter()
-            .filter(|event| line_wait_event(event))
-            .cloned()
-            .collect();
-        let text = collect_strings(&Value::Array(filtered));
+        let text = line_scan_text(events.iter().copied());
         return Ok(line_regex_matches(&re, &text));
     }
     Ok(match until {
         "idle" => is_idle(lifecycle, activity),
         "done" => {
-            events.iter().any(event_is_run_terminal)
+            events.iter().any(|event| event_is_run_terminal(event))
                 || lifecycle.is_some_and(|life| matches!(life, "closed" | "failed" | "terminated"))
         }
         "blocked" => {
@@ -1010,15 +1023,15 @@ pub(crate) fn until_met(
                 })
         }
         "observed-update" => !events.is_empty(),
-        "interaction" => events.iter().any(event_is_interaction),
-        "workflow-terminal" => events.iter().any(event_is_workflow_terminal),
+        "interaction" => events.iter().any(|event| event_is_interaction(event)),
+        "workflow-terminal" => events.iter().any(|event| event_is_workflow_terminal(event)),
         "run-terminal" => {
-            events.iter().any(event_is_run_terminal)
+            events.iter().any(|event| event_is_run_terminal(event))
                 || lifecycle
                     .is_some_and(|life| matches!(life, "closed" | "failed" | "idle" | "terminated"))
         }
         other => {
-            events.iter().any(event_is_run_terminal)
+            events.iter().any(|event| event_is_run_terminal(event))
                 || lifecycle
                     .is_some_and(|life| matches!(life, "closed" | "failed" | "idle" | "terminated"))
                 || other == "done"
@@ -1026,15 +1039,31 @@ pub(crate) fn until_met(
     })
 }
 
-fn matching_wait_line(until: &str, events: &[Value]) -> Option<String> {
+/// Concatenate the human-readable strings of the line-wait-eligible events,
+/// one event's text block per newline-separated section, without cloning the
+/// events into a new JSON array.
+fn line_scan_text<'a>(events: impl Iterator<Item = &'a Value>) -> String {
+    let mut out = String::new();
+    for event in events.filter(|event| line_wait_event(event)) {
+        let part = collect_strings(event);
+        if part.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&part);
+    }
+    out
+}
+
+fn matching_wait_line<'a>(
+    until: &str,
+    events: impl IntoIterator<Item = &'a Value>,
+) -> Option<String> {
     let pattern = until.strip_prefix("line:")?;
     let re = regex::Regex::new(pattern).ok()?;
-    let filtered: Vec<Value> = events
-        .iter()
-        .filter(|event| line_wait_event(event))
-        .cloned()
-        .collect();
-    let text = collect_strings(&Value::Array(filtered));
+    let text = line_scan_text(events.into_iter());
     first_matching_wait_line(&re, &text).map(str::to_string)
 }
 
@@ -1264,6 +1293,7 @@ fn event_is_interaction(event: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn run_terminal_matches_nested_event_type() {
@@ -1440,6 +1470,144 @@ mod tests {
         assert_eq!(row["status"], json!("idle"));
         assert_eq!(row["cwd"], json!("/tmp/wt"));
         assert_eq!(row["host"], json!("box"));
+    }
+
+    /// A Hub double that serves a 100k-row journal with the same bounded tail
+    /// semantics as Store::read_journal (newest 2000 rows; fromSeq floor;
+    /// reachedAfterSeq only when the floor is exactly after+1, and true for an
+    /// empty range). `match_seq` carries "BUILD FAILED". Counts requests.
+    async fn spawn_window_hub(
+        match_seq: i64,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use axum::{
+            Router,
+            extract::{Path, Query, State},
+            response::Json,
+            routing::get,
+        };
+        use std::collections::HashMap;
+        use std::sync::atomic::Ordering;
+
+        const N: i64 = 100_000;
+        const WINDOW: i64 = 2_000;
+
+        #[derive(Clone)]
+        struct Hub {
+            match_seq: i64,
+            requests: Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        async fn journal(
+            State(hub): State<Hub>,
+            Query(q): Query<HashMap<String, String>>,
+            Path(_id): Path<String>,
+        ) -> Json<Value> {
+            hub.requests.fetch_add(1, Ordering::SeqCst);
+            let after: i64 = q.get("afterSeq").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let before: Option<i64> = q.get("beforeSeq").and_then(|s| s.parse().ok());
+            // Inclusive high bound, clamped to durable (mirrors the Hub).
+            let high = before.map(|b| b.min(N)).unwrap_or(N);
+            // Newest WINDOW rows of (after, high], ascending.
+            let lo = (after + 1).max(high - WINDOW + 1);
+            let events: Vec<Value> = if high > after && lo <= high {
+                (lo..=high)
+                    .map(|seq| {
+                        let text = if seq == hub.match_seq {
+                            "BUILD FAILED".to_string()
+                        } else {
+                            format!("line {seq}")
+                        };
+                        json!({"seq": seq.to_string(),
+                            "event":{"type":"message","payload":{"role":"assistant","text":text}}})
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let reached = events.first().map(|_| lo == after + 1).unwrap_or(true);
+            let from_seq = events.first().map(|_| lo.to_string());
+            Json(json!({
+                "durableSeq": N.to_string(),
+                "fromSeq": from_seq,
+                "reachedAfterSeq": reached,
+                "events": events,
+            }))
+        }
+        async fn instance(Path(_id): Path<String>) -> Json<Value> {
+            Json(json!({ "instanceId": "ins_deep", "lifecycle": "running", "activity": "working" }))
+        }
+        let hub = Hub {
+            match_seq,
+            requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let requests = hub.requests.clone();
+        let app = Router::new()
+            .route("/v1/instances/{id}/journal", get(journal))
+            .route("/v1/instances/{id}", get(instance))
+            .with_state(hub);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, server, requests)
+    }
+
+    /// Match sits at seq 500, far below the 16-page descent floor (~68k). Over
+    /// several polls the latched windowComplete stays false (the empty
+    /// top-of-tail read on poll 2+ must not be mis-read as "reached") and the
+    /// timeout verdict names outstanding work.
+    #[tokio::test]
+    async fn wait_partial_window_stays_incomplete_across_polls() {
+        let (addr, server, requests) = spawn_window_hub(500).await;
+        let client =
+            HubClient::new(format!("http://{addr}"), Some("test-token".into()), None).unwrap();
+        let result = wait(&client, "ins_deep", "line:BUILD FAILED", Some("0"), 5_000)
+            .await
+            .expect("wait returns");
+
+        assert_eq!(result["reason"], json!("timeout"));
+        assert_eq!(result["windowComplete"], json!(false));
+        assert_eq!(result["reachedAfterSeq"], json!(false));
+        assert_eq!(result["outstandingWork"], json!(true));
+        // Poll 1 = 16 descent reads; poll 2+ read the now-empty (after,
+        // durable] top of tail. At least one such trivial read happened and did
+        // NOT reset completeness.
+        assert!(requests.load(std::sync::atomic::Ordering::SeqCst) >= 17);
+
+        server.abort();
+    }
+
+    /// Match sits at seq 70_000, inside the 16-page descended range, but the
+    /// descent still stops above seq 1: a POSITIVE match returns condition-met
+    /// immediately even though the window is partial.
+    #[tokio::test]
+    async fn wait_line_match_met_inside_partial_window() {
+        let (addr, server, requests) = spawn_window_hub(70_000).await;
+        let client =
+            HubClient::new(format!("http://{addr}"), Some("test-token".into()), None).unwrap();
+        let result = wait(&client, "ins_deep", "line:BUILD FAILED", Some("0"), 5_000)
+            .await
+            .expect("wait returns");
+
+        assert_eq!(result["reason"], json!("condition-met"));
+        assert_eq!(result["windowComplete"], json!(false));
+        assert_eq!(result["reachedAfterSeq"], json!(false));
+        assert_eq!(result["outstandingWork"], json!(false));
+        assert!(
+            result["matchedLine"]
+                .as_str()
+                .unwrap()
+                .contains("BUILD FAILED")
+        );
+        // Exactly one descent pass (16 pages), no busy second poll.
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 16);
+
+        server.abort();
     }
 
     /// Cursor 0, journal deeper than the descent budget, `--until idle`:

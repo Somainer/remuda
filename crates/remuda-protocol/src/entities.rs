@@ -89,6 +89,15 @@ pub struct Host {
     pub journal_id: Id,
     /// `durable_seq`; protocol §2.1.
     pub durable_seq: U64,
+    /// Operator-configured API-relay bind for direct-network routing (D-047,
+    /// Amendment A1).
+    ///
+    /// Absent — the only default — keeps this host's relay listener on
+    /// loopback and sends every `via` session through `hub-relay`. Because the
+    /// field must be set by an operator for any non-loopback listener to
+    /// exist, D-031's ban on exposing services still holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_bind: Option<HostRelayBind>,
 }
 
 /// RepositoryRef; `protocol.md` §2.2.

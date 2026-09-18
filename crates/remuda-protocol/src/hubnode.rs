@@ -95,6 +95,36 @@ pub const METHOD_HOST_FILES_READ: &str = "host.files.read";
 /// answer "unknown method", which the Hub surfaces as a clean 400 instead of
 /// hanging the route.
 pub const METHOD_HOST_FILES_SEARCH: &str = "host.files.search";
+
+// ── api.* stream class (D-048, 2026-09-19) ─────────────────────────────────
+//
+// Model-API relay frames. All seven are **notifications**: they carry no
+// JSON-RPC id and never enter the Hub→Node pending map, so a hot relay stream
+// cannot consume the 32 in-flight RPC slots `instance.create` and `tty.write`
+// depend on. Each direction keeps its own per-link stream registry instead.
+//
+// These ride the existing Hub↔Node link for the same reason `object.pull` does
+// (`docs/design/protocol.md` §7.4): the ssh-stdio bridge forwards whole JSON
+// frames only, so a binary channel would change that bridge's security
+// boundary. `D-047`/`D-031`: the bytes are an allowlisted, single-origin,
+// instance-scoped application request on an already-authorized link, not a
+// tunnel.
+
+/// Worker Node→Hub (or Hub→proxy Node): open one relayed HTTP request.
+pub const METHOD_API_OPEN: &str = "api.open";
+/// W Node→Hub→H Node: more request body for an open stream.
+pub const METHOD_API_BODY: &str = "api.body";
+/// Proxy Node→Hub→worker Node: response status line and headers.
+pub const METHOD_API_HEAD: &str = "api.head";
+/// Proxy Node→Hub→worker Node: one base64 response body chunk.
+pub const METHOD_API_CHUNK: &str = "api.chunk";
+/// Either direction: terminal frame for a stream, success or error.
+pub const METHOD_API_END: &str = "api.end";
+/// Either direction: abandon a stream (client disconnect, deadline, link loss).
+pub const METHOD_API_CANCEL: &str = "api.cancel";
+/// Consumer→producer: flow control, one credit per chunk the consumer drained.
+pub const METHOD_API_CREDIT: &str = "api.credit";
+
 /// Workspace id selecting the Node scratch area (`<tmp>/remuda-*`) for the
 /// read-only host-file routes. Real workspace ids are `ws_…` ids, so `tmp`
 /// can never alias a registration.
@@ -209,6 +239,20 @@ pub enum HubNodeMethod {
     TtyScreen,
     /// [`METHOD_OBJECT_PULL`] (Node→Hub).
     ObjectPull,
+    /// [`METHOD_API_OPEN`] (D-048).
+    ApiOpen,
+    /// [`METHOD_API_BODY`] (D-048).
+    ApiBody,
+    /// [`METHOD_API_HEAD`] (D-048).
+    ApiHead,
+    /// [`METHOD_API_CHUNK`] (D-048).
+    ApiChunk,
+    /// [`METHOD_API_END`] (D-048).
+    ApiEnd,
+    /// [`METHOD_API_CANCEL`] (D-048).
+    ApiCancel,
+    /// [`METHOD_API_CREDIT`] (D-048).
+    ApiCredit,
 }
 
 /// An explicitly sequenced phase of a workspace mutation.
@@ -939,6 +983,174 @@ pub struct ObjectChunkParams {
     pub last: bool,
 }
 
+/// `api.open` params (D-048): begin one relayed HTTP request.
+///
+/// Sent by the worker host's Node, which has already accepted the request on
+/// its per-instance loopback listener and authorized it locally. The Hub
+/// authorizes it a second time against the instance and the resolved route
+/// before any credential is loaded — the Node's word is not sufficient, exactly
+/// as for `object.pull`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiOpenParams {
+    /// Instance whose session issued this request.
+    pub instance_id: String,
+    /// Hub-allocated stream identity, unique per link.
+    pub stream_id: String,
+    /// HTTP method. The relay accepts `GET` and `POST` only.
+    pub method: String,
+    /// Path **under** the profile's base path, with no query string.
+    pub path: String,
+    /// Raw query string, or empty. Forwarded verbatim; never re-encoded.
+    #[serde(default)]
+    pub query: String,
+    /// Request headers, name and value, after the allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ApiHeader>,
+    /// Request body, standard base64, when it fits one frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_base64: Option<String>,
+    /// True when the body follows as [`ApiBodyParams`] frames in `seq` order.
+    pub body_chunked: bool,
+    /// Caller deadline in milliseconds from now, clamped to the stream cap.
+    pub deadline_ms: u32,
+}
+
+/// One header, name and value; D-048.
+///
+/// A list rather than a map because HTTP permits a header to repeat (`x-stainless-*`
+/// does), and folding repeats into one value would change the request the
+/// gateway sees.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiHeader {
+    /// Header name.
+    pub name: String,
+    /// Header value, verbatim.
+    pub value: String,
+}
+
+/// `api.body` params (D-048): request-body continuation.
+///
+/// One direction only — W Node→Hub→H Node — because only the request body is
+/// chunked on this side. A response body is carried by [`ApiChunkParams`],
+/// which travels the opposite way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiBodyParams {
+    /// Stream this body belongs to.
+    pub stream_id: String,
+    /// Zero-based contiguous chunk sequence.
+    pub seq: u32,
+    /// Chunk bytes, standard base64.
+    pub data_base64: String,
+    /// True on the final request-body chunk.
+    pub last: bool,
+}
+
+/// `api.head` params (D-048): the proxy host's response status and headers.
+///
+/// Sent before any body chunk so the worker's listener can commit a status line
+/// to the harness as soon as the gateway answers, rather than waiting for the
+/// first body byte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiHeadParams {
+    /// Stream this response belongs to.
+    pub stream_id: String,
+    /// HTTP status code from the gateway.
+    pub status: u16,
+    /// Response headers after the allowlist; `set-cookie` is always dropped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ApiHeader>,
+}
+
+/// `api.chunk` params (D-048): one coalesced response body chunk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiChunkParams {
+    /// Stream this chunk belongs to.
+    pub stream_id: String,
+    /// Zero-based contiguous chunk sequence.
+    pub seq: u32,
+    /// Chunk bytes, standard base64. Opaque: the body is never parsed as SSE.
+    pub data_base64: String,
+    /// True on the final response chunk.
+    pub last: bool,
+}
+
+/// Why an `api.*` stream ended early; D-048.
+///
+/// Stable lowercase codes, like the §9.2 unknown reasons. The worker's listener
+/// maps each to an Anthropic-shaped HTTP error so the harness renders a real
+/// model-API failure rather than a transport fault.
+pub const API_ERROR_VIA_HOST_OFFLINE: &str = "via-host-offline";
+/// The worker host's Node lost its link to the Hub.
+pub const API_ERROR_HUB_LINK_LOST: &str = "hub-link-lost";
+/// The gateway was unreachable, or the timeout ladder was breached.
+pub const API_ERROR_UPSTREAM_TIMEOUT: &str = "upstream-timeout";
+/// The operator ended the instance while a stream was in flight.
+pub const API_ERROR_INSTANCE_GONE: &str = "instance-gone";
+/// The request named a destination outside the profile's pinned origin.
+pub const API_ERROR_DESTINATION_REFUSED: &str = "destination-refused";
+/// The consumer stopped reading; the producer was cancelled.
+pub const API_ERROR_CANCELLED: &str = "cancelled";
+
+/// `api.end` error detail (D-048). Counters on the frame stay usable either way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiEndError {
+    /// One of the `API_ERROR_*` codes.
+    pub code: String,
+    /// Human-readable detail. Never carries a body, header, or credential.
+    pub message: String,
+}
+
+/// `api.end` params (D-048): terminal frame for one stream.
+///
+/// Carries counters only. Bodies and headers never reach the journal, so this
+/// is what a per-stream audit record is built from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiEndParams {
+    /// Stream that ended.
+    pub stream_id: String,
+    /// Absent on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiEndError>,
+    /// Request body bytes, pre-base64.
+    pub bytes_up: u64,
+    /// Response body bytes, post-base64-decode.
+    pub bytes_down: u64,
+    /// Wall-clock milliseconds from `api.open` to this frame.
+    pub ms: u64,
+}
+
+/// `api.cancel` params (D-048): abandon a stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiCancelParams {
+    /// Stream to abandon.
+    pub stream_id: String,
+    /// Why, in the sender's words. Best-effort detail, never a contract.
+    pub reason: String,
+}
+
+/// `api.credit` params (D-048): flow control.
+///
+/// The Hub→Node outbound queue is 32 slots shared with tty frames, so a
+/// producer may have only a few chunks unacknowledged. The consumer sends one
+/// credit per chunk it has drained, and the producer stalls at the cap rather
+/// than filling the shared queue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiCreditParams {
+    /// Stream being credited.
+    pub stream_id: String,
+    /// Chunks the consumer has drained and is ready to receive again.
+    pub chunks: u32,
+}
+
 /// Batched `journal.append` with an optional sequence watermark.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1135,6 +1347,13 @@ impl HubNodeMethod {
             Self::TtyAttach => METHOD_TTY_ATTACH,
             Self::TtyScreen => METHOD_TTY_SCREEN,
             Self::ObjectPull => METHOD_OBJECT_PULL,
+            Self::ApiOpen => METHOD_API_OPEN,
+            Self::ApiBody => METHOD_API_BODY,
+            Self::ApiHead => METHOD_API_HEAD,
+            Self::ApiChunk => METHOD_API_CHUNK,
+            Self::ApiEnd => METHOD_API_END,
+            Self::ApiCancel => METHOD_API_CANCEL,
+            Self::ApiCredit => METHOD_API_CREDIT,
         }
     }
 
@@ -1168,6 +1387,13 @@ impl HubNodeMethod {
             METHOD_TTY_ATTACH => Self::TtyAttach,
             METHOD_TTY_SCREEN => Self::TtyScreen,
             METHOD_OBJECT_PULL => Self::ObjectPull,
+            METHOD_API_OPEN => Self::ApiOpen,
+            METHOD_API_BODY => Self::ApiBody,
+            METHOD_API_HEAD => Self::ApiHead,
+            METHOD_API_CHUNK => Self::ApiChunk,
+            METHOD_API_END => Self::ApiEnd,
+            METHOD_API_CANCEL => Self::ApiCancel,
+            METHOD_API_CREDIT => Self::ApiCredit,
             _ => return None,
         })
     }
@@ -1200,6 +1426,26 @@ impl HubNodeMethod {
                 | Self::TtyResize
                 | Self::TtyAttach
                 | Self::TtyScreen
+        )
+    }
+
+    /// `api.*` relay frames (D-048).
+    ///
+    /// All seven are notifications with their own per-link stream registry, so
+    /// a carrier must route them to that registry and **never** to the
+    /// JSON-RPC dispatch table: letting them in there would spend the 32
+    /// in-flight slots `instance.create` and `tty.write` need on a hot stream.
+    #[must_use]
+    pub fn is_api(self) -> bool {
+        matches!(
+            self,
+            Self::ApiOpen
+                | Self::ApiBody
+                | Self::ApiHead
+                | Self::ApiChunk
+                | Self::ApiEnd
+                | Self::ApiCancel
+                | Self::ApiCredit
         )
     }
 }

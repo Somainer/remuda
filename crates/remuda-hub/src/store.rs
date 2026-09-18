@@ -84,6 +84,35 @@ pub const JOURNAL_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 /// chunks instead of monopolising the connection for a whole 256-event page.
 pub const APPEND_CHUNK_MAX: usize = 64;
 
+/// Serialized-JSON budget for one writer job. The count cap alone lets 64
+/// large transcript/screen frames become one long transaction; the byte cap
+/// shrinks such a chunk so a job is bounded by volume, not just row count.
+pub const APPEND_CHUNK_MAX_BYTES: usize = 1024 * 1024;
+
+/// Split a frame's events into `[start, end)` writer-job chunks bounded by
+/// [`APPEND_CHUNK_MAX`] rows and [`APPEND_CHUNK_MAX_BYTES`] of serialized
+/// JSON. A single event over the byte budget still forms a chunk of one, like
+/// the journal window's oversized-row rule.
+pub(crate) fn journal_append_chunks(events: &[Value]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < events.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < events.len() && end - start < APPEND_CHUNK_MAX {
+            let size = events[end].to_string().len();
+            if end != start && bytes.saturating_add(size) > APPEND_CHUNK_MAX_BYTES {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            end += 1;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
 /// Log a `warn` when `name` took longer than [`SLOW_JOB`].
 fn note_slow(name: &'static str, kind: &'static str, elapsed: Duration) {
     if elapsed >= SLOW_JOB {
@@ -118,9 +147,12 @@ impl Drop for StoreJoin {
 /// Read-only connections handed out one at a time under a semaphore.
 ///
 /// A connection is created on first use and parked back in `idle` afterwards,
-/// so a Hub that never serves a long read never opens one. `closed` makes the
-/// pool refuse new work after [`Store::close`] has checkpointed the WAL, so a
-/// late reader cannot reopen the file behind the writer's back.
+/// so a Hub that never serves a long read never opens one. After
+/// [`Store::close`] the pool refuses new work at both the permit gate
+/// ([`Store::read`]) and [`ReaderPool::take`], so a read that lost the race
+/// with shutdown cannot reopen the file behind the writer's checkpoint. A
+/// connection already checked out by an in-flight read runs to completion and
+/// is dropped on return rather than parked.
 struct ReaderPool {
     path: PathBuf,
     permits: Semaphore,
@@ -139,7 +171,13 @@ impl ReaderPool {
     }
 
     /// Take an idle connection, or open a fresh read-only one.
+    ///
+    /// Errors [`StoreError::Closed`] if the pool was retired after the caller
+    /// acquired its permit.
     fn take(&self) -> Result<Connection, StoreError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(StoreError::Closed);
+        }
         if let Ok(mut idle) = self.idle.lock()
             && let Some(conn) = idle.pop()
         {
@@ -970,6 +1008,23 @@ pub struct JournalAppend {
     pub replayed: bool,
     /// Inclusive instance watermark after this call (may exceed `record.seq` on replay).
     pub durable_seq: i64,
+}
+
+/// One bounded [`Store::read_journal`] window with the metadata a caller needs
+/// to tell a complete page from a partial tail window (hub-store-1).
+#[derive(Clone, Debug)]
+pub struct JournalPage {
+    /// Window events in ascending seq order, newest rows when the cap tripped.
+    pub events: Vec<JournalRecord>,
+    /// Durable seq read from the SAME snapshot as `events`, so every returned
+    /// event has `seq <= durable_seq`.
+    pub durable_seq: i64,
+    /// seq of `events[0]` — the window floor — or `None` for an empty window.
+    pub from_seq: Option<i64>,
+    /// Whether the window reaches `after_seq`: true for an empty window or when
+    /// `from_seq == after_seq + 1`. False means rows exist below the floor and
+    /// the caller holds a tail window, not the whole range.
+    pub reached_after_seq: bool,
 }
 
 /// Hub-side journal resume cursor for one instance.
@@ -2979,52 +3034,91 @@ impl Store {
         }).await
     }
 
-    /// Journal window from `after_seq` exclusive, on the reader pool.
+    /// Bounded journal window on the reader pool.
     ///
-    /// Bounded by [`JOURNAL_WINDOW_ROWS`] and [`JOURNAL_WINDOW_BYTES`] and
-    /// anchored on the durable tail, so a screen read costs O(window) rather
-    /// than O(journal) (hub-store-1). When the window cannot reach `after_seq`
-    /// the events returned are the newest ones, not the oldest: whoever asks is
-    /// looking at a live session, and the tail is the part that answers them.
-    /// `events[0].seq > after_seq + 1` is the caller's signal that it holds a
-    /// window and should re-page with `afterSeq`.
+    /// Selects rows in `(after_seq, high]`, where `high` is
+    /// `before_seq.clamp(..=durable_seq)` when given else the durable tail, and
+    /// returns at most [`JOURNAL_WINDOW_ROWS`] / [`JOURNAL_WINDOW_BYTES`] of
+    /// the NEWEST rows in that range. The default call (no `before_seq`) is the
+    /// durable tail, so a screen read costs O(window) rather than O(journal)
+    /// (hub-store-1).
+    ///
+    /// The result says what it covers: [`JournalPage::from_seq`] is the floor
+    /// and [`JournalPage::reached_after_seq`] is false when rows below the
+    /// floor were cut. Re-paging the SAME `after_seq` returns the SAME tail; to
+    /// walk the cut-away older history a caller descends with `before_seq =
+    /// from_seq - 1` until `reached_after_seq` is true. There is no ascending
+    /// `limit`/`offset` on this endpoint.
+    ///
+    /// Durable seq and the window are read inside one deferred transaction, so
+    /// they share one WAL snapshot: an append landing between the two reads
+    /// cannot make the window carry an event past the durable seq returned
+    /// beside it (which would make a cursoring caller re-deliver).
     pub async fn read_journal(
         &self,
         instance_id: String,
         after_seq: i64,
-    ) -> Result<(Vec<JournalRecord>, i64), StoreError> {
+        before_seq: Option<i64>,
+    ) -> Result<JournalPage, StoreError> {
         self.read("read_journal", move |conn| {
-            let durable = load_instance(conn, &instance_id)?
+            // Deferred BEGIN over the &Connection: the pool hands out shared
+            // refs, and this conn is used on one blocking thread at a time.
+            // The tx rolls back on error via the Transaction guard, so a failed
+            // window cannot leave the pooled connection inside a transaction.
+            let tx = conn.unchecked_transaction()?;
+            let durable = load_instance(&tx, &instance_id)?
                 .map(|i| i.durable_seq.parse::<i64>().unwrap_or(0))
                 .unwrap_or(0);
-            // Walk back from the tail so the byte cap keeps the NEWEST events;
-            // the rows come out descending and are reversed once capped.
-            let mut stmt = conn.prepare(
-                "SELECT seq, event_id, payload_json, observed_at FROM journal
-                 WHERE instance_id = ?1 AND seq > ?2 ORDER BY seq DESC LIMIT ?3",
-            )?;
-            let mut rows = stmt.query(params![instance_id, after_seq, JOURNAL_WINDOW_ROWS])?;
-            let mut events: Vec<JournalRecord> = Vec::new();
-            let mut bytes = 0usize;
-            while let Some(row) = rows.next()? {
-                let payload: String = row.get(2)?;
-                // Always keep the first (newest) row: a single event larger
-                // than the whole budget must still be readable.
-                if !events.is_empty() && bytes.saturating_add(payload.len()) > JOURNAL_WINDOW_BYTES
-                {
-                    break;
+            // Inclusive high bound; NULL means the durable tail.
+            let high: Option<i64> = before_seq.map(|before| before.min(durable));
+            let events = {
+                // Walk back from the high end so the byte cap keeps the newest
+                // rows; the rows come out descending and are reversed once cut.
+                let mut stmt = tx.prepare(
+                    "SELECT seq, event_id, payload_json, observed_at FROM journal
+                     WHERE instance_id = ?1 AND seq > ?2 AND (?3 IS NULL OR seq <= ?3)
+                     ORDER BY seq DESC LIMIT ?4",
+                )?;
+                let mut rows =
+                    stmt.query(params![instance_id, after_seq, high, JOURNAL_WINDOW_ROWS])?;
+                let mut events: Vec<JournalRecord> = Vec::new();
+                let mut bytes = 0usize;
+                while let Some(row) = rows.next()? {
+                    let payload: String = row.get(2)?;
+                    // Always keep the first (newest) row: a single event larger
+                    // than the whole budget must still be readable.
+                    if !events.is_empty()
+                        && bytes.saturating_add(payload.len()) > JOURNAL_WINDOW_BYTES
+                    {
+                        break;
+                    }
+                    bytes = bytes.saturating_add(payload.len());
+                    events.push(JournalRecord {
+                        instance_id: instance_id.clone(),
+                        seq: row.get(0)?,
+                        event_id: row.get(1)?,
+                        event: serde_json::from_str(&payload).unwrap_or(Value::Null),
+                        observed_at: row.get(3)?,
+                    });
                 }
-                bytes = bytes.saturating_add(payload.len());
-                events.push(JournalRecord {
-                    instance_id: instance_id.clone(),
-                    seq: row.get(0)?,
-                    event_id: row.get(1)?,
-                    event: serde_json::from_str(&payload).unwrap_or(Value::Null),
-                    observed_at: row.get(3)?,
-                });
-            }
-            events.reverse();
-            Ok((events, durable))
+                events.reverse();
+                events
+            };
+            tx.commit()?;
+            let from_seq = events.first().map(|event| event.seq);
+            let reached_after_seq = match from_seq {
+                // Empty window: nothing exists in (after_seq, high].
+                None => true,
+                // All queried rows are > after_seq by construction, so the floor
+                // reaches the cursor exactly at after_seq + 1.
+                Some(first) => first == after_seq + 1,
+            };
+            Ok(JournalPage {
+                events,
+                durable_seq: durable,
+                from_seq,
+                reached_after_seq,
+            })
         })
         .await
     }
@@ -5781,10 +5875,12 @@ mod tests {
             .expect("record");
         assert_eq!(diagnostic.event["payload"]["origin"], json!("hub"));
         assert_eq!(diagnostic.event["payload"]["topic"], json!("diagnostic"));
-        let (events, durable) = store
-            .read_journal(instance.instance_id, 0)
+        let journal_page = store
+            .read_journal(instance.instance_id, 0, None)
             .await
             .expect("journal");
+        let events = journal_page.events;
+        let durable = journal_page.durable_seq;
         assert_eq!(durable, diagnostic.seq);
         assert!(
             events
@@ -6897,5 +6993,48 @@ mod derive_tests {
             }
         }));
         assert_eq!(life, Some("failed"));
+    }
+
+    #[test]
+    fn append_chunks_bound_count_and_bytes_and_cover_everything() {
+        use super::{APPEND_CHUNK_MAX, APPEND_CHUNK_MAX_BYTES, journal_append_chunks};
+        use serde_json::Value;
+        // 256 small events split into 4 count-bounded chunks, contiguously.
+        let small: Vec<Value> = (0..256).map(|n| json!({ "n": n })).collect();
+        let ranges = journal_append_chunks(&small);
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0], 0..64);
+        assert_eq!(ranges[3], 192..256);
+        assert_eq!(ranges.last().unwrap().end, small.len());
+        for range in &ranges {
+            assert!(range.len() <= APPEND_CHUNK_MAX);
+        }
+
+        // Five huge events (each ~400 KB > no, under 1 MiB each): two fit under
+        // the byte budget, so 64-large-event batches cannot be one job.
+        let huge: Vec<Value> = (0..5)
+            .map(|n| json!({ "blob": "q".repeat(400_000), "n": n }))
+            .collect();
+        let ranges = journal_append_chunks(&huge);
+        for range in &ranges {
+            let bytes: usize = huge[range.clone()]
+                .iter()
+                .map(|event| event.to_string().len())
+                .sum();
+            // A chunk of >1 carries at most the byte budget; a single oversized
+            // event is allowed through on its own.
+            if range.len() > 1 {
+                assert!(bytes <= APPEND_CHUNK_MAX_BYTES, "chunk bytes {bytes}");
+            }
+        }
+        assert_eq!(
+            ranges.iter().map(std::ops::Range::len).sum::<usize>(),
+            huge.len()
+        );
+
+        // One event larger than the whole budget still forms a chunk of one.
+        let giant = vec![json!({ "blob": "z".repeat(2_000_000) })];
+        let ranges = journal_append_chunks(&giant);
+        assert_eq!(ranges, vec![0..1]);
     }
 }

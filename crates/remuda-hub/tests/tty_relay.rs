@@ -374,6 +374,14 @@ async fn cached_snapshot_is_sent_when_the_node_cannot_be_attached() -> Result<()
         .context("hub did not send its cached snapshot (B3)")?;
     assert_eq!(cached["source"], json!("hub-cache"));
     assert_eq!(cached["instanceId"], json!(instance_id.as_id().as_str()));
+    // The cache is stale by definition — the bytes are whatever this Hub last
+    // saw before the link went away — so the follower must be told how old
+    // they are and why they stopped, or it paints an hour-old frame as live.
+    assert_eq!(cached["reason"], json!("node-link-unavailable"));
+    let captured_at = cached["capturedAt"]
+        .as_str()
+        .context("hub-cache snapshot carries no capture time")?;
+    assert!(captured_at.ends_with('Z'), "capturedAt {captured_at}");
     let decoded = {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -657,6 +665,246 @@ async fn max_instances_override_and_reconciliation_survive_a_hub_restart() -> Re
     })
     .await??;
     assert_eq!(reconciled["lastError"], json!("node-epoch-changed"));
+    Ok(())
+}
+
+/// Seed an active worker holding `instance_id` on `host_id`.
+///
+/// The roster row is written straight to the store rather than through
+/// `/v1/workers/dispatch`: dispatch would create its *own* instance, and this
+/// test needs the worker bound to the instance the reconcile is about.
+async fn seed_hub_worker(
+    hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    instance_id: &InstanceId,
+    name: &str,
+) -> Result<String> {
+    use remuda_protocol::{EntityMeta, ProjectId, U64, WorkerRoster, WorkerRosterId, WorkerState};
+    let store = hub.store().context("store")?;
+    let now = remuda_protocol::Timestamp::try_from("2026-01-01T00:00:00.000Z".to_string())?;
+    let worker = WorkerRoster {
+        meta: EntityMeta {
+            id: WorkerRosterId::new(),
+            revision: U64(1),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        project_id: ProjectId::new(),
+        name: name.to_string(),
+        instance_id: Some(instance_id.clone()),
+        host_id: host_id.parse()?,
+        workspace_id: remuda_protocol::WorkspaceId::new(),
+        harness: "claude".into(),
+        driver: Some("claude-pty".into()),
+        model: None,
+        provider_profile_id: None,
+        branch: format!("wt/{name}/seed"),
+        worktree_path: format!("/tmp/{name}"),
+        port_block: None,
+        target_dir: None,
+        brief_object_id: None,
+        task_id: None,
+        state: WorkerState::Working,
+        watch: None,
+        last_nudge_at: None,
+        resumed_from: None,
+        replace_count: None,
+        supply_decision: None,
+        reclaimed_bytes: None,
+    };
+    let row = store.insert_worker(worker, "seed-device".into()).await?;
+    Ok(row.meta.id.as_id().to_string())
+}
+
+/// Read one worker's row by id.
+async fn worker_row(addr: std::net::SocketAddr, cookie: &str, id: &str) -> Result<Value> {
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/workers/{id}"),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "worker {id} {status} {body}");
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+/// The host's fleet view: capacity, running count and free slots.
+async fn hostcap(addr: std::net::SocketAddr, cookie: &str, host_id: &HostId) -> Result<Value> {
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/hosts/{}/hostcap", host_id.as_id().as_str()),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "hostcap {status} {body}");
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+/// Read one instance row.
+async fn instance_row(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    instance_id: &InstanceId,
+) -> Result<Value> {
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{}", instance_id.as_id().as_str()),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "instance {instance_id:?} {status} {body}");
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+/// The 2026-09-18 demo, end to end: a Node restart loses an instance and
+/// everything the Hub derived from it must follow — the row, the worker
+/// holding it, and the placement slot it occupied.
+///
+/// The demo's four zombies stayed `running` after their processes died with
+/// the old Node, so they counted against `maxInstances` (placement was
+/// unsatisfiable until the cap was raised by hand) while `remuda watch` kept
+/// calling them working.
+#[tokio::test]
+async fn a_lost_instance_fails_its_worker_and_frees_the_slot() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let survivor = InstanceId::new();
+    let zombie = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, node_token) =
+        node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &survivor, "seed-keep").await?;
+    seed_instance(&mut node, &zombie, "seed-lost").await?;
+    let worker_id = seed_hub_worker(&hub, host_id.as_id().as_str(), &zombie, "c-demo").await?;
+    let survivor_worker =
+        seed_hub_worker(&hub, host_id.as_id().as_str(), &survivor, "c-keep").await?;
+
+    // Both rows hold slots, so the cap the restart must free is observable.
+    let before = hostcap(hub.addr, &cookie, &host_id).await?;
+    let free_before = before["freeSlots"].as_i64().context("freeSlots")?;
+    assert_eq!(before["running"], json!(2));
+    node.close(None).await?;
+    drop(node);
+
+    // The Node comes back under a new epoch. `survivor` is reported live; the
+    // zombie is reported *exited* — the Node enumerated the row and confessed
+    // it is gone, which must settle rather than shield the Hub's stale copy.
+    let _node = node_hello(
+        hub.addr,
+        &node_token,
+        &host_id,
+        Some("epoch_two"),
+        Some(json!([
+            {
+                "id": survivor.as_id().as_str(),
+                "hostId": host_id.as_id().as_str(),
+                "lifecycle": "running"
+            },
+            {
+                "id": zombie.as_id().as_str(),
+                "hostId": host_id.as_id().as_str(),
+                "lifecycle": "exited"
+            }
+        ])),
+    )
+    .await?;
+
+    let zombie_row = instance_row(hub.addr, &cookie, &zombie).await?;
+    assert_eq!(zombie_row["lifecycle"], json!("exited"));
+    assert_eq!(
+        zombie_row["lastError"],
+        json!("node-epoch-changed"),
+        "the settled row must say why"
+    );
+
+    // The worker holding it must stop reading as active: a blocked worker is
+    // one its coordinator can act on, a `working` one over a dead process is
+    // the lie that kept `remuda watch` reporting progress.
+    let zombie_worker = worker_row(hub.addr, &cookie, &worker_id).await?;
+    assert_eq!(
+        zombie_worker["state"]["state"],
+        json!("blocked"),
+        "a lost instance must fail the worker holding it: {zombie_worker}"
+    );
+    assert_eq!(zombie_worker["state"]["reason"], json!("node-epoch-changed"));
+
+    // The survivor and its worker are untouched.
+    let survivor_row = instance_row(hub.addr, &cookie, &survivor).await?;
+    assert_eq!(survivor_row["lifecycle"], json!("running"));
+    let kept_worker = worker_row(hub.addr, &cookie, &survivor_worker).await?;
+    assert_eq!(kept_worker["state"]["state"], json!("working"));
+
+    // The slot came back: the demo's sessions were unplaceable until the cap
+    // was raised by hand.
+    let after = hostcap(hub.addr, &cookie, &host_id).await?;
+    assert_eq!(after["running"], json!(1), "only the survivor holds a slot");
+    assert_eq!(
+        after["freeSlots"].as_i64().context("freeSlots")?,
+        free_before + 1,
+        "settling the lost row must give its placement slot back"
+    );
+    Ok(())
+}
+
+/// The same reconcile on a host with a neighbour online must not touch the
+/// neighbour's rows: the settle is host-scoped, and a restart on one machine
+/// is not evidence about another's sessions.
+#[tokio::test]
+async fn a_node_restart_leaves_another_hosts_rows_alone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_a = HostId::new();
+    let host_b = HostId::new();
+    let lost = InstanceId::new();
+    let neighbour = InstanceId::new();
+
+    let enroll_a = enroll_token(hub.addr, &cookie).await?;
+    let (mut node_a, token_a) =
+        node_hello(hub.addr, &enroll_a, &host_a, Some("epoch_one"), None).await?;
+    let enroll_b = enroll_token(hub.addr, &cookie).await?;
+    let (mut node_b, token_b) =
+        node_hello(hub.addr, &enroll_b, &host_b, Some("epoch_one"), None).await?;
+    seed_instance(&mut node_a, &lost, "seed-a").await?;
+    seed_instance(&mut node_b, &neighbour, "seed-b").await?;
+    node_a.close(None).await?;
+    drop(node_a);
+
+    // Host A restarts and reports nothing at all — every one of its rows is
+    // lost. Host B is still online and still holds its own instance.
+    let _node_a = node_hello(hub.addr, &token_a, &host_a, Some("epoch_two"), Some(json!([]))).await?;
+
+    let lost_row = instance_row(hub.addr, &cookie, &lost).await?;
+    assert_eq!(lost_row["lifecycle"], json!("exited"));
+    assert_eq!(lost_row["lastError"], json!("node-epoch-changed"));
+
+    let neighbour_row = instance_row(hub.addr, &cookie, &neighbour).await?;
+    assert_eq!(
+        neighbour_row["lifecycle"],
+        json!("running"),
+        "another host's rows are not this restart's to settle: {neighbour_row}"
+    );
+    // Host B was never touched: its epoch is unchanged, so a reconnect under
+    // the same epoch and a matching inventory is a no-op rather than a settle.
+    let _node_b = node_hello(
+        hub.addr,
+        &token_b,
+        &host_b,
+        Some("epoch_one"),
+        Some(json!([{ "id": neighbour.as_id().as_str(), "lifecycle": "running" }])),
+    )
+    .await?;
+    let neighbour_row = instance_row(hub.addr, &cookie, &neighbour).await?;
+    assert_eq!(neighbour_row["lifecycle"], json!("running"));
     Ok(())
 }
 

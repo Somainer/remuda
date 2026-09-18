@@ -304,6 +304,17 @@ pub fn run(opts: Options) -> Result<i32, RunError> {
         .model
         .clone()
         .unwrap_or_else(|| default_model(dialect).to_owned());
+    // model-pin-1: stand in for a harness that ignores `--model` and answers on
+    // something else — the 2026-09-18 substitution. Set, the session *reports*
+    // this id everywhere it would report the selected model, while `--model` is
+    // still parsed as usual, so a test can tell "the pin was sent" apart from
+    // "the pin was honoured". Env rather than a flag: the real materializer
+    // builds the argv, so a test cannot add one.
+    let model = std::env::var("FAKE_HARNESS_REPORT_MODEL")
+        .ok()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .unwrap_or(model);
     let meta = SessionMeta {
         session_id: session_id.clone(),
         cwd: cwd.clone(),

@@ -84,6 +84,10 @@ async function clearApprovals(page: Page, instanceId: string) {
     }
   }, instanceId);
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 15_000 });
+  // The interaction is removed from the pending list on answer; wait for the
+  // 2 s poll to reflect that so the parked card has unmounted before any
+  // popover geometry is measured.
+  await expect(page.getByTestId("approval-card")).toHaveCount(0);
 }
 
 async function openModelList(page: Page) {

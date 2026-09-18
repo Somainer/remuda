@@ -4412,12 +4412,16 @@ fn apply_instance_projection(
     {
         // The selection path rides the model payload, not EffectiveModel;
         // merge it into the projected record so the listed/typed marker
-        // survives a page reload.
+        // survives a page reload. The driver stamps it on `effective`; the
+        // older test/fake shape put it at the payload top level — accept both.
         let mut effective = effective.clone();
         if let Some(object) = effective.as_object_mut()
-            && let Some(path) = payload.get("selectionPath")
+            && let Some(path) = object
+                .get("selectionPath")
+                .or_else(|| payload.get("selectionPath"))
+                .cloned()
         {
-            object.insert("selectionPath".into(), path.clone());
+            object.insert("selectionPath".into(), path);
         }
         apply_effective_model_projection(conn, instance_id, &effective, payload.get("catalog"))?;
     }

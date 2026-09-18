@@ -106,27 +106,26 @@ export function computeAnchored(
   const roomAboveCleared = Math.max(0, triggerRect.top - gap - upperBoundary);
   const vhCap = Math.floor(viewport.height * maxHeightVh);
   const need = panel.preferredHeight;
-  // The room the up side has that ALSO clears the obstruction (a parked
-  // approval card): when a card is present the panel may not cover it.
+  // A panel opening up must stay below a parked obstruction (approval card);
+  // this is how much up room clears it.
   const upRoomCleared = obstruction > 0 ? roomAboveCleared : roomAbove;
   const upFitsCleared = upRoomCleared >= need;
+  const blockedUpByCard = obstruction > 0 && !upFitsCleared;
 
   // Side choice:
-  // 1. open up when the panel clears any obstruction AND fits there;
-  // 2. otherwise open down whenever the dock leaves some room below — a
-  //    down panel never overlaps the card (it is below the trigger) and its
-  //    capped body scrolls, instead of covering the card with an up panel;
-  // 3. otherwise (no room below either) stay up, capped to the gap below
-  //    the obstruction so the card stays visible.
+  // - a parked card that blocks a full-height up panel → open below; the
+  //   panel then starts at the trigger and can never cover the card (it may
+  //   extend past the viewport bottom when the composer is docked low, where
+  //   covering a dismissible card is the only alternative);
+  // - otherwise the preferred side wins a tie, flip only when the other side
+  //   is strictly roomier.
   let placement: PopoverPlacement;
   if (preferUp) {
-    placement = upFitsCleared ? "up" : roomBelow > 0 ? "down" : "up";
+    placement = blockedUpByCard || roomBelow > roomAbove ? "down" : "up";
   } else {
-    placement = !upFitsCleared ? "down" : "up";
+    placement = blockedUpByCard ? "down" : roomAbove > roomBelow ? "up" : "down";
   }
-  // Cap to the room the chosen side actually has; on up the cap honours the
-  // obstruction so the panel never covers it.
-  const room = placement === "up" ? upRoomCleared : roomBelow;
+  const room = placement === "up" ? roomAbove : roomBelow;
   const cap = Math.min(vhCap, room);
   const maxHeight = cap > 0 ? cap : undefined;
   const panelHeight = Math.min(need, maxHeight ?? need);

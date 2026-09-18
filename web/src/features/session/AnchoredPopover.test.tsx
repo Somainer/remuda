@@ -59,23 +59,23 @@ describe("computeAnchored placement math", () => {
     expect(measured.maxHeight).toBeLessThanOrEqual(480);
   });
 
-  it("opens below when an approval card blocks the preferred above side", () => {
-    // Trigger 700–730, card bottom 660: the panel (190px) cannot clear the
-    // card above, so it flips down and never overlaps the card.
+  it("flips below when an approval card blocks above and below is usable", () => {
+    // Trigger 500–530 in a 900 viewport: card bottom 460 leaves only 24px
+    // cleared above, but 354px below (>= 160 floor) → dodge down.
     const down = computeAnchored(
-      { top: 700, bottom: 730, left: 100, right: 200, width: 100 },
+      { top: 500, bottom: 530, left: 100, right: 200, width: 100 },
       { preferredHeight: 190, width: 300 },
       { width: 1440, height: 900 },
-      { ...OPTS, avoidBottom: 660 },
+      { ...OPTS, avoidBottom: 460 },
     );
     expect(down.placement).toBe("down");
-    expect(down.top).toBe(738);
+    expect(down.top).toBe(538);
   });
 
   it("opens above when the panel clears a card that only reaches partway", () => {
     // Trigger 700–730 in a 900 viewport: 684px above, 154px below. A card
     // ending at 450 leaves 234px of cleared room above — enough for the 190px
-    // panel, so it opens up (the roomier side) and clears the card.
+    // panel, so it opens up and clears the card.
     const up = computeAnchored(
       { top: 700, bottom: 730, left: 100, right: 200, width: 100 },
       { preferredHeight: 190, width: 300 },
@@ -84,8 +84,22 @@ describe("computeAnchored placement math", () => {
     );
     expect(up.placement).toBe("up");
     expect(up.top).toBe(700 - 8 - 190);
-    // The panel's 190px box (502..692) stays above the card bottom 450.
     expect(up.top).toBeGreaterThanOrEqual(458);
+  });
+
+  it("dodges below the composer when a card blocks up and below has no room", () => {
+    // Composer docked at the bottom with a parked card: up is blocked by the
+    // card and below has no viewport room, but below still wins because a
+    // panel opening downward starts at the trigger and can never cover the
+    // card (it may extend past the viewport edge, the lesser of two evils).
+    const measured = computeAnchored(
+      { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
+      { preferredHeight: 131, width: 300 },
+      { width: 1440, height: 900 },
+      { ...OPTS, avoidBottom: 770 },
+    );
+    expect(measured.placement).toBe("down");
+    expect(measured.top).toBe(895);
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {
@@ -107,20 +121,6 @@ describe("computeAnchored placement math", () => {
     );
     // Right edges coincide; the panel overlaps the trigger horizontally.
     expect(measured.left + 200).toBe(520);
-  });
-
-  it("opens below when an approval card leaves no room above", () => {
-    // Trigger at y=700; a card whose bottom edge is 660 occupies the space
-    // above (room ~24px), and below has 170px → flips down instead of
-    // overlapping the card.
-    const measured = computeAnchored(
-      { top: 700, bottom: 730, left: 100, right: 200, width: 100 },
-      { preferredHeight: 190, width: 300 },
-      { width: 1440, height: 900 },
-      { ...OPTS, avoidBottom: 660 },
-    );
-    expect(measured.placement).toBe("down");
-    expect(measured.top).toBe(738);
   });
 });
 

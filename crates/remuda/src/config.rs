@@ -23,8 +23,9 @@
 //! HOST_TOKEN, HOST_TOKEN_FILE (or NODE_TOKEN_FILE), LABELS (JSON object),
 //! MAX_INSTANCES, PROVIDER_PROFILES (JSON object), SHUTDOWN_TIMEOUT_SECS,
 //! BOOTSTRAP_TOKEN, WEB_PASSWORD_FILE, COOKIE_SECURE, WEB_ROOT,
-//! ALLOWED_ORIGINS, WEB_ORIGINS (JSON arrays), COMMAND_ACCEPT_TIMEOUT_MS, and
-//! CREATE_SETTLE_TIMEOUT_MS, AUTO_TRUST_REGISTERED_WORKSPACES, WORKSPACE_ROOTS
+//! ALLOWED_ORIGINS, WEB_ORIGINS (JSON arrays), COMMAND_ACCEPT_TIMEOUT_MS,
+//! CREATE_SETTLE_TIMEOUT_MS, COMMAND_SETTLE_TIMEOUT_MS,
+//! AUTO_TRUST_REGISTERED_WORKSPACES, WORKSPACE_ROOTS
 //! (JSON path array), all prefixed `REMUDA_`.
 //! Direct token environment variables take precedence over token-file variables.
 
@@ -74,6 +75,8 @@ pub(crate) struct Hub {
     pub command_accept_timeout_ms: u64,
     #[serde(alias = "createSettleTimeoutMs")]
     pub create_settle_timeout_ms: u64,
+    #[serde(alias = "commandSettleTimeoutMs")]
+    pub command_settle_timeout_ms: u64,
     #[serde(alias = "hostLostGraceMs")]
     pub host_lost_grace_ms: u64,
     /// Per-file attachment staging ceiling in bytes (D-027b); 0 means the Hub
@@ -382,6 +385,7 @@ impl Default for Hub {
             web_root: None,
             command_accept_timeout_ms: remuda_hub::DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS,
             create_settle_timeout_ms: remuda_hub::MIN_CREATE_SETTLE_TIMEOUT_MS,
+            command_settle_timeout_ms: remuda_hub::DEFAULT_COMMAND_SETTLE_TIMEOUT_MS,
             host_lost_grace_ms: 600_000,
             attachment_max_bytes: 0,
         }
@@ -594,6 +598,10 @@ impl Config {
             self.hub.create_settle_timeout_ms =
                 parse_env(&value, "REMUDA_CREATE_SETTLE_TIMEOUT_MS")?;
         }
+        if let Some(value) = env_text(env, "REMUDA_COMMAND_SETTLE_TIMEOUT_MS")? {
+            self.hub.command_settle_timeout_ms =
+                parse_env(&value, "REMUDA_COMMAND_SETTLE_TIMEOUT_MS")?;
+        }
         if let Some(value) = env_text(env, "REMUDA_WEB_ORIGINS")? {
             self.node.web_origins = parse_json_env(&value, "REMUDA_WEB_ORIGINS")?;
         }
@@ -718,6 +726,11 @@ impl Config {
         ensure!(
             self.hub.command_accept_timeout_ms > 0,
             "hub.command_accept_timeout_ms must be positive"
+        );
+        ensure!(
+            self.hub.command_settle_timeout_ms > self.hub.command_accept_timeout_ms,
+            "hub.command_settle_timeout_ms must exceed hub.command_accept_timeout_ms, \
+             or the ack deadline fails a send still in flight"
         );
         ensure!(
             self.hub.create_settle_timeout_ms >= remuda_hub::MIN_CREATE_SETTLE_TIMEOUT_MS,
@@ -904,6 +917,35 @@ mod tests {
                 .node
                 .workspace_roots,
             Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn command_settle_timeout_defaults_and_must_exceed_the_accept_timeout() {
+        // Default is configurable (not dropped by a struct spread) and valid.
+        let config = Config::default();
+        assert_eq!(
+            config.hub.command_settle_timeout_ms,
+            remuda_hub::DEFAULT_COMMAND_SETTLE_TIMEOUT_MS
+        );
+        config.validate().expect("defaults validate");
+
+        // An env override reaches the field.
+        let fixture = Fixture::new("");
+        let config = fixture
+            .load(&[("REMUDA_COMMAND_SETTLE_TIMEOUT_MS", "20000")])
+            .expect("env override");
+        assert_eq!(config.hub.command_settle_timeout_ms, 20_000);
+
+        // A settle deadline at or below the accept timeout is rejected: it would
+        // fail a send still in flight.
+        assert!(
+            fixture
+                .load(&[
+                    ("REMUDA_COMMAND_ACCEPT_TIMEOUT_MS", "20000"),
+                    ("REMUDA_COMMAND_SETTLE_TIMEOUT_MS", "10000"),
+                ])
+                .is_err()
         );
     }
 

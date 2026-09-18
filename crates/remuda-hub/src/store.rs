@@ -939,7 +939,7 @@ pub struct CommandRecord {
     pub operation: String,
     /// `queued` / `accepted` / `settled` / `failed`.
     pub state: String,
-    /// `clear` / `unknown` / `reconciling`.
+    /// `clear` / `unknown` / `reconciling` / `failed`.
     pub resolution: String,
     /// True after Hub persisted a forward intent (never resend).
     pub forwarded: bool,
@@ -2817,12 +2817,17 @@ impl Store {
     }
 
     /// Node RPC success → `accepted`.
+    ///
+    /// Recovers a `failed` row too: if a misconfigured ack deadline fired while
+    /// the accept was still on the wire (accept timeout raised above the settle
+    /// deadline), the real accept must still win and clear the stale reason. A
+    /// `settled` row is never regressed.
     pub async fn mark_accepted(&self, command_id: String) -> Result<CommandRecord, StoreError> {
         self.run_named("mark_accepted", move |conn| {
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE commands SET state = 'accepted', resolution = 'clear', updated_at = ?1
-                 WHERE id = ?2 AND state = 'queued'",
+                "UPDATE commands SET state = 'accepted', resolution = 'clear', reason = NULL, updated_at = ?1
+                 WHERE id = ?2 AND state IN ('queued', 'failed')",
                 params![now, command_id],
             )?;
             load_command(conn, &command_id)?.ok_or_else(|| StoreError::Id("unknown command".into()))
@@ -2913,16 +2918,19 @@ impl Store {
 
     /// Move a forwarded, still-unresolved command to `failed` with a reason.
     ///
-    /// Only a row still `queued` with resolution `unknown` is touched, so:
-    /// - an accepted row (`state='accepted'`) settles from the mirrored journal
-    ///   undisturbed;
-    /// - a reconciling row (`resolution='reconciling'`, RPC reply lost) is left
-    ///   for the journal to converge per protocol §2.5 — never failed by a
-    ///   deadline;
-    /// - a row a late journal accept already advanced is left alone.
+    /// Fails any row still `queued` — whether resolution is `unknown` (the Node
+    /// was offline at forward and never received the call) or `reconciling` (the
+    /// call was delivered but the RPC reply was lost past the accept deadline,
+    /// protocol §2.5). An `accepted` / `settled` / already-`failed` row is left
+    /// alone by the `state = 'queued'` guard.
     ///
-    /// This is the send/steer path where the Node error-replies or, while
-    /// offline, never acks at all (docs/design/evidence/instance-send-1.md).
+    /// §2.5 is preserved by the *recovery* direction, not by refusing to fail:
+    /// a journaled `accepted` / `settled` that arrives after the deadline flips
+    /// the row back out of `failed` and clears the stale reason (see
+    /// [`apply_command_lifecycle`]). So a genuinely in-flight send that the
+    /// journal later confirms is corrected, while one the Node never journals
+    /// stays `failed` with its reason instead of sitting at `queued` forever
+    /// (docs/design/evidence/instance-send-1.md).
     pub async fn fail_command(
         &self,
         command_id: String,
@@ -2933,7 +2941,7 @@ impl Store {
             let changed = conn.execute(
                 "UPDATE commands
                  SET state = 'failed', resolution = 'failed', reason = ?1, updated_at = ?2
-                 WHERE id = ?3 AND state = 'queued' AND resolution = 'unknown'",
+                 WHERE id = ?3 AND state = 'queued'",
                 params![reason, now, command_id],
             )?;
             if changed == 0 {
@@ -4184,7 +4192,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     ensure_column(&conn, "commands", "reason", "TEXT")?;
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS devices_token_prefix ON devices(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
-        CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;")?;
+        CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS commands_instance ON commands(instance_id, created_at DESC);")?;
     crate::workspaces::migrate(&conn)?;
     crate::projects::migrate(&conn)?;
     crate::tasks::migrate(&conn)?;
@@ -4606,15 +4615,20 @@ fn apply_command_projection(
     }
     match state {
         "accepted" => {
+            // Recover a row a deadline failed while the call was still in
+            // flight: a journaled accept is the Node's durable word (§2.5), so
+            // it wins over the Hub's speculative `failed` and clears the stale
+            // reason. Still guarded off `settled` so a late accept cannot
+            // regress a completed command.
             conn.execute(
-                "UPDATE commands SET state = 'accepted', resolution = 'clear', updated_at = ?1
-                 WHERE id = ?2 AND state = 'queued'",
+                "UPDATE commands SET state = 'accepted', resolution = 'clear', reason = NULL, updated_at = ?1
+                 WHERE id = ?2 AND state IN ('queued', 'failed')",
                 params![now, command_id],
             )?;
         }
         "settled" => {
             conn.execute(
-                "UPDATE commands SET state = 'settled', resolution = 'clear', updated_at = ?1
+                "UPDATE commands SET state = 'settled', resolution = 'clear', reason = NULL, updated_at = ?1
                  WHERE id = ?2 AND state != 'settled'",
                 params![now, command_id],
             )?;
@@ -5027,6 +5041,104 @@ mod tests {
             .expect("row");
         assert_eq!(converged.state, "accepted");
         assert_eq!(converged.resolution, "clear");
+    }
+
+    /// The deadline can fail a send whose accept was still in flight. §2.5's
+    /// recovery direction then wins: a journaled `accepted` flips the row back
+    /// out of `failed` and clears the stale reason, so a genuinely delivered
+    /// send is corrected rather than left wrongly failed.
+    #[tokio::test]
+    async fn a_journaled_accept_recovers_a_deadline_failed_send() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host_id = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-recover").await;
+        let _ = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("slow-node".into()),
+                    node_version: Some("test".into()),
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enroll");
+        let instance = store
+            .insert_instance(
+                host_id.clone(),
+                None,
+                "claude".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("instance");
+        let (command, _) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host_id.clone(),
+                "instance.send".into(),
+                json!({"instanceId": instance.instance_id}),
+                None,
+            )
+            .await
+            .expect("command");
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await
+            .expect("forward once");
+
+        // The ack deadline fired while the send was still in flight.
+        let failed = store
+            .fail_command(
+                command.command_id.clone(),
+                "node did not acknowledge".into(),
+            )
+            .await
+            .expect("fail")
+            .expect("row failed");
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.resolution, "failed");
+        assert!(failed.reason.is_some());
+
+        // The Node journaled its durable accept afterwards.
+        store
+            .append_journal(
+                host_id.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity",
+                        "entityType": "command",
+                        "entityId": command.command_id,
+                        "state": "accepted",
+                        "entity": { "commandId": command.command_id, "state": "accepted" }
+                    }
+                }),
+            )
+            .await
+            .expect("journaled accept");
+        let recovered = store
+            .get_command(command.command_id.clone())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            recovered.state, "accepted",
+            "journal accept overrides the failed row"
+        );
+        assert_eq!(recovered.resolution, "clear");
+        assert!(
+            recovered.reason.is_none(),
+            "the stale failure reason is cleared"
+        );
     }
 
     /// D-018: an enrolled host re-announces with its own stored node token,

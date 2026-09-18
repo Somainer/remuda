@@ -114,6 +114,14 @@ export type TtySession = {
   detach(): Promise<void>;
   disconnectForTest(): void;
   reconnectForTest(): void;
+  /**
+   * Re-ask the Hub for this session's tty snapshot.
+   *
+   * For a stale frame the socket is *open* — that is how the cached bytes
+   * arrived — so a reconnect would be a no-op. Re-subscribing is what makes
+   * the Hub try `tty.attach` again (see `send_follow_snapshot`).
+   */
+  retrySnapshot(): void;
 };
 
 export const TTY_INPUT_BATCH_MS = 8;
@@ -198,6 +206,11 @@ function openReplaySession(handlers: TtyHandlers): TtySession {
       offset = 0n;
       status = "connecting";
       handlers.onStatus("connecting");
+      emitFixture();
+    },
+    retrySnapshot() {
+      // The replay fixture has no Hub behind it; re-emitting is its equivalent
+      // of re-asking, and keeps the lab's reconnect affordance honest.
       emitFixture();
     },
   };
@@ -449,6 +462,22 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
     socket.send(JSON.stringify({ type: "tty.resize", cols, rows }));
   };
 
+  /**
+   * Ask the Hub for the tty snapshot again.
+   *
+   * Re-subscribing is the real retry: the Hub answers a `subscribe` with
+   * `send_follow_snapshot`, which re-attempts `tty.attach` before falling back
+   * to its cache. That is what a stale frame needs — the link came back and the
+   * screen is still the Hub's copy of it — whereas dropping the socket would
+   * only make the browser reconnect to the same live Hub.
+   */
+  const resubscribe = () => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(
+      JSON.stringify({ type: "subscribe", instanceIds: [instance.id], tty: 1 }),
+    );
+  };
+
   const openSocket = () => {
     if (closed) return;
     handlers.onStatus(sawSnapshot ? "reconnecting" : "connecting");
@@ -515,6 +544,9 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
       if (socket && socket.readyState === WebSocket.OPEN) return;
       window.clearTimeout(reconnectTimer);
       openSocket();
+    },
+    retrySnapshot() {
+      resubscribe();
     },
   };
 }

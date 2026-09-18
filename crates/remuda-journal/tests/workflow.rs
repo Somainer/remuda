@@ -149,6 +149,13 @@ fn the_recorded_221_run_folds_real_members_with_model_tokens_and_phases() {
         );
         assert!(member.duration_ms.is_some_and(|ms| ms.0 > 0));
         assert!(member.calls.is_some());
+        // c-wfcard: the three real timestamps ride every completed snapshot.
+        assert!(member.started_at.is_some(), "started_at from agent jsonl");
+        assert!(member.ended_at.is_some(), "ended_at for a stopped member");
+        assert!(
+            member.last_progress_at.is_some(),
+            "last_progress_at from the newest transcript line"
+        );
     }
 
     // The real transcript carries model + token usage for the agents that ran.
@@ -170,6 +177,11 @@ fn the_recorded_221_run_folds_real_members_with_model_tokens_and_phases() {
     assert_eq!(run.totals.as_ref().unwrap().agents_done.0, 4);
     assert_eq!(run.totals.as_ref().unwrap().agents_running.0, 0);
     assert!(run.note.is_none(), "real data never carries the note");
+    // c-wfcard: the launch instant rides the run snapshot for queue waits.
+    assert!(
+        run.launched_at.is_some(),
+        "launched_at from the launch fold"
+    );
 }
 
 #[test]

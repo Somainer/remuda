@@ -4556,6 +4556,7 @@ export type WorkflowMemberPayload = ({
   "durationMs"?: (U64 | (null));
   "endedAt"?: (Timestamp | (null));
   "label": Knowledge2;
+  "lastProgressAt"?: (Timestamp | (null));
   "latestTool"?: (Knowledge2 | (null));
   "memberId": Id;
   "modelRequested": Knowledge2;
@@ -4588,6 +4589,7 @@ export type WorkflowPhasePayload = ({
 export type WorkflowRunPayload = ({
   "description"?: (Knowledge2 | (null));
   "engine": WorkflowEngine;
+  "launchedAt"?: (Timestamp | (null));
   "live"?: (WorkflowLive | (null));
   "name"?: (Knowledge2 | (null));
   "nativeRunId": Knowledge2;

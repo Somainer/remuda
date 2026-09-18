@@ -150,7 +150,10 @@ impl DevNode {
     /// also hide an unrelated carrier's casualties.
     pub async fn reconcile_herdr(&self) -> Result<(), NodeError> {
         self.reconcile_native_pty().await?;
-        // Sweep pinned hook-relay copies no surviving instance references.
+        // Pin the hook relay now, so the copy captures the build the Node is
+        // running rather than whatever lands before the first hooked launch,
+        // then sweep pinned copies no surviving instance references.
+        self.pin_hook_relay();
         self.collect_hook_relays();
         self.reconcile_herdr_with(remuda_herdr::RetryPolicy::default())
             .await

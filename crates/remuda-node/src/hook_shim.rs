@@ -5,10 +5,18 @@
 //! leaves the running Node's `current_exe` reading `<path> (deleted)`. When the
 //! hook command embedded that per-launch path, every hook event after the
 //! rebuild died with `exec: <path> (deleted): not found`. The fix is to resolve
-//! the executable **once** at Node start and pin a private copy under
-//! `<data dir>/hook-bin/<version>/remuda`: replacing the on-disk binary then
-//! breaks neither live nor newly created instances (roadmap R4 installed-vs-
-//! running skew).
+//! the executable at Node start, pin a private copy under
+//! `<data dir>/hook-bin/<version>/remuda`, and eagerly pin it at Node start so
+//! the copy captures the build the Node is running: replacing the on-disk
+//! binary then breaks neither live nor newly created instances (roadmap R4
+//! installed-vs-running skew).
+//!
+//! Pinning a ~200 MB binary can transiently fail — the source is briefly absent
+//! while a rebuild unlinks the old file before linking the new one, or the
+//! stripped `(deleted)` path no longer exists. That failure is **never cached**
+//! and **never fatal**: the launch degrades to the resolved source path (a
+//! broken hook on an instance that still launches, the pre-pin behaviour) and
+//! the next launch retries the pin.
 //!
 //! The pinned copy is content-addressed by the build hash, so an unchanged
 //! binary pins once across restarts and a replacement lands in its own version
@@ -22,7 +30,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Top-level directory under the Node data dir holding pinned relay copies.
@@ -55,8 +63,8 @@ static REGISTRY: Mutex<Option<HashMap<PathBuf, Arc<HookRelay>>>> = Mutex::new(No
 /// handle. Idempotent: a second call for the same data dir returns the first.
 ///
 /// Cheap: `current_exe` plus, only for the `(deleted)` corner, a single `stat`.
-/// No hashing and no copy happen here — those are deferred to the first
-/// [`HookRelay::pinned_path`] so a Node that never binds a hook pays nothing.
+/// The hash and copy are deferred to [`HookRelay::pin_now`] (called at Node
+/// start) or the first [`HookRelay::relay_path`], whichever comes first.
 pub(crate) fn ensure(data_dir: &Path) -> Arc<HookRelay> {
     let hook_bin_dir = data_dir.join(HOOK_BIN_DIR);
     let mut guard = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -77,14 +85,16 @@ pub(crate) fn for_data_dir(data_dir: &Path) -> Arc<HookRelay> {
 #[derive(Debug)]
 pub(crate) struct HookRelay {
     /// This process's executable, de-`(deleted)`-ed. `None` when
-    /// `current_exe` failed — the relay then reports the same error a
-    /// per-launch resolution used to.
+    /// `current_exe` failed — the relay then falls back to reporting no
+    /// pinned path and hooks degrade rather than the launch failing.
     source: Option<PathBuf>,
     /// `<data dir>/hook-bin`.
     hook_bin_dir: PathBuf,
-    /// Memoized pinned path (or the error from pinning it). Pinning hashes a
-    /// ~200 MB binary, so it must happen at most once.
-    pinned: OnceLock<Result<PathBuf, String>>,
+    /// Memoized **successful** pin only. A pin failure is transient — the
+    /// source binary can be momentarily absent while a rebuild unlinks the old
+    /// file before linking the new one — so it is never cached: the next launch
+    /// retries. `Some` once a pin has succeeded; pinning then never runs again.
+    pinned: Mutex<Option<PathBuf>>,
 }
 
 impl HookRelay {
@@ -100,30 +110,59 @@ impl HookRelay {
         Arc::new(Self {
             source,
             hook_bin_dir,
-            pinned: OnceLock::new(),
+            pinned: Mutex::new(None),
         })
     }
 
-    /// The pinned copy the hook relay must reference, computed once.
-    pub(crate) fn pinned_path(&self) -> Result<PathBuf, String> {
-        self.pinned
-            .get_or_init(|| {
-                let source = self
-                    .source
-                    .as_ref()
-                    .ok_or_else(|| "cannot locate the remuda binary for hooks".to_owned())?;
-                pin(source, &self.hook_bin_dir)
-                    .map_err(|error| format!("pin remuda hook relay: {error}"))
-            })
-            .clone()
+    /// The path the hook relay must reference.
+    ///
+    /// Prefers the Node-owned pinned copy; a successful pin is memoized so the
+    /// ~200 MB hash and copy run at most once. A pin **failure is not fatal and
+    /// not cached**: it degrades to the resolved source path (a broken hook on
+    /// an instance that still launches, which is exactly the pre-pin
+    /// behaviour), and the next launch retries the pin. `None` only when even
+    /// the source could not be resolved (`current_exe` failed).
+    pub(crate) fn relay_path(&self) -> Option<PathBuf> {
+        if let Ok(guard) = self.pinned.lock()
+            && let Some(pinned) = guard.as_ref()
+        {
+            return Some(pinned.clone());
+        }
+        let source = self.source.as_ref()?;
+        match pin(source, &self.hook_bin_dir) {
+            Ok(pinned) => {
+                if let Ok(mut guard) = self.pinned.lock() {
+                    *guard = Some(pinned.clone());
+                }
+                Some(pinned)
+            }
+            Err(error) => {
+                // Do not cache: the source may reappear (a rebuild's unlink
+                // window, a since-restored binary), so the next launch retries.
+                // Degrade to the live source so the agent still launches.
+                tracing::warn!(
+                    %error,
+                    source = %source.display(),
+                    "could not pin the remuda hook relay; falling back to the source binary"
+                );
+                Some(source.clone())
+            }
+        }
     }
 
-    /// The pinned path if it has already been computed, without forcing a pin.
+    /// Pin the relay now, if it has not been pinned yet. Called at Node start so
+    /// the copy captures the running build rather than whatever lands before the
+    /// first hooked launch. Best-effort: a failure is logged and retried later.
+    pub(crate) fn pin_now(&self) {
+        let _ = self.relay_path();
+    }
+
+    /// The pinned path if a pin has already succeeded, without forcing one.
     ///
     /// GC uses this to protect the version the running Node pinned without
     /// paying a ~200 MB hash on a Node that has not bound a hook yet.
     pub(crate) fn pinned_if_ready(&self) -> Option<PathBuf> {
-        self.pinned.get().and_then(|result| result.clone().ok())
+        self.pinned.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Build a relay from an explicit source binary, for tests that must
@@ -133,7 +172,7 @@ impl HookRelay {
         Arc::new(Self {
             source: Some(source),
             hook_bin_dir,
-            pinned: OnceLock::new(),
+            pinned: Mutex::new(None),
         })
     }
 }
@@ -396,12 +435,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
         let source = write_source(dir.path(), "remuda", b"#!/bin/sh\ntrue\n");
-        let relay = HookRelay {
-            source: Some(source.clone()),
-            hook_bin_dir: data_dir.join(HOOK_BIN_DIR),
-            pinned: OnceLock::new(),
-        };
-        let pinned = relay.pinned_path().expect("pin");
+        let relay = HookRelay::for_test(source.clone(), data_dir.join(HOOK_BIN_DIR));
+        let pinned = relay.relay_path().expect("pin");
         assert!(pinned.starts_with(data_dir.join(HOOK_BIN_DIR)));
         assert!(is_regular_file(&pinned));
 
@@ -418,7 +453,7 @@ mod tests {
             );
         }
         // Memoized: a second call is byte-identical, not a re-pin.
-        assert_eq!(relay.pinned_path().unwrap(), pinned);
+        assert_eq!(relay.relay_path().unwrap(), pinned);
     }
 
     /// GC removes the version no live instance references, keeps the referenced
@@ -452,6 +487,41 @@ mod tests {
         assert!(
             !stale.exists(),
             "the unreferenced, non-running version is collected"
+        );
+    }
+
+    /// A pin failure is transient: it is never cached, degrades to the source
+    /// path, and the very next call retries and succeeds once the source is back.
+    #[test]
+    fn a_failed_pin_falls_back_to_the_source_and_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source = dir.path().join("remuda");
+        // Source absent at first — the rebuild unlink window. hash_file fails,
+        // so the pin fails.
+        let relay = HookRelay::for_test(source.clone(), data_dir.join(HOOK_BIN_DIR));
+        let fallback = relay
+            .relay_path()
+            .expect("a failed pin still yields a path");
+        assert_eq!(fallback, source, "a failed pin degrades to the source path");
+        assert!(
+            relay.pinned_if_ready().is_none(),
+            "a failed pin must not be cached"
+        );
+
+        // The source reappears (link step finished / binary restored). The next
+        // call retries and now pins under hook-bin.
+        write_source(dir.path(), "remuda", b"restored-bytes\n");
+        let pinned = relay.relay_path().expect("retry pins");
+        assert!(
+            pinned.starts_with(data_dir.join(HOOK_BIN_DIR)),
+            "the retry pins under hook-bin: {}",
+            pinned.display()
+        );
+        assert_eq!(
+            relay.pinned_if_ready().as_deref(),
+            Some(pinned.as_path()),
+            "a successful pin is now cached"
         );
     }
 }

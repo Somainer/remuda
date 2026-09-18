@@ -144,6 +144,33 @@ pub fn group_alive(pgid: i32) -> bool {
     }
 }
 
+/// Whether a single process (by pid, not group) is still running.
+///
+/// Like [`group_alive`], this asks the kernel with signal 0 rather than parsing
+/// the process table, and counts an `EPERM` process as present. Use this for a
+/// child whose pid is *not* its group leader (a grandchild): `kill(pid, 0)`
+/// targets one process, whereas `killpg(pid, 0)` would look for a group whose id
+/// is `pid`, a different thing.
+#[must_use]
+pub fn process_alive(pid: i32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid <= 0 {
+            return false;
+        }
+        match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(()) => true,
+            Err(nix::errno::Errno::EPERM) => true,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// One member of a process group as read from the host process table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GroupMember {

@@ -39,10 +39,12 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
     // killing the fake on the default disposition and making the SIGKILL-rung
     // test vacuous. Real parent death is still caught by the watcher's
     // `getppid()` poll; blocking the kernel's PDEATHSIG does not disable that.
-    let ignore_sigterm =
-        std::env::var("FAKE_CLAUDE_IGNORE_SIGTERM").is_ok_and(|value| value == "1");
+    //
+    // Gated by `cfg(unix)` along with the binding, since `block_sigterm` exists
+    // only on unix: on another platform an unconditional binding would be an
+    // unused-variable warning.
     #[cfg(unix)]
-    if ignore_sigterm {
+    if std::env::var("FAKE_CLAUDE_IGNORE_SIGTERM").is_ok_and(|value| value == "1") {
         block_sigterm();
     }
 
@@ -74,6 +76,19 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let _ = std::fs::write(&path, argv.join("\n"));
     }
+    // `FAKE_CLAUDE_GRANDCHILD_PID_FILE=<path>`: spawn one long-lived child in
+    // **this process's group** and write its pid to the file.
+    //
+    // The close ladder's SIGKILL signals the whole group, but `Child::kill` /
+    // `kill_on_drop` reach only the direct child. A grandchild therefore only
+    // dies if rung 3's group signal fires, which makes that rung's coverage
+    // structural rather than relying on `kill_on_drop` to hide a missing
+    // `killpg`. The grandchild deliberately uses no `setsid`, so it inherits
+    // the group `spawn_command` put the fake in; its handle is leaked (std does
+    // not kill-on-drop by default), so the grandchild outlives a direct-child
+    // kill and is reaped only by the group signal.
+    #[cfg(unix)]
+    let _grandchild = spawn_group_grandchild();
     let session_id = flags
         .session_id
         .clone()
@@ -444,4 +459,24 @@ fn block_sigterm() {
     set.add(nix::sys::signal::Signal::SIGTERM);
     let _ =
         nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_BLOCK, Some(&set), None);
+}
+
+/// Spawn a long-lived `sleep` grandchild in this process's group and record its
+/// pid. Unix only. Returns the child handle (kept alive by the caller so it is
+/// not reaped early; it does not kill-on-drop). Returns `None` when not asked
+/// for or when spawn fails — never fatal to the fake itself.
+#[cfg(unix)]
+fn spawn_group_grandchild() -> Option<std::process::Child> {
+    let pid_path = std::env::var("FAKE_CLAUDE_GRANDCHILD_PID_FILE").ok()?;
+    // No `process_group`/`setsid`: stay in the fake's group. `sleep` ignores
+    // stdin, so it survives EOF like the IGNORE_EOF/IGNORE_SIGTERM parent.
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let _ = std::fs::write(&pid_path, child.id().to_string());
+    Some(child)
 }

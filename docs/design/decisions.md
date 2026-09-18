@@ -380,7 +380,7 @@ journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚
 | 日期 | 2026-09-19 |
 |---|---|
 | 状态 | adopted |
-| 相关 | [ui-spec.md §2.1](./ui-spec.md)（会话列表）、§1.4、[workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.3 / §11.7、D-024 addendum |
+| 相关 | [ui-spec.md §2.1](./ui-spec.md)（会话列表）、[workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.3 / §11.7、D-024 addendum |
 
 **背景**：`web/src/features/session/SessionList.tsx` 把 `lifecycle · activity · connectivity | host / worktree · driver` 渲染成行内 `.meta`，并追加 `shortId(instance.id, 8)`，行内还有 `send…` 与 enter/esc/ctrl+c。而 `ui-spec.md` §2.1 的线框本来就只有「点 + 标题 + 一句」——**当前代码才是偏离规格的那一方**，不是规格要为新建议让路。
 

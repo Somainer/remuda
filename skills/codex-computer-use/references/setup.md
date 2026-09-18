@@ -62,7 +62,7 @@ Grok 或其他未注入原生 Computer Use 工具的宿主走这条路。Launche
 
 ## 本机验证记录
 
-本 skill 的结论来自哪些实测、哪些仍未验证，见 [codex-cua-1.md](../../../docs/design/evidence/codex-cua-1.md)（“验证记录”）。要点：**原生 MCP 元数据可达，但 Claude Code 这类宿主实际消费 CUA 截图与操作 UI 尚未验证**。别把下面任何一条当成 UI 链路可用的证明。
+本 skill 的结论来自哪些实测、哪些仍未验证，见 [codex-cua-1.md](../../../docs/design/evidence/codex-cua-1.md)（“验证记录”）。要点：**原生 MCP 元数据可达，但 Claude Code 这类宿主实际消费 CUA 截图与操作 UI 尚未验证**；那份记录里没有任何一条是 UI 链路可用的证明。
 
 ## 参考来源
 

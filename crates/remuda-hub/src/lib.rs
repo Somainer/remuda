@@ -222,6 +222,14 @@ impl RunningHub {
         self.state.nodes.remove(host_id).await;
     }
 
+    /// Test helper: run the restart reconcile pass against the live state, as
+    /// `spawn` does on startup. Models a Hub restart re-entering reconcile
+    /// without tearing down the process.
+    #[doc(hidden)]
+    pub async fn test_reconcile(&self) {
+        crate::gatequeue::reconcile(&self.state).await;
+    }
+
     /// Mint a scoped device token against this Hub's store (D-018).
     ///
     /// In-process equivalent of `POST /v1/login`, for components composed into

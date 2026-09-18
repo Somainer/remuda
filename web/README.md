@@ -39,6 +39,6 @@ VITE_MOCK=0 VITE_API_BASE=http://127.0.0.1:8787 VITE_ACCESS_CODE=dev pnpm dev
 | `pnpm test` | Vitest（status 投影、tool registry、journal seq/gap、transcript assemble） |
 | `pnpm test:e2e` | Playwright `session-structured` / `new-session` / `approvals`（chromium + mobile-webkit） |
 | `pnpm lint` | oxlint `src` |
-| `pnpm preview` | 预览生产包（注册 `public/sw.js`） |
+| `pnpm preview` | 预览生产包（构建时生成 `dist/sw.js`） |
 
-PWA：`public/manifest.webmanifest`（standalone，`start_url=/sessions`）+ `public/sw.js` 只预缓存壳，不缓存 `/v1/` journal。生产且 HTTPS/`isSecureContext` 才 `register('/sw.js')`。
+PWA：`public/manifest.webmanifest`（standalone，`start_url=/sessions`）+ `sw.src.js`（只预缓存壳，不缓存 `/v1/` journal）。它不是 public 目录里逐字节拷贝的静态文件：`vite.config.ts` 经 `sw-build.ts` 插件在构建时把按构建派生的缓存名盖进去、输出 `dist/sw.js`（dev 服在 `/sw.js` 提供同一 worker），所以每次部署 worker 字节都变、旧壳在 activate 时被清掉。生产且 HTTPS/`isSecureContext` 才由 `startPWA` 注册 `/sw.js`。

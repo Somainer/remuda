@@ -87,19 +87,18 @@ describe("computeAnchored placement math", () => {
     expect(up.top).toBeGreaterThanOrEqual(458);
   });
 
-  it("dodges below the composer when a card blocks up and below has no room", () => {
-    // Composer docked at the bottom with a parked card: up is blocked by the
-    // card and below has no viewport room, but below still wins because a
-    // panel opening downward starts at the trigger and can never cover the
-    // card (it may extend past the viewport edge, the lesser of two evils).
+  it("stays up when a card blocks up and below cannot host a usable panel", () => {
+    // Composer docked at the bottom (no usable room below) with a parked
+    // card: opening down would push controls off-screen, so stay up — the
+    // capped body is reachable even if it covers the dismissible card.
     const measured = computeAnchored(
       { top: 857, bottom: 887, left: 590, right: 699, width: 109 },
       { preferredHeight: 131, width: 300 },
       { width: 1440, height: 900 },
       { ...OPTS, avoidBottom: 770 },
     );
-    expect(measured.placement).toBe("down");
-    expect(measured.top).toBe(895);
+    expect(measured.placement).toBe("up");
+    expect(measured.top).toBeLessThan(857);
   });
 
   it("shifts a panel that would overflow the right edge back inside", () => {

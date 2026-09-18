@@ -111,19 +111,26 @@ export function computeAnchored(
   const upRoomCleared = obstruction > 0 ? roomAboveCleared : roomAbove;
   const upFitsCleared = upRoomCleared >= need;
   const blockedUpByCard = obstruction > 0 && !upFitsCleared;
+  // Dodging below must leave a usable panel; when the composer is docked at
+  // the viewport bottom (no room below) opening down would push the controls
+  // off-screen, so stay up — covering a dismissible card is the lesser evil
+  // over an unreachable menu.
+  const DOWN_USABLE = 120;
+  const canDodgeDown = roomBelow >= DOWN_USABLE;
 
   // Side choice:
-  // - a parked card that blocks a full-height up panel → open below; the
-  //   panel then starts at the trigger and can never cover the card (it may
-  //   extend past the viewport bottom when the composer is docked low, where
-  //   covering a dismissible card is the only alternative);
+  // - a parked card that blocks a full-height up panel → open below, but only
+  //   when below has room for a usable panel;
   // - otherwise the preferred side wins a tie, flip only when the other side
   //   is strictly roomier.
   let placement: PopoverPlacement;
   if (preferUp) {
-    placement = blockedUpByCard || roomBelow > roomAbove ? "down" : "up";
+    placement = blockedUpByCard && canDodgeDown
+      || !blockedUpByCard && roomBelow > roomAbove
+      ? "down"
+      : "up";
   } else {
-    placement = blockedUpByCard ? "down" : roomAbove > roomBelow ? "up" : "down";
+    placement = !blockedUpByCard && roomAbove > roomBelow ? "up" : "down";
   }
   const room = placement === "up" ? roomAbove : roomBelow;
   const cap = Math.min(vhCap, room);

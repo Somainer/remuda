@@ -1068,9 +1068,12 @@ async fn fake_node(
                                     "effective": {
                                         "id": resolved,
                                         "source": "remuda",
-                                        "observedAt": "2026-09-14T12:00:00.000Z"
+                                        "observedAt": "2026-09-14T12:00:00.000Z",
+                                        // Listed when the id was offered by
+                                        // the session's own launch catalog;
+                                        // the typed-id case exercises typed.
+                                        "selectionPath": selection_path
                                     },
-                                    "selectionPath": selection_path,
                                     "raw": resolved
                                 }),
                             )

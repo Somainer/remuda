@@ -113,7 +113,7 @@
 
 | 检查 | 结果 |
 |---|---|
-| 源报告逐行比对 | 去掉 §11.3 行 423 后与 `/tmp/remuda-agents/briefs/src/workbench-ux-improvement-2026-09.md` **无差异** |
+| 源报告逐行比对 | `diff` 去掉 §11.3 行 423 后，与 `/tmp/remuda-agents/briefs/src/workbench-ux-improvement-2026-09.md` 只余 §4 记录的三处（§2.3 / §5-P0-2 / §11.7 P0-5 行）；其余逐字节相同 |
 | 个人标识 | 行 423 的三个 workspace 芯片名里，两个非产品名（个人 workspace 名与雇主名）已替换为中性占位 `<workspace>` / `<workspace-2>`，`hybrid-harness` 保留（仓库自身的目录名，D-001）；提交内容其余部分只含机器名（`bolt` / `devbox-sg`）与产品名，均为仓库既有文档中的既有写法 |
 | `scripts/ci/secret-scan.sh` | PASS — 无私有令牌命中（行 423 的雇主名是本次替换的触发原因） |
 | `scripts/ci/no-tunnel-scan.sh` | PASS — 两份新文档对 D-031 的禁用 token 集合零匹配（本文件表格内不重复拼写这些 token，避免扫描器命中自身） |

@@ -957,6 +957,11 @@ pub struct ModelPayload {
     /// Absent on later edges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<ModelCatalogInfo>,
+    /// For a Remuda-initiated switch (`effective.source = remuda`), whether
+    /// the requested id came from the session's own list or was typed
+    /// verbatim. Absent for launch snapshots and terminal-side switches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_path: Option<ModelSelectionPath>,
 }
 
 ///

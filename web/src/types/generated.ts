@@ -2482,8 +2482,21 @@ export type MethodCall = (({
 /** MethodName wire values; `protocol.md` §7.2. */
 export type MethodName = ("runtime.hello" | "runtime.heartbeat" | "host.report" | "host.get" | "host.list" | "driver.list" | "driver.capabilities" | "workspace.register" | "workspace.get" | "workspace.list" | "worktree.create" | "worktree.remove" | "instance.create" | "instance.attach" | "instance.open_terminal" | "instance.resume" | "instance.send" | "instance.configure" | "instance.fork" | "instance.cancel" | "instance.close" | "instance.get" | "instance.list" | "command.get" | "command.list" | "run.get" | "run.list" | "run.wait" | "workflow.wait" | "interaction.list" | "interaction.get" | "interaction.respond" | "events.subscribe" | "events.read" | "events.ack" | "events.unsubscribe" | "reconcile.instance" | "tty.attach" | "tty.detach" | "tty.write" | "tty.resize" | "object.stat" | "object.read" | "object.prepare" | "object.write" | "object.commit");
 
+/** Provenance of the gateway discovery cache that answered a catalog resolution, so the UI can flag a list the session's own CLI may reject. */
+export type ModelCacheInfo = ({
+  "baseUrl"?: (string | null);
+  "fetchedAt"?: (string | null);
+  "scope": ModelCacheScope;
+  [key: string]: unknown;
+});
+
+/** Which `cache/gateway-models.json` file answered a catalog resolution. */
+export type ModelCacheScope = ("scoped-config-dir" | "host-fallback");
+
 /** The model list a session can actually switch to, with its provenance. */
 export type ModelCatalogInfo = ({
+  "cache"?: (ModelCacheInfo | (null));
+  "discoveryEnv"?: (boolean | null);
   "models": (((string))[]);
   "observedAt": Timestamp;
   "source": ModelListSource;
@@ -2505,6 +2518,7 @@ export type ModelPayload = ({
   "effective": EffectiveModel;
   "raw"?: (string | null);
   "requested"?: (string | null);
+  "selectionPath"?: (ModelSelectionPath | (null));
   [key: string]: unknown;
 });
 
@@ -2516,6 +2530,9 @@ export type ModelRoles = ({
   "workhorse"?: (string | null);
   [key: string]: unknown;
 });
+
+/** How a Remuda-initiated switch selected its id. The verdict (not this marker) remains the acceptance authority; this only says whether the id was offered by the session's own discovered list. */
+export type ModelSelectionPath = ("listed" | "typed");
 
 /** ModelSwitchInput; `protocol.md` §3.1. */
 export type ModelSwitchInput = ({

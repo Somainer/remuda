@@ -717,3 +717,53 @@ fn provider_profile_legacy_shapes_all_read_as_direct() {
         json!({})
     );
 }
+
+/// D-047: the Node reports the route it took on the create result, and that is
+/// the only place the Hub may take the observed route from.
+///
+/// Without this field there was nothing to echo: the spec carries the
+/// *requested* route (whose `route` may be `auto`), so a projection filled from
+/// it would report intent as fact.
+#[test]
+fn instance_create_result_carries_the_node_reported_route() {
+    let base = json!({
+        "command": fixture("command.json"),
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "prepared": true,
+        "sendCommandId": "cmd_01993ab0-0000-7000-8000-000000000002",
+        "runId": null
+    });
+
+    // A direct session omits the field entirely, so a Node that predates D-047
+    // (and every pre-D-047 response body) is byte-identical.
+    let result = round_trip::<InstanceCreateResult>(base.clone());
+    assert_eq!(result.api_route, None);
+    assert!(
+        serde_json::to_value(&result)
+            .unwrap()
+            .get("apiRoute")
+            .is_none(),
+        "an unproxied create result must not gain an apiRoute key"
+    );
+
+    for (route, host) in [("hub-relay", Some("mac-host")), ("direct-net", None)] {
+        let mut value = base.clone();
+        let mut api_route = json!({"mode": "via", "route": route});
+        api_route["viaHostId"] = json!("hst_01993ab0-0000-7000-8000-000000000007");
+        if let Some(label) = host {
+            api_route["viaHostLabel"] = json!(label);
+        }
+        value["apiRoute"] = api_route;
+        let result = round_trip::<InstanceCreateResult>(value.clone());
+        let carried = result.api_route.clone().expect("apiRoute");
+        assert!(carried.is_via(), "{route}");
+        assert_eq!(carried.route.map(ApiRouteKind::as_str), Some(route));
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
+    }
+
+    // `auto` is a request, not a report: a Node echoing it would be claiming to
+    // have decided nothing.
+    let mut bad = base;
+    bad["apiRoute"] = json!({"mode": "via", "route": "auto"});
+    assert!(serde_json::from_value::<InstanceCreateResult>(bad).is_err());
+}

@@ -7061,6 +7061,17 @@
     "InstanceCreateResult": {
       "description": "InstanceCreateResult; `protocol.md` §7.2.",
       "properties": {
+        "apiRoute": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApiRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`api_route`; protocol §7.2 (D-047).\n\nThe route the **Node** actually took, which is the only thing the Hub\nmay record on the instance projection (D-035 rule 4). Absent means no\nproxy: a direct session, or a Node that predates D-047 and therefore\nnever proxied anything.\n\nThis is where the observed route enters the Hub. The spec carries the\n*requested* route ([`crate::RequestedApiRoute`], whose `route` may be\n`auto`); this carries the resolved one."
+        },
         "command": {
           "$ref": "#/$defs/Command",
           "description": "`command`; protocol §7.2."
@@ -14868,16 +14879,14 @@
     },
     "ProviderDelivery": {
       "additionalProperties": false,
-      "description": "Provider delivery of one profile; `protocol.md` §4.4 (D-047).\n\nThe wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling:\nthe sub-mode has nowhere to live in a single keyword. An absent `delivery`\nis [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a\nprofile row written before this type existed keeps parsing.\n\nDeserialization is strict on the one combination that cannot be honoured\n(`mode: via` with no host) and on unknown enum values, which are parse\nerrors rather than silent defaults: a typo'd route must not quietly become\n`auto` and move a session's egress to a machine the operator did not name.",
+      "description": "Provider delivery of one profile; `protocol.md` §4.4 (D-047).\n\nThe wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling:\nthe sub-mode has nowhere to live in a single keyword. An absent `delivery`\nis [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a\nprofile row written before this type existed keeps parsing.\n\nDeserialization is strict on the one combination that cannot be honoured:\n`mode: via` with no `via_host_id` is a parse error, not a default. Unknown\nenum values are parse errors too, so a typo'd route cannot quietly become\n`auto` and move a session's egress to a machine the operator did not name.\n[`Self::is_valid`] stays as the runtime check for a value built in Rust.\n\nThe `serde` attribute is for the **schema** only: `Deserialize` is\nhand-written below (it must reject `via` with no host), so nothing here\nreads this attribute at runtime — but schemars does, and without it the\ngenerated schema would claim to accept unknown keys when the wire struct\nrefuses them.",
       "properties": {
         "mode": {
           "$ref": "#/$defs/ProviderDeliveryMode",
-          "default": "direct",
           "description": "`direct` or `via`."
         },
         "route": {
           "$ref": "#/$defs/ApiRouteMode",
-          "default": "auto",
           "description": "Route between the worker host and [`Self::via_host_id`]. Ignored by\n`direct`, but always serialized so the stored row is self-describing."
         },
         "viaHostId": {

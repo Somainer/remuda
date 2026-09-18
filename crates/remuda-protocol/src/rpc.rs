@@ -333,6 +333,18 @@ pub struct InstanceCreateResult {
     /// `run_id`; protocol §7.2.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub run_id: Option<RunId>,
+    /// `api_route`; protocol §7.2 (D-047).
+    ///
+    /// The route the **Node** actually took, which is the only thing the Hub
+    /// may record on the instance projection (D-035 rule 4). Absent means no
+    /// proxy: a direct session, or a Node that predates D-047 and therefore
+    /// never proxied anything.
+    ///
+    /// This is where the observed route enters the Hub. The spec carries the
+    /// *requested* route ([`crate::RequestedApiRoute`], whose `route` may be
+    /// `auto`); this carries the resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_route: Option<crate::ApiRoute>,
 }
 
 /// InstanceAttachParams; `protocol.md` §7.2.

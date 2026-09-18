@@ -131,15 +131,32 @@ fn unknown_route_and_mode_are_parse_errors_not_defaults() {
     assert!(serde_json::from_value::<ProviderProfile>(value).is_err());
 }
 
-/// `via` without a host cannot be honoured. The type still deserializes (so a
-/// stored row is readable and can be repaired) but reports itself invalid,
-/// which is what the Hub refuses on.
+/// `via` without a host cannot be honoured, so the wire refuses it outright
+/// rather than deferring the failure to launch time. `is_valid` remains as the
+/// runtime check for a value built in Rust rather than parsed.
 #[test]
-fn via_without_a_host_is_representable_but_invalid() {
-    let delivery: ProviderDelivery = serde_json::from_value(json!({"mode": "via"})).unwrap();
-    assert!(delivery.is_via());
-    assert_eq!(delivery.via_host_id, None);
-    assert!(!delivery.is_valid());
+fn via_without_a_host_is_a_parse_error() {
+    for bad in [
+        json!({"mode": "via"}),
+        json!({"mode": "via", "route": "hub-relay"}),
+    ] {
+        let parsed = serde_json::from_value::<ProviderDelivery>(bad.clone());
+        assert!(parsed.is_err(), "{bad} must not parse");
+    }
+
+    // The profile-level path refuses it too, not just the inner type.
+    let mut value = fixture();
+    value["delivery"] = json!({"mode": "via"});
+    assert!(serde_json::from_value::<ProviderProfile>(value).is_err());
+
+    // A built-but-invalid value is still detectable without parsing.
+    let hand_built = ProviderDelivery {
+        mode: ProviderDeliveryMode::Via,
+        via_host_id: None,
+        route: ApiRouteMode::Auto,
+    };
+    assert!(hand_built.is_via());
+    assert!(!hand_built.is_valid());
 
     assert!(ProviderDelivery::direct().is_valid());
     assert!(ProviderDelivery::via(host_id(), ApiRouteMode::Auto).is_valid());

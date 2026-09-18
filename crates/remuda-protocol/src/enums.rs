@@ -585,10 +585,6 @@ impl ApiRouteKind {
     }
 }
 
-/// Wire value of [`ApiRoute`] `mode`: no proxy; the route is undefined because
-/// there is nothing to route.
-pub const API_ROUTE_DIRECT: &str = "direct";
-
 /// Provider delivery of one profile; `protocol.md` §4.4 (D-047).
 ///
 /// The wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling:
@@ -596,15 +592,21 @@ pub const API_ROUTE_DIRECT: &str = "direct";
 /// is [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a
 /// profile row written before this type existed keeps parsing.
 ///
-/// Deserialization is strict on the one combination that cannot be honoured
-/// (`mode: via` with no host) and on unknown enum values, which are parse
-/// errors rather than silent defaults: a typo'd route must not quietly become
+/// Deserialization is strict on the one combination that cannot be honoured:
+/// `mode: via` with no `via_host_id` is a parse error, not a default. Unknown
+/// enum values are parse errors too, so a typo'd route cannot quietly become
 /// `auto` and move a session's egress to a machine the operator did not name.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+/// [`Self::is_valid`] stays as the runtime check for a value built in Rust.
+///
+/// The `serde` attribute is for the **schema** only: `Deserialize` is
+/// hand-written below (it must reject `via` with no host), so nothing here
+/// reads this attribute at runtime — but schemars does, and without it the
+/// generated schema would claim to accept unknown keys when the wire struct
+/// refuses them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderDelivery {
     /// `direct` or `via`.
-    #[serde(default)]
     pub mode: ProviderDeliveryMode,
     /// Proxy host (`hst_…`). Required by `via`, meaningless for `direct`.
     ///
@@ -615,8 +617,54 @@ pub struct ProviderDelivery {
     pub via_host_id: Option<HostId>,
     /// Route between the worker host and [`Self::via_host_id`]. Ignored by
     /// `direct`, but always serialized so the stored row is self-describing.
-    #[serde(default)]
     pub route: ApiRouteMode,
+}
+
+/// Deserialization shape for [`ProviderDelivery`].
+///
+/// A separate type because the rejection cannot be expressed as a serde field
+/// attribute, and it must not become a schema keyword: `mode: via` without a
+/// host is a cross-field rule, and the generated schema documents both fields
+/// independently (the write-body contract that `route` may be absent is stated
+/// in the OpenAPI operation, not in this derived schema).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderDeliveryWire {
+    #[serde(default)]
+    mode: ProviderDeliveryMode,
+    #[serde(default)]
+    via_host_id: Option<HostId>,
+    #[serde(default)]
+    route: ApiRouteMode,
+}
+
+impl TryFrom<ProviderDeliveryWire> for ProviderDelivery {
+    type Error = WireValueError;
+    fn try_from(wire: ProviderDeliveryWire) -> Result<Self, Self::Error> {
+        let delivery = Self {
+            mode: wire.mode,
+            via_host_id: wire.via_host_id,
+            route: wire.route,
+        };
+        // `via` with no host names no machine to egress on. Accepting it would
+        // defer the failure to launch time, where the operator has already
+        // been told the dispatch was taken.
+        if delivery.is_valid() {
+            Ok(delivery)
+        } else {
+            Err(WireValueError(
+                "delivery mode `via` requires `viaHostId`".into(),
+            ))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderDelivery {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        ProviderDeliveryWire::deserialize(deserializer)
+            .and_then(|wire| ProviderDelivery::try_from(wire).map_err(D::Error::custom))
+    }
 }
 
 impl ProviderDelivery {

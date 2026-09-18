@@ -107,6 +107,11 @@ async fn login(addr: std::net::SocketAddr, bootstrap: &str, name: &str) -> Resul
 }
 
 struct Fixture {
+    // Held for the fixture's life: the data dir used to be unlinked as soon as
+    // `fixture()` returned, which was harmless while every query reused the
+    // one pre-opened writer connection, but a lazily-opened reader pool opens
+    // its own connections on demand and cannot open an unlinked path.
+    _dir: tempfile::TempDir,
     hub: remuda_hub::RunningHub,
     addr: std::net::SocketAddr,
     cookie: String,
@@ -178,6 +183,7 @@ async fn fixture() -> Result<Fixture> {
         .context("node token")?
         .to_owned();
     Ok(Fixture {
+        _dir: dir,
         hub,
         addr,
         cookie,

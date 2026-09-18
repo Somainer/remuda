@@ -544,7 +544,7 @@ impl Store {
         project: Project,
         created_by: String,
     ) -> Result<Project, StoreError> {
-        self.run(move |conn| {
+        self.run_named("insert_project", move |conn| {
             let id = project.meta.id.as_id().to_string();
             let now = crate::config::now_rfc3339();
             let doc = serde_json::to_string(&project)?;
@@ -560,7 +560,7 @@ impl Store {
 
     /// List projects, oldest first.
     pub async fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
-        self.run(|conn| {
+        self.run_named("list_projects", |conn| {
             let mut stmt = conn.prepare("SELECT id FROM projects ORDER BY created_at")?;
             let ids: Vec<String> = stmt
                 .query_map([], |row| row.get(0))?
@@ -578,7 +578,8 @@ impl Store {
 
     /// One project.
     pub async fn get_project(&self, project_id: String) -> Result<Option<Project>, StoreError> {
-        self.run(move |conn| load_project(conn, &project_id)).await
+        self.run_named("get_project", move |conn| load_project(conn, &project_id))
+            .await
     }
 
     /// Apply a mutation to a project doc, bumping revision and updated_at.
@@ -590,7 +591,7 @@ impl Store {
     where
         F: FnOnce(&mut Project) -> Result<(), StoreError> + Send + 'static,
     {
-        self.run(move |conn| {
+        self.run_named("patch_project", move |conn| {
             let Some(mut project) = load_project(conn, &project_id)? else {
                 return Ok(None);
             };
@@ -613,7 +614,7 @@ impl Store {
 
     /// Delete a project.
     pub async fn delete_project(&self, project_id: String) -> Result<Option<Project>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("delete_project", move |conn| {
             let existing = load_project(conn, &project_id)?;
             conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
             Ok(existing)

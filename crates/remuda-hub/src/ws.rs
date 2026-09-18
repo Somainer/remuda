@@ -535,21 +535,35 @@ pub(crate) async fn handle_node_method(
                 .await
                 .map_err(map_host_store)?;
             let mut last = None;
-            let mut seq = seq;
-            for event in events {
-                let appended = state
+            let mut next_seq = seq;
+            // Fold the frame into bounded writer jobs: one transaction per
+            // chunk, awaited before the next so the writer yields between
+            // batches instead of holding its single connection for a whole
+            // 256-event replay page. A chunk is bounded by event count AND by
+            // serialized bytes, so a frame of large transcript/screen events
+            // cannot smuggle one long transaction past the count cap
+            // (hub-store-1).
+            for range in crate::store::journal_append_chunks(&events) {
+                let appended_chunk = state
                     .store
-                    .append_journal(host_id.clone(), instance_id.clone(), seq, event)
+                    .append_journal_batch(
+                        host_id.clone(),
+                        instance_id.clone(),
+                        next_seq,
+                        events[range].to_vec(),
+                    )
                     .await
                     .map_err(map_host_store)?;
-                if !appended.replayed {
-                    publish_journal(&state.bus, &appended.record);
-                    crate::alerts::observe(state, &appended.record);
-                    crate::usage_store::observe_journal(state, &appended.record).await;
-                    crate::supply::observe_journal_text(state, &appended.record).await;
+                for appended in appended_chunk {
+                    if !appended.replayed {
+                        publish_journal(&state.bus, &appended.record);
+                        crate::alerts::observe(state, &appended.record);
+                        crate::usage_store::observe_journal(state, &appended.record).await;
+                        crate::supply::observe_journal_text(state, &appended.record).await;
+                    }
+                    next_seq = Some(appended.record.seq.saturating_add(1));
+                    last = Some(appended);
                 }
-                seq = Some(appended.record.seq.saturating_add(1));
-                last = Some(appended);
             }
             let appended = last.ok_or_else(|| {
                 HubError::BadRequest("journal.append requires event or events".into())
@@ -1570,12 +1584,18 @@ async fn resync_after_gap(
 }
 
 async fn snapshot_json(state: &AppState, instance_id: &str) -> Result<Value, HubError> {
-    let (events, durable) = state.store.read_journal(instance_id.to_string(), 0).await?;
+    let page = state
+        .store
+        .read_journal(instance_id.to_string(), 0, None)
+        .await?;
     Ok(json!({
         "type": "snapshot",
         "instanceId": instance_id,
-        "asOfSeq": durable.to_string(),
-        "events": events,
+        "asOfSeq": page.durable_seq.to_string(),
+        "durableSeq": page.durable_seq.to_string(),
+        "fromSeq": page.from_seq.map(|seq| seq.to_string()),
+        "reachedAfterSeq": page.reached_after_seq,
+        "events": page.events,
     }))
 }
 

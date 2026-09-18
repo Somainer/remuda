@@ -1619,7 +1619,7 @@ impl Store {
         let lane = job.lane_id.clone();
         let queued = String::from(job.queued_at.clone());
         let created = String::from(job.queued_at.clone());
-        self.run(move |conn| {
+        self.run_named("insert_gate_job", move |conn| {
             conn.execute(
                 "INSERT INTO gate_jobs
                     (id, project_id, state, lane_id, queued_at, doc_json, revision,
@@ -1637,7 +1637,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<GateJob>, crate::store::StoreError> {
         let id = id.to_owned();
-        self.run(move |conn| {
+        self.run_named("get_gate_job", move |conn| {
             let raw: Option<String> = conn
                 .query_row(
                     "SELECT doc_json FROM gate_jobs WHERE id = ?1",
@@ -1655,7 +1655,7 @@ impl Store {
         project_id: Option<&str>,
     ) -> Result<Vec<GateJob>, crate::store::StoreError> {
         let project_id = project_id.map(str::to_owned);
-        self.run(move |conn| {
+        self.run_named("list_gate_jobs", move |conn| {
             let mut jobs = Vec::new();
             if let Some(project) = &project_id {
                 let mut statement = conn.prepare(
@@ -1694,7 +1694,7 @@ impl Store {
         F: FnOnce(&mut GateJob) -> Option<()> + Send + 'static,
     {
         let id = id.to_owned();
-        self.run(move |conn| {
+        self.run_named("mutate_gate_job", move |conn| {
             let Some(mut job) = conn
                 .query_row(
                     "SELECT doc_json FROM gate_jobs WHERE id = ?1",
@@ -1751,7 +1751,7 @@ impl Store {
         let project_id = project_id.to_owned();
         let job_id = job_id.to_owned();
         let created_by = created_by.to_owned();
-        self.run(move |conn| {
+        self.run_named("insert_gate_log", move |conn| {
             let now = now();
             let expires_at = gate_log_expiry(&now);
             // One log per job: a re-verify attempt replaces the prior row so
@@ -1790,7 +1790,7 @@ impl Store {
         id: &str,
     ) -> Result<Option<GateLogObject>, crate::store::StoreError> {
         let id = id.to_owned();
-        self.run(move |conn| {
+        self.run_named("get_gate_log", move |conn| {
             let mapper = |row: &rusqlite::Row<'_>| {
                 Ok(GateLogObject {
                     object_id: row.get(0)?,

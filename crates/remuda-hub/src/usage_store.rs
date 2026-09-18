@@ -486,7 +486,9 @@ pub async fn observe_journal(state: &AppState, record: &JournalRecord) {
     };
     let inserted = state
         .store
-        .run(move |conn| insert_usage_event(conn, &row).map_err(crate::store::StoreError::from))
+        .run_named("observe_journal", move |conn| {
+            insert_usage_event(conn, &row).map_err(crate::store::StoreError::from)
+        })
         .await;
     if let Err(error) = inserted {
         tracing::warn!(%error, instance_id = %record.instance_id, "usage event projection failed");

@@ -301,7 +301,7 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 状态条渲染纯 reducer `turnEnd` 的唯一裁决（`working | waiting | ended | unknown` + `decidedBy` + `endedAt`），不再直接渲染 hook 相位锁存。`phase.ts` / `liveStatus.ts` 仍是纯 fold，所有消费决策归 reducer。优先级从严到宽：
 
 1. **人机回合高于一切结束信号**：本 instance 有 pending 交互、screen 锁存自身报 blocked、或新鲜的 hook `blocked` 相位时，无论 hook 通道多静默、spinner 是否已清空，都判 `waiting`。parked 权限 hook 本身就不发记录、其对话框又会清掉 spinner，否则会在 6 s stall 预算后误判「回合结束」并把代持消息 POST 给仍卡在对话框上的 agent。一个 hook 已静默又无 pending 的 blocked 是 `unknown`，绝不是「等待操作」。
-2. hook 的 `turn-ended` / `interrupted` **无条件**直接定终（harness 自己的终态词，新到即覆盖 `decidedBy=hook`）；文件层（grok 的 `turn.live` 相位打在既有 lifecycle 上、`tier=file`）的终态相位同样无条件定终，但 `decidedBy=file`——该 run 没有 hook 通道，绝不能把文件层的回合结束记到 hook 名下。hook 通道**新鲜**时，hook 活动相位持有回合（设计 §2.4 规则 6，screen 的中途 idle 边沿被忽略）。
+2. hook 的 `turn-ended` / `interrupted` **无条件**直接定终（harness 自己的终态词，新到即覆盖 `decidedBy=hook`）；文件层（grok 的 `turn.live` 相位打在既有 lifecycle 上、`tier=file`）的终态相位同样无条件定终，但 `decidedBy=file`——grok run 仍登记 `SignalTier::Hook`（`ApprovalChannel::EmulatedScreen`，见 `crates/remuda-node/src/adapter_registry.rs`），只是这条相位证据自身带 `tier=file` 标签，终裁按证据的 tier 记为 file，而不是按 run 的登记 tier 记成 hook。hook 通道**新鲜**时，hook 活动相位持有回合（设计 §2.4 规则 6，screen 的中途 idle 边沿被忽略）。
 3. hook 通道一旦 `stalled` / `never-materialised`（`channelHealth`，3×2 s）即降为参考，screen 的非活动 `live.status`（或 pty `agent_status`）结束回合——但 screen 清空每「离开」只发一次、其 `observedAt` 会留到下一回合，所以要求 screen 锚 **不早于** 锁存相位的 `since`，避免短回合沿用上一回合的清空时间。
 4. 再没有 screen 时，晚于锁存 `since` 的 assistant 消息从 transcript 收尾结束。
 
@@ -330,13 +330,13 @@ Compact：回合结束后把 thinking + 中间 tool 折成「N 次工具 · M �
 
 注册键 = `driverKind + '.' + nativeToolName`，再映射到族。不要把 Codex `commandExecution` 硬叫 Bash（`deepseek-harness.md` §2.2）。
 
-**各 harness 原生名 → 族（注册表按原生名分发，绝不先改名成 Claude 工具名；卡片可共用 shell/read/write/task 布局）。** grok/codex 文件适配器的 `driverKind` 都是 `shell-pty`，身份只由原生名承载。grok 这张表与 Rust 侧 adapter 的 name→`ToolCategory` 表是同一张（`grok-structural-translation.md` §3.1），两侧必须同步：
+**各 harness 原生名 → 族（注册表按原生名分发，绝不先改名成 Claude 工具名；卡片可共用 shell/read/write/task 布局）。** grok/codex 文件适配器的 `driverKind` 都是 `shell-pty`，身份只由原生名承载。grok 卡片的标题统一是 ACP 帧的人类 `title`（`displayTitle`），稳定原生名一律作为弱化次级标签（`data-testid=tool-native-name`）跟随其后——presenter 按原生名分发，人类 title 只用于标题。grok 这张表与 Rust 侧 adapter 的 name→`ToolCategory` 表是同一张（`grok-structural-translation.md` §3.1），两侧必须同步：
 
 | harness | 原生名 | 族 / 呈现要点 |
 |---|---|---|
 | claude | `Bash` `Edit` `Read` `Write` `Workflow` `Task`/`Agent` | 同名族 |
 | claude | `mcp__server__tool` | MCP |
-| grok | `run_terminal_command` | Bash 布局；读 `command`/`description`/`is_background`，标题用人类 title、稳定名保留 |
+| grok | `run_terminal_command` | Bash 布局；读 `command`/`description`/`is_background`，cwd 在 completed 帧的 `rawOutput.current_dir`（运行中输入里没有）。卡片标题 = ACP 人类 title（`displayTitle`，如 `Execute \`printf …\``），稳定原生名以弱化的次级标签渲染（`data-testid=tool-native-name`，值为 `run_terminal_command`）；折叠态同规则 |
 | grok | `read_file` / `list_dir` | Read 布局；路径取 `target_file` / `target_directory`（不是 `file_path`），范围 `offset`/`limit` |
 | grok | `write` / `search_replace` | Write / Edit 布局；`file_path` + `old_string`/`new_string` |
 | grok | `grep` `web_search` `web_fetch` `open_page` `open_page_with_find` `x_*` | Generic（Search 样式） |

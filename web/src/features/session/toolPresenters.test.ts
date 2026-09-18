@@ -11,7 +11,13 @@
 import { describe, expect, it } from "vitest";
 import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { known, type Id } from "../../types/wire";
-import { compactInput, humanDuration, parseRhaiWorkflowMeta, parseWorkflowMeta, presentTool } from "./toolPresenters";
+import {
+  compactInput,
+  humanDuration,
+  parseWorkflowMeta,
+  presentTool,
+  RHAI_META_OPENER,
+} from "./toolPresenters";
 
 function call(name: string, input: unknown): ToolCallPayload {
   return {
@@ -191,23 +197,35 @@ describe("presentTool · unknown tools", () => {
   });
 });
 
+/** A call whose displayTitle is the ACP human title, like the adapter emits. */
+function titledCall(name: string, title: string, input: unknown): ToolCallPayload {
+  return { ...call(name, input), displayTitle: known(title) };
+}
+
+/** A final shell result carrying the completed frame's rawOutput. */
+function grokShellResult(rawOutput: Record<string, unknown>): ToolResultPayload {
+  return { ...result("exit: 0\n"), structuredResult: known({ status: "completed", rawOutput }) };
+}
+
 /**
  * Grok presenter coverage. The `run_terminal_command` and `ask_user_question`
  * inputs are verbatim from crates/remuda-driver/tests/fixtures/grok/
- * tui-updates.jsonl (frame 7 normalized rawInput, frames 34/36 questions).
+ * tui-updates.jsonl (line 8 normalized rawInput, lines 35/37 questions).
  */
 describe("presentTool · grok run_terminal_command", () => {
-  // Frame 7 (statusless Running update) rawInput, verbatim from the fixture.
+  // Line 8 (statusless Running update) rawInput, verbatim from the fixture.
   const SHELL_INPUT = {
     variant: "Bash",
     command: "printf SPIKE_TOOL_OK > spike-result.txt",
     description: "Write the fixed probe marker in the throwaway directory.",
     is_background: false,
   };
+  // The human title the same line carries.
+  const SHELL_TITLE = "Execute `printf SPIKE_TOOL_OK > spike-result.txt`";
 
   it("renders the shell layout from the native command/description inputs", () => {
-    const view = presentTool("run_terminal_command", call("run_terminal_command", SHELL_INPUT), null);
-    expect(view.title).toBe("Shell");
+    const view = presentTool("run_terminal_command", titledCall("run_terminal_command", SHELL_TITLE, SHELL_INPUT), null);
+    expect(view.title).toBe(SHELL_TITLE);
     expect(view.subtitle).toBe("Write the fixed probe marker in the throwaway directory.");
     expect(view.status).toBe("running");
     expect(view.details).toContainEqual({
@@ -220,7 +238,7 @@ describe("presentTool · grok run_terminal_command", () => {
   it("shows the exit code and output once the completed frame lands", () => {
     const view = presentTool(
       "run_terminal_command",
-      call("run_terminal_command", SHELL_INPUT),
+      titledCall("run_terminal_command", SHELL_TITLE, SHELL_INPUT),
       result("exit: 0\n"),
     );
     expect(view.status).toBe("done");
@@ -230,10 +248,19 @@ describe("presentTool · grok run_terminal_command", () => {
     );
   });
 
+  it("reads the working directory from rawOutput.current_dir on the completed frame (line 9)", () => {
+    const view = presentTool(
+      "run_terminal_command",
+      titledCall("run_terminal_command", SHELL_TITLE, SHELL_INPUT),
+      grokShellResult({ type: "Bash", exit_code: 0, current_dir: "/workspace/grok-spike" }),
+    );
+    expect(view.details).toContainEqual({ label: "目录", value: "/workspace/grok-spike" });
+  });
+
   it("marks a background command", () => {
     const view = presentTool(
       "run_terminal_command",
-      call("run_terminal_command", { ...SHELL_INPUT, is_background: true }),
+      titledCall("run_terminal_command", SHELL_TITLE, { ...SHELL_INPUT, is_background: true }),
       null,
     );
     expect(view.details).toContainEqual({ label: "后台", value: "是" });
@@ -241,7 +268,7 @@ describe("presentTool · grok run_terminal_command", () => {
 });
 
 describe("presentTool · grok ask_user_question", () => {
-  // Frame 36 normalized rawInput, verbatim from the fixture.
+  // Line 37 normalized rawInput, verbatim from the fixture.
   const QUESTION_INPUT = {
     variant: "AskUserQuestion",
     questions: [
@@ -255,32 +282,35 @@ describe("presentTool · grok ask_user_question", () => {
       },
     ],
   };
+  // The human title from line 37.
+  const QUESTION_TITLE = "Ask: Choose the probe result.";
 
   it("renders the question and its option labels instead of a JSON table", () => {
-    const view = presentTool("ask_user_question", call("ask_user_question", QUESTION_INPUT), null);
-    expect(view.title).toBe("Question");
+    const view = presentTool("ask_user_question", titledCall("ask_user_question", QUESTION_TITLE, QUESTION_INPUT), null);
+    expect(view.title).toBe(QUESTION_TITLE);
     expect(view.subtitle).toBe("Choose the probe result.");
     expect(view.status).toBe("running");
-    expect(view.details).toContainEqual({
-      label: "问题",
-      value: "Choose the probe result.",
-      pre: false,
-    });
     expect(view.details).toContainEqual({ label: "选项", value: "Alpha / Beta" });
+    // The question text is the subtitle; it is not repeated as a body row.
+    expect(view.details.some((d) => d.label === "问题")).toBe(false);
   });
 
   it("shows the committed answer from the completed frame", () => {
     const answered = result(
       'User has answered your questions: "Choose the probe result."="Alpha". You can now continue with the user\'s answers in mind.',
     );
-    const view = presentTool("ask_user_question", call("ask_user_question", QUESTION_INPUT), answered);
+    const view = presentTool(
+      "ask_user_question",
+      titledCall("ask_user_question", QUESTION_TITLE, QUESTION_INPUT),
+      answered,
+    );
     expect(view.status).toBe("done");
     expect(view.details.some((d) => d.label === "回答" && d.value.includes("Alpha"))).toBe(true);
   });
 
   it("labels a multiSelect question as multi-choice", () => {
     // Synthesized from docs, not captured [U]: the 1.0.30 fixture records only
-    // a single-select question (frame 36).
+    // a single-select question (line 37).
     const multi = {
       questions: [{ question: "Pick several.", options: [{ label: "A" }, { label: "B" }], multiSelect: true }],
     };
@@ -298,16 +328,27 @@ describe("presentTool · other grok native inputs", () => {
       call("read_file", { target_file: "/repo/src/main.rs", offset: 10, limit: 40 }),
       null,
     );
-    expect(view.title).toBe("Read");
+    expect(view.title).toBe("read_file");
     expect(view.subtitle).toBe("/repo/src/main.rs");
     expect(view.details).toContainEqual({ label: "范围", value: "第 10 行起，40 行" });
+  });
+
+  it("reads list_dir.target_directory", () => {
+    // Synthesized from docs, not captured [U].
+    const view = presentTool(
+      "list_dir",
+      call("list_dir", { target_directory: "/repo/src" }),
+      null,
+    );
+    expect(view.subtitle).toBe("/repo/src");
+    expect(view.details).toContainEqual({ label: "目录", value: "/repo/src" });
   });
 
   it("renders a spawn_subagent task with its type and isolation", () => {
     // Synthesized from docs, not captured [U].
     const view = presentTool(
       "spawn_subagent",
-      call("spawn_subagent", {
+      titledCall("spawn_subagent", "Explore: Map the signal bus", {
         prompt: "Map the signal bus",
         description: "Bus survey",
         subagent_type: "Explore",
@@ -315,7 +356,7 @@ describe("presentTool · other grok native inputs", () => {
       }),
       null,
     );
-    expect(view.title).toBe("Task");
+    expect(view.title).toBe("Explore: Map the signal bus");
     expect(view.subtitle).toBe("Bus survey");
     expect(view.details).toContainEqual({ label: "子代理", value: "Explore" });
     expect(view.details).toContainEqual({ label: "隔离", value: "worktree" });
@@ -338,18 +379,21 @@ describe("presentTool · other grok native inputs", () => {
   });
 });
 
-describe("parseRhaiWorkflowMeta", () => {
+describe("parseWorkflowMeta · grok Rhai opener", () => {
   it("reads name/description from the Rhai meta map", () => {
     // Synthesized from docs, not captured [U]: no workflow call exists in the
     // 1.0.30 fixture; the shape is grok-structural-translation.md §3.1/§3.4.
     const script = `let meta = #{ name: "release", description: "Ship the build" };
 run("build");`;
-    expect(parseRhaiWorkflowMeta(script)).toEqual({ name: "release", description: "Ship the build" });
+    expect(parseWorkflowMeta(script, { opener: RHAI_META_OPENER })).toEqual({
+      name: "release",
+      description: "Ship the build",
+    });
   });
 
   it("returns nothing when there is no Rhai meta literal", () => {
-    expect(parseRhaiWorkflowMeta("run(\"build\");")).toEqual({});
-    expect(parseRhaiWorkflowMeta("")).toEqual({});
+    expect(parseWorkflowMeta('run("build");', { opener: RHAI_META_OPENER })).toEqual({});
+    expect(parseWorkflowMeta("", { opener: RHAI_META_OPENER })).toEqual({});
   });
 });
 
@@ -363,16 +407,26 @@ parallel([agent("test"), agent("docs")]);`;
       call("workflow", { source: { script } }),
       null,
     );
-    expect(view.title).toBe("Workflow");
+    expect(view.title).toBe("workflow");
     expect(view.subtitle).toBe("Ship the build");
     expect(view.details).toContainEqual({ label: "工作流", value: "release" });
+  });
+
+  it("shows the run id a name/resume/pause/stop source addresses", () => {
+    // Synthesized from docs, not captured [U].
+    const byName = presentTool("workflow", call("workflow", { source: { name: "run-7" } }), null);
+    expect(byName.details).toContainEqual({ label: "运行", value: "run-7" });
+    const paused = presentTool("workflow", call("workflow", { source: { pause: "run-42" } }), null);
+    expect(paused.details).toContainEqual({ label: "运行", value: "run-42" });
+    const byString = presentTool("workflow", call("workflow", { source: "run-9" }), null);
+    expect(byString.details).toContainEqual({ label: "运行", value: "run-9" });
   });
 
   it("falls back to the source kind plus a truncated script, never a blank card", () => {
     // Synthesized from docs, not captured [U].
     const longScript = Array.from({ length: 50 }, (_, i) => `// line ${i}`).join("\n");
     const paused = presentTool("workflow", call("workflow", { source: { pause: "run-42" } }), null);
-    expect(paused.title).toBe("Workflow");
+    expect(paused.title).toBe("workflow");
     expect(paused.subtitle).toBeTruthy();
     expect(paused.subtitle).toBe("暂停运行");
     const noMeta = presentTool("workflow", call("workflow", { source: { script: longScript } }), null);
@@ -383,7 +437,8 @@ parallel([agent("test"), agent("docs")]);`;
   });
 });
 
-describe("humanDuration", () => {  it.each([
+describe("humanDuration", () => {
+  it.each([
     [600000, "10 分钟"],
     [60000, "1 分钟"],
     [30000, "30 秒"],

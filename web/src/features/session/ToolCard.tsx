@@ -3,7 +3,7 @@ import type { ToolCallPayload, ToolResultPayload } from "../../types/observation
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString, jsonPreview } from "../../lib/format";
 import { DiffBlock } from "../../components/DiffBlock";
-import { familyFor, splitMcpName } from "./toolRegistry";
+import { familyFor, isGrokTool, splitGrokMcpName, splitMcpName } from "./toolRegistry";
 import { presentTool } from "./toolPresenters";
 import { WorkflowTimelineCard } from "./workflow/WorkflowTimelineCard";
 import { LiveToolElapsed } from "./live/LiveStatusStrip";
@@ -39,7 +39,40 @@ function cwdOf(call: ToolCallPayload): string | null {
   return asString(rec?.workspaceId) ?? asString(rec?.cwd);
 }
 
-function BashCard({ call, result, completeness }: { call: ToolCallPayload; result: ToolResultPayload | null; completeness: string }) {
+/**
+ * A shell call's working directory from its completed frame: grok puts
+ * `current_dir` in rawOutput, not the tool input (fixture line 9).
+ */
+function resultCwd(result: ToolResultPayload | null): string | null {
+  if (!result) return null;
+  const structured = asRecord(knowledgeValue(result.structuredResult));
+  return asString(asRecord(structured?.rawOutput)?.current_dir);
+}
+
+/** The stable native name as a muted secondary label (grok cards). */
+function NativeLabel({ name }: { name: string }) {
+  return (
+    <span className={css.stat} data-testid="tool-native-name">
+      {name}
+    </span>
+  );
+}
+
+function BashCard({
+  call,
+  result,
+  completeness,
+  nativeName,
+  displayTitle,
+  grok,
+}: {
+  call: ToolCallPayload;
+  result: ToolResultPayload | null;
+  completeness: string;
+  nativeName: string;
+  displayTitle: string;
+  grok: boolean;
+}) {
   const input = knowledgeValue(call.input);
   const rec = asRecord(input);
   const command = asString(rec?.command) ?? jsonPreview(input);
@@ -47,17 +80,23 @@ function BashCard({ call, result, completeness }: { call: ToolCallPayload; resul
   const running = !result || result.stage !== "final";
   const stdout = asTextBlocks(result);
   const lines = stdout ? stdout.split("\n").length : 0;
+  // Claude's BashCard keeps its existing executor-derived cwd; grok puts the
+  // working directory in the input while running and in rawOutput when done.
+  const cwd = grok
+    ? asString(rec?.current_dir) ?? asString(rec?.cwd) ?? resultCwd(result) ?? cwdOf(call)
+    : cwdOf(call);
   return (
     <article className={`${css.tool} ${completeness === "partial" ? css.toolPartial : ""}`}>
       <div className={css.toolHead}>
-        <span className={css.toolTitle}>Bash</span>
+        <span className={css.toolTitle}>{grok ? displayTitle : "Bash"}</span>
+        {grok ? <NativeLabel name={nativeName} /> : null}
         <span className={css.toolStatus}>
           {running ? <span className={css.runDot} /> : null}
           {running ? <LiveToolElapsed call={call} /> : exit === undefined ? "无 exit" : `exit ${exit}`}
         </span>
         {completeness !== "structured" ? <span className={css.stat}>不完整</span> : null}
         <span className={css.spacer} />
-        <span className={css.stat}>{cwdOf(call) ?? call.toolCallId}</span>
+        <span className={css.stat}>{cwd ?? call.toolCallId}</span>
       </div>
       <pre className={css.cmd}>{`$ ${command}`}</pre>
       {result ? (
@@ -79,11 +118,17 @@ function EditWriteCard({
   call,
   result,
   diffState,
+  displayTitle,
+  grok,
+  nativeName,
 }: {
   family: "Edit" | "Write";
   call: ToolCallPayload;
   result: ToolResultPayload | null;
   diffState: DiffState;
+  displayTitle: string;
+  grok: boolean;
+  nativeName: string;
 }) {
   const rec = asRecord(knowledgeValue(call.input));
   const path = asString(rec?.file_path) ?? result?.changes[0]?.path ?? "file";
@@ -96,7 +141,8 @@ function EditWriteCard({
   return (
     <article className={css.tool}>
       <div className={css.toolHead}>
-        <span className={css.toolTitle}>{family}</span>
+        <span className={css.toolTitle}>{grok ? displayTitle : family}</span>
+        {grok ? <NativeLabel name={nativeName} /> : null}
         <span className={css.path}>{path}</span>
         {stat ? <span className={css.stat}>{stat}</span> : null}
         <span className={css.spacer} />
@@ -107,8 +153,25 @@ function EditWriteCard({
   );
 }
 
-function ReadCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
+function ReadCard({
+  call,
+  result,
+  nativeName,
+  displayTitle,
+  grok,
+}: {
+  call: ToolCallPayload;
+  result: ToolResultPayload | null;
+  nativeName: string;
+  displayTitle: string;
+  grok: boolean;
+}) {
   const rec = asRecord(knowledgeValue(call.input));
+  // Grok reads use target_file (and list_dir uses target_directory); Claude
+  // uses file_path.
+  const path = grok
+    ? (asString(rec?.target_file) ?? asString(rec?.target_directory) ?? asString(rec?.file_path) ?? "file")
+    : (asString(rec?.file_path) ?? "file");
   const offset = rec?.offset;
   const limit = rec?.limit;
   const range = typeof offset === "number" || typeof limit === "number" ? `:${String(offset ?? 1)}-${String(limit ?? "")}` : "";
@@ -118,12 +181,14 @@ function ReadCard({ call, result }: { call: ToolCallPayload; result: ToolResultP
         .filter(Boolean)
         .join("\n")
     : "";
+  const heading = grok ? displayTitle : "Read";
   return (
     <article className={css.tool}>
       <div className={css.toolHead}>
-        <span className={css.toolTitle}>Read</span>
+        <span className={css.toolTitle}>{heading}</span>
+        {grok ? <NativeLabel name={nativeName} /> : null}
         <span className={css.path}>
-          {asString(rec?.file_path) ?? "file"}
+          {path}
           {range}
         </span>
       </div>
@@ -132,13 +197,27 @@ function ReadCard({ call, result }: { call: ToolCallPayload; result: ToolResultP
   );
 }
 
-function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPayload | null }) {
+function McpCard({
+  call,
+  result,
+  grok,
+}: {
+  call: ToolCallPayload;
+  result: ToolResultPayload | null;
+  grok: boolean;
+}) {
   const name = knowledgeValue(call.toolName) ?? "mcp";
-  const { server, tool } = splitMcpName(name);
+  // Grok reaches MCP through the explicit use_tool/search_tool calls; the
+  // qualified server__tool name rides the tool_name input.
+  const rec = asRecord(knowledgeValue(call.input));
+  const { server, tool } = grok
+    ? splitGrokMcpName(asString(rec?.tool_name) ?? name)
+    : splitMcpName(name);
   return (
     <article className={css.tool}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>MCP</span>
+        {grok ? <NativeLabel name={name} /> : null}
         <span className={css.path}>
           {server}/{tool}
         </span>
@@ -168,11 +247,14 @@ function McpCard({ call, result }: { call: ToolCallPayload; result: ToolResultPa
  */
 function PresentedCard({
   name,
+  grok,
   call,
   result,
   completeness,
 }: {
+  /** Stable native tool name — this is what presentTool dispatches on. */
   name: string;
+  grok: boolean;
   call: ToolCallPayload;
   result: ToolResultPayload | null;
   completeness: string;
@@ -183,6 +265,7 @@ function PresentedCard({
     <article className={`${css.tool} ${completeness === "partial" ? css.toolPartial : ""}`}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>{view.title}</span>
+        {grok && view.title !== name ? <NativeLabel name={name} /> : null}
         {view.subtitle ? <span className={css.path}>{view.subtitle}</span> : null}
         <span className={css.toolStatus} data-testid="tool-status" data-status={view.status}>
           {view.status === "running" ? <span className={css.runDot} /> : <span className={css.okDot} />}
@@ -255,13 +338,18 @@ export function ToolCard({
 }) {
   const [folded, setFolded] = useState(defaultFolded);
   const shown = settle ? result : null;
-  const name = knowledgeValue(call.displayTitle) ?? knowledgeValue(call.toolName) ?? "tool";
-  const family = familyFor(driverKind, knowledgeValue(call.toolName));
+  // Dispatch on the stable native name; the human title is the heading only.
+  const nativeName = knowledgeValue(call.toolName) ?? "tool";
+  const displayTitle = knowledgeValue(call.displayTitle) ?? nativeName;
+  const family = familyFor(driverKind, nativeName);
+  // grok's file-adapter observations are all stamped driverKind shell-pty.
+  const grok = driverKind === "shell-pty" && isGrokTool(nativeName);
   if (folded) {
     return (
       <article className={css.tool} data-testid="tool-card" data-folded="1">
         <div className={css.toolHead}>
-          <span className={css.toolTitle}>{name}</span>
+          <span className={css.toolTitle}>{grok ? displayTitle : nativeName}</span>
+          {grok ? <NativeLabel name={nativeName} /> : null}
           <span className={css.stat}>{family}</span>
           <span className={css.spacer} />
           <button type="button" className={css.openBtn} onClick={() => setFolded(false)}>
@@ -271,14 +359,17 @@ export function ToolCard({
       </article>
     );
   }
+  // grok has no workflow engine in this round (WorkflowEngine::GrokWorkflow
+  // is excluded by the structural plan), so its workflow call always uses the
+  // Rhai presenter card even when a run timeline happens to be mounted.
   const inner =
     family === "Bash" ? (
-      <BashCard call={call} result={shown} completeness={completeness} />
+      <BashCard call={call} result={shown} completeness={completeness} nativeName={nativeName} displayTitle={displayTitle} grok={grok} />
     ) : family === "Edit" || family === "Write" ? (
-      <EditWriteCard family={family} call={call} result={shown} diffState={diffState} />
+      <EditWriteCard family={family} call={call} result={shown} diffState={diffState} displayTitle={displayTitle} grok={grok} nativeName={nativeName} />
     ) : family === "Read" ? (
-      <ReadCard call={call} result={shown} />
-    ) : family === "Workflow" && workflow ? (
+      <ReadCard call={call} result={shown} nativeName={nativeName} displayTitle={displayTitle} grok={grok} />
+    ) : family === "Workflow" && workflow && !grok ? (
       // r-ux-w: the timeline card hangs directly on this tool row, visible by
       // default; the presenter card is the fallback when no run data exists.
       <WorkflowTimelineCard
@@ -291,9 +382,9 @@ export function ToolCard({
         onUndismiss={onUndismissWorkflow}
       />
     ) : family === "MCP" ? (
-      <McpCard call={call} result={shown} />
+      <McpCard call={call} result={shown} grok={grok} />
     ) : (
-      <PresentedCard name={name} call={call} result={shown} completeness={completeness} />
+      <PresentedCard name={nativeName} call={call} result={shown} completeness={completeness} grok={grok} />
     );
   return (
     <div data-testid="tool-card" data-folded="0">

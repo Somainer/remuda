@@ -1,10 +1,32 @@
 import { useState } from "react";
-import { useInstallPrompt } from "../lib/pwa";
+import { applyUpdate, useInstallPrompt, useUpdateAvailable } from "../lib/pwa";
 import ui from "../styles/ui.module.css";
 
 export function InstallBar() {
   const offer = useInstallPrompt();
+  const updateAvailable = useUpdateAvailable();
   const [hidden, setHidden] = useState(false);
+
+  // An update over a live shell wins the bar: leaving it stranded is the very
+  // failure this fixes, so it takes priority over the install offer.
+  if (updateAvailable) {
+    return (
+      <div className={ui.install} data-testid="update-bar" role="region" aria-label="应用更新">
+        <span>有新版本，点击刷新</span>
+        <span className={ui.installActions}>
+          <button
+            type="button"
+            className={`${ui.btnPrimary} ${ui.installBtn}`}
+            data-testid="update-refresh"
+            onClick={() => applyUpdate()}
+          >
+            刷新
+          </button>
+        </span>
+      </div>
+    );
+  }
+
   if (!offer || hidden) return null;
 
   const ios = offer.kind === "ios";

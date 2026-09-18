@@ -62,6 +62,58 @@ async fn raw_static_traversals_return_404_without_leaking_files() -> Result<()> 
     Ok(())
 }
 
+#[tokio::test]
+async fn cache_headers_match_asset_class_and_missing_assets_404() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("web");
+    std::fs::create_dir(&root)?;
+    std::fs::create_dir(root.join("assets"))?;
+    std::fs::write(root.join("index.html"), "shell")?;
+    std::fs::write(root.join("sw.js"), "worker")?;
+    std::fs::write(root.join("assets/index-abc123.js"), "hashed module")?;
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    config.web_root = Some(root);
+    let hub = spawn(config).await?;
+
+    fn headers_of(response: &str) -> String {
+        response
+            .split_once("\r\n\r\n")
+            .unwrap()
+            .0
+            .to_ascii_lowercase()
+    }
+
+    // index.html and sw.js revalidate every load so a redeploy is seen.
+    for path in ["/", "/index.html", "/sw.js"] {
+        let (status, response) = get(hub.addr, path).await?;
+        assert_eq!(status, 200, "{path}: {response}");
+        assert!(
+            headers_of(&response).contains("cache-control: no-cache"),
+            "{path}: {response}"
+        );
+    }
+
+    // Hashed assets are immutable for a year.
+    let (status, response) = get(hub.addr, "/assets/index-abc123.js").await?;
+    assert_eq!(status, 200);
+    assert!(
+        headers_of(&response).contains("cache-control: public, max-age=31536000, immutable"),
+        "{response}"
+    );
+
+    // A missing hashed asset is a hard 404, never the SPA HTML fallback.
+    let (status, response) = get(hub.addr, "/assets/index-deadbe.js").await?;
+    assert_eq!(status, 404, "{response}");
+    assert!(
+        !response.to_ascii_lowercase().contains("text/html"),
+        "{response}"
+    );
+    assert!(!response.contains("shell"), "{response}");
+
+    hub.shutdown().await;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn static_symlinks_cannot_escape_even_via_spa_fallback() -> Result<()> {

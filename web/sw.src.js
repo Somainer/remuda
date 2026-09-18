@@ -1,4 +1,10 @@
-const CACHE = "runtime-shell-v2";
+// Service worker source. This file is NOT copied verbatim: the build plugin in
+// vite.config.ts reads it, substitutes __CACHE_NAME__ with a per-build cache
+// name (see cacheNameForBuild in src/lib/swCache.ts), and emits the result as
+// dist/sw.js. Because the cache name carries the build identity the worker's
+// bytes change on every deploy, so the browser's byte-compare update check
+// sees a new worker and the activate sweep below reclaims the old shell.
+const CACHE = "__CACHE_NAME__";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg", "/icons/icon-192.png", "/icons/icon-512.png"];
 
 self.addEventListener("install", (event) => {
@@ -26,9 +32,26 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/v1/") || url.pathname.startsWith("/node/") || url.pathname.startsWith("/push/")) return;
   if (event.request.mode === "navigate") {
-    event.respondWith(caches.match("/index.html").then((hit) => hit || fetch("/index.html")));
+    // Network-first: fetch the document so a redeployed shell (new asset
+    // hashes) is served immediately, refresh the cached copy on success, and
+    // fall back to the cached shell only when the network fails.
+    event.respondWith(
+      (async () => {
+        try {
+          const fresh = await fetch(event.request);
+          const cache = await caches.open(CACHE);
+          await cache.put("/index.html", fresh.clone());
+          return fresh;
+        } catch {
+          const cached = await caches.match("/index.html");
+          return cached || Response.error();
+        }
+      })(),
+    );
     return;
   }
+  // Hashed /assets/* and other same-origin GETs stay cache-first: their names
+  // already change per build, so a cached hit is always the right bytes.
   event.respondWith(caches.match(event.request).then((hit) => hit || fetch(event.request)));
 });
 

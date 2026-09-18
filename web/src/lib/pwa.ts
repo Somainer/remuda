@@ -34,11 +34,60 @@ export function checkForUpdate(): void {
   void navigator.serviceWorker.getRegistration().then((reg) => reg?.update());
 }
 
+// A waiting worker means a redeployed shell is ready but the page is still
+// driven by the old one. We surface a refresh affordance rather than reloading
+// unannounced, then post ACTIVATE_UPDATE and reload once on controllerchange.
+let updateWaiting: ServiceWorker | null = null;
+const updateListeners = new Set<(available: boolean) => void>();
+let reloading = false;
+
+function announceUpdate(worker: ServiceWorker | null): void {
+  updateWaiting = worker;
+  for (const listener of updateListeners) listener(worker !== null);
+}
+
+export function subscribeUpdate(listener: (available: boolean) => void): () => void {
+  updateListeners.add(listener);
+  listener(updateWaiting !== null);
+  return () => updateListeners.delete(listener);
+}
+
+/** Tell the waiting worker to take over; the controllerchange handler reloads. */
+export function applyUpdate(): void {
+  const worker = updateWaiting ?? navigator.serviceWorker?.controller;
+  worker?.postMessage("ACTIVATE_UPDATE");
+}
+
+function watchRegistration(reg: ServiceWorkerRegistration): void {
+  const check = (worker: ServiceWorker | null) => {
+    // Only an update over an existing controller is a "new version"; the very
+    // first install (no controller yet) is a fresh page, not an update.
+    if (worker && worker.state === "installed" && navigator.serviceWorker.controller) {
+      announceUpdate(worker);
+    }
+  };
+  if (reg.waiting) check(reg.waiting);
+  reg.addEventListener("updatefound", () => {
+    const installing = reg.installing;
+    if (!installing) return;
+    installing.addEventListener("statechange", () => check(installing));
+  });
+}
+
 export function startPWA(): void {
   if (window.isSecureContext && "serviceWorker" in navigator) {
     if (import.meta.env.PROD) {
-      void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" });
+      void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then((reg) => {
+        watchRegistration(reg);
+      });
     }
+    // A single reload when the new worker takes control; the guard stops the
+    // controllerchange → reload → controllerchange loop.
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (reloading) return;
+      reloading = true;
+      window.location.reload();
+    });
     navigator.serviceWorker.addEventListener("message", (event) => {
       const data = event.data as { type?: string; url?: string } | undefined;
       if (data?.type === "push-open" && typeof data.url === "string" && data.url.startsWith("/")) {
@@ -56,6 +105,13 @@ export type InstallOffer =
   | { kind: "prompt"; prompt: () => Promise<void> }
   | { kind: "ios" }
   | { kind: "demo" };
+
+/** True once a redeployed worker is waiting; drives the refresh bar. */
+export function useUpdateAvailable(): boolean {
+  const [available, setAvailable] = useState(false);
+  useEffect(() => subscribeUpdate(setAvailable), []);
+  return available;
+}
 
 export function useInstallPrompt(): InstallOffer | null {
   const [event, setEvent] = useState<BeforeInstall | null>(null);

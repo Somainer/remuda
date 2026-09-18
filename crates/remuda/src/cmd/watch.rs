@@ -351,7 +351,7 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
     // The model actually answering. `modelEffective` when an observation
     // disagreed with the dispatch request, else the requested id. A pinned model
     // that was silently substituted used to be invisible here, because the row
-    // only ever carried the request (D-036 / model-pin-1); a `>` marks the
+    // only ever carried the request (model-pin-1); a `>` marks the
     // divergence so the two can be told apart at a glance.
     let mut model = Col {
         name: "MODEL",
@@ -379,7 +379,7 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
                 .unwrap_or("-")
                 .to_string(),
         );
-        model.cells.push(truncate(model_label(row), 32));
+        model.cells.push(truncate(model_label(row), 48));
         evidence.cells.push(truncate(sha_or_reason(row), 40));
         detail.cells.push(truncate(
             row.get("watch")
@@ -419,9 +419,12 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
 /// The model cell: the effective id when it diverged from the request, else the
 /// requested id.
 ///
-/// `requested>observed` when the two disagree, so a substitution is legible
-/// without a second column — and so the requested id is not simply dropped,
-/// which would hide the pin the operator actually typed.
+/// On a divergence this renders `observed ⇐ requested`, observed FIRST. The
+/// observed id is the one thing the column exists to show, and the cell is head
+/// truncated to fit — putting the requested id first (an earlier draft did) cut
+/// the observed half off the demo's own 30-char ids and hid exactly the
+/// substitution it was added for. The requested id follows, so the pin the
+/// operator typed is still on the row.
 fn model_label(row: &Value) -> String {
     let field = |key: &str| {
         row.get(key)
@@ -430,8 +433,11 @@ fn model_label(row: &Value) -> String {
             .filter(|value| !value.is_empty())
     };
     match (field("model"), field("modelEffective")) {
+        // Only a real divergence carries `modelEffective`; a gateway resolving
+        // the pin to an upstream vendor name is stored as the request, so it
+        // reaches the `None` arm and is not shown as a substitution.
         (Some(requested), Some(observed)) if requested != observed => {
-            format!("{requested}>{observed}")
+            format!("{observed} ⇐ {requested}")
         }
         (_, Some(observed)) => observed.to_string(),
         (Some(requested), None) => requested.to_string(),
@@ -505,7 +511,7 @@ mod tests {
         assert!(!is_done(&row));
     }
 
-    /// D-036 / model-pin-1: the MODEL cell reports what answered, and makes a
+    /// model-pin-1: the MODEL cell reports what answered, and makes a
     /// substitution legible instead of showing only the request.
     #[test]
     fn the_model_cell_reports_the_effective_id_and_marks_a_divergence() {
@@ -521,14 +527,15 @@ mod tests {
             })),
             "ark/seed-evolving[1m]"
         );
-        // The regression: asked for one model, another answered. Both are shown,
-        // request first, so the pin the operator typed is not simply dropped.
+        // The regression: asked for one model in the same namespace, another
+        // answered. Observed is FIRST so head-truncation cannot cut the one
+        // thing this column exists to show; the requested pin still follows.
         assert_eq!(
             model_label(&serde_json::json!({
                 "model": "model_hub/es1_orange_o50[1m]",
-                "modelEffective": "claude-opus-4-8",
+                "modelEffective": "model_hub/es1_orange_o48[1m]",
             })),
-            "model_hub/es1_orange_o50[1m]>claude-opus-4-8"
+            "model_hub/es1_orange_o48[1m] ⇐ model_hub/es1_orange_o50[1m]"
         );
         // An observation with no recorded request still reports honestly.
         assert_eq!(
@@ -540,6 +547,21 @@ mod tests {
         assert_eq!(
             model_label(&serde_json::json!({"model": "", "modelEffective": "  "})),
             "-"
+        );
+    }
+
+    /// The observed id must survive the column's truncation — it is the half
+    /// that answers, and the demo's ids are ~30 chars each.
+    #[test]
+    fn truncation_keeps_the_observed_id() {
+        let row = serde_json::json!({
+            "model": "model_hub/es1_orange_o50[1m]",
+            "modelEffective": "model_hub/es1_orange_o48[1m]",
+        });
+        let cell = truncate(model_label(&row), 48);
+        assert!(
+            cell.contains("model_hub/es1_orange_o48"),
+            "the observed id must remain in a 48-char cell: {cell}"
         );
     }
 }

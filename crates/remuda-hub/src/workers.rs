@@ -611,7 +611,7 @@ pub(crate) async fn dispatch_core(
             model,
             // Nothing has observed a turn yet at dispatch time, so there is no
             // effective model to report. The watch pass fills it in if and when
-            // the observed id disagrees with the request (D-036).
+            // the observed id disagrees with the request (model-pin-1).
             model_effective: None,
             provider_profile_id,
             branch,

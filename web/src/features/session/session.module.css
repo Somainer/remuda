@@ -28,6 +28,9 @@
   color: var(--mute);
   width: 20px;
   flex: none;
+  /* The 20px glyph keeps its look; touch reach comes from a mobile-only
+     44px ::after, never a visual resize (ui-spec.md §3.4, D-039). */
+  position: relative;
 }
 
 .title {
@@ -105,6 +108,9 @@
   display: inline-flex;
   align-items: center;
   white-space: nowrap;
+  /* Visual height stays 25px; touch reach comes from a mobile-only
+     44px ::after, never a visual resize (ui-spec.md §3.4, D-039). */
+  position: relative;
 }
 
 .viewSegOn {
@@ -156,7 +162,8 @@
   flex-wrap: wrap;
   gap: 9px;
   font-family: var(--mono);
-  font-size: 11px;
+  /* Status meta never goes below 12px, desktop or mobile. */
+  font-size: var(--text-aux);
   color: var(--mute);
   padding-left: 0;
 }
@@ -2446,7 +2453,6 @@
 
   .meta {
     padding-left: 30px;
-    font-size: 10.5px;
     gap: 6px;
   }
 
@@ -2460,6 +2466,25 @@
     min-height: 32px;
     padding: 0;
     justify-content: center;
+    /* The square stays 32px visually; the ::after below supplies the reach. */
+    position: relative;
+  }
+
+  /*
+   * Invisible 44px hit areas over small glyphs/segments, same mechanism as
+   * .effortIconBtn::after below: absolutely centred on the visible control,
+   * so the visual size never changes (ui-spec.md §3.4, D-039).
+   */
+  .back::after,
+  .stopBtn::after,
+  .viewSeg::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
   }
 
   .dock {
@@ -2496,8 +2521,8 @@
     position: absolute;
     top: 50%;
     left: 50%;
-    width: 44px;
-    height: 44px;
+    width: var(--touch);
+    height: var(--touch);
     transform: translate(-50%, -50%);
   }
 

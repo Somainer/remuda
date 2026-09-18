@@ -19,6 +19,7 @@ pub mod approval;
 pub mod bus;
 pub mod decision;
 pub mod event;
+pub mod hook_silence;
 pub mod live;
 pub mod map;
 pub mod pending;

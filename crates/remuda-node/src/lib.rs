@@ -96,6 +96,14 @@ pub use service::{LocalDrivers, RunningNode, ServeConfig, compose, serve};
 pub use signal::{
     HOOKS_ENABLE_ENV, HookSessionEvidence, binds_instance, hook_activity, hooks_enabled,
 };
+// Hook-channel silence diagnostics live in remuda-signal next to the socket
+// they probe; re-exported here as the Node-owned surface the instance badge
+// reads.
+pub use remuda_signal::hook_silence::{
+    HookSilenceProbes, HookSilenceReason, classify as classify_hook_silence,
+    diagnose as diagnose_hook_silence, link_fresh as hook_link_fresh,
+    relay_executable as hook_relay_executable, socket_listening as hook_socket_listening,
+};
 pub use signal_messages::{MessageAssembler, MessageDelta, message_delta};
 pub use stdio::{
     StdioOptions, run_stdio, run_stdio_opts, run_stdio_runtime_opts, run_stdio_with_node,

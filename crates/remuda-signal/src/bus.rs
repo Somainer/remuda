@@ -128,6 +128,12 @@ struct TurnState {
     session_id: Option<String>,
     /// Whether the turn is currently active.
     active: Option<bool>,
+    /// Wall-clock time of the newest hook record from this pid, whatever its
+    /// kind. Hooks are event-driven, so a long tool genuinely goes quiet; the
+    /// driver bounds its "hooks still vouch for a live turn" guard by this
+    /// age rather than holding busy forever once the channel stalls (the
+    /// missing-Stop hole). `None` until the first fold touches the slot.
+    last_seen: Option<std::time::Instant>,
 }
 
 impl SignalBus {
@@ -277,6 +283,32 @@ impl SignalBus {
         })
     }
 
+    /// Wall-clock instant the newest hook record of *any* kind arrived from
+    /// `pid`, when one has. The driver bounds its hook guard by this age so a
+    /// channel that stops delivering (a degraded relay, a stalled journal pump)
+    /// cannot hold the screen's idle edge forever. Returns `None` for a pid the
+    /// bus never bound, so background CLIs sharing the socket cannot be timed.
+    #[must_use]
+    pub fn hook_last_seen(&self, pid: i32) -> Option<std::time::Instant> {
+        self.turn_active
+            .lock()
+            .ok()
+            .and_then(|slots| slots.iter().find(|slot| slot.pid == pid)?.last_seen)
+    }
+
+    /// Stamp the newest-hook-record time on an existing slot for `pid`.
+    ///
+    /// Only touches a slot `SessionStart`/a turn boundary already created: it
+    /// never mints one, so an event from an unbound background process cannot
+    /// fabricate freshness for the foreground agent.
+    fn touch(&self, pid: i32) {
+        if let Ok(mut slots) = self.turn_active.lock()
+            && let Some(slot) = slots.iter_mut().find(|slot| slot.pid == pid)
+        {
+            slot.last_seen = Some(std::time::Instant::now());
+        }
+    }
+
     /// A pending cancel was confirmed by fresh native screen evidence. Keep
     /// the driver's idle guard in sync even when Claude emits no Stop hook.
     pub fn confirm_screen_interrupt(&self, pid: i32) {
@@ -313,12 +345,14 @@ impl SignalBus {
                 pid,
                 session_id: session_id.or(previous.session_id),
                 active,
+                last_seen: previous.last_seen,
             });
         } else {
             slots.push_back(TurnState {
                 pid,
                 session_id,
                 active,
+                last_seen: None,
             });
         }
         while slots.len() > 32 {
@@ -398,6 +432,9 @@ impl SignalBus {
                 mapped.session_id.clone(),
                 Some(mapped.kind == MappedKind::TurnStarted),
             );
+        // Stamp recency on every folded record so the driver's hook guard can
+        // bound itself (see `hook_last_seen`); a no-op for an unbound pid.
+        self.touch(event.ppid);
         if turn_matches && mapped.kind == MappedKind::TurnStarted {
             let _ = self.interrupt_pid.compare_exchange(
                 event.ppid,

@@ -539,15 +539,18 @@ pub(crate) async fn handle_node_method(
             // Fold the frame into bounded writer jobs: one transaction per
             // chunk, awaited before the next so the writer yields between
             // batches instead of holding its single connection for a whole
-            // 256-event replay page (hub-store-1).
-            for chunk in events.chunks(crate::store::APPEND_CHUNK_MAX) {
+            // 256-event replay page. A chunk is bounded by event count AND by
+            // serialized bytes, so a frame of large transcript/screen events
+            // cannot smuggle one long transaction past the count cap
+            // (hub-store-1).
+            for range in crate::store::journal_append_chunks(&events) {
                 let appended_chunk = state
                     .store
                     .append_journal_batch(
                         host_id.clone(),
                         instance_id.clone(),
                         next_seq,
-                        chunk.to_vec(),
+                        events[range].to_vec(),
                     )
                     .await
                     .map_err(map_host_store)?;
@@ -1581,12 +1584,18 @@ async fn resync_after_gap(
 }
 
 async fn snapshot_json(state: &AppState, instance_id: &str) -> Result<Value, HubError> {
-    let (events, durable) = state.store.read_journal(instance_id.to_string(), 0).await?;
+    let page = state
+        .store
+        .read_journal(instance_id.to_string(), 0, None)
+        .await?;
     Ok(json!({
         "type": "snapshot",
         "instanceId": instance_id,
-        "asOfSeq": durable.to_string(),
-        "events": events,
+        "asOfSeq": page.durable_seq.to_string(),
+        "durableSeq": page.durable_seq.to_string(),
+        "fromSeq": page.from_seq.map(|seq| seq.to_string()),
+        "reachedAfterSeq": page.reached_after_seq,
+        "events": page.events,
     }))
 }
 

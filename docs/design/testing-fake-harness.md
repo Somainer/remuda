@@ -45,6 +45,11 @@ fake-harness --kind claude|codex|grok [选项]
 `--home` 时作为 home 回退。退出：`/exit`（claude、grok）、`/quit`
 （codex）、grok 双击 Ctrl+Q、EOF、或收到 SIGTERM/SIGHUP/SIGINT。
 
+`FAKE_HARNESS_REPORT_MODEL` 让会话**上报**该 id（`message.model`、屏幕、artifact），
+而 `--model` 仍照常解析 —— 用来仿真"忽略 `--model`、实际答在别的模型上"的 harness
+（model-pin-1 的 2026-09-18 替换）。测试因此能把"pin 发出去了"和"pin 生效了"分开断言；
+argv 由真实 materializer 构造，测试无法另加 flag，所以走 env 而非 flag。
+
 ## 3 场景格式
 
 JSON（默认）或 YAML（按扩展名）。未知字段直接报错，避免拼写错误静默

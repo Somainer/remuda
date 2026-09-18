@@ -961,21 +961,30 @@ const permissionMode = new Map<Id, string>();
 
 export const mockDb: MockDb = { hosts, workspaces, instances, interactions, journals, titles, summaries, permissionMode };
 
-export function mockReadJournal(journalId: Id, afterSeq?: U64, limit = 128) {
+export function mockReadJournal(journalId: Id, afterSeq?: U64, beforeSeq?: U64, limit = 128) {
   if (journalId === journalLong) ensureLongJournal();
   if (journalId === journalBatchE) ensureBatchEJournal();
   const after = afterSeq ? Number(afterSeq) : 0;
+  const before = beforeSeq ? Number(beforeSeq) : null;
   if (journalId === journalStale && after > 0) {
     throw new Error("GAP_FILL_FAILED");
   }
   const all = journals.get(journalId) ?? [];
-  const truncated = (journalId === journalGap || journalId === journalStale) && after === 0;
-  const source = truncated ? all.filter((e) => Number(e.seq) <= GAP_HISTORY_SEQ) : all.filter((e) => Number(e.seq) > after);
+  const truncated = (journalId === journalGap || journalId === journalStale) && after === 0 && before === null;
+  const source = truncated
+    ? all.filter((e) => Number(e.seq) <= GAP_HISTORY_SEQ)
+    : all.filter((e) => {
+        const seq = Number(e.seq);
+        return seq > after && (before === null || seq <= before);
+      });
   const bigJournal = journalId === journalLong || journalId === journalBatchE;
   const cap = bigJournal ? Math.max(limit, LONG_EVENT_COUNT, BATCH_E_EVENT_COUNT) : limit;
-  const events = source.slice(0, cap);
+  // Mirror the Hub's bounded tail window: newest `cap` rows win, ascending.
+  const events = source.slice(-cap);
   const durableSeq = all.length ? all[all.length - 1].seq : "0";
-  return { events, durableSeq, floorSeq: "1" as U64 };
+  const windowFromSeq: U64 | null = events.length ? events[0].seq : null;
+  const reachedAfterSeq = windowFromSeq === null || Number(windowFromSeq) === after + 1;
+  return { events, durableSeq, windowFromSeq, reachedAfterSeq };
 }
 
 export function mockGappedTail(journalId: Id): EventsBatch["params"] | null {

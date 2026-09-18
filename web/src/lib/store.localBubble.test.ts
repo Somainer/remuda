@@ -41,12 +41,13 @@ function stubPostSend(api: Api) {
     id: INSTANCE,
     journalId: JOURNAL,
   } as Awaited<ReturnType<Api["instanceGet"]>>);
-  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", floorSeq: "0" });
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
   vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
     subscriptionId: "sub_local_bubble",
     journalId: JOURNAL,
     durableSeq: "0",
-    floorSeq: "0",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_local_bubble",

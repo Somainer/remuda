@@ -738,6 +738,34 @@ pub(super) struct HookSilencePaths {
     pub socket: std::path::PathBuf,
 }
 
+/// Name the check that explains a quiet hook tier at a screen-idle end, or
+/// `None` when there is nothing honest to say.
+///
+/// A *fresh* tier returns `None` unconditionally: a clean `Stop` that just
+/// landed is a normal end and must never write a `hook.silence` record. Of the
+/// probes this screen poller can actually run, the missing pinned relay wins
+/// over an unbound socket; when both are healthy there is `None` — a finished
+/// session emits no hooks, and judging the journal pump needs the Node
+/// transport's flush cursor, which this layer does not hold (so this never
+/// reports `link-stalled`).
+fn silence_reason_for(
+    hook_fresh: bool,
+    relay_executable: bool,
+    socket_listening: bool,
+) -> Option<remuda_signal::hook_silence::HookSilenceReason> {
+    use remuda_signal::hook_silence::HookSilenceReason;
+    if hook_fresh {
+        return None;
+    }
+    if !relay_executable {
+        return Some(HookSilenceReason::RelayMissing);
+    }
+    if !socket_listening {
+        return Some(HookSilenceReason::SocketRefused);
+    }
+    None
+}
+
 /// Spawn the per-instance promotion poller.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn(
@@ -1158,10 +1186,17 @@ pub(super) fn spawn(
             // has actually decided the turn is idle: a running-but-hook-quiet
             // tool still shows its spinner, and there "no events for a few
             // seconds" is normal, not a broken channel (the plain amber note is
-            // enough). At the screen-decided end, probe — at a slow cadence —
-            // the relay, the socket and the link, and journal the first failed
-            // Node-side check only when it changes. A clean hook Stop leaves
-            // every check healthy (returns None), so no record is emitted.
+            // enough). At the screen-idle end, probe — at a slow cadence — the
+            // pinned relay and the instance hook socket, and journal the first
+            // failed check only when it changes.
+            //
+            // We deliberately do NOT claim `link-stalled` here: this screen
+            // poller cannot see the Node transport's journal-pump cursor, and a
+            // finished session simply emits no hooks — so an old hook timestamp
+            // with a healthy relay+socket is an ordinary quiet end, not a stalled
+            // pump (the `link-stalled` check belongs to a caller that holds the
+            // real flush cursor). A fresh tier (a clean Stop that just landed)
+            // is skipped entirely, so a normal turn never writes a record.
             if status == Some(ScreenStatus::Idle)
                 && !hook_fresh
                 && silence_paths.is_some()
@@ -1172,13 +1207,11 @@ pub(super) fn spawn(
                     && let Some(paths) = silence_paths.as_ref()
                 {
                     silence_ticks = 0;
-                    let reason = remuda_signal::hook_silence::diagnose(
-                        Some(paths.relay.as_path()),
-                        paths.socket.as_path(),
-                        hook_last_seen,
-                        PROMOTE_POLL.saturating_mul(HOOK_STALL_POLLS),
-                    )
-                    .await;
+                    let relay_ok =
+                        remuda_signal::hook_silence::relay_executable(Some(paths.relay.as_path()));
+                    let socket_ok =
+                        remuda_signal::hook_silence::socket_listening(paths.socket.as_path()).await;
+                    let reason = silence_reason_for(hook_fresh, relay_ok, socket_ok);
                     if last_silence != Some(reason) {
                         last_silence = Some(reason);
                         if let Some(reason) = reason {
@@ -2016,6 +2049,28 @@ mod tests {
         assert_eq!(
             hook_health_for(None, false, false),
             HookHealth::NeverMaterialised
+        );
+    }
+
+    #[test]
+    fn a_clean_stop_emits_no_hook_silence_record_and_a_quiet_end_naming_only_real_failures() {
+        use remuda_signal::hook_silence::HookSilenceReason;
+        // A fresh tier (a Stop just landed) is a normal end: no reason, so the
+        // badge gains no false「journal 推送停滞」and no hook.silence row is
+        // journaled.
+        assert_eq!(silence_reason_for(true, true, true), None);
+        assert_eq!(silence_reason_for(true, false, false), None);
+        // Relay + socket both healthy but stale: an ordinary quiet end, NOT a
+        // link-stalled claim (the screen poller does not hold the pump cursor).
+        assert_eq!(silence_reason_for(false, true, true), None);
+        // A real, named failure surfaces in dependency order.
+        assert_eq!(
+            silence_reason_for(false, false, false),
+            Some(HookSilenceReason::RelayMissing)
+        );
+        assert_eq!(
+            silence_reason_for(false, true, false),
+            Some(HookSilenceReason::SocketRefused)
         );
     }
 

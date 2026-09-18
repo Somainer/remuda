@@ -275,6 +275,12 @@ pub struct ProjectGateLane {
     /// PATH prefix (toolchain bin dirs) for the gate environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_path: Option<String>,
+    /// Per-step wall-clock budgets (step name → seconds) for this lane,
+    /// forwarded to the runner as `REMUDA_GATE_STEP_TIMEOUTS`. A lane entry
+    /// overrides the same key on [`ProjectGate::timeouts`]; `0` seconds means
+    /// no cap for that step. Absent leaves the runner's built-in defaults.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub timeouts: std::collections::BTreeMap<String, u64>,
 }
 
 /// Gate configuration; design §3.2 (placeholder, consumed by r-mergequeue).
@@ -299,6 +305,12 @@ pub struct ProjectGate {
     /// Mandatory gate steps.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mandatory_steps: Vec<String>,
+    /// Project-wide per-step wall-clock budgets (step name → seconds),
+    /// forwarded to the runner as `REMUDA_GATE_STEP_TIMEOUTS`. A per-lane
+    /// [`ProjectGateLane::timeouts`] entry overrides the same key here; `0`
+    /// seconds means no cap for that step. Absent leaves the runner's defaults.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub timeouts: std::collections::BTreeMap<String, u64>,
 }
 
 impl Default for ProjectGate {
@@ -315,6 +327,7 @@ impl Default for ProjectGate {
                 "gen-api-current".into(),
                 "verify-tree".into(),
             ],
+            timeouts: std::collections::BTreeMap::new(),
         }
     }
 }

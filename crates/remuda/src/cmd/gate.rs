@@ -82,6 +82,12 @@ enum GateCommand {
         /// Restrict to one project.
         #[arg(long)]
         project: Option<String>,
+        /// Request the cancel and return without waiting for the terminal state.
+        #[arg(long)]
+        no_wait: bool,
+        /// Emit the job as JSON instead of the step table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -97,9 +103,13 @@ impl Entrypoint for GateArgs {
                     json,
                 }) => list_jobs(hub, project, state, branch, json).await,
                 Some(GateCommand::Log { hub, id }) => print_log(hub, &id).await,
-                Some(GateCommand::Cancel { hub, job, project }) => {
-                    cancel_job(hub, project, job).await
-                }
+                Some(GateCommand::Cancel {
+                    hub,
+                    job,
+                    project,
+                    no_wait,
+                    json,
+                }) => cancel_job(hub, project, job, no_wait, json).await,
                 None => {
                     let Some(branch) = self.branch else {
                         anyhow::bail!(
@@ -519,6 +529,8 @@ async fn cancel_job(
     hub: HubOpts,
     project: Option<String>,
     job_or_branch: String,
+    no_wait: bool,
+    as_json: bool,
 ) -> anyhow::Result<i32> {
     let client = hub.connect()?;
     let project = resolve_project(&client, &project).await?;
@@ -544,6 +556,21 @@ async fn cancel_job(
             &serde_json::json!({}),
         )
         .await?;
-    super::hub_client::print_json(&value)?;
-    Ok(0)
+    // A cancel is a request, not a verdict: the run still decides. Unless the
+    // caller opted out, poll to the real terminal state and let the exit code
+    // reflect what actually happened — including a job that landed anyway.
+    if no_wait {
+        super::hub_client::print_json(&value)?;
+        return Ok(0);
+    }
+    let code = wait_for_job(&client, &project, &job_id, "cancel", as_json).await?;
+    // wait_for_job returns 0 for a landed job; a canceled request that landed
+    // anyway is not a success from the operator's point of view.
+    let job = client
+        .get(&format!("/v1/projects/{project}/gate/jobs/{job_id}"))
+        .await?;
+    if job.get("state").and_then(Value::as_str) == Some("landed") {
+        return Ok(1);
+    }
+    Ok(code)
 }

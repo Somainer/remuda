@@ -72,6 +72,12 @@ pub struct HubConfig {
     /// on the lane host before retention drops them (default seven days).
     #[serde(default = "default_gate_ref_retention_ms")]
     pub gate_ref_retention_ms: u64,
+    /// Grace after a gate cancel is requested before the scheduler finishes a
+    /// `canceling` job `canceled` on its own, even if the lane never answered
+    /// `gate.cancel` (default 30 seconds). A late run reply after this is
+    /// ignored rather than applied.
+    #[serde(default = "default_gate_cancel_grace_ms")]
+    pub gate_cancel_grace_ms: u64,
     /// Per-IP authentication attempt burst budget (login/pair/passkey).
     #[serde(default = "default_auth_ip_burst")]
     pub auth_ip_burst: f64,
@@ -147,6 +153,13 @@ fn default_gate_ref_retention_ms() -> u64 {
     7 * 24 * 60 * 60 * 1000
 }
 
+/// Thirty seconds: long enough for a well-behaved lane to kill its step group
+/// and report `canceled`, short enough that a parked or dead lane cannot hold
+/// the outcome hostage.
+fn default_gate_cancel_grace_ms() -> u64 {
+    30 * 1000
+}
+
 fn default_push_block_ms() -> u64 {
     30_000
 }
@@ -192,6 +205,7 @@ impl Default for HubConfig {
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
             gate_ref_retention_ms: default_gate_ref_retention_ms(),
+            gate_cancel_grace_ms: default_gate_cancel_grace_ms(),
             auth_ip_burst: default_auth_ip_burst(),
             auth_ip_refill_per_sec: default_auth_ip_refill_per_sec(),
             auth_global_burst: default_auth_global_burst(),
@@ -225,6 +239,7 @@ impl HubConfig {
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
             gate_ref_retention_ms: default_gate_ref_retention_ms(),
+            gate_cancel_grace_ms: default_gate_cancel_grace_ms(),
             // Keep production rate-limit defaults here so the 429 integration
             // test exercises real budgets; the Playwright harness relaxes them
             // explicitly because it mounts the login page dozens of times from

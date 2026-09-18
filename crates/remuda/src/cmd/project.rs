@@ -103,7 +103,9 @@ enum ProjectCommand {
         allow_multiple_dispatchers: Option<bool>,
         /// Replace the whole gate configuration from a JSON document
         /// (`{lanes:[{id,hostId,repoPath,targetDir,ports,env,lockPath,
-        /// pwEndpoint,toolchainPath}], web, affected}`) or `@file.json`.
+        /// pwEndpoint,toolchainPath,timeouts}], web, affected, timeouts}`) or
+        /// `@file.json`. `timeouts` maps a step name to seconds (0 = no cap);
+        /// a per-lane entry overrides the project-level one.
         #[arg(long)]
         gate: Option<String>,
     },

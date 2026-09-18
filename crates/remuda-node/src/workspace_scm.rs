@@ -59,6 +59,25 @@ pub fn handle_rpc(node: &DevNode, method: &str, params: &Value) -> Result<Value,
     }
 }
 
+/// `handle_rpc` with its blocking git work off the async runtime's threads,
+/// under the carrier's in-flight cap.
+///
+/// These are read-only, but they are not cheap: `status` and `diff` shell out
+/// to git over the whole worktree, which on a large or cold repo is seconds of
+/// blocking. A carrier that spawns them off the select loop still parks a
+/// runtime worker for that time, so on a one- or two-worker host a few
+/// concurrent `scm.diff`s park the loop — `gate.cancel` included.
+pub(crate) async fn handle_rpc_capped(
+    node: &DevNode,
+    method: &str,
+    params: &Value,
+) -> Result<Value, NodeError> {
+    let node = node.clone();
+    let method = method.to_owned();
+    let params = params.clone();
+    crate::gate::run_long_method(move || handle_rpc(&node, &method, &params)).await
+}
+
 /// Resolve a registered workspace by id and re-validate its canonical identity.
 ///
 /// An unregistered id, a removed root, or a root that moved since registration

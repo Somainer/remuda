@@ -83,6 +83,74 @@ pub fn is_long_carrier_method(method: &str) -> bool {
         || crate::workspace_scm::is_scm_method(method)
 }
 
+/// How many long carrier methods may be in flight on one Node at once.
+///
+/// Off-loop spawning alone is not enough. Several of these bodies used to be
+/// synchronous (`provision_worker_typed`, `worktree_rpc`, `handle_rpc`) and the
+/// ones that are not still do blocking work, so a spawn is only honest if the
+/// work also leaves the async runtime's threads. Without a cap, N concurrent
+/// long methods park all N runtime workers — `available_parallelism`, which is
+/// one or two on a small remote host — and the carrier loop with them,
+/// `gate.cancel` included. That is worse than the serialized inline path this
+/// branch removed, which could at least never consume every worker at once.
+///
+/// Excess long methods wait for a permit rather than piling more blocking work
+/// onto the runtime. They are all minutes-long background operations, so
+/// queueing is what they expect; the cheap reads and `gate.cancel` are not in
+/// this set and are never held back by it.
+///
+/// Kept well under the smallest realistic runtime width so a burst of long
+/// methods can always leave workers for the pumps and cheap reads.
+const MAX_IN_FLIGHT_LONG_METHODS: usize = 4;
+
+/// Cap on long methods in flight, process-wide.
+///
+/// A `OnceLock` rather than a field so the bound holds across every carrier and
+/// every dispatch table in the process, including carriers that construct their
+/// own `DevNode`. It is a cap on *work*, not on any one caller, so sharing it
+/// globally is the point.
+fn long_method_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_LONG_METHODS))
+    })
+}
+
+/// Run one long carrier method under the in-flight cap, on a blocking thread.
+///
+/// The carriers call this from their spawned task instead of awaiting the body
+/// directly, so a method that blocks (a `git fetch`, a worktree walk, a cargo
+/// target delete) cannot occupy a runtime worker thread that a pump or another
+/// request needs. `body` is the synchronous part of the method; anything
+/// genuinely async stays with the caller.
+///
+/// The permit is held across the blocking call and released when the body
+/// returns (or unwinds), so at most [`MAX_IN_FLIGHT_LONG_METHODS`] of these run
+/// at once process-wide. Excess callers wait for a permit *without* occupying a
+/// runtime worker, which is what keeps the cap from being worked around by the
+/// callers it is meant to bound.
+pub(crate) async fn run_long_method<T, B>(body: B) -> Result<T, crate::NodeError>
+where
+    T: Send + 'static,
+    B: FnOnce() -> Result<T, crate::NodeError> + Send + 'static,
+{
+    let permit = long_method_permits()
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| crate::NodeError::DriverUnavailable)?;
+    tokio::task::spawn_blocking(move || {
+        let result = body();
+        // Released as the body returns — and on unwind, since the permit is a
+        // local of this closure.
+        drop(permit);
+        result
+    })
+    .await
+    .map_err(|error| crate::NodeError::Driver(format!("long carrier method join: {error}")))?
+}
+
 /// Default cap for a whole gate run and for a `--then` command.
 const DEFAULT_GATE_TIMEOUT_SECS: u64 = 60 * 60;
 const DEFAULT_THEN_TIMEOUT_SECS: u64 = 10 * 60;
@@ -1538,6 +1606,118 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// At most [`MAX_IN_FLIGHT_LONG_METHODS`] long methods run at once.
+    ///
+    /// This is the property that keeps a burst of long methods from parking
+    /// every runtime worker — and so the carrier loop — on a small host. The
+    /// bodies here hold until the test says otherwise, so without the cap all
+    /// of them would be inside `body` simultaneously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_long_method_cap_bounds_concurrency() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        // Bodies block on this rather than sleeping, so "is it in the body" is
+        // observable rather than a timing race. A std channel is the honest
+        // primitive here: the bodies are on blocking threads and must not need
+        // the async runtime to make progress.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(std::sync::Mutex::new(released));
+        let total = MAX_IN_FLIGHT_LONG_METHODS + 3;
+
+        let mut handles = Vec::new();
+        for _ in 0..total {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            let released = Arc::clone(&released);
+            handles.push(tokio::spawn(async move {
+                run_long_method(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    // Blocking wait: this is a blocking thread, and the body
+                    // must not yield back to the runtime.
+                    let _ = released
+                        .lock()
+                        .expect("release receiver lock")
+                        .recv_timeout(std::time::Duration::from_secs(30));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }));
+        }
+
+        // Give every permitted body time to enter, then confirm the cap holds.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            running.load(Ordering::SeqCst),
+            MAX_IN_FLIGHT_LONG_METHODS,
+            "exactly the cap's worth of bodies should be running"
+        );
+
+        // Releasing drains the queue without ever exceeding the cap.
+        for _ in 0..total {
+            let _ = release.send(());
+        }
+        for handle in handles {
+            handle.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            MAX_IN_FLIGHT_LONG_METHODS,
+            "peak concurrency must equal the cap: more means the cap leaked, \
+             fewer means the bodies never overlapped"
+        );
+    }
+
+    /// A body that panics must not leak its permit.
+    ///
+    /// The panic is caught and surfaced as an error (that is what keeps a
+    /// panicking carrier method from taking the Node down), so the property to
+    /// prove is that the permit still comes back: run *more than the cap* of
+    /// panicking bodies concurrently and require every one to finish. A leaked
+    /// permit would strand the excess past the cap and the deadline would fire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicking_long_method_releases_its_permit() {
+        // The expected panics are noise here; the assertion is what matters.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let total = MAX_IN_FLIGHT_LONG_METHODS + 3;
+        let mut handles = Vec::new();
+        for _ in 0..total {
+            handles.push(tokio::spawn(async {
+                run_long_method(|| -> Result<(), crate::NodeError> {
+                    panic!("body panicked");
+                })
+                .await
+            }));
+        }
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for handle in handles {
+                let result = handle
+                    .await
+                    .expect("the spawned task itself does not panic");
+                assert!(
+                    result.is_err(),
+                    "a panicking body is reported as an error, not a value"
+                );
+            }
+        })
+        .await;
+        std::panic::set_hook(previous);
+        drained.expect("a leaked permit would strand the excess bodies past the deadline");
+    }
+
+    /// A body that errors returns the error rather than panicking the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_long_method_returns_its_error() {
+        let result: Result<(), crate::NodeError> =
+            run_long_method(|| Err(crate::NodeError::InvalidRequest("nope".into()))).await;
+        assert!(matches!(result, Err(crate::NodeError::InvalidRequest(_))));
+    }
 
     struct Fixture {
         node: DevNode,

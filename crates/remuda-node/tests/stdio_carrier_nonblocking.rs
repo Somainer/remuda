@@ -270,18 +270,19 @@ fn worker_remove_and_a_concurrent_screen_both_answer_within_two_seconds() {
         "params": { "instanceId": UNKNOWN_INSTANCE },
     }));
 
+    // One window for both, starting when they were sent: the property is that
+    // neither request waits on the other, so a shared budget is the honest
+    // measure. Back-to-back windows would let a request that had actually been
+    // serialized behind the first still pass, by paying for it out of its own
+    // fresh 2s. Unmatched frames are retained by `wait_for`, so whichever reply
+    // lands second is never lost while looking for the first.
+    let deadline = Instant::now() + Duration::from_secs(2);
     let screen = node
-        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
-            frame["id"] == json!("screen-1")
-        })
+        .wait_for(deadline, |frame| frame["id"] == json!("screen-1"))
         .expect("tty.screen must answer within 2s");
     assert_eq!(screen["id"], "screen-1");
-    // Its own bound, not what is left of the first request's: each must be
-    // prompt on its own, which is the property the fix is about.
     let removed = node
-        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
-            frame["id"] == json!("remove-unknown")
-        })
+        .wait_for(deadline, |frame| frame["id"] == json!("remove-unknown"))
         .expect("worker.remove for an unknown worker must answer within 2s");
     // Unknown worker: nothing removed, but a real (non-hanging) reply.
     assert_eq!(removed["id"], "remove-unknown");
@@ -370,21 +371,17 @@ fn close_and_retire_of_an_instance_not_on_this_node_answer_not_found_promptly() 
         "params": { "name": "c-ghost", "instanceId": UNKNOWN_INSTANCE },
     }));
 
-    // Each request gets its own bound: each must be prompt on its own, which is
-    // the property under test, rather than sharing one window between them.
+    // One window for both, for the reason in the test above.
+    let deadline = Instant::now() + Duration::from_secs(2);
     let close = node
-        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
-            frame["id"] == json!("close-1")
-        })
+        .wait_for(deadline, |frame| frame["id"] == json!("close-1"))
         .expect("instance.close for an unknown instance must answer promptly");
     assert!(
         close.get("error").is_some(),
         "closing an instance not on this Node is a prompt error, not a wait: {close}"
     );
     let removed = node
-        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
-            frame["id"] == json!("remove-2")
-        })
+        .wait_for(deadline, |frame| frame["id"] == json!("remove-2"))
         .expect("worker.remove for an unknown instance must answer promptly");
     assert!(
         removed.get("error").is_some(),

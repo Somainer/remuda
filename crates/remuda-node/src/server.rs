@@ -882,8 +882,8 @@ async fn dispatch_rpc(
                 })?;
             serde_json::to_value(workspace).map_err(NodeError::from)
         }
-        "worktree.list" => node.worktree_rpc(method, &params),
-        "worker.provision" => node.provision_worker(&params).await,
+        "worktree.list" => node.worktree_rpc_capped(method, &params).await,
+        "worker.provision" => node.provision_worker_capped(&params).await,
         "worker.remove" => node.remove_worker(&params).await,
         method if crate::gate::is_gate_method(method) => {
             node.dispatch_gate_rpc(method, &params).await
@@ -893,9 +893,9 @@ async fn dispatch_rpc(
             let resources = serde_json::to_value(crate::inventory::sample_resources())?;
             Ok(json!({ "resources": resources }))
         }
-        "worktree.create" => node.create_worktree(&params),
+        "worktree.create" => node.worktree_rpc_capped(method, &params).await,
         method if crate::workspace_scm::is_scm_method(method) => {
-            crate::workspace_scm::handle_rpc(node, method, &params)
+            crate::workspace_scm::handle_rpc_capped(node, method, &params).await
         }
         method if crate::subagent::is_subagent_method(method) => {
             crate::subagent::handle_rpc(node, method, &params)

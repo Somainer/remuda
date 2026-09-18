@@ -2529,6 +2529,14 @@
             },
             "type": "array"
           },
+          "timeouts": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Per-step wall-clock budgets (step name to seconds; 0 = no cap). A per-lane entry overrides the same key here.",
+            "type": "object"
+          },
           "web": {
             "enum": [
               "auto",
@@ -2560,6 +2568,14 @@
           },
           "targetDir": {
             "type": "string"
+          },
+          "timeouts": {
+            "additionalProperties": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Per-step wall-clock budgets (step name to seconds; 0 = no cap) for this lane; overrides the project-level entry per key.",
+            "type": "object"
           }
         },
         "required": [

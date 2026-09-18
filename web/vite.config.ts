@@ -1,6 +1,7 @@
 /// <reference types="vitest/config" />
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { serviceWorkerPlugin } from "./sw-build.ts";
 
 const hub = process.env.VITE_HUB_URL;
 // Gate / CI runs (VITE_NO_WATCH=1) serve a fixed tree and never edit it, so
@@ -10,7 +11,7 @@ const hub = process.env.VITE_HUB_URL;
 const noWatch = process.env.VITE_NO_WATCH === "1";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), serviceWorkerPlugin()],
   server: {
     ...(hub
       ? {

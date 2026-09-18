@@ -278,6 +278,98 @@ pub fn slash_model_args(content: &str) -> Option<String> {
     Some(content[start..start + end].trim().to_owned())
 }
 
+/// Whether an observed model id contradicts a requested pin.
+///
+/// Verdict of the model-pin comparison (`evidence/model-pin-1.md` §3). Three
+/// outcomes, because two ids being unequal is *not* the same as them
+/// disagreeing: a gateway resolves a catalog id to an upstream vendor name, so
+/// an unequal pair is often a correct launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPinVerdict {
+    /// The observation is the pin, or the pin's other context-window spelling.
+    Honoured,
+    /// A different id **in the pin's own namespace** answered. Decidable, and a
+    /// refusal offence.
+    Mismatch,
+    /// The observation is an upstream resolution of the pin, in a vocabulary
+    /// the pin cannot be compared against (`model_hub/es1_orange_o50[1m]` →
+    /// `claude-opus-5`). Reported, never refused: measured on a real gateway,
+    /// a correct launch and a substituted one look identical here.
+    Unresolvable,
+}
+
+/// Strip a trailing context-window variant suffix (`…[1m]`).
+///
+/// The suffix selects a real variant, so it is never dropped when *sending* an
+/// id; it is only ignored when deciding whether two observations name the same
+/// model family.
+fn without_context_suffix(id: &str) -> &str {
+    let id = id.trim();
+    match (id.rfind('['), id.ends_with(']')) {
+        (Some(open), true) => id[..open].trim_end(),
+        _ => id,
+    }
+}
+
+/// Whether an id is namespaced (`vendor/model`), i.e. spoken in the vocabulary
+/// a gateway catalog and a `/model` verdict use.
+fn is_namespaced(id: &str) -> bool {
+    id.contains('/')
+}
+
+/// Compare an observed effective model against the requested pin.
+///
+/// The rule, and why it is not equality (measured, `model-pin-1.md` §3):
+///
+/// - equal, or equal ignoring a `[1m]` context suffix → [`Honoured`];
+/// - both ids namespaced but different → [`Mismatch`]. Both the pin and a
+///   `/model` verdict speak this vocabulary, so a disagreement here is real:
+///   the session is on a model nobody asked for.
+/// - the pin is namespaced and the observation is not → [`Unresolvable`]. This
+///   is the gateway resolving the pin to a vendor name. A correctly pinned
+///   session records `claude-opus-5` for `model_hub/es1_orange_o50[1m]`, and a
+///   substituted one records `claude-opus-4-8`; neither upstream name is in the
+///   catalog, so this channel cannot tell them apart and must not refuse.
+/// - neither namespaced and different → [`Mismatch`]: two bare aliases
+///   (`sonnet` vs `haiku`) are the same vocabulary.
+///
+/// `catalog` is the session's discovered model list when known. An observation
+/// that is itself a catalog id confirms the vocabulary is comparable, which is
+/// what lets a namespaced disagreement be trusted.
+///
+/// [`Honoured`]: ModelPinVerdict::Honoured
+/// [`Mismatch`]: ModelPinVerdict::Mismatch
+/// [`Unresolvable`]: ModelPinVerdict::Unresolvable
+#[must_use]
+pub fn compare_model_pin(pin: &str, observed: &str, catalog: &[String]) -> ModelPinVerdict {
+    let pin = pin.trim();
+    let observed = observed.trim();
+    if pin.is_empty() || observed.is_empty() {
+        // Nothing to contradict: a pin that was never requested cannot mismatch.
+        return ModelPinVerdict::Honoured;
+    }
+    if observed == pin || without_context_suffix(observed) == without_context_suffix(pin) {
+        return ModelPinVerdict::Honoured;
+    }
+    // A catalog hit proves the observation is spoken in the catalog's
+    // vocabulary, the same one the pin uses.
+    let in_catalog = |id: &str| {
+        catalog
+            .iter()
+            .any(|entry| entry == id || without_context_suffix(entry) == without_context_suffix(id))
+    };
+    match (is_namespaced(pin), is_namespaced(observed)) {
+        (true, true) => ModelPinVerdict::Mismatch,
+        (true, false) if in_catalog(observed) => ModelPinVerdict::Mismatch,
+        (true, false) => ModelPinVerdict::Unresolvable,
+        // A bare pin (`sonnet`) against a namespaced observation is the gateway
+        // resolving an alias: `sonnet` → `model_hub/es1_orange_o48`. Not
+        // comparable either way round.
+        (false, true) => ModelPinVerdict::Unresolvable,
+        (false, false) => ModelPinVerdict::Mismatch,
+    }
+}
+
 /// The effective-model half of a [`ModelPayload`]: the resolved id plus what
 /// established it.
 #[derive(
@@ -490,5 +582,100 @@ new sessions\x1b[2m\x1b[22m\n\x1b[2m     ANTHROPIC_MODEL is set to \x1b[22m`mode
         assert_ne!(a, model_event_id("ins_one", "msg_2", "ark/a"));
         assert_ne!(a, model_event_id("ins_two", "msg_1", "ark/a"));
         assert!(a.as_id().as_str().starts_with("evt_"));
+    }
+
+    /// model-pin-1 §3: the pin comparison, anchored on ids measured against a
+    /// real gateway rather than on invented pairs.
+    #[test]
+    fn a_gateway_resolution_is_not_a_mismatch() {
+        // Measured: a session correctly pinned to o50 records `claude-opus-5`.
+        // Refusing this was the flaw in the equality gate.
+        assert_eq!(
+            compare_model_pin("model_hub/es1_orange_o50[1m]", "claude-opus-5", &[]),
+            ModelPinVerdict::Unresolvable
+        );
+        // And the substituted case looks identical through this channel, which
+        // is precisely why neither may refuse.
+        assert_eq!(
+            compare_model_pin("model_hub/es1_orange_o48[1m]", "claude-opus-4-8", &[]),
+            ModelPinVerdict::Unresolvable
+        );
+    }
+
+    #[test]
+    fn the_pin_answering_is_honoured_with_or_without_its_context_suffix() {
+        assert_eq!(
+            compare_model_pin("ark/seed-evolving[1m]", "ark/seed-evolving", &[]),
+            ModelPinVerdict::Honoured
+        );
+        assert_eq!(
+            compare_model_pin("ark/seed-evolving", "ark/seed-evolving[1m]", &[]),
+            ModelPinVerdict::Honoured
+        );
+        assert_eq!(
+            compare_model_pin(
+                "model_hub/es1_orange_o50[1m]",
+                "model_hub/es1_orange_o50[1m]",
+                &[]
+            ),
+            ModelPinVerdict::Honoured
+        );
+    }
+
+    /// The decidable case: a `/model` verdict speaks the pin's vocabulary, so a
+    /// different namespaced id is a real substitution — the demo's failure.
+    #[test]
+    fn a_different_id_in_the_pins_namespace_is_a_mismatch() {
+        assert_eq!(
+            compare_model_pin(
+                "model_hub/es1_orange_o50[1m]",
+                "model_hub/es1_orange_o48[1m]",
+                &[]
+            ),
+            ModelPinVerdict::Mismatch
+        );
+        // Two bare aliases are also one vocabulary.
+        assert_eq!(
+            compare_model_pin("sonnet", "haiku", &[]),
+            ModelPinVerdict::Mismatch
+        );
+    }
+
+    /// A catalog hit proves the observation is spoken in the catalog's
+    /// vocabulary, which upgrades an otherwise unresolvable pair to a mismatch.
+    #[test]
+    fn a_catalog_hit_makes_an_unnamespaced_observation_comparable() {
+        let catalog = vec!["es1_orange_o48".to_owned(), "es1_orange_o50".to_owned()];
+        assert_eq!(
+            compare_model_pin("model_hub/es1_orange_o50[1m]", "es1_orange_o48", &catalog),
+            ModelPinVerdict::Mismatch
+        );
+        // Not in the catalog: still an upstream name we cannot reason about.
+        assert_eq!(
+            compare_model_pin("model_hub/es1_orange_o50[1m]", "claude-opus-5", &catalog),
+            ModelPinVerdict::Unresolvable
+        );
+    }
+
+    /// A bare alias pin resolving to a concrete gateway id is normal.
+    #[test]
+    fn an_alias_pin_resolving_to_a_gateway_id_is_not_a_mismatch() {
+        assert_eq!(
+            compare_model_pin("sonnet", "model_hub/es1_orange_o48", &[]),
+            ModelPinVerdict::Unresolvable
+        );
+    }
+
+    /// No pin, or nothing observed yet: nothing to contradict.
+    #[test]
+    fn an_absent_pin_or_observation_never_mismatches() {
+        assert_eq!(
+            compare_model_pin("", "claude-opus-5", &[]),
+            ModelPinVerdict::Honoured
+        );
+        assert_eq!(
+            compare_model_pin("model_hub/es1_orange_o50[1m]", "   ", &[]),
+            ModelPinVerdict::Honoured
+        );
     }
 }

@@ -813,6 +813,7 @@ async fn seed_hub_worker(
         harness: "claude".into(),
         driver: Some("claude-pty".into()),
         model: None,
+        model_effective: None,
         provider_profile_id: None,
         branch: format!("wt/{name}/seed"),
         worktree_path: format!("/tmp/{name}"),

@@ -119,8 +119,21 @@ pub struct RecipeProvider {
     /// Secret reference spelling (scheme + name/path), never the secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
-    /// Requested model id.
+    /// Model id the launch was *asked* to use. This is `spec.model_id` when one
+    /// was explicitly given, else the profile's ranked first model, so it is
+    /// always populated even on an unpinned launch. Read this for "what model
+    /// did the launch target"; read [`Self::model_pin`] for whether an explicit
+    /// pin exists.
     pub model_requested: String,
+    /// The **explicit** dispatch pin — `spec.model_id` only, with no
+    /// profile-default fallback. `None` on an unpinned launch.
+    ///
+    /// The post-launch pin gate arms from this and this alone: an unpinned
+    /// launch must never be refused for departing from a model nobody named.
+    /// Distinct from [`Self::model_requested`], which is also set to the
+    /// synthetic profile default on unpinned launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_pin: Option<String>,
 }
 
 /// Permission flags actually emitted.

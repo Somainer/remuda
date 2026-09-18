@@ -37,11 +37,6 @@ export type TtyStale = {
   reason?: string;
 };
 
-/** Statuses that mean the painted bytes are not a live process. */
-export function isStaleStatus(status: TtyStatus): boolean {
-  return status === "stale";
-}
-
 /** ConEmu `OSC 9;4` states the terminal header progress bar understands. */
 export type TtyProgressState = "done" | "percent" | "error" | "indeterminate" | "paused";
 
@@ -249,13 +244,14 @@ function extractBase64(value: unknown): string | null {
 /**
  * The staleness of a Hub-cached `tty.snapshot`, or null when it is live.
  *
- * Keyed on `source: "hub-cache"` first: correct Hubs stamp only that path, so
- * an older Hub (which sends the same `tty.snapshot` type with no stamp) stays
- * live rather than being marked stale with an unknown age. `capturedAt` is
- * parsed to an age against the browser clock — the browser and Hub already
- * agree on wall time for every other timestamp the UI renders — and an
- * unparseable or absent value yields an age of undefined, which the header
- * renders as "age unknown" rather than inventing one.
+ * Keyed on `source: "hub-cache"`: that marker means "these are the bytes the
+ * Hub had lying around", which is stale by definition whatever else the frame
+ * carries. A live attach paints the Node's own snapshot and never sets it, so
+ * the marker alone separates the two. `capturedAt` is parsed to an age against
+ * the browser clock — the browser and Hub already agree on wall time for every
+ * other timestamp the UI renders — and a Hub too old to stamp it yields an age
+ * of undefined, which the header renders as "age unknown" rather than
+ * inventing one.
  */
 function staleFromSnapshot(msg: Record<string, unknown>): TtyStale | null {
   if (msg.source !== "hub-cache") return null;

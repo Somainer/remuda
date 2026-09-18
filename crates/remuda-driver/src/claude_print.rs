@@ -84,6 +84,15 @@ pub struct ClaudePrintOptions {
     pub setting_sources: Option<Vec<String>>,
     /// Initialize handshake timeout.
     pub handshake_timeout: Duration,
+    /// Total bound for [`Driver::close`]. The ladder spends it in two equal
+    /// slices — stdin EOF with a bounded wait, then SIGTERM to the process group
+    /// with a bounded wait — before SIGKILL and a short fixed reap (§2.3).
+    ///
+    /// Stdin EOF is a request, not a guarantee: a child mid-turn, blocked on an
+    /// unanswered `can_use_tool`, or one that stopped draining stdin, can ignore
+    /// it indefinitely. An unbounded close would hang forever on the long-lived
+    /// sdk carrier, so the EOF request *and* every wait are inside this bound.
+    pub close_timeout: Duration,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
 }
@@ -108,6 +117,7 @@ impl ClaudePrintOptions {
             agent_mcp: None,
             setting_sources: None,
             handshake_timeout: Duration::from_secs(30),
+            close_timeout: Duration::from_secs(10),
             settings_overlay_path: None,
         }
     }
@@ -260,6 +270,9 @@ struct Inner {
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
     closed: AtomicBool,
+    /// Whether the `exited` session lifecycle has already been emitted, so the
+    /// reader task and [`Driver::close`] cannot both emit it (§2.3: exactly once).
+    exit_emitted: AtomicBool,
     /// Last successfully launched spec; `resume` re-materializes from this.
     last_spec: Mutex<Option<InstanceSpec>>,
 }
@@ -269,11 +282,32 @@ pub struct ClaudePrintDriver {
     options: ClaudePrintOptions,
     inner: Arc<Inner>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    /// Carrier this object launches and stamps.
+    ///
+    /// `claude-print` and `claude-sdk` are the same transport (stream-json over
+    /// stdio, same handshake, same mapper) differing by one launch flag, so
+    /// `claude_sdk.rs` drives this engine with [`DriverKind::ClaudeSdk`] rather
+    /// than forking ~1000 lines of mapper (`print-replacement.md` §2.5, batch 2).
+    carrier: DriverKind,
 }
 
 impl ClaudePrintDriver {
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePrintOptions) -> Self {
+        Self::with_carrier(options, DriverKind::ClaudePrint)
+    }
+
+    /// Wire name of the carrier this object drives, for user-facing messages and
+    /// logs. Sibling drivers pass the same kebab-case spelling.
+    fn carrier_name(&self) -> &'static str {
+        match self.carrier {
+            DriverKind::ClaudeSdk => "claude-sdk",
+            _ => "claude-print",
+        }
+    }
+
+    /// [`Self::new`], stamping and launching `carrier` instead of `claude-print`.
+    pub(crate) fn with_carrier(options: ClaudePrintOptions, carrier: DriverKind) -> Self {
         Self {
             options,
             inner: Arc::new(Inner {
@@ -292,15 +326,17 @@ impl ClaudePrintDriver {
                         version: String::new(),
                         sha256: dummy_digest(),
                     },
-                    driver_kind: DriverKind::ClaudePrint,
+                    driver_kind: carrier,
                     channel: SourceChannel::Stdout,
                 }),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                exit_emitted: AtomicBool::new(false),
                 last_spec: Mutex::new(None),
             }),
             reader: Mutex::new(None),
+            carrier,
         }
     }
 
@@ -315,10 +351,13 @@ impl ClaudePrintDriver {
     }
 
     async fn launch(&self, spec: InstanceSpec, session: SessionAction) -> DriverResult<RunHandle> {
-        if spec.driver != DriverKind::ClaudePrint {
-            return Err(DriverError::InvalidLaunchSpec(
-                "ClaudePrintDriver requires driverKind claude-print".into(),
-            ));
+        if spec.driver != self.carrier {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "{} driver requires driverKind {}, got {:?}",
+                self.carrier_name(),
+                self.carrier_name(),
+                spec.driver
+            )));
         }
         reject_bot_bypass(&spec, self.options.origin)?;
         let session_id = session.session_id().to_string();
@@ -393,7 +432,7 @@ impl ClaudePrintDriver {
                 host_id: spec.host.clone(),
                 session_id: session_id.clone(),
                 pin: recipe.binary.clone(),
-                driver_kind: DriverKind::ClaudePrint,
+                driver_kind: self.carrier,
                 channel: SourceChannel::Stdout,
             };
         }
@@ -401,6 +440,7 @@ impl ClaudePrintDriver {
         *self.inner.events.lock().await = Some(tx);
         *self.inner.last_spec.lock().await = Some(spec.clone());
         self.inner.closed.store(false, Ordering::SeqCst);
+        self.inner.exit_emitted.store(false, Ordering::SeqCst);
 
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("sessionId".into(), session_id);
@@ -417,8 +457,9 @@ impl ClaudePrintDriver {
         });
 
         let inner = Arc::clone(&self.inner);
+        let carrier = self.carrier_name();
         let reader = tokio::spawn(async move {
-            map_loop(inner, outbound).await;
+            map_loop(inner, outbound, carrier).await;
         });
         *self.reader.lock().await = Some(reader);
         Ok(RunHandle::new(recipe, ack, rx))
@@ -546,12 +587,7 @@ impl Driver for ClaudePrintDriver {
                 version: "unpinned".into(),
                 sha256: dummy_digest(),
             });
-        Ok(capability_snapshot(
-            DriverKind::ClaudePrint,
-            &pin,
-            U64(1),
-            U64(1),
-        )?)
+        Ok(capability_snapshot(self.carrier, &pin, U64(1), U64(1))?)
     }
 
     async fn start(&self, spec: InstanceSpec) -> DriverResult<RunHandle> {
@@ -591,11 +627,11 @@ impl Driver for ClaudePrintDriver {
                     .as_deref()
                     .is_some_and(|value| !value.is_empty())
                 {
-                    return Err(DriverError::CapabilityUnsupported(
-                        "claude-print cannot switch effort in-session: relaunch with --effort; \
-                         use the claude-pty or shell-pty carrier for /effort"
-                            .into(),
-                    ));
+                    return Err(DriverError::CapabilityUnsupported(format!(
+                        "{} cannot switch effort in-session: relaunch with --effort; \
+                         use the claude-pty or shell-pty carrier for /effort",
+                        self.carrier_name()
+                    )));
                 }
                 if !switch.model_id.is_empty() {
                     live.process
@@ -644,15 +680,41 @@ impl Driver for ClaudePrintDriver {
         let mut live_guard = self.inner.live.lock().await;
         let recipe = live_guard.as_ref().map(|live| live.recipe.clone());
         if let Some(live) = live_guard.as_mut() {
-            let _ = live.process.close_stdin().await;
-            let _ = live.process.wait().await;
+            close_ladder(live, self.options.close_timeout, self.carrier_name()).await;
         }
         *live_guard = None;
-        *self.inner.events.lock().await = None;
         drop(live_guard);
-        // S5: the child has exited, so the launch overlays can go.
+
+        // Stop this launch's reader before touching the events channel. The
+        // child is already reaped, so its stdout is at EOF and `map_loop` is on
+        // its way out; give it a short bound to finish and deliver the `exited`
+        // lifecycle itself, then abort it if it is still parked.
+        //
+        // The abort is the point. A reader outlives close detached, and a later
+        // `start()` on this driver resets `exit_emitted` for the new launch; a
+        // reader A still parked on `inner.live` at that moment could then emit a
+        // *second* `exited` into launch B's channel. Joining it here (or killing
+        // it) closes that window: by the time `close` returns, no task from this
+        // launch can emit.
+        if let Some(mut reader) = self.reader.lock().await.take()
+            && tokio::time::timeout(Duration::from_millis(500), &mut reader)
+                .await
+                .is_err()
+        {
+            reader.abort();
+        }
+
+        // Whichever path got there first — the reader finishing naturally, or
+        // this call covering an aborted one — emits exactly once
+        // (`exit_emitted`), and only while `events` is still live.
+        let _ = emit_exit(&self.inner, "exited").await;
+        *self.inner.events.lock().await = None;
+        // S5: the child has exited, so the launch overlays can go. The label is
+        // the carrier's wire name, matching the kebab-case the sibling drivers
+        // pass (`claude-pty`, `claude-bg`, `generic-pty`).
+        let carrier = self.carrier_name();
         if let Some(recipe) = recipe {
-            crate::recipe::report_launch_cleanup(&recipe, "claude-print");
+            crate::recipe::report_launch_cleanup(&recipe, carrier);
         }
         Ok(DriverAck::not_dispatched())
     }
@@ -677,7 +739,7 @@ impl Driver for ClaudePrintDriver {
             .clone()
             .ok_or(DriverError::NativeSessionNotFound)?;
         spec.host = native_ref.host_id.clone();
-        spec.driver = DriverKind::ClaudePrint;
+        spec.driver = self.carrier;
         spec.kind = remuda_protocol::AgentKind::Claude;
         self.launch(spec, SessionAction::Resume { session_id })
             .await
@@ -691,20 +753,136 @@ impl Driver for ClaudePrintDriver {
         if session_id.trim().is_empty() {
             return Err(DriverError::NativeSessionNotFound);
         }
-        spec.driver = DriverKind::ClaudePrint;
+        spec.driver = self.carrier;
         self.launch(spec, SessionAction::Resume { session_id })
             .await
     }
 }
 
-async fn map_loop(inner: Arc<Inner>, mut outbound: mpsc::Receiver<Outbound>) {
+/// Close the child on a bounded ladder: stdin EOF with a bounded wait, SIGTERM
+/// to the process group with a bounded wait, then SIGKILL to the group plus a
+/// bounded reap (`print-replacement.md` §2.3).
+///
+/// Stdin EOF is only a request. A child mid-turn, blocked on a `can_use_tool`
+/// nobody answered, or one that simply stopped draining stdin, can ignore it
+/// for as long as it likes — and on the long-lived sdk carrier the previous
+/// unbounded `wait()` turned that into an `instance.close` that never returned.
+/// **Every** rung is bounded, including the EOF request itself: when the child
+/// stops reading and the 64-slot writer channel fills, enqueuing the EOF blocks
+/// exactly the way the subsequent wait could. The function never returns while
+/// still holding a live child it could kill.
+async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
+    // The group id equals the direct child's pid because `spawn_command` puts it
+    // in its own group. Read it before any wait: once reaped, `id()` is `None`.
+    let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
+
+    // Rung 1: the graceful path. Request stdin EOF, then give the child the
+    // whole first slice to leave. The two steps share one bound: `close_stdin`
+    // enqueues onto the writer channel, and that enqueue can block when the
+    // child stopped draining and the channel is full — so it must sit inside
+    // the timeout, not before it. Most closes end here.
+    let first_slice = timeout.mul_f32(0.5);
+    let request_eof_and_wait = async {
+        let _ = live.process.close_stdin().await;
+        let _ = live.process.wait().await;
+    };
+    if tokio::time::timeout(first_slice, request_eof_and_wait)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    // Rung 2: SIGTERM to the whole group, then the second slice. The native
+    // `interrupt` control request is not used here: it travels over stdin, which
+    // rung 1 already asked to close, so nothing further can be written — and
+    // interrupting before EOF would cancel in-flight work on every ordinary
+    // close, which `instance.close` does not promise. The interrupt path stays
+    // in `Driver::cancel`.
+    //
+    // The group gets the signal so a `Bash` tool or MCP server the child spawned
+    // leaves with it instead of outliving the instance. A child with a handler
+    // can use this slice to flush its transcript.
+    debug!(carrier, "close: stdin EOF ignored, terminating the group");
+    terminate_group(pgid, carrier);
+    let second_slice = timeout.saturating_sub(first_slice);
+    if tokio::time::timeout(second_slice, live.process.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    // Rung 3: SIGKILL to the group, which nothing can ignore, then reap so a
+    // zombie cannot survive close. `kill` reaches only the direct child, hence
+    // the group signal first. The reap has a short bound for a child wedged in
+    // uninterruptible kernel IO; such a process cannot be killed by userspace,
+    // but close still returns rather than hanging.
+    warn!(carrier, "close: SIGTERM ignored, killing the process group");
+    kill_group(pgid, carrier);
+    let _ = live.process.kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), live.process.wait()).await;
+}
+
+/// SIGTERM every member of the child's process group. Unix only; on other
+/// platforms the child has no group to signal and `kill()` in the ladder is the
+/// fallback, so this is a no-op there. `None` means the pid was already gone.
+#[cfg(unix)]
+fn terminate_group(pgid: Option<i32>, carrier: &str) {
+    if let Some(pgid) = pgid {
+        signal_child_group(pgid, nix::sys::signal::Signal::SIGTERM, carrier);
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_group(pgid: Option<i32>, carrier: &str) {
+    let _ = (pgid, carrier);
+}
+
+/// SIGKILL every member of the child's process group. Unix only.
+#[cfg(unix)]
+fn kill_group(pgid: Option<i32>, carrier: &str) {
+    if let Some(pgid) = pgid {
+        signal_child_group(pgid, nix::sys::signal::Signal::SIGKILL, carrier);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(pgid: Option<i32>, carrier: &str) {
+    let _ = (pgid, carrier);
+}
+
+/// Send a signal to every member of process group `pgid`.
+///
+/// `unsafe` is forbidden workspace-wide, so this goes through `nix` rather than
+/// a raw `libc::killpg` — the same path `shell_pty/lifecycle.rs` uses. A group
+/// that is already gone (`ESRCH`) is the outcome being asked for, and `EPERM`
+/// means something in it is not ours to signal; neither is worth failing a close
+/// over, so both are logged and swallowed. The `nix` signal type is kept out of
+/// the non-unix callers' signatures so the `cfg(not(unix))` stubs compile.
+#[cfg(unix)]
+fn signal_child_group(pgid: i32, signal: nix::sys::signal::Signal, carrier: &str) {
+    if pgid <= 0 {
+        return;
+    }
+    match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(errno) => debug!(carrier, pgid, %errno, "process-group signal failed"),
+    }
+}
+
+async fn map_loop(
+    inner: Arc<Inner>,
+    mut outbound: mpsc::Receiver<Outbound>,
+    carrier: &'static str,
+) {
     while let Some(frame) = outbound.recv().await {
         if let Err(error) = handle_frame(&inner, frame).await {
-            warn!(%error, "claude-print map failed");
+            warn!(carrier, %error, "stream-json map failed");
         }
     }
     if let Err(error) = emit_exit(&inner, "exited").await {
-        debug!(%error, "claude-print exit lifecycle");
+        debug!(carrier, %error, "exit lifecycle");
     }
 }
 
@@ -809,9 +987,14 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
     Ok(())
 }
 
+/// Emit the session `exited` lifecycle, at most once per launch.
+///
+/// Two callers race for it: the reader task when stdout hits EOF, and
+/// [`Driver::close`] after the ladder. Whichever arrives first wins; the other
+/// is a no-op, so a consumer never sees the session exit twice (§2.3).
 async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
-    if inner.closed.load(Ordering::SeqCst) {
-        // still emit
+    if inner.exit_emitted.swap(true, Ordering::SeqCst) {
+        return Ok(());
     }
     let observation = {
         let mut mapper = inner.mapper.lock().await;
@@ -1329,6 +1512,23 @@ fn map_task_notification(
 }
 
 impl Mapper {
+    /// Completeness for a streamed content block: `Partial` while it is still
+    /// open, `Structured` once the final block closes it.
+    ///
+    /// D-028a item 3 / `print-replacement.md` §2.5: on the sdk carrier a stream
+    /// delta is explicitly a partial observation and the final assistant block
+    /// is the authority. `claude-print` kept every content observation
+    /// `Structured` before this parameter existed, and stays that way — its
+    /// consumers and journal fixtures were built against that, and nothing
+    /// measured on print changed here.
+    fn content_completeness(&self, closed: bool) -> Completeness {
+        if closed || self.driver_kind != DriverKind::ClaudeSdk {
+            Completeness::Structured
+        } else {
+            Completeness::Partial
+        }
+    }
+
     fn observation(
         &mut self,
         completeness: Completeness,
@@ -1855,7 +2055,7 @@ fn refuse_prohibited_argv(argv: &[String]) -> DriverResult<()> {
             )
     }) {
         return Err(DriverError::NativeFeatureDisabled(
-            "refusing prohibited flag on claude-print argv".into(),
+            "refusing prohibited flag on stream-json argv".into(),
         ));
     }
     Ok(())
@@ -1992,6 +2192,55 @@ fn extract_local_stdout(content: &str) -> String {
     let body = &content[start + "<local-command-stdout>".len()..];
     let end = body.find("</local-command-stdout>").unwrap_or(body.len());
     body[..end].trim().to_owned()
+}
+
+/// Test-only stdout mapper over the real stream assembler.
+///
+/// The live path is [`ClaudePrintDriver`]'s reader task, whose [`Mapper`] is
+/// private. `tests/claude_sdk_stream.rs` replays recorded NDJSON through the
+/// same `map_outbound` the driver uses, so a fixture assertion is an assertion
+/// about production behaviour rather than a reimplementation of it.
+#[cfg(any(test, feature = "test-stub"))]
+pub struct StdoutMapper {
+    mapper: Mapper,
+}
+
+#[cfg(any(test, feature = "test-stub"))]
+impl StdoutMapper {
+    /// Mapper stamping `driver` on channel `stdout`.
+    #[must_use]
+    pub fn new(driver: DriverKind, session_id: &str) -> Self {
+        Self {
+            mapper: Mapper {
+                stream: stream::StreamState::default(),
+                ids: NativeIds::default(),
+                seq: 0,
+                instance_id: InstanceId::new(),
+                run_id: RunId::new(),
+                journal_id: fallback_obj(),
+                host_id: fallback_host(),
+                session_id: session_id.to_owned(),
+                pin: BinaryPin {
+                    abs_path: String::new(),
+                    version: "fixture".into(),
+                    sha256: dummy_digest(),
+                },
+                driver_kind: driver,
+                channel: SourceChannel::Stdout,
+            },
+        }
+    }
+
+    /// Map one decoded stdout frame, exactly as the reader task does.
+    pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
+        map_outbound(&mut self.mapper, &Outbound::from_value(value))
+    }
+
+    /// Native session id the mapper has adopted from `system/init`.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.mapper.session_id
+    }
 }
 
 /// Transcript-to-observations mapper for a live claude-pty session.

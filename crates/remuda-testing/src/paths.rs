@@ -16,6 +16,9 @@ pub enum ScriptKind {
     AskUser,
     /// Workflow `task_*` frames and two `result` lines.
     Workflow,
+    /// Two turns separated by a `{"turn":"end"}` barrier, each with its own
+    /// `result`, for the `claude-sdk` multi-turn carrier (§3 batch 1).
+    TwoTurn,
 }
 
 impl ScriptKind {
@@ -26,12 +29,19 @@ impl ScriptKind {
             Self::Approval => "approval",
             Self::AskUser => "askuser",
             Self::Workflow => "workflow",
+            Self::TwoTurn => "twoturn",
         }
     }
 
     /// Every bundled script, in the order tests usually run them.
-    pub fn all() -> [Self; 4] {
-        [Self::Ok, Self::Approval, Self::AskUser, Self::Workflow]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Ok,
+            Self::Approval,
+            Self::AskUser,
+            Self::Workflow,
+            Self::TwoTurn,
+        ]
     }
 }
 
@@ -42,6 +52,7 @@ pub fn script_kind_from_name(name: &str) -> Option<ScriptKind> {
         "approval" => Some(ScriptKind::Approval),
         "askuser" | "ask" => Some(ScriptKind::AskUser),
         "workflow" | "wf" => Some(ScriptKind::Workflow),
+        "twoturn" | "two-turn" => Some(ScriptKind::TwoTurn),
         _ => None,
     }
 }
@@ -110,6 +121,7 @@ pub fn script_source(kind: ScriptKind) -> &'static str {
         ScriptKind::Approval => include_str!("../fixtures/scripts/approval.jsonl"),
         ScriptKind::AskUser => include_str!("../fixtures/scripts/askuser.jsonl"),
         ScriptKind::Workflow => include_str!("../fixtures/scripts/workflow.jsonl"),
+        ScriptKind::TwoTurn => include_str!("../fixtures/scripts/twoturn.jsonl"),
     }
 }
 

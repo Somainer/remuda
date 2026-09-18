@@ -78,6 +78,7 @@ export type Capability = {
 
 export type DriverKind =
   | "claude-print"
+  | "claude-sdk"
   | "claude-pty"
   | "claude-bg"
   | "codex-appserver"

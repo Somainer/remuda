@@ -29,10 +29,34 @@ pub enum FakeClaudeError {
 
 /// Run the fake until stdin EOF. Returns the process exit code.
 pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
+    // `FAKE_CLAUDE_IGNORE_SIGTERM=1` must take effect **before any thread is
+    // spawned**. SIGTERM is blocked on this thread, so the parent-watch thread
+    // (below) inherits the blocked mask.
+    //
+    // Doing this only after `parent_watch::install` is too late: that watcher
+    // thread would start with SIGTERM unblocked, and the process-directed
+    // SIGTERM the close ladder sends at rung 2 would be delivered *there*,
+    // killing the fake on the default disposition and making the SIGKILL-rung
+    // test vacuous. Real parent death is still caught by the watcher's
+    // `getppid()` poll; blocking the kernel's PDEATHSIG does not disable that.
+    //
+    // Gated by `cfg(unix)` along with the binding, since `block_sigterm` exists
+    // only on unix: on another platform an unconditional binding would be an
+    // unused-variable warning.
+    #[cfg(unix)]
+    if std::env::var("FAKE_CLAUDE_IGNORE_SIGTERM").is_ok_and(|value| value == "1") {
+        block_sigterm();
+    }
+
     // Exit with the spawner if the test is killed. The harness hands us a
     // piped stdin, so its death shows up as EOF anyway; pdeathsig and the
     // parent-pid poll cover the cases where stdin was redirected elsewhere.
     let _parent_watch = crate::parent_watch::install();
+    // `FAKE_CLAUDE_STOP_READING=1`: after answering the `initialize` handshake,
+    // never read stdin again. A child that stopped draining wedges the driver's
+    // 64-slot writer channel, which is what made `close_stdin` itself able to
+    // hang — a behaviour the close ladder has to bound.
+    let stop_reading = std::env::var("FAKE_CLAUDE_STOP_READING").is_ok_and(|value| value == "1");
     if std::env::args()
         .skip(1)
         .any(|arg| arg == "--version" || arg == "-V")
@@ -41,6 +65,30 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         return Ok(0);
     }
     let flags = ClaudeFlags::parse(std::env::args().skip(1));
+    // `FAKE_CLAUDE_ARGV_FILE=<path>`: record the argv this process was actually
+    // launched with, one token per line.
+    //
+    // A golden-argv test that asserts against a literal the driver never reads
+    // proves only that the literal is self-consistent. This lets a test assert
+    // on what the child *received*, which is the thing that would regress if
+    // `-p` ever came back.
+    if let Ok(path) = std::env::var("FAKE_CLAUDE_ARGV_FILE") {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let _ = std::fs::write(&path, argv.join("\n"));
+    }
+    // `FAKE_CLAUDE_GRANDCHILD_PID_FILE=<path>`: spawn one long-lived child in
+    // **this process's group** and write its pid to the file.
+    //
+    // The close ladder's SIGKILL signals the whole group, but `Child::kill` /
+    // `kill_on_drop` reach only the direct child. A grandchild therefore only
+    // dies if rung 3's group signal fires, which makes that rung's coverage
+    // structural rather than relying on `kill_on_drop` to hide a missing
+    // `killpg`. The grandchild deliberately uses no `setsid`, so it inherits
+    // the group `spawn_command` put the fake in; its handle is leaked (std does
+    // not kill-on-drop by default), so the grandchild outlives a direct-child
+    // kill and is reaped only by the group signal.
+    #[cfg(unix)]
+    let _grandchild = spawn_group_grandchild();
     let session_id = flags
         .session_id
         .clone()
@@ -54,6 +102,7 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         cursor: 0,
         last_behavior: None,
         interrupted: false,
+        saw_initialize: false,
         transcript,
     };
     session.emit_init()?;
@@ -67,6 +116,26 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         }
         let incoming: Value = serde_json::from_str(trimmed)?;
         session.handle_incoming(incoming, &mut lines)?;
+        // Handshake done; from here the child never drains stdin. The parent
+        // stdin watch is suppressed for this knob (see parent_watch); the
+        // getppid() poll still reaps us when the test really goes away.
+        if stop_reading && session.saw_initialize {
+            std::thread::sleep(std::time::Duration::from_secs(300));
+        }
+    }
+    // `FAKE_CLAUDE_IGNORE_EOF=1`: do not leave when stdin closes.
+    //
+    // A real child can ignore stdin EOF indefinitely — mid-turn, or blocked on a
+    // `can_use_tool` nobody answered — which is what made an unbounded `wait()`
+    // in `Driver::close` hang forever. The close ladder has to be tested against
+    // a child that actually behaves that way, so this makes the fake one.
+    // Deliberately not driven by a script line: EOF handling is process
+    // behaviour, not conversation.
+    if std::env::var("FAKE_CLAUDE_IGNORE_EOF").is_ok_and(|value| value == "1") {
+        // Park, but never forever: the parent-death watch installed above exits
+        // with the spawner, and this cap keeps a leaked fake from outliving a
+        // test run on a shared host.
+        std::thread::sleep(std::time::Duration::from_secs(300));
     }
     Ok(0)
 }
@@ -78,6 +147,9 @@ struct Session {
     cursor: usize,
     last_behavior: Option<String>,
     interrupted: bool,
+    /// The `initialize` control request has been answered; after this the
+    /// `FAKE_CLAUDE_STOP_READING` knob parks without reading more stdin.
+    saw_initialize: bool,
     transcript: Option<File>,
 }
 
@@ -145,6 +217,7 @@ impl Session {
                 Ok(())
             }
             "initialize" => {
+                self.saw_initialize = true;
                 emit(&initialize_success(&request_id))?;
                 Ok(())
             }
@@ -180,6 +253,7 @@ impl Session {
                     }
                     self.last_behavior = permission_behavior(&response);
                 }
+                ScriptStep::EndTurn => return Ok(()),
                 ScriptStep::Emit(frame) => {
                     if let Some(when) = when_filter(&frame) {
                         let got = self.last_behavior.as_deref().unwrap_or("allow");
@@ -370,4 +444,39 @@ fn rewrite_walk(value: &mut Value, session_id: &str, cwd: &str) {
         }
         _ => {}
     }
+}
+
+/// Block SIGTERM for this process (test knob only).
+///
+/// `nix`'s `signal`/`sigaction` are `unsafe fn` because a *handler function* must
+/// be async-signal-safe, and `unsafe` is forbidden workspace-wide. `sigprocmask`
+/// is safe and, for a process that never unblocks the signal, observably the
+/// same: SIGTERM stays pending and does not kill it, so a close ladder has to
+/// escalate to SIGKILL.
+#[cfg(unix)]
+fn block_sigterm() {
+    let mut set = nix::sys::signal::SigSet::empty();
+    set.add(nix::sys::signal::Signal::SIGTERM);
+    let _ =
+        nix::sys::signal::sigprocmask(nix::sys::signal::SigmaskHow::SIG_BLOCK, Some(&set), None);
+}
+
+/// Spawn a long-lived `sleep` grandchild in this process's group and record its
+/// pid. Unix only. Returns the child handle (kept alive by the caller so it is
+/// not reaped early; it does not kill-on-drop). Returns `None` when not asked
+/// for or when spawn fails — never fatal to the fake itself.
+#[cfg(unix)]
+fn spawn_group_grandchild() -> Option<std::process::Child> {
+    let pid_path = std::env::var("FAKE_CLAUDE_GRANDCHILD_PID_FILE").ok()?;
+    // No `process_group`/`setsid`: stay in the fake's group. `sleep` ignores
+    // stdin, so it survives EOF like the IGNORE_EOF/IGNORE_SIGTERM parent.
+    let child = std::process::Command::new("sleep")
+        .arg("300")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let _ = std::fs::write(&pid_path, child.id().to_string());
+    Some(child)
 }

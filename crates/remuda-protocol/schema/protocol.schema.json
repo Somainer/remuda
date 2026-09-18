@@ -3145,6 +3145,11 @@
           "type": "string"
         },
         {
+          "const": "claude-sdk",
+          "description": "Wire value `claude-sdk`.",
+          "type": "string"
+        },
+        {
           "const": "claude-pty",
           "description": "Wire value `claude-pty`.",
           "type": "string"

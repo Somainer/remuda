@@ -35,11 +35,32 @@ pub enum SettingSources {
     Value(String),
 }
 
+/// Which argv template [`SpawnSpec::argv`] builds.
+///
+/// The two carriers differ by exactly one flag. `-p` is "Print response and
+/// exit", which ends the child after one turn and is the whole reason
+/// `claude-print` cannot be a worker carrier (`print-replacement.md` §2.1,
+/// D-035). Non-interactive mode does not need it: the CLI treats a session as
+/// non-interactive when stdout is not a TTY, and the SDK child has piped stdout,
+/// so the Agent SDK's own argv builder omits `-p` too (§1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpawnMode {
+    /// `claude -p` — one response, then the process exits. Default for
+    /// compatibility with the existing `claude-print` carrier.
+    #[default]
+    Print,
+    /// Agent-SDK-shaped stream-json with **no** `-p`, so stdin stays open and
+    /// each further `user` line is another turn on the same child (§2.1).
+    Sdk,
+}
+
 /// Spawn configuration for a Claude print session.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
     /// Claude binary. Default `claude`.
     pub binary: PathBuf,
+    /// Which argv template to build. Default [`SpawnMode::Print`].
+    pub mode: SpawnMode,
     /// Working directory (`Command::current_dir`; never `--cwd`).
     pub cwd: PathBuf,
     /// `--session-id`. Generated when `None` and `resume` is `None`.
@@ -88,6 +109,7 @@ impl Default for SpawnSpec {
     fn default() -> Self {
         Self {
             binary: PathBuf::from("claude"),
+            mode: SpawnMode::Print,
             cwd: PathBuf::from("."),
             session_id: None,
             resume: None,
@@ -114,14 +136,20 @@ impl Default for SpawnSpec {
 }
 
 impl SpawnSpec {
-    /// Print-mode argv (never `--bare`, `--no-session-persistence`, `--cwd`, or a prompt).
+    /// Stream-json argv (never `--bare`, `--no-session-persistence`, `--cwd`, or a prompt).
+    ///
+    /// [`SpawnMode::Print`] leads with `-p`; [`SpawnMode::Sdk`] omits it and is
+    /// otherwise identical, so the two carriers cannot drift apart.
     pub fn argv(&self) -> Result<Vec<OsString>, Error> {
         if let Some(raw) = &self.raw_argv {
             check_forbidden(raw.iter().map(String::as_str))?;
             return Ok(raw.iter().map(OsString::from).collect());
         }
-        let mut argv: Vec<OsString> = vec![
-            "-p".into(),
+        let mut argv: Vec<OsString> = Vec::new();
+        if self.mode == SpawnMode::Print {
+            argv.push("-p".into());
+        }
+        argv.extend::<Vec<OsString>>(vec![
             "--input-format".into(),
             "stream-json".into(),
             "--output-format".into(),
@@ -130,7 +158,7 @@ impl SpawnSpec {
             "host".into(),
             "--permission-prompt-tool".into(),
             "stdio".into(),
-        ];
+        ]);
         if self.verbose {
             argv.push("--verbose".into());
         }
@@ -279,6 +307,14 @@ impl ClaudeProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own process group, so a close ladder can signal the child *and*
+        // whatever it spawned (`Bash` tools, MCP servers) without the signal
+        // reaching the Node itself — the Node shares the default group. Set at
+        // spawn rather than by a post-spawn `setpgid`, which races the first
+        // grandchild. `process_group` is safe (no `pre_exec`), which matters
+        // because `unsafe` is forbidden workspace-wide.
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().map_err(|source| Error::Spawn {
             binary: binary.to_path_buf(),
             source,
@@ -591,5 +627,81 @@ mod tests {
         };
         let err = spec.argv().expect_err("bare");
         assert!(matches!(err, Error::ForbiddenFlag { .. }));
+    }
+
+    fn argv_text(spec: &SpawnSpec) -> Vec<String> {
+        spec.argv()
+            .expect("argv")
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The whole point of the sdk carrier: `-p` is "Print response and exit",
+    /// so it is the one flag that must not appear (`print-replacement.md` §2.1,
+    /// key decision 3). Everything else stays byte-identical to print, which is
+    /// what keeps the two templates from drifting.
+    #[test]
+    fn sdk_mode_drops_dash_p_and_changes_nothing_else() {
+        let base = SpawnSpec {
+            model: Some("haiku".into()),
+            session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+            ..SpawnSpec::default()
+        };
+        let print = argv_text(&base);
+        let sdk = argv_text(&SpawnSpec {
+            mode: SpawnMode::Sdk,
+            ..base.clone()
+        });
+
+        assert_eq!(print.first().map(String::as_str), Some("-p"));
+        assert!(!sdk.iter().any(|a| a == "-p" || a == "--print"));
+        assert_eq!(sdk, print[1..].to_vec());
+
+        // Non-interactive still comes from piped stdout, so the stream-json
+        // contract and the host permission channel are unchanged (§1.3, §4.2.3).
+        for flag in [
+            "--input-format",
+            "--output-format",
+            "stream-json",
+            "--permission-prompts",
+            "host",
+            "--permission-prompt-tool",
+            "stdio",
+            "--include-partial-messages",
+            "--include-hook-events",
+            "--forward-subagent-text",
+            "--replay-user-messages",
+        ] {
+            assert!(sdk.iter().any(|a| a == flag), "sdk argv missing {flag}");
+        }
+        // §2.1: never these, on either template.
+        for flag in [
+            "--bare",
+            "--safe-mode",
+            "--no-session-persistence",
+            "--continue",
+        ] {
+            assert!(!sdk.iter().any(|a| a == flag), "sdk argv has {flag}");
+        }
+    }
+
+    /// Resume is a new process continuing the same native JSONL (D-026), and it
+    /// is `--resume <id>` rather than `--continue` on both templates.
+    #[test]
+    fn sdk_mode_resume_passes_the_session_id() {
+        let sdk = argv_text(&SpawnSpec {
+            mode: SpawnMode::Sdk,
+            resume: Some("22222222-2222-4222-8222-222222222222".into()),
+            session_id: None,
+            ..SpawnSpec::default()
+        });
+        let at = sdk.iter().position(|a| a == "--resume").expect("--resume");
+        assert_eq!(
+            sdk.get(at + 1).map(String::as_str),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        assert!(!sdk.iter().any(|a| a == "--session-id"));
+        assert!(!sdk.iter().any(|a| a == "-p"));
     }
 }

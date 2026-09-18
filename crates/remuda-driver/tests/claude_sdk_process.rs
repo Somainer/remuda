@@ -65,6 +65,14 @@ fn load_spec() -> InstanceSpec {
 }
 
 fn driver_for(kind: ScriptKind) -> (tempfile::TempDir, ClaudeSdkDriver, InstanceSpec) {
+    driver_with_env(kind, BTreeMap::new())
+}
+
+/// [`driver_for`] plus extra child env (`FAKE_CLAUDE_*` knobs).
+fn driver_with_env(
+    kind: ScriptKind,
+    env: BTreeMap<String, String>,
+) -> (tempfile::TempDir, ClaudeSdkDriver, InstanceSpec) {
     let tmp = tempfile::tempdir().unwrap();
     let launch = tmp.path().join("launch");
     let home = tmp.path().join("home");
@@ -75,11 +83,13 @@ fn driver_for(kind: ScriptKind) -> (tempfile::TempDir, ClaudeSdkDriver, Instance
         "FAKE_CLAUDE_SCRIPT".into(),
         script_path(kind).to_string_lossy().into_owned(),
     );
+    extra.extend(env);
     let mut options =
         ClaudeSdkOptions::new(profile(), launch, home, BinarySource::Pinned(pin_fake()));
     options.origin = InputOrigin::Human;
     options.extra_env = extra;
     options.handshake_timeout = Duration::from_secs(5);
+    options.close_timeout = Duration::from_secs(3);
     let mut spec = load_spec();
     spec.cwd = tmp
         .path()
@@ -88,6 +98,19 @@ fn driver_for(kind: ScriptKind) -> (tempfile::TempDir, ClaudeSdkDriver, Instance
         .to_string_lossy()
         .into_owned();
     (tmp, ClaudeSdkDriver::new(options), spec)
+}
+
+/// Whether the child named by the launch ack is still running.
+///
+/// `spawn_command` puts the child in its own process group, so its pid is also
+/// its pgid and the existing `kill(-pgid, 0)` probe answers this without parsing
+/// `ps`. A process we may not signal still counts as alive, which is the honest
+/// answer for this assertion.
+fn process_alive(pid: &str) -> bool {
+    let Ok(pid) = pid.parse::<i32>() else {
+        return false;
+    };
+    remuda_driver::shell_pty::lifecycle::group_alive(pid)
 }
 
 fn prompt(text: &str) -> DriverInput {
@@ -152,16 +175,49 @@ fn turn_done_count(obs: &[Observation]) -> usize {
         .count()
 }
 
-/// Golden argv. `-p` is the whole difference between the carriers, and its
-/// absence is what lets stdin stay open (§2.1, key decision 3).
-#[test]
-fn sdk_argv_has_no_dash_p() {
-    let argv = fake_claude_argv("11111111-1111-4111-8111-111111111111", false);
+/// Golden argv, read back from the child itself.
+///
+/// The earlier version of this test asserted against `fake_claude_argv`, a
+/// literal the driver never reads — so it could only ever prove the literal was
+/// self-consistent. The fake now records its own argv, so this asserts on what
+/// the process was actually launched with, which is the thing that regresses if
+/// `-p` ever comes back (§2.1).
+#[tokio::test]
+async fn the_child_is_launched_without_dash_p() {
+    let recorded = std::env::temp_dir().join(format!(
+        "remuda-sdk-argv-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_CLAUDE_ARGV_FILE".into(),
+        recorded.to_string_lossy().into_owned(),
+    );
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let _handle = driver.start(spec).await.expect("start");
+
+    let argv: Vec<String> = std::fs::read_to_string(&recorded)
+        .expect("fake recorded its argv")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let _ = std::fs::remove_file(&recorded);
+
     assert!(
         !argv.iter().any(|a| a == "-p" || a == "--print"),
-        "sdk argv must not print-and-exit: {argv:?}"
+        "the child must not print-and-exit: {argv:?}"
     );
-    for flag in ["--input-format", "--output-format", "stream-json"] {
+    for flag in [
+        "--input-format",
+        "--output-format",
+        "stream-json",
+        "--permission-prompt-tool",
+        "stdio",
+    ] {
         assert!(argv.iter().any(|a| a == flag), "missing {flag} in {argv:?}");
     }
     // §2.1: never these, on any template.
@@ -171,8 +227,9 @@ fn sdk_argv_has_no_dash_p() {
         "--no-session-persistence",
         "--continue",
     ] {
-        assert!(!argv.iter().any(|a| a == flag), "sdk argv has {flag}");
+        assert!(!argv.iter().any(|a| a == flag), "child argv has {flag}");
     }
+    driver.close().await.expect("close");
 }
 
 /// One turn end to end: the §2.5 observation table, stamped `claude-sdk` on
@@ -259,6 +316,14 @@ async fn a_second_send_reaches_the_same_process_and_session() {
         })
         .expect("native session id");
 
+    // The child must still be running *between* the turns — that is the property
+    // print does not have, and checking it here (rather than only at the end)
+    // pins where a regression would appear.
+    assert!(
+        process_alive(&pid),
+        "pid {pid} exited after the first turn: the child did not survive it"
+    );
+
     // No relaunch, no resume: the same driver object, the same live stdin.
     driver.send(prompt("second")).await.expect("second send");
     let second = collect_until(&mut handle, Duration::from_secs(5), |obs| {
@@ -277,17 +342,23 @@ async fn a_second_send_reaches_the_same_process_and_session() {
         }
     }
 
-    // Same process: `capabilities` reads the live recipe, and the ack pid was
-    // minted once at launch. A relaunch would have replaced both.
+    // Same OS process, observed across both turns. The launch ack is a snapshot
+    // taken once, so comparing it with itself proves nothing; what matters is
+    // that the process it named is still the live child after the second turn.
+    assert!(
+        process_alive(&pid),
+        "pid {pid} is gone after two turns: the child did not survive, which is \
+         exactly the print defect this carrier exists to fix"
+    );
     let live_pin = driver.capabilities().await.expect("capabilities");
     assert_eq!(live_pin.driver_kind, DriverKind::ClaudeSdk);
-    assert_eq!(
-        handle.ack().native_ids.get("pid"),
-        Some(&pid),
-        "pid changed: the second turn went to a different process"
-    );
 
     driver.close().await.expect("close");
+    // And the ladder actually reaped it.
+    assert!(
+        !process_alive(&pid),
+        "pid {pid} outlived close: the ladder did not reap the child"
+    );
 }
 
 /// Resume is a **new** process with `--resume <id>` (D-026); the exited child is
@@ -347,4 +418,90 @@ async fn tty_surface_is_unsupported() {
     ));
     assert!(driver.screen_read().await.expect("screen_read").is_none());
     assert!(driver.tty_bridge().await.is_none());
+}
+
+/// §2.3: `close` is a bounded ladder, not an unbounded `wait`.
+///
+/// The child here ignores stdin EOF, which is exactly what a real one does when
+/// it is mid-turn or blocked on an unanswered `can_use_tool`. The previous
+/// implementation called `child.wait()` with no bound while holding `inner.live`,
+/// so `instance.close` on the long-lived sdk carrier would hang forever and take
+/// every other control operation with it. Close must return inside the bound
+/// with the child gone.
+#[tokio::test]
+async fn close_returns_within_the_bound_when_the_child_ignores_stdin_eof() {
+    let mut env = BTreeMap::new();
+    env.insert("FAKE_CLAUDE_IGNORE_EOF".into(), "1".into());
+    let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
+    let mut handle = driver.start(spec).await.expect("start");
+    let pid = handle
+        .ack()
+        .native_ids
+        .get("pid")
+        .expect("pid on the launch ack")
+        .clone();
+    assert!(process_alive(&pid), "child should be running before close");
+
+    // `close_timeout` is 3s in this harness; allow the three rungs plus the
+    // final reap, and still fail well before a hang would look like a pass.
+    let started = std::time::Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(20), driver.close()).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        closed.is_ok(),
+        "close did not return: the ladder is unbounded again"
+    );
+    closed.unwrap().expect("close ack");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "close took {elapsed:?}, which is not a bounded ladder"
+    );
+    assert!(
+        !process_alive(&pid),
+        "pid {pid} survived close: the ladder never reached SIGKILL"
+    );
+
+    // Exactly one `exited` lifecycle, and it is still delivered even though the
+    // child had to be killed — a consumer must not be left without it.
+    let mut exits = 0;
+    while let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(200), handle.recv()).await
+    {
+        if lifecycle_named(&obs) == Some("session") && lifecycle_status(&obs) == Some("exited") {
+            exits += 1;
+        }
+    }
+    assert_eq!(exits, 1, "expected exactly one session `exited` lifecycle");
+}
+
+/// A child that leaves on its own must not be killed, and must still report one
+/// `exited` lifecycle — the reader task and `close` race for it.
+#[tokio::test]
+async fn a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle() {
+    let (_tmp, driver, spec) = driver_for(ScriptKind::Ok);
+    let mut handle = driver.start(spec).await.expect("start");
+    let pid = handle.ack().native_ids.get("pid").expect("pid").clone();
+    driver.send(prompt("hi")).await.expect("send");
+    let _ = collect_until(&mut handle, Duration::from_secs(5), |obs| {
+        turn_done_count(obs) >= 1
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    driver.close().await.expect("close");
+    // The graceful rung is 60% of a 3s budget, so a cooperative exit is fast.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a cooperative child should not have waited for the interrupt rung"
+    );
+    assert!(!process_alive(&pid), "child should be reaped");
+
+    let mut exits = 0;
+    while let Ok(Some(obs)) = tokio::time::timeout(Duration::from_millis(200), handle.recv()).await
+    {
+        if lifecycle_named(&obs) == Some("session") && lifecycle_status(&obs) == Some("exited") {
+            exits += 1;
+        }
+    }
+    assert_eq!(exits, 1, "expected exactly one session `exited` lifecycle");
 }

@@ -84,6 +84,13 @@ pub struct ClaudePrintOptions {
     pub setting_sources: Option<Vec<String>>,
     /// Initialize handshake timeout.
     pub handshake_timeout: Duration,
+    /// How long [`Driver::close`] waits for the child to leave on its own after
+    /// stdin EOF, before escalating to interrupt and then SIGKILL (§2.3).
+    ///
+    /// Stdin EOF is a request, not a guarantee: a child mid-turn, or blocked on
+    /// an unanswered `can_use_tool`, can ignore it indefinitely. An unbounded
+    /// wait would hang `instance.close` forever on the long-lived sdk carrier.
+    pub close_timeout: Duration,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
 }
@@ -108,6 +115,7 @@ impl ClaudePrintOptions {
             agent_mcp: None,
             setting_sources: None,
             handshake_timeout: Duration::from_secs(30),
+            close_timeout: Duration::from_secs(10),
             settings_overlay_path: None,
         }
     }
@@ -260,6 +268,9 @@ struct Inner {
     policy: Mutex<PermissionPolicy>,
     events: Mutex<Option<mpsc::Sender<Observation>>>,
     closed: AtomicBool,
+    /// Whether the `exited` session lifecycle has already been emitted, so the
+    /// reader task and [`Driver::close`] cannot both emit it (§2.3: exactly once).
+    exit_emitted: AtomicBool,
     /// Last successfully launched spec; `resume` re-materializes from this.
     last_spec: Mutex<Option<InstanceSpec>>,
 }
@@ -319,6 +330,7 @@ impl ClaudePrintDriver {
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                exit_emitted: AtomicBool::new(false),
                 last_spec: Mutex::new(None),
             }),
             reader: Mutex::new(None),
@@ -426,6 +438,7 @@ impl ClaudePrintDriver {
         *self.inner.events.lock().await = Some(tx);
         *self.inner.last_spec.lock().await = Some(spec.clone());
         self.inner.closed.store(false, Ordering::SeqCst);
+        self.inner.exit_emitted.store(false, Ordering::SeqCst);
 
         let mut ack = DriverAck::transport_written();
         ack.native_ids.insert("sessionId".into(), session_id);
@@ -442,8 +455,9 @@ impl ClaudePrintDriver {
         });
 
         let inner = Arc::clone(&self.inner);
+        let carrier = self.carrier_name();
         let reader = tokio::spawn(async move {
-            map_loop(inner, outbound).await;
+            map_loop(inner, outbound, carrier).await;
         });
         *self.reader.lock().await = Some(reader);
         Ok(RunHandle::new(recipe, ack, rx))
@@ -664,12 +678,17 @@ impl Driver for ClaudePrintDriver {
         let mut live_guard = self.inner.live.lock().await;
         let recipe = live_guard.as_ref().map(|live| live.recipe.clone());
         if let Some(live) = live_guard.as_mut() {
-            let _ = live.process.close_stdin().await;
-            let _ = live.process.wait().await;
+            close_ladder(live, self.options.close_timeout, self.carrier_name()).await;
         }
         *live_guard = None;
-        *self.inner.events.lock().await = None;
         drop(live_guard);
+        // The reader task ends at stdout EOF and calls `emit_exit`, but it races
+        // this close: if it has not run yet, clearing `events` first would drop
+        // the lifecycle entirely. Emit here (idempotent, `exit_emitted`) and
+        // only then close the channel, so `exited` is observed exactly once
+        // whether the child left on its own or was killed by the ladder.
+        let _ = emit_exit(&self.inner, "exited").await;
+        *self.inner.events.lock().await = None;
         // S5: the child has exited, so the launch overlays can go. The label is
         // the carrier's wire name, matching the kebab-case the sibling drivers
         // pass (`claude-pty`, `claude-bg`, `generic-pty`).
@@ -720,14 +739,98 @@ impl Driver for ClaudePrintDriver {
     }
 }
 
-async fn map_loop(inner: Arc<Inner>, mut outbound: mpsc::Receiver<Outbound>) {
+/// Close the child on a bounded ladder: stdin EOF, then interrupt, then SIGKILL
+/// of the child's process group (`print-replacement.md` §2.3).
+///
+/// Stdin EOF is only a request. A child mid-turn, or blocked on a `can_use_tool`
+/// nobody answered, can ignore it for as long as it likes — and on the
+/// long-lived sdk carrier the previous unbounded `wait()` turned that into an
+/// `instance.close` that never returned. Each rung gets its own slice of
+/// `timeout`, and the function returns once the child is reaped or the ladder is
+/// exhausted; it never returns while still holding a live child it could kill.
+async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
+    // The group id equals the direct child's pid because `spawn_command` puts it
+    // in its own group. Read it before any wait: once reaped, `id()` is `None`.
+    let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
+    let _ = live.process.close_stdin().await;
+
+    // Rung 1: the graceful path. Most closes end here.
+    let graceful = timeout.mul_f32(0.6);
+    if tokio::time::timeout(graceful, live.process.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    // Rung 2: ask the CLI to abandon the turn, which unblocks a child waiting on
+    // its own in-flight work. This is the same native control request `cancel`
+    // uses, not a signal.
+    debug!(carrier, "close: stdin EOF ignored, sending interrupt");
+    let _ = live.process.interrupt(true).await;
+    let after_interrupt = timeout.saturating_sub(graceful);
+    if tokio::time::timeout(after_interrupt, live.process.wait())
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    // Rung 3: SIGKILL. `kill` only reaches the direct child, so signal the whole
+    // group first — a `Bash` tool or MCP server it spawned would otherwise
+    // outlive the instance holding the workspace open.
+    warn!(
+        carrier,
+        "close: interrupt ignored, killing the process group"
+    );
+    if let Some(pgid) = pgid {
+        kill_group(pgid, carrier);
+    }
+    let _ = live.process.kill();
+    // Reap it, so the ladder cannot leave a zombie behind. The child is killed
+    // and unignorably so; a short bound still keeps `close` from hanging if the
+    // process is wedged in the kernel (uninterruptible IO).
+    let _ = tokio::time::timeout(Duration::from_secs(2), live.process.wait()).await;
+}
+
+/// SIGKILL every member of `pgid`, treating an already-gone group as success.
+///
+/// `unsafe` is forbidden workspace-wide, so this goes through `nix` rather than
+/// a raw `libc::killpg`. A group that is already gone (`ESRCH`) is the outcome
+/// being asked for, and `EPERM` means something in it is not ours to kill —
+/// neither is worth failing a close over, so both are logged and swallowed.
+fn kill_group(pgid: i32, carrier: &str) {
+    #[cfg(unix)]
+    {
+        if pgid <= 0 {
+            return;
+        }
+        match nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(errno) => debug!(carrier, pgid, %errno, "process-group kill failed"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, carrier);
+    }
+}
+
+async fn map_loop(
+    inner: Arc<Inner>,
+    mut outbound: mpsc::Receiver<Outbound>,
+    carrier: &'static str,
+) {
     while let Some(frame) = outbound.recv().await {
         if let Err(error) = handle_frame(&inner, frame).await {
-            warn!(%error, "claude-print map failed");
+            warn!(carrier, %error, "stream-json map failed");
         }
     }
     if let Err(error) = emit_exit(&inner, "exited").await {
-        debug!(%error, "claude-print exit lifecycle");
+        debug!(carrier, %error, "exit lifecycle");
     }
 }
 
@@ -832,9 +935,14 @@ async fn emit_all(inner: &Inner, observations: Vec<Observation>) -> DriverResult
     Ok(())
 }
 
+/// Emit the session `exited` lifecycle, at most once per launch.
+///
+/// Two callers race for it: the reader task when stdout hits EOF, and
+/// [`Driver::close`] after the ladder. Whichever arrives first wins; the other
+/// is a no-op, so a consumer never sees the session exit twice (§2.3).
 async fn emit_exit(inner: &Inner, status: &str) -> DriverResult<()> {
-    if inner.closed.load(Ordering::SeqCst) {
-        // still emit
+    if inner.exit_emitted.swap(true, Ordering::SeqCst) {
+        return Ok(());
     }
     let observation = {
         let mut mapper = inner.mapper.lock().await;

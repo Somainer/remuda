@@ -1103,10 +1103,12 @@ async fn switch_worker_model(
         .await;
     }
 
-    // The verdict is the acceptance authority: record a switch the CLI
-    // actually applied even when it showed no confirmation prompt. The
-    // confirmed-dialog path is recorded as before when the screen cannot be
-    // read back.
+    // The verdict is the acceptance authority on 2.1.272 (no dialog). When
+    // no verdict was read back, fall back to the dialog gate outcome: an
+    // Enter was only sent because the confirmation dialog was seen, so
+    // confirmed=true means the legacy path accepted and the row is updated;
+    // only a genuinely unconfirmed attempt (neither dialog nor verdict) stays
+    // unrecorded and asks the operator to answer manually.
     let verdict = await_model_verdict(&state, &host_id, &instance_id, &model).await;
     let (applied, accepted_id, rejected) = match verdict {
         Some(ModelVerdict::Accepted(id)) => (true, Some(id), None),
@@ -1151,13 +1153,16 @@ async fn switch_worker_model(
         )
         .await
         .map_err(map_store)?;
-    let hint = match (confirmed, rejected, accepted_id.is_some()) {
-        (_, _, true) if confirmed => "model switched and confirmed",
-        (_, _, true) => "model applied with no confirmation dialog (verdict read back)",
-        (_, Some("not-found"), false) => "model id not found by the CLI; switch not recorded",
-        (_, Some(_), false) => "model switch dismissed; previous model kept",
-        _ => {
+    let hint = match (rejected, applied, confirmed) {
+        (Some("not-found"), _, _) => "model id not found by the CLI; switch not recorded",
+        (Some(_), _, _) => "model switch dismissed; previous model kept",
+        (None, true, true) => "model switched and confirmed",
+        (None, true, false) => "model applied with no confirmation dialog (verdict read back)",
+        (None, false, false) => {
             "no confirmation dialog or verdict observed; not sending Enter — answer it with `remuda worker answer <name> enter`"
+        }
+        (None, false, true) => {
+            "confirmation dialog answered, but no read-back was observed; verify the model on the worker"
         }
     };
     Ok(Json(json!({

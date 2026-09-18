@@ -307,6 +307,14 @@ impl ClaudeProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own process group, so a close ladder can signal the child *and*
+        // whatever it spawned (`Bash` tools, MCP servers) without the signal
+        // reaching the Node itself — the Node shares the default group. Set at
+        // spawn rather than by a post-spawn `setpgid`, which races the first
+        // grandchild. `process_group` is safe (no `pre_exec`), which matters
+        // because `unsafe` is forbidden workspace-wide.
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().map_err(|source| Error::Spawn {
             binary: binary.to_path_buf(),
             source,

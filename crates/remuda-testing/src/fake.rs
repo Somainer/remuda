@@ -41,6 +41,17 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         return Ok(0);
     }
     let flags = ClaudeFlags::parse(std::env::args().skip(1));
+    // `FAKE_CLAUDE_ARGV_FILE=<path>`: record the argv this process was actually
+    // launched with, one token per line.
+    //
+    // A golden-argv test that asserts against a literal the driver never reads
+    // proves only that the literal is self-consistent. This lets a test assert
+    // on what the child *received*, which is the thing that would regress if
+    // `-p` ever came back.
+    if let Ok(path) = std::env::var("FAKE_CLAUDE_ARGV_FILE") {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let _ = std::fs::write(&path, argv.join("\n"));
+    }
     let session_id = flags
         .session_id
         .clone()
@@ -67,6 +78,20 @@ pub fn run_fake_claude() -> Result<i32, FakeClaudeError> {
         }
         let incoming: Value = serde_json::from_str(trimmed)?;
         session.handle_incoming(incoming, &mut lines)?;
+    }
+    // `FAKE_CLAUDE_IGNORE_EOF=1`: do not leave when stdin closes.
+    //
+    // A real child can ignore stdin EOF indefinitely — mid-turn, or blocked on a
+    // `can_use_tool` nobody answered — which is what made an unbounded `wait()`
+    // in `Driver::close` hang forever. The close ladder has to be tested against
+    // a child that actually behaves that way, so this makes the fake one.
+    // Deliberately not driven by a script line: EOF handling is process
+    // behaviour, not conversation.
+    if std::env::var("FAKE_CLAUDE_IGNORE_EOF").is_ok_and(|value| value == "1") {
+        // Park, but never forever: the parent-death watch installed above exits
+        // with the spawner, and this cap keeps a leaked fake from outliving a
+        // test run on a shared host.
+        std::thread::sleep(std::time::Duration::from_secs(300));
     }
     Ok(0)
 }

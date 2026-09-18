@@ -301,11 +301,11 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 状态条渲染纯 reducer `turnEnd` 的唯一裁决（`working | waiting | ended | unknown` + `decidedBy` + `endedAt`），不再直接渲染 hook 相位锁存。`phase.ts` / `liveStatus.ts` 仍是纯 fold，所有消费决策归 reducer。优先级从严到宽：
 
 1. **人机回合高于一切结束信号**：本 instance 有 pending 交互、screen 锁存自身报 blocked、或新鲜的 hook `blocked` 相位时，无论 hook 通道多静默、spinner 是否已清空，都判 `waiting`。parked 权限 hook 本身就不发记录、其对话框又会清掉 spinner，否则会在 6 s stall 预算后误判「回合结束」并把代持消息 POST 给仍卡在对话框上的 agent。一个 hook 已静默又无 pending 的 blocked 是 `unknown`，绝不是「等待操作」。
-2. hook 的 `turn-ended` / `interrupted` **无条件**直接定终（harness 自己的终态词，新到即覆盖 `decidedBy=hook`）；hook 通道**新鲜**时，hook 活动相位持有回合（设计 §2.4 规则 6，screen 的中途 idle 边沿被忽略）。
+2. hook 的 `turn-ended` / `interrupted` **无条件**直接定终（harness 自己的终态词，新到即覆盖 `decidedBy=hook`）；文件层（grok 的 `turn.live` 相位打在既有 lifecycle 上、`tier=file`）的终态相位同样无条件定终，但 `decidedBy=file`——该 run 没有 hook 通道，绝不能把文件层的回合结束记到 hook 名下。hook 通道**新鲜**时，hook 活动相位持有回合（设计 §2.4 规则 6，screen 的中途 idle 边沿被忽略）。
 3. hook 通道一旦 `stalled` / `never-materialised`（`channelHealth`，3×2 s）即降为参考，screen 的非活动 `live.status`（或 pty `agent_status`）结束回合——但 screen 清空每「离开」只发一次、其 `observedAt` 会留到下一回合，所以要求 screen 锚 **不早于** 锁存相位的 `since`，避免短回合沿用上一回合的清空时间。
 4. 再没有 screen 时，晚于锁存 `since` 的 assistant 消息从 transcript 收尾结束。
 
-- `ended` 显示「回合结束」+ 小芯片 `data-testid=live-decided-by`（值 hook/screen/transcript）；elapsed 始终锚在**回合开始**（submit/spinner 再锚，跨回合从事件列表重取，不依赖会被 turn-ended/clear 覆盖的锁存 `since`），结束时冻结在该回合时长 `endedAt − start`（即终端显示的时长），而不是塌成 0:00 或在稍后打开页面时变成「结束以来」；移除 Esc 打断按钮。迟到的 hook `Stop` 改判 `decidedBy`，但 composer 的 `ended→idle` 边沿幂等，不二次 flush、不移动时长。
+- `ended` 显示「回合结束」+ 小芯片 `data-testid=live-decided-by`（值 hook/file/screen/transcript；`file` 来自锁存相位的 `tier=file` 标签，grok 文件层结束的回合显示 `file` 而非 `hook`）；elapsed 始终锚在**回合开始**（submit/spinner 再锚，跨回合从事件列表重取，不依赖会被 turn-ended/clear 覆盖的锁存 `since`），结束时冻结在该回合时长 `endedAt − start`（即终端显示的时长），而不是塌成 0:00 或在稍后打开页面时变成「结束以来」；移除 Esc 打断按钮。迟到的 hook `Stop` 改判 `decidedBy`，但 composer 的 `ended→idle` 边沿幂等，不二次 flush、不移动时长。
 - composer 相位由该 reducer 与 `projectStatus` 合并：`ended→idle` 是工作→空闲边沿，已有 effect 恰好调用一次 `flushHeld`；`unknown` 退回 instance 投影，不塌成 idle/blocked。
 - amber 静默注记可附 Node 侧实际跑过的检查名（`relay-missing` / `socket-refused` / `link-stalled`，来自 instance 上的 `hook.silence` 诊断）。屏幕轮询层只真正探测 relay 与 socket：一个正常结束的会话本来就不再发 hook，relay/socket 都健康时**不报** `link-stalled`（该判定只属于持有 journal flush 游标的 transport 层），新鲜 tier（Stop 刚到）也不写记录；没有检查结果时徽标保持原样，绝不猜原因。
 - `Notification` hook（含 Claude Code 的 `idle_prompt`「等待你输入」）是结束后的咨询，不是阻断请求：不抬相位、不算 waiting；在站内以 toast + 会话页小通知列表呈现（文案、时间、可忽略；`permission_prompt` 类链接到待处理对话卡），既有 push 路径不变。注意 grok 没有单独的阻断权限 hook——它唯一的权限提示就是 `Notification(permission_prompt)`；移除其 waiting 语义后，grok 的 blocked 状态**只**由 screen 层（OSC/屏幕 blocked 锁存与 pending 对话框识别）给出。

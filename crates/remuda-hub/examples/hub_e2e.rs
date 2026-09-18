@@ -255,6 +255,10 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
             // an unchanged epoch is a reconnect and settles nothing.
             "nodeEpoch": format!("epoch-e2e-{epoch}"),
             "instances": inventory,
+            // This fake node always found its store, so an empty inventory is
+            // a claim the Hub may act on. A real Node that cannot say this
+            // omits the key instead (see `DevNode::announceable_inventory`).
+            "instanceStoreFound": true,
             "host": {
                 "hostname": "e2e-fake-node.local",
                 "workspaceRevision": 1,

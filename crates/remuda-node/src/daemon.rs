@@ -478,7 +478,14 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     params["durable"] = json!(true);
     params["controllerTakeover"] = json!(true);
     params["controllerGeneration"] = json!(generation.to_string());
-    params["instances"] = serde_json::to_value(node.list_instances()?.items)?;
+    // Absent rather than empty when this Node cannot vouch for its store: the
+    // Hub settles every live row an inventory omits, so an unwarranted `[]`
+    // would exit sessions this process simply cannot see. The attestation
+    // travels with the list it belongs to.
+    if let Some(inventory) = node.announceable_inventory()? {
+        params["instances"] = inventory;
+        params["instanceStoreFound"] = json!(true);
+    }
     params["instanceWatermarks"] = json!(
         shared
             .acked

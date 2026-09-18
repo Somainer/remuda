@@ -268,6 +268,39 @@ impl DevNode {
         })
     }
 
+    /// The instance inventory to announce at hello, or `None` when it cannot
+    /// be vouched for.
+    ///
+    /// The Hub settles every live row a hello omits, so an *empty* inventory
+    /// is a destructive claim: it says this Node holds nothing, and the Hub
+    /// acts on that by exiting every session on the host. A Node that cannot
+    /// attest that it actually found its instance store — a `--data-dir`
+    /// pointed somewhere else, a wiped disk — enumerates zero rows without
+    /// that meaning anything, so it reports `None` and the hello carries no
+    /// `instances` key at all. The Hub reads an absent key as "cannot
+    /// compare" and leaves the rows alone, which is the only safe reading.
+    pub fn announceable_inventory(&self) -> Result<Option<Value>, NodeError> {
+        let items = self.inner.store.list_instances()?;
+        if items.is_empty() && !self.inner.store.instance_store_is_durable() {
+            tracing::warn!(
+                "instance store not found under this data dir; refusing to announce an \
+                 empty inventory (it would settle every row on this host)"
+            );
+            return Ok(None);
+        }
+        serde_json::to_value(items).map(Some).map_err(Into::into)
+    }
+
+    /// Whether this Node found a durable instance store where it expected one.
+    ///
+    /// The attestation that travels with the inventory. It is what lets a Hub
+    /// honour an empty inventory — "I really do hold nothing" — instead of
+    /// having to treat every empty list as a possible wrong `--data-dir`.
+    #[must_use]
+    pub fn found_instance_store(&self) -> bool {
+        self.inner.store.instance_store_is_durable()
+    }
+
     /// Read one Instance.
     pub fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError> {
         self.inner.store.get_instance(instance_id)

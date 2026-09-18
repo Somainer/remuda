@@ -20060,10 +20060,10 @@
           "type": "object"
         },
         {
-          "description": "Host offline, instance closed, or carrier gone.\n\n`reason` is the machine-readable why — the carrier code\n(`host-offline`, `instance-closed`, …) or the instance row's own\n`lastError` (`node-epoch-changed`, `host-lost`, …) when the row is\nauthoritative. It is carried rather than folded into `detail` alone so\n`remuda watch`'s reason column can print it: a settled\n`node-epoch-changed` is the one fact that tells the owner the\nconversation can still be resumed (2026-09-18 demo).",
+          "description": "Host offline, instance closed, or carrier gone.\n\n`reason` is the machine-readable why — the carrier code\n(`host-offline`, `instance-closed`, …) or the instance row's own\n`lastError` (`node-epoch-changed`, `host-lost`, …) when the row is\nauthoritative. It is carried rather than folded into `detail` alone so\n`remuda watch`'s reason column can print it: a settled\n`node-epoch-changed` is the one fact that tells the owner the\nconversation can still be resumed (2026-09-18 demo).\n\nDefaulted on read, because this enum is persisted verbatim inside\n`worker_roster.doc_json`. Every roster row written before the field\nexisted is `{\"status\":\"gone\"}` with nothing else, and a required field\nwould make those rows fail to deserialize — which takes out the whole\nroster list, and node.hello itself, since the epoch reconcile reads\nworker rows.",
           "properties": {
             "reason": {
-              "description": "Machine-readable why.",
+              "description": "Machine-readable why.\n\nOmitted when empty rather than sent as `\"\"`, which is what keeps the\nfield honest in the schema: the generator describes the *serialize*\ncontract, so a field that is always written is always required there\nno matter how lax its reader is. Only a skip makes the two agree.",
               "type": "string"
             },
             "status": {
@@ -20072,8 +20072,7 @@
             }
           },
           "required": [
-            "status",
-            "reason"
+            "status"
           ],
           "type": "object"
         },
@@ -20225,10 +20224,10 @@
           "type": "object"
         },
         {
-          "description": "Host offline, instance closed, or carrier gone.\n\n`reason` is the machine-readable why — the carrier code\n(`host-offline`, `instance-closed`, …) or the instance row's own\n`lastError` (`node-epoch-changed`, `host-lost`, …) when the row is\nauthoritative. It is carried rather than folded into `detail` alone so\n`remuda watch`'s reason column can print it: a settled\n`node-epoch-changed` is the one fact that tells the owner the\nconversation can still be resumed (2026-09-18 demo).",
+          "description": "Host offline, instance closed, or carrier gone.\n\n`reason` is the machine-readable why — the carrier code\n(`host-offline`, `instance-closed`, …) or the instance row's own\n`lastError` (`node-epoch-changed`, `host-lost`, …) when the row is\nauthoritative. It is carried rather than folded into `detail` alone so\n`remuda watch`'s reason column can print it: a settled\n`node-epoch-changed` is the one fact that tells the owner the\nconversation can still be resumed (2026-09-18 demo).\n\nDefaulted on read, because this enum is persisted verbatim inside\n`worker_roster.doc_json`. Every roster row written before the field\nexisted is `{\"status\":\"gone\"}` with nothing else, and a required field\nwould make those rows fail to deserialize — which takes out the whole\nroster list, and node.hello itself, since the epoch reconcile reads\nworker rows.",
           "properties": {
             "reason": {
-              "description": "Machine-readable why.",
+              "description": "Machine-readable why.\n\nOmitted when empty rather than sent as `\"\"`, which is what keeps the\nfield honest in the schema: the generator describes the *serialize*\ncontract, so a field that is always written is always required there\nno matter how lax its reader is. Only a skip makes the two agree.",
               "type": "string"
             },
             "status": {
@@ -20237,8 +20236,7 @@
             }
           },
           "required": [
-            "status",
-            "reason"
+            "status"
           ],
           "type": "object"
         },

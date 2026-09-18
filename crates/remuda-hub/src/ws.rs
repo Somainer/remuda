@@ -850,6 +850,14 @@ async fn object_pull(
 /// reconciliation only runs when an epoch change is actually observed and the
 /// Node did send an inventory — otherwise a stateless Node would wipe rows it
 /// simply never enumerates.
+///
+/// An *empty* inventory is the one answer that is destructive in the wrong
+/// direction, because it reads as "I own nothing" and settles every row on the
+/// host. It is honoured only when the Node also attests that it found its
+/// instance store (`instanceStoreFound`): a `--data-dir` pointed at the wrong
+/// path enumerates zero rows without that meaning anything, and trusting it
+/// would exit every session on the host. Absent evidence, the rows are left
+/// alone — the same hands-off answer an absent key gets.
 async fn reconcile_lost_instances(
     state: &AppState,
     host_id: &str,
@@ -874,6 +882,14 @@ async fn reconcile_lost_instances(
         );
         return Ok(());
     };
+    if reported.is_empty() && params.get("instanceStoreFound") != Some(&Value::Bool(true)) {
+        tracing::warn!(
+            %host_id,
+            "node epoch changed and hello reported an empty inventory this node does not \
+             vouch for; leaving instance rows untouched"
+        );
+        return Ok(());
+    }
     let reported: Vec<String> = reported
         .iter()
         .filter(|item| !entry_is_terminal(item))
@@ -931,7 +947,7 @@ fn entry_is_terminal(item: &Value) -> bool {
     )
 }
 
-/// Move every active worker holding `instance_id` to blocked.
+/// Move every in-progress worker holding `instance_id` to blocked.
 ///
 /// The instance row settling is only half the loss: a worker whose process is
 /// gone but whose roster row still says `working` keeps counting as active,
@@ -939,6 +955,11 @@ fn entry_is_terminal(item: &Value) -> bool {
 /// still making progress. Blocked-with-a-reason is what the dispatch contract
 /// already means by "this worker cannot continue", so the transition reuses
 /// [`WorkerState::Blocked`] rather than inventing a fourth state.
+///
+/// Only `dispatched`/`working` workers are rewritten. A `done` worker has
+/// already reported a sha and a `blocked` one has already given a reason:
+/// overwriting either would destroy a result the worker did deliver, and say
+/// the session was lost when the work was finished. `retired` is terminal.
 ///
 /// Scoped by `host_id`: instance ids are unique, but the guard keeps a future
 /// id collision from letting one host's restart fail another host's rows.
@@ -952,7 +973,7 @@ async fn fail_workers_holding(
         .list_workers_for_host(host_id.to_string())
         .await?;
     for worker in workers {
-        if !worker.state.is_active()
+        if !worker.state.is_in_progress()
             || worker.instance_id.as_ref().map(|id| id.as_id().as_str()) != Some(instance_id)
         {
             continue;
@@ -1413,6 +1434,16 @@ async fn send_tty_snapshot(
                             .map_err(|_| ())?;
                         return Ok(());
                     }
+                }
+                // The attach succeeded, so this session is *live* — it simply
+                // had no backlog to replay (a fresh PTY, or a Node that had
+                // nothing buffered yet). Returning here is the whole point of
+                // this branch: falling through would serve the Hub's cache and
+                // label a running session stale, freezing stdin on a terminal
+                // that is answering. The stream is bound above, so live bytes
+                // reach this follower as ordinary binary frames.
+                if stream_id.is_some() {
+                    return Ok(());
                 }
             }
             Ok(None) => tracing::debug!(

@@ -854,16 +854,20 @@ pub fn hello_capabilities(host: &Value) -> Option<Value> {
 
 /// Build stdio hello params from a nested host inventory value.
 ///
-/// `instances` is this Node's own instance inventory — pass
-/// `serde_json::to_value(node.list_instances()?.items)` from a composed runtime.
-/// It rides every hello, daemon or not, for the same reason the outbound-WSS
-/// hello does: the Hub reconciles rows this Node no longer owns by diffing it
-/// against the epoch it recorded, and a hello with no `instances` key leaves
-/// those rows `running` forever, holding placement slots nothing can release.
+/// `instances` is this Node's own instance inventory, from
+/// [`crate::DevNode::announceable_inventory`]. It rides every hello, daemon or
+/// not, for the same reason the outbound-WSS hello does: the Hub reconciles
+/// rows this Node no longer owns by diffing it against the epoch it recorded,
+/// and a hello with no `instances` key leaves those rows `running` forever,
+/// holding placement slots nothing can release.
 ///
-/// `None` stays a real answer, not an empty one: a Node that cannot enumerate
-/// sends no key at all, and the Hub keeps its current hands-off behaviour
-/// rather than reading silence as "I own nothing".
+/// `None` stays a real answer, not an empty one: a Node that cannot vouch for
+/// its instance store sends no key at all, and the Hub keeps its hands-off
+/// behaviour rather than reading silence as "I own nothing". `Some` — an empty
+/// array included — carries the matching attestation, because
+/// `announceable_inventory` yields a list only for a store it could read:
+/// that pairing is what lets the Hub honour "I really do hold nothing" without
+/// also honouring a wrong `--data-dir`.
 #[must_use]
 pub fn stdio_hello_params(
     host_id: &HostId,
@@ -899,6 +903,13 @@ pub fn stdio_hello_params(
         // nothing", so a Node too old to list its rows cannot wipe them.
         if let Some(instances) = instances {
             object.insert("instances".into(), instances);
+            // The attestation rides the inventory it belongs to, so the two can
+            // never disagree: a caller that supplies a list has vouched for it
+            // (see [`crate::DevNode::announceable_inventory`]), and a caller
+            // with nothing to vouch for supplies no list at all. The Hub needs
+            // this to tell "I really do hold nothing" from "my data dir is
+            // wrong", which look identical in the array.
+            object.insert("instanceStoreFound".into(), Value::Bool(true));
         }
     }
     params

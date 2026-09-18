@@ -1368,6 +1368,8 @@ hello result：`{protocol:{major,minor},connectionId:Id,serverEpoch:Id,observati
 
 `params.instances`（可选，additive）：Node 本次进程拥有的 Instance 清单，每项为 §2.3 的 Instance 对象（Hub 读其 `id` 与 `lifecycle`）。两种 carrier 都发送它——`ssh-stdio` 与 outbound WSS 同等——因为 Hub 只依据它做重启对账：`nodeEpoch` 变化时，Hub 记录中仍 live 而清单里不再 live 的行会被投影为 `exited` 并写入 `lastError: "node-epoch-changed"`（Hub 侧同样以该字符串作为 worker 的 blocked reason），同时释放其 placement slot。判定依据是条目的 `lifecycle` 而非其是否存在：Node 自报 `exited`/`failed` 的条目是**已承认的丢失**，不得因其出现而保护 Hub 的旧行。缺失该 key 表示“无法枚举”而不是“没有实例”——Hub 据此保持现状不动任何行，因此老 Node 的沉默不会被当作否认。
 
+**空清单的额外要求**：`[]` 是唯一会产生破坏性后果的取值（“我一个都没有”会让 Hub 结算该 host 上每一行），因此只有 `params.instanceStoreFound: true` 与它同行时 Hub 才采信。该字段表示 Node 确实在预期位置找到了 instance store：`--data-dir` 指错、磁盘被清空、或使用内存 store 时都会枚举出零行，而这不代表任何东西，此时 Node 必须**省略** `instances`（而非发送 `[]`）——Hub 对两种沉默一视同仁。`requested` 行不在对账范围内：它是 Hub 单方面、尚未被 Node 确认的意图，重启窗口内的缺席不能证明它已丢失，由 `expire_stale_requested` 按时间单独回收。
+
 身份层：Node 优先使用每 Host 单独的 mTLS client certificate，证书身份绑定 enrollment hostId；简化部署可用 TLS + 每 Node 独立的 256-bit 随机 token，Hub 只保存校验材料，支持轮换/撤销。设备 token 与 Node token 是不同身份，不能互换；Web 登录后使用同源安全 cookie 与 CSRF 保护，WS 首次鉴权使用短时会话凭据/同源校验，不把长期 token 放 URL。SSH 登录只负责隧道，不代替应用内 actor/scope 检查。MCP agent capability 与 Bot token 也是受限身份，不能获取 Hub 管理 credential。
 
 Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence 的命令返回 `OWNER_FENCED`。一个 Node 的新连接取代旧连接，新连接完成 reconciliation 前不派发变更。Node 必须使用 OS 单实例锁和每 native session 的本地 writer lock；没有锁实现的 host 不能把 lease 宣称为防止重复进程的充分保证。网络分区时旧运行可继续原生执行，但 runtime 不在另一 Host 启动同 Instance，也不在租约失效后接受新的跨主机控制任务。

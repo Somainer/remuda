@@ -593,3 +593,118 @@ async fn a_restart_settles_a_claude_pty_row_and_the_inventory_agrees() {
         "the hello inventory must not re-report a session the sweep just settled"
     );
 }
+
+/// A Node that cannot vouch for its instance store must not announce an empty
+/// inventory.
+///
+/// The Hub settles every live row a hello omits, so `[]` is a destructive
+/// claim: it says "I hold nothing" and the Hub exits every session on the
+/// host. A `--data-dir` pointed at the wrong path enumerates zero rows without
+/// that meaning anything, so such a Node reports `None` — no `instances` key
+/// at all — and leaves the Hub's rows for a Node that can vouch for itself.
+///
+/// "Vouch" is specifically *the store file was already there*. A brand-new
+/// data dir is indistinguishable from a wrong one: both enumerate zero rows
+/// and neither can show that emptiness is real, so both stay silent. That
+/// costs nothing, because a host whose store never existed has no rows on the
+/// Hub for the silence to leave behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_that_was_never_found_announces_no_inventory() {
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+
+    // Nothing has created `node.sqlite` here yet.
+    let fresh = compose(&config).expect("compose");
+    assert!(
+        !fresh.found_instance_store(),
+        "a data dir this process had to create is not one it can vouch for"
+    );
+    assert!(
+        fresh.list_instances().expect("list").items.is_empty(),
+        "and it holds nothing, which is exactly why the claim is unsafe"
+    );
+    assert_eq!(
+        fresh.announceable_inventory().expect("inventory"),
+        None,
+        "an unwarranted empty inventory must not be announced: the Hub would \
+         settle every live row on this host"
+    );
+}
+
+/// The other half, and the one the demo turned on: a Node that reopens the
+/// data dir it was already using *can* vouch, so its inventory rides the hello
+/// even when the sweep has just emptied it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopened_store_vouches_for_an_empty_inventory() {
+    use serde_json::json;
+
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+
+    // First run creates the store; the second finds it.
+    let first = compose(&config).expect("compose");
+    let id = {
+        let mut request = create_req(AgentKind::Terminal, DriverKind::ShellPty);
+        request.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "while :; do sleep 0.1; done".into(),
+        ];
+        let created = first.create_instance(request).await.expect("create");
+        created.instance.meta.id.clone()
+    };
+    drop(first);
+
+    let restarted = compose(&config).expect("reopen");
+    assert!(
+        restarted.found_instance_store(),
+        "a data dir that already held instance rows is one this process vouches for"
+    );
+    // The restart sweep settles the session, and the inventory the hello
+    // announces must say so rather than re-reporting it as held.
+    restarted.reconcile_herdr().await.expect("reconcile");
+    assert_eq!(
+        restarted.get_instance(&id).expect("instance").lifecycle,
+        InstanceLifecycle::Exited
+    );
+    let announced = restarted
+        .announceable_inventory()
+        .expect("inventory")
+        .expect("a vouched store announces its rows");
+    let rows = announced.as_array().expect("array");
+    let reported = rows
+        .iter()
+        .find(|row| row["id"] == json!(id.as_id().as_str()))
+        .expect("the settled row is still listed");
+    assert_eq!(
+        reported["lifecycle"],
+        json!("exited"),
+        "the hello must report the swept row as exited, not as a session it still holds"
+    );
+}
+
+/// An in-memory store holds nothing and can attest to nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_memory_store_never_vouches() {
+    use remuda_node::{DevNode, DriverRegistry, LocalStore, MemoryStore};
+    use std::sync::Arc;
+
+    let store = Arc::new(MemoryStore::new(64));
+    assert!(
+        !store.instance_store_is_durable(),
+        "an in-memory store must not claim durable instance rows"
+    );
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+    let node = DevNode::with_parts(
+        &config.http,
+        store,
+        DriverRegistry::with_fake().expect("drivers"),
+    )
+    .expect("compose node");
+    assert_eq!(
+        node.announceable_inventory().expect("inventory"),
+        None,
+        "with nothing to vouch for, the hello carries no inventory key"
+    );
+}

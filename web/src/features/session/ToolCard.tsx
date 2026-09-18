@@ -4,7 +4,7 @@ import { knowledgeValue } from "../../types/command";
 import { asRecord, asString, jsonPreview } from "../../lib/format";
 import { DiffBlock } from "../../components/DiffBlock";
 import { familyFor, isGrokTool, splitGrokMcpName, splitMcpName } from "./toolRegistry";
-import { presentTool } from "./toolPresenters";
+import { presentTool, resultCurrentDir } from "./toolPresenters";
 import { WorkflowTimelineCard } from "./workflow/WorkflowTimelineCard";
 import { LiveToolElapsed } from "./live/LiveStatusStrip";
 import type {
@@ -40,17 +40,14 @@ function cwdOf(call: ToolCallPayload): string | null {
 }
 
 /**
- * A shell call's working directory from its completed frame: grok puts
- * `current_dir` in rawOutput, not the tool input (fixture line 9).
+ * The stable native name as a muted secondary label (grok cards). Hidden when
+ * the heading already is the native name: on main the grok adapter sets
+ * display_title = tool_name, so without this guard every card printed the
+ * name twice. Once the D-043 translation carries the ACP human title into
+ * display_title, heading and name diverge and the label appears.
  */
-function resultCwd(result: ToolResultPayload | null): string | null {
-  if (!result) return null;
-  const structured = asRecord(knowledgeValue(result.structuredResult));
-  return asString(asRecord(structured?.rawOutput)?.current_dir);
-}
-
-/** The stable native name as a muted secondary label (grok cards). */
-function NativeLabel({ name }: { name: string }) {
+function NativeLabel({ heading, name }: { heading: string; name: string }) {
+  if (heading === name) return null;
   return (
     <span className={css.stat} data-testid="tool-native-name">
       {name}
@@ -83,13 +80,13 @@ function BashCard({
   // Claude's BashCard keeps its existing executor-derived cwd; grok puts the
   // working directory in the input while running and in rawOutput when done.
   const cwd = grok
-    ? asString(rec?.current_dir) ?? asString(rec?.cwd) ?? resultCwd(result) ?? cwdOf(call)
+    ? asString(rec?.current_dir) ?? asString(rec?.cwd) ?? resultCurrentDir(result) ?? cwdOf(call)
     : cwdOf(call);
   return (
     <article className={`${css.tool} ${completeness === "partial" ? css.toolPartial : ""}`}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>{grok ? displayTitle : "Bash"}</span>
-        {grok ? <NativeLabel name={nativeName} /> : null}
+        {grok ? <NativeLabel heading={displayTitle} name={nativeName} /> : null}
         <span className={css.toolStatus}>
           {running ? <span className={css.runDot} /> : null}
           {running ? <LiveToolElapsed call={call} /> : exit === undefined ? "无 exit" : `exit ${exit}`}
@@ -142,7 +139,7 @@ function EditWriteCard({
     <article className={css.tool}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>{grok ? displayTitle : family}</span>
-        {grok ? <NativeLabel name={nativeName} /> : null}
+        {grok ? <NativeLabel heading={displayTitle} name={nativeName} /> : null}
         <span className={css.path}>{path}</span>
         {stat ? <span className={css.stat}>{stat}</span> : null}
         <span className={css.spacer} />
@@ -174,7 +171,12 @@ function ReadCard({
     : (asString(rec?.file_path) ?? "file");
   const offset = rec?.offset;
   const limit = rec?.limit;
-  const range = typeof offset === "number" || typeof limit === "number" ? `:${String(offset ?? 1)}-${String(limit ?? "")}` : "";
+  // `limit` is a line count, not an end line, so the copy matches the
+  // presenter: "from line N, M lines" — never a misleading `10-40`.
+  const range =
+    typeof offset === "number" || typeof limit === "number"
+      ? `第 ${String(offset ?? 1)} 行起${typeof limit === "number" && limit ? `，${String(limit)} 行` : ""}`
+      : "";
   const snippet = result
     ? result.blocks
         .map((b) => (b.type === "text" ? b.text : ""))
@@ -186,11 +188,9 @@ function ReadCard({
     <article className={css.tool}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>{heading}</span>
-        {grok ? <NativeLabel name={nativeName} /> : null}
-        <span className={css.path}>
-          {path}
-          {range}
-        </span>
+        {grok ? <NativeLabel heading={displayTitle} name={nativeName} /> : null}
+        <span className={css.path}>{path}</span>
+        {range ? <span className={css.stat}>{range}</span> : null}
       </div>
       {snippet ? <pre className={css.stdout}>{snippet}</pre> : null}
     </article>
@@ -217,7 +217,7 @@ function McpCard({
     <article className={css.tool}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>MCP</span>
-        {grok ? <NativeLabel name={name} /> : null}
+        {grok ? <NativeLabel heading="MCP" name={name} /> : null}
         <span className={css.path}>
           {server}/{tool}
         </span>
@@ -265,7 +265,7 @@ function PresentedCard({
     <article className={`${css.tool} ${completeness === "partial" ? css.toolPartial : ""}`}>
       <div className={css.toolHead}>
         <span className={css.toolTitle}>{view.title}</span>
-        {grok && view.title !== name ? <NativeLabel name={name} /> : null}
+        {grok ? <NativeLabel heading={view.title} name={name} /> : null}
         {view.subtitle ? <span className={css.path}>{view.subtitle}</span> : null}
         <span className={css.toolStatus} data-testid="tool-status" data-status={view.status}>
           {view.status === "running" ? <span className={css.runDot} /> : <span className={css.okDot} />}
@@ -349,7 +349,7 @@ export function ToolCard({
       <article className={css.tool} data-testid="tool-card" data-folded="1">
         <div className={css.toolHead}>
           <span className={css.toolTitle}>{grok ? displayTitle : nativeName}</span>
-          {grok ? <NativeLabel name={nativeName} /> : null}
+          {grok ? <NativeLabel heading={displayTitle} name={nativeName} /> : null}
           <span className={css.stat}>{family}</span>
           <span className={css.spacer} />
           <button type="button" className={css.openBtn} onClick={() => setFolded(false)}>

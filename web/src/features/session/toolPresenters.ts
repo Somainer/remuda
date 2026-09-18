@@ -103,11 +103,12 @@ function truncate(text: string, max = 200): string {
 }
 
 /**
- * Grok carries a shell call's working directory in the completed frame's
- * `rawOutput.current_dir`, not in the tool input (fixture tui-updates.jsonl
- * line 9). `structuredResult` holds the whole terminal update frame.
+ * A shell call's working directory from its completed frame: grok puts
+ * `current_dir` in rawOutput, not the tool input (fixture tui-updates.jsonl
+ * line 9). `structuredResult` holds the whole terminal update frame. Shared by
+ * the presenter and ToolCard's BashCard so the lookup lives in one place.
  */
-function grokResultCwd(result: ToolResultPayload | null): string | null {
+export function resultCurrentDir(result: ToolResultPayload | null): string | null {
   if (!result) return null;
   const structured = asRecord(knowledgeValue(result.structuredResult));
   return asString(asRecord(structured?.rawOutput)?.current_dir);
@@ -263,7 +264,7 @@ export function presentTool(
     const details: ToolDetail[] = [{ label: "$", value: command, pre: true }];
     // The input has no cwd while the call runs; the completed frame carries
     // rawOutput.current_dir (fixture line 9).
-    const cwd = asString(record?.current_dir) ?? asString(record?.cwd) ?? grokResultCwd(result);
+    const cwd = asString(record?.current_dir) ?? asString(record?.cwd) ?? resultCurrentDir(result);
     if (cwd) details.push({ label: "目录", value: cwd });
     if (record?.is_background === true) details.push({ label: "后台", value: "是" });
     const exit = result ? knowledgeValue(result.exitCode) : undefined;

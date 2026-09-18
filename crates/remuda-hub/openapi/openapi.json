@@ -1786,13 +1786,26 @@
             },
             "type": "array"
           },
+          "fromSeq": {
+            "description": "Window floor (seq of events[0]); null for an empty window.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "instanceId": {
             "type": "string"
+          },
+          "reachedAfterSeq": {
+            "description": "False when rows below the window floor were cut; descend with beforeSeq=fromSeq-1.",
+            "type": "boolean"
           }
         },
         "required": [
           "instanceId",
           "durableSeq",
+          "fromSeq",
+          "reachedAfterSeq",
           "events"
         ],
         "type": "object"
@@ -6048,6 +6061,14 @@
           {
             "in": "query",
             "name": "afterSeq",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "beforeSeq",
+            "description": "Inclusive upper bound for descending to older history below a tail window.",
             "schema": {
               "type": "string"
             }

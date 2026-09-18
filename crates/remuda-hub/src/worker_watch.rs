@@ -331,6 +331,19 @@ async fn observe_one(
             .await
             .map_err(map_store)?
     {
+        // Source-scoped: only the *launch* read-back can prove a dispatch
+        // substitution. A later human `/model` switch is `source = slash`, and a
+        // Remuda `instance.configure` is `source = remuda`; both overwrite
+        // `modelEffective` while `worker.model` keeps the dispatch pin, so
+        // comparing them here would end an intentionally reconfigured worker
+        // Blocked with two ids nobody substituted. Mirrors the Node gate.
+        let source = record
+            .model_effective
+            .as_ref()
+            .and_then(|effective| effective.get("source"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_launch_readback = source == "launch";
         let observed = record
             .model_effective
             .as_ref()
@@ -353,7 +366,7 @@ async fn observe_one(
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(observed) = observed {
+        if is_launch_readback && let Some(observed) = observed {
             let requested = worker.model.as_deref().unwrap_or_default();
             // Only a same-vocabulary disagreement is a divergence. An upstream
             // gateway resolution (`Unresolvable`) and an agreeing id (`Honoured`)
@@ -502,12 +515,16 @@ async fn observe_one(
             )
         }
     };
-    // model-pin-1: a model the requester did not ask for outranks every screen
-    // classification. The instance is already failed by the Node's own gate, and
-    // `ScreenClass::Failed` deliberately leaves `next_state` alone, so without
-    // this the worker would sit in `Dispatched`/`Working` forever while its
-    // process was gone. `WorkerState` has no `Failed` arm, so `Blocked` carries
-    // the reason, naming both ids (model-pin-1).
+    // model-pin-1: a launch read-back that names a model the requester did not
+    // ask for is a hard block, outranking every screen classification. The Hub
+    // derives this itself from the projected `source = launch` observation
+    // above; the Node gate independently closes the process and fails the
+    // instance, but the worker row's state is decided here rather than assumed
+    // from the instance lifecycle. `WorkerState` has no `Failed` arm, so
+    // `Blocked` carries the reason naming both ids. A true substitution is
+    // terminal for this dispatch, so the state stays Blocked on later passes; a
+    // reconfigured session never reaches it because non-launch observations
+    // are excluded above.
     let (status, next_blocked) = match &model_mismatch {
         Some((requested, observed)) => {
             let reason = format!("model-mismatch: requested {requested}, observed {observed}");

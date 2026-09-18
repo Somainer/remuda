@@ -179,4 +179,98 @@ fn the_grok_dump_carries_chunk_streaming_and_cancel_facts() {
     assert!(body.contains("\"close\""));
     // The two cancellations (ctrl_c + send_now) survive normalization.
     assert!(body.contains("cancelled"));
+    // D-043: the statusless progress updates become Running replacements,
+    // stable names come from `_meta`, and categories resolve past Shell.
+    assert!(body.contains("\"running\""));
+    assert!(body.contains("\"replace\""));
+    assert!(body.contains("run_terminal_command"));
+    assert!(body.contains("ask_user_question"));
+    assert!(body.contains("\"other\""));
+}
+
+#[test]
+fn the_grok_dump_orders_proposed_running_and_final_by_monotonic_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let dump = run_grok(dir.path());
+    for (call_id, expected_len) in [
+        ("call-spike-1789326032369250000", 3),
+        ("call-spike-1789326112818929000", 3),
+    ] {
+        let facts: Vec<(String, u64, String, Option<String>)> = dump["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| {
+                let item = event["source"]["nativeItemId"]["value"].as_str()?;
+                if item != call_id {
+                    return None;
+                }
+                // `body` is flattened onto the stamped event.
+                let payload = &event["payload"];
+                let kind = event["kind"].as_str().unwrap_or("").to_owned();
+                let revision = payload["revision"].as_str()?.parse().ok()?;
+                let state = payload["state"]
+                    .as_str()
+                    .or_else(|| payload["stage"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let operation = payload["operation"].as_str().map(str::to_owned);
+                Some((kind, revision, state, operation))
+            })
+            .collect();
+        assert_eq!(
+            facts.len(),
+            expected_len,
+            "{call_id}: proposed → running → final"
+        );
+        assert_eq!(
+            facts[0],
+            (
+                "tool_call".into(),
+                1,
+                "proposed".into(),
+                Some("open".into())
+            )
+        );
+        assert_eq!(
+            facts[1],
+            (
+                "tool_call".into(),
+                2,
+                "running".into(),
+                Some("replace".into())
+            )
+        );
+        assert_eq!(
+            facts[2],
+            (
+                "tool_result".into(),
+                3,
+                "final".into(),
+                Some("close".into())
+            )
+        );
+        // Strictly increasing revisions on the shared node.
+        for pair in facts.windows(2) {
+            assert!(pair[0].1 < pair[1].1, "{call_id} revision regressed");
+        }
+    }
+
+    // The human title rides the Running node while the stable tool name never
+    // changes to that title.
+    let running = dump["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| &event["payload"])
+        .find(|payload| {
+            payload["toolCallId"].is_string()
+                && payload["state"].as_str() == Some("running")
+                && payload["toolName"]["value"].as_str() == Some("run_terminal_command")
+                && payload["displayTitle"]["value"].as_str()
+                    == Some("Execute `printf SPIKE_TOOL_OK > spike-result.txt`")
+        })
+        .expect("running payload");
+    assert_eq!(running["category"], json!("shell"));
+    assert_eq!(running["input"]["value"]["variant"], json!("Bash"));
 }

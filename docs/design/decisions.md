@@ -22,6 +22,7 @@
 | D-040 | 2026-09-19 | **`/s/:id` compact 铬预算：space chips 折成单芯片入顶栏；诊断 meta 进「运行详情」disclosure；分段与 Stop 不得进 ⋯**（workbench UX 批次 P0-1 / P0-5）。§1.4 的「约 400px 显示可横向滚动的 space chips 与 tabs」限定到列表路由；`/s/:instanceId` 及子视图在 compact 下允许折成单枚当前 space 芯片并入顶栏，点开同一个抽屉（`spaces-drawer-open` 行为与 testid 不变）。§2.2 header 从「规范两行诊断」改为「主行 + 可折叠**运行详情**」，ASCII 图同步重画：主行保留 host 芯片 + cost + 状态点 + 分段 + Stop，其余诊断进 disclosure（默认收起、展开态按设备 `localStorage` 持久化、`session-meta` testid 保留）。`terminal\|structured` 分段与 Stop **始终留在顶栏，永不进 ⋯ 溢出菜单**。 | coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, 决策 1 与 2） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 P0-1 行（**CONFLICTS**，且指出该建议与自己矛盾）与 P0-5 行（**CONFLICTS**，修订前 `:235` 误写作 233）；[ui-spec.md §1.3 / §1.4 / §2.2](./ui-spec.md)；D-024、D-028 |
 | D-041 | 2026-09-19 | **工具卡默认折叠的豁免集合与折行最小信息量**（workbench UX 批次 P1-10 / P1-20）。默认折叠**只对 compact 且已 settled、且 family ∉ {Workflow, error}** 的卡生效；`interaction.*` 同样豁免；running / 未 settled 的卡永不折叠。折行内容 = family + **关键参数**（Bash = 命令首行、Edit/Write/Read = 路径），按宽度截断且 `title` 给全文，裸 `Bash` 不合规。**折叠分支必须在 family 判定之后**才可提前 return——`ToolCard.tsx` 的 `if (folded) return …` 早于 `family === "Workflow"` 分支，一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动；验收硬指标是卡头 elapsed 在运行中递增，不是「卡可见」。桌面默认态不变，展开后与桌面完全一致（同一组件、同一 testid）。 | coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, 决策 3） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 P1-10 / P1-20 行（**CONFLICTS**，点名 `ToolCard.tsx:260` 早于 `:281-292`）；[ui-spec.md §2.2](./ui-spec.md)；`toolPresenters.ts` Bash 分支给出折行参数 |
 | D-042 | 2026-09-19 | **手机 composer 单行 + 选项 sheet 的边界：触发器带 mode 词与档名，三态与诚实标注留在外面**（workbench UX 批次 P0-3）。compact 下 control bar 允许收成一个选项触发器，但触发器**必须**同时显示当前 `permissionMode` 的词与 effort 档名（形如 `manual · high`），`danger` 模式必须在触发器上可见——把 bypass 态藏进 sheet 是本条最响的禁止项。可进 sheet：附件、harness 只读芯片、context 用量、权限选择器、effort 滑杆。**不得**进 sheet：发送/排队/打断三态按钮、队列 chip、「尚未验证」标注。placeholder 分平台；插队与 Esc 打断的 `window.confirm` 换 `Sheet`（桌面 `popover`、手机 `sheet`，焦点圈定、Esc = 取消、返回焦点到触发器），确认后的命令语义与 `commandId` 路径完全不变；桌面布局与 testid 零变化。 | coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, 决策 4） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 P0-3 行（**CONFLICTS**）；[ui-spec.md §2.2](./ui-spec.md)；D-028a（三态 / 队列 chip / 「尚未验证」） |
+| D-043 | 2026-09-19 | **Grok 结构通道以 TUI 落盘的 ACP 帧为权威，文件层按 protocol §5.7 翻译：工具稳定名取 `_meta["x.ai/tool"].name`（缺失即 unknown/not-emitted，绝不用人类 `title` 冒充；title 只作 `display_title`）；`category` 先走设计文档 §3.1 名字表、再按帧 `kind` 回落、最后 Other，不再恒 Shell；无 `status` 的 `tool_call_update` 与 `in_progress` 都是同 node 的 Running（`Replace`，revision+1，缺字段保持旧值）；只有 `completed/failed/denied/cancelled` 是终态（发 Final，revision 严格大于最后一次 ToolCall），`pending` 与未知 status 非终态、保持 opaque 不关节点；`content[]` 的 `content`/`diff`/`terminal` 分别译文本块/`FileChange`（Applied 仅 completed 且无 error）/terminal 引用文本标记，非 text 内容不再静默丢弃，且 `rawOutput.output_for_prompt` 只在没有 content 型文本块时兜底；thought 收尾改 `Close`+全文。零协议增量、不叠加第二条 grok-acp 进程（D-028）；共享的 `adapters/mod.rs` 构造函数不动，codex 字节级不变。`turn.live` file-tier 相位、question 升格 interaction、terminal log tail、1.0.34 实帧相关的 workflow/子代理下钻（PR8）不在本决策内；合成帧以 [U] 标注。 | coordinator 派发 c-grok-toolid | [grok-structural-translation.md](./grok-structural-translation.md)；[protocol.md](./protocol.md) §5.7 grok-acp；D-028 |
 | D-045 | 2026-09-19 | **computer-use 能力按次授权与投递（capability grant and delivery）**。新增能力名 **`computer-use`**：它**不是** host 属性、不是 driver 属性、不是全局开关，而是**按会话、按次、显式申请**的授权——只有 `remuda instance create` / `remuda dispatch` 上显式的 `--capability computer-use` 能授予，任何默认路径都不授予、不继承、不因「装了就可用」而生效。**两道门都必须过**：(1) 来源必须是 Human 或 Bot，`LaunchOrigin::Agent` 一律拒绝——一个 agent 永远不能为自己铸出桌面控制，门形照抄 `presets::merge_yolo_argv` 的双门（`crates/remuda-driver/src/presets.rs:151-166`）；(2) 目标主机的心跳 `cli[]` 必须回报已安装的 `computer-use` 行（[codex-cua.md](./codex-cua.md) §3.4），未回报即拒绝。**投递只有两条，两条都不碰操作员自己的配置**：(a) 仅当本次 launch 的 native home 是 **Remuda 管的**时，把 skill 字节**从 `remuda` 二进制内嵌物**化到 `<native_home>/skills/codex-computer-use/**`（目录 0700、文件 0600）——「受管」**逐 kind 定义**：claude 是它的作用域 config dir（**继承来的 `~/.claude` 不算受管**），codex 是 `<launch_dir>/codex-home`，grok 是 `<launch_dir>/grok-home`；**门不是 `inherit_default_config`**——那是 claude 专属标志，对一次 codex launch 同样为真（`crates/remuda-node/src/native.rs:238-240`），拿它当门会在 codex 上给出错误答案。继承来的操作员 home **只读不写**，即 `~/.claude`、`~/.codex`、`~/.grok` 在**任何**分支上都不会被打开写（`crates/remuda-driver/src/launch/overlay.rs:25-28` 是这条的权威表述，也是本决策存在的理由）；**codex 与 grok 本批只拿腿 (b)**：仓库与 skill 都没有证据表明它们读任何 skills 目录，往影子 home 写 skill 树没有读者，所以它们的投递**就是那份 per-instance MCP config**。(b) 一律写 per-instance `<launch_dir>/mcp-cua.json`（0600），并**按 `AgentKind` 而非 driver 挂载**：claude 走 argv `--mcp-config <path>`（`mcp-config` 早已在四族白名单且取值，`crates/remuda-driver/src/flags.rs:64,82,89,333`），codex 走 shadow `config.toml` 的 `[mcp_servers.codex-computer-use]`（`crates/remuda-driver/src/launch/shadow.rs:110-168`）——`shell-pty` 是 kind 多态的，跑 claude 时走 argv、跑 codex 时走 shadow home，**规则随 kind 不随 driver**。**环境变量握手**：`c-cua-launch` **只在能力被授予时**向子进程注入 `REMUDA_CAPABILITY_COMPUTER_USE=1`（硬化的 `launch-cua-repl.sh` 未见它即拒绝启动）；该变量是**信号不是边界**——任何有 shell 的东西都能自己导出它，**真边界是「没有授予就绝不物料化」**。**绝不发 `--strict-mcp-config`**（该 flag 被永久禁用，`flags.rs:15`）：Remuda 提供的能力只**增加** server，绝不替换 agent 自己的 server 集合。物料化文件带 digest 进 `LaunchRecipe.materialized_files`（`crates/remuda-driver/src/recipe.rs:157-179`），所以 launch 审计能说清这次到底授予了什么。**拒绝**各有独立消息：Agent 来源、主机未回报、非 macOS、launcher 缺失，以及 **`bypassPermissions` 与 `computer-use` 在同一次 launch 上同时申请**——无人值守的桌面控制叠加跳过的工具审批，是唯一没有回收路径的组合，两者同时出现即拒绝（不是「忽略其一」，也不是需要另一个隐含 flag）。所有拒绝都发生在 create/dispatch 被持久接受**之前**，绝不静默降级、绝不静默丢弃能力请求（同 D-035 的拒绝形状）。**本决策同时记下截图两条**（计划里曾分别为 D-038，因 id 已被占，合并入本行并加此标记）：(1) **截图进 journal 与 web** —— tool result 合法携带 `image` content block，字节只存对象库（Node 用宿主 token 走 `POST /v1/hosts/{id}/files/objects` 暂存，`crates/remuda-hub/src/host_files.rs:44`），`ContentBlock::Image` + `MediaBlock` 协议早已合法（`crates/remuda-protocol/src/observation.rs:143-155,189-195`）；**只发文本的 producer 是 bug，不是策略**（journal `crates/remuda-journal/src/claude.rs:1396,1470-1484`、driver `crates/remuda-driver/src/adapters/mod.rs:387-406`、web `web/src/features/session/toolPresenters.ts:44-51` 三处今天都丢弃非文本）；**不新增 `ObservationKind`**；截图**不是 artifact**，只有 agent 显式存盘才发 `artifact`；渲染规则见 ui-spec §2.2（卡内定高缩略图、`loading="lazy"`、点开 `/v1/objects/{id}`、绝不自动展开）。(2) **截图保留期** —— 沿用既有附件对象的生命周期与过期，**永不内联 journal、永不写日志**，提交的证据文档必须用脱敏或合成屏；更短的 CUA 专属 TTL 是 Hub 旋钮与第七个任务，不在本批。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §2/§3/§4/§6；各条约束的 file:line 见该文 §3.2；Q1–Q6 默认值见其 §8 |
 | D-046 | 2026-09-19 | **CUA 交互路由：`elicitation/create` 由 worker 自己答，但回答权被 launch 请求约束**。事实基础：agent 侧今天**只有一条** elicitation 桥，且只搭在 Claude 的 hook 事件上——`Elicitation` 已是注册事件、阻塞、可带 `action` 回复（`crates/remuda-signal/src/event.rs:114-135`），已能生成 `Interaction{kind: elicitation}` 卡（`crates/remuda-signal/src/approval.rs:153-208`），也能从 `InteractionAnswer::Elicitation` 回一个动作（`crates/remuda-signal/src/bus.rs:1017-1030`）。**但这条链路够不到 MCP 的 `elicitation/create`**：`cua-repl` 是 stdio MCP server，它的 elicitation 走 MCP 协议本身，而 codex shadow 的 `hooks.json` 只注册 `SessionStart` 与 `PermissionRequest` 两个事件（`CODEX_EVENTS`，`crates/remuda-driver/src/launch/shadow.rs:40-45`；grok 的 `GROK_EVENTS` 同样不含 elicitation 类事件，`shadow.rs:47-55`），**两者都不是 MCP 的 `elicitation/create`**，所以**今天没有任何路径能把一个 MCP server 的 `elicitation/create` 送到 `/approvals`**（缺的是一个从 harness 到 Hub 的 producer，不是 `InteractionCarrier` 取值——那个枚举已有七个值，见 [codex-cua.md](./codex-cua.md) §5.3）。因此本批的合同是：**worker 自己在 cua-repl 的 `initialize` 里声明 `capabilities.elicitation` 并自行回答**——按应用审批时 `accept` 且 `persist: session`，而**回答权被本次 launch 的请求约束**：只有请求中点名的 bundle id 可以批准，未点名的应用一律不批（`skills/codex-computer-use/SKILL.md` 的既有规则，本决策把它从「skill 的自律」升级为「能力授权语义的一部分」）。**同时如实记账**：这条路线意味着桌面审批没有 journal 行、没有 `/approvals` 卡、没有第二人复核，只有 worker 的一面之词——这是本批明确接受的代价，写进 D-045 的「后续」而不是假装它已解决。**后续**（不在本批，前置是一条 MCP 级 elicitation 桥：为不经过 Claude hook 的 harness 造 producer，并给它一个 `InteractionCarrier` 取值）：把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。在那之前，`D-045` 的 bypass 拒绝与「只批准点名应用」共同构成唯一的边界。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §5；[native-pty-first.md](./native-pty-first.md) §5 P5 残留（原文：`Elicitation` 仅按二进制读取端形状实现，**未取得实机 payload**）|
 
@@ -380,6 +381,7 @@ live 证据里第 1 轮报 `false`、第 2 轮报 `true`，两个都不对（第
 journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚成
 `Structured` 的最终块，两轮各有自己的 `result` 与 usage/cost。该文档同时列出这轮
 **没有**测到的东西（interrupt、steer、网关、审批活链路），以免 ADR 超额声称。
+
 ## D-038
 
 **2026-09-19 · 会话列表行 = 状态点 + 标题 + 一句下一步；三维 wire 与 `ins_` 退到展开/tooltip；行内遥控收进溢出菜单**
@@ -464,6 +466,71 @@ journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚
 **由谁**：coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, decision 4）。该计划是派工单，未入库；理由与默认值见报告 §11.7 的 P0-3 行。
 
 **依据**：报告 §11.7 的 P0-3 行判 **CONFLICTS**（权限与 effort 的可见性、D-028a 三态与诚实标注）；`decisions.md` D-028a 的三态/队列 chip/「尚未验证」要求是本条的边界来源。
+
+## D-043
+
+**2026-09-19 · Grok 结构转译契约：文件层 ACP 帧按协议 §5.7 翻译，不新增 driver、不改 wire schema**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | D-028、[grok-structural-translation.md](./grok-structural-translation.md)、[protocol.md](./protocol.md) §5.7 grok-acp |
+
+**背景**：P6 已把 grok TUI 落盘的 `updates.jsonl` / `events.jsonl` tail 进 journal，
+但 `GrokAdapter` 的工具转译与协议 §5.7 相反：稳定工具名取的是会变化的人类
+`title`（协议要求 `_meta["x.ai/tool"].name`，title 只作展示）；`category` 恒为
+`Shell`；无 `status` 的 `tool_call_update`（夹具实帧：先 Pending、再无 status
+进度帧、最后 completed）被直接丢弃，导致 `ToolCallState::Running` 与
+`ResultStage::Partial` 在 grok 通道零产出；`content[]` 只取第一段文本，`diff` /
+`terminal` / 非 text 块全部消失；thought 收尾用 `Open` 重发全文而不是 `Close`。
+
+**决策**（仅翻译层，零协议增量；不叠加第二条 grok-acp 进程，延续 D-028 一终端一会话）：
+
+1. **身份**：`tool_name` 只取 `_meta["x.ai/tool"].name`；缺失即
+   `Knowledge::Unknown{reason:"not-emitted"}`，绝不用 `title` 冒充稳定名。
+   `display_title` 取帧上 `title`，缺失时回落工具名。
+2. **类别**：先查名字表（设计文档 §3.1：`run_terminal_command→Shell`、
+   `read_file/list_dir→FileRead`、`write/search_replace→FileWrite`、
+   `grep/web_search/web_fetch/open_page/open_page_with_find/x_*→Search`、
+   `spawn_subagent→Agent`、`workflow→Workflow`、`search_tool/use_tool→Mcp`），
+   名字未知再按帧 `kind`（`execute→Shell`、`write/edit→FileWrite`、
+   `ask_user/other→Other`），最后才 `Other`。Rust 表与 web registry 表同引 §3.1。
+3. **Running**：无 `status` 的 `tool_call_update` 以及 `status=="in_progress"`
+   都是同一 node 的 Running `ToolCall`：`state=Running`、revision 2、`Replace`；
+   只对已见过 Pending 的 `toolCallId` 生效（中途加入的 tail 看到陌生进度帧仍忽略，
+   但不影响后续终态结果）。帧上缺的字段保持旧值（`display_title` / `rawInput` /
+   name / kind）。
+4. **终态判定按协议 §5.7，不把所有带 `status` 的帧都当终态**：只有
+   `completed` / `failed` / `denied` / `cancelled` 发 `ToolResult` `Final`，
+   revision 严格大于该 node 最后一次 `ToolCall` revision（web `newerMutation`
+   要求单调，否则卡片冻结在 proposed）；`pending` 与未知 status 不是终态，
+   保持 opaque、不关节点（等后续帧），不伪造结果；`outcome` / `exit_code` /
+   `structured_result` 行为不变。
+5. **content[]**：`{type:"content"}` 内层 text → 文本块；`{type:"diff"}` →
+   `FileChange{path（diff.path 或 locations[0].path）, diff, application}`，
+   `Applied` 仅当 `status==completed` 且无 error，否则 `Unknown`；
+   `{type:"terminal"}` → 只命名 terminal id 的文本块，不是 tty-attach 承诺；
+   其余非 text 内容以带原生类型的文本标记出现，不再静默丢弃。
+   `rawOutput.output_for_prompt` 仅在本帧没有产出任何 **content 型文本块**时兜底
+   追加（terminal/image/未知类型标记不抑制该兜底，避免真实命令输出被标记挤掉）。
+6. **thought 收尾**：`turn_completed` 用 `Close` + 累积全文（与 message 的
+   open/append/close 一致），取消回合带 `Interrupted` 状态。
+7. 共享的 `adapters/mod.rs` 负载构造函数签名不动（codex 字节级不变）；grok 专用
+   构造函数全部住在 `grok_adapter.rs`。不新增 `ObservationPayload` 变体、不改
+   `protocol.md`、不重生成 schema。
+
+**范围边界**：本决策只覆盖 PR1/PR2 的帧→负载翻译。`turn.live` file-tier 相位、
+`ask_user_question` 升格 interaction、`terminal/<id>.log` 增量 stdout、fake-harness
+保真度与 web presenter 分别由后续任务落地；grok workflow engine 与子代理下钻
+（PR8）依赖 1.0.34 实帧重采（PR7），不在本决策内，且任何测试不得据 1.0.30
+`--no-subagents --no-plan` 夹具断言「grok 不支持 X」。夹具中未捕获的 diff /
+terminal 内容帧形状以 [U] 标注为合成帧，1.0.34 重采时校正。
+
+**影响**：`crates/remuda-driver/src/adapters/grok_adapter.rs` 及单测、
+`crates/remuda/tests/p6_adapter_parity.rs`；夹具三帧序列现在翻译为
+Proposed(rev1 Open) → Running(rev2 Replace) → Final(rev3 Close)，
+`remuda journal diff --no-whitelist` 自比对仍相等，codex 与 fake-harness 事实集
+不变。
 
 ## D-045
 

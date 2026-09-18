@@ -17,10 +17,17 @@
 //!   completion state. The fixture proves the server can emit multiple SSE
 //!   deltas that the client persists as one line, so this promises chunk
 //!   granularity, never token granularity.
-//! * **Tools** are `tool_call` (name in `title`, input in `rawInput`) followed
-//!   by `tool_call_update` carrying `status` and `rawOutput.exit_code`. A
-//!   hook-denied call ends `failed` with `error:"denied: …"`/`Hook denied`;
-//!   that maps to [`ToolOutcome::Denied`].
+//! * **Tools** follow the `protocol.md` §5.7 grok-acp row (D-043): the stable
+//!   tool identity is `_meta["x.ai/tool"].name` — never the human `title`,
+//!   which only feeds `display_title`. The category resolves through the
+//!   design-doc §3.1 name table and falls back to the frame's `kind`. A
+//!   statusless `tool_call_update` is the **Running** mutation (same node,
+//!   `Replace`, revision 2); fields the frame omits keep their previous value.
+//!   The terminal update closes the node with a `ToolResult` whose revision is
+//!   strictly greater. `content[]` maps to text blocks and `FileChange`s;
+//!   non-text content is surfaced, never silently dropped. A hook-denied call
+//!   ends `failed` with `error:"denied: …"`/`Hook denied`; that maps to
+//!   [`ToolOutcome::Denied`].
 //! * **Permissions have no answer channel in files.**
 //!   `permission_requested` / `permission_resolved` are post-hoc summaries, and
 //!   `wait_ms:0` does not mean no visible prompt (§A5 [V]); they are journaled
@@ -34,15 +41,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use remuda_protocol::{
-    AgentKind, ContentStatus, Id, Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle,
-    ObservationPayload, Severity, ToolOutcome, UsageScope,
+    AgentKind, ChangeApplication, ContentBlock, ContentStatus, FileChange, Id, Knowledge,
+    LifecyclePayload, LifecycleTopic, MutationOperation, NativeLifecycle, NodeMutation,
+    ObservationPayload, ResultStage, Severity, TextBlock, ThoughtPayload, ThoughtRepresentation,
+    ToolCallPayload, ToolCallState, ToolCategory, ToolOutcome, ToolResultPayload, U64, UsageScope,
 };
 use serde_json::Value;
 
 use crate::adapters::{
-    AdapterBinding, AdapterHome, AdapterObservation, FileSignalAdapter, message_chunk,
-    message_close, message_payload, node_id, thought_chunk, thought_payload, tool_call_payload,
-    tool_result_payload, turn_lifecycle,
+    AdapterBinding, AdapterHome, AdapterObservation, FileSignalAdapter, first_mutation,
+    message_chunk, message_close, message_payload, node_id, not_emitted, thought_chunk,
+    turn_lifecycle,
 };
 use crate::error::DriverResult;
 use crate::grok_session::{
@@ -64,6 +73,43 @@ struct Stream {
     thought: String,
 }
 
+/// Per-tool-call state for revision-monotonic tool translation (D-043).
+///
+/// `revision` is the last revision emitted on the node: the Proposed
+/// `tool_call` opens at 1, each statusless progress update replaces at the
+/// next revision, and the terminal result closes one revision above that, so
+/// `assemble.ts` `newerMutation` never drops the closing fact.
+struct ToolCallTrack {
+    /// Journal node shared by the call and its result.
+    node: Id,
+    /// Last emitted revision for this node.
+    revision: u64,
+    /// Stable name from `_meta["x.ai/tool"].name`.
+    name: Option<String>,
+    /// Frame `kind`, used only for the category fallback.
+    kind: Option<String>,
+    /// Human title; the payload falls back to `name` when this stays absent.
+    display_title: Option<String>,
+    /// Last seen `rawInput`.
+    input: Option<Value>,
+    /// The terminal result already emitted for this call.
+    finished: bool,
+}
+
+impl ToolCallTrack {
+    fn new(node: Id) -> Self {
+        Self {
+            node,
+            revision: 1,
+            name: None,
+            kind: None,
+            display_title: None,
+            input: None,
+            finished: false,
+        }
+    }
+}
+
 /// File-tail adapter for one grok TUI session.
 pub struct GrokAdapter {
     home: AdapterHome,
@@ -81,8 +127,9 @@ pub struct GrokAdapter {
     streams: HashMap<String, Stream>,
     /// Prompts already closed.
     closed: HashSet<String>,
-    /// Tool results already emitted.
-    results: HashSet<String>,
+    /// Per-call translation state: revision counter and carry-over fields for
+    /// the "absent fields keep their previous value" rule (protocol §5.7).
+    tools: HashMap<String, ToolCallTrack>,
     /// Frames already processed (native event id), restart-safe dedupe.
     seen_events: HashSet<String>,
     /// Last usage.json contents fed to the aggregator.
@@ -106,7 +153,7 @@ impl GrokAdapter {
             thought_nodes: HashMap::new(),
             streams: HashMap::new(),
             closed: HashSet::new(),
-            results: HashSet::new(),
+            tools: HashMap::new(),
             seen_events: HashSet::new(),
             usage_json: None,
             usage_totals: UsageAggregator::new(),
@@ -281,21 +328,43 @@ impl GrokAdapter {
                     let Some(call_id) = tool_call_id else {
                         continue;
                     };
-                    let key = format!("call:{call_id}");
-                    if self.nodes.contains_key(&key) {
+                    if self.tools.contains_key(&call_id) {
                         continue;
                     }
-                    let id = node_id(&mut self.nodes, &key);
                     let update = &record.frame["params"]["update"];
-                    let name = string(update, "title").or_else(|| {
-                        update
-                            .pointer("/_meta/x.ai~1tool/name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    });
+                    // Protocol §5.7: the stable name is `_meta["x.ai/tool"]
+                    // .name`; `title` is the display sentence only.
+                    let name = meta_field(update, "name");
+                    let kind = meta_field(update, "kind").or_else(|| string(update, "kind"));
+                    let title = string(update, "title");
                     let input = update.get("rawInput").cloned();
-                    let mut observed =
-                        AdapterObservation::structured(tool_call_payload(id, name, input));
+                    let category = categorize(name.as_deref(), kind.as_deref());
+                    let display_title = title.clone().or_else(|| name.clone());
+                    let id = node_id(&mut self.nodes, &format!("call:{call_id}"));
+                    self.tools.insert(
+                        call_id.clone(),
+                        ToolCallTrack {
+                            node: id.clone(),
+                            revision: 1,
+                            name: name.clone(),
+                            kind,
+                            display_title: display_title.clone(),
+                            input: input.clone(),
+                            finished: false,
+                        },
+                    );
+                    let payload = grok_tool_call_payload(
+                        id,
+                        name,
+                        display_title,
+                        category,
+                        input,
+                        ToolCallState::Proposed,
+                        MutationOperation::Open,
+                        1,
+                        None,
+                    );
+                    let mut observed = AdapterObservation::structured(payload);
                     observed.item_id = Some(call_id);
                     if let Some(prompt) = &prompt {
                         observed.turn_id = Some(prompt.clone());
@@ -307,41 +376,22 @@ impl GrokAdapter {
                         continue;
                     };
                     let update = &record.frame["params"]["update"];
-                    // A statusless update is an in-progress mutation; the only
-                    // terminal update carries status. Ignore the progress one.
-                    let Some(status) = string(update, "status") else {
-                        continue;
+                    // A statusless update and `in_progress` are the
+                    // in-progress (Running) mutation. Only the four protocol
+                    // §5.7 statuses are terminal; `pending` and unknown
+                    // statuses stay opaque and leave the node open.
+                    let observed = match string(update, "status").as_deref() {
+                        None | Some("in_progress") => {
+                            self.running_update(&call_id, update, prompt.as_deref())
+                        }
+                        Some(status @ ("completed" | "failed" | "denied" | "cancelled")) => {
+                            self.final_update(&call_id, update, status, prompt.as_deref())
+                        }
+                        Some(_) => None,
                     };
-                    if !self.results.insert(call_id.clone()) {
-                        continue;
+                    if let Some(observed) = observed {
+                        out.push(observed);
                     }
-                    let id = node_id(&mut self.nodes, &format!("call:{call_id}"));
-                    let raw = update.get("rawOutput");
-                    let text = update
-                        .pointer("/content/0/content/text")
-                        .and_then(Value::as_str)
-                        .filter(|text| !text.is_empty())
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            raw.and_then(|value| value.get("output_for_prompt"))
-                                .and_then(Value::as_str)
-                                .filter(|text| !text.is_empty())
-                                .map(str::to_owned)
-                        });
-                    let exit_code = raw
-                        .and_then(|value| value.get("exit_code"))
-                        .and_then(Value::as_i64)
-                        .and_then(|code| i32::try_from(code).ok());
-                    let outcome = tool_outcome(&status, update.get("error"), exit_code);
-                    let structured = Some(update.clone());
-                    let mut observed = AdapterObservation::structured(tool_result_payload(
-                        id, text, structured, exit_code, outcome,
-                    ));
-                    observed.item_id = Some(call_id);
-                    if let Some(prompt) = &prompt {
-                        observed.turn_id = Some(prompt.clone());
-                    }
-                    out.push(observed);
                 }
                 GrokSessionUpdate::HookExecution | GrokSessionUpdate::Unknown { .. } => {
                     // turn_completed closes the streamed nodes; usage frames are
@@ -403,10 +453,140 @@ impl GrokAdapter {
         if stream.thought_chunks > 0
             && let Some(node) = self.thought_nodes.get(prompt).cloned()
         {
+            // Close (not a fresh Open, as before) with the accumulated text —
+            // the same open/append/close contract as the message stream.
             let text = std::mem::take(&mut stream.thought);
-            out.push(AdapterObservation::structured(thought_payload(node, text)).with_turn(prompt));
+            out.push(
+                AdapterObservation::structured(thought_close_payload(
+                    node,
+                    stream.thought_chunks + 1,
+                    stream.thought_chunks,
+                    text,
+                    status,
+                ))
+                .with_turn(prompt),
+            );
         }
         out
+    }
+
+    /// Translate a statusless (or `in_progress`) `tool_call_update` into the
+    /// Running mutation: same node, `Replace`, next revision. Fields the frame
+    /// omits keep their previous value (protocol §5.7 "不含字段保持旧值"). A
+    /// progress frame for a call whose Pending frame was never seen is ignored.
+    fn running_update(
+        &mut self,
+        call_id: &str,
+        update: &Value,
+        prompt: Option<&str>,
+    ) -> Option<AdapterObservation> {
+        let track = self.tools.get_mut(call_id)?;
+        if track.finished {
+            return None;
+        }
+        if let Some(name) = meta_field(update, "name") {
+            track.name = Some(name);
+        }
+        if let Some(kind) = meta_field(update, "kind").or_else(|| string(update, "kind")) {
+            track.kind = Some(kind);
+        }
+        if let Some(title) = string(update, "title") {
+            track.display_title = Some(title);
+        }
+        if let Some(input) = update.get("rawInput") {
+            track.input = Some(input.clone());
+        }
+        let category = categorize(track.name.as_deref(), track.kind.as_deref());
+        track.revision += 1;
+        let revision = track.revision;
+        let payload = grok_tool_call_payload(
+            track.node.clone(),
+            track.name.clone(),
+            track.display_title.clone().or_else(|| track.name.clone()),
+            category,
+            track.input.clone(),
+            ToolCallState::Running,
+            MutationOperation::Replace,
+            revision,
+            Some(revision - 1),
+        );
+        let mut observed = AdapterObservation::structured(payload);
+        observed.item_id = Some(call_id.to_owned());
+        if let Some(prompt) = prompt {
+            observed.turn_id = Some(prompt.to_owned());
+        }
+        Some(observed)
+    }
+
+    /// Translate the terminal `tool_call_update` into the Final result, closing
+    /// the node at a revision strictly greater than the last call revision.
+    fn final_update(
+        &mut self,
+        call_id: &str,
+        update: &Value,
+        status: &str,
+        prompt: Option<&str>,
+    ) -> Option<AdapterObservation> {
+        // A tail joined mid-call may see the terminal frame first; still give
+        // the result its node (the file is replayed from zero on restart, so a
+        // later Pending frame dedupes through `self.tools`).
+        let track = self.tools.entry(call_id.to_owned()).or_insert_with(|| {
+            let node = node_id(&mut self.nodes, &format!("call:{call_id}"));
+            ToolCallTrack::new(node)
+        });
+        if track.finished {
+            return None;
+        }
+        track.finished = true;
+        track.revision += 1;
+        let revision = track.revision;
+        let base_revision = revision - 1;
+        let id = track.node.clone();
+
+        let raw = update.get("rawOutput");
+        let error = update.get("error").filter(|value| !value.is_null());
+        let exit_code = raw
+            .and_then(|value| value.get("exit_code"))
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok());
+        let outcome = tool_outcome(status, error, exit_code);
+        let applied = status == "completed" && error.is_none();
+        // The fallback keys off content-typed text only: terminal/image/unknown
+        // markers are not command output, so they must not suppress
+        // `output_for_prompt` (which is the real result text for a shell call).
+        let (mut blocks, changes, has_content_text) = tool_content(update, applied);
+        if !has_content_text
+            && let Some(text) = raw
+                .and_then(|value| value.get("output_for_prompt"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        {
+            blocks.push(ContentBlock::Text(Box::new(TextBlock {
+                text: text.to_owned(),
+            })));
+        }
+        let payload = grok_tool_result_payload(
+            id,
+            revision,
+            base_revision,
+            blocks,
+            changes,
+            Some(update.clone()),
+            exit_code,
+            outcome,
+        );
+        // The result is now self-contained; release the potentially large tool
+        // inputs so a long-lived adapter does not retain every call's input.
+        track.name = None;
+        track.kind = None;
+        track.display_title = None;
+        track.input = None;
+        let mut observed = AdapterObservation::structured(payload);
+        observed.item_id = Some(call_id.to_owned());
+        if let Some(prompt) = prompt {
+            observed.turn_id = Some(prompt.to_owned());
+        }
+        Some(observed)
     }
 
     /// Drain `events.jsonl`.
@@ -595,6 +775,290 @@ fn tool_outcome(status: &str, error: Option<&Value>, exit_code: Option<i32>) -> 
         "cancelled" => ToolOutcome::Cancelled,
         _ => ToolOutcome::Unknown,
     }
+}
+
+/// Read a string field of `_meta["x.ai/tool"]` (the pointer escapes `/` as
+/// `~1`, per RFC 6901).
+fn meta_field(update: &Value, field: &str) -> Option<String> {
+    update
+        .pointer(&format!("/_meta/x.ai~1tool/{field}"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Name → category table, from
+/// docs/design/grok-structural-translation.md §3.1 (the web registry in
+/// `toolRegistry.ts` mirrors the same table).
+fn category_for_name(name: &str) -> Option<ToolCategory> {
+    match name {
+        "run_terminal_command" => Some(ToolCategory::Shell),
+        "read_file" | "list_dir" => Some(ToolCategory::FileRead),
+        "write" | "search_replace" => Some(ToolCategory::FileWrite),
+        "grep" | "web_search" | "web_fetch" | "open_page" | "open_page_with_find" => {
+            Some(ToolCategory::Search)
+        }
+        "spawn_subagent" => Some(ToolCategory::Agent),
+        "workflow" => Some(ToolCategory::Workflow),
+        "search_tool" | "use_tool" => Some(ToolCategory::Mcp),
+        // x_* is the x.ai extension family (search/query tools).
+        named if named.starts_with("x_") => Some(ToolCategory::Search),
+        _ => None,
+    }
+}
+
+/// Resolve the category: name table first, then the frame `kind`, `Other`
+/// last. Measured kinds are `execute` / `write` / `edit` / `ask_user` /
+/// `other` (design doc §3.1); unknown kinds must not invent a category.
+fn categorize(name: Option<&str>, kind: Option<&str>) -> ToolCategory {
+    if let Some(category) = name.and_then(category_for_name) {
+        return category;
+    }
+    match kind {
+        Some("execute") => ToolCategory::Shell,
+        Some("write") | Some("edit") => ToolCategory::FileWrite,
+        _ => ToolCategory::Other,
+    }
+}
+
+/// Build a grok `ToolCall` observation payload with explicit revision
+/// arithmetic. Revision 1 is the Proposed `Open`; later revisions are
+/// `Replace` mutations (the Running progress frames).
+#[allow(clippy::too_many_arguments)]
+fn grok_tool_call_payload(
+    id: Id,
+    name: Option<String>,
+    display_title: Option<String>,
+    category: ToolCategory,
+    input: Option<Value>,
+    state: ToolCallState,
+    operation: MutationOperation,
+    revision: u64,
+    base_revision: Option<u64>,
+) -> ObservationPayload {
+    let mutation = if revision == 1 && operation == MutationOperation::Open {
+        first_mutation(id.clone())
+    } else {
+        NodeMutation {
+            node_id: id.clone(),
+            revision: U64(revision),
+            operation,
+            base_revision: base_revision.map(U64),
+        }
+    };
+    ObservationPayload::ToolCall(Box::new(ToolCallPayload {
+        mutation,
+        tool_call_id: id,
+        parent_tool_call_id: None,
+        tool_name: name.map_or_else(not_emitted, |value| Knowledge::Known { value }),
+        display_title: display_title.map_or_else(not_emitted, |value| Knowledge::Known { value }),
+        category,
+        input: input.map_or_else(not_emitted, |value| Knowledge::Known { value }),
+        input_text_delta: None,
+        state,
+        executor: Knowledge::NotApplicable,
+    }))
+}
+
+/// Build the Final `ToolResult` at an explicit revision strictly greater than
+/// the last call mutation, so the timeline never freezes on an older revision.
+#[allow(clippy::too_many_arguments)]
+fn grok_tool_result_payload(
+    id: Id,
+    revision: u64,
+    base_revision: u64,
+    blocks: Vec<ContentBlock>,
+    changes: Vec<FileChange>,
+    structured: Option<Value>,
+    exit_code: Option<i32>,
+    outcome: ToolOutcome,
+) -> ObservationPayload {
+    ObservationPayload::ToolResult(Box::new(ToolResultPayload {
+        mutation: NodeMutation {
+            node_id: id.clone(),
+            revision: U64(revision),
+            operation: MutationOperation::Close,
+            base_revision: Some(U64(base_revision)),
+        },
+        tool_call_id: id,
+        stage: ResultStage::Final,
+        outcome,
+        blocks,
+        structured_result: structured.map_or_else(not_emitted, |value| Knowledge::Known { value }),
+        exit_code: exit_code.map_or_else(
+            || Knowledge::Unknown {
+                reason: "not-emitted".into(),
+                evidence_event_ids: Vec::new(),
+            },
+            |code| Knowledge::Known { value: code },
+        ),
+        changes,
+    }))
+}
+
+/// Close a thought node with the accumulated text, mirroring `message_close`
+/// (one Open stream, one terminal Close snapshot).
+fn thought_close_payload(
+    node: Id,
+    revision: u64,
+    base_revision: u64,
+    text: String,
+    status: ContentStatus,
+) -> ObservationPayload {
+    ObservationPayload::Thought(Box::new(ThoughtPayload {
+        mutation: NodeMutation {
+            node_id: node.clone(),
+            revision: U64(revision),
+            operation: MutationOperation::Close,
+            base_revision: Some(U64(base_revision)),
+        },
+        thought_id: node,
+        representation: ThoughtRepresentation::Text,
+        text: Some(text),
+        part_index: 0,
+        status,
+    }))
+}
+
+/// Map a terminal update's grok `content[]` array to protocol blocks and file
+/// changes. `applied` decides a diff's `ChangeApplication`. The third return
+/// value is true only when a `{type:"content"}` text block was produced —
+/// terminal/image/unknown markers do not count, so callers can fall back to
+/// `rawOutput.output_for_prompt` for the real result text.
+fn tool_content(update: &Value, applied: bool) -> (Vec<ContentBlock>, Vec<FileChange>, bool) {
+    let Some(blocks) = update.get("content").and_then(Value::as_array) else {
+        return (Vec::new(), Vec::new(), false);
+    };
+    let locations = update.get("locations").and_then(Value::as_array);
+    let mut out_blocks = Vec::new();
+    let mut changes = Vec::new();
+    let mut has_content_text = false;
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("content") => {
+                map_content_inner(block.get("content"), &mut out_blocks, &mut has_content_text);
+            }
+            Some("diff") => changes.push(map_diff(block, locations, applied)),
+            Some("terminal") => {
+                // A native terminal reference names its output sink; it is
+                // never a promise that Remuda can attach to the tty
+                // (protocol §5.7).
+                out_blocks.push(text_block(terminal_marker(block)));
+            }
+            // Unknown block types stay visible rather than vanishing.
+            Some(other) => out_blocks.push(text_block(format!("[grok content block: {other}]"))),
+            None => {}
+        }
+    }
+    (out_blocks, changes, has_content_text)
+}
+
+/// Map the inner object of a `{type:"content"}` block; typed non-text content
+/// degrades to a labelled text marker instead of being dropped. Only a
+/// non-empty inner text block sets `has_content_text`.
+fn map_content_inner(
+    inner: Option<&Value>,
+    out: &mut Vec<ContentBlock>,
+    has_content_text: &mut bool,
+) {
+    let Some(inner) = inner else {
+        return;
+    };
+    match inner.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(text) = inner
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                out.push(text_block(text.to_owned()));
+                *has_content_text = true;
+            }
+        }
+        Some(other) => out.push(text_block(format!("[grok content block: {other}]"))),
+        None => {}
+    }
+}
+
+/// Translate one `{type:"diff"}` content block into a `FileChange`.
+///
+/// The diff block shape below is **synthesized from docs, not captured**
+/// ([U] in the design doc): the shipped grok 1.0.30 fixture contains no diff
+/// content, so the exact native field spelling is revisited at the 1.0.34
+/// recapture (design doc PR7).
+fn map_diff(block: &Value, locations: Option<&Vec<Value>>, applied: bool) -> FileChange {
+    let path = block
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .or_else(|| block.pointer("/diff/path").and_then(Value::as_str))
+        .or_else(|| {
+            locations
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("path").or_else(|| item.get("uri")))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("")
+        .to_owned();
+    FileChange {
+        path,
+        diff: diff_text(block),
+        application: if applied {
+            ChangeApplication::Applied
+        } else {
+            ChangeApplication::Unknown
+        },
+    }
+}
+
+/// Best-effort diff text extraction for the [U] diff block shape.
+fn diff_text(block: &Value) -> String {
+    if let Some(text) = block
+        .get("diff")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return text.to_owned();
+    }
+    if let Some(text) = block
+        .get("patch")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return text.to_owned();
+    }
+    if let Some(object) = block.get("diff").filter(|value| value.is_object()) {
+        if let Some(text) = object
+            .get("diff")
+            .or_else(|| object.get("patch"))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            return text.to_owned();
+        }
+        return object.to_string();
+    }
+    block.to_string()
+}
+
+/// Human marker for a `{type:"terminal"}` block; tries the likely native id
+/// fields ([U] — the fixture has no terminal content blocks).
+fn terminal_marker(block: &Value) -> String {
+    let terminal_id = ["terminalId", "terminal_id", "id", "sessionId", "path"]
+        .into_iter()
+        .find_map(|key| {
+            block
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        });
+    match terminal_id {
+        Some(id) => format!("[grok terminal: {id}]"),
+        None => "[grok terminal]".to_owned(),
+    }
+}
+
+fn text_block(text: String) -> ContentBlock {
+    ContentBlock::Text(Box::new(TextBlock { text }))
 }
 
 /// Build a permission lifecycle observation from an events.jsonl record.

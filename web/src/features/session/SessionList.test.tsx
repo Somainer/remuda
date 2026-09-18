@@ -46,6 +46,7 @@ vi.mock("../../lib/store", () => ({
     effortEffectiveOf: () => null,
     modelOf: () => "model_hub/es1_orange_o50[1m]",
     modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
+    modelCatalogOf: () => null,
     refreshScreens: vi.fn(),
     broadcast: vi.fn(),
     send: vi.fn(),
@@ -57,7 +58,7 @@ vi.mock("../../lib/store", () => ({
 const titles: Record<string, string> = {};
 const hostNames: Record<string, string> = { "host-a": "alpha", "host-b": "beta" };
 /// Per-instance effective-model observations the mocked store hands back
-/// (D-036 / model-pin-1). Empty by default: most rows have not read one back.
+/// (model-pin-1). Empty by default: most rows have not read one back.
 const modelEffective: Record<
   string,
   { id: string; source: string; observedAt: string }
@@ -250,7 +251,7 @@ describe("SessionList scope and conditions", () => {
 /** Space id the real buildSpaces() derives for the fixture host/workspace. */
 const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
 
-describe("SessionList effective-model label (D-036 / model-pin-1)", () => {
+describe("SessionList effective-model label (model-pin-1)", () => {
   afterEach(() => {
     for (const key of Object.keys(modelEffective)) delete modelEffective[key];
   });
@@ -277,25 +278,44 @@ describe("SessionList effective-model label (D-036 / model-pin-1)", () => {
     expect(label).toHaveAttribute("data-model-diverged", "0");
   });
 
-  // The regression: the pin was requested and something else answered. The row
-  // must show what answered and mark the divergence, because showing only the
-  // request is what made the substituted model invisible.
-  it("shows the observed id and marks a divergence when the pin was not honoured", () => {
+  // The regression: the pin was requested and a DIFFERENT model in the same
+  // vocabulary answered. The row must show what answered and mark the
+  // divergence, because showing only the request is what made the substituted
+  // model invisible.
+  it("marks a divergence when a different model in the pin's namespace answered", () => {
     for (const id of ["ins_a", "ins_b"]) {
       modelEffective[id] = {
-        id: "claude-opus-4-8",
+        id: "model_hub/es1_orange_o48[1m]",
         source: "launch",
         observedAt: "2026-09-18T00:00:00Z",
       };
     }
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("claude-opus-4-8");
-    expect(label).toHaveAttribute("data-model-effective", "claude-opus-4-8");
+    expect(label).toHaveTextContent("model_hub/es1_orange_o48[1m]");
+    expect(label).toHaveAttribute("data-model-effective", "model_hub/es1_orange_o48[1m]");
     expect(label).toHaveAttribute("data-model-diverged", "1");
     // Both ids stay legible, so the pin that was asked for is not lost.
     expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o50[1m]");
-    expect(label.getAttribute("title")).toContain("claude-opus-4-8");
+    expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o48[1m]");
+  });
+
+  // The measured false positive (model-pin-1 §3): a gateway resolves a catalog
+  // id to an upstream vendor name. This is a correct launch and must NOT be
+  // flagged as diverged, even though the two strings differ.
+  it("does not flag a gateway resolving the pin to an upstream vendor name", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+      modelEffective[id] = {
+        id: "claude-opus-5",
+        source: "launch",
+        observedAt: "2026-09-18T00:00:00Z",
+      };
+    }
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label).toHaveTextContent("claude-opus-5");
+    expect(label).toHaveAttribute("data-model-effective", "claude-opus-5");
+    expect(label).toHaveAttribute("data-model-diverged", "0");
   });
 });
 

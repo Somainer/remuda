@@ -14,6 +14,7 @@ import { useModifierHeld } from "../../lib/useModifierHeld";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
+import { compareModelPin } from "./modelEffective";
 import { LaunchedByMark } from "./LaunchedBy";
 import {
   applyFilters,
@@ -591,21 +592,24 @@ export function SessionList({
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
-                        // D-036 / model-pin-1: label the row with the model that
+                        // model-pin-1: label the row with the model that
                         // actually answered, not the one that was requested. A
                         // pin silently replaced by the host's default used to be
                         // indistinguishable here from an honoured one, because
                         // the row only ever showed the request.
                         //
                         // The observation comes from `modelEffective.ts` through
-                        // the store, so this reuses that one source of truth
-                        // rather than re-deriving an id.
+                        // the store, and the divergence test is the same alias
+                        // rule the Node and Hub use (`compareModelPin`), so a
+                        // correct gateway launch — a catalog id resolved to an
+                        // upstream vendor name — is not flagged.
                         const requested = hubStore.modelOf(instance.id, instance.kind);
                         const effective = hubStore.modelEffectiveOf(instance.id);
-                        // A gateway resolves a catalog id to an upstream name,
-                        // so a difference is worth showing but is not by itself
-                        // a fault (evidence/model-pin-1.md §3).
-                        const diverged = !!effective && !!requested && effective.id !== requested;
+                        const catalog = hubStore.modelCatalogOf(instance.id)?.models ?? [];
+                        const verdict = effective
+                          ? compareModelPin(requested, effective.id, catalog)
+                          : "honoured";
+                        const diverged = verdict === "mismatch";
                         return (
                           <>
                             <span className={css.sep}>·</span>

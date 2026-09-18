@@ -1012,11 +1012,13 @@ export type GateJob = ({
   "attempts": (number);
   "baseSha"?: (string | null);
   "branch": (string);
+  "cancelRequestedAt"?: (Timestamp | (null));
   "currentMainSha"?: (string | null);
   "error"?: (string | null);
   "failedStep"?: (string | null);
   "finishedAt"?: (Timestamp | (null));
   "headSha"?: (string | null);
+  "homeLandInFlight"?: (boolean);
   "hostId"?: (HostId | (null));
   "id": GateJobId;
   "keepLogs": (boolean);
@@ -3175,6 +3177,9 @@ export type ProjectGate = ({
   "landSerialization"?: (string | null);
   "lanes"?: ((ProjectGateLane)[]);
   "mandatorySteps"?: (((string))[]);
+  "timeouts"?: ({
+  [key: string]: (number);
+});
   "web"?: (string | null);
   [key: string]: unknown;
 });
@@ -3194,6 +3199,9 @@ export type ProjectGateLane = ({
   "remote"?: (string | null);
   "repoPath": (string);
   "targetDir": (string);
+  "timeouts"?: ({
+  [key: string]: (number);
+});
   "toolchainPath"?: (string | null);
   [key: string]: unknown;
 });

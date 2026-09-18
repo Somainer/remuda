@@ -88,6 +88,7 @@ const HUB_CAPABILITIES = printCapabilities();
 const KINDS: Instance["kind"][] = ["claude", "codex", "grok", "agy", "generic", "terminal"];
 const DRIVERS: Instance["driver"][] = [
   "claude-print",
+  "claude-sdk",
   "claude-pty",
   "claude-bg",
   "codex-appserver",
@@ -115,7 +116,16 @@ function mapKind(raw: string): Instance["kind"] {
   return KINDS.find((k) => k === raw) ?? "generic";
 }
 
-function mapDriver(raw: string): Instance["driver"] {
+/**
+ * Coerce a reported driver to a known one.
+ *
+ * The fallback is a display-only last resort for a driver this build has never
+ * heard of. It must never swallow a driver we *do* know: mislabelling a
+ * `claude-sdk` instance as `claude-print` tells the operator the session ends
+ * after one turn when in fact its child is still alive across turns, which is
+ * the whole difference between the two carriers (D-037).
+ */
+export function mapDriver(raw: string): Instance["driver"] {
   return DRIVERS.find((d) => d === raw) ?? "claude-print";
 }
 

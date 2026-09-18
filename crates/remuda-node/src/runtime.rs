@@ -3859,7 +3859,10 @@ mod tests {
                     models,
                     source: remuda_protocol::ModelListSource::GatewayDiscovery,
                     observed_at: timestamp_now().expect("now"),
+                    cache: None,
+                    discovery_env: None,
                 }),
+                selection_path: None,
             }));
             observation
         }

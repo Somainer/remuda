@@ -953,6 +953,62 @@ fn shows_model_confirmation(lines: &[String]) -> bool {
     })
 }
 
+/// How a typed `/model <id>` settled, read off the live screen.
+#[derive(Debug)]
+enum ModelVerdict {
+    /// `Set model to <id>` — the resolved id now in effect.
+    Accepted(String),
+    /// `not found` / `Kept model as` — the CLI refused.
+    Rejected(&'static str),
+}
+
+/// Scan the bottom of the screen for a `/model` command verdict. An accepted
+/// id matches when it equals the requested id or the two differ only by a
+/// gateway path prefix (an alias resolving to a concrete gateway spelling).
+fn read_model_verdict(lines: &[String], requested: &str) -> Option<ModelVerdict> {
+    for line in lines.iter().rev().take(12) {
+        match remuda_protocol::parse_model_stdout(line) {
+            remuda_protocol::ModelStdout::Accepted(observed) => {
+                let id = observed.id;
+                let same = id == requested
+                    || id.ends_with(&format!("/{requested}"))
+                    || requested.ends_with(&format!("/{id}"));
+                if same {
+                    return Some(ModelVerdict::Accepted(id));
+                }
+            }
+            remuda_protocol::ModelStdout::NotFound => {
+                return Some(ModelVerdict::Rejected("not-found"));
+            }
+            remuda_protocol::ModelStdout::Kept => {
+                return Some(ModelVerdict::Rejected("dialog-kept"));
+            }
+            remuda_protocol::ModelStdout::Other => {}
+        }
+    }
+    None
+}
+
+/// Poll the live screen for the verdict after the typed `/model` lands. The
+/// verdict, not the (version-specific) confirmation dialog, is the acceptance
+/// authority: on 2.1.272 a valid id applies with no prompt at all.
+async fn await_model_verdict(
+    state: &AppState,
+    host_id: &str,
+    instance_id: &str,
+    requested: &str,
+) -> Option<ModelVerdict> {
+    for _ in 0..12 {
+        if let Some(lines) = bottom_screen_lines(state, host_id, instance_id).await
+            && let Some(verdict) = read_model_verdict(&lines, requested)
+        {
+            return Some(verdict);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    None
+}
+
 async fn switch_worker_model(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1023,6 +1079,7 @@ async fn switch_worker_model(
     tokio::time::sleep(MODEL_SETTLE).await;
 
     // Gate: confirm only when the screen actually shows the confirmation.
+    // On 2.1.272 a valid id applies with no dialog at all.
     let screen = bottom_screen_lines(&state, &host_id, &instance_id).await;
     let confirmed = screen.as_deref().is_some_and(shows_model_confirmation);
     if confirmed {
@@ -1046,17 +1103,33 @@ async fn switch_worker_model(
         .await;
     }
 
+    // The verdict is the acceptance authority on 2.1.272 (no dialog). When
+    // no verdict was read back, fall back to the dialog gate outcome: an
+    // Enter was only sent because the confirmation dialog was seen, so
+    // confirmed=true means the legacy path accepted and the row is updated;
+    // only a genuinely unconfirmed attempt (neither dialog nor verdict) stays
+    // unrecorded and asks the operator to answer manually.
+    let verdict = await_model_verdict(&state, &host_id, &instance_id, &model).await;
+    let (applied, accepted_id, rejected) = match verdict {
+        Some(ModelVerdict::Accepted(id)) => (true, Some(id), None),
+        Some(ModelVerdict::Rejected(reason)) => (false, None, Some(reason)),
+        None => (confirmed, None, None),
+    };
+    let recorded_model = accepted_id.clone().unwrap_or_else(|| model.clone());
+
     let now = crate::config::now_rfc3339();
     let previous_model = worker.model.clone();
     let updated = state
         .store
         .mutate_worker(worker.meta.id.as_id().to_string(), move |row| {
-            if confirmed {
-                row.model = Some(model.clone());
-                row.last_nudge_at = Some(
-                    remuda_protocol::Timestamp::try_from(now)
-                        .map_err(|err| StoreError::Id(err.to_string()))?,
-                );
+            if applied {
+                row.model = Some(recorded_model.clone());
+                if confirmed {
+                    row.last_nudge_at = Some(
+                        remuda_protocol::Timestamp::try_from(now)
+                            .map_err(|err| StoreError::Id(err.to_string()))?,
+                    );
+                }
             }
             Ok(())
         })
@@ -1069,19 +1142,39 @@ async fn switch_worker_model(
             device.id,
             "worker.switch-model".into(),
             Some(updated.meta.id.as_id().to_string()),
-            json!({ "from": previous_model, "to": body.model, "confirmed": confirmed }),
+            json!({
+                "from": previous_model,
+                "to": body.model,
+                "resolved": accepted_id,
+                "confirmed": confirmed,
+                "applied": applied,
+                "rejected": rejected,
+            }),
         )
         .await
         .map_err(map_store)?;
+    let hint = match (rejected, applied, confirmed) {
+        (Some("not-found"), _, _) => "model id not found by the CLI; switch not recorded",
+        (Some(_), _, _) => "model switch dismissed; previous model kept",
+        (None, true, true) => "model switched and confirmed",
+        (None, true, false) => "model applied with no confirmation dialog (verdict read back)",
+        (None, false, false) => {
+            "no confirmation dialog or verdict observed; not sending Enter — answer it with `remuda worker answer <name> enter`"
+        }
+        (None, false, true) => {
+            "confirmation dialog answered, but no read-back was observed; verify the model on the worker"
+        }
+    };
     Ok(Json(json!({
         "worker": updated,
         "confirmed": confirmed,
-        "screen": screen.unwrap_or_default(),
-        "hint": if confirmed {
-            "model switched and confirmed"
-        } else {
-            "no confirmation dialog observed; not sending Enter — answer it with `remuda worker answer <name> enter`"
-        },
+        "applied": applied,
+        "resolved": accepted_id,
+        "rejected": rejected,
+        "screen": bottom_screen_lines(&state, &host_id, &instance_id)
+            .await
+            .unwrap_or_default(),
+        "hint": hint,
     })))
 }
 
@@ -1568,4 +1661,58 @@ fn fmt_rfc3339_millis(secs: i64) -> String {
         dt.second(),
         dt.millisecond(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_without_dialog_still_records_the_switch() {
+        // 2.1.272: a valid id applies straight away, no confirmation prompt.
+        let lines = vec![
+            "$ /model claude-fable-5-1".to_owned(),
+            "Set model to `claude-fable-5-1` and saved as your default for new sessions".to_owned(),
+        ];
+        match read_model_verdict(&lines, "claude-fable-5-1") {
+            Some(ModelVerdict::Accepted(id)) => assert_eq!(id, "claude-fable-5-1"),
+            other => panic!("expected accepted verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verdict_accepts_a_resolved_alias() {
+        let lines = vec![
+            "Set model to `model_hub/es1_orange_o48[1m]` and saved as your default for new sessions"
+                .to_owned(),
+        ];
+        match read_model_verdict(&lines, "model_hub/es1_orange_o48[1m]") {
+            Some(ModelVerdict::Accepted(id)) => assert_eq!(id, "model_hub/es1_orange_o48[1m]"),
+            other => panic!("expected accepted verdict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_found_verdict_is_a_rejection() {
+        let lines = vec!["Model 'claude-grok-9.9' not found".to_owned()];
+        match read_model_verdict(&lines, "claude-grok-9.9") {
+            Some(ModelVerdict::Rejected("not-found")) => {}
+            other => panic!("expected not-found rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kept_model_verdict_is_a_rejection() {
+        let lines = vec!["Kept model as `claude-opus-5`".to_owned()];
+        match read_model_verdict(&lines, "claude-fable-5-1") {
+            Some(ModelVerdict::Rejected("dialog-kept")) => {}
+            other => panic!("expected dialog-kept rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_lines_have_no_verdict() {
+        let lines = vec!["$ ls".to_owned(), "echo: hello".to_owned()];
+        assert!(read_model_verdict(&lines, "anything").is_none());
+    }
 }

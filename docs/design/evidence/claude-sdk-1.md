@@ -4,6 +4,13 @@
 **Status:** measured. One live session on a throwaway local dev server, redacted below.
 **Design:** [print-replacement.md](../print-replacement.md) §2.1 (process model), §2.2 (resume and session identity), §2.5 (observation table), §2.6 (second carrier). Decision row [D-037](../decisions.md).
 **Scope:** M1 = §3 batch 1 + batch 2 + the registration half of batch 3.
+**Commits:** the live run below was made on branch `wt/c-sdkdriver/b-sdkdriver-md` at
+`56e55988` (the M1 series as first reviewed). The handback round that followed —
+the bounded close ladder, the web driver label, the test fixes and this
+paragraph — landed on the same branch; its final commit is `HANDBACK_SHA`. The
+argv, pids, session id and journal quoted here are from the `56e55988` tree; the
+close ladder changed `Driver::close` after that run, and its behaviour is covered
+by `tests/claude_sdk_process.rs` rather than by a second live session.
 
 `LIVE`: this session spent real Haiku budget on two one-word turns (reported cost
 below, two `result` frames). Everything else in the change is covered by
@@ -153,9 +160,22 @@ Reading this against the four things the task asked to show:
 4. **the second turn on the same process** — seq 34 onward is the second send,
    answered by the same pid under the same `nativeId`.
 
-Two `result` frames arrived, one per turn; only the second is
-`affects_completion: true`, which is `map_result`'s existing rule
-(a Workflow's first `result` must not tear the session down) behaving unchanged.
+Two `result` frames arrived, one per turn — and the `affects_completion` values
+above (turn 1 `false`, turn 2 `true`) are **not** what §2.5 asks for. That table
+says `affects_completion` only when the result is terminal. What actually decides
+it is `map_result`'s inherited print heuristic, `result_index > 0 &&
+queued_turn_count == 0`, which was written for a Workflow emitting `result_index`
+0 then 1 inside **one** print turn: the first is not process completion, the
+second is.
+
+On a child that survives, `result_index` instead grows **per turn**, so the rule
+reads "every turn after the first is terminal" — which is why turn 1 reports
+`false` and turn 2 reports `true` here. Both are wrong on this carrier: turn 1
+did complete, and turn 2 was not the end of the session (the child was still
+alive and took `close` afterwards). Nothing downstream in M1 keys off this field
+on the sdk carrier, so it is recorded rather than patched; fixing it means
+deciding what "terminal" means for a long-lived child, which is an M2 item in
+[D-037](../decisions.md) and not a same-round change.
 
 ## 7. What this session did *not* show
 
@@ -178,6 +198,9 @@ Honest gaps, so the ADR does not over-claim:
   without `-p`, `ping` frames on a slow gateway, `can_use_tool` without `-p`,
   session id after a gateway turn) remain M2. This run used the host's native
   login, `delegation: none`.
+- **`affects_completion` is on the print heuristic, not the §2.5 rule.** See §6:
+  it is `result_index`-derived, which means something different once the child
+  outlives a turn. M2 owns it.
 - **No approval or AskUserQuestion round-trip live.** Those are covered against
   `fake-claude` (`approval` / `askuser` scripts) via the shared
   `handle_can_use_tool`, which M1 reuses unchanged.

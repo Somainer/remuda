@@ -333,11 +333,25 @@ lifecycle，Node 无需 driver 专用代码就把它抬进 `nativeRef`）；id �
 
 **M1 边界**。已交付：protocol 枚举 + 重生成的 schema/TS、两套 argv 模板（wire 与
 materializer）、driver 本体与参数化的 mapper、能力矩阵、fake 的 turn barrier 与不带
-`-p` 的 spawn、Node 工厂与矩阵、汇编器/进程/矩阵三层测试、真实两轮 live 证据。
+`-p` 的 spawn、Node 工厂与矩阵、汇编器/进程/矩阵三层测试、真实两轮 live 证据；
+交接复审一轮另补：`Driver::close` 的有界阶梯（stdin → 有界 wait → 原生 interrupt →
+子进程组 SIGKILL，`exited` 恰好一次）与 web 侧的 `claude-sdk` 标签（此前 UI 把 sdk
+实例显示成 print，等于告诉操作者"这个会话一轮就结束"）。
+
 **M2 owns**：print 退役（夹具对账变绿之后）、§2.4 的 suggestions 白名单与
 launch-bypass 拒绝、AskUserQuestion 的活链路验证、§4.2 网关探针——在那个探针跑之前
 **gateway-on-sdk 留 `unknown`**，不作为 supported 发布。`onUserDialog`、subagent
 drill-in、sidecar、IDE lock/MCP 都不在 M1（§2.9）。
+
+**另有一项 M2 账（复审记账，不在本轮修）**：`map_result` 的 `affects_completion`
+仍用 print 的启发式 `result_index > 0 && queued_turn_count == 0`。那条规则是为
+「一个 print 轮次里 Workflow 先发 `result_index` 0 再发 1」写的；可是在活过多轮的
+子进程上 `result_index` 是**按轮**递增的，于是它读作「第一轮之后每一轮都是终结」——
+live 证据里第 1 轮报 `false`、第 2 轮报 `true`，两个都不对（第 1 轮确实完成了，第 2
+轮也不是会话终点，子进程还活着并随后接了 `close`）。§2.5 的规则是「只有终结时才
+`affects_completion`」。M1 没有任何下游在 sdk carrier 上依赖这个字段，所以先记账：
+要修得先定义「对一个长寿子进程而言什么算终结」，那是 M2 的决定，不是同轮改动。
+证据见 [claude-sdk-1.md](./evidence/claude-sdk-1.md) §6。
 
 **实测**：[claude-sdk-1.md](./evidence/claude-sdk-1.md) 在一台一次性本地 dev server
 上用真实 CLI 跑了一轮 `LIVE`：`--driver claude-sdk` 被原样转发，进程表里的 argv

@@ -15,7 +15,7 @@ use remuda_protocol::{
     Knowledge, LifecyclePayload, Observation, ObservationPayload, PromptInput, PromptMode,
     SourceChannel, TextBlock,
 };
-use remuda_testing::{ScriptKind, ensure_workspace_bin, fake_claude_argv, script_path};
+use remuda_testing::{ScriptKind, ensure_workspace_bin, script_path};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;

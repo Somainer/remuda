@@ -52,8 +52,15 @@ impl Default for FakeDriver {
 impl FakeDriver {
     /// Claude-print stub with the built-in OK fixture.
     pub fn new() -> Self {
+        Self::with_kind(DriverKind::ClaudePrint)
+    }
+
+    /// [`Self::new`] stamping `kind` instead, so a Hub/Web loopback fixture for
+    /// a `claude-sdk` instance does not report itself as `claude-print` (§3
+    /// fixture strategy).
+    pub fn with_kind(kind: DriverKind) -> Self {
         Self {
-            kind: DriverKind::ClaudePrint,
+            kind,
             state: Mutex::new(State {
                 started: false,
                 closed: false,

@@ -598,7 +598,7 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 | `online, lastSeenAt, rttMs?` | 心跳（Hub 所见 Host.state 的投影） |
 | `agentVersion` | Node Agent |
 | `resources?` | cpu/mem，缺则不画仪表 |
-| `cli[]` | `{kind, version, path, auth: gateway-native\|logged_in\|logged_out\|unknown}` — **绝对路径+版本**，按主机盘点。Claude `gateway-native` 只报布尔，不含 token |
+| `cli[]` | `{kind, version, path, auth: gateway-native\|logged_in\|logged_out\|unknown, installed: boolean}` — **绝对路径+版本**，按主机盘点。Claude `gateway-native` 只报布尔，不含 token。`installed` 是探针自己的判断（`path` 存在与否），与 `path` 是否为空**不是**同一件事：一台没装某 CLI 的主机仍可回报该行并带 `installed: false` |
 | `instanceCount` | |
 
 **`computer-use` 行（D-045 / [codex-cua.md](./codex-cua.md) §3.4）**
@@ -607,7 +607,13 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 
 - `kind: "computer-use"`，`path` / `version` / `installed` 按上面同一张表渲染；
   `auth` 恒为 `unknown`——Remuda **刻意不探测**这个 vendor 的登录态；
-- `installed: false` 渲染为「**未安装**」，与其它 CLI 同一套措辞；
+- `installed: false` 渲染为「**未安装**」，与其它 CLI 同一套措辞。
+  **这条要求改一处现有代码**：`web/src/features/hosts/model.ts:85-87` 的
+  `installedCli` 过滤是 `Boolean(entry.path || entry.version)`——一条
+  `installed: false` 的行既没有 `path` 也可能没有 `version`，**今天会被这行直接丢掉**，
+  于是「未安装」永远画不出来，只会静默消失（而 §3.3 要求它与「未上报」是不同的画法）。
+  过滤条件必须改读 `installed`（`installedCli` 的语义本来就是「装了的那些」，
+  未安装行需要另一条渲染路径）。该代码归 `c-cua-hostcap`；本节只写规格。
 - **这一行缺席**（老 Node 不上报）渲染为「**未上报**」，**绝不**渲染成
   「不支持」——这正是 §3.3 的规则在这个字段上的落点：没有数据 ≠ 否；
 - `cliSummary` 的 `<kind>-cli ` 前缀剥离（`web/src/features/hosts/model.ts:89-101`）

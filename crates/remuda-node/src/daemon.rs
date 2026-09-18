@@ -1,6 +1,7 @@
 //! Persistent runtime with replaceable local NDJSON controllers.
 
 use crate::inventory::{CollectRequest, collect};
+use crate::stdio::rpc_code;
 use crate::transport::hubnode;
 use crate::{DevNode, NodeError, StdioOptions, enroll};
 use remuda_protocol::{Id, U64};
@@ -614,9 +615,12 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     tokio::spawn(async move {
                         let result = hubnode::dispatch_method(&node, &method, params).await;
                         if !id.is_null() {
+                            // Same code the reply would carry on the inline path
+                            // (and on stdio): a not-found or a bad request is
+                            // -32602, not the internal -32603 class.
                             let response = match result {
                                 Ok(value) => hubnode::rpc_ok(id, value),
-                                Err(error) => hubnode::rpc_error(id, -32602, &error.to_string()),
+                                Err(error) => hubnode::rpc_error(id, rpc_code(&error), &error.to_string()),
                             };
                             let _ = long_tx.send(response).await;
                         }
@@ -641,7 +645,7 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 if !id.is_null() {
                     let response = match result {
                         Ok(value) => hubnode::rpc_ok(id,value),
-                        Err(error) => hubnode::rpc_error(id,-32602,&error.to_string()),
+                        Err(error) => hubnode::rpc_error(id,rpc_code(&error),&error.to_string()),
                     };
                     if *changed.borrow() != generation {return Ok(());}
                     tokio::select! {

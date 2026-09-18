@@ -128,6 +128,9 @@ fn public_wire_types_are_registered_for_generation() {
         // §9.1: parsed verdict of a /model stdout line — mapper output, not a
         // wire type.
         "ModelStdout",
+        // model-pin-1: pure pin-vs-observed comparison shared by the Node gate
+        // and the Hub watch classification; never serialized on the wire.
+        "ModelPinVerdict",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

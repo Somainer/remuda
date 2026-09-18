@@ -472,7 +472,7 @@ async fn send_from_params(node: &DevNode, params: Value) -> Result<(InstanceId, 
     let prompt = parsed
         .as_ref()
         .and_then(InstanceSendParams::prompt_text)
-        .map(str::to_owned)
+        .map(|text| text.into_owned())
         .or_else(|| prompt_of(&params))
         .unwrap_or_default();
     let command_id = parsed

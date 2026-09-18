@@ -291,6 +291,12 @@
           "hostId": {
             "type": "string"
           },
+          "idempotencyKey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "instanceId": {
             "type": [
               "string",
@@ -300,10 +306,45 @@
           "operation": {
             "type": "string"
           },
+          "payload": {
+            "additionalProperties": true,
+            "type": "object"
+          },
           "resolution": {
+            "enum": [
+              "clear",
+              "reconciling",
+              "unknown"
+            ],
             "type": "string"
           },
+          "settlement": {
+            "additionalProperties": true,
+            "properties": {
+              "outcome": {
+                "enum": [
+                  "cancelled",
+                  "completed",
+                  "expired",
+                  "rejected"
+                ],
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "outcome"
+            ],
+            "type": "object"
+          },
           "state": {
+            "enum": [
+              "accepted",
+              "queued",
+              "settled"
+            ],
             "type": "string"
           },
           "updatedAt": {
@@ -312,9 +353,16 @@
         },
         "required": [
           "commandId",
+          "createdAt",
+          "forwarded",
           "hostId",
+          "idempotencyKey",
+          "instanceId",
           "operation",
-          "state"
+          "payload",
+          "resolution",
+          "state",
+          "updatedAt"
         ],
         "type": "object"
       },
@@ -984,6 +1032,24 @@
         },
         "required": [
           "path"
+        ],
+        "type": "object"
+      },
+      "InstanceCommands": {
+        "properties": {
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/CommandRecord"
+            },
+            "type": "array"
+          },
+          "instanceId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "instanceId",
+          "commands"
         ],
         "type": "object"
       },
@@ -5881,6 +5947,45 @@
       }
     },
     "/v1/instances/{id}/commands": {
+      "get": {
+        "operationId": "instanceCommands",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceCommands"
+                }
+              }
+            },
+            "description": "Recent commands for the instance, newest first"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      },
       "post": {
         "operationId": "instanceCommand",
         "parameters": [

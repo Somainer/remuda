@@ -526,8 +526,10 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
     let parsed: InstanceSendParams = serde_json::from_value(params.clone())?;
     let prompt = parsed
         .prompt_text()
-        .ok_or_else(|| NodeError::InvalidRequest("instance.send requires input.text".into()))?
-        .to_owned();
+        .ok_or_else(|| {
+            NodeError::InvalidRequest("instance.send requires input.text or input.blocks".into())
+        })?
+        .into_owned();
     let instance_id = InstanceId::from_str(&parsed.instance_id)?;
     submit(
         crate::origin::wire_origin(&params),
@@ -535,12 +537,10 @@ async fn dispatch_send(node: &DevNode, params: Value) -> Result<Value, NodeError
         &instance_id,
         CommandAction::Send,
         Some(prompt),
-        // c-steer: carry the web's `mode` ("steer" jumps the queue); an
-        // unknown value degrades to a plain new turn.
-        params.get("mode").and_then(Value::as_str).and_then(|raw| {
-            serde_json::from_value::<remuda_protocol::PromptMode>(Value::String(raw.to_owned()))
-                .ok()
-        }),
+        // c-steer/c-send: carry the delivery `mode` ("steer" jumps the queue),
+        // read from either the top level (web) or nested under `input` (CLI).
+        // An unknown value degrades to a plain new turn.
+        parsed.delivery_mode(),
         parsed.attachments(),
         parsed.command_id.as_deref(),
         parsed.run_id.as_deref(),
@@ -1130,5 +1130,118 @@ mod driver_fidelity_tests {
             .await
             .expect("a spec with no driver still launches");
         assert!(created.pointer("/instance/driver").is_some(), "{created}");
+    }
+
+    /// Poll an instance's journal until `predicate` matches one of its events,
+    /// then return the matching event. The instance worker runs the send off
+    /// the RPC path, so a spin-wait is how the test observes what the driver
+    /// actually received.
+    async fn await_journal_event(
+        node: &DevNode,
+        instance_id: &InstanceId,
+        predicate: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let journal_id = node
+            .get_instance(instance_id)
+            .expect("instance exists")
+            .journal_id;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let page = node
+                .read_journal(&journal_id, None, 256)
+                .expect("read journal");
+            let events = serde_json::to_value(&page.events).expect("events json");
+            if let Some(found) = events
+                .as_array()
+                .and_then(|events| events.iter().find(|event| predicate(event)))
+            {
+                return found.clone();
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("no journal event matched within the deadline: {events}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The ssh-stdio demo defect: a CLI `instance.send` carries its prompt as
+    /// `input.blocks` with no top-level `text`/`prompt`, and the stdio codec
+    /// replied `invalid request` so the prompt reached no driver. The joined
+    /// text must now arrive, and a delivery mode nested under `input` must be
+    /// honoured.
+    #[tokio::test]
+    async fn a_blocks_only_send_reaches_the_driver_with_joined_text_and_nested_mode() {
+        let node = node();
+        // `claude-print` is the in-process FakeDriver: it echoes the prompt it
+        // received and marks a steer, so the test observes exactly what reached
+        // the driver over the stdio codec path.
+        let created = create(&node, dispatch_spec("claude-print"))
+            .await
+            .expect("create accepted");
+        let instance_id = InstanceId::from_str(
+            created
+                .pointer("/instance/id")
+                .and_then(Value::as_str)
+                .expect("instance id"),
+        )
+        .expect("parse instance id");
+
+        // Exactly the shape crates/remuda/src/cmd/instance.rs builds: a prompt
+        // wrapper with text blocks and the mode nested under `input`.
+        let params = json!({
+            "instanceId": instance_id.as_id().to_string(),
+            "input": {
+                "type": "prompt",
+                "mode": "steer",
+                "blocks": [
+                    {"type": "text", "text": "first line"},
+                    {"type": "text", "text": "second line"},
+                ],
+                "origin": "cli",
+            },
+            "completionScope": "native-turn",
+        });
+        let accepted = dispatch_send(&node, params)
+            .await
+            .expect("blocks-only send must be accepted, not refused");
+        assert_eq!(
+            accepted
+                .pointer("/command/operation")
+                .and_then(Value::as_str),
+            Some("instance.send"),
+            "the send is a real command, not an error: {accepted}"
+        );
+
+        // The fake driver echoes `fake: {prompt}`, so the joined text is what it
+        // received.
+        let message = await_journal_event(&node, &instance_id, |event| {
+            event.get("kind").and_then(Value::as_str) == Some("message")
+                && event
+                    .pointer("/payload/blocks/0/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text == "fake: first line\nsecond line")
+        })
+        .await;
+        assert_eq!(
+            message.pointer("/payload/role").and_then(Value::as_str),
+            Some("assistant"),
+            "the echoed prompt is an assistant message: {message}"
+        );
+
+        // The fake driver emits a `fake-driver-mode` lifecycle only for a steer,
+        // proving the nested `input.mode` reached `command_parts` as a steer and
+        // not a plain new turn.
+        let mode = await_journal_event(&node, &instance_id, |event| {
+            event.get("kind").and_then(Value::as_str) == Some("lifecycle")
+                && event.pointer("/payload/nativeName").and_then(Value::as_str)
+                    == Some("fake-driver-mode")
+        })
+        .await;
+        assert_eq!(
+            mode.pointer("/payload/status/value")
+                .and_then(Value::as_str),
+            Some("steer"),
+            "the nested steer mode carried to the driver: {mode}"
+        );
     }
 }

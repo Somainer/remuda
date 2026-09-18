@@ -12,11 +12,12 @@
 
 use crate::{
     BINARY_HEADER_LEN, BinaryChannel, BinaryFrameError, BinaryHeader, JsonRpcVersion,
-    PROTOCOL_VERSION, ProtocolVersion, U64, decode_binary_frame,
+    PROTOCOL_VERSION, PromptMode, ProtocolVersion, U64, decode_binary_frame,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 /// JSON-RPC method for the first stdio frame (Bearer equivalent).
 pub const METHOD_NODE_AUTH: &str = "node.auth";
@@ -661,6 +662,11 @@ pub struct InstanceSendParams {
     /// Flattened prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Delivery mode when the caller places it at the top level (`steer` jumps
+    /// the queue). The web nests it under `input`; both are read by
+    /// [`InstanceSendParams::delivery_mode`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Staged attachment metadata (D-027). Additive: an older Node that does
     /// not know this field simply degrades the send to text-only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1303,19 +1309,61 @@ impl JournalSeqWatermark {
     }
 }
 
+/// Join the `text` fields of an `input.blocks` array in order, newline
+/// separated. Returns `None` when the value is absent, is not an array, or
+/// holds no text blocks — mirroring `runtime_wss::prompt_of`.
+fn join_text_blocks(blocks: Option<&Value>) -> Option<String> {
+    let blocks = blocks?.as_array()?;
+    let mut out = String::new();
+    for block in blocks {
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(text);
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 impl InstanceSendParams {
-    /// Prompt text from `input.text`, `input` string, or `prompt`.
+    /// Prompt text from `input.text`, `input` string, joined `input.blocks`
+    /// text blocks, or the flattened `prompt`.
+    ///
+    /// The CLI, fleet and feishu senders all build the block shape
+    /// (`input.blocks: [{type:"text", text}]`); folding it here is what lets an
+    /// otherwise-identical `instance.send` reach a driver over the stdio codec
+    /// the same way it already does on a WSS host
+    /// (`transport::wss::runtime_wss::prompt_of`).
     #[must_use]
-    pub fn prompt_text(&self) -> Option<&str> {
-        self.input
-            .as_ref()
-            .and_then(|input| {
-                input
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| input.as_str())
-            })
-            .or(self.prompt.as_deref())
+    pub fn prompt_text(&self) -> Option<Cow<'_, str>> {
+        if let Some(input) = self.input.as_ref() {
+            if let Some(text) = input
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| input.as_str())
+            {
+                return Some(Cow::Borrowed(text));
+            }
+            if let Some(joined) = join_text_blocks(input.get("blocks")) {
+                return Some(Cow::Owned(joined));
+            }
+        }
+        self.prompt.as_deref().map(Cow::Borrowed)
+    }
+
+    /// Delivery mode carried on the params (`mode`) or nested under `input`
+    /// (`input.mode`), whichever the caller used. Unknown values return `None`
+    /// so the receiver degrades to a plain new turn.
+    #[must_use]
+    pub fn delivery_mode(&self) -> Option<PromptMode> {
+        let raw = self.mode.as_deref().or_else(|| {
+            self.input
+                .as_ref()
+                .and_then(|input| input.get("mode"))
+                .and_then(Value::as_str)
+        })?;
+        serde_json::from_value::<PromptMode>(Value::String(raw.to_owned())).ok()
     }
 
     /// Staged attachments from the flattened field or an `input.attachments`
@@ -1446,7 +1494,7 @@ mod tests {
         let params: InstanceSendParams =
             serde_json::from_value(json!({"instanceId":"ins_1", "prompt":"hi"})).expect("de");
         assert!(params.attachments().is_empty());
-        assert_eq!(params.prompt_text(), Some("hi"));
+        assert_eq!(params.prompt_text().as_deref(), Some("hi"));
         // An empty list must not appear on the wire either.
         let value = serde_json::to_value(&params).expect("ser");
         assert!(value.get("attachments").is_none());
@@ -1484,6 +1532,61 @@ mod tests {
         .expect("de");
         assert_eq!(wrapped.attachments()[0].object_id, "obj_2");
         assert_eq!(wrapped.attachments()[0].name, None);
+    }
+
+    /// The CLI, fleet and feishu senders build `input.blocks` with text blocks
+    /// but no top-level `text`/`prompt`; the Node must still recover the prompt
+    /// (the ssh-stdio demo defect: `instance.send` reached no driver at all).
+    #[test]
+    fn send_params_join_input_blocks_and_read_nested_mode() {
+        let params: InstanceSendParams = serde_json::from_value(json!({
+            "instanceId": "ins_1",
+            "input": {
+                "type": "prompt",
+                "mode": "steer",
+                "blocks": [
+                    {"type": "text", "text": "first line"},
+                    {"type": "text", "text": "second line"},
+                ],
+                "origin": "cli",
+            },
+        }))
+        .expect("de");
+        assert_eq!(
+            params.prompt_text().as_deref(),
+            Some("first line\nsecond line"),
+            "text blocks join in order with newlines"
+        );
+        assert_eq!(
+            params.delivery_mode(),
+            Some(PromptMode::Steer),
+            "a mode nested under input is honoured"
+        );
+    }
+
+    /// A top-level `mode` still wins, and an unknown value degrades to a plain
+    /// new turn rather than erroring.
+    #[test]
+    fn send_params_read_top_level_mode_and_degrade_unknown() {
+        let steer: InstanceSendParams = serde_json::from_value(json!({
+            "instanceId": "ins_1",
+            "prompt": "hi",
+            "mode": "steer",
+        }))
+        .expect("de");
+        assert_eq!(steer.delivery_mode(), Some(PromptMode::Steer));
+
+        let unknown: InstanceSendParams = serde_json::from_value(json!({
+            "instanceId": "ins_1",
+            "input": {"blocks": [{"type": "text", "text": "hi"}], "mode": "bogus"},
+        }))
+        .expect("de");
+        assert_eq!(unknown.prompt_text().as_deref(), Some("hi"));
+        assert_eq!(
+            unknown.delivery_mode(),
+            None,
+            "an unknown mode is not an error; it degrades to new-turn"
+        );
     }
 
     #[test]

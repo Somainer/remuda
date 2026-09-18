@@ -112,7 +112,9 @@ pub mod store_test_support {
     use std::path::Path;
     use std::time::Duration;
 
-    use crate::store::InstanceDelegation;
+    use crate::store::{CommandRecord, CommandSettlement, InstanceDelegation};
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
@@ -265,6 +267,59 @@ pub mod store_test_support {
             })
             .await
             .expect("tail via writer")
+    }
+
+    /// A fully-populated `CommandRecord` serialized exactly as the
+    /// `/v1/instances/{id}/commands` route emits it (camelCase, internal ledger
+    /// columns skipped, `settlement` present). The OpenAPI test compares this
+    /// against the documented `CommandRecord` properties so a field cannot be
+    /// added to the struct (or renamed) without the spec drifting.
+    pub fn sample_command_record_json() -> Value {
+        let record = CommandRecord {
+            command_id: "cmd_sample".into(),
+            instance_id: Some("ins_sample".into()),
+            host_id: "hst_sample".into(),
+            operation: "instance.send".into(),
+            state: "settled".into(),
+            resolution: "clear".into(),
+            forwarded: true,
+            settlement_outcome: Some("rejected".into()),
+            settlement_reason: Some("node rejected the send".into()),
+            settlement: Some(CommandSettlement {
+                outcome: "rejected".into(),
+                reason: Some("node rejected the send".into()),
+            }),
+            payload: json!({ "input": { "type": "prompt" } }),
+            idempotency_key: Some("idem_sample".into()),
+            created_at: "2026-09-18T00:00:00.000Z".into(),
+            updated_at: "2026-09-18T00:00:01.000Z".into(),
+        };
+        serde_json::to_value(record).expect("command record serializes")
+    }
+
+    /// The wire values the protocol assigns to `SettlementOutcome` (§2.5),
+    /// serialized from the enum itself. The journal projection accepts exactly
+    /// the values this enum parses, so the OpenAPI test diffs the documented
+    /// `settlement.outcome` enum against this set: a protocol outcome (such as
+    /// `expired`) cannot be persisted by the projection while missing from the
+    /// spec and generated client.
+    pub fn settlement_outcome_wire_values() -> BTreeSet<String> {
+        use remuda_protocol::SettlementOutcome;
+        [
+            SettlementOutcome::Completed,
+            SettlementOutcome::Rejected,
+            SettlementOutcome::Cancelled,
+            SettlementOutcome::Expired,
+        ]
+        .into_iter()
+        .map(|outcome| {
+            serde_json::to_value(outcome)
+                .expect("settlement outcome serializes")
+                .as_str()
+                .expect("wire value is a string")
+                .to_owned()
+        })
+        .collect()
     }
 }
 

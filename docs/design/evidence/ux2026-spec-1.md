@@ -8,12 +8,12 @@
 
 | 文件 | 变化 |
 |---|---|
-| `docs/design/workbench-ux-improvement-2026-09.md` | 新增（源报告入库）。除下述三处外与源文件逐字节相同 |
+| `docs/design/workbench-ux-improvement-2026-09.md` | 新增（源报告入库）。除 §4 列出的四处外与源文件逐字节相同 |
 | `docs/design/ui-spec.md` | 六处修订，见 §2 |
 | `docs/design/decisions.md` | 追加 D-038…D-042，见 §3 |
 | `docs/design/evidence/ux2026-spec-1.md` | 本文件 |
 
-源报告入库时按任务要求把 §11.3 行 423 的个人 workspace 名（原 `remuda-sg`）替换为中性占位 `<workspace>`；已验证其余 497 行与源文件完全一致（`diff` 去掉该行后无输出）。
+源报告入库时按任务要求把 §11.3 行 423 的个人 workspace 名（原 `remuda-sg`）替换为中性占位 `<workspace>`；同一行的雇主名一并换成 `<workspace-2>`（理由见 §4）。已验证其余各行与源文件完全一致（`diff` 去掉行 423 后只余 §4 记录的三处）。
 
 ## 2. `ui-spec.md` 逐条：旧文 → 新文 → 对应 §11.7 冲突行
 
@@ -86,15 +86,18 @@
 | **D-041** | 工具卡默认折叠的豁免集合与折行最小信息量 | P1-10 / P1-20 |
 | **D-042** | 手机 composer 单行 + 选项 sheet 的边界：触发器带 mode 词与档名，三态与诚实标注留在外面 | P0-3 |
 
-## 4. 源报告的三处必要修正
+## 4. 源报告的四处修正
 
-报告入库后只允许改这三处（§11.6 的两处措辞 + §11.7 的行号）：
+报告入库后只改下面四处：任务指定的 §11.3 行 423 占位替换，外加 §11.6 的两处措辞与 §11.7 的一处行号。`diff` 去掉行 423 后只余这三处。
 
 | 位置 | 旧文 | 新文 |
 |---|---|---|
+| §11.3 行 423 | workspace 芯片 `remuda-sg` / 雇主名 / `hybrid-harness` | **`<workspace>` / `<workspace-2>` / `hybrid-harness`**（个人 workspace 名与雇主名都换中性占位；`hybrid-harness` 是仓库自身目录名，D-001，保留） |
 | §2.3 | `.meta { font-size: 10.5px }`，低于 tokens「重要状态不低于 12px」（`tokens.css --text-label: 11px` 注释） | `.meta` **桌面 11px / 手机 10.5px**（基础值 `session.module.css:153-159`，10.5px 只在手机媒体查询里），两者都低于 type scale 的 12px 下限（`tokens.css:52-53` 块头注释，**不是** `--text-label` 自己的注释） |
 | §5-P0-2 | `.meta` 10.5px → ≥12px；`.back` 20px → `--touch` | `.meta` 桌面 11px / 手机 10.5px → 统一 `var(--text-aux)`；`.back` 20px 字形 → 配 44×44 `::after` 热区（**不是**把字形撑到 44px） |
 | §11.7 P0-5 行 | 「第 **233** 行就是 `seq 184 · connectivity=connected · $0.12`」 | 「第二行（修订前是第 **235** 行，本节此前误写作 233）就是 …」 |
+
+**为何行 423 要换两个名字**：任务点名的「`remuda-sg` 与 `hybrid-harness` 之间的个人 workspace 名」是 `remuda-sg`；同一处并列的中间名是雇主名，命中 `scripts/ci/private-tokens.sha256` 的哈希 denylist —— 留着它会使提交内容被 `scripts/ci/secret-scan.sh` 判为私有令牌（已实测：不改则扫描失败，改成占位后 PASS）。两个名字都是同一份列表里的同一类内容，按任务对行 423 的意图一并中性化，不触碰报告其余任何一行。
 
 已核对：`tokens.css:52-53` 是 `/* Type scale (P1-3): body 14, inputs/emphasis 16, aux 12-13, labels 11.` / `Important status never relies on sub-12 px text. */`，而 `--text-aux` / `--text-label` / `--touch` 分别在 `:57` / `:58` / `:68`——两处措辞的更正都成立。
 
@@ -111,7 +114,8 @@
 | 检查 | 结果 |
 |---|---|
 | 源报告逐行比对 | 去掉 §11.3 行 423 后与 `/tmp/remuda-agents/briefs/src/workbench-ux-improvement-2026-09.md` **无差异** |
-| 个人标识 | 提交内容仅含机器名（`bolt` / `devbox-sg`）与产品名，均为仓库既有文档中的既有写法；个人 workspace 名已按任务要求替换为 `<workspace>` |
-| `scripts/ci/no-tunnel-scan.sh` 口径 | 新入库的两份文档对禁用 token 集合（cloudflared / ngrok / frpc / frps / bore / tailscale funnel / `ssh -R` / `ssh -D`）零匹配 |
+| 个人标识 | 行 423 的三个 workspace 芯片名里，两个非产品名（个人 workspace 名与雇主名）已替换为中性占位 `<workspace>` / `<workspace-2>`，`hybrid-harness` 保留（仓库自身的目录名，D-001）；提交内容其余部分只含机器名（`bolt` / `devbox-sg`）与产品名，均为仓库既有文档中的既有写法 |
+| `scripts/ci/secret-scan.sh` | PASS — 无私有令牌命中（行 423 的雇主名是本次替换的触发原因） |
+| `scripts/ci/no-tunnel-scan.sh` | PASS — 两份新文档对 D-031 的禁用 token 集合零匹配（本文件表格内不重复拼写这些 token，避免扫描器命中自身） |
 | 文档内引用一致性 | `ui-spec.md` 新增段落引用的 ADR 编号与 `decisions.md` 新增条目一一对应；§2 表格里的「旧文」逐字取自修订前文件 |
 | 全量 web hub e2e | 见本任务 DONE 前的运行记录（docs-only 分支，用于确认没有连带回归） |

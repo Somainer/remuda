@@ -380,6 +380,7 @@ live 证据里第 1 轮报 `false`、第 2 轮报 `true`，两个都不对（第
 journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚成
 `Structured` 的最终块，两轮各有自己的 `result` 与 usage/cost。该文档同时列出这轮
 **没有**测到的东西（interrupt、steer、网关、审批活链路），以免 ADR 超额声称。
+
 ## D-038
 
 **2026-09-19 · 会话列表行 = 状态点 + 标题 + 一句下一步；三维 wire 与 `ins_` 退到展开/tooltip；行内遥控收进溢出菜单**
@@ -464,6 +465,65 @@ journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚
 **由谁**：coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, decision 4）。该计划是派工单，未入库；理由与默认值见报告 §11.7 的 P0-3 行。
 
 **依据**：报告 §11.7 的 P0-3 行判 **CONFLICTS**（权限与 effort 的可见性、D-028a 三态与诚实标注）；`decisions.md` D-028a 的三态/队列 chip/「尚未验证」要求是本条的边界来源。
+
+## D-043
+
+**2026-09-19 · Grok 结构转译契约：文件层 ACP 帧按协议 §5.7 翻译，不新增 driver、不改 wire schema**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | D-028、[grok-structural-translation.md](./grok-structural-translation.md)、[protocol.md](./protocol.md) §5.7 grok-acp |
+
+**背景**：P6 已把 grok TUI 落盘的 `updates.jsonl` / `events.jsonl` tail 进 journal，
+但 `GrokAdapter` 的工具转译与协议 §5.7 相反：稳定工具名取的是会变化的人类
+`title`（协议要求 `_meta["x.ai/tool"].name`，title 只作展示）；`category` 恒为
+`Shell`；无 `status` 的 `tool_call_update`（夹具实帧：先 Pending、再无 status
+进度帧、最后 completed）被直接丢弃，导致 `ToolCallState::Running` 与
+`ResultStage::Partial` 在 grok 通道零产出；`content[]` 只取第一段文本，`diff` /
+`terminal` / 非 text 块全部消失；thought 收尾用 `Open` 重发全文而不是 `Close`。
+
+**决策**（仅翻译层，零协议增量；不叠加第二条 grok-acp 进程，延续 D-028 一终端一会话）：
+
+1. **身份**：`tool_name` 只取 `_meta["x.ai/tool"].name`；缺失即
+   `Knowledge::Unknown{reason:"not-emitted"}`，绝不用 `title` 冒充稳定名。
+   `display_title` 取帧上 `title`，缺失时回落工具名。
+2. **类别**：先查名字表（设计文档 §3.1：`run_terminal_command→Shell`、
+   `read_file/list_dir→FileRead`、`write/search_replace→FileWrite`、
+   `grep/web_search/web_fetch/open_page/open_page_with_find/x_*→Search`、
+   `spawn_subagent→Agent`、`workflow→Workflow`、`search_tool/use_tool→Mcp`），
+   名字未知再按帧 `kind`（`execute→Shell`、`write/edit→FileWrite`、
+   `ask_user/other→Other`），最后才 `Other`。Rust 表与 web registry 表同引 §3.1。
+3. **Running**：无 `status` 的 `tool_call_update` 是同一 node 的第二次
+   `ToolCall`：`state=Running`、revision 2、`Replace`；只对已见过 Pending 的
+   `toolCallId` 生效（中途加入的 tail 看到陌生进度帧仍忽略，但不影响后续终态
+   结果）。帧上缺的字段保持旧值（`display_title` / `rawInput` / name / kind）。
+4. **终态**：带 `status` 的 update 仍发 `ToolResult` `Final`，revision 严格大于
+   该 node 最后一次 `ToolCall` revision（web `newerMutation` 要求单调，否则卡片
+   冻结在 proposed）；`outcome` / `exit_code` / `structured_result` 行为不变。
+5. **content[]**：`{type:"content"}` 内层 text → 文本块；`{type:"diff"}` →
+   `FileChange{path（diff.path 或 locations[0].path）, diff, application}`，
+   `Applied` 仅当 `status==completed` 且无 error，否则 `Unknown`；
+   `{type:"terminal"}` → 只命名 terminal id 的文本块，不是 tty-attach 承诺；
+   其余非 text 内容以带原生类型的文本标记出现，不再静默丢弃。
+6. **thought 收尾**：`turn_completed` 用 `Close` + 累积全文（与 message 的
+   open/append/close 一致），取消回合带 `Interrupted` 状态。
+7. 共享的 `adapters/mod.rs` 负载构造函数签名不动（codex 字节级不变）；grok 专用
+   构造函数全部住在 `grok_adapter.rs`。不新增 `ObservationPayload` 变体、不改
+   `protocol.md`、不重生成 schema。
+
+**范围边界**：本决策只覆盖 PR1/PR2 的帧→负载翻译。`turn.live` file-tier 相位、
+`ask_user_question` 升格 interaction、`terminal/<id>.log` 增量 stdout、fake-harness
+保真度与 web presenter 分别由后续任务落地；grok workflow engine 与子代理下钻
+（PR8）依赖 1.0.34 实帧重采（PR7），不在本决策内，且任何测试不得据 1.0.30
+`--no-subagents --no-plan` 夹具断言「grok 不支持 X」。夹具中未捕获的 diff /
+terminal 内容帧形状以 [U] 标注为合成帧，1.0.34 重采时校正。
+
+**影响**：`crates/remuda-driver/src/adapters/grok_adapter.rs` 及单测、
+`crates/remuda/tests/p6_adapter_parity.rs`；夹具三帧序列现在翻译为
+Proposed(rev1 Open) → Running(rev2 Replace) → Final(rev3 Close)，
+`remuda journal diff --no-whitelist` 自比对仍相等，codex 与 fake-harness 事实集
+不变。
 
 ## D-045
 

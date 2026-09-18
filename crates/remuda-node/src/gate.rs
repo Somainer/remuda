@@ -2226,6 +2226,25 @@ JSON
     }
 
     #[test]
+    fn gate_step_timeouts_reach_the_child_env_as_the_serialized_map() {
+        // A non-empty per-step timeouts map is forwarded to the gate runner as
+        // the serialized `REMUDA_GATE_STEP_TIMEOUTS` env var; an empty map sets
+        // nothing.
+        let host = BTreeMap::new();
+        let mut request = bare_run_params();
+        request.timeouts.insert("cargo-test".into(), 2400);
+        request.timeouts.insert("web-hub-e2e".into(), 0);
+        let child = super::gate_run_child_env(&request, &host);
+        assert_eq!(
+            child.get("REMUDA_GATE_STEP_TIMEOUTS").map(String::as_str),
+            Some(r#"{"cargo-test":2400,"web-hub-e2e":0}"#)
+        );
+
+        let bare = super::gate_run_child_env(&bare_run_params(), &BTreeMap::new());
+        assert!(!bare.contains_key("REMUDA_GATE_STEP_TIMEOUTS"));
+    }
+
+    #[test]
     fn lane_env_is_the_only_channel_for_a_pty_flag() {
         // A lane that deliberately sets a carrier flag in its config is honored
         // (the escape hatch); nothing else introduces one.

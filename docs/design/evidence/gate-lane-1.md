@@ -18,7 +18,9 @@ its lane checkout, and — for a land — CAS-pushes main with its own credentia
   queued/running/passed/failed/landed/canceling/canceled, and the
   `gate.run` / `gate.cancel` / `gate.then` (Hub→Node) plus `gate.event`
   (Node→Hub) wire types. `ProjectGateLane` gains additive `env`, `lockPath`,
-  `pwEndpoint`, `toolchainPath`.
+  `pwEndpoint`, `toolchainPath`, `timeouts` (per-step wall-clock budgets, step
+  name → seconds, `0` = no cap; overrides the project-level `ProjectGate.timeouts`
+  per key).
 - Hub `remuda-hub/src/gatequeue.rs`: `gate_jobs` table, routes
   `POST|GET /v1/projects/{id}/gate`, `GET /v1/projects/{id}/gate/jobs/{jobId}`,
   `POST …/cancel`, `GET /v1/gate/jobs`; FIFO scheduler (parallel verify across

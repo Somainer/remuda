@@ -2329,6 +2329,25 @@ impl Engine {
                 "transcript_path": self.paths.main.to_string_lossy()
             }),
         );
+        // Optional idle-prompt Notification, AFTER the turn's Stop (claude
+        // dialect only). This is the ordering from the 2026-09-18 incident:
+        // the turn has already ended when the advisory lands. It is
+        // non-blocking and must never reopen the turn.
+        let idle_notification = self.turn.as_ref().is_some_and(|t| t.spec.idle_notification);
+        if idle_notification && self.dialect == Dialect::Claude {
+            self.event(
+                "idle_notification",
+                json!({ "notification_type": "idle_prompt" }),
+            );
+            self.fire_hook(
+                HookEvent::Notification,
+                json!({
+                    "notification_type": "idle_prompt",
+                    "message": "Claude is waiting for your input",
+                    "level": "info"
+                }),
+            );
+        }
         Ok(())
     }
 

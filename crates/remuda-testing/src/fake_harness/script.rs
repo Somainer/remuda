@@ -79,6 +79,12 @@ pub struct TurnSpec {
     /// thinking some more with xhigh effort)`) for screen-tier tests.
     #[serde(default)]
     pub spinner: Option<SpinnerSpec>,
+    /// Fire a non-blocking `Notification` hook carrying Claude Code's idle
+    /// prompt (`notification_type: "idle_prompt"`) immediately *after* the
+    /// turn's `Stop`. Reproduces the ordering where the idle advisory arrives
+    /// once the turn has already ended; it must never raise a phase or a wait.
+    #[serde(default)]
+    pub idle_notification: bool,
 }
 
 /// Scripted spinner status line sequence.

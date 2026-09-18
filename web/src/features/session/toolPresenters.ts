@@ -17,7 +17,7 @@
 import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString } from "../../lib/format";
-import { splitMcpName } from "./toolRegistry";
+import { splitGrokMcpName, splitMcpName } from "./toolRegistry";
 
 /** One labelled row in a tool card body. */
 export type ToolDetail = {
@@ -86,6 +86,55 @@ export function parseWorkflowMeta(script: string): { name?: string; description?
   };
   return { name: field("name"), description: field("description") };
 }
+
+/**
+ * Pull `name` / `description` out of a grok Rhai workflow's
+ * `let meta = #{ name: "…", description: "…" };`.
+ *
+ * Rhai map literals open with `#{`, so this is parsed separately from
+ * Claude's `export const meta`. Same tolerant contract as
+ * {@link parseWorkflowMeta}: no match returns `{}` and the caller degrades to
+ * the source kind plus a truncated script, never a blank card.
+ */
+export function parseRhaiWorkflowMeta(script: string): { name?: string; description?: string } {
+  const meta = /let\s+meta\s*=\s*#\{/.exec(script);
+  if (!meta) return {};
+  let depth = 0;
+  let end = -1;
+  for (let i = meta.index + meta[0].length - 1; i < script.length; i++) {
+    const ch = script[i];
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  const body = script.slice(meta.index, end < 0 ? script.length : end + 1);
+  const field = (key: string): string | undefined => {
+    const match = new RegExp(`\\b${key}\\s*:\\s*(['"\`])([\\s\\S]*?)\\1`).exec(body);
+    return match?.[2];
+  };
+  return { name: field("name"), description: field("description") };
+}
+
+/** Truncate a long script for the no-meta fallback, keeping the card honest. */
+function truncate(text: string, max = 200): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}…`;
+}
+
+/** Human copy for a grok workflow `source` discriminator (design §3.1). */
+const RHAI_SOURCE_COPY: Record<string, string> = {
+  script: "Rhai 脚本",
+  script_path: "脚本路径",
+  resume: "恢复运行",
+  pause: "暂停运行",
+  stop: "停止运行",
+  name: "运行名",
+};
 
 /** Minutes/seconds in words, for a timeout given in milliseconds. */
 export function humanDuration(ms: number): string {
@@ -215,8 +264,145 @@ export function presentTool(
     return { title: name, subtitle: path, status: state, details };
   }
 
-  if (name.startsWith("mcp__") || name.includes("__")) {
-    const { server, tool } = splitMcpName(name);
+  // --- grok native tools (design grok-structural-translation §3.1/§6.4).
+  // Shared shell/read/write/task layouts with the Claude branches above; the
+  // registry key stays the grok native name. Field names are grok's own
+  // (`command`, `target_file`, `file_path`, `questions[]`, …), not Claude's.
+
+  if (name === "run_terminal_command") {
+    const command = asString(record?.command) ?? "";
+    const details: ToolDetail[] = [{ label: "$", value: command, pre: true }];
+    const cwd = asString(record?.current_dir) ?? asString(record?.cwd);
+    if (cwd) details.push({ label: "目录", value: cwd });
+    if (record?.is_background === true) details.push({ label: "后台", value: "是" });
+    const exit = result ? knowledgeValue(result.exitCode) : undefined;
+    if (exit !== undefined && exit !== null) details.push({ label: "exit", value: String(exit) });
+    return {
+      title: "Shell",
+      subtitle: asString(record?.description) ?? (command.split("\n")[0] || null),
+      status: state,
+      details: withResult(details, result, "输出"),
+    };
+  }
+
+  if (name === "read_file") {
+    const path =
+      asString(record?.target_file) ?? asString(record?.file_path) ?? result?.changes[0]?.path ?? "file";
+    const details: ToolDetail[] = [{ label: "路径", value: path }];
+    const offset = record?.offset;
+    const limit = record?.limit;
+    if (typeof offset === "number" || typeof limit === "number") {
+      details.push({ label: "范围", value: `第 ${String(offset ?? 1)} 行起${limit ? `，${String(limit)} 行` : ""}` });
+    }
+    return { title: "Read", subtitle: path, status: state, details: withResult(details, result, "内容") };
+  }
+
+  if (name === "list_dir") {
+    const path = asString(record?.target_directory) ?? asString(record?.path) ?? "dir";
+    return {
+      title: "List Dir",
+      subtitle: path,
+      status: state,
+      details: withResult([{ label: "目录", value: path }], result, "内容"),
+    };
+  }
+
+  if (name === "write") {
+    const path = asString(record?.file_path) ?? result?.changes[0]?.path ?? "file";
+    const details: ToolDetail[] = [{ label: "路径", value: path }];
+    const changed = result?.changes.length ?? 0;
+    if (changed) details.push({ label: "改动", value: `${changed} 处` });
+    return { title: "Write", subtitle: path, status: state, details };
+  }
+
+  if (name === "search_replace") {
+    const path = asString(record?.file_path) ?? result?.changes[0]?.path ?? "file";
+    const details: ToolDetail[] = [{ label: "路径", value: path }];
+    if (record?.old_string != null || record?.new_string != null) {
+      details.push({ label: "替换", value: "old_string → new_string" });
+    }
+    const changed = result?.changes.length ?? 0;
+    if (changed) details.push({ label: "改动", value: `${changed} 处` });
+    return { title: "Edit", subtitle: path, status: state, details: withResult(details, result) };
+  }
+
+  if (name === "spawn_subagent") {
+    const description = asString(record?.description) ?? asString(record?.prompt) ?? null;
+    const details: ToolDetail[] = [];
+    const type = asString(record?.subagent_type);
+    if (type) details.push({ label: "子代理", value: type });
+    const isolation = asString(record?.isolation);
+    if (isolation) details.push({ label: "隔离", value: isolation });
+    const prompt = asString(record?.prompt);
+    if (prompt) details.push({ label: "任务", value: prompt, pre: true, fold: prompt.length > 200 });
+    return { title: "Task", subtitle: description, status: state, details: withResult(details, result) };
+  }
+
+  if (name === "workflow") {
+    // The Rhai run discriminator lives in `source` (name / script /
+    // script_path / resume / pause / stop). Parse the Rhai meta on its own;
+    // without a meta literal the card shows the source kind and a truncated
+    // script — never a blank heading.
+    const sourceRec = asRecord(record?.source);
+    const script = asString(sourceRec?.script) ?? asString(record?.script) ?? "";
+    const scriptPath = asString(sourceRec?.script_path);
+    const sourceKind = sourceRec
+      ? (["resume", "pause", "stop", "name", "script_path", "script"] as const).find(
+          (key) => sourceRec[key] !== undefined && sourceRec[key] !== null,
+        ) ?? null
+      : typeof record?.source === "string"
+        ? "name"
+        : null;
+    const meta = parseRhaiWorkflowMeta(script);
+    const kindLine = sourceKind ? RHAI_SOURCE_COPY[sourceKind] ?? sourceKind : "Rhai 工作流";
+    const subtitle =
+      meta.description ??
+      meta.name ??
+      asString(record?.description) ??
+      (sourceKind === "script_path" && scriptPath ? scriptPath : kindLine);
+    const details: ToolDetail[] = [];
+    if (meta.name) details.push({ label: "工作流", value: meta.name });
+    if (sourceKind) details.push({ label: "来源", value: kindLine });
+    if (state === "running") details.push({ label: "状态", value: "在后台运行 · /workflows 可查看进度" });
+    if (script) details.push({ label: "脚本", value: truncate(script), pre: true, fold: true });
+    else if (scriptPath) details.push({ label: "脚本路径", value: scriptPath });
+    return { title: "Workflow", subtitle, status: state, details: withResult(details, result) };
+  }
+
+  if (name === "ask_user_question") {
+    // Usually projected to an interaction and rendered as QuestionForm; this
+    // card is the fallback for a tool-only frame.
+    const questions = Array.isArray(record?.questions) ? record.questions : [];
+    const first = asRecord(questions[0]);
+    const questionText = asString(first?.question);
+    const options = Array.isArray(first?.options) ? first.options : [];
+    const labels = options
+      .map((option) => asString(asRecord(option)?.label) ?? null)
+      .filter((value): value is string => value !== null);
+    const multi = first?.multiSelect === true;
+    const details: ToolDetail[] = [];
+    if (questionText) details.push({ label: "问题", value: questionText, pre: questionText.includes("\n") });
+    if (labels.length) details.push({ label: multi ? "选项（多选）" : "选项", value: labels.join(" / ") });
+    return {
+      title: "Question",
+      subtitle: questionText,
+      status: state,
+      details: withResult(details, result, "回答"),
+    };
+  }
+
+  // MCP: a Claude `mcp__server__tool` qualified name, or a grok call to the
+  // explicit `use_tool` / `search_tool` MCP tools. A bare `__` in any other
+  // name is not enough — the registry's tightened heuristic owns that call.
+  if (name.startsWith("mcp__") || name === "use_tool" || name === "search_tool") {
+    let server: string;
+    let tool: string;
+    if (name.startsWith("mcp__")) {
+      ({ server, tool } = splitMcpName(name));
+    } else {
+      const qualified = asString(record?.tool_name) ?? name;
+      ({ server, tool } = splitGrokMcpName(qualified));
+    }
     return {
       title: "MCP",
       subtitle: `${server}/${tool}`,

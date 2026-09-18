@@ -330,6 +330,23 @@ Compact：回合结束后把 thinking + 中间 tool 折成「N 次工具 · M �
 
 注册键 = `driverKind + '.' + nativeToolName`，再映射到族。不要把 Codex `commandExecution` 硬叫 Bash（`deepseek-harness.md` §2.2）。
 
+**各 harness 原生名 → 族（注册表按原生名分发，绝不先改名成 Claude 工具名；卡片可共用 shell/read/write/task 布局）。** grok/codex 文件适配器的 `driverKind` 都是 `shell-pty`，身份只由原生名承载。grok 这张表与 Rust 侧 adapter 的 name→`ToolCategory` 表是同一张（`grok-structural-translation.md` §3.1），两侧必须同步：
+
+| harness | 原生名 | 族 / 呈现要点 |
+|---|---|---|
+| claude | `Bash` `Edit` `Read` `Write` `Workflow` `Task`/`Agent` | 同名族 |
+| claude | `mcp__server__tool` | MCP |
+| grok | `run_terminal_command` | Bash 布局；读 `command`/`description`/`is_background`，标题用人类 title、稳定名保留 |
+| grok | `read_file` / `list_dir` | Read 布局；路径取 `target_file` / `target_directory`（不是 `file_path`），范围 `offset`/`limit` |
+| grok | `write` / `search_replace` | Write / Edit 布局；`file_path` + `old_string`/`new_string` |
+| grok | `grep` `web_search` `web_fetch` `open_page` `open_page_with_find` `x_*` | Generic（Search 样式） |
+| grok | `spawn_subagent` | Task 布局；`prompt`/`description`/`subagent_type`/`isolation` |
+| grok | `workflow` | Workflow 族；解析 Rhai `let meta = #{ name: "…", description: "…" };`，**不**走 Claude `export const meta`；解析失败退回 source 类型（script/script_path/resume/pause/stop/name）+ 截断脚本，永不 blank 卡 |
+| grok | `search_tool` / `use_tool` | MCP；grok 限定名是 `server__tool`（无 `mcp__` 前缀），server/tool 从 `use_tool.tool_name` 取 |
+| grok | `ask_user_question` | Generic 兜底卡（问题 + 选项 labels + multiSelect）；正常应升格为 `interaction` 由 QuestionForm 渲染，卡只是无 interaction 帧时的 fallback |
+
+MCP 启发式收紧：**只有** `mcp__…` 限定名或表中显式 MCP 族才映射到 MCP；未知工具名里裸含 `__` 不再判 MCP（grok 的 `server__tool` 只经 `use_tool` 输入到达）。
+
 | 族 | 线框要点 | 字段 | 状态 |
 |---|---|---|---|
 | **Bash** | 命令一行；stdout/stderr 折叠；exit pill | `command`, `cwd`, `stdout?`, `stderr?`, `exitCode?` | running 无 exit；缺 exit **不准**画成功（DSH TerminalBlock 限制） |

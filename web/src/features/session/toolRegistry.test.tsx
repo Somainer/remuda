@@ -39,6 +39,38 @@ describe("tool registry dispatch", () => {
     expect(TOOL_FAMILIES).toContain("Generic");
   });
 
+  it("maps grok native names to families while keeping the native key", () => {
+    // docs/design/grok-structural-translation.md §3.1. File adapters stamp
+    // driverKind shell-pty; the name alone carries the identity.
+    expect(familyFor("shell-pty", "run_terminal_command")).toBe("Bash");
+    expect(familyFor("shell-pty", "read_file")).toBe("Read");
+    expect(familyFor("shell-pty", "list_dir")).toBe("Read");
+    expect(familyFor("shell-pty", "write")).toBe("Write");
+    expect(familyFor("shell-pty", "search_replace")).toBe("Edit");
+    expect(familyFor("shell-pty", "grep")).toBe("Generic");
+    expect(familyFor("shell-pty", "web_search")).toBe("Generic");
+    expect(familyFor("shell-pty", "web_fetch")).toBe("Generic");
+    expect(familyFor("shell-pty", "open_page")).toBe("Generic");
+    expect(familyFor("shell-pty", "open_page_with_find")).toBe("Generic");
+    expect(familyFor("shell-pty", "x_post_timeline")).toBe("Generic");
+    expect(familyFor("shell-pty", "spawn_subagent")).toBe("Task");
+    expect(familyFor("shell-pty", "workflow")).toBe("Workflow");
+    expect(familyFor("shell-pty", "search_tool")).toBe("MCP");
+    expect(familyFor("shell-pty", "use_tool")).toBe("MCP");
+    expect(familyFor("shell-pty", "ask_user_question")).toBe("Generic");
+    // The registry key is still the native name, never a Claude alias.
+    expect(registryKey("shell-pty", "run_terminal_command")).toBe("shell-pty.run_terminal_command");
+  });
+
+  it("no longer treats a bare double underscore in an unknown name as MCP", () => {
+    // grok qualified names are `server__tool`, but they arrive inside
+    // use_tool.tool_name; a bare `__` must not label some other unknown tool.
+    expect(familyFor("shell-pty", "drive__search_files")).toBe("Generic");
+    expect(familyFor("shell-pty", "plan__draft__v2")).toBe("Generic");
+    // The real Claude qualified spelling still maps.
+    expect(familyFor("claude-print", "mcp__server__tool")).toBe("MCP");
+  });
+
   it("renders the Bash card for Bash, and a key/value summary for unknown tools", () => {
     const { rerender } = render(
       <ToolCard

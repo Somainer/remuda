@@ -2,7 +2,6 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  AnchoredPopover,
   computeAnchored,
   useAnchoredPopover,
   type AnchoredStyle,
@@ -334,18 +333,6 @@ describe("useAnchoredPopover measured positioning", () => {
     expect(after).not.toContain("max-height: none");
   });
 
-  it("renders nothing while closed", () => {
-    render(
-      <AnchoredPopover
-        triggerRef={{ current: null }}
-        open={false}
-        testId="gone"
-      >
-        x
-      </AnchoredPopover>,
-    );
-    expect(screen.queryByTestId("gone")).toBeNull();
-  });
 });
 
 describe("EffortSlider list with a tall catalog", () => {

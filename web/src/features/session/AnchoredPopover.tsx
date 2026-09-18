@@ -4,7 +4,6 @@ import {
   useRef,
   useState,
   type CSSProperties,
-  type ReactNode,
   type RefObject,
 } from "react";
 
@@ -107,33 +106,28 @@ export function computeAnchored(
   const roomAboveCleared = Math.max(0, triggerRect.top - gap - upperBoundary);
   const vhCap = Math.floor(viewport.height * maxHeightVh);
   const need = panel.preferredHeight;
+  // The room the up side has that ALSO clears the obstruction (a parked
+  // approval card): when a card is present the panel may not cover it.
+  const upRoomCleared = obstruction > 0 ? roomAboveCleared : roomAbove;
+  const upFitsCleared = upRoomCleared >= need;
 
-  // Side selection (preferred direction wins a tie, since the composer docks
-  // at the bottom):
-  // - an obstruction the preferred (up) side cannot clear → open down;
-  // - otherwise the preferred side unless the other side is strictly roomier.
-  const upBlockedByObstruction = obstruction > 0 && roomAboveCleared < need;
+  // Side choice:
+  // 1. open up when the panel clears any obstruction AND fits there;
+  // 2. otherwise open down whenever the dock leaves some room below — a
+  //    down panel never overlaps the card (it is below the trigger) and its
+  //    capped body scrolls, instead of covering the card with an up panel;
+  // 3. otherwise (no room below either) stay up, capped to the gap below
+  //    the obstruction so the card stays visible.
   let placement: PopoverPlacement;
   if (preferUp) {
-    placement = upBlockedByObstruction || roomBelow > roomAbove ? "down" : "up";
+    placement = upFitsCleared ? "up" : roomBelow > 0 ? "down" : "up";
   } else {
-    placement = !upBlockedByObstruction && roomAbove > roomBelow ? "up" : "down";
+    placement = !upFitsCleared ? "down" : "up";
   }
-  // A flip down must never place the panel past the viewport bottom: when a
-  // down panel (at the height it can actually take) would clip the edge,
-  // stay preferred/up where the body scrolls inside a smaller cap instead.
-  const downHeight = Math.min(need, roomBelow, vhCap);
-  if (
-    placement === "down" &&
-    triggerRect.bottom + gap + downHeight > viewport.height - margin
-  ) {
-    placement = "up";
-  }
-  // Cap to plain viewport room (never shrink to the card↔trigger gap — that
-  // collapsed tall catalogs). A down panel with no room clips the edge like
-  // the legacy absolute menu rather than covering the card.
-  const room = placement === "up" ? roomAbove : roomBelow;
-  const cap = Math.max(0, Math.min(vhCap, room));
+  // Cap to the room the chosen side actually has; on up the cap honours the
+  // obstruction so the panel never covers it.
+  const room = placement === "up" ? upRoomCleared : roomBelow;
+  const cap = Math.min(vhCap, room);
   const maxHeight = cap > 0 ? cap : undefined;
   const panelHeight = Math.min(need, maxHeight ?? need);
 
@@ -267,7 +261,10 @@ export function useAnchoredPopover(
       setMeasured(null);
       return;
     }
-    scheduleMeasure();
+    // Measure synchronously in the layout effect so the FIRST paint already
+    // carries the computed box — a rAF-deferred first measurement paints one
+    // frame at the fallback left:0/top:0 viewport corner.
+    measure();
     const panel = panelRef.current;
     let observer: ResizeObserver | undefined;
     if (typeof ResizeObserver !== "undefined" && panel) {
@@ -335,58 +332,4 @@ export function useAnchoredPopover(
     style,
     remeasure: scheduleMeasure,
   };
-}
-
-/**
- * Declarative wrapper: renders `children` in a positioned `div` anchored to
- * `triggerRef` while `open`. The caller owns open/close state so its own
- * outside-pointerdown / hover logic stays untouched.
- */
-export function AnchoredPopover({
-  triggerRef,
-  open,
-  options,
-  className,
-  testId,
-  role = "dialog",
-  ariaLabel,
-  data,
-  onMouseEnter,
-  onMouseLeave,
-  onKeyDown,
-  children,
-}: {
-  triggerRef: RefObject<HTMLElement | null>;
-  open: boolean;
-  options?: AnchoredOptions;
-  className?: string;
-  testId?: string;
-  role?: "dialog" | "menu" | undefined;
-  ariaLabel?: string;
-  data?: Record<string, string | number | boolean | undefined>;
-  onMouseEnter?: () => void;
-  onMouseLeave?: () => void;
-  onKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void;
-  children: ReactNode;
-}) {
-  const panelRef = useRef<HTMLDivElement>(null);
-  const anchored = useAnchoredPopover(triggerRef, panelRef, open, options);
-  if (!open) return null;
-  return (
-    <div
-      ref={panelRef}
-      className={className}
-      style={anchored.style}
-      data-testid={testId}
-      data-placement={anchored.placement}
-      role={role}
-      aria-label={ariaLabel}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
-      onKeyDown={onKeyDown}
-      {...data}
-    >
-      {children}
-    </div>
-  );
 }

@@ -640,6 +640,17 @@ impl DevNode {
             .map(|config| config.data_dir.clone())
     }
 
+    /// Pin the hook relay at Node start so its content-addressed copy captures
+    /// the build the Node is running, not whatever replaces it before the first
+    /// hooked launch. Best-effort: a failure is logged and retried per launch.
+    /// A fake-driver Node (no `herdr_config`) has no relay to pin.
+    pub(crate) fn pin_hook_relay(&self) {
+        let Some(config) = &self.inner.herdr_config else {
+            return;
+        };
+        crate::hook_shim::for_data_dir(&config.data_dir).pin_now();
+    }
+
     /// Collect `hook-bin/<version>` directories no live instance references.
     ///
     /// Called at Node start and after `instance.purge`. The version the running

@@ -472,11 +472,7 @@ pub(crate) async fn send(
 /// how the send actually settled (accepted / failed) rather than only the
 /// queued row the POST returned. Best effort: on any error the queued row
 /// stands (docs/design/evidence/instance-send-1.md).
-pub(crate) async fn resolve_command_state(
-    client: &HubClient,
-    instance_id: &str,
-    body: &mut Value,
-) {
+pub(crate) async fn resolve_command_state(client: &HubClient, instance_id: &str, body: &mut Value) {
     let command_id = body
         .pointer("/command/commandId")
         .and_then(Value::as_str)

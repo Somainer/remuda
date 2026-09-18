@@ -1205,7 +1205,9 @@ mod driver_fidelity_tests {
             .await
             .expect("blocks-only send must be accepted, not refused");
         assert_eq!(
-            accepted.pointer("/command/operation").and_then(Value::as_str),
+            accepted
+                .pointer("/command/operation")
+                .and_then(Value::as_str),
             Some("instance.send"),
             "the send is a real command, not an error: {accepted}"
         );
@@ -1236,7 +1238,8 @@ mod driver_fidelity_tests {
         })
         .await;
         assert_eq!(
-            mode.pointer("/payload/status/value").and_then(Value::as_str),
+            mode.pointer("/payload/status/value")
+                .and_then(Value::as_str),
             Some("steer"),
             "the nested steer mode carried to the driver: {mode}"
         );

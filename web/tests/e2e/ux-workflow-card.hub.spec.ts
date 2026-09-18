@@ -142,7 +142,7 @@ async function ensurePhaseOpen(page: Page, nth = 0) {
   await expect(head).toHaveAttribute("aria-expanded", "true");
 }
 
-test("card runs live then auto-collapses to the one-line summary", async ({ page }) => {
+test("card runs live and stays expanded after finishing; only dismiss collapses it", async ({ page }) => {
   const instanceId = await openWorkflowSession(page, "workflow card demo running");
   void instanceId;
   const card = page.getByTestId("workflow-card").first();
@@ -156,16 +156,20 @@ test("card runs live then auto-collapses to the one-line summary", async ({ page
   await page.getByTestId("composer-input").fill("workflow card demo done");
   await page.getByTestId("composer-send").click();
 
-  // Terminal state auto-collapses the card; the header keeps the summary.
+  // The terminal transition must NOT auto-collapse: the card stays open with
+  // the header summary.
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
   const head = card.locator("button").first();
-  await expect(head).toHaveAttribute("aria-expanded", "false");
+  await expect(head).toHaveAttribute("aria-expanded", "true");
   await expect(head).toContainText("4/4 agents");
   await expect(head).toContainText("tokens");
 
-  // Click expands the detail again; completed phases stay collapsed, open Verify.
+  // Only the reader's dismiss collapses the card; clicking again reopens it.
+  await head.click();
+  await expect(head).toHaveAttribute("aria-expanded", "false");
   await head.click();
   await expect(head).toHaveAttribute("aria-expanded", "true");
+  // Completed phases stay collapsed; open Verify manually.
   await ensurePhaseOpen(page, 1);
   await expect(page.getByTestId("workflow-agent").filter({ hasText: "verify:auth.ts" })).toBeVisible();
 });
@@ -174,7 +178,9 @@ test("a 20-agent phase folds 8 quiet rows behind 还有 n 个", async ({ page })
   await openWorkflowSession(page, "workflow card fold");
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
-  await card.locator("button").first().click();
+  // c-wfcard: the card stays expanded through completion — only the phase
+  // needs opening.
+  await expect(card.getByTestId("workflow-card-head")).toHaveAttribute("aria-expanded", "true");
   await ensurePhaseOpen(page, 0);
 
   const visibleRows = () => page.locator("[data-testid='workflow-agent']:visible");
@@ -193,7 +199,8 @@ test("a failed agent row is never folded", async ({ page }) => {
   await openWorkflowSession(page, "workflow card fail");
   const card = page.getByTestId("workflow-card").first();
   await expect(card).toHaveAttribute("data-status", "failed", { timeout: 20_000 });
-  await card.locator("button").first().click();
+  // c-wfcard: a failed finished card is open unless dismissed.
+  await expect(card.getByTestId("workflow-card-head")).toHaveAttribute("aria-expanded", "true");
   await ensurePhaseOpen(page, 0);
   const failed = page.getByTestId("workflow-agent").filter({ hasText: "review:security" });
   await expect(failed).toBeVisible();
@@ -214,7 +221,7 @@ test("at 390px every agent stays on one line; model/tool meta hidden", async ({ 
   await page.getByTestId("composer-input").fill("workflow card demo done");
   await page.getByTestId("composer-send").click();
   await expect(card).toHaveAttribute("data-status", "completed", { timeout: 20_000 });
-  await card.locator("button").first().click();
+  // c-wfcard: the card stays open through completion; open the phase only.
   await ensurePhaseOpen(page, 0);
   // Now shrink: agent rows must stay one line with model/tool meta hidden.
   await page.setViewportSize({ width: 390, height: 844 });

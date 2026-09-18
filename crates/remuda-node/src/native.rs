@@ -63,12 +63,18 @@ pub struct NativeDriverConfig {
     pub pty_hooks: bool,
     /// The `remuda` binary hooks re-enter as the relay.
     ///
-    /// `None` — the normal case — resolves this process's own executable at
-    /// launch: it is the binary the Node is already running, so it exists and
-    /// its relay speaks the same wire as the socket it will connect to. Boxed
-    /// because `NativeDriverConfig` is a variant of `LocalDrivers`, and an
-    /// inline `PathBuf` for a field that is almost always absent pushes that
-    /// enum over the size clippy is willing to accept.
+    /// `None` — the normal case — uses a Node-owned **pinned copy** of this
+    /// process's own executable, resolved once per data dir (see
+    /// [`crate::hook_shim`]) and held in a process-global registry rather than
+    /// in this config, so the size-sensitive `LocalDrivers` enum gains no field.
+    /// Pinning is what keeps the relay working after a rebuild replaces the
+    /// on-disk Node binary in place: `current_exe` of a replaced file reads
+    /// `<path> (deleted)` on Linux, and embedding that per-launch path made
+    /// every later hook die with `exec: … (deleted): not found`. A configured
+    /// override exists for packaging that splits them. Boxed because
+    /// `NativeDriverConfig` is a variant of `LocalDrivers`, and an inline
+    /// `PathBuf` for a field that is almost always absent pushes that enum over
+    /// the size clippy is willing to accept.
     pub relay_binary: Option<Box<PathBuf>>,
     /// Claude print initialize timeout.
     pub print_handshake_timeout: Duration,
@@ -86,6 +92,9 @@ impl NativeDriverConfig {
         let herdr_session =
             node_herdr_session(&data_dir, std::env::var("REMUDA_HERDR_SESSION").ok());
         let herdr_socket_dir = Some(data_dir.join("herdr"));
+        // Register (once) this Node's pinned hook relay for this data dir; the
+        // handle is kept in a process-global registry, not in this config.
+        crate::hook_shim::ensure(&data_dir);
         Self {
             data_dir,
             claude_binary: std::env::var_os("REMUDA_CLAUDE_BIN")
@@ -463,9 +472,13 @@ impl DriverFactory for NativeClaudeFactory {
                 // nobody can start an agent in has nothing to hook. An agent
                 // target is already an agent, so the precondition is met.
                 if self.config.pty_hooks && (agent_kind.is_some() || options.promote) {
+                    let relay = relay_binary(&self.config)?;
+                    // Record which pinned relay this instance uses, so Node-start
+                    // and post-purge GC keep this version while the instance lives.
+                    crate::hook_shim::record_instance_relay(&instance_dir, &relay);
                     options.hooks = Some(remuda_driver::shell_pty::HookConfig {
                         instance_dir: instance_dir.clone(),
-                        relay_binary: relay_binary(&self.config)?,
+                        relay_binary: relay,
                         // Pin the requested start mode, then release only tui
                         // after the foreground SessionStart is bound (§9.2).
                         tui: match launch.request.tui.unwrap_or_default() {
@@ -526,19 +539,20 @@ fn agent_pty_kind(kind: remuda_protocol::AgentKind) -> Option<remuda_protocol::A
 
 /// The binary a hook re-enters as `remuda hook emit`.
 ///
-/// Defaults to this process's own executable: it is the binary the Node is
-/// already running, so it exists and its relay speaks the same wire as the
-/// socket it will connect to. A configured override exists for packaging that
-/// splits them.
+/// A configured override wins verbatim (packaging that splits the relay from
+/// the Node). Otherwise it is the Node-owned **pinned copy** of this process's
+/// executable, resolved once at Node start: naming the live binary here is what
+/// let a rebuild that replaced it in place turn every subsequent hook into
+/// `exec: <path> (deleted): not found`. The pinned copy has its own lifetime
+/// under `<data dir>/hook-bin/<version>/remuda` and survives the source being
+/// replaced.
 fn relay_binary(config: &NativeDriverConfig) -> Result<PathBuf, DriverError> {
     if let Some(path) = &config.relay_binary {
         return Ok(path.as_ref().clone());
     }
-    std::env::current_exe().map_err(|error| {
-        DriverError::Failed(format!(
-            "cannot locate the remuda binary for hooks: {error}"
-        ))
-    })
+    crate::hook_shim::for_data_dir(&config.data_dir)
+        .pinned_path()
+        .map_err(DriverError::Failed)
 }
 
 fn cwd_is_registered(cwd: &Path, registered_root: &Path) -> bool {
@@ -1466,6 +1480,108 @@ mod tests {
     use super::*;
     use crate::runtime::fixture_instance;
     use remuda_protocol::{AgentKind, HostId, InstanceId, WorkspaceId};
+
+    /// A stub executable standing in for the running `remuda` binary.
+    fn write_relay_source(dir: &Path) -> PathBuf {
+        let path = dir.join("remuda");
+        std::fs::write(&path, b"#!/bin/sh\ntrue\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    /// A config whose default hook relay is a controllable stub source, rooted
+    /// in `data_dir`, so tests never pin the test binary itself.
+    fn config_with_stub_relay(data_dir: &Path, source: &Path) -> NativeDriverConfig {
+        crate::hook_shim::register_stub_for_test(data_dir, source);
+        NativeDriverConfig::new(data_dir.to_path_buf())
+    }
+
+    /// Test 1: the hook command names the pinned copy under `hook-bin/`, never
+    /// the resolved source path (the bug: it embedded `current_exe`, which reads
+    /// `<path> (deleted)` after an in-place rebuild).
+    #[test]
+    fn the_hook_relay_command_names_the_pinned_copy_not_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source = write_relay_source(dir.path());
+        let config = config_with_stub_relay(&data_dir, &source);
+
+        let pinned = relay_binary(&config).expect("pinned relay");
+        assert!(
+            pinned.starts_with(data_dir.join("hook-bin")),
+            "relay must be pinned under <data dir>/hook-bin, got {}",
+            pinned.display()
+        );
+
+        // Render the overlay the shell-pty carrier writes and assert the hook
+        // command references the pinned copy, not the source binary.
+        let overlay = remuda_driver::materialize_overlay(&remuda_driver::OverlayOptions {
+            launch_dir: data_dir.join("instances/ins_x/launch"),
+            relay_binary: pinned.clone(),
+            socket_path: data_dir.join("instances/ins_x/hook.sock"),
+            tui: remuda_driver::TuiMode::Default,
+            base: None,
+        })
+        .expect("overlay");
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&overlay.path).unwrap()).unwrap();
+        let command = settings["hooks"]["PostToolBatch"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("PostToolBatch command");
+        assert!(
+            command.contains(&pinned.to_string_lossy().into_owned()),
+            "command must exec the pinned copy: {command}"
+        );
+        assert!(
+            command.contains("/hook-bin/"),
+            "command must reference the pinned hook-bin path: {command}"
+        );
+        assert!(
+            !command.contains(&source.to_string_lossy().into_owned()),
+            "command must not name the source binary: {command}"
+        );
+    }
+
+    /// Test 3: after pinning, replacing or deleting the source leaves the pinned
+    /// relay present and the hook command for a new instance byte-identical.
+    #[test]
+    fn the_pinned_relay_command_is_stable_when_the_source_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source = write_relay_source(dir.path());
+        let original = std::fs::read(&source).unwrap();
+        let config = config_with_stub_relay(&data_dir, &source);
+
+        let first = relay_binary(&config).expect("first pin");
+        // Replace the source the way a rebuild does: write a new file and rename
+        // over the target, so the replacement is a distinct inode. Then delete
+        // it entirely — the "(deleted)" scenario the bug came from.
+        let replacement = dir.path().join("remuda.new");
+        std::fs::write(&replacement, b"#!/bin/sh\nfalse\n").unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+
+        let second = relay_binary(&config).expect("second pin");
+        assert_eq!(first, second, "the pinned path is memoized and stable");
+        assert!(first.is_file(), "the pinned copy survives source removal");
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            original,
+            "the pinned copy keeps the bytes it was pinned from"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                std::fs::metadata(&first).unwrap().permissions().mode() & 0o111 != 0,
+                "the pinned copy stays executable"
+            );
+        }
+    }
 
     #[test]
     fn herdr_defaults_isolate_data_roots_and_preserve_explicit_session() {

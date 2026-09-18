@@ -1,0 +1,457 @@
+//! The Node's own executable, resolved once and pinned into the Node data dir
+//! so the hook relay never names the live binary.
+//!
+//! On Linux a rebuild that replaces `<data>/target-node/debug/remuda` in place
+//! leaves the running Node's `current_exe` reading `<path> (deleted)`. When the
+//! hook command embedded that per-launch path, every hook event after the
+//! rebuild died with `exec: <path> (deleted): not found`. The fix is to resolve
+//! the executable **once** at Node start and pin a private copy under
+//! `<data dir>/hook-bin/<version>/remuda`: replacing the on-disk binary then
+//! breaks neither live nor newly created instances (roadmap R4 installed-vs-
+//! running skew).
+//!
+//! The pinned copy is content-addressed by the build hash, so an unchanged
+//! binary pins once across restarts and a replacement lands in its own version
+//! directory. Old versions no live instance still references are garbage-
+//! collected at Node start and after `instance.purge`; the version the running
+//! Node itself pinned is never collected.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Top-level directory under the Node data dir holding pinned relay copies.
+const HOOK_BIN_DIR: &str = "hook-bin";
+
+/// Filename of the pinned relay inside each `hook-bin/<version>` directory.
+const RELAY_NAME: &str = "remuda";
+
+/// Per-instance file recording the pinned relay path a launch used, so GC can
+/// tell which `hook-bin/<version>` directories a live instance still needs.
+const INSTANCE_REF_FILE: &str = "hook-relay";
+
+/// Suffix the Linux kernel appends to `/proc/self/exe` (and thus
+/// `current_exe`) once the running executable's directory entry is unlinked or
+/// replaced in place.
+const DELETED_SUFFIX: &str = " (deleted)";
+
+static SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Process-wide registry of resolved relays, keyed by `<data dir>/hook-bin`.
+///
+/// A [`HookRelay`] lives here rather than in `NativeDriverConfig` so the config
+/// — a variant of the size-sensitive `LocalDrivers` enum — gains no field. Each
+/// data dir resolves its relay exactly once; the entry is shared (`Arc`) across
+/// every cloned config and driver factory, so the ~200 MB hash and copy run at
+/// most once per Node.
+static REGISTRY: Mutex<Option<HashMap<PathBuf, Arc<HookRelay>>>> = Mutex::new(None);
+
+/// Resolve (once) and register the relay for `data_dir`, returning the shared
+/// handle. Idempotent: a second call for the same data dir returns the first.
+///
+/// Cheap: `current_exe` plus, only for the `(deleted)` corner, a single `stat`.
+/// No hashing and no copy happen here — those are deferred to the first
+/// [`HookRelay::pinned_path`] so a Node that never binds a hook pays nothing.
+pub(crate) fn ensure(data_dir: &Path) -> Arc<HookRelay> {
+    let hook_bin_dir = data_dir.join(HOOK_BIN_DIR);
+    let mut guard = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+    let registry = guard.get_or_insert_with(HashMap::new);
+    Arc::clone(
+        registry
+            .entry(hook_bin_dir.clone())
+            .or_insert_with(|| HookRelay::from_current_exe(hook_bin_dir)),
+    )
+}
+
+/// The already-registered relay for `data_dir`, resolving it if absent.
+pub(crate) fn for_data_dir(data_dir: &Path) -> Arc<HookRelay> {
+    ensure(data_dir)
+}
+
+/// The Node's own executable and the pinned copy the hook relay points at.
+#[derive(Debug)]
+pub(crate) struct HookRelay {
+    /// This process's executable, de-`(deleted)`-ed. `None` when
+    /// `current_exe` failed — the relay then reports the same error a
+    /// per-launch resolution used to.
+    source: Option<PathBuf>,
+    /// `<data dir>/hook-bin`.
+    hook_bin_dir: PathBuf,
+    /// Memoized pinned path (or the error from pinning it). Pinning hashes a
+    /// ~200 MB binary, so it must happen at most once.
+    pinned: OnceLock<Result<PathBuf, String>>,
+}
+
+impl HookRelay {
+    /// Resolve this process's executable, stripping any `(deleted)` suffix.
+    fn from_current_exe(hook_bin_dir: PathBuf) -> Arc<Self> {
+        let source = match std::env::current_exe() {
+            Ok(path) => Some(strip_deleted_suffix(path)),
+            Err(error) => {
+                tracing::warn!(%error, "cannot locate the remuda binary for hooks");
+                None
+            }
+        };
+        Arc::new(Self {
+            source,
+            hook_bin_dir,
+            pinned: OnceLock::new(),
+        })
+    }
+
+    /// The pinned copy the hook relay must reference, computed once.
+    pub(crate) fn pinned_path(&self) -> Result<PathBuf, String> {
+        self.pinned
+            .get_or_init(|| {
+                let source = self
+                    .source
+                    .as_ref()
+                    .ok_or_else(|| "cannot locate the remuda binary for hooks".to_owned())?;
+                pin(source, &self.hook_bin_dir)
+                    .map_err(|error| format!("pin remuda hook relay: {error}"))
+            })
+            .clone()
+    }
+
+    /// The pinned path if it has already been computed, without forcing a pin.
+    ///
+    /// GC uses this to protect the version the running Node pinned without
+    /// paying a ~200 MB hash on a Node that has not bound a hook yet.
+    pub(crate) fn pinned_if_ready(&self) -> Option<PathBuf> {
+        self.pinned.get().and_then(|result| result.clone().ok())
+    }
+
+    /// Build a relay from an explicit source binary, for tests that must
+    /// replace or delete the source without touching the running executable.
+    #[cfg(test)]
+    fn for_test(source: PathBuf, hook_bin_dir: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            source: Some(source),
+            hook_bin_dir,
+            pinned: OnceLock::new(),
+        })
+    }
+}
+
+/// Register a stub relay for `data_dir`, so tests exercise the pin/GC path
+/// against a controllable source rather than the ~200 MB test binary.
+#[cfg(test)]
+pub(crate) fn register_stub_for_test(data_dir: &Path, source: &Path) {
+    let hook_bin_dir = data_dir.join(HOOK_BIN_DIR);
+    let mut guard = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+    let registry = guard.get_or_insert_with(HashMap::new);
+    registry.insert(
+        hook_bin_dir.clone(),
+        HookRelay::for_test(source.to_path_buf(), hook_bin_dir),
+    );
+}
+
+/// Strip a trailing `" (deleted)"` the kernel appends to a replaced executable
+/// path, but only when the stripped path names an existing regular file.
+///
+/// A real file whose name literally ends in `" (deleted)"` (nothing at the
+/// stripped path, or a non-file there) is returned untouched.
+pub(crate) fn strip_deleted_suffix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    let Some(stripped) = text.strip_suffix(DELETED_SUFFIX) else {
+        return path;
+    };
+    let candidate = PathBuf::from(stripped);
+    match fs::metadata(&candidate) {
+        Ok(meta) if meta.is_file() => candidate,
+        _ => path,
+    }
+}
+
+/// Pin `source` into `hook-bin/<version>/remuda`, returning the pinned path.
+///
+/// Content-addressed by the build hash: an already-pinned version is returned
+/// without touching the filesystem, so a byte-identical binary pins once across
+/// restarts.
+fn pin(source: &Path, hook_bin_dir: &Path) -> io::Result<PathBuf> {
+    let version = version_tag(source)?;
+    let version_dir = hook_bin_dir.join(&version);
+    let dest = version_dir.join(RELAY_NAME);
+    if is_regular_file(&dest) {
+        return Ok(dest);
+    }
+    create_dir_private(hook_bin_dir)?;
+    create_dir_private(&version_dir)?;
+    let pinned = install(source, &version_dir, &dest)?;
+    tracing::info!(
+        source = %source.display(),
+        pinned = %pinned.display(),
+        "pinned remuda hook relay"
+    );
+    Ok(pinned)
+}
+
+/// Content hash of `source`, `sha256:`-stripped, as the version directory name.
+fn version_tag(source: &Path) -> io::Result<String> {
+    let digest = remuda_driver::hash_file(source)
+        .map_err(|error| io::Error::other(format!("hash remuda binary: {error}")))?;
+    let encoded = String::from(digest);
+    Ok(encoded
+        .strip_prefix("sha256:")
+        .unwrap_or(&encoded)
+        .to_owned())
+}
+
+/// Hard-link (falling back to copy) `source` to a temp name, then rename it to
+/// `dest`. On `ETXTBSY` a relay at `dest` is mid-exec, so publish beside it
+/// under a fresh path rather than fighting the busy inode.
+fn install(source: &Path, version_dir: &Path, dest: &Path) -> io::Result<PathBuf> {
+    let token = unique_token();
+    let temp = version_dir.join(format!(".{RELAY_NAME}.{token}.part"));
+    let _ = fs::remove_file(&temp);
+    // A hard-link shares the source inode, which is already owner-executable
+    // and cannot be rewritten in place while the Node runs it; do not chmod it,
+    // that would mutate the live binary's own permissions. Only the copy
+    // fallback — a distinct inode — is locked down to 0500.
+    match fs::hard_link(source, &temp) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::debug!(%error, "hook relay hard-link fell back to copy");
+            copy_file(source, &temp)?;
+            set_mode(&temp, 0o500)?;
+        }
+    }
+    match fs::rename(&temp, dest) {
+        Ok(()) => Ok(dest.to_path_buf()),
+        Err(error) if is_etxtbsy(&error) => {
+            let fresh = version_dir.join(format!("{RELAY_NAME}-{token}"));
+            fs::rename(&temp, &fresh)?;
+            Ok(fresh)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(error)
+        }
+    }
+}
+
+fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut input = File::open(src)?;
+    let mut output = OpenOptions::new().create_new(true).write(true).open(dst)?;
+    io::copy(&mut input, &mut output)?;
+    output.flush()?;
+    let _ = output.sync_all();
+    Ok(())
+}
+
+/// Record which pinned relay a launch used, so GC can protect its version while
+/// the instance is live. Best-effort: a failure here must not fail a launch.
+pub(crate) fn record_instance_relay(instance_dir: &Path, pinned: &Path) {
+    let path = instance_dir.join(INSTANCE_REF_FILE);
+    if let Err(error) = fs::write(&path, pinned.to_string_lossy().as_bytes()) {
+        tracing::warn!(%error, path = %path.display(), "could not record hook relay reference");
+    }
+}
+
+/// Remove `hook-bin/<version>` directories no live instance references.
+///
+/// The version the running Node itself pinned (`running`) is never removed,
+/// even if no instance directory names it yet. A no-op when nothing has been
+/// pinned.
+pub(crate) fn garbage_collect(data_dir: &Path, running: Option<&Path>) {
+    let hook_bin_dir = data_dir.join(HOOK_BIN_DIR);
+    if !hook_bin_dir.is_dir() {
+        return;
+    }
+    let mut keep = referenced_versions(data_dir, &hook_bin_dir);
+    if let Some(version) = running.and_then(|path| version_of(path, &hook_bin_dir)) {
+        keep.insert(version);
+    }
+    let entries = match fs::read_dir(&hook_bin_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(%error, "could not scan hook-bin for garbage collection");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if keep.contains(&name) {
+            continue;
+        }
+        match fs::remove_dir_all(entry.path()) {
+            Ok(()) => tracing::info!(version = %name, "collected unreferenced hook relay"),
+            Err(error) => {
+                tracing::warn!(%error, version = %name, "could not collect hook relay")
+            }
+        }
+    }
+}
+
+/// Versions named by the `hook-relay` reference file in each instance directory.
+fn referenced_versions(data_dir: &Path, hook_bin_dir: &Path) -> HashSet<String> {
+    let mut versions = HashSet::new();
+    let instances = data_dir.join("instances");
+    let Ok(entries) = fs::read_dir(&instances) else {
+        return versions;
+    };
+    for entry in entries.flatten() {
+        let ref_file = entry.path().join(INSTANCE_REF_FILE);
+        let Ok(text) = fs::read_to_string(&ref_file) else {
+            continue;
+        };
+        if let Some(version) = version_of(Path::new(text.trim()), hook_bin_dir) {
+            versions.insert(version);
+        }
+    }
+    versions
+}
+
+/// The `<version>` component of a `hook-bin/<version>/remuda` path, when it is
+/// one of ours.
+fn version_of(pinned: &Path, hook_bin_dir: &Path) -> Option<String> {
+    let version_dir = pinned.parent()?;
+    if version_dir.parent() != Some(hook_bin_dir) {
+        return None;
+    }
+    version_dir.file_name()?.to_str().map(str::to_owned)
+}
+
+fn is_regular_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+fn create_dir_private(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    set_mode(dir, 0o700)
+}
+
+fn is_etxtbsy(error: &io::Error) -> bool {
+    error.kind() == ErrorKind::ExecutableFileBusy || error.raw_os_error() == Some(26)
+}
+
+fn unique_token() -> String {
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}-{seq}", std::process::id())
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Suffix rule: a `(deleted)` path whose stripped form exists as a regular
+    /// file yields the stripped path; an existing file whose name really ends
+    /// in that text is returned unchanged.
+    #[test]
+    fn deleted_suffix_is_stripped_only_when_the_real_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("remuda");
+        std::fs::write(&real, b"binary").unwrap();
+        let deleted = PathBuf::from(format!("{}{DELETED_SUFFIX}", real.display()));
+        assert_eq!(strip_deleted_suffix(deleted), real);
+
+        // A file whose name literally ends in " (deleted)" survives untouched.
+        let literal = dir.path().join(format!("weird{DELETED_SUFFIX}"));
+        std::fs::write(&literal, b"binary").unwrap();
+        assert_eq!(strip_deleted_suffix(literal.clone()), literal);
+
+        // Nothing at the stripped path: keep the original.
+        let phantom = dir.path().join(format!("gone{DELETED_SUFFIX}"));
+        assert_eq!(strip_deleted_suffix(phantom.clone()), phantom);
+    }
+
+    fn write_source(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        set_mode(&path, 0o755).unwrap();
+        path
+    }
+
+    /// Regression: after pinning, overwriting or deleting the source leaves the
+    /// pinned copy present, executable, and at a stable path.
+    #[test]
+    fn a_pinned_relay_survives_the_source_being_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source = write_source(dir.path(), "remuda", b"#!/bin/sh\ntrue\n");
+        let relay = HookRelay {
+            source: Some(source.clone()),
+            hook_bin_dir: data_dir.join(HOOK_BIN_DIR),
+            pinned: OnceLock::new(),
+        };
+        let pinned = relay.pinned_path().expect("pin");
+        assert!(pinned.starts_with(data_dir.join(HOOK_BIN_DIR)));
+        assert!(is_regular_file(&pinned));
+
+        // Replace the source in place, then delete it entirely.
+        std::fs::write(&source, b"#!/bin/sh\nfalse\n").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        assert!(is_regular_file(&pinned), "pinned copy must survive");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(
+                std::fs::metadata(&pinned).unwrap().permissions().mode() & 0o111 != 0,
+                "pinned copy must stay executable"
+            );
+        }
+        // Memoized: a second call is byte-identical, not a re-pin.
+        assert_eq!(relay.pinned_path().unwrap(), pinned);
+    }
+
+    /// GC removes the version no live instance references, keeps the referenced
+    /// one, and never removes the currently running version.
+    #[test]
+    fn garbage_collect_keeps_referenced_and_running_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let hook_bin = data_dir.join(HOOK_BIN_DIR);
+
+        // Pin two distinct versions.
+        let running_src = write_source(dir.path(), "running", b"running-bytes\n");
+        let running = pin(&running_src, &hook_bin).unwrap();
+        let referenced_src = write_source(dir.path(), "referenced", b"referenced-bytes\n");
+        let referenced = pin(&referenced_src, &hook_bin).unwrap();
+        let stale_src = write_source(dir.path(), "stale", b"stale-bytes\n");
+        let stale = pin(&stale_src, &hook_bin).unwrap();
+
+        // A live instance references only the "referenced" version.
+        let instance_dir = data_dir.join("instances").join("ins_live");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        record_instance_relay(&instance_dir, &referenced);
+
+        garbage_collect(&data_dir, Some(&running));
+
+        assert!(is_regular_file(&running), "running version must survive");
+        assert!(
+            is_regular_file(&referenced),
+            "referenced version must survive"
+        );
+        assert!(
+            !stale.exists(),
+            "the unreferenced, non-running version is collected"
+        );
+    }
+}

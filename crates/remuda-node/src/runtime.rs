@@ -377,6 +377,9 @@ impl DevNode {
                 }
             }
         }
+        // The purged instance may have held the last reference to a pinned
+        // hook relay version; collect any now-unreferenced ones.
+        self.collect_hook_relays();
         Ok(serde_json::json!({
             "purged": removed,
             "directoryRemoved": directory_removed,
@@ -635,6 +638,19 @@ impl DevNode {
             .herdr_config
             .as_ref()
             .map(|config| config.data_dir.clone())
+    }
+
+    /// Collect `hook-bin/<version>` directories no live instance references.
+    ///
+    /// Called at Node start and after `instance.purge`. The version the running
+    /// Node pinned is always kept. A fake-driver Node (no `herdr_config`) has no
+    /// pinned relay and nothing to collect.
+    pub(crate) fn collect_hook_relays(&self) {
+        let Some(config) = &self.inner.herdr_config else {
+            return;
+        };
+        let running = crate::hook_shim::for_data_dir(&config.data_dir).pinned_if_ready();
+        crate::hook_shim::garbage_collect(&config.data_dir, running.as_deref());
     }
 
     /// Submit send/cancel/respond/close through an Instance's bounded queue.

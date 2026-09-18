@@ -29,6 +29,12 @@ account credentials were copied into this apparatus or these fixtures.
   the initial schema-failure run, while PreToolUse/PostToolUse are from the
   corrected successful tool run. Notification is from the
   earlier permission probe session `01a09c22-f3fd-7922-9412-ee8053e7804a`.
+  Note: grok's only permission-prompt signal is this non-blocking
+  `Notification(permission_prompt)` — it has no blocking PermissionRequest
+  hook. Remuda no longer folds a Notification into the waiting/blocked phase,
+  so for grok the blocked/waiting-interaction state now comes from the screen
+  tier alone (the OSC/screen blocked latch and pending-dialog detection); the
+  Notification is surfaced as an in-app advisory instead.
 - `hook-deny-{updates,events}.jsonl`: complete real denial-session files, proving
   PreToolUse denial under `--always-approve`. The hook annotation and terminal
   outcome are intentionally retained as unknown parser variants.

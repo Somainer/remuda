@@ -752,10 +752,11 @@ async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
     // The group id equals the direct child's pid because `spawn_command` puts it
     // in its own group. Read it before any wait: once reaped, `id()` is `None`.
     let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
-    let _ = live.process.close_stdin().await;
 
-    // Rung 1: the graceful path. Most closes end here.
-    let graceful = timeout.mul_f32(0.6);
+    // Rung 1: the graceful path. Stdin EOF is the polite "no more turns", and
+    // most closes end here.
+    let graceful = timeout.mul_f32(0.5);
+    let _ = live.process.close_stdin().await;
     if tokio::time::timeout(graceful, live.process.wait())
         .await
         .is_ok()
@@ -763,59 +764,62 @@ async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
         return;
     }
 
-    // Rung 2: ask the CLI to abandon the turn, which unblocks a child waiting on
-    // its own in-flight work. This is the same native control request `cancel`
-    // uses, not a signal.
-    debug!(carrier, "close: stdin EOF ignored, sending interrupt");
-    let _ = live.process.interrupt(true).await;
-    let after_interrupt = timeout.saturating_sub(graceful);
-    if tokio::time::timeout(after_interrupt, live.process.wait())
+    // Rung 2: SIGTERM-equivalent for this transport would be the native
+    // `interrupt` control request — but that travels over stdin, and
+    // `close_stdin` already shut the writer down (`WriterCmd::Close` breaks its
+    // loop), so nothing further can be written. Interrupting *before* EOF would
+    // mean cancelling in-flight work on every ordinary close, which is not what
+    // `instance.close` promises. So the escalation is straight to signals, and
+    // the interrupt path stays where it belongs: `Driver::cancel`.
+    //
+    // SIGTERM first, so a child that installs a handler can still flush its
+    // transcript; the group gets it, because a `Bash` tool or MCP server the
+    // child spawned would otherwise outlive the instance.
+    debug!(carrier, "close: stdin EOF ignored, terminating the group");
+    if let Some(pgid) = pgid {
+        signal_child_group(pgid, nix::sys::signal::Signal::SIGTERM, carrier);
+    }
+    let after_term = timeout.saturating_sub(graceful);
+    if tokio::time::timeout(after_term, live.process.wait())
         .await
         .is_ok()
     {
         return;
     }
 
-    // Rung 3: SIGKILL. `kill` only reaches the direct child, so signal the whole
-    // group first — a `Bash` tool or MCP server it spawned would otherwise
-    // outlive the instance holding the workspace open.
-    warn!(
-        carrier,
-        "close: interrupt ignored, killing the process group"
-    );
+    // Rung 3: SIGKILL, which nothing can ignore. `kill` only reaches the direct
+    // child, so signal the group as well.
+    warn!(carrier, "close: SIGTERM ignored, killing the process group");
     if let Some(pgid) = pgid {
-        kill_group(pgid, carrier);
+        signal_child_group(pgid, nix::sys::signal::Signal::SIGKILL, carrier);
     }
     let _ = live.process.kill();
     // Reap it, so the ladder cannot leave a zombie behind. The child is killed
-    // and unignorably so; a short bound still keeps `close` from hanging if the
-    // process is wedged in the kernel (uninterruptible IO).
+    // unignorably; a short bound still keeps `close` from hanging if the process
+    // is wedged in the kernel (uninterruptible IO).
     let _ = tokio::time::timeout(Duration::from_secs(2), live.process.wait()).await;
 }
 
-/// SIGKILL every member of `pgid`, treating an already-gone group as success.
+/// Send `signal` to every member of the child's process group.
 ///
 /// `unsafe` is forbidden workspace-wide, so this goes through `nix` rather than
 /// a raw `libc::killpg`. A group that is already gone (`ESRCH`) is the outcome
-/// being asked for, and `EPERM` means something in it is not ours to kill —
+/// being asked for, and `EPERM` means something in it is not ours to signal —
 /// neither is worth failing a close over, so both are logged and swallowed.
-fn kill_group(pgid: i32, carrier: &str) {
+fn signal_child_group(pgid: i32, signal: nix::sys::signal::Signal, carrier: &str) {
     #[cfg(unix)]
     {
         if pgid <= 0 {
             return;
         }
-        match nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pgid),
-            nix::sys::signal::Signal::SIGKILL,
-        ) {
+        match nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
-            Err(errno) => debug!(carrier, pgid, %errno, "process-group kill failed"),
+            Err(errno) => debug!(carrier, pgid, %errno, "process-group signal failed"),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (pgid, carrier);
+        let _ = (pgid, signal, carrier);
     }
 }
 

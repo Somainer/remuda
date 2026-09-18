@@ -229,6 +229,7 @@ async fn enqueue_job(
         queued_at: ts(&now),
         started_at: None,
         finished_at: None,
+        cancel_requested_at: None,
         base_sha: None,
         head_sha: None,
         merge_sha: None,
@@ -360,6 +361,12 @@ async fn cancel_project_job(
                 .store
                 .mutate_gate_job(&job_id, |row| {
                     row.state = GateJobState::Canceling;
+                    // Stamp the first cancel request; the scheduler finishes
+                    // the job canceled after a bounded grace even if the Node
+                    // never answers.
+                    if row.cancel_requested_at.is_none() {
+                        row.cancel_requested_at = Some(now_ts());
+                    }
                     Some(())
                 })
                 .await
@@ -489,8 +496,53 @@ pub(crate) async fn tick(state: &AppState) {
     if let Err(error) = schedule(state).await {
         tracing::warn!(%error, "gate queue schedule tick failed");
     }
+    // Finish jobs whose cancel grace has expired without a Node answer.
+    finish_expired_cancels(state).await;
     // Pinned-ref retention; self-throttled, so this is cheap on every tick.
     sweep_expired_refs(state).await;
+}
+
+/// Finish any `canceling` job whose cancel grace has elapsed. A Node that never
+/// answers `gate.cancel` must not decide the outcome: after the bounded grace
+/// the Hub finishes the job `canceled`, keeping its evidence, and a later run
+/// reply for that (now terminal) job is ignored rather than applied.
+async fn finish_expired_cancels(state: &AppState) {
+    let Ok(jobs) = state.store.list_gate_jobs(None).await else {
+        return;
+    };
+    let grace_ms = state.config.gate_cancel_grace_ms;
+    let now = now();
+    for job in jobs {
+        if job.state != GateJobState::Canceling {
+            continue;
+        }
+        let Some(requested) = &job.cancel_requested_at else {
+            continue;
+        };
+        let elapsed_ms = age_ms(&now, requested);
+        if elapsed_ms.is_none_or(|age| age < grace_ms) {
+            continue;
+        }
+        let finished = state
+            .store
+            .mutate_gate_job(job.id.as_id().as_str(), |row| {
+                if row.state != GateJobState::Canceling {
+                    return None;
+                }
+                row.state = GateJobState::Canceled;
+                row.finished_at = Some(now_ts());
+                row.error =
+                    Some("canceled; the lane did not answer within the cancel grace".into());
+                row.reason = Some("canceled; run did not stop in time".into());
+                Some(())
+            })
+            .await;
+        if let Ok(Some(job)) = finished {
+            journal(state, &job.requested_by, "gate.canceled", &job).await;
+            drop_job_refs(state, &job).await;
+            schedule_once(state);
+        }
+    }
 }
 
 async fn schedule(state: &AppState) -> Result<(), HubError> {
@@ -563,6 +615,7 @@ async fn schedule(state: &AppState) -> Result<(), HubError> {
                 lane,
                 project.default_base_branch.clone(),
                 resolve_push_from(lane, &project),
+                merge_step_timeouts(&project.gate, lane),
             )
             .await;
         }
@@ -631,12 +684,27 @@ fn resolve_push_from(
     remuda_protocol::GatePushFrom::Lane
 }
 
+/// Per-step wall-clock budgets for a run: project defaults with the lane's own
+/// entries layered on top (lane wins per key). `0` seconds is preserved so the
+/// runner reads it as "no cap" for that step.
+fn merge_step_timeouts(
+    gate: &remuda_protocol::ProjectGate,
+    lane: &remuda_protocol::ProjectGateLane,
+) -> std::collections::BTreeMap<String, u64> {
+    let mut merged = gate.timeouts.clone();
+    for (step, secs) in &lane.timeouts {
+        merged.insert(step.clone(), *secs);
+    }
+    merged
+}
+
 async fn dispatch(
     state: &AppState,
     job: &GateJob,
     lane: &remuda_protocol::ProjectGateLane,
     base_branch: String,
     push_from: remuda_protocol::GatePushFrom,
+    timeouts: std::collections::BTreeMap<String, u64>,
 ) {
     let claim_lane = lane.id.clone();
     let claim_host = lane.host_id.clone();
@@ -671,7 +739,7 @@ async fn dispatch(
         pw_endpoint: lane.pw_endpoint.clone(),
         toolchain_path: lane.toolchain_path.clone(),
         ports: lane.ports.clone(),
-        timeouts: std::collections::BTreeMap::new(),
+        timeouts,
         gate_timeout_secs: 0,
         push: true,
         push_from,
@@ -822,7 +890,16 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     // host. The lane therefore reports `passed` for a land job; the job stays
     // `running` across the handoff so `remuda land` keeps waiting instead of
     // reading a verify as a completed land.
-    let home_land = if existing.mode == GateMode::Land && result.status == "passed" {
+    //
+    // A canceling job is authoritative: the verdict verified the merge, but the
+    // operator asked to cancel, so we never advance main. The one exception is
+    // a `pushFrom: lane` land whose Node already pushed and reports `landed` —
+    // main moved, so we keep `landed` and record the cancel arrived too late
+    // (honesty over tidiness). Everything else canceling ends `canceled`,
+    // keeping mergeSha/mergeRef/steps, with no home-host handoff.
+    let is_canceling = existing.state == GateJobState::Canceling;
+    let home_land = if !is_canceling && existing.mode == GateMode::Land && result.status == "passed"
+    {
         home_land_plan(state, &existing, &result).await
     } else {
         None
@@ -831,6 +908,42 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
+            if is_canceling {
+                // Record the terminal evidence, then resolve the cancel.
+                for step in &result.steps {
+                    match row
+                        .steps
+                        .iter()
+                        .position(|existing| existing.name == step.name)
+                    {
+                        Some(index) => row.steps[index] = step.clone(),
+                        None => row.steps.push(step.clone()),
+                    }
+                }
+                row.base_sha = result.base_sha.clone().or(row.base_sha.clone());
+                row.head_sha = result.head_sha.clone().or(row.head_sha.clone());
+                row.merge_sha = result.merge_sha.clone().or(row.merge_sha.clone());
+                row.merge_ref = result.merge_ref.clone().or(row.merge_ref.clone());
+                row.current_main_sha = result.current_main_sha.clone();
+                if let Some(object_id) = &log_object_id {
+                    row.log_object_id = Some(object_id.clone());
+                }
+                row.finished_at = Some(now_ts());
+                if result.status == "landed" {
+                    // The lane already pushed before the cancel reached it;
+                    // main moved. Keep the truth rather than claim a cancel.
+                    row.state = GateJobState::Landed;
+                    row.error = None;
+                    row.reason = Some("cancel arrived after the lane had pushed main".into());
+                } else {
+                    row.state = GateJobState::Canceled;
+                    row.error = Some(result.error.clone().unwrap_or_else(|| {
+                        "canceled after the run verified but was not landed".into()
+                    }));
+                    row.reason = Some("canceled; verified but not landed".into());
+                }
+                return Some(());
+            }
             if result.status == "canceled" {
                 row.state = GateJobState::Canceled;
                 row.finished_at = Some(now_ts());
@@ -930,8 +1043,12 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
     }
     // A canceled job's pinned merge will never be landed; a lane-side land
     // already consumed its own pin. Either way the refs go now rather than
-    // waiting for retention.
-    if matches!(job.state, GateJobState::Canceled | GateJobState::Landed) {
+    // waiting for retention. The exception is a job canceled after it verified
+    // (`is_canceling`): it keeps its pinned merge so an operator can still land
+    // it by hand, and retention drops the ref later like any unlanded verify.
+    if matches!(job.state, GateJobState::Landed)
+        || (job.state == GateJobState::Canceled && !is_canceling)
+    {
         drop_job_refs(state, &job).await;
     }
     schedule_once(state);
@@ -1040,6 +1157,13 @@ async fn home_land_plan(
 /// which main moved but the job did not finish, because the push itself is a
 /// single leased update.
 async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
+    // If the job turned `canceling` between the verify and this push, honour
+    // the cancel: never push. The cancel/scheduler path finishes it canceled.
+    if let Some(job) = state.store.get_gate_job(job_id).await.ok().flatten()
+        && job.state != GateJobState::Running
+    {
+        return;
+    }
     let params = serde_json::to_value(&plan.params).unwrap_or(Value::Null);
     let reply = state
         .nodes
@@ -1093,7 +1217,10 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
-            if row.state != GateJobState::Running && row.state != GateJobState::Canceling {
+            // Only a still-running job may be landed. A job that turned
+            // `canceling` between the plan and the push is finished canceled
+            // by the scheduler/cancel path, and nothing is pushed here.
+            if row.state != GateJobState::Running {
                 return None;
             }
             match landed.status.as_str() {
@@ -1355,6 +1482,16 @@ pub(crate) async fn reconcile(state: &AppState) {
         let _ = state
             .store
             .mutate_gate_job(job.id.as_id().as_str(), |row| {
+                if row.state == GateJobState::Canceling {
+                    // A cancel was already requested; do not silently drop it
+                    // back into the queue. Finish it canceled.
+                    row.state = GateJobState::Canceled;
+                    row.finished_at = Some(now_ts());
+                    row.error =
+                        Some("hub restarted while the job was canceling; finished canceled".into());
+                    row.reason = Some("canceled; hub restarted mid-cancel".into());
+                    return Some(());
+                }
                 row.state = GateJobState::Queued;
                 row.started_at = None;
                 row.host_id = None;

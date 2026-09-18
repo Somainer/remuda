@@ -308,6 +308,11 @@ pub struct GateJob {
     /// When the job reached a terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Timestamp>,
+    /// When a cancel was requested while the job was running. Drives the
+    /// bounded grace after which the scheduler finishes a `canceling` job
+    /// `canceled` even if the Node never answered the cancel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<Timestamp>,
     /// Base (`main`) sha the merge was verified onto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,

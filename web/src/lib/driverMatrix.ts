@@ -93,6 +93,10 @@ export function defaultDriver(host: HostMatrix | undefined, kind: AgentKindId | 
 export const DRIVER_LABELS: Record<DriverKind, string> = {
   "shell-pty": "原生终端 (shell-pty)",
   "claude-print": "结构化 print (claude-print) · 诊断用，单轮即结束",
+  // D-037: same stream-json/stdio transport as print minus `-p`, so stdin stays
+  // open and the child serves many turns. No Terminal view on this carrier
+  // (stdio is not a PTY). Experimental and never a default — explicit only.
+  "claude-sdk": "结构化 stream-json (claude-sdk) · 多轮，无终端视图 · 实验性",
   "claude-pty": "herdr PTY (claude-pty)",
   "generic-pty": "herdr 通用 PTY (generic-pty)",
   "claude-bg": "claude-bg",

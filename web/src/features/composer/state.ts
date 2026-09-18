@@ -152,6 +152,32 @@ export function composerState(_kind: string, phase: Phase, caps: CapabilitySnaps
   };
 }
 
+/** Whether a queued (Remuda-held) row may 插队发送 right now, and if not, why. */
+export type SteerHeldControl = { enabled: boolean; reason: string };
+
+/**
+ * c-steer 插队发送: can one already-queued Remuda-held row interrupt the running
+ * turn and jump ahead this instant? The gesture is only honest while a turn is
+ * genuinely working and the carrier can interrupt; every other case returns a
+ * visible reason rather than an inert control (see Composer / Transcript rows).
+ */
+export function steerHeldControl(kind: string, phase: Phase, caps: CapabilitySnapshot): SteerHeldControl {
+  if (phase === "idle" || phase === "exited") {
+    return { enabled: false, reason: "无进行中的回合，回车即送出" };
+  }
+  if (phase === "blocked") {
+    // Esc into an open question is forbidden; the row flushes after the answer.
+    return { enabled: false, reason: "问题处理中，回答后送出" };
+  }
+  const { steer } = composerState(kind, phase, caps);
+  if (steer.available) {
+    // Emulated / unknown provisions stay actionable, carrying their honest
+    // caveat note (「Remuda 代发取消序列」/「尚未验证」) up to the button title.
+    return { enabled: true, reason: steer.note ?? "" };
+  }
+  return { enabled: false, reason: "该载体未提供打断能力，无法插队" };
+}
+
 function supportedInterrupt(cap: Capability | undefined): InterruptControl {
   if (!isSupported(cap)) return { available: false };
   const p = provision(cap);

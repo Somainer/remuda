@@ -7,6 +7,7 @@ import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
+import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
@@ -45,6 +46,11 @@ export function SessionPage({
   const sending = sendingIds.includes(instanceId);
   const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
   const [resuming, setResuming] = useState(false);
+  // 已打断 receipt shared by the composer controls and the transcript held-row
+  // 插队发送 button, so the gesture reads the same from either place. Reset on
+  // session switch; the composer also clears it on the next turn / after 4 s.
+  const [interrupted, setInterrupted] = useState(false);
+  useEffect(() => setInterrupted(false), [instanceId]);
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
   const showTerminal = instance ? canShowTerminal(instance) : false;
@@ -414,6 +420,13 @@ export function SessionPage({
             bubbles={bubbles}
             compact={hub.compact}
             journalStatus={journalStatus}
+            steerHeld={steerHeldControl(instance.kind, composerPhase, instance.capabilities)}
+            onSteerHeld={async (_iid, id) => {
+              const landed = await hubStore.steerHeld(instance.id, id);
+              // 已打断 is a receipt for an interrupt that actually landed.
+              if (landed) setInterrupted(true);
+              return landed;
+            }}
             onRetryJournal={() => {
               void hubStore.catchup(instance.id);
             }}
@@ -488,6 +501,8 @@ export function SessionPage({
           disabled={status === "exited"}
           phase={composerPhase}
           capabilities={instance.capabilities}
+          interrupted={interrupted}
+          onInterruptedChange={setInterrupted}
           held={heldBubbles.map((b) => ({
             id: b.clientRequestId,
             text: b.text,
@@ -508,6 +523,7 @@ export function SessionPage({
             hubStore.hold(instance.id, text, reason, refs, previews);
           }}
           onRetractHeld={(id) => hubStore.retract(id)}
+          onSteerHeld={(id) => hubStore.steerHeld(instance.id, id)}
           onFlushHeld={() => hubStore.flushHeld(instance.id)}
           onInterrupt={() => hubStore.cancel(instance.id)}
           permissionMode={
@@ -561,7 +577,7 @@ export function SessionPage({
                   mediaType: item.mediaType,
                   size: item.size,
                 }));
-              await hubStore.send(instance.id, text, attachments ?? [], previews, mode);
+              return await hubStore.send(instance.id, text, attachments ?? [], previews, mode);
             } finally {
               setSending(false);
             }

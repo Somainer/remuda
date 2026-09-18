@@ -743,6 +743,31 @@
   color: var(--danger, #e06c5c);
 }
 
+/* c-steer 插队发送: per-queued-row interrupt-and-send. */
+.queuedSteer {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 7px;
+  line-height: 1.6;
+  flex: none;
+  white-space: nowrap;
+}
+
+.queuedSteer:disabled {
+  opacity: 0.5;
+}
+
+.heldRowActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
 .sendIcon {
   width: 44px;
   height: 44px;

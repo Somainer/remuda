@@ -373,7 +373,14 @@ async fn handle_stdio_frame(
     frame: Value,
 ) -> Result<FrameOutcome, NodeError> {
     if frame.get("method").is_none() {
-        hubnode_codec::persist_hello_result(data_dir, &frame)?;
+        // Record the Hub's hello result, but never at the cost of the carrier.
+        // This is bookkeeping — the reply is already in hand from the wire —
+        // and the frame is the loop's last chance to read a `?`-free path on
+        // this arm, so a read-only data directory must not be fatal here. A
+        // carrier that exits takes every live Instance's journal with it.
+        if let Err(error) = hubnode_codec::persist_hello_result(data_dir, &frame) {
+            tracing::warn!(%error, "could not persist the hello result");
+        }
         return Ok(FrameOutcome::none());
     }
     let request = match decode_request(&frame) {

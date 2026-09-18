@@ -4,13 +4,15 @@
 **Status:** measured. One live session on a throwaway local dev server, redacted below.
 **Design:** [print-replacement.md](../print-replacement.md) §2.1 (process model), §2.2 (resume and session identity), §2.5 (observation table), §2.6 (second carrier). Decision row [D-037](../decisions.md).
 **Scope:** M1 = §3 batch 1 + batch 2 + the registration half of batch 3.
-**Commits:** the live run below was made on branch `wt/c-sdkdriver/b-sdkdriver-md` at
-`56e55988` (the M1 series as first reviewed). The handback rounds that followed
-are: round 2 (the bounded close ladder, the web driver label, de-tautologised
-tests) at `14381315..8993e51b`, and round 3 (the real SIGKILL rung, bounding
-`close_stdin`, joining the reader) ending at `955592c5`, on the same branch,
+**Commits (rebased):** the live run was made on branch
+`wt/c-sdkdriver/b-sdkdriver-md` at `56e55988`, the M1-series tip as first
+reviewed; that object remains reachable after later rebases even though it is no
+longer on the branch's first-parent line. On the branch, the same series now
+starts at `e18d5101`. The handback rounds are: round 2 (bounded close ladder, web
+driver label, de-tautologised tests) at `73156446..9650ec69`, and round 3 (the
+real SIGKILL rung, bounding `close_stdin`, joining the reader) at `c2d0657d`,
 with this documentation commit last. The argv, pids, session id and journal
-quoted here are from the `56e55988` tree; `Driver::close` was reworked in both
+quoted below are from the `56e55988` tree; `Driver::close` was reworked in both
 handback rounds after that run, and its behaviour — including a child that
 ignores stdin EOF, a saturated writer, and a child that ignores SIGTERM — is
 covered by `tests/claude_sdk_process.rs` rather than by a second live session.

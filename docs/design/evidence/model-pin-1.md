@@ -9,11 +9,13 @@ with the fake harness from `crates/remuda-testing`, on an isolated temp root. No
 host, user or path names appear below; every model id is either a synthetic
 stand-in or a host-generic gateway id.
 
-Implementation: branch `wt/c-modelpin/b-modelpin-md`; the full implementation is
-at `b22d047efda2931f89741fea5d635811060abb1a` (this evidence doc lands in the
-commit immediately after). The channel work (argv + overlay + reporting) is in
-the earlier commits; the post-launch read-back gate and the alias-aware
-comparison are in the later ones on the same branch.
+Implementation: branch `wt/c-modelpin/b-modelpin-md`; the full implementation
+through the round-3 source-scoping and explicit-pin fixes is at
+`46e92c6fa99c16c8f9b489f2607f7d112ba18b4a` (this evidence doc lands in the
+commits immediately after). The argv/overlay channel work and reporting are in
+the earlier commits; the post-launch read-back gate, the alias-aware comparison,
+the Hub launch-source scope, and the explicit-`model_pin` arming follow on the
+same branch.
 
 ---
 
@@ -211,6 +213,25 @@ evidence of a substitution, so the launch continues rather than being killed on 
 guess. Later human `/model` and Remuda `configure` switches (`source =
 Slash`/`Remuda`) are out of scope and can never refuse a launch.
 
+The gate arms from the recipe's **explicit pin only** (`RecipeProvider.model_pin`,
+which is `spec.model_id` and nothing else), not from `model_requested`. On an
+unpinned launch `model_requested` still carries the profile's default model, so
+arming from it would make an unpinned launch refuseable if launch attribution
+ever changed. `pin_from_recipe` is the single arming path.
+
+### 3.3.1 The Hub half is source-scoped too
+
+The watch pass derives the `Blocked` worker from the projected `modelEffective`,
+and must apply the **same** source gate: it only treats a record with
+`effective.source == "launch"` as a possible substitution. The instance
+projection is source-agnostic, so an operator switching the session after launch
+(a human `/model`, or a Hub `instance.configure`) overwrites `modelEffective`
+while `WorkerRoster.model` keeps the dispatch pin. Without the source filter the
+next watch pass would end an intentionally reconfigured worker `Blocked` naming
+two ids nobody substituted, and keep it Blocked. `slash`/`remuda` observations
+change neither worker state nor the effective-model column.
+
+
 On a `Mismatch` the pump journals the contradicting observation, sends
 `DriverRequest::Close` to stop the process, and records
 `model-mismatch: requested <pin> but <observed> answered`. The Hub watch pass
@@ -245,12 +266,13 @@ is.
 | `remuda-driver/tests/materializer.rs::shell_pty_agent` | the pin on argv verbatim for claude-print / claude-pty / shell-pty; no pin ⇒ no token; no `--model` grafted onto codex/grok/agy |
 | `remuda-driver/tests/model_pin_overlay.rs` | host `model` + `ANTHROPIC_MODEL` evicted under delegation `none`; endpoint/credential kept; blank pin is not a pin; case-insensitive env match |
 | `remuda-protocol/src/model.rs::tests` | `compare_model_pin`: suffix-equal Honoured, same-namespace Mismatch, upstream resolution Unresolvable, catalog hit, bare alias, absent pin |
-| `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate: synthetic snapshot never judged, launch read-back mismatch refuses naming both ids, gateway resolution passes, later switches out of scope, no read-back fails open, no pin never refuses |
+| `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate: synthetic snapshot never judged, launch read-back mismatch refuses naming both ids, gateway resolution passes, later switches out of scope, no read-back fails open, no pin never refuses, **an unpinned/blank pin arms no gate despite a populated `model_requested`** |
 | `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY, **honoured** and **mismatch** cases: the pinned id is received; a substituted launch is stopped Failed, both ids named |
-| `remuda-hub/tests/watch.rs` | a mismatch read-back ends the worker Blocked naming both ids and sets `modelEffective`; a gateway→upstream resolution is neither blocked nor recorded as a divergence |
+| `remuda-hub/tests/watch.rs` | a launch-sourced mismatch ends the worker Blocked naming both ids and sets `modelEffective`; a gateway→upstream resolution is neither blocked nor recorded; **a `slash`/`remuda` switch after an honoured launch keeps the worker Working across repeated passes** |
 | `remuda-hub/src/store.rs::tests` | a `model` journal event projects the observed id to `modelEffective` |
+| `remuda-driver/tests/materializer.rs` | `spec.model_id` becomes `RecipeProvider.model_pin` verbatim; an unpinned launch has `model_pin = None` even when `model_requested` is populated |
+| `web/.../EffortSlider.test.tsx` | the slider's requested-vs-actual note uses the alias rule: gateway resolution and suffix variants not flagged, real same-namespace mismatch flagged, pending not flagged |
 | `remuda/src/cmd/watch.rs::tests` | the MODEL cell: observed-first `observed ⇐ requested` on divergence, `-` when unknown, truncation keeps the observed id |
-| `web/src/features/session/modelEffective.test.ts` | the TS `compareModelPin` mirrors the Rust rule, incl. the gateway false positive |
 | `web/src/features/session/SessionList.test.tsx` | the row label: requested until read back; real substitution marked diverged; gateway resolution not marked |
 | `remuda-node/tests/model_pin_evidence.rs` | `#[ignore]` capture tool that produced §1.2–1.3 |
 

@@ -1,5 +1,10 @@
 //! Enums wire declarations; `protocol.md`.
 
+use serde::{Deserialize, Serialize};
+use std::str::FromStr as _;
+
+use crate::{HostId, WireValueError};
+
 wire_enum!(AgentKind, "1.3", {
     Claude => "claude",
     Codex => "codex",
@@ -459,6 +464,447 @@ wire_enum!(ProviderProfileKind, "4.4", {
     Gateway => "gateway",
     Direct => "direct",
 });
+
+// ── API routing (D-047 / D-048, 2026-09-19) ────────────────────────────────
+
+/// Wire value of [`ProviderDeliveryMode`] `via`: route this session's model API
+/// egress through [`ProviderDelivery::via_host_id`].
+pub const PROVIDER_DELIVERY_VIA: &str = "via";
+/// Wire value of [`ProviderDeliveryMode`] `direct`; the default, and what an
+/// absent `delivery` on the wire means.
+pub const PROVIDER_DELIVERY_DIRECT: &str = "direct";
+
+/// Delivery mode of one provider profile; `protocol.md` §4.4 (D-047).
+///
+/// `direct` (D2 default) is today's behaviour: `baseUrl` plus the credential
+/// travel to the worker host. `via` egresses every model API request of the
+/// session on a named host instead, and never falls back to `direct` — a
+/// reroute would push the request onto a machine the operator excluded.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderDeliveryMode {
+    /// No proxy: the worker host is the egress host. The D2 default.
+    #[default]
+    Direct,
+    /// Egress on the host named by [`ProviderDelivery::via_host_id`].
+    Via,
+}
+
+impl ProviderDeliveryMode {
+    /// Canonical wire spelling (identical to the serde rendering).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => PROVIDER_DELIVERY_DIRECT,
+            Self::Via => PROVIDER_DELIVERY_VIA,
+        }
+    }
+}
+
+/// Route a `via` delivery takes between the worker host `W` and the proxy host
+/// `H`; `protocol.md` §4.4 (D-047, Amendment A1).
+///
+/// Decided **once at launch** and echoed by the Node as [`ApiRouteKind`]. A
+/// failing `DirectNet` mid-session is never silently re-routed to `HubRelay`:
+/// the request fails and the instance reports `blocked{api-route-down}`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiRouteMode {
+    /// Try the direct network path to `H` when `H` has a configured relay bind,
+    /// otherwise relay through the Hub host. The default.
+    #[default]
+    Auto,
+    /// Always in-band over the existing Hub↔Node link.
+    HubRelay,
+    /// Require the direct network path; refuse at launch with
+    /// `api-via-unreachable` when the probe fails.
+    DirectNet,
+}
+
+impl ApiRouteMode {
+    /// Canonical wire spelling (identical to the serde rendering).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::HubRelay => "hub-relay",
+            Self::DirectNet => "direct-net",
+        }
+    }
+}
+
+/// The route a `via` session **actually** took, as echoed by the Node; D-035
+/// rule 4 (`protocol.md` §4.4).
+///
+/// Only the two resolved routes exist on this type: `auto` is a request, never
+/// an observation, so a record that says `auto` would be the Hub reporting what
+/// it asked for instead of what ran.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiRouteKind {
+    /// Request bytes went over the network to `H`'s relay endpoint.
+    DirectNet,
+    /// Request bytes rode the Hub↔Node link to `H` (or the Hub process).
+    HubRelay,
+}
+
+impl ApiRouteKind {
+    /// Canonical wire spelling (identical to the serde rendering).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectNet => "direct-net",
+            Self::HubRelay => "hub-relay",
+        }
+    }
+}
+
+/// Wire value of [`ApiRoute`] `mode`: no proxy; the route is undefined because
+/// there is nothing to route.
+pub const API_ROUTE_DIRECT: &str = "direct";
+
+/// Provider delivery of one profile; `protocol.md` §4.4 (D-047).
+///
+/// The wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling:
+/// the sub-mode has nowhere to live in a single keyword. An absent `delivery`
+/// is [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a
+/// profile row written before this type existed keeps parsing.
+///
+/// Deserialization is strict on the one combination that cannot be honoured
+/// (`mode: via` with no host) and on unknown enum values, which are parse
+/// errors rather than silent defaults: a typo'd route must not quietly become
+/// `auto` and move a session's egress to a machine the operator did not name.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderDelivery {
+    /// `direct` or `via`.
+    #[serde(default)]
+    pub mode: ProviderDeliveryMode,
+    /// Proxy host (`hst_…`). Required by `via`, meaningless for `direct`.
+    ///
+    /// `via` naming the worker host itself is **not** rewritten here: it
+    /// collapses to `direct` at decision time, in the Hub, where the placed
+    /// host is known. The wire keeps what the operator asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_host_id: Option<HostId>,
+    /// Route between the worker host and [`Self::via_host_id`]. Ignored by
+    /// `direct`, but always serialized so the stored row is self-describing.
+    #[serde(default)]
+    pub route: ApiRouteMode,
+}
+
+impl ProviderDelivery {
+    /// `{mode: direct, route: auto}`; §4.4 (D2 default).
+    #[must_use]
+    pub fn direct() -> Self {
+        Self::default()
+    }
+
+    /// A `via` delivery to `host_id`.
+    #[must_use]
+    pub fn via(host_id: HostId, route: ApiRouteMode) -> Self {
+        Self {
+            mode: ProviderDeliveryMode::Via,
+            via_host_id: Some(host_id),
+            route,
+        }
+    }
+
+    /// True when this delivery proxies through another host.
+    #[must_use]
+    pub const fn is_via(&self) -> bool {
+        matches!(self.mode, ProviderDeliveryMode::Via)
+    }
+
+    /// The one combination that cannot be honoured: `via` with no host.
+    ///
+    /// Also the PATCH-time check, so a refusal is a 400 on the request rather
+    /// than a launch that fails later.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        !(matches!(self.mode, ProviderDeliveryMode::Via) && self.via_host_id.is_none())
+    }
+
+    /// True for the D2 default, which is omitted on the wire; §4.4.
+    ///
+    /// A `route` on a `direct` delivery is not the default — it is a value the
+    /// operator set — so it keeps the field, and with it the operator's intent.
+    #[must_use]
+    pub fn is_direct_default(&self) -> bool {
+        self.mode == ProviderDeliveryMode::Direct
+            && self.via_host_id.is_none()
+            && self.route == ApiRouteMode::Auto
+    }
+}
+
+/// Route the launch **requested**, carried on the instance spec so the Node and
+/// the operator's surfaces can see it before the Node answers; §4.4 (D-047).
+///
+/// This is intent. [`ApiRoute`] is the observation the Node echoes back, and the
+/// only one a UI may render as fact (D-035).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequestedApiRoute {
+    /// `direct` when this session does not proxy, `via` when it does.
+    #[serde(default)]
+    pub mode: ProviderDeliveryMode,
+    /// Proxy host (`hst_…`); present only for `via`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_host_id: Option<HostId>,
+    /// Route to attempt first.
+    #[serde(default)]
+    pub route: ApiRouteMode,
+}
+
+/// The API route an instance is actually using; `protocol.md` §2.3 (D-047).
+///
+/// Stored on the instance projection next to `providerSource` /
+/// `providerSourceHint` so `remuda watch` and the Session strip report what
+/// ran, never what was asked for (D-035).
+///
+/// The two halves come from different places, which is worth keeping straight:
+/// the Node decides and reports [`Self::mode`], [`Self::route`] and
+/// [`Self::via_host_id`] — it is the machine that bound a listener and probed
+/// the path — while [`Self::via_host_label`] is the Hub's own registry label,
+/// attached on write-back so a surface can name the host without a second
+/// lookup. A Hub that takes the request's word for the route would be
+/// reporting intent as observation, which is the failure this type exists to
+/// make impossible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApiRoute {
+    /// `direct` (no proxy) or `via`.
+    #[serde(default)]
+    pub mode: ProviderDeliveryMode,
+    /// Resolved route; present only when [`Self::mode`] is `via`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<ApiRouteKind>,
+    /// Proxy host (`hst_…`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_host_id: Option<HostId>,
+    /// Operator-facing label of the proxy host, so the strip can name it
+    /// without a second lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_host_label: Option<String>,
+}
+
+impl ApiRoute {
+    /// `{mode: direct}`; no proxy.
+    #[must_use]
+    pub fn direct() -> Self {
+        Self {
+            mode: ProviderDeliveryMode::Direct,
+            route: None,
+            via_host_id: None,
+            via_host_label: None,
+        }
+    }
+
+    /// A `via` route to `host_id` that took `route`.
+    #[must_use]
+    pub fn via(host_id: HostId, label: Option<String>, route: ApiRouteKind) -> Self {
+        Self {
+            mode: ProviderDeliveryMode::Via,
+            route: Some(route),
+            via_host_id: Some(host_id),
+            via_host_label: label,
+        }
+    }
+
+    /// True when this instance proxies its model API egress.
+    #[must_use]
+    pub const fn is_via(&self) -> bool {
+        matches!(self.mode, ProviderDeliveryMode::Via)
+    }
+}
+
+/// Host-level relay bind for direct-network routing; `protocol.md` §2.1
+/// (D-047, Amendment A1).
+///
+/// Present on a host only when the operator configured one. Absent means the
+/// proxy host's relay listener stays loopback-only and every `via` session
+/// takes `hub-relay`, which is what keeps D-031 intact: no listener opens on a
+/// non-loopback address without an explicit operator setting, and a bind is an
+/// address to serve on — never a tunnel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HostRelayBind {
+    /// Explicit bind address (`host:port`). Never `0.0.0.0` and never public:
+    /// the Hub refuses those, and the Node refuses to bind them.
+    pub addr: String,
+    /// Source addresses the listener accepts, by CIDR or exact address. Empty
+    /// means "whatever the operator's firewall allows" and is the stricter
+    /// reading, not an any-address allowance.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+/// Why a `via` dispatch was refused; `protocol.md` §4.4 (D-047, §B.5).
+///
+/// Stable lowercase codes in the §9.2 reason vocabulary. Each is a **refusal**,
+/// and a refusal is the whole point: there is no code here for "fell back to
+/// direct", because no such path may exist. A `via` request that cannot be
+/// honoured fails, so a request never reaches a machine the operator excluded
+/// and the UI never has to lie about where it went.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiViaRefusal {
+    /// The named host is not in the registry. Wire value `api-via-unknown-host`.
+    ApiViaUnknownHost,
+    /// The named host is enrolled but has no live Hub↔Node session. Checked
+    /// before any name, port, or worktree allocation.
+    /// Wire value `api-via-host-offline`.
+    ApiViaHostOffline,
+    /// The named host's Node predates `api.*` and cannot serve as a proxy.
+    /// Never downgraded to `direct` (D-035). Wire value `api-via-unsupported`.
+    ApiViaUnsupported,
+    /// `route: direct-net` was required and the probe to the proxy host's relay
+    /// bind failed or timed out (Amendment A1).
+    /// Wire value `api-via-unreachable`.
+    ApiViaUnreachable,
+}
+
+impl ApiViaRefusal {
+    /// Canonical wire spelling (identical to the serde rendering).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiViaUnknownHost => "api-via-unknown-host",
+            Self::ApiViaHostOffline => "api-via-host-offline",
+            Self::ApiViaUnsupported => "api-via-unsupported",
+            Self::ApiViaUnreachable => "api-via-unreachable",
+        }
+    }
+
+    /// HTTP status the Hub answers with; §B.5.
+    ///
+    /// `ApiViaUnknownHost` is a bad request — the caller named something that
+    /// does not exist — while the rest are conflicts with current state that a
+    /// retry may clear, so the surfaces stay distinguishable without parsing
+    /// the message.
+    #[must_use]
+    pub const fn status(self) -> u16 {
+        match self {
+            Self::ApiViaUnknownHost => 400,
+            Self::ApiViaHostOffline | Self::ApiViaUnsupported | Self::ApiViaUnreachable => 409,
+        }
+    }
+}
+
+/// Roster reason for a session whose proxy host went away mid-flight; §B.5.
+///
+/// A `WorkerWatchStatus::Blocked` reason, not a dispatch refusal: the launch
+/// succeeded, and this is what `remuda watch` reports once the route is down.
+/// Adjacent to `idle-api-error`, and distinct from it — retrying cannot clear a
+/// route whose host is gone.
+pub const API_ROUTE_DOWN: &str = "api-route-down";
+
+/// `apiVia: "self"` — the Hub host itself as the proxy host; §4.4 (D-047).
+///
+/// The owner's case: the Mac runs the Hub and the relay, so this names it
+/// without the operator having to look up its `hst_…`.
+pub const API_VIA_SELF: &str = "self";
+/// `apiVia: "none"` — force direct delivery for this one dispatch, overriding
+/// a profile or project that would otherwise proxy; §4.4 (D-047).
+pub const API_VIA_NONE: &str = "none";
+
+/// The per-dispatch `apiVia` override; `protocol.md` §4.4 (D-047).
+///
+/// Stays a **string** on the wire, because two of its three values are
+/// keywords and only one carries an id. The waterfall is
+/// request `apiVia` > project > profile `delivery` > `direct`, and it is
+/// resolved by the Hub after host placement, not here.
+///
+/// Serialized through its wire spelling rather than a derive, so the type is
+/// ergonomic in Rust while the frame keeps the operator-facing keyword form
+/// (`hst_…` / `self` / `none`) that the CLI and bot commands already speak.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(try_from = "String", into = "String")]
+pub enum ApiViaOverride {
+    /// A specific proxy host.
+    Host(HostId),
+    /// [`API_VIA_SELF`]: the Hub host.
+    HubHost,
+    /// [`API_VIA_NONE`]: no proxy, whatever the profile says.
+    Direct,
+}
+
+impl TryFrom<String> for ApiViaOverride {
+    type Error = WireValueError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<ApiViaOverride> for String {
+    fn from(value: ApiViaOverride) -> Self {
+        value.as_wire()
+    }
+}
+
+impl ApiViaOverride {
+    /// Wire spelling (`hst_…`, `self`, or `none`).
+    #[must_use]
+    pub fn as_wire(&self) -> String {
+        match self {
+            Self::Host(id) => id.as_id().as_str().to_owned(),
+            Self::HubHost => API_VIA_SELF.to_owned(),
+            Self::Direct => API_VIA_NONE.to_owned(),
+        }
+    }
+
+    /// Parse the wire string. Unknown spellings are an error, never a default:
+    /// a mistyped host must not quietly become `direct`, which would send the
+    /// request — and the credential — to a machine the operator excluded.
+    pub fn parse(value: &str) -> Result<Self, WireValueError> {
+        match value.trim() {
+            API_VIA_SELF => Ok(Self::HubHost),
+            API_VIA_NONE => Ok(Self::Direct),
+            other => HostId::from_str(other).map(Self::Host),
+        }
+    }
+}
+
+impl std::str::FromStr for ApiViaOverride {
+    type Err = WireValueError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl std::fmt::Display for ApiViaOverride {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.as_wire())
+    }
+}
 
 wire_enum!(SelectionReason, "4.1", {
     Pinned => "pinned",

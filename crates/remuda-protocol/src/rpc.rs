@@ -87,6 +87,31 @@ pub struct TransportLimits {
     pub lease_ttl_ms: u32,
     /// `max_wait_ms`; protocol §7.4.
     pub max_wait_ms: u32,
+    /// `max_api_streams`; protocol §7.4 (D-048).
+    ///
+    /// Live `api.*` relay streams allowed per link. Defaulted on read because
+    /// `hello.limits` written before D-048 has no such key, and a required
+    /// field would fail the whole handshake against an older Hub.
+    #[serde(default = "default_max_api_streams")]
+    pub max_api_streams: u32,
+    /// `api_chunk_bytes`; protocol §7.4 (D-048).
+    ///
+    /// Raw bytes coalesced into one `api.chunk` before base64: 64 KiB becomes
+    /// ~87 KiB on the wire, well under the 1 MiB `max_json_frame_bytes`.
+    #[serde(default = "default_api_chunk_bytes")]
+    pub api_chunk_bytes: u32,
+}
+
+/// §7.4 default for [`TransportLimits::max_api_streams`].
+#[must_use]
+pub const fn default_max_api_streams() -> u32 {
+    8
+}
+
+/// §7.4 default for [`TransportLimits::api_chunk_bytes`].
+#[must_use]
+pub const fn default_api_chunk_bytes() -> u32 {
+    65_536
 }
 
 /// ConnectionLease; `protocol.md` §7.1.

@@ -62,6 +62,11 @@ pub struct ProviderProfile {
     pub scope: String,
     /// Fingerprint/last4 only.
     pub secret: ProviderSecretView,
+    /// How this profile's sessions reach the model API. Omitted means
+    /// `{mode: direct, route: auto}`, which is what every profile stored before
+    /// D-047 is; §4.4 (D-047, D2).
+    #[serde(default, skip_serializing_if = "ProviderDelivery::is_direct_default")]
+    pub delivery: ProviderDelivery,
     /// Create-time.
     pub created_at: Timestamp,
     /// Update-time.
@@ -89,6 +94,13 @@ pub struct ProviderOverlaySpec {
         skip_serializing_if = "is_universal_scope"
     )]
     pub scope: String,
+    /// Delivery this profile's sessions use; absent means `direct`. §4.4 (D-047).
+    ///
+    /// Public: it carries no secret, and the web Provider page renders it. The
+    /// Node reads the resolved *route* off [`InstanceSpec::api_route`], never
+    /// this field, so a profile edited mid-session cannot move a live instance.
+    #[serde(default, skip_serializing_if = "ProviderDelivery::is_direct_default")]
+    pub delivery: ProviderDelivery,
 }
 
 fn universal_scope() -> String {
@@ -448,6 +460,14 @@ pub struct InstanceSpec {
     /// `parent`; protocol §4.1.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub parent: Option<InstanceParent>,
+    /// Model API route this launch requests; absent means no proxy. §4.1 (D-047).
+    ///
+    /// The resolved *route* (§4.4) is a Hub decision made after placement, so
+    /// the Hub writes this immediately before forwarding create. The Node reads
+    /// it to decide whether to serve a relay listener at all, and never records
+    /// it as the route that ran: that is the [`ApiRoute`] it echoes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_route: Option<RequestedApiRoute>,
 }
 
 /// ProviderSelection; `protocol.md` §4.1.

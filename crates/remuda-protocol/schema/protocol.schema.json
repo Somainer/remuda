@@ -315,6 +315,114 @@
       ],
       "type": "object"
     },
+    "ApiRoute": {
+      "additionalProperties": false,
+      "description": "The API route an instance is actually using; `protocol.md` §2.3 (D-047).\n\nStored on the instance projection next to `providerSource` /\n`providerSourceHint` so `remuda watch` and the Session strip report what\nran, never what was asked for (D-035).\n\nThe two halves come from different places, which is worth keeping straight:\nthe Node decides and reports [`Self::mode`], [`Self::route`] and\n[`Self::via_host_id`] — it is the machine that bound a listener and probed\nthe path — while [`Self::via_host_label`] is the Hub's own registry label,\nattached on write-back so a surface can name the host without a second\nlookup. A Hub that takes the request's word for the route would be\nreporting intent as observation, which is the failure this type exists to\nmake impossible.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ProviderDeliveryMode",
+          "default": "direct",
+          "description": "`direct` (no proxy) or `via`."
+        },
+        "route": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApiRouteKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Resolved route; present only when [`Self::mode`] is `via`."
+        },
+        "viaHostId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Proxy host (`hst_…`)."
+        },
+        "viaHostLabel": {
+          "description": "Operator-facing label of the proxy host, so the strip can name it\nwithout a second lookup.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ApiRouteKind": {
+      "description": "The route a `via` session **actually** took, as echoed by the Node; D-035\nrule 4 (`protocol.md` §4.4).\n\nOnly the two resolved routes exist on this type: `auto` is a request, never\nan observation, so a record that says `auto` would be the Hub reporting what\nit asked for instead of what ran.",
+      "oneOf": [
+        {
+          "const": "direct-net",
+          "description": "Request bytes went over the network to `H`'s relay endpoint.",
+          "type": "string"
+        },
+        {
+          "const": "hub-relay",
+          "description": "Request bytes rode the Hub↔Node link to `H` (or the Hub process).",
+          "type": "string"
+        }
+      ]
+    },
+    "ApiRouteMode": {
+      "description": "Route a `via` delivery takes between the worker host `W` and the proxy host\n`H`; `protocol.md` §4.4 (D-047, Amendment A1).\n\nDecided **once at launch** and echoed by the Node as [`ApiRouteKind`]. A\nfailing `DirectNet` mid-session is never silently re-routed to `HubRelay`:\nthe request fails and the instance reports `blocked{api-route-down}`.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "Try the direct network path to `H` when `H` has a configured relay bind,\notherwise relay through the Hub host. The default.",
+          "type": "string"
+        },
+        {
+          "const": "hub-relay",
+          "description": "Always in-band over the existing Hub↔Node link.",
+          "type": "string"
+        },
+        {
+          "const": "direct-net",
+          "description": "Require the direct network path; refuse at launch with\n`api-via-unreachable` when the probe fails.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApiViaOverride": {
+      "description": "The per-dispatch `apiVia` override; `protocol.md` §4.4 (D-047).\n\nStays a **string** on the wire, because two of its three values are\nkeywords and only one carries an id. The waterfall is\nrequest `apiVia` > project > profile `delivery` > `direct`, and it is\nresolved by the Hub after host placement, not here.\n\nSerialized through its wire spelling rather than a derive, so the type is\nergonomic in Rust while the frame keeps the operator-facing keyword form\n(`hst_…` / `self` / `none`) that the CLI and bot commands already speak.",
+      "type": "string"
+    },
+    "ApiViaRefusal": {
+      "description": "Why a `via` dispatch was refused; `protocol.md` §4.4 (D-047, §B.5).\n\nStable lowercase codes in the §9.2 reason vocabulary. Each is a **refusal**,\nand a refusal is the whole point: there is no code here for \"fell back to\ndirect\", because no such path may exist. A `via` request that cannot be\nhonoured fails, so a request never reaches a machine the operator excluded\nand the UI never has to lie about where it went.",
+      "oneOf": [
+        {
+          "const": "api-via-unknown-host",
+          "description": "The named host is not in the registry. Wire value `api-via-unknown-host`.",
+          "type": "string"
+        },
+        {
+          "const": "api-via-host-offline",
+          "description": "The named host is enrolled but has no live Hub↔Node session. Checked\nbefore any name, port, or worktree allocation.\nWire value `api-via-host-offline`.",
+          "type": "string"
+        },
+        {
+          "const": "api-via-unsupported",
+          "description": "The named host's Node predates `api.*` and cannot serve as a proxy.\nNever downgraded to `direct` (D-035). Wire value `api-via-unsupported`.",
+          "type": "string"
+        },
+        {
+          "const": "api-via-unreachable",
+          "description": "`route: direct-net` was required and the probe to the proxy host's relay\nbind failed or timed out (Amendment A1).\nWire value `api-via-unreachable`.",
+          "type": "string"
+        }
+      ]
+    },
     "ApprovalAnswer": {
       "description": "ApprovalAnswer; `protocol.md` §5.4.",
       "properties": {
@@ -6038,6 +6146,17 @@
           "$ref": "#/$defs/Knowledge14",
           "description": "`platform`; protocol §2.1."
         },
+        "relayBind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostRelayBind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Operator-configured API-relay bind for direct-network routing (D-047,\nAmendment A1).\n\nAbsent — the only default — keeps this host's relay listener on\nloopback and sends every `via` session through `hub-relay`. Because the\nfield must be set by an operator for any non-loopback listener to\nexist, D-031's ban on exposing services still holds."
+        },
         "revision": {
           "$ref": "#/$defs/U64",
           "description": "`revision`; protocol §1.1."
@@ -6404,6 +6523,29 @@
       },
       "required": [
         "hostId"
+      ],
+      "type": "object"
+    },
+    "HostRelayBind": {
+      "additionalProperties": false,
+      "description": "Host-level relay bind for direct-network routing; `protocol.md` §2.1\n(D-047, Amendment A1).\n\nPresent on a host only when the operator configured one. Absent means the\nproxy host's relay listener stays loopback-only and every `via` session\ntakes `hub-relay`, which is what keeps D-031 intact: no listener opens on a\nnon-loopback address without an explicit operator setting, and a bind is an\naddress to serve on — never a tunnel.",
+      "properties": {
+        "addr": {
+          "description": "Explicit bind address (`host:port`). Never `0.0.0.0` and never public:\nthe Hub refuses those, and the Node refuses to bind them.",
+          "type": "string"
+        },
+        "allowFrom": {
+          "default": [],
+          "description": "Source addresses the listener accepts, by CIDR or exact address. Empty\nmeans \"whatever the operator's firewall allows\" and is the stricter\nreading, not an any-address allowance.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "addr",
+        "allowFrom"
       ],
       "type": "object"
     },
@@ -7316,6 +7458,17 @@
     "InstanceSpec": {
       "description": "InstanceSpec; `protocol.md` §4.1.",
       "properties": {
+        "apiRoute": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestedApiRoute"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Model API route this launch requests; absent means no proxy. §4.1 (D-047).\n\nThe resolved *route* (§4.4) is a Hub decision made after placement, so\nthe Hub writes this immediately before forwarding create. The Node reads\nit to decide whether to serve a relay listener at all, and never records\nit as the route that ran: that is the [`ApiRoute`] it echoes back."
+        },
         "args": {
           "description": "`args`; protocol §4.1.",
           "items": {
@@ -14713,6 +14866,53 @@
       ],
       "type": "object"
     },
+    "ProviderDelivery": {
+      "additionalProperties": false,
+      "description": "Provider delivery of one profile; `protocol.md` §4.4 (D-047).\n\nThe wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling:\nthe sub-mode has nowhere to live in a single keyword. An absent `delivery`\nis [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a\nprofile row written before this type existed keeps parsing.\n\nDeserialization is strict on the one combination that cannot be honoured\n(`mode: via` with no host) and on unknown enum values, which are parse\nerrors rather than silent defaults: a typo'd route must not quietly become\n`auto` and move a session's egress to a machine the operator did not name.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ProviderDeliveryMode",
+          "default": "direct",
+          "description": "`direct` or `via`."
+        },
+        "route": {
+          "$ref": "#/$defs/ApiRouteMode",
+          "default": "auto",
+          "description": "Route between the worker host and [`Self::via_host_id`]. Ignored by\n`direct`, but always serialized so the stored row is self-describing."
+        },
+        "viaHostId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Proxy host (`hst_…`). Required by `via`, meaningless for `direct`.\n\n`via` naming the worker host itself is **not** rewritten here: it\ncollapses to `direct` at decision time, in the Hub, where the placed\nhost is known. The wire keeps what the operator asked for."
+        }
+      },
+      "required": [
+        "mode",
+        "route"
+      ],
+      "type": "object"
+    },
+    "ProviderDeliveryMode": {
+      "description": "Delivery mode of one provider profile; `protocol.md` §4.4 (D-047).\n\n`direct` (D2 default) is today's behaviour: `baseUrl` plus the credential\ntravel to the worker host. `via` egresses every model API request of the\nsession on a named host instead, and never falls back to `direct` — a\nreroute would push the request onto a machine the operator excluded.",
+      "oneOf": [
+        {
+          "const": "direct",
+          "description": "No proxy: the worker host is the egress host. The D2 default.",
+          "type": "string"
+        },
+        {
+          "const": "via",
+          "description": "Egress on the host named by [`ProviderDelivery::via_host_id`].",
+          "type": "string"
+        }
+      ]
+    },
     "ProviderIngress": {
       "description": "ProviderIngress wire values; `protocol.md` §4.1.",
       "oneOf": [
@@ -14749,6 +14949,10 @@
         "baseUrl": {
           "description": "Ingress base URL copied onto `ANTHROPIC_BASE_URL` for gateway.",
           "type": "string"
+        },
+        "delivery": {
+          "$ref": "#/$defs/ProviderDelivery",
+          "description": "Delivery this profile's sessions use; absent means `direct`. §4.4 (D-047).\n\nPublic: it carries no secret, and the web Provider page renders it. The\nNode reads the resolved *route* off [`InstanceSpec::api_route`], never\nthis field, so a profile edited mid-session cannot move a live instance."
         },
         "headers": {
           "additionalProperties": {
@@ -14805,6 +15009,10 @@
             "string",
             "null"
           ]
+        },
+        "delivery": {
+          "$ref": "#/$defs/ProviderDelivery",
+          "description": "How this profile's sessions reach the model API. Omitted means\n`{mode: direct, route: auto}`, which is what every profile stored before\nD-047 is; §4.4 (D-047, D2)."
         },
         "headers": {
           "additionalProperties": {
@@ -15551,6 +15759,38 @@
         "repositoryId",
         "gitCommonDir",
         "headOid"
+      ],
+      "type": "object"
+    },
+    "RequestedApiRoute": {
+      "additionalProperties": false,
+      "description": "Route the launch **requested**, carried on the instance spec so the Node and\nthe operator's surfaces can see it before the Node answers; §4.4 (D-047).\n\nThis is intent. [`ApiRoute`] is the observation the Node echoes back, and the\nonly one a UI may render as fact (D-035).",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ProviderDeliveryMode",
+          "default": "direct",
+          "description": "`direct` when this session does not proxy, `via` when it does."
+        },
+        "route": {
+          "$ref": "#/$defs/ApiRouteMode",
+          "default": "auto",
+          "description": "Route to attempt first."
+        },
+        "viaHostId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Proxy host (`hst_…`); present only for `via`."
+        }
+      },
+      "required": [
+        "mode",
+        "route"
       ],
       "type": "object"
     },
@@ -18818,6 +19058,13 @@
     "TransportLimits": {
       "description": "TransportLimits; `protocol.md` §7.4.",
       "properties": {
+        "apiChunkBytes": {
+          "default": 65536,
+          "description": "`api_chunk_bytes`; protocol §7.4 (D-048).\n\nRaw bytes coalesced into one `api.chunk` before base64: 64 KiB becomes\n~87 KiB on the wire, well under the 1 MiB `max_json_frame_bytes`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "heartbeatIntervalMs": {
           "description": "`heartbeat_interval_ms`; protocol §7.4.",
           "format": "uint32",
@@ -18826,6 +19073,13 @@
         },
         "leaseTtlMs": {
           "description": "`lease_ttl_ms`; protocol §7.4.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxApiStreams": {
+          "default": 8,
+          "description": "`max_api_streams`; protocol §7.4 (D-048).\n\nLive `api.*` relay streams allowed per link. Defaulted on read because\n`hello.limits` written before D-048 has no such key, and a required\nfield would fail the whole handshake against an older Hub.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -18882,7 +19136,9 @@
         "maxSubscriptionBufferEvents",
         "heartbeatIntervalMs",
         "leaseTtlMs",
-        "maxWaitMs"
+        "maxWaitMs",
+        "maxApiStreams",
+        "apiChunkBytes"
       ],
       "type": "object"
     },

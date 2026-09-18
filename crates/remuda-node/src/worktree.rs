@@ -134,9 +134,6 @@ pub fn provision_record(
     })
 }
 
-/// Remove a worker's provisioned worktree with `git worktree remove --force`
-/// and drop it from the catalog. The branch itself is kept (gate/land owns
-/// branch deletion); only the working tree is reclaimed.
 /// Whether this Node has a recorded worktree named `name`.
 ///
 /// A pure read of the same catalog `remove_record` consults, so a caller can
@@ -150,6 +147,9 @@ pub fn has_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
     Ok(catalog.worktrees.iter().any(|row| row.name == name))
 }
 
+/// Remove a worker's provisioned worktree with `git worktree remove --force`
+/// and drop it from the catalog. The branch itself is kept (gate/land owns
+/// branch deletion); only the working tree is reclaimed.
 pub fn remove_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
     validate_name(name)?;
     let repo_root = repo_root(Some(repo))?;

@@ -1,6 +1,6 @@
 # 连接与验证
 
-本 skill 使用用户已经安装的 **Codex Computer Use**。它不重新分发 OpenAI 应用，也不安装后台服务。仅上传此目录不会连接到你的 Mac。
+本 skill 使用用户已经安装的 **Codex Computer Use**。它不重新分发 OpenAI 应用，也不安装后台服务。仅仅落盘这个目录不会连接到任何 Mac；只有所在的 agent 会话真的调用下面的 launcher，才会连本机已装的运行时。
 
 ## 两条启动路径
 
@@ -15,29 +15,20 @@
 
 ## 原生 MCP（Claude Code 等已认证宿主）
 
-从包含本 skill 的仓库根目录安装（目标已存在则先看内容，不要覆盖已有修改）：
+**本 skill 不安装自己，也不写宿主的用户级配置。** Remuda 按次授权时把 MCP 配置物化到本次启动的实例目录（`<launch_dir>/mcp-cua.json`），再作为 `--mcp-config` 交给 agent；宿主自己的配置始终由使用者自己拥有。
+
+因此：
+
+- **人**可以手工注册：用宿主自己的 MCP 注册方式，把本目录的 `scripts/launch-mcp.sh` 作为 stdio 服务加入；`CODEX_HOME` 非默认时用环境变量传入。已有同名配置时先看现有内容，不要自动删除或替换。不要把 Codex 认证信息、socket 或会话标识拷进宿主配置。
+- **agent** 不得替人安装：不写宿主用户级配置目录，不改宿主的 MCP 注册。缺注册就报告，由人决定。
+
+只探测协议元数据（不调用 `list_apps`，不修改任何配置）：
 
 ```sh
-mkdir -p "$HOME/.claude/skills"
-cp -R -n skills/codex-computer-use "$HOME/.claude/skills/"
-```
-
-只探测协议元数据（不调用 `list_apps`）：
-
-```sh
-python3 "$HOME/.claude/skills/codex-computer-use/scripts/probe_mcp.py"
+python3 <本 skill 目录>/scripts/probe_mcp.py
 ```
 
 `metadata_ok` = `initialize` + `tools/list` 成功。`--schema` 打印当前参数定义。
-
-注册 stdio MCP：
-
-```sh
-claude mcp add --transport stdio --scope user codex-computer-use -- \
-  /bin/sh "$HOME/.claude/skills/codex-computer-use/scripts/launch-mcp.sh"
-```
-
-已有同名配置时先 `claude mcp get codex-computer-use`，不要自动删除或替换。项目范围用 `--scope local`。自定义 Codex 目录时加 `--env "CODEX_HOME=/absolute/path"`。不要把 Codex 认证信息、socket 或会话标识拷进 Claude 配置。
 
 用 `/mcp` 看连接。只有宿主实际返回可解释的界面或截图，才算观察链路可用。
 

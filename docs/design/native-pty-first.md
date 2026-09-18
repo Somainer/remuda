@@ -110,6 +110,7 @@ herdr 剩下的**唯一不可替代价值是跨 Node 重启存活**（以及现�
 
 - **传输**：per-instance unix socket（`<instance dir>/hook.sock`，0600）。socket 路径由 driver 计算后**刻意注入**子进程环境，不进继承白名单——环境变量边界是既有安全约束（凭据泄漏、`LD_PRELOAD`/代理/CA 注入）的分界线，新增变量必须走 driver-computed 一侧。凭据 per-instance，独立于主设备凭据。**替换今天 `spawn_hook_watch` 每 200 ms 轮询一个 JSON 文件的做法**——轮询无法让 `PermissionRequest` 阻塞等答案。
 - **overlay materializer**：生成 per-session 的 `--settings` 合并文件、`CODEX_HOME` / `GROK_HOME` 影子目录与 hook 脚本。**只 merge、只在 session 生命周期内存在、从不写用户自己的配置文件。**
+- **pinned hook relay**：overlay 命令、shadow hook 文件与 `REMUDA_HOOK_RELAY` 里嵌入的 `remuda` 路径**不是运行中的可执行文件**，而是 Node 在启动时把自身 `current_exe` 钉进 `<data_dir>/hook-bin/<version>/remuda` 的一份私有副本（按 build hash 内容寻址；`<version>` 目录 0700、文件 0500；hard-link 失败回退到 copy）。理由：Linux 上原地重建替换 Node 二进制后，`current_exe` 读成 `<path> (deleted)`，若把该 per-launch 路径烤进 hook 命令，重建后每个 hook 事件都会 `exec: … (deleted): not found` 而全部丢失（R4「已安装 ≠ 运行中」偏差）。resolve 时防御性剥除结尾 `" (deleted)"`——仅当剥除后的路径确为存在的常规文件；名字本就以该文本结尾的真实文件原样保留。副本有**独立于 live 可执行文件的生命周期**：Node 启动与 `instance.purge` 之后回收无任何 live instance 引用的 `hook-bin/<version>`，但**从不回收运行中 Node 自己钉的那一版**。
 - **launch shim**：`<instance dir>/launch/bin/` 下的透明 `exec` 包装，置于 PATH 最前。用户在该终端里手敲 `claude` 也会命中 overlay ——**这是统一原则的物理实现**。
 - `remuda-screen`：从现有 promote 与交互识别代码抽出的签名库，**零 herdr 依赖**，输入改为模拟器网格，规则来自 §10 的可版本化规则表。
 
@@ -220,7 +221,7 @@ herdr 把 bracketed paste 与提交时序整个藏在 `agent.prompt` 里；nativ
 `DELETE /v1/instances/{id}` 语义在 D-024 addendum 与 [remote-terminal.md](./remote-terminal.md#deleting-a-session) 已定稿，native 路径只需保证两件事：
 
 - `?force=1` 的「先停后删」走的是 §5.3 的**同一条信号阶梯**，而不是另写一份 kill；
-- `instance.purge` 删掉 `<data_dir>/instances/<id>`（launch 产物、overlay、hook socket、附件、pty 日志），**永不碰**用户自己的 `~/.claude` / `~/.codex` / `~/.grok` transcript。
+- `instance.purge` 删掉 `<data_dir>/instances/<id>`（launch 产物、overlay、hook socket、附件、pty 日志、以及记录本 instance 所用 relay 版本的 `hook-relay` 引用文件），**永不碰**用户自己的 `~/.claude` / `~/.codex` / `~/.grok` transcript。pinned hook relay（§4.2）**不在**该目录内：它是 Node 自有、按版本内容寻址、有独立生命周期的一份副本，位于 `<data_dir>/hook-bin/<version>/remuda`，绝不是 live 可执行文件；purge 之后触发一次 GC，回收不再被任何 live instance 引用的版本，但保留运行中 Node 自己钉的那一版。
 
 herdr 时代遗留的已知债「`instance stop` 不回收 herdr workspace」随 carrier 一起消失：native 路径没有 workspace/tab/pane 三层，只有一个进程组。
 

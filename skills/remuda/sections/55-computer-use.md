@@ -34,21 +34,26 @@ desktop brief missing any of three terms, or carrying the bypass combination:
 | --- | --- |
 | `missing-capability` | a `capability: computer-use` line |
 | `missing-host` | the host, as `hst_…` or a `host:` line |
-| `missing-bundle-id` | every app the worker may touch, by bundle id |
+| `missing-bundle-id` | an app bundle id, in reverse-DNS form |
 | `capability-bypass` | absent — the combination is refused |
 
 The trigger is desktop vocabulary in prose (`computer use`, `computer-use`,
 `cua-repl`, `iPhone Mirroring`, `list_apps`, `get_app_state`, `点击屏幕`,
-`操作桌面` …) or a capability declaration. Fenced code blocks are ignored, so
-a brief about a UI codebase stays clean. `--force-lint` overrides it; reach
-for that only if you know why, because the lint is the cheap half of a gate
-whose expensive half is a refused launch.
+`操作桌面` …) or a capability declaration. The probe is a term list, not a
+parser, so naming the capability anywhere in prose — even to say it is *not*
+granted — trips it; only a fenced block is exempt. Every probe ignores fenced
+code and reads prose only, so a grant written inside a fence is not a grant.
+The bundle-id check looks for a reverse-DNS name (`com.apple.TextEdit`), so a
+plain domain does not satisfy it. `--force-lint` overrides all of it; reach for
+that only if you know why, because the lint is the cheap half of a gate whose
+expensive half is a refused launch.
 
 Also carry into the brief:
 
-- **the exact app bundle id.** Approval rights are bounded to the apps the
-  request named (D-046): the worker may answer `elicitation/create` with
-  `accept` only for those, and must not approve any other app.
+- **the exact app bundle id for every app** the worker may touch. Approval
+  rights are bounded to the apps the request named (D-046): the worker may
+  answer `elicitation/create` with `accept` only for those, and must not
+  approve any other app.
 - **a report of which backend it used** — native MCP tools or `cua-repl` —
   what it actually observed, and **what it did not verify** or was blocked
   on. The skill already requires this of itself; ask for it explicitly.
@@ -58,11 +63,45 @@ Also carry into the brief:
 - a desktop screenshot can capture anything, so no screenshots as artifacts
   unless you asked for a file.
 
+### How delivery works
+
+Two things are delivered per launch, and neither touches the operator's own
+config — Remuda opens nothing under the home-level agent config directories
+(the `.claude`, `.codex` and `.grok` beside the operator's home) for writing
+on any branch:
+
+- the **skill bytes** into the launch's managed native home
+  (`<native_home>/skills/codex-computer-use/`, 0700/0600), from copies
+  embedded in the `remuda` binary. This leg is claude-only: an inherited
+  operator home is read and never written, and codex and grok have no skills
+  directory reader at all, so they get no skill tree rather than a file
+  nothing reads. The launch record lists what was materialized, with digests.
+- a **per-instance MCP config** at `<launch_dir>/mcp-cua.json` (0600) naming
+  the launcher by absolute host path, hung on argv as `--mcp-config` (claude)
+  or in the shadow `config.toml` (codex). This leg is every kind's delivery.
+  `--strict-mcp-config` is never sent, so the agent's own MCP servers survive
+  the grant.
+
+When the capability is granted the launch also sets
+`REMUDA_CAPABILITY_COMPUTER_USE=1` in the child environment, which is what the
+hardened `cua-repl` launcher checks before starting. **That variable is a
+signal, not a boundary** — anything with a shell can export it itself. The real
+boundary is that nothing is materialized unless the capability was granted: no
+grant, no `mcp-cua.json`, so no launcher path to point at. A worker told to
+report the missing capability must not retry or export the variable itself.
+
 ### What you will and will not see
 
 Every action journals as an MCP tool call (`tool_name:
-mcp__codex-computer-use__<verb>`), and screenshots a tool returns render
-inside the tool card. **The per-app approval does not appear in
+mcp__codex-computer-use__<verb>`). Returning the screenshots such a tool
+produces is what `c-cua-media` implements — today every tool-result producer
+and the web renderer drop non-text blocks, so until that lands a CUA session
+shows the calls but not the pictures. Once it does, image blocks render inside
+the tool card as a bounded thumbnail. Screenshots are never inlined or
+base64-encoded into the journal: the bytes live in the object store and the
+journal carries an object reference.
+
+**The per-app approval does not appear in
 `/approvals`** — the worker answers its own `elicitation/create`, so there is
 no journal line for it, no card, and no second reviewer. That is the accepted
 cost of this batch (D-046). Never write a report that reads as if a human

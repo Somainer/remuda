@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import css from "./session.module.css";
 import { ViewSwitch } from "./ViewSwitch";
 
 describe("ViewSwitch", () => {
@@ -37,5 +38,19 @@ describe("ViewSwitch", () => {
     onChange.mockClear();
     await user.keyboard("{ArrowLeft}");
     expect(onChange).toHaveBeenCalledWith("structured");
+  });
+
+  it("keeps the hit-area-bearing viewSeg class on both radios regardless of state", () => {
+    // The 44px touch reach is attached to `.viewSeg` via a mobile-only
+    // ::after (geometry is measured in ux-touchhit.hub.spec.ts; jsdom has no
+    // layout). The on-state class is additive, so toggling state must never
+    // detach the hit area from a segment.
+    render(<ViewSwitch value="tty" onChange={vi.fn()} />);
+    const selected = screen.getByTestId("view-switch-tty");
+    const other = screen.getByTestId("view-switch-structured");
+    expect(selected.className.split(" ")).toContain(css.viewSeg);
+    expect(other.className.split(" ")).toContain(css.viewSeg);
+    expect(selected.className.split(" ")).toContain(css.viewSegOn);
+    expect(other.className.split(" ")).not.toContain(css.viewSegOn);
   });
 });

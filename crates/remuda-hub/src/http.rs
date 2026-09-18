@@ -1783,11 +1783,14 @@ pub(crate) async fn forward_if_online(
             .await?
             .ok_or(HubError::NotFound);
     }
-    // A forwarded non-create command now has resolution `unknown`. Arm a bounded
-    // ack deadline so it cannot sit at `queued` forever if neither an accept nor
-    // an error reply lands (a Node that went offline between the online check
-    // and the call, or a hung one). The guarded transition leaves accepted /
-    // reconciling / already-failed rows alone.
+    // A forwarded non-create command now has resolution `unknown`. Arm a
+    // bounded ack deadline so it cannot sit at `queued` forever if no terminal
+    // reply lands: a Node that went offline between the online check and the
+    // call (`unknown`), or one that received the call but whose RPC reply was
+    // lost past the accept deadline (`reconciling`, §2.5). Either way the row
+    // fails with a reason; a journaled accept/settle that arrives later
+    // recovers it (see `apply_command_lifecycle`). The guarded transition
+    // leaves accepted / settled / already-failed rows alone.
     schedule_command_ack_deadline(state, &command);
     let mut params = command.payload.clone();
     let object = params
@@ -2070,7 +2073,7 @@ fn schedule_command_ack_deadline(state: &AppState, command: &CommandRecord) {
     if command.operation == "instance.create" || command.state != "queued" {
         return;
     }
-    let timeout = Duration::from_millis(state.config.command_settle_timeout_ms.max(1));
+    let timeout = Duration::from_millis(state.config.command_settle_timeout_ms().max(1));
     let state = state.clone();
     let command_id = command.command_id.clone();
     let operation = command.operation.clone();

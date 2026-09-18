@@ -514,17 +514,35 @@ async fn a_cooperative_child_exits_on_stdin_eof_with_one_exit_lifecycle() {
 /// without this the SIGKILL rung would be untested — and that is the rung that
 /// exists for a wedged child holding the workspace open.
 ///
-/// This is the regression test for the earlier vacuous version: SIGTERM used to
-/// be blocked on the main thread *after* the parent-watch thread spawned, so the
-/// signal was delivered to that unmasked thread and killed the fake at rung 2.
-/// Deleting the SIGKILL rung, or masking SIGTERM on the wrong thread, must both
-/// fail here — the first by leaving the child alive, the second by returning at
-/// the end of the first slice rather than after both.
+/// Two independent guards make this non-vacuous:
+///
+/// * **SIGTERM ordering** — SIGTERM is masked before any thread spawns, and the
+///   test asserts the child outlived *both* bounded slices (≥ 3s). Masking it on
+///   the wrong thread lets the process-directed signal kill the fake at rung 2,
+///   and close then returns after one slice.
+/// * **The group SIGKILL itself** — the fake spawns a long-lived grandchild in
+///   its process group. `Child::kill` and `kill_on_drop` reach only the direct
+///   child, so the grandchild survives deleting rung 3's `killpg`; the elapsed
+///   assertion alone could not tell the group signal apart from `kill_on_drop`
+///   reaping the direct child. The grandchild dying is the structural guard.
+#[cfg(unix)]
 #[tokio::test]
 async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
+    let grandchild_pid_file = std::env::temp_dir().join(format!(
+        "remuda-sdk-grandchild-{}-{}.pid",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let mut env = BTreeMap::new();
     env.insert("FAKE_CLAUDE_IGNORE_EOF".into(), "1".into());
     env.insert("FAKE_CLAUDE_IGNORE_SIGTERM".into(), "1".into());
+    env.insert(
+        "FAKE_CLAUDE_GRANDCHILD_PID_FILE".into(),
+        grandchild_pid_file.to_string_lossy().into_owned(),
+    );
     let (_tmp, driver, spec) = driver_with_env(ScriptKind::Ok, env);
     let handle = driver.start(spec).await.expect("start");
     let pid = handle
@@ -534,6 +552,24 @@ async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
         .expect("pid on the launch ack")
         .clone();
     assert!(process_alive(&pid), "child should be running before close");
+
+    // Read the grandchild the fake spawned in its own group.
+    let grandchild = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&grandchild_pid_file)
+                && let Ok(gpid) = text.trim().parse::<i32>()
+            {
+                return gpid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the fake should spawn a grandchild");
+    assert!(
+        remuda_driver::shell_pty::lifecycle::process_alive(grandchild),
+        "grandchild {grandchild} should be running before close"
+    );
 
     // Harness budget: 3s, split 1.5s / 1.5s between the stdin-EOF and SIGTERM
     // slices, plus a fixed 2s reap after SIGKILL.
@@ -566,6 +602,16 @@ async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
         !process_alive(&pid),
         "pid {pid} survived a close that had to reach SIGKILL"
     );
+
+    // The grandchild is in the child's group and is not the direct child, so
+    // only rung 3's group SIGKILL could reap it. Give the kernel a beat, then
+    // assert it is gone. Deleting the group signal leaves this one alive.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !remuda_driver::shell_pty::lifecycle::process_alive(grandchild),
+        "grandchild {grandchild} survived: rung 3 did not SIGKILL the process group"
+    );
+    let _ = std::fs::remove_file(&grandchild_pid_file);
 }
 
 /// Item 2: the stdin-EOF request itself must be bounded.

@@ -187,6 +187,85 @@ pub mod store_test_support {
             .await
             .expect("reader hold");
     }
+
+    /// Occupy the single WRITER connection for `sleep`, reproducing a long job
+    /// that used to block every queued job. Drives the hub-store-1 evidence
+    /// harness (`tests/hub_store_evidence.rs`, `--ignored`).
+    pub async fn hold_writer(store: &Store, sleep: Duration) {
+        store
+            .run_named("test.hold_writer", move |_| {
+                std::thread::sleep(sleep);
+                Ok(())
+            })
+            .await
+            .expect("writer hold");
+    }
+
+    /// Read + JSON-parse every journal row, reproducing the pre-hub-store-1
+    /// unbounded `read_journal` (no LIMIT). Evidence harness only.
+    pub async fn read_all_journal_parsed(store: &Store, instance_id: &str) -> usize {
+        let instance_id = instance_id.to_owned();
+        store
+            .read("test.read_all_journal", move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT payload_json FROM journal
+                         WHERE instance_id = ?1 AND seq > 0 ORDER BY seq ASC",
+                    )
+                    .expect("prepare");
+                let mut rows = stmt.query([&instance_id]).expect("query");
+                let mut n = 0;
+                while let Some(row) = rows.next().expect("next") {
+                    let payload: String = row.get(0).expect("payload");
+                    let _: serde_json::Value = serde_json::from_str(&payload).expect("json");
+                    n += 1;
+                }
+                Ok(n)
+            })
+            .await
+            .expect("read all journal")
+    }
+
+    /// Pending-interaction count on the WRITER thread, where `list_interactions`
+    /// used to queue before the reader pool. Evidence harness only.
+    pub async fn pending_interactions_via_writer(store: &Store) -> usize {
+        store
+            .run_named("test.pending_via_writer", |conn| {
+                let count: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM interactions WHERE state = 'pending'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(count as usize)
+            })
+            .await
+            .expect("pending via writer")
+    }
+
+    /// One journal-tail read on the WRITER thread, where `read_journal_tail`
+    /// used to queue. Evidence harness only.
+    pub async fn journal_tail_via_writer(store: &Store, instance_id: &str, limit: i64) -> usize {
+        let instance_id = instance_id.to_owned();
+        store
+            .run_named("test.tail_via_writer", move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT payload_json FROM (
+                        SELECT payload_json, seq FROM journal
+                        WHERE instance_id = ?1 ORDER BY seq DESC LIMIT ?2
+                     ) ORDER BY seq ASC",
+                )?;
+                let mut rows = stmt.query(rusqlite::params![instance_id, limit])?;
+                let mut n = 0;
+                while let Some(row) = rows.next()? {
+                    let payload: String = row.get(0)?;
+                    let _ = serde_json::from_str::<serde_json::Value>(&payload);
+                    n += 1;
+                }
+                Ok(n)
+            })
+            .await
+            .expect("tail via writer")
+    }
 }
 
 /// A bound Hub that shuts down when dropped.

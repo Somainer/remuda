@@ -36,14 +36,24 @@ self.addEventListener("fetch", (event) => {
   if (url.pathname.startsWith("/v1/") || url.pathname.startsWith("/node/") || url.pathname.startsWith("/push/")) return;
   if (event.request.mode === "navigate") {
     // Network-first: fetch the document so a redeployed shell (new asset
-    // hashes) is served immediately, refresh the cached copy on success, and
-    // fall back to the cached shell only when the network fails.
+    // hashes) is served immediately, and fall back to the cached shell only
+    // when the network fails.
     event.respondWith(
       (async () => {
         try {
           const fresh = await fetch(event.request);
-          const cache = await caches.open(CACHE);
-          await cache.put("/index.html", fresh.clone());
+          // Refresh the cached shell only from a good document, after the
+          // response is already promised: a 502 must never become the offline
+          // shell, and a write that rejects (quota, 206, storage error) happens
+          // in waitUntil rather than discarding the document just delivered.
+          if (fresh.ok) {
+            event.waitUntil(
+              caches
+                .open(CACHE)
+                .then((cache) => cache.put("/index.html", fresh.clone()))
+                .catch(() => undefined),
+            );
+          }
           return fresh;
         } catch {
           const cached = await caches.match("/index.html");

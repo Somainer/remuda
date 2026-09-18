@@ -815,6 +815,8 @@ Hub 操作面（M1）先落地一个薄的可配置子集：`id, name, kind: gat
 
 #### 4.4.1 模型 API 交付方式与路由（D-047，2026-09-19）
 
+设计全文见 [api-routing.md](./api-routing.md)。
+
 网关凭据是主机绑定的，所以今天「只在一台机器的 relay 上可达的模型」无法交给
 另一台机器上的 worker：把凭据发过去既违背 D-021，也未必有用——那个 origin
 从 worker 主机可能根本不可路由。D-047 加了**一个可选参数**来关闭这个缺口。
@@ -826,7 +828,7 @@ type ApiRouteKind = "direct-net" | "hub-relay";   // 已决议的路由；没有
 
 type ProviderDelivery = {
   mode: ProviderDeliveryMode;
-  viaHostId?: HostId | null;   // via 时必填；direct 时无意义
+  viaHostId?: HostId | null;   // via 时必填（缺则反序列化报错）；direct 时无意义
   route: ApiRouteMode;         // 缺省 auto
 };
 
@@ -1535,6 +1537,8 @@ TransportLimits v1 默认建议：`maxJsonFrameBytes=1048576`、`maxBinaryChunkB
 6. Node 与 Hub 按 journal seq 补齐副本；每个实例单独标 recovered/reconciling。一个不可恢复的 optional driver 不阻断其它 Instance 的事件与 Claude 主路径。
 
 ### 7.6 `api.*` 带内模型 API 代理流（D-047 / D-048，2026-09-19）
+
+设计全文见 [api-routing.md](./api-routing.md)。
 
 `delivery = via:<H>` 的会话把模型 API 请求交给 H 出去（D-047）。W 的 Node 在
 每实例 loopback 监听器上收到请求后，把它变成这里的七个帧之一，走**既有**

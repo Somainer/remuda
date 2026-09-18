@@ -19,7 +19,28 @@ import {
 } from "./fixture";
 import { bytesFromBase64, toBytes } from "./ids";
 
-export type TtyStatus = "connecting" | "live" | "reconnecting" | "failed";
+export type TtyStatus = "connecting" | "live" | "reconnecting" | "failed" | "stale";
+
+/**
+ * A screen the browser is showing that is no longer changing.
+ *
+ * The Hub falls back to its own byte cache when `tty.attach` cannot be
+ * answered, and those bytes are whatever it last saw — painting them as a live
+ * terminal is the 2026-09-18 bug, where a frozen 17:36 frame kept a 运行中
+ * header for a session whose process had been dead for an hour. `ageMs` is
+ * absent when the Hub has no capture time (bytes cached before it stamped
+ * them), which must read as "age unknown", never as "just now".
+ */
+export type TtyStale = {
+  ageMs?: number;
+  /** Hub reason code: `node-link-unavailable` / `instance-gone`. */
+  reason?: string;
+};
+
+/** Statuses that mean the painted bytes are not a live process. */
+export function isStaleStatus(status: TtyStatus): boolean {
+  return status === "stale";
+}
 
 /** ConEmu `OSC 9;4` states the terminal header progress bar understands. */
 export type TtyProgressState = "done" | "percent" | "error" | "indeterminate" | "paused";
@@ -71,7 +92,7 @@ export type TtyHandlers = {
     reset: boolean,
     replay: boolean,
   ) => void;
-  onStatus: (status: TtyStatus, message?: string) => void;
+  onStatus: (status: TtyStatus, message?: string, stale?: TtyStale) => void;
   onSnapshot?: () => void;
   /**
    * The attached session is (or is no longer) showing a full-screen TUI.
@@ -225,6 +246,31 @@ function extractBase64(value: unknown): string | null {
   return null;
 }
 
+/**
+ * The staleness of a Hub-cached `tty.snapshot`, or null when it is live.
+ *
+ * Keyed on `source: "hub-cache"` first: correct Hubs stamp only that path, so
+ * an older Hub (which sends the same `tty.snapshot` type with no stamp) stays
+ * live rather than being marked stale with an unknown age. `capturedAt` is
+ * parsed to an age against the browser clock — the browser and Hub already
+ * agree on wall time for every other timestamp the UI renders — and an
+ * unparseable or absent value yields an age of undefined, which the header
+ * renders as "age unknown" rather than inventing one.
+ */
+function staleFromSnapshot(msg: Record<string, unknown>): TtyStale | null {
+  if (msg.source !== "hub-cache") return null;
+  const capturedAt = typeof msg.capturedAt === "string" ? msg.capturedAt : null;
+  const reason = typeof msg.reason === "string" ? msg.reason : undefined;
+  let ageMs: number | undefined;
+  if (capturedAt) {
+    const at = Date.parse(capturedAt);
+    // A clock skew between browser and Hub can put `at` in the future; a
+    // negative age would render as nonsense, so clamp at zero.
+    if (Number.isFinite(at)) ageMs = Math.max(0, Date.now() - at);
+  }
+  return ageMs === undefined ? { reason } : { ageMs, reason };
+}
+
 function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession {
   let socket: WebSocket | null = null;
   let streamUuid: Uint8Array | null = null;
@@ -338,7 +384,13 @@ function openLiveSession(instance: Instance, handlers: TtyHandlers): TtySession 
         const payload = bytesFromBase64(b64);
         if (payload) deliverOutput(payload, 0n, streamId || "tty_snapshot");
       }
-      handlers.onStatus("live");
+      // A stamped snapshot is the Hub's own cache, not a live attach: the
+      // bytes are the last thing it saw before the link went away. Reporting
+      // it live is what let a frozen screen keep a 运行中 header, so the
+      // stamp decides the status rather than being decoration on it.
+      const stale = staleFromSnapshot(msg);
+      if (stale) handlers.onStatus("stale", undefined, stale);
+      else handlers.onStatus("live");
       return;
     }
     if (type === "gap") {

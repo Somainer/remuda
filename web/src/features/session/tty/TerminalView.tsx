@@ -12,12 +12,7 @@ import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
 import { TuiModeIndicator } from "./TuiModeIndicator";
 import { TtyProgressBar } from "./TtyProgressBar";
-import {
-  openTtySession,
-  type TtyProgress,
-  type TtySession,
-  type TtyStatus,
-} from "./client";
+import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type TtyStatus } from "./client";
 import { binaryStringToBytes } from "./ids";
 import { LocalInput } from "./LocalInput";
 import { attachTerminalRenderer, type TerminalRenderer } from "./renderer";
@@ -32,6 +27,7 @@ import {
 } from "./mouseReports";
 import { createReplayGuard, groupByOrigin, type OutChunk } from "./replayGuard";
 import { applyStdinPolicy, stdinPolicy } from "./stdinPolicy";
+import { StaleScreenBadge } from "./StaleScreenBadge";
 import { NIGHT_CORRAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
 import css from "./TerminalView.module.css";
 
@@ -73,6 +69,9 @@ export function TerminalView({
   const { mobile, coarsePointer, offsetTop } = useWorkbenchViewport();
   const [inputOverride, setInputOverride] = useState<{ direct: boolean; mode: DisplayMode } | null>(null);
   const [status, setStatus] = useState<TtyStatus>("connecting");
+  // Present only with a `stale` status: how old the painted frame is and why
+  // it stopped. Cleared by any live frame.
+  const [stale, setStale] = useState<TtyStale | null>(null);
   const [cols, setCols] = useState(80);
   const [rows, setRows] = useState(24);
   const [fullscreen, setFullscreen] = useState(false);
@@ -103,7 +102,12 @@ export function TerminalView({
   const [preview, setPreview] = useState("");
   const [rawTail, setRawTail] = useState("");
   const [ready, setReady] = useState(false);
-  const frozen = status === "reconnecting" || status === "failed";
+  // A stale frame is the Hub's cache: `tty.attach` could not be answered, so
+  // keystrokes have nowhere to go. Freezing it is the same call the reconnect
+  // path already makes — `disableStdin` is an all-or-nothing switch, and
+  // leaving it on would type into whatever is at the prompt *now* while the
+  // operator reads a screen from an hour ago.
+  const frozen = status === "reconnecting" || status === "failed" || status === "stale";
 
   const send = (data: string | Uint8Array) => {
     void sessionRef.current?.write(data);
@@ -171,6 +175,7 @@ export function TerminalView({
     resetStreamRef.current = true;
     setReady(false);
     setStatus("connecting");
+    setStale(null);
     setMouseMode(term.modes.mouseTrackingMode);
     setMouseReports(true);
     setAltScreen(undefined);
@@ -345,8 +350,9 @@ export function TerminalView({
         outQueue.push({ bytes, replay });
         if (!outRaf) outRaf = requestAnimationFrame(flushOut);
       },
-      onStatus: (next, message) => {
+      onStatus: (next, message, nextStale) => {
         setStatus(next);
+        setStale(next === "stale" ? (nextStale ?? {}) : null);
         if (next === "connecting") {
           resetStreamRef.current = true;
           setAltScreen(undefined);
@@ -486,6 +492,10 @@ export function TerminalView({
           requestedTui={instance.kind === "claude" ? instance.tui : undefined}
           hasEngagedAltScreen={hasEngagedAltScreen}
         />
+        {/* The header strip's honesty: a stale frame must say so here, beside
+            the renderer pill, and not only in the banner below — 运行中 alone
+            over a frozen screen is the failure this batch exists to end. */}
+        {status === "stale" && stale ? <StaleScreenBadge stale={stale} /> : null}
         <div className={css.seg}>
           <button
             type="button"
@@ -604,8 +614,10 @@ export function TerminalView({
             ? "正在连接终端…"
             : status === "reconnecting"
               ? "reconnecting · 终端保留最后一帧，不清屏"
-              : "终端连接失败"}
-          {status === "reconnecting" || status === "failed" ? (
+              : status === "stale"
+                ? "画面来自 Hub 缓存，不是实时输出"
+                : "终端连接失败"}
+          {status === "reconnecting" || status === "failed" || status === "stale" ? (
             <button
               type="button"
               className={css.geo}

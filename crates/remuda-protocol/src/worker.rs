@@ -1141,18 +1141,22 @@ mod tests {
         assert!(WorkerState::Dispatched.is_in_progress());
         assert!(WorkerState::Working.is_in_progress());
         assert!(!WorkerState::Done { sha: "x".into() }.is_in_progress());
-        assert!(!WorkerState::Blocked {
-            reason: "need creds".into()
-        }
-        .is_in_progress());
+        assert!(
+            !WorkerState::Blocked {
+                reason: "need creds".into()
+            }
+            .is_in_progress()
+        );
         assert!(!WorkerState::Retired.is_in_progress());
         // And every one of those is still "active" except retired, which is
         // exactly why the narrower predicate is the one callers must reach for.
         assert!(WorkerState::Done { sha: "x".into() }.is_active());
-        assert!(WorkerState::Blocked {
-            reason: "need creds".into()
-        }
-        .is_active());
+        assert!(
+            WorkerState::Blocked {
+                reason: "need creds".into()
+            }
+            .is_active()
+        );
     }
 
     #[test]

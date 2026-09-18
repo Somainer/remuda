@@ -105,7 +105,7 @@ export function computeAnchored(
   const upperBoundary = obstruction ? Math.max(margin, obstruction + gap) : margin;
   const roomAbove = Math.max(0, triggerRect.top - gap - upperBoundary);
   const roomBelow = Math.max(0, viewport.height - triggerRect.bottom - margin - gap);
-  const vhCap = Math.max(80, Math.floor(viewport.height * maxHeightVh));
+  const vhCap = Math.floor(viewport.height * maxHeightVh);
 
   // Pick the side: honour the preferred direction when the panel's natural
   // height fits there, otherwise take whichever side has more room.
@@ -116,7 +116,9 @@ export function computeAnchored(
     placement = roomBelow >= panel.preferredHeight || roomBelow >= roomAbove ? "down" : "up";
   }
   const room = placement === "up" ? roomAbove : roomBelow;
-  const maxHeight = Math.max(80, Math.min(vhCap, Math.floor(room)));
+  // No floor: a positive minimum would force the panel past an obstruction
+  // (the approval card) when the available gap is smaller.
+  const maxHeight = Math.max(0, Math.min(vhCap, Math.floor(room)));
   const panelHeight = Math.min(panel.preferredHeight, maxHeight);
 
   // Horizontal alignment against the trigger, then shift inside the viewport.

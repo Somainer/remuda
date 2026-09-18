@@ -1157,6 +1157,8 @@ fn default_limits() -> TransportLimits {
         heartbeat_interval_ms: 15_000,
         lease_ttl_ms: 60_000,
         max_wait_ms: 30_000,
+        max_api_streams: remuda_protocol::default_max_api_streams(),
+        api_chunk_bytes: remuda_protocol::default_api_chunk_bytes(),
     }
 }
 

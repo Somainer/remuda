@@ -817,6 +817,17 @@
       "HostView": {
         "additionalProperties": true,
         "properties": {
+          "relayBind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HostRelayBind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback."
+          },
           "capabilities": {
             "additionalProperties": true,
             "type": "object"
@@ -1055,6 +1066,19 @@
       },
       "InstanceCreate": {
         "properties": {
+          "apiRoute": {
+            "description": "Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1).",
+            "enum": [
+              "auto",
+              "hub-relay",
+              "direct-net"
+            ],
+            "type": "string"
+          },
+          "apiVia": {
+            "description": "Per-instance delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct.",
+            "type": "string"
+          },
           "args": {
             "description": "Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present.",
             "items": {
@@ -1271,6 +1295,11 @@
               "draining"
             ],
             "type": "string"
+          },
+          "apiRoute": {
+            "$ref": "#/components/schemas/ApiRoute",
+            "description": "Model-API route this instance actually uses (D-047); absent on a direct session.",
+            "readOnly": true
           },
           "connectivity": {
             "type": "string"
@@ -2880,6 +2909,10 @@
           "defaultGateway": {
             "type": "boolean"
           },
+          "delivery": {
+            "$ref": "#/components/schemas/ProviderDelivery",
+            "description": "Delivery mode (D-047). Omitted means direct / auto."
+          },
           "defaultModel": {
             "description": "Must be one of the enabled models.",
             "type": "string"
@@ -2939,6 +2972,118 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "ApiRoute": {
+        "description": "Model-API route an instance is actually using (D-047). Echoed by the Node, never set from the request, so a surface reports what ran.",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "direct",
+              "via"
+            ],
+            "type": "string"
+          },
+          "route": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ApiRouteKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "viaHostId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "viaHostLabel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "ApiRouteKind": {
+        "description": "The route a via session actually took. `auto` is a request, never an observation.",
+        "enum": [
+          "direct-net",
+          "hub-relay"
+        ],
+        "type": "string"
+      },
+      "ApiRouteMode": {
+        "description": "Route a via delivery takes between the worker host and the proxy host. Decided once at launch (D-047 Amendment A1).",
+        "enum": [
+          "auto",
+          "hub-relay",
+          "direct-net"
+        ],
+        "type": "string"
+      },
+      "ApiViaRefusal": {
+        "description": "Why a via dispatch was refused (D-047). Every value is a refusal; there is no fallback-to-direct value.",
+        "enum": [
+          "api-via-unknown-host",
+          "api-via-host-offline",
+          "api-via-unsupported",
+          "api-via-unreachable"
+        ],
+        "type": "string"
+      },
+      "HostRelayBind": {
+        "description": "Explicit non-loopback relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback and every via session on hub-relay.",
+        "additionalProperties": false,
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "allowFrom": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "addr"
+        ],
+        "type": "object"
+      },
+      "ProviderDelivery": {
+        "description": "How a profile's sessions reach the model API (D-047). Absent means {mode: direct, route: auto}. `via` requires `viaHostId`.",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "direct",
+              "via"
+            ],
+            "type": "string"
+          },
+          "route": {
+            "$ref": "#/components/schemas/ApiRouteMode"
+          },
+          "viaHostId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode",
+          "route"
+        ],
         "type": "object"
       },
       "ProviderHealth": {
@@ -3060,6 +3205,10 @@
           "defaultGateway": {
             "type": "boolean"
           },
+          "delivery": {
+            "$ref": "#/components/schemas/ProviderDelivery",
+            "description": "Set the delivery mode (D-047)."
+          },
           "defaultModel": {
             "description": "Must be one of the enabled models.",
             "type": [
@@ -3113,6 +3262,10 @@
               "string",
               "null"
             ]
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/ProviderDelivery",
+            "description": "Delivery mode (D-047). Omitted means direct / auto."
           },
           "headers": {
             "additionalProperties": {
@@ -3954,6 +4107,19 @@
       "WorkerDispatch": {
         "type": "object",
         "properties": {
+          "apiRoute": {
+            "description": "Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1).",
+            "enum": [
+              "auto",
+              "hub-relay",
+              "direct-net"
+            ],
+            "type": "string"
+          },
+          "apiVia": {
+            "description": "Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Omitted leaves the waterfall to the project and profile.",
+            "type": "string"
+          },
           "projectId": {
             "pattern": "^prj_",
             "type": "string"

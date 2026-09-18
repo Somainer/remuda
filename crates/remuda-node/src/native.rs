@@ -1492,6 +1492,9 @@ fn instance_spec(
         required_capabilities: Vec::new(),
         completion_scope: CompletionScope::NativeTurn,
         parent: None,
+        // D-047: the request carries no resolved route, so this spec means
+        // "no proxy". A `via` route is written by the Hub after placement.
+        api_route: None,
     })
 }
 

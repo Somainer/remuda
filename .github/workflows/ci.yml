@@ -62,6 +62,11 @@ jobs:
         run: ./scripts/gen-skill.sh --check
       - name: Coordinator script tests
         run: python3 -B -m unittest discover -s scripts/tests -p 'test_*.py'
+      - name: Committed skills lint clean
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          ./scripts/ci/skills-lint.sh
       - name: Prebuild remuda-testing bins
         run: cargo build -p remuda-testing --bins --locked
       - name: Shared Rust merge gate

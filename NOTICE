@@ -85,6 +85,20 @@ herdrx
   JSON shape rewritten in Rust. Not a Go copy.
 
 -------------------------------------------------------------------------------
+Not copied (referenced by absolute path at runtime only)
+
+OpenAI Codex / ChatGPT Computer Use
+  Local path: skills/codex-computer-use/
+  This skill contains no OpenAI code or binaries and redistributes nothing.
+  It drives proprietary software the operator has already installed — the
+  Codex Computer Use MCP helper and the ChatGPT `cua_node` runtime — by
+  absolute path, over stdio, only after a Remuda launch explicitly grants the
+  `computer-use` capability. The vendor paths and the
+  `2DC432GLL2.com.openai.sky.CUAService` Mach service identifier appear as
+  constants documenting that boundary. ChatGPT, Codex and Computer Use are
+  trademarks of OpenAI; Remuda is not affiliated with or endorsed by OpenAI.
+
+-------------------------------------------------------------------------------
 Future Apache-2.0 imports (vibe-kanban, Herdr detect, Codex crates, …) must
 keep the upstream copyright/SPDX header, record revision and local
 modifications, and add a block here.

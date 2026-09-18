@@ -2417,6 +2417,10 @@ export interface components {
             landSerialization?: "global-cas";
             lanes?: components["schemas"]["ProjectGateLane"][];
             mandatorySteps?: string[];
+            /** @description Per-step wall-clock budgets (step name to seconds; 0 = no cap). A per-lane entry overrides the same key here. */
+            timeouts?: {
+                [key: string]: number;
+            };
             /** @enum {string} */
             web?: "auto" | "always" | "never";
         };
@@ -2427,6 +2431,10 @@ export interface components {
             remote?: string;
             repoPath: string;
             targetDir: string;
+            /** @description Per-step wall-clock budgets (step name to seconds; 0 = no cap) for this lane; overrides the project-level entry per key. */
+            timeouts?: {
+                [key: string]: number;
+            };
         };
         ProjectHostQuota: {
             diskBudgetGb?: number;

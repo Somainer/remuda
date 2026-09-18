@@ -179,10 +179,12 @@ owner 的评审意见：三层不能写死。对照先例（Erlang supervision t
       { "id": "lane1", "hostId": "hst_sg", "repoPath": "<remote-agents>/repo",
         "targetDir": "<remote-agents>/target-gate",  "ports": "58980-58989", "remote": "sg" },
       { "id": "lane2", "hostId": "hst_sg", "repoPath": "<remote-agents>/repo2",
-        "targetDir": "<remote-agents>/target-gate2", "ports": "58970-58979", "remote": "sg2" }
+        "targetDir": "<remote-agents>/target-gate2", "ports": "58970-58979", "remote": "sg2",
+        "timeouts": { "web-hub-e2e": 3600 } }  // 覆盖该 lane 该步的墙钟上限（秒；0=不限）
     ],
     "landSerialization": "global-cas",  // 验证可并行，落地永远串行（playbook I4）
-    "mandatorySteps": ["secret-scan", "no-tunnel-scan", "gen-api-current", "verify-tree"]
+    "mandatorySteps": ["secret-scan", "no-tunnel-scan", "gen-api-current", "verify-tree"],
+    "timeouts": { "cargo-test": 2400 }  // 项目级 per-step 墙钟上限（秒；0=不限），lane 同名键覆盖
   },
 
   // ——— policies：enforced 与 configurable 分开存，enforced 只有 owner 能改 ———

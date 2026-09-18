@@ -18,13 +18,28 @@ its lane checkout, and — for a land — CAS-pushes main with its own credentia
   queued/running/passed/failed/landed/canceling/canceled, and the
   `gate.run` / `gate.cancel` / `gate.then` (Hub→Node) plus `gate.event`
   (Node→Hub) wire types. `ProjectGateLane` gains additive `env`, `lockPath`,
-  `pwEndpoint`, `toolchainPath`.
+  `pwEndpoint`, `toolchainPath`, `timeouts` (per-step wall-clock budgets, step
+  name → seconds, `0` = no cap; overrides the project-level `ProjectGate.timeouts`
+  per key).
 - Hub `remuda-hub/src/gatequeue.rs`: `gate_jobs` table, routes
   `POST|GET /v1/projects/{id}/gate`, `GET /v1/projects/{id}/gate/jobs/{jobId}`,
   `POST …/cancel`, `GET /v1/gate/jobs`; FIFO scheduler (parallel verify across
   lanes, serialized land per project, one job per lane); global-cas re-verify
-  (re-queue on `base-moved`, ≤3 attempts); queued/running cancel; restart
-  reconcile; every transition journaled to `audit_log` (subject = job id).
+  (re-queue on `base-moved`, ≤3 attempts); queued/running cancel; every
+  transition journaled to `audit_log` (subject = job id).
+- Cancel is authoritative: a `canceling` job never lands. `apply_result` skips
+  the home-land handoff for a canceling job and finishes it `canceled`, keeping
+  `mergeSha`/`mergeRef`/steps (retention drops the ref later, like any unlanded
+  verify). The single case where main did move — a `pushFrom: lane` land whose
+  Node already pushed and reports `landed`, or a `pushFrom: home` push that lands
+  main before the cancel reaches its terminal write — keeps `landed` and records
+  the cancel arrived too late (honesty over tidiness). `reconcile` finishes a
+  `canceling` job `canceled` on restart rather than re-queueing it. A cancel
+  never waits out `GATE_RUN_TIMEOUT`: `cancelRequestedAt` is stamped on the first
+  request and a scheduler tick finishes the job `canceled` after a bounded grace
+  (`gateCancelGraceMs`, default 30 s), after which a late run reply is ignored;
+  the grace is suspended while a home push is in flight (`homeLandInFlight`), so
+  the longer `HOME_LAND_TIMEOUT` push writes the honest outcome itself.
 - Node `remuda-node/src/gate.rs`: lane runner — fetch, main sync, branch
   fast-forward with the stale-tip refusal (held worker worktree ff'd in place,
   diverged tip rejected), runs its **own `remuda` binary** with
@@ -39,10 +54,15 @@ its lane checkout, and — for a land — CAS-pushes main with its own credentia
   carrier event pumps for both outbound WSS and ssh-stdio.
 - CLI `remuda/src/cmd/gate.rs`: `remuda gate <branch> [--web auto|always|never]
   [--lane] [--no-wait]`, `remuda land <branch> [--then "<cmd>"]`,
-  `remuda gate list [--state] [--branch]`, `remuda gate cancel <gjb|branch>`.
+  `remuda gate list [--state] [--branch]`,
+  `remuda gate cancel <gjb|branch> [--no-wait] [--json]`.
   Wait mode prints live `name: status (duration ms)` step lines; exit code =
-  outcome (0 passed/landed, 2 canceled, 1 otherwise). `remuda project set
-  --gate @file.json` configures lanes. `remuda watch` prints active gate rows;
+  outcome (0 passed/landed, 2 canceled, 1 otherwise). `remuda gate cancel` now
+  requests the cancel and then waits for the real terminal state by default:
+  exit 2 on a clean cancel, exit 1 if the job landed anyway (the cancel raced a
+  push), 0 otherwise; `--no-wait` returns the accepted `canceling` row without
+  waiting and `--json` emits the job as JSON. `remuda project set --gate
+  @file.json` configures lanes. `remuda watch` prints active gate rows;
   `remuda report [--for-owner]` adds active/failed gate jobs and the last landed
   sha. `remuda dispatch --carrier native|herdr|print` prefers the advertised
   native shell-pty, then herdr; print is never silent.

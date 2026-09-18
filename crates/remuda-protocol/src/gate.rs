@@ -308,6 +308,17 @@ pub struct GateJob {
     /// When the job reached a terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Timestamp>,
+    /// When a cancel was requested while the job was running. Drives the
+    /// bounded grace after which the scheduler finishes a `canceling` job
+    /// `canceled` even if the Node never answered the cancel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<Timestamp>,
+    /// Set while the project home host is running `gate.land` for this job
+    /// (`pushFrom: home`). A cancel during this window must not let the bounded
+    /// cancel grace finalize the job or drop its pinned merge: the home push
+    /// can take minutes and its own terminal write records the honest outcome.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub home_land_in_flight: bool,
     /// Base (`main`) sha the merge was verified onto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_sha: Option<String>,

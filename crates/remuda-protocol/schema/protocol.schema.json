@@ -4763,6 +4763,17 @@
           "description": "Branch under verification.",
           "type": "string"
         },
+        "cancelRequestedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When a cancel was requested while the job was running. Drives the\nbounded grace after which the scheduler finishes a `canceling` job\n`canceled` even if the Node never answered the cancel."
+        },
         "currentMainSha": {
           "description": "Current main when a land lost the compare-and-swap (retry signal).",
           "type": [
@@ -4801,6 +4812,10 @@
             "string",
             "null"
           ]
+        },
+        "homeLandInFlight": {
+          "description": "Set while the project home host is running `gate.land` for this job\n(`pushFrom: home`). A cancel during this window must not let the bounded\ncancel grace finalize the job or drop its pinned merge: the home push\ncan take minutes and its own terminal write records the honest outcome.",
+          "type": "boolean"
         },
         "hostId": {
           "anyOf": [
@@ -14228,6 +14243,15 @@
           },
           "type": "array"
         },
+        "timeouts": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Project-wide per-step wall-clock budgets (step name → seconds),\nforwarded to the runner as `REMUDA_GATE_STEP_TIMEOUTS`. A per-lane\n[`ProjectGateLane::timeouts`] entry overrides the same key here; `0`\nseconds means no cap for that step. Absent leaves the runner's defaults.",
+          "type": "object"
+        },
         "web": {
           "description": "Web gate mode (`auto` / `always` / `never`).",
           "type": [
@@ -14313,6 +14337,15 @@
         "targetDir": {
           "description": "Dedicated cargo target dir.",
           "type": "string"
+        },
+        "timeouts": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Per-step wall-clock budgets (step name → seconds) for this lane,\nforwarded to the runner as `REMUDA_GATE_STEP_TIMEOUTS`. A lane entry\noverrides the same key on [`ProjectGate::timeouts`]; `0` seconds means\nno cap for that step. Absent leaves the runner's built-in defaults.",
+          "type": "object"
         },
         "toolchainPath": {
           "description": "PATH prefix (toolchain bin dirs) for the gate environment.",

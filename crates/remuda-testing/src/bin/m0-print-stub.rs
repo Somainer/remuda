@@ -264,7 +264,9 @@ async fn maybe_answer(
                 )
                 .await?;
         }
-        ScriptKind::Ok | ScriptKind::Workflow => {}
+        // TwoTurn exercises the claude-sdk multi-turn carrier, not the M0
+        // print acceptance path; it needs no interaction answer.
+        ScriptKind::Ok | ScriptKind::Workflow | ScriptKind::TwoTurn => {}
     }
     Ok(())
 }
@@ -304,7 +306,7 @@ fn assert_script(
     let names: Vec<&str> = events.iter().map(kind_name).collect();
     let has = |n: &str| names.contains(&n);
     match kind {
-        ScriptKind::Ok => {
+        ScriptKind::Ok | ScriptKind::TwoTurn => {
             if !has("lifecycle") {
                 return Some(format!("ok: missing lifecycle in {names:?}"));
             }

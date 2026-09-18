@@ -14,6 +14,14 @@ pub enum ScriptStep {
         /// Host `control_response.response.request_id`.
         request_id: String,
     },
+    /// End this turn and keep the rest of the script for the next `user` frame.
+    ///
+    /// Without a barrier the cursor runs to the end of the script on the first
+    /// turn, so a second `user` line emits nothing — which is exactly the shape
+    /// a `-p` child has and therefore cannot demonstrate that `claude-sdk`
+    /// survives more than one turn (`print-replacement.md` §2.1, §3 batch 1).
+    /// Written `{"turn":"end"}`.
+    EndTurn,
 }
 
 /// Load a script from `FAKE_CLAUDE_SCRIPT` (path or `ok`/`approval`/`askuser`/`workflow`).
@@ -53,6 +61,10 @@ pub fn parse_script_text(text: &str) -> Result<Vec<ScriptStep>, String> {
             steps.push(ScriptStep::ExpectControlResponse { request_id });
             continue;
         }
+        if value.get("turn").and_then(Value::as_str) == Some("end") {
+            steps.push(ScriptStep::EndTurn);
+            continue;
+        }
         steps.push(ScriptStep::Emit(value));
     }
     Ok(steps)
@@ -68,6 +80,7 @@ pub fn strip_helper_keys(mut value: Value) -> Value {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("when");
         obj.remove("expect");
+        obj.remove("turn");
     }
     value
 }

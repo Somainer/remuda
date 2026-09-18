@@ -180,6 +180,7 @@ impl Session {
                     }
                     self.last_behavior = permission_behavior(&response);
                 }
+                ScriptStep::EndTurn => return Ok(()),
                 ScriptStep::Emit(frame) => {
                     if let Some(when) = when_filter(&frame) {
                         let got = self.last_behavior.as_deref().unwrap_or("allow");

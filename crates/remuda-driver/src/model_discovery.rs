@@ -339,12 +339,10 @@ pub(crate) async fn await_scoped_catalog(
             .cache
             .as_ref()
             .is_some_and(|cache| matches!(cache.scope, ModelCacheScope::ScopedConfigDir));
-        if scoped && resolved.models != initial.models {
-            return Some(resolved);
-        }
-        if scoped {
-            // Same ids, but the provenance changed from host fallback to the
-            // session's own — still worth re-stamping so the warning clears.
+        // A scoped answer (different ids, or the same list from the
+        // session's own cache instead of the host fallback) is the refresh
+        // the picker needs; either way the provenance flips to scoped.
+        if scoped && (resolved.models != initial.models || resolved.cache != initial.cache) {
             return Some(resolved);
         }
     }

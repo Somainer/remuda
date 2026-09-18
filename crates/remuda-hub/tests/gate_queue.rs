@@ -65,6 +65,11 @@ struct ScriptState {
     land_calls: Mutex<Vec<Value>>,
     /// Successive `gate.land` verdicts; defaults to `landed`.
     land_replies: Mutex<VecDeque<Value>>,
+    /// When set, the fake home host holds each `gate.land` open until this is
+    /// notified, and signals `land_started` once the call has arrived — so a
+    /// test can cancel while the home push is genuinely in flight.
+    land_gate: Mutex<Option<Arc<Notify>>>,
+    land_started: Arc<Notify>,
     /// Observed gate.unpin params (ref cleanup).
     unpin_calls: Mutex<Vec<Value>>,
     /// Node→Hub request counter (ids must be unique).
@@ -176,6 +181,14 @@ async fn enroll(
                 "gate.land" => {
                     let job = params["jobId"].as_str().unwrap_or("").to_string();
                     script.land_calls.lock().unwrap().push(params);
+                    // Let a test observe that the push has started and, when a
+                    // gate is configured, hold the call open until released so
+                    // the cancel lands while the home push is in flight.
+                    script.land_started.notify_waiters();
+                    let gate = script.land_gate.lock().unwrap().clone();
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
                     script
                         .land_replies
                         .lock()
@@ -1120,8 +1133,110 @@ async fn cancel_while_running_a_home_land_never_lands() -> Result<()> {
     Ok(())
 }
 
-/// A run reply that arrives only after the cancel grace has expired changes
-/// nothing: the scheduler already finished the job `canceled`, no push ever
+/// A cancel that arrives *after* the verify reply, while the home host is
+/// mid-push, must not produce today's dishonesty in mirror image: if the push
+/// lands main, the job reports `landed` (not `canceled`), keeps its unpin and
+/// journal, and the bounded cancel grace never finalizes it out from under the
+/// in-flight push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_a_home_push_that_lands_reports_landed() -> Result<()> {
+    // A short grace: if the fix regressed, the grace would flip the job to
+    // canceled well before we release the push.
+    let ctx = Ctx::spawn_with_config(
+        2,
+        |body| {
+            body["gate"]["lanes"][0]["pushFrom"] = json!("home");
+            body["gate"]["lanes"][0]["fetchRemote"] = json!("lane-alias");
+        },
+        |config| config.gate_cancel_grace_ms = 200,
+    )
+    .await?;
+    let response = ctx
+        .http
+        .patch(format!(
+            "http://{}/v1/projects/{}",
+            ctx.hub.addr, ctx.project
+        ))
+        .bearer_auth(&ctx.token)
+        .json(&json!({"homeHost": ctx.hosts[1]}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200, "{:?}", response.text().await);
+
+    // Hold the home host's gate.land open until the test releases it.
+    let release = Arc::new(Notify::new());
+    *ctx.scripts[1].land_gate.lock().unwrap() = Some(release.clone());
+
+    // The lane verifies immediately (no wait_cancel): the home-land handoff
+    // starts right after the pass.
+    ctx.scripts[0].script(
+        "wt/a/cancel-midpush",
+        RunSpec {
+            status: "passed",
+            merge_sha: Some("3333333333333333333333333333333333333333"),
+            merge_ref: Some("refs/remuda/gate/pinned"),
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/cancel-midpush","mode":"land","laneId":"lane1"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+
+    // Wait until the home push has genuinely started, then cancel into it.
+    let started = ctx.scripts[1].land_started.notified();
+    tokio::pin!(started);
+    tokio::time::timeout(Duration::from_secs(8), &mut started)
+        .await
+        .expect("home push should start");
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success());
+    // Let the (short) grace elapse while the push is still held: it must NOT
+    // finalize the job, because the home land is in flight.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mid = ctx.job(id).await;
+    assert_ne!(
+        mid["state"], "canceled",
+        "the grace must not finalize a job with a push in flight: {mid}"
+    );
+
+    // Release the push: it lands main. The honest outcome is `landed`.
+    release.notify_waiters();
+    let done = ctx.wait_state(id, &["landed", "canceled", "failed"]).await;
+    assert_eq!(
+        done["state"], "landed",
+        "a cancel during a push that lands main must report landed: {done}"
+    );
+    assert_eq!(
+        done["reason"], "cancel arrived after the home host pushed main",
+        "the late cancel is recorded honestly: {done}"
+    );
+    assert_eq!(
+        ctx.scripts[1].land_calls.lock().unwrap().len(),
+        1,
+        "the home host pushed exactly once"
+    );
+    // The landed job's lane refs are unpinned and the transition journaled.
+    for _ in 0..40 {
+        if !ctx.scripts[0].unpin_calls.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        ctx.scripts[0].unpin_calls.lock().unwrap().len(),
+        1,
+        "a landed job still drops the lane's pinned refs"
+    );
+    Ok(())
+}
+
 /// happened, and the late `passed` verdict is ignored rather than applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_run_reply_after_the_cancel_grace_changes_nothing() -> Result<()> {

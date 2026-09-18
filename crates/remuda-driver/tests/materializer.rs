@@ -1378,7 +1378,7 @@ mod shell_pty_agent {
         );
     }
 
-    /// D-036 / model-pin-1: an explicit pin must reach the process on **every**
+    /// model-pin-1: an explicit pin must reach the process on **every**
     /// claude carrier, byte-identical.
     ///
     /// The regression this pins down: `claude-print`/`claude-pty` emitted
@@ -1426,7 +1426,7 @@ mod shell_pty_agent {
     }
 
     /// Rule 3: no pin, no token. An instance with no `model_id` keeps the
-    /// pre-D-036 behaviour exactly — the harness picks, and nothing invents a
+    /// pre-model-pin-1 behaviour exactly — the harness picks, and nothing invents a
     /// default that then looks like a choice somebody made.
     #[test]
     fn no_pin_emits_no_model_token_on_any_carrier() {

@@ -919,7 +919,7 @@ pub struct WorkerRoster {
     /// Model id the agent was **asked** to launch with (the dispatch pin, or
     /// the ranked choice admission made).
     ///
-    /// This is a request, not an observation: D-036 / model-pin-1 found every
+    /// This is a request, not an observation: model-pin-1 found every
     /// roster row naming a pin that never reached the process. Read
     /// [`Self::model_effective`] for what actually answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]

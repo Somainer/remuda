@@ -81,11 +81,13 @@ pub use flags::validate_spec_args as validate_launch_args;
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, WaitUntil};
 pub use launch::{
     HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,
-    SHIM_DISABLE_ENV, ShimSet, TuiMode, materialize_overlay, materialize_shims, shim_disabled,
+    SHIM_DISABLE_ENV, ShimSet, TuiMode, apply_model_pin, is_model_env,
+    load_effective_user_settings, materialize_overlay, materialize_shims, merge_settings_layers,
+    shim_disabled,
 };
 pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,
-    materialize_with_token_broker, render_api_key_helper_script,
+    materialize_with_token_broker, pinned_model_for, render_api_key_helper_script,
 };
 pub use presets::{KindPreset, PRESETS, merge_yolo_argv, preset_by_id, preset_for_spec};
 pub use process::current_process_identity;

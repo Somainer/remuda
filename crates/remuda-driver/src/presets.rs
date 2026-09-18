@@ -35,6 +35,17 @@ pub struct KindPreset {
     pub home_env: Option<&'static str>,
     /// Whether the launch overlay is passed as `--settings <path>`.
     pub settings_flag: bool,
+    /// Flag that carries an explicit model pin, when this CLI takes one on an
+    /// interactive launch.
+    ///
+    /// D-036 / model-pin-1: the native PTY agent path used to emit no model
+    /// flag at all, so a dispatch `--model` was recorded in every audit record
+    /// and roster row while the host's own default answered every turn. Only
+    /// claude is wired here: codex and grok take their model through their own
+    /// config/subcommand vocabulary, and agy's interactive launch has no pin
+    /// flag to give — inventing a spelling for them would be a launch crash,
+    /// not a fix.
+    pub model_flag: Option<&'static str>,
 }
 
 /// Built-in presets for dogfood kinds.
@@ -49,6 +60,7 @@ pub const PRESETS: &[KindPreset] = &[
         done_means_idle: true,
         home_env: None,
         settings_flag: true,
+        model_flag: Some("--model"),
     },
     KindPreset {
         id: "codex",
@@ -60,6 +72,7 @@ pub const PRESETS: &[KindPreset] = &[
         done_means_idle: true,
         home_env: Some("CODEX_HOME"),
         settings_flag: false,
+        model_flag: None,
     },
     KindPreset {
         id: "grok",
@@ -71,6 +84,7 @@ pub const PRESETS: &[KindPreset] = &[
         done_means_idle: true,
         home_env: Some("GROK_HOME"),
         settings_flag: false,
+        model_flag: None,
     },
     KindPreset {
         id: "agy",
@@ -82,6 +96,7 @@ pub const PRESETS: &[KindPreset] = &[
         done_means_idle: true,
         home_env: None,
         settings_flag: false,
+        model_flag: None,
     },
     KindPreset {
         id: "gemini",
@@ -93,6 +108,7 @@ pub const PRESETS: &[KindPreset] = &[
         done_means_idle: true,
         home_env: None,
         settings_flag: false,
+        model_flag: None,
     },
 ];
 

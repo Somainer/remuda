@@ -1732,6 +1732,21 @@ fn prepare_launch_blocking(
         ),
         (user, operator) => user.or(operator),
     };
+    // D-036 / model-pin-1, belt and braces: an explicit pin is authoritative on
+    // its own, whatever the delegation. `none` still means the host owns the
+    // endpoint and the credential — it must stop meaning the host owns the
+    // model, which is how the 2026-09-18 demo ran every pinned worker on the
+    // host's default. Applied after the merge above so it lands on whichever
+    // base won, and only when a pin actually exists (rule 3: no pin, no
+    // change). This is the second channel; the materializer's `--model` argv is
+    // the first, and they carry the same id.
+    let model_pin = spec.and_then(crate::materializer::pinned_model_for);
+    if native_claude && let Some(pin) = model_pin.as_deref() {
+        crate::launch::apply_model_pin(
+            base_settings.get_or_insert_with(|| serde_json::json!({})),
+            pin,
+        );
+    }
     let provider_note = provider_source_lifecycle(
         options,
         &recipe,

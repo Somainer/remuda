@@ -41,7 +41,16 @@ pub async fn static_handler(uri: Uri, web_root: Option<PathBuf>) -> Response {
         let Ok(root) = root.canonicalize() else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        for asset in [path, "index.html"] {
+        // A miss under /assets/ is a stale hashed request from a superseded
+        // build: return 404 rather than falling through to index.html, so a
+        // module request never receives HTML (a 200 that dies on the MIME
+        // check is what turned a missing asset into a silent white page).
+        let fallbacks: &[&str] = if is_asset_path(path) {
+            &[]
+        } else {
+            &["index.html"]
+        };
+        for asset in std::iter::once(path).chain(fallbacks.iter().copied()) {
             if let Ok(candidate) = root.join(asset).canonicalize() {
                 // Check the resolved path, including the SPA fallback, so an
                 // in-root symlink cannot expose a file outside the web root.
@@ -55,12 +64,17 @@ pub async fn static_handler(uri: Uri, web_root: Option<PathBuf>) -> Response {
                 }
             }
         }
+        if is_asset_path(path) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
     }
 
     if let Some(file) = WebAssets::get(path) {
         return file_response(path, file.data.into_owned());
     }
-    if let Some(file) = WebAssets::get("index.html") {
+    if !is_asset_path(path)
+        && let Some(file) = WebAssets::get("index.html")
+    {
         return file_response("index.html", file.data.into_owned());
     }
     (
@@ -77,12 +91,39 @@ fn safe_relative_path(path: &str) -> bool {
         && !path.split('/').any(|segment| segment == "..")
 }
 
+/// Hashed build output under `/assets/`: its name changes per build, so it is
+/// cached forever and a miss is a hard 404 (never the SPA HTML fallback).
+fn is_asset_path(path: &str) -> bool {
+    path.starts_with("assets/")
+}
+
+/// `Cache-Control` policy by asset class: the shell (`index.html`, `sw.js`)
+/// must revalidate every load so a redeploy is picked up, while hashed
+/// `/assets/*` are immutable and cached for a year.
+fn cache_control_for(path: &str) -> &'static str {
+    if is_asset_path(path) {
+        "public, max-age=31536000, immutable"
+    } else if path == "index.html" || path == "sw.js" {
+        "no-cache"
+    } else {
+        // Everything else (manifest, icons, favicon) keeps today's behaviour:
+        // no explicit directive.
+        ""
+    }
+}
+
 fn file_response(path: &str, body: Vec<u8>) -> Response {
     let mime = mime_of(path);
     let mut response = body.into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    let cache_control = cache_control_for(path);
+    if !cache_control.is_empty() {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(cache_control),
+        );
+    }
     response
 }
 

@@ -355,11 +355,17 @@ live 证据里第 1 轮报 `false`、第 2 轮报 `true`，两个都不对（第
 要修得先定义「对一个长寿子进程而言什么算终结」，那是 M2 的决定，不是同轮改动。
 证据见 [claude-sdk-1.md](./evidence/claude-sdk-1.md) §6。
 
-**close 的残留（复审记账，M2）**：有界阶梯消除了「永不返回」，但 `close` 在整段
-阶梯期间一直持有 `inner.live` 锁，所以这段时间里 `send` / `cancel` /
-`respond_interaction`（它们都要拿同一把锁）仍是阻塞的——只是被 `close_timeout`
-**封顶**而不是消除。要彻底不阻塞，得让 close 不持锁地驱动终止（把 live 取出后在锁外
-跑阶梯、或让控制操作走独立通道），那会动到 `Live` 的所有权形状，超出 M1。
+**close 的残留（复审记账，M2；详见
+[claude-sdk-1.md](./evidence/claude-sdk-1.md) §9）**：有界阶梯只在 `close` **已经拿到
+`inner.live` 锁之后**消除了「无界 wait」。锁本身仍是另一道门：`Driver::send` 持有
+这把锁、一直 await 到 `send_user` 把一行写进 64 槽 writer channel 为止，而 Node 路径
+（`crates/remuda-node/src/native.rs` 的 `DriverRequest::Send`）对这次 await **没有任何
+超时**。于是对一个停止 drain stdin 的子进程，writer 通道写满后，先到的 `send` 会一直
+占着 `inner.live`，后到的 `instance.close` 拿不到锁、阶梯根本开不起来——仍可能从这扇
+门挂死。这不是本轮的有界 EOF 请求能覆盖的（那条只在 close 已持锁后生效）。**M2 的
+所有权改造项**：给 `send` 加界（写通道超时），或让 `close` 以超时方式取锁 / 不持锁地
+驱动终止（把 live 取出后在锁外跑阶梯、或控制操作走独立通道）。那会动到 `Live` 的
+所有权形状，超出 M1。
 
 **实测**：[claude-sdk-1.md](./evidence/claude-sdk-1.md) 在一台一次性本地 dev server
 上用真实 CLI 跑了一轮 `LIVE`：`--driver claude-sdk` 被原样转发，进程表里的 argv

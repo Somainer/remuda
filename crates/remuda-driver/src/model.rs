@@ -14,7 +14,7 @@
 //! - rejects (`Model '<id>' not found`) and dismissed pickers (`Kept model
 //!   as <id>`) are `system` transcript records, not `user` records.
 
-use remuda_protocol::{ObservedModel, Severity};
+use remuda_protocol::{EffortSource, ModelSelectionPath, ObservedModel, Severity};
 use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
@@ -97,7 +97,17 @@ struct BridgeState {
     verdict_gen: u64,
     verdict: Option<ModelReadback>,
     requested: Option<ModelRequest>,
+    /// Whether the current `requested` id was offered by the session's own
+    /// resolved catalog (`listed`) or typed verbatim (`typed`). Absent for
+    /// launch seeds and terminal-side switches.
+    requested_path: Option<ModelSelectionPath>,
     generation: u64,
+    /// The session's own switchable ids. `None` while the only answer was the
+    /// host-fallback cache (the CLI's own list is not known then).
+    own_catalog: Option<Vec<String>>,
+    /// The latest effective model, with what established it, so a catalog
+    /// refresh can name the model in effect without inventing an edge.
+    last_effective: Option<(String, EffortSource, Option<ModelSelectionPath>)>,
 }
 
 impl ModelBridge {
@@ -114,17 +124,47 @@ impl ModelBridge {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// Seed/update the session's own resolved catalog. The scoped cache,
+    /// settings and builtin answers describe ids the CLI itself will accept;
+    /// the host-fallback answer does not, so it is seeded as `None`.
+    pub(crate) fn set_own_catalog(&self, ids: Option<Vec<String>>) {
+        self.lock().own_catalog = ids;
+    }
+
+    /// The latest effective model, its attribution and selection path.
+    pub(crate) fn last_effective(
+        &self,
+    ) -> Option<(String, EffortSource, Option<ModelSelectionPath>)> {
+        self.lock().last_effective.clone()
+    }
+
     pub(crate) fn arm(&self, request: ModelRequest) -> u64 {
         let mut state = self.lock();
+        let path = match &state.own_catalog {
+            Some(ids) => {
+                if ids.iter().any(|id| id == &request.id) {
+                    ModelSelectionPath::Listed
+                } else {
+                    ModelSelectionPath::Typed
+                }
+            }
+            // The session's own list is unknown (host-fallback answer): any
+            // switch is a verbatim `/model <id>` the verdict must judge.
+            None => ModelSelectionPath::Typed,
+        };
         state.generation += 1;
         let generation = state.generation;
         state.pending = Some((generation, request.clone()));
         state.requested = Some(request);
+        state.requested_path = Some(path);
         generation
     }
 
     pub(crate) fn note_launch_request(&self, id: String) {
-        self.lock().requested = Some(ModelRequest { id });
+        let mut state = self.lock();
+        state.requested = Some(ModelRequest { id: id.clone() });
+        state.requested_path = None;
+        state.last_effective = Some((id, EffortSource::Launch, None));
     }
 
     pub(crate) fn pending(&self) -> Option<ModelRequest> {
@@ -148,6 +188,22 @@ impl ModelBridge {
         self.lock().requested.clone()
     }
 
+    /// Selection path recorded for the current `requested` switch, if any.
+    pub(crate) fn requested_path(&self) -> Option<ModelSelectionPath> {
+        self.lock().requested_path
+    }
+
+    /// Record the latest model the transcript proved in effect, with its
+    /// attribution and the selection path that established it.
+    pub(crate) fn note_effective(
+        &self,
+        id: String,
+        source: EffortSource,
+        path: Option<ModelSelectionPath>,
+    ) {
+        self.lock().last_effective = Some((id, source, path));
+    }
+
     pub(crate) fn resolve(&self, generation: u64, observed: ObservedModel) {
         {
             let mut state = self.lock();
@@ -156,6 +212,11 @@ impl ModelBridge {
             {
                 state.pending = None;
             }
+            state.last_effective = Some((
+                observed.id.clone(),
+                EffortSource::Remuda,
+                state.requested_path,
+            ));
             state.verdict = Some(ModelReadback::Applied(observed));
             state.verdict_gen = generation;
         }
@@ -585,5 +646,43 @@ mod tests {
                 .any(|(s, sev)| s.starts_with("model-degraded:bogus:not-found")
                     && *sev == Severity::Warning)
         );
+    }
+
+    #[test]
+    fn arm_marks_listed_ids_and_typed_fallback() {
+        let bridge = ModelBridge::new();
+        bridge.set_own_catalog(Some(vec!["e2e/auto".to_owned(), "e2e/fast".to_owned()]));
+        bridge.arm(ModelRequest::new("e2e/fast").unwrap());
+        assert_eq!(bridge.requested_path(), Some(ModelSelectionPath::Listed));
+        bridge.arm(ModelRequest::new("claude-grok-4.6").unwrap());
+        assert_eq!(bridge.requested_path(), Some(ModelSelectionPath::Typed));
+    }
+
+    #[test]
+    fn host_fallback_answer_makes_every_switch_typed() {
+        // Only the host-fallback cache answered: the session's own list is
+        // unknown, so even ids the fallback offered must go through the
+        // verbatim /model path and let the verdict decide.
+        let bridge = ModelBridge::new();
+        bridge.set_own_catalog(None);
+        bridge.arm(ModelRequest::new("claude-grok-4.6").unwrap());
+        assert_eq!(bridge.requested_path(), Some(ModelSelectionPath::Typed));
+    }
+
+    #[test]
+    fn resolve_records_the_effective_model() {
+        let bridge = ModelBridge::new();
+        bridge.note_launch_request("e2e/auto".to_owned());
+        let generation = bridge.arm(ModelRequest::new("e2e/fast").unwrap());
+        bridge.resolve(
+            generation,
+            ObservedModel {
+                id: "e2e/fast".to_owned(),
+            },
+        );
+        let (id, source, path) = bridge.last_effective().expect("effective recorded");
+        assert_eq!(id, "e2e/fast");
+        assert_eq!(source, EffortSource::Remuda);
+        assert_eq!(path, Some(ModelSelectionPath::Typed));
     }
 }

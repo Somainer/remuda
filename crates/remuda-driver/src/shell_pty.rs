@@ -1140,13 +1140,69 @@ impl ShellPtyDriver {
                     .parent()
                     .map(std::path::Path::to_path_buf)
             });
+        let catalog_env: Vec<(String, String)> =
+            agent_env(&self.options.target, &recipe, self.options.pin_native_home)
+                .into_iter()
+                .chain(
+                    self.options
+                        .extra_env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                )
+                .filter(|(key, _)| !crate::child_env::is_denied(key))
+                .collect();
         let model_catalog = crate::model_discovery::resolve_catalog(
             Some(std::path::Path::new(&recipe.native_home)),
             host_config_dir.as_deref(),
             Some(&std::path::Path::new(&recipe.native_home).join("settings.json")),
-            &[],
+            &catalog_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
             launch_model.as_deref(),
         );
+        model_bridge.set_own_catalog(crate::model_discovery::own_ids(&model_catalog));
+        // The scoped discovery cache is written a beat after launch; while it
+        // is missing the promotion-time answer may be the host fallback.
+        // Re-resolve when the session's own cache lands and re-stamp the
+        // catalog so the picker never freezes on the fallback list.
+        {
+            let bridge = Arc::clone(&model_bridge);
+            let events = tx.clone();
+            let seq = Arc::clone(&self.seq);
+            let ctx = hook_ctx.clone();
+            let initial = model_catalog.clone();
+            let native_home = recipe.native_home.clone();
+            let settings_path = std::path::PathBuf::from(&recipe.native_home).join("settings.json");
+            let host_dir = host_config_dir.clone();
+            let current = launch_model.clone();
+            let env = catalog_env.clone();
+            tokio::spawn(async move {
+                let payload = crate::model_discovery::scoped_refresh_payload(
+                    std::path::PathBuf::from(native_home),
+                    host_dir,
+                    Some(settings_path),
+                    env,
+                    current,
+                    initial,
+                    bridge,
+                )
+                .await;
+                if let Some(body) = payload
+                    && let Err(error) = crate::shell_pty::promotion::emit_payload(
+                        &events,
+                        &seq,
+                        &ctx,
+                        remuda_protocol::SourceChannel::Transcript,
+                        remuda_protocol::Completeness::Structured,
+                        body,
+                    )
+                    .await
+                {
+                    tracing::debug!(%error, "model catalog refresh: event channel closed");
+                }
+            });
+        }
         let model_io: Arc<dyn crate::model::SwitchIo> = Arc::new(ShellEffortIo {
             state: Arc::clone(&state),
             events: tx.clone(),

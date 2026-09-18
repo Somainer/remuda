@@ -482,17 +482,22 @@ class HubStore {
         [instanceId]: parsed.catalog,
       };
     }
-    if (live && this.state.modelPending[instanceId]) {
+    // A catalog-only refresh edge (the scoped gateway cache landed after
+    // promotion; no `requested`, so it is not a switch verdict) hydrates the
+    // list but must never settle an in-flight pending or move the optimistic
+    // selection.
+    const catalogOnly = Boolean(parsed.catalog) && !parsed.hasRequested;
+    if (live && this.state.modelPending[instanceId] && !catalogOnly) {
       // Our own push-down settled: keep the optimistic selection; the mismatch
       // line renders if the resolved id differs.
       patch.modelPending = { ...this.state.modelPending };
       delete patch.modelPending[instanceId];
-    } else if (live) {
+    } else if (live && !catalogOnly) {
       // Live, terminal-side switch: fold the observed id into the local
       // selection so a hand-typed `/model` moves the picker, never calling
       // configure back.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
-    } else if (this.state.models[instanceId] == null) {
+    } else if (!live && this.state.models[instanceId] == null) {
       // History replay on a fresh mount: seed the selection from the observed
       // id so the picker reflects the resolved model after reload.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
@@ -1480,10 +1485,22 @@ class HubStore {
     try {
       await this.configure(instanceId, this.permissionModeOf(instanceId), { model });
     } catch (error) {
+      // A post the Hub/Node refused (offline node, 4xx, network) must be
+      // pixel-distinguishable from a switch that worked: clear pending,
+      // revert the optimistic selection to the last observed id, and toast
+      // the reason — same shape as a model-degraded lifecycle rejection.
       const pending = { ...this.state.modelPending };
       delete pending[instanceId];
-      this.emit({ modelPending: pending });
-      throw error;
+      const effective = this.state.modelEffective[instanceId];
+      const models = { ...this.state.models };
+      if (effective) models[instanceId] = effective.id;
+      else delete models[instanceId];
+      const reason = error instanceof Error ? error.message : String(error);
+      this.toast(`模型切换失败：${reason}`);
+      this.emit({ modelPending: pending, models });
+      // Swallow after reporting: SessionPage hands this promise straight to
+      // the Composer (no void), and the toast is the failure mouth. Re-
+      // throwing would only create an unhandled rejection.
     }
   }
 

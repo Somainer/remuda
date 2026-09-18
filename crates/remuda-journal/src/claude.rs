@@ -653,6 +653,7 @@ fn model_envelope(
             },
             raw: raw.map(str::to_owned),
             catalog: None,
+            selection_path: None,
         })),
     )?;
     env.event_id = Some(event_id);

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { readDraft, writeDraft } from "../../lib/drafts";
 import { expandCodeQuotes } from "../../lib/codeAnchors";
 import {
@@ -21,6 +21,8 @@ import type { PromptMode } from "../../types/generated";
 import type { CapabilitySnapshot } from "../../types/nativeRef";
 import { AttachButtons, AttachmentChips, CodeQuoteChips } from "./AttachmentChips";
 import { EffortSlider } from "./EffortSlider";
+import { useAnchoredPopover } from "./AnchoredPopover";
+import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
 import {
   defaultEffortIndex,
   effortAt,
@@ -49,7 +51,6 @@ import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import css from "./session.module.css";
 
 type MenuId = "effort" | "permission" | "usage" | null;
-type Placement = "up" | "down";
 
 /** A held prompt row (c-steer). `id` is the local bubble id. */
 export type HeldItem = {
@@ -85,6 +86,8 @@ export function Composer({
   models,
   modelEffective,
   modelPending,
+  modelSelectionPath,
+  modelCatalog,
   effort,
   onEffort,
   effortEffective,
@@ -144,6 +147,10 @@ export function Composer({
   modelEffective?: string | null;
   /** §9.1 a model switch in flight. */
   modelPending?: { id: string; queued: boolean } | null;
+  /** Read-back marker: did the last Remuda switch pick a listed id or type it. */
+  modelSelectionPath?: ModelSelectionPath | null;
+  /** Resolved catalog with provenance, for the picker diagnostic note. */
+  modelCatalog?: ModelCatalogView | null;
   effort?: EffortSelection;
   onEffort?: (next: EffortSelection) => void;
   /** §9.1 transcript-read-back level; null/undefined = unobserved (`?`). */
@@ -172,7 +179,6 @@ export function Composer({
 }) {
   const [text, setText] = useState(() => readDraft(instanceId));
   const [menu, setMenu] = useState<MenuId>(null);
-  const [placement, setPlacement] = useState<Placement>("down");
   // Mirrors of prompts posted straight into a harness-native queue (codex
   // Tab): the wire owns them, so these chips are display-only and never
   // cancelable here. Remuda-held rows arrive through the `held` prop.
@@ -201,8 +207,50 @@ export function Composer({
   // previous insert just produced rather than a stale React closure.
   const textRef = useRef(text);
   textRef.current = text;
-  const barRef = useRef<HTMLDivElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
+  const menuRefs = {
+    effort: useRef<HTMLDivElement>(null),
+    permission: useRef<HTMLDivElement>(null),
+    usage: useRef<HTMLDivElement>(null),
+  };
+  const triggerRefs = {
+    effort: useRef<HTMLButtonElement>(null),
+    permission: useRef<HTMLButtonElement>(null),
+    usage: useRef<HTMLButtonElement>(null),
+  };
+  // A pending approval/question card parks above the composer; a menu opening
+  // upward must not overlap it. The getter re-queries the DOM at measure time
+  // (the card lives in a different React subtree and can appear late).
+  const approvalRef = useMemo<{ readonly current: HTMLElement | null }>(
+    () => ({
+      get current() {
+        return document.querySelector<HTMLElement>(
+          "[data-testid='approval-card'], [data-testid='question-form']",
+        );
+      },
+    }),
+    [],
+  );
+  // Each menu is anchored to ITS OWN trigger chip, flips on the room the
+  // measured panel actually needs (re-measured on the slider/list flip via
+  // ResizeObserver), and is height-capped to the available viewport room.
+  const effortAnchor = useAnchoredPopover(
+    triggerRefs.effort,
+    menuRefs.effort,
+    menu === "effort",
+    { align: "start", preferUp: true, avoidElements: [approvalRef] },
+  );
+  const permissionAnchor = useAnchoredPopover(
+    triggerRefs.permission,
+    menuRefs.permission,
+    menu === "permission",
+    { align: "end", preferUp: true, avoidElements: [approvalRef] },
+  );
+  const usageAnchor = useAnchoredPopover(
+    triggerRefs.usage,
+    menuRefs.usage,
+    menu === "usage",
+    mobile ? { sheet: true } : { align: "end", preferUp: false },
+  );
   const phaseRef = useRef(phase);
   // The harness is fixed for the life of a session; it is chosen on New Session.
   const harness = kind;
@@ -532,7 +580,17 @@ export function Composer({
       if (!rootRef.current?.contains(event.target as Node)) dismissUsage();
     };
     const onKey = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") dismissUsage();
+      if (event.key !== "Escape") return;
+      // Return focus to the chip that opened the menu before it unmounts.
+      if (menu) {
+        const chipFor: Record<NonNullable<MenuId>, React.RefObject<HTMLElement | null>> = {
+          effort: triggerRefs.effort,
+          permission: triggerRefs.permission,
+          usage: triggerRefs.usage,
+        };
+        chipFor[menu].current?.focus();
+      }
+      dismissUsage();
     };
     window.addEventListener("pointerdown", onDown);
     window.addEventListener("keydown", onKey);
@@ -542,22 +600,8 @@ export function Composer({
     };
   }, [menu]);
 
-  useLayoutEffect(() => {
-    if (!menu) return;
-    const bar = barRef.current;
-    const panel = menuRef.current;
-    if (!bar || !panel) return;
-    const barRect = bar.getBoundingClientRect();
-    const approval = document.querySelector("[data-testid='approval-card'], [data-testid='question-form']");
-    const approvalBottom = approval?.getBoundingClientRect().bottom ?? 0;
-    const roomAbove = barRect.top - Math.max(approvalBottom, 0);
-    const next = roomAbove >= panel.offsetHeight + 8 ? "up" : "down";
-    if (next !== placement) setPlacement(next);
-  }, [menu, harness, currentEffort.index, placement]);
-
   const toggle = (id: MenuId) => {
     if (id !== "usage") usagePinned.current = false;
-    setPlacement("down");
     setMenu((cur) => (cur === id ? null : id));
   };
 
@@ -590,6 +634,11 @@ export function Composer({
   const primaryTestId =
     controls.primary.kind === "queue" ? "composer-queue" : "composer-send";
 
+  const modelLockedReason = caps.model
+    ? effortDisabled
+      ? "会话已退出或为只读会话（observed-only），无法下发 instance.configure"
+      : null
+    : "此会话不支持模型切换（无 instance.configure 能力）";
   return (
     <form
       ref={rootRef}
@@ -718,7 +767,7 @@ export function Composer({
           onKeyDown={onKeyDown}
         />
       </div>
-      <div className={css.controlBar} ref={barRef} data-testid="composer-bar">
+      <div className={css.controlBar} data-testid="composer-bar">
         <AttachButtons
           className={css.chip}
           disabled={disabled}
@@ -734,6 +783,7 @@ export function Composer({
         ) : null}
         {caps.effort ? (
           <button
+            ref={triggerRefs.effort}
             type="button"
             className={`${css.chip} ${ember ? css.ember : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
             data-testid="model-effort-chip"
@@ -773,6 +823,7 @@ export function Composer({
         ) : null}
         {caps.context ? (
           <button
+            ref={triggerRefs.usage}
             type="button"
             className={css.chip}
             data-testid="context-chip"
@@ -792,14 +843,12 @@ export function Composer({
               if (usageRollup) {
                 usagePinned.current = true;
                 cancelHoverClose();
-                setPlacement("down");
                 setMenu("usage");
               }
             }}
             onMouseEnter={() => {
               if (usageRollup && hoverCapable()) {
                 cancelHoverClose();
-                setPlacement("down");
                 setMenu("usage");
               }
             }}
@@ -815,6 +864,7 @@ export function Composer({
         {caps.permission ? (
           onPermission ? (
             <button
+              ref={triggerRefs.permission}
               type="button"
               className={`${css.chip} ${permissionPending ? css.chipPending : ""}`}
               data-testid="permission-chip"
@@ -903,18 +953,20 @@ export function Composer({
           rollup={usageRollup}
           mobile={mobile}
           onClose={dismissUsage}
-          anchorUp={!mobile && placement === "up"}
-          panelRef={menuRef}
+          placement={usageAnchor.placement}
+          anchorStyle={usageAnchor.style}
+          panelRef={menuRefs.usage}
           onMouseEnter={cancelHoverClose}
           onMouseLeave={scheduleHoverClose}
         />
       ) : null}
       {menu === "effort" ? (
         <div
-          ref={menuRef}
-          className={`${css.popover} ${css.popoverCard} ${placement === "up" ? css.popoverUp : ""}`}
+          ref={menuRefs.effort}
+          style={effortAnchor.style}
+          className={`${css.popover} ${css.popoverCard}`}
           data-testid="effort-menu"
-          data-placement={placement}
+          data-placement={effortAnchor.placement}
         >
           <EffortSlider
             kind={harness}
@@ -922,21 +974,30 @@ export function Composer({
             models={caps.model ? models : undefined}
             modelEffective={caps.model ? modelEffective : null}
             modelPending={caps.model ? modelPending : null}
+            modelSelectionPath={caps.model ? modelSelectionPath : null}
+            modelCatalog={caps.model ? (modelCatalog ?? null) : null}
+            modelLockedReason={modelLockedReason}
             index={currentEffort.index}
             ultracode={ultraOn}
             disabled={effortLocked}
             onChange={(next) => onEffort?.(next)}
             onModel={caps.model ? onModel : undefined}
+            onClose={() => {
+              setMenu(null);
+              triggerRefs.effort.current?.focus();
+            }}
           />
         </div>
       ) : null}
       {menu === "permission" ? (
         <div
-          ref={menuRef}
-          className={`${css.popover} ${placement === "up" ? css.popoverUp : ""}`}
+          ref={menuRefs.permission}
+          style={permissionAnchor.style}
+          className={css.popover}
           data-testid="permission-menu"
-          data-placement={placement}
+          data-placement={permissionAnchor.placement}
         >
+          <div data-popover-scroll="1">
           {permOptions.map((m) => {
             const reachable = isLiveReachable(harness, m.id, launchPermissionMode);
             const active = liveMode === m.id;
@@ -967,6 +1028,7 @@ export function Composer({
               </button>
             );
           })}
+          </div>
         </div>
       ) : null}
     </form>

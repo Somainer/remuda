@@ -11330,9 +11330,69 @@
         }
       ]
     },
+    "ModelCacheInfo": {
+      "description": "Provenance of the gateway discovery cache that answered a catalog\nresolution, so the UI can flag a list the session's own CLI may reject.",
+      "properties": {
+        "baseUrl": {
+          "description": "`baseUrl` recorded in the cache document, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fetchedAt": {
+          "description": "`fetchedAt` recorded in the cache document, verbatim, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "$ref": "#/$defs/ModelCacheScope",
+          "description": "Scoped session cache or the host fallback."
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "type": "object"
+    },
+    "ModelCacheScope": {
+      "description": "Which `cache/gateway-models.json` file answered a catalog resolution.",
+      "oneOf": [
+        {
+          "const": "scoped-config-dir",
+          "description": "The session's own scoped config dir (`CLAUDE_CONFIG_DIR`).",
+          "type": "string"
+        },
+        {
+          "const": "host-fallback",
+          "description": "The host user's conventional `~/.claude` dir, used as a fallback\nbecause the scoped cache had not been written yet.",
+          "type": "string"
+        }
+      ]
+    },
     "ModelCatalogInfo": {
       "description": "The model list a session can actually switch to, with its provenance.",
       "properties": {
+        "cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelCacheInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Gateway cache provenance when `source` is gateway discovery: which\ncache file answered (scoped or host fallback) and the base URL / fetch\ntime it recorded. Absent for settings/builtin resolutions."
+        },
+        "discoveryEnv": {
+          "description": "Whether `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` was present in\nthe launch environment. Absent when it could not be determined.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "models": {
           "description": "Model ids/aliases, display order, de-duplicated.",
           "items": {
@@ -11437,6 +11497,17 @@
             "string",
             "null"
           ]
+        },
+        "selectionPath": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelSelectionPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "For a Remuda-initiated switch (`effective.source = remuda`), whether\nthe requested id came from the session's own list or was typed\nverbatim. Absent for launch snapshots and terminal-side switches."
         }
       },
       "required": [
@@ -11477,6 +11548,21 @@
         }
       },
       "type": "object"
+    },
+    "ModelSelectionPath": {
+      "description": "How a Remuda-initiated switch selected its id. The verdict (not this\nmarker) remains the acceptance authority; this only says whether the id\nwas offered by the session's own discovered list.",
+      "oneOf": [
+        {
+          "const": "listed",
+          "description": "The id was listed by the session's own resolved catalog.",
+          "type": "string"
+        },
+        {
+          "const": "typed",
+          "description": "The id was not listed; Remuda typed `/model <id>` verbatim and let\nthe CLI verdict decide.",
+          "type": "string"
+        }
+      ]
     },
     "ModelSwitchInput": {
       "description": "ModelSwitchInput; `protocol.md` §3.1.",

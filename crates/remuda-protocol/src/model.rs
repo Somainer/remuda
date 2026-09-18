@@ -403,6 +403,51 @@ pub enum ModelListSource {
     Builtin,
 }
 
+/// Which `cache/gateway-models.json` file answered a catalog resolution.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelCacheScope {
+    /// The session's own scoped config dir (`CLAUDE_CONFIG_DIR`).
+    ScopedConfigDir,
+    /// The host user's conventional `~/.claude` dir, used as a fallback
+    /// because the scoped cache had not been written yet.
+    HostFallback,
+}
+
+/// Provenance of the gateway discovery cache that answered a catalog
+/// resolution, so the UI can flag a list the session's own CLI may reject.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCacheInfo {
+    /// Scoped session cache or the host fallback.
+    pub scope: ModelCacheScope,
+    /// `baseUrl` recorded in the cache document, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// `fetchedAt` recorded in the cache document, verbatim, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetched_at: Option<String>,
+}
+
+/// How a Remuda-initiated switch selected its id. The verdict (not this
+/// marker) remains the acceptance authority; this only says whether the id
+/// was offered by the session's own discovered list.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelSelectionPath {
+    /// The id was listed by the session's own resolved catalog.
+    Listed,
+    /// The id was not listed; Remuda typed `/model <id>` verbatim and let
+    /// the CLI verdict decide.
+    Typed,
+}
+
 /// The model list a session can actually switch to, with its provenance.
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
@@ -415,6 +460,15 @@ pub struct ModelCatalogInfo {
     pub source: ModelListSource,
     /// When the list was resolved.
     pub observed_at: Timestamp,
+    /// Gateway cache provenance when `source` is gateway discovery: which
+    /// cache file answered (scoped or host fallback) and the base URL / fetch
+    /// time it recorded. Absent for settings/builtin resolutions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<ModelCacheInfo>,
+    /// Whether `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` was present in
+    /// the launch environment. Absent when it could not be determined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_env: Option<bool>,
 }
 
 /// Parse a `cache/gateway-models.json` document into ordered model ids.

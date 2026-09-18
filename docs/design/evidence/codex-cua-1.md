@@ -96,6 +96,41 @@ lookup off its default.
   every committed skill script, frontmatter `name` == directory name, file
   modes, and a reject list for host-mutating instructions.
 
+## Repository checks (2026-09-19, worktree `wt/c-cua-skill`)
+
+```
+$ git ls-files skills/codex-computer-use
+skills/codex-computer-use/SKILL.md
+skills/codex-computer-use/references/setup.md
+skills/codex-computer-use/scripts/launch-cua-repl.sh
+skills/codex-computer-use/scripts/launch-mcp.sh
+skills/codex-computer-use/scripts/probe_mcp.py
+
+$ ./scripts/ci/no-tunnel-scan.sh
+no-tunnel-scan: passed
+
+$ ./scripts/ci/secret-scan.sh
+secret-scan: pass
+
+$ ./scripts/ci/skills-lint.sh
+skills-lint: passed
+```
+
+`skills-lint` also runs in CI as its own step in the `rust` job (beside the
+coordinator script tests), and `scripts/tests/test_skills_lint.py` is picked up
+by the existing `unittest discover -s scripts/tests`.
+
+The refusal path the gated launcher takes without a grant:
+
+```
+$ /bin/sh skills/codex-computer-use/scripts/launch-cua-repl.sh
+codex-computer-use: refusing to start the cua-repl desktop-control surface.
+It evaluates arbitrary JS with click/typeText/pressKey over every app on this desktop.
+A Remuda launch grants it with --capability computer-use, which sets
+REMUDA_CAPABILITY_COMPUTER_USE=1 for the agent. There is no interactive bypass.
+(exit 1)
+```
+
 ## Redaction rule for CUA evidence
 
 A CUA screenshot can show anything that was on the desktop. Evidence in this

@@ -136,8 +136,7 @@ fn source_routes() -> BTreeSet<(String, String)> {
                         // Require a non-identifier char before the method name
                         // (so `forget(` does not match `get(`) — the name always
                         // follows `.`, `:`, whitespace or the argument start.
-                        let boundary = idx == 0
-                            || !ident_char(services.as_bytes()[idx - 1]);
+                        let boundary = idx == 0 || !ident_char(services.as_bytes()[idx - 1]);
                         if boundary {
                             matched.push(method.to_string());
                         }
@@ -173,7 +172,10 @@ fn openapi_is_31_and_covers_source_routes_and_methods() {
     // The push carrier is nest-mounted, not .route-registered, so pin its
     // documented subpaths explicitly.
     for push_path in ["/push/config", "/push/subscriptions"] {
-        assert!(paths.contains_key(push_path), "openapi.json missing {push_path}");
+        assert!(
+            paths.contains_key(push_path),
+            "openapi.json missing {push_path}"
+        );
     }
 
     // Documented (method, path) operations.
@@ -269,11 +271,23 @@ fn command_record_schema_matches_the_serialized_struct() {
         BTreeSet::from(["clear".into(), "reconciling".into(), "unknown".into()]),
         "Command.resolution must stay the §12.2 vocabulary"
     );
+    // The settlement outcome enum must equal the *entire* protocol
+    // SettlementOutcome set, not merely contain the sample's value: the journal
+    // projection persists any outcome the protocol enum parses (including
+    // `expired`), so a narrower spec would document a vocabulary the Hub emits.
+    assert_eq!(
+        enum_values(schema, "/properties/settlement/properties/outcome/enum"),
+        remuda_hub::store_test_support::settlement_outcome_wire_values(),
+        "settlement.outcome enum must match the protocol SettlementOutcome set"
+    );
     // The sample is a rejected settlement; both levels use documented values.
-    assert!(enum_values(schema, "/properties/settlement/properties/outcome/enum")
-        .contains(sample["settlement"]["outcome"].as_str().unwrap()));
-    assert!(enum_values(schema, "/properties/state/enum")
-        .contains(sample["state"].as_str().unwrap()));
+    assert!(
+        enum_values(schema, "/properties/settlement/properties/outcome/enum")
+            .contains(sample["settlement"]["outcome"].as_str().unwrap())
+    );
+    assert!(
+        enum_values(schema, "/properties/state/enum").contains(sample["state"].as_str().unwrap())
+    );
 
     // Internal ledger columns must never leak to the wire.
     for private in ["settlementOutcome", "settlementReason", "reason"] {

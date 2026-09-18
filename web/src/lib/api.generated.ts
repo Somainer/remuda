@@ -1709,7 +1709,7 @@ export interface components {
             resolution: "clear" | "reconciling" | "unknown";
             settlement?: {
                 /** @enum {string} */
-                outcome: "cancelled" | "completed" | "rejected";
+                outcome: "cancelled" | "completed" | "expired" | "rejected";
                 reason?: string;
             } & {
                 [key: string]: unknown;

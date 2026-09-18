@@ -554,7 +554,10 @@ async fn a_send_the_node_rejects_settles_rejected_and_is_listed_by_the_new_route
     assert_eq!(row["resolution"], json!("clear"));
     assert_eq!(row["settlement"]["outcome"], json!("rejected"));
     assert!(
-        row["settlement"].get("reason").and_then(Value::as_str).is_some(),
+        row["settlement"]
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some(),
         "{row}"
     );
     assert!(row.get("reason").is_none(), "no top-level reason: {row}");
@@ -675,7 +678,11 @@ async fn a_send_the_node_never_acks_rests_reconciling_and_is_never_self_failed()
         .to_string();
     // The lost RPC reply marked it reconciling, still three-state `queued`.
     assert_eq!(body["command"]["state"], json!("queued"), "{body}");
-    assert_eq!(body["command"]["resolution"], json!("reconciling"), "{body}");
+    assert_eq!(
+        body["command"]["resolution"],
+        json!("reconciling"),
+        "{body}"
+    );
     assert_eq!(body["command"]["forwarded"], json!(true), "{body}");
     assert!(body["command"].get("settlement").is_none(), "{body}");
 
@@ -713,8 +720,14 @@ async fn a_send_the_node_never_acks_rests_reconciling_and_is_never_self_failed()
             json!("settled"),
             "a never-acked send must not be settled (rejected or otherwise): {row}"
         );
-        assert!(row.get("settlement").is_none(), "no settlement is invented: {row}");
-        assert!(row.get("reason").is_none(), "no top-level reason field: {row}");
+        assert!(
+            row.get("settlement").is_none(),
+            "no settlement is invented: {row}"
+        );
+        assert!(
+            row.get("reason").is_none(),
+            "no top-level reason field: {row}"
+        );
         assert_eq!(row["forwarded"], json!(true), "{row}");
     }
     Ok(())

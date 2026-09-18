@@ -325,6 +325,7 @@
                 "enum": [
                   "cancelled",
                   "completed",
+                  "expired",
                   "rejected"
                 ],
                 "type": "string"

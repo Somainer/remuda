@@ -114,6 +114,7 @@ pub mod store_test_support {
 
     use crate::store::{CommandRecord, CommandSettlement, InstanceDelegation};
     use serde_json::{Value, json};
+    use std::collections::BTreeSet;
 
     pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
@@ -294,6 +295,31 @@ pub mod store_test_support {
             updated_at: "2026-09-18T00:00:01.000Z".into(),
         };
         serde_json::to_value(record).expect("command record serializes")
+    }
+
+    /// The wire values the protocol assigns to `SettlementOutcome` (§2.5),
+    /// serialized from the enum itself. The journal projection accepts exactly
+    /// the values this enum parses, so the OpenAPI test diffs the documented
+    /// `settlement.outcome` enum against this set: a protocol outcome (such as
+    /// `expired`) cannot be persisted by the projection while missing from the
+    /// spec and generated client.
+    pub fn settlement_outcome_wire_values() -> BTreeSet<String> {
+        use remuda_protocol::SettlementOutcome;
+        [
+            SettlementOutcome::Completed,
+            SettlementOutcome::Rejected,
+            SettlementOutcome::Cancelled,
+            SettlementOutcome::Expired,
+        ]
+        .into_iter()
+        .map(|outcome| {
+            serde_json::to_value(outcome)
+                .expect("settlement outcome serializes")
+                .as_str()
+                .expect("wire value is a string")
+                .to_owned()
+        })
+        .collect()
     }
 }
 

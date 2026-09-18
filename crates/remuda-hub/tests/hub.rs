@@ -514,7 +514,8 @@ async fn a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route(
         .context("commandId")?
         .to_string();
     assert_eq!(
-        body["command"]["state"], json!("failed"),
+        body["command"]["state"],
+        json!("failed"),
         "a rejected send must resolve failed, not queued: {body}"
     );
     let reason = body["command"]["reason"]

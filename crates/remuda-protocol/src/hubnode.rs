@@ -12,7 +12,7 @@
 
 use crate::{
     BINARY_HEADER_LEN, BinaryChannel, BinaryFrameError, BinaryHeader, JsonRpcVersion,
-    PROTOCOL_VERSION, ProtocolVersion, PromptMode, U64, decode_binary_frame,
+    PROTOCOL_VERSION, PromptMode, ProtocolVersion, U64, decode_binary_frame,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -1357,15 +1357,12 @@ impl InstanceSendParams {
     /// so the receiver degrades to a plain new turn.
     #[must_use]
     pub fn delivery_mode(&self) -> Option<PromptMode> {
-        let raw = self
-            .mode
-            .as_deref()
-            .or_else(|| {
-                self.input
-                    .as_ref()
-                    .and_then(|input| input.get("mode"))
-                    .and_then(Value::as_str)
-            })?;
+        let raw = self.mode.as_deref().or_else(|| {
+            self.input
+                .as_ref()
+                .and_then(|input| input.get("mode"))
+                .and_then(Value::as_str)
+        })?;
         serde_json::from_value::<PromptMode>(Value::String(raw.to_owned())).ok()
     }
 

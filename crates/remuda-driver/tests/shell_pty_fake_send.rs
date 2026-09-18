@@ -68,7 +68,9 @@ fn spec_for(cwd: &Path) -> InstanceSpec {
 fn prompt(text: &str) -> DriverInput {
     DriverInput::Prompt(Box::new(PromptInput {
         mode: PromptMode::NewTurn,
-        blocks: vec![ContentBlock::Text(Box::new(TextBlock { text: text.into() }))],
+        blocks: vec![ContentBlock::Text(Box::new(TextBlock {
+            text: text.into(),
+        }))],
         origin: remuda_protocol::InputOrigin::Human,
         native_client_message_id: "probe".into(),
     }))
@@ -200,7 +202,10 @@ async fn a_send_lands_when_idle_and_is_held_until_a_running_turn_ends() {
     // prompt for the next turn.
     let mid_turn = Driver::wait_control(&driver).await;
     assert!(
-        matches!(mid_turn, Err(remuda_driver::DriverError::ControlUnavailable)),
+        matches!(
+            mid_turn,
+            Err(remuda_driver::DriverError::ControlUnavailable)
+        ),
         "control must be refused mid-turn, got {mid_turn:?}"
     );
 
@@ -225,7 +230,10 @@ async fn a_send_lands_when_idle_and_is_held_until_a_running_turn_ends() {
     assert!(after, "control never returned after the turn ended");
 
     // (3) The held send is now delivered and starts its own turn.
-    driver.send(prompt("PROBE_TWO")).await.expect("post-turn send");
+    driver
+        .send(prompt("PROBE_TWO"))
+        .await
+        .expect("post-turn send");
     assert!(
         await_status(&driver, ScreenStatus::Working, Duration::from_secs(10)).await
             || await_status(&driver, ScreenStatus::Idle, Duration::from_secs(2)).await,

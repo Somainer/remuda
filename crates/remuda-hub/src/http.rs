@@ -1803,15 +1803,13 @@ pub(crate) async fn forward_if_online(
             .await?
             .ok_or(HubError::NotFound);
     }
-    // A forwarded non-create command now has resolution `unknown`. Arm a
-    // bounded ack deadline so it cannot sit at `queued` forever if no terminal
-    // reply lands: a Node that went offline between the online check and the
-    // call (`unknown`), or one that received the call but whose RPC reply was
-    // lost past the accept deadline (`reconciling`, §2.5). Either way the row
-    // fails with a reason; a journaled accept/settle that arrives later
-    // recovers it (see `apply_command_lifecycle`). The guarded transition
-    // leaves accepted / settled / already-failed rows alone.
-    schedule_command_ack_deadline(state, &command);
+    // A forwarded non-create command now has resolution `unknown`. There is
+    // deliberately no Hub-side ack deadline that settles it: a forward intent
+    // exists, so §2.5 forbids expiring or rejecting the command without asking
+    // the Node, and without evidence it did not run the Hub cannot call it
+    // rejected. A lost reply rests at `reconciling`; the Node's mirrored
+    // journal converges the row to accepted / settled. Only an *explicit*
+    // Node error reply settles the row (outcome `rejected`, below).
     let mut params = command.payload.clone();
     let object = params
         .as_object_mut()
@@ -2001,17 +1999,17 @@ async fn fail_unaccepted_create(
             .await?;
         return Err(HubError::BadRequest(message));
     }
-    // A forwarded non-create command the Node rejected must not sit at `queued`
-    // forever: move it to `failed` carrying the reason so the ledger and the
-    // operator can see why (docs/design/evidence/instance-send-1.md). A row
-    // that already advanced (a journal accept that raced the reply) is left
-    // untouched by the guarded transition.
-    if let Some(failed) = state
+    // An explicit Node error reply is positive evidence the command did not
+    // run. Settle it the way §2.5 prescribes — `settled` with settlement
+    // outcome `rejected` and the Node's reason — rather than leave it queued or
+    // invent a fourth state. A row that already advanced (a journal accept that
+    // raced the reply) is terminal and returned untouched.
+    if let Some(rejected) = state
         .store
-        .fail_command(command.command_id.clone(), message.clone())
+        .reject_command(command.command_id.clone(), message.clone())
         .await?
     {
-        return Ok(failed);
+        return Ok(rejected);
     }
     state
         .store
@@ -2075,46 +2073,6 @@ fn schedule_create_settlement_watch(state: &AppState, command: &CommandRecord) {
                 %command_id,
                 %error,
                 "failed to record create settlement timeout"
-            ),
-        }
-    });
-}
-
-/// Give a forwarded non-create command a bounded ack deadline.
-///
-/// A create already has its own settlement watch and its own failure path, so
-/// this covers the rest (send, steer, cancel, respond, …). If the row is still
-/// `queued` when the deadline elapses — the Node accepted nothing and
-/// error-replied nothing (offline mid-forward, or a hung Node) — it moves to
-/// `failed` with a reason rather than sitting at `queued` forever. A row that
-/// meanwhile advanced to accepted/settled/failed is left untouched by the
-/// guarded transition (docs/design/evidence/instance-send-1.md).
-fn schedule_command_ack_deadline(state: &AppState, command: &CommandRecord) {
-    if command.operation == "instance.create" || command.state != "queued" {
-        return;
-    }
-    let timeout = Duration::from_millis(state.config.command_settle_timeout_ms().max(1));
-    let state = state.clone();
-    let command_id = command.command_id.clone();
-    let operation = command.operation.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        let reason = format!(
-            "node did not acknowledge {operation} within {} ms",
-            timeout.as_millis()
-        );
-        match state.store.fail_command(command_id.clone(), reason).await {
-            Ok(Some(_)) => tracing::warn!(
-                %command_id,
-                %operation,
-                timeout_ms = timeout.as_millis(),
-                "forwarded command never acknowledged; marked failed"
-            ),
-            Ok(None) => {}
-            Err(error) => tracing::error!(
-                %command_id,
-                %error,
-                "failed to record command ack timeout"
             ),
         }
     });

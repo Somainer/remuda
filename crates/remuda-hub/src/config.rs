@@ -11,8 +11,6 @@ pub const DEVICE_COOKIE: &str = "remuda_device";
 pub const DEFAULT_COMMAND_ACCEPT_TIMEOUT_MS: u64 = 5_000;
 /// Minimum create settlement deadline; native cold starts must fit inside it.
 pub const MIN_CREATE_SETTLE_TIMEOUT_MS: u64 = 120_000;
-/// Default ack deadline for a forwarded non-create command before it fails.
-pub const DEFAULT_COMMAND_SETTLE_TIMEOUT_MS: u64 = 10_000;
 /// Default lifetime of the bootstrap device access code (D-018).
 pub const DEFAULT_BOOTSTRAP_TTL_HOURS: u64 = 24;
 /// Default lifetime of a minted node enroll token (D-018).
@@ -63,12 +61,6 @@ pub struct HubConfig {
     /// Deadline for a later create settlement observation (ms, minimum 120 seconds).
     #[serde(default = "default_create_settle_timeout_ms")]
     pub create_settle_timeout_ms: u64,
-    /// Bounded ack deadline for a forwarded non-create command (send/steer/etc).
-    /// If neither an accept nor an error reply arrives, the row moves to
-    /// `failed` with a reason instead of sitting at `queued` forever (default
-    /// ten seconds). Config key `commandSettleTimeoutMs`.
-    #[serde(default = "default_command_settle_timeout_ms")]
-    pub command_settle_timeout_ms: u64,
     /// Offline grace before stale instances exit with reason host-lost (default ten minutes).
     #[serde(default = "default_host_lost_grace_ms")]
     pub host_lost_grace_ms: u64,
@@ -192,10 +184,6 @@ fn default_create_settle_timeout_ms() -> u64 {
     MIN_CREATE_SETTLE_TIMEOUT_MS
 }
 
-fn default_command_settle_timeout_ms() -> u64 {
-    DEFAULT_COMMAND_SETTLE_TIMEOUT_MS
-}
-
 impl Default for HubConfig {
     fn default() -> Self {
         Self {
@@ -214,7 +202,6 @@ impl Default for HubConfig {
             follow_buffer_events: default_follow_buffer_events(),
             command_accept_timeout_ms: default_command_accept_timeout_ms(),
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
-            command_settle_timeout_ms: default_command_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
             gate_ref_retention_ms: default_gate_ref_retention_ms(),
@@ -249,7 +236,6 @@ impl HubConfig {
             follow_buffer_events: default_follow_buffer_events(),
             command_accept_timeout_ms: default_command_accept_timeout_ms(),
             create_settle_timeout_ms: default_create_settle_timeout_ms(),
-            command_settle_timeout_ms: default_command_settle_timeout_ms(),
             host_lost_grace_ms: default_host_lost_grace_ms(),
             requested_grace_ms: default_requested_grace_ms(),
             gate_ref_retention_ms: default_gate_ref_retention_ms(),
@@ -272,18 +258,6 @@ impl HubConfig {
     pub(crate) fn create_settle_timeout_ms(&self) -> u64 {
         self.create_settle_timeout_ms
             .max(MIN_CREATE_SETTLE_TIMEOUT_MS)
-    }
-
-    /// Effective ack deadline for a forwarded non-create command.
-    ///
-    /// Never shorter than the RPC accept timeout plus a one-second margin: the
-    /// deadline must outlast the in-flight `call`, or a slow-but-valid accept
-    /// would be failed before `mark_accepted` runs. (`mark_accepted` now
-    /// recovers a `failed` row as a backstop, but the clamp keeps the common
-    /// path from ever racing.)
-    pub(crate) fn command_settle_timeout_ms(&self) -> u64 {
-        self.command_settle_timeout_ms
-            .max(self.command_accept_timeout_ms.saturating_add(1_000))
     }
 }
 

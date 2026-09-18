@@ -11,6 +11,7 @@
 
 use crate::config::{new_id, now_rfc3339};
 use crate::provider_models::{self, ProviderModel};
+use remuda_protocol::SettlementOutcome;
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -937,15 +938,27 @@ pub struct CommandRecord {
     pub host_id: String,
     /// Wire operation.
     pub operation: String,
-    /// `queued` / `accepted` / `settled` / `failed`.
+    /// `queued` / `accepted` / `settled` — the only three Command progress
+    /// states (protocol §2.5, §12.2). A failed delivery is a *settled* command
+    /// with a rejection settlement, never a fourth state.
     pub state: String,
-    /// `clear` / `unknown` / `reconciling` / `failed`.
+    /// `clear` / `unknown` / `reconciling`. A dispatched send the Hub cannot
+    /// resolve rests at `unknown`; it is never promoted to a fourth value.
     pub resolution: String,
     /// True after Hub persisted a forward intent (never resend).
     pub forwarded: bool,
-    /// Failure reason when `state` is `failed`; `None` otherwise.
+    /// Settlement outcome once `state == settled` (`completed` / `rejected` /
+    /// `cancelled`), parsed from protocol §2.5 `SettlementOutcome`. Internal
+    /// ledger column: projected to the wire as `settlement.outcome`.
+    #[serde(skip)]
+    pub settlement_outcome: Option<String>,
+    /// Human reason for a `rejected` settlement; projected as
+    /// `settlement.reason`. Internal ledger column, never a top-level field.
+    #[serde(skip)]
+    pub settlement_reason: Option<String>,
+    /// Protocol §2.5 settlement projection, present only once settled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub settlement: Option<CommandSettlement>,
     /// Original payload.
     pub payload: Value,
     /// Optional caller idempotency key.
@@ -954,6 +967,34 @@ pub struct CommandRecord {
     pub created_at: String,
     /// Update-time.
     pub updated_at: String,
+}
+
+/// Hub projection of protocol §2.5 `Command.settlement`. A settled command
+/// always carries an `outcome` drawn from the wire `SettlementOutcome` enum;
+/// `reason` holds the Node's message for a `rejected` settlement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandSettlement {
+    /// `completed` / `rejected` / `cancelled` (§2.5 `SettlementOutcome`).
+    pub outcome: String,
+    /// The Node's rejection message; present only for `rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl CommandRecord {
+    /// Build the wire settlement projection from the ledger columns.
+    fn settlement_projection(
+        outcome: Option<&str>,
+        reason: Option<&str>,
+    ) -> Option<CommandSettlement> {
+        outcome.map(|outcome| CommandSettlement {
+            outcome: outcome.to_owned(),
+            reason: reason
+                .filter(|_| outcome == "rejected")
+                .map(str::to_owned),
+        })
+    }
 }
 
 /// Mirrored journal event.
@@ -2816,18 +2857,21 @@ impl Store {
         .await
     }
 
-    /// Node RPC success → `accepted`.
+    /// Node RPC success → `accepted`, only from `queued`.
     ///
-    /// Recovers a `failed` row too: if a misconfigured ack deadline fired while
-    /// the accept was still on the wire (accept timeout raised above the settle
-    /// deadline), the real accept must still win and clear the stale reason. A
-    /// `settled` row is never regressed.
+    /// There is no fourth state to recover: a forwarded send that the Node
+    /// never acknowledges stays `queued` with resolution `unknown` /
+    /// `reconciling` until the Node's mirrored journal says otherwise (§2.5,
+    /// §12.2). A `settled` row — including a `rejected` settlement — is
+    /// terminal and is never regressed by a later accept.
     pub async fn mark_accepted(&self, command_id: String) -> Result<CommandRecord, StoreError> {
         self.run_named("mark_accepted", move |conn| {
             let now = now_rfc3339();
             conn.execute(
-                "UPDATE commands SET state = 'accepted', resolution = 'clear', reason = NULL, updated_at = ?1
-                 WHERE id = ?2 AND state IN ('queued', 'failed')",
+                "UPDATE commands
+                 SET state = 'accepted', resolution = 'clear',
+                     settlement_outcome = NULL, settlement_reason = NULL, updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued'",
                 params![now, command_id],
             )?;
             load_command(conn, &command_id)?.ok_or_else(|| StoreError::Id("unknown command".into()))
@@ -2855,7 +2899,13 @@ impl Store {
         .await
     }
 
-    /// Node-reported completion → `settled`.
+    /// Node-reported completion → `settled` with outcome `completed`.
+    ///
+    /// This is the path the Node's own settle frame takes (`ws.rs`). It always
+    /// records the `completed` settlement and clears any rejection reason, so a
+    /// settled row can never carry a stale failure reason. The first terminal
+    /// settlement is stable: an already-`settled` row is returned unchanged
+    /// rather than regressed (protocol §2.5, terminal states do not revert).
     pub async fn mark_settled(
         &self,
         command_id: String,
@@ -2868,11 +2918,17 @@ impl Store {
             if row.host_id != host_id {
                 return Err(StoreError::Id("command belongs to another host".into()));
             }
-            let now = now_rfc3339();
-            conn.execute(
-                "UPDATE commands SET state = 'settled', resolution = 'clear', updated_at = ?1 WHERE id = ?2",
-                params![now, command_id],
-            )?;
+            if row.state != "settled" {
+                let now = now_rfc3339();
+                conn.execute(
+                    "UPDATE commands
+                     SET state = 'settled', resolution = 'clear',
+                         settlement_outcome = 'completed', settlement_reason = NULL,
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    params![now, command_id],
+                )?;
+            }
             load_command(conn, &command_id)?
                 .ok_or_else(|| StoreError::Id("unknown command".into()))
         })
@@ -2891,18 +2947,19 @@ impl Store {
     /// Recent commands for one instance, newest first, bounded by `limit`.
     ///
     /// Backs `GET /v1/instances/{id}/commands`: each row carries operation,
-    /// state, resolution, reason and timestamps so an operator can see why a
-    /// send resolved the way it did.
+    /// the three-state state, resolution, the §2.5 settlement projection and
+    /// timestamps so an operator can see how a send resolved.
     pub async fn list_instance_commands(
         &self,
         instance_id: String,
         limit: usize,
     ) -> Result<Vec<CommandRecord>, StoreError> {
         let limit = limit.clamp(1, 200) as i64;
-        self.run(move |conn| {
+        self.read("list_instance_commands", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
-                        payload_json, idempotency_key, created_at, updated_at, reason
+                        payload_json, idempotency_key, created_at, updated_at,
+                        settlement_outcome, settlement_reason
                  FROM commands
                  WHERE instance_id = ?1
                  ORDER BY created_at DESC, id DESC
@@ -2916,31 +2973,31 @@ impl Store {
         .await
     }
 
-    /// Move a forwarded, still-unresolved command to `failed` with a reason.
+    /// Settle a still-`queued` command with a `rejected` settlement.
     ///
-    /// Fails any row still `queued` — whether resolution is `unknown` (the Node
-    /// was offline at forward and never received the call) or `reconciling` (the
-    /// call was delivered but the RPC reply was lost past the accept deadline,
-    /// protocol §2.5). An `accepted` / `settled` / already-`failed` row is left
-    /// alone by the `state = 'queued'` guard.
+    /// This is the *pre-dispatch / explicit-rejection* case the §2.5 diagram
+    /// routes to `settled` with settlement outcome `rejected`: the Node
+    /// durably answered the RPC with an error, so the Hub has positive
+    /// evidence the command did not run. It is **not** used for a lost reply or
+    /// a Node that never answers — without evidence the command did not run,
+    /// §2.5 forbids marking it rejected, and such a row rests at `queued` with
+    /// resolution `unknown` / `reconciling` for the mirrored journal to
+    /// converge.
     ///
-    /// §2.5 is preserved by the *recovery* direction, not by refusing to fail:
-    /// a journaled `accepted` / `settled` that arrives after the deadline flips
-    /// the row back out of `failed` and clears the stale reason (see
-    /// [`apply_command_lifecycle`]). So a genuinely in-flight send that the
-    /// journal later confirms is corrected, while one the Node never journals
-    /// stays `failed` with its reason instead of sitting at `queued` forever
-    /// (docs/design/evidence/instance-send-1.md).
-    pub async fn fail_command(
+    /// Returns `None` when the row already advanced (an `accepted` that raced
+    /// the error, or an already-`settled` terminal); terminal states never
+    /// revert (docs/design/evidence/instance-send-1.md).
+    pub async fn reject_command(
         &self,
         command_id: String,
         reason: String,
     ) -> Result<Option<CommandRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("reject_command", move |conn| {
             let now = now_rfc3339();
             let changed = conn.execute(
                 "UPDATE commands
-                 SET state = 'failed', resolution = 'failed', reason = ?1, updated_at = ?2
+                 SET state = 'settled', resolution = 'clear',
+                     settlement_outcome = 'rejected', settlement_reason = ?1, updated_at = ?2
                  WHERE id = ?3 AND state = 'queued'",
                 params![reason, now, command_id],
             )?;
@@ -4014,7 +4071,9 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             payload_json TEXT NOT NULL,
             idempotency_key TEXT UNIQUE,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            settlement_outcome TEXT,
+            settlement_reason TEXT
         );
         CREATE TABLE IF NOT EXISTS journal (
             instance_id TEXT NOT NULL,
@@ -4186,10 +4245,12 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "failed_attempts",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    // A forwarded non-create command that the Node rejects or never acks moves
-    // to `failed` carrying this reason, so the operator sees why instead of a
-    // row stuck at `queued` (docs/design/evidence/instance-send-1.md).
-    ensure_column(&conn, "commands", "reason", "TEXT")?;
+    // Protocol §2.5: a command has only three progress states. A rejected
+    // delivery is `settled` carrying settlement outcome `rejected` and the
+    // Node's reason, never a fourth state. These two columns project that
+    // settlement; they are NULL until the row settles.
+    ensure_column(&conn, "commands", "settlement_outcome", "TEXT")?;
+    ensure_column(&conn, "commands", "settlement_reason", "TEXT")?;
     conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS devices_token_prefix ON devices(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS hosts_token_prefix ON hosts(token_prefix) WHERE token_prefix IS NOT NULL;
         CREATE UNIQUE INDEX IF NOT EXISTS pair_codes_prefix ON pair_codes(code_prefix) WHERE code_prefix IS NOT NULL;
@@ -4615,22 +4676,40 @@ fn apply_command_projection(
     }
     match state {
         "accepted" => {
-            // Recover a row a deadline failed while the call was still in
-            // flight: a journaled accept is the Node's durable word (§2.5), so
-            // it wins over the Hub's speculative `failed` and clears the stale
-            // reason. Still guarded off `settled` so a late accept cannot
-            // regress a completed command.
+            // A journaled accept is the Node's durable word (§2.5) and moves a
+            // still-`queued` row (resolution `unknown` / `reconciling`) to
+            // accepted. A settled row is terminal and never regresses.
             conn.execute(
-                "UPDATE commands SET state = 'accepted', resolution = 'clear', reason = NULL, updated_at = ?1
-                 WHERE id = ?2 AND state IN ('queued', 'failed')",
+                "UPDATE commands
+                 SET state = 'accepted', resolution = 'clear',
+                     settlement_outcome = NULL, settlement_reason = NULL, updated_at = ?1
+                 WHERE id = ?2 AND state = 'queued'",
                 params![now, command_id],
             )?;
         }
         "settled" => {
+            // The Node's Command entity carries its §2.5 settlement as
+            // `{state:"known", value:{outcome, error}}`. Only accept an outcome
+            // from the protocol vocabulary; a normal completion without one is
+            // `completed`. The rejection reason rides `error.message`.
+            let outcome = payload
+                .pointer("/entity/settlement/value/outcome")
+                .and_then(Value::as_str)
+                .filter(|outcome| {
+                    serde_json::from_value::<SettlementOutcome>(json!(outcome)).is_ok()
+                })
+                .unwrap_or("completed");
+            let reason = payload
+                .pointer("/entity/settlement/value/error/message")
+                .and_then(Value::as_str)
+                .filter(|_| outcome == "rejected")
+                .map(str::to_owned);
             conn.execute(
-                "UPDATE commands SET state = 'settled', resolution = 'clear', reason = NULL, updated_at = ?1
-                 WHERE id = ?2 AND state != 'settled'",
-                params![now, command_id],
+                "UPDATE commands
+                 SET state = 'settled', resolution = 'clear',
+                     settlement_outcome = ?1, settlement_reason = ?2, updated_at = ?3
+                 WHERE id = ?4 AND state != 'settled'",
+                params![outcome, reason, now, command_id],
             )?;
         }
         _ => {}
@@ -5043,16 +5122,16 @@ mod tests {
         assert_eq!(converged.resolution, "clear");
     }
 
-    /// The deadline can fail a send whose accept was still in flight. §2.5's
-    /// recovery direction then wins: a journaled `accepted` flips the row back
-    /// out of `failed` and clears the stale reason, so a genuinely delivered
-    /// send is corrected rather than left wrongly failed.
+    /// A forwarded send whose RPC reply is lost never leaves the three-state
+    /// model: it rests at `queued` with resolution `unknown` / `reconciling`
+    /// (§2.5, §12.2 — no fourth state, no speculative failure), and the Node's
+    /// mirrored journal is what converges it to accepted and then settled.
     #[tokio::test]
-    async fn a_journaled_accept_recovers_a_deadline_failed_send() {
+    async fn a_never_acked_send_rests_unknown_until_the_journal_settles_it() {
         let dir = tempfile::tempdir().expect("data dir");
         let store = Store::open(dir.path()).expect("store");
         let host_id = new_id("hst").expect("host id");
-        let token = enroll_token(&store, "enroll-recover").await;
+        let token = enroll_token(&store, "enroll-converge").await;
         let _ = store
             .authenticate_host(
                 HostAuthRequest {
@@ -5093,51 +5172,180 @@ mod tests {
             .await
             .expect("forward once");
 
-        // The ack deadline fired while the send was still in flight.
-        let failed = store
-            .fail_command(
-                command.command_id.clone(),
-                "node did not acknowledge".into(),
-            )
+        // The RPC accept timed out: the reply is lost, so the Hub delegates to
+        // reconciliation. The row stays `queued` — never a fourth state — with
+        // no settlement.
+        let reconciling = store
+            .mark_reconciling(command.command_id.clone())
             .await
-            .expect("fail")
-            .expect("row failed");
-        assert_eq!(failed.state, "failed");
-        assert_eq!(failed.resolution, "failed");
-        assert!(failed.reason.is_some());
+            .expect("reconciling");
+        assert_eq!(reconciling.state, "queued");
+        assert_eq!(reconciling.resolution, "reconciling");
+        assert!(reconciling.settlement.is_none());
 
-        // The Node journaled its durable accept afterwards.
-        store
-            .append_journal(
-                host_id.clone(),
-                instance.instance_id.clone(),
-                None,
+        // The Node journaled its durable accept, then its completed settlement.
+        for (state, outcome) in [
+            ("accepted", Value::Null),
+            (
+                "settled",
                 json!({
-                    "kind": "lifecycle",
-                    "payload": {
-                        "type": "entity",
-                        "entityType": "command",
-                        "entityId": command.command_id,
-                        "state": "accepted",
-                        "entity": { "commandId": command.command_id, "state": "accepted" }
-                    }
+                    "state": "known",
+                    "value": { "outcome": "completed", "resultRef": null, "error": null }
                 }),
-            )
-            .await
-            .expect("journaled accept");
-        let recovered = store
+            ),
+        ] {
+            let mut entity = json!({ "commandId": command.command_id, "state": state });
+            if outcome != Value::Null {
+                entity["settlement"] = outcome;
+            }
+            store
+                .append_journal(
+                    host_id.clone(),
+                    instance.instance_id.clone(),
+                    None,
+                    json!({
+                        "kind": "lifecycle",
+                        "payload": {
+                            "type": "entity",
+                            "entityType": "command",
+                            "entityId": command.command_id,
+                            "state": state,
+                            "entity": entity
+                        }
+                    }),
+                )
+                .await
+                .expect("journaled lifecycle");
+        }
+        let settled = store
             .get_command(command.command_id.clone())
             .await
             .expect("query")
             .expect("row");
+        assert_eq!(settled.state, "settled");
+        assert_eq!(settled.resolution, "clear");
+        let projection = settled.settlement.as_ref().expect("settlement projected");
+        assert_eq!(projection.outcome, "completed");
+        assert!(projection.reason.is_none());
+        // The internal ledger columns never appear as wire fields.
+        let wire = serde_json::to_value(&settled).expect("serialize");
+        assert!(wire.get("settlementOutcome").is_none());
+        assert!(wire.get("settlementReason").is_none());
+        assert!(wire.get("reason").is_none());
+    }
+
+    /// An explicit Node rejection is the §2.5 `settled` + outcome `rejected`
+    /// case — not a fourth state. A later positive settle frame must not
+    /// regress the terminal rejection, and a settled row never carries a
+    /// mismatched reason (the mark_settled hole from the previous round).
+    #[tokio::test]
+    async fn a_rejected_send_settles_rejected_and_a_later_settle_frame_keeps_it() {
+        let dir = tempfile::tempdir().expect("data dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host_id = new_id("hst").expect("host id");
+        let token = enroll_token(&store, "enroll-reject").await;
+        let _ = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: token,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some("reject-node".into()),
+                    node_version: Some("test".into()),
+                },
+                verify_eq,
+                |_| Ok("test-hash".into()),
+            )
+            .await
+            .expect("host enroll");
+        let instance = store
+            .insert_instance(
+                host_id.clone(),
+                None,
+                "claude".into(),
+                "shell-pty".into(),
+                None,
+                json!({}),
+            )
+            .await
+            .expect("instance");
+        let (command, _) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host_id.clone(),
+                "instance.send".into(),
+                json!({"instanceId": instance.instance_id}),
+                None,
+            )
+            .await
+            .expect("command");
+        store
+            .mark_forward_intent(command.command_id.clone())
+            .await
+            .expect("forward once");
+
+        let rejected = store
+            .reject_command(
+                command.command_id.clone(),
+                "instance.send requires input.text".into(),
+            )
+            .await
+            .expect("reject")
+            .expect("row rejected");
+        assert_eq!(rejected.state, "settled", "a rejection settles, never a 4th state");
+        assert_eq!(rejected.resolution, "clear");
+        let settlement = rejected.settlement.expect("settlement present");
+        assert_eq!(settlement.outcome, "rejected");
         assert_eq!(
-            recovered.state, "accepted",
-            "journal accept overrides the failed row"
+            settlement.reason.as_deref(),
+            Some("instance.send requires input.text")
         );
-        assert_eq!(recovered.resolution, "clear");
+
+        // The Node's positive settle frame (ws.rs mark_settled) must not
+        // regress the terminal rejection nor leave a reason on a `completed`
+        // row: the row stays rejected with its reason.
+        let after_frame = store
+            .mark_settled(command.command_id.clone(), host_id.clone())
+            .await
+            .expect("settle frame");
+        assert_eq!(after_frame.state, "settled");
+        assert_eq!(
+            after_frame.settlement.as_ref().expect("settlement").outcome,
+            "rejected",
+            "terminal rejection is not overwritten by a later completed frame"
+        );
+        // A late accept cannot regress it either.
+        let after_accept = store
+            .mark_accepted(command.command_id.clone())
+            .await
+            .expect("accept");
+        assert_eq!(after_accept.state, "settled");
+
+        // A clean completion on a *different* command records completed with
+        // no reason, proving mark_settled clears rather than preserves.
+        let (other, _) = store
+            .queue_command(
+                None,
+                Some(instance.instance_id.clone()),
+                host_id.clone(),
+                "instance.send".into(),
+                json!({"instanceId": instance.instance_id}),
+                None,
+            )
+            .await
+            .expect("command");
+        let completed = store
+            .mark_settled(other.command_id.clone(), host_id.clone())
+            .await
+            .expect("settle");
+        assert_eq!(completed.state, "settled");
+        assert_eq!(
+            completed.settlement.as_ref().expect("settlement").outcome,
+            "completed"
+        );
         assert!(
-            recovered.reason.is_none(),
-            "the stale failure reason is cleared"
+            completed.settlement.as_ref().expect("settlement").reason.is_none(),
+            "a completed settlement never carries a reason"
         );
     }
 
@@ -6810,7 +7018,8 @@ fn load_journal_row(
 fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
-                payload_json, idempotency_key, created_at, updated_at, reason
+                payload_json, idempotency_key, created_at, updated_at,
+                settlement_outcome, settlement_reason
          FROM commands WHERE id = ?1",
         params![id],
         command_from_row,
@@ -6822,7 +7031,8 @@ fn load_command(conn: &Connection, id: &str) -> Result<Option<CommandRecord>, St
 fn load_command_by_key(conn: &Connection, key: &str) -> Result<Option<CommandRecord>, StoreError> {
     conn.query_row(
         "SELECT id, instance_id, host_id, operation, state, resolution, forwarded,
-                payload_json, idempotency_key, created_at, updated_at, reason
+                payload_json, idempotency_key, created_at, updated_at,
+                settlement_outcome, settlement_reason
          FROM commands WHERE idempotency_key = ?1",
         params![key],
         command_from_row,
@@ -7111,6 +7321,8 @@ fn apply_instance_lifecycle(
 fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     let payload: String = row.get(7)?;
     let forwarded: i64 = row.get(6)?;
+    let settlement_outcome: Option<String> = row.get(11)?;
+    let settlement_reason: Option<String> = row.get(12)?;
     Ok(CommandRecord {
         command_id: row.get(0)?,
         instance_id: row.get(1)?,
@@ -7119,7 +7331,12 @@ fn command_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> 
         state: row.get(4)?,
         resolution: row.get(5)?,
         forwarded: forwarded != 0,
-        reason: row.get(11)?,
+        settlement: CommandRecord::settlement_projection(
+            settlement_outcome.as_deref(),
+            settlement_reason.as_deref(),
+        ),
+        settlement_outcome,
+        settlement_reason,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
         idempotency_key: row.get(8)?,
         created_at: row.get(9)?,

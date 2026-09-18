@@ -896,6 +896,10 @@
   clip-path: polygon(0 0, 100% 0, 100% var(--ctx-pct, 0%), 0 var(--ctx-pct, 0%));
 }
 
+/* The composer's anchored menus. Positioning (fixed left/top, flip and the
+   height cap) is computed by the AnchoredPopover primitive from the trigger
+   rect — the old left:0/absolute rules pinned every card to the composer's
+   left edge and let a tall catalog run off-screen. */
 .popover {
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -903,38 +907,31 @@
   padding: 7px 0;
   display: flex;
   flex-direction: column;
-  width: 100%;
-  min-width: 0;
-  max-width: 100%;
+  width: min(300px, calc(100vw - 16px));
   box-sizing: border-box;
   z-index: 5;
+  overflow: hidden;
 }
 
-.popoverUp {
-  position: absolute;
-  left: 0;
-  bottom: calc(100% + 8px);
+/* The one scrolling region inside a height-capped popover: head and footer
+   stay, the body scrolls. EffortSlider's list body and the wrapped
+   permission/usage menus all mark themselves with this attribute. */
+.popover [data-popover-scroll="1"] {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
-/* context-usage-1 desktop: absolutely anchored below the chip bar too, so
-   opening the panel never reflows the dock (a reflow would move the chip
-   out from under the pointer and the hover-close timer would dismiss it). */
-.popoverDown {
-  position: absolute;
-  left: 0;
-  top: calc(100% + 8px);
-}
-
-/* Compact Codex-style effort card: ~300px, never wider than the composer. */
+/* Compact Codex-style effort card: ~300px, never wider than the viewport. */
 .popoverCard {
-  width: min(300px, 100%);
   padding: 0;
   box-shadow: 0 8px 24px var(--scrim);
 }
 
 /* context-usage-1: the context chip's hover/tap card. */
 .usagePopover {
-  width: min(286px, 100%);
+  width: min(286px, calc(100vw - 16px));
   padding: 0;
   font-size: 11.5px;
   line-height: 1.45;
@@ -1117,6 +1114,8 @@
   font-size: 10.5px;
   color: var(--mute);
   line-height: 1.5;
+  /* Stays below the scrolling list body inside the height-capped popover. */
+  flex: 0 0 auto;
 }
 
 .effortRow,
@@ -1237,6 +1236,9 @@
   flex-direction: column;
   gap: 1px;
   min-width: 0;
+  /* Fill the height-capped popover so the list body owns the scroll. */
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /*
@@ -1844,6 +1846,8 @@
   align-items: center;
   gap: 6px;
   padding-bottom: 4px;
+  /* Head stays put while the list body scrolls in the capped popover. */
+  flex: 0 0 auto;
 }
 
 .effortListTitle {
@@ -1858,6 +1862,61 @@
   display: flex;
   flex-direction: column;
   margin: 0 -12px;
+  /* The popover's max-height bounds this; the catalog can be 75+ rows.
+     x: clip keeps the rows' edge-to-edge hover bleed without producing a
+     horizontal scrollbar (visible would compute to auto alongside y:auto). */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: clip;
+  overscroll-behavior: contain;
+}
+
+/* Catalog provenance warning: a list the session's own terminal could
+   reject is never shown as the session's own list without this mark. */
+.effortCatalogNote {
+  margin: 4px 12px 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--ink-1, var(--ink-2));
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--mute);
+}
+
+.effortCatalogNote[data-reason="host-fallback"] {
+  color: var(--ember-ultra);
+}
+
+/* Verbatim /model <id> fallback input at the foot of the model section. */
+.effortTypeRow {
+  padding: 6px 12px 4px;
+}
+
+.effortTypeInput {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--ink-0);
+  color: var(--paper);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+
+.effortTypeInput:disabled {
+  opacity: 0.55;
+}
+
+/* "直输 id" / "列表内" path marker on the current model row. */
+.effortPathTag {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--cold);
+  white-space: nowrap;
 }
 
 /* Ember motion: transform + opacity only, so every layer stays on the compositor. */

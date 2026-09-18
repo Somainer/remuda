@@ -1,9 +1,19 @@
-const CACHE = "runtime-shell-v2";
+// Service worker source. This file is NOT copied verbatim: the build plugin
+// (sw-build.ts, wired from vite.config.ts) stamps the single placeholder token
+// on the const CACHE line below with a per-build cache name (see
+// cacheNameForBuild in src/lib/swCache.ts) and emits the result as dist/sw.js.
+// Because the cache name carries the build identity the worker's bytes change
+// on every deploy, so the browser's byte-compare update check sees a new
+// worker and the activate sweep below reclaims the old shell.
+const CACHE = "__CACHE_NAME__";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg", "/icons/icon-192.png", "/icons/icon-512.png"];
 
 self.addEventListener("install", (event) => {
+  // No skipWaiting() here: a redeployed worker must sit in "waiting" while a
+  // tab is driven by the old one, so the page can offer the "new version" bar
+  // instead of being yanked mid-session. It takes over only when the client
+  // posts ACTIVATE_UPDATE (the message handler below calls skipWaiting).
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
-  self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
@@ -26,9 +36,41 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/v1/") || url.pathname.startsWith("/node/") || url.pathname.startsWith("/push/")) return;
   if (event.request.mode === "navigate") {
-    event.respondWith(caches.match("/index.html").then((hit) => hit || fetch("/index.html")));
+    // Network-first: fetch the document so a redeployed shell (new asset
+    // hashes) is served immediately, and fall back to the cached shell only
+    // when the network fails.
+    event.respondWith(
+      (async () => {
+        try {
+          const fresh = await fetch(event.request);
+          // Refresh the cached shell only from a good document. The clone must
+          // be taken NOW, before fresh is returned to respondWith: afterwards
+          // the browser locks the body to stream the document, and a clone()
+          // deferred into the caches.open callback throws (the .catch below
+          // would silently freeze the cached shell on the old bytes). A 502
+          // must also never become the offline shell, and a write that rejects
+          // (quota, a 206, a storage error) stays inside waitUntil rather than
+          // discarding the document the network just delivered.
+          if (fresh.ok) {
+            const copy = fresh.clone();
+            event.waitUntil(
+              caches
+                .open(CACHE)
+                .then((cache) => cache.put("/index.html", copy))
+                .catch(() => undefined),
+            );
+          }
+          return fresh;
+        } catch {
+          const cached = await caches.match("/index.html");
+          return cached || Response.error();
+        }
+      })(),
+    );
     return;
   }
+  // Hashed /assets/* and other same-origin GETs stay cache-first: their names
+  // already change per build, so a cached hit is always the right bytes.
   event.respondWith(caches.match(event.request).then((hit) => hit || fetch(event.request)));
 });
 

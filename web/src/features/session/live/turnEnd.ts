@@ -9,21 +9,32 @@
  * session already has, exactly as the Node's worker classifier merges them, so
  * the end of a turn is decided from evidence rather than from one latch:
  *
- * - a hook turn boundary (`turn-ended` / `interrupted`) is authoritative;
- * - while the hook tier is *fresh* a hook active phase holds the turn open and
- *   the screen's idle edge is ignored (design §2.4 rule 6, raise-only);
- * - once the hook tier is stalled or never-materialised it drops to advisory
- *   and the screen's inactive `live.status` ends the turn;
- * - with no screen either, an assistant message newer than the latched phase
- *   ends it from the transcript tail.
+ * Precedence, in order:
  *
- * The end is the *earliest* channel that legitimately called it, so a late
- * hook `Stop` arriving after a screen-decided end neither moves `endedAt`
- * forward nor changes `decidedBy` — the decision is idempotent over the event
- * set. `unknown` never collapses to idle and never to `等待操作`.
+ * 1. A real human turn wins over **every** end signal. A parked permission hook
+ *    sends nothing by definition and the spinner clears while its dialog is up,
+ *    so a pending interaction (or the screen latch's own `blocked` verdict, or a
+ *    fresh hook `blocked` phase) keeps the turn `waiting` no matter how quiet the
+ *    hook tier gets or what the spinner currently shows.
+ * 2. A hook turn boundary (`turn-ended` / `interrupted`) wins outright, fresh or
+ *    not — a boundary event is terminal; it is the harness's own word.
+ * 3. While the hook tier is *fresh* a hook active phase holds the turn open and
+ *    the screen's idle edge is ignored (design §2.4 rule 6, raise-only).
+ * 4. Once the hook tier is stalled or never-materialised it drops to advisory
+ *    and the screen's inactive `live.status` ends the turn. The clear is emitted
+ *    once per leave and its timestamp survives into the next turn, so it only
+ *    counts when it is at or after the latched phase's `since`.
+ * 5. With no screen either, an assistant message newer than the latched phase
+ *    ends it from the transcript tail.
+ *
+ * `unknown` never collapses to idle and never to `等待操作`.
  *
  * Pure: `phase.ts` and `liveStatus.ts` stay untouched folds; this reducer owns
- * every consumer decision.
+ * every consumer decision. The decision is rendered once and the composer maps
+ * `ended → idle`; that working→idle edge fires the held-queue flush a single
+ * time, so a hook Stop landing after a screen-decided end (it overrides
+ * `decidedBy` here per rule 2) neither re-flushes nor moves the duration clock —
+ * the elapsed reading anchors at the turn *start*, not at `endedAt`.
  */
 import type { Observation } from "../../../types/generated";
 import type { TierHealth } from "./channelHealth";
@@ -67,9 +78,6 @@ function parse(at: string | null | undefined): number | null {
   return Number.isNaN(t) ? null : t;
 }
 
-/** Precedence for a timestamp tie: hook > screen > transcript. */
-const RANK: Record<DecidedBy, number> = { hook: 0, screen: 1, transcript: 2 };
-
 /**
  * Fold the channels to one turn decision. See the module comment for the
  * precedence rules; this is a pure function of its inputs.
@@ -86,51 +94,47 @@ export function turnEnd(input: TurnEndInput): TurnDecision {
   const hookEnded = phaseIsEnd(phase);
   const phaseSince = parse(phase?.since) ?? parse(phase?.observedAt);
 
-  // --- end candidates, each with the anchor it would stop the clock at ---
-  const candidates: { channel: DecidedBy; at: string }[] = [];
+  // 1. A real human turn outranks every end candidate. A parked hook is silent
+  //    by definition and the spinner clears behind its dialog, so without this
+  //    guard a permission left open past the hook-stall budget would read as
+  //    "ended" and POST the held queue into an agent still on the dialog.
+  const freshBlocked = fresh && phase?.phase === "blocked";
+  if (hasPending || screenBlocked === true || freshBlocked) {
+    // `decidedBy` is meaningful only on `ended`.
+    return { state: "waiting", decidedBy: null, endedAt: null };
+  }
+
+  // 2. A hook turn boundary is the harness's own terminal word and wins
+  //    outright (a Stop that lands after a screen-decided end overrides
+  //    decidedBy but the consumer's ended→idle edge stays idempotent).
   if (hookEnded) {
     const at = phase!.since ?? phase!.observedAt;
-    if (at) candidates.push({ channel: "hook", at });
+    if (at) return { state: "ended", decidedBy: "hook", endedAt: at };
   }
-  // The screen idle edge counts only once this run expected a hook tier that
-  // is no longer vouching for a live turn (advisory, or it reported the end
-  // itself). That suppresses both a pure-pty spinner clear (no hook turn to
-  // close) and the brief mid-turn "idle" the TUI shows between tool calls
-  // (raise-only, rule 6) while still ending a stalled turn from the screen.
-  const screenInactive = screen && screen.active === false && screen.observedAt;
-  if (screenInactive && hookExpected && (advisory || hookEnded)) {
-    candidates.push({ channel: "screen", at: screen!.observedAt! });
+
+  // 4. The hook tier is advisory: a screen idle edge at/after this turn's phase
+  //    anchor ends it. A pure-pty session (no hook tier) is excluded — its
+  //    spinner clear never opens or closes a hook turn. The anchor lower bound
+  //    rejects a stale clear that was emitted for the *previous* turn and never
+  //    repainted during a short turn that showed no spinner of its own.
+  if (advisory && screen && screen.active === false && screen.observedAt) {
+    const at = parse(screen.observedAt);
+    if (at !== null && (phaseSince === null || at >= phaseSince)) {
+      return { state: "ended", decidedBy: "screen", endedAt: screen.observedAt };
+    }
   }
-  // No screen at all: an assistant reply newer than the latched phase is the
-  // last evidence the turn produced output and then went quiet. Requires a
-  // real (expected, latched) hook turn — a lone message never opens/closes one.
+
+  // 5. No screen at all: an assistant reply newer than the latched phase is the
+  //    last evidence the turn produced output and then went quiet. Requires a
+  //    real (expected, latched) hook turn — a lone message never opens one.
   if (hookExpected && phase && advisory && !screen && lastAssistantAt) {
     const at = parse(lastAssistantAt);
     if (at !== null && (phaseSince === null || at > phaseSince)) {
-      candidates.push({ channel: "transcript", at: lastAssistantAt });
+      return { state: "ended", decidedBy: "transcript", endedAt: lastAssistantAt };
     }
-  }
-  if (candidates.length > 0) {
-    candidates.sort((a, b) => {
-      const ta = parse(a.at) ?? 0;
-      const tb = parse(b.at) ?? 0;
-      return ta !== tb ? ta - tb : RANK[a.channel] - RANK[b.channel];
-    });
-    const winner = candidates[0]!;
-    return { state: "ended", decidedBy: winner.channel, endedAt: winner.at };
   }
 
   // --- still open ---
-  // 等待操作 is for a real human turn only: a pending interaction for this
-  // instance, the screen latch reporting blocked, or a *fresh* hook blocked
-  // phase (since the map fix, only a real PermissionRequest/Elicitation hook
-  // raises blocked). A blocked phase whose hook tier is stalled with nothing
-  // pending is `unknown`, never waiting — the idle_prompt Notification that
-  // used to latch blocked must not masquerade as a human turn.
-  const freshBlocked = fresh && phase?.phase === "blocked";
-  if (hasPending || screenBlocked === true || freshBlocked) {
-    return { state: "waiting", decidedBy: freshBlocked ? "hook" : "screen", endedAt: null };
-  }
   if (fresh && phase) {
     return { state: "working", decidedBy: "hook", endedAt: null };
   }

@@ -172,6 +172,13 @@ export function useAnchoredPopover(
   const frame = useRef<number | null>(null);
   const optionsRef = useRef(resolved);
   optionsRef.current = resolved;
+  // Self-settling trigger tracker: so a layout shift that moves the trigger
+  // (an approval card unmounting, streamed content) moves the fixed panel
+  // without an infinite rAF loop (a perpetual loop re-positions the panel
+  // every frame, which Playwright reads as an unstable, unclickable target).
+  const trackRaf = useRef(0);
+  const stableFrames = useRef(0);
+  const lastBox = useRef("");
 
   const measure = useCallback(() => {
     const trigger = triggerRef.current;
@@ -185,13 +192,12 @@ export function useAnchoredPopover(
       setMeasured(null);
       return;
     }
-    // The panel's natural size, ignoring the height cap the previous
-    // measurement imposed — otherwise a clamped panel can never grow again
-    // when the list view flips in.
-    const prevMaxHeight = panel.style.maxHeight;
-    panel.style.maxHeight = "none";
-    const preferredHeight = panel.offsetHeight || panel.scrollHeight || 0;
-    panel.style.maxHeight = prevMaxHeight;
+    // The panel's natural (un-capped) content height. Reading scrollHeight
+    // does NOT mutate inline style: toggling maxHeight off/on would resize
+    // the panel, fire its own ResizeObserver, and re-enter this function in
+    // a feedback loop whose box never settles. scrollHeight reports the full
+    // content extent even while max-height clamps the rendered offsetHeight.
+    const preferredHeight = Math.max(panel.offsetHeight, panel.scrollHeight);
     const width = panel.offsetWidth || panel.scrollWidth || 0;
 
     // The prospective horizontal span of the panel at the trigger; only
@@ -265,6 +271,40 @@ export function useAnchoredPopover(
     // frame at the fallback left:0/top:0 viewport corner.
     measure();
     const panel = panelRef.current;
+
+    // Follow the trigger while it is actually moving, then stop: after the
+    // box is unchanged for SETTLE_FRAMES frames the panel has converged and
+    // the loop cancels itself (a later scroll/resize/panel resize restarts
+    // it via startTracking). This keeps the panel on the trigger through
+    // reflows without re-positioning every frame forever.
+    const SETTLE_FRAMES = 20;
+    const track = () => {
+      const rect = triggerRef.current?.getBoundingClientRect();
+      if (rect) {
+        const box = [rect.left, rect.top, rect.width, rect.height]
+          .map((n) => Math.round(n * 10) / 10)
+          .join(",");
+        if (box !== lastBox.current) {
+          lastBox.current = box;
+          stableFrames.current = 0;
+          measure();
+        } else {
+          stableFrames.current += 1;
+        }
+      }
+      if (stableFrames.current < SETTLE_FRAMES) {
+        trackRaf.current = window.requestAnimationFrame(track);
+      } else {
+        trackRaf.current = 0;
+      }
+    };
+    const startTracking = () => {
+      stableFrames.current = 0;
+      if (typeof window !== "undefined" && !trackRaf.current) {
+        trackRaf.current = window.requestAnimationFrame(track);
+      }
+    };
+
     let observer: ResizeObserver | undefined;
     if (typeof ResizeObserver !== "undefined" && panel) {
       observer = new ResizeObserver(() => scheduleMeasure());
@@ -272,46 +312,23 @@ export function useAnchoredPopover(
     }
     window.addEventListener("resize", scheduleMeasure);
     // The trigger moves on any ancestor scroll (the panel is fixed, the
-    // trigger is not), so listen in capture mode for scrolls everywhere.
-    window.addEventListener("scroll", scheduleMeasure, true);
-    // Layout shifts that move the trigger without resize/scroll events
-    // (an approval card unmounts, turn events stream in, images load): a
-    // fixed panel does not follow the trigger automatically, so after the
-    // opening measurement settles, compare its box each animation frame and
-    // re-measure on change.
-    let raf = 0;
-    let lastBox = "";
-    let armed = false;
-    const track = () => {
-      if (!armed) {
-        // Skip the opening burst (panel growth itself nudges layout once).
-        armed = true;
-        raf = window.requestAnimationFrame(track);
-        return;
-      }
-      const rect = triggerRef.current?.getBoundingClientRect();
-      if (rect) {
-        const box = [rect.left, rect.top, rect.width, rect.height]
-          .map((n) => Math.round(n * 10) / 10)
-          .join(",");
-        if (box !== lastBox) {
-          lastBox = box;
-          scheduleMeasure();
-        }
-      }
-      raf = window.requestAnimationFrame(track);
+    // trigger is not), so listen in capture mode for scrolls everywhere and
+    // re-arm the (normally stopped) trigger tracker on such movement.
+    const onScroll = () => {
+      scheduleMeasure();
+      startTracking();
     };
-    if (typeof window !== "undefined" && !resolved.sheet) {
-      raf = window.requestAnimationFrame(track);
-    }
+    window.addEventListener("scroll", onScroll, true);
+    startTracking();
     return () => {
       observer?.disconnect();
       window.removeEventListener("resize", scheduleMeasure);
-      window.removeEventListener("scroll", scheduleMeasure, true);
-      if (raf) window.cancelAnimationFrame(raf);
+      window.removeEventListener("scroll", onScroll, true);
+      if (trackRaf.current) window.cancelAnimationFrame(trackRaf.current);
+      trackRaf.current = 0;
       if (frame.current != null) window.cancelAnimationFrame(frame.current);
     };
-  }, [open, panelRef, triggerRef, resolved.sheet, scheduleMeasure]);
+  }, [open, panelRef, triggerRef, resolved.sheet, scheduleMeasure, measure]);
 
   const style: CSSProperties =
     resolved.sheet ?

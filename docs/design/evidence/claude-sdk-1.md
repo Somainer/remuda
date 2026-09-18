@@ -5,17 +5,27 @@
 **Design:** [print-replacement.md](../print-replacement.md) §2.1 (process model), §2.2 (resume and session identity), §2.5 (observation table), §2.6 (second carrier). Decision row [D-037](../decisions.md).
 **Scope:** M1 = §3 batch 1 + batch 2 + the registration half of batch 3.
 **Commits (rebased):** the live run was made on branch
-`wt/c-sdkdriver/b-sdkdriver-md` at `56e55988`, the M1-series tip as first
-reviewed; that object remains reachable after later rebases even though it is no
-longer on the branch's first-parent line. On the branch, the same series now
-starts at `e18d5101`. The handback rounds are: round 2 (bounded close ladder, web
-driver label, de-tautologised tests) at `73156446..9650ec69`, and round 3 (the
-real SIGKILL rung, bounding `close_stdin`, joining the reader) at `c2d0657d`,
-with this documentation commit last. The argv, pids, session id and journal
-quoted below are from the `56e55988` tree; `Driver::close` was reworked in both
-handback rounds after that run, and its behaviour — including a child that
-ignores stdin EOF, a saturated writer, and a child that ignores SIGTERM — is
-covered by `tests/claude_sdk_process.rs` rather than by a second live session.
+`wt/c-sdkdriver/b-sdkdriver-md` at the M1-series tip. On the current branch that
+tree is `00be605e` (`refactor(driver): name the carrier in wire form…`); the
+pre-rebase object was `56e55988`, which is kept only as a historical label — no
+ref contains it and a fresh clone cannot resolve it. The argv, pids, session id
+and journal quoted below are from that tree. The handback rounds, by on-branch
+sha:
+
+- **Round 2** — `ec6a90c5..73156446`: the bounded close ladder and the web
+  driver label (plus `f686b130` and the evidence commit `c4575129` in between).
+- **Round 3** — `c2d0657d`: the real SIGKILL rung (SIGTERM masked before any
+  thread spawns), bounding the `close_stdin` EOF request, and joining/aborting
+  the reader.
+- **Round 4** — `dd634467` (the structural grandchild guard for the SIGKILL rung
+  and the non-unix `cfg` nit) plus the documentation accuracy commits for the
+  rebase (this paragraph) and the `inner.live`/`send` residual in §9. The
+  evidence commit naming round 4 is the last commit on the branch.
+
+`Driver::close` was reworked in rounds 2 and 3 after the live run, and its
+behaviour — including a child that ignores stdin EOF, a saturated writer, and a
+child that ignores SIGTERM — is covered by `tests/claude_sdk_process.rs` rather
+than by a second live session.
 
 `LIVE`: this session spent real Haiku budget on two one-word turns (reported cost
 below, two `result` frames). Everything else in the change is covered by
@@ -221,3 +231,29 @@ cargo test -p remuda-node           # (claude, claude-sdk) accepted; sdk never a
 
 No network and no billed model in any of those. The live session above is
 evidence, not a gate — per §3's fixture strategy.
+
+## 9. The residual the bounded close does *not* cover (M2)
+
+Round 2 made `Driver::close` a bounded ladder, and round 3 made the SIGKILL rung
+real and bounded the `close_stdin` EOF request itself. Both bounds start **once
+`close` already holds `inner.live`**. The lock acquisition is a separate door,
+and it is still unbounded.
+
+`Driver::send` takes the same `inner.live` lock and then awaits `send_user`
+until one line is written into the wire crate's 64-slot writer channel
+(`crates/remuda-claude-wire/src/process.rs`). The Node path that calls it —
+`DriverRequest::Send` in `crates/remuda-node/src/native.rs` — puts **no timeout
+on that await**. So against a child that has stopped draining stdin:
+
+1. the writer task blocks on the pipe and, once the two 64-slot channels fill,
+   `send_user` parks;
+2. that `send` keeps holding `inner.live`;
+3. a later `instance.close` blocks acquiring `inner.live`, so the bounded ladder
+   never starts — the hang comes back through a door the EOF bound cannot see.
+
+The saturated-writer regression test (`close_returns_when_stdin_is_not_drained…`)
+does **not** cover this: it never starts a competing `send`, so it reaches the
+ladder with the lock free. M2 owns the ownership rework that closes the door — a
+bounded `send` (a write timeout on the writer channel), or `close` taking
+`inner.live` with a timeout / driving termination outside the lock. That changes
+the shape of `Live`, so it is deliberately not part of M1.

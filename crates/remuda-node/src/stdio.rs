@@ -196,12 +196,16 @@ where
     let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     node.set_object_source(Arc::new(object_broker.source()));
     let (gate_tx, mut gate_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
-    // Long gate methods (run/then/land/unpin) park for minutes; serving them
-    // inline on the input arm freezes every outgoing pump below until the run
-    // ends. They run on their own task and their JSON-RPC reply rides this
-    // channel back to the single writer, interleaving with gate.event, tty and
-    // journal frames in any order.
-    let (long_tx, mut long_rx) = mpsc::channel::<Value>(JOURNAL_QUEUE_CAPACITY);
+    // Long carrier methods park for minutes (a gate run/then/land/unpin, a
+    // worker provision/remove that shells out to git and reclaims a cargo
+    // target, an instance close, a worktree/SCM read): serving them inline on
+    // the input arm freezes every outgoing pump below until the body ends. They
+    // run on their own task through the same `handle_stdio_frame` entry point,
+    // and the resulting frame (plus any journal pump the reply must start) rides
+    // this channel back to the single writer, interleaving with gate.event, tty
+    // and journal frames in any order. gate.cancel and every cheap read stay
+    // inline so the cancel escape hatch fires at once.
+    let (long_tx, mut long_rx) = mpsc::channel::<FrameOutcome>(JOURNAL_QUEUE_CAPACITY);
     spawn_stdio_tty_pump(node.clone(), tty_tx);
     spawn_stdio_gate_pump(node.clone(), gate_tx);
     let mut pumps = HashMap::<InstanceId, JoinHandle<()>>::new();
@@ -228,8 +232,13 @@ where
                 }
             }
             frame = long_rx.recv() => {
-                if let Some(frame) = frame {
-                    write_ndjson(&mut output, &frame).await?;
+                if let Some(outcome) = frame {
+                    if let Some(response) = outcome.response {
+                        write_ndjson(&mut output, &response).await?;
+                    }
+                    if let Some(instance_id) = outcome.pump_instance {
+                        ensure_journal_pump(&node, instance_id, &journal_tx, &mut pumps)?;
+                    }
                 }
             }
             line = input.next_line() => {
@@ -270,28 +279,45 @@ where
                 if object_broker.handle_frame(&frame) {
                     continue;
                 }
-                // Long gate methods (run/then/land/unpin) can park for minutes.
-                // Serving them inline here would starve every outgoing pump in
-                // this select until the run ends — the exact freeze the Hub saw
-                // as `running` with no steps. Hand them to a task that writes the
-                // real JSON-RPC reply back through `long_tx` when the method
-                // returns; every other method keeps its inline path. gate.cancel
-                // is not long, so it stays inline and can kill a running gate.
-                if let Some(method) = frame.get("method").and_then(Value::as_str)
-                    && crate::gate::is_long_gate_method(method)
+                // Long carrier methods can park for minutes: a gate
+                // run/then/land/unpin, a worker.provision/worker.remove that
+                // shells out to `git worktree` and recursively reclaims a cargo
+                // target, an instance.close, or a worktree/SCM read that shells
+                // out to git. Serving any of them inline here would starve every
+                // outgoing pump in this select until the body returns — the
+                // freeze the live demo saw as a job `running` with no steps, and
+                // the same park a `remuda retire` produced with no gate at all.
+                // Hand them to a task that runs the identical `handle_stdio_frame`
+                // path off the loop and sends the outcome (reply + any journal
+                // pump the reply starts) back through `long_tx`; every other
+                // method keeps its inline path. gate.cancel is not long, so it
+                // stays inline and can kill a running gate.
+                if frame
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::gate::is_long_carrier_method)
                 {
-                    let id = frame.get("id").cloned().unwrap_or(Value::Null);
-                    let params = frame
-                        .get("params")
-                        .cloned()
-                        .unwrap_or_else(|| json!({}));
-                    let method = method.to_owned();
                     let node = node.clone();
+                    let enrollment = enrollment.clone();
+                    let data_dir = opts.data_dir.clone();
+                    let transport = opts.transport.clone();
                     let long_tx = long_tx.clone();
                     tokio::spawn(async move {
-                        let result = node.dispatch_gate_rpc(&method, &params).await;
-                        if let Some(response) = response_for(id, result) {
-                            let _ = long_tx.send(response).await;
+                        match handle_stdio_frame(
+                            &node,
+                            &enrollment,
+                            &data_dir,
+                            &transport,
+                            frame,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => {
+                                let _ = long_tx.send(outcome).await;
+                            }
+                            Err(error) => {
+                                tracing::debug!(%error, "off-loop stdio dispatch failed");
+                            }
                         }
                     });
                     continue;

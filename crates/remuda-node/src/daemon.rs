@@ -436,7 +436,7 @@ async fn accept_controller(
 async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     node: &DevNode,
     opts: &StdioOptions,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     generation: u64,
     read: &mut R,
     write: &mut W,
@@ -510,6 +510,14 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let _object_session = FailOnDrop(object_broker.clone());
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut line = Vec::new();
+    // Long carrier methods (a gate run/then/land/unpin, a worker
+    // provision/remove, an instance close, a worktree/SCM read) park for
+    // minutes and do unbounded blocking work. Awaiting one on this read arm
+    // freezes the whole controller: journals stop forwarding and, fatally,
+    // `gate.cancel` cannot even be read while a run is in flight — the escape
+    // hatch the rest of the design leans on. Spawn each on its own task and let
+    // its encoded reply ride this channel back so only this loop writes.
+    let (long_tx, mut long_rx) = tokio::sync::mpsc::channel::<Value>(128);
     loop {
         if *changed.borrow() != generation {
             return Ok(());
@@ -527,6 +535,16 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
             }
             frame = tty_rx.recv(), if ready => {
                 if let Some(frame) = frame {write_frame(write, &frame).await?;}
+            }
+            response = long_rx.recv() => {
+                let Some(response) = response else { return Ok(()); };
+                if *changed.borrow() != generation {return Ok(());}
+                tokio::select! {
+                    _ = changed.changed() => return Ok(()),
+                    result = tokio::time::timeout(Duration::from_secs(30),write_frame(write,&response)) => {
+                        result.map_err(|_|NodeError::Transport("controller response timed out".into()))??;
+                    }
+                }
             }
             _ = tick.tick(), if ready => {
                 if !pending.is_empty() && last_ack.elapsed() > Duration::from_secs(30) {
@@ -571,22 +589,41 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 let request = hubnode::decode_request(&frame)?;
                 let id = request.id.unwrap_or(Value::Null);
                 let params = request.params.unwrap_or(json!({}));
-                // A live gate parks for minutes; holding the shared dispatch
-                // lease across it serializes every other controller's dispatch
-                // behind the whole run. Take the lease only for the takeover
-                // check, drop it, then run the gate body lease-free. `gate.cancel`
-                // is not long — it stays on the inline path so it can kill a
-                // running gate at once.
-                let long_gate = ready
+                // A long carrier method (gate run/then/land/unpin, worker
+                // provision/remove, instance close, worktree/SCM read) parks for
+                // minutes and does unbounded blocking work. Awaiting it on this
+                // read arm — or holding the shared dispatch lease across it —
+                // freezes journals and every other controller behind the whole
+                // body, and blinds this loop to `gate.cancel` while a run is in
+                // flight. Take the lease only for the takeover check, drop it,
+                // then run the body on its own task whose reply rides `long_tx`
+                // back to this loop. `gate.cancel` and every cheap read are not
+                // long — they stay inline so the cancel escape hatch fires at
+                // once.
+                let long_carrier = ready
                     && !crate::interactions::is_interaction_method(&request.method)
-                    && crate::gate::is_long_gate_method(&request.method);
-                let result = if long_gate {
+                    && crate::gate::is_long_carrier_method(&request.method);
+                if long_carrier {
                     {
                         let _dispatch = shared.dispatch.lock().await;
                         if shared.controller.lock().map_err(|_| NodeError::StorePoisoned)?.generation != generation {return Ok(());}
                     }
-                    node.dispatch_gate_rpc(&request.method, &params).await
-                } else {
+                    let node = node.clone();
+                    let method = request.method.clone();
+                    let long_tx = long_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hubnode::dispatch_method(&node, &method, params).await;
+                        if !id.is_null() {
+                            let response = match result {
+                                Ok(value) => hubnode::rpc_ok(id, value),
+                                Err(error) => hubnode::rpc_error(id, -32602, &error.to_string()),
+                            };
+                            let _ = long_tx.send(response).await;
+                        }
+                    });
+                    continue;
+                }
+                let result = {
                     let _dispatch = shared.dispatch.lock().await;
                     if shared.controller.lock().map_err(|_| NodeError::StorePoisoned)?.generation != generation {return Ok(());}
                     let result = if !ready {

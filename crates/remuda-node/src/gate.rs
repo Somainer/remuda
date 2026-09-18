@@ -41,14 +41,46 @@ pub fn is_gate_method(method: &str) -> bool {
 }
 
 /// Gate RPCs that can park a carrier's request loop for minutes and so must be
-/// dispatched off the read path (spawned on stdio; lease-free on WSS/daemon).
+/// dispatched off the read path (lease-free on the outbound WSS runtime).
 ///
 /// `gate.cancel` is deliberately excluded: it is the escape hatch that kills a
 /// running gate, so it must run inline and immediately — a queued cancel is a
 /// dead cancel.
+///
+/// This stays gate-only because the WSS arm that consumes it routes straight to
+/// [`DevNode::dispatch_gate_rpc`], which rejects anything that is not a gate
+/// method. Carriers that serve frames one at a time on their read loop
+/// (ssh-stdio, the daemon controller) use the broader
+/// [`is_long_carrier_method`] and the general dispatch entry point instead.
 #[must_use]
 pub fn is_long_gate_method(method: &str) -> bool {
     is_gate_method(method) && method != remuda_protocol::METHOD_GATE_CANCEL
+}
+
+/// Every Hub→Node method whose body can do unbounded blocking work — a gate run
+/// or a `--then`, a home-host land or unpin, a worker provision/remove that
+/// shells out to `git worktree` and recursively reclaims a cargo target, an
+/// instance close, or a worktree/SCM read that shells out to git.
+///
+/// The single-reader carriers (ssh-stdio at `stdio.rs`, the daemon controller
+/// at `daemon.rs`) serve one frame at a time on their read loop, so awaiting any
+/// of these inline freezes every outgoing pump beside it — journals, tty frames,
+/// gate events and, fatally, `gate.cancel` — until the body returns. Live
+/// evidence: a `remuda retire` (worker.remove) or a `remuda worker resume` over
+/// a dead instance parked the ssh-stdio loop for good with no gate running.
+/// Those carriers spawn every method in this set on its own task and let the
+/// reply ride the outgoing channel back to the single writer.
+///
+/// `gate.cancel` and every cheap read (tty.screen, host.resources, heartbeats,
+/// interactions) stay inline: the cancel must run at once to be an escape hatch,
+/// and the reads return promptly.
+#[must_use]
+pub fn is_long_carrier_method(method: &str) -> bool {
+    is_long_gate_method(method)
+        || crate::worker::is_worker_method(method)
+        || method == "instance.close"
+        || crate::worktree::is_worktree_method(method)
+        || crate::workspace_scm::is_scm_method(method)
 }
 
 /// Default cap for a whole gate run and for a `--then` command.

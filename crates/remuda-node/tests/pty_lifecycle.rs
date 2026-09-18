@@ -454,3 +454,257 @@ async fn reconciling_a_restart_twice_does_not_journal_the_loss_twice() {
         .count();
     assert_eq!(notices, 1, "one restart, one notice");
 }
+
+/// Minimal Instance row for a store-seeded restart case; mirrors the Node's
+/// own test fixture (`runtime::fixture_instance`) without needing it public.
+#[allow(clippy::too_many_lines)]
+fn seeded_instance(
+    instance_id: remuda_protocol::InstanceId,
+    host_id: remuda_protocol::HostId,
+    workspace_id: remuda_protocol::WorkspaceId,
+    driver: DriverKind,
+) -> remuda_protocol::Instance {
+    use remuda_protocol::{
+        Activity, AgentKind, ClaudeRef, Connectivity, EntityMeta, InstanceMode, Knowledge,
+        LaunchedBy, NativeRef, Ownership, ProcessRef, U64,
+    };
+    let now = remuda_protocol::Timestamp::try_from("2026-09-15T00:00:00.000Z".to_string())
+        .expect("timestamp");
+    let session_id = "0199a1f0-0000-7000-8000-aaaaaaaaaaaa".to_owned();
+    remuda_protocol::Instance {
+        meta: EntityMeta {
+            id: instance_id,
+            revision: U64(1),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        host_id: host_id.clone(),
+        workspace_id,
+        kind: AgentKind::Claude,
+        driver,
+        lifecycle: InstanceLifecycle::Ready,
+        activity: Knowledge::Known {
+            value: Activity::Idle,
+        },
+        activity_evidence_event_ids: Vec::new(),
+        connectivity: Connectivity::Connected,
+        ownership: Ownership::Managed,
+        native_ref: NativeRef {
+            host_id,
+            native_store_id: remuda_protocol::Id::new("obj").expect("id"),
+            kind: AgentKind::Claude,
+            session_id: Knowledge::Known {
+                value: session_id.clone(),
+            },
+            transcript: Knowledge::NotApplicable,
+            signal_tier: None,
+            capabilities: Vec::new(),
+            codex: None,
+            acp: None,
+            claude: Some(ClaudeRef {
+                session_id: session_id.clone(),
+            }),
+            claude_bg: None,
+            agy: None,
+            herdr: None,
+        },
+        process_ref: ProcessRef {
+            process_generation: U64(1),
+            process_identity: Knowledge::NotApplicable,
+            connection_epoch: remuda_protocol::Id::new("epoch").expect("id"),
+        },
+        spec_revision: U64(1),
+        launch_id: Knowledge::Known {
+            value: remuda_protocol::Id::new("launch").expect("id"),
+        },
+        capabilities: remuda_node::driver_capability_snapshot(driver),
+        owner_fence: U64(1),
+        active_run_ids: Vec::new(),
+        parent: None,
+        journal_id: remuda_protocol::Id::new("obj").expect("id"),
+        durable_seq: U64(0),
+        exit: Knowledge::NotApplicable,
+        last_error: None,
+        mode: Some(InstanceMode::Native),
+        promoted_at: None,
+        launched_by: Some(LaunchedBy::Remuda),
+    }
+}
+
+/// The restart sweep must cover every in-process driver, not `shell-pty` alone.
+///
+/// A `claude-pty` row survived its Node restart reading `running` in
+/// node.sqlite, which is how the 2026-09-18 demo ended up with four instances
+/// whose processes were dead still counting against `maxInstances` — and with
+/// the hello inventory repeating that lie to the Hub, which then had nothing to
+/// reconcile against.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_settles_a_claude_pty_row_and_the_inventory_agrees() {
+    use remuda_node::{LocalStore, MemoryStore};
+
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+    let id = remuda_protocol::InstanceId::new();
+
+    // The previous Node's durable row, as it left it: ready, and with no
+    // process behind it any more.
+    {
+        let store = MemoryStore::open_journaled(data.path(), 64).expect("store");
+        store
+            .insert_instance(seeded_instance(
+                id.clone(),
+                remuda_protocol::HostId::new(),
+                remuda_protocol::WorkspaceId::new(),
+                DriverKind::ClaudePty,
+            ))
+            .expect("seed a ready claude-pty row");
+        assert_eq!(
+            store.get_instance(&id).expect("read back").lifecycle,
+            InstanceLifecycle::Ready,
+            "the seed must start life as a row that claims to be running"
+        );
+    }
+
+    // A fresh process, exactly as a real restart composes one.
+    let restarted = compose(&config).expect("reopen");
+    restarted.reconcile_herdr().await.expect("reconcile");
+
+    let instance = restarted.get_instance(&id).expect("instance");
+    assert_eq!(
+        instance.lifecycle,
+        InstanceLifecycle::Exited,
+        "a carrier the Node can no longer hold must not still read as ready"
+    );
+    assert_eq!(
+        instance.last_error.as_deref(),
+        Some(remuda_node::reclaim::NODE_EPOCH_CHANGED),
+    );
+
+    // The inventory the hello announces must agree with the row, or the Hub
+    // reconciles a Node that is still claiming the session it just lost.
+    let inventory = restarted.list_instances().expect("list").items;
+    let reported = inventory
+        .iter()
+        .find(|row| row.meta.id == id)
+        .expect("the settled row is still listed");
+    assert_eq!(
+        reported.lifecycle,
+        InstanceLifecycle::Exited,
+        "the hello inventory must not re-report a session the sweep just settled"
+    );
+}
+
+/// A Node that cannot vouch for its instance store must not announce an empty
+/// inventory.
+///
+/// The Hub settles every live row a hello omits, so `[]` is a destructive
+/// claim: it says "I hold nothing" and the Hub exits every session on the
+/// host. A `--data-dir` pointed at the wrong path enumerates zero rows without
+/// that meaning anything, so such a Node reports `None` — no `instances` key
+/// at all — and leaves the Hub's rows for a Node that can vouch for itself.
+///
+/// "Vouch" is specifically *the store file was already there*. A brand-new
+/// data dir is indistinguishable from a wrong one: both enumerate zero rows
+/// and neither can show that emptiness is real, so both stay silent. That
+/// costs nothing, because a host whose store never existed has no rows on the
+/// Hub for the silence to leave behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_that_was_never_found_announces_no_inventory() {
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+
+    // Nothing has created `node.sqlite` here yet.
+    let fresh = compose(&config).expect("compose");
+    assert!(
+        !fresh.found_instance_store(),
+        "a data dir this process had to create is not one it can vouch for"
+    );
+    assert!(
+        fresh.list_instances().expect("list").items.is_empty(),
+        "and it holds nothing, which is exactly why the claim is unsafe"
+    );
+    assert_eq!(
+        fresh.announceable_inventory().expect("inventory"),
+        None,
+        "an unwarranted empty inventory must not be announced: the Hub would \
+         settle every live row on this host"
+    );
+}
+
+/// The other half, and the one the demo turned on: a Node that reopens the
+/// data dir it was already using *can* vouch, so its inventory rides the hello
+/// even when the sweep has just emptied it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reopened_store_vouches_for_an_empty_inventory() {
+    use serde_json::json;
+
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+
+    // First run creates the store; the second finds it.
+    let first = compose(&config).expect("compose");
+    let id = {
+        let mut request = create_req(AgentKind::Terminal, DriverKind::ShellPty);
+        request.args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "while :; do sleep 0.1; done".into(),
+        ];
+        let created = first.create_instance(request).await.expect("create");
+        created.instance.meta.id.clone()
+    };
+    drop(first);
+
+    let restarted = compose(&config).expect("reopen");
+    assert!(
+        restarted.found_instance_store(),
+        "a data dir that already held instance rows is one this process vouches for"
+    );
+    // The restart sweep settles the session, and the inventory the hello
+    // announces must say so rather than re-reporting it as held.
+    restarted.reconcile_herdr().await.expect("reconcile");
+    assert_eq!(
+        restarted.get_instance(&id).expect("instance").lifecycle,
+        InstanceLifecycle::Exited
+    );
+    let announced = restarted
+        .announceable_inventory()
+        .expect("inventory")
+        .expect("a vouched store announces its rows");
+    let rows = announced.as_array().expect("array");
+    let reported = rows
+        .iter()
+        .find(|row| row["id"] == json!(id.as_id().as_str()))
+        .expect("the settled row is still listed");
+    assert_eq!(
+        reported["lifecycle"],
+        json!("exited"),
+        "the hello must report the swept row as exited, not as a session it still holds"
+    );
+}
+
+/// An in-memory store holds nothing and can attest to nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_in_memory_store_never_vouches() {
+    use remuda_node::{DevNode, DriverRegistry, LocalStore, MemoryStore};
+    use std::sync::Arc;
+
+    let store = Arc::new(MemoryStore::new(64));
+    assert!(
+        !store.instance_store_is_durable(),
+        "an in-memory store must not claim durable instance rows"
+    );
+    let data = tempfile::tempdir().expect("data dir");
+    let config = native_config(data.path());
+    let node = DevNode::with_parts(
+        &config.http,
+        store,
+        DriverRegistry::with_fake().expect("drivers"),
+    )
+    .expect("compose node");
+    assert_eq!(
+        node.announceable_inventory().expect("inventory"),
+        None,
+        "with nothing to vouch for, the hello carries no inventory key"
+    );
+}

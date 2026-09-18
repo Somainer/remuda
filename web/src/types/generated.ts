@@ -4495,6 +4495,7 @@ export type WorkerWatch = (({
   "status": "stalled";
   [key: string]: unknown;
 }) | ({
+  "reason"?: (string);
   "status": "gone";
   [key: string]: unknown;
 }) | ({
@@ -4530,6 +4531,7 @@ export type WorkerWatchStatus = (({
   "status": "stalled";
   [key: string]: unknown;
 }) | ({
+  "reason"?: (string);
   "status": "gone";
   [key: string]: unknown;
 }) | ({

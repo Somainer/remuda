@@ -575,8 +575,14 @@ async fn perform_hello(
         // Always announce the instance inventory, daemon or not. The Hub needs
         // it to reconcile rows this Node no longer owns after a restart; a
         // hello without one leaves those rows running forever, holding
-        // placement slots nothing can release.
-        params["instances"] = serde_json::to_value(runtime.node.list_instances()?.items)?;
+        // placement slots nothing can release. A store this Node cannot vouch
+        // for yields no key rather than an empty list — see
+        // `DevNode::announceable_inventory`.
+        if let Some(inventory) = runtime.node.announceable_inventory()? {
+            params["instances"] = inventory;
+            // The attestation travels with the list it belongs to.
+            params["instanceStoreFound"] = json!(true);
+        }
         if runtime.controller.is_some() {
             params["daemon"] = json!(true);
             params["durable"] = json!(true);

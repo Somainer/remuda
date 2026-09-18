@@ -109,12 +109,40 @@ where
 
 /// Connect a Node socket and complete `node.hello`, optionally announcing an
 /// epoch and an instance inventory (what a daemon Node sends on reconnect).
+///
+/// A supplied inventory carries the `instanceStoreFound` attestation with it,
+/// exactly as a real Node pairs the two: it is what makes an *empty* inventory
+/// a claim the Hub may act on. Use [`node_hello_unvouched`] to send one without.
 async fn node_hello(
     addr: std::net::SocketAddr,
     bearer: &str,
     host_id: &HostId,
     epoch: Option<&str>,
     instances: Option<Value>,
+) -> Result<(Ws, String)> {
+    let vouched = instances.is_some().then(|| json!(true));
+    node_hello_inner(addr, bearer, host_id, epoch, instances, vouched).await
+}
+
+/// A hello whose inventory the Node does *not* vouch for — the shape a Node
+/// with a wrong `--data-dir` produces, and the one the Hub must refuse.
+async fn node_hello_unvouched(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    host_id: &HostId,
+    epoch: &str,
+    instances: Value,
+) -> Result<(Ws, String)> {
+    node_hello_inner(addr, bearer, host_id, Some(epoch), Some(instances), None).await
+}
+
+async fn node_hello_inner(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    host_id: &HostId,
+    epoch: Option<&str>,
+    instances: Option<Value>,
+    store_found: Option<Value>,
 ) -> Result<(Ws, String)> {
     let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
     req.headers_mut()
@@ -132,6 +160,9 @@ async fn node_hello(
     }
     if let Some(instances) = instances {
         params["instances"] = instances;
+    }
+    if let Some(store_found) = store_found {
+        params["instanceStoreFound"] = store_found;
     }
     node.send(Message::Text(
         json!({"jsonrpc":"2.0","id":"hello","method":"node.hello","params":params})
@@ -374,6 +405,14 @@ async fn cached_snapshot_is_sent_when_the_node_cannot_be_attached() -> Result<()
         .context("hub did not send its cached snapshot (B3)")?;
     assert_eq!(cached["source"], json!("hub-cache"));
     assert_eq!(cached["instanceId"], json!(instance_id.as_id().as_str()));
+    // The cache is stale by definition — the bytes are whatever this Hub last
+    // saw before the link went away — so the follower must be told how old
+    // they are and why they stopped, or it paints an hour-old frame as live.
+    assert_eq!(cached["reason"], json!("node-link-unavailable"));
+    let captured_at = cached["capturedAt"]
+        .as_str()
+        .context("hub-cache snapshot carries no capture time")?;
+    assert!(captured_at.ends_with('Z'), "capturedAt {captured_at}");
     let decoded = {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -385,6 +424,91 @@ async fn cached_snapshot_is_sent_when_the_node_cannot_be_attached() -> Result<()
             .any(|w| w == b"cached-screen"),
         "cached snapshot did not carry the buffered bytes"
     );
+    Ok(())
+}
+
+/// An attach that succeeds with nothing to replay is a *live* session, not a
+/// stale one.
+///
+/// A fresh PTY (or a Node with nothing buffered yet) answers `tty.attach` with
+/// a stream id and no `snapshotBase64`. Falling through to the Hub's cache on
+/// that answer would label a running session stale and freeze its stdin — the
+/// browser would refuse keystrokes on a terminal that is answering. The stream
+/// is bound, so live bytes still arrive as ordinary binary frames.
+#[tokio::test]
+async fn an_attach_without_snapshot_bytes_stays_live() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+    let stream_id = remuda_protocol::Id::new("tty")?;
+    let uuid = StreamUuid::from_prefixed_id(stream_id.as_str()).expect("stream uuid");
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, _) = node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    bind_stream(&mut node, &instance_id, &stream_id, "bind").await?;
+
+    // Prime the Hub's cache, so a fall-through *would* have bytes to serve and
+    // the test cannot pass merely because the cache happens to be empty.
+    let mut warmup = follow_socket(hub.addr, &cookie, &instance_id).await?;
+    node.send(Message::Binary(
+        encode_binary_frame(BinaryChannel::TtyOutput, uuid, 0, b"stale-fallback")?.into(),
+    ))
+    .await?;
+    anyhow::ensure!(
+        wait_for(&mut warmup, binary_containing(b"stale-fallback"))
+            .await
+            .is_some(),
+        "hub never cached the tty output"
+    );
+    drop(warmup);
+
+    // The Node now answers `tty.attach` with a live stream and no backlog.
+    let attach_stream_id = stream_id.as_str().to_string();
+    let responder = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(Ok(Message::Text(text)))) =
+                tokio::time::timeout(Duration::from_millis(300), node.next()).await
+            else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if value.get("method").and_then(Value::as_str) != Some("tty.attach") {
+                continue;
+            }
+            let id = value.get("id").cloned().unwrap_or(Value::Null);
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "streamId": attach_stream_id,
+                    "altScreen": false,
+                }
+            });
+            let _ = node.send(Message::Text(reply.to_string().into())).await;
+        }
+    });
+
+    let mut follow = follow_socket(hub.addr, &cookie, &instance_id).await?;
+    // The authoritative mode notice is what a successful attach sends; the
+    // cached snapshot is what a failed one sends.
+    let notice = wait_for(&mut follow, json_of_type("tty.mode"))
+        .await
+        .context("a successful attach must announce the mode boundary")?;
+    assert_eq!(notice["streamId"], json!(stream_id.as_str()));
+
+    // No stale frame may follow it.
+    let stale = wait_for(&mut follow, json_of_type("tty.snapshot")).await;
+    assert!(
+        stale.is_none(),
+        "a live session must not be served the hub cache: {stale:?}"
+    );
+    responder.abort();
     Ok(())
 }
 
@@ -658,6 +782,510 @@ async fn max_instances_override_and_reconciliation_survive_a_hub_restart() -> Re
     .await??;
     assert_eq!(reconciled["lastError"], json!("node-epoch-changed"));
     Ok(())
+}
+
+/// Seed an active worker holding `instance_id` on `host_id`.
+///
+/// The roster row is written straight to the store rather than through
+/// `/v1/workers/dispatch`: dispatch would create its *own* instance, and this
+/// test needs the worker bound to the instance the reconcile is about.
+async fn seed_hub_worker(
+    hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    instance_id: &InstanceId,
+    name: &str,
+) -> Result<String> {
+    use remuda_protocol::{EntityMeta, ProjectId, U64, WorkerRoster, WorkerRosterId, WorkerState};
+    let store = hub.store().context("store")?;
+    let now = remuda_protocol::Timestamp::try_from("2026-01-01T00:00:00.000Z".to_string())?;
+    let worker = WorkerRoster {
+        meta: EntityMeta {
+            id: WorkerRosterId::new(),
+            revision: U64(1),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        project_id: ProjectId::new(),
+        name: name.to_string(),
+        instance_id: Some(instance_id.clone()),
+        host_id: host_id.parse()?,
+        workspace_id: remuda_protocol::WorkspaceId::new(),
+        harness: "claude".into(),
+        driver: Some("claude-pty".into()),
+        model: None,
+        provider_profile_id: None,
+        branch: format!("wt/{name}/seed"),
+        worktree_path: format!("/tmp/{name}"),
+        port_block: None,
+        target_dir: None,
+        brief_object_id: None,
+        task_id: None,
+        state: WorkerState::Working,
+        watch: None,
+        last_nudge_at: None,
+        resumed_from: None,
+        replace_count: None,
+        supply_decision: None,
+        reclaimed_bytes: None,
+    };
+    let row = store.insert_worker(worker, "seed-device".into()).await?;
+    Ok(row.meta.id.as_id().to_string())
+}
+
+/// Read one worker's row by id.
+async fn worker_row(addr: std::net::SocketAddr, cookie: &str, id: &str) -> Result<Value> {
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/workers/{id}"),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "worker {id} {status} {body}");
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+/// The host's fleet view: capacity, running count and free slots.
+async fn hostcap(addr: std::net::SocketAddr, cookie: &str, host_id: &HostId) -> Result<Value> {
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/hosts/{}/hostcap", host_id.as_id().as_str()),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "hostcap {status} {body}");
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+/// Read one instance row.
+async fn instance_row(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    instance_id: &InstanceId,
+) -> Result<Value> {
+    let (status, _, body) = http(
+        addr,
+        "GET",
+        &format!("/v1/instances/{}", instance_id.as_id().as_str()),
+        &[("Cookie", cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "instance {instance_id:?} {status} {body}");
+    Ok(serde_json::from_str(body.trim())?)
+}
+
+/// The 2026-09-18 demo, end to end: a Node restart loses an instance and
+/// everything the Hub derived from it must follow — the row, the worker
+/// holding it, and the placement slot it occupied.
+///
+/// The demo's four zombies stayed `running` after their processes died with
+/// the old Node, so they counted against `maxInstances` (placement was
+/// unsatisfiable until the cap was raised by hand) while `remuda watch` kept
+/// calling them working.
+#[tokio::test]
+async fn a_lost_instance_fails_its_worker_and_frees_the_slot() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let survivor = InstanceId::new();
+    let zombie = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, node_token) =
+        node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &survivor, "seed-keep").await?;
+    seed_instance(&mut node, &zombie, "seed-lost").await?;
+    let worker_id = seed_hub_worker(&hub, host_id.as_id().as_str(), &zombie, "c-demo").await?;
+    let survivor_worker =
+        seed_hub_worker(&hub, host_id.as_id().as_str(), &survivor, "c-keep").await?;
+
+    // Both rows hold slots, so the cap the restart must free is observable.
+    let before = hostcap(hub.addr, &cookie, &host_id).await?;
+    let free_before = before["freeSlots"].as_i64().context("freeSlots")?;
+    assert_eq!(before["running"], json!(2));
+    node.close(None).await?;
+    drop(node);
+
+    // The Node comes back under a new epoch. `survivor` is reported live; the
+    // zombie is reported *exited* — the Node enumerated the row and confessed
+    // it is gone, which must settle rather than shield the Hub's stale copy.
+    let _node = node_hello(
+        hub.addr,
+        &node_token,
+        &host_id,
+        Some("epoch_two"),
+        Some(json!([
+            {
+                "id": survivor.as_id().as_str(),
+                "hostId": host_id.as_id().as_str(),
+                "lifecycle": "running"
+            },
+            {
+                "id": zombie.as_id().as_str(),
+                "hostId": host_id.as_id().as_str(),
+                "lifecycle": "exited"
+            }
+        ])),
+    )
+    .await?;
+
+    let zombie_row = instance_row(hub.addr, &cookie, &zombie).await?;
+    assert_eq!(zombie_row["lifecycle"], json!("exited"));
+    assert_eq!(
+        zombie_row["lastError"],
+        json!("node-epoch-changed"),
+        "the settled row must say why"
+    );
+
+    // The worker holding it must stop reading as active: a blocked worker is
+    // one its coordinator can act on, a `working` one over a dead process is
+    // the lie that kept `remuda watch` reporting progress.
+    let zombie_worker = worker_row(hub.addr, &cookie, &worker_id).await?;
+    assert_eq!(
+        zombie_worker["state"]["state"],
+        json!("blocked"),
+        "a lost instance must fail the worker holding it: {zombie_worker}"
+    );
+    assert_eq!(
+        zombie_worker["state"]["reason"],
+        json!("node-epoch-changed")
+    );
+
+    // The survivor and its worker are untouched.
+    let survivor_row = instance_row(hub.addr, &cookie, &survivor).await?;
+    assert_eq!(survivor_row["lifecycle"], json!("running"));
+    let kept_worker = worker_row(hub.addr, &cookie, &survivor_worker).await?;
+    assert_eq!(kept_worker["state"]["state"], json!("working"));
+
+    // The slot came back: the demo's sessions were unplaceable until the cap
+    // was raised by hand.
+    let after = hostcap(hub.addr, &cookie, &host_id).await?;
+    assert_eq!(after["running"], json!(1), "only the survivor holds a slot");
+    assert_eq!(
+        after["freeSlots"].as_i64().context("freeSlots")?,
+        free_before + 1,
+        "settling the lost row must give its placement slot back"
+    );
+    Ok(())
+}
+
+/// The same reconcile on a host with a neighbour online must not touch the
+/// neighbour's rows: the settle is host-scoped, and a restart on one machine
+/// is not evidence about another's sessions.
+#[tokio::test]
+async fn a_node_restart_leaves_another_hosts_rows_alone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_a = HostId::new();
+    let host_b = HostId::new();
+    let lost = InstanceId::new();
+    let neighbour = InstanceId::new();
+
+    let enroll_a = enroll_token(hub.addr, &cookie).await?;
+    let (mut node_a, token_a) =
+        node_hello(hub.addr, &enroll_a, &host_a, Some("epoch_one"), None).await?;
+    let enroll_b = enroll_token(hub.addr, &cookie).await?;
+    let (mut node_b, token_b) =
+        node_hello(hub.addr, &enroll_b, &host_b, Some("epoch_one"), None).await?;
+    seed_instance(&mut node_a, &lost, "seed-a").await?;
+    seed_instance(&mut node_b, &neighbour, "seed-b").await?;
+    node_a.close(None).await?;
+    drop(node_a);
+
+    // Host A restarts and reports nothing at all — every one of its rows is
+    // lost. Host B is still online and still holds its own instance.
+    let _node_a = node_hello(
+        hub.addr,
+        &token_a,
+        &host_a,
+        Some("epoch_two"),
+        Some(json!([])),
+    )
+    .await?;
+
+    let lost_row = instance_row(hub.addr, &cookie, &lost).await?;
+    assert_eq!(lost_row["lifecycle"], json!("exited"));
+    assert_eq!(lost_row["lastError"], json!("node-epoch-changed"));
+
+    let neighbour_row = instance_row(hub.addr, &cookie, &neighbour).await?;
+    assert_eq!(
+        neighbour_row["lifecycle"],
+        json!("running"),
+        "another host's rows are not this restart's to settle: {neighbour_row}"
+    );
+    // Host B was never touched: its epoch is unchanged, so a reconnect under
+    // the same epoch and a matching inventory is a no-op rather than a settle.
+    let _node_b = node_hello(
+        hub.addr,
+        &token_b,
+        &host_b,
+        Some("epoch_one"),
+        Some(json!([{ "id": neighbour.as_id().as_str(), "lifecycle": "running" }])),
+    )
+    .await?;
+    let neighbour_row = instance_row(hub.addr, &cookie, &neighbour).await?;
+    assert_eq!(neighbour_row["lifecycle"], json!("running"));
+    Ok(())
+}
+
+/// An empty inventory the Node does not vouch for must not wipe the host.
+///
+/// `[]` and "my data dir pointed somewhere else" look identical in the array,
+/// and the Hub settles every live row an inventory omits. Honouring an
+/// unattested empty list would exit every session on the host — a far worse
+/// outcome than leaving a genuinely-lost row behind for the operator to see.
+#[tokio::test]
+async fn an_unvouched_empty_inventory_leaves_rows_alone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, node_token) =
+        node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    node.close(None).await?;
+    drop(node);
+
+    // A new epoch and an empty inventory, with no `instanceStoreFound`: the
+    // shape a Node with a wrong `--data-dir` produces.
+    let _node =
+        node_hello_unvouched(hub.addr, &node_token, &host_id, "epoch_two", json!([])).await?;
+
+    let row = instance_row(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(
+        row["lifecycle"],
+        json!("running"),
+        "an unstaked empty inventory must not settle anything: {row}"
+    );
+    Ok(())
+}
+
+/// An empty inventory the Node *does* vouch for is honoured: that is the
+/// distinction the attestation exists to draw.
+#[tokio::test]
+async fn a_vouched_empty_inventory_still_settles_lost_rows() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let instance_id = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, node_token) =
+        node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &instance_id, "seed").await?;
+    node.close(None).await?;
+    drop(node);
+
+    let _node = node_hello(
+        hub.addr,
+        &node_token,
+        &host_id,
+        Some("epoch_two"),
+        Some(json!([])),
+    )
+    .await?;
+
+    let row = instance_row(hub.addr, &cookie, &instance_id).await?;
+    assert_eq!(row["lifecycle"], json!("exited"));
+    assert_eq!(row["lastError"], json!("node-epoch-changed"));
+    Ok(())
+}
+
+/// A create still in flight must survive a Node restart.
+///
+/// A `requested` row is a Hub-side intent the Node has not acknowledged, so a
+/// Node that restarts in that window reports nothing for it without the create
+/// being lost. Settling it here would kill a create that may yet land; those
+/// rows have their own age-bounded reaper.
+#[tokio::test]
+async fn a_requested_row_survives_the_epoch_reconcile() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let live = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, node_token) =
+        node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &live, "seed-live").await?;
+    // A create the Hub recorded but no Node receipt ever acknowledged.
+    let store = hub.store().context("store")?;
+    let created = store
+        .insert_instance(
+            host_id.as_id().as_str().to_string(),
+            None,
+            "claude".into(),
+            "claude-pty".into(),
+            Some("in-flight".into()),
+            json!({}),
+        )
+        .await?;
+    assert_eq!(created.lifecycle, "requested", "the seed must be in flight");
+    let requested_id = created.instance_id;
+    node.close(None).await?;
+    drop(node);
+
+    // The restart reports neither: one row is an acknowledged instance the new
+    // process no longer holds, the other was never acknowledged at all.
+    let _node = node_hello(
+        hub.addr,
+        &node_token,
+        &host_id,
+        Some("epoch_two"),
+        Some(json!([])),
+    )
+    .await?;
+
+    let live_row = instance_row(hub.addr, &cookie, &live).await?;
+    assert_eq!(
+        live_row["lifecycle"],
+        json!("exited"),
+        "an acknowledged row the node no longer holds must settle"
+    );
+    let (status, _, body) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{requested_id}"),
+        &[("Cookie", cookie.as_str())],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "{status} {body}");
+    let requested_row: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(
+        requested_row["lifecycle"],
+        json!("requested"),
+        "a create in flight is not this reconcile's to settle: {requested_row}"
+    );
+    Ok(())
+}
+
+/// A worker that already reported DONE keeps its sha through a Node restart.
+///
+/// The instance is gone either way, but the worker's *result* did land: a
+/// restart must not rewrite a delivered report into "blocked by a lost
+/// session", which would tell the coordinator to redo finished work.
+#[tokio::test]
+async fn a_done_worker_keeps_its_sha_when_its_instance_is_lost() -> Result<()> {
+    use remuda_protocol::WorkerState;
+
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new();
+    let done_instance = InstanceId::new();
+    let working_instance = InstanceId::new();
+
+    let enroll = enroll_token(hub.addr, &cookie).await?;
+    let (mut node, node_token) =
+        node_hello(hub.addr, &enroll, &host_id, Some("epoch_one"), None).await?;
+    seed_instance(&mut node, &done_instance, "seed-done").await?;
+    seed_instance(&mut node, &working_instance, "seed-working").await?;
+    let done_worker =
+        seed_hub_worker(&hub, host_id.as_id().as_str(), &done_instance, "c-done").await?;
+    let working_worker = seed_hub_worker(
+        &hub,
+        host_id.as_id().as_str(),
+        &working_instance,
+        "c-working",
+    )
+    .await?;
+    // The first worker has already reported its sha; the second is mid-turn.
+    hub.store()
+        .context("store")?
+        .mutate_worker(done_worker.clone(), |row| {
+            row.state = WorkerState::Done {
+                sha: "0123456789abcdef".into(),
+            };
+            Ok(())
+        })
+        .await?;
+    node.close(None).await?;
+    drop(node);
+
+    let _node = node_hello(
+        hub.addr,
+        &node_token,
+        &host_id,
+        Some("epoch_two"),
+        Some(json!([])),
+    )
+    .await?;
+
+    let done = worker_row(hub.addr, &cookie, &done_worker).await?;
+    assert_eq!(
+        done["state"]["state"],
+        json!("done"),
+        "a delivered report must survive a restart: {done}"
+    );
+    assert_eq!(
+        done["state"]["sha"],
+        json!("0123456789abcdef"),
+        "and it must keep the sha it claimed: {done}"
+    );
+    let working = worker_row(hub.addr, &cookie, &working_worker).await?;
+    assert_eq!(
+        working["state"]["state"],
+        json!("blocked"),
+        "a worker still mid-turn is the one the loss must fail: {working}"
+    );
+    assert_eq!(working["state"]["reason"], json!("node-epoch-changed"));
+    Ok(())
+}
+
+/// A roster row written before `WorkerWatchStatus::Gone` carried a reason must
+/// still load.
+///
+/// The watch is persisted verbatim inside `worker_roster.doc_json`, so a
+/// required field would make every pre-existing row fail to deserialize —
+/// taking out the whole roster list, and node.hello itself, since the epoch
+/// reconcile reads worker rows. `load_worker` is a plain `serde_json::from_str`
+/// with no leniency of its own, so the default has to live on the variant.
+#[test]
+fn a_legacy_gone_watch_row_still_deserializes() {
+    use remuda_protocol::{WorkerRoster, WorkerWatchStatus};
+
+    // Exactly what a Hub predating the field wrote: the variant's tag and
+    // nothing else.
+    let legacy: WorkerWatchStatus =
+        serde_json::from_value(json!({ "status": "gone" })).expect("legacy gone must load");
+    assert_eq!(legacy.kind(), "gone");
+    match legacy {
+        WorkerWatchStatus::Gone { reason } => assert!(reason.is_empty()),
+        other => panic!("expected gone, got {other:?}"),
+    }
+
+    // And through the row shape the store actually holds, which is what
+    // `load_worker` deserializes.
+    let roster: WorkerRoster = serde_json::from_value(json!({
+        "id": "wkr_01993ab0-0000-7000-8000-000000000001",
+        "revision": "1",
+        "createdAt": "2026-09-17T00:00:00.000Z",
+        "updatedAt": "2026-09-17T00:00:00.000Z",
+        "projectId": "prj_01993ab0-0000-7000-8000-000000000002",
+        "name": "c-legacy",
+        "hostId": "hst_01993ab0-0000-7000-8000-000000000003",
+        "workspaceId": "wsp_01993ab0-0000-7000-8000-000000000004",
+        "harness": "claude",
+        "branch": "wt/c-legacy/brief-md",
+        "worktreePath": "/tmp/remuda-wt/c-legacy",
+        "state": { "state": "working" },
+        "watch": { "status": "gone", "observedAt": "2026-09-17T00:00:00.000Z" },
+    }))
+    .expect("a roster row with a legacy gone watch must load");
+    let watch = roster.watch.expect("watch");
+    assert_eq!(watch.status.kind(), "gone");
 }
 
 /// A stop for an instance the Node forgot must settle, not hang: the command

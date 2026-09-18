@@ -319,35 +319,51 @@ impl DevNode {
         Ok(())
     }
 
-    /// Settle native-PTY sessions that did not survive this Node's restart
+    /// Settle every session that did not survive this Node's restart
     /// (D-028 §8, plan A).
     ///
-    /// An in-process `portable-pty` dies with the Node: the child is ours, and
-    /// when the master fd closes the kernel sends `SIGHUP` to the foreground
-    /// group. There is no adopting it back. Plan A accepts that and requires
-    /// the loss be *said out loud* rather than left as a row that claims to be
-    /// ready — so every live `shell-pty` row from the previous process is
-    /// marked exited with `node-epoch-changed`, and a diagnostic carries the
-    /// same reason into the journal for the web to render as
-    /// 「Node 重启，会话已结束」 beside a Resume affordance.
+    /// An in-process driver dies with the Node: an in-process `portable-pty`
+    /// loses its child to `SIGHUP` when the master fd closes, and a stdio
+    /// driver's process is a direct child. There is no adopting either back.
+    /// Plan A accepts that and requires the loss be *said out loud* rather
+    /// than left as a row that claims to be ready — so every such row from the
+    /// previous process is marked exited with `node-epoch-changed`, and a
+    /// diagnostic carries the same reason into the journal for the web to
+    /// render as 「Node 重启，会话已结束」 beside a Resume affordance.
+    ///
+    /// This sweeps **every** driver, not `shell-pty` alone. Restricting it to
+    /// in-process PTYs left `claude-pty`, `claude-bg`, `codex-appserver` and
+    /// `grok-acp` rows reading `running` forever after a restart: they hold
+    /// placement slots nothing can release, `remuda watch` keeps calling them
+    /// working, and the web terminal keeps showing a frozen screen.
+    ///
+    /// Two things are exempt, and each is a carrier that legitimately outlives
+    /// this process:
+    /// * a driver in [`Self::instance_drivers`] was built by *this* process,
+    ///   so it is alive and not a restart casualty;
+    /// * a row with a durable `pty_resources` entry is Herdr-carried. Those
+    ///   panes really do survive the Node and are [`Self::reconcile_herdr`]'s
+    ///   business — it adopts the live ones and settles the rest, and it runs
+    ///   *after* this so the resource rows are still here to tell the two
+    ///   apart.
     ///
     /// Resume is what makes this honest rather than merely blunt: D-026 can
     /// continue the same conversation, and §5.6 makes that a new PTY with
     /// `--resume` prefilled. The session is over; the conversation is not.
     ///
-    /// Herdr-carried instances are **not** touched — they genuinely do survive,
-    /// which is why herdr stays an optional carrier until `remuda-ptyd` lands
-    /// in P8. Those are [`Self::reconcile_herdr`]'s business.
-    ///
     /// Runs at startup, before any instance is served. Idempotent: a row that
     /// is already exited is left alone, so a Node that restarts twice does not
     /// journal the loss twice.
     pub async fn reconcile_native_pty(&self) -> Result<(), NodeError> {
+        let herdr_carried: BTreeSet<String> = self
+            .inner
+            .store
+            .pty_resources()?
+            .into_iter()
+            .filter_map(|resource| resource.instance_id.map(|id| id.as_id().to_string()))
+            .collect();
         let mut lost = Vec::new();
         for instance in self.inner.store.list_instances()? {
-            if instance.driver != DriverKind::ShellPty {
-                continue;
-            }
             if matches!(
                 instance.lifecycle,
                 InstanceLifecycle::Exited | InstanceLifecycle::Failed
@@ -366,12 +382,18 @@ impl DevNode {
             {
                 continue;
             }
+            // Herdr-carried: the pane may still exist and be adoptable, so its
+            // row is not this sweep's to settle. Doing it here would journal a
+            // 「会话已结束」 for a session the operator is still looking at.
+            if herdr_carried.contains(instance.meta.id.as_id().as_str()) {
+                continue;
+            }
             lost.push(instance.meta.id.clone());
         }
         for id in lost {
             tracing::warn!(
                 instance = %id.as_id(),
-                "native PTY did not survive the node restart; marking exited ({NODE_EPOCH_CHANGED})"
+                "session did not survive the node restart; marking exited ({NODE_EPOCH_CHANGED})"
             );
             self.inner
                 .store

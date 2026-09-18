@@ -18,6 +18,7 @@ use remuda_protocol::hubnode::{
 };
 use remuda_protocol::{
     ConnectionLease, HeartbeatResult, HelloResult, PROTOCOL_VERSION, TransportLimits, U64,
+    WorkerState,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -67,7 +68,7 @@ impl FollowEvent {
 #[derive(Clone, Default)]
 pub struct TtyRelay {
     streams: Arc<std::sync::Mutex<HashMap<String, StreamOwner>>>,
-    buffers: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
+    buffers: Arc<std::sync::Mutex<HashMap<String, CachedScreen>>>,
 }
 
 /// Host-validated owner of a tty stream UUID.
@@ -128,21 +129,49 @@ impl TtyRelay {
         }
         if let Ok(mut buffers) = self.buffers.lock() {
             let buf = buffers.entry(instance_id.to_owned()).or_default();
-            buf.extend_from_slice(payload);
+            buf.bytes.extend_from_slice(payload);
+            // Stamped on every append: the age the browser renders is the age
+            // of the *newest* byte, which is what "this screen is frozen as of
+            // T" means. A buffer that never re-stamped would age from first
+            // attach and overstate how stale a slow-but-live stream is.
+            buf.captured_at = Some(now_rfc3339());
             const MAX: usize = 256 * 1024;
-            if buf.len() > MAX {
-                let drop = buf.len() - MAX;
-                buf.drain(..drop);
+            if buf.bytes.len() > MAX {
+                let drop = buf.bytes.len() - MAX;
+                buf.bytes.drain(..drop);
             }
         }
     }
 
-    fn snapshot(&self, instance_id: &str) -> Vec<u8> {
+    /// The cached bytes plus when the newest of them arrived.
+    ///
+    /// The timestamp is what lets a follower tell a live frame from a fossil:
+    /// the Hub's cache is the last resort when `tty.attach` cannot be answered,
+    /// and without an age the browser has no way to know the screen it is
+    /// painting stopped changing hours ago (2026-09-18 demo).
+    fn snapshot(&self, instance_id: &str) -> CachedScreen {
         self.buffers
             .lock()
             .ok()
             .and_then(|buffers| buffers.get(instance_id).cloned())
             .unwrap_or_default()
+    }
+}
+
+/// The Hub's bounded per-instance byte cache, with the capture time.
+///
+/// Empty is the default: an instance the Hub has never seen output for has no
+/// screen at all, which is different from a screen captured at an unknown
+/// time, so `captured_at` stays `None` and callers send nothing.
+#[derive(Clone, Default)]
+struct CachedScreen {
+    bytes: Vec<u8>,
+    captured_at: Option<String>,
+}
+
+impl CachedScreen {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
     }
 }
 
@@ -808,13 +837,27 @@ async fn object_pull(
 /// `running`/`requested` that no epoch will ever settle, they hold placement
 /// slots, and a later stop never completes. When the announced `nodeEpoch`
 /// differs from the one recorded for this host, every live row the Node no
-/// longer lists is projected to `exited` with a Hub-authored diagnostic so the
-/// loss is visible in the journal instead of silent.
+/// longer *holds* is projected to `exited` with a Hub-authored diagnostic so
+/// the loss is visible in the journal instead of silent.
+///
+/// "No longer holds" is read off the entry's own `lifecycle`, not off its
+/// presence: an entry the Node lists as `exited`/`failed` is a confessed loss,
+/// and treating it as "reported" would leave the Hub row shielding a process
+/// that is already gone. Only an entry the Node claims is live proves the row
+/// should survive.
 ///
 /// Nodes that omit `instances` (a plain, non-daemon hello) report nothing, so
 /// reconciliation only runs when an epoch change is actually observed and the
 /// Node did send an inventory — otherwise a stateless Node would wipe rows it
 /// simply never enumerates.
+///
+/// An *empty* inventory is the one answer that is destructive in the wrong
+/// direction, because it reads as "I own nothing" and settles every row on the
+/// host. It is honoured only when the Node also attests that it found its
+/// instance store (`instanceStoreFound`): a `--data-dir` pointed at the wrong
+/// path enumerates zero rows without that meaning anything, and trusting it
+/// would exit every session on the host. Absent evidence, the rows are left
+/// alone — the same hands-off answer an absent key gets.
 async fn reconcile_lost_instances(
     state: &AppState,
     host_id: &str,
@@ -839,8 +882,17 @@ async fn reconcile_lost_instances(
         );
         return Ok(());
     };
+    if reported.is_empty() && params.get("instanceStoreFound") != Some(&Value::Bool(true)) {
+        tracing::warn!(
+            %host_id,
+            "node epoch changed and hello reported an empty inventory this node does not \
+             vouch for; leaving instance rows untouched"
+        );
+        return Ok(());
+    }
     let reported: Vec<String> = reported
         .iter()
+        .filter(|item| !entry_is_terminal(item))
         .filter_map(|item| {
             item.get("id")
                 .or_else(|| item.get("instanceId"))
@@ -853,7 +905,7 @@ async fn reconcile_lost_instances(
         .reconcile_reported_instances(
             host_id.to_string(),
             reported,
-            "node-epoch-changed".to_string(),
+            NODE_EPOCH_CHANGED.to_string(),
         )
         .await?;
     for instance_id in lost {
@@ -862,6 +914,7 @@ async fn reconcile_lost_instances(
             %instance_id,
             "node epoch changed; instance lost"
         );
+        fail_workers_holding(state, host_id, &instance_id).await?;
         publish_hub_diagnostic(
             state,
             &instance_id,
@@ -869,6 +922,77 @@ async fn reconcile_lost_instances(
             "node epoch changed; instance lost",
         )
         .await;
+    }
+    Ok(())
+}
+
+/// The reason code a Node restart writes, on both sides of the wire.
+///
+/// `remuda_node::reclaim::NODE_EPOCH_CHANGED` is the same string, but the Hub
+/// must not depend on the Node crate for it; the web turns exactly this
+/// spelling into 「Node 重启，会话已结束」 plus Resume
+/// (`web/src/lib/commandStatus.ts`), so a new spelling would silently lose
+/// both the sentence and the affordance.
+pub(crate) const NODE_EPOCH_CHANGED: &str = "node-epoch-changed";
+
+/// True when an inventory entry says its process is gone.
+///
+/// A Node that omits the key is assumed alive: the inventory's contract is
+/// "here is what I hold", and a Node too old to state a lifecycle must not
+/// have its silence read as a confession.
+fn entry_is_terminal(item: &Value) -> bool {
+    matches!(
+        item.get("lifecycle").and_then(Value::as_str),
+        Some("exited" | "failed")
+    )
+}
+
+/// Move every in-progress worker holding `instance_id` to blocked.
+///
+/// The instance row settling is only half the loss: a worker whose process is
+/// gone but whose roster row still says `working` keeps counting as active,
+/// keeps holding its port block, and tells its coordinator a dead session is
+/// still making progress. Blocked-with-a-reason is what the dispatch contract
+/// already means by "this worker cannot continue", so the transition reuses
+/// [`WorkerState::Blocked`] rather than inventing a fourth state.
+///
+/// Only `dispatched`/`working` workers are rewritten. A `done` worker has
+/// already reported a sha and a `blocked` one has already given a reason:
+/// overwriting either would destroy a result the worker did deliver, and say
+/// the session was lost when the work was finished. `retired` is terminal.
+///
+/// Scoped by `host_id`: instance ids are unique, but the guard keeps a future
+/// id collision from letting one host's restart fail another host's rows.
+async fn fail_workers_holding(
+    state: &AppState,
+    host_id: &str,
+    instance_id: &str,
+) -> Result<(), HubError> {
+    let workers = state
+        .store
+        .list_workers_for_host(host_id.to_string())
+        .await?;
+    for worker in workers {
+        if !worker.state.is_in_progress()
+            || worker.instance_id.as_ref().map(|id| id.as_id().as_str()) != Some(instance_id)
+        {
+            continue;
+        }
+        tracing::warn!(
+            %host_id,
+            %instance_id,
+            worker = %worker.name,
+            "node epoch changed; failing the worker holding the lost instance"
+        );
+        state
+            .store
+            .mutate_worker(worker.meta.id.as_id().to_string(), |row| {
+                row.state = WorkerState::Blocked {
+                    reason: NODE_EPOCH_CHANGED.to_string(),
+                };
+                Ok(())
+            })
+            .await?;
     }
     Ok(())
 }
@@ -1229,14 +1353,26 @@ async fn send_tty_snapshot(
     out_tx: &mpsc::Sender<FollowMsg>,
     instance_id: &str,
 ) -> Result<(), ()> {
-    let host_id = state
+    // Read the row once: it carries both the host to attach through and the
+    // lifecycle that decides whether the cached screen below is a live view or
+    // the remains of a session that has already ended.
+    let record = state
         .store
         .get_instance(instance_id.to_string())
         .await
         .ok()
-        .flatten()
-        .map(|instance| instance.host_id);
-    let mut cached_stream_id = None;
+        .flatten();
+    let host_id = record.as_ref().map(|instance| instance.host_id.clone());
+    // Why the cached screen is not live, when it reaches the browser. A row
+    // that is already terminal explains itself. Otherwise the Hub has no live
+    // screen to show — `tty.attach` went unanswered, or it answered without
+    // bytes — and reporting the link, rather than the session, is the claim
+    // that is actually supported: the session may well be alive on the far
+    // side of a broken link.
+    let fallback_reason = match record.as_ref().map(|row| row.lifecycle.as_str()) {
+        Some("exited" | "failed" | "closed" | "terminated") => "instance-gone",
+        _ => "node-link-unavailable",
+    };
     if let Some(host_id) = host_id.as_deref() {
         match state
             .nodes
@@ -1259,7 +1395,6 @@ async fn send_tty_snapshot(
                 {
                     state.tty.bind(&uuid, host_id, instance_id);
                 }
-                cached_stream_id = stream_id;
                 // Every fresh attach supplies an authoritative mode boundary.
                 // Null means this snapshot has no emulator-backed observation
                 // (or an older Node omitted it); it clears a prior true/false
@@ -1270,7 +1405,7 @@ async fn send_tty_snapshot(
                 let mut notice = json!({
                     "type": "tty.mode",
                     "instanceId": instance_id,
-                    "streamId": cached_stream_id,
+                    "streamId": stream_id,
                     "altScreen": result.get("altScreen").and_then(Value::as_bool),
                 });
                 if let Some(progress) = result.get("progress") {
@@ -1290,17 +1425,25 @@ async fn send_tty_snapshot(
                         .and_then(Value::as_str)
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(0);
-                    if let Some(frame) = encode_output_frame(
-                        cached_stream_id.as_deref().unwrap_or(""),
-                        offset,
-                        &bytes,
-                    ) {
+                    if let Some(frame) =
+                        encode_output_frame(stream_id.as_deref().unwrap_or(""), offset, &bytes)
+                    {
                         out_tx
                             .send(FollowMsg::Binary(frame))
                             .await
                             .map_err(|_| ())?;
                         return Ok(());
                     }
+                }
+                // The attach succeeded, so this session is *live* — it simply
+                // had no backlog to replay (a fresh PTY, or a Node that had
+                // nothing buffered yet). Returning here is the whole point of
+                // this branch: falling through would serve the Hub's cache and
+                // label a running session stale, freezing stdin on a terminal
+                // that is answering. The stream is bound above, so live bytes
+                // reach this follower as ordinary binary frames.
+                if stream_id.is_some() {
+                    return Ok(());
                 }
             }
             Ok(None) => tracing::debug!(
@@ -1319,25 +1462,31 @@ async fn send_tty_snapshot(
     // B3: the Hub's own bounded cache is the last resort. Without a stream id
     // from the Node there is nothing to address a binary frame to, so the
     // cached bytes travel as a JSON diagnostic the follower can still render.
+    //
+    // The bytes are *stale*: they are whatever this Hub last saw before the
+    // link went away, and the browser must not paint them as a live screen
+    // (2026-09-18: a frozen 17:36 frame kept its 运行中 header for a session
+    // whose process had been dead for an hour). So the snapshot carries the
+    // capture time and why it is not live. The binary path is deliberately not
+    // taken even when a stream id is known: `tty.frame` has nowhere to put the
+    // metadata, and an unlabelled frame is exactly the bug.
     let cached = state.tty.snapshot(instance_id);
     if cached.is_empty() {
         return Ok(());
     }
-    let frame = cached_stream_id
-        .as_deref()
-        .and_then(|stream_id| encode_output_frame(stream_id, 0, &cached));
-    let message = match frame {
-        Some(frame) => FollowMsg::Binary(frame),
-        None => FollowMsg::Text(
-            json!({
-                "type": "tty.snapshot",
-                "instanceId": instance_id,
-                "source": "hub-cache",
-                "dataBase64": encode_b64(&cached),
-            })
-            .to_string(),
-        ),
-    };
+    let message = FollowMsg::Text(
+        json!({
+            "type": "tty.snapshot",
+            "instanceId": instance_id,
+            "source": "hub-cache",
+            "dataBase64": encode_b64(&cached.bytes),
+            // Absent for bytes cached by a Hub too old to have stamped them;
+            // the web must then say the age is unknown rather than guess.
+            "capturedAt": cached.captured_at,
+            "reason": fallback_reason,
+        })
+        .to_string(),
+    );
     out_tx.send(message).await.map_err(|_| ())?;
     Ok(())
 }

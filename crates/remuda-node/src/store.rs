@@ -48,6 +48,19 @@ pub trait LocalStore: Send + Sync {
     fn insert_instance(&self, instance: Instance) -> Result<(), NodeError>;
     /// Return all Instances in stable identity order.
     fn list_instances(&self) -> Result<Vec<Instance>, NodeError>;
+    /// Whether this store is backed by durable instance rows on disk.
+    ///
+    /// A Node announcing an *empty* inventory is making a claim the Hub acts
+    /// on destructively: it settles every live row on the host. That claim is
+    /// only trustworthy when the Node actually found its instance store — a
+    /// `--data-dir` pointed at the wrong path, a wiped disk, or a compose with
+    /// an in-memory store all enumerate zero rows while owning nothing, and
+    /// believing them would delete every session on the host.
+    ///
+    /// So this is the vouch the hello's `instances` key rests on: a store that
+    /// cannot attest to its own persistence reports `false`, and the Node then
+    /// omits the key rather than sending `[]`.
+    fn instance_store_is_durable(&self) -> bool;
     /// Read one Instance.
     fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError>;
     /// Remove an Instance and its Node-owned rows; `false` when unknown.
@@ -511,6 +524,14 @@ impl LocalStore for MemoryStore {
             .values()
             .map(|record| record.instance.clone())
             .collect())
+    }
+
+    fn instance_store_is_durable(&self) -> bool {
+        // The rows must have been *found*, not merely given a file to live in:
+        // `EntityDb::open` creates `node.sqlite` on a fresh path, so an
+        // existing connection proves only that we can write, not that anything
+        // was ever here. See `EntityDb::found_existing`.
+        self.entities.as_ref().is_some_and(|db| db.found_existing())
     }
 
     fn get_instance(&self, instance_id: &InstanceId) -> Result<Instance, NodeError> {

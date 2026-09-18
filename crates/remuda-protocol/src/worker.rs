@@ -67,6 +67,18 @@ impl WorkerState {
         !matches!(self, Self::Retired)
     }
 
+    /// True while the worker is still *making progress* — dispatched, or
+    /// working its brief.
+    ///
+    /// Narrower than [`Self::is_active`], which is only "not retired". A
+    /// `done` worker has reported a sha and a `blocked` one has already said
+    /// why, so neither is a live claim that more work is coming; a caller
+    /// asking "should I interrupt this?" wants this predicate, not that one.
+    #[must_use]
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, Self::Dispatched | Self::Working)
+    }
+
     /// True for the `working` state.
     #[must_use]
     pub fn is_working(&self) -> bool {
@@ -153,7 +165,31 @@ pub enum WorkerWatchStatus {
     /// Busy but silent past the stall threshold.
     Stalled,
     /// Host offline, instance closed, or carrier gone.
-    Gone,
+    ///
+    /// `reason` is the machine-readable why — the carrier code
+    /// (`host-offline`, `instance-closed`, …) or the instance row's own
+    /// `lastError` (`node-epoch-changed`, `host-lost`, …) when the row is
+    /// authoritative. It is carried rather than folded into `detail` alone so
+    /// `remuda watch`'s reason column can print it: a settled
+    /// `node-epoch-changed` is the one fact that tells the owner the
+    /// conversation can still be resumed (2026-09-18 demo).
+    ///
+    /// Defaulted on read, because this enum is persisted verbatim inside
+    /// `worker_roster.doc_json`. Every roster row written before the field
+    /// existed is `{"status":"gone"}` with nothing else, and a required field
+    /// would make those rows fail to deserialize — which takes out the whole
+    /// roster list, and node.hello itself, since the epoch reconcile reads
+    /// worker rows.
+    Gone {
+        /// Machine-readable why.
+        ///
+        /// Omitted when empty rather than sent as `""`, which is what keeps the
+        /// field honest in the schema: the generator describes the *serialize*
+        /// contract, so a field that is always written is always required there
+        /// no matter how lax its reader is. Only a skip makes the two agree.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
     /// The instance lifecycle failed (or exited after an errored turn), or the
     /// last turn result errored. The worker cannot make progress as launched;
     /// unlike `gone` there is a concrete cause to report.
@@ -174,7 +210,7 @@ impl WorkerWatchStatus {
             Self::Blocked { .. } => WATCH_BLOCKED,
             Self::IdleApiError => WATCH_IDLE_API_ERROR,
             Self::Stalled => WATCH_STALLED,
-            Self::Gone => WATCH_GONE,
+            Self::Gone { .. } => WATCH_GONE,
             Self::Failed { .. } => WATCH_FAILED,
         }
     }
@@ -311,8 +347,11 @@ pub enum ScreenClass {
     },
     /// Host offline / instance closed / carrier gone.
     Gone {
-        /// Machine-readable why.
-        reason: &'static str,
+        /// Machine-readable why: a carrier code (`host-offline`,
+        /// `instance-closed`, …) or the instance row's own `lastError`
+        /// (`node-epoch-changed`, `host-lost`, …) when the row is authoritative
+        /// and already says how it died.
+        reason: String,
     },
     /// The instance failed or exited after an errored turn, or the last turn
     /// result errored. Distinct from `Gone`: the worker is dead *with a known
@@ -677,13 +716,13 @@ pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
     }
     if !signals.host_online {
         return ScreenClass::Gone {
-            reason: "host-offline",
+            reason: "host-offline".to_string(),
         };
     }
     // A closed/terminated carrier has nothing left to read.
     if is_closed_lifecycle(&lifecycle) {
         return ScreenClass::Gone {
-            reason: "instance-closed",
+            reason: "instance-closed".to_string(),
         };
     }
     // A fresh DONE/BLOCKED report outranks a clean exit: a print worker's
@@ -703,10 +742,19 @@ pub fn classify_screen(signals: &ScreenSignals<'_>) -> ScreenClass {
     } else if let Some(report) = journal_report(signals) {
         return report;
     }
-    // Exited with no fresh report: the process is gone.
+    // Exited with no fresh report: the process is gone. The row's own
+    // `lastError` is the honest why when it has one — a Hub-settled
+    // `node-epoch-changed` is the reason the worker died, and a bare
+    // `instance-closed` would throw that away and read as if the owner had
+    // stopped it.
     if lifecycle == "exited" {
         return ScreenClass::Gone {
-            reason: "instance-closed",
+            reason: signals
+                .lifecycle_reason
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(first_line)
+                .unwrap_or_else(|| "instance-closed".to_string()),
         };
     }
     // A native first-run/permission dialog on the live screen owns the
@@ -1085,6 +1133,33 @@ mod tests {
     }
 
     #[test]
+    fn only_a_worker_still_making_progress_is_in_progress() {
+        // The distinction `fail_workers_holding` turns on: `is_active` is only
+        // "not retired", so a delivered report would be overwritten with
+        // "blocked by a lost session" — telling a coordinator to redo work
+        // that is already done.
+        assert!(WorkerState::Dispatched.is_in_progress());
+        assert!(WorkerState::Working.is_in_progress());
+        assert!(!WorkerState::Done { sha: "x".into() }.is_in_progress());
+        assert!(
+            !WorkerState::Blocked {
+                reason: "need creds".into()
+            }
+            .is_in_progress()
+        );
+        assert!(!WorkerState::Retired.is_in_progress());
+        // And every one of those is still "active" except retired, which is
+        // exactly why the narrower predicate is the one callers must reach for.
+        assert!(WorkerState::Done { sha: "x".into() }.is_active());
+        assert!(
+            WorkerState::Blocked {
+                reason: "need creds".into()
+            }
+            .is_active()
+        );
+    }
+
+    #[test]
     fn state_update_validation() {
         assert!(WorkerState::from_update("working", None, None).is_ok());
         assert!(WorkerState::from_update("done", Some("abc"), None).is_ok());
@@ -1220,19 +1295,42 @@ mod tests {
         let lines = rows("DONE 0123456789abcdef\n");
         let mut s = sig(&lines, "ready", "idle");
         s.host_online = false;
-        assert!(matches!(
+        assert_eq!(
             classify_screen(&s),
             ScreenClass::Gone {
-                reason: "host-offline"
+                reason: "host-offline".to_string()
             }
-        ));
+        );
         let closed = sig(&lines, "closed", "idle");
-        assert!(matches!(
+        assert_eq!(
             classify_screen(&closed),
             ScreenClass::Gone {
-                reason: "instance-closed"
+                reason: "instance-closed".to_string()
             }
-        ));
+        );
+    }
+
+    /// A row the Hub already settled with a reason classifies gone *with that
+    /// reason*: `node-epoch-changed` is why the worker died, and reporting a
+    /// bare `instance-closed` would read as if its owner had stopped it.
+    #[test]
+    fn gone_survives_the_settled_rows_own_reason() {
+        let mut s = sig(&[], "exited", "idle");
+        s.screen_available = false;
+        assert_eq!(
+            classify_screen(&s),
+            ScreenClass::Gone {
+                reason: "instance-closed".to_string()
+            },
+            "a clean exit with no recorded reason keeps the carrier code"
+        );
+        s.lifecycle_reason = Some("node-epoch-changed");
+        assert_eq!(
+            classify_screen(&s),
+            ScreenClass::Gone {
+                reason: "node-epoch-changed".to_string()
+            }
+        );
     }
 
     #[test]
@@ -1301,12 +1399,12 @@ mod tests {
         // A print worker exits 0 with no error tail: gone, not failed.
         s.journal_lines = &[];
         s.last_error_line = None;
-        assert!(matches!(
+        assert_eq!(
             classify_screen(&s),
             ScreenClass::Gone {
-                reason: "instance-closed"
+                reason: "instance-closed".to_string()
             }
-        ));
+        );
     }
 
     #[test]

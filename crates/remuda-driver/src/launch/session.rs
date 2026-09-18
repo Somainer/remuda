@@ -200,6 +200,14 @@ impl HookSession {
         self.bus.turn_active(pid)
     }
 
+    /// Wall-clock time of the newest hook record from the exact foreground
+    /// agent, when one exists. The promotion poller bounds its hook guard by
+    /// this so a stalled hook channel cannot pin the screen to `working`.
+    #[must_use]
+    pub fn hook_last_seen(&self, pid: i32) -> Option<std::time::Instant> {
+        self.bus.hook_last_seen(pid)
+    }
+
     /// The PTY observed a fresh native interruption marker after cancel.
     pub fn confirm_screen_interrupt(&self, pid: i32) {
         self.bus.confirm_screen_interrupt(pid);

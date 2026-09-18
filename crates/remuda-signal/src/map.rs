@@ -37,9 +37,17 @@ pub enum MappedKind {
     SessionEnded,
     /// `MessageDisplay`: one streamed line delta.
     MessageDelta,
-    /// `Notification` / `PermissionRequest` / `Elicitation`: the agent wants a
-    /// human. Observed only in P1; no answer is sent.
+    /// `PermissionRequest` / `Elicitation`: the agent is blocked and wants a
+    /// human decision. Raises the `blocked` phase and parks a hook.
     InteractionObserved,
+    /// `Notification`: an advisory the harness prints (idle prompt, "waiting
+    /// for your input", a permission hint). It is NOT a blocking request — it
+    /// carries no decision the Node answers — so it must never raise the turn
+    /// phase or move the instance to `waiting`. The idle-prompt Notification in
+    /// particular fires *after* the turn already ended; treating it as a wait
+    /// stranded the composer (root cause, ins_01a0b3b2 2026-09-18 17:03). It is
+    /// journaled so the web can surface it as an in-app notification.
+    NotificationObserved,
     /// `PreToolUse`: a tool is about to run.
     ToolStarted,
     /// `PostToolUse` / `PostToolBatch`: a tool finished.
@@ -164,6 +172,23 @@ pub fn map_event(event: &HookEvent) -> Mapped {
             related.insert("backgroundTaskName".into(), value.to_owned());
         }
     }
+    // Notification advisory fields, for the web's in-app notification list.
+    // `notification_type` distinguishes an idle prompt from a permission hint;
+    // `message` is the human-readable line. Scoped to Notification so no other
+    // event's `message`/type field leaks into these keys.
+    if event.name == "Notification" {
+        for (key, field) in [
+            ("notificationType", "notification_type"),
+            ("notificationType", "notificationType"),
+            ("message", "message"),
+        ] {
+            if let Some(value) = event.text(field) {
+                related
+                    .entry(key.into())
+                    .or_insert_with(|| value.to_owned());
+            }
+        }
+    }
     // MessageDisplay's delta is the payload P3 needs; index/final say where the
     // line belongs and whether a later block will replace it.
     if let Some(index) = event
@@ -269,7 +294,17 @@ fn classify(event: &HookEvent) -> (MappedKind, LifecycleTopic, &'static str, Sev
             "streaming",
             Severity::Info,
         ),
-        "Notification" | "PermissionRequest" | "Elicitation" => (
+        "Notification" => (
+            // A Notification is an advisory, never a blocking request: its
+            // status stays inert (`observed`) so the journal projection and
+            // `hook_activity` never fold it to `waiting`, and it opens no live
+            // phase. The web surfaces it as an in-app notification instead.
+            MappedKind::NotificationObserved,
+            LifecycleTopic::Hook,
+            "observed",
+            Severity::Info,
+        ),
+        "PermissionRequest" | "Elicitation" => (
             MappedKind::InteractionObserved,
             LifecycleTopic::Permission,
             "waiting",
@@ -323,7 +358,14 @@ pub fn phase(_event: &HookEvent, kind: MappedKind) -> Option<Phase> {
         MappedKind::MessageDelta => Phase::TextStreaming,
         MappedKind::ToolStarted => Phase::ToolStarted,
         MappedKind::ToolFinished | MappedKind::ToolFailed => Phase::ToolFinished,
-        MappedKind::SessionStarted | MappedKind::SessionEnded | MappedKind::Diagnostic => {
+        // A Notification never raises a phase: it is an idle-time advisory, not
+        // a turn transition, so it leaves the latch untouched (the previous
+        // phase holds until a real boundary or the reducer's screen/transcript
+        // fold ends the turn).
+        MappedKind::NotificationObserved
+        | MappedKind::SessionStarted
+        | MappedKind::SessionEnded
+        | MappedKind::Diagnostic => {
             return None;
         }
     })
@@ -491,6 +533,57 @@ mod tests {
             assert_eq!(
                 map_event(&event(name, serde_json::json!({}))).completeness,
                 Completeness::Structured
+            );
+        }
+    }
+
+    #[test]
+    fn an_idle_prompt_notification_never_raises_a_phase_or_a_wait() {
+        // Root cause (ins_01a0b3b2, 2026-09-18 17:03): a Stop, then pty idle,
+        // then a Notification carrying Claude Code's idle prompt was classified
+        // as `blocked` / waiting and latched, stranding the composer and the
+        // held queue. A Notification is an advisory, so it must map to its own
+        // inert kind with an observed status and open no phase.
+        let mapped = map_event(&event(
+            "Notification",
+            serde_json::json!({
+                "notification_type": "idle_prompt",
+                "message": "Claude is waiting for your input",
+            }),
+        ));
+        assert_eq!(mapped.kind, MappedKind::NotificationObserved);
+        assert_eq!(native(&mapped).topic, LifecycleTopic::Hook);
+        assert_eq!(
+            native(&mapped).status,
+            Knowledge::Known {
+                value: "observed".into()
+            }
+        );
+        let related = &native(&mapped).related_ids;
+        assert_eq!(related["notificationType"], "idle_prompt");
+        assert_eq!(related["message"], "Claude is waiting for your input");
+        assert!(phase(&event("Notification", serde_json::json!({})), mapped.kind).is_none());
+    }
+
+    #[test]
+    fn a_permission_notification_is_still_an_advisory_not_a_blocking_wait() {
+        // Even a permission_prompt *Notification* is not the blocking
+        // PermissionRequest hook: the Node answers nothing for it, so it never
+        // moves the instance to waiting — the web links it to the real dialog
+        // instead. Only the actual PermissionRequest/Elicitation hooks block.
+        let mapped = map_event(&event(
+            "Notification",
+            serde_json::json!({"notification_type": "permission_prompt"}),
+        ));
+        assert_eq!(mapped.kind, MappedKind::NotificationObserved);
+        assert!(phase(&event("Notification", serde_json::json!({})), mapped.kind).is_none());
+
+        for name in ["PermissionRequest", "Elicitation"] {
+            let request = map_event(&event(name, serde_json::json!({})));
+            assert_eq!(request.kind, MappedKind::InteractionObserved);
+            assert_eq!(
+                phase(&event(name, serde_json::json!({})), request.kind),
+                Some(Phase::Blocked)
             );
         }
     }

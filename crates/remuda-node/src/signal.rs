@@ -139,7 +139,11 @@ pub fn hook_activity(observation: &Observation) -> Option<remuda_protocol::Activ
         // A turn that ended badly still ended: the composer has to come back,
         // or the user cannot type again after one failed turn.
         "Stop" | "StopFailure" => Some(Activity::Idle),
-        "Notification" | "PermissionRequest" | "Elicitation" => Some(Activity::WaitingInteraction),
+        // Only a real blocking request is a human turn. A `Notification` is an
+        // idle-time advisory (the "waiting for your input" idle prompt fires
+        // *after* the turn ended); folding it to `waiting` stranded the
+        // composer, so it moves nothing.
+        "PermissionRequest" | "Elicitation" => Some(Activity::WaitingInteraction),
         _ => None,
     }
 }
@@ -581,7 +585,8 @@ mod tests {
             Some(Activity::WaitingInteraction)
         );
         // Tool events are progress, not boundaries; SubagentStop is not
-        // evidence at all.
+        // evidence at all; a Notification is an idle-time advisory (the
+        // "waiting for your input" idle prompt) and must never read as a wait.
         for name in [
             "PreToolUse",
             "PostToolUse",
@@ -589,6 +594,7 @@ mod tests {
             "MessageDisplay",
             "SubagentStop",
             "SessionStart",
+            "Notification",
         ] {
             assert_eq!(hook_activity(&hook(name)), None, "{name} must not move it");
         }

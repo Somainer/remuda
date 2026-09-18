@@ -518,3 +518,51 @@ describe("Composer context usage chip", () => {
     expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
   });
 });
+
+describe("Composer held-queue flush (turn-end boundary)", () => {
+  it("flushes a Remuda-held row exactly once when a screen-decided end maps working→idle", () => {
+    // The multi-channel turn reducer can end a turn from the screen even with
+    // no Stop hook; SessionPage maps that decision to composer phase idle. The
+    // held prompt must flush on that single edge and never again when a late
+    // hook Stop arrives (the decision stays ended, so there is no second edge).
+    const onFlushHeld = vi.fn();
+    const held = [{ id: "b1", text: "queued prompt", reason: "turn" as const, holder: "remuda" as const }];
+    const { rerender } = render(
+      <Composer
+        instanceId="ins_flush"
+        mobile={false}
+        onSend={vi.fn()}
+        phase="working"
+        held={held}
+        onFlushHeld={onFlushHeld}
+      />,
+    );
+    expect(onFlushHeld).not.toHaveBeenCalled();
+
+    // The screen decides the end: phase goes idle and the held row flushes.
+    rerender(
+      <Composer
+        instanceId="ins_flush"
+        mobile={false}
+        onSend={vi.fn()}
+        phase="idle"
+        held={held}
+        onFlushHeld={onFlushHeld}
+      />,
+    );
+    expect(onFlushHeld).toHaveBeenCalledTimes(1);
+
+    // A late hook Stop / repeated render while still idle must not re-flush.
+    rerender(
+      <Composer
+        instanceId="ins_flush"
+        mobile={false}
+        onSend={vi.fn()}
+        phase="idle"
+        held={held}
+        onFlushHeld={onFlushHeld}
+      />,
+    );
+    expect(onFlushHeld).toHaveBeenCalledTimes(1);
+  });
+});

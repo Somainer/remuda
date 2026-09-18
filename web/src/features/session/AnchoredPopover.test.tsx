@@ -333,6 +333,27 @@ describe("useAnchoredPopover measured positioning", () => {
     expect(after).not.toContain("max-height: none");
   });
 
+  it("stops re-positioning once the trigger box settles", async () => {
+    // Regression: a perpetual rAF tracker (and a max-height toggle that
+    // resized the panel each measurement) kept the panel moving forever, so
+    // Playwright actionability checks saw its buttons as unstable.
+    render(<Harness panel={panelSize} open onAnchor={() => {}} />);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const styleAt = () => screen.getByTestId("panel").getAttribute("style") ?? "";
+    const first = styleAt();
+    // Let the tracker run well past its settle budget (20 frames).
+    for (let i = 0; i < 30; i++) {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    }
+    expect(styleAt()).toBe(first);
+    // A scroll re-arms tracking, but with the trigger static the style still
+    // converges rather than churning.
+    window.dispatchEvent(new Event("scroll", { bubbles: true, cancelable: true }));
+    for (let i = 0; i < 30; i++) {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+    }
+    expect(styleAt()).toBe(first);
+  });
 });
 
 describe("EffortSlider list with a tall catalog", () => {

@@ -20,6 +20,7 @@ import session from "./session.module.css";
 import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
 import { readShowInjected, writeShowInjected } from "./injectedPref";
 import { readPosition, writePosition } from "./readingPosition";
+import { dismissWorkflow, readDismissedWorkflows, undismissWorkflow } from "./workflowDismiss";
 import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSearch";
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
@@ -141,6 +142,14 @@ function TranscriptInner({
   const instanceId = routeInstanceId;
   const saved = useMemo(() => (instanceId ? readPosition(instanceId) : null), [instanceId]);
 
+  // c-wfcard: workflow ids whose live card this reader dismissed. Dismissal is
+  // per workflow and persisted (runtime localStorage); only a dismissed card
+  // may be swept into the compact fold. The Set itself is the state; the
+  // instance-switch reset below re-reads it for the new route id.
+  const [dismissedWorkflows, setDismissedWorkflows] = useState<Set<string>>(() =>
+    instanceId ? readDismissedWorkflows(instanceId) : new Set<string>(),
+  );
+
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
   // an id change, or one session's "already restored"/pin state would leak
@@ -169,12 +178,23 @@ function TranscriptInner({
     pendingScroll.current = null;
     steeringRef.current.clear();
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
+    setDismissedWorkflows(instanceId ? readDismissedWorkflows(instanceId) : new Set());
   }
 
   const [showInjected, setShowInjected] = useState(readShowInjected);
+  const toggleWorkflowDismiss = useCallback(
+    (workflowId: string, dismiss: boolean) => {
+      if (!instanceId) return;
+      const next = dismiss
+        ? dismissWorkflow(instanceId, workflowId)
+        : undismissWorkflow(instanceId, workflowId);
+      setDismissedWorkflows(new Set(next));
+    },
+    [instanceId],
+  );
   const assembled = useMemo(
-    () => compactTranscript(assembleTranscript(events, bubbles), compact),
-    [events, bubbles, compact],
+    () => compactTranscript(assembleTranscript(events, bubbles), compact, dismissedWorkflows),
+    [events, bubbles, compact, dismissedWorkflows],
   );
   // Injected records are dropped from the list rather than hidden with CSS so
   // the virtual window measures the rows it actually draws.
@@ -635,6 +655,8 @@ function TranscriptInner({
                       ? (hit?.childId ?? null)
                       : null
                 }
+                dismissedWorkflows={dismissedWorkflows}
+                onToggleWorkflowDismiss={toggleWorkflowDismiss}
               />
             );
           })}
@@ -678,6 +700,8 @@ function TranscriptRow({
   steerHeld,
   onSteerHeld,
   steering,
+  dismissedWorkflows,
+  onToggleWorkflowDismiss,
 }: {
   node: TranscriptNode;
   index: number;
@@ -694,6 +718,8 @@ function TranscriptRow({
   steerHeld?: SteerHeldControl;
   onSteerHeld?: SteerHeldHandler;
   steering: Set<string>;
+  dismissedWorkflows: ReadonlySet<string>;
+  onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -733,7 +759,19 @@ function TranscriptRow({
         searchCurrent ? css.rowCurrent : "",
       ].join(" ").trim()}
     >
-      {renderNode(node, { defaultFolded, collapseTick, settle, expandTick, hitChildId, instanceId, steerHeld, onSteerHeld, steering })}    </div>
+      {renderNode(node, {
+        defaultFolded,
+        collapseTick,
+        settle,
+        expandTick,
+        hitChildId,
+        instanceId,
+        steerHeld,
+        onSteerHeld,
+        steering,
+        dismissedWorkflows,
+        onToggleWorkflowDismiss,
+      })}    </div>
   );
 }
 
@@ -744,10 +782,17 @@ function ToolRow({
   hitChildId,
 }: {
   node: Extract<TranscriptNode, { type: "tool" }>;
-  opts: { defaultFolded: boolean; collapseTick: number; settle: boolean };
+  opts: {
+    defaultFolded: boolean;
+    collapseTick: number;
+    settle: boolean;
+    dismissedWorkflows: ReadonlySet<string>;
+    onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
+  };
   hitChildId?: string | null;
 }): ReactNode {
   const failed = isToolFailure(node);
+  const workflowId = node.workflow?.run.workflowId;
   const card = (
     <ToolCard
       key={`${node.id}:${opts.collapseTick}`}
@@ -759,6 +804,9 @@ function ToolRow({
       workflow={node.workflow}
       defaultFolded={failed ? false : opts.defaultFolded}
       settle={opts.settle}
+      workflowDismissed={workflowId ? opts.dismissedWorkflows.has(workflowId) : false}
+      onDismissWorkflow={workflowId ? () => opts.onToggleWorkflowDismiss(workflowId, true) : undefined}
+      onUndismissWorkflow={workflowId ? () => opts.onToggleWorkflowDismiss(workflowId, false) : undefined}
     />
   );
   const folds = (node.subagents?.length ?? 0) > 0 ? (
@@ -795,6 +843,8 @@ function renderNode(
     steerHeld?: SteerHeldControl;
     onSteerHeld?: SteerHeldHandler;
     steering: Set<string>;
+    dismissedWorkflows: ReadonlySet<string>;
+    onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
   },
 ): ReactNode {
   if (node.type === "message") {
@@ -971,7 +1021,13 @@ function renderNode(
             <ToolRow
               key={child.id}
               node={child}
-              opts={{ defaultFolded: opts.defaultFolded, collapseTick: opts.collapseTick, settle: opts.settle }}
+              opts={{
+                defaultFolded: opts.defaultFolded,
+                collapseTick: opts.collapseTick,
+                settle: opts.settle,
+                dismissedWorkflows: opts.dismissedWorkflows,
+                onToggleWorkflowDismiss: opts.onToggleWorkflowDismiss,
+              }}
               hitChildId={opts.hitChildId ?? null}
             />
           ) : child.type === "thought" ? (

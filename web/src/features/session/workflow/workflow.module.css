@@ -281,6 +281,13 @@
   color: var(--mute);
 }
 .agentMeta b { font-weight: 400; color: var(--ink-1); }
+/* c-wfcard: one-character clock prefix (等/闲) and the absent-value dash. */
+.clockTag {
+  font-style: normal;
+  margin-right: 2px;
+  color: var(--mute);
+}
+.agentMeta .missing { color: var(--mute); }
 
 .model {
   max-width: 144px;

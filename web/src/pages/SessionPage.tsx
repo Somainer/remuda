@@ -16,6 +16,7 @@ import { LiveStatusStrip } from "../features/session/live/LiveStatusStrip";
 import { TaskTrack } from "../features/session/TaskTrack";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
+import { readDismissedWorkflows } from "../features/session/workflowDismiss";
 import { canShowTerminal, hasStructuredSignal, isTtyLabFixtureId, resolveTtyLabInstance, TerminalView } from "../features/session/tty";
 import { ScreenView } from "../features/session/ScreenView";
 import { ViewSwitch } from "../features/session/ViewSwitch";
@@ -151,7 +152,9 @@ export function SessionPage({
   const statusLabel = commandRow?.label ?? UI_STATUS_LABEL[status];
   const usageEvent = events.findLast((e) => e.kind === "usage");
   const usage = usageEvent?.kind === "usage" ? usageEvent.payload : undefined;
-  const tasks = collectTasks(compactTranscript(assembleTranscript(events, bubbles), hub.compact));
+  const tasks = collectTasks(
+    compactTranscript(assembleTranscript(events, bubbles), hub.compact, readDismissedWorkflows(instanceId)),
+  );
   const snapshotLoading = Boolean(instance) && hub.events[instanceId] === undefined && !isTtyLabFixtureId(instanceId);
 
   if (!instance && hub.ready) {

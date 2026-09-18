@@ -22,6 +22,8 @@
 | D-040 | 2026-09-19 | **`/s/:id` compact 铬预算：space chips 折成单芯片入顶栏；诊断 meta 进「运行详情」disclosure；分段与 Stop 不得进 ⋯**（workbench UX 批次 P0-1 / P0-5）。§1.4 的「约 400px 显示可横向滚动的 space chips 与 tabs」限定到列表路由；`/s/:instanceId` 及子视图在 compact 下允许折成单枚当前 space 芯片并入顶栏，点开同一个抽屉（`spaces-drawer-open` 行为与 testid 不变）。§2.2 header 从「规范两行诊断」改为「主行 + 可折叠**运行详情**」，ASCII 图同步重画：主行保留 host 芯片 + cost + 状态点 + 分段 + Stop，其余诊断进 disclosure（默认收起、展开态按设备 `localStorage` 持久化、`session-meta` testid 保留）。`terminal\|structured` 分段与 Stop **始终留在顶栏，永不进 ⋯ 溢出菜单**。 | coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, 决策 1 与 2） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 P0-1 行（**CONFLICTS**，且指出该建议与自己矛盾）与 P0-5 行（**CONFLICTS**，修订前 `:235` 误写作 233）；[ui-spec.md §1.3 / §1.4 / §2.2](./ui-spec.md)；D-024、D-028 |
 | D-041 | 2026-09-19 | **工具卡默认折叠的豁免集合与折行最小信息量**（workbench UX 批次 P1-10 / P1-20）。默认折叠**只对 compact 且已 settled、且 family ∉ {Workflow, error}** 的卡生效；`interaction.*` 同样豁免；running / 未 settled 的卡永不折叠。折行内容 = family + **关键参数**（Bash = 命令首行、Edit/Write/Read = 路径），按宽度截断且 `title` 给全文，裸 `Bash` 不合规。**折叠分支必须在 family 判定之后**才可提前 return——`ToolCard.tsx` 的 `if (folded) return …` 早于 `family === "Workflow"` 分支，一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动；验收硬指标是卡头 elapsed 在运行中递增，不是「卡可见」。桌面默认态不变，展开后与桌面完全一致（同一组件、同一 testid）。 | coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, 决策 3） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 P1-10 / P1-20 行（**CONFLICTS**，点名 `ToolCard.tsx:260` 早于 `:281-292`）；[ui-spec.md §2.2](./ui-spec.md)；`toolPresenters.ts` Bash 分支给出折行参数 |
 | D-042 | 2026-09-19 | **手机 composer 单行 + 选项 sheet 的边界：触发器带 mode 词与档名，三态与诚实标注留在外面**（workbench UX 批次 P0-3）。compact 下 control bar 允许收成一个选项触发器，但触发器**必须**同时显示当前 `permissionMode` 的词与 effort 档名（形如 `manual · high`），`danger` 模式必须在触发器上可见——把 bypass 态藏进 sheet 是本条最响的禁止项。可进 sheet：附件、harness 只读芯片、context 用量、权限选择器、effort 滑杆。**不得**进 sheet：发送/排队/打断三态按钮、队列 chip、「尚未验证」标注。placeholder 分平台；插队与 Esc 打断的 `window.confirm` 换 `Sheet`（桌面 `popover`、手机 `sheet`，焦点圈定、Esc = 取消、返回焦点到触发器），确认后的命令语义与 `commandId` 路径完全不变；桌面布局与 testid 零变化。 | coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, 决策 4） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 P0-3 行（**CONFLICTS**）；[ui-spec.md §2.2](./ui-spec.md)；D-028a（三态 / 队列 chip / 「尚未验证」） |
+| D-045 | 2026-09-19 | **computer-use 能力按次授权与投递（capability grant and delivery）**。新增能力名 **`computer-use`**：它**不是** host 属性、不是 driver 属性、不是全局开关，而是**按会话、按次、显式申请**的授权——只有 `remuda instance create` / `remuda dispatch` 上显式的 `--capability computer-use` 能授予，任何默认路径都不授予、不继承、不因「装了就可用」而生效。**两道门都必须过**：(1) 来源必须是 Human 或 Bot，`LaunchOrigin::Agent` 一律拒绝——一个 agent 永远不能为自己铸出桌面控制，门形照抄 `presets::merge_yolo_argv` 的双门（`crates/remuda-driver/src/presets.rs:151-166`）；(2) 目标主机的心跳 `cli[]` 必须回报已安装的 `computer-use` 行（[codex-cua.md](./codex-cua.md) §3.4），未回报即拒绝。**投递只有两条，两条都不碰操作员自己的配置**：(a) 仅当本次 launch 的 native home 是 **Remuda 管的**时，把 skill 字节**从 `remuda` 二进制内嵌物**化到 `<native_home>/skills/codex-computer-use/**`（目录 0700、文件 0600）——「受管」**逐 kind 定义**：claude 是它的作用域 config dir（**继承来的 `~/.claude` 不算受管**），codex 是 `<launch_dir>/codex-home`，grok 是 `<launch_dir>/grok-home`；**门不是 `inherit_default_config`**——那是 claude 专属标志，对一次 codex launch 同样为真（`crates/remuda-node/src/native.rs:238-240`），拿它当门会在 codex 上给出错误答案。继承来的操作员 home **只读不写**，即 `~/.claude`、`~/.codex`、`~/.grok` 在**任何**分支上都不会被打开写（`crates/remuda-driver/src/launch/overlay.rs:25-28` 是这条的权威表述，也是本决策存在的理由）；**codex 与 grok 本批只拿腿 (b)**：仓库与 skill 都没有证据表明它们读任何 skills 目录，往影子 home 写 skill 树没有读者，所以它们的投递**就是那份 per-instance MCP config**。(b) 一律写 per-instance `<launch_dir>/mcp-cua.json`（0600），并**按 `AgentKind` 而非 driver 挂载**：claude 走 argv `--mcp-config <path>`（`mcp-config` 早已在四族白名单且取值，`crates/remuda-driver/src/flags.rs:64,82,89,333`），codex 走 shadow `config.toml` 的 `[mcp_servers.codex-computer-use]`（`crates/remuda-driver/src/launch/shadow.rs:110-168`）——`shell-pty` 是 kind 多态的，跑 claude 时走 argv、跑 codex 时走 shadow home，**规则随 kind 不随 driver**。**环境变量握手**：`c-cua-launch` **只在能力被授予时**向子进程注入 `REMUDA_CAPABILITY_COMPUTER_USE=1`（硬化的 `launch-cua-repl.sh` 未见它即拒绝启动）；该变量是**信号不是边界**——任何有 shell 的东西都能自己导出它，**真边界是「没有授予就绝不物料化」**。**绝不发 `--strict-mcp-config`**（该 flag 被永久禁用，`flags.rs:15`）：Remuda 提供的能力只**增加** server，绝不替换 agent 自己的 server 集合。物料化文件带 digest 进 `LaunchRecipe.materialized_files`（`crates/remuda-driver/src/recipe.rs:157-179`），所以 launch 审计能说清这次到底授予了什么。**拒绝**各有独立消息：Agent 来源、主机未回报、非 macOS、launcher 缺失，以及 **`bypassPermissions` 与 `computer-use` 在同一次 launch 上同时申请**——无人值守的桌面控制叠加跳过的工具审批，是唯一没有回收路径的组合，两者同时出现即拒绝（不是「忽略其一」，也不是需要另一个隐含 flag）。所有拒绝都发生在 create/dispatch 被持久接受**之前**，绝不静默降级、绝不静默丢弃能力请求（同 D-035 的拒绝形状）。**本决策同时记下截图两条**（计划里曾分别为 D-038，因 id 已被占，合并入本行并加此标记）：(1) **截图进 journal 与 web** —— tool result 合法携带 `image` content block，字节只存对象库（Node 用宿主 token 走 `POST /v1/hosts/{id}/files/objects` 暂存，`crates/remuda-hub/src/host_files.rs:44`），`ContentBlock::Image` + `MediaBlock` 协议早已合法（`crates/remuda-protocol/src/observation.rs:143-155,189-195`）；**只发文本的 producer 是 bug，不是策略**（journal `crates/remuda-journal/src/claude.rs:1396,1470-1484`、driver `crates/remuda-driver/src/adapters/mod.rs:387-406`、web `web/src/features/session/toolPresenters.ts:44-51` 三处今天都丢弃非文本）；**不新增 `ObservationKind`**；截图**不是 artifact**，只有 agent 显式存盘才发 `artifact`；渲染规则见 ui-spec §2.2（卡内定高缩略图、`loading="lazy"`、点开 `/v1/objects/{id}`、绝不自动展开）。(2) **截图保留期** —— 沿用既有附件对象的生命周期与过期，**永不内联 journal、永不写日志**，提交的证据文档必须用脱敏或合成屏；更短的 CUA 专属 TTL 是 Hub 旋钮与第七个任务，不在本批。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §2/§3/§4/§6；各条约束的 file:line 见该文 §3.2；Q1–Q6 默认值见其 §8 |
+| D-046 | 2026-09-19 | **CUA 交互路由：`elicitation/create` 由 worker 自己答，但回答权被 launch 请求约束**。事实基础：agent 侧今天**只有一条** elicitation 桥，且只搭在 Claude 的 hook 事件上——`Elicitation` 已是注册事件、阻塞、可带 `action` 回复（`crates/remuda-signal/src/event.rs:114-135`），已能生成 `Interaction{kind: elicitation}` 卡（`crates/remuda-signal/src/approval.rs:153-208`），也能从 `InteractionAnswer::Elicitation` 回一个动作（`crates/remuda-signal/src/bus.rs:1017-1030`）。**但这条链路够不到 MCP 的 `elicitation/create`**：`cua-repl` 是 stdio MCP server，它的 elicitation 走 MCP 协议本身，而 codex shadow 的 `hooks.json` 只注册 `SessionStart` 与 `PermissionRequest` 两个事件（`CODEX_EVENTS`，`crates/remuda-driver/src/launch/shadow.rs:40-45`；grok 的 `GROK_EVENTS` 同样不含 elicitation 类事件，`shadow.rs:47-55`），**两者都不是 MCP 的 `elicitation/create`**，所以**今天没有任何路径能把一个 MCP server 的 `elicitation/create` 送到 `/approvals`**（缺的是一个从 harness 到 Hub 的 producer，不是 `InteractionCarrier` 取值——那个枚举已有七个值，见 [codex-cua.md](./codex-cua.md) §5.3）。因此本批的合同是：**worker 自己在 cua-repl 的 `initialize` 里声明 `capabilities.elicitation` 并自行回答**——按应用审批时 `accept` 且 `persist: session`，而**回答权被本次 launch 的请求约束**：只有请求中点名的 bundle id 可以批准，未点名的应用一律不批（`skills/codex-computer-use/SKILL.md` 的既有规则，本决策把它从「skill 的自律」升级为「能力授权语义的一部分」）。**同时如实记账**：这条路线意味着桌面审批没有 journal 行、没有 `/approvals` 卡、没有第二人复核，只有 worker 的一面之词——这是本批明确接受的代价，写进 D-045 的「后续」而不是假装它已解决。**后续**（不在本批，前置是一条 MCP 级 elicitation 桥：为不经过 Claude hook 的 harness 造 producer，并给它一个 `InteractionCarrier` 取值）：把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。在那之前，`D-045` 的 bypass 拒绝与「只批准点名应用」共同构成唯一的边界。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §5；[native-pty-first.md](./native-pty-first.md) §5 P5 残留（原文：`Elicitation` 仅按二进制读取端形状实现，**未取得实机 payload**）|
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -462,3 +464,143 @@ journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚
 **由谁**：coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, decision 4）。该计划是派工单，未入库；理由与默认值见报告 §11.7 的 P0-3 行。
 
 **依据**：报告 §11.7 的 P0-3 行判 **CONFLICTS**（权限与 effort 的可见性、D-028a 三态与诚实标注）；`decisions.md` D-028a 的三态/队列 chip/「尚未验证」要求是本条的边界来源。
+
+## D-045
+
+**2026-09-19 · computer-use 能力按次授权与投递（capability grant and delivery）**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | D-011、D-017、D-025、D-028 §4.2、D-035、D-046、[codex-cua.md](./codex-cua.md)、[native-pty-first.md](./native-pty-first.md) §5、[ui-spec.md](./ui-spec.md) §2.2/§2.6 |
+
+**背景**：`skills/codex-computer-use/` 让一个编码 agent 通过本机已安装的 Codex
+Computer Use 读取或操作 macOS 应用界面：或走宿主注入的原生 MCP 工具，或在宿主
+未认证时拉起一个 stdio `cua-repl`，后者**求值任意 JS** 并对本机每个应用持有
+`click` / `typeText` / `pressKey`。skill 自己的验证记录（2026-09-17 / 09-19）
+写明：非 Codex 宿主走原生 MCP 会拿到 `Sender process is not authenticated`，
+直连 `computeruse.sock` 会被服务端断开，而「Claude Code 实际消费 MCP 截图及操作
+UI」一栏的结论是**未验证**——**没有任何一条路径被证明对 Remuda 启动的 agent 跑通过**。
+
+把它接进产品前先要回答三件事：谁有权要它、它怎么到达 agent、它做了什么之后能看见。
+今天的现状是：Remuda **不给任何 agent 投递 skill**（`skills/remuda` 只由
+`scripts/gen-skill.sh` 组装给人类协调员）；一个被启动的会话能看见什么，完全取决于
+native home 是不是继承来的（[codex-cua.md](./codex-cua.md) §3.1）；`--mcp-config`
+早在四族 argv 白名单里，但**从任何产品面上都够不到**。
+
+**决策**：
+
+1. **能力名与门**：能力名 `computer-use`，**按会话按次显式申请**，只有
+   `remuda instance create` / `remuda dispatch` 上的显式 `--capability computer-use`
+   能授予。它**不是** host 属性、不是 driver 属性、不是全局开关，不写进任何默认、
+   preset 或 workspace，不从父 instance 继承。
+2. **两道门，缺一不可**：(a) 来源必须是 `LaunchOrigin::Human` 或 `Bot`，
+   `LaunchOrigin::Agent` **一律拒绝**（门形照抄 `presets::merge_yolo_argv`，
+   `crates/remuda-driver/src/presets.rs:151-166`）；(b) 目标主机心跳的 `cli[]`
+   必须回报 `kind: "computer-use"` 且 `installed: true`。
+3. **投递两条腿**：(a) skill 字节从 `remuda` 二进制内嵌物化到**受管的 claude
+   native home**（`<native_home>/skills/codex-computer-use/**`，目录 0700、文件
+   0600）——**门是「本次 launch 的 home 是不是 Remuda 管的」，逐 kind 定义**
+   （claude：作用域 config dir；codex：`launch_dir/codex-home`；grok：
+   `launch_dir/grok-home`），**不是** `inherit_default_config`（那是 claude 专属
+   标志，对 codex launch 也为真）；(b) 一律写 per-instance
+   `<launch_dir>/mcp-cua.json`（0600）。**codex / grok 本批只有腿 (b)**：仓库与
+   skill 都没有证据表明它们读任何 skills 目录，往影子 home 写 skill 树没有读者，
+   投递就只是那份 MCP config。
+4. **按 `AgentKind` 挂载，不按 driver**：claude / grok / agy 走 argv
+   `--mcp-config <path>`；codex 走 shadow home 的
+   `[mcp_servers.codex-computer-use]`。`shell-pty` / `generic-pty` 是 kind 多态的，
+   **同一 driver 承载 claude 与 codex**，所以规则按 kind 说：`shell-pty` 跑 claude
+   （D-036 自托管那一轮）走 argv，`shell-pty` 跑 codex 走 shadow home。
+   **绝不发 `--strict-mcp-config`**（该 flag 永久禁用，`flags.rs:15`）：能力只
+   **增加** agent 自己的 MCP server，绝不替换。
+5. **环境变量握手**：`c-cua-launch` **只在能力被授予时**向子进程注入
+   `REMUDA_CAPABILITY_COMPUTER_USE=1`；硬化后的 `launch-cua-repl.sh` 未见到它就
+   拒绝启动。**该变量是信号不是边界**——任何有 shell 的东西都能自己导出它；**真
+   边界是「没有授予就绝不物料化」**：未授予时 `mcp-cua.json` 根本不存在，agent
+   没有可指的 launcher 路径。
+6. **拒绝各有独立消息**，且都发生在 create/dispatch 被持久接受**之前**：Agent
+   来源、主机未回报、主机回报 `installed: false`、非 macOS、launcher 缺失，以及
+   **`bypassPermissions` 与 `computer-use` 同一次 launch**——无人值守的桌面控制
+   叠加跳过的工具审批是唯一没有回收路径的组合，两者同时出现即拒绝（不是「忽略
+   其一」，也不是需要另一个隐含 flag）。
+7. **截图两条**（原计划曾分别为 D-038；因该 id 已被占用，并入本行并加此标记）：
+   (a) **截图进 journal 与 web** —— tool result 合法携带 `image` content block，
+   字节只存对象库（Node 用宿主 token 走 `POST /v1/hosts/{id}/files/objects`），
+   `ContentBlock::Image` + `MediaBlock` 协议早已合法；**只发文本的 producer 是
+   bug，不是策略**；**不新增 `ObservationKind`**；截图**不是 artifact**，只有
+   agent 显式存盘才发 `artifact`；渲染规则见 ui-spec §2.2。(b) **保留期** ——
+   沿用既有附件对象的生命周期与过期，**永不内联 journal、永不写日志**，证据文档
+   必须用脱敏或合成屏；更短的 CUA 专属 TTL 是 Hub 旋钮与第七个任务。
+8. **host fact 只读**：`computer-use` 是一行普通 `cli[]` 行（`installed` / `path` /
+   `version` 读 `Info.plist` / `auth: unknown`），非 macOS 也回报该行
+   （`installed: false`）。`version` 是**文件读取，绝不 exec**——跑 vendor 二进制
+   问版本会启动一个 Mach service。Hub 侧零改动。
+
+**后果**：
+
+- Remuda 第一次向被启动的 agent **投递文件**（内嵌字节 → 受管 home），因此新增一条
+  「内嵌副本与 `skills/` 源目录 digest 相等」的测试要求，防两者漂移。
+- `~/.claude`、`~/.codex`、`~/.grok` 在**任何**分支上都不会被打开写——这是
+  `overlay.rs:25-28` 既有规则的延伸，需要有测试钉住，不能只靠代码审查。
+- 能力请求一旦被拒绝就**不能静默降级或静默丢弃**，否则操作员会以为授予成功。
+- `computer-use` 是 Remuda 授予过的**最大爆炸半径**：一个握有全机 `click` /
+  `typeText` 的 worker 能发消息、点对话框、花钱，而今天的 journal 什么都看不见。
+  缓解是 D-045 的两道门、Q4 的 bypass 拒绝、以及让每个动作与截图在能力被真用之前
+  就先在会话里可见。
+- 本批**不**为 CUA 加 Hub placement 谓词：拒绝发生在 launch 而不是 placement，
+  由操作员的 `remuda dispatch --host` 负责选对机器。
+- **合并闸门不是绿灯单测**：`c-cua-launch` 的合并前提是一条真实探针（至少一个
+  Remuda 启动的 agent 端到端驱动 `cua-repl`），记录进
+  `docs/design/evidence/codex-cua-1.md`。探针失败则只交拒绝路径与物料化，能力
+  **默认关闭**。
+
+## D-046
+
+**2026-09-19 · CUA 交互路由：`elicitation/create` 由 worker 自己答，回答权被 launch 请求约束**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted |
+| 相关 | D-005、D-017、D-045、[codex-cua.md](./codex-cua.md) §5、[native-pty-first.md](./native-pty-first.md) §5 P5、[ui-spec.md](./ui-spec.md) §2.5 |
+
+**背景**：`cua-repl` 会发 `elicitation/create` 做**按应用审批**——「允许这个 agent
+操作这个应用吗」。agent 侧今天**只有一条** elicitation 桥，且只搭在 Claude 的 hook
+事件上：`Elicitation` 是注册事件、是阻塞事件、可回 `action`
+（`crates/remuda-signal/src/event.rs:114-135`），已能生成
+`Interaction{kind: Elicitation}` 卡（`crates/remuda-signal/src/approval.rs:153-208`），
+也能从 `InteractionAnswer::Elicitation` 回一个动作
+（`crates/remuda-signal/src/bus.rs:1017-1030`）。**但这条链路够不到 MCP 的
+`elicitation/create`**：cua-repl 是 stdio MCP server，它的 elicitation 走 MCP 协议
+本身；codex shadow 的 `hooks.json` 只注册 `SessionStart` 与 `PermissionRequest`
+（`shadow.rs:40-45`），grok 的 `GROK_EVENTS` 同样不含 elicitation 类事件
+（`shadow.rs:47-55`）。所以**今天没有任何路径**能把 MCP server 的
+`elicitation/create` 变成 `/approvals` 里的一张卡。
+
+**决策**：**worker 自己答，回答权被本次 launch 的请求约束。**
+
+- worker 在 cua-repl 的 `initialize` 里声明 `capabilities.elicitation`；
+- 对 `elicitation/create`：**仅当目标应用是本次请求点名的应用**时 `accept` 且
+  `persist: session`；未点名的应用**一律不批**；
+- 「点名的应用」= 派发 brief 里写明的 bundle id；`c-cua-coord` 要求 brief 写出确切
+  bundle id，并禁止为未点名的应用批准 elicitation。
+- **后续（不在本批）**：把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的
+  唯一出口。前置是**每个 harness 各造一个 producer**，把 MCP `elicitation/create`
+  抬进 interaction bus——**不需要新的 `InteractionCarrier` 取值**：该枚举已有七个
+  （`ClaudeControl` / `ClaudeHook` / `HarnessHook` / `CodexRpc` / `AcpRpc` /
+  `NativeTty` / `Unsupported`，`crates/remuda-protocol/src/enums.rs:242-249`），
+  按 harness 选即可（claude 已经就是 `HarnessHook`，`approval.rs:191`；codex → `CodexRpc`；grok → `AcpRpc`）。
+  缺的是 **producer 位置**，不是枚举值。
+
+**后果**：
+
+- **本批的桌面审批没有 journal 行、没有 `/approvals` 卡、没有第二人复核**，只有
+  worker 的一面之词。这是明确接受的代价，写进文档而不是假装它已解决；UI 与文档
+  都**不能**画出一张并不存在的审批卡。
+- claude 侧 `Elicitation` 的实机 payload **至今未取得**
+  （[native-pty-first.md](./native-pty-first.md) §5 P5 残留：仅按二进制读取端形状
+  实现），所以连「Claude hook 那条桥能不能真的覆盖 CUA」也是 UNVERIFIED。
+- 在 MCP 级桥存在之前，D-045 的 bypass 拒绝 +「只批准点名应用」是唯一的边界，
+  且**已知不足**：它约束的是 worker 的自律，不是一台会拒绝的机器。
+- 本批不为 grok 建能力目标：§5.3 的路由对 grok 无落点，且没有证据表明 grok 能
+  消费该 MCP server。

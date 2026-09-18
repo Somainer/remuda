@@ -40,6 +40,15 @@ export function checkForUpdate(): void {
 let updateWaiting: ServiceWorker | null = null;
 const updateListeners = new Set<(available: boolean) => void>();
 let reloading = false;
+// Whether this page load was already controlled by a worker when startPWA ran.
+// A controllerchange with nothing at startup is the first install claiming the
+// tab via clients.claim() — a fresh visit, not an update, so it must not
+// reload the page unprompted.
+let controlledAtStartup = false;
+// Set only by applyUpdate, i.e. the user accepting the "new version" bar. It
+// covers the first-session case (controlledAtStartup is false but the user
+// explicitly asked) and distinguishes it from the first-install claim.
+let updateAccepted = false;
 
 function announceUpdate(worker: ServiceWorker | null): void {
   updateWaiting = worker;
@@ -55,7 +64,9 @@ export function subscribeUpdate(listener: (available: boolean) => void): () => v
 /** Tell the waiting worker to take over; the controllerchange handler reloads. */
 export function applyUpdate(): void {
   const worker = updateWaiting ?? navigator.serviceWorker?.controller;
-  worker?.postMessage("ACTIVATE_UPDATE");
+  if (!worker) return;
+  updateAccepted = true;
+  worker.postMessage("ACTIVATE_UPDATE");
 }
 
 function watchRegistration(reg: ServiceWorkerRegistration): void {
@@ -76,14 +87,19 @@ function watchRegistration(reg: ServiceWorkerRegistration): void {
 
 export function startPWA(): void {
   if (window.isSecureContext && "serviceWorker" in navigator) {
+    controlledAtStartup = Boolean(navigator.serviceWorker.controller);
     if (import.meta.env.PROD) {
       void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then((reg) => {
         watchRegistration(reg);
       });
     }
-    // A single reload when the new worker takes control; the guard stops the
+    // One reload when a replacement worker takes control, but never for the
+    // very first install claiming the tab (nothing was controlled at startup
+    // and the user did not accept an update): that used to reload every
+    // first-time visitor unprompted. The flag also stops a
     // controllerchange → reload → controllerchange loop.
     navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (!controlledAtStartup && !updateAccepted) return;
       if (reloading) return;
       reloading = true;
       window.location.reload();

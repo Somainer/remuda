@@ -8,8 +8,11 @@ const CACHE = "__CACHE_NAME__";
 const SHELL = ["/", "/index.html", "/manifest.webmanifest", "/favicon.svg", "/icons/icon-192.png", "/icons/icon-512.png"];
 
 self.addEventListener("install", (event) => {
+  // No skipWaiting() here: a redeployed worker must sit in "waiting" while a
+  // tab is driven by the old one, so the page can offer the "new version" bar
+  // instead of being yanked mid-session. It takes over only when the client
+  // posts ACTIVATE_UPDATE (the message handler below calls skipWaiting).
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
-  self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {

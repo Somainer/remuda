@@ -70,6 +70,83 @@ fn brief_lint_exit_codes() -> Result<()> {
     Ok(())
 }
 
+// ── desktop control lint (D-045 / D-046) ───────────────────────────────────
+
+/// A brief that grants desktop control must carry the host and the bundle ids,
+/// and must not also ask for a bypassed permission posture.
+#[test]
+fn brief_lint_desktop_control_rule() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Vocabulary, no capability: rejected, and the message names the value.
+    let ungranted = dir.path().join("cua-ungranted.md");
+    std::fs::write(
+        &ungranted,
+        "Use computer-use to read the note in TextEdit.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", ungranted.to_str().unwrap()])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-capability"), "{stderr}");
+    assert!(stderr.contains("computer-use"), "{stderr}");
+
+    // The full grant: capability, host, bundle id — clean.
+    let granted = dir.path().join("cua-granted.md");
+    std::fs::write(
+        &granted,
+        "Read the note in TextEdit using computer-use.\n\
+         capability: computer-use\n\
+         host: hst_mac-mini\n\
+         Approved apps: com.apple.TextEdit only.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", granted.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The refused combination (D-045 §4 / Q4).
+    let bypassed = dir.path().join("cua-bypass.md");
+    std::fs::write(
+        &bypassed,
+        "Read the note in TextEdit using computer-use.\n\
+         capability: computer-use\n\
+         host: hst_mac-mini\n\
+         Approved apps: com.apple.TextEdit only.\n\
+         Launch with --dangerously-skip-permissions.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", bypassed.to_str().unwrap()])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("capability-bypass"), "{stderr}");
+    assert!(stderr.contains("D-045"), "{stderr}");
+
+    // JSON mode reports the rules machine-readably.
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", bypassed.to_str().unwrap(), "--json"])
+        .output()?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["ok"], false);
+    assert!(
+        report["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["rule"] == "capability-bypass")
+    );
+    Ok(())
+}
+
 #[test]
 fn help_lists_new_verbs() -> Result<()> {
     for (command, pieces) in [

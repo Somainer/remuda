@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { EffortSlider } from "./EffortSlider";
@@ -267,8 +267,9 @@ describe("EffortSlider tall catalog", () => {
     const user = userEvent.setup();
     mountList();
     await user.click(screen.getByTestId("effort-open-list"));
-    // The selected tier row (high, index 2) opens focused.
-    expect(screen.getByTestId("effort-tier-high")).toHaveFocus();
+    // The selected tier row (high, index 2) opens focused; the initial focus
+    // ride is scheduled on an animation frame.
+    await waitFor(() => expect(screen.getByTestId("effort-tier-high")).toHaveFocus());
     await user.keyboard("{ArrowDown}");
     expect(screen.getByTestId("effort-tier-xhigh")).toHaveFocus();
     await user.keyboard("{End}");

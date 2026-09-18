@@ -58,31 +58,9 @@ Grok 或其他未注入原生 Computer Use 工具的宿主走这条路。Launche
 - 不修改 TCC，不设绕过权限的参数，不伪装成 Codex 内部会话。
 - 协议探测丢弃 stderr；它不是完整日志诊断器。
 
-## 本次验证记录
+## 本机验证记录
 
-### 2026-09-17
-
-| 检查 | 结果 |
-| --- | --- |
-| 当前 Codex `cua.getState()` | 成功返回应用和浏览器清单；未进行 UI 输入 |
-| 本机 `SkyComputerUseClient --help` | 提供 `mcp` 子命令 |
-| 独立子进程 MCP `initialize`、`tools/list` | 成功，返回 10 个原生应用工具 |
-| Claude Code 本机版本 | 2.1.274 |
-| Claude Code 实际消费 MCP 截图及操作 UI | 未验证 |
-| 用户级 skill 安装、MCP 注册及权限修改 | 本次开发未执行 |
-
-### 2026-09-19
-
-| 检查 | 结果 |
-| --- | --- |
-| `probe_mcp.py --schema` | `metadata_ok`，10 个原生工具 |
-| 未认证宿主调用原生 `list_apps` | `Sender process is not authenticated` |
-| Python 直连 `computeruse.sock` ping | 连接后被断开 |
-| `launch-cua-repl.sh` 等价启动（ChatGPT `cua_node` + `CUA_REPL_ENABLED_SURFACES=computer`） | `cua.listApps` 成功 |
-| `cua.getApp("com.apple.ScreenContinuity")` | 成功；需回答 `elicitation/create` |
-| iPhone Mirroring 截图与坐标点击 | 成功；AX 树只有窗口铬 |
-| 改 `clientInfo.name` 为 `codex` | 不能通过原生 MCP 鉴权 |
-| Grok 会话内 Orca computer-use | 用户要求不要用 |
+本 skill 的结论来自哪些实测、哪些仍未验证，见 [codex-cua-1.md](../../../docs/design/evidence/codex-cua-1.md)（“验证记录”）。要点：**原生 MCP 元数据可达，但 Claude Code 这类宿主实际消费 CUA 截图与操作 UI 尚未验证**。别把下面任何一条当成 UI 链路可用的证明。
 
 ## 参考来源
 

@@ -153,7 +153,18 @@ pub enum WorkerWatchStatus {
     /// Busy but silent past the stall threshold.
     Stalled,
     /// Host offline, instance closed, or carrier gone.
-    Gone,
+    ///
+    /// `reason` is the machine-readable why — the carrier code
+    /// (`host-offline`, `instance-closed`, …) or the instance row's own
+    /// `lastError` (`node-epoch-changed`, `host-lost`, …) when the row is
+    /// authoritative. It is carried rather than folded into `detail` alone so
+    /// `remuda watch`'s reason column can print it: a settled
+    /// `node-epoch-changed` is the one fact that tells the owner the
+    /// conversation can still be resumed (2026-09-18 demo).
+    Gone {
+        /// Machine-readable why.
+        reason: String,
+    },
     /// The instance lifecycle failed (or exited after an errored turn), or the
     /// last turn result errored. The worker cannot make progress as launched;
     /// unlike `gone` there is a concrete cause to report.
@@ -174,7 +185,7 @@ impl WorkerWatchStatus {
             Self::Blocked { .. } => WATCH_BLOCKED,
             Self::IdleApiError => WATCH_IDLE_API_ERROR,
             Self::Stalled => WATCH_STALLED,
-            Self::Gone => WATCH_GONE,
+            Self::Gone { .. } => WATCH_GONE,
             Self::Failed { .. } => WATCH_FAILED,
         }
     }

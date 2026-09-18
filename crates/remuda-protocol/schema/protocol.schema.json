@@ -20060,15 +20060,20 @@
           "type": "object"
         },
         {
-          "description": "Host offline, instance closed, or carrier gone.",
+          "description": "Host offline, instance closed, or carrier gone.\n\n`reason` is the machine-readable why — the carrier code\n(`host-offline`, `instance-closed`, …) or the instance row's own\n`lastError` (`node-epoch-changed`, `host-lost`, …) when the row is\nauthoritative. It is carried rather than folded into `detail` alone so\n`remuda watch`'s reason column can print it: a settled\n`node-epoch-changed` is the one fact that tells the owner the\nconversation can still be resumed (2026-09-18 demo).",
           "properties": {
+            "reason": {
+              "description": "Machine-readable why.",
+              "type": "string"
+            },
             "status": {
               "const": "gone",
               "type": "string"
             }
           },
           "required": [
-            "status"
+            "status",
+            "reason"
           ],
           "type": "object"
         },
@@ -20220,15 +20225,20 @@
           "type": "object"
         },
         {
-          "description": "Host offline, instance closed, or carrier gone.",
+          "description": "Host offline, instance closed, or carrier gone.\n\n`reason` is the machine-readable why — the carrier code\n(`host-offline`, `instance-closed`, …) or the instance row's own\n`lastError` (`node-epoch-changed`, `host-lost`, …) when the row is\nauthoritative. It is carried rather than folded into `detail` alone so\n`remuda watch`'s reason column can print it: a settled\n`node-epoch-changed` is the one fact that tells the owner the\nconversation can still be resumed (2026-09-18 demo).",
           "properties": {
+            "reason": {
+              "description": "Machine-readable why.",
+              "type": "string"
+            },
             "status": {
               "const": "gone",
               "type": "string"
             }
           },
           "required": [
-            "status"
+            "status",
+            "reason"
           ],
           "type": "object"
         },

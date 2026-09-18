@@ -573,6 +573,66 @@ async fn stalled_requires_an_aged_quiet_turn() {
     );
 }
 
+/// A row the Hub settled with `node-epoch-changed` must classify gone *with
+/// that reason*.
+///
+/// The 2026-09-18 demo: after the Node restarted, `remuda watch` kept calling
+/// the dead sessions working. Even once the row settles, reporting a bare
+/// carrier code (`host-offline`, `instance-closed`) throws away the one fact
+/// the owner can act on — the process is gone because the Node restarted, and
+/// the conversation can be resumed. The classification must carry it.
+#[tokio::test]
+async fn gone_carries_the_settled_rows_own_reason() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-epoch", "58930-58959").await;
+    let (worker_id, _) = ctx.dispatch(&project, "c-epoch", "58930-58959").await;
+
+    // Settle the roster row's instance exactly as the Hub's epoch reconcile
+    // does, then take the Node away so the screen is unreadable too: both
+    // paths must agree on the reason rather than the weaker carrier code.
+    let instance_id = {
+        let observed = ctx.observe().await;
+        observed["items"][0]["instanceId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    ctx.hub
+        .store()
+        .expect("store")
+        .settle_instance_exited(instance_id.clone(), "node-epoch-changed".into())
+        .await
+        .expect("settle");
+    ctx.hub.test_disconnect_node(&ctx.host).await;
+
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(
+        row["watch"]["status"], "gone",
+        "a settled session with no carrier must read gone: {row}"
+    );
+    assert_eq!(
+        row["watch"]["reason"], "node-epoch-changed",
+        "the settled row's own reason must survive into the classification: {row}"
+    );
+    // `detail` prefixes where the read came from, so a reader can tell a
+    // journal classification from a screen one; the reason travels whole in
+    // its own field, which is what the CLI's reason column prints.
+    let detail = row["watch"]["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("node-epoch-changed"),
+        "detail must repeat the reason: {detail}"
+    );
+    let (_, roster) = ctx.request("GET", "/v1/workers", None).await;
+    let persisted = roster["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == json!(worker_id))
+        .expect("roster row");
+    assert_eq!(persisted["watch"]["reason"], "node-epoch-changed");
+}
+
 #[tokio::test]
 async fn gone_when_carrier_reports_closed() {
     let ctx = Ctx::spawn().await.unwrap();

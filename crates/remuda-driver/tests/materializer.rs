@@ -1886,3 +1886,156 @@ mod permission_axes {
         );
     }
 }
+
+/// The sdk argv is print's minus `-p`, and the session id is still passed
+/// (`print-replacement.md` §2.1, §2.2 item 2).
+#[test]
+fn sdk_argv_is_print_without_dash_p() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let mut print_spec = load_spec();
+    print_spec.driver = DriverKind::ClaudePrint;
+    let print = materialize(&request(
+        &print_spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap();
+
+    let mut sdk_spec = load_spec();
+    sdk_spec.driver = DriverKind::ClaudeSdk;
+    let sdk = materialize(&request(
+        &sdk_spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap();
+
+    assert_eq!(print.argv.first().map(String::as_str), Some("-p"));
+    assert!(!sdk.argv.iter().any(|a| a == "-p" || a == "--print"));
+    assert_eq!(sdk.argv, print.argv[1..].to_vec(), "only -p may differ");
+
+    // Turns arrive on stdin, and the session identity is still ours to set so
+    // the CLI does not invent a different one (§2.2 item 2).
+    assert_eq!(sdk.input_delivery, remuda_protocol::InputDelivery::Stdio);
+    let at = sdk
+        .argv
+        .iter()
+        .position(|a| a == "--session-id")
+        .unwrap_or_else(|| panic!("no --session-id in {:?}", sdk.argv));
+    assert_eq!(
+        sdk.argv.get(at + 1).map(String::as_str),
+        Some("01993ab0-0000-7000-8000-000000000003")
+    );
+    // Default is host approvals over stdio (§2.3).
+    assert!(
+        sdk.argv
+            .windows(2)
+            .any(|w| w[0] == "--permission-prompts" && w[1] == "host")
+    );
+    assert!(
+        sdk.argv
+            .windows(2)
+            .any(|w| w[0] == "--permission-prompt-tool" && w[1] == "stdio")
+    );
+    for flag in [
+        "--bare",
+        "--safe-mode",
+        "--no-session-persistence",
+        "--continue",
+    ] {
+        assert!(!sdk.argv.iter().any(|a| a == flag), "sdk argv has {flag}");
+    }
+}
+
+/// Bypass behaves as print's: the CLI mode plus the skip-permissions flag.
+#[test]
+fn sdk_bypass_matches_print() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.driver = DriverKind::ClaudeSdk;
+    spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+        mode: ClaudePermissionMode::BypassPermissions,
+        interaction: ClaudeInteractionMode::Host,
+    }));
+    let recipe = materialize(&request(
+        &spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .unwrap();
+    assert!(
+        recipe
+            .argv
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions")
+    );
+    assert!(
+        recipe
+            .argv
+            .iter()
+            .any(|flag| flag == "--allow-dangerously-skip-permissions")
+    );
+    assert!(!recipe.argv.iter().any(|a| a == "-p"));
+}
+
+/// §2.8: sdk refuses `dontAsk` rather than inheriting print's M0 auto-deny
+/// debt. Silently denying every tool call is not a behaviour to carry forward.
+#[test]
+fn sdk_refuses_dont_ask_instead_of_inheriting_the_m0_debt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = stub_binary(tmp.path(), "stub-1.0.0");
+    let launch = tmp.path().join("launch");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut spec = load_spec();
+    spec.driver = DriverKind::ClaudeSdk;
+    spec.permission_mode = PermissionMode::Claude(Box::new(ClaudePermission {
+        mode: ClaudePermissionMode::DontAsk,
+        interaction: ClaudeInteractionMode::Host,
+    }));
+    let error = materialize(&request(
+        &spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .expect_err("dontAsk must be refused on claude-sdk");
+    assert!(
+        matches!(error, DriverError::NativeFeatureDisabled(ref msg) if msg.contains("dontAsk")),
+        "{error:?}"
+    );
+
+    // Print still tags the debt, unchanged.
+    let mut print_spec = spec.clone();
+    print_spec.driver = DriverKind::ClaudePrint;
+    let print = materialize(&request(
+        &print_spec,
+        &native_profile(),
+        &launch,
+        &home,
+        pin_source(&binary),
+    ))
+    .expect("print still accepts dontAsk");
+    assert!(
+        print
+            .technical_debt
+            .iter()
+            .any(|tag| tag == TECH_DEBT_M0_PERM_01)
+    );
+}

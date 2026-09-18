@@ -2100,6 +2100,9 @@ impl TranscriptMapper {
                 bridge.note_launch_request(id.clone());
             }
         }
+        if let Some(catalog) = &catalog {
+            bridge.set_own_catalog(crate::model_discovery::own_ids(catalog));
+        }
         self.model_bridge = Some(bridge);
         self.model_catalog = catalog;
         self
@@ -2132,6 +2135,7 @@ impl TranscriptMapper {
             },
             raw: None,
             catalog,
+            selection_path: None,
         }));
         Ok(vec![self.mapper.observation(
             Completeness::Structured,
@@ -2444,11 +2448,19 @@ impl TranscriptMapper {
         source: EffortSource,
         raw: Option<String>,
     ) -> DriverResult<Vec<Observation>> {
-        let requested = self
+        let (requested, selection_path) = self
             .model_bridge
             .as_ref()
-            .and_then(|bridge| bridge.requested())
-            .map(|request| request.id);
+            .map(|bridge| {
+                let path = if source == EffortSource::Remuda {
+                    bridge.requested_path()
+                } else {
+                    None
+                };
+                bridge.note_effective(observed.id.clone(), source, path);
+                (bridge.requested().map(|request| request.id), path)
+            })
+            .unwrap_or((None, None));
         let payload = ObservationPayload::Model(Box::new(ModelPayload {
             requested,
             effective: EffectiveModel {
@@ -2460,6 +2472,7 @@ impl TranscriptMapper {
             // The catalog rides the launch snapshot; transcript edges never
             // re-send it.
             catalog: None,
+            selection_path,
         }));
         Ok(vec![self.mapper.observation(
             Completeness::Structured,

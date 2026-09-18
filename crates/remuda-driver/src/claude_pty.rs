@@ -361,6 +361,10 @@ impl ClaudePtyDriver {
             &env_pairs,
             spec.model_id.as_deref(),
         );
+        // Owned snapshot for the catalog re-resolve task, which outlives the
+        // move of `env` into the workspace/pane creation below.
+        let refresh_env: Vec<(String, String)> =
+            env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         let created = self
             .resources
@@ -603,6 +607,47 @@ impl ClaudePtyDriver {
             Arc::clone(&permission_queue),
             permission_io,
         );
+
+        // Seed the selection-path catalog, then re-resolve once the session's
+        // own scoped discovery cache lands (the promotion-time answer may be
+        // the operator's host fallback) and re-stamp the picker's catalog.
+        model_bridge.set_own_catalog(crate::model_discovery::own_ids(&model_catalog));
+        {
+            let bridge = Arc::clone(&model_bridge);
+            let events = tx.clone();
+            let seq = Arc::clone(&self.seq);
+            let refresh_ctx = ctx.clone();
+            let initial = model_catalog.clone();
+            let native_home = std::path::PathBuf::from(recipe.native_home.clone());
+            let host_dir = host_config_dir.clone();
+            let settings_path = std::path::Path::new(&recipe.native_home).join("settings.json");
+            let current = spec.model_id.clone();
+            tokio::spawn(async move {
+                let payload = crate::model_discovery::scoped_refresh_payload(
+                    native_home,
+                    host_dir,
+                    Some(settings_path),
+                    refresh_env,
+                    current,
+                    initial,
+                    bridge,
+                )
+                .await;
+                if let Some(body) = payload
+                    && let Err(error) = emit_obs(
+                        &events,
+                        &seq,
+                        &refresh_ctx,
+                        SourceChannel::Transcript,
+                        Completeness::Structured,
+                        body,
+                    )
+                    .await
+                {
+                    tracing::debug!(%error, "model catalog refresh: event channel closed");
+                }
+            });
+        }
 
         *self.inner.lock().await = Some(PtyLive {
             ctx,

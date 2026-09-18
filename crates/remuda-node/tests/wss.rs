@@ -235,7 +235,13 @@ async fn wss_reannounce_keeps_a_single_host_row() {
         { "kind": "claude", "version": "2.1.268", "path": "/usr/bin/claude", "auth": "unknown" },
         { "kind": "codex", "version": "0.1.0", "path": "/usr/bin/codex", "auth": "unknown" },
         { "kind": "grok", "version": "1.0.0", "path": "/usr/bin/grok", "auth": "unknown" },
-        { "kind": "agy", "version": "1.2.1", "path": "/usr/bin/agy", "auth": "unknown" }
+        { "kind": "agy", "version": "1.2.1", "path": "/usr/bin/agy", "auth": "unknown" },
+        // The presence-only capability row (D-045 §3.4). It has no `path`
+        // because this fixture host has no vendor bundle, and it must still
+        // survive the hello → Hub store → `/v1/hosts` round trip as
+        // `installed: false` rather than being dropped or read as absent
+        // evidence.
+        { "kind": "computer-use", "auth": "unknown", "installed": false }
     ]);
     let link = tokio::time::timeout(TIMEOUT, WssLink::connect(config.clone()))
         .await
@@ -272,13 +278,24 @@ async fn wss_reannounce_keeps_a_single_host_row() {
     assert_eq!(items[0]["hostId"], json!(host_id.as_id().as_str()));
     assert_eq!(items[0]["online"], json!(true));
     let empty = Vec::new();
-    let kinds: Vec<&str> = items[0]["cli"]
-        .as_array()
-        .unwrap_or(&empty)
+    let rows = items[0]["cli"].as_array().unwrap_or(&empty);
+    let kinds: Vec<&str> = rows.iter().filter_map(|row| row["kind"].as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["claude", "codex", "grok", "agy", "computer-use"],
+        "{items:?}"
+    );
+    // The capability row crosses a real WSS hello → Hub store → `/v1/hosts`
+    // unchanged: always present, honest about absence, and never authenticated
+    // (D-045 §3.4). This host has no vendor bundle, and the Hub must report
+    // that as `installed: false` rather than dropping the row.
+    let capability = rows
         .iter()
-        .filter_map(|row| row["kind"].as_str())
-        .collect();
-    assert_eq!(kinds, ["claude", "codex", "grok", "agy"], "{items:?}");
+        .find(|row| row["kind"] == "computer-use")
+        .expect("computer-use row reaches /v1/hosts");
+    assert_eq!(capability["installed"], json!(false), "{capability:?}");
+    assert_eq!(capability["auth"], json!("unknown"), "{capability:?}");
+    assert!(capability["path"].is_null(), "{capability:?}");
 
     tokio::time::timeout(TIMEOUT, link.shutdown())
         .await

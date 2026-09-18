@@ -999,6 +999,20 @@ async fn cancel_a_queued_job_marks_it_canceled_without_a_node_call() -> Result<(
         .iter()
         .any(|params| params["branch"] == "wt/b/hold");
     assert!(!seen, "canceled job was never dispatched");
+    // The queued cancel is terminal on the Hub alone: the Node saw the running
+    // job's run but never any dispatch, cancel, or other RPC for the canceled
+    // one. Its only arrival is wt/a/hold.
+    let arrivals = ctx.scripts[0].arrivals.lock().unwrap().clone();
+    assert_eq!(
+        arrivals.len(),
+        1,
+        "only the running job was ever dispatched: {arrivals:?}"
+    );
+    assert_eq!(arrivals[0]["branch"], "wt/a/hold");
+    assert!(
+        ctx.scripts[0].gate_cancels.lock().unwrap().is_empty(),
+        "a queued cancel never calls the Node"
+    );
     Ok(())
 }
 
@@ -1028,6 +1042,183 @@ async fn cancel_a_running_job_sends_gate_cancel_and_finishes_canceled() -> Resul
     let done = ctx.wait_state(id, &["canceled", "failed"]).await;
     assert_eq!(done["state"], "canceled", "{done}");
     assert!(!ctx.scripts[0].gate_cancels.lock().unwrap().is_empty());
+    Ok(())
+}
+
+/// Cancel a `pushFrom: home` land while it is running. The lane verified and
+/// pinned a merge, but the operator canceled: the job ends `canceled`, the
+/// home host is never asked to push, and the verified mergeSha / mergeRef
+/// survive on the job (the merge is real, it simply was not landed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_while_running_a_home_land_never_lands() -> Result<()> {
+    let ctx = Ctx::spawn_with(2, |body| {
+        body["gate"]["lanes"][0]["pushFrom"] = json!("home");
+        body["gate"]["lanes"][0]["fetchRemote"] = json!("lane-alias");
+    })
+    .await?;
+    let response = ctx
+        .http
+        .patch(format!(
+            "http://{}/v1/projects/{}",
+            ctx.hub.addr, ctx.project
+        ))
+        .bearer_auth(&ctx.token)
+        .json(&json!({"homeHost": ctx.hosts[1]}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200, "{:?}", response.text().await);
+
+    ctx.scripts[0].script(
+        "wt/a/cancel-home",
+        RunSpec {
+            // The lane holds the run open until the cancel arrives, then
+            // reports a *pass* with a pinned merge (the D-034 verify verdict).
+            wait_cancel: true,
+            status: "passed",
+            merge_sha: Some("3333333333333333333333333333333333333333"),
+            merge_ref: Some("refs/remuda/gate/pinned"),
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/cancel-home","mode":"land","laneId":"lane1"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    let _ = ctx.wait_state(id, &["running"]).await;
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success());
+
+    let done = ctx.wait_state(id, &["canceled", "landed", "failed"]).await;
+    assert_eq!(
+        done["state"], "canceled",
+        "a canceled home land must never land: {done}"
+    );
+    assert!(
+        ctx.scripts[1].land_calls.lock().unwrap().is_empty(),
+        "the home host was never asked to push"
+    );
+    assert!(
+        ctx.scripts[0].land_calls.lock().unwrap().is_empty(),
+        "the lane was never asked to push"
+    );
+    // The verified merge is real; the job keeps it and only records that it was
+    // not landed.
+    assert_eq!(
+        done["mergeSha"], "3333333333333333333333333333333333333333",
+        "the verified mergeSha survives: {done}"
+    );
+    assert_eq!(
+        done["mergeRef"], "refs/remuda/gate/pinned",
+        "the pinned mergeRef survives: {done}"
+    );
+    Ok(())
+}
+
+/// A run reply that arrives only after the cancel grace has expired changes
+/// nothing: the scheduler already finished the job `canceled`, no push ever
+/// happened, and the late `passed` verdict is ignored rather than applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_run_reply_after_the_cancel_grace_changes_nothing() -> Result<()> {
+    let ctx = Ctx::spawn_with_config(
+        2,
+        |body| {
+            body["gate"]["lanes"][0]["pushFrom"] = json!("home");
+            body["gate"]["lanes"][0]["fetchRemote"] = json!("lane-alias");
+        },
+        |config| config.gate_cancel_grace_ms = 200,
+    )
+    .await?;
+    let response = ctx
+        .http
+        .patch(format!(
+            "http://{}/v1/projects/{}",
+            ctx.hub.addr, ctx.project
+        ))
+        .bearer_auth(&ctx.token)
+        .json(&json!({"homeHost": ctx.hosts[1]}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200);
+
+    ctx.scripts[0].script(
+        "wt/a/late",
+        RunSpec {
+            // The lane never breaks on cancel; it keeps running well past the
+            // 200 ms grace, then replies passed — far too late to matter.
+            delay_ms: 2500,
+            status: "passed",
+            merge_sha: Some("3333333333333333333333333333333333333333"),
+            merge_ref: Some("refs/remuda/gate/pinned"),
+            ..RunSpec::default()
+        },
+    );
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/late","mode":"land","laneId":"lane1"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    let _ = ctx.wait_state(id, &["running"]).await;
+    let (status, _) = ctx
+        .request(
+            "POST",
+            &format!("/v1/projects/{}/gate/jobs/{id}/cancel", ctx.project),
+            Some(json!({})),
+        )
+        .await;
+    assert!(status.is_success());
+
+    // The grace expires long before the run reply; the scheduler finishes it.
+    let done = ctx.wait_state(id, &["canceled", "landed", "failed"]).await;
+    assert_eq!(done["state"], "canceled", "{done}");
+    // Give the delayed run reply time to arrive and (be ignored).
+    tokio::time::sleep(Duration::from_millis(2800)).await;
+    let after = ctx.job(id).await;
+    assert_eq!(
+        after["state"], "canceled",
+        "the late passed reply does not resurrect the job: {after}"
+    );
+    assert!(
+        ctx.scripts[1].land_calls.lock().unwrap().is_empty(),
+        "no push ever happened"
+    );
+    Ok(())
+}
+
+/// The merged per-step timeouts (project defaults with the lane's own entries
+/// layered on top) reach the lane in the recorded `gate.run` params.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_run_carries_the_merged_step_timeouts() -> Result<()> {
+    let ctx = Ctx::spawn_with(1, |body| {
+        body["gate"]["timeouts"] = json!({"cargo-test": 2400, "web-hub-e2e": 1800});
+        // The lane overrides web-hub-e2e and adds its own key.
+        body["gate"]["lanes"][0]["timeouts"] = json!({"web-hub-e2e": 3600, "clippy": 0});
+    })
+    .await?;
+    let job = ctx
+        .enqueue(json!({"branch":"wt/a/timeouts","mode":"verify"}))
+        .await;
+    let id = job["id"].as_str().unwrap();
+    let _ = ctx.wait_state(id, &["passed", "failed"]).await;
+    let arrivals = ctx.scripts[0].arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 1, "one run dispatched: {arrivals:?}");
+    let timeouts = &arrivals[0]["timeouts"];
+    assert_eq!(
+        timeouts["cargo-test"], 2400,
+        "project default survives: {timeouts}"
+    );
+    assert_eq!(
+        timeouts["web-hub-e2e"], 3600,
+        "the lane wins on a shared key: {timeouts}"
+    );
+    assert_eq!(
+        timeouts["clippy"], 0,
+        "a lane-only key (0 = no cap): {timeouts}"
+    );
     Ok(())
 }
 

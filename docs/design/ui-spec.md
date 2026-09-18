@@ -264,6 +264,18 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 
 手机：无右栏；Workflow / diff 点开进 sheet。composer 贴 `visualViewport` 底边。
 
+**实时状态条（dock，`LiveStatusStrip`）——回合是否结束由会话已有的每条通道共同决定，不由 hook 相位锁存单独决定**
+
+状态条渲染纯 reducer `turnEnd` 的唯一裁决（`working | waiting | ended | unknown` + `decidedBy` + `endedAt`），不再直接渲染 hook 相位锁存。`phase.ts` / `liveStatus.ts` 仍是纯 fold，所有消费决策归 reducer：
+
+- hook 的 `turn-ended` / `interrupted` 直接定终；hook 通道**新鲜**时，hook 活动相位持有回合（设计 §2.4 规则 6，screen 的中途 idle 边沿被忽略）。
+- hook 通道一旦 `stalled` / `never-materialised`（`channelHealth`，3×2 s）即降为参考，screen 的非活动 `live.status`（或 pty `agent_status`）结束回合；再没有 screen 时，晚于锁存 `since` 的 assistant 消息从 transcript 收尾结束。
+- 结束锚取**最早**的合法结束证据，按 hook > screen > transcript 决胜，所以迟到的 hook `Stop` 不会重启计时、不会二次 flush；`ended` 显示「回合结束」+ 小芯片 `data-testid=live-decided-by`（值 hook/screen/transcript），计时在 `endedAt` 停止（`useElapsed(active=false)`），并移除 Esc 打断按钮。
+- 「等待操作」**只**给真正的人机回合：本 instance 有 pending 交互、screen 锁存自身报 blocked、或新鲜的 hook `blocked` 相位。一个 hook 已静默又无 pending 的 blocked 是 `unknown`，绝不是「等待操作」。
+- composer 相位由该 reducer 与 `projectStatus` 合并：`ended→idle` 是工作→空闲边沿，已有 effect 恰好调用一次 `flushHeld`（结束按 `endedAt` 幂等锁存）。
+- amber 静默注记可附 Node 侧实际跑过的检查名（`relay-missing` / `socket-refused` / `link-stalled`，来自 instance 上的 `hook.silence` 诊断）；没有检查结果时徽标保持原样，绝不猜原因。
+- `Notification` hook（含 Claude Code 的 `idle_prompt`「等待你输入」）是结束后的咨询，不是阻断请求：不抬相位、不算 waiting；在站内以 toast + 会话页小通知列表呈现（文案、时间、可忽略；`permission_prompt` 类链接到待处理对话卡），既有 push 路径不变。
+
 **Transcript 节点（journal fold，稳定 `nodeId`）**
 
 | 节点 | 默认 | 数据 |

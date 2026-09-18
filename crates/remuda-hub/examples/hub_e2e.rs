@@ -232,6 +232,89 @@ async fn mint_enroll_via_device(addr: SocketAddr, bootstrap: &str) -> Result<Str
         .ok_or_else(|| anyhow!("enroll token missing"))
 }
 
+/// The `node.hello` frame the harness sends, enroll and restart alike.
+///
+/// `live` is the instance inventory the Node announces. A restart reports what
+/// survived it — nothing, for an in-process carrier — which is what the Hub
+/// diffs against the epoch it recorded. See `NODE_RESTART_SENTINEL`.
+fn node_hello_frame(
+    host_id: &HostId,
+    workspaces: &Value,
+    epoch: u64,
+    live: &[String],
+) -> Value {
+    let host = host_id.as_id().as_str();
+    let inventory: Vec<Value> = live
+        .iter()
+        .map(|instance_id| {
+            json!({ "id": instance_id, "hostId": host, "lifecycle": "running" })
+        })
+        .collect();
+    json!({
+        "jsonrpc": "2.0",
+        "id": "hello",
+        "method": "node.hello",
+        "params": {
+            "hostId": host,
+            "nodeVersion": "0.1.0-e2e",
+            "label": "e2e-fake-node",
+            // A new epoch on every restart is what makes the Hub reconcile;
+            // an unchanged epoch is a reconnect and settles nothing.
+            "nodeEpoch": format!("epoch-e2e-{epoch}"),
+            "instances": inventory,
+            "host": {
+                "hostname": "e2e-fake-node.local",
+                "workspaceRevision": 1,
+                "workspaces": workspaces,
+                "labels": { "role": "e2e" },
+                // The shared Hub, slider and spaces scenarios create five instances.
+                "maxInstances": 8,
+                // Inventory only: this harness never launches herdr.
+                "herdr": { "version": "e2e-fake" },
+                "cli": [{
+                    "kind": "claude",
+                    "version": "2.1.268",
+                    "absolutePath": "/usr/bin/claude",
+                    "authState": "logged_in"
+                }, {
+                    "kind": "codex",
+                    "version": "0.154.0-e2e-fake",
+                    "absolutePath": "/usr/bin/codex",
+                    "authState": "logged_in"
+                }]
+            },
+            // D-028 §5.1: the kind/driver matrix the web reads to default
+            // New Session to the native shell-pty carrier. The Hub stores
+            // this verbatim on the host view; nothing is hardcoded in the
+            // web client.
+            "capabilities": {
+                "driverInventory": [
+                    {
+                        "kind": "shell-pty",
+                        "launchable": true,
+                        "reasonCode": "fake-node-native-pty"
+                    },
+                    {
+                        "kind": "claude-print",
+                        "launchable": true,
+                        "reasonCode": "fake-node-legacy"
+                    },
+                    {
+                        "kind": "claude-pty",
+                        "launchable": true,
+                        "reasonCode": "fake-node-resume"
+                    },
+                    {
+                        "kind": "generic-pty",
+                        "launchable": true,
+                        "reasonCode": "fake-node-legacy"
+                    }
+                ]
+            }
+        }
+    })
+}
+
 async fn fake_node(
     addr: SocketAddr,
     enroll: String,
@@ -261,68 +344,13 @@ async fn fake_node(
         { "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" },
         { "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }
     ]);
+    // The enroll hello announces an empty inventory — this process holds no
+    // sessions yet — and a later restart re-announces whatever is still live.
+    // The Hub reads a missing key as "cannot enumerate" and an empty array as
+    // "owns nothing", so "no sessions yet" is spelled `[]` deliberately.
+    let mut node_epoch = 1u64;
     ws.send(Message::Text(
-        json!({
-            "jsonrpc": "2.0",
-            "id": "hello",
-            "method": "node.hello",
-            "params": {
-                "hostId": host_id.as_id().as_str(),
-                "nodeVersion": "0.1.0-e2e",
-                "label": "e2e-fake-node",
-                "host": {
-                    "hostname": "e2e-fake-node.local",
-                    "workspaceRevision": 1,
-                    "workspaces": workspaces,
-                    "labels": { "role": "e2e" },
-                    // The shared Hub, slider and spaces scenarios create five instances.
-                    "maxInstances": 8,
-                    // Inventory only: this harness never launches herdr.
-                    "herdr": { "version": "e2e-fake" },
-                    "cli": [{
-                        "kind": "claude",
-                        "version": "2.1.268",
-                        "absolutePath": "/usr/bin/claude",
-                        "authState": "logged_in"
-                    }, {
-                        "kind": "codex",
-                        "version": "0.154.0-e2e-fake",
-                        "absolutePath": "/usr/bin/codex",
-                        "authState": "logged_in"
-                    }]
-                },
-                // D-028 §5.1: the kind/driver matrix the web reads to default
-                // New Session to the native shell-pty carrier. The Hub stores
-                // this verbatim on the host view; nothing is hardcoded in the
-                // web client.
-                "capabilities": {
-                    "driverInventory": [
-                        {
-                            "kind": "shell-pty",
-                            "launchable": true,
-                            "reasonCode": "fake-node-native-pty"
-                        },
-                        {
-                            "kind": "claude-print",
-                            "launchable": true,
-                            "reasonCode": "fake-node-legacy"
-                        },
-                        {
-                            "kind": "claude-pty",
-                            "launchable": true,
-                            "reasonCode": "fake-node-resume"
-                        },
-                        {
-                            "kind": "generic-pty",
-                            "launchable": true,
-                            "reasonCode": "fake-node-legacy"
-                        }
-                    ]
-                }
-            }
-        })
-        .to_string()
-        .into(),
+        node_hello_frame(&host_id, &workspaces, node_epoch, &[]).to_string().into(),
     ))
     .await?;
     let hello = match ws.next().await {
@@ -1374,6 +1402,66 @@ async fn fake_node(
                         }
                         tty.submit(&bytes)
                     };
+                    // `TTYNODE_RESTART` typed into a session makes the fake
+                    // Node restart: ack the write, drop the socket, reconnect
+                    // under a new epoch, and re-announce an inventory that no
+                    // longer holds the session the operator was looking at.
+                    //
+                    // Only that one is dropped, and the harness's own maps are
+                    // left alone: this is a *shared* single-node harness, and
+                    // a restart that wiped every other spec's live session
+                    // would fail them for reasons that have nothing to do with
+                    // their subject. What matters to the Hub is the hello's
+                    // inventory, not what this fixture believes.
+                    if submitted.as_deref() == Some(
+                        std::str::from_utf8(NODE_RESTART_SENTINEL).unwrap_or_default(),
+                    ) {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        node_epoch += 1;
+                        let mut survivors: Vec<String> = ttys
+                            .keys()
+                            .chain(claude_ptys.iter())
+                            .filter(|id| id.as_str() != instance_id.as_str())
+                            .cloned()
+                            .collect();
+                        survivors.sort();
+                        survivors.dedup();
+                        let _ = ws.close(None).await;
+                        let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+                        req.headers_mut().insert(
+                            "Authorization",
+                            format!("Bearer {durable_token}")
+                                .parse()
+                                .context("authorization header")?,
+                        );
+                        let (next_ws, _) = tokio_tungstenite::connect_async(req).await?;
+                        ws = next_ws;
+                        ws.send(Message::Text(
+                            node_hello_frame(&host_id, &workspaces, node_epoch, &survivors)
+                                .to_string()
+                                .into(),
+                        ))
+                        .await?;
+                        // The hello reply shares the socket with unrelated Hub
+                        // RPCs; stash those rather than swallowing them.
+                        loop {
+                            let Some(Ok(Message::Text(text))) =
+                                tokio::time::timeout(Duration::from_secs(5), ws.next()).await?
+                            else {
+                                anyhow::bail!("hub closed during the fake node restart");
+                            };
+                            let value: Value = serde_json::from_str(&text)?;
+                            if value.get("id").and_then(Value::as_str) == Some("hello") {
+                                anyhow::ensure!(
+                                    value.get("result").is_some(),
+                                    "restart hello rejected: {value}"
+                                );
+                                break;
+                            }
+                            frame_queue.push_back(text.to_string());
+                        }
+                        continue;
+                    }
                     if let Some(line) = submitted {
                         append_n =
                             append_native_user(&mut ws, &instance_id, append_n, &line).await?;
@@ -1689,11 +1777,21 @@ struct ScriptedFrame {
 const TTY_ALT_ON_SENTINEL: &[u8] = b"TTYMODE_ALT_ON";
 const TTY_ALT_OFF_SENTINEL: &[u8] = b"TTYMODE_ALT_OFF";
 
+/// Typing this line (followed by Enter) makes the fake Node *restart*: it
+/// reconnects under a new `nodeEpoch` announcing an inventory that no longer
+/// contains the other live instances, exactly as `hubnode_codec::stdio_hello_params`
+/// now reports after a real Node's sweep.
+///
+/// The inventory is the whole point: before this, a hello carried no
+/// `instances` key at all and the Hub had an epoch change with nothing to
+/// diff, so the rows of every process that died with the previous Node stayed
+/// `running` and kept holding placement slots.
+const NODE_RESTART_SENTINEL: &[u8] = b"TTYNODE_RESTART";
+
 /// OSC 9;4 progress sentinels (native-config, 2026-09-16). Each emits the raw
 /// ConEmu sequence plus a `tty.mode` notice carrying the parsed progress,
 /// exactly like the Node's local emulator pump.
-const TTY_PROGRESS_INDET_SENTINEL: &[u8] = b"TTYPROG_INDET";
-const TTY_PROGRESS_PERCENT_SENTINEL: &[u8] = b"TTYPROG_PERCENT";
+const TTY_PROGRESS_INDET_SENTINEL: &[u8] = b"TTYPROG_INDET";const TTY_PROGRESS_PERCENT_SENTINEL: &[u8] = b"TTYPROG_PERCENT";
 const TTY_PROGRESS_ERROR_SENTINEL: &[u8] = b"TTYPROG_ERROR";
 const TTY_PROGRESS_DONE_SENTINEL: &[u8] = b"TTYPROG_DONE";
 

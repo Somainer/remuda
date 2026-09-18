@@ -284,6 +284,15 @@ impl ClaudePrintDriver {
         Self::with_carrier(options, DriverKind::ClaudePrint)
     }
 
+    /// Wire name of the carrier this object drives, for user-facing messages and
+    /// logs. Sibling drivers pass the same kebab-case spelling.
+    fn carrier_name(&self) -> &'static str {
+        match self.carrier {
+            DriverKind::ClaudeSdk => "claude-sdk",
+            _ => "claude-print",
+        }
+    }
+
     /// [`Self::new`], stamping and launching `carrier` instead of `claude-print`.
     pub(crate) fn with_carrier(options: ClaudePrintOptions, carrier: DriverKind) -> Self {
         Self {
@@ -330,8 +339,10 @@ impl ClaudePrintDriver {
     async fn launch(&self, spec: InstanceSpec, session: SessionAction) -> DriverResult<RunHandle> {
         if spec.driver != self.carrier {
             return Err(DriverError::InvalidLaunchSpec(format!(
-                "this driver requires driverKind {:?}, got {:?}",
-                self.carrier, spec.driver
+                "{} driver requires driverKind {}, got {:?}",
+                self.carrier_name(),
+                self.carrier_name(),
+                spec.driver
             )));
         }
         reject_bot_bypass(&spec, self.options.origin)?;
@@ -601,9 +612,9 @@ impl Driver for ClaudePrintDriver {
                     .is_some_and(|value| !value.is_empty())
                 {
                     return Err(DriverError::CapabilityUnsupported(format!(
-                        "{:?} cannot switch effort in-session: relaunch with --effort; \
+                        "{} cannot switch effort in-session: relaunch with --effort; \
                          use the claude-pty or shell-pty carrier for /effort",
-                        self.carrier
+                        self.carrier_name()
                     )));
                 }
                 if !switch.model_id.is_empty() {
@@ -659,9 +670,12 @@ impl Driver for ClaudePrintDriver {
         *live_guard = None;
         *self.inner.events.lock().await = None;
         drop(live_guard);
-        // S5: the child has exited, so the launch overlays can go.
+        // S5: the child has exited, so the launch overlays can go. The label is
+        // the carrier's wire name, matching the kebab-case the sibling drivers
+        // pass (`claude-pty`, `claude-bg`, `generic-pty`).
+        let carrier = self.carrier_name();
         if let Some(recipe) = recipe {
-            crate::recipe::report_launch_cleanup(&recipe, &format!("{:?}", self.carrier));
+            crate::recipe::report_launch_cleanup(&recipe, carrier);
         }
         Ok(DriverAck::not_dispatched())
     }

@@ -116,6 +116,36 @@ An older Node that never reports the row yields `{"reported": false}` with **no*
 `dispatch_retire_hostcap_cli_lifecycle` asserts the unreported shape against a
 real Hub and a fake Node whose `cli[]` holds only claude.
 
+## The row crosses the wire unchanged
+
+`crates/remuda-node/tests/wss.rs::wss_reannounce_keeps_a_single_host_row` drives
+a real outbound-WSS hello into an in-process Hub and reads `/v1/hosts` back.
+The row it returns for a host with no vendor bundle, verbatim (other keys
+elided):
+
+```json
+{ "kind": "computer-use", "auth": "unknown", "installed": false }
+```
+
+asserted as: the `cli[]` kinds are
+`["claude", "codex", "grok", "agy", "computer-use"]`, and the capability row has
+`installed == false`, `auth == "unknown"` and a null `path`.
+
+That assertion was **not** written to pass. Adding the row to this fixture first
+failed with:
+
+```
+left:  ["claude", "codex", "grok", "agy"]
+right: ["claude", "codex", "grok", "agy", "computer-use"]
+```
+
+because the test injects `config.cli` directly and so bypasses the probe
+entirely — which is the useful part: it proves the row reaches `/v1/hosts`
+through the real hello/store path rather than only in the probe's own unit
+test, and it would catch the row being dropped by the Hub's `normalize_cli`
+(which honours an explicit `installed: false` instead of inferring it from
+`path`).
+
 ## Web
 
 `web/src/features/hosts/model.ts` gains `computerUseState()`, which returns a
@@ -154,6 +184,7 @@ Fixtures carry all three states: `devbox-sg` installed, `devbox` absent,
 | Rust unit (`diagnostics.rs`) | doctor check absent (names its path, warning) and present (ok, version) |
 | Rust unit (`hostcap.rs`) | reported-installed / reported-absent / unreported row shaping |
 | Rust integration (`dispatch_cli.rs`) | `remuda hostcap` against a real Hub + fake Node → `computerUse.reported == false` |
+| Rust integration (`wss.rs`) | the row survives a real WSS hello → Hub store → `/v1/hosts` round trip |
 | vitest (`model.test.ts`) | the three states; `cliSummary` label survival; absent row dropped |
 | vitest (`HostDiagnostics.test.tsx`) | the three rendered states, incl. no "未安装" claim when unreported |
 

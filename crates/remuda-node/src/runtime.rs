@@ -1124,6 +1124,23 @@ impl DevNode {
     }
 }
 
+/// The explicit pin a launch gate arms from: the recipe's `model_pin`
+/// (`spec.model_id`, no profile fallback), trimmed and empties dropped.
+///
+/// Deliberately not `model_requested`, which is also set to the profile's
+/// default model on an unpinned launch; arming from it would make an unpinned
+/// launch refuseable.
+fn pin_from_recipe(recipe: &Option<remuda_driver::LaunchRecipe>) -> Option<String> {
+    normalize_explicit_pin(recipe.as_ref()?.provider.model_pin.as_deref())
+}
+
+/// Trim a pin and treat a blank/absent one as "no explicit pin".
+fn normalize_explicit_pin(pin: Option<&str>) -> Option<String> {
+    pin.map(str::trim)
+        .filter(|pin| !pin.is_empty())
+        .map(str::to_owned)
+}
+
 /// Post-launch model-pin read-back (`evidence/model-pin-1.md` §3).
 ///
 /// model-pin-1: a `--model` pin is sent, but a host layer can still make the
@@ -1230,13 +1247,11 @@ fn spawn_observation_pump(
         let mut workflow = crate::workflow_producer::WorkflowProducer::new(instance_id.clone());
         let mut workflow_tick = tokio::time::interval(crate::workflow_producer::WORKFLOW_POLL);
         workflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // model-pin-1: refuse a launch the pin did not reach. The pin is the
-        // recipe's own requested id, so the gate reads what the launch actually
-        // asked for rather than re-deriving it.
-        let mut model_pin = ModelPinGate::new(driver.launch_recipe().and_then(|recipe| {
-            let requested = recipe.provider.model_requested.trim().to_owned();
-            (!requested.is_empty()).then_some(requested)
-        }));
+        // model-pin-1: refuse a launch the explicit pin did not reach. The gate
+        // arms from `model_pin` — `spec.model_id` only, never the
+        // profile-derived default that also populates `model_requested` on an
+        // unpinned launch — so a launch with no pin can never start refusing.
+        let mut model_pin = ModelPinGate::new(pin_from_recipe(&driver.launch_recipe()));
         loop {
             tokio::select! {
                 maybe_observation = observations.recv() => {
@@ -3942,6 +3957,21 @@ mod tests {
             );
         }
 
+        /// The gate arms from the *explicit* pin, not the profile-derived
+        /// `model_requested`. Blank/absent explicit pins arm no gate, even
+        /// though an unpinned launch's `model_requested` still carries the
+        /// profile default.
+        #[test]
+        fn an_unpinned_or_blank_pin_arms_no_gate() {
+            assert_eq!(normalize_explicit_pin(None), None);
+            assert_eq!(normalize_explicit_pin(Some("   ")), None);
+            assert_eq!(normalize_explicit_pin(Some("")), None);
+            assert_eq!(
+                normalize_explicit_pin(Some("  model_hub/x[1m] ")),
+                Some("model_hub/x[1m]".to_owned())
+            );
+            assert_eq!(pin_from_recipe(&None), None);
+        }
         /// The catalog from the snapshot makes an un-namespaced launch read-back
         /// comparable, upgrading it to a decidable mismatch.
         #[test]

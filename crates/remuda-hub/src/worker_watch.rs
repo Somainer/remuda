@@ -281,6 +281,11 @@ async fn observe_one(
     let mut instance_updated: Option<String> = None;
     let mut record_lifecycle = String::new();
     let mut lifecycle_reason: Option<String> = None;
+    // D-036 / model-pin-1: the id actually observed answering, when it differs
+    // from the one this worker was dispatched with. Reported rather than
+    // assumed — the roster used to show only the request, which is how a
+    // silently substituted model looked identical to an honoured pin.
+    let mut model_effective: Option<String> = None;
     if let Some(instance_id) = worker.instance_id.as_ref()
         && let Some(record) = state
             .store
@@ -292,6 +297,17 @@ async fn observe_one(
         instance_updated = Some(record.updated_at);
         record_lifecycle = record.lifecycle;
         lifecycle_reason = record.last_error;
+        model_effective = record
+            .model_effective
+            .as_ref()
+            .and_then(|effective| effective.get("id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|observed| !observed.is_empty())
+            // Only a divergence is worth a second column: an observation that
+            // agrees with the request tells a reader nothing new.
+            .filter(|observed| worker.model.as_deref() != Some(*observed))
+            .map(str::to_owned);
     }
 
     let (lines, mut lifecycle, forced_gone, raw, screen_available) =
@@ -483,6 +499,11 @@ async fn observe_one(
                 row.state = next;
             }
             row.watch = Some(watch);
+            // Report the observed id when it diverged; never clear a divergence
+            // already recorded because this pass could not read the row.
+            if model_effective.is_some() {
+                row.model_effective = model_effective;
+            }
             Ok(())
         })
         .await

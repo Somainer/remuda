@@ -916,9 +916,28 @@ pub struct WorkerRoster {
     /// worker inexplicable. Absent on rows written before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
-    /// Model id the agent launched with.
+    /// Model id the agent was **asked** to launch with (the dispatch pin, or
+    /// the ranked choice admission made).
+    ///
+    /// This is a request, not an observation: D-036 / model-pin-1 found every
+    /// roster row naming a pin that never reached the process. Read
+    /// [`Self::model_effective`] for what actually answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Model id actually observed answering, once it is known to differ from
+    /// [`Self::model`].
+    ///
+    /// Populated from the instance's `modelEffective` projection (the `/model`
+    /// verdict or an assistant record's `message.model`) during a watch pass,
+    /// and only when it disagrees with the requested id — an agreeing
+    /// observation adds nothing a reader cannot already see. Absent on rows
+    /// written before this field existed, and on rows where nothing diverged.
+    ///
+    /// Note the two ids are not always the same vocabulary: a gateway resolves
+    /// a catalog id to an upstream name, so a difference here is a report, not
+    /// by itself a fault (see `docs/design/evidence/model-pin-1.md` §3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_effective: Option<String>,
     /// Provider profile used, when admission picked one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_profile_id: Option<String>,

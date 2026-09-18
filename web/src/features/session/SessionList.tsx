@@ -591,6 +591,40 @@ export function SessionList({
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
+                        // D-036 / model-pin-1: label the row with the model that
+                        // actually answered, not the one that was requested. A
+                        // pin silently replaced by the host's default used to be
+                        // indistinguishable here from an honoured one, because
+                        // the row only ever showed the request.
+                        //
+                        // The observation comes from `modelEffective.ts` through
+                        // the store, so this reuses that one source of truth
+                        // rather than re-deriving an id.
+                        const requested = hubStore.modelOf(instance.id, instance.kind);
+                        const effective = hubStore.modelEffectiveOf(instance.id);
+                        // A gateway resolves a catalog id to an upstream name,
+                        // so a difference is worth showing but is not by itself
+                        // a fault (evidence/model-pin-1.md §3).
+                        const diverged = !!effective && !!requested && effective.id !== requested;
+                        return (
+                          <>
+                            <span className={css.sep}>·</span>
+                            <span
+                              data-testid="session-model"
+                              data-model-effective={effective ? effective.id : "unknown"}
+                              data-model-diverged={diverged ? "1" : "0"}
+                              title={
+                                effective
+                                  ? `请求 ${requested} · 实际 ${effective.id}（${effective.source}）`
+                                  : `请求 ${requested} · 实际模型尚未从会话回读`
+                              }
+                            >
+                              {effective ? effective.id : requested}
+                            </span>
+                          </>
+                        );
+                      })()}
+                      {(() => {
                         const effort = hubStore.effortOf(instance.id, instance.kind);
                         // §9.1: the list row shows the transcript-read-back
                         // effective level too, with `?` until it is observed.

@@ -348,6 +348,15 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
         name: "DRIVER",
         cells: Vec::new(),
     };
+    // The model actually answering. `modelEffective` when an observation
+    // disagreed with the dispatch request, else the requested id. A pinned model
+    // that was silently substituted used to be invisible here, because the row
+    // only ever carried the request (D-036 / model-pin-1); a `>` marks the
+    // divergence so the two can be told apart at a glance.
+    let mut model = Col {
+        name: "MODEL",
+        cells: Vec::new(),
+    };
     let mut evidence = Col {
         name: "SHA/REASON",
         cells: Vec::new(),
@@ -370,6 +379,7 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
                 .unwrap_or("-")
                 .to_string(),
         );
+        model.cells.push(truncate(model_label(row), 32));
         evidence.cells.push(truncate(sha_or_reason(row), 40));
         detail.cells.push(truncate(
             row.get("watch")
@@ -380,7 +390,7 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
             48,
         ));
     }
-    let cols = [&name, &status, &driver, &evidence, &detail];
+    let cols = [&name, &status, &driver, &model, &evidence, &detail];
     let widths: Vec<usize> = cols
         .iter()
         .map(|col| {
@@ -399,9 +409,33 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
         print!("{:<width$}  ", name.cells[i], width = widths[0]);
         print!("{:<width$}  ", status.cells[i], width = widths[1]);
         print!("{:<width$}  ", driver.cells[i], width = widths[2]);
-        print!("{:<width$}  ", evidence.cells[i], width = widths[3]);
-        print!("{:<width$}", detail.cells[i], width = widths[4]);
+        print!("{:<width$}  ", model.cells[i], width = widths[3]);
+        print!("{:<width$}  ", evidence.cells[i], width = widths[4]);
+        print!("{:<width$}", detail.cells[i], width = widths[5]);
         println!();
+    }
+}
+
+/// The model cell: the effective id when it diverged from the request, else the
+/// requested id.
+///
+/// `requested>observed` when the two disagree, so a substitution is legible
+/// without a second column — and so the requested id is not simply dropped,
+/// which would hide the pin the operator actually typed.
+fn model_label(row: &Value) -> String {
+    let field = |key: &str| {
+        row.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    match (field("model"), field("modelEffective")) {
+        (Some(requested), Some(observed)) if requested != observed => {
+            format!("{requested}>{observed}")
+        }
+        (_, Some(observed)) => observed.to_string(),
+        (Some(requested), None) => requested.to_string(),
+        (None, None) => "-".to_string(),
     }
 }
 
@@ -469,5 +503,43 @@ mod tests {
             "Is this a project you created or one you trust?"
         );
         assert!(!is_done(&row));
+    }
+
+    /// D-036 / model-pin-1: the MODEL cell reports what answered, and makes a
+    /// substitution legible instead of showing only the request.
+    #[test]
+    fn the_model_cell_reports_the_effective_id_and_marks_a_divergence() {
+        // Agreement (or no observation yet): just the requested id.
+        assert_eq!(
+            model_label(&serde_json::json!({"model": "model_hub/es1_orange_o50[1m]"})),
+            "model_hub/es1_orange_o50[1m]"
+        );
+        assert_eq!(
+            model_label(&serde_json::json!({
+                "model": "ark/seed-evolving[1m]",
+                "modelEffective": "ark/seed-evolving[1m]",
+            })),
+            "ark/seed-evolving[1m]"
+        );
+        // The regression: asked for one model, another answered. Both are shown,
+        // request first, so the pin the operator typed is not simply dropped.
+        assert_eq!(
+            model_label(&serde_json::json!({
+                "model": "model_hub/es1_orange_o50[1m]",
+                "modelEffective": "claude-opus-4-8",
+            })),
+            "model_hub/es1_orange_o50[1m]>claude-opus-4-8"
+        );
+        // An observation with no recorded request still reports honestly.
+        assert_eq!(
+            model_label(&serde_json::json!({"modelEffective": "claude-opus-5"})),
+            "claude-opus-5"
+        );
+        // Nothing known, and blank values are not ids.
+        assert_eq!(model_label(&serde_json::json!({})), "-");
+        assert_eq!(
+            model_label(&serde_json::json!({"model": "", "modelEffective": "  "})),
+            "-"
+        );
     }
 }

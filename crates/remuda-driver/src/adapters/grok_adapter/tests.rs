@@ -625,9 +625,10 @@ fn diff_terminal_and_unknown_content_blocks_are_surfaced_synthesized() {
             { "type": "diff", "path": "/workspace/a.txt", "diff": "@@ -1 +1 @@\n-old\n+new\n" }
         ]
     });
-    let (blocks, changes) = tool_content(&completed, true);
+    let (blocks, changes, has_content_text) = tool_content(&completed, true);
     assert_eq!(blocks.len(), 1);
     assert_eq!(changes.len(), 1);
+    assert!(has_content_text);
     assert_eq!(changes[0].path, "/workspace/a.txt");
     assert!(changes[0].diff.contains("+new"));
     assert_eq!(
@@ -643,8 +644,9 @@ fn diff_terminal_and_unknown_content_blocks_are_surfaced_synthesized() {
         "locations": [{ "path": "/workspace/located.txt" }],
         "content": [{ "type": "diff", "diff": { "path": "/workspace/located.txt", "patch": "@@ " } }]
     });
-    let (blocks, changes) = tool_content(&failed, false);
+    let (blocks, changes, has_content_text) = tool_content(&failed, false);
     assert!(blocks.is_empty());
+    assert!(!has_content_text);
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].path, "/workspace/located.txt");
     assert_eq!(changes[0].diff, "@@ ");
@@ -654,7 +656,8 @@ fn diff_terminal_and_unknown_content_blocks_are_surfaced_synthesized() {
     );
 
     // Terminal references are text markers, never tty-attach promises; typed
-    // non-text content and unknown outer types are markers too.
+    // non-text content and unknown outer types are markers too. None of those
+    // markers count as content text, so output_for_prompt still applies.
     let mixed = json!({
         "content": [
             { "type": "terminal", "terminalId": "term-7", "path": "terminal/x.log" },
@@ -663,8 +666,9 @@ fn diff_terminal_and_unknown_content_blocks_are_surfaced_synthesized() {
             { "type": "future_block" }
         ]
     });
-    let (blocks, changes) = tool_content(&mixed, false);
+    let (blocks, changes, has_content_text) = tool_content(&mixed, false);
     assert!(changes.is_empty());
+    assert!(!has_content_text);
     let texts: Vec<String> = blocks
         .iter()
         .filter_map(|block| match block {
@@ -681,6 +685,158 @@ fn diff_terminal_and_unknown_content_blocks_are_surfaced_synthesized() {
             "[grok content block: future_block]".to_owned(),
         ]
     );
+}
+
+#[test]
+fn terminal_only_content_keeps_the_real_output_for_prompt_synthesized() {
+    // Synthesized from docs, not captured [U]: a shell call whose content[] is
+    // just a terminal reference must still surface rawOutput.output_for_prompt
+    // — markers must not suppress the real command output (regression guard).
+    let updates = [
+        frame(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-term",
+            "title": "run_terminal_command",
+            "rawInput": { "command": "echo hi" },
+            "_meta": { "x.ai/tool": { "name": "run_terminal_command", "kind": "execute" } }
+        })),
+        frame(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-term",
+            "status": "completed",
+            "content": [
+                { "type": "terminal", "terminalId": "term-1", "path": "terminal/call-term.log" }
+            ],
+            "rawOutput": {
+                "type": "Bash",
+                "output_for_prompt": "hi\nexit: 0\n",
+                "exit_code": 0
+            }
+        })),
+    ]
+    .concat();
+    let (_dir, mut adapter) = adapter_for_updates(&updates);
+    let observed = adapter.poll().unwrap();
+    let results = tool_results(&observed);
+    assert_eq!(results.len(), 1);
+    let texts: Vec<&str> = results[0]
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            remuda_protocol::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("term-1")),
+        "terminal marker kept: {texts:?}"
+    );
+    assert!(
+        texts.contains(&"hi\nexit: 0\n"),
+        "real output_for_prompt present: {texts:?}"
+    );
+}
+
+#[test]
+fn in_progress_runs_and_unknown_statuses_stay_open_synthesized() {
+    // Synthesized from docs, not captured [U]: protocol §5.7 — pending /
+    // in_progress are not terminal, unknown statuses stay opaque.
+    let updates = [
+        frame(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-status",
+            "title": "run_terminal_command",
+            "rawInput": { "command": "sleep 1" },
+            "_meta": { "x.ai/tool": { "name": "run_terminal_command", "kind": "execute" } }
+        })),
+        // in_progress behaves like the statusless progress frame.
+        frame(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-status",
+            "status": "in_progress",
+            "title": "Execute `sleep 1`"
+        })),
+        // An unknown future status must not close the node with a result.
+        frame(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-status",
+            "status": "deferred_by_future_build"
+        })),
+        frame(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-status",
+            "status": "completed",
+            "rawOutput": { "output_for_prompt": "exit: 0\n", "exit_code": 0 }
+        })),
+    ]
+    .concat();
+    let (_dir, mut adapter) = adapter_for_updates(&updates);
+    let observed = adapter.poll().unwrap();
+
+    let calls = tool_calls(&observed);
+    assert_eq!(calls.len(), 2, "proposal + one Running, not per status");
+    assert_eq!(calls[0].state, remuda_protocol::ToolCallState::Proposed);
+    assert_eq!(calls[0].mutation.revision, remuda_protocol::U64(1));
+    assert_eq!(calls[1].state, remuda_protocol::ToolCallState::Running);
+    assert_eq!(calls[1].mutation.revision, remuda_protocol::U64(2));
+
+    let results = tool_results(&observed);
+    assert_eq!(results.len(), 1, "unknown status produced no result");
+    assert_eq!(results[0].mutation.revision, remuda_protocol::U64(3));
+    assert_eq!(results[0].outcome, ToolOutcome::Succeeded);
+
+    // A standalone pending update also leaves the node untouched.
+    let pending_only = [
+        frame(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-pending",
+            "title": "run_terminal_command",
+            "rawInput": {},
+            "_meta": { "x.ai/tool": { "name": "run_terminal_command", "kind": "execute" } }
+        })),
+        frame(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-pending",
+            "status": "pending"
+        })),
+    ]
+    .concat();
+    let (_dir2, mut adapter2) = adapter_for_updates(&pending_only);
+    let observed2 = adapter2.poll().unwrap();
+    assert_eq!(tool_calls(&observed2).len(), 1);
+    assert!(tool_results(&observed2).is_empty());
+}
+
+#[test]
+fn finished_tracks_release_their_tool_inputs_synthesized() {
+    // Synthesized from docs, not captured [U].
+    let updates = [
+        frame(json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "call-clear",
+            "title": "run_terminal_command",
+            "rawInput": { "command": "echo large-payload" },
+            "_meta": { "x.ai/tool": { "name": "run_terminal_command", "kind": "execute" } }
+        })),
+        frame(json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "call-clear",
+            "status": "completed",
+            "rawOutput": { "output_for_prompt": "exit: 0\n", "exit_code": 0 }
+        })),
+    ]
+    .concat();
+    let (_dir, mut adapter) = adapter_for_updates(&updates);
+    adapter.poll().unwrap();
+    let track = adapter
+        .tools
+        .get("call-clear")
+        .expect("track retained for dedupe");
+    assert!(track.finished);
+    assert!(track.input.is_none());
+    assert!(track.name.is_none());
+    assert!(track.display_title.is_none());
+    assert!(track.kind.is_none());
 }
 
 #[test]

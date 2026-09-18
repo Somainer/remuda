@@ -376,13 +376,18 @@ impl GrokAdapter {
                         continue;
                     };
                     let update = &record.frame["params"]["update"];
-                    // A statusless update is the in-progress (Running) mutation;
-                    // only a status-bearing update is terminal.
-                    let observed = match string(update, "status") {
-                        None => self.running_update(&call_id, update, prompt.as_deref()),
-                        Some(status) => {
-                            self.final_update(&call_id, update, &status, prompt.as_deref())
+                    // A statusless update and `in_progress` are the
+                    // in-progress (Running) mutation. Only the four protocol
+                    // §5.7 statuses are terminal; `pending` and unknown
+                    // statuses stay opaque and leave the node open.
+                    let observed = match string(update, "status").as_deref() {
+                        None | Some("in_progress") => {
+                            self.running_update(&call_id, update, prompt.as_deref())
                         }
+                        Some(status @ ("completed" | "failed" | "denied" | "cancelled")) => {
+                            self.final_update(&call_id, update, status, prompt.as_deref())
+                        }
+                        Some(_) => None,
                     };
                     if let Some(observed) = observed {
                         out.push(observed);
@@ -465,10 +470,10 @@ impl GrokAdapter {
         out
     }
 
-    /// Translate a statusless `tool_call_update` into the Running mutation:
-    /// same node, `Replace`, next revision. Fields the frame omits keep their
-    /// previous value (protocol §5.7 "不含字段保持旧值"). A progress frame for
-    /// a call whose Pending frame was never seen is ignored.
+    /// Translate a statusless (or `in_progress`) `tool_call_update` into the
+    /// Running mutation: same node, `Replace`, next revision. Fields the frame
+    /// omits keep their previous value (protocol §5.7 "不含字段保持旧值"). A
+    /// progress frame for a call whose Pending frame was never seen is ignored.
     fn running_update(
         &mut self,
         call_id: &str,
@@ -546,10 +551,11 @@ impl GrokAdapter {
             .and_then(|code| i32::try_from(code).ok());
         let outcome = tool_outcome(status, error, exit_code);
         let applied = status == "completed" && error.is_none();
-        let (mut blocks, changes) = tool_content(update, applied);
-        if !blocks
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Text(_)))
+        // The fallback keys off content-typed text only: terminal/image/unknown
+        // markers are not command output, so they must not suppress
+        // `output_for_prompt` (which is the real result text for a shell call).
+        let (mut blocks, changes, has_content_text) = tool_content(update, applied);
+        if !has_content_text
             && let Some(text) = raw
                 .and_then(|value| value.get("output_for_prompt"))
                 .and_then(Value::as_str)
@@ -569,6 +575,12 @@ impl GrokAdapter {
             exit_code,
             outcome,
         );
+        // The result is now self-contained; release the potentially large tool
+        // inputs so a long-lived adapter does not retain every call's input.
+        track.name = None;
+        track.kind = None;
+        track.display_title = None;
+        track.input = None;
         let mut observed = AdapterObservation::structured(payload);
         observed.item_id = Some(call_id.to_owned());
         if let Some(prompt) = prompt {
@@ -908,17 +920,23 @@ fn thought_close_payload(
 }
 
 /// Map a terminal update's grok `content[]` array to protocol blocks and file
-/// changes. `applied` decides a diff's `ChangeApplication`.
-fn tool_content(update: &Value, applied: bool) -> (Vec<ContentBlock>, Vec<FileChange>) {
+/// changes. `applied` decides a diff's `ChangeApplication`. The third return
+/// value is true only when a `{type:"content"}` text block was produced —
+/// terminal/image/unknown markers do not count, so callers can fall back to
+/// `rawOutput.output_for_prompt` for the real result text.
+fn tool_content(update: &Value, applied: bool) -> (Vec<ContentBlock>, Vec<FileChange>, bool) {
     let Some(blocks) = update.get("content").and_then(Value::as_array) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), false);
     };
     let locations = update.get("locations").and_then(Value::as_array);
     let mut out_blocks = Vec::new();
     let mut changes = Vec::new();
+    let mut has_content_text = false;
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
-            Some("content") => map_content_inner(block.get("content"), &mut out_blocks),
+            Some("content") => {
+                map_content_inner(block.get("content"), &mut out_blocks, &mut has_content_text);
+            }
             Some("diff") => changes.push(map_diff(block, locations, applied)),
             Some("terminal") => {
                 // A native terminal reference names its output sink; it is
@@ -931,12 +949,17 @@ fn tool_content(update: &Value, applied: bool) -> (Vec<ContentBlock>, Vec<FileCh
             None => {}
         }
     }
-    (out_blocks, changes)
+    (out_blocks, changes, has_content_text)
 }
 
 /// Map the inner object of a `{type:"content"}` block; typed non-text content
-/// degrades to a labelled text marker instead of being dropped.
-fn map_content_inner(inner: Option<&Value>, out: &mut Vec<ContentBlock>) {
+/// degrades to a labelled text marker instead of being dropped. Only a
+/// non-empty inner text block sets `has_content_text`.
+fn map_content_inner(
+    inner: Option<&Value>,
+    out: &mut Vec<ContentBlock>,
+    has_content_text: &mut bool,
+) {
     let Some(inner) = inner else {
         return;
     };
@@ -948,6 +971,7 @@ fn map_content_inner(inner: Option<&Value>, out: &mut Vec<ContentBlock>) {
                 .filter(|text| !text.is_empty())
             {
                 out.push(text_block(text.to_owned()));
+                *has_content_text = true;
             }
         }
         Some(other) => out.push(text_block(format!("[grok content block: {other}]"))),

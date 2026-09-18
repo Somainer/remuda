@@ -158,6 +158,10 @@ impl HubCarrier for StdioCarrier {
                 &hello.params.node_epoch,
                 host,
                 token.as_deref(),
+                // This carrier composes its own `DevNode` *after* the hello is
+                // written, so it holds no rows to enumerate. `None` (no key)
+                // is the honest answer; `[]` would claim it owns nothing.
+                None,
             );
             write_ndjson(
                 &mut output,

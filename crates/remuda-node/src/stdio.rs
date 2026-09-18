@@ -180,6 +180,15 @@ where
         &node_epoch,
         host,
         token.as_deref(),
+        // The inventory is the whole point of the epoch handshake: without it
+        // the Hub sees the epoch change, has nothing to diff, and leaves the
+        // rows of every process that died with the previous Node `running`
+        // forever — holding placement slots nothing can release. Enumerated
+        // after `reconcile_herdr` ran at startup, so a row this Node can no
+        // longer hold is already settled here rather than announced as live.
+        // A Node that cannot vouch for its own store sends `None` instead of
+        // an empty list; see `announceable_inventory`.
+        node.announceable_inventory()?,
     );
     write_ndjson(
         &mut output,

@@ -360,4 +360,25 @@ fn close_and_retire_of_an_instance_not_on_this_node_answer_not_found_promptly() 
         removed.get("error").is_some(),
         "retiring an instance not on this Node is a prompt not-found, not a wait: {removed}"
     );
+
+    // And the carrier is still there afterwards. Serving a request for an
+    // instance this Node does not know used to be fatal: the journal pump's
+    // `?` unwound the stdio loop and the process exited, so every later request
+    // hung and journals stopped reaching the Hub — the live freeze, with no
+    // gate running and no busy thread.
+    node.send(&json!({
+        "jsonrpc": "2.0",
+        "id": "after-1",
+        "method": "host.resources",
+        "params": {},
+    }));
+    let after = node
+        .wait_for(Instant::now() + Duration::from_secs(2), |frame| {
+            frame["id"] == json!("after-1")
+        })
+        .expect("the carrier must still answer after an unknown-instance request");
+    assert!(
+        after.get("result").is_some(),
+        "the carrier is still serving: {after}"
+    );
 }

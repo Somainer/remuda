@@ -3027,6 +3027,7 @@ fn shell_recipe(options: &ShellPtyOptions, cwd: &str) -> DriverResult<LaunchReci
             delegation: Delegation::None,
             secret_ref: None,
             model_requested: String::new(),
+            model_pin: None,
         },
         permission: RecipePermission {
             cli_mode: None,

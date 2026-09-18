@@ -1455,6 +1455,41 @@ mod shell_pty_agent {
                 "{driver:?} invented a pin: {:?}",
                 recipe.argv
             );
+            // model-pin-1: the gate must arm only from an explicit pin. Even
+            // though `model_requested` is populated (print/pty resolve the
+            // profile default, and shell-pty records it), `model_pin` is None
+            // when no spec.model_id was given, so an unpinned launch cannot be
+            // refused.
+            assert!(
+                recipe.provider.model_pin.is_none(),
+                "{driver:?} must not mint an explicit pin on an unpinned launch"
+            );
+            assert!(
+                !recipe.provider.model_requested.is_empty() || driver == DriverKind::ShellPty,
+                "{driver:?}: model_requested shape"
+            );
+        }
+    }
+
+    /// An explicit spec.model_id is carried verbatim as the recipe's
+    /// `model_pin`, distinct from the profile-derived `model_requested`.
+    #[test]
+    fn an_explicit_spec_model_id_is_the_recipe_model_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        for driver in [
+            DriverKind::ClaudePrint,
+            DriverKind::ClaudePty,
+            DriverKind::ShellPty,
+        ] {
+            let mut spec = agent_spec(AgentKind::Claude);
+            spec.driver = driver;
+            spec.model_id = Some("model_hub/es1_orange_o50[1m]".into());
+            let recipe = recipe(&spec, tmp.path(), LaunchOrigin::Human);
+            assert_eq!(
+                recipe.provider.model_pin.as_deref(),
+                Some("model_hub/es1_orange_o50[1m]"),
+                "{driver:?} must carry the explicit pin"
+            );
         }
     }
 

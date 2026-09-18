@@ -109,6 +109,7 @@ impl FakeDriver {
                     .model_id
                     .clone()
                     .unwrap_or_else(|| "passthrough/example-model".into()),
+                model_pin: spec.model_id.clone(),
             },
             permission: RecipePermission {
                 cli_mode: Some("dontAsk".into()),

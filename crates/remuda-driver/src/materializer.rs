@@ -456,6 +456,7 @@ fn materialize_inner(
                 .as_ref()
                 .map(|secret| secret.as_str().to_string()),
             model_requested: model,
+            model_pin: pinned_model(request.spec),
         },
         permission,
         technical_debt: debt,
@@ -672,6 +673,7 @@ fn materialize_shell_pty_agent(
                 .as_ref()
                 .map(|secret| secret.as_str().to_string()),
             model_requested: resolve_model(request.spec, request.profile).unwrap_or_default(),
+            model_pin: pinned_model(request.spec),
         },
         permission,
         technical_debt: debt,

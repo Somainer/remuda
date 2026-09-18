@@ -420,7 +420,7 @@ UI 侧：搜索框「搜索工作区、标签页、窗格」+ **时钟/列表切
 - **环形 context 剩余百分比**（实测 1 / 55 / 96 / 78）+ 彩色菱形状态点；
 - 标题 = 最近一条消息（`You: continue`、`DONE 7d054b9a`、`Session started`）；
 - 副标题 = 最近事件原文，**错误直接上一等位置**：`API Error: Request rejected (429) · Rate li…`；
-- 再跟 workspace 芯片（`<workspace>` / `bytedance` / `hybrid-harness`）· agent（`Claude Code`）· 相对时间。
+- 再跟 workspace 芯片（`<workspace>` / `<workspace-2>` / `hybrid-harness`）· agent（`Claude Code`）· 相对时间。
 
 顶部常驻横幅「需要开启推送通知 —— 收件箱、用量和实时活动都通过 Agent 推送送达」。底部是**按 provider 的配额条**：Claude 绿 ~55%、OpenAI 琥珀 ~85%、第三家空。
 

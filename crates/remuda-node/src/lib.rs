@@ -15,6 +15,7 @@ mod entity;
 mod error;
 mod files;
 mod gate;
+mod hook_shim;
 mod identity;
 mod interactions;
 mod inventory;

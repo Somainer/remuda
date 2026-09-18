@@ -154,6 +154,9 @@ function TranscriptInner({
   // Declared before the route-switch reset below, which clears it per
   // instance like the other per-route refs.
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // Row heights keyed by STABLE NODE ID, never array index (see the `sizes`
+  // memo below); reset per session in the route-reset block.
+  const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
 
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
@@ -161,7 +164,6 @@ function TranscriptInner({
   // into the next. The reset runs during render (not in an effect) so React
   // StrictMode's dev-time mount replay cannot wipe a restore set by the
   // passive restore effect.
-  const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
   const [instanceEpoch, setInstanceEpoch] = useState(instanceId);
   const restoredRef = useRef(false);
   // Follow state restores from the last visit; a brand-new session pins.
@@ -219,9 +221,10 @@ function TranscriptInner({
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState(720);
-  // Row heights keyed by STABLE NODE ID, never array index: load-earlier
-  // prepends thousands of nodes and would shift every index-keyed
-  // measurement, making padTop for the held anchor jump and never converge.
+  // Derive the index-keyed size array the virtual window reads from. The
+  // heights map above is keyed by STABLE NODE ID: load-earlier prepends
+  // thousands of nodes without shifting index-keyed measurements, so padTop
+  // for the held anchor cannot jump.
   const sizes = useMemo(
     () => nodes.map((node) => rowHeights.get(node.id) ?? 0),
     [nodes, rowHeights],
@@ -344,7 +347,7 @@ function TranscriptInner({
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
     // Sub-pixel tolerance: measured heights jitter by fractions of a px
-      // between frames; ignore deltas under 1 instead of thrashing state.
+    // between frames; ignore deltas under 1 instead of thrashing state.
     setRowHeights((prev) => {
       const last = prev.get(id);
       if (last !== undefined && Math.abs(last - height) < 1) return prev;

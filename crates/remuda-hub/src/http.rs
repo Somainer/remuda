@@ -182,6 +182,9 @@ pub fn routes() -> Router<crate::AppState> {
 pub struct JournalQuery {
     #[serde(rename = "afterSeq")]
     after_seq: Option<String>,
+    /// Inclusive upper bound for paging older history below a tail window.
+    #[serde(rename = "beforeSeq")]
+    before_seq: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1701,7 +1704,15 @@ pub async fn get_subagent_transcript(
     Ok(Json(response))
 }
 
-/// `GET /v1/instances/:id/journal`
+/// `GET /v1/instances/:id/journal?afterSeq=&beforeSeq=`
+///
+/// Returns the bounded tail window of `(afterSeq, min(beforeSeq, durableSeq)]`
+/// (at most 2000 rows / 8 MiB; newest rows win). Additive window metadata lets
+/// a caller detect a partial page: `fromSeq` is the floor (`events[0].seq`) and
+/// `reachedAfterSeq` is false when rows below it were cut. To retrieve the
+/// cut-away older history, descend with `beforeSeq = fromSeq - 1` (same
+/// `afterSeq`) until `reachedAfterSeq` is true; re-issuing the same
+/// `afterSeq` without `beforeSeq` returns the same tail.
 pub async fn get_journal(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1722,11 +1733,20 @@ pub async fn get_journal(
         .as_deref()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    let (events, durable) = state.store.read_journal(instance_id.clone(), after).await?;
+    let before = query
+        .before_seq
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok());
+    let page = state
+        .store
+        .read_journal(instance_id.clone(), after, before)
+        .await?;
     Ok(Json(json!({
         "instanceId": instance_id,
-        "durableSeq": durable.to_string(),
-        "events": events,
+        "durableSeq": page.durable_seq.to_string(),
+        "fromSeq": page.from_seq.map(|seq| seq.to_string()),
+        "reachedAfterSeq": page.reached_after_seq,
+        "events": page.events,
     })))
 }
 

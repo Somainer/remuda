@@ -235,7 +235,7 @@ async fn mark_rejected(
     let command = command_id.to_owned();
     let host = host_id.to_owned();
     let reason = reason.to_owned();
-    store.run(move |conn| {
+    store.run_named("mark_rejected", move |conn| {
         let tx = conn.transaction()?;
         let now = crate::config::now_rfc3339();
         tx.execute("UPDATE commands SET resolution = 'clear', updated_at = ?1 WHERE id = ?2 AND state = 'queued'", params![now, command])?;
@@ -292,7 +292,7 @@ async fn observe_snapshot(
         workspace["hostId"] = json!(host_id);
     }
     let host = host_id.to_owned();
-    let event = state.store.run(move |conn| {
+    let event = state.store.run_named("observe_snapshot", move |conn| {
         let tx = conn.transaction()?;
         let (old_revision, old_workspaces) = load_snapshot(&tx, &host)?;
         let changed = revision > old_revision;
@@ -337,7 +337,9 @@ async fn observe_snapshot(
 }
 
 async fn snapshot_view(store: &Store, id: String) -> Result<Value, HubError> {
-    let (revision, workspaces) = store.run(move |conn| load_snapshot(conn, &id)).await?;
+    let (revision, workspaces) = store
+        .run_named("snapshot_view", move |conn| load_snapshot(conn, &id))
+        .await?;
     Ok(json!({"workspaceRevision": revision.max(0), "workspaces": workspaces}))
 }
 

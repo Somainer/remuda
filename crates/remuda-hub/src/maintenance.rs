@@ -9,7 +9,7 @@ pub async fn migrate(data_dir: &Path) -> anyhow::Result<()> {
     // Opening the writer is asynchronous. A queued read proves initialization
     // finished and propagates a failed writer open instead of reporting success.
     let result = store
-        .run(|conn| {
+        .run_named("migrate", |conn| {
             conn.query_row("SELECT count(*) FROM devices", [], |row| {
                 row.get::<_, i64>(0)
             })?;

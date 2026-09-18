@@ -52,7 +52,7 @@ async fn device_verification_yields_writer_and_rechecks_revocation_hash_and_scop
                 }
                 "replace-hash" => {
                     store
-                        .run(move |conn| {
+                        .run_named("device_verification_yields_writer_and_rechecks_revocation_hash_and_scope", move |conn| {
                             conn.execute(
                                 "UPDATE devices SET token_hash = 'replacement' WHERE id = ?1",
                                 params![id],
@@ -62,7 +62,7 @@ async fn device_verification_yields_writer_and_rechecks_revocation_hash_and_scop
                         .await?;
                 }
                 "change-scope" => {
-                    store.run(move |conn| {
+                    store.run_named("device_verification_yields_writer_and_rechecks_revocation_hash_and_scope", move |conn| {
                         conn.execute(
                             "UPDATE devices SET name = 'current', kind = 'agent', instance_id = 'ins_current_scope' WHERE id = ?1",
                             params![id],
@@ -197,13 +197,16 @@ async fn device_lookup_is_indexed_and_legacy_migration_verifies_only_the_named_r
     let legacy_id = devices[37].id.clone();
     let id = legacy_id.clone();
     store
-        .run(move |conn| {
-            conn.execute(
-                "UPDATE devices SET token_prefix = NULL WHERE id = ?1",
-                params![id],
-            )?;
-            Ok(())
-        })
+        .run_named(
+            "device_lookup_is_indexed_and_legacy_migration_verifies_only_the_named_row",
+            move |conn| {
+                conn.execute(
+                    "UPDATE devices SET token_prefix = NULL WHERE id = ?1",
+                    params![id],
+                )?;
+                Ok(())
+            },
+        )
         .await
         .unwrap();
     assert!(
@@ -354,13 +357,16 @@ async fn host_lookup_and_legacy_host_id_migration_are_bounded_and_bound_to_the_s
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let legacy_id = id.clone();
     store
-        .run(move |conn| {
-            conn.execute(
-                "UPDATE hosts SET token_prefix = NULL WHERE id = ?1",
-                params![legacy_id],
-            )?;
-            Ok(())
-        })
+        .run_named(
+            "host_lookup_and_legacy_host_id_migration_are_bounded_and_bound_to_the_secret",
+            move |conn| {
+                conn.execute(
+                    "UPDATE hosts SET token_prefix = NULL WHERE id = ?1",
+                    params![legacy_id],
+                )?;
+                Ok(())
+            },
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -508,7 +514,7 @@ async fn sqlite_query_plans_use_auth_indexes() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     store
-        .run(|conn| {
+        .run_named("sqlite_query_plans_use_auth_indexes", |conn| {
             for (table, column, index) in [
                 ("devices", "token_prefix", "devices_token_prefix"),
                 ("hosts", "token_prefix", "hosts_token_prefix"),

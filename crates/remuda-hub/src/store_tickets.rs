@@ -108,7 +108,7 @@ impl Store {
     /// Upsert a ticket. Re-issuing for an interaction must first mark the
     /// previous row non-open (the partial unique index enforces this).
     pub async fn upsert_card_ticket(&self, record: CardTicketRecord) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("upsert_card_ticket", move |conn| {
             conn.execute(
                 "INSERT INTO card_tickets (
                     ticket_id, device_id, interaction_id, instance_id, session_key,
@@ -153,7 +153,7 @@ impl Store {
         ticket_id: String,
         device_id: String,
     ) -> Result<Option<CardTicketRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("get_card_ticket_for_bot", move |conn| {
             conn.query_row(
                 &format!("SELECT {TICKET_COLUMNS} FROM card_tickets WHERE ticket_id = ?1 AND device_id = ?2"),
                 params![ticket_id, device_id],
@@ -172,7 +172,7 @@ impl Store {
         interaction_id: String,
         device_id: String,
     ) -> Result<Option<CardTicketRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("get_open_card_ticket_for_bot", move |conn| {
             conn.query_row(
                 &format!(
                     "SELECT {TICKET_COLUMNS} FROM card_tickets
@@ -194,7 +194,7 @@ impl Store {
         device_id: String,
         now_ms: i64,
     ) -> Result<Vec<CardTicketRecord>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("list_open_card_tickets", move |conn| {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {TICKET_COLUMNS} FROM card_tickets
                  WHERE device_id = ?1 AND state = 'open' AND expires_at_ms > ?2
@@ -216,7 +216,7 @@ impl Store {
         state: String,
         card_message_id: Option<String>,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("set_card_ticket_state", move |conn| {
             match card_message_id {
                 Some(message_id) => {
                     conn.execute(
@@ -244,7 +244,7 @@ impl Store {
         device_id: String,
         session_key: String,
     ) -> Result<Vec<String>, StoreError> {
-        self.run(move |conn| {
+        self.run_named("expire_card_tickets_for_session", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT ticket_id FROM card_tickets
                  WHERE device_id = ?1 AND session_key = ?2 AND state = 'open'",
@@ -271,7 +271,7 @@ impl Store {
         open_ids: &[String],
     ) -> Result<(), StoreError> {
         let ids = open_ids.to_vec();
-        self.run(move |conn| {
+        self.run_named("set_bot_owner_allowlist", move |conn| {
             let now = crate::config::now_rfc3339();
             conn.execute(
                 "DELETE FROM bot_owner_allowlist WHERE device_id = ?1",
@@ -295,7 +295,7 @@ impl Store {
         device_id: String,
         open_id: String,
     ) -> Result<bool, StoreError> {
-        self.run(move |conn| {
+        self.run_named("bot_owner_allowlist_contains", move |conn| {
             let found = conn
                 .query_row(
                     "SELECT 1 FROM bot_owner_allowlist WHERE device_id = ?1 AND open_id = ?2",

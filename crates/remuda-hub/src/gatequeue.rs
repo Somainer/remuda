@@ -230,6 +230,7 @@ async fn enqueue_job(
         started_at: None,
         finished_at: None,
         cancel_requested_at: None,
+        home_land_in_flight: false,
         base_sha: None,
         head_sha: None,
         merge_sha: None,
@@ -516,6 +517,14 @@ async fn finish_expired_cancels(state: &AppState) {
         if job.state != GateJobState::Canceling {
             continue;
         }
+        // A home host is still pushing main for this job: HOME_LAND_TIMEOUT is
+        // far longer than the cancel grace, and land_from_home writes the
+        // honest terminal state (landed if it pushed, canceled otherwise) and
+        // clears this flag. Finalizing here would both race that write and drop
+        // a pinned merge the home host is still fetching.
+        if job.home_land_in_flight {
+            continue;
+        }
         let Some(requested) = &job.cancel_requested_at else {
             continue;
         };
@@ -526,7 +535,7 @@ async fn finish_expired_cancels(state: &AppState) {
         let finished = state
             .store
             .mutate_gate_job(job.id.as_id().as_str(), |row| {
-                if row.state != GateJobState::Canceling {
+                if row.state != GateJobState::Canceling || row.home_land_in_flight {
                     return None;
                 }
                 row.state = GateJobState::Canceled;
@@ -937,10 +946,25 @@ async fn apply_result(state: &AppState, job_id: &str, result: GateRunResult) {
                     row.reason = Some("cancel arrived after the lane had pushed main".into());
                 } else {
                     row.state = GateJobState::Canceled;
-                    row.error = Some(result.error.clone().unwrap_or_else(|| {
-                        "canceled after the run verified but was not landed".into()
-                    }));
-                    row.reason = Some("canceled; verified but not landed".into());
+                    if result.status == "passed" {
+                        // The run verified green; only the land was skipped.
+                        row.error = Some(result.error.clone().unwrap_or_else(|| {
+                            "canceled after the run verified but was not landed".into()
+                        }));
+                        row.reason = Some("canceled; verified but not landed".into());
+                    } else {
+                        // The run itself ended canceled/failed: keep its own
+                        // evidence rather than claim it verified.
+                        row.failed_step = result.failed_step.clone().or(row.failed_step.clone());
+                        row.error = result
+                            .error
+                            .clone()
+                            .or_else(|| Some(format!("canceled; run ended {}", result.status)));
+                        row.reason = result
+                            .reason
+                            .clone()
+                            .or_else(|| Some(format!("canceled; run ended {}", result.status)));
+                    }
                 }
                 return Some(());
             }
@@ -1157,11 +1181,22 @@ async fn home_land_plan(
 /// which main moved but the job did not finish, because the push itself is a
 /// single leased update.
 async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
-    // If the job turned `canceling` between the verify and this push, honour
-    // the cancel: never push. The cancel/scheduler path finishes it canceled.
-    if let Some(job) = state.store.get_gate_job(job_id).await.ok().flatten()
-        && job.state != GateJobState::Running
-    {
+    // Claim the push: mark the home land in flight so a cancel arriving during
+    // it cannot be finalized (or have its pinned merge dropped) by the bounded
+    // cancel grace — the push can take minutes, and land_from_home writes the
+    // honest terminal state itself. A job no longer `running` was already
+    // finished (canceled or otherwise); never push it.
+    let claimed = state
+        .store
+        .mutate_gate_job(job_id, |row| {
+            if row.state != GateJobState::Running {
+                return None;
+            }
+            row.home_land_in_flight = true;
+            Some(())
+        })
+        .await;
+    if !matches!(claimed, Ok(Some(_))) {
         return;
     }
     let params = serde_json::to_value(&plan.params).unwrap_or(Value::Null);
@@ -1217,11 +1252,34 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
     let outcome = state
         .store
         .mutate_gate_job(job_id, move |row| {
-            // Only a still-running job may be landed. A job that turned
-            // `canceling` between the plan and the push is finished canceled
-            // by the scheduler/cancel path, and nothing is pushed here.
-            if row.state != GateJobState::Running {
+            // Only a job the push still owns may be written here. Once it is
+            // already terminal, nothing to do (its flag is already clear).
+            if !matches!(row.state, GateJobState::Running | GateJobState::Canceling) {
                 return None;
+            }
+            // The home land is done; clear the in-flight marker whatever the
+            // outcome so the cancel grace is free to act again.
+            row.home_land_in_flight = false;
+            // A cancel that arrived during the push finds the job `canceling`.
+            // A `landed` result is still authoritative — main moved, so record
+            // `landed` and note the cancel arrived too late (mirrors the
+            // apply_result pushFrom-lane branch: honesty over tidiness). Any
+            // other outcome pushed nothing, so honour the cancel: `canceled`.
+            if row.state == GateJobState::Canceling {
+                if landed.status == "landed" {
+                    row.state = GateJobState::Landed;
+                    row.finished_at = Some(now_ts());
+                    row.merge_sha = landed.merge_sha.clone().or(row.merge_sha.clone());
+                    row.error = None;
+                    row.reason = Some("cancel arrived after the home host pushed main".into());
+                } else {
+                    row.state = GateJobState::Canceled;
+                    row.finished_at = Some(now_ts());
+                    row.current_main_sha = landed.current_main_sha.clone();
+                    row.error = Some("canceled; the home host did not push main".into());
+                    row.reason = Some("canceled; not landed".into());
+                }
+                return Some(());
             }
             match landed.status.as_str() {
                 "landed" => {
@@ -1276,6 +1334,7 @@ async fn land_from_home(state: &AppState, job_id: &str, plan: HomeLandPlan) {
     let action = match job.state {
         GateJobState::Landed => "gate.landed",
         GateJobState::Queued => "gate.base-moved-requeue",
+        GateJobState::Canceled => "gate.canceled",
         _ => "gate.failed",
     };
     journal(state, &job.requested_by, action, &job).await;

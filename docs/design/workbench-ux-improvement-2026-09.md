@@ -295,8 +295,8 @@ Moshi 定位（资料）：「在你已经控制的机器上，给长跑 coding 
 
 ### 8.1 主机切换
 
-- 观察：未连接时 Machines 卡「Mifune-Workstation (local)」+ SSH 目标框 + Connect over SSH（key-only）。
-- 观察：已连接顶栏 `Mifune-Workstation · herdr 2`；底栏 host 下拉。与手机「连接」同一工作流，不是另一套 IDE。
+- 观察：未连接时 Machines 卡「<workstation> (local)」+ SSH 目标框 + Connect over SSH（key-only）。
+- 观察：已连接顶栏 `<workstation> · herdr 2`；底栏 host 下拉。与手机「连接」同一工作流，不是另一套 IDE。
 
 ### 8.2 侧栏 WORKSPACES
 
@@ -449,7 +449,7 @@ Diff 正文是**定宽不折行、右侧硬裁**的行号视图 —— 手机上
 
 Playwright 实测（`127.0.0.1:57482`，官方 `:24544` 仍未监听，与 §8 一致）：
 
-- 未连接时是 Machines 页：`Mifune-Workstation (local) v0.3.26` + `Connect over SSH`（文案强调必须免密钥入）+ 「No daemon? Run `moshi serve`」。
+- 未连接时是 Machines 页：`<workstation> (local) v0.3.26` + `Connect over SSH`（文案强调必须免密钥入）+ 「No daemon? Run `moshi serve`」。
 - 连上后 URL 是 **完全自描述的**：`/session/w5%3At2R?view=chat&source=claude&session=<uuid>&node=w5%3At2R`。即 **view + source + session + node 四元组**，投影是**可寻址的，不是一个模式开关**。
 - 但 **`Web` / `Files` / `Diff` 三个按钮不改 URL** —— 它们是右侧栏面板，不是路由。`Diff` 按钮标签上带 `*` 表示工作树脏。
 - 单改 URL 的 `?view=chat` **不会**切视图（仍渲染 Term）；必须先在侧栏选中那条会话（`session/main` 不是有效 pane）。所以 §8.2「`view=chat` vs `view=term` 写在 URL」准确，但要补一句：URL 是**结果**，不是入口。

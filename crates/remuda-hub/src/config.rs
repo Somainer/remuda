@@ -258,6 +258,18 @@ impl HubConfig {
         self.create_settle_timeout_ms
             .max(MIN_CREATE_SETTLE_TIMEOUT_MS)
     }
+
+    /// Effective ack deadline for a forwarded non-create command.
+    ///
+    /// Never shorter than the RPC accept timeout plus a one-second margin: the
+    /// deadline must outlast the in-flight `call`, or a slow-but-valid accept
+    /// would be failed before `mark_accepted` runs. (`mark_accepted` now
+    /// recovers a `failed` row as a backstop, but the clamp keeps the common
+    /// path from ever racing.)
+    pub(crate) fn command_settle_timeout_ms(&self) -> u64 {
+        self.command_settle_timeout_ms
+            .max(self.command_accept_timeout_ms.saturating_add(1_000))
+    }
 }
 
 /// RFC3339 UTC with millisecond precision (`protocol.md` §1.1).

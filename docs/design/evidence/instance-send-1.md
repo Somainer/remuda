@@ -26,14 +26,21 @@ forwarded: true` and no turn ever started — is fixed. On this run, over the
 
 The composer submitted correctly on the **glyph rung alone**: on this host the
 pinned hook relay could not load (an environment `libssl.so.3` gap, unrelated to
-this change), so no hook receipt was available and the driver fell back to the
-emulator screen signature. The Enter still submitted every prompt, so no
-ghost-suggestion clearing key was needed in the keys module (brief Fix 2).
+this change), so **no `UserPromptSubmit` / `Stop` hook fired for any prompt** and
+the driver fell back to the emulator screen signature throughout. Consequently
+the mid-turn hold and the boundary delivery were observed only through the
+emulator transcript (the rendered grid), not through hook evidence. The Enter
+still submitted every prompt, so no ghost-suggestion clearing key was needed in
+the keys module (brief Fix 2); the hold-and-deliver mechanics are additionally
+covered deterministically, with hooks on, by the driver test
+`shell_pty_fake_send::a_send_lands_when_idle_and_is_held_until_a_running_turn_ends`,
+which asserts on the fake harness's own submit/enqueue event log.
 
 ## Setup
 
-- `remuda 0.1.0`, commit `4d36f61e`, rustc 1.94.1, target
-  `x86_64-unknown-linux-gnu`.
+- `remuda 0.1.0` built from this branch, rustc 1.94.1, target
+  `x86_64-unknown-linux-gnu`. (An earlier draft cited a commit sha that was
+  rebased away; the run predates the final history, so no sha is pinned here.)
 - Claude binary: `2.1.274 (Claude Code)`, resolved from PATH (the real CLI, not
   a Remuda shim).
 - Scratch dev server, its own data dir and loopback ports, never the demo:
@@ -109,7 +116,22 @@ instance.send  state=settled  resolution=clear  reason=None  created=…02:29:47
 instance.create state=settled resolution=clear  reason=None  created=…02:27:13Z
 ```
 
-The failed-resolution path (a forwarded send the Node rejects or never acks →
-`state: failed` with a reason) is covered deterministically by the Hub test
-`a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route`, since
-this live host accepts every send.
+The failed-resolution paths are covered deterministically by two Hub tests,
+since this live host accepts every send: `a_send_the_node_rejects_resolves_failed_and_is_listed_by_the_new_route`
+(an error reply → `failed`) and `a_send_the_node_never_acks_fails_on_the_deadline`
+(the Node receives the call but never replies → `reconciling` → the bounded ack
+deadline fails the row). The store test `a_journaled_accept_recovers_a_deadline_failed_send`
+proves the §2.5 recovery direction: a journaled accept that arrives after a
+deadline failure flips the row back to `accepted` and clears the reason.
+
+## Known follow-up for the web owner (not fixed here)
+
+`web/src/lib/api.ts` coerces command state and resolution through allowlists
+that predate this change: an unknown `state` becomes `"accepted"` and an unknown
+`resolution` becomes `"clear"`. A `failed` send therefore renders in the web UI
+as accepted with a clear resolution, hiding the failure and its reason. The Hub
+now emits `failed` / `failed` with a `reason`, and the generated client
+(`web/src/lib/api.generated.ts`, regenerated here) carries them, but the
+hand-written coercion in `api.ts` needs the web owner to extend those allowlists.
+This worker's ownership excludes `web/` beyond the generated client, so it is
+flagged rather than fixed.

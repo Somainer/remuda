@@ -16,6 +16,11 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 /// Default `read --lines` (herdr-style viewport).
 const DEFAULT_LINES: usize = 120;
+/// How long `send` polls the command ledger for a terminal state before
+/// printing whatever it has. Must outlast the Hub's default ack deadline
+/// (`command_settle_timeout_ms`, 10 s) plus a margin so a never-acked send
+/// prints its `failed` resolution rather than a stale `queued` row.
+const SEND_RESOLVE_POLL_MS: u64 = 12_000;
 
 /// `remuda instance` subcommands.
 #[derive(clap::Args)]
@@ -481,17 +486,28 @@ pub(crate) async fn resolve_command_state(client: &HubClient, instance_id: &str,
         return;
     };
     let mut resolved = body["command"].clone();
-    // The error-reply path resolves synchronously; the ack-deadline path resolves
-    // shortly after. Poll the new commands listing a few times for a terminal
-    // state before giving up on the queued row.
-    for attempt in 0..20 {
+    // The error-reply path resolves synchronously; the ack-deadline path only
+    // resolves once the Hub's `command_settle_timeout_ms` elapses (default 10 s,
+    // never below the accept timeout + 1 s). Poll until a terminal state or a
+    // window that comfortably outlasts that deadline, so a send the Node never
+    // acks actually prints its `failed` resolution rather than a stale `queued`
+    // row. A send that resolves fast breaks out on the first check, so the long
+    // window only applies to a genuinely stuck send — which is exactly when the
+    // operator wants to wait for the outcome.
+    let deadline = Instant::now() + Duration::from_millis(SEND_RESOLVE_POLL_MS);
+    let mut first = true;
+    loop {
         let state = resolved.get("state").and_then(Value::as_str).unwrap_or("");
         if matches!(state, "accepted" | "settled" | "failed") {
             break;
         }
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        if !first {
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        first = false;
         let Ok(listing) = client
             .get(&format!("/v1/instances/{instance_id}/commands?limit=50"))
             .await

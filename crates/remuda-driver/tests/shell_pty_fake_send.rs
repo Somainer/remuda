@@ -23,6 +23,7 @@ use remuda_protocol::{
 };
 use remuda_screen::ScreenStatus;
 use remuda_testing::ensure_workspace_bin;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -84,7 +85,7 @@ const SCENARIO: &str = r#"{
       "match_prefix": "PROBE_ONE",
       "text": "done one",
       "tools": [
-        { "name": "Bash", "input": { "command": "sleep" }, "approval": "auto", "duration_ms": 2500 }
+        { "name": "Bash", "input": { "command": "sleep" }, "approval": "auto", "duration_ms": 3500 }
       ]
     },
     {
@@ -110,6 +111,58 @@ async fn await_status(driver: &ShellPtyDriver, want: ScreenStatus, budget: Durat
     false
 }
 
+/// The fake harness's semantic event log (`FAKE_HARNESS_EVENTS_OUT`), one JSON
+/// object per line. `submit` starts a turn from idle; `enqueue` is text typed
+/// into a *running* turn (absorbed at the tool boundary); `boundary_deliver`
+/// fires when queued text is absorbed. Reading it is how the test sees what the
+/// harness actually did with each write, independent of the screen.
+fn harness_events(path: &Path) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+/// Count `submit` events whose `content` equals `text`.
+fn submits_of(events: &[Value], text: &str) -> usize {
+    events
+        .iter()
+        .filter(|e: &&Value| {
+            e.get("event").and_then(Value::as_str) == Some("submit")
+                && e.get("content").and_then(Value::as_str) == Some(text)
+        })
+        .count()
+}
+
+fn events_named<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
+    events
+        .iter()
+        .filter(|e: &&Value| e.get("event").and_then(Value::as_str) == Some(name))
+        .collect()
+}
+
+/// Deliver `input` the way the Node's D-022 tick does: only write into the PTY
+/// once the driver says control is available. Returns true if it was written,
+/// false if control stayed unavailable for the whole budget (still mid-turn).
+async fn deliver_when_ready(driver: &ShellPtyDriver, input: DriverInput, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if Driver::wait_control(driver).await.is_ok() {
+            driver
+                .send(input)
+                .await
+                .expect("send once control is ready");
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn install_fake_claude(root: &Path) -> PathBuf {
     let install = root.join("opt/bin");
     std::fs::create_dir_all(&install).unwrap();
@@ -121,7 +174,7 @@ fn install_fake_claude(root: &Path) -> PathBuf {
     dest
 }
 
-fn driver_for(root: &Path, scenario_path: &Path) -> ShellPtyDriver {
+fn driver_for(root: &Path, scenario_path: &Path, events_path: &Path) -> ShellPtyDriver {
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
     let native_home = root.join("home");
@@ -154,6 +207,11 @@ fn driver_for(root: &Path, scenario_path: &Path) -> ShellPtyDriver {
         "FAKE_HARNESS_SCRIPT".into(),
         scenario_path.to_string_lossy().into_owned(),
     );
+    // The semantic event log the test reads back to prove submit vs enqueue.
+    options.extra_env.insert(
+        "FAKE_HARNESS_EVENTS_OUT".into(),
+        events_path.to_string_lossy().into_owned(),
+    );
     options.hooks = Some(HookConfig {
         instance_dir,
         relay_binary: relay_bin(),
@@ -168,8 +226,9 @@ async fn a_send_lands_when_idle_and_is_held_until_a_running_turn_ends() {
     let root = dir.path();
     let scenario_path = root.join("scenario.json");
     std::fs::write(&scenario_path, SCENARIO).unwrap();
+    let events_path = root.join("harness-events.jsonl");
 
-    let driver = driver_for(root, &scenario_path);
+    let driver = driver_for(root, &scenario_path, &events_path);
     let spec = spec_for(&root.join("workspace"));
     let _events = driver.start(spec).await.expect("start").into_events();
 
@@ -197,16 +256,26 @@ async fn a_send_lands_when_idle_and_is_held_until_a_running_turn_ends() {
         driver.screen_status()
     );
 
-    // (2) Mid-turn: the driver must refuse control rather than typing into the
-    // running turn — the same refusal the Node's D-022 tick reads to hold the
-    // prompt for the next turn.
-    let mid_turn = Driver::wait_control(&driver).await;
+    // (2) Mid-turn: the driver refuses control, so a queue-style delivery does
+    // not write PROBE_TWO into the running turn at all. `deliver_when_ready`
+    // spends its whole (short) budget failing `wait_control` while the tool
+    // runs, exactly as the Node's tick would, and returns false.
+    let wrote_mid_turn =
+        deliver_when_ready(&driver, prompt("PROBE_TWO"), Duration::from_millis(800)).await;
     assert!(
-        matches!(
-            mid_turn,
-            Err(remuda_driver::DriverError::ControlUnavailable)
-        ),
-        "control must be refused mid-turn, got {mid_turn:?}"
+        !wrote_mid_turn,
+        "control must be refused mid-turn so the held prompt is not written into the running turn"
+    );
+    // Nothing typed into the turn: no enqueue, and PROBE_TWO has not been
+    // submitted.
+    let during = harness_events(&events_path);
+    assert!(
+        events_named(&during, "enqueue").is_empty(),
+        "a held prompt must not be typed into the running turn (would enqueue): {during:?}"
+    );
+    assert!(
+        submits_of(&during, "PROBE_TWO") == 0,
+        "PROBE_TWO must not submit mid-turn: {during:?}"
     );
 
     // The turn ends: the screen returns to idle and control is available again.
@@ -215,30 +284,35 @@ async fn a_send_lands_when_idle_and_is_held_until_a_running_turn_ends() {
         "the turn never returned to idle: status={:?}",
         driver.screen_status()
     );
-    let after = {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut ok = false;
-        while Instant::now() < deadline {
-            if Driver::wait_control(&driver).await.is_ok() {
-                ok = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        ok
-    };
-    assert!(after, "control never returned after the turn ended");
 
-    // (3) The held send is now delivered and starts its own turn.
-    driver
-        .send(prompt("PROBE_TWO"))
-        .await
-        .expect("post-turn send");
+    // (3) Delivered at the boundary: the same queue delivery now writes exactly
+    // once, and the harness records a single PROBE_TWO submit that starts its
+    // own turn.
+    let wrote_after =
+        deliver_when_ready(&driver, prompt("PROBE_TWO"), Duration::from_secs(5)).await;
+    assert!(
+        wrote_after,
+        "the held send never delivered after the turn ended"
+    );
     assert!(
         await_status(&driver, ScreenStatus::Working, Duration::from_secs(10)).await
             || await_status(&driver, ScreenStatus::Idle, Duration::from_secs(2)).await,
         "the post-turn send never reached the harness: status={:?}",
         driver.screen_status()
+    );
+
+    // Let the second turn's records settle, then assert exactly one PROBE_TWO
+    // submit across the whole run — the boundary delivery, never a mid-turn one.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let all = harness_events(&events_path);
+    let probe_two_submits = submits_of(&all, "PROBE_TWO");
+    assert_eq!(
+        probe_two_submits, 1,
+        "the held prompt must submit exactly once, at the boundary: {all:?}"
+    );
+    assert!(
+        events_named(&all, "enqueue").is_empty(),
+        "the held prompt was never typed into a running turn: {all:?}"
     );
 
     Driver::close(&driver).await.unwrap();

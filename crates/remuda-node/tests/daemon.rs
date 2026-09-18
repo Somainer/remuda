@@ -55,6 +55,20 @@ impl Peer {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// One frame, or `None` when the controller closed the pipe.
+    ///
+    /// `next` panics on a close, which is right when a frame is owed; this is
+    /// for the polls that run until a deadline and must treat a closed stream
+    /// as a (failing) end rather than a panic.
+    async fn next_opt(&mut self) -> Option<Value> {
+        let mut line = String::new();
+        let count = self.read.read_line(&mut line).await.ok()?;
+        if count == 0 {
+            return None;
+        }
+        serde_json::from_str(&line).ok()
+    }
+
     async fn ack(&mut self, frame: &Value) -> u64 {
         let seq: u64 = frame["params"]["seq"].as_str().unwrap().parse().unwrap();
         self.send(
@@ -450,5 +464,114 @@ async fn outbound_reconnect_replays_offline_completion_without_a_new_command() {
         .unwrap();
     link.shutdown().await;
     drop(lease);
+    node.shutdown().await.unwrap();
+}
+
+/// A long carrier method must not blind the daemon controller.
+///
+/// The live freeze rode `remuda node bridge`: the controller awaited the whole
+/// body on its read arm, so journals stopped forwarding and — the point of the
+/// design — `gate.cancel` could not even be *read* while a run was in flight.
+/// The escape hatch was unusable exactly when it was needed.
+///
+/// `gate.then` is a long carrier method that runs an arbitrary `bash -lc`, so a
+/// command that sleeps is a long method with a controllable duration and no
+/// fixture binary to build. While it runs the controller must still (1) answer
+/// an unrelated request and (2) accept the next frame, which is what makes
+/// `gate.cancel` readable. Both are checked inside the sleep, before the long
+/// method has returned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_method_does_not_blind_the_daemon_controller() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        dir.path().to_path_buf(),
+    ))
+    .unwrap();
+    let control = test_control(dir.path());
+    let task = start(node.clone(), dir.path(), control).await;
+    let mut peer = Peer::connect(dir.path(), false, json!([])).await;
+
+    // A long carrier method, parked in a sleep the test controls by duration.
+    let sleep_secs = 6;
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "then-1",
+        "method": "gate.then",
+        "params": {
+            "jobId": "gjb_bridge",
+            "command": format!("sleep {sleep_secs}"),
+            "cwd": dir.path().to_string_lossy(),
+        },
+    }))
+    .await;
+
+    // Let it get into the sleep, then prove the loop is still serving. These
+    // are read off the same controller, so they can only arrive if the read arm
+    // is turning while the long method is in flight.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    peer.send(json!({
+        "jsonrpc": "2.0",
+        "id": "screen-1",
+        "method": "host.resources",
+        "params": {},
+    }))
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_unrelated = false;
+    let mut saw_cancel_read = false;
+    while tokio::time::Instant::now() < deadline && !(saw_unrelated && saw_cancel_read) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Some(frame)) = tokio::time::timeout(remaining, peer.next_opt()).await else {
+            break;
+        };
+        if frame["id"] == json!("screen-1") && frame.get("result").is_some() {
+            saw_unrelated = true;
+            // The frame that stood in for `gate.cancel` in the live incident:
+            // it must be accepted, not merely queued behind the long method.
+            peer.send(json!({
+                "jsonrpc": "2.0",
+                "id": "cancel-1",
+                "method": "gate.cancel",
+                "params": { "jobId": "gjb_bridge" },
+            }))
+            .await;
+        }
+        if frame["id"] == json!("cancel-1") {
+            saw_cancel_read = true;
+        }
+    }
+    assert!(
+        saw_unrelated,
+        "the controller must answer an unrelated request while a long method runs"
+    );
+    assert!(
+        saw_cancel_read,
+        "gate.cancel must be readable while a long method runs — that is the escape hatch"
+    );
+
+    // And the long method's own reply still lands, with its real result.
+    let mut saw_then = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline && !saw_then {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Some(frame)) = tokio::time::timeout(remaining, peer.next_opt()).await else {
+            break;
+        };
+        if frame["id"] == json!("then-1") {
+            assert_eq!(
+                frame["result"]["exitCode"],
+                json!(0),
+                "gate.then result: {frame}"
+            );
+            saw_then = true;
+        }
+    }
+    assert!(saw_then, "the long method's own reply must still arrive");
+
+    drop(peer);
+    task.abort();
+    let _ = task.await;
     node.shutdown().await.unwrap();
 }

@@ -1134,7 +1134,7 @@ async fn provider_usage(
             let id_for = id.clone();
             let model_for = model.clone();
             let agg = store
-                .run(move |conn| {
+                .run_named("provider_usage", move |conn| {
                     crate::usage_store::aggregate_supply(conn, &id_for, &model_for)
                         .map_err(crate::store::StoreError::from)
                 })

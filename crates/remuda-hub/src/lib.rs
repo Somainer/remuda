@@ -109,7 +109,12 @@ pub struct AppState {
 /// from integration tests. Not part of the supported API.
 #[doc(hidden)]
 pub mod store_test_support {
+    use std::path::Path;
+    use std::time::Duration;
+
     use crate::store::InstanceDelegation;
+
+    pub use crate::store::{APPEND_CHUNK_MAX, JOURNAL_WINDOW_BYTES, JOURNAL_WINDOW_ROWS, Store};
 
     /// A leaf-worker delegation scoped to one project.
     pub fn leaf_delegation(project_id: &str) -> Result<InstanceDelegation, String> {
@@ -125,6 +130,62 @@ pub mod store_test_support {
             task_id: None,
             enforce_tree: true,
         })
+    }
+
+    /// Open a Hub DB and enroll one host, returning the store and its host id.
+    ///
+    /// The Store-direct equivalent of the `spawn` + fake-node WS dance, for
+    /// tests that exercise the writer/reader split rather than HTTP.
+    pub async fn open_with_host(dir: &Path, label: &str) -> anyhow::Result<(Store, String)> {
+        use crate::store::{HostAuthOutcome, HostAuthRequest};
+
+        let store = Store::open(dir)?;
+        // Prefix-indexed tokens are 64 hex chars; derive a deterministic one.
+        let mut plaintext: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        if plaintext.len() < 64 {
+            plaintext = format!("{plaintext:0<64}");
+        }
+        plaintext.truncate(64);
+        let prefix = crate::auth::token_prefix(&plaintext).map(str::to_string);
+        store
+            .insert_enroll_token(
+                plaintext.clone(),
+                prefix,
+                "hub-store-test".into(),
+                "2099-01-01T00:00:00.000Z".into(),
+            )
+            .await?;
+        let host_id = crate::config::new_id("hst")?;
+        let outcome = store
+            .authenticate_host(
+                HostAuthRequest {
+                    presented: plaintext,
+                    hello_host_id: Some(host_id.clone()),
+                    label: Some(label.into()),
+                    node_version: None,
+                },
+                |presented, hash| presented == hash,
+                |_| Ok("test-hash".into()),
+            )
+            .await?;
+        anyhow::ensure!(
+            matches!(outcome, HostAuthOutcome::Authenticated { .. }),
+            "host enrollment rejected"
+        );
+        Ok((store, host_id))
+    }
+
+    /// Test fixture: occupy one reader-pool connection for `sleep`, exactly
+    /// like a long read landing on the pool. The pool has more than one
+    /// connection, so other reads and the writer thread must not wait.
+    pub async fn hold_reader(store: &Store, sleep: Duration) {
+        store
+            .read("test.hold_reader", move |_| {
+                std::thread::sleep(sleep);
+                Ok(())
+            })
+            .await
+            .expect("reader hold");
     }
 }
 
@@ -154,7 +215,7 @@ impl RunningHub {
         if let Some(store) = self.store.as_ref() {
             let host_id = host_id.to_owned();
             store
-                .run(move |conn| {
+                .run_named("test_insert_host", move |conn| {
                     let now = crate::config::now_rfc3339();
                     conn.execute(
                         "INSERT OR REPLACE INTO hosts

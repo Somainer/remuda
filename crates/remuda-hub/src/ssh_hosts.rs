@@ -220,7 +220,7 @@ async fn remove_host(
     state.store.mark_host_offline(id.clone()).await?;
     state
         .store
-        .run(move |conn| {
+        .run_named("remove_host", move |conn| {
             conn.execute("DELETE FROM hosts WHERE id = ?1", [id])?;
             Ok(())
         })
@@ -236,7 +236,7 @@ impl Store {
         let hash = crate::auth::hash_secret(&token)?;
         let prefix = crate::auth::token_prefix(&token).map(str::to_owned);
         let changed = self
-            .run(move |conn| {
+            .run_named("managed_session_token", move |conn| {
                 Ok(conn.execute(
                     "UPDATE hosts SET token_hash = ?2, token_prefix = ?3 WHERE id = ?1 AND state != 'retired'
                      AND EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id)",
@@ -255,7 +255,7 @@ impl Store {
         id: String,
         body: AddSshHost,
     ) -> Result<HostRecord, HubError> {
-        let result = self.run(move |conn| {
+        let result = self.run_named("insert_managed_host", move |conn| {
             let tx = conn.transaction()?;
             if tx.query_row("SELECT 1 FROM ssh_hosts WHERE target = ?1", [&body.target], |_| Ok(())).optional()?.is_some() {
                 return Err(StoreError::Id("SSH target already registered".into()));
@@ -275,7 +275,7 @@ impl Store {
     }
 
     async fn managed_hosts(&self) -> Result<Vec<ManagedHost>, StoreError> {
-        self.run(|conn| {
+        self.run_named("managed_hosts", |conn| {
             let mut stmt = conn.prepare("SELECT host_id, target, policy_json FROM ssh_hosts JOIN hosts ON hosts.id = ssh_hosts.host_id WHERE state != 'retired'")?;
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
             rows.map(|row| { let (id, target, policy) = row?; Ok(ManagedHost { id, target, policy: serde_json::from_str(&policy)? }) }).collect()
@@ -289,7 +289,7 @@ impl Store {
         error: Option<String>,
     ) -> Result<(), StoreError> {
         let status = status.to_owned();
-        self.run(move |conn| {
+        self.run_named("ssh_status", move |conn| {
             conn.execute(
                 "UPDATE hosts SET state = ?2 WHERE id = ?1 AND state != 'retired'",
                 params![id, status],
@@ -311,7 +311,7 @@ impl Store {
         reachable: bool,
         error: Option<String>,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("ssh_daemon_probe", move |conn| {
             conn.execute(
                 "UPDATE hosts SET state = ?2, offline_since = CASE WHEN ?3 THEN NULL
                  WHEN state = 'daemon-unreachable' THEN COALESCE(offline_since, ?4)
@@ -343,7 +343,7 @@ impl Store {
         host_id: String,
         instances: Vec<Value>,
     ) -> Result<(), StoreError> {
-        self.run(move |conn| {
+        self.run_named("reconcile_daemon_instances", move |conn| {
             let tx = conn.transaction()?;
             for instance in instances {
                 if instance["hostId"].as_str() != Some(&host_id) { continue; }
@@ -371,7 +371,7 @@ impl Store {
     }
 
     async fn retire_managed_host(&self, id: String) -> Result<(), HubError> {
-        let outcome = self.run(move |conn| {
+        let outcome = self.run_named("retire_managed_host", move |conn| {
             let tx = conn.transaction()?;
             if tx.query_row("SELECT 1 FROM ssh_hosts WHERE host_id = ?1", [&id], |_| Ok(())).optional()?.is_none() { return Ok(false); }
             let active: i64 = tx.query_row("SELECT COUNT(*) FROM instances WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'archived')", [&id], |row| row.get(0))?;
@@ -601,25 +601,31 @@ mod tests {
             .unwrap();
         let host_id = id.clone();
         store
-            .run(move |conn| {
-                conn.execute(
-                    "UPDATE hosts SET last_seen_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
-                    [host_id],
-                )?;
-                Ok(())
-            })
+            .run_named(
+                "bridge_loss_grace_begins_only_after_daemon_probe_fails",
+                move |conn| {
+                    conn.execute(
+                        "UPDATE hosts SET last_seen_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                        [host_id],
+                    )?;
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         store.mark_all_hosts_offline().await.unwrap();
         assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
         store
-            .run(move |conn| {
-                conn.execute(
-                    "UPDATE hosts SET offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
-                    [id],
-                )?;
-                Ok(())
-            })
+            .run_named(
+                "bridge_loss_grace_begins_only_after_daemon_probe_fails",
+                move |conn| {
+                    conn.execute(
+                        "UPDATE hosts SET offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                        [id],
+                    )?;
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         assert_eq!(store.expire_lost_hosts(60_000).await.unwrap(), 0);
@@ -631,7 +637,7 @@ mod tests {
         assert_eq!(store.expire_lost_hosts(0).await.unwrap(), 0);
         let disconnected_id = id.clone();
         store
-            .run(move |conn| {
+            .run_named("bridge_loss_grace_begins_only_after_daemon_probe_fails", move |conn| {
                 conn.execute(
                     "UPDATE hosts SET state = 'offline', offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
                     [disconnected_id],
@@ -651,13 +657,16 @@ mod tests {
         );
         let old_id = id.clone();
         store
-            .run(move |conn| {
-                conn.execute(
-                    "UPDATE hosts SET offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
-                    [old_id],
-                )?;
-                Ok(())
-            })
+            .run_named(
+                "bridge_loss_grace_begins_only_after_daemon_probe_fails",
+                move |conn| {
+                    conn.execute(
+                        "UPDATE hosts SET offline_since = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                        [old_id],
+                    )?;
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         store.ssh_daemon_probe(id, false, None).await.unwrap();

@@ -535,21 +535,32 @@ pub(crate) async fn handle_node_method(
                 .await
                 .map_err(map_host_store)?;
             let mut last = None;
-            let mut seq = seq;
-            for event in events {
-                let appended = state
+            let mut next_seq = seq;
+            // Fold the frame into bounded writer jobs: one transaction per
+            // chunk, awaited before the next so the writer yields between
+            // batches instead of holding its single connection for a whole
+            // 256-event replay page (hub-store-1).
+            for chunk in events.chunks(crate::store::APPEND_CHUNK_MAX) {
+                let appended_chunk = state
                     .store
-                    .append_journal(host_id.clone(), instance_id.clone(), seq, event)
+                    .append_journal_batch(
+                        host_id.clone(),
+                        instance_id.clone(),
+                        next_seq,
+                        chunk.to_vec(),
+                    )
                     .await
                     .map_err(map_host_store)?;
-                if !appended.replayed {
-                    publish_journal(&state.bus, &appended.record);
-                    crate::alerts::observe(state, &appended.record);
-                    crate::usage_store::observe_journal(state, &appended.record).await;
-                    crate::supply::observe_journal_text(state, &appended.record).await;
+                for appended in appended_chunk {
+                    if !appended.replayed {
+                        publish_journal(&state.bus, &appended.record);
+                        crate::alerts::observe(state, &appended.record);
+                        crate::usage_store::observe_journal(state, &appended.record).await;
+                        crate::supply::observe_journal_text(state, &appended.record).await;
+                    }
+                    next_seq = Some(appended.record.seq.saturating_add(1));
+                    last = Some(appended);
                 }
-                seq = Some(appended.record.seq.saturating_add(1));
-                last = Some(appended);
             }
             let appended = last.ok_or_else(|| {
                 HubError::BadRequest("journal.append requires event or events".into())

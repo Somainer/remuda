@@ -198,7 +198,7 @@ async fn live_objects(
     now: String,
 ) -> Result<Vec<ObjectRecord>, StoreError> {
     store
-        .run(move |conn| {
+        .run_named("live_objects", move |conn| {
             let mut statement = conn.prepare(
                 "SELECT id, instance_id, host_id, media_type, stored_name, original_name, kind,
                         digest, byte_len, expires_at, anchor

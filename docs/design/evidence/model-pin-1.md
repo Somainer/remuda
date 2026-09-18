@@ -9,9 +9,11 @@ with the fake harness from `crates/remuda-testing`, on an isolated temp root. No
 host, user or path names appear below; every model id is either a synthetic
 stand-in or a host-generic gateway id.
 
-Implementation: branch `wt/c-modelpin/b-modelpin-md`, sha
-`22b4aa4201bd282534b7368454a4396e5be6ef3c` (channel + reporting work; the
-post-launch read-back gate landed in the follow-up revision on the same branch).
+Implementation: branch `wt/c-modelpin/b-modelpin-md`; the full implementation is
+at `b22d047efda2931f89741fea5d635811060abb1a` (this evidence doc lands in the
+commit immediately after). The channel work (argv + overlay + reporting) is in
+the earlier commits; the post-launch read-back gate and the alias-aware
+comparison are in the later ones on the same branch.
 
 ---
 

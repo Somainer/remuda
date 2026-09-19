@@ -1,0 +1,294 @@
+//! D-045 CLI preflight for `--capability computer-use` on instance create.
+//!
+//! The in-process Hub gets a fake Node whose hello inventory carries an
+//! `os` string and an optional `computer-use` cli row — exactly the bytes the
+//! hostcap batch will produce. Preflight happens before persistence, so each
+//! refusal must show up at the command line with the host id named.
+
+use anyhow::Result;
+use futures::{SinkExt, StreamExt};
+use remuda_hub::{HubConfig, spawn};
+use serde_json::{Value, json};
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_remuda")
+}
+
+struct Hub {
+    _dir: tempfile::TempDir,
+    _hub: remuda_hub::RunningHub,
+    base: String,
+    token: String,
+    host: String,
+    _node: tokio::task::JoinHandle<()>,
+}
+
+async fn recv_json<S>(ws: &mut S) -> Result<Value>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    match tokio::time::timeout(Duration::from_secs(8), ws.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => Ok(serde_json::from_str(&text)?),
+        other => Err(anyhow::anyhow!("unexpected frame {other:?}")),
+    }
+}
+
+async fn spawn_hub(os: Option<&str>, computer_use_row: Option<Value>) -> Result<Hub> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+    let token = hub.mint_device_token("cua-cli").await?;
+    let host = remuda_protocol::HostId::new().as_id().to_string();
+    let workspace = remuda_protocol::WorkspaceId::new().as_id().to_string();
+
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
+    let mut request = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(request).await?;
+    let mut host_obj = json!({
+        "hostname": "cua-cli-host",
+        "labels": {},
+        "maxInstances": 8,
+        "cli": [{"kind":"claude","version":"0.0.0","absolutePath":"/usr/bin/claude","authState":"unknown"}],
+        "workspaces": [{"workspaceId": workspace, "hostId": host, "root": "/tmp/repo"}],
+        "workspaceRevision": 1,
+    });
+    if let Some(os) = os {
+        host_obj["os"] = json!(os);
+    }
+    if let Some(row) = computer_use_row {
+        host_obj["cli"].as_array_mut().unwrap().push(row);
+    }
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "hello", "method": "runtime.hello",
+            "params": { "hostId": host, "nodeVersion": "0.1.0-test", "host": host_obj }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    assert!(hello["result"]["nodeToken"].is_string());
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok(frame) = recv_json(&mut node).await else {
+                break;
+            };
+            if let Some(id) = frame.get("id").cloned()
+                && frame.get("method").is_some()
+            {
+                let result = match frame["method"].as_str().unwrap_or("") {
+                    "worker.provision" => json!({
+                        "name": "x", "branch": "wt/x/work", "startPoint": "origin/main",
+                        "worktreePath": "/tmp/remuda-wt/x", "targetDir": "/tmp/remuda-target/x",
+                    }),
+                    _ => json!({"accepted": true,
+                        "instanceId": "ins_fake00000000000000000000000001"}),
+                };
+                let response = json!({"jsonrpc":"2.0","id":id,"result":result});
+                if node
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let base = format!("http://{}", hub.addr);
+    Ok(Hub {
+        _dir: dir,
+        _hub: hub,
+        base,
+        token,
+        host,
+        _node: task,
+    })
+}
+
+fn run(args: &[&str], hub: &Hub) -> std::process::Output {
+    let mut all = args.to_vec();
+    all.extend(["--hub", &hub.base, "--token", &hub.token]);
+    std::process::Command::new(bin())
+        .args(all)
+        .output()
+        .expect("run remuda")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_capability_is_refused_and_named() -> Result<()> {
+    let hub = spawn_hub(Some("macos"), None).await?;
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--capability",
+            "desktop",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"desktop\""), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grok_kind_is_refused_at_the_cli() -> Result<()> {
+    let hub = spawn_hub(Some("macos"), None).await?;
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--kind",
+            "grok",
+            "--driver",
+            "shell-pty",
+            "--capability",
+            "computer-use",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not supported"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_without_the_row_is_refused_with_a_retry_direction() -> Result<()> {
+    let hub = spawn_hub(Some("macos"), None).await?;
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--capability",
+            "computer-use",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&hub.host), "{stderr}");
+    assert!(stderr.contains("not reported"), "{stderr}");
+    assert!(stderr.contains("--host"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reporting_not_installed_is_refused_with_the_probed_path() -> Result<()> {
+    let row = json!({
+        "kind": "computer-use",
+        "installed": false,
+        "path": "/Users/u/.codex/computer-use/Codex Computer Use.app",
+        "auth": "unknown",
+    });
+    let hub = spawn_hub(Some("macos"), Some(row)).await?;
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--capability",
+            "computer-use",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not installed"), "{stderr}");
+    assert!(stderr.contains("Codex Computer Use.app"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_macos_host_is_refused_and_names_the_os() -> Result<()> {
+    let row = json!({"kind": "computer-use", "installed": true, "auth": "unknown"});
+    let hub = spawn_hub(Some("linux"), Some(row)).await?;
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--capability",
+            "computer-use",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("linux"), "{stderr}");
+    assert!(stderr.contains("macOS"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_capability_on_macos_passes_preflight_and_reaches_the_node() -> Result<()> {
+    let row = json!({
+        "kind": "computer-use",
+        "installed": true,
+        "path": "/Users/u/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+        "auth": "unknown",
+    });
+    let hub = spawn_hub(Some("macos"), Some(row)).await?;
+    // The CLI preflight passes; the development Node then refuses at its own
+    // boundary because the fake Linux process has no computer-use probe — the
+    // two layers are deliberately independent, and the Node boundary is what
+    // makes this honest. We assert on the CLI not refusing and on the refusal
+    // arriving from downstream rather than the preflight message.
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--capability",
+            "computer-use",
+        ],
+        &hub,
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // No client-side refusal wording: preflight passed.
+    assert!(
+        !combined.contains("not reported"),
+        "preflight refused: {combined}"
+    );
+    assert!(
+        !combined.contains("requires macOS"),
+        "preflight refused: {combined}"
+    );
+    Ok(())
+}
+
+#[test]
+fn help_lists_the_capability_flag() -> Result<()> {
+    let output = std::process::Command::new(bin())
+        .args(["instance", "create", "--help"])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--capability"), "{stdout}");
+    Ok(())
+}

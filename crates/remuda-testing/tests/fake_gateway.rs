@@ -312,7 +312,7 @@ async fn models_lists_two_catalogs_that_overlap_without_nesting() -> Result<()> 
 
     let plain: Value = client
         .get(format!("{}/v1/models", gateway.base_url()))
-        .header("authorization", "Bearer not-a-real-token")
+        .header("authorization", "Bearer fake-not-real-token")
         .send()
         .await?
         .json()
@@ -326,7 +326,7 @@ async fn models_lists_two_catalogs_that_overlap_without_nesting() -> Result<()> 
 
     let anthropic: Value = client
         .get(format!("{}/v1/models", gateway.base_url()))
-        .header("authorization", "Bearer not-a-real-token")
+        .header("authorization", "Bearer fake-not-real-token")
         .header("anthropic-version", ANTHROPIC_VERSION)
         .send()
         .await?
@@ -425,7 +425,7 @@ async fn models_answers_under_a_base_path_too() -> Result<()> {
 #[tokio::test]
 async fn the_recorder_keeps_header_names_and_never_a_value() -> Result<()> {
     let gateway = FakeGateway::start().await?;
-    let token = "sk-not-a-real-credential-0000";
+    let token = "sk-fake-credential-0000";
     let (status, _, _) = post_messages(
         &gateway,
         &[
@@ -497,7 +497,7 @@ async fn a_credential_bearing_request_is_flagged_by_name_only() -> Result<()> {
     // The audit direction that matters: this fixture must be able to *report*
     // that a credential arrived, by name, without ever holding its value.
     let gateway = FakeGateway::start().await?;
-    let token = "sk-flagged-credential-9999";
+    let token = "sk-fake-flagged-9999";
     let (status, _, _) = post_messages(
         &gateway,
         &[("authorization", &format!("Bearer {token}"))],
@@ -578,8 +578,8 @@ async fn a_mismatched_credential_is_refused_and_only_the_verdict_is_kept() -> Re
     // bearer unchanged. The value is configured but never retrievable, and the
     // failure is reported without quoting either value.
     let gateway = FakeGateway::start().await?;
-    let configured = "sk-configured-0000";
-    let presented = "relay-bearer-from-the-worker-1111";
+    let configured = "sk-fake-configured-0000";
+    let presented = "fake-worker-bearer-1111";
     gateway.expect_credential(configured);
 
     let (status, _, body) = post_messages(
@@ -602,10 +602,26 @@ async fn a_mismatched_credential_is_refused_and_only_the_verdict_is_kept() -> Re
             .any(|entry| entry.contains("not the configured one")),
         "the mismatch must be reported: {violations:?}"
     );
-    for leaked in [configured, presented, "relay-bearer", "sk-configured"] {
+    // Check the whole value and a distinctive inner slice of each, so a report
+    // that quoted only part of a credential is caught too. The slices are
+    // derived from the values rather than hard-coded, so they cannot go stale
+    // when the fixture literals are renamed.
+    let distinctive = |value: &str| {
+        value
+            .split_once('-')
+            .map_or("", |(_, rest)| rest)
+            .to_string()
+    };
+    let fragments = [
+        configured.to_string(),
+        presented.to_string(),
+        distinctive(configured),
+        distinctive(presented),
+    ];
+    for leaked in fragments {
         for violation in &violations {
             assert!(
-                !violation.contains(leaked),
+                !violation.contains(&leaked),
                 "the report quoted a value ({leaked}): {violations:?}"
             );
         }
@@ -617,7 +633,7 @@ async fn a_mismatched_credential_is_refused_and_only_the_verdict_is_kept() -> Re
 #[tokio::test]
 async fn the_configured_credential_is_accepted() -> Result<()> {
     let gateway = FakeGateway::start().await?;
-    let configured = "sk-configured-2222";
+    let configured = "sk-fake-configured-2222";
     // Configured as the bare token, so it matches whichever spelling arrives.
     gateway.expect_credential(configured);
 
@@ -651,12 +667,12 @@ async fn the_configured_credential_is_accepted() -> Result<()> {
 #[tokio::test]
 async fn clearing_the_expected_credential_restores_the_permissive_default() -> Result<()> {
     let gateway = FakeGateway::start().await?;
-    gateway.expect_credential("sk-configured-3333");
+    gateway.expect_credential("sk-fake-configured-3333");
     gateway.clear_expected_credential();
 
     let (status, _, _) = post_messages(
         &gateway,
-        &[("authorization", "Bearer something-else-entirely")],
+        &[("authorization", "Bearer fake-something-else")],
         &request_body(),
     )
     .await?;
@@ -758,8 +774,8 @@ async fn a_relay_bearer_instead_of_the_profile_credential_is_caught() -> Result<
     // fixture must tell the two apart by value, which is the whole point of
     // configuring an expected credential.
     let gateway = FakeGateway::start().await?;
-    let profile_token = "sk-profile-credential-4444";
-    let worker_bearer = "relay-bearer-per-instance-5555";
+    let profile_token = "sk-fake-profile-4444";
+    let worker_bearer = "fake-worker-bearer-5555";
     assert_ne!(profile_token, worker_bearer);
     gateway.expect_credential(profile_token);
 
@@ -817,7 +833,7 @@ async fn assert_presented_expected_credential_fails_when_nothing_was_configured(
     let gateway = FakeGateway::start().await?;
     post_messages(
         &gateway,
-        &[("authorization", "Bearer anything-at-all")],
+        &[("authorization", "Bearer fake-anything")],
         &request_body(),
     )
     .await?;
@@ -846,7 +862,7 @@ async fn expect_authorization_refuses_a_credential_free_request() -> Result<()> 
     // involved, because no expected value was configured.
     let (status, _, _) = post_messages(
         &gateway,
-        &[("authorization", "Bearer anything-at-all")],
+        &[("authorization", "Bearer fake-anything")],
         &request_body(),
     )
     .await?;

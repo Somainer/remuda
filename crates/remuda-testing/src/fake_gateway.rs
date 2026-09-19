@@ -947,6 +947,14 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
 ///
 /// `fake/model-1-1m` reports a context window at or above
 /// `LONG_CONTEXT_TOKENS`, which is what earns the `1m` tag downstream.
+///
+/// **This route records a credential verdict but does not act on it**: a
+/// mismatch is captured in [`FakeGateway::saw_credential_mismatch`] and still
+/// answers `200`. Only `/v1/messages` turns a mismatch into a `401`. That is
+/// deliberate — discovery is how a profile is set up, so failing it on a
+/// credential would be a different (and harsher) contract than the design's —
+/// but it means a caller must read the verdict rather than rely on a status
+/// code here.
 async fn models(
     State(gateway): State<Arc<GatewayInner>>,
     headers: HeaderMap,

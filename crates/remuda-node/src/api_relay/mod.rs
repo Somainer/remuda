@@ -926,6 +926,23 @@ impl ApiRelayState {
             .clone()
     }
 
+    /// Drop this instance's provision-lock entry when this caller held the
+    /// last Arc (a concurrent waiter still inside `provision_lock` keeps its
+    /// own clone, so its entry survives). Prevents the per-id map growing for
+    /// the Node's lifetime.
+    pub(crate) fn prune_provision_lock(&self, instance_id: &str) {
+        let mut locks = self
+            .provision_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if locks
+            .get(instance_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(instance_id);
+        }
+    }
+
     /// The observed route a previous accepted attempt recorded for an instance,
     /// so an idempotent retried create echoes the same value.
     pub(crate) fn observed_route(&self, instance_id: &str) -> Option<remuda_protocol::ApiRoute> {
@@ -1134,6 +1151,32 @@ mod tests {
         assert_eq!(chunks[3].len(), 7);
         assert!(split_body_chunks(Bytes::new(), chunk).is_empty());
         assert_eq!(split_body_chunks(Bytes::from_static(b"x"), chunk).len(), 1);
+    }
+
+    #[test]
+    fn provision_lock_entry_is_pruned_when_unheld() {
+        let state = ApiRelayState::new();
+        let held = state.provision_lock("i-prune");
+        assert_eq!(Arc::strong_count(&held), 2); // map + this clone
+        state.prune_provision_lock("i-prune");
+        assert!(
+            state
+                .provision_locks
+                .lock()
+                .unwrap()
+                .contains_key("i-prune"),
+            "a waiter still holds it: the entry survives"
+        );
+        drop(held);
+        state.prune_provision_lock("i-prune");
+        assert!(
+            !state
+                .provision_locks
+                .lock()
+                .unwrap()
+                .contains_key("i-prune"),
+            "no holder remains: the entry is removed"
+        );
     }
 }
 

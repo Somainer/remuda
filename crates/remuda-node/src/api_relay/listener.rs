@@ -175,6 +175,25 @@ pub(crate) async fn provision_for_request(
     instance_id: &str,
     request: &crate::CreateInstanceRequest,
 ) -> Result<Option<ProvisionedRoute>, NodeError> {
+    // Serialize the reuse check, the multi-second probe and the bind for this
+    // instance: a retry overlapping a provisioning first attempt waits here and
+    // then reuses the winner's listener instead of binding a second one and
+    // shutting the winner down.
+    let provision_lock = state.provision_lock(instance_id);
+    let _provision_permit = provision_lock.lock().await;
+    let result = provision_for_request_locked(state, instance_id, request).await;
+    drop(_provision_permit);
+    // Entries are per instance id and otherwise live forever; drop this one
+    // once no other waiter holds it (a concurrent loser keeps its own Arc).
+    state.prune_provision_lock(instance_id);
+    result
+}
+
+async fn provision_for_request_locked(
+    state: &Arc<ApiRelayState>,
+    instance_id: &str,
+    request: &crate::CreateInstanceRequest,
+) -> Result<Option<ProvisionedRoute>, NodeError> {
     let Some(route) = request.api_route.as_ref() else {
         return Ok(None);
     };
@@ -186,12 +205,6 @@ pub(crate) async fn provision_for_request(
             "api route mode `via` requires a viaHostId".into(),
         ));
     }
-    // Serialize the reuse check, the multi-second probe and the bind for this
-    // instance: a retry overlapping a provisioning first attempt waits here and
-    // then reuses the winner's listener instead of binding a second one and
-    // shutting the winner down.
-    let provision_lock = state.provision_lock(instance_id);
-    let _provision_permit = provision_lock.lock().await;
     // An earlier accepted attempt already bound this instance's relay. A
     // worker listener is always registered together with its observed route,
     // so a route-less entry is a different role (the proxy listener): reuse

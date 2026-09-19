@@ -25,6 +25,7 @@ anyhow.workspace = true
 async-trait = "0.1"
 axum.workspace = true
 base64 = "0.22"
+bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
 glob = "0.3"
@@ -35,15 +36,17 @@ remuda-herdr.workspace = true
 remuda-journal.workspace = true
 remuda-protocol.workspace = true
 remuda-signal.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle = "2.6"
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+url = "2"
 tracing.workspace = true
 uuid.workspace = true
 nix = { version = "0.28", features = ["process", "fs", "signal"] }

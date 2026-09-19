@@ -100,6 +100,35 @@ describe("host detail CLI table", () => {
     expect(absent[0]).toHaveTextContent("computer-use");
   });
 
+  it("shows the placeholder when the only rows are non-capability absences", () => {
+    // An older Node: it probes agent CLIs but not the capability, and none of
+    // the CLIs it looked for are installed. Nothing is renderable — the absent
+    // rows are non-capability ones, which the table deliberately does not draw
+    // — so the guard must count the *rendered* set and show 尚无盘点 rather
+    // than leaving an empty box.
+    vi.mocked(store.useHub).mockReturnValue(
+      hostWithCli([
+        { kind: "claude", installed: false },
+        { kind: "codex", installed: false },
+        { kind: "grok", installed: false },
+      ]),
+    );
+    renderDetail();
+    expect(cliRows()).toHaveLength(0);
+    expect(screen.getByText("尚无盘点")).toBeInTheDocument();
+  });
+
+  it("does not show the placeholder when only the capability's absent row renders", () => {
+    // The complement: the capability absence *does* render, so the box is not
+    // empty and the placeholder must stay away.
+    vi.mocked(store.useHub).mockReturnValue(
+      hostWithCli([{ kind: "computer-use", installed: false }]),
+    );
+    renderDetail();
+    expect(cliRows()).toHaveLength(1);
+    expect(screen.queryByText("尚无盘点")).not.toBeInTheDocument();
+  });
+
   it("renders an installed capability row alongside the installed CLIs", () => {
     vi.mocked(store.useHub).mockReturnValue(
       hostWithCli([

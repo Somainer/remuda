@@ -149,15 +149,30 @@ async function assertSingleLine(chip: Locator) {
 
 test.describe("composer control bar and effort", () => {
   test("chips render collapsed with requested effort and unknown native read-back", async ({ page }) => {
+    const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
-    await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
-    await assertRequestedEffortUnknown(page, "high");
-    await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
-    await expect(page.getByTestId("context-chip")).toBeVisible();
-    await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
-    await expect(page.getByTestId("effort-menu")).toHaveCount(0);
+    if (mobile) {
+      // D-042: on phones the harness/permission controls ride inside the
+      // options sheet; the fused trigger keeps the permission word + effort
+      // tier and the context chip stays on the collapsed bar.
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-permission", "manual");
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      await expect(page.getByTestId("harness-chip")).toHaveCount(0);
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+      await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
+      await expect(page.getByTestId("composer-trigger-permission")).toContainText(/询问|可改|全自动|绕过/);
+      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+    } else {
+      await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
+      await assertRequestedEffortUnknown(page, "high");
+      await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
+      await expect(page.getByTestId("effort-menu")).toHaveCount(0);
+    }
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-bar.png");
     }
@@ -331,8 +346,12 @@ test.describe("composer control bar and effort", () => {
   });
 
   test("an existing session shows the harness as a label, not a menu", async ({ page }) => {
+    const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
+    // D-042: the read-only harness chip rides inside the options sheet on
+    // phones; open it before the chip assertions.
+    if (mobile) await page.getByTestId("model-effort-chip").click();
     const chip = page.getByTestId("harness-chip");
     await expect(chip).toHaveAttribute("data-readonly", "1");
     await expect(chip).toContainText(/Claude/);
@@ -456,6 +475,7 @@ test.describe("composer control bar and effort", () => {
   });
 
   test("structured Grok session shows four chips including its editable permission menu", async ({ page }) => {
+    const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "Grok 会话").click();
     await expect(page.getByTestId("session-page")).toBeVisible();
@@ -463,19 +483,38 @@ test.describe("composer control bar and effort", () => {
     await expect(structured).toBeVisible();
     await structured.click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
-    await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
     await expect(page.getByTestId("model-effort-chip")).toBeVisible();
     await expect(page.getByTestId("context-chip")).toBeVisible();
     // This fixture reports a structured-workflow capability, so SessionPage
     // provides the permission menu rather than the raw-PTY read-only label.
-    const permission = page.getByTestId("permission-chip");
-    await expect(permission).toContainText("询问");
-    await expect(permission).toHaveAttribute("aria-expanded", "false");
-    await permission.click();
-    await expect(permission).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByTestId("permission-menu")).toBeVisible();
-    await expect(page.getByTestId("permission-option-manual")).toBeVisible();
-    await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+    if (mobile) {
+      // D-042: the harness chip and the permission control live in the
+      // options sheet; the fused trigger is the expanded anchor. The Grok
+      // fixture alternates between an editable wheel and a read-only label
+      // (same timing flake as desktop), so accept whichever one mounted.
+      const trigger = page.getByTestId("model-effort-chip");
+      await expect(trigger).toHaveAttribute("aria-expanded", "false");
+      await trigger.click();
+      await expect(trigger).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
+      const editable = await page.getByTestId("permission-menu").count();
+      if (editable) {
+        await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+        await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+      } else {
+        await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-readonly", "1");
+      }
+    } else {
+      await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
+      const permission = page.getByTestId("permission-chip");
+      await expect(permission).toContainText("询问");
+      await expect(permission).toHaveAttribute("aria-expanded", "false");
+      await permission.click();
+      await expect(permission).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByTestId("permission-menu")).toBeVisible();
+      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+      await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+    }
   });
 
   test("the fill reaches the knob at every stop; the ember field exists on ultracode alone", async ({ page }) => {

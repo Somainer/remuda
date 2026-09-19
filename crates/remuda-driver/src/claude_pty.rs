@@ -1440,16 +1440,34 @@ fn spawn_transcript_pump(
                     hydrator = Some((crate::claude_transcript::TranscriptTail::new(path), mapper));
                 }
             }
-            if let Some((tail, mapper)) = hydrator.as_mut() {
+            if let Some(hydrated) = hydrator.take() {
                 // A read error is transient (the file is being appended to);
                 // the next tick retries from the same offset.
-                let lines = tail.poll().unwrap_or_default();
-                // Flush the buffered assistant run at the end of the batch:
-                // the mapper holds a run open until it is superseded, so the
-                // final message of a finished turn would otherwise wait for
-                // the next record to arrive.
-                let mut batches: Vec<_> = lines.iter().map(|line| mapper.map_line(line)).collect();
-                batches.push(mapper.flush());
+                // D-045 §6.2: mapping (and the screenshot staging it can do)
+                // runs on a blocking thread — the stager parks until the Hub
+                // answers, so this never stalls a tokio worker.
+                let (tail, mapper, batches) =
+                    tokio::task::spawn_blocking(move || -> (
+                        crate::claude_transcript::TranscriptTail,
+                        TranscriptMapper,
+                        Vec<Result<Vec<Observation>, DriverError>>,
+                    ) {
+                        let (mut tail, mut mapper) = hydrated;
+                        let lines = tail.poll().unwrap_or_default();
+                        // Flush the buffered assistant run at the end of the
+                        // batch: the mapper holds a run open until superseded,
+                        // so the final message of a finished turn would
+                        // otherwise wait for the next record to arrive.
+                        let mut batches: Vec<_> =
+                            lines.iter().map(|line| mapper.map_line(line)).collect();
+                        batches.push(mapper.flush());
+                        (tail, mapper, batches)
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("transcript mapping task panicked: {error}")
+                    });
+                hydrator = Some((tail, mapper));
                 for batch in batches {
                     let mapped = match batch {
                         Ok(mapped) => mapped,

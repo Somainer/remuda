@@ -48,22 +48,36 @@ fn user_frame(content: serde_json::Value) -> serde_json::Value {
             "content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_cua_1",
+                "content": content.clone(),
+            }],
+        },
+        // Claude mirrors the content array here.
+        "toolUseResult": {
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_cua_1",
                 "content": content,
             }],
         },
     })
 }
 
-fn result_blocks(mapper: &mut StdoutMapper, content: serde_json::Value) -> Vec<ContentBlock> {
+fn map_result(
+    mapper: &mut StdoutMapper,
+    content: serde_json::Value,
+) -> remuda_protocol::ToolResultPayload {
     let observations = mapper.map(user_frame(content)).unwrap();
-    let result = observations
+    observations
         .into_iter()
         .find_map(|observation| match observation.body {
-            ObservationPayload::ToolResult(result) => Some(result),
+            ObservationPayload::ToolResult(result) => Some(*result),
             _ => None,
         })
-        .expect("one tool result");
-    result.blocks
+        .expect("one tool result")
+}
+
+fn result_blocks(mapper: &mut StdoutMapper, content: serde_json::Value) -> Vec<ContentBlock> {
+    map_result(mapper, content).blocks
 }
 
 #[test]
@@ -99,6 +113,30 @@ fn mixed_result_is_text_plus_staged_reference() {
         other => panic!("{other:?}"),
     }
     assert_eq!(stager.staged.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn whole_result_payload_carries_no_base64_with_mirrored_sidecar() {
+    let stager = Arc::new(FakeStager {
+        fail: false,
+        staged: Mutex::new(Vec::new()),
+    });
+    let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess").with_media_stager(stager);
+    let result = map_result(
+        &mut mapper,
+        json!([
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": png(),
+            }},
+        ]),
+    );
+    let raw = serde_json::to_string(&result).unwrap();
+    assert!(
+        !raw.contains(png().as_str()),
+        "mirrored sidecar leaked base64"
+    );
 }
 
 #[test]

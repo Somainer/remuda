@@ -22,6 +22,8 @@ export type SheetProps = {
   /** Applied to the panel, for per-caller width/placement. */
   className?: string;
   testId?: string;
+  /** Stable id for the panel, so the trigger's `aria-controls` resolves. */
+  panelId?: string;
   children: ReactNode;
 };
 
@@ -34,6 +36,7 @@ export function Sheet({
   variant = "popover",
   className = "",
   testId,
+  panelId,
   children,
 }: SheetProps) {
   const trap = useFocusTrap({ open, onClose, labelledBy, initialFocusRef, returnFocusRef });
@@ -49,6 +52,7 @@ export function Sheet({
         className={`${css.panel} ${variant === "sheet" ? css.panelSheet : css.panelPopover} ${className}`}
         data-testid={testId}
         data-variant={variant}
+        id={panelId}
       >
         {children}
       </div>

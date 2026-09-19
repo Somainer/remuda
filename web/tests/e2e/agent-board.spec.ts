@@ -4,28 +4,45 @@ function row(page: import("@playwright/test").Page, text: string) {
   return page.getByTestId("board-card").filter({ hasText: text }).first();
 }
 
+// Scope note (see docs/design/evidence/ux2026-nextstep-1.md §3): these rows
+// live in worktree Spaces OTHER than the default sfe-root Space the bare
+// /sessions route pins to, so the default route renders none of them
+// (pre-existing fixed-scope behavior, failing identically on unmodified
+// main). The row shape is scope-independent; ?scope=all only restores the
+// rows the assertions need.
 test.describe("agent board", () => {
   test("shows kind badges, worktree, status triple, snippet, and DONE", async ({ page }) => {
-    await page.goto("/sessions");
+    await page.goto("/sessions?scope=all");
     const grok = row(page, "grok-canary");
     await expect(grok).toBeVisible();
     await expect(grok).toHaveAttribute("data-kind", "grok");
     await expect(grok.getByTestId("board-done")).toContainText("DONE");
     await expect(grok.getByTestId("board-snippet")).toContainText("DONE ");
-    await expect(grok).toContainText("wt/x-acpwire/canary");
-    await expect(grok).toContainText("ready");
-    await expect(grok).toContainText("connected");
     await expect(row(page, "codex-worker")).toHaveAttribute("data-kind", "codex");
     await expect(row(page, "agy-board")).toHaveAttribute("data-kind", "agy");
     await expect(row(page, "claude-pty")).toHaveAttribute("data-kind", "claude");
+
+    // P0-6: the wire triple and host/worktree are hidden behind the row's
+    // closed disclosure by default; expanding reveals the same fields.
+    await expect(grok.getByTestId("session-lifecycle")).toBeHidden();
+    await grok.getByTestId("session-wire-toggle").click();
+    await expect(grok.getByTestId("session-lifecycle")).toBeVisible();
+    await expect(grok.getByTestId("session-lifecycle")).toContainText("ready");
+    await expect(grok.getByTestId("session-lifecycle")).toContainText("connected");
+    await expect(grok.getByTestId("session-wire")).toContainText("wt/x-acpwire/canary");
   });
 
   test("quick send, keys, and stop", async ({ page }) => {
-    await page.goto("/sessions");
+    await page.goto("/sessions?scope=all");
     const codex = row(page, "codex-worker");
+    await codex.getByTestId("board-more").click();
+    await expect(page.getByTestId("board-actions-panel")).toBeVisible();
     await codex.getByTestId("board-prompt").fill("PAUSE");
     await codex.getByTestId("board-send").click();
     await expect(codex.getByTestId("board-snippet")).toContainText("PAUSE");
+    // Sending closes the sheet; reopen for the key row. Keys keep it open so
+    // several keys can land in a row.
+    await codex.getByTestId("board-more").click();
     await codex.getByTestId("board-key-enter").click();
     await expect(codex.getByTestId("board-snippet")).toContainText("^ENTER");
     await codex.getByTestId("board-key-esc").click();
@@ -35,7 +52,7 @@ test.describe("agent board", () => {
   });
 
   test("fleet toolbar broadcasts to selected instances", async ({ page }) => {
-    await page.goto("/sessions");
+    await page.goto("/sessions?scope=all");
     await row(page, "codex-worker").getByTestId("board-select").check();
     await row(page, "agy-board").getByTestId("board-select").check();
     await expect(page.getByTestId("board-fleet")).toContainText("2 已选");

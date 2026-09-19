@@ -1,9 +1,12 @@
 import { useSyncExternalStore } from "react";
+
+/** Bounded journal tail the list reads per live instance to project its phrase. */
+const SUMMARY_TAIL = 64;
 import type { Command } from "../types/command";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
-import type { Id } from "../types/wire";
+import type { Id, U64 } from "../types/wire";
 import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
@@ -58,6 +61,7 @@ import {
   normalizePermissionMode as normalizeKindPermissionMode,
 } from "../features/session/permissions";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
+import { liveSummary } from "../features/session/liveSummary";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -289,6 +293,8 @@ export type HubState = {
   compact: boolean;
   answering: Record<string, true>;
   screens: Record<string, { lines: string[]; done: boolean }>;
+  /** List-row live phrases projected from each instance's journal tail. */
+  summaries: Record<string, string>;
 };
 
 const initial: HubState = {
@@ -322,6 +328,7 @@ const initial: HubState = {
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
   screens: {},
+  summaries: {},
 };
 
 type Listener = () => void;
@@ -997,6 +1004,88 @@ class HubStore {
     this.hydrateUsageRollups(instances.items);
     this.hydrateModels(instances.items);
     this.hydratePermissionEffective(instances.items);
+    // NOTE: list-row live phrases are NOT derived here. refresh() fans into
+    // every authenticated path (close/cancel/create/resume re-enter it) and
+    // must not add journal polling; the mounted SessionList hydrates phrases
+    // for the rows it renders via hydrateRowSummaries().
+  }
+
+  /** durableSeq already projected for a row phrase; unchanged seq = skip. */
+  private summarySeqs = new Map<Id, string>();
+  /** Ids this store currently projects phrases for (reconciled each tick). */
+  private summaryManaged = new Set<Id>();
+  /** Coalesces overlapping ticks so journal reads never overlap. */
+  private summariesInFlight: Promise<void> | null = null;
+
+  /**
+   * Project one live phrase per rendered list row from a bounded journal tail.
+   * Driven by the mounted SessionList poll (not refresh): the call is scoped
+   * to rendered row ids, skips instances whose durableSeq is unchanged, never
+   * overlaps itself, and clears phrases that no longer apply (finished run,
+   * row no longer rendered), so a row always falls back to its constant text
+   * rather than keeping a stale invented phrase.
+   */
+  hydrateRowSummaries(rowIds: Id[]): Promise<void> {
+    if (this.summariesInFlight) return this.summariesInFlight;
+    const job = this.projectRowSummaries(rowIds).finally(() => {
+      if (this.summariesInFlight === job) this.summariesInFlight = null;
+    });
+    this.summariesInFlight = job;
+    return job;
+  }
+
+  private async projectRowSummaries(rowIds: Id[]): Promise<void> {
+    const rows = rowIds.flatMap((id) => this.state.instances.find((row) => row.id === id) ?? []);
+    const current = new Map(rows.map((row) => [row.id, row]));
+    const results = await Promise.all(
+      rows.map(async (instance) => {
+        const seq = String(instance.durableSeq ?? "0");
+        if (this.summarySeqs.get(instance.id) === seq) {
+          return { instance, phrase: this.state.summaries[instance.id], unchanged: true } as const;
+        }
+        try {
+          // One bounded read: the journal endpoint serves the newest window
+          // (≤2000 rows ascending). Open at durable-N so the tail stays small.
+          const from = Math.max(0, Number(seq) - SUMMARY_TAIL);
+          const page = await api.eventsRead({
+            journalId: instance.journalId,
+            afterSeq: String(from) as U64,
+            limit: SUMMARY_TAIL,
+          });
+          this.summarySeqs.set(instance.id, seq);
+          return { instance, phrase: liveSummary(page.events) ?? "", unchanged: false } as const;
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    const next = { ...this.state.summaries };
+    let changed = false;
+    // Add/update the projected phrases for this render and drop keys whose
+    // row is no longer managed (space switch / unmount) so they cannot stick.
+    for (const id of this.summaryManaged) {
+      if (!current.has(id) && id in next) {
+        delete next[id];
+        this.summarySeqs.delete(id);
+        changed = true;
+      }
+    }
+    this.summaryManaged = new Set(current.keys());
+    for (const result of results) {
+      if (!result || result.unchanged) continue;
+      const { instance, phrase } = result;
+      if (phrase) {
+        if (next[instance.id] !== phrase) {
+          next[instance.id] = phrase;
+          changed = true;
+        }
+      } else if (instance.id in next) {
+        delete next[instance.id];
+        changed = true;
+      }
+    }
+    if (changed) this.emit({ summaries: next });
   }
 
   async follow(instanceId: Id) {
@@ -1017,9 +1106,13 @@ class HubStore {
     // Another mount may finish loading this journal while this read is pending.
     if (this.journals.has(instance.journalId)) return;
     const history = seed.events;
+    const historyPhrase = liveSummary(history);
     this.emit({
       instances: applyInstanceActivity(this.state.instances, history),
       events: { ...this.state.events, [instanceId]: history },
+      summaries: historyPhrase
+        ? { ...this.state.summaries, [instanceId]: historyPhrase }
+        : this.state.summaries,
     });
     // §9.1: the Hub record usually already carries the latest effective level;
     // replay history effort edges too so a reconnect before refresh is honest.
@@ -1058,6 +1151,12 @@ class HubStore {
         }
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
+        const phrase = liveSummary(next);
+        // Clear a finished run's phrase so the row falls back to its
+        // constant sentence instead of keeping a stale (invented) status.
+        const summaries = { ...this.state.summaries };
+        if (phrase) summaries[instanceId] = phrase;
+        else delete summaries[instanceId];
         this.emit({
           instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
@@ -1068,6 +1167,7 @@ class HubStore {
                 [instanceId]: { lines: lastLines(screen.lines, 80), done: doneFromLines(screen.lines) },
               }
             : this.state.screens,
+          summaries,
         });
       },
       onPrepend: (older) => {
@@ -1640,7 +1740,9 @@ class HubStore {
   }
 
   summaryOf(instanceId: Id) {
-    return api.summaryOf(instanceId);
+    // The live list projects the phrase from the journal tail into state;
+    // the mock client still supplies its scripted summaries directly.
+    return this.state.summaries[instanceId] ?? api.summaryOf(instanceId);
   }
 
   permissionModeOf(instanceId: Id) {

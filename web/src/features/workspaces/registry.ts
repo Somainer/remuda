@@ -8,6 +8,10 @@ export function mapWorkspace(row: RegisteredWorkspace): Workspace {
     label: row.root.split("/").filter(Boolean).at(-1) ?? row.root,
     revision: "1", createdAt: "", updatedAt: "",
     writePolicy: "default", canonicalRoot: known(row.root),
+    // Carried by clients that know the worktree metadata; the minimal Node
+    // registry reply omits them and the fields stay undefined.
+    worktreeLabel: row.worktreeLabel,
+    branch: row.branch,
   };
 }
 

@@ -96,6 +96,28 @@ async function postConfigure(page: Page, instanceId: string, model: string) {
   );
 }
 
+/**
+ * Wait until the verdict/lifecycle the fake node journals reaches the web's
+ * journal window. Read-back assertions must wait on this STATE instead of a
+ * fixed delay: under gate load the panel opened before the event was applied
+ * and the default 5s attribute timeout could expire.
+ */
+async function waitForJournalFragment(page: Page, instanceId: string, fragment: string): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(
+          async ({ id, needle }) =>
+            (
+              await fetch(`/v1/instances/${id}/journal`, { credentials: "include" }).then((r) => r.json())
+            ).events?.some((e: unknown) => JSON.stringify(e).includes(needle)) ?? false,
+          { id: instanceId, needle: fragment },
+        ),
+      { timeout: 15_000, message: `journal carries ${fragment}` },
+    )
+    .toBe(true);
+}
+
 test("the picker lists the gateway-discovered models and selection read-backs", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Model picker discovery");
@@ -198,10 +220,14 @@ test("a terminal-side /model moves the picker without posting configure", async 
   // Send a terminal-side slash command; the fake node echoes a model obs.
   await page.getByTestId("composer-input").fill("/model:e2e/fast");
   await page.getByTestId("composer-input").press("Enter");
+  // Wait for the slash-attributed model observation before opening the list:
+  // the picker reads the applied journal state, not the send's completion.
+  await waitForJournalFragment(page, instanceId, `"slash"`);
   await openModelList(page);
   await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
     "data-model-current",
     "fast",
+    { timeout: 10_000 },
   );
   await expect(page.getByTestId("model-option-fast")).toHaveAttribute("data-selected", "1");
   // The fold never called back into instance.configure (no ping-pong).
@@ -213,8 +239,11 @@ test("a not-found rejection reverts the selection and toasts", async ({ page }) 
   const instanceId = await createSession(page, "Model not found revert");
   await clearApprovals(page, instanceId);
   await postConfigure(page, instanceId, "__notfound__:e2e/ghost");
+  // The rejection toast renders from the model-degraded lifecycle event; wait
+  // for the verdict itself so a late journal cannot miss the 5s expectation.
+  await waitForJournalFragment(page, instanceId, "model-degraded");
   // A rejection toast is shown.
-  await expect(page.getByText(/模型切换被拒绝/)).toBeVisible();
+  await expect(page.getByText(/模型切换被拒绝/)).toBeVisible({ timeout: 10_000 });
   await openModelList(page);
   // Selection reverted to the launch model auto, not the refused ghost.
   await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute("data-model-current", "auto");
@@ -226,6 +255,8 @@ test("a queued model switch shows the 排队中 tag", async ({ page }) => {
   const instanceId = await createSession(page, "Model queued tag");
   await clearApprovals(page, instanceId);
   await postConfigure(page, instanceId, "__queued__:e2e/fast");
+  // The queued tag renders from the model-queued lifecycle verdict.
+  await waitForJournalFragment(page, instanceId, "model-queued");
   await openModelList(page);
   await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
     "data-model-pending",

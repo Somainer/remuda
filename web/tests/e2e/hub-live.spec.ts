@@ -17,42 +17,49 @@ async function shot(page: Page, name: string) {
 
 /** Answer every pending approval/question this instance currently has. */
 async function answerPendingApprovals(page: Page, instanceId: string) {
+  // Gate flake: a launch approval is journaled concurrently with the create
+  // response, so an interactions poll taken immediately after navigation can
+  // read 0 pending — a `.toBe(0)` poll then passes before the approval exists
+  // and the launch stays blocked forever (90s test timeout). Wait for the
+  // pending approval to APPEAR, answer it, then wait for the list to clear.
+  const pending = () =>
+    page.evaluate(async (id) => {
+      const list = await fetch("/v1/interactions", { credentials: "include" });
+      const body = (await list.json()) as {
+        items?: {
+          id: string;
+          instanceId?: string;
+          state?: string;
+          request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
+        }[];
+      };
+      return (body.items ?? []).filter((item) => item.instanceId === id && item.state === "pending");
+    }, instanceId);
+
+  const mine = await expect
+    .poll(async () => (await pending()).length, { timeout: 20_000, message: "launch approval appears" })
+    .toBeGreaterThan(0)
+    .then(() => pending());
+
+  for (const item of mine) {
+    const optionId = item.request?.options?.[0]?.id;
+    if (!optionId) continue;
+    await page.evaluate(
+      ({ iid, optionId, digest }) =>
+        fetch(`/v1/interactions/${iid}/answer`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
+          }),
+        }),
+      { iid: item.id, optionId, digest: item.request?.inputDigest },
+    );
+  }
+
   await expect
-    .poll(
-      async () =>
-        await page.evaluate(async (id) => {
-          const list = await fetch("/v1/interactions", { credentials: "include" });
-          const body = (await list.json()) as {
-            items?: {
-              id: string;
-              instanceId?: string;
-              state?: string;
-              request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
-            }[];
-          };
-          const mine = (body.items ?? []).filter(
-            (item) => item.instanceId === id && item.state === "pending",
-          );
-          for (const item of mine) {
-            const optionId = item.request?.options?.[0]?.id;
-            if (!optionId) continue;
-            await fetch(`/v1/interactions/${item.id}/answer`, {
-              method: "POST",
-              credentials: "include",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                answer: {
-                  kind: "approval",
-                  optionId,
-                  inputDigest: item.request?.inputDigest ?? "",
-                },
-              }),
-            });
-          }
-          return mine.length;
-        }, instanceId),
-      { timeout: 20_000 },
-    )
+    .poll(async () => (await pending()).length, { timeout: 20_000, message: "approvals clear" })
     .toBe(0);
 }
 

@@ -242,6 +242,48 @@ impl DirectResponse {
     }
 }
 
+/// Why a direct-net egress call failed, carrying the ladder stage so the
+/// listener maps it to an HTTP status and a stable relay code without
+/// substring-matching rendered text. No variant carries the origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectForwardError {
+    /// The frame-named path/method was refused before any network call.
+    DestinationRefused,
+    /// The gateway could not be reached (connect refused/DNS/reset).
+    GatewayUnreachable,
+    /// The first-byte ladder elapsed.
+    TimedOut,
+}
+
+impl DirectForwardError {
+    /// HTTP status the W-facing listener renders.
+    pub(crate) fn status(self) -> u16 {
+        match self {
+            Self::DestinationRefused => 502,
+            Self::GatewayUnreachable => 503,
+            Self::TimedOut => 504,
+        }
+    }
+
+    /// Stable relay code in the Anthropic-shaped error body.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::DestinationRefused => API_ERROR_DESTINATION_REFUSED,
+            Self::GatewayUnreachable => remuda_protocol::hubnode::API_ERROR_VIA_HOST_OFFLINE,
+            Self::TimedOut => API_ERROR_UPSTREAM_TIMEOUT,
+        }
+    }
+
+    /// Fixed, origin-free message for the W-facing body.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::DestinationRefused => "the relay request was refused",
+            Self::GatewayUnreachable => "the pinned gateway origin was unreachable",
+            Self::TimedOut => "upstream timed out before first byte",
+        }
+    }
+}
+
 /// Run one direct-net request (H's direct listener → gateway). Same origin
 /// pin and credential swap as [`serve_inbound`], no frame layer. The body is
 /// streamed (the caller enforces its byte cap at the stream boundary), never
@@ -255,26 +297,29 @@ pub(crate) async fn direct_forward(
     query: &str,
     headers: Vec<ApiHeader>,
     body: reqwest::Body,
-) -> Result<DirectResponse, NodeError> {
-    let url = build_url(ctx, path, query)?;
+) -> Result<DirectResponse, DirectForwardError> {
+    let url = build_url(ctx, path, query).map_err(|_| DirectForwardError::DestinationRefused)?;
     let method = method
         .parse::<reqwest::Method>()
-        .map_err(|error| NodeError::InvalidRequest(format!("method not allowed: {error}")))?;
+        .map_err(|_| DirectForwardError::DestinationRefused)?;
     let request = http
         .request(method, url)
         .headers(header_map(&build_headers(ctx, headers)))
         .body(body);
-    let response = tokio::time::timeout(ctx.timeouts.ttft, request.send())
-        .await
-        .map_err(|_| {
-            NodeError::Transport("api relay direct upstream timed out before first byte".into())
-        })?
-        .map_err(|error| {
+    let response = match tokio::time::timeout(ctx.timeouts.ttft, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
             // The reqwest Display carries the pinned URL (gateway origin): it
             // is logged on H only and must not be rendered into a body W sees.
             tracing::warn!(%error, "direct egress gateway request failed");
-            NodeError::Transport("api relay direct upstream request failed".into())
-        })?;
+            return if error.is_connect() || error.is_timeout() {
+                Err(DirectForwardError::GatewayUnreachable)
+            } else {
+                Err(DirectForwardError::DestinationRefused)
+            };
+        }
+        Err(_) => return Err(DirectForwardError::TimedOut),
+    };
     Ok(DirectResponse {
         status: response.status(),
         headers: response_headers_from(&response),

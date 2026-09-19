@@ -137,8 +137,13 @@ impl RelayInstance {
 pub(crate) struct Provision {
     /// The running listener.
     pub(crate) listener: Arc<RelayInstance>,
-    /// The resolved, echoed route — never `auto`.
+    /// The resolved, echoed route — never `auto`. Read by tests; production
+    /// callers use [`Self::observed`].
+    #[allow(dead_code)]
     pub(crate) kind: ApiRouteKind,
+    /// The observed route registered together with the listener, so a retry
+    /// can never observe a live listener with no route to echo.
+    pub(crate) observed: remuda_protocol::ApiRoute,
 }
 
 /// A provisioned route plus the values the settings overlay must carry.
@@ -176,21 +181,24 @@ pub(crate) async fn provision_for_request(
     if !matches!(route.mode, ProviderDeliveryMode::Via) {
         return Ok(None);
     }
-    let Some(via_host_id) = route.via_host_id.clone() else {
+    if route.via_host_id.is_none() {
         return Err(NodeError::InvalidRequest(
             "api route mode `via` requires a viaHostId".into(),
         ));
-    };
-    // An earlier accepted attempt already bound this instance's relay. Echo
-    // the same overlay and observed route with no new guard: its lifetime is
-    // owned by the worker the first attempt spawned.
+    }
+    // An earlier accepted attempt already bound this instance's relay. A
+    // worker listener is always registered together with its observed route,
+    // so a route-less entry is a different role (the proxy listener): reuse
+    // is refused rather than echoing a fabricated route.
     if let Some(existing) = state.instance_relay(instance_id) {
+        let observed = existing.observed.clone().ok_or_else(|| {
+            NodeError::InvalidConfig(
+                "api relay instance id is already bound without a via route".into(),
+            )
+        })?;
         return Ok(Some(ProvisionedRoute {
             overlay: existing.overlay(),
-            observed: existing
-                .observed
-                .clone()
-                .expect("a worker listener is always registered with its observed route"),
+            observed,
             guard: None,
         }));
     }
@@ -205,7 +213,6 @@ pub(crate) async fn provision_for_request(
                 "api relay launch needs the profile baseUrl to bind its base path".into(),
             )
         })?;
-    let via_host_id_for_route = via_host_id.clone();
     let provision = provision_worker(
         state,
         instance_id,
@@ -218,11 +225,9 @@ pub(crate) async fn provision_for_request(
         base_url: provision.listener.base_url(),
         bearer: provision.listener.bearer_token(),
     };
-    let observed = remuda_protocol::ApiRoute::via(via_host_id_for_route, None, provision.kind);
-    state.set_observed(instance_id, observed.clone());
     Ok(Some(ProvisionedRoute {
         overlay,
-        observed,
+        observed: provision.observed,
         guard: Some(super::ProvisionGuard::new(
             Arc::clone(state),
             instance_id.to_owned(),
@@ -267,13 +272,28 @@ pub(crate) async fn provision_worker_with_bearer(
         NodeError::InvalidRequest(format!("api relay profile baseUrl invalid: {error}"))
     })?;
     let base_path = parsed.path().to_owned();
+    // Build the observed route alongside the bind so it can be registered in
+    // the same step; the via host comes from the validated request.
+    let via_host = requested.via_host_id.clone().ok_or_else(|| {
+        NodeError::InvalidRequest("api route mode `via` requires a viaHostId".into())
+    })?;
+    let observed_for =
+        move |kind: ApiRouteKind| remuda_protocol::ApiRoute::via(via_host.clone(), None, kind);
     match requested.route {
         ApiRouteMode::HubRelay => {
-            let listener =
-                start_worker(state, instance_id, &base_path, WorkerMode::HubRelay, bearer).await?;
+            let listener = start_worker(
+                state,
+                instance_id,
+                &base_path,
+                WorkerMode::HubRelay,
+                bearer,
+                observed_for(ApiRouteKind::HubRelay),
+            )
+            .await?;
             Ok(Provision {
                 listener,
                 kind: ApiRouteKind::HubRelay,
+                observed: observed_for(ApiRouteKind::HubRelay),
             })
         }
         ApiRouteMode::DirectNet => {
@@ -298,11 +318,13 @@ pub(crate) async fn provision_worker_with_bearer(
                 &base_path,
                 WorkerMode::DirectNet { endpoint: url },
                 bearer,
+                observed_for(ApiRouteKind::DirectNet),
             )
             .await?;
             Ok(Provision {
                 listener,
                 kind: ApiRouteKind::DirectNet,
+                observed: observed_for(ApiRouteKind::DirectNet),
             })
         }
         ApiRouteMode::Auto => {
@@ -320,18 +342,28 @@ pub(crate) async fn provision_worker_with_bearer(
                     &base_path,
                     WorkerMode::DirectNet { endpoint: url },
                     bearer,
+                    observed_for(ApiRouteKind::DirectNet),
                 )
                 .await?;
                 return Ok(Provision {
                     listener,
                     kind: ApiRouteKind::DirectNet,
+                    observed: observed_for(ApiRouteKind::DirectNet),
                 });
             }
-            let listener =
-                start_worker(state, instance_id, &base_path, WorkerMode::HubRelay, bearer).await?;
+            let listener = start_worker(
+                state,
+                instance_id,
+                &base_path,
+                WorkerMode::HubRelay,
+                bearer,
+                observed_for(ApiRouteKind::HubRelay),
+            )
+            .await?;
             Ok(Provision {
                 listener,
                 kind: ApiRouteKind::HubRelay,
+                observed: observed_for(ApiRouteKind::HubRelay),
             })
         }
     }
@@ -374,6 +406,7 @@ async fn start_worker(
     base_path: &str,
     mode: WorkerMode,
     bearer: RelayBearer,
+    observed: remuda_protocol::ApiRoute,
 ) -> Result<Arc<RelayInstance>, NodeError> {
     // The only bind a worker listener ever performs. The `0` asks the kernel
     // for a free port; the `127.0.0.1` is non-negotiable.
@@ -393,6 +426,7 @@ async fn start_worker(
         RelayRole::Worker(mode),
         bearer,
         Vec::new(),
+        Some(observed),
     )
     .await
 }
@@ -431,6 +465,8 @@ pub(crate) async fn start_proxy(
         RelayRole::Proxy(context),
         bearer,
         rules,
+        // Proxy direct-net listeners carry no via route of their own.
+        None,
     )
     .await
 }
@@ -444,6 +480,7 @@ async fn start_serving(
     role: RelayRole,
     bearer: RelayBearer,
     rules: Vec<policy::PeerRule>,
+    observed: Option<remuda_protocol::ApiRoute>,
 ) -> Result<Arc<RelayInstance>, NodeError> {
     let (stop, stopped) = oneshot::channel::<()>();
     let instance = Arc::new(RelayInstance {
@@ -472,7 +509,10 @@ async fn start_serving(
             tracing::debug!(%error, "api relay listener exited");
         }
     });
-    state.register_instance(Arc::clone(&instance), None);
+    // Listener and observed route register in one step: a retry that finds the
+    // listener always finds the route to echo, and register_instance shuts
+    // down any listener evicted by this insert.
+    state.register_instance(Arc::clone(&instance), observed);
     Ok(instance)
 }
 

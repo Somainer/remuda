@@ -954,6 +954,28 @@ async fn fake_node(
                             append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
                         continue;
                     }
+                    // c-cua-media: a computer-use MCP call whose result carries
+                    // a screenshot staged through the host-token object route.
+                    if cua_screenshot_prompt(prompt) {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        append_n = append_cua_scenario(
+                            &mut ws,
+                            addr,
+                            host_id.as_id().as_str(),
+                            &durable_token,
+                            &instance_id,
+                            prompt,
+                            command_id,
+                            append_n,
+                        )
+                        .await?;
+                        continue;
+                    }
                     // C2: the journal user node for a composer send carries the
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
@@ -3889,6 +3911,273 @@ async fn append_workflow_scenario(
         ),
     )
     .await?;
+    Ok(n)
+}
+
+/// c-cua-media: the screenshot sentinel — a prompt with this prefix drives the
+/// synthetic computer-use tool result instead of the echo path.
+fn cua_screenshot_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("cua screenshot")
+}
+
+/// A fixed 240x240 synthetic PNG (a red→blue gradient band, 1622 bytes).
+/// Never a real desktop capture (`codex-cua.md` §6.4).
+fn cua_png_base64() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(cua_png_bytes())
+}
+
+fn cua_png_bytes() -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(CUA_PNG_240_B64)
+        .expect("synthetic png fixture")
+}
+
+/// Base64 of the 240x240 synthetic fixture.
+const CUA_PNG_240_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAPAAAADwCAIAAACxN37FAAAGHUlEQVR42u3SBxMIBAAGUJJsl1EUulRGqCtb6MqqiCMUX+NaKkqHkIiTNMXJ3ofKTKepxUXKKhcZyTijZOWMSqWu+h+9n/DuXoEC+adg/j4nfxXK2XPzZ+H8cV5+L5IzRfNbsfxaPL+UyOmSOVUqJ0vnxPk5XiY/l82xcjlaPkcuyOELc6hCfqqYgxflx4vzQ6UcqJz9VbLvkuy9NHuqZvdl2XV5dl6R76tlR/V8VyPba2bbldlaK1tq59s62XxVNl2db67Jxmvzdd18VS8b6md9g6xrmLWNsqZxvmySL67L6qb5vFlWNc/K6/PZDVlxY5a3yKct80mrfNw6H7XJhzdl2c354Ja83zbvtcu7t+ad9nm7Q5Z2zFudsuS2vNk5i7tkUdcsvD0L7sj8bpnXPW8kr9+Z1+7K3Lsz557Mvjez7svM+zPjgUx/MNN6ZOpDmfJwJj+SST0zsVcmPJrxj2Vc77z6eMb2yZi+Gd0vrzyRUf3z8oC8NDAvPpkXBuX5p/Lc4IwckmefzoiheWZYhg/PsGcydESefjZDRmbwc3nq+Qx6IU++mIEvZcDL6T8qT7ySfqPTd0z6jM3jr6b3uDw2Po9OSK+J6Tkpj0zOw1Py0NT0mJYHp+eBGbl/Zu6blXtn5545uXtu7notd76e/0jd56Xb/NyxILcvTNdF6bI4nd/MbUvS6a10XJoOb6f9O7n13bR7L23fzy0f5OZluenDtPkorT9Oq0/S8tO0WJ4bV+SGz3L9yjRflWafp+nqXPdFmnyZxmvSaG0arkuD9am/IfW+St2vc+3GXPNNrt6UqzanzrepvSW1tubKbam5PTW+S/UdqfZ9rtiZy3flst2puieX7s0l+1JlfyofSKUfcvGPuehgKv6UCody4eFccCTlj6bcsZT9OWWO5/wTKX0ypU6l5OmU+CXFf02x31L0TIr8nvP+SOE/c+7ZFPor5/ydgv+kQAGhhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFlpooYUWWmihhRZaaKGFFvr/EvpfXjJrkxF8WxAAAAAASUVORK5CYII=";
+
+/// The fake-node stager the *real* transcript mapper calls when it folds the
+/// native image item. Like the production Node, it posts to the host-token
+/// route asking for typed image storage. The fold runs on the tokio blocking
+/// pool (which still carries runtime context), so the upload runtime has to
+/// live on its own std thread — a nested `Runtime::block_on` there would
+/// panic ("Cannot start a runtime from within a runtime").
+#[derive(Debug)]
+struct CuaStager {
+    http_base: String,
+    host: String,
+    token: String,
+}
+
+impl remuda_protocol::ToolMediaStager for CuaStager {
+    fn max_bytes(&self) -> u64 {
+        25 * 1024 * 1024
+    }
+
+    fn stage(
+        &self,
+        name: &str,
+        media_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<remuda_protocol::Id, remuda_protocol::ToolMediaError> {
+        let http_base = self.http_base.clone();
+        let host = self.host.clone();
+        let token = self.token.clone();
+        let name = name.to_owned();
+        let media_type = media_type.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.send(Err(remuda_protocol::ToolMediaError::Unstageable(format!(
+                        "runtime: {error}"
+                    ))));
+                    return;
+                }
+            };
+            let result = runtime.block_on(async move {
+                let response = reqwest::Client::new()
+                    .post(format!("{http_base}/v1/hosts/{host}/files/objects",))
+                    .bearer_auth(&token)
+                    .header("Content-Type", "application/octet-stream")
+                    .query(&[("name", name.as_str()), ("mediaType", media_type.as_str())])
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        remuda_protocol::ToolMediaError::Unstageable(format!("upload: {error}"))
+                    })?;
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                if !status.is_success() {
+                    return Err(remuda_protocol::ToolMediaError::Unstageable(format!(
+                        "hub refused: {status}"
+                    )));
+                }
+                let staged: Value = serde_json::from_str(&body).map_err(|error| {
+                    remuda_protocol::ToolMediaError::Unstageable(format!("json: {error}"))
+                })?;
+                let object_id =
+                    staged
+                        .get("objectId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            remuda_protocol::ToolMediaError::Unstageable("no objectId".into())
+                        })?;
+                remuda_protocol::Id::try_from(object_id.to_owned()).map_err(|error| {
+                    remuda_protocol::ToolMediaError::Unstageable(format!("id: {error}"))
+                })
+            });
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(95))
+            .map_err(|error| {
+                remuda_protocol::ToolMediaError::Unstageable(format!("stager join: {error}"))
+            })?
+    }
+}
+
+/// c-cua-media: append NATIVE claude transcript records — an MCP tool call and
+/// a tool result whose content carries a base64 screenshot — and let the REAL
+/// remuda-journal mapper fold them. The mapper's stager uploads the PNG to the
+/// object route, so what gets journaled is the object reference; the mirrored
+/// `toolUseResult` is scrubbed too. Drives the same path a production Node
+/// takes, rather than hand-building folded blocks (D-045 §6.2).
+#[allow(clippy::too_many_arguments)]
+async fn append_cua_scenario(
+    ws: &mut NodeWs,
+    addr: SocketAddr,
+    host: &str,
+    token: &str,
+    instance_id: &str,
+    prompt: &str,
+    command_id: Option<&str>,
+    mut n: u64,
+) -> Result<u64> {
+    // The composer's own bubble with the SAME commandId shape the normal
+    // composer-send path uses, so the optimistic bubble folds away instead
+    // of lingering on 等待发送.
+    let node = command_id
+        .map(|id| {
+            // Strip the prefix and use the bare UUID, exactly like
+            // append_command_user: obj_cmd_<uuid> is rejected by typed id
+            // consumers.
+            id.strip_prefix("cmd_")
+                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
+        })
+        .unwrap_or_else(|| format!("obj_legacy_{n}"));
+    n = append_user_message(ws, instance_id, n, prompt, command_id, &node).await?;
+
+    let http_base = format!("http://{addr}");
+    let stager = std::sync::Arc::new(CuaStager {
+        http_base,
+        host: host.to_owned(),
+        token: token.to_owned(),
+    });
+    let instance = remuda_protocol::InstanceId::try_from(instance_id.to_owned())?;
+    let image = cua_png_base64();
+    // Native records, mirroring what `claude` writes when an MCP tool returns
+    // a screenshot: the assistant tool_use, then the user tool_result. The
+    // sidecar duplicates the content array — the mapper must scrub both.
+    let assistant_line = json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_cua_get_app_state_1",
+                "name": "mcp__codex-computer-use__get_app_state",
+                "input": { "app": "com.apple.Safari" },
+            }],
+        },
+    });
+    let result_line = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_cua_get_app_state_1",
+                "content": [
+                    { "type": "text", "text": "window state captured" },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image,
+                        },
+                    },
+                ],
+            }],
+        },
+        // Claude mirrors the content here; the producer must scrub it.
+        "toolUseResult": {
+            "content": [
+                { "type": "text", "text": "window state captured" },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image,
+                    },
+                },
+            ],
+        },
+    });
+
+    // Fold on a blocking thread: the stager parks until the Hub answers, so
+    // this must not run on the fake node's tokio workers (same rule the
+    // production driver prefold follows).
+    let host_owned = host.to_owned();
+    let events = tokio::task::spawn_blocking(move || -> Result<Vec<Value>> {
+        let mut events = Vec::new();
+        let ctx = remuda_journal::MapContext::claude_file(
+            instance.clone(),
+            remuda_protocol::Id::new("obj")?,
+            remuda_protocol::HostId::try_from(host_owned)?,
+            "cua-session",
+            remuda_protocol::SourceChannel::Transcript,
+        )
+        .with_media_stager(Some(stager));
+        let mut ids = remuda_journal::NativeIds::new(instance.as_id().as_str());
+        for record in [assistant_line, result_line] {
+            let line = serde_json::to_vec(&record)?;
+            let cursor = remuda_protocol::FileCursor {
+                file_identity: remuda_protocol::Id::new("obj")?,
+                file_generation: remuda_protocol::U64(1),
+                length: remuda_protocol::U64(line.len() as u64),
+                digest: remuda_journal::digest_of(&line),
+                offset: remuda_protocol::U64(line.len() as u64),
+            };
+            for envelope in remuda_journal::map_claude_line(&ctx, &mut ids, &line, &cursor)? {
+                // The observation payload serializes externally tagged as
+                // {"kind","payload"}; journal.append wants the kind plus its
+                // inner payload (it re-wraps), so pull the payload out.
+                let tagged = serde_json::to_value(&envelope.body)?;
+                let kind = tagged
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("mapped envelope has no kind: {tagged}"))?
+                    .to_owned();
+                let payload = tagged
+                    .get("payload")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("mapped envelope has no payload: {tagged}"))?;
+                events.push(json!({ "kind": kind, "payload": payload }));
+            }
+        }
+        Ok(events)
+    })
+    .await??;
+    for event in events {
+        let kind = event
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("mapped event missing kind"))?
+            .to_owned();
+        let payload = event
+            .get("payload")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("mapped event missing payload"))?;
+        n = append_event(ws, instance_id, n, &kind, payload).await?;
+    }
+
+    n = append_journal(
+        ws,
+        instance_id,
+        n,
+        "assistant",
+        "cua screenshot staged through the object store",
+    )
+    .await?;
+    n = append_native_status(ws, instance_id, n, "idle").await?;
     Ok(n)
 }
 

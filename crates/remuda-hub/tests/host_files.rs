@@ -516,6 +516,154 @@ async fn node_stages_with_its_own_token_and_another_host_cannot() -> Result<()> 
 }
 
 #[tokio::test]
+async fn staged_screenshot_is_typed_and_served_as_an_image() -> Result<()> {
+    // D-045 §6.2: a tool-result screenshot stages with an explicit
+    // `mediaType` and is served inline as the sniffed image type so the web
+    // tool card can render it from `/v1/objects/{id}`.
+    let fixture = fixture().await?;
+    // Complete 1x1 PNG (signature alone is enough for the sniffer; carry the
+    // whole file so the browser-side e2e renders the same bytes).
+    let png = base64_png_1x1();
+
+    async fn raw_head(
+        addr: std::net::SocketAddr,
+        path: &str,
+        token: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> Result<(u16, String, Vec<u8>)> {
+        let mut stream = TcpStream::connect(addr).await?;
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+             Content-Type: {content_type}\r\nContent-Length: {}\r\n\
+             Authorization: Bearer {token}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).await?;
+        stream.write_all(body).await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        let split = buf
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| anyhow!("no header terminator"))?;
+        let head_text = String::from_utf8_lossy(&buf[..split]).to_string();
+        let status = head_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        Ok((status, head_text, buf[split + 4..].to_vec()))
+    }
+
+    let (status, head, body) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?name=screen-1.png&mediaType=image/png",
+            fixture.host_id
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        &png,
+    )
+    .await?;
+    assert_eq!(status, 200, "{head}");
+    let staged = serde_json::from_str::<Value>(String::from_utf8_lossy(&body).trim())?;
+    let object_id = staged["objectId"].as_str().context("objectId")?.to_owned();
+
+    // The browser route serves the same bytes inline as image/png.
+    let (status, pulled) = raw(
+        fixture.addr,
+        "GET",
+        &format!("/v1/objects/{object_id}"),
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200);
+    assert_eq!(pulled, png);
+
+    // A claimed image type the bytes do not back is a 400, never a stored
+    // object typed image/* (which would hand the browser a renderer).
+    let (status, _, _) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?mediaType=image/png",
+            fixture.host_id
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        b"not a png at all",
+    )
+    .await?;
+    assert_eq!(status, 400);
+
+    // A non-image mediaType is refused on this opt-in.
+    let (status, _, _) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?mediaType=text/html",
+            fixture.host_id
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        &png,
+    )
+    .await?;
+    assert_eq!(status, 400);
+
+    // image/jpg is the legacy spelling of image/jpeg; it must be accepted
+    // when the magic bytes are JPEG (declared_matches, not strict equality).
+    let jpeg = [
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+    ];
+    let (status, head, body) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?name=screen.jpg&mediaType=image/jpg",
+            fixture.host_id
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        &jpeg,
+    )
+    .await?;
+    assert_eq!(status, 200, "{head}");
+    let staged = serde_json::from_str::<Value>(String::from_utf8_lossy(&body).trim())?;
+    assert!(staged["objectId"].as_str().is_some());
+
+    // An over-long / malformed media type is rejected on validation, before
+    // the bytes are inspected — the raw claim never reaches the 400 body.
+    let long_type = format!("image/{}", "x".repeat(256));
+    let (status, head, _) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?mediaType={}",
+            fixture.host_id, long_type
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        &png,
+    )
+    .await?;
+    assert_eq!(status, 400);
+    assert!(!head.contains(&long_type));
+
+    fixture.hub.shutdown().await;
+    Ok(())
+}
+
+/// The 70-byte 1x1 PNG the e2e fake node stages too.
+fn base64_png_1x1() -> Vec<u8> {
+    const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(PNG_B64)
+        .expect("png fixture")
+}
+
+#[tokio::test]
 async fn staging_rejects_oversize_and_unsanitized_names() -> Result<()> {
     let fixture = fixture().await?;
     // Declared length over the 25 MiB default cap is rejected on the header

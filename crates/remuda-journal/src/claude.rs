@@ -184,6 +184,17 @@ impl ClaudeJsonlTailer {
         })
     }
 
+    /// Attach the Node's tool-media stager so image result blocks stage their
+    /// bytes and become `objectId` references (D-045 §6.2).
+    #[must_use]
+    pub fn with_media_stager(
+        mut self,
+        stager: std::sync::Arc<dyn remuda_protocol::ToolMediaStager>,
+    ) -> Self {
+        self.ctx = self.ctx.with_media_stager(Some(stager));
+        self
+    }
+
     /// Resume a previous tail.
     pub fn resume(path: impl Into<PathBuf>, ctx: MapContext, resume: SourceResume) -> Self {
         let ids = NativeIds::new(ctx.instance_id.as_id().as_str());
@@ -1365,7 +1376,21 @@ fn tool_result(
     // subagent launch whose real completion arrives as a task-notification.
     let sidecar = value.get("toolUseResult");
     let async_launch = remuda_protocol::tool_result_is_async_launch(sidecar) && !is_error;
-    let text = tool_result_text(block);
+    // Image content (e.g. an MCP screenshot) is staged into the object store
+    // and carried as an `objectId` reference; unstageable bytes degrade to a
+    // text block. D-045 §6.2: bytes are never inlined into the journal.
+    let folded =
+        remuda_protocol::fold_tool_result(block.get("content"), ctx.media_stager.as_deref());
+    // Claude mirrors the native content array into `toolUseResult`; scrub any
+    // mirrored image data there too, or the base64 rides into
+    // `structured_result` and back out on every replay.
+    let structured_result = match sidecar.cloned() {
+        Some(mut sidecar) => {
+            remuda_protocol::sanitize_tool_result_sidecar(&mut sidecar, &folded.images);
+            Knowledge::Known { value: sidecar }
+        }
+        None => unknown("not-emitted"),
+    };
     // The result node is opened at revision 1, whether Final (normal result)
     // or Partial (background launch); a later task-notification replaces it at
     // revision 5 and the hook SubagentStop at revision 4.
@@ -1394,11 +1419,8 @@ fn tool_result(
             } else {
                 ToolOutcome::Succeeded
             },
-            blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
-            structured_result: match sidecar {
-                Some(v) => known(v.clone()),
-                None => unknown("not-emitted"),
-            },
+            blocks: folded.blocks,
+            structured_result,
             exit_code: unknown("not-emitted"),
             changes: Vec::new(),
         })),
@@ -1466,22 +1488,6 @@ fn task_notification_results(
             changes: Vec::new(),
         })),
     )?])
-}
-
-fn tool_result_text(block: &Value) -> String {
-    match block.get("content") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(items)) => items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
 }
 
 fn tool_category(name: &str) -> ToolCategory {

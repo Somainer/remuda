@@ -172,6 +172,7 @@ async fn live_claude_pty_start_prompt_idle_read_close() {
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         instance_id: None,
+        media_stager: None,
         profile: profile(),
         launch_dir: launch.clone(),
         native_home: isolated_native_home(),

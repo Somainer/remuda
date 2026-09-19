@@ -115,7 +115,7 @@ fn rpc_serves_the_recorded_sidechain_transcript() {
         ))
         .unwrap();
 
-    let result = remuda_node::subagent::read_for_store(&store, &instance_id, AGENT).unwrap();
+    let result = remuda_node::subagent::read_for_store(&store, &instance_id, AGENT, None).unwrap();
     assert_eq!(result["available"], serde_json::json!(true));
     assert_eq!(result["meta"]["agentId"], serde_json::json!(AGENT));
     assert_eq!(result["meta"]["runId"], serde_json::json!(RUN));
@@ -136,11 +136,13 @@ fn rpc_serves_the_recorded_sidechain_transcript() {
 
     // A registered-but-unstarted agent reads as 启动中, not an error.
     let starting =
-        remuda_node::subagent::read_for_store(&store, &instance_id, "0000000000000000").unwrap();
+        remuda_node::subagent::read_for_store(&store, &instance_id, "0000000000000000", None)
+            .unwrap();
     assert_eq!(starting["available"], serde_json::json!(false));
 
     // Path-traversal agent ids are rejected before touching the filesystem.
-    let err = remuda_node::subagent::read_for_store(&store, &instance_id, "../etc").unwrap_err();
+    let err =
+        remuda_node::subagent::read_for_store(&store, &instance_id, "../etc", None).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("agent"),
         "unexpected error: {err}"
@@ -151,5 +153,103 @@ fn rpc_serves_the_recorded_sidechain_transcript() {
 fn unknown_instance_is_a_store_error() {
     let tmp = tempfile::tempdir().unwrap();
     let store = MemoryStore::open_journaled(tmp.path().join("node"), 256).unwrap();
-    assert!(remuda_node::subagent::read_for_store(&store, &InstanceId::new(), AGENT).is_err());
+    assert!(
+        remuda_node::subagent::read_for_store(&store, &InstanceId::new(), AGENT, None).is_err()
+    );
+}
+
+/// D-045 §6.2: a screenshot in a sidechain tool result stages through an
+/// injected stager and comes back as an object reference (subagent path).
+#[test]
+fn subagent_read_stages_screenshot_to_object_reference() {
+    use remuda_protocol::{Id, ToolMediaError, ToolMediaStager};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingStager {
+        staged: Mutex<Vec<(String, String, usize)>>,
+    }
+    impl std::fmt::Debug for RecordingStager {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("RecordingStager")
+        }
+    }
+    impl ToolMediaStager for RecordingStager {
+        fn max_bytes(&self) -> u64 {
+            4 * 1024 * 1024
+        }
+        fn stage(
+            &self,
+            name: &str,
+            media_type: &str,
+            bytes: Vec<u8>,
+        ) -> Result<Id, ToolMediaError> {
+            self.staged
+                .lock()
+                .unwrap()
+                .push((name.to_owned(), media_type.to_owned(), bytes.len()));
+            Id::new("obj").map_err(|e| ToolMediaError::Unstageable(e.to_string()))
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let session_id = "sess_cua";
+    let project = tmp.path().join("home/.claude/projects/-tmp-subagent-cua");
+    let run_dir = project.join(format!("{session_id}/subagents/workflows/{RUN}"));
+    fs::create_dir_all(&run_dir).unwrap();
+    // 1x1 PNG base64 (67 raw bytes).
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    let agent_line = serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_shot",
+                "content": [
+                    {"type": "text", "text": "captured"},
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": png
+                    }}
+                ]
+            }]
+        }
+    });
+    fs::write(
+        run_dir.join(format!("agent-{AGENT}.jsonl")),
+        format!("{}\n", serde_json::to_string(&agent_line).unwrap()),
+    )
+    .unwrap();
+    fs::write(
+        run_dir.join(format!("agent-{AGENT}.meta.json")),
+        r#"{"agent_id":"aae139d44933cefe2"}"#,
+    )
+    .unwrap();
+    let transcript = project.join(format!("{session_id}.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, b"{\"type\":\"user\"}\n").unwrap();
+
+    let store = MemoryStore::open_journaled(tmp.path().join("node"), 256).unwrap();
+    let instance_id = InstanceId::new();
+    store
+        .insert_instance(instance_with_transcript(
+            instance_id.clone(),
+            &transcript.to_string_lossy(),
+        ))
+        .unwrap();
+
+    let stager = Arc::new(RecordingStager::default());
+    let result =
+        remuda_node::subagent::read_for_store(&store, &instance_id, AGENT, Some(stager.clone()))
+            .unwrap();
+    assert_eq!(stager.staged.lock().unwrap().len(), 1, "image was staged");
+
+    let serialized = serde_json::to_string(&result).unwrap();
+    assert!(!serialized.contains(png), "base64 leaked into read result");
+    assert!(
+        serialized.contains("obj_"),
+        "staged object reference present: {serialized}"
+    );
 }

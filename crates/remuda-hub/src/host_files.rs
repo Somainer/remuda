@@ -130,6 +130,13 @@ struct StageQuery {
     /// Basename of the file as read on the Node; sanitised server-side.
     #[serde(default)]
     name: Option<String>,
+    /// Opt-in renderable media type (D-045 §6.2): a tool-result screenshot
+    /// stages as an `image/*` object so `GET /v1/objects/{id}` serves it
+    /// inline for the card thumbnail. Absent, host files keep their historical
+    /// `application/octet-stream` typing. The bytes' magic bytes must sniff as
+    /// exactly the claimed allowlisted image type.
+    #[serde(default, rename = "mediaType")]
+    media_type: Option<String>,
 }
 
 /// `GET /v1/hosts/{id}/files` — proxy a directory listing to the Node.
@@ -252,9 +259,10 @@ async fn proxy_to_host(
 /// `POST /v1/hosts/{id}/files/objects` — stage bytes a Node read off disk.
 ///
 /// Host-token authenticated: the token must resolve to the host named in the
-/// path, so a host can only stage under its own key. Bytes are stored as
-/// `application/octet-stream` regardless of the filename; download serves them
-/// with `nosniff` and an attachment disposition.
+/// path, so a host can only stage under its own key. Without `mediaType` the
+/// bytes are stored as `application/octet-stream` (download with `nosniff`
+/// and an attachment disposition); with a validated image `mediaType` they
+/// are stored as that sniffed image type and served inline.
 async fn stage_object(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -297,14 +305,42 @@ async fn stage_object(
         ),
     };
     let digest = crate::config::sha256_hex(&body);
+    // Without `mediaType`, host files stay deliberately untyped bytes. With
+    // it, the claim is length-capped and charset-validated by the same
+    // validator the operator uploader uses, and accepted only when it names
+    // an image whose magic bytes back it (so image/jpg matches a JPEG); a
+    // bad claim or missing magic is a 400, never an octet-stream object
+    // masquerading as an image.
+    let (media_type, extension) = match query.media_type.as_deref() {
+        None => ("application/octet-stream".to_owned(), "bin".to_owned()),
+        Some(raw) => {
+            let claimed =
+                crate::objects::accepted_file_media_type(raw).map_err(HubError::BadRequest)?;
+            if !claimed.starts_with("image/") {
+                return Err(HubError::BadRequest(
+                    "host-file mediaType must name an image type".into(),
+                ));
+            }
+            let Some((sniffed, sniffed_ext)) = crate::objects::sniff_image(&body) else {
+                return Err(HubError::BadRequest(format!(
+                    "mediaType {claimed} does not match the staged bytes"
+                )));
+            };
+            if !crate::objects::declared_matches(&claimed, sniffed) {
+                return Err(HubError::BadRequest(format!(
+                    "mediaType {claimed} disagrees with sniffed type {sniffed}"
+                )));
+            }
+            (sniffed.to_owned(), sniffed_ext.to_owned())
+        }
+    };
     let record = state
         .store
         .insert_object(crate::store::NewObject {
             instance_id: staging_instance(&host_id),
             host_id: host_id.clone(),
-            // Never type host files as a renderable media kind.
-            media_type: "application/octet-stream".to_owned(),
-            extension: "bin".to_owned(),
+            media_type,
+            extension,
             original_name,
             digest,
             bytes: body.to_vec(),

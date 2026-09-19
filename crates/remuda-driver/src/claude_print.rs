@@ -82,6 +82,10 @@ pub struct ClaudePrintOptions {
     pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
+    /// Node-supplied stager for image content blocks a tool result carries
+    /// (D-045 §6.2). `None` (default) degrades images to text blocks; bytes
+    /// are never inlined into observations.
+    pub media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
     /// Initialize handshake timeout.
     pub handshake_timeout: Duration,
     /// Total bound for [`Driver::close`]. The ladder spends it in two equal
@@ -119,6 +123,7 @@ impl ClaudePrintOptions {
             handshake_timeout: Duration::from_secs(30),
             close_timeout: Duration::from_secs(10),
             settings_overlay_path: None,
+            media_stager: None,
         }
     }
 }
@@ -157,6 +162,9 @@ struct Mapper {
     driver_kind: DriverKind,
     /// Source channel for the same reason: `stdout` live, `transcript` on replay.
     channel: SourceChannel,
+    /// Stages image result bytes into the Hub object store (D-045 §6.2).
+    /// `None` carriers degrade every image to an honest text block.
+    media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 }
 
 #[derive(Default)]
@@ -308,6 +316,7 @@ impl ClaudePrintDriver {
 
     /// [`Self::new`], stamping and launching `carrier` instead of `claude-print`.
     pub(crate) fn with_carrier(options: ClaudePrintOptions, carrier: DriverKind) -> Self {
+        let media_stager = options.media_stager.clone();
         Self {
             options,
             inner: Arc::new(Inner {
@@ -328,6 +337,7 @@ impl ClaudePrintDriver {
                     },
                     driver_kind: carrier,
                     channel: SourceChannel::Stdout,
+                    media_stager,
                 }),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
@@ -435,6 +445,7 @@ impl ClaudePrintDriver {
                 pin: recipe.binary.clone(),
                 driver_kind: self.carrier,
                 channel: SourceChannel::Stdout,
+                media_stager: self.options.media_stager.clone(),
             };
         }
         *self.inner.policy.lock().await = policy;
@@ -909,11 +920,133 @@ async fn handle_frame(inner: &Inner, frame: Outbound) -> DriverResult<()> {
     {
         return handle_can_use_tool(inner, env, req).await;
     }
+    // D-045 §6.2: stage tool-result images BEFORE taking the mapper lock. The
+    // staging bridge parks until the Hub answers; running it on a blocking
+    // thread keeps the tokio worker (and every other frame) moving.
+    let frame = prefold_user_frame(inner, frame).await?;
     let observations = {
         let mut mapper = inner.mapper.lock().await;
         map_outbound(&mut mapper, &frame)?
     };
     emit_all(inner, observations).await
+}
+
+/// Whether a user frame carries a tool_result whose content (or mirrored
+/// sidecar) still contains data-bearing image items.
+fn frame_needs_prefold(frame: &Outbound) -> bool {
+    let Outbound::User(msg) = frame else {
+        return false;
+    };
+    let blocks = match &msg.message.content {
+        UserContent::Blocks(blocks) => blocks.as_slice(),
+        UserContent::Text(_) => return false,
+    };
+    if blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .any(|block| value_has_unfolded_image(block.get("content")))
+    {
+        return true;
+    }
+    value_has_unfolded_image(msg.tool_use_result.as_ref())
+}
+
+/// Depth-first presence check for an image item with inline data that was not
+/// already folded (no `remudaMedia` flag).
+fn value_has_unfolded_image(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    match value {
+        Value::Object(map) => {
+            // Case-insensitive type match and the same byte-bearing spellings
+            // the fold/scrub accept (`data`, `source.data`, `file.base64`),
+            // so prefold detection is a superset of what would be staged
+            // inline; an `Image`/`file.base64` item can't skip the blocking
+            // prefold onto a tokio worker.
+            let is_image = map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.eq_ignore_ascii_case("image"));
+            let already = map
+                .get("remudaMedia")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_bytes = map.get("data").and_then(Value::as_str).is_some()
+                || map
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .and_then(|source| source.get("data"))
+                    .and_then(Value::as_str)
+                    .is_some()
+                || map
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .and_then(|file| file.get("base64"))
+                    .and_then(Value::as_str)
+                    .is_some();
+            if is_image && !already && has_bytes {
+                return true;
+            }
+            map.values()
+                .any(|child| value_has_unfolded_image(Some(child)))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|child| value_has_unfolded_image(Some(child))),
+        _ => false,
+    }
+}
+
+/// Fold a frame's tool-result images off the async runtime, replacing native
+/// content with folded markers and scrubbing the `toolUseResult` mirror.
+async fn prefold_user_frame(inner: &Inner, frame: Outbound) -> DriverResult<Outbound> {
+    if !frame_needs_prefold(&frame) {
+        return Ok(frame);
+    }
+    let stager = {
+        let mapper = inner.mapper.lock().await;
+        mapper.media_stager.clone()
+    };
+    let Some(stager) = stager else {
+        // No object route: the synchronous mapper produces the honest text
+        // fallbacks; there is nothing to park on.
+        return Ok(frame);
+    };
+    tokio::task::spawn_blocking(move || prefold_blocking(frame, stager.as_ref()))
+        .await
+        .map_err(|error| {
+            DriverError::CarrierUnavailable(format!("tool-media staging task panicked: {error}"))
+        })?
+}
+
+fn prefold_blocking(
+    mut frame: Outbound,
+    stager: &dyn remuda_protocol::ToolMediaStager,
+) -> DriverResult<Outbound> {
+    let Outbound::User(msg) = &mut frame else {
+        return Ok(frame);
+    };
+    let mut outcomes = Vec::new();
+    if let UserContent::Blocks(blocks) = &mut msg.message.content {
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(content) = block.get("content") else {
+                continue;
+            };
+            let folded = remuda_protocol::fold_tool_result(Some(content), Some(stager));
+            outcomes.extend(folded.images.iter().cloned());
+            block["content"] = serde_json::json!({
+                remuda_protocol::folded_marker(): folded.blocks,
+            });
+        }
+    }
+    if let Some(sidecar) = msg.tool_use_result.as_mut() {
+        remuda_protocol::sanitize_tool_result_sidecar(sidecar, &outcomes);
+    }
+    Ok(frame)
 }
 
 async fn handle_can_use_tool(
@@ -1187,11 +1320,26 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                         let (result_id, revision, operation) =
                             mapper.ids.tool_result_open(tool_use_id)?;
                         let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                        let text = match block.get("content") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(other) => other.to_string(),
-                            None => String::new(),
-                        };
+                        // Image items (an MCP screenshot, say) stage their
+                        // bytes through the Node's object endpoint and ride as
+                        // `objectId` references; unstageable ones degrade to a
+                        // text block naming media type and size. In production
+                        // the frame is pre-folded on a blocking thread, so this
+                        // call is a cheap marker deserialization there. D-045
+                        // §6.2: never inline the content array (its base64)
+                        // into the journal — the previous `to_string()` did
+                        // exactly that.
+                        let folded = remuda_protocol::fold_tool_result(
+                            block.get("content"),
+                            mapper.media_stager.as_deref(),
+                        );
+                        // Claude mirrors the content array into toolUseResult;
+                        // scrub any mirrored image data (idempotent when the
+                        // prefold pass already did it).
+                        let mut sanitized_sidecar = msg.tool_use_result.clone();
+                        if let Some(sidecar) = sanitized_sidecar.as_mut() {
+                            remuda_protocol::sanitize_tool_result_sidecar(sidecar, &folded.images);
+                        }
                         // A backgrounded (or build-deferred) subagent's launch
                         // tool_result is written *immediately* with
                         // `toolUseResult.isAsync`; the real completion arrives
@@ -1223,8 +1371,8 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                                 } else {
                                     ToolOutcome::Succeeded
                                 },
-                                blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
-                                structured_result: match msg.tool_use_result.clone() {
+                                blocks: folded.blocks,
+                                structured_result: match sanitized_sidecar {
                                     Some(value) => Knowledge::Known { value },
                                     None => Knowledge::NotApplicable,
                                 },
@@ -2241,6 +2389,7 @@ impl StdoutMapper {
                 },
                 driver_kind: driver,
                 channel: SourceChannel::Stdout,
+                media_stager: None,
             },
         }
     }
@@ -2248,6 +2397,14 @@ impl StdoutMapper {
     /// Map one decoded stdout frame, exactly as the reader task does.
     pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
         map_outbound(&mut self.mapper, &Outbound::from_value(value))
+    }
+
+    /// Attach the tool-media stager so image result blocks become object
+    /// references instead of text fallbacks (D-045 §6.2).
+    #[must_use]
+    pub fn with_media_stager(mut self, stager: Arc<dyn remuda_protocol::ToolMediaStager>) -> Self {
+        self.mapper.media_stager = Some(stager);
+        self
     }
 
     /// Native session id the mapper has adopted from `system/init`.
@@ -2315,6 +2472,7 @@ impl TranscriptMapper {
                 },
                 driver_kind: driver,
                 channel: SourceChannel::Transcript,
+                media_stager: None,
             },
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
@@ -2330,6 +2488,17 @@ impl TranscriptMapper {
             permission: remuda_protocol::LivePermissionTracker::new(),
             permission_bridge: None,
         }
+    }
+
+    /// Attach the tool-media stager so image result blocks become object
+    /// references instead of text fallbacks (D-045 §6.2).
+    #[must_use]
+    pub(crate) fn with_media_stager(
+        mut self,
+        stager: Arc<dyn remuda_protocol::ToolMediaStager>,
+    ) -> Self {
+        self.mapper.media_stager = Some(stager);
+        self
     }
 
     /// Attach the §9.1 effort bridge so this mapper drives switch read-back and
@@ -3117,6 +3286,7 @@ pub mod review {
                     },
                     driver_kind: DriverKind::ClaudePrint,
                     channel: SourceChannel::Stdout,
+                    media_stager: None,
                 },
             }
         }
@@ -3146,6 +3316,7 @@ pub mod review {
             },
             driver_kind: DriverKind::ClaudePrint,
             channel: SourceChannel::Stdout,
+            media_stager: None,
         };
         map_outbound(&mut mapper, &frame)
     }

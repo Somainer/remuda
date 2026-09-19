@@ -81,7 +81,18 @@ pub struct NativeDriverConfig {
     pub print_handshake_timeout: Duration,
     /// Non-secret development environment forwarded to drivers.
     pub extra_env: BTreeMap<String, String>,
+    /// Connection-scoped stager for image content blocks a tool result
+    /// carries (D-045 §6.2). The slot is empty until the outbound Hub link
+    /// attaches its host-token client; factories read it at each `build`, so
+    /// a link connecting after startup still reaches later instances.
+    pub tool_media_stager: ToolMediaStagerSlot,
 }
+
+/// Shared holder for the Node's tool-media stager. One `Arc` lives in the
+/// driver config (read at every instance build) and the same one in the
+/// runtime (written on every Hub hello).
+pub type ToolMediaStagerSlot =
+    Arc<std::sync::RwLock<Option<Arc<dyn remuda_protocol::ToolMediaStager>>>>;
 
 impl NativeDriverConfig {
     /// Build production-shaped defaults rooted below `data_dir`.
@@ -123,6 +134,7 @@ impl NativeDriverConfig {
             relay_binary: None,
             print_handshake_timeout: Duration::from_secs(30),
             extra_env,
+            tool_media_stager: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -201,6 +213,18 @@ pub fn native_driver_registry(config: NativeDriverConfig) -> Result<DriverRegist
 struct NativeClaudeFactory {
     kind: DriverKind,
     config: NativeDriverConfig,
+}
+
+impl NativeClaudeFactory {
+    /// The Hub-link stager currently installed, if any; read per build so an
+    /// instance launched after the link connects stages its result images.
+    fn tool_media_stager(&self) -> Option<Arc<dyn remuda_protocol::ToolMediaStager>> {
+        self.config
+            .tool_media_stager
+            .read()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
 }
 
 impl DriverFactory for NativeClaudeFactory {
@@ -327,6 +351,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
+                options.media_stager = self.tool_media_stager();
                 Arc::new(ClaudePrintDriver::new(options))
             }
             // Same options as print: the carriers differ by one launch flag, so
@@ -345,6 +370,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.handshake_timeout = self.config.print_handshake_timeout;
                 options.inherit_default_config = inherit_default_config;
                 options.settings_overlay_path = overlay.clone();
+                options.media_stager = self.tool_media_stager();
                 Arc::new(ClaudeSdkDriver::new(options))
             }
             DriverKind::ClaudePty => {
@@ -372,6 +398,7 @@ impl DriverFactory for NativeClaudeFactory {
                 options.seed_onboarding = self.config.seed_claude_onboarding;
                 options.host_claude_config = HostClaudeConfig::from_env();
                 options.instance_id = Some(launch.instance.meta.id.clone());
+                options.media_stager = self.tool_media_stager();
                 Arc::new(ClaudePtyDriver::new(options))
             }
             DriverKind::ClaudeBg => {

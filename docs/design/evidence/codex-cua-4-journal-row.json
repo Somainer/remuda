@@ -1,0 +1,60 @@
+{
+  "instanceId": "ins_01a0ba3c-e343-74a6-bd13-8bee017e2aed",
+  "seq": 8,
+  "eventId": "evt_01a0ba3c-ed66-7393-8019-baba0d36c371",
+  "event": {
+    "kind": "tool_result",
+    "payload": {
+      "nodeId": "obj_4509d6df-9366-7db0-bff3-f5e682e497ce",
+      "revision": "1",
+      "operation": "open",
+      "baseRevision": null,
+      "toolCallId": "obj_fe04f528-8b37-79b4-9b40-3e84ab66f3aa",
+      "stage": "final",
+      "outcome": "succeeded",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "window state captured"
+        },
+        {
+          "type": "image",
+          "objectId": "obj_01a0ba3c-ed60-7115-a2ef-3bfa063368c0",
+          "mediaType": "image/png",
+          "name": "screen-1.png",
+          "size": 1622
+        }
+      ],
+      "structuredResult": {
+        "state": "known",
+        "value": {
+          "content": [
+            {
+              "type": "text",
+              "text": "window state captured"
+            },
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "remudaData": "obj_01a0ba3c-ed60-7115-a2ef-3bfa063368c0"
+              },
+              "remudaMedia": true
+            }
+          ]
+        }
+      },
+      "exitCode": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "changes": []
+    },
+    "eventId": "evt_01a0ba3c-ed66-7393-8019-baba0d36c371",
+    "seq": "8",
+    "instanceId": "ins_01a0ba3c-e343-74a6-bd13-8bee017e2aed"
+  },
+  "observedAt": "2026-09-19T15:15:50.246Z"
+}

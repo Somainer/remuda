@@ -53,6 +53,7 @@ ece = { version = "2.2", default-features = false, features = ["backend-openssl"
 # Software ES256 authenticator for the passkey ceremony tests (D-029).
 openssl = "0.10"
 # The offline Anthropic-Messages gateway the api-routing relay e2e runs against.
+remuda-journal.workspace = true
 remuda-testing.workspace = true
 serde_cbor_2 = "0.13"
 sha2.workspace = true

@@ -242,6 +242,10 @@ impl WorkflowProducer {
             SourceChannel::WorkflowJournal,
         );
         ctx.driver_kind = DriverKind::ShellPty;
+        // The workflow tailer maps lifecycle/usage/terminal facts, never
+        // tool results, so no media stager is attached here; workflow-member
+        // screenshots fold through the `subagent.transcript` RPC path (D-045
+        // §6.2, codex-cua-4 evidence).
         ctx
     }
 

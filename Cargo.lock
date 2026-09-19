@@ -3283,6 +3283,7 @@ dependencies = [
  "futures",
  "openssl",
  "remuda-driver",
+ "remuda-journal",
  "remuda-protocol",
  "remuda-push",
  "remuda-screen",
@@ -3326,6 +3327,7 @@ name = "remuda-journal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "futures",
  "remuda-protocol",
  "rusqlite",
@@ -3380,6 +3382,7 @@ dependencies = [
 name = "remuda-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "jsonschema",
  "schemars 1.2.2",
  "serde",

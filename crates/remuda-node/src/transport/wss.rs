@@ -252,6 +252,20 @@ fn attach_object_source(
                     link.node.set_host_file_stager(None);
                 }
             }
+            // D-045 §6.2: tool-result images stage through the same host-token
+            // route, typed as renderable media.
+            let media = crate::files::HubToolMediaStager::from_ws_url(
+                ws_url,
+                link.node.host().meta.id.as_id().as_str().to_owned(),
+                token.to_owned(),
+            );
+            match media {
+                Ok(stager) => link.node.set_tool_media_stager(Some(Arc::new(stager))),
+                Err(error) => {
+                    tracing::warn!(%error, "Node cannot derive a tool-media upload URL");
+                    link.node.set_tool_media_stager(None);
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(
@@ -260,6 +274,9 @@ fn attach_object_source(
             );
             link.node.set_object_source(Arc::new(broker.source()));
             link.node.set_host_file_stager(None);
+            // Drop the previous connection's tool-media stager too: it holds
+            // that connection's origin and host token, which must not survive.
+            link.node.set_tool_media_stager(None);
         }
     }
 }

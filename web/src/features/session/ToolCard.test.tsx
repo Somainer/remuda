@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { known, type Id } from "../../types/wire";
@@ -86,5 +86,22 @@ describe("ToolCard · image tool result (D-045 §6.2)", () => {
     );
     expect(screen.queryByTestId("tool-media")).toBeNull();
     expect(screen.queryByTestId("tool-thumb")).toBeNull();
+  });
+
+  it("swaps an expired object to the fixed not-attached note instead of a broken image", () => {
+    const { container } = render(
+      <ToolCard
+        driverKind="claude-pty"
+        call={mcpCall()}
+        result={imageResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    const img = screen.getByTestId("tool-thumb") as HTMLImageElement;
+    // Simulate the object route 404/expiring (24 h TTL or budget sweep).
+    fireEvent.error(img);
+    expect(screen.queryByTestId("tool-thumb")).toBeNull();
+    expect(screen.getByText(/image not attached: image\/png/)).toBeTruthy();
   });
 });

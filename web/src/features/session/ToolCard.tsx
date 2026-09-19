@@ -31,33 +31,46 @@ function asTextBlocks(result: ToolResultPayload | null): string {
  * ui-spec §2.2): max-height lives in CSS, `loading="lazy"`, alt is the block
  * name, and a click opens the object route — never an auto-expanded lightbox.
  * An image the Node could not stage arrives as a text block, so there is no
- * broken-image branch here.
+ * broken-image branch there; a staged object that has since expired (24 h TTL
+ * or budget sweep) fails to load and swaps to the same fixed note instead of
+ * a broken-image icon.
  */
 function ResultMedia({ result }: { result: ToolResultPayload | null }) {
   const media = resultMedia(result);
+  const [failed, setFailed] = useState<Record<number, boolean>>({});
   if (media.length === 0) return null;
   return (
     <div className={css.toolMedia} data-testid="tool-media">
-      {media.map((image, index) => (
-        <a
-          // The Hub dedupes identical bytes to one objectId, so the index
-          // keeps duplicate screenshots as distinct list items.
-          key={`${image.objectId}:${index}`}
-          className={css.toolMediaLink}
-          href={objectUrl(image.objectId)}
-          target="_blank"
-          rel="noreferrer"
-          data-testid="tool-media-link"
-        >
-          <img
-            className={css.toolThumb}
-            src={objectUrl(image.objectId)}
-            alt={image.name}
-            loading="lazy"
-            data-testid="tool-thumb"
-          />
-        </a>
-      ))}
+      {media.map((image, index) => {
+        if (failed[index]) {
+          return (
+            <span key={`${image.objectId}:${index}`} className={css.toolMediaMissing}>
+              [image not attached: {image.mediaType}]
+            </span>
+          );
+        }
+        return (
+          <a
+            // The Hub dedupes identical bytes to one objectId, so the index
+            // keeps duplicate screenshots as distinct list items.
+            key={`${image.objectId}:${index}`}
+            className={css.toolMediaLink}
+            href={objectUrl(image.objectId)}
+            target="_blank"
+            rel="noreferrer"
+            data-testid="tool-media-link"
+          >
+            <img
+              className={css.toolThumb}
+              src={objectUrl(image.objectId)}
+              alt={image.name}
+              loading="lazy"
+              data-testid="tool-thumb"
+              onError={() => setFailed((prev) => ({ ...prev, [index]: true }))}
+            />
+          </a>
+        );
+      })}
     </div>
   );
 }

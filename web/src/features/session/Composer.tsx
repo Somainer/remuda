@@ -511,10 +511,15 @@ export function Composer({
 
   /**
    * The interrupt Sheet confirm must act on the LIVE turn state: if the turn
-   * ended while the dialog was open there is nothing to cancel.
+   * ended while the dialog was open there is nothing to cancel. Read the
+   * phase through its ref (not the render closure) so the guard is current at
+   * click time.
    */
   const confirmInterrupt = () => {
-    if (!busy || !controlsRef.current.interrupt.available) return;
+    const livePhase = phaseRef.current;
+    if ((livePhase !== "working" && livePhase !== "blocked") || !controlsRef.current.interrupt.available) {
+      return;
+    }
     void doInterrupt();
   };
 
@@ -796,7 +801,7 @@ export function Composer({
         <button
           key={m.id}
           type="button"
-          className={`${css.effortRow} ${active ? css.effortOn : ""}`}
+          className={`${css.effortRow} ${active ? css.effortOn : ""} ${inSheet ? opt.sheetPermRow : ""}`}
           data-testid={`permission-option-${m.id}`}
           data-launch-only={m.launchOnly || !reachable ? "1" : undefined}
           disabled={!reachable}
@@ -874,7 +879,7 @@ export function Composer({
   const contextChipNode = caps.context ? (
     <button
       type="button"
-      className={css.chip}
+      className={`${css.chip} ${opt.sheetTouch}`}
       data-testid="context-chip"
       data-has-popover={usageRollup ? "1" : "0"}
       aria-haspopup={usageRollup ? "dialog" : undefined}

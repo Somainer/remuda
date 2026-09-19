@@ -131,7 +131,19 @@ fn normalize_cli(value: Option<&Value>) -> Option<Value> {
 }
 
 /// The one per-launch host capability granted this batch (D-045).
+/// The capability name.
 pub const CAPABILITY_COMPUTER_USE: &str = "computer-use";
+
+/// The remote-host location the c-cua-hostcap Node probe stats (must match
+/// `COMPUTER_USE_CLIENT` in `remuda-node/src/inventory.rs` on
+/// `wt/c-cua-hostcap`), shown symbolically for the *host* — never expanded
+/// from the CLI/Hub process env (a Linux coordinator must not print its own
+/// `$HOME` as a path on a Mac). The host resolves `$CODEX_HOME` to its codex
+/// home, falling back to `$HOME/.codex`.
+pub const COMPUTER_USE_CLIENT_SYMBOLIC: &str = "$CODEX_HOME/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+
+/// The fallback symbolic location for a host with `CODEX_HOME` unset.
+pub const COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT: &str = "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
 
 /// Validate requested capability spellings the same way the Node materializer
 /// does: an unknown value is an error naming it, never silently dropped.
@@ -171,19 +183,26 @@ pub fn computer_use_preflight(host: &crate::store::HostRecord) -> Result<(), Str
     let Some(row) = row else {
         return Err(format!(
             "host {host_id} has not reported the \"{CAPABILITY_COMPUTER_USE}\" capability \
-             (no computer-use row in its inventory); update/run a Node that probes it, \
-             or pick another host with --host"
+             (no computer-use row in its inventory); enable Codex Computer Use at \
+             {COMPUTER_USE_CLIENT_SYMBOLIC} on that host (or \
+             {COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT} when CODEX_HOME is unset), then update/run \
+             a Node that probes it, or pick another host with --host"
         ));
     };
     if row.get("installed").and_then(Value::as_bool) != Some(true) {
+        // The row's path when present is the host's own reported location; when
+        // absent the hostcap probe omits it for an uninstalled bundle, so name
+        // the symbolic location it probes (never a local-process path).
         let probed = row
             .get("path")
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
-            .unwrap_or("<no path reported>");
+            .unwrap_or(COMPUTER_USE_CLIENT_SYMBOLIC);
         return Err(format!(
-            "host {host_id} reports \"{CAPABILITY_COMPUTER_USE}\" as not installed; the Node probed \
-             {probed} — enable Codex Computer Use on that Mac or pick another host with --host"
+            "host {host_id} reports \"{CAPABILITY_COMPUTER_USE}\" as not installed; enable \
+             Codex Computer Use at {probed} on that host (or \
+             {COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT} when CODEX_HOME is unset), or pick another \
+             host with --host"
         ));
     }
     Ok(())
@@ -303,6 +322,19 @@ mod tests {
         );
         let error = computer_use_preflight(&absent).unwrap_err();
         assert!(error.contains("not installed") && error.contains("SkyComputerUseClient"));
+
+        // Installed=false with no path names the symbolic remote-host location,
+        // never a bare placeholder (round-6 item 1).
+        let pathless = host(
+            Some("macos"),
+            json!([{"kind":"computer-use","installed":false,"auth":"unknown"}]),
+        );
+        let error = computer_use_preflight(&pathless).unwrap_err();
+        assert!(error.contains("not installed"), "{error}");
+        assert!(error.contains("$CODEX_HOME/"), "{error}");
+        assert!(error.contains("SkyComputerUseClient"), "{error}");
+        assert!(error.contains("$HOME/.codex"), "{error}");
+        assert!(!error.contains("<no path reported>"), "{error}");
 
         // Non-macOS refuses before the row matters.
         let linux = host(

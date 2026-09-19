@@ -120,10 +120,16 @@ never, no-request): desktop control plus auto-approved actions has no
 recovery path; remove one of the two
 ```
 
-Host gate (CLI/Hub), three shapes. The absent/not-installed messages name
-the probed path, falling back to the default
-`$CODEX_HOME/computer-use/Codex Computer Use.app` (or `$HOME/.codex/...`)
-when the row carries none — never a bare `<no path reported>` placeholder:
+Host gate, three shapes. The CLI (`crates/remuda/src/cmd/capability.rs`)
+and Hub (`crates/remuda-hub/src/inventory.rs`) name the install location
+**symbolically for the remote host** — `$CODEX_HOME/…SkyComputerUseClient`
+(the exact file c-cua-hostcap's probe stats), or `$HOME/.codex/…` when
+`CODEX_HOME` is unset. Neither expands the CLI/Hub process's own
+`CODEX_HOME`/`HOME` (a Linux coordinator refusing a Mac host cannot print a
+path on its own box); the Node-side gate (which runs ON the host) does expand
+its real env. Never a bare `<no path reported>`.
+
+CLI exact strings (macOS host; `--host`):
 
 ```
 host hst_… is linux, but the "computer-use" capability requires macOS;
@@ -131,12 +137,29 @@ host hst_… is linux, but the "computer-use" capability requires macOS;
 
 host hst_… has not reported the "computer-use" capability (no computer-use
 row in its inventory); enable Codex Computer Use at
-/Users/u/.codex/computer-use/Codex Computer Use.app, or update/run a Node
-that probes it, or pick another host with --host
+$CODEX_HOME/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient
+on that host (or $HOME/.codex/…/SkyComputerUseClient when CODEX_HOME is
+unset), or update/run a Node that probes it, or pick another host with --host
 
 host hst_… reports "computer-use" as not installed; enable Codex Computer
-Use at /Users/u/.codex/computer-use/Codex Computer Use.app, or pick another
-host with --host
+Use at $CODEX_HOME/…/SkyComputerUseClient on that host (or
+$HOME/.codex/…/SkyComputerUseClient when CODEX_HOME is unset), or pick
+another host with --host
+```
+
+When the row carries a real host `path` (installed=true or an explicit
+host-reported path), both gates print that path verbatim instead of the
+symbolic one.
+
+Hub exact strings (the common path for placement-resolved / direct-API
+launches, which never go through the CLI) are the same shape, prefixed
+`host hst_…` (e.g. the not-installed form):
+
+```
+host hst_… reports "computer-use" as not installed; enable Codex Computer
+Use at $CODEX_HOME/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient
+on that host (or $HOME/.codex/…/SkyComputerUseClient when CODEX_HOME is
+unset), or pick another host with --host
 ```
 
 CLI instance create, no resolvable/known host:
@@ -280,12 +303,14 @@ Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
 - `crates/remuda-node` lib tests (2): factory refusal for granted codex on
   shell-pty hooks-off and on generic-pty; pure `(kind, os, cli-row)` gate
   classifications (5) plus absent-row/no-path default-location tests (2).
-- `crates/remuda/tests/cua_cli.rs` (8) and
+- `crates/remuda/tests/cua_cli.rs` (9) and
   `crates/remuda/tests/mcp_hub.rs::agent_scoped_…`: host/value/kind refusals;
   dispatch refused for claude and codex; an **instance-scoped agent token**
   creates without capabilities despite GET /v1/hosts returning 403, and is
   refused loudly (not silently dispatched) with capabilities when the host
-  cannot be verified.
+  cannot be verified; `pathless_not_installed_row_…` pins the symbolic remote
+  `$CODEX_HOME/…/SkyComputerUseClient` location, the `$HOME/.codex` fallback,
+  and asserts no local-HOME expansion and no `<no path reported>` placeholder.
 - `crates/remuda-hub/tests/workers.rs`: dispatch refuses computer-use for both
   harnesses with no provisioning; unknown value refused; create refuses
   claude `bypassPermissions`/`bypass` and codex `never`/`no-request` and names

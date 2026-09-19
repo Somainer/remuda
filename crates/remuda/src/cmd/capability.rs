@@ -35,28 +35,25 @@ pub fn requests_computer_use(capabilities: &[String]) -> bool {
     capabilities.iter().any(|value| value == COMPUTER_USE)
 }
 
+/// The remote-host file the c-cua-hostcap Node probe stats, shown symbolically
+/// for the *target host* — never expanded from this CLI process's own
+/// `CODEX_HOME`/`HOME` (a Linux coordinator refusing a Mac host must not print
+/// a path that only exists on its own box). Must match `COMPUTER_USE_CLIENT`
+/// in `remuda-node/src/inventory.rs` on the hostcap branch. The host resolves
+/// `$CODEX_HOME`, falling back to `$HOME/.codex`.
+const COMPUTER_USE_CLIENT_SYMBOLIC: &str = "$CODEX_HOME/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+const COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT: &str = "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+
 /// Classify one host view against the `computer-use` gate (D-045 §2/§4).
 ///
 /// `host` is the JSON `GET /v1/hosts/{id}` returns: `{hostId, os, cli: [...]}`.
 /// `Ok(())` means the host reports an installed capability on macOS. Every
 /// error names the host id and what was actually observed, with a retry
 /// direction.
-/// The default client path the hostcap probe resolves on macOS,
-/// `$CODEX_HOME/computer-use/Codex Computer Use.app` (falls back to
-/// `$HOME/.codex/...`). Mirrors `remuda_node::computer_use::default_client_path`
-/// and c-cua-hostcap's `computer_use_client_path`; hostcap will unify these.
-fn default_client_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex"))
-        })?;
-    Some(home.join("computer-use").join("Codex Computer Use.app"))
-}
-
 pub fn host_supports_computer_use(host: &Value) -> Result<()> {
-    // Path named in the not-installed / not-reported messages: the row's path,
-    // else the default the probe looks for, else a placeholder.
+    // Path named in the not-installed / not-reported messages: the host's own
+    // reported path when present, else the symbolic remote-host location the
+    // hostcap probe stats (never this CLI process's local env).
     let probed_path = || -> String {
         let rows = host.get("cli").and_then(Value::as_array);
         let row_path = rows
@@ -69,8 +66,7 @@ pub fn host_supports_computer_use(host: &Value) -> Result<()> {
             .filter(|path| !path.is_empty());
         row_path
             .map(str::to_owned)
-            .or_else(|| default_client_path().map(|path| path.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "<no path reported>".into())
+            .unwrap_or_else(|| COMPUTER_USE_CLIENT_SYMBOLIC.to_owned())
     };
     let host_id = host
         .get("hostId")
@@ -99,7 +95,8 @@ pub fn host_supports_computer_use(host: &Value) -> Result<()> {
         let probed = probed_path();
         bail!(
             "host {host_id} has not reported the {COMPUTER_USE:?} capability \
-             (no computer-use row in its inventory); enable Codex Computer Use at {probed}, \
+             (no computer-use row in its inventory); enable Codex Computer Use at {probed} \
+             on that host (or {COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT} when CODEX_HOME is unset), \
              or update/run a Node that probes it, or pick another host with --host"
         );
     };
@@ -107,7 +104,8 @@ pub fn host_supports_computer_use(host: &Value) -> Result<()> {
         let probed = probed_path();
         bail!(
             "host {host_id} reports {COMPUTER_USE:?} as not installed; enable Codex Computer \
-             Use at {probed}, or pick another host with --host"
+             Use at {probed} on that host (or {COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT} when \
+             CODEX_HOME is unset), or pick another host with --host"
         );
     }
     Ok(())

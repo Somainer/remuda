@@ -242,6 +242,56 @@ async fn non_macos_host_is_refused_and_names_the_os() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pathless_not_installed_row_names_symbolic_host_location_not_placeholder() -> Result<()> {
+    // Round-6 item 3: the hostcap probe omits `path` whenever installed=false.
+    // The CLI refusal must name the symbolic REMOTE-host location it probes
+    // (not expand the coordinator's own CODEX_HOME/HOME, and never print
+    // "<no path reported>").
+    let row = json!({"kind": "computer-use", "installed": false, "auth": "unknown"});
+    let hub = spawn_hub(Some("macos"), Some(row)).await?;
+    let output = run(
+        &[
+            "instance",
+            "create",
+            "--host",
+            &hub.host,
+            "--capability",
+            "computer-use",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("$CODEX_HOME/computer-use/Codex Computer Use.app"),
+        "must name the symbolic host install location: {stderr}"
+    );
+    assert!(
+        stderr.contains("SkyComputerUseClient"),
+        "must name the exact file hostcap probes: {stderr}"
+    );
+    assert!(
+        stderr.contains("$HOME/.codex"),
+        "must give the CODEX_HOME-unset fallback: {stderr}"
+    );
+    assert!(
+        !stderr.contains("<no path reported>"),
+        "must not print the bare placeholder: {stderr}"
+    );
+    // The CLI's own local HOME must never be expanded into a host message.
+    if let Ok(local_home) = std::env::var("HOME")
+        && !local_home.is_empty()
+        && local_home != "/"
+    {
+        assert!(
+            !stderr.contains(&local_home),
+            "remote-host message must not expand the local HOME {local_home:?}: {stderr}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn installed_capability_on_macos_passes_preflight_and_reaches_the_node() -> Result<()> {
     let row = json!({
         "kind": "computer-use",

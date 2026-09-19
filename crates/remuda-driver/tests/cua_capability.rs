@@ -534,9 +534,10 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
 #[test]
 fn granted_codex_on_a_non_shell_carrier_is_refused_and_writes_nothing() {
     // Codex delivery exists only on shell-pty + HookSession. Generic-pty (and
-    // every other non-shell driver) is refused at the materializer, mirroring
-    // the Node factory, so no mcp-cua.json/launchers/audit entry is produced —
-    // never a granted-but-undelivered recipe (§3.3).
+    // every other non-shell driver) is refused at the materializer's PRE-WRITE
+    // gate (computer_use_requested, round 5), so the refusal fires before the
+    // launch dir itself is created — this is what distinguishes it from the
+    // round-4 gate that ran after the dir/overlay existed.
     let dirs = dirs();
     let binary = stub_binary(dirs.root.path());
     let mut spec = load_spec();
@@ -544,8 +545,20 @@ fn granted_codex_on_a_non_shell_carrier_is_refused_and_writes_nothing() {
     spec.driver = DriverKind::GenericPty;
     grant(&mut spec);
 
-    let error = materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary))
-        .expect_err("granted codex on generic-pty must be refused by the materializer");
+    // Point at a launch dir that does not exist yet. The shared `dirs()` helper
+    // pre-creates it, which would mask a post-dir refusal; use a fresh
+    // sub-path the materializer never gets to create.
+    let nonexistent_launch = dirs.root.path().join("launch-never-created");
+    assert!(!nonexistent_launch.exists());
+
+    let error = materialize(&request(
+        &mut spec,
+        &nonexistent_launch,
+        &dirs.home,
+        true,
+        &binary,
+    ))
+    .expect_err("granted codex on generic-pty must be refused by the materializer");
     let message = error.to_string();
     assert!(
         message.contains("computer-use")
@@ -553,10 +566,16 @@ fn granted_codex_on_a_non_shell_carrier_is_refused_and_writes_nothing() {
             && message.contains("REMUDA_PTY_HOOKS"),
         "{message}"
     );
-    // Refusal writes nothing at all.
-    assert!(!dirs.launch.join("mcp-cua.json").exists());
-    assert!(!dirs.launch.join("cua").exists());
-    assert!(!dirs.launch.join("codex-home").exists());
+    // The pre-write gate refuses before the launch dir (and everything in it)
+    // is created.
+    assert!(
+        !nonexistent_launch.exists(),
+        "refusal must fire before the launch dir is created"
+    );
+    assert!(!nonexistent_launch.join("mcp-cua.json").exists());
+    assert!(!nonexistent_launch.join("cua").exists());
+    assert!(!nonexistent_launch.join("codex-home").exists());
+    // And the shared managed home is untouched too.
     assert!(!dirs.home.join(SKILL_ROOT).exists());
 }
 

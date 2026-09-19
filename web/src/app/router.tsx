@@ -1,6 +1,7 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Outlet, Route, Routes, useLocation } from "react-router-dom";
 import { AuthGate } from "./AuthGate";
 import { Shell } from "./Shell";
+import { PhoneShell } from "./PhoneShell";
 import { LoginPage } from "../pages/LoginPage";
 import { SessionsPage } from "../pages/SessionsPage";
 import { NewSessionPage } from "../pages/NewSessionPage";
@@ -13,6 +14,32 @@ import { ProvidersPage, ProviderDetailPage } from "../pages/ProvidersPage";
 import { BotsPage, BotDetailPage } from "../pages/BotsPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { SubagentView } from "../features/session/subagent/SubagentView";
+import { resolveLanding } from "../lib/mobileRoute";
+import { useWorkbenchViewport } from "../lib/viewport";
+
+/**
+ * D-049 viewport redirect layer (ui-spec §1.2 / §4.7). A pathless layout
+ * element that either renders its subtree or a `<Navigate replace>` derived
+ * from the pure resolveLanding(). Mounted around both the desktop index
+ * routes (compact bounces /sessions and /approvals into /m) and the /m tree
+ * (desktop bounces back to /sessions). Re-renders live on viewport changes.
+ */
+function ViewportGate() {
+  const { mobile } = useWorkbenchViewport();
+  const location = useLocation();
+  const target = resolveLanding(location.pathname, location.search, mobile);
+  if (target) return <Navigate to={target} replace />;
+  return <Outlet />;
+}
+
+/**
+ * PWA start_url "/": the same pure resolver picks /m (compact) or
+ * /sessions, so "/" carries no decision of its own.
+ */
+function RootLanding() {
+  const { mobile } = useWorkbenchViewport();
+  return <Navigate to={resolveLanding("/", "", mobile) ?? "/sessions"} replace />;
+}
 
 export function AppRouter() {
   return (
@@ -21,8 +48,11 @@ export function AppRouter() {
       <Route path="/pair" element={<LoginPage mode="pair" />} />
       <Route element={<AuthGate />}>
         <Route element={<Shell />}>
-          <Route path="/" element={<Navigate to="/sessions" replace />} />
-          <Route path="/sessions" element={<SessionsPage />} />
+          <Route path="/" element={<RootLanding />} />
+          <Route element={<ViewportGate />}>
+            <Route path="/sessions" element={<SessionsPage />} />
+            <Route path="/approvals" element={<ApprovalsPage />} />
+          </Route>
           <Route path="/sessions/new" element={<NewSessionPage />} />
           <Route path="/s/:instanceId" element={<SessionPage />} />
           <Route path="/s/:instanceId/tty" element={<SessionPage view="tty" />} />
@@ -30,7 +60,6 @@ export function AppRouter() {
           <Route path="/s/:instanceId/files" element={<SessionPage view="files" />} />
           <Route path="/s/:instanceId/events" element={<SessionPage view="events" />} />
           <Route path="/s/:instanceId/agents/:agentId" element={<SubagentView />} />
-          <Route path="/approvals" element={<ApprovalsPage />} />
           <Route path="/hosts" element={<HostsPage />} />
           <Route path="/hosts/:hostId" element={<HostDetailPage />} />
           <Route path="/fleet" element={<FleetPage />} />
@@ -41,6 +70,13 @@ export function AppRouter() {
           <Route path="/bots" element={<BotsPage />} />
           <Route path="/bots/:channelId" element={<BotDetailPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+        </Route>
+        <Route element={<ViewportGate />}>
+          <Route path="/m" element={<PhoneShell />}>
+            <Route index element={<SessionsPage />} />
+            <Route path="inbox" element={<ApprovalsPage />} />
+            <Route path="*" element={<Navigate to="/m" replace />} />
+          </Route>
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/sessions" replace />} />

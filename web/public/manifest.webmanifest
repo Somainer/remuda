@@ -3,7 +3,7 @@
   "short_name": "runtime",
   "description": "Remote agent runtime control surface",
   "display": "standalone",
-  "start_url": "/sessions",
+  "start_url": "/",
   "scope": "/",
   "theme_color": "#12161c",
   "background_color": "#0c0f14",

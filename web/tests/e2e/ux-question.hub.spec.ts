@@ -174,16 +174,33 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
     [390, 844, "ledger", "390-ledger"],
   ] as const) {
     await page.setViewportSize({ width, height });
+    // The width implies the shell: 390px redirects /approvals -> /m/inbox
+    // (D-049) and 1440px keeps /approvals. Wait for that asynchronous
+    // navigation and re-assert the card so the frame is never shot mid-
+    // redirect against the previous shell's stale tree.
+    await expect(page).toHaveURL(width < 768 ? /\/m\/inbox(?:\?|$)/ : /\/approvals(?:\?|$)/);
+    const frameCard = page
+      .getByTestId("approval-row")
+      .filter({ hasText: "AskUserQuestion" })
+      .first()
+      .getByTestId("question-form");
+    await expect(frameCard.getByText("接下来这个会话主要想做什么？")).toBeVisible();
     await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
     await shot(page, `ask-user-question-1-card-${suffix}.png`);
   }
 
-  // It answers from the approvals page too.
+  // It answers from the approvals page too. The 390px frames redirect
+  // /approvals -> /m/inbox (D-049), and widening back bounces /m/inbox ->
+  // /sessions, so re-enter the approvals centre and re-locate the card.
   await page.setViewportSize({ width: 1440, height: 900 });
-  await card.getByRole("radio", { name: /继续排查 remuda 环境/ }).click();
-  await card.getByRole("tab", { name: /记忆/ }).click();
-  await card.getByRole("checkbox", { name: /保存端口/ }).click();
-  await card.getByTestId("question-submit").click();
+  await page.goto("/approvals");
+  const desktopRow = page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" }).first();
+  await expect(desktopRow).toBeVisible({ timeout: 20_000 });
+  const desktopCard = desktopRow.getByTestId("question-form");
+  await desktopCard.getByRole("radio", { name: /继续排查 remuda 环境/ }).click();
+  await desktopCard.getByRole("tab", { name: /记忆/ }).click();
+  await desktopCard.getByRole("checkbox", { name: /保存端口/ }).click();
+  await desktopCard.getByTestId("question-submit").click();
   await expect(page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" })).toHaveCount(0, {
     timeout: 15_000,
   });

@@ -4,8 +4,12 @@ function row(page: import("@playwright/test").Page, text: string) {
   return page.getByTestId("board-card").filter({ hasText: text }).first();
 }
 
-// The board rows under test live in separate worktree Spaces, so these cases
-// run the list in global scope (the row-overflow Sheet is scope-independent).
+// Scope note (see docs/design/evidence/ux2026-nextstep-1.md §3): these rows
+// live in worktree Spaces OTHER than the default sfe-root Space the bare
+// /sessions route pins to, so the default route renders none of them
+// (pre-existing fixed-scope behavior, failing identically on unmodified
+// main). The row shape is scope-independent; ?scope=all only restores the
+// rows the assertions need.
 test.describe("agent board", () => {
   test("shows kind badges, worktree, status triple, snippet, and DONE", async ({ page }) => {
     await page.goto("/sessions?scope=all");
@@ -21,7 +25,7 @@ test.describe("agent board", () => {
     // P0-6: the wire triple and host/worktree are hidden behind the row's
     // closed disclosure by default; expanding reveals the same fields.
     await expect(grok.getByTestId("session-lifecycle")).toBeHidden();
-    await grok.getByTestId("session-wire").locator("summary").click();
+    await grok.getByTestId("session-wire-toggle").click();
     await expect(grok.getByTestId("session-lifecycle")).toBeVisible();
     await expect(grok.getByTestId("session-lifecycle")).toContainText("ready");
     await expect(grok.getByTestId("session-lifecycle")).toContainText("connected");

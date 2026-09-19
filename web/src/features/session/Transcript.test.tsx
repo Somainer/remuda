@@ -78,6 +78,39 @@ function failedTool(seqCall: number, seqResult: number): Observation[] {
   ];
 }
 
+function settledBash(seqCall: number, seqResult: number): Observation[] {
+  return [
+    obs(seqCall, "tool_call", {
+      nodeId: `nc-${seqCall}` as Id, revision: "1", operation: "open", baseRevision: null,
+      toolCallId: "tc-bash" as Id, parentToolCallId: null,
+      toolName: known("Bash"), displayTitle: known("Bash"), category: "shell",
+      input: known({ command: "echo silent-command" }), inputTextDelta: null, state: "running",
+      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+    }),
+    obs(seqResult, "tool_result", {
+      nodeId: `nr-${seqResult}` as Id, revision: "1", operation: "close", baseRevision: null,
+      toolCallId: "tc-bash" as Id, stage: "final", outcome: "succeeded",
+      blocks: [{ type: "text", text: "zorpto-searchfind-4711" }],
+      structuredResult: unknownKnowledge("text"),
+      exitCode: known(0), changes: [],
+    }),
+  ];
+}
+
+/** Match the workbench compact query (a 390px layout); anything else = desktop. */
+function stubCompactLayout() {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: query.includes("max-width: 767px"),
+    media: query,
+    onchange: null,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  }));
+}
+
 function renderRouted(events: Observation[], path = "/s/ins_t", compact = true) {
   return render(
     <MemoryRouter initialEntries={[path]}>
@@ -347,5 +380,46 @@ describe("Transcript search (batch E)", () => {
     await user.type(screen.getByTestId("transcript-search-input"), "beta");
     expect(root.getAttribute("aria-live")).toBe("off");
     expect(screen.getByTestId("transcript-search-count").getAttribute("aria-live")).toBe("off");
+  });
+});
+
+describe("D-041 fold vs in-transcript search hit", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("auto-expands a folded card that becomes the current search hit (and re-folds after)", async () => {
+    stubCompactLayout();
+    const user = userEvent.setup();
+    // One turn; the settled Bash and the assistant message do NOT reach the
+    // >=2 compact-fold threshold, so the card is a direct top-level row.
+    renderRouted(
+      [
+        userMessage(1, "跑一下"),
+        ...settledBash(2, 3),
+        assistantMessage(4, "done"),
+      ],
+      "/s/ins_hit",
+    );
+    const card = screen.getByTestId("tool-card");
+    // Compact + settled ordinary card starts folded; result text is hidden.
+    expect(card.getAttribute("data-folded")).toBe("1");
+    expect(screen.queryByText("zorpto-searchfind-4711")).toBeNull();
+
+    // Search for text that exists ONLY in the tool result.
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "zorpto-searchfind-4711");
+
+    // The hit auto-expands the D-041 fold so the match is visible and the
+    // full card body (stdout) is mounted.
+    await expect
+      .poll(() => screen.getByTestId("tool-card").getAttribute("data-folded"))
+      .toBe("0");
+    expect(screen.getByText("zorpto-searchfind-4711")).toBeTruthy();
+
+    // Clearing the search removes the transient hit expansion; the card is
+    // its compact default again (the reader did not press 展开).
+    await user.clear(screen.getByTestId("transcript-search-input"));
+    await expect
+      .poll(() => screen.getByTestId("tool-card").getAttribute("data-folded"))
+      .toBe("1");
   });
 });

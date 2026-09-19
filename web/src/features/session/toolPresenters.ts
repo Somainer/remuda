@@ -102,6 +102,88 @@ function truncate(text: string, max = 200): string {
   return `${text.slice(0, max)}…`;
 }
 
+/** First physical line of a command — the folded row's key argument (D-041). */
+function firstLine(text: string | null | undefined): string | null {
+  if (!text) return null;
+  const line = text.split("\n")[0];
+  return line.length ? line : null;
+}
+
+/**
+ * Single-line JSON preview for a command-less Bash input. `jsonPreview` is a
+ * pretty-printed (multi-line, brace-first) dump made for raw panels; the
+ * folded row must stay one physical line, so compact it to one JSON string.
+ */
+function singleLinePreview(input: unknown): string {
+  if (typeof input === "string") return input;
+  if (input === undefined) return "";
+  try {
+    return JSON.stringify(input);
+  } catch {
+    return String(input);
+  }
+}
+
+/**
+ * The key argument a folded one-line row carries next to its family.
+ */
+export type FoldedKeyArgument = {
+  /** What the one-line row shows — the command's first physical line. */
+  text: string;
+  /** The full value (all command lines / the whole path) for the `title`. */
+  title: string;
+};
+
+/**
+ * The key argument a folded one-line row must carry next to its family
+ * (D-041, ui-spec.md §2.2): the Bash command's first line, or the path for
+ * Edit / Write / Read (Claude and grok field names). Returns null for
+ * families the spec table gives no key argument (Task / MCP / Generic); the
+ * caller then renders family alone, except a Bash call whose input has no
+ * `command` falls back to a JSON preview so the row is never a bare `Bash`.
+ *
+ * The row shows `text` and truncates by width; `title` carries the complete
+ * value (`text` is only the first physical line of a multi-line command).
+ */
+export function foldedKeyArgument(
+  name: string,
+  call: ToolCallPayload,
+  result: ToolResultPayload | null = null,
+): FoldedKeyArgument | null {
+  const record = asRecord(knowledgeValue(call.input));
+  const changedPath = result?.changes[0]?.path ?? null;
+  const pathArg = (value: string | null): FoldedKeyArgument | null =>
+    value ? { text: value, title: value } : null;
+  switch (name) {
+    case "Bash":
+    case "run_terminal_command": {
+      const command = asString(record?.command);
+      const full = command ?? singleLinePreview(knowledgeValue(call.input));
+      return full ? { text: firstLine(full) ?? full, title: full } : null;
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit":
+      return pathArg(asString(record?.file_path) ?? asString(record?.notebook_path) ?? changedPath);
+    case "read_file":
+      // list_dir's fields are accepted too: both render as the Read family.
+      return pathArg(
+        asString(record?.target_file) ??
+          asString(record?.target_directory) ??
+          asString(record?.file_path) ??
+          changedPath,
+      );
+    case "list_dir":
+      return pathArg(asString(record?.target_directory) ?? asString(record?.path) ?? changedPath);
+    case "write":
+    case "search_replace":
+      return pathArg(asString(record?.file_path) ?? changedPath);
+    default:
+      return null;
+  }
+}
+
 /**
  * A shell call's working directory from its completed frame: grok puts
  * `current_dir` in rawOutput, not the tool input (fixture tui-updates.jsonl

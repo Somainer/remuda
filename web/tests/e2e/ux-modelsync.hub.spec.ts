@@ -272,7 +272,6 @@ async function clearApprovals(page: Page, instanceId: string) {
   // Wait for the poll to drop the answered card before measuring popovers.
   await expect(page.getByTestId("approval-card")).toHaveCount(0);
 }
-
 test.afterEach(async ({ page }) => {
   for (const id of created.splice(0)) {
     await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);

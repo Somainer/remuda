@@ -455,6 +455,34 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     expect(workingCard.querySelector("[data-testid='session-next-step']")?.textContent).toBe("运行中…");
   });
 
+  it("keeps each row's wire toggle aria-expanded in sync when two rows are open", async () => {
+    const user = userEvent.setup();
+    hub.instances = [session("ins_a", { activity: known("idle") }), session("ins_b", { activity: known("idle") })];
+    renderList();
+    const cards = screen.getAllByTestId("board-card");
+    const cardA = cards.find((card) => card.querySelector(`a[href="/s/ins_a"]`))!;
+    const cardB = cards.find((card) => card.querySelector(`a[href="/s/ins_b"]`))!;
+    const toggleA = cardA.querySelector("[data-testid='session-wire-toggle']") as HTMLElement;
+    const toggleB = cardB.querySelector("[data-testid='session-wire-toggle']") as HTMLElement;
+    const wireA = cardA.querySelector("[data-testid='session-wire']") as HTMLDetailsElement;
+    const wireB = cardB.querySelector("[data-testid='session-wire']") as HTMLDetailsElement;
+    expect(toggleA.getAttribute("aria-expanded")).toBe("false");
+    await user.click(toggleA);
+    expect(toggleA.getAttribute("aria-expanded")).toBe("true");
+    expect(wireA.open).toBe(true);
+    // Opening B must not close A: each row tracks its own disclosure.
+    await user.click(toggleB);
+    expect(toggleB.getAttribute("aria-expanded")).toBe("true");
+    expect(toggleA.getAttribute("aria-expanded")).toBe("true");
+    expect(wireA.open).toBe(true);
+    expect(wireB.open).toBe(true);
+    await user.click(toggleA);
+    expect(toggleA.getAttribute("aria-expanded")).toBe("false");
+    expect(toggleB.getAttribute("aria-expanded")).toBe("true");
+    expect(wireA.open).toBe(false);
+    expect(wireB.open).toBe(true);
+  });
+
   it("does not render the go handle when the blocked row has no pending interaction", () => {
     renderList();
     const blockedCard = screen

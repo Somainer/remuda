@@ -1,7 +1,6 @@
 # ux2026-nextstep-1 — 列表行去 wire 串（P0-6，D-038）
 
 - 日期：2026-09-19
-- 任务：`briefs/plans/workbench-ux.md` §B-2 `c-nextstep`（仓库内仅此一份计划文件；没有 docs/design/plans 目录，引用以仓库实际路径为准）
 - 规格依据：`docs/design/ui-spec.md` D-038（§2.1「行内容 = 状态点 + 标题 + 一句下一步」）；线框第二句 `Workflow wf_ab12 · phase compile`
 - 截图（合成 fake-node fixture，无真实路径/主机名/用户名）：`ux2026-nextstep-1-1440.png`、`ux2026-nextstep-1-390.png`
 
@@ -46,7 +45,7 @@ follow 的 session 页仍从 history replay 与 live batch 更新短语（finish
 
 ## 5. 390 px 几何（bounding-box，非 nowrap scrollHeight）
 
-基线在 **b0dd8389**（`merge: wt/c-grokpartials`，本次 rebase 的直接基底）上用同一 fake-node fixture、同一 390×844 视口实测；探针脚本（Playwright，锁 `/tmp/remuda-local-e2e.lock-b`，独立 target 目录）：
+几何基线在 **b0dd8389**（`merge: wt/c-grokpartials`）上用同一 fake-node fixture、同一 390×844 视口实测（该测量早于本分支后续 rebase，作为「改前」基线保持不变；分支本身当前 rebase 在更新的 main 上，见 §6）。探针脚本（Playwright，锁 `/tmp/remuda-local-e2e.lock-b`，独立 target 目录）：
 
 ```ts
 // 基线：在 b0dd8389 临时 worktree 起 hub_e2e，建 blocked-question + terminal 两实例后
@@ -55,26 +54,35 @@ const h = await card.evaluate((el) => Math.round(el.getBoundingClientRect().heig
 // BASELINE390 blocked=292.5 terminal=260.5
 ```
 
-改动后同一探针：blocked 行 **152.6 px**，terminal 行 **120.6 px**（closed disclosure sr-only 绝对定位、对子内容 display:none，行高不含 wire）。满套件并发负载下 flex 回流会让绝对高度多约 54px，所以**套件里的几何门**不钉死改后绝对高度，而是用 bounding-box 断言三个不变量（wrap 回归任一会破）：① blocked/terminal `cardH ≤ 基线值`；② headline `height ≤ computed line-height + 1`；③ sentence 同。探针与记录的新值 152.6/120.6 保留在本文件作为设计目标。
+改动后同一探针：**静跑**（只跑本 spec）blocked 行 **152.6 px**、terminal 行 **120.6 px**；**满套件负载下实测最大** blocked **206.6 px**、terminal **132.6 px**（flex 回流 + 字体渲染）。e2e 门按「负载最大 + ~10px 容差」取改后上限：blocked **215 px**、terminal **185 px**，并且两者仍远低于改前基线 292.5/260.5；另断言 headline 与 sentence 的 bounding-box 高度各自不超过一行（`height ≤ computed line-height + 1`），标题/句子折行立刻失败。
 
-## 6. 复跑命令（本 worker 指定端口 + 锁）
+## 6. 基底、复跑命令与结果（本 worker 指定端口 + 锁）
+
+分支基底：**83ad6d8e**（`merge: wt/c-sessionchrome`，最新 main；round-4 复核后再次 rebase）；390 px 几何基线测自更早的 b0dd8389（见 §5，作为「改前」基线）。
 
 ```bash
 export HUB_E2E_LISTEN=127.0.0.1:58910 HUB_E2E_WEB_PORT=58919 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:58911
 export PW_CHANNEL=chromium PW_TEST_CONNECT_WS_ENDPOINT=ws://127.0.0.1:3177/
 # 单元
 pnpm --dir web install --frozen-lockfile
-pnpm --dir web exec vitest run          # 131 files / 1219 tests
-pnpm --dir web exec tsc -b              # typecheck
+pnpm --dir web exec vitest run
+pnpm --dir web exec tsc -b
 pnpm --dir web exec oxlint <changed src>
 # mock + hub e2e（串行，flock /tmp/remuda-local-e2e.lock-b）
 cd web
 ./node_modules/.bin/playwright test --project=chromium tests/e2e/agent-board.spec.ts
-./node_modules/.bin/playwright test -c playwright.hub.config.ts   # 130→138 tests: 120 passed / 0 failed / 16 skipped (post-rebase run on d58be746)
+./node_modules/.bin/playwright test -c playwright.hub.config.ts
 # Rust
 cargo fmt --all --check
 cargo build -p remuda-hub --examples --locked
 ```
+
+满套件结果在推送头上复跑（2026-09-20，锁 `…lock-b`，端口 58910/58919/58911）：
+
+- `agent-board.spec.ts`（mock）：**3 passed / 0 failed**；
+- `ux-nextstep.hub.spec.ts`（hub）：**1 passed / 0 failed**；
+- 全 hub 套件（playwright.hub.config.ts，146 test）：**130 passed / 0 failed / 16 skipped**，sha `7d8421e2`；
+- 单元 `pnpm --dir web exec vitest run`：131 files / 1258 tests 全绿；`tsc -b`、oxlint、`cargo fmt --all --check`、`cargo clippy -p remuda-hub --example hub_e2e -D warnings` 全绿。
 
 ## 7. 兼容性
 

@@ -704,7 +704,7 @@
   background: var(--paper);
 }
 
-.tty {
+.ttyTag {
   height: 22px;
   border: 1px solid var(--line);
   border-radius: var(--radius);

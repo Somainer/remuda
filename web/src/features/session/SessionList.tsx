@@ -136,8 +136,11 @@ export function SessionList({
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
-  // Which row's wire disclosure is open (drives the side trigger aria).
-  const [wireOpenFor, setWireOpenFor] = useState<Id | null>(null);
+  // Ids of rows whose wire disclosure is open (multiple rows may be open at
+  // once; drives the side triggers' aria-expanded).
+  const [wireOpenIds, setWireOpenIds] = useState<readonly Id[]>([]);
+  const toggleWire = (id: Id) =>
+    setWireOpenIds((current) => (current.includes(id) ? current.filter((row) => row !== id) : [...current, id]));
   const actionHeadingId = "session-row-actions-title";
 
   /**
@@ -634,14 +637,13 @@ export function SessionList({
                   ) : null}
                   <div className={css.rowSide}>
                     <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
-                    {/* Wire disclosure trigger: opens the session-wire
-                        details without rendering anything when closed (the
-                        details is visually hidden until open). */}
+                    {/* Wire disclosure trigger: toggles the controlled
+                        session-wire details without mutating the DOM. */}
                     <button
                       type="button"
                       className={css.wireToggle}
                       data-testid="session-wire-toggle"
-                      aria-expanded={wireOpenFor === instance.id}
+                      aria-expanded={wireOpenIds.includes(instance.id)}
                       aria-controls={`session-wire-${instance.id}`}
                       aria-label="运行详情"
                       title={`${instance.lifecycle} · ${activity} · ${instance.connectivity} | ${hubStore.hostName(instance.hostId)}${
@@ -650,14 +652,7 @@ export function SessionList({
                       onClick={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
-                        const card = event.currentTarget.closest("[data-testid='board-card']");
-                        const details = card?.querySelector(
-                          "[data-testid='session-wire']",
-                        ) as HTMLDetailsElement | null;
-                        if (!details) return;
-                        const open = !details.open;
-                        details.open = open;
-                        setWireOpenFor(open ? instance.id : null);
+                        toggleWire(instance.id);
                       }}
                     >
                       详情
@@ -679,17 +674,29 @@ export function SessionList({
                       ⋯
                     </button>
                   </div>
-                  <details className={css.wire} data-testid="session-wire" id={`session-wire-${instance.id}`}>
-                    <summary className={css.wireSummary} tabIndex={-1} aria-hidden="true">
-                      {tty ? (
-                        <span className={css.tty} title={nativeShort(instance)}>
-                          终端
-                        </span>
-                      ) : null}
-                    </summary>
+                  <details
+                    className={css.wire}
+                    data-testid="session-wire"
+                    id={`session-wire-${instance.id}`}
+                    open={wireOpenIds.includes(instance.id)}
+                    onToggle={(event) => {
+                      const open = (event.currentTarget as HTMLDetailsElement).open;
+                      setWireOpenIds((current) => {
+                        const has = current.includes(instance.id);
+                        if (open === has) return current;
+                        return open ? [...current, instance.id] : current.filter((row) => row !== instance.id);
+                      });
+                    }}
+                  >
+                    <summary className={css.wireSummary} tabIndex={-1} aria-hidden="true" />
                     <div className={css.wireBody}>
                       <span className={css.wireId}>{shortId(instance.id, 8)}</span>
                       {exit ? <span className={css.exit}>{exit}</span> : null}
+                      {tty ? (
+                        <span className={css.ttyTag} title={nativeShort(instance)}>
+                          终端
+                        </span>
+                      ) : null}
                     </div>
                     <div className={css.meta} data-testid="session-lifecycle">
                       <span>{instance.lifecycle}</span>

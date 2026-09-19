@@ -235,13 +235,17 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   await page.setViewportSize({ width: 390, height: 844 });
 
   // 390 px geometry, measured against bounding boxes (scrollHeight on a
-  // nowrap element cannot fail).
-  //
-  // Post-change measured heights (same fixture/viewport, probe in the
-  // evidence doc): blocked row 152.6 px, terminal row 120.6 px in a quiet
-  // run; under full-suite load flex reflow can add ~54 px, so the gate
-  // below checks the one-line geometry and the exact baseline bound
-  // (292.5 / 260.5) rather than an absolute post-change height.
+  // nowrap element cannot fail). Two bounds per row:
+  //  - the pre-change baseline on b0dd8389 (292.5 / 260.5): the redesign
+  //    must never exceed the old row;
+  //  - a tight post-change bound: quiet-run maxima 152.6 (blocked) and
+  //    120.6 (terminal), full-suite loaded maxima 206.6 and ~132.6, plus
+  //    ~10 px tolerance → 215 / 185. A wrapping regression blows this long
+  //    before it reaches the baseline.
+  const BASELINE_BLOCKED_H = 292.5;
+  const BASELINE_TERMINAL_H = 260.5;
+  const REDESIGN_BLOCKED_H = 215;
+  const REDESIGN_TERMINAL_H = 185;
   const geometry = await approvalRow.evaluate((card) => {
     const lineMetrics = (selector: string) => {
       const el = card.querySelector(selector);
@@ -256,18 +260,16 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
       sentence: lineMetrics("[data-testid='session-next-step']"),
     };
   });
-  // Re-measure defensively: the absolute cardH flips between ~153 (wire
-  // fully collapsed) and ~207 (flex reflow under full-suite load) depending
-  // on timing; gate on the tight one-line geometry and the baseline bound,
-  // not on an absolute row height.
-  expect(geometry.cardH).toBeLessThanOrEqual(292.5);
+  expect(geometry.cardH).toBeLessThanOrEqual(REDESIGN_BLOCKED_H);
+  expect(geometry.cardH).toBeLessThanOrEqual(BASELINE_BLOCKED_H);
   expect(geometry.headline.oneLine, `headline ${JSON.stringify(geometry.headline)}`).toBe(true);
   expect(geometry.sentence.oneLine, `sentence ${JSON.stringify(geometry.sentence)}`).toBe(true);
 
   const terminalGeometry = await terminalRow.evaluate((card) => ({
     cardH: Math.round(card.getBoundingClientRect().height * 10) / 10,
   }));
-  expect(terminalGeometry.cardH).toBeLessThanOrEqual(260.5);
+  expect(terminalGeometry.cardH).toBeLessThanOrEqual(REDESIGN_TERMINAL_H);
+  expect(terminalGeometry.cardH).toBeLessThanOrEqual(BASELINE_TERMINAL_H);
 
   await shot(page, "ux2026-nextstep-1-390.png");
 });

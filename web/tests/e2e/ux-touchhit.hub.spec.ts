@@ -101,8 +101,14 @@ async function createClaudeSession(page: Page): Promise<string> {
   );
   await page.getByTestId("new-session-start").click();
   const res = await creating;
-  expect(res.ok(), `instance create failed: ${res.status()} ${await res.text().catch(() => "")}`).toBe(true);
-  const instanceId = (await res.json()).instance.instanceId as string;
+  // Read the body once: res.text()/res.json() consume the stream, so the
+  // assertion and the id parse must share the same string.
+  const body = await res.text();
+  expect(res.ok(), `instance create failed: ${res.status()} ${body}`).toBe(true);
+  const instanceId = (JSON.parse(body) as {
+    instance?: { instanceId?: string };
+  }).instance?.instanceId as string;
+  expect(instanceId).toBeTruthy();
   created.push(instanceId);
   await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
   // The effort controls live in the structured-view composer dock; a fresh

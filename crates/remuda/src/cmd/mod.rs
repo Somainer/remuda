@@ -2,6 +2,7 @@
 
 pub mod agents;
 mod brief;
+mod capability;
 pub mod dev;
 mod dispatch;
 pub mod dispatcher;

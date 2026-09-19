@@ -78,6 +78,12 @@ pub(crate) enum InstanceCommand {
         /// Optional command id for create idempotency.
         #[arg(long)]
         command_id: Option<String>,
+        /// Per-launch host capability grant (repeatable). Only
+        /// `computer-use` exists; it requires a macOS host reporting the
+        /// installed capability and is incompatible with bypass permissions
+        /// (D-045).
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
     },
     /// List instances (`name`, `kind`, `status`, `cwd`, `host`).
     #[command(visible_alias = "ls")]
@@ -181,6 +187,7 @@ pub(crate) struct CreateOpts {
     pub title: Option<String>,
     pub prompt: Option<String>,
     pub command_id: Option<String>,
+    pub capabilities: Vec<String>,
 }
 
 /// Run a `remuda instance` subcommand.
@@ -201,6 +208,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                 prompt,
                 prompt_file,
                 command_id,
+                capabilities,
             } => {
                 let prompt = match (prompt, prompt_file) {
                     (Some(_), Some(_)) => bail!("use --prompt or --prompt-file, not both"),
@@ -222,6 +230,7 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
                         title,
                         prompt,
                         command_id,
+                        capabilities,
                     },
                 )
                 .await?;
@@ -330,6 +339,17 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     if opts.host.is_some() && !opts.labels.is_empty() {
         bail!("use --host or --labels, not both");
     }
+    super::capability::validate_requested(&opts.capabilities)?;
+    // grok is not a capability target this batch (D-045 §3.2/§5.3).
+    if super::capability::requests_computer_use(&opts.capabilities)
+        && !matches!(opts.kind.as_str(), "claude" | "codex")
+    {
+        bail!(
+            "the \"computer-use\" capability is not supported for kind {:?} this batch; \
+             supported kinds are claude and codex",
+            opts.kind
+        );
+    }
     if let Some(name) = &opts.name {
         worktree::validate_name(name)?;
     }
@@ -383,27 +403,43 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     if tty_attach_driver(&opts.driver) {
         body["requiredCapabilities"] = json!(["tty-attach", "live-attach"]);
     }
+    if !opts.capabilities.is_empty() {
+        body["capabilities"] = json!(opts.capabilities);
+    }
 
     // Hub placement (proposal.md §4.6) accepts hostId, labels[], or any.
     // Still send hostId when the CLI can resolve it so older Hubs that require
     // the field keep working; otherwise Hub pick_hosts runs.
+    let hosts = client.list_hosts().await.unwrap_or_default();
     if let Some(host) = &opts.host {
         body["hostId"] = json!(host);
         body["placement"] = json!({ "host": host });
     } else if !opts.labels.is_empty() {
         body["placement"] = json!({ "labels": opts.labels });
-        if let Ok(hosts) = client.list_hosts().await
-            && let Ok(host_id) = pick_host(&hosts, &opts.labels)
-        {
+        if let Ok(host_id) = pick_host(&hosts, &opts.labels) {
             body["hostId"] = json!(host_id);
         }
     } else {
         body["placement"] = json!({ "kind": "any" });
-        if let Ok(hosts) = client.list_hosts().await
-            && let Ok(host_id) = pick_host(&hosts, &[])
-        {
+        if let Ok(host_id) = pick_host(&hosts, &[]) {
             body["hostId"] = json!(host_id);
         }
+    }
+
+    // D-045 gate 2, before persistence: the target host must be a macOS host
+    // whose Node reports the capability installed. When placement is explicit
+    // (`--host`/labels resolved) we check the exact target; `kind:any` checks
+    // the Hub's pick when one was resolved. The Hub re-checks regardless.
+    if super::capability::requests_computer_use(&opts.capabilities)
+        && let Some(host_id) = body.get("hostId").and_then(Value::as_str)
+        && let Some(host) = hosts.iter().find(|host| {
+            host.get("hostId")
+                .or_else(|| host.get("id"))
+                .and_then(Value::as_str)
+                == Some(host_id)
+        })
+    {
+        super::capability::host_supports_computer_use(host)?;
     }
 
     Ok(client.create_instance(&body).await?)

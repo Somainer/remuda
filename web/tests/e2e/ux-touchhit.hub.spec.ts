@@ -290,8 +290,13 @@ test("header controls that are on screen own their full 44px corners at 390px wi
 
     // The two 26px effort glyph buttons (reset on the pill; list-back on the
     // tier list) keep their glyph box and own their ::after corners.
+    // D-042 (c-composer): at touch width the effort card rides inside the
+    // composer options bottom sheet (not an anchored popover), so reveal the
+    // effort section by scrolling it into view before probing its glyphs.
     await page.getByTestId("model-effort-chip").click();
+    await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
     await expect(page.getByTestId("effort-menu")).toBeVisible();
+    await page.getByTestId("effort-reset").scrollIntoViewIfNeeded();
     await mark(page.getByTestId("effort-reset"), "effort-reset");
     const resetBox = await assertTapTarget(page, page.getByTestId("effort-reset"), "effort-reset");
     expect(resetBox.width).toBeLessThan(27);
@@ -299,6 +304,7 @@ test("header controls that are on screen own their full 44px corners at 390px wi
 
     await page.getByTestId("effort-open-list").click();
     await expect(page.getByTestId("effort-slider-panel")).toBeVisible();
+    await page.getByTestId("effort-list-back").scrollIntoViewIfNeeded();
     await mark(page.getByTestId("effort-list-back"), "effort-list-back");
     const listBackBox = await assertTapTarget(
       page,

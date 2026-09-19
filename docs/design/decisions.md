@@ -27,6 +27,7 @@
 | D-046 | 2026-09-19 | **CUA 交互路由：`elicitation/create` 由 worker 自己答，但回答权被 launch 请求约束**。事实基础：agent 侧今天**只有一条** elicitation 桥，且只搭在 Claude 的 hook 事件上——`Elicitation` 已是注册事件、阻塞、可带 `action` 回复（`crates/remuda-signal/src/event.rs:114-135`），已能生成 `Interaction{kind: elicitation}` 卡（`crates/remuda-signal/src/approval.rs:153-208`），也能从 `InteractionAnswer::Elicitation` 回一个动作（`crates/remuda-signal/src/bus.rs:1017-1030`）。**但这条链路够不到 MCP 的 `elicitation/create`**：`cua-repl` 是 stdio MCP server，它的 elicitation 走 MCP 协议本身，而 codex shadow 的 `hooks.json` 只注册 `SessionStart` 与 `PermissionRequest` 两个事件（`CODEX_EVENTS`，`crates/remuda-driver/src/launch/shadow.rs:40-45`；grok 的 `GROK_EVENTS` 同样不含 elicitation 类事件，`shadow.rs:47-55`），**两者都不是 MCP 的 `elicitation/create`**，所以**今天没有任何路径能把一个 MCP server 的 `elicitation/create` 送到 `/approvals`**（缺的是一个从 harness 到 Hub 的 producer，不是 `InteractionCarrier` 取值——那个枚举已有七个值，见 [codex-cua.md](./codex-cua.md) §5.3）。因此本批的合同是：**worker 自己在 cua-repl 的 `initialize` 里声明 `capabilities.elicitation` 并自行回答**——按应用审批时 `accept` 且 `persist: session`，而**回答权被本次 launch 的请求约束**：只有请求中点名的 bundle id 可以批准，未点名的应用一律不批（`skills/codex-computer-use/SKILL.md` 的既有规则，本决策把它从「skill 的自律」升级为「能力授权语义的一部分」）。**同时如实记账**：这条路线意味着桌面审批没有 journal 行、没有 `/approvals` 卡、没有第二人复核，只有 worker 的一面之词——这是本批明确接受的代价，写进 D-045 的「后续」而不是假装它已解决。**后续**（不在本批，前置是一条 MCP 级 elicitation 桥：为不经过 Claude hook 的 harness 造 producer，并给它一个 `InteractionCarrier` 取值）：把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。在那之前，`D-045` 的 bypass 拒绝与「只批准点名应用」共同构成唯一的边界。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §5；[native-pty-first.md](./native-pty-first.md) §5 P5 残留（原文：`Elicitation` 仅按二进制读取端形状实现，**未取得实机 payload**）|
 | D-047 | 2026-09-19 | **模型 API 交付方式可选：`direct`（默认）或 `via:<hostId>` 经由某台机器出去（路由子模式 `auto`/`hub-relay`/`direct-net`）；拒绝而非改道（refuse-never-reroute）。** profile 上是 `ProviderProfile.delivery`（嵌套对象，缺省 = `{mode:direct, route:auto}`），逐次派发是 `apiVia`（字符串：`<hostId>` \| `self` \| `none`）加可选 `apiRoute`；瀑布 = 请求 > 项目 > profile > `direct`，在**放置之后**解析（`via:<W>` 收敛为 `direct`）。H 的属性 `relayBind` 未配置时 W 与 H 之间无直连路径，只能走 `hub-relay`。决议**只在启动时做一次**并写明在实例上；会话中途直连失败**不**静默切到 hub-relay，请求失败、实例报 `blocked{api-route-down}`。D-031 仍然成立：不装不探任何隧道工具、不监听非 loopback（除非操作员显式配置 `relayBind`）、单一固定 origin、实例作用域、字节走既有链路。 | coordinator（实现方，承接 owner 2026-09-19 指示） | [api-routing.md](./api-routing.md) §2/§3/§4/§5/§8、D-031、D-021、D-035；未落地（类型与线格式先落，行为在 tasks 2–6） |
 | D-048 | 2026-09-19 | **`api.*` 带内流类（`api.open`/`body`/`head`/`chunk`/`end`/`cancel`/`credit`）承载代理请求，与 `object.pull`/`object.chunk` 同构。** 全部是 notification，**自带每链路 stream 注册表**，绝不进 Hub→Node 的 32 槽 pending map（否则几条流就卡死 `instance.create`/`tty.write`）；新增 `TransportLimits.maxApiStreams`（默认 8/链路、2/实例）与 `apiChunkBytes`（默认 64 KiB 原始 ≈ 87 KiB base64，远低于 1 MiB 帧上限）；生产者每流最多 4 个未确认 chunk，消费者以 `api.credit` 放行，块间 `yield_now()`；SSE 必须合并（≥16 KiB 或 ≥50 ms 或流结束），body 是**不透明字节**、不按 SSE 解析。 | coordinator（实现方） | [api-routing.md](./api-routing.md) §7、protocol.md §7.4 object.pull 先例、ws.rs 出站队列容量 32 |
+| D-049 | 2026-09-19 | **手机优先 UI：受限 `/m` 路由树 + 会话本体不分叉 + 视口重定向层 + `start_url: /` + badge/权限横幅口径 + 平台听写真名。** (1) **受限路由树**：同一 Vite PWA 内新增手机优先路由树，`/m` **只拥有导航与首页级信息架构**——`/m`（会话 home）、`/m/inbox`（收件箱）、Jump To sheet、phone 底栏（会话·收件箱(n)·新建·更多）；桌面路由零改动，不做独立客户端、不做原生 app。(2) **会话本体不分叉**：手机打开会话仍是共享的 `/s/:instanceId`（及 `/tty` `/structured` `/files` `/events`），`/sessions/new` `/login` `/pair` `/settings` 同样共享；改善靠该路由的 compact 形态（D-040/D-041/D-042 + ui-spec §4.7 铬预算：一条顶栏 `--top-mobile` 52px + 一条底栏 `--bar` 64px、正文 ≥ 60% 视口、截断优先级=标题→space 芯片→状态文字、状态点恒在主行、`终端\|结构` 分段与 Stop 永不截断/进 ⋯；§1.4 chips 折单芯片 + tabs 行收起；**host 芯片与 cost 仅 compact 折入「运行详情」，D-040 桌面主行规则不变**），不复制 transcript。(3) **重定向与深链**（`<Navigate replace>`）：compact 下 `/sessions`→`/m`、`/approvals?focus=`→`/m/inbox?focus=`（**query 原样保留**）；桌面下 `/m*`→`/sessions`；**`/s/:id` 永不重定向**（两套壳下同一条路由）；`/sessions/new` `/login` `/pair` `/settings` 两侧不重定向。(4) **`start_url` 从 `/sessions` 改为 `/`**，由重定向层按视口判定落点（手机装的 PWA 落 `/m`，桌面落 `/sessions`），一份 manifest、一份 SW。(5) **badge**：推送 payload 增加一个**可选**整数 `badge` 字段（该设备 pending interaction 数），SW 调 `setAppBadge`/`clearAppBadge`，无 Badging API 则什么都不做、不用通知条数冒充，字段缺失行为逐字节不变；**不新增推送事件类型**。(6) **权限申请不在启动时弹**，只在 `/m/inbox` 顶部横幅（用户手势触发）与设置→通知两处；iOS 未加主屏时横幅文案改「先加到主屏幕」。(7) **语音**：平台键盘听写优先、先成文再发送（`composing()` 守卫对听写同样生效）、Web Speech API 仅作可用时增强且默认关、不做云转写/录音上传/协议字段、iOS Safari 无 `SpeechRecognition`（写进设置文案）、终端段不提供语音。(8) **里程碑**：M1 = home、会话、收件箱、新建、登录、语音；键盘条、分组 Jump To、badge 与推送真机验证排 M2。取舍：会话路由 compact 去掉 app 底栏后「回家」靠 44px 返回键 + Jump To（ui-spec §4.7 / 计划风险 E9），若实测反感只回滚该条、不回滚整棵 `/m` 树。 | coordinator（mobile-ui 计划 section (B)/(D) D1–D8 默认值，所有者未拍板即按默认执行；任务 c-mspec 落规格） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5（P0 能读能批能说 + 明确不做）、§6（落地顺序）、§7.1（home）、§9（SOTA 一句话「投影不是第二个 agent、终端一键可回不 fork」+「不要抄」清单）、§10-19（主分段）、§10-23（Jump To 不做第二套空间模型）、§11.2（分组/时钟/只搜标题）、§11.3（Inbox 两档、错误当正文、权限横幅）、§11.4（git 扫视串可学、硬裁 diff 不抄）、§11.5（端口/Kill 面板与隧道整体不抄，D-031）；[ui-spec.md §1.2/§1.3/§4.5/§4.6/§4.7/§4.8](./ui-spec.md)；D-026/D-028a/D-031/D-038/D-039/D-040/D-041/D-042；[evidence/mobile-ui-1.md](./evidence/mobile-ui-1.md) |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -827,3 +828,74 @@ bodyChunked, deadlineMs}`）、`api.body`（请求体续帧）、`api.head`
 字段。这些参数类型与其余 M1 Hub↔Node 操作帧同属一族，因此和
 `object.pull`/`tty.*` 的参数一样不进 `protocol.md` §12 的生成目录，而是在
 §7.6 以文档记录（carrier 按手写路径把它们路由进 stream 注册表）。
+
+## D-049
+
+**2026-09-19 · 手机优先 UI：受限 `/m` 路由树、会话本体不分叉、视口重定向层、`start_url: /`、badge/权限横幅与平台听写**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted（规格层；实施按 mobile-ui 计划任务 2–9 跟进） |
+| 相关 | [ui-spec.md §1.1/§1.2/§1.3/§1.4/§4.5/§4.6/§4.7/§4.8](./ui-spec.md)、D-026、D-028a、D-031、D-038、D-039、D-040、D-041、D-042、[workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md)、[evidence/mobile-ui-1.md](./evidence/mobile-ui-1.md) |
+
+**背景**：报告 §2.1 观察到手机会话页「垂直铬叠五层，正文只剩中间一小块」，而
+手机需要的首页（§7.1 / §11.2 的分组跳转）与收件箱（§11.3 两档、错误当正文）
+在信息架构上**不是桌面列表的密度变体**：桌面 `/sessions` 要筛选器/多选/广播/
+行内遥控，手机要分组 + 一句下一步 + context 环 + 一键处理。mobile-ui 计划
+§(B) 评估了三个选项：
+
+1. **只做共享路由的 compact 分支（拒绝）**：把手机首页硬塞进
+   `SessionList` 会同时压死桌面形态与在飞的列表重写，且既有 e2e 断言全部压在
+   同一组件上——改动面比新建一个手机首页更大。
+2. **同一 PWA 内的受限 `/m` 路由树（采纳）**：新增手机壳只拥有导航与首页级
+   信息架构，共享 store / auth / API / SW，桌面路由零改动。
+3. **独立客户端 / 第二个 Vite 入口（拒绝）**：报告 §5「明确不做」写明不新做
+   原生 iOS/Android（§0.5 钉死单一 Vite 入口）；两份 auth / store / SW 会立刻
+   分叉，违反报告 §9 的 SOTA 一句话——**结构视图是 live session 的投影，不是
+   第二个 agent；终端始终可一键回去且不 fork。**
+
+方案 2 的关键取舍是**只分一半**：首页与收件箱可以新做（它们在手机上本来就是
+另一套 IA），会话屏**绝不**分叉——会话页承载 journal follow、turn 裁决、
+composer 三态（D-028a）、terminal attach、内联审批与 resume（D-026），复制它
+就是第二份 transcript，并会与 D-040/D-041/D-042 的在飞实施正面冲突。手机上的
+会话改善全部落在共享 `/s/:id` 的 compact 形态上。另一笔记下的取舍：会话路由
+compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To；若实测反感，
+只回滚这一条、不回滚整棵 `/m` 树（计划风险 E9）。
+
+**决策**：规格条文以 [ui-spec.md §4.7](./ui-spec.md)（路由树、重定向、可测量
+铬预算、截断优先级）与 [§4.8](./ui-spec.md)（语音）为准，此处不重复条文，只
+钉边界与编号归属：
+
+1. **受限 `/m` 树**：只含 `/m`（home）、`/m/inbox`、Jump To sheet、phone
+   底栏；会话本体与新建/登录/配对/设置保持共享路由。
+2. **重定向层**：compact `/sessions`→`/m`、`/approvals?focus=`→
+   `/m/inbox?focus=`（query 原样保留）；桌面 `/m*`→`/sessions`；
+   **`/s/:id` 永不重定向**。
+3. **铬预算**：一条顶栏 `--top-mobile` + 一条底栏 `--bar`；正文（composer
+   收起、无软键盘）≥ 60% 视口；截断顺序 标题 → space 芯片 → 状态文字；分段与
+   Stop 永不截断/进 ⋯（与 D-040 一致）。**compact-only 例外**：会话主行的
+   host 芯片与 cost 折进「运行详情」（space 芯片已点名主机与项目），D-040 的
+   **桌面**主行规则不变；状态点恒在主行。
+4. **PWA**：`start_url` 从 `/sessions` 改为 `/`，一份 manifest / SW，落点由
+   重定向层按视口判定。
+5. **badge**：推送 payload 增加一个**可选**整数 `badge` 字段；无 Badging API
+   什么都不做；不新增推送事件类型（详见 §4.5）。
+6. **权限申请**：不在启动时弹，只在 `/m/inbox` 横幅与设置 → 通知两处由手势
+   触发；iOS 未加主屏时文案为「先加到主屏幕」。
+7. **语音**：平台键盘听写优先、先成文再发送；Web Speech API 仅增强且默认关；
+   不做云转写；iOS Safari 无 `SpeechRecognition`（写进设置文案）；终端段无语音
+   （详见 §4.8）。
+8. **里程碑**：M1 = home、会话、收件箱、新建、登录、语音；键盘条、分组 Jump
+   To、badge 与推送真机验证排 M2；git 面板五 tab 在 M2 之后。
+9. **不抄清单**：报告 §9 的「不要抄」（顶栏/composer 盖正文、绿色品牌/Space
+   Grotesk/FAB/地球图标）照行；DEV SERVERS / Kill 端口旁栏与隧道列表以 §11.5
+   的「**整体不抄**」为准（§9 只说不要先做），D-031 的隧道禁令不变。
+
+**由谁**：coordinator（mobile-ui 计划 §(B) 设计与 §(D) D1–D8 推荐默认值；
+所有者未另行拍板即按默认执行；任务 c-mspec 落规格，零代码）。
+
+**依据**：报告 §5（P0「能读、能批、能说」与「明确不做」）、§6（落地顺序）、
+§7.1（home）、§9（SOTA 一句话、「不要抄」清单）、§10-19 / §10-23、§11.2
+（Jump To 分组、只搜标题）、§11.3（Inbox 两档、错误当正文、权限横幅）、§11.4
+（git 扫视串可学、硬裁 diff 与行内丢弃不抄）、§11.5（端口/Kill 旁栏与隧道整体
+不抄）；与 D-038…D-042 的逐条无冲突对照见 [evidence/mobile-ui-1.md](./evidence/mobile-ui-1.md) §4。

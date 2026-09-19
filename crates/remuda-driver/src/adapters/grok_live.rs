@@ -67,6 +67,7 @@ use remuda_signal::live::{
 use remuda_signal::question::resolved_in_terminal;
 use serde_json::Value;
 
+use super::grok_terminal::TerminalTails;
 use super::{AdapterObservation, FileSignalAdapter, GrokAdapter};
 use crate::error::DriverResult;
 
@@ -102,6 +103,10 @@ pub struct GrokLive {
     inner: GrokAdapter,
     identity: LiveIdentity,
     projection: LiveProjection,
+    /// Cross-task seam: terminal-log tails owned by task **c-grok-stdout**
+    /// (implementation in `grok_terminal.rs`); coordinate any edit here with
+    /// that task's owner.
+    terminal: TerminalTails,
 }
 
 impl GrokLive {
@@ -113,6 +118,7 @@ impl GrokLive {
             inner,
             identity,
             projection: LiveProjection::default(),
+            terminal: TerminalTails::new(),
         }
     }
 }
@@ -132,9 +138,14 @@ impl FileSignalAdapter for GrokLive {
 
     fn poll(&mut self) -> DriverResult<Vec<AdapterObservation>> {
         let observed = self.inner.poll()?;
-        Ok(self
+        let mut projected = self
             .projection
-            .fold_batch(observed, &self.identity, now_ts()))
+            .fold_batch(observed, &self.identity, now_ts());
+        // Cross-task seam (c-grok-stdout): fold terminal/<callId>.log tails
+        // into this poll's observations. Owned by c-grok-stdout; see
+        // grok_terminal.rs.
+        self.terminal.fold(&self.inner, &mut projected);
+        Ok(projected)
     }
 }
 

@@ -23,6 +23,7 @@
 pub mod codex_adapter;
 pub mod grok_adapter;
 pub mod grok_live;
+pub mod grok_terminal;
 pub mod supervisor;
 
 use remuda_protocol::{

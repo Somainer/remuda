@@ -150,6 +150,13 @@ function TranscriptInner({
     instanceId ? readDismissedWorkflows(instanceId) : new Set<string>(),
   );
 
+  // D-041: node ids whose folded tool row the reader expanded. The transcript
+  // virtualises rows (rows unmount ~8 rows out of the window), so expansion
+  // cannot live in the card's own useState or the row height collapses again
+  // on the way back. Session-scoped like dismissedWorkflows; 全部折叠 clears
+  // it explicitly (collapse must re-fold even a previously expanded row).
+  const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
+
   // Bounded-window paging: true while the load-earlier row awaits its page.
   // Declared before the route-switch reset below, which clears it per
   // instance like the other per-route refs.
@@ -191,11 +198,21 @@ function TranscriptInner({
     steeringRef.current.clear();
     setLoadingEarlier(false);
     setRowHeights(new Map());
+    setExpandedTools(new Set());
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
     setDismissedWorkflows(instanceId ? readDismissedWorkflows(instanceId) : new Set());
   }
 
   const [showInjected, setShowInjected] = useState(readShowInjected);
+  const toggleToolExpand = useCallback((nodeId: string, expanded: boolean) => {
+    setExpandedTools((prev) => {
+      if (expanded === prev.has(nodeId)) return prev;
+      const next = new Set(prev);
+      if (expanded) next.add(nodeId);
+      else next.delete(nodeId);
+      return next;
+    });
+  }, []);
   const toggleWorkflowDismiss = useCallback(
     (workflowId: string, dismiss: boolean) => {
       if (!instanceId) return;
@@ -627,7 +644,17 @@ function TranscriptInner({
     <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
       <div className={css.toolbar}>
-        <button type="button" className={ui.chip} data-testid="collapse-all" onClick={() => setCollapseTick((n) => n + 1)}>
+        <button
+          type="button"
+          className={ui.chip}
+          data-testid="collapse-all"
+          onClick={() => {
+            // Explicit collapse wins over a prior reader expansion; the
+            // bumped row key remounts each card with its local latch reset.
+            setExpandedTools(new Set());
+            setCollapseTick((n) => n + 1);
+          }}
+        >
           全部折叠
         </button>
         <button
@@ -760,6 +787,8 @@ function TranscriptInner({
                 }
                 dismissedWorkflows={dismissedWorkflows}
                 onToggleWorkflowDismiss={toggleWorkflowDismiss}
+                expandedTools={expandedTools}
+                onToggleToolExpand={toggleToolExpand}
               />
             );
           })}
@@ -804,6 +833,8 @@ function TranscriptRow({
   steering,
   dismissedWorkflows,
   onToggleWorkflowDismiss,
+  expandedTools,
+  onToggleToolExpand,
 }: {
   node: TranscriptNode;
   active: boolean;
@@ -821,6 +852,8 @@ function TranscriptRow({
   steering: Set<string>;
   dismissedWorkflows: ReadonlySet<string>;
   onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
+  expandedTools: ReadonlySet<string>;
+  onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -877,6 +910,8 @@ function TranscriptRow({
         steering,
         dismissedWorkflows,
         onToggleWorkflowDismiss,
+        expandedTools,
+        onToggleToolExpand,
       })}    </div>
   );
 }
@@ -894,6 +929,8 @@ function ToolRow({
     settle: boolean;
     dismissedWorkflows: ReadonlySet<string>;
     onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
+    expandedTools: ReadonlySet<string>;
+    onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
   };
   hitChildId?: string | null;
 }): ReactNode {
@@ -910,6 +947,8 @@ function ToolRow({
       workflow={node.workflow}
       defaultFolded={failed ? false : opts.defaultFolded}
       settle={opts.settle}
+      expanded={opts.expandedTools.has(node.id)}
+      onExpand={() => opts.onToggleToolExpand(node.id, true)}
       workflowDismissed={workflowId ? opts.dismissedWorkflows.has(workflowId) : false}
       onDismissWorkflow={workflowId ? () => opts.onToggleWorkflowDismiss(workflowId, true) : undefined}
       onUndismissWorkflow={workflowId ? () => opts.onToggleWorkflowDismiss(workflowId, false) : undefined}
@@ -951,6 +990,8 @@ function renderNode(
     steering: Set<string>;
     dismissedWorkflows: ReadonlySet<string>;
     onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
+    expandedTools: ReadonlySet<string>;
+    onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
   },
 ): ReactNode {
   if (node.type === "message") {
@@ -1133,6 +1174,8 @@ function renderNode(
                 settle: opts.settle,
                 dismissedWorkflows: opts.dismissedWorkflows,
                 onToggleWorkflowDismiss: opts.onToggleWorkflowDismiss,
+                expandedTools: opts.expandedTools,
+                onToggleToolExpand: opts.onToggleToolExpand,
               }}
               hitChildId={opts.hitChildId ?? null}
             />

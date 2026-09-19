@@ -379,7 +379,7 @@ compact（手机）下已结束的普通工具卡默认折成**一行**，点开
 | 规则 | 内容 |
 |---|---|
 | 生效条件 | 仅 **compact**（§1.3 断点）**且**该卡已 settled（call/result 配对完成，或明确失败）时默认折叠。**running / 未 settled 的卡永不折叠**——正在发生的事要看得见 |
-| 豁免集合（永不折叠，无论 settled） | `family === "Workflow"`（`workflow.run` 按上表：运行中与结束后都展开，只有读者 dismiss 才折叠）；`error` 卡（上表「`error` 展开」）；`interaction.*`（未决时钉在 composer 上方） |
+| 豁免集合（自动 compact 折叠下永不折叠，无论 settled） | 本豁免只约束自动 compact 默认折叠；读者显式「全部折叠」仍保持既有桌面行为（一切非 failed 卡都折，含 Workflow 与 running）。豁免：`family === "Workflow"`（`workflow.run` 按上表：运行中与结束后都展开，只有读者 dismiss 才折叠）；`error` 卡（上表「`error` 展开」）；`interaction.*`（未决时钉在 composer 上方） |
 | 折行内容 | **family + 关键参数**，不能只写族名。Bash = 命令首行（截断到宽度，`title` 给全文）；Edit / Write / Read = 路径（同样截断 + `title` 全文）；Workflow/Task/MCP 见豁免与各自族默认。裸 `Bash` 不合规 |
 | 实现约束 | 折叠分支**必须在 family 判定之后**才可提前 return。当前 `ToolCard.tsx` 的 `if (folded) return …` 早于 `family === "Workflow"` 分支，一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动——这是本条的验收硬指标，不能只断言「卡可见」，要断言卡头 elapsed 在运行中递增 |
 | 展开态 | 展开后的卡与桌面完全一致（同一组件、同一 testid）；折叠只改默认开合，不改内容 |

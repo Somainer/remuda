@@ -1,8 +1,15 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { known, type Id } from "../../types/wire";
-import { familyFor, registryKey, TOOL_FAMILIES } from "./toolRegistry";
+import {
+  familyFor,
+  isInteractionTool,
+  registryKey,
+  shouldFoldToolCard,
+  TOOL_FAMILIES,
+} from "./toolRegistry";
 import { ToolCard } from "./ToolCard";
 
 function call(toolName: string, input: Record<string, string>): ToolCallPayload {
@@ -59,6 +66,42 @@ function renderGrok(cardCall: ToolCallPayload, result: ToolResultPayload | null 
     />,
   );
 }
+
+/** A final (settled) result for a Claude-family card. */
+function doneResult(outcome: ToolResultPayload["outcome"] = "succeeded"): ToolResultPayload {
+  return {
+    nodeId: "obj_n" as Id,
+    revision: "2",
+    operation: "replace",
+    baseRevision: "1",
+    toolCallId: "obj_c" as Id,
+    stage: "final",
+    outcome,
+    blocks: [],
+    structuredResult: known({}),
+    exitCode: known(0),
+    changes: [],
+  };
+}
+
+/**
+ * Stub the workbench media query. `compact=true` makes the COMPACT_WORKBENCH_QUERY
+ * match (a 390px layout); anything else reads as the desktop default.
+ */
+function stubLayout(compact: boolean) {
+  vi.stubGlobal("matchMedia", (query: string) => ({
+    matches: compact && query.includes("max-width: 767px"),
+    media: query,
+    onchange: null,
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => false,
+  }));
+}
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("tool registry dispatch", () => {
   it("maps native names onto families and does not call Codex commandExecution Bash", () => {
@@ -200,11 +243,13 @@ describe("rendered grok ToolCards", () => {
   });
 
   it("does not duplicate the native name in the folded row either", () => {
+    // Running cards are D-041-exempt and never fold, so this is a settled card
+    // folded by an explicit collapse-all request on a non-compact layout.
     const { container } = render(
       <ToolCard
         driverKind="shell-pty"
         call={grokCall("read_file", "read_file", { target_file: "/a.rs" })}
-        result={null}
+        result={grokResult({})}
         completeness="structured"
         diffState="unknown"
         defaultFolded
@@ -256,5 +301,393 @@ describe("rendered grok ToolCards", () => {
     expect(screen.getByTestId("tool-native-name").textContent).toBe("use_tool");
     expect(screen.queryByText("mcp/use_tool")).toBeNull();
     expect(container.textContent).not.toContain("mcp/use_tool");
+  });
+});
+
+/**
+ * D-041 fold decision table (ui-spec.md §2.2): family × settled × compact,
+ * with every exemption.
+ */
+describe("shouldFoldToolCard · D-041 decision table", () => {
+  it("folds an ordinary settled card on compact, never on desktop by default", () => {
+    expect(shouldFoldToolCard({ family: "Bash", settled: true, compact: true })).toBe(true);
+    expect(shouldFoldToolCard({ family: "Edit", settled: true, compact: true })).toBe(true);
+    expect(shouldFoldToolCard({ family: "Read", settled: true, compact: true })).toBe(true);
+    expect(shouldFoldToolCard({ family: "Write", settled: true, compact: true })).toBe(true);
+    expect(shouldFoldToolCard({ family: "Task", settled: true, compact: true })).toBe(true);
+    expect(shouldFoldToolCard({ family: "MCP", settled: true, compact: true })).toBe(true);
+    expect(shouldFoldToolCard({ family: "Generic", settled: true, compact: true })).toBe(true);
+    // Desktop default state is unchanged.
+    expect(shouldFoldToolCard({ family: "Bash", settled: true, compact: false })).toBe(false);
+  });
+
+  it("never folds a running / unsettled card under the automatic compact fold", () => {
+    expect(shouldFoldToolCard({ family: "Bash", settled: false, compact: true })).toBe(false);
+    expect(shouldFoldToolCard({ family: "Bash", settled: false, compact: false })).toBe(false);
+    // collapse-all still folds it — see the requested test below.
+  });
+
+  it("never folds the Workflow family under the automatic compact fold", () => {
+    expect(
+      shouldFoldToolCard({ family: "Workflow", settled: true, compact: true }),
+    ).toBe(false);
+    expect(
+      shouldFoldToolCard({ family: "Workflow", settled: false, compact: true }),
+    ).toBe(false);
+    // collapse-all still folds it — see the requested test below.
+  });
+
+  it("never folds error (failed/denied) cards", () => {
+    expect(
+      shouldFoldToolCard({ family: "Bash", settled: true, compact: true, failed: true }),
+    ).toBe(false);
+    expect(
+      shouldFoldToolCard({
+        family: "Bash",
+        settled: true,
+        compact: false,
+        failed: true,
+        requested: true,
+      }),
+    ).toBe(false);
+  });
+
+  it("never folds interaction.* cards", () => {
+    expect(
+      shouldFoldToolCard({ family: "Generic", settled: true, compact: true, interaction: true }),
+    ).toBe(false);
+    expect(isInteractionTool("AskUserQuestion")).toBe(true);
+    expect(isInteractionTool("ask_user_question")).toBe(true);
+    expect(isInteractionTool("Bash")).toBe(false);
+    expect(isInteractionTool(undefined)).toBe(false);
+  });
+
+  it("collapse-all (requested) folds every non-failed card, including running and Workflow", () => {
+    // Ruling: 全部折叠 keeps main's exact behaviour — D-041 exemptions govern
+    // only the automatic compact fold.
+    expect(
+      shouldFoldToolCard({ family: "Bash", settled: true, compact: false, requested: true }),
+    ).toBe(true);
+    expect(
+      shouldFoldToolCard({ family: "Generic", settled: true, compact: false, requested: true }),
+    ).toBe(true);
+    // A still-running card folds under collapse-all.
+    expect(
+      shouldFoldToolCard({ family: "Bash", settled: false, compact: false, requested: true }),
+    ).toBe(true);
+    // The Workflow family folds under collapse-all too.
+    expect(
+      shouldFoldToolCard({ family: "Workflow", settled: true, compact: false, requested: true }),
+    ).toBe(true);
+    // Failed/denied cards are the single exception, exactly as main.
+    expect(
+      shouldFoldToolCard({
+        family: "Bash",
+        settled: true,
+        compact: false,
+        failed: true,
+        requested: true,
+      }),
+    ).toBe(false);
+  });
+});
+
+/**
+ * Rendered D-041 rows: the compact one-liner for finished ordinary cards,
+ * what it carries, and the exemptions that keep full cards mounted.
+ */
+describe("rendered D-041 compact folds", () => {
+  it("folds a settled Bash card to family + command first line; expanding mounts the full card", () => {
+    stubLayout(true);
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "echo workflow-running" })}
+        result={doneResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    let card = screen.getByTestId("tool-card");
+    expect(card.getAttribute("data-folded")).toBe("1");
+    const arg = screen.getByTestId("tool-fold-arg");
+    expect(arg.textContent).toBe("echo workflow-running");
+    expect(arg.getAttribute("title")).toBe("echo workflow-running");
+    // The family word is the heading — no redundant duplicate family chip.
+    expect(card.textContent).toContain("Bash");
+    expect((card.textContent ?? "").match(/Bash/g)).toHaveLength(1);
+    // The full card body is not mounted while folded.
+    expect(screen.queryByText("$ echo workflow-running")).toBeNull();
+    // The toggle exposes the fold state and is distinguishable across rows.
+    const toggle = screen.getByTestId("tool-fold-open");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.getAttribute("aria-label")).toBe("展开 Bash echo workflow-running");
+
+    fireEvent.click(toggle);
+    card = screen.getByTestId("tool-card");
+    expect(card.getAttribute("data-folded")).toBe("0");
+    expect(screen.getByText("$ echo workflow-running")).toBeTruthy();
+    expect(screen.getByText(/exit 0/)).toBeTruthy();
+  });
+
+  it("shows only the first command line but exposes the full command in title", () => {
+    stubLayout(true);
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "set -e\ncargo test" })}
+        result={doneResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    const arg = screen.getByTestId("tool-fold-arg");
+    expect(arg.textContent).toBe("set -e");
+    expect(arg.getAttribute("title")).toBe("set -e\ncargo test");
+    expect(screen.getByTestId("tool-card").textContent).not.toContain("cargo test");
+  });
+
+  it("folds a settled Edit card to family + the path", () => {
+    stubLayout(true);
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Edit", { file_path: "/repo/src/main.rs", old_string: "a", new_string: "b" })}
+        result={doneResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+    const arg = screen.getByTestId("tool-fold-arg");
+    expect(arg.textContent).toBe("/repo/src/main.rs");
+    expect(arg.getAttribute("title")).toBe("/repo/src/main.rs");
+    expect(screen.queryByText("拟修改")).toBeNull();
+  });
+
+  it("keeps the desktop default unfolded with the same settled card", () => {
+    stubLayout(false);
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "ninja -C build" })}
+        result={doneResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.getByText("$ ninja -C build")).toBeTruthy();
+  });
+
+  it("an expanded card stays expanded when its virtualised row unmounts and remounts", () => {
+    // The transcript owns the expansion (Set keyed by node id): the row
+    // unmounts ~8 rows outside the virtual window, so a card-local latch
+    // would silently re-fold on the way back.
+    stubLayout(true);
+    const onExpand = vi.fn();
+    const cardProps = {
+      driverKind: "claude-print",
+      call: call("Bash", { command: "echo survives-remount" }),
+      result: doneResult(),
+      completeness: "structured",
+      diffState: "unknown" as const,
+    };
+    const { unmount } = render(<ToolCard {...cardProps} expanded={false} onExpand={onExpand} />);
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+
+    fireEvent.click(screen.getByTestId("tool-fold-open"));
+    expect(onExpand).toHaveBeenCalledTimes(1);
+
+    // The transcript row scrolls away: React unmounts the card entirely.
+    unmount();
+    expect(screen.queryByTestId("tool-card")).toBeNull();
+
+    // The row scrolls back; the transcript re-renders with the stored state.
+    render(<ToolCard {...cardProps} expanded onExpand={onExpand} />);
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    // The full card body is mounted without another click.
+    expect(screen.getByText("$ echo survives-remount")).toBeTruthy();
+    expect(screen.queryByTestId("tool-fold-open")).toBeNull();
+  });
+
+  it("collapse-all folds even a running card on desktop (main behaviour)", () => {
+    stubLayout(false);
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "still going" })}
+        result={null}
+        completeness="structured"
+        diffState="unknown"
+        defaultFolded
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+  });
+
+  it("collapse-all folds the Workflow family on desktop (main behaviour)", () => {
+    stubLayout(false);
+    const k = <T,>(value: T) => known(value);
+    render(
+      <MemoryRouter initialEntries={["/s/ins_wf"]}>
+        <ToolCard
+          driverKind="claude-print"
+          call={call("Workflow", { script: "export const meta = {}" })}
+          result={null}
+          completeness="structured"
+          diffState="unknown"
+          defaultFolded
+          workflow={{
+            run: {
+              workflowId: "wf_unit",
+              engine: "claude-workflow",
+              nativeRunId: k("wf_native"),
+              nativeTaskId: k("task"),
+              toolCallId: "obj_c",
+              state: "running",
+              revision: "1",
+              title: k("demo"),
+              name: k("demo-wf"),
+              description: k("demo workflow"),
+              totals: null,
+              live: null,
+              note: null,
+              launchedAt: null,
+              resultRef: null,
+            },
+            phases: [],
+            members: [],
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+    expect(screen.queryByTestId("workflow-card")).toBeNull();
+  });
+
+  it("a running card seen live folds the moment its final result settles (no reload)", () => {
+    stubLayout(true);
+    const { rerender } = render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "long task" })}
+        result={null}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.queryByTestId("tool-fold-arg")).toBeNull();
+
+    // D-041 ruling: the result lands live (no remount, no reload) — the card
+    // folds immediately; a live phone session is the scroll problem the fold
+    // exists for. The reader can expand it again.
+    rerender(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "long task" })}
+        result={doneResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    const card = screen.getByTestId("tool-card");
+    expect(card.getAttribute("data-folded")).toBe("1");
+    expect(screen.getByTestId("tool-fold-arg").textContent).toBe("long task");
+    expect(screen.queryByText("$ long task")).toBeNull();
+  });
+
+  it("folds a card that mounts already settled (settled history) on compact", () => {
+    stubLayout(true);
+    // A fresh mount — e.g. scrolled history, or a turn completed before the
+    // reader opened it — starts folded even though the call is done.
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "long task" })}
+        result={doneResult()}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+    expect(screen.getByTestId("tool-fold-arg").textContent).toBe("long task");
+  });
+
+  it("keeps a failed (error) card open on compact", () => {
+    stubLayout(true);
+    render(
+      <ToolCard
+        driverKind="claude-print"
+        call={call("Bash", { command: "make test" })}
+        result={doneResult("failed")}
+        completeness="structured"
+        diffState="unknown"
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.queryByTestId("tool-fold-open")).toBeNull();
+  });
+
+  it("keeps an interaction fallback card (ask_user_question) open on compact", () => {
+    stubLayout(true);
+    renderGrok(
+      grokCall("ask_user_question", "Ask: Choose one.", {
+        questions: [{ question: "Choose one.", options: [], multiSelect: null }],
+      }),
+      grokResult({}),
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.queryByTestId("tool-fold-open")).toBeNull();
+  });
+
+  it("never folds the Workflow family: the live timeline card stays mounted", () => {
+    stubLayout(true);
+    const k = <T,>(value: T) => known(value);
+    render(
+      <MemoryRouter initialEntries={["/s/ins_wf"]}>
+        <ToolCard
+          driverKind="claude-print"
+          call={call("Workflow", { script: "export const meta = {}" })}
+          result={null}
+          completeness="structured"
+          diffState="unknown"
+          workflow={{
+            run: {
+              workflowId: "wf_unit",
+              engine: "claude-workflow",
+              nativeRunId: k("wf_native"),
+              nativeTaskId: k("task"),
+              toolCallId: "obj_c",
+              state: "running",
+              revision: "1",
+              title: k("demo"),
+              name: k("demo-wf"),
+              description: k("demo workflow"),
+              totals: null,
+              live: null,
+              note: null,
+              launchedAt: null,
+              resultRef: null,
+            },
+            phases: [
+              {
+                workflowId: "wf_unit",
+                phaseId: "p1",
+                nativePhaseId: k("p1"),
+                label: k("Review"),
+                state: "running",
+                revision: "1",
+                parentPhaseId: null,
+              },
+            ],
+            members: [],
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.getByTestId("workflow-card").getAttribute("data-status")).toBe("running");
   });
 });

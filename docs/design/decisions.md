@@ -446,7 +446,7 @@ journal 51 条全部 `driverKind: claude-sdk`，流式增量以 `Partial` 汇聚
 
 **背景**：`ui-spec.md` 要求 `workflow.run` **运行中与结束后都展开，只有读者 dismiss 才折叠**，`error` 卡**必须展开**；而 `ToolCard.tsx` 的 `if (folded) return …` 分支在 `family === "Workflow"` 分支**之前** return（约 `:260` vs `:281-292`）。一律默认折叠会让 `WorkflowTimelineCard` 永不挂载、1Hz 走针不启动——是**静默杀死功能**，不是视觉问题。另 `ui-spec.md` 要求 Bash「命令一行」，折成裸「Bash」违规。
 
-**决策**：默认折叠**只对 compact 且已 settled、且 family ∉ {Workflow, error}** 的卡生效；`interaction.*` 同样豁免；running / 未 settled 的卡**永不折叠**。折行内容 = **family + 关键参数**（Bash = 命令首行，Edit/Write/Read = 路径），按宽度截断且 `title` 给全文，裸 `Bash` 不合规。**折叠分支必须在 family 判定之后**才可提前 return。桌面默认态不变；展开后的卡与桌面完全一致（同一组件、同一 testid）。
+**决策**：默认折叠**只对 compact 且已 settled、且 family ∉ {Workflow, error}** 的卡生效；`interaction.*` 同样豁免；running / 未 settled 的卡**永不自动折叠**。豁免只约束自动 compact 默认折叠；读者显式「全部折叠」保持既有桌面行为——一切非 failed 卡（含 Workflow 与 running）都折。折行内容 = **family + 关键参数**（Bash = 命令首行，Edit/Write/Read = 路径），按宽度截断且 `title` 给全文，裸 `Bash` 不合规。**折叠分支必须在 family 判定之后**才可提前 return。桌面默认态不变；展开后的卡与桌面完全一致（同一组件、同一 testid）。
 
 **由谁**：coordinator（coordinator dispatch plan workbench-ux, 2026-09-19, decision 3）。该计划是派工单，未入库；理由与默认值见报告 §11.7 的 P1-10 / P1-20 行。
 

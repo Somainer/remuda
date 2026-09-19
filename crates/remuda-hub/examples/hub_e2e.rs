@@ -880,6 +880,28 @@ async fn fake_node(
                             append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
                         continue;
                     }
+                    // c-toolfold: a Bash tool the reader watches while it is
+                    // running, then settles live with no reload. Proves D-041's
+                    // automatic compact fold fires the moment the final result
+                    // arrives (not only for reloaded settled history). The
+                    // "mcp" variant mounts a settled card with a long qualified
+                    // MCP name for the 390px overflow/hit-target assertions.
+                    if prompt.contains("toolfold settle") {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        append_n = append_toolfold_settle_scenario(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            prompt.contains("mcp"),
+                        )
+                        .await?;
+                        continue;
+                    }
                     // r-ux-w: synthetic workflow timeline-card scenarios take the
                     // short path (their own scripted journal sequence).
                     if let Some(kind) = workflow_kind(prompt) {
@@ -2811,6 +2833,118 @@ fn wf_phase(workflow_id: &str, phase_id: &str, label: &str, state: &str) -> Valu
         "revision": "1",
         "parentPhaseId": null,
     })
+}
+
+/// c-toolfold: one Bash tool observed running, then settled live. The call
+/// frame goes out first, the scenario pauses long enough for a follower to
+/// render the running card, then the final result lands in a later frame so
+/// the web's automatic compact fold can be proven without a reload. With
+/// `long_mcp`, emit a settled card carrying an over-40-char qualified MCP
+/// name instead (no running gap): the 390px overflow/hit-target case.
+async fn append_toolfold_settle_scenario(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    instance_id: &str,
+    mut n: u64,
+    long_mcp: bool,
+) -> Result<u64> {
+    let tool_id = "obj_toolfold_settle";
+    if long_mcp {
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "tool_call",
+            json!({
+                "nodeId": tool_id,
+                "revision": "1",
+                "operation": "open",
+                "baseRevision": null,
+                "toolCallId": tool_id,
+                "parentToolCallId": null,
+                "toolName": wf_known(json!("mcp__remuda-very-long-integration-server__search_files_everywhere")),
+                "displayTitle": wf_known(json!("mcp__remuda-very-long-integration-server__search_files_everywhere")),
+                "category": "other",
+                "input": wf_known(json!({ "query": "toolfold long mcp name" })),
+                "inputTextDelta": null,
+                "state": "running",
+                "executor": wf_unknown(),
+            }),
+        )
+        .await?;
+        n = append_event(
+            ws,
+            instance_id,
+            n,
+            "tool_result",
+            json!({
+                "nodeId": tool_id,
+                "revision": "2",
+                "operation": "close",
+                "baseRevision": "1",
+                "toolCallId": tool_id,
+                "stage": "final",
+                "outcome": "succeeded",
+                "blocks": [{ "type": "text", "text": "ok\n" }],
+                "structuredResult": wf_known(json!({ "matches": [] })),
+                "exitCode": wf_known(json!(0)),
+                "changes": [],
+            }),
+        )
+        .await?;
+        n = append_journal(ws, instance_id, n, "assistant", "toolfold mcp 已结束").await?;
+        return append_native_status(ws, instance_id, n, "idle").await;
+    }
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "tool_call",
+        json!({
+            "nodeId": tool_id,
+            "revision": "1",
+            "operation": "open",
+            "baseRevision": null,
+            "toolCallId": tool_id,
+            "parentToolCallId": null,
+            "toolName": wf_known(json!("Bash")),
+            "displayTitle": wf_known(json!("Bash")),
+            "category": "shell",
+            "input": wf_known(json!({ "command": "echo toolfold-live-settle" })),
+            "inputTextDelta": null,
+            "state": "running",
+            "executor": wf_unknown(),
+        }),
+    )
+    .await?;
+    // Give the follower time to paint the running row; the hub suite is
+    // serial, so this only lengthens this one scripted turn.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "tool_result",
+        json!({
+            "nodeId": tool_id,
+            "revision": "2",
+            "operation": "close",
+            "baseRevision": "1",
+            "toolCallId": tool_id,
+            "stage": "final",
+            "outcome": "succeeded",
+            "blocks": [{ "type": "text", "text": "settled live\n" }],
+            "structuredResult": wf_known(json!({ "stdout": "settled live\n" })),
+            "exitCode": wf_known(json!(0)),
+            "changes": [],
+        }),
+    )
+    .await?;
+    // A single tool with no thought stays outside the compact summary fold
+    // (needs >= 2 tools/thoughts), so the card remains directly addressable.
+    n = append_journal(ws, instance_id, n, "assistant", "toolfold 已结束").await?;
+    append_native_status(ws, instance_id, n, "idle").await
 }
 
 #[allow(clippy::too_many_lines)]

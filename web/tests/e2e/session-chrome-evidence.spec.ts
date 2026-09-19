@@ -46,15 +46,31 @@ test.describe("session chrome evidence", () => {
       });
       await row(page, "Grok 会话").click();
       await expect(page.getByTestId("view-switch")).toBeVisible();
+      // Wait for the session route/view to settle before the tty shot: right
+      // after a row click resolvedView can still read "structured" (the
+      // previous width's remembered choice), which made the tty and structured
+      // goldens byte-identical. Click 终端 and assert the documented state.
+      await page.getByTestId("view-switch-tty").click();
+      await expect(page).toHaveURL(/\/tty$/);
+      await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "tty");
+      await expect(page.getByTestId("view-switch-tty")).toHaveAttribute("aria-checked", "true");
       await shot(page, `session-chrome-1-switch-tty-${tag}.png`);
       await page.getByTestId("view-switch-structured").click();
+      await expect(page).toHaveURL(/\/structured$/);
       await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
+      await expect(page.getByTestId("view-switch-structured")).toHaveAttribute("aria-checked", "true");
       await shot(page, `session-chrome-1-switch-structured-${tag}.png`);
 
       // No switch at all for a structured-only driver; harness is a static label.
       await page.goto("/sessions");
       await row(page, "空闲会话").click();
       await expect(page.getByTestId("view-switch")).toHaveCount(0);
+      // Gate the shot on the SESSION page + composer bar (view-switch count 0
+      // is already true on the sessions list, so it alone does not prove the
+      // row navigation finished); otherwise the golden is a list capture. A
+      // structured-only driver lands on the bare /s/{id} route (no suffix).
+      await expect(page).toHaveURL(/\/s\/[^/]+$/);
+      await expect(page.getByTestId("composer-bar")).toBeVisible();
       // The golden shows the composer bar without a modal scrim, so take the
       // harness-label screenshot with the bar in its normal state.
       await shot(page, `session-chrome-1-harness-label-${tag}.png`);

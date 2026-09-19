@@ -48,7 +48,7 @@ import { COMMAND_STATUS_LABEL } from "../lib/commandStatus";
 import { notify } from "../lib/notify";
 import type { DriverKind } from "../types/nativeRef";
 import type { Kind, TuiMode } from "../types/instance";
-import { cliSummary, installedCli, isStaleOffline, sortHostsOnlineFirst, useHostViews } from "../features/hosts";
+import { cliSummary, isStaleOffline, sortHostsOnlineFirst, supportedHarnessKinds, useHostViews } from "../features/hosts";
 import {
   defaultDriver,
   DRIVER_LABELS,
@@ -266,7 +266,11 @@ export function NewSessionPage() {
   const workspaces = sortRecent(hostWorkspaces, prefs.recentWorkspaceIds);
   const hostView = hostViews.find((h) => h.id === hostId);
   const hostCli = cliSummary(hostView?.cli ?? host?.cli);
-  const supportedKinds = installedCli(hostView?.cli ?? host?.cli).map((entry) => entry.kind);
+  // Never the capability row: it is a host fact, not a harness. If it entered
+  // this list, `supportedKinds.length` would go non-zero on a host that has
+  // the vendor client but no agent CLI on PATH, suppressing the `claude`
+  // fallback below and leaving every kind disabled.
+  const supportedKinds = supportedHarnessKinds(hostView?.cli ?? host?.cli);
   const kindEnabled = (id: CreateKind) =>
     id === "terminal" ? true : supportedKinds.length ? supportedKinds.includes(id) : id === "claude";
   const activeKind: CreateKind = kindEnabled(kind)

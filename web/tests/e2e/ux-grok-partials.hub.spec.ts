@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { access, chmod, copyFile, mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -83,7 +84,7 @@ async function stopNode(node: ChildProcess) {
   clearTimeout(timer);
 }
 
-type StdoutSample = { at: number; working: boolean; stdout: string };
+type StdoutSample = { at: number; working: boolean; settled: boolean; stdout: string };
 
 test("grok shell card shows growing stdout partials before the Final result", async ({ page }, testInfo) => {
   test.setTimeout(240_000);
@@ -107,6 +108,9 @@ test("grok shell card shows growing stdout partials before the Final result", as
   let node: ChildProcess | undefined;
   let instanceId: string | undefined;
   let nodeLog = "";
+  // Hoisted so the finally block can scrub it out of the attached node log.
+  let enrollToken = "";
+  const hostName = os.hostname();
 
   try {
     await Promise.all([mkdir(bin), mkdir(workspace), mkdir(grokHome)]);
@@ -133,7 +137,7 @@ test("grok shell card shows growing stdout partials before the Final result", as
       headers: { Origin: new URL(page.url()).origin },
     });
     expect(minted.ok()).toBe(true);
-    const enrollToken = (await minted.json()).token;
+    enrollToken = (await minted.json()).token;
     await writeFile(tokenFile, enrollToken, { mode: 0o600 });
     const hub = new URL(process.env.VITE_HUB_URL ?? `http://${process.env.HUB_E2E_LISTEN ?? "127.0.0.1:58880"}`);
     hub.protocol = hub.protocol === "https:" ? "wss:" : "ws:";
@@ -266,55 +270,10 @@ test("grok shell card shows growing stdout partials before the Final result", as
       () => (window as unknown as { __grokStdoutSamples?: StdoutSample[] }).__grokStdoutSamples ?? [],
     );
 
-    // 1 — GROWTH BEFORE FINAL: before the card shows its exit pill (i.e. on
-    // the streamed Partials only), distinct stdout prefixes rendered, each a
-    // strict extension of the previous one. The streamed text is a raw byte
-    // stream (no separator between fragments); the "$ …" header is part of the
-    // streamed prefix and the command's lines arrive progressively.
-    const preFinal = samples.filter((s) => !s.settled && s.stdout.length > 0);
-    const distinctPreFinal = preFinal.filter((s, i) => i === 0 || s.stdout !== preFinal[i - 1]!.stdout);
-    expect(
-      distinctPreFinal.length,
-      `expected growing pre-final stdout; samples: ${JSON.stringify(samples.map((s) => s.stdout))}`,
-    ).toBeGreaterThanOrEqual(2);
-    for (let i = 1; i < distinctPreFinal.length; i += 1) {
-      expect(
-        distinctPreFinal[i]!.stdout.startsWith(distinctPreFinal[i - 1]!.stdout),
-        `pre-final stdout only grows by extension: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
-      ).toBe(true);
-    }
-    expect(
-      distinctPreFinal.some((s) => s.stdout.includes("one")),
-      `"one" streamed before the Final: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
-    ).toBe(true);
-    expect(
-      distinctPreFinal.some((s) => s.stdout.includes("two")),
-      `"two" streamed before the Final: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
-    ).toBe(true);
-
-    // 2 — THE FINAL IS AUTHORITATIVE. At turn end the routine tools fold into
-    // a compact group; expand it and assert the settled shell card.
-    const fold = page.getByTestId("compact-fold").first();
-    await expect(fold).toHaveAttribute("aria-expanded", "false", { timeout: 5_000 });
-    await fold.click();
-    const shellCard = page.getByTestId("tool-card").filter({ hasText: "printf" }).first();
-    await expect(shellCard).toContainText("exit 0", { timeout: 5_000 });
-    const settledAll = (await shellCard.textContent()) ?? "";
-    expect(settledAll).toContain("one\ntwo\nthree\n");
-    // The Final text is the stdout block (the `$ command` line is a separate,
-    // always-present first <pre>, and stdout is the following one). It holds
-    // the authoritative result exactly: no streamed "$ …" header inside stdout,
-    // and its lines are not duplicated.
-    const settledStdout = await shellCard.locator("pre").nth(1).textContent({ timeout: 5_000 }).catch(() => "");
-    expect(settledStdout).toBe("one\ntwo\nthree\n");
-    expect(settledStdout).not.toContain("$ printf");
-    expect(settledStdout.match(/one/g)).toHaveLength(1);
-    expect(settledStdout.match(/three/g)).toHaveLength(1);
-
-    // 3 — PRODUCER GROUND TRUTH: the durable journal for the shell node holds
-    // one or more Partial Append frames (revisions strictly increasing) and
-    // then a Final Close at a strictly higher revision whose text is exactly
-    // the authoritative result — so the DOM growth is driven end to end.
+    // Read the durable journal once — it is both the producer ground truth
+    // (section 3) and the source for the growth prefix the DOM must show
+    // (section 1), so the growth check never hardcodes how many Partials a
+    // loaded gate happened to coalesce.
     const journal = await page.request.get(`/v1/instances/${id}/journal`, { timeout: 10_000 }).then((r) => r.json()) as {
       events: { event: { kind: string; payload: Record<string, unknown> } }[];
     };
@@ -337,12 +296,80 @@ test("grok shell card shows growing stdout partials before the Final result", as
       finalIndex >= 0,
       `final shell result in journal: ${JSON.stringify(results.map((r) => ({ ...r, text: JSON.stringify(r.text) })))}`,
     ).toBe(true);
-    const before = results.slice(0, finalIndex);
-    const partialAppends = before.filter((r) => r.stage === "partial" && r.operation === "append");
+    const partialAppends = results
+      .slice(0, finalIndex)
+      .filter((r) => r.stage === "partial" && r.operation === "append");
     expect(
       partialAppends.length >= 1,
       `streamed partial appends before final: ${JSON.stringify(results.map((r) => ({ op: r.operation, stage: r.stage })))}`,
     ).toBe(true);
+    // Cumulative text the producer streamed, one entry per Partial Append in
+    // revision order — the exact prefixes the card should pass through.
+    let cumulative = "";
+    const partialPrefixes: string[] = [];
+    for (const partial of partialAppends) {
+      cumulative += partial.text;
+      partialPrefixes.push(cumulative);
+    }
+
+    // 1 — GROWTH BEFORE FINAL: before the card shows its exit pill (i.e. on
+    // the streamed Partials only), distinct stdout prefixes rendered, each a
+    // strict extension of the previous one. The streamed text is a raw byte
+    // stream (no separator between fragments). The required content is derived
+    // from the journal's observed Partial texts rather than hardcoded, so a
+    // gate that coalesces the last Partial and Final into one frame does not
+    // make this point-in-time DOM check flaky.
+    const preFinal = samples.filter((s) => !s.settled && s.stdout.length > 0);
+    const distinctPreFinal = preFinal.filter((s, i) => i === 0 || s.stdout !== preFinal[i - 1]!.stdout);
+    expect(
+      distinctPreFinal.length,
+      `expected growing pre-final stdout; samples: ${JSON.stringify(samples.map((s) => s.stdout))}`,
+    ).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < distinctPreFinal.length; i += 1) {
+      expect(
+        distinctPreFinal[i]!.stdout.startsWith(distinctPreFinal[i - 1]!.stdout),
+        `pre-final stdout only grows by extension: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
+      ).toBe(true);
+    }
+    // The streamed prefix always carries the command header then the first
+    // output line, so "one" is visible before the Final in every schedule.
+    expect(
+      distinctPreFinal.some((s) => s.stdout.includes("one")),
+      `"one" streamed before the Final: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
+    ).toBe(true);
+    // Every distinct pre-final rendering must be a strict prefix of the text
+    // the producer had streamed by that point — i.e. the visible growth is a
+    // subsequence of the journal's Partial accumulation, not invented bytes.
+    const streamedText = partialPrefixes.at(-1)!;
+    for (const sample of distinctPreFinal) {
+      expect(
+        streamedText.startsWith(sample.stdout) || sample.stdout.startsWith(streamedText),
+        `pre-final stdout ${JSON.stringify(sample.stdout)} is not a prefix of streamed ${JSON.stringify(streamedText)}`,
+      ).toBe(true);
+    }
+
+    // 2 — THE FINAL IS AUTHORITATIVE. At turn end the routine tools fold into
+    // a compact group; expand it and assert the settled shell card.
+    const fold = page.getByTestId("compact-fold").first();
+    await expect(fold).toHaveAttribute("aria-expanded", "false", { timeout: 5_000 });
+    await fold.click();
+    const shellCard = page.getByTestId("tool-card").filter({ hasText: "printf" }).first();
+    await expect(shellCard).toContainText("exit 0", { timeout: 5_000 });
+    const settledAll = (await shellCard.textContent()) ?? "";
+    expect(settledAll).toContain("one\ntwo\nthree\n");
+    // The Final text is the stdout block (the `$ command` line is a separate,
+    // always-present first <pre>, and stdout is the following one). It holds
+    // the authoritative result exactly: no streamed "$ …" header inside stdout,
+    // and its lines are not duplicated.
+    const settledStdout = (await shellCard.locator("pre").nth(1).textContent({ timeout: 5_000 }).catch(() => "")) ?? "";
+    expect(settledStdout).toBe("one\ntwo\nthree\n");
+    expect(settledStdout).not.toContain("$ printf");
+    expect(settledStdout.match(/one/g)).toHaveLength(1);
+    expect(settledStdout.match(/three/g)).toHaveLength(1);
+
+    // 3 — PRODUCER GROUND TRUTH (journal fetched above): increasing Partial
+    // Append revisions followed by a higher-revision Final Close carrying the
+    // authoritative result — the DOM growth is driven end to end.
     for (let i = 1; i < partialAppends.length; i += 1) {
       expect(BigInt(partialAppends[i]!.revision) > BigInt(partialAppends[i - 1]!.revision)).toBe(true);
     }
@@ -359,7 +386,14 @@ test("grok shell card shows growing stdout partials before the Final result", as
     if (node) await stopNode(node);
     try {
       const logPath = testInfo.outputPath("native-node.log");
-      await writeFile(logPath, nodeLog.replaceAll(dir, "$TEST_DIR")).catch(() => {});
+      await writeFile(
+        logPath,
+        nodeLog
+          .replaceAll(enrollToken || "__unused__", "[redacted]")
+          .replaceAll(dir, "$TEST_DIR")
+          .replaceAll(process.env.HOME || "__unused__", "$HOME")
+          .replaceAll(hostName, "$HOST"),
+      ).catch(() => {});
       await testInfo.attach("native-node.log", { path: logPath, contentType: "text/plain" }).catch(() => {});
       const groundPath = testInfo.outputPath("native-events.jsonl");
       await writeFile(groundPath, await readFile(eventsFile, "utf8").catch(() => "")).catch(() => {});

@@ -125,28 +125,40 @@ async function answerPending(page: Page, instanceId: string) {
       message: "launch approval exists",
     })
     .toBeGreaterThan(0);
-  const mine = (await items()).filter((item) => item.state === "pending");
-  for (const item of mine) {
-    const optionId = item.request?.options?.[0]?.id;
-    if (!optionId) continue;
-    await page.evaluate(
-      ({ iid, optionId, digest }) =>
-        fetch(`/v1/interactions/${iid}/answer`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
-          }),
-        }),
-      { iid: item.interactionId ?? item.id, optionId, digest: item.request?.inputDigest },
-    );
-  }
+  // Re-answer inside the clearing poll so late options, a rejected POST or a
+  // second approval self-heal instead of timing out.
+  const answered = new Set<string>();
   await expect
-    .poll(() => items().then((list) => list.filter((item) => item.state === "pending").length), {
-      timeout: 20_000,
-      message: "approvals clear",
-    })
+    .poll(
+      async () => {
+        const pending = (await items()).filter((item) => item.state === "pending");
+        for (const item of pending) {
+          if (answered.has(item.id)) continue;
+          const optionId = item.request?.options?.[0]?.id;
+          if (!optionId) continue;
+          const ok = await page.evaluate(
+            async ({ iid, optionId, digest }) => {
+              const res = await fetch(`/v1/interactions/${iid}/answer`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
+                }),
+              });
+              return res.ok;
+            },
+            { iid: item.interactionId ?? item.id, optionId, digest: item.request?.inputDigest },
+          );
+          if (ok) answered.add(item.id);
+        }
+        return pending.length;
+      },
+      {
+        timeout: 20_000,
+        message: "approvals clear",
+      },
+    )
     .toBe(0);
 }
 

@@ -46,27 +46,37 @@ async function answerPendingApprovals(page: Page, instanceId: string) {
     .poll(async () => (await items()).length, { timeout: 20_000, message: "launch approval exists" })
     .toBeGreaterThan(0);
 
-  const mine = (await items()).filter((item) => item.state === "pending");
-  for (const item of mine) {
-    const optionId = item.request?.options?.[0]?.id;
-    if (!optionId) continue;
-    await page.evaluate(
-      ({ iid, optionId, digest }) =>
-        fetch(`/v1/interactions/${iid}/answer`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
-          }),
-        }),
-      { iid: item.id, optionId, digest: item.request?.inputDigest },
-    );
-  }
-
+  // Clear inside the poll: every attempt re-lists the pending set and answers
+  // whatever is still open, so a late-populated options array, a rejected
+  // answer, or a second approval cannot strand the launch until the timeout.
+  // An id is remembered only after its answer POST succeeded.
+  const answered = new Set<string>();
   await expect
     .poll(
-      async () => (await items()).filter((item) => item.state === "pending").length,
+      async () => {
+        const pending = (await items()).filter((item) => item.state === "pending");
+        for (const item of pending) {
+          if (answered.has(item.id)) continue;
+          const optionId = item.request?.options?.[0]?.id;
+          if (!optionId) continue;
+          const ok = await page.evaluate(
+            async ({ iid, optionId, digest }) => {
+              const res = await fetch(`/v1/interactions/${iid}/answer`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
+                }),
+              });
+              return res.ok;
+            },
+            { iid: item.id, optionId, digest: item.request?.inputDigest },
+          );
+          if (ok) answered.add(item.id);
+        }
+        return pending.length;
+      },
       { timeout: 20_000, message: "approvals clear" },
     )
     .toBe(0);

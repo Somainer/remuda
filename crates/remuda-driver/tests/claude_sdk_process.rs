@@ -571,12 +571,14 @@ async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
         "grandchild {grandchild} should be running before close"
     );
 
-    // Harness budget: 3s, split 1.5s / 1.5s between the stdin-EOF and SIGTERM
-    // slices, plus a fixed 2s reap after SIGKILL.
-    const BUDGET: Duration = Duration::from_secs(3);
+    // The driver's two SIGINT/SIGHUP slices are 2 s each in production; the
+    // assertions below only need the child to have survived *both* (so rung 3
+    // is the thing that killed it), hence the 1.5 s/3 s literals.
     const SLICE: Duration = Duration::from_millis(1500);
     let started = std::time::Instant::now();
-    let closed = tokio::time::timeout(Duration::from_secs(20), driver.close()).await;
+    // Loaded-host ceiling: 2 s + 2 s signal rungs, the 0.5 s SIGKILL window
+    // and the driver's 30 s post-SIGKILL reap grace (REAP_EXITING_GRACE).
+    let closed = tokio::time::timeout(Duration::from_secs(60), driver.close()).await;
     let elapsed = started.elapsed();
     assert!(
         closed.is_ok(),
@@ -592,25 +594,37 @@ async fn close_kills_a_child_that_ignores_both_eof_and_sigterm() {
     assert!(
         elapsed >= SLICE + SLICE - Duration::from_millis(100),
         "close returned in {elapsed:?}: the child did not survive the SIGTERM \
-         slice, so rung 3 was never exercised (budget {BUDGET:?})"
+         slice, so rung 3 was never exercised"
     );
     assert!(
-        elapsed < BUDGET + Duration::from_secs(3),
-        "close took {elapsed:?}: the ladder is not bounded"
-    );
-    assert!(
-        !process_alive(&pid),
-        "pid {pid} survived a close that had to reach SIGKILL"
+        elapsed < Duration::from_secs(36),
+        "close took {elapsed:?}: the ladder is not bounded by the configured rungs"
     );
 
+    // Wait on the observable state, not on a fixed sleep: on the loaded gate
+    // host a SIGKILLed child can take seconds to run the kernel exit path and
+    // become a zombie its parent has reaped, and a zombie still answers
+    // signal 0. The driver's post-SIGKILL reap grace is 30 s; use the same
+    // bound here.
+    async fn wait_gone(pid: i32, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if !remuda_driver::shell_pty::lifecycle::process_alive(pid) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what} {pid} survived a close that had to reach SIGKILL"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    wait_gone(pid.parse().expect("numeric pid"), "pid").await;
+
     // The grandchild is in the child's group and is not the direct child, so
-    // only rung 3's group SIGKILL could reap it. Give the kernel a beat, then
-    // assert it is gone. Deleting the group signal leaves this one alive.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert!(
-        !remuda_driver::shell_pty::lifecycle::process_alive(grandchild),
-        "grandchild {grandchild} survived: rung 3 did not SIGKILL the process group"
-    );
+    // only rung 3's group SIGKILL could reap it. Wait for it to be gone the
+    // same way; deleting the group signal leaves this one alive.
+    wait_gone(grandchild, "grandchild").await;
     let _ = std::fs::remove_file(&grandchild_pid_file);
 }
 

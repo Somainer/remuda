@@ -167,13 +167,30 @@ impl ConsumeSupervisor {
         )
     }
 
-    /// Signal SIGTERM and wait for workers to finish.
-    pub async fn shutdown(mut self) {
+    /// Signal SIGTERM to every child without waiting for its reader to finish.
+    ///
+    /// Use before [`Self::join`] when shutdown must keep processing accepted
+    /// events while the children terminate.
+    pub fn terminate(&self) {
         let _ = self.shutdown.send(true);
         sigterm_all(&self.pids);
+    }
+
+    /// Wait for every reader worker to finish. On shutdown each reader drains
+    /// the child's already-accepted stdout to EOF before exiting, so this
+    /// returning means every accepted event has been put on the event channel.
+    pub async fn join(mut self) {
         if let Some(join) = self.join.take() {
-            let _ = timeout(Duration::from_secs(8), join).await;
+            // Loaded-host budget: by this point the children have been asked to
+            // exit and their readers only need scheduling to flush a pipe.
+            let _ = timeout(Duration::from_secs(30), join).await;
         }
+    }
+
+    /// Signal SIGTERM and wait for workers to finish.
+    pub async fn shutdown(self) {
+        self.terminate();
+        self.join().await;
     }
 }
 
@@ -339,7 +356,19 @@ async fn run_one(
             biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    let _ = finish_shutdown(&mut child, stdin, pid, pids).await;
+                    // SIGTERM first (a child may treat stdin EOF, not the
+                    // signal, as its shutdown reason and must not observe EOF
+                    // first), then release stdin before the drain so a
+                    // signal-proof child that exits on EOF is not held.
+                    if let Some(pid) = pid {
+                        let _ = send_sigterm(pid);
+                    }
+                    drop(stdin);
+                    drain_stdout(&mut stdout, tx, settings, key, &mut line).await;
+                    // Reap unconditionally: drain returns on EOF (the child
+                    // has exited) or on the bounded drain deadline.
+                    let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                    forget_pid(pids, pid);
                     return Ok(RunEnd::Shutdown);
                 }
             }
@@ -349,28 +378,7 @@ async fn run_one(
                     let status = finish_child(&mut child, stdin, pid, pids).await;
                     return Ok(RunEnd::Exited(status));
                 }
-                if line.len() > settings.line_max_bytes {
-                    let _ = tx.send(ConsumeEvent::BadLine {
-                        event_key: key.to_string(),
-                        detail: Error::LineTooLong(settings.line_max_bytes).to_string(),
-                    }).await;
-                    continue;
-                }
-                match parse_event_line(&line) {
-                    Ok(event) => {
-                        let _ = tx.send(ConsumeEvent::Event {
-                            event_key: key.to_string(),
-                            event: Box::new(event),
-                        }).await;
-                    }
-                    Err(err) => {
-                        debug!(event_key = %key, %err, "feishu consume bad line");
-                        let _ = tx.send(ConsumeEvent::BadLine {
-                            event_key: key.to_string(),
-                            detail: err.to_string(),
-                        }).await;
-                    }
-                }
+                dispatch_line(settings, key, tx, &line).await;
             }
             status = child.wait() => {
                 forget_pid(pids, pid);
@@ -378,6 +386,78 @@ async fn run_one(
                 let code = status?.code();
                 return Ok(RunEnd::Exited(code));
             }
+        }
+    }
+}
+
+/// Parse and deliver one stdout line as an event or a bad-line diagnostic.
+async fn dispatch_line(
+    settings: &ConsumeSettings,
+    key: &str,
+    tx: &mpsc::Sender<ConsumeEvent>,
+    line: &str,
+) {
+    if line.len() > settings.line_max_bytes {
+        let _ = tx
+            .send(ConsumeEvent::BadLine {
+                event_key: key.to_string(),
+                detail: Error::LineTooLong(settings.line_max_bytes).to_string(),
+            })
+            .await;
+        return;
+    }
+    match parse_event_line(line) {
+        Ok(event) => {
+            let _ = tx
+                .send(ConsumeEvent::Event {
+                    event_key: key.to_string(),
+                    event: Box::new(event),
+                })
+                .await;
+        }
+        Err(err) => {
+            debug!(event_key = %key, %err, "feishu consume bad line");
+            let _ = tx
+                .send(ConsumeEvent::BadLine {
+                    event_key: key.to_string(),
+                    detail: err.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+/// Upper bound for reading the child's accepted stdout after SIGTERM.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
+
+/// Keep reading the SIGTERM-ed child's stdout to EOF, enqueuing every line.
+///
+/// Closing the event channel before these buffered lines were read dropped
+/// accepted events on shutdown (a gate flake under host load). This drains
+/// PURELY on `read_line`: the call site has just sent SIGTERM, so racing a
+/// `child.wait()` arm here would win on an already-reaped child and return
+/// with buffered bytes still in the pipe. `Ok(0)` is reached only when the
+/// child has exited and closed its stdout, i.e. after every buffered byte was
+/// consumed. [`SHUTDOWN_DRAIN`] bounds a child that ignores SIGTERM; the
+/// caller reaps afterwards regardless of which path ended the drain.
+async fn drain_stdout(
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    tx: &mpsc::Sender<ConsumeEvent>,
+    settings: &ConsumeSettings,
+    key: &str,
+    line: &mut String,
+) {
+    let deadline = sleep(SHUTDOWN_DRAIN);
+    tokio::pin!(deadline);
+    loop {
+        line.clear();
+        tokio::select! {
+            biased;
+            _ = &mut deadline => break,
+            result = stdout.read_line(line) => match result {
+                Ok(0) | Err(_) => break,
+                Ok(_) => dispatch_line(settings, key, tx, line).await,
+            },
         }
     }
 }

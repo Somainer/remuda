@@ -99,34 +99,67 @@ async function createSession(page: Page, prompt: string): Promise<string> {
 }
 
 async function answerPending(page: Page, instanceId: string) {
-  await page.evaluate(async (id) => {
-    for (;;) {
-      const list = await fetch("/v1/interactions", { credentials: "include" });
-      const body = (await list.json()) as {
-        items?: {
-          id: string;
-          instanceId?: string;
-          state?: string;
-          request?: { inputDigest?: string; options?: { id: string }[] };
-        }[];
-      };
-      const mine = (body.items ?? []).filter((item) => item.instanceId === id && item.state === "pending");
-      if (mine.length === 0) return;
-      for (const item of mine) {
-        const optionId = item.request?.options?.[0]?.id;
-        if (!optionId) continue;
-        await fetch(`/v1/interactions/${item.id}/answer`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            answer: { kind: "approval", optionId, inputDigest: item.request?.inputDigest ?? "" },
-          }),
-        });
-      }
-      await new Promise((resolve) => setTimeout(resolve, 300));
-    }
-  }, instanceId);
+  // Wait for the launch approval to EXIST (in any state) first: an immediate
+  // poll can read nothing while the approval is still being journaled, which
+  // used to make this helper return with the launch still blocked.
+  const items = () =>
+    page.evaluate(
+      async (id) => {
+        const list = await fetch("/v1/interactions", { credentials: "include" });
+        const body = (await list.json()) as {
+          items?: {
+            id: string;
+            interactionId?: string;
+            instanceId?: string;
+            state?: string;
+            request?: { inputDigest?: string; options?: { id: string }[] };
+          }[];
+        };
+        return (body.items ?? []).filter((item) => item.instanceId === id);
+      },
+      instanceId,
+    );
+  await expect
+    .poll(() => items().then((list) => list.length), {
+      timeout: 20_000,
+      message: "launch approval exists",
+    })
+    .toBeGreaterThan(0);
+  // Re-answer inside the clearing poll so late options, a rejected POST or a
+  // second approval self-heal instead of timing out.
+  const answered = new Set<string>();
+  await expect
+    .poll(
+      async () => {
+        const pending = (await items()).filter((item) => item.state === "pending");
+        for (const item of pending) {
+          if (answered.has(item.id)) continue;
+          const optionId = item.request?.options?.[0]?.id;
+          if (!optionId) continue;
+          const ok = await page.evaluate(
+            async ({ iid, optionId, digest }) => {
+              const res = await fetch(`/v1/interactions/${iid}/answer`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
+                }),
+              });
+              return res.ok;
+            },
+            { iid: item.interactionId ?? item.id, optionId, digest: item.request?.inputDigest },
+          );
+          if (ok) answered.add(item.id);
+        }
+        return pending.length;
+      },
+      {
+        timeout: 20_000,
+        message: "approvals clear",
+      },
+    )
+    .toBe(0);
 }
 
 /** Wire-level POST log for one page. */

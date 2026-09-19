@@ -287,12 +287,19 @@ async fn supervise<A: InstanceApi + 'static>(
             return result.context("dispatcher worker failed")?;
         }
     };
+    // Arm draining before terminating anyone: the worker stops follow polling
+    // and treats channel end as a clean exit, but the event receiver stays
+    // OPEN — closing it while the readers are still flushing would reject
+    // their last sends. SIGTERM the children synchronously, then wait for the
+    // reader workers: each drains its child's accepted stdout to EOF before it
+    // exits, so their senders drop only after every accepted event is in the
+    // channel. The worker then processes the buffer and sees recv == None.
     let _ = stopping.send(true);
+    supervisor.terminate();
     let mut completed = None;
     let drained = tokio::time::timeout(shutdown_timeout, async {
-        tokio::join!(supervisor.shutdown(), async {
-            completed = Some((&mut worker).await);
-        });
+        supervisor.join().await;
+        completed = Some((&mut worker).await);
     })
     .await;
     if drained.is_err() {
@@ -328,8 +335,12 @@ async fn drive<A: InstanceApi>(
         tokio::select! {
             biased;
             _ = stopped.changed(), if !draining => {
+                // Stop follow polling. Do NOT close the receiver: the consume
+                // reader workers are terminating concurrently and must be able
+                // to enqueue every accepted stdout line. The channel ends
+                // naturally once their senders drop, which the recv arm reads
+                // as a clean completion because `draining` is set.
                 draining = true;
-                events.close();
             }
             _ = &mut deadline, if !draining && !waiting.is_empty() => {
                 bail!("dispatcher consume startup timed out before both subscriptions became ready");
@@ -505,6 +516,11 @@ mod tests {
                 .await
                 .expect("consume restarted and replayed");
             }
+            // Release the gated create once the children have actually received
+            // the shutdown signal (their SIGTERM evidence exists). The accepted
+            // `continue` line cannot be lost regardless of when that lands:
+            // supervise joins the reader workers — who drain the children's
+            // stdout to EOF — before the worker's event channel closes.
             tokio::spawn(async move {
                 wait_for(&stopped_dir.join("im.message.receive_v1.stopped")).await;
                 wait_for(&stopped_dir.join("card.action.trigger.stopped")).await;
@@ -517,7 +533,10 @@ mod tests {
             consume,
             Duration::from_secs(5),
             Duration::from_secs(5),
-            Duration::from_millis(20),
+            // Follow-poll cadence: cannot gate the accepted-event drain (shutdown
+            // drains readers to EOF before closing the channel), so this only
+            // bounds idle follow polling and needs no loaded-host inflation.
+            Duration::from_secs(1),
             stop,
         )
         .await
@@ -653,11 +672,14 @@ mod tests {
                 next_seq: 1,
             },
         );
-        let (_inbound, events) = mpsc::channel(1);
+        let (inbound, events) = mpsc::channel(1);
         let (stop, stopped) = watch::channel(false);
         let stop_task = tokio::spawn(async move {
             followed.notified().await;
             stop.send(true).expect("stop after idle poll");
+            // Shutdown drains: the watch stops polling; channel end (senders
+            // dropped, as the supervisor readers do after terminating) ends it.
+            drop(inbound);
         });
         let dispatcher = tokio::time::timeout(
             Duration::from_secs(5),

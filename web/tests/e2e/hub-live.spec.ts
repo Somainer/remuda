@@ -15,43 +15,69 @@ async function shot(page: Page, name: string) {
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
-/** Answer every pending approval/question this instance currently has. */
+/**
+ * Answer every pending approval/question this instance currently has.
+ *
+ * Gate flake: a launch approval is journaled concurrently with the create
+ * response, so an interactions poll taken immediately after navigation can
+ * read 0 pending — the old helper passed as soon as pending read 0, before the
+ * approval existed, and the launch stayed blocked. We therefore wait until an
+ * interaction for the instance EXISTS in any state (proving the launch
+ * approval was created — it may already be answered, e.g. the hook-approval
+ * case resolves its card on /approvals before calling this helper), answer
+ * whatever is still pending, then wait for the pending list to clear.
+ */
 async function answerPendingApprovals(page: Page, instanceId: string) {
+  const items = () =>
+    page.evaluate(async (id) => {
+      const list = await fetch("/v1/interactions", { credentials: "include" });
+      const body = (await list.json()) as {
+        items?: {
+          id: string;
+          instanceId?: string;
+          state?: string;
+          request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
+        }[];
+      };
+      return (body.items ?? []).filter((item) => item.instanceId === id);
+    }, instanceId);
+
+  await expect
+    .poll(async () => (await items()).length, { timeout: 20_000, message: "launch approval exists" })
+    .toBeGreaterThan(0);
+
+  // Clear inside the poll: every attempt re-lists the pending set and answers
+  // whatever is still open, so a late-populated options array, a rejected
+  // answer, or a second approval cannot strand the launch until the timeout.
+  // An id is remembered only after its answer POST succeeded.
+  const answered = new Set<string>();
   await expect
     .poll(
-      async () =>
-        await page.evaluate(async (id) => {
-          const list = await fetch("/v1/interactions", { credentials: "include" });
-          const body = (await list.json()) as {
-            items?: {
-              id: string;
-              instanceId?: string;
-              state?: string;
-              request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
-            }[];
-          };
-          const mine = (body.items ?? []).filter(
-            (item) => item.instanceId === id && item.state === "pending",
+      async () => {
+        const pending = (await items()).filter((item) => item.state === "pending");
+        for (const item of pending) {
+          if (answered.has(item.id)) continue;
+          const optionId = item.request?.options?.[0]?.id;
+          if (!optionId) continue;
+          const ok = await page.evaluate(
+            async ({ iid, optionId, digest }) => {
+              const res = await fetch(`/v1/interactions/${iid}/answer`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  answer: { kind: "approval", optionId, inputDigest: digest ?? "" },
+                }),
+              });
+              return res.ok;
+            },
+            { iid: item.id, optionId, digest: item.request?.inputDigest },
           );
-          for (const item of mine) {
-            const optionId = item.request?.options?.[0]?.id;
-            if (!optionId) continue;
-            await fetch(`/v1/interactions/${item.id}/answer`, {
-              method: "POST",
-              credentials: "include",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                answer: {
-                  kind: "approval",
-                  optionId,
-                  inputDigest: item.request?.inputDigest ?? "",
-                },
-              }),
-            });
-          }
-          return mine.length;
-        }, instanceId),
-      { timeout: 20_000 },
+          if (ok) answered.add(item.id);
+        }
+        return pending.length;
+      },
+      { timeout: 20_000, message: "approvals clear" },
     )
     .toBe(0);
 }
@@ -580,8 +606,12 @@ test("a hook-carried approval shows the real tool input and an always-allow opti
     page.getByTestId("approval-row").filter({ hasText: "/tmp/hook-approval.txt" }),
   ).toHaveCount(0, { timeout: 20_000 });
 
-  // A blocking approval holds the composer; answering it releases the session.
-  await answerPendingApprovals(page, instanceId);
+  // The card WAS this instance's blocking launch approval; the click above has
+  // already answered it. Do NOT call answerPendingApprovals here: once the
+  // fake node's card is answered it leaves interaction.list (it serves only
+  // its pending map), so the helper's "an interaction exists" wait would time
+  // out on the already-resolved card. The enabled composer below is the
+  // release signal.
   await page.goto(`/s/${instanceId}`);
   await expect(page.getByTestId("session-page")).toBeVisible();
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });

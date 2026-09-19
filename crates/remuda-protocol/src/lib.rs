@@ -27,6 +27,7 @@ pub mod schema;
 mod supply;
 mod task;
 mod task_notification;
+mod tool_media;
 mod worker;
 
 pub use binary::*;
@@ -49,6 +50,7 @@ pub use scalar::*;
 pub use supply::*;
 pub use task::*;
 pub use task_notification::*;
+pub use tool_media::*;
 pub use worker::*;
 
 /// Hub policy default for delegation depth (edges from a human root); §2.5 ⑤.

@@ -45,13 +45,13 @@ use tokio::sync::{Semaphore, mpsc};
 
 // ── api.egress (Hub→Node credential handoff) ───────────────────────────────
 //
-// The c-apiroute-hub branch adds these to `remuda-protocol::hubnode.rs`:
-// `METHOD_API_EGRESS` and `ApiEgressParams`, sent to the proxy host when the
-// route is decided at launch and again after reconnect, with `revoke: true`
-// on instance exit. They are defined locally here under the exact wire names
-// so adopting the protocol types on merge is mechanical; delete this block
-// once that branch lands. Credentials ride *only* this notification — never
-// `api.open` — stay in memory, and render redacted in Debug.
+// Local mirror of `remuda_protocol::hubnode::{METHOD_API_EGRESS, ApiEgressParams}`
+// (added by c-apiroute-hub); delete this block and import the protocol types
+// in a one-commit switch once that branch lands. The Hub sends it to the
+// proxy host when the route is decided at launch and again after reconnect,
+// with `revoke: true` on instance exit. Credentials ride *only* this
+// notification — never `api.open` — stay in memory, and render redacted in
+// Debug.
 
 /// Hub→Node notification: install (or revoke) one instance's egress context.
 pub(crate) const METHOD_API_EGRESS: &str = "api.egress";

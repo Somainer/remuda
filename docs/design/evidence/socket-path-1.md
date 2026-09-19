@@ -156,6 +156,31 @@ Bind sites covered: remuda-signal `socket.rs`, remuda-driver `secrets.rs`
 tested TMPDIRs) and its error now also carries path/byte length/limit. No
 `UnixDatagram::bind` sites exist in the workspace. `web/` untouched.
 
+### Remaining data-dir-dependent socket: the herdr carrier
+
+The **herdr terminal carrier** API socket is still
+`<data_dir>/herdr/herdr.sock` (`NativeDriverConfig::herdr_socket_dir`,
+consumed by `remuda-herdr` which is spawned with that directory and manages
+additional named-session sockets beneath it). It is not yet routed through
+the chooser. Exact threshold: the suffix is the 17-byte `/herdr/herdr.sock`,
+so the bind fails once
+
+```
+len(<data_dir>) > 90   on Linux    (hard sun_path 107; safe threshold 83)
+len(<data_dir>) > 86   on macOS    (hard sun_path 103)
+```
+
+Impact is narrower than the hook/daemon sockets: the carrier is the PTY
+terminal path (`ClaudePty`/codex/grok through herdr), not the default
+`ShellPty` agent launches; round-1/2's reported failures and the
+`live_pipeline` regression are on the hook socket, which is redirected.
+Tests bind fake-herdr sockets under a TMPDIR-independent short root
+(`remuda_testing::ShortTempDir`), so the matrix stays green under a long
+TMPDIR. Routing the carrier through the chooser (a `herdr-<hash>.sock`
+runtime socket plus the `herdr/herdr.sock` discovery link, handed to the
+spawned herdr process) is a deliberate follow-up because herdr also creates
+per-session sockets relative to the configured directory.
+
 ## 3 Tests
 
 Chooser unit tests (remuda-signal `runtime_dir.rs` + integration

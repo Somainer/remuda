@@ -211,7 +211,15 @@ test.describe("composer control bar and effort", () => {
     await assertPillGeometry(page);
     const card = await menu.boundingBox();
     expect(card).toBeTruthy();
-    expect(card!.width).toBeLessThanOrEqual(301);
+    if (test.info().project.name === "chromium") {
+      // Desktop: compact ~300px anchored card.
+      expect(card!.width).toBeLessThanOrEqual(301);
+    } else {
+      // D-042: in the phone options sheet the card is intentionally
+      // frameless and full-width (wider than the 300px desktop card).
+      expect(menu).toHaveAttribute("data-in-sheet", "1");
+      expect(card!.width).toBeGreaterThan(301);
+    }
     await assertFillReachesKnob(page);
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-effort-menu.png");

@@ -111,6 +111,32 @@
   }
 }
 
+/* In-sheet permission/effort nodes: frameless, full-width wrappers so the
+   sheet does not draw the desktop anchored-popover border/radius/300px cap
+   (which produced a double frame + dead strip at 390px). The inner effort
+   slider card keeps its own visuals. */
+.sheetMenu,
+.sheetCard {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+
+.sheetMenu {
+  display: block;
+  overflow: visible;
+  z-index: auto;
+}
+
+.sheetCard {
+  display: block;
+  overflow: visible;
+  z-index: auto;
+}
+
 /* Options sheet sections (Sheet panel already supplies surface/padding). */
 .optionsPanel {
   width: min(420px, 100%);

@@ -557,6 +557,34 @@ pub fn computer_use_plist_path(env: &ProbeEnv) -> PathBuf {
     codex_home(env).join(COMPUTER_USE_PLIST)
 }
 
+/// The vendor **app bundle root** the client and its plist live under.
+///
+/// Derived from [`COMPUTER_USE_CLIENT`] rather than spelled out again, so the
+/// refusal messages that name "where to install this" and the path the probe
+/// actually stats cannot disagree. This is the single definition callers
+/// outside this crate should join from.
+#[must_use]
+pub fn computer_use_bundle_path(env: &ProbeEnv) -> PathBuf {
+    // `computer-use/Codex Computer Use.app/` + five more components down to the
+    // binary, so the bundle root is six components above the client.
+    let client = computer_use_client_path(env);
+    let mut bundle = client.clone();
+    for _ in 0..BUNDLE_TO_CLIENT_COMPONENTS {
+        if !bundle.pop() {
+            return client;
+        }
+    }
+    bundle
+}
+
+/// Components between the app bundle root and the client binary inside it:
+/// `Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/<bin>`.
+///
+/// Named rather than inlined so the increment is auditable: getting it wrong
+/// points the gate's "install it here" message at a directory the probe never
+/// stats, which is worse than saying nothing.
+const BUNDLE_TO_CLIENT_COMPONENTS: usize = 6;
+
 /// Presence-only `computer-use` row (`docs/design/codex-cua.md` §3.4).
 ///
 /// Two rules make this row honest, and both are load-bearing:
@@ -1332,6 +1360,42 @@ mod tests {
             .iter()
             .find(|c| c.kind == COMPUTER_USE_KIND)
             .expect("the computer-use row is always present")
+    }
+
+    /// The bundle root is derived from the client path, not spelled separately.
+    ///
+    /// The gate's refusal messages name this as "where to install this", so it
+    /// must be the directory the probe actually stats — one definition, so the
+    /// two cannot drift apart in a future edit.
+    #[test]
+    fn computer_use_bundle_path_is_the_clients_own_app_bundle() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let env = env_for(bin.path(), home.path());
+        let bundle = computer_use_bundle_path(&env);
+        let client = computer_use_client_path(&env);
+        assert!(
+            client.starts_with(&bundle),
+            "the client must live inside the bundle it is derived from: \
+             bundle={} client={}",
+            bundle.display(),
+            client.display()
+        );
+        // <codex_home>/computer-use/Codex Computer Use.app, and nothing wider.
+        assert!(
+            bundle.ends_with("Codex Computer Use.app"),
+            "{}",
+            bundle.display()
+        );
+        assert_eq!(
+            bundle
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("computer-use"),
+            "{}",
+            bundle.display()
+        );
     }
 
     /// The whole point of the row: it never runs the vendor binary.

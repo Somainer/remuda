@@ -167,13 +167,30 @@ impl ConsumeSupervisor {
         )
     }
 
-    /// Signal SIGTERM and wait for workers to finish.
-    pub async fn shutdown(mut self) {
+    /// Signal SIGTERM to every child without waiting for its reader to finish.
+    ///
+    /// Use before [`Self::join`] when shutdown must keep processing accepted
+    /// events while the children terminate.
+    pub fn terminate(&self) {
         let _ = self.shutdown.send(true);
         sigterm_all(&self.pids);
+    }
+
+    /// Wait for every reader worker to finish. On shutdown each reader drains
+    /// the child's already-accepted stdout to EOF before exiting, so this
+    /// returning means every accepted event has been put on the event channel.
+    pub async fn join(mut self) {
         if let Some(join) = self.join.take() {
-            let _ = timeout(Duration::from_secs(8), join).await;
+            // Loaded-host budget: by this point the children have been asked to
+            // exit and their readers only need scheduling to flush a pipe.
+            let _ = timeout(Duration::from_secs(30), join).await;
         }
+    }
+
+    /// Signal SIGTERM and wait for workers to finish.
+    pub async fn shutdown(self) {
+        self.terminate();
+        self.join().await;
     }
 }
 
@@ -339,7 +356,15 @@ async fn run_one(
             biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    let _ = finish_shutdown(&mut child, stdin, pid, pids).await;
+                    if let Some(pid) = pid {
+                        let _ = send_sigterm(pid);
+                    }
+                    let reaped = drain_stdout(&mut child, &mut stdout, tx, settings, key, &mut line).await;
+                    drop(stdin);
+                    if !reaped {
+                        let _ = timeout(Duration::from_secs(2), child.wait()).await;
+                    }
+                    forget_pid(pids, pid);
                     return Ok(RunEnd::Shutdown);
                 }
             }
@@ -349,34 +374,86 @@ async fn run_one(
                     let status = finish_child(&mut child, stdin, pid, pids).await;
                     return Ok(RunEnd::Exited(status));
                 }
-                if line.len() > settings.line_max_bytes {
-                    let _ = tx.send(ConsumeEvent::BadLine {
-                        event_key: key.to_string(),
-                        detail: Error::LineTooLong(settings.line_max_bytes).to_string(),
-                    }).await;
-                    continue;
-                }
-                match parse_event_line(&line) {
-                    Ok(event) => {
-                        let _ = tx.send(ConsumeEvent::Event {
-                            event_key: key.to_string(),
-                            event: Box::new(event),
-                        }).await;
-                    }
-                    Err(err) => {
-                        debug!(event_key = %key, %err, "feishu consume bad line");
-                        let _ = tx.send(ConsumeEvent::BadLine {
-                            event_key: key.to_string(),
-                            detail: err.to_string(),
-                        }).await;
-                    }
-                }
+                dispatch_line(settings, key, tx, &line).await;
             }
             status = child.wait() => {
                 forget_pid(pids, pid);
                 drop(stdin);
                 let code = status?.code();
                 return Ok(RunEnd::Exited(code));
+            }
+        }
+    }
+}
+
+/// Parse and deliver one stdout line as an event or a bad-line diagnostic.
+async fn dispatch_line(
+    settings: &ConsumeSettings,
+    key: &str,
+    tx: &mpsc::Sender<ConsumeEvent>,
+    line: &str,
+) {
+    if line.len() > settings.line_max_bytes {
+        let _ = tx
+            .send(ConsumeEvent::BadLine {
+                event_key: key.to_string(),
+                detail: Error::LineTooLong(settings.line_max_bytes).to_string(),
+            })
+            .await;
+        return;
+    }
+    match parse_event_line(line) {
+        Ok(event) => {
+            let _ = tx
+                .send(ConsumeEvent::Event {
+                    event_key: key.to_string(),
+                    event: Box::new(event),
+                })
+                .await;
+        }
+        Err(err) => {
+            debug!(event_key = %key, %err, "feishu consume bad line");
+            let _ = tx
+                .send(ConsumeEvent::BadLine {
+                    event_key: key.to_string(),
+                    detail: err.to_string(),
+                })
+                .await;
+        }
+    }
+}
+
+/// Upper bound for reading the child's accepted stdout after SIGTERM.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
+
+/// Keep reading the SIGTERM-ed child's stdout to EOF, enqueuing every line,
+/// until the child exits, EOF, or the bounded drain window passes.
+///
+/// Closing the event channel before these buffered lines were read dropped
+/// accepted events on shutdown (a gate flake under host load). Returns whether
+/// the child was observed exiting; a child ignoring SIGTERM only loses its
+/// remaining stdout once [`SHUTDOWN_DRAIN`] passes.
+async fn drain_stdout(
+    child: &mut Child,
+    stdout: &mut BufReader<tokio::process::ChildStdout>,
+    tx: &mpsc::Sender<ConsumeEvent>,
+    settings: &ConsumeSettings,
+    key: &str,
+    line: &mut String,
+) -> bool {
+    let deadline = sleep(SHUTDOWN_DRAIN);
+    tokio::pin!(deadline);
+    loop {
+        line.clear();
+        tokio::select! {
+            biased;
+            _ = &mut deadline => return false,
+            status = child.wait() => return status.is_ok(),
+            result = stdout.read_line(line) => {
+                if let Ok(0) | Err(_) = result {
+                    return false;
+                }
+                dispatch_line(settings, key, tx, line).await;
             }
         }
     }

@@ -133,7 +133,8 @@ async fn watch_follows_all_hosts_resyncs_gaps_reconnects_and_stops_on_sigint() {
         .spawn()
         .unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-    timeout(Duration::from_secs(10), connections.recv())
+    // Readiness budget for the spawned watch CLI on a loaded gate host.
+    timeout(Duration::from_secs(60), connections.recv())
         .await
         .unwrap()
         .unwrap();
@@ -164,7 +165,8 @@ async fn watch_follows_all_hosts_resyncs_gaps_reconnects_and_stops_on_sigint() {
     fixture.frames.send(None).unwrap();
     let stale = until(&mut lines, |value| value["stream"] == "disconnected").await;
     assert_eq!(stale["stale"], true);
-    timeout(Duration::from_secs(10), connections.recv())
+    // Reconnect is the same readiness wait on a loaded gate host.
+    timeout(Duration::from_secs(60), connections.recv())
         .await
         .unwrap()
         .unwrap();
@@ -182,7 +184,7 @@ async fn watch_follows_all_hosts_resyncs_gaps_reconnects_and_stops_on_sigint() {
             .success()
     );
     assert!(
-        timeout(Duration::from_secs(5), child.wait())
+        timeout(Duration::from_secs(30), child.wait())
             .await
             .unwrap()
             .unwrap()

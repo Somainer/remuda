@@ -1,0 +1,1461 @@
+//! Hub e2e for the D-047/D-048 model-API relay, driven against the offline
+//! fake gateway in `remuda-testing`.
+//!
+//! The shape under test is the in-band one from `docs/design/api-routing.md`
+//! §3: a worker's Node accepts a request on its per-instance loopback listener
+//! and forwards it as `api.open` / `api.body` over the **existing** Hub↔Node
+//! link; the Hub (or the proxy host's Node, when the proxy host is not the Hub
+//! host) rebuilds the request against the profile's pinned origin, swaps the
+//! credential, and streams the response back as `api.head` / `api.chunk` /
+//! `api.end`. Neither leg opens a listener off loopback.
+//!
+//! ## These frames are notifications, with no ids and no acks
+//!
+//! That is a hard requirement, not a style choice: `api-routing.md` §4.4 says
+//! all seven frames are notifications, each direction keeping its own per-link
+//! stream registry, so a hot relay stream **never** consumes the 32-slot
+//! in-flight RPC map that `instance.create` and `tty.*` depend on. Every helper
+//! here therefore sends and observes *notifications*: a test that waited for a
+//! JSON-RPC reply to an `api.*` frame would hang until its timeout, because no
+//! reply is ever coming. Ordering is carried by `streamId` and `seq`, not by
+//! request/response correlation.
+//!
+//! ## Why most of this file is `#[ignore]`d
+//!
+//! The relay router is task 2 (`c-apiroute-hub`). Until it lands there is no
+//! arm for `api.*` and no stream table, so a notification for one of those
+//! methods is simply ignored (an unknown *notification* has no id, so the Hub
+//! has nothing to answer and drops it — `crates/remuda-hub/src/ws.rs`, the
+//! `handle_node_method` fall-through). Every assertion that needs the router is
+//! written out in full and marked
+//! `#[ignore = "relay router lands with c-apiroute-hub"]` — that exact wording,
+//! so `grep -c 'relay router lands with c-apiroute-hub'` lists every one to
+//! un-ignore when the router merges. This file then becomes the acceptance
+//! evidence, and until then it records, in executable form, exactly what "done"
+//! means rather than a prose restatement of it.
+//!
+//! Three tests are **not** ignored, and none of them waits on a reply that will
+//! never come:
+//!
+//! 1. `an_api_notification_is_ignored_today_and_the_link_survives` pins the
+//!    current behaviour (no relay frames are produced) and that an unknown
+//!    notification does not kill the link — so the ignored tests are not
+//!    silently passing for the wrong reason, and the day this flips the
+//!    un-ignored set is the reminder the router arrived;
+//! 2. `the_relay_destination_streams_sse_and_lists_two_catalogs` speaks HTTP to
+//!    the fake gateway directly, proving the relay's destination really is a
+//!    working streaming Anthropic-Messages origin with the two-catalog listing;
+//! 3. `a_profile_can_point_at_the_fake_gateway_and_test_it` proves a stored
+//!    profile whose `baseUrl` is the fixture can be created and tested, which
+//!    every ignored test below depends on.
+//!
+//! ## Route selection is not set up here
+//!
+//! The ignored tests drive the relay at the frame level: they speak `api.*`
+//! themselves rather than asking the Hub to resolve a `via:<H>` route, because
+//! the route waterfall and the `apiVia` request field are `c-apiroute-hub`'s
+//! own deliverable (task 2) and the provider create/patch surface has no
+//! `delivery` field to set today. Where a test needs a *proxy* leg it stands up
+//! the second fake Node (H) the plan's §(C) task 2 names, and plays both
+//! machines.
+
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use futures::{SinkExt, StreamExt};
+use remuda_hub::{HubConfig, spawn};
+use remuda_protocol::{HostId, InstanceId};
+use remuda_testing::fake_gateway::{DEFAULT_TEXT, FakeGateway, Script};
+use serde_json::{Value, json};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+/// Generous: this box is a shared devbox and the Hub is spun up in-process.
+const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long an un-ignored probe waits before concluding "no relay frames".
+///
+/// Short on purpose: the assertion is that nothing happens, and a long wait for
+/// a negative is just a slow test.
+const QUIET_BUDGET: Duration = Duration::from_millis(1200);
+
+/// Ceiling on a single relayed chunk, raw bytes (D-048 `apiChunkBytes`).
+const API_CHUNK_BYTES: usize = 64 * 1024;
+
+/// The credential the fixture profile is created with.
+///
+/// A synthetic value that exists only in this process. No test ever asserts on
+/// it directly: the gateway compares it in constant time and reports a boolean,
+/// so the value is never printed, copied into output, or written to a file.
+const PROFILE_TOKEN: &str = "sk-fake-profile-0001";
+
+/// The worker's per-instance relay bearer — the value a worker holds, and the
+/// one that must **never** reach the gateway.
+///
+/// Used to keep the two credentials distinguishable: the origin is configured
+/// with [`PROFILE_TOKEN`], so a relay that forwarded *this* value instead
+/// presents a credential that does not match and is refused. The value is never
+/// sent anywhere in these tests and never printed; only the mismatch verdict is
+/// read.
+const WORKER_RELAY_BEARER: &str = "fake-worker-bearer-0002";
+
+type NodeSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+// ── Frame plumbing ─────────────────────────────────────────────────────────
+
+async fn recv_json(ws: &mut NodeSocket) -> Result<Value> {
+    loop {
+        let message = tokio::time::timeout(TIMEOUT, ws.next())
+            .await
+            .map_err(|_| anyhow!("ws timeout"))?
+            .ok_or_else(|| anyhow!("ws closed"))??;
+        match message {
+            Message::Text(text) => return Ok(serde_json::from_str(&text)?),
+            Message::Ping(_) | Message::Pong(_) => continue,
+            other => return Err(anyhow!("unexpected frame {other:?}")),
+        }
+    }
+}
+
+async fn send_json(node: &mut NodeSocket, frame: Value) -> Result<()> {
+    node.send(Message::Text(frame.to_string().into())).await?;
+    Ok(())
+}
+
+/// Send an `api.*` **notification**: no `id`, no reply expected or possible.
+async fn notify(node: &mut NodeSocket, method: &str, params: Value) -> Result<()> {
+    send_json(
+        node,
+        json!({ "jsonrpc": "2.0", "method": method, "params": params }),
+    )
+    .await
+}
+
+/// Send an ordinary JSON-RPC **request** and read until its matching reply.
+///
+/// Used only for the control-plane methods (`node.hello`, `journal.append`,
+/// `tty.frame`), which _are_ requests and do reply. Any relay notification that
+/// arrives while waiting is handed to `collect`.
+async fn request<F>(
+    node: &mut NodeSocket,
+    frame: Value,
+    mut collect: F,
+) -> Result<(Value, Vec<Value>)>
+where
+    F: FnMut(&Value) -> bool,
+{
+    let rpc_id = frame["id"].clone();
+    send_json(node, frame).await?;
+    let mut notifications = Vec::new();
+    loop {
+        let reply = recv_json(node).await?;
+        if reply.get("method").is_some() {
+            if collect(&reply) {
+                notifications.push(reply["params"].clone());
+            }
+            continue;
+        }
+        if reply["id"] == rpc_id {
+            return Ok((reply, notifications));
+        }
+    }
+}
+
+/// Read notifications off one node until `stop` matches one (or the budget runs
+/// out), returning everything seen.
+///
+/// The relay's frames are all notifications, so this — not a reply — is how a
+/// test observes the response leg.
+async fn collect_notifications<F>(
+    node: &mut NodeSocket,
+    budget: Duration,
+    mut stop: F,
+) -> Result<Vec<Value>>
+where
+    F: FnMut(&Value) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut seen = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), recv_json(node)).await {
+            Ok(Ok(frame)) => {
+                let done = stop(&frame);
+                seen.push(frame);
+                if done {
+                    return Ok(seen);
+                }
+            }
+            Ok(Err(err)) => return Err(err),
+            // Quiet: not an error, just nothing more to see yet.
+            Err(_) => continue,
+        }
+    }
+    Ok(seen)
+}
+
+/// Every `api.*` frame the node received for `stream_id`.
+fn frames_for(frames: &[Value], stream_id: &str) -> Vec<Value> {
+    frames
+        .iter()
+        .filter(|frame| {
+            frame["method"]
+                .as_str()
+                .is_some_and(|method| method.starts_with("api."))
+                && frame["params"]["streamId"] == json!(stream_id)
+        })
+        .map(|frame| frame["params"].clone())
+        .collect()
+}
+
+// ── Fixtures ───────────────────────────────────────────────────────────────
+
+/// A booted Hub, a connected fake Node, and a projected running instance.
+struct Fixture {
+    addr: std::net::SocketAddr,
+    cookie: String,
+    node: NodeSocket,
+    instance_id: String,
+    _hub: remuda_hub::RunningHub,
+    _dir: tempfile::TempDir,
+}
+
+/// Boot a Hub, mint an enroll token, connect a fake Node, and project one
+/// running instance onto it.
+async fn fixture() -> Result<Fixture> {
+    let dir = tempfile::tempdir()?;
+    let config = HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &bootstrap).await?;
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
+
+    // Note: `upgrade`, not `request` — `request` is the RPC helper above.
+    let mut upgrade = format!("ws://{addr}/v1/node").into_client_request()?;
+    upgrade
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut node, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(upgrade)).await??;
+
+    let host_id = HostId::new().as_id().as_str().to_owned();
+    send_json(
+        &mut node,
+        json!({"jsonrpc":"2.0", "id":"hello", "method":"node.hello",
+            "params":{"hostId": host_id, "nodeVersion":"0.1.0", "label":"relay-worker"}}),
+    )
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    anyhow::ensure!(hello.pointer("/result/hostId").is_some(), "{hello}");
+
+    // Project a running instance onto **this** host, so the Hub can authorize
+    // the relay against a real instance row (it re-checks the Node's word,
+    // exactly as for object.pull).
+    let instance_id = InstanceId::new().as_id().as_str().to_owned();
+    let (ack, _) = request(
+        &mut node,
+        json!({"jsonrpc":"2.0", "id":"s1", "method":"journal.append",
+            "params":{"instanceId":instance_id, "event":{
+                "kind":"lifecycle",
+                "payload":{"type":"entity", "entityType":"instance", "state":"ready",
+                           "reasonCode":"driver-started"}}}}),
+        |_| false,
+    )
+    .await?;
+    anyhow::ensure!(ack.get("result").is_some(), "instance projection: {ack}");
+
+    Ok(Fixture {
+        addr,
+        cookie,
+        node,
+        instance_id,
+        _hub: hub,
+        _dir: dir,
+    })
+}
+
+/// A second fake Node, playing the proxy host H.
+///
+/// The plan's §(C) task 2 asks for a *pair* of fake Nodes: `via:<H>` means the
+/// worker's Node hands the request to the Hub and the Hub hands it to H, so a
+/// test that only ever had one Node could not tell which machine actually did
+/// the egress — nor drive "H went offline mid-stream", which is a failure about
+/// a *remote* link rather than the worker's own. The two tests that need it
+/// (`a_via_host_lost_mid_stream_…`) connect one of these and then drop it.
+struct ProxyNode {
+    host_id: String,
+    /// Held so the connection lives as long as the value does; dropping the
+    /// `ProxyNode` is how a test takes H offline.
+    node: NodeSocket,
+}
+
+impl ProxyNode {
+    /// Connect a second Node and complete its hello.
+    ///
+    /// Enrollment comes from the Hub's own mint, exactly as the worker's does —
+    /// H is an ordinary enrolled host, not a special case.
+    async fn connect(addr: std::net::SocketAddr, enroll: &str, label: &str) -> Result<Self> {
+        let mut upgrade = format!("ws://{addr}/v1/node").into_client_request()?;
+        upgrade
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {enroll}").parse()?);
+        let (mut node, _) =
+            tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(upgrade)).await??;
+        let host_id = HostId::new().as_id().as_str().to_owned();
+        send_json(
+            &mut node,
+            json!({"jsonrpc":"2.0", "id":"hello", "method":"node.hello",
+                "params":{"hostId": host_id, "nodeVersion":"0.1.0", "label": label}}),
+        )
+        .await?;
+        let reply = recv_json(&mut node).await?;
+        anyhow::ensure!(reply.pointer("/result/hostId").is_some(), "{reply}");
+        Ok(Self { host_id, node })
+    }
+}
+
+// ── HTTP helpers ───────────────────────────────────────────────────────────
+
+/// Minimal HTTP client: one request, `Connection: close`, head and body back.
+///
+/// Returns `(status, head, body)` — the head is separate because the login
+/// cookie only exists there, and the body because every other route answers in
+/// JSON.
+async fn http(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<&str>,
+) -> Result<(u16, String, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    let mut stream = TcpStream::connect(addr).await?;
+    let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(body) = body {
+        head.push_str("Content-Type: application/json\r\n");
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut request = head.into_bytes();
+    if let Some(body) = body {
+        request.extend_from_slice(body.as_bytes());
+    }
+    stream.write_all(&request).await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf);
+    let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    Ok((status, head.to_string(), rest.to_string()))
+}
+
+async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<String> {
+    let body = json!({ "bootstrapToken": bootstrap, "deviceName": "api-relay-test" }).to_string();
+    let (status, head, rest) = http(addr, "POST", "/v1/login", &[], Some(&body)).await?;
+    anyhow::ensure!(status == 200, "login {status} {rest}");
+    head.lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|line| line.split_once(':')?.1.split(';').next())
+        .map(|value| value.trim().to_string())
+        .context("login set-cookie")
+}
+
+/// Create a gateway profile pointing at `base_url` and return its id.
+///
+/// The profile carries [`PROFILE_TOKEN`]; no test reads it back out of the Hub,
+/// and the gateway only ever reports whether the credential it received matched.
+///
+/// Note: this does **not** set a delivery mode. The provider create/patch
+/// surface has no `delivery` field yet — that arrives with `c-apiroute-hub`
+/// (task 2), together with the `apiVia` waterfall. The ignored tests below
+/// therefore drive the relay at the frame level, which is the layer this file
+/// owns.
+async fn create_profile(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    base_url: &str,
+) -> Result<String> {
+    let body = json!({
+        "name": "relay-fixture",
+        "kind": "gateway",
+        "baseUrl": base_url,
+        "models": ["fake/model-1"],
+        "defaultModel": "fake/model-1",
+        "authToken": PROFILE_TOKEN,
+        "defaultGateway": true,
+    })
+    .to_string();
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/providers",
+        &[("Cookie", cookie)],
+        Some(&body),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "create profile {status} {rest}");
+    let created: Value = serde_json::from_str(rest.trim())?;
+    created["id"]
+        .as_str()
+        .map(str::to_string)
+        .context("profile id")
+}
+
+// ── api.* params ───────────────────────────────────────────────────────────
+
+/// The `api.open` params a worker's Node sends for one Messages request.
+///
+/// Built as raw JSON rather than from `remuda_protocol::ApiOpenParams` so this
+/// file reads as the wire contract itself; the shapes are identical and the Hub
+/// parses node frames as `serde_json::Value` regardless. Swapping in the typed
+/// params is a local change confined to this helper if that is ever preferred.
+fn api_open_params(instance_id: &str, stream_id: &str, body: &str) -> Value {
+    json!({
+        "instanceId": instance_id,
+        "streamId": stream_id,
+        "method": "POST",
+        "path": "messages",
+        "query": "",
+        "headers": [
+            { "name": "content-type", "value": "application/json" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "x-stainless-lang", "value": "js" },
+        ],
+        "bodyBase64": base64_encode(body.as_bytes()),
+        "bodyChunked": false,
+        "deadlineMs": 30_000,
+    })
+}
+
+/// An `api.body` continuation frame's params.
+fn api_body_params(stream_id: &str, seq: usize, slice: &[u8], last: bool) -> Value {
+    json!({
+        "streamId": stream_id,
+        "seq": seq,
+        "dataBase64": base64_encode(slice),
+        "last": last,
+    })
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn base64_decode(value: &str) -> Result<Vec<u8>> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.decode(value)?)
+}
+
+/// A Messages request body, as a client would send it.
+fn messages_body() -> String {
+    json!({
+        "model": "fake/model-1",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }],
+    })
+    .to_string()
+}
+
+/// Reassemble the `api.chunk` payloads of one stream, in `seq` order.
+///
+/// Coalescing preserves byte order exactly (D-048), so sorting by `seq` and
+/// concatenating must reproduce the origin's body byte for byte.
+fn reassemble_chunks(frames: &[Value]) -> Result<Vec<u8>> {
+    let mut chunks: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame.get("dataBase64").is_some() && frame.get("bytesDown").is_none())
+        .collect();
+    chunks.sort_by_key(|frame| frame["seq"].as_u64().unwrap_or(0));
+    let mut body = Vec::new();
+    for chunk in chunks {
+        body.extend_from_slice(&base64_decode(
+            chunk["dataBase64"].as_str().context("dataBase64")?,
+        )?);
+    }
+    Ok(body)
+}
+
+/// Reassemble the `text_delta` payloads of an SSE body into one string.
+///
+/// Returns an error on a malformed frame rather than skipping it: a frame the
+/// relay mangled is exactly what the caller is looking for.
+fn reassemble_deltas(body: &str) -> Result<String> {
+    let mut out = String::new();
+    for block in body.split("\n\n") {
+        let mut event = None;
+        let mut data = None;
+        for line in block.lines() {
+            if let Some(rest) = line.strip_prefix("event: ") {
+                event = Some(rest);
+            } else if let Some(rest) = line.strip_prefix("data: ") {
+                data = Some(rest);
+            }
+        }
+        if event != Some("content_block_delta") {
+            continue;
+        }
+        let value: Value = serde_json::from_str(data.context("delta without data")?)?;
+        out.push_str(
+            value
+                .pointer("/delta/text")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+    }
+    Ok(out)
+}
+
+/// The `api.head` params of the first response head for `stream_id`.
+fn api_head(frames: &[Value], stream_id: &str) -> Option<Value> {
+    frames_for(frames, stream_id)
+        .into_iter()
+        .find(|params| params.get("status").is_some())
+}
+
+/// The header names on an `api.head`'s `headers` list, lowercased.
+fn head_header_names(head: &Value) -> Vec<String> {
+    head["headers"]
+        .as_array()
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|header| header["name"].as_str().map(str::to_ascii_lowercase))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Assert the origin saw exactly the profile credential and nothing else.
+///
+/// The relay's real credential assertion, and the reason the fixture compares
+/// values: a relay that forwarded the worker's per-instance bearer instead
+/// would present a *different* credential, which the gateway answers `401` and
+/// reports as a mismatch. Both values stay inside the fixture — this only reads
+/// verdicts.
+fn assert_profile_credential_swapped(gateway: &FakeGateway) -> Result<()> {
+    gateway
+        .assert_presented_expected_credential()
+        .context("the relay must present the profile credential, not the worker's bearer")?;
+    anyhow::ensure!(
+        !gateway.saw_credential_mismatch(),
+        "a credential other than the profile's reached the origin: {:?}",
+        gateway.credential_violations()
+    );
+    Ok(())
+}
+
+// ── Un-ignored: the facts the relay is built on ────────────────────────────
+
+/// Today `api.*` has no router, so an `api.open` notification is ignored.
+///
+/// Two things are pinned here, and both matter. First, no relay frame comes
+/// back — so the `#[ignore]`d tests below are not failing for the wrong reason,
+/// and the day this flips, the un-ignored set is the reminder the router
+/// arrived. Second, an unknown *notification* does not kill the link: it has no
+/// id, so the Hub has nothing to answer and must simply move on. If it instead
+/// tore the connection down, every relay failure would look like a host going
+/// offline.
+#[tokio::test]
+async fn an_api_notification_is_ignored_today_and_the_link_survives() -> Result<()> {
+    let mut fixture = fixture().await?;
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_probe", &messages_body()),
+    )
+    .await?;
+
+    let seen = collect_notifications(&mut fixture.node, QUIET_BUDGET, |frame| {
+        frame["method"]
+            .as_str()
+            .is_some_and(|method| method.starts_with("api."))
+    })
+    .await?;
+    assert!(
+        !seen.iter().any(|frame| frame["method"]
+            .as_str()
+            .is_some_and(|method| method.starts_with("api."))),
+        "no relay router exists yet, so no api.* frame should come back: {seen:?}"
+    );
+
+    // The control plane is untouched by the ignored notification.
+    let (ack, _) = request(
+        &mut fixture.node,
+        json!({"jsonrpc":"2.0", "id":"alive", "method":"journal.append",
+            "params":{"instanceId": fixture.instance_id, "event":{
+                "kind":"lifecycle",
+                "payload":{"type":"entity", "entityType":"instance", "state":"ready",
+                           "reasonCode":"driver-started"}}}}),
+        |_| false,
+    )
+    .await?;
+    assert!(
+        ack.get("result").is_some(),
+        "an unknown api.* notification must not break the link: {ack}"
+    );
+    Ok(())
+}
+
+/// The relay's destination is a real, streaming Messages origin.
+///
+/// This is the one test that exercises the fake gateway over the same loopback
+/// path a relay takes, and it needs no Hub relay code: it speaks HTTP to the
+/// gateway directly. It fails if the fixture and the relay disagree about what
+/// the origin does — SSE framing, the `anthropic-version` header, or the
+/// two-catalog listing.
+#[tokio::test]
+async fn the_relay_destination_streams_sse_and_lists_two_catalogs() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let client = reqwest::Client::builder().timeout(TIMEOUT).build()?;
+
+    // A credential-free request still streams, which is what lets a relay test
+    // assert on the credential *swap* rather than on a credential.
+    let response = client
+        .post(format!("{}/v1/messages", gateway.base_url()))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(messages_body())
+        .send()
+        .await
+        .context("POST /v1/messages")?;
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")),
+        "the origin must stream: {:?}",
+        response.headers()
+    );
+    let body = response.text().await?;
+    assert!(body.contains("event: message_start"), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
+    // The text arrives split across `text_delta` events, so the way to check it
+    // is to reassemble the deltas — which is also what proves the framing is
+    // lossless rather than merely well-formed.
+    assert_eq!(reassemble_deltas(&body)?, DEFAULT_TEXT);
+
+    // The two listings overlap without nesting, so a probe that read one
+    // surface under-reports — the reason `/discover` unions both.
+    let plain = model_ids(
+        &client
+            .get(format!("{}/v1/models", gateway.base_url()))
+            .send()
+            .await?
+            .json::<Value>()
+            .await?,
+    )?;
+    let anthropic = model_ids(
+        &client
+            .get(format!("{}/v1/models", gateway.base_url()))
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await?
+            .json::<Value>()
+            .await?,
+    )?;
+    assert!(
+        plain.iter().any(|id| !anthropic.contains(id))
+            && anthropic.iter().any(|id| !plain.contains(id)),
+        "each surface must own an id the other lacks: {plain:?} vs {anthropic:?}"
+    );
+
+    // A discovery probe through the Hub unions both surfaces, which is what the
+    // profile the ignored tests create resolves against.
+    //
+    // The token matters: the Hub only sends `anthropic-version` when it has a
+    // credential to send, so probing without one reads the plain surface alone
+    // and the union would be missing every `claude-*` id.
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token.clone()).await?;
+    // Armed only now: the direct probes above deliberately send no credential,
+    // so an expectation in force earlier would have refused them.
+    gateway.expect_credential(PROFILE_TOKEN);
+    let discover = json!({
+        "baseUrl": gateway.base_url(),
+        "token": PROFILE_TOKEN,
+    })
+    .to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/providers/discover",
+        &[("Cookie", cookie.as_str())],
+        Some(&discover),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "discover {status} {rest}");
+    let found: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(found["ok"], true, "{found}");
+    // `/discover` answers its own shape: the catalog sits under `models`.
+    let discovered: Vec<String> = found["models"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in plain.iter().chain(anthropic.iter()) {
+        assert!(
+            discovered.contains(id),
+            "the union must offer {id}; got {discovered:?}"
+        );
+    }
+
+    // The probe presented the profile credential and it compared equal — the
+    // credential-swap check, not the no-credentials one (a probe that carries a
+    // credential is correct, so `assert_no_credentials` is the wrong tool).
+    assert_profile_credential_swapped(&gateway)?;
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// The ids of a `/v1/models` response body, in order.
+fn model_ids(body: &Value) -> Result<Vec<String>> {
+    Ok(body["data"]
+        .as_array()
+        .context("data")?
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// A profile pointing at the fixture is accepted, and `POST /test` reaches it.
+///
+/// The ignored tests all need a stored profile whose `baseUrl` is the fixture;
+/// this proves that part works today, independently of the router.
+#[tokio::test]
+async fn a_profile_can_point_at_the_fake_gateway_and_test_it() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token.clone()).await?;
+
+    // The gateway will insist on the profile's token, so a probe that failed to
+    // attach it would be refused rather than silently accepted.
+    gateway.expect_credential(PROFILE_TOKEN);
+
+    let id = create_profile(hub.addr, &cookie, &gateway.base_url()).await?;
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/providers/{id}/test"),
+        &[("Cookie", cookie.as_str())],
+        Some("{}"),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "provider test {status} {rest}");
+    let result: Value = serde_json::from_str(rest.trim())?;
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["reachable"], true, "{result}");
+
+    // The stored profile's credential is what reached the origin.
+    assert_profile_credential_swapped(&gateway)?;
+    assert!(
+        gateway.saw_header("anthropic-version"),
+        "the probe reads the anthropic surface too: {:?}",
+        gateway.header_names()
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+// ── Ignored until `c-apiroute-hub` lands: the relay's own acceptance ───────
+
+/// Happy path: one relayed Messages request, streamed back to the worker.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn relays_a_messages_request_and_streams_the_response_back() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    // The origin insists on the profile credential, so a relay that forwarded
+    // the worker's per-instance bearer is refused here rather than passing.
+    gateway.expect_credential(PROFILE_TOKEN);
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    // api.open is a notification: no id, no ack, and the response leg arrives
+    // as notifications too.
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_1", &messages_body()),
+    )
+    .await?;
+
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_1") && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+
+    // The response head arrives before the body, so the worker's listener can
+    // commit a status line without waiting for the first byte.
+    let head = api_head(&frames, "st_1").context("no api.head")?;
+    assert_eq!(head["status"], 200, "{head}");
+
+    let body = String::from_utf8(reassemble_chunks(&frames_for(&frames, "st_1"))?)?;
+    assert!(body.contains("event: message_start"), "{body}");
+    assert!(body.contains("event: content_block_delta"), "{body}");
+    assert!(body.contains("event: message_stop"), "{body}");
+    assert_eq!(reassemble_deltas(&body)?, DEFAULT_TEXT);
+
+    // ApiEndParams carries counters only — `{streamId, error?, bytesUp,
+    // bytesDown, ms}`. No status, no body, no header ever reaches it, which is
+    // what lets `api.end` be the journal record.
+    let end = frames_for(&frames, "st_1")
+        .into_iter()
+        .find(|params| params.get("bytesDown").is_some())
+        .context("no api.end")?;
+    assert!(
+        end.get("error").is_none(),
+        "the stream ended in error: {end}"
+    );
+    assert!(
+        end["bytesDown"].as_u64().unwrap_or(0) >= body.len() as u64,
+        "api.end must count the response bytes: {end}"
+    );
+    assert!(
+        end["bytesUp"].as_u64().is_some() && end["ms"].as_u64().is_some(),
+        "api.end carries both counters and a duration: {end}"
+    );
+    assert!(
+        end.get("status").is_none()
+            && end.get("headers").is_none()
+            && end.get("bodyBase64").is_none(),
+        "api.end carries counters, never a status, body or header: {end}"
+    );
+
+    // The credential swap: the origin saw the profile credential, and the
+    // worker's relay bearer never left the worker.
+    //
+    // The fixture is configured with the *profile* token and separately told
+    // which value the worker holds, so it can distinguish the two by value. A
+    // relay that forwarded the worker's bearer unchanged — the mistake this
+    // whole design exists to prevent — presents a credential that is not the
+    // configured one, is refused `401`, and reports a mismatch here.
+    assert_profile_credential_swapped(&gateway)?;
+    // The worker's own bearer is a different value, so if it were what arrived
+    // the assertion above would already have failed; this makes the intent
+    // explicit and keeps the constant load-bearing.
+    assert_ne!(PROFILE_TOKEN, WORKER_RELAY_BEARER);
+    assert!(
+        gateway.saw_header("anthropic-version") && gateway.saw_header("x-stainless-lang"),
+        "the request header allowlist carries these through: {:?}",
+        gateway.header_names()
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// A request body too large for one frame is chunked as `api.body`.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn relays_a_chunked_request_body_larger_than_one_frame() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    // Several 64 KiB chunks, comfortably under the 1 MiB frame cap.
+    let filler = "x".repeat(200 * 1024);
+    let body = json!({
+        "model": "fake/model-1",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": filler }],
+    })
+    .to_string();
+
+    // Open with no inline body and `bodyChunked`, then push the body as
+    // `api.body` notifications — one per slice, `last` on the final one.
+    let mut params = api_open_params(&fixture.instance_id, "st_chunked", "");
+    params["bodyBase64"] = Value::Null;
+    params["bodyChunked"] = json!(true);
+    notify(&mut fixture.node, "api.open", params).await?;
+
+    let slices: Vec<&[u8]> = body.as_bytes().chunks(API_CHUNK_BYTES).collect();
+    assert!(slices.len() >= 3, "a 200 KiB body must need several chunks");
+    for (seq, slice) in slices.iter().enumerate() {
+        let last = seq + 1 == slices.len();
+        notify(
+            &mut fixture.node,
+            "api.body",
+            api_body_params("st_chunked", seq, slice, last),
+        )
+        .await?;
+    }
+
+    // The origin received the whole body — the only thing that proves the
+    // chunking was lossless rather than merely accepted frame by frame.
+    let received = wait_for_origin(&gateway, &mut fixture.node, "st_chunked", |request| {
+        request.body_bytes == body.len()
+    })
+    .await?;
+    assert_eq!(
+        received.body_bytes,
+        body.len(),
+        "the origin must see the reassembled body length"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// H going offline mid-stream ends the stream truthfully — never by rerouting.
+///
+/// D-047 §Failure behaviour: falling back to direct delivery would leak the
+/// request to a machine the operator excluded and make the session strip lie,
+/// so the stream must end with an error and `remuda watch` must report
+/// `api-route-down`.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Result<()> {
+    // A plain origin: with `via:<H>` and H gone, the assertion below is that the
+    // origin is never reached at all, so scripting it to answer slowly would be
+    // inert — there is no request for the delay to affect. What this test proves
+    // is the absence of a reroute, not the timing of one.
+    let gateway = FakeGateway::start().await?;
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    // The pair of Nodes the plan asks for: W (the worker, already connected)
+    // and H (the proxy host). `via:<H>` is resolved by the router, so the test
+    // stands up H and then takes it away.
+    let enroll = fixture
+        ._hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
+    let proxy = ProxyNode::connect(fixture.addr, &enroll, "relay-proxy").await?;
+    let _proxy_host = proxy.host_id;
+
+    let addr = fixture.addr;
+    let cookie = fixture.cookie.clone();
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_offline", &messages_body()),
+    )
+    .await?;
+
+    // H goes away with the stream in flight. The worker's socket stays open:
+    // the terminal `api.end` for this stream has to arrive on it, and a test
+    // that dropped it could never see the frame it is asserting about.
+    drop(proxy.node);
+
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_offline")
+            && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+    let end = frames_for(&frames, "st_offline")
+        .into_iter()
+        .find(|params| params.get("bytesDown").is_some())
+        .context("the stream must be terminated, not abandoned")?;
+    assert_eq!(
+        end["error"]["code"], "via-host-offline",
+        "the terminal frame must name the cause: {end}"
+    );
+
+    // No code path may reach the origin another way once mode == via. A direct
+    // fallback would have to present a credential to the pinned origin, so
+    // nothing may have arrived at all.
+    assert!(
+        gateway.requests().is_empty(),
+        "a lost via host must not push the request anywhere else: {:?}",
+        gateway.requests()
+    );
+    assert!(
+        !gateway.saw_credential_mismatch(),
+        "no fallback request may reach the origin with any credential"
+    );
+
+    // And the roster observation becomes the reason `remuda watch` reports.
+    // `API_ROUTE_DOWN` is a worker-watch reason, not an instance field, so the
+    // surface is `POST /v1/workers/observe` — a GET of the instance is not it.
+    let (status, _, rest) = http(
+        addr,
+        "POST",
+        "/v1/workers/observe",
+        &[("Cookie", cookie.as_str())],
+        Some("{}"),
+    )
+    .await?;
+    assert_eq!(status, 200, "observe {status} {rest}");
+    let observed: Value = serde_json::from_str(rest.trim())?;
+    let reasons: Vec<&str> = observed["workers"]
+        .as_array()
+        .map(|workers| {
+            workers
+                .iter()
+                .filter_map(|worker| worker["reason"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        reasons.contains(&"api-route-down"),
+        "a lost route is reported, not hidden: {observed}"
+    );
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// A request-body frame over `apiChunkBytes` is refused, not truncated.
+///
+/// D-048 sets `apiChunkBytes` at 64 KiB raw (≈87 KiB base64), far under the
+/// 1 MiB `maxJsonFrameBytes`. The oversized frame has to be sent on the leg
+/// that actually carries request bodies — W Node→Hub, i.e. `api.body`. An
+/// oversized `api.chunk` would be refused for *direction* (that method travels
+/// H→Hub→W), which would prove nothing about the size limit.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn an_oversized_api_body_frame_is_refused_not_truncated() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    let mut params = api_open_params(&fixture.instance_id, "st_big", "");
+    params["bodyBase64"] = Value::Null;
+    params["bodyChunked"] = json!(true);
+    notify(&mut fixture.node, "api.open", params).await?;
+
+    // Several times the cap in one frame.
+    let oversized = vec![b'x'; API_CHUNK_BYTES * 4];
+    notify(
+        &mut fixture.node,
+        "api.body",
+        api_body_params("st_big", 0, &oversized, false),
+    )
+    .await?;
+
+    // A notification cannot be answered with a JSON-RPC error, so the refusal
+    // shows up the way §B.2 says it does: the stream is cancelled upstream and
+    // terminated downstream with `api.end{error}`. What must *not* happen is
+    // silent acceptance, and the origin must never see the oversized body.
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_big") && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+    let end = frames_for(&frames, "st_big")
+        .into_iter()
+        .find(|params| params.get("bytesDown").is_some())
+        .context("an oversized frame must terminate the stream, not be swallowed")?;
+    assert!(
+        end["error"].is_object(),
+        "the terminal frame must carry the error code: {end}"
+    );
+    assert!(
+        gateway
+            .requests()
+            .iter()
+            .all(|request| request.body_bytes <= API_CHUNK_BYTES),
+        "the origin must never receive an oversized body: {:?}",
+        gateway.requests()
+    );
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// A live relay stream must not starve Hub→Node control frames.
+///
+/// Risk 1 in the plan: the Hub→Node outbound queue is 32 slots shared with tty
+/// frames, so `api.*` uses its own stream table with per-stream credits rather
+/// than that queue or the RPC pending map. The probe is a genuine Hub→Node
+/// control frame on the *shared* queue: attaching a follower makes the Hub
+/// issue `tty.attach` to the Node (`crates/remuda-hub/src/ws.rs`, the follow
+/// handler). If relay chunks were filling the queue, that attach would arrive
+/// late — or not at all before a consumer's patience runs out.
+///
+/// The probe is deliberately a Hub→Node frame rather than a Node→Hub one: the
+/// hazard is the outbound direction, so a test that measured an inbound method
+/// would not exercise the queue this risk is about.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn tty_attach_still_flows_while_a_relay_stream_is_hot() -> Result<()> {
+    // A response large enough to keep chunks flowing for a while.
+    let gateway = FakeGateway::start_with(vec![Script::messages("x".repeat(512 * 1024))]).await?;
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    // Open the relay stream and leave it running — no credits are sent, so the
+    // producer stays at its cap with the queue under pressure.
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_hot", &messages_body()),
+    )
+    .await?;
+
+    // Attaching a follower is what makes the Hub push `tty.attach` down to the
+    // Node. Timing it is timing the shared queue.
+    let started = std::time::Instant::now();
+    let mut req = format!(
+        "ws://{}/v1/follow?instanceId={}",
+        fixture.addr, fixture.instance_id
+    )
+    .into_client_request()?;
+    req.headers_mut()
+        .insert("Cookie", fixture.cookie.parse().unwrap());
+    let (mut follow, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(req)).await??;
+    let snapshot = recv_json(&mut follow).await?;
+    anyhow::ensure!(snapshot["type"] == json!("snapshot"), "{snapshot}");
+    follow
+        .send(Message::Text(
+            json!({
+                "type": "subscribe",
+                "instanceIds": [fixture.instance_id],
+                "tty": 1
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+
+    // Read the Node's socket until the Hub's `tty.attach` shows up, answering
+    // relay notifications into the count so the producer is not blocked by a
+    // full socket buffer.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut attached = None;
+    let mut relay_chunks = 0usize;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), recv_json(&mut fixture.node)).await {
+            Ok(Ok(frame)) => {
+                if frame["method"] == json!("tty.attach") {
+                    attached = Some(started.elapsed());
+                    break;
+                }
+                if frame["method"] == json!("api.chunk") {
+                    relay_chunks += 1;
+                }
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => continue,
+        }
+    }
+    let elapsed = attached
+        .context("the Hub must still issue tty.attach to the Node while a relay stream is hot")?;
+    assert!(
+        relay_chunks >= 1,
+        "the relay stream must actually be flowing for this to prove anything"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "tty.attach waited {elapsed:?} behind a hot relay stream"
+    );
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// A destination outside the profile's pinned origin is refused.
+///
+/// Risk 5: the relay must not become a general HTTP proxy. The Node pins origin
+/// and path; the Hub re-checks. A refused request must never reach the origin.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn a_non_allowlisted_destination_is_refused() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    // A path escaping the profile's base path.
+    let mut escaping = api_open_params(&fixture.instance_id, "st_evil1", &messages_body());
+    escaping["path"] = json!("../../etc/passwd");
+    notify(&mut fixture.node, "api.open", escaping).await?;
+
+    // A request trying to name another origin.
+    let mut elsewhere = api_open_params(&fixture.instance_id, "st_evil2", &messages_body());
+    elsewhere["headers"] = json!([{ "name": "host", "value": "elsewhere.example:443" }]);
+    notify(&mut fixture.node, "api.open", elsewhere).await?;
+
+    // Both must be terminated with `destination-refused`, and the pinned origin
+    // must see neither.
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        let params = &frame["params"];
+        (params["streamId"] == json!("st_evil1") || params["streamId"] == json!("st_evil2"))
+            && params.get("bytesDown").is_some()
+    })
+    .await?;
+    for stream in ["st_evil1", "st_evil2"] {
+        let end = frames_for(&frames, stream)
+            .into_iter()
+            .find(|params| params.get("bytesDown").is_some())
+            .with_context(|| format!("{stream} must be terminated, not ignored"))?;
+        assert_eq!(
+            end["error"]["code"], "destination-refused",
+            "{stream} must be refused by name: {end}"
+        );
+    }
+    assert_eq!(
+        gateway.request_count(),
+        0,
+        "a refused destination must never reach the gateway: {:?}",
+        gateway.requests()
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// Credit exhaustion stalls the producer instead of filling the shared queue.
+///
+/// D-048: a producer may have at most 4 unacked chunks per stream and stalls at
+/// the cap; the consumer sends `api.credit` as it drains. Without this, a long
+/// SSE stream would fill the 32-slot outbound queue and block tty frames.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
+    // A response long enough to need far more chunks than the credit cap.
+    let gateway =
+        FakeGateway::start_with(vec![Script::messages("y".repeat(4 * 1024 * 1024))]).await?;
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_credit", &messages_body()),
+    )
+    .await?;
+
+    // Read whatever arrives without crediting, and count it.
+    //
+    // The stop predicate counts *cumulatively* through the closure's captured
+    // state. Testing one frame in isolation cannot work — a single frame is at
+    // most one chunk, so "more than 4" would never be true and the collector
+    // would always burn its whole budget.
+    let mut seen_chunks = 0usize;
+    let frames = collect_notifications(&mut fixture.node, Duration::from_secs(3), |frame| {
+        if frame["params"]["streamId"] == json!("st_credit")
+            && frame["params"].get("dataBase64").is_some()
+        {
+            seen_chunks += 1;
+        }
+        seen_chunks > 4
+    })
+    .await?;
+    let uncredited = frames_for(&frames, "st_credit")
+        .iter()
+        .filter(|params| params.get("dataBase64").is_some())
+        .count();
+
+    // Both halves matter: at least one chunk must have arrived (the stream
+    // really started) and no more than the cap must have (it really stalled).
+    // Asserting only the upper bound would pass on a stream that never ran.
+    assert!(
+        uncredited >= 1,
+        "the relay stream must start before it can stall at a cap"
+    );
+    assert!(
+        uncredited <= 4,
+        "the producer must stall at the credit cap, saw {uncredited} uncredited chunks"
+    );
+
+    // Credit the stream and the producer resumes.
+    notify(
+        &mut fixture.node,
+        "api.credit",
+        json!({"streamId":"st_credit", "chunks": 4}),
+    )
+    .await?;
+    let resumed = collect_notifications(&mut fixture.node, Duration::from_secs(5), |frame| {
+        frame["params"]["streamId"] == json!("st_credit")
+            && frame["params"].get("dataBase64").is_some()
+    })
+    .await?;
+    assert!(
+        frames_for(&resumed, "st_credit")
+            .iter()
+            .any(|params| params.get("dataBase64").is_some()),
+        "the producer must resume after a credit"
+    );
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// A `429` observed at the origin reaches supply evidence as a status.
+///
+/// Two halves, deliberately kept apart. On the **wire**, `ApiHeadParams` is
+/// where a status travels, so the relayed `api.head` must carry `429` and must
+/// carry `retry-after` through the response allowlist. `ApiEndParams` has no
+/// status field at all — only `{streamId, error?, bytesUp, bytesDown, ms}` — so
+/// asserting one there would be asserting on a field the wire does not have.
+///
+/// On the **record**, the design names supply evidence: H projects the observed
+/// status into `POST /v1/providers/{id}/supply/events` (D-047 §Journal), and a
+/// 429 is what cools a family window. The projection is the router's job; this
+/// shows the surface it lands on, which is where a test must look for it.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn an_origin_429_is_projected_into_supply_evidence() -> Result<()> {
+    let gateway = FakeGateway::start_with(vec![Script::status(429)]).await?;
+    let mut fixture = fixture().await?;
+    let profile_id = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_429", &messages_body()),
+    )
+    .await?;
+
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_429") && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+
+    // On the wire: the status is relayed verbatim, so the worker's listener
+    // answers a real Anthropic rate-limit error rather than a transport fault.
+    let head = api_head(&frames, "st_429").context("no api.head")?;
+    assert_eq!(head["status"], 429, "{head}");
+    assert!(
+        head_header_names(&head)
+            .iter()
+            .any(|name| name == "retry-after"),
+        "retry-after survives the response allowlist: {head}"
+    );
+
+    // And api.end carries counters only — no status, because it has no such
+    // field, and no body or header either.
+    let end = frames_for(&frames, "st_429")
+        .into_iter()
+        .find(|params| params.get("bytesDown").is_some())
+        .context("no api.end")?;
+    assert!(
+        end.get("status").is_none()
+            && end.get("headers").is_none()
+            && end.get("bodyBase64").is_none(),
+        "api.end is counters only: {end}"
+    );
+
+    // On the record: this is the surface the projection writes to, and it is
+    // where a 429 becomes visible (`supply.lastError` names the cooled
+    // families — the design stores no raw status field).
+    let event = json!({
+        "type": "textual",
+        "text": "API Error: 429 rate limited",
+        "httpStatus": 429,
+    })
+    .to_string();
+    let (status, _, rest) = http(
+        fixture.addr,
+        "POST",
+        &format!("/v1/providers/{profile_id}/supply/events"),
+        &[("Cookie", fixture.cookie.as_str())],
+        Some(&event),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "supply event {status} {rest}");
+    let (status, _, rest) = http(
+        fixture.addr,
+        "GET",
+        &format!("/v1/providers/{profile_id}/supply"),
+        &[("Cookie", fixture.cookie.as_str())],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "get supply {status} {rest}");
+    let supply: Value = serde_json::from_str(rest.trim())?;
+    assert!(
+        supply["supply"]["lastError"]
+            .as_str()
+            .is_some_and(|error| error.contains("429")),
+        "the observed status must surface in the supply record: {supply}"
+    );
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// The response allowlist drops `set-cookie` and keeps `content-type`.
+#[tokio::test]
+#[ignore = "relay router lands with c-apiroute-hub"]
+async fn the_response_header_allowlist_drops_set_cookie() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    // The origin must actually send a `set-cookie`, or this assertion would
+    // pass whether or not the allowlist works.
+    gateway.set_response_header("set-cookie", "session=should-never-be-relayed; HttpOnly");
+    let mut fixture = fixture().await?;
+    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_hdr", &messages_body()),
+    )
+    .await?;
+
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_hdr") && frame["params"].get("status").is_some()
+    })
+    .await?;
+    let head = api_head(&frames, "st_hdr").context("no api.head")?;
+    let names = head_header_names(&head);
+    assert!(
+        !names.iter().any(|name| name == "set-cookie"),
+        "set-cookie is always dropped: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name == "content-type"),
+        "content-type survives: {names:?}"
+    );
+
+    // The value must not be relayed either, not merely the name omitted.
+    assert!(
+        !head.to_string().contains("should-never-be-relayed"),
+        "a dropped header's value must not appear anywhere on the wire: {head}"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// Wait for the origin to answer the first request matching `predicate`.
+///
+/// The relay's own progress is invisible from either socket (both legs are
+/// notifications), so the origin's recorder is the honest place to observe that
+/// a request completed — and it is the only place a test can see the body the
+/// origin actually received.
+async fn wait_for_origin<F>(
+    gateway: &FakeGateway,
+    node: &mut NodeSocket,
+    stream_id: &str,
+    mut predicate: F,
+) -> Result<remuda_testing::fake_gateway::RecordedRequest>
+where
+    F: FnMut(&remuda_testing::fake_gateway::RecordedRequest) -> bool,
+{
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(request) = gateway.requests().into_iter().find(|req| predicate(req)) {
+            return Ok(request);
+        }
+        // Drain the worker's socket so a producer blocked on credits can make
+        // progress; ignore whatever comes back.
+        let _ = collect_notifications(node, Duration::from_millis(200), |frame| {
+            frame["params"]["streamId"] == json!(stream_id)
+                && frame["params"].get("bytesDown").is_some()
+        })
+        .await?;
+    }
+    Err(anyhow!(
+        "the relayed request never reached the origin for {stream_id}"
+    ))
+}

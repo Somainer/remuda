@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
@@ -88,9 +89,53 @@ async fn main() -> Result<()> {
     };
     let host_id = HostId::new();
     let pending: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+    // c-mobilenew knobs:
+    //  - HUB_E2E_EXITED_INSTANCES seeds N already-exited shell-pty rows, the
+    //    phone repro shape (a long list the Node no longer holds).
+    //  - HUB_E2E_SCREEN_DELAY_MS makes tty.screen for those seeded rows slow
+    //    (0 keeps every other spec fast).
+    //  - a gate file at $TMPDIR/remuda-e2e-screen-gate-<port> parks seeded
+    //    screen replies until removed, letting a spec saturate the read budget.
+    let exited_count = std::env::var("HUB_E2E_EXITED_INSTANCES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0);
+    let screen_delay_ms = std::env::var("HUB_E2E_SCREEN_DELAY_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(0);
+    let screen_gate = std::env::temp_dir().join(format!("remuda-e2e-screen-gate-{}", addr.port()));
+    // A gate left behind by an aborted run would park the next suite's reads.
+    let _ = std::fs::remove_file(&screen_gate);
+    // Seeded ids are populated after hello (below); the fake node reads them
+    // per tty.screen through this shared set.
+    let screen_knobs = Arc::new(ScreenKnobs {
+        seeded_ids: Mutex::new(HashSet::<String>::new()),
+        delay_ms: screen_delay_ms,
+        gate: Some(screen_gate.clone()),
+    });
     let (ready_tx, ready_rx) = oneshot::channel();
-    let node = tokio::spawn(fake_node(addr, enroll, host_id.clone(), pending, ready_tx));
+    let node = tokio::spawn(fake_node(
+        addr,
+        enroll,
+        host_id.clone(),
+        pending,
+        ready_tx,
+        screen_knobs.clone(),
+    ));
     ready_rx.await.context("fake node hello")?;
+    // Seed after enroll: the host row must exist, and the hello reconciliation
+    // must already have run against an empty inventory so seeded rows are not
+    // mistaken for hello losses.
+    if exited_count > 0
+        && let Some(hub) = hub.as_ref()
+        && let Some(store) = hub.store()
+    {
+        let ids = seed_exited_instances(store, &host_id, "wsp_e2e", exited_count)
+            .await
+            .context("seed exited instances")?;
+        *screen_knobs.seeded_ids.lock().await = ids;
+    }
     // A stand-in Anthropic-Messages gateway so provider discovery has a real
     // /v1/models to read without reaching any live endpoint.
     let upstream_listen =
@@ -100,11 +145,14 @@ async fn main() -> Result<()> {
         .context("fake upstream")?;
     let upstream_addr = upstream.local_addr()?;
     let upstream_task = tokio::spawn(fake_upstream(upstream));
+    let seeded_screen_ids_json: Value = json!(screen_knobs.seeded_ids.lock().await.clone());
     let line = json!({
         "hub": format!("http://{addr}"),
         "token": BOOTSTRAP,
         "hostId": host_id.as_id().as_str(),
         "upstream": format!("http://{upstream_addr}"),
+        "screenGate": screen_gate.display().to_string(),
+        "seededExitedIds": seeded_screen_ids_json,
     });
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
@@ -113,6 +161,59 @@ async fn main() -> Result<()> {
     upstream_task.abort();
     drop(hub);
     Ok(())
+}
+
+/// Seed `count` shell-pty instances that have already exited on this host.
+///
+/// The 2026-09-19 phone repro shape: rows the Node no longer holds, still
+/// listed by the Hub, whose screen reads a phone used to fan out one-per-row.
+/// Inserted straight into the in-process store (the example owns it) and then
+/// settled through the same journal path a real `exited` event takes, so the
+/// web sees exactly what production shows. Returns the seeded ids — the fake
+/// node recognises them when applying screen-read knobs.
+async fn seed_exited_instances(
+    store: &remuda_hub::store_test_support::Store,
+    host_id: &HostId,
+    workspace_id: &str,
+    count: usize,
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for n in 0..count {
+        // The store assigns the instance id itself; seed with a placeholder and
+        // use the returned record's id for everything afterwards.
+        let record = store
+            .insert_instance(
+                host_id.as_id().as_str().to_owned(),
+                Some(workspace_id.to_owned()),
+                "claude".into(),
+                "shell-pty".into(),
+                Some(format!("e2e-mobile-exited-{n:02}")),
+                json!({}),
+            )
+            .await
+            .map_err(|err| anyhow!("seed instance {n}: {err}"))?;
+        let instance_id = record.instance_id.clone();
+        let event = json!({
+            "kind": "lifecycle",
+            "payload": {
+                "type": "entity",
+                "entityType": "instance",
+                "state": "exited",
+                "entity": { "nativeRef": { "sessionId": { "value": null } } }
+            }
+        });
+        store
+            .append_journal_batch(
+                host_id.as_id().as_str().to_owned(),
+                instance_id.clone(),
+                None,
+                vec![event],
+            )
+            .await
+            .map_err(|err| anyhow!("seed exit {n}: {err}"))?;
+        ids.insert(instance_id);
+    }
+    Ok(ids)
 }
 
 /// A catalog big enough to need the bulk controls, served under `/bulk/v1`.
@@ -344,12 +445,24 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
     })
 }
 
+/// c-mobilenew tty.screen knobs (see env knobs in `main`).
+#[derive(Debug)]
+struct ScreenKnobs {
+    /// Seeded exited rows the delay/gate knobs apply to.
+    seeded_ids: Mutex<HashSet<String>>,
+    /// Artificial reply delay for seeded rows.
+    delay_ms: u64,
+    /// While this file exists, seeded screen replies park.
+    gate: Option<PathBuf>,
+}
+
 async fn fake_node(
     addr: SocketAddr,
     enroll: String,
     host_id: HostId,
     pending: Arc<Mutex<HashMap<String, Value>>>,
     ready: oneshot::Sender<()>,
+    screen_knobs: Arc<ScreenKnobs>,
 ) -> Result<()> {
     let mut req = format!("ws://{addr}/v1/node")
         .into_client_request()
@@ -433,9 +546,15 @@ async fn fake_node(
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
     // as the current handler returns.
     let mut frame_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // Delayed tty.screen replies re-enter the single-writer loop here: the
+    // reply task never touches the socket itself.
+    let (screen_tx, mut screen_rx) = tokio::sync::mpsc::channel::<(Value, Value)>(64);
     loop {
         tokio::select! {
             biased;
+            Some((id, body)) = screen_rx.recv() => {
+                send_rpc_ok(&mut ws, id, body).await?;
+            }
             Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
                 let Some(card) = pending.lock().await.remove(&closed_iid) else {
                     continue;
@@ -1418,6 +1537,34 @@ async fn fake_node(
                     let agent_id = params.get("agentId").and_then(Value::as_str).unwrap_or("");
                     send_rpc_ok(&mut ws, id, drill_subagent_answer(agent_id)).await?;
                 }
+                "tty.screen" => {
+                    // Seeding knobs only apply to the seeded exited rows;
+                    // every live session's screen still answers immediately.
+                    // The wait happens off the dispatch loop so a parked bulk
+                    // read cannot stall instance.create behind it.
+                    let seeded = screen_knobs.seeded_ids.lock().await.contains(&instance_id);
+                    let body = tty_screen_body(&instance_id, seeded);
+                    let tx = screen_tx.clone();
+                    let gate = screen_knobs.gate.clone();
+                    let delay_ms = screen_knobs.delay_ms;
+                    tokio::spawn(async move {
+                        if seeded && delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+                        if seeded && let Some(gate) = gate.as_ref() {
+                            let step = Duration::from_millis(100);
+                            let max = Duration::from_secs(45);
+                            let mut waited = Duration::ZERO;
+                            // File present = park this read (the spec's
+                            // saturation switch); released when it is removed.
+                            while gate.exists() && waited < max {
+                                tokio::time::sleep(step).await;
+                                waited += step;
+                            }
+                        }
+                        let _ = tx.send((id, body)).await;
+                    });
+                }
                 "tty.attach" => {
                     if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
                         send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
@@ -1919,6 +2066,17 @@ fn g2_scm_answer(method: &str, params: &Value) -> Value {
                    "value": "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff0000"},
         "content": "# TODO\n- g2\n- ship\n",
         "truncated": false, "limits": limits,
+    })
+}
+
+/// A `tty.screen` answer. Seeded exited rows report their real lifecycle; live
+/// sessions answer as a running emulator grid.
+fn tty_screen_body(instance_id: &str, seeded: bool) -> Value {
+    json!({
+        "supported": true,
+        "source": "emulator",
+        "lifecycle": if seeded { "exited" } else { "running" },
+        "lines": ["e2e fake screen", instance_id],
     })
 }
 

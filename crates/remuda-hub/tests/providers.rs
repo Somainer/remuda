@@ -1259,3 +1259,87 @@ async fn a_legacy_string_catalog_migrates_to_structured_rows() -> Result<()> {
     assert_eq!(stored[0]["enabled"], true);
     Ok(())
 }
+
+/// D-047: the Hub accepts the delivery fields today and ignores them.
+///
+/// The OpenAPI document marks `delivery`, `apiVia`, `apiRoute` and `relayBind`
+/// as accepted-but-not-yet-applied. That marker is only honest if a body
+/// carrying them really is accepted: the Hub's request bodies are plain serde
+/// structs, so a field they do not name is dropped rather than rejected — but
+/// nothing pinned that, and a later `deny_unknown_fields` would turn every
+/// marked field into a 400 that the spec still advertised as accepted.
+#[tokio::test]
+async fn delivery_fields_are_accepted_and_ignored_until_they_are_applied() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    let auth = [("Cookie", cookie.as_str())];
+
+    // A create body carrying every D-047 write field at once.
+    let body = json!({
+        "name": "routed-gw",
+        "kind": "gateway",
+        "baseUrl": "http://127.0.0.1:1",
+        "models": ["passthrough/auto"],
+        "authToken": "sk-fake-routed-zzzz",
+        "delivery": {
+            "mode": "via",
+            "viaHostId": "hst_01993ab0-0000-7000-8000-000000000007",
+            "route": "hub-relay"
+        }
+    })
+    .to_string();
+    let (status, _, created) = http(hub.addr, "POST", "/v1/providers", &auth, Some(&body)).await?;
+    anyhow::ensure!(status == 200, "create {status} {created}");
+    let created: Value = serde_json::from_str(created.trim())?;
+    let id = created["id"].as_str().context("id")?.to_string();
+    // Not applied yet, so the response carries no applied delivery at all.
+    // Absent is the spec's spelling of `{mode: direct, route: auto}`, so this
+    // is the default read back — and when task 2 lands, this assertion flips to
+    // `via` and the OpenAPI marker goes with it.
+    assert!(
+        created.get("delivery").is_none(),
+        "an ignored delivery must not be reported as applied: {created}"
+    );
+
+    // A PATCH carrying one is accepted too, with the same outcome.
+    let patch = json!({ "delivery": { "mode": "via", "viaHostId": "hst_01993ab0-0000-7000-8000-000000000007" } })
+        .to_string();
+    let (status, _, patched) = http(
+        hub.addr,
+        "PATCH",
+        &format!("/v1/providers/{id}"),
+        &auth,
+        Some(&patch),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "patch {status} {patched}");
+    let patched: Value = serde_json::from_str(patched.trim())?;
+    assert!(patched.get("delivery").is_none(), "{patched}");
+
+    // The dispatch surface names the same two fields. It has no project here,
+    // so the call is expected to fail on *that*, not on the body shape: a body
+    // carrying `apiVia`/`apiRoute` must not be a serde rejection.
+    let dispatch = json!({
+        "projectId": "prj_01993ab0-0000-7000-8000-000000000001",
+        "brief": "noop",
+        "apiVia": "none",
+        "apiRoute": "hub-relay"
+    })
+    .to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/workers/dispatch",
+        &auth,
+        Some(&dispatch),
+    )
+    .await?;
+    assert_ne!(status, 200, "no such project should not dispatch");
+    for unknown in ["unknown field", "unknown variant", "missing field `apiVia`"] {
+        assert!(
+            !rest.contains(unknown),
+            "the delivery fields must not be a body-parse rejection: {status} {rest}"
+        );
+    }
+    Ok(())
+}

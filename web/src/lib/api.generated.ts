@@ -1629,6 +1629,29 @@ export interface components {
             error: string;
             interactionId: string;
         };
+        /** @description Model-API route an instance is actually using (D-047). Echoed by the Node, never set from the request, so a surface reports what ran. */
+        ApiRoute: {
+            /** @enum {string} */
+            mode: "direct" | "via";
+            route?: components["schemas"]["ApiRouteKind"] | null;
+            viaHostId?: string | null;
+            viaHostLabel?: string | null;
+        };
+        /**
+         * @description The route a via session actually took. `auto` is a request, never an observation.
+         * @enum {string}
+         */
+        ApiRouteKind: "direct-net" | "hub-relay";
+        /**
+         * @description Route a via delivery takes between the worker host and the proxy host. Decided once at launch (D-047 Amendment A1).
+         * @enum {string}
+         */
+        ApiRouteMode: "auto" | "hub-relay" | "direct-net";
+        /**
+         * @description Why a `via` dispatch was refused (D-047). Every value is a refusal; there is no fallback-to-direct value. Returned as `ErrorBody.code` by the operations that resolve a route: `POST /v1/instances`, `POST /v1/workers/dispatch` and the provider write routes (`POST /v1/providers`, `PATCH /v1/providers/{id}`). The HTTP status is 400 for `api-via-unknown-host` and 409 for the other three.
+         * @enum {string}
+         */
+        ApiViaRefusal: "api-via-unknown-host" | "api-via-host-offline" | "api-via-unsupported" | "api-via-unreachable";
         AttachmentContent: components["schemas"]["AttachmentRef"] & {
             /** @description Standard base64 of the stored bytes, ready for an MCP image or text content block. */
             data: string;
@@ -1760,7 +1783,7 @@ export interface components {
             token: string;
         };
         ErrorBody: {
-            /** @description Machine-readable error code. Instance creation uses PROVIDER_NOT_CONFIGURED for an explicit gateway request without a matching provider profile and PLACEMENT_UNSATISFIABLE for unsatisfied placement constraints. */
+            /** @description Machine-readable error code. Instance creation uses PROVIDER_NOT_CONFIGURED for an explicit gateway request without a matching provider profile and PLACEMENT_UNSATISFIABLE for unsatisfied placement constraints. A `via` delivery that cannot be honoured is refused with one of ApiViaRefusal (`api-via-unknown-host` 400, `api-via-host-offline` / `api-via-unsupported` / `api-via-unreachable` 409) rather than silently delivered direct. */
             code: string;
             error: string;
             reasons?: string[];
@@ -1876,6 +1899,11 @@ export interface components {
             /** @description auto | native | profile:<id> */
             providerBinding?: string;
         };
+        /** @description Explicit non-loopback relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback and every via session on hub-relay. */
+        HostRelayBind: {
+            addr: string;
+            allowFrom?: string[];
+        };
         /** @description Node-reported load snapshot, persisted verbatim. Placement only trusts cpuPct/memPct when sampledAt is within the freshness window (60 s); older samples trigger a bounded host.resources refresh before a refusal. */
         HostResources: {
             /** @description Logical CPU count reported by the Node. */
@@ -1926,6 +1954,8 @@ export interface components {
             online: boolean;
             /** @description auto | native | profile:<id> */
             providerBinding?: string;
+            /** @description Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            relayBind?: components["schemas"]["HostRelayBind"] | null;
             /** @description Latest CPU/mem snapshot with Hub-stamped sample time. */
             resources?: components["schemas"]["HostResources"] | null;
             ssh?: {
@@ -1964,6 +1994,13 @@ export interface components {
             instanceId: string;
         };
         InstanceCreate: {
+            /**
+             * @description Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.
+             * @enum {string}
+             */
+            apiRoute?: "auto" | "hub-relay" | "direct-net";
+            /** @description Per-instance delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5. */
+            apiVia?: string;
             /** @description Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present. */
             args?: string[];
             /** @description Host-absolute executable override. The Node validates and pins it; the Hub only stores the string. */
@@ -2038,6 +2075,8 @@ export interface components {
              * @enum {string}
              */
             activity: "unknown" | "idle" | "working" | "blocked" | "draining";
+            /** @description Model-API route this instance actually uses (D-047); absent on a direct session. */
+            readonly apiRoute?: components["schemas"]["ApiRoute"];
             connectivity: string;
             createdAt?: string;
             cwd?: string | null;
@@ -2516,6 +2555,8 @@ export interface components {
             defaultGateway?: boolean;
             /** @description Must be one of the enabled models. */
             defaultModel?: string;
+            /** @description Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            delivery?: components["schemas"]["ProviderDeliveryInput"];
             headers?: {
                 [key: string]: string;
             };
@@ -2525,6 +2566,21 @@ export interface components {
             name: string;
             /** @description universal or host:<hostId> */
             scope?: string;
+        };
+        /** @description How a profile's sessions reach the model API (D-047), as stored and read back. Absent means {mode: direct, route: auto}. `mode: via` requires `viaHostId`. This is the read model: `route` is always emitted. Write bodies may omit it (see ProviderDeliveryInput). */
+        ProviderDelivery: {
+            /** @enum {string} */
+            mode: "direct" | "via";
+            route: components["schemas"]["ApiRouteMode"];
+            viaHostId?: string | null;
+        };
+        /** @description Delivery mode on a create/PATCH body (D-047). Same shape as ProviderDelivery except that `route` may be omitted, which means `auto`; the read model always emits it. `mode: via` requires `viaHostId`. */
+        ProviderDeliveryInput: {
+            /** @enum {string} */
+            mode: "direct" | "via";
+            /** @description Omitted means `auto`. */
+            route?: components["schemas"]["ApiRouteMode"];
+            viaHostId?: string | null;
         };
         /** @description Probe a gateway before the profile exists. The token is used once and never echoed. */
         ProviderDiscover: {
@@ -2569,6 +2625,8 @@ export interface components {
             defaultGateway?: boolean;
             /** @description Must be one of the enabled models. */
             defaultModel?: string | null;
+            /** @description Set the delivery mode (D-047). Accepted but not yet applied: the waterfall that acts on it lands with api-routing task 2. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            delivery?: components["schemas"]["ProviderDeliveryInput"];
             headers?: {
                 [key: string]: string;
             };
@@ -2585,6 +2643,8 @@ export interface components {
             defaultGateway: boolean;
             /** @description Must be one of the enabled models. */
             defaultModel?: string | null;
+            /** @description Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            delivery?: components["schemas"]["ProviderDelivery"];
             headers?: {
                 [key: string]: string;
             };
@@ -2761,6 +2821,13 @@ export interface components {
             name?: string;
         };
         WorkerDispatch: {
+            /**
+             * @description Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.
+             * @enum {string}
+             */
+            apiRoute?: "auto" | "hub-relay" | "direct-net";
+            /** @description Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Omitted leaves the waterfall to the project and profile. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5. */
+            apiVia?: string;
             /** @description Brief bytes (utf8); staged as an object attachment, never inlined. */
             brief: string;
             briefName?: string;

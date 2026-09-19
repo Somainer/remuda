@@ -62,6 +62,26 @@ export type AgyRef = ({
   [key: string]: unknown;
 });
 
+/** The API route an instance is actually using; `protocol.md` §2.3 (D-047).  Stored on the instance projection next to `providerSource` / `providerSourceHint` so `remuda watch` and the Session strip report what ran, never what was asked for (D-035).  The two halves come from different places, which is worth keeping straight: the Node decides and reports [`Self::mode`], [`Self::route`] and [`Self::via_host_id`] — it is the machine that bound a listener and probed the path — while [`Self::via_host_label`] is the Hub's own registry label, attached on write-back so a surface can name the host without a second lookup. A Hub that takes the request's word for the route would be reporting intent as observation, which is the failure this type exists to make impossible. */
+export type ApiRoute = ({
+  "mode": ProviderDeliveryMode;
+  "route"?: (ApiRouteKind | (null));
+  "viaHostId"?: (HostId | (null));
+  "viaHostLabel"?: (string | null);
+});
+
+/** The route a `via` session **actually** took, as echoed by the Node; D-035 rule 4 (`protocol.md` §4.4).  Only the two resolved routes exist on this type: `auto` is a request, never an observation, so a record that says `auto` would be the Hub reporting what it asked for instead of what ran. */
+export type ApiRouteKind = ("direct-net" | "hub-relay");
+
+/** Route a `via` delivery takes between the worker host `W` and the proxy host `H`; `protocol.md` §4.4 (D-047, Amendment A1).  Decided **once at launch** and echoed by the Node as [`ApiRouteKind`]. A failing `DirectNet` mid-session is never silently re-routed to `HubRelay`: the request fails and the instance reports `blocked{api-route-down}`. */
+export type ApiRouteMode = ("auto" | "hub-relay" | "direct-net");
+
+/** The per-dispatch `apiVia` override; `protocol.md` §4.4 (D-047).  Stays a **string** on the wire, because two of its three values are keywords and only one carries an id. The waterfall is request `apiVia` > project > profile `delivery` > `direct`, and it is resolved by the Hub after host placement, not here.  Serialized through its wire spelling rather than a derive, so the type is ergonomic in Rust while the frame keeps the operator-facing keyword form (`hst_…` / `self` / `none`) that the CLI and bot commands already speak. */
+export type ApiViaOverride = (string);
+
+/** Why a `via` dispatch was refused; `protocol.md` §4.4 (D-047, §B.5).  Stable lowercase codes in the §9.2 reason vocabulary. Each is a **refusal**, and a refusal is the whole point: there is no code here for "fell back to direct", because no such path may exist. A `via` request that cannot be honoured fails, so a request never reaches a machine the operator excluded and the UI never has to lie about where it went. */
+export type ApiViaRefusal = ("api-via-unknown-host" | "api-via-host-offline" | "api-via-unsupported" | "api-via-unreachable");
+
 /** ApprovalAnswer; `protocol.md` §5.4. */
 export type ApprovalAnswer = ({
   "inputDigest": Digest;
@@ -1304,6 +1324,7 @@ export type Host = ({
   "nodeVersion": Knowledge2;
   "ownerPrincipalId": Id;
   "platform": Knowledge14;
+  "relayBind"?: (HostRelayBind | (null));
   "revision": U64;
   "state": HostState;
   "transport": HostTransport;
@@ -1397,6 +1418,12 @@ export type HostId = (string);
 export type HostParams = ({
   "hostId": HostId;
   [key: string]: unknown;
+});
+
+/** Host-level relay bind for direct-network routing; `protocol.md` §2.1 (D-047, Amendment A1).  Present on a host only when the operator configured one. Absent means the proxy host's relay listener stays loopback-only and every `via` session takes `hub-relay`, which is what keeps D-031 intact: no listener opens on a non-loopback address without an explicit operator setting, and a bind is an address to serve on — never a tunnel. */
+export type HostRelayBind = ({
+  "addr": (string);
+  "allowFrom": (((string))[]);
 });
 
 /** HostReportParams; `protocol.md` §7.2. */
@@ -1516,6 +1543,7 @@ export type InstanceCreateParams = ({
 
 /** InstanceCreateResult; `protocol.md` §7.2. */
 export type InstanceCreateResult = ({
+  "apiRoute"?: (ApiRoute | (null));
   "command": Command;
   "instanceId": InstanceId;
   "prepared": (boolean);
@@ -1614,6 +1642,7 @@ export type InstanceSnapshot = ({
 
 /** InstanceSpec; `protocol.md` §4.1. */
 export type InstanceSpec = ({
+  "apiRoute"?: (RequestedApiRoute | (null));
   "args": (((string))[]);
   "binaryPath"?: (string | null);
   "binaryRef": Id;
@@ -3307,12 +3336,23 @@ export type ProtocolVersion = ({
   [key: string]: unknown;
 });
 
+/** Provider delivery of one profile; `protocol.md` §4.4 (D-047).  The wire shape is nested, not the CLI's `direct` / `via:<hostId>` spelling: the sub-mode has nowhere to live in a single keyword. An absent `delivery` is [`ProviderDelivery::default`] — `{mode: direct, route: auto}` — so a profile row written before this type existed keeps parsing.  Deserialization is strict on the one combination that cannot be honoured: `mode: via` with no `via_host_id` is a parse error, not a default. Unknown enum values are parse errors too, so a typo'd route cannot quietly become `auto` and move a session's egress to a machine the operator did not name. [`Self::is_valid`] stays as the runtime check for a value built in Rust.  The `serde` attribute is for the **schema** only: `Deserialize` is hand-written below (it must reject `via` with no host), so nothing here reads this attribute at runtime — but schemars does, and without it the generated schema would claim to accept unknown keys when the wire struct refuses them. */
+export type ProviderDelivery = ({
+  "mode": ProviderDeliveryMode;
+  "route": ApiRouteMode;
+  "viaHostId"?: (HostId | (null));
+});
+
+/** Delivery mode of one provider profile; `protocol.md` §4.4 (D-047).  `direct` (D2 default) is today's behaviour: `baseUrl` plus the credential travel to the worker host. `via` egresses every model API request of the session on a named host instead, and never falls back to `direct` — a reroute would push the request onto a machine the operator excluded. */
+export type ProviderDeliveryMode = ("direct" | "via");
+
 /** ProviderIngress wire values; `protocol.md` §4.1. */
 export type ProviderIngress = ("anthropic-messages" | "openai-responses" | "openai-chat" | "gemini-native" | "native-login");
 
 /** Launch overlay the Node writes as Claude `--settings`. The token stays off this type. */
 export type ProviderOverlaySpec = ({
   "baseUrl": (string);
+  "delivery"?: ProviderDelivery;
   "headers": ({
   [key: string]: (string);
 });
@@ -3329,6 +3369,7 @@ export type ProviderProfile = ({
   "createdAt": Timestamp;
   "defaultGateway": (boolean);
   "defaultModel": (string | null);
+  "delivery"?: ProviderDelivery;
   "headers": ({
   [key: string]: (string);
 });
@@ -3515,6 +3556,13 @@ export type RepositoryRef = ({
   "headOid": (string);
   "repositoryId": Id;
   [key: string]: unknown;
+});
+
+/** Route the launch **requested**, carried on the instance spec so the Node and the operator's surfaces can see it before the Node answers; §4.4 (D-047).  This is intent. [`ApiRoute`] is the observation the Node echoes back, and the only one a UI may render as fact (D-035). */
+export type RequestedApiRoute = ({
+  "mode": ProviderDeliveryMode;
+  "route": ApiRouteMode;
+  "viaHostId"?: (HostId | (null));
 });
 
 /** ResolutionState wire values; `protocol.md` §2.5. */
@@ -4227,8 +4275,10 @@ export type TranscriptRef = ({
 
 /** TransportLimits; `protocol.md` §7.4. */
 export type TransportLimits = ({
+  "apiChunkBytes": (number);
   "heartbeatIntervalMs": (number);
   "leaseTtlMs": (number);
+  "maxApiStreams": (number);
   "maxBinaryChunkBytes": (number);
   "maxEventsPerBatch": (number);
   "maxInFlightRpc": (number);

@@ -2733,6 +2733,9 @@ fn fixture_host(host_id: HostId) -> Result<Host, NodeError> {
         driver_inventory: crate::inventory::driver_inventory(),
         journal_id: Id::new("obj")?,
         durable_seq: U64(0),
+        // D-047: no relay bind configured here, so this fixture host serves
+        // every `via` session over `hub-relay` and opens no extra listener.
+        relay_bind: None,
     })
 }
 

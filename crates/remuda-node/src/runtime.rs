@@ -541,14 +541,60 @@ impl DevNode {
         .await
     }
 
+    /// Resolve the command a raced loser must echo after losing the
+    /// `insert_instance` race against a *live* existing instance:
+    ///
+    /// * the winner's row for this command id already accepted → echo it;
+    /// * the winner's row exists but is still Queued → bounded wait for it to
+    ///   reach Accepted/Settled, erroring on the deadline rather than
+    ///   returning a queued row the Hub would reject;
+    /// * no row exists for this command id (the loser carried a fresh id) →
+    ///   durably accept the loser's own command against the existing instance
+    ///   and journal it, without launching anything.
+    async fn command_for_raced_create(
+        &self,
+        instance_id: &InstanceId,
+        mut command: Command,
+    ) -> Result<Command, NodeError> {
+        match self.inner.store.get_command(&command.command_id) {
+            Ok(recorded)
+                if matches!(
+                    recorded.state,
+                    CommandState::Accepted | CommandState::Settled
+                ) =>
+            {
+                Ok(recorded)
+            }
+            Ok(_) => {
+                self.wait_for_accepted_create_command(&command.command_id)
+                    .await
+            }
+            Err(_) => {
+                accept_command(&mut command)?;
+                if self
+                    .inner
+                    .store
+                    .insert_command(instance_id, command.clone())?
+                {
+                    append_command_lifecycle(
+                        self.inner.store.as_ref(),
+                        instance_id,
+                        &command,
+                        "accepted",
+                    )?;
+                }
+                Ok(command)
+            }
+        }
+    }
+
     /// Wait briefly for a racing winner's create command to reach the ledger
     /// in an accepted state. A create that lost the `insert_instance` race
     /// must echo the winner's *accepted* command (the Hub rejects queued
     /// replies), so the loser yields while the winner moves from insert
-    /// (queued) to accept + save. The window is bounded: a winner that
-    /// crashes mid-accept surfaces an error instead of an indefinite hang or
-    /// a queued reply.
-    async fn wait_for_recorded_create_command(
+    /// (queued) to accept + save. The window is bounded: a winner that stalls
+    /// mid-accept surfaces an error instead of a queued reply.
+    async fn wait_for_accepted_create_command(
         &self,
         command_id: &CommandId,
     ) -> Result<Command, NodeError> {
@@ -563,7 +609,10 @@ impl DevNode {
                 return Ok(command);
             }
             if std::time::Instant::now() >= deadline {
-                return self.inner.store.get_command(command_id);
+                return Err(NodeError::Conflict(format!(
+                    "command {} did not reach an accepted state in time",
+                    command_id.as_id()
+                )));
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -775,20 +824,34 @@ impl DevNode {
         // The instance insert is the idempotency point for two creates whose
         // provisions overlapped the multi-second route probe (the per-instance
         // provision lock keeps the listener bind single-writer, but the loser
-        // reaches this insert while the winner is accepting). A Conflict here
-        // means the winner owns the instance row: reply with its recorded
-        // accepted command rather than failing the create.
+        // reaches this insert while the winner is accepting). The Conflict
+        // fallback is scoped to a raced create of a *live* instance: a
+        // terminated (Exited/Failed) row keeps the original error, and the
+        // provision guard below is dropped on that error so the freshly bound
+        // listener is revoked.
         if let Err(insert_error) = self.inner.store.insert_instance(instance) {
             if !matches!(insert_error, NodeError::Conflict(_)) {
                 return Err(insert_error);
             }
+            let existing_instance = self.inner.store.get_instance(&instance_id)?;
+            if matches!(
+                existing_instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ) {
+                return Err(NodeError::Conflict(format!(
+                    "instance {} already exists",
+                    instance_id.as_id()
+                )));
+            }
+            let command = self.command_for_raced_create(&instance_id, command).await?;
+            // Fallback succeeded: this listener is the winner's (provision is
+            // idempotent per instance id), so commit rather than revoke. Any
+            // error return above drops the guard and revokes the bind.
             if let Some(guard) = provision_guard.take() {
                 guard.commit();
             }
-            let recorded = self.wait_for_recorded_create_command(&command_id).await?;
-            let existing_instance = self.inner.store.get_instance(&instance_id)?;
             return Ok(CreateInstanceResponse {
-                command: recorded,
+                command,
                 instance: existing_instance,
                 api_route: self
                     .inner
@@ -4397,10 +4460,27 @@ mod api_relay_launch_test {
         let instance_id = remuda_protocol::InstanceId::new();
         let command_id = remuda_protocol::CommandId::new();
 
-        // A TCP endpoint that completes the connect but never answers: the
-        // route:auto direct-net probe blocks for its full 3 s budget.
+        // A TCP endpoint that accepts the connect but never answers: the
+        // route:auto direct-net probe then waits its full 3 s request
+        // timeout. A background thread counts probe connections
+        // structurally, so the "loser reused the winner's provision"
+        // assertion does not depend on wall-clock timing; accepted sockets
+        // are deliberately held open (dropping one would make reqwest fail
+        // immediately).
         let stall = std::net::TcpListener::bind("127.0.0.1:0").expect("stall listener");
         let endpoint = format!("http://127.0.0.1:{}/", stall.local_addr().unwrap().port());
+        let probe_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counter = std::sync::Arc::clone(&probe_hits);
+        let held_clone = std::sync::Arc::clone(&held);
+        let acceptor = stall.try_clone().expect("clone stall listener");
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = acceptor.accept() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held_clone.lock().unwrap().push(stream);
+            }
+        });
 
         let mk = || -> CreateInstanceRequest {
             serde_json::from_value(serde_json::json!({
@@ -4420,23 +4500,15 @@ mod api_relay_launch_test {
             .expect("request")
         };
 
-        // Both enters the accept path together; the second one overlaps the
+        // Both enter the accept path together; the second overlaps the
         // winner's provision and races the instance insert.
         let node_a = std::sync::Arc::clone(&node);
         let node_b = std::sync::Arc::clone(&node);
         let req_a = mk();
         let req_b = mk();
-        let started = std::time::Instant::now();
         let (a, b) = tokio::join!(
             tokio::spawn(async move { node_a.create_instance(req_a).await }),
             tokio::spawn(async move { node_b.create_instance(req_b).await }),
-        );
-        // Only one 3 s probe should run (the loser reuses the winner's
-        // listener), not two end-to-end serial probes (~6 s).
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "no second end-to-end probe: {:?}",
-            started.elapsed()
         );
         let a = a.expect("task").expect("first create Ok");
         let b = b
@@ -4467,7 +4539,72 @@ mod api_relay_launch_test {
                 .instance_relay(instance_id.as_id().as_str())
                 .is_some()
         );
+        // Structural proof of reuse: the loser never ran its own 3 s probe —
+        // exactly one probe connection reached the stalled endpoint.
+        assert_eq!(
+            probe_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the winner probes; the loser reuses its listener"
+        );
+        // Release the held sockets and stop accepting.
+        drop(held);
         drop(stall);
+    }
+
+    /// Reusing a *terminated* (Exited) instance id with a fresh command id is
+    /// not an idempotent replay: the create returns the store's Conflict, and
+    /// because the fallback is scoped to live rows, the listener it bound for
+    /// the refused attempt is revoked rather than left alive.
+    #[tokio::test]
+    async fn create_naming_a_terminated_instance_id_fails_and_revokes_bind() {
+        let node = node();
+        let host = node.host().meta.id.clone();
+        let instance_id = remuda_protocol::InstanceId::new();
+        let value = serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "instanceId": instance_id.as_id().to_string(),
+            "hostId": host,
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": { "mode": "via", "viaHostId": HostId::new(), "route": "hub-relay" }
+        });
+        node.create_instance(serde_json::from_value(value.clone()).expect("request"))
+            .await
+            .expect("first create accepted");
+        let registry = node.api_relay();
+        assert!(
+            registry
+                .instance_relay(instance_id.as_id().as_str())
+                .is_some()
+        );
+
+        // Mark the instance exited the way the terminal worker path does.
+        journal_instance_phase(
+            node.store(),
+            &instance_id,
+            InstanceLifecycle::Exited,
+            "ready",
+            "test-exit",
+        )
+        .expect("mark exited");
+        registry.revoke_instance(instance_id.as_id().as_str());
+
+        // Fresh command id on the same terminated instance id: provision
+        // succeeds (bind), but the insert conflict must propagate, and the
+        // dropped guard must revoke the new listener.
+        let mut retry: CreateInstanceRequest = serde_json::from_value(value).expect("request");
+        retry.command_id = Some(remuda_protocol::CommandId::new());
+        let error = node
+            .create_instance(retry)
+            .await
+            .expect_err("terminated instance id is a Conflict");
+        assert!(matches!(error, NodeError::Conflict(_)), "{error:?}");
+        assert!(
+            registry
+                .instance_relay(instance_id.as_id().as_str())
+                .is_none(),
+            "the refused attempt's listener is revoked"
+        );
     }
 
     /// A nameless `via` on the request rejects the create before any row or

@@ -1875,10 +1875,10 @@ async fn tty_attach_still_flows_while_a_relay_stream_is_hot() -> Result<()> {
     Ok(())
 }
 
-/// A destination outside the profile's pinned origin is refused.
-///
-/// Risk 5: the relay must not become a general HTTP proxy. The Node pins origin
-/// and path; the Hub re-checks. A refused request must never reach the origin.
+/// D-048 §7.6 (round-3 item 6): the 50 ms coalesce flush is a timer raced
+/// against the upstream read, not a check evaluated when the next byte
+/// happens to arrive. A small SSE prologue followed by a multi-second idle
+/// gap must reach the listener as an api.chunk well before the gap ends.
 #[tokio::test]
 async fn the_hub_egress_coalesces_and_delivers_incrementally_before_end() -> Result<()> {
     // D-048 §7.6: coalescing flushes at ≥16 KiB OR ≥50 ms. A small event
@@ -1933,6 +1933,71 @@ async fn the_hub_egress_coalesces_and_delivers_incrementally_before_end() -> Res
         .iter()
         .any(|params| params.get("bytesDown").is_some());
     assert!(saw_end, "the stream must end after draining: {tail:?}");
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// D-048 §7.6 (round-3 item 7): coalescing, not the 64 KiB drain. Drive the
+/// egress with several tiny SSE writes — the whole body far under 16 KiB —
+/// each separated by an idle gap, and assert the writes arrive as separate
+/// non-terminal api.chunk frames, every one under the frame cap. A 200 KiB
+/// body would only prove the 64 KiB splitter; this proves the 50 ms timer
+/// flushes small buffered bytes repeatedly.
+#[tokio::test]
+async fn coalescing_separates_small_delayed_writes_into_sub_cap_frames() -> Result<()> {
+    let gateway = FakeGateway::start_with(vec![Script::SseWithGaps {
+        gap_ms: 250,
+        // A handful of bytes per event: the entire body is under a KiB of SSE
+        // framing, nowhere near the 16 KiB coalesce threshold.
+        text: "ab".into(),
+        events: 3,
+    }])
+    .await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_coalesce", &messages_body()),
+    )
+    .await?;
+    // Three data chunks plus the terminal empty chunk fit the initial 4-credit
+    // producer window, so no api.credit round trip is needed.
+
+    // Collect until the terminal api.end.
+    let frames = collect_notifications(&mut fixture.node, Duration::from_secs(10), |frame| {
+        frame["params"]["streamId"] == json!("st_coalesce")
+            && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+    let data_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| {
+            frame["method"] == json!("api.chunk")
+                && frame["params"]["streamId"] == json!("st_coalesce")
+                // Data frames only: the empty last:true marker is not a flush.
+                && frame["params"].get("last") != Some(&json!(true))
+        })
+        .collect();
+    assert!(
+        data_frames.len() >= 2,
+        "several small delayed writes must flush as several frames, got {}: {frames:?}",
+        data_frames.len()
+    );
+    for frame in &data_frames {
+        let b64 = frame["params"]["dataBase64"].as_str().unwrap_or("");
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)?;
+        assert!(
+            bytes.len() < API_CHUNK_BYTES,
+            "every timer-flushed frame must stay under the {API_CHUNK_BYTES} cap, got {}",
+            bytes.len()
+        );
+    }
+    let ended = frames_for(&frames, "st_coalesce")
+        .iter()
+        .any(|params| params.get("bytesDown").is_some());
+    assert!(ended, "the stream must terminate: {frames:?}");
     gateway.shutdown().await;
     Ok(())
 }
@@ -2011,6 +2076,10 @@ async fn a_302_redirect_never_leaks_the_credential_to_the_target() -> Result<()>
     Ok(())
 }
 
+/// A destination outside the profile's pinned origin is refused.
+///
+/// Risk 5: the relay must not become a general HTTP proxy. The Node pins origin
+/// and path; the Hub re-checks. A refused request must never reach the origin.
 #[tokio::test]
 async fn a_non_allowlisted_destination_is_refused() -> Result<()> {
     let gateway = FakeGateway::start().await?;

@@ -232,6 +232,20 @@ pub enum Script {
         /// Text carried by each of the two `text_delta` events.
         text: String,
     },
+    /// Several small SSE events, each a separate upstream write after an idle
+    /// `gap_ms`, with the whole body far under one relay frame. Exercises the
+    /// coalesce timer across multiple flushes (D-048 §7.6): every event must
+    /// reach the listener as its own small `api.chunk` at ~50 ms rather than
+    /// being buffered into one frame at end of stream.
+    SseWithGaps {
+        /// Idle gap before every event after the first, in milliseconds.
+        gap_ms: u64,
+        /// Text carried by each small `text_delta` event.
+        text: String,
+        /// Number of events (the first flushes immediately, the rest after a
+        /// gap); clamped to at least 2.
+        events: u32,
+    },
 }
 
 impl Script {
@@ -306,7 +320,7 @@ impl Script {
             Self::Status { code, .. } => *code,
             Self::AbortMidStream { .. } => 200,
             Self::Redirect { .. } => 302,
-            Self::DelayedSse { .. } => 200,
+            Self::DelayedSse { .. } | Self::SseWithGaps { .. } => 200,
         }
     }
 }
@@ -950,6 +964,11 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
             .body(axum::body::Body::empty())
             .expect("redirect response"),
         Script::DelayedSse { gap_ms, text } => delayed_sse_response(gap_ms, &text),
+        Script::SseWithGaps {
+            gap_ms,
+            text,
+            events,
+        } => sse_with_gaps_response(gap_ms, &text, events.max(2)),
     };
     let mut response = response;
     apply_configured_headers(response.headers_mut(), &gateway.response_headers());
@@ -1149,6 +1168,76 @@ fn delayed_sse_response(gap_ms: u64, text: &str) -> Response {
         .header("cache-control", "no-store")
         .body(Body::from_stream(stream))
         .expect("delayed sse response")
+}
+
+/// Several tiny SSE writes, each (after the first) following an idle gap, the
+/// whole sequence far below one relay frame. See [`Script::SseWithGaps`].
+fn sse_with_gaps_response(gap_ms: u64, text: &str, events: u32) -> Response {
+    let mut first = String::new();
+    push_event(
+        &mut first,
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_fake", "type": "message", "role": "assistant",
+                "model": DEFAULT_MODEL, "content": [],
+                "stop_reason": null, "stop_sequence": null,
+                "usage": { "input_tokens": 8, "output_tokens": 0 },
+            },
+        }),
+    );
+    push_event(
+        &mut first,
+        "content_block_start",
+        &json!({"type":"content_block_start","index":0,
+                 "content":{"type":"text","text":""}}),
+    );
+    push_event(
+        &mut first,
+        "content_block_delta",
+        &json!({"type":"content_block_delta","index":0,
+                 "delta":{"type":"text_delta","text":text}}),
+    );
+    // (delay before this write, payload). The first write flushes immediately.
+    let mut writes: Vec<(u64, Bytes)> = vec![(0, Bytes::from(first))];
+    for idx in 1..events {
+        let mut out = String::new();
+        push_event(
+            &mut out,
+            "content_block_delta",
+            &json!({"type":"content_block_delta","index":0,
+                     "delta":{"type":"text_delta","text":text}}),
+        );
+        if idx + 1 == events {
+            push_event(
+                &mut out,
+                "content_block_stop",
+                &json!({"type":"content_block_stop","index":0}),
+            );
+            push_event(
+                &mut out,
+                "message_delta",
+                &json!({"type":"message_delta",
+                         "delta":{"stop_reason":"end_token","stop_sequence":null},
+                         "usage":{"output_tokens": token_count(text)}}),
+            );
+            push_event(&mut out, "message_stop", &json!({"type":"message_stop"}));
+        }
+        writes.push((gap_ms, Bytes::from(out)));
+    }
+    let stream = futures::stream::iter(writes).then(|(delay, bytes)| async move {
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        Ok::<Bytes, std::io::Error>(bytes)
+    });
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-store")
+        .body(Body::from_stream(stream))
+        .expect("sse with gaps response")
 }
 
 fn sse_response(text: &str, abort: bool) -> Response {

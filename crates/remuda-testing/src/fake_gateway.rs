@@ -52,7 +52,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
-use futures::stream;
+use futures::stream::StreamExt as _;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -812,14 +812,22 @@ fn sse_response(text: &str, abort: bool) -> Response {
         builder.header(header::CONTENT_LENGTH, body.len())
     };
     let body = if abort {
-        let prefix = Bytes::from(body);
-        Body::from_stream(stream::iter(vec![
-            Ok::<Bytes, std::io::Error>(prefix),
+        // Two frames: the SSE prefix, then — after a short pause so the prefix
+        // is actually flushed to the socket — an error that makes hyper reset
+        // the connection. Yielding both in one poll would race the flush and
+        // the peer would see an empty reply instead of a truncated stream,
+        // which is a different failure and would make an abort test prove
+        // nothing.
+        let prefix =
+            futures::stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(body)) });
+        let abort = futures::stream::once(async {
+            tokio::time::sleep(ABORT_FLUSH_GRACE).await;
             Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "fake gateway: scripted mid-stream abort",
-            )),
-        ]))
+            ))
+        });
+        Body::from_stream(prefix.chain(abort))
     } else {
         Body::from(body)
     };
@@ -827,6 +835,13 @@ fn sse_response(text: &str, abort: bool) -> Response {
         .body(body)
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
+
+/// How long [`Script::AbortMidStream`] waits before resetting the connection.
+///
+/// Long enough for hyper to flush the prefix frame it was just handed, short
+/// enough that a test never notices. Without it the reset wins the race and the
+/// peer observes an empty reply rather than a truncated stream.
+const ABORT_FLUSH_GRACE: Duration = Duration::from_millis(50);
 
 fn push_event(out: &mut String, event: &str, data: &Value) {
     out.push_str("event: ");

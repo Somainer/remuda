@@ -245,39 +245,50 @@ async fn an_abort_mid_stream_delivers_deltas_then_truncates() -> Result<()> {
         "a longer scripted body here",
     )])
     .await?;
-    let response = reqwest::Client::builder()
+
+    // Read the body incrementally rather than through `text()`: the point of
+    // the script is that the bytes *arrive* and then stop, so the test has to
+    // observe both halves. A read error on its own would pass on a fixture that
+    // sent nothing at all, which is the failure this guards against.
+    let mut response = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?
         .post(format!("{}/v1/messages", gateway.base_url()))
         .header("content-type", "application/json")
         .body(request_body())
         .send()
-        .await;
-    // The connection is aborted mid-body, so either the send itself fails or
-    // the body read does. Both are the truncation this script models; a clean
-    // 200 with a complete SSE document is not.
-    let body = match response {
-        Ok(response) => {
-            assert_eq!(response.status().as_u16(), 200);
-            match response.text().await {
-                Ok(body) => body,
-                Err(_) => {
-                    gateway.shutdown().await;
-                    return Ok(());
-                }
+        .await
+        .context("the abort must still send a response head")?;
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut body = Vec::new();
+    let mut truncated = false;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            // The connection was reset mid-body: the truncation under test.
+            Ok(None) => break,
+            Err(_) => {
+                truncated = true;
+                break;
             }
         }
-        Err(_) => {
-            gateway.shutdown().await;
-            return Ok(());
-        }
-    };
-    // If a body did arrive, it must be visibly truncated: deltas but no
-    // terminator, which is what a relay has to notice and report.
+    }
+    let body = String::from_utf8_lossy(&body).to_string();
+
+    // Deltas must have arrived before the cut — otherwise this is an empty
+    // reply, not a truncated stream, and asserts nothing about a relay.
+    assert!(
+        body.contains("event: content_block_delta"),
+        "the abort must deliver deltas before it cuts: {body:?}"
+    );
+    // And the terminator must be absent, which is what a consumer has to
+    // notice: a truncated SSE document, not a clean close.
     assert!(
         !body.contains("message_stop"),
         "an aborted stream must not reach message_stop: {body:?}"
     );
+    assert!(truncated, "the stream must end by reset, not a clean EOF");
     let events = parse_sse(&body).unwrap_or_default();
     assert!(
         events

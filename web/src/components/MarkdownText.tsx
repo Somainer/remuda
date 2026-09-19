@@ -60,6 +60,18 @@ function FileMentionRow({ mention }: { mention: FileMention }) {
  */
 const FenceContext = createContext(false);
 
+/**
+ * Stable `pre` override. This must be a module-level component: react-markdown
+ * renders overrides by their function identity, and an inline arrow rebuilt on
+ * every Markdown render makes React remount the whole `<pre>` subtree (FencedCode
+ * and CodeBlock included) on each transcript re-render. The remount restarted
+ * the CodeBlock highlighter effect, detaching the block node mid-assertion in
+ * the evidence screenshot loops ("Element is not attached to the DOM").
+ */
+function FenceMarkdownPre({ children }: { children?: ReactNode }) {
+  return <FenceContext.Provider value={true}>{children}</FenceContext.Provider>;
+}
+
 type CodeProps = {
   className?: string;
   children?: ReactNode;
@@ -102,9 +114,7 @@ function renderWithFileMentions(text: string): ReactNode {
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}
         components={{
-          pre: ({ children }) => (
-            <FenceContext.Provider value={true}>{children}</FenceContext.Provider>
-          ),
+          pre: FenceMarkdownPre,
           code: FencedCode,
         }}
       >

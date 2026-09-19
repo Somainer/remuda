@@ -132,6 +132,36 @@ describe("syntax highlighting", () => {
     expect(screen.getByTestId("code-note")).toBeTruthy();
     expect(screen.getByTestId("code-code").querySelectorAll("[class*='hljs']").length).toBe(0);
   });
+
+  it("keeps the same CodeBlock DOM node when MarkdownText re-renders", async () => {
+    // Gate flake: a fresh inline pre override per Markdown render remounted the
+    // fence subtree, so every transcript re-render (and the lazy highlight
+    // swap) detached the code-block node between assertion and screenshot.
+    const text = [
+      "请看代码:",
+      "```ts",
+      "export function greet(name: string): string {",
+      "  return name;",
+      "}",
+      "```",
+      "",
+      "```bash",
+      "echo deploy",
+      "```",
+    ].join("\n");
+    const { rerender } = render(<MarkdownText text={text} />);
+    // Wait for the async highlight to land before sampling identity, so the
+    // later assertion compares against the post-highlight subtree.
+    await waitFor(() =>
+      expect(screen.getAllByTestId("code-block")[0]!.querySelector(".hljs-keyword")).toBeTruthy(),
+    );
+    const first = screen.getAllByTestId("code-block")[0]!;
+    const second = screen.getAllByTestId("code-block")[1]!;
+    rerender(<MarkdownText text={text} />);
+    rerender(<MarkdownText text={text} />);
+    expect(screen.getAllByTestId("code-block")[0]).toBe(first);
+    expect(screen.getAllByTestId("code-block")[1]).toBe(second);
+  });
 });
 
 describe("sanitising fence bodies", () => {

@@ -68,29 +68,36 @@ const created: string[] = [];
 /**
  * Stable code-block evidence capture for a per-theme loop.
  *
- * Gate flake (grok-e2e gate run 21:34 at the 390 loop :235; cua-hostcap gate
- * run 22:09 at the 1440 loop :158, on main d1f4fe95): right after the
- * data-theme switch, a live re-render swapped the transcript subtree and the
- * code-block resolved before the switch detached between toBeVisible and
- * screenshot. Always call this AFTER flipping the theme: it re-locates the
- * first block, waits for the toolbar, and polls until the block's height is
- * equal across two samples (highlight/re-render wave settled) before
- * screenshotting. Both evidence loops use this so they cannot drift apart.
+ * Gate flake (grok-e2e gate run 21:34 at the 390 loop; cua-hostcap gate
+ * run 22:09 at the 1440 loop, on main d1f4fe95; still present on
+ * main 83ad6d8e at 00:26): right after the data-theme switch, a transcript
+ * re-render replaced the code-block node — MarkdownText rebuilt its inline
+ * react-markdown `pre` override on every render, so React remounted the fence
+ * subtree and the lazy highlighter's async swap detached the node between
+ * toBeVisible and the screenshot ("Element is not attached to the DOM" /
+ * "element is not stable").
+ *
+ * The product fix (stable pre override) keeps the node's identity. This
+ * helper is the defence in depth: re-location, toolbar visibility, height
+ * settling and the screenshot all run inside ONE expect-toPass retry, so a
+ * detaching node or a late layout wave simply re-arms the whole attempt
+ * instead of pinning a stale handle.
  */
 async function settleAndShootCodeBlock(page: Page, screenshotPath: string): Promise<void> {
-  const shot = page.getByTestId("code-block").first();
-  await expect(shot).toBeVisible();
-  await expect(shot.getByTestId("code-toolbar")).toBeVisible();
-  await expect.poll(
+  await expect(
     async () => {
-      const first = (await shot.boundingBox())?.height ?? 0;
-      await page.waitForTimeout(120);
-      const second = (await shot.boundingBox())?.height ?? -1;
-      return first > 0 && first === second ? first : 0;
+      const shot = page.getByTestId("code-block").first();
+      await expect(shot.getByTestId("code-toolbar")).toBeVisible({ timeout: 2_000 });
+      const firstHeight = (await shot.boundingBox())?.height ?? 0;
+      await page.waitForTimeout(100);
+      const secondHeight = (await shot.boundingBox())?.height ?? 0;
+      if (!(firstHeight > 0 && firstHeight === secondHeight)) {
+        throw new Error("code-block layout is still settling");
+      }
+      await shot.screenshot({ path: screenshotPath, timeout: 5_000 });
     },
-    { message: `code-block height settles before ${path.basename(screenshotPath)}` },
-  ).toBeGreaterThan(0);
-  await shot.screenshot({ path: screenshotPath });
+    { message: `code-block settles and captures ${path.basename(screenshotPath)}` },
+  ).toPass({ timeout: 20_000 });
 }
 
 async function createReadySession(page: Page, prompt: string, mobile = false): Promise<string> {

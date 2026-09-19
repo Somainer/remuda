@@ -664,6 +664,10 @@ async fn run_egress(
                     reason,
                 ));
             } else {
+                // The terminal zero-byte chunk must take the next seq: it is
+                // the ordering key the Hub validates, so a repeat would look
+                // like a duplicate chunk.
+                seq += 1;
                 bytes_down += len;
             }
         }

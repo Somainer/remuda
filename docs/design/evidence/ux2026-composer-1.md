@@ -59,7 +59,7 @@
 
 - 命令：默认 mock 配置（`pnpm exec playwright test -c playwright.local.config.ts --project=chromium`，VITE_MOCK=1 的本地 43141 端口）+ `REMUDA_EVIDENCE=1`，仅跑 `session-chrome-evidence.spec.ts`，重生成四张 `session-chrome-1-*-400.png`（switch-tty / switch-structured / harness-label / files）。
 - 触发原因：旧黄金是共享 dev server（他人 worktree 的旧 UI）截图，且 tty 与 structured 字节相同、harness-label 实际截到的是会话列表。
-- 脱敏检查（人工逐张核对）：画面仅含 mock fixture 标识——空间/主机 `sfe-root`、`valhalla`、`x-acpwire`、`x-codexdrv`（`web/src/lib/mock.ts` 的 wsp*）、`devbox-sg`；路径 `/home/devuser/Projects/...`、`/home/dev/projects/...`；会话 `ins_mock`/`ins_0199…`、提示词 `清一下 /tmp/coord-media`。**无** `bolt-devbox`、真实主机名、用户主目录路径或用户名。
+- 脱敏检查（人工逐张核对）：画面仅含 mock fixture 标识——空间/主机 `sfe-root`、`valhalla`、`x-acpwire`、`x-codexdrv`（`web/src/lib/mock.ts` 的 wsp*）、`devbox-sg`；路径 `/home/devuser/Projects/...`、`/home/dev/projects/...`；会话 `ins_mock`/`ins_0199…`、提示词 `清一下 /tmp/coord-media`。**无**私有主机别名、真实主机名、用户主目录路径或用户名。
 - 同步：390px 的 `composer-slider-5-{plain,top,ultra}-{night,ledger}-390.png` 六张因 effort 卡片在 sheet 内全宽无边框而重生成（同一 mock 配置 + REMUDA_EVIDENCE，仅跑 composer-effort ladder 用例）；1440/768 黄金不变。
 
 ## 兼容性迁移

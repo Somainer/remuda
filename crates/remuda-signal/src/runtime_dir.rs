@@ -517,6 +517,52 @@ pub fn bind_io_error(path: &Path, error: io::Error) -> io::Error {
 }
 
 #[cfg(all(test, unix))]
+pub(crate) mod testutil {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// A short-lived directory on the fixed `/tmp/remuda-<uid>` root.
+    ///
+    /// `tempfile::tempdir()` honours `TMPDIR`; a test asserting an *in-place*
+    /// (non-redirected) socket, or a direct bind's parent mode, cannot use it
+    /// under a long TMPDIR. Removed recursively on drop.
+    #[must_use]
+    pub(crate) struct ShortDir {
+        path: PathBuf,
+    }
+
+    impl ShortDir {
+        pub(crate) fn new() -> Self {
+            let path = PathBuf::from("/tmp")
+                .join(format!("remuda-{}", super::current_uid()))
+                .join(format!(
+                    "sigtest-{}-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0),
+                    SEQ.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        pub(crate) fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for ShortDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -526,8 +572,10 @@ mod tests {
 
     #[test]
     fn a_short_preferred_path_is_used_directly() {
-        let dir = tmp_root();
+        // Fixed short root: tempdir honours TMPDIR and would redirect.
+        let dir = testutil::ShortDir::new();
         let preferred = dir.path().join("hook.sock");
+        assert!(preferred.as_os_str().len() <= SAFE_SOCKET_PATH_BYTES);
         let placement = place_socket(&preferred, "x.sock").unwrap();
         assert_eq!(placement.bind_path(), preferred);
         assert_eq!(placement.link_path(), None);

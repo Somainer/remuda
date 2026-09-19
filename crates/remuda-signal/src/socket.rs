@@ -381,7 +381,9 @@ mod tests {
     #[tokio::test]
     async fn the_socket_and_its_directory_are_private() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        // Fixed short root so the socket genuinely binds under `instance/`
+        // (tempdir honours a long TMPDIR and would force a redirect).
+        let dir = crate::runtime_dir::testutil::ShortDir::new();
         let instance = dir.path().join("instance");
         let socket = instance.join("hook.sock");
         let server = HookServer::bind(

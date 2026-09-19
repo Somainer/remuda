@@ -171,9 +171,10 @@ mod tests {
 
     #[tokio::test]
     async fn an_unbound_socket_is_socket_refused_once_the_relay_is_present() {
-        let dir =
-            std::env::temp_dir().join(format!("remuda-hook-silence-sock-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Fixed short root: std::env::temp_dir honours a long TMPDIR and the
+        // pid-suffixed directory then exceeds sun_path.
+        let root = crate::runtime_dir::testutil::ShortDir::new();
+        let dir = root.path();
         let socket = dir.join("hooks.sock");
 
         // Nothing ever bound it.
@@ -195,7 +196,6 @@ mod tests {
         };
         assert_eq!(classify(&probes), None);
         drop(listener);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

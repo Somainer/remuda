@@ -762,7 +762,7 @@ describe("Composer mobile options trigger (D-042)", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it("does not post a steer on confirm after the turn ended independently", async () => {
+  it("does not post a steer when ok is clicked after live controls lose steer", async () => {
     const user = userEvent.setup();
     const onSend = vi.fn();
     const { rerender } = render(
@@ -779,8 +779,10 @@ describe("Composer mobile options trigger (D-042)", () => {
     await user.type(screen.getByTestId("composer-input"), "jump now");
     await user.click(screen.getByTestId("composer-steer"));
     const dialog = screen.getByTestId("composer-confirm");
-    // Simulate the confirm click landing after the phase already flipped but
-    // before the effect removed the dialog: the guard still re-checks refs.
+    // The dialog stays mounted (phase is still "working"), but the live
+    // controls snapshot loses the interrupt/steer capability (the turn's
+    // state moved underneath the open dialog — steer derives from the
+    // interrupt key). Clicking ok must re-check the ref and refuse to post.
     rerender(
       <Composer
         instanceId="ins_late"
@@ -788,13 +790,12 @@ describe("Composer mobile options trigger (D-042)", () => {
         onSend={onSend}
         kind="claude"
         effort={effortAt("claude", 2)}
-        phase="idle"
-        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+        phase="working"
+        capabilities={caps({ interrupt: cap("unsupported"), queue: cap() })}
       />,
     );
-    // The effect dismisses it; even if ok were clicked, the guard blocks the
-    // post. Here the dialog is already gone.
-    expect(dialog).not.toBeInTheDocument();
+    expect(dialog).toBeInTheDocument();
+    await user.click(screen.getByTestId("composer-confirm-ok"));
     expect(onSend).not.toHaveBeenCalled();
   });
 

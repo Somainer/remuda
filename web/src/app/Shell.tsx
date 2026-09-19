@@ -176,6 +176,9 @@ export function Shell() {
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
   const onSessions = isSessionRoute(location.pathname);
   const onNew = location.pathname === "/sessions/new";
+  // D-040: on compact /s/:id* the full chips row folds into one current-space
+  // chip rendered by the session header; the strip stays on index routes.
+  const onSessionPage = layoutOf(location.pathname) === "session";
   const workbench = useSpaceWorkbench();
   const activeSpaceId = workbench.active?.id;
   const activeInstanceId = workbench.instanceId;
@@ -302,7 +305,7 @@ export function Shell() {
         </aside>
       ) : null}
       <main className={css.main}>
-        {onSessions && mobile ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} onSelect={workbench.select} /> : null}
+        {onSessions && mobile && !onSessionPage ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} onSelect={workbench.select} /> : null}
         {onSessions ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
         {onNew ? <SessionsPage dimmed /> : null}
         <Outlet />

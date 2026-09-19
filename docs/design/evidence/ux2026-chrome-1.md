@@ -145,3 +145,16 @@ devbox 共享浏览器与加载相关的既有 flake：`agent-board` 3、`compos
 Hub 套件（flock /tmp/remuda-local-e2e.lock-b，59120/59139/59121）：全量 138 例
 122 passed 0 failed（16 个既有 skip）；ux-chrome / ux-touchhit / ux-files 合跑
 14/14 绿。
+
+### ux-code.hub.spec.ts gate 失败（54cad03e 合 d1f4fe95，390px 证据循环）
+
+gate 报 `locator.screenshot: Element is not attached to the DOM`：theme 切换后
+`toBeVisible` 已过、截图瞬间 code-block 被替换。在本分支单独跑该用例
+`playwright test -c playwright.hub.config.ts ux-code.hub.spec.ts -g
+"toolbar stays visible" --repeat-each=3`（59120/59139/59121，lock-b）**3/3 绿
+（8.5s/8.1s/9.2s）**，无法复现——疑似 live observation 到达时 transcript 子树
+恰好重渲染撞上截图窗口。按约定对证据循环做最小加固（commit 见
+`test(web): re-settle the 390px code block after theme switch`）：theme 切换后
+**重新定位** code-block，等 code-toolbar 可见，并 poll 到 block 高度两次相等
+（高亮/重渲染波平息）再截图；locator 每次重查，中途即便节点被换也会解析到稳定
+的新节点。加固后再跑 3/3 绿。

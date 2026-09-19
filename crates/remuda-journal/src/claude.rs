@@ -191,7 +191,7 @@ impl ClaudeJsonlTailer {
         mut self,
         stager: std::sync::Arc<dyn remuda_protocol::ToolMediaStager>,
     ) -> Self {
-        self.ctx = self.ctx.with_media_stager(stager);
+        self.ctx = self.ctx.with_media_stager(Some(stager));
         self
     }
 
@@ -1379,10 +1379,18 @@ fn tool_result(
     // Image content (e.g. an MCP screenshot) is staged into the object store
     // and carried as an `objectId` reference; unstageable bytes degrade to a
     // text block. D-045 §6.2: bytes are never inlined into the journal.
-    let blocks = remuda_protocol::tool_result_content_blocks(
-        block.get("content"),
-        ctx.media_stager.as_deref(),
-    );
+    let folded =
+        remuda_protocol::fold_tool_result(block.get("content"), ctx.media_stager.as_deref());
+    // Claude mirrors the native content array into `toolUseResult`; scrub any
+    // mirrored image data there too, or the base64 rides into
+    // `structured_result` and back out on every replay.
+    let structured_result = match sidecar.cloned() {
+        Some(mut sidecar) => {
+            remuda_protocol::sanitize_tool_result_sidecar(&mut sidecar, &folded.images);
+            Knowledge::Known { value: sidecar }
+        }
+        None => unknown("not-emitted"),
+    };
     // The result node is opened at revision 1, whether Final (normal result)
     // or Partial (background launch); a later task-notification replaces it at
     // revision 5 and the hook SubagentStop at revision 4.
@@ -1411,11 +1419,8 @@ fn tool_result(
             } else {
                 ToolOutcome::Succeeded
             },
-            blocks,
-            structured_result: match sidecar {
-                Some(v) => known(v.clone()),
-                None => unknown("not-emitted"),
-            },
+            blocks: folded.blocks,
+            structured_result,
             exit_code: unknown("not-emitted"),
             changes: Vec::new(),
         })),

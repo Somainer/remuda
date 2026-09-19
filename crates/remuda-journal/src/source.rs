@@ -82,13 +82,14 @@ impl MapContext {
         }
     }
 
-    /// Attach the Node's tool-media stager (host-token object endpoint).
+    /// Attach the Node's tool-media stager (host-token object endpoint);
+    /// `None` leaves image blocks degrading to text.
     #[must_use]
     pub fn with_media_stager(
         mut self,
-        stager: std::sync::Arc<dyn remuda_protocol::ToolMediaStager>,
+        stager: Option<std::sync::Arc<dyn remuda_protocol::ToolMediaStager>>,
     ) -> Self {
-        self.media_stager = Some(stager);
+        self.media_stager = stager;
         self
     }
 }

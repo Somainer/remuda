@@ -51,9 +51,7 @@ fn context(instance: &InstanceId, stager: Option<Arc<dyn ToolMediaStager>>) -> M
         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
         SourceChannel::Transcript,
     );
-    if let Some(stager) = stager {
-        ctx = ctx.with_media_stager(stager);
-    }
+    ctx = ctx.with_media_stager(stager);
     ctx
 }
 
@@ -75,11 +73,21 @@ fn map_record(record: serde_json::Value, ctx: &MapContext) -> Vec<ObservationPay
         .collect()
 }
 
+/// Build a native user record carrying the tool_result. Claude mirrors the
+/// content array into `toolUseResult`, so the helper mirrors it too: the
+/// producer must scrub base64 out of both places.
 fn tool_result_record(content: serde_json::Value) -> serde_json::Value {
     json!({
         "type": "user",
         "message": {
             "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_screenshot_1",
+                "content": content,
+            }],
+        },
+        "toolUseResult": {
             "content": [{
                 "type": "tool_result",
                 "tool_use_id": "toolu_screenshot_1",
@@ -151,6 +159,39 @@ fn mixed_text_and_image_result_becomes_text_plus_object_reference() {
 }
 
 #[test]
+fn whole_result_payload_carries_no_base64_with_mirrored_sidecar() {
+    // Regression: the screenshot's base64 rode into structured_result via the
+    // mirrored toolUseResult even after blocks were folded correctly.
+    let stager = Arc::new(FakeStager {
+        limit: 4 * 1024 * 1024,
+        fail: false,
+        staged: Mutex::new(Vec::new()),
+    });
+    let instance = InstanceId::new();
+    let ctx = context(&instance, Some(stager));
+    let payloads = map_record(
+        tool_result_record(json!([
+            {"type": "text", "text": "window focused"},
+            {"type": "image", "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": png_1x1(),
+            }},
+        ])),
+        &ctx,
+    );
+    let result = first_result(&payloads);
+    let raw = serde_json::to_string(result).unwrap();
+    assert!(!raw.contains(&png_1x1()), "sidecar still carries base64");
+    // The object id survives in the scrubbed sidecar.
+    let object_id = match &result.blocks[1] {
+        ContentBlock::Image(media) => media.object_id.as_str().to_owned(),
+        other => panic!("{other:?}"),
+    };
+    assert!(raw.contains(&object_id));
+}
+
+#[test]
 fn image_only_result_is_one_reference_and_never_inlines_bytes() {
     let stager = Arc::new(FakeStager {
         limit: 4 * 1024 * 1024,
@@ -172,8 +213,9 @@ fn image_only_result_is_one_reference_and_never_inlines_bytes() {
     let result = first_result(&payloads);
     assert_eq!(result.blocks.len(), 1);
     assert!(matches!(&result.blocks[0], ContentBlock::Image(_)));
-    // The encoded payload never appears anywhere in the serialized result.
-    let raw = serde_json::to_string(&result.blocks).unwrap();
+    // The encoded payload never appears anywhere in the FULL serialized
+    // result (blocks plus the mirrored structured_result sidecar).
+    let raw = serde_json::to_string(result).unwrap();
     assert!(!raw.contains(&png_1x1()));
 }
 
@@ -234,7 +276,7 @@ fn unstageable_image_degrades_without_dropping_the_result() {
     match &result.blocks[1] {
         ContentBlock::Text(text) => {
             assert!(text.text.contains("67 bytes"), "{}", text.text);
-            assert!(text.text.contains("connection refused"), "{}", text.text);
+            assert!(text.text.contains("staging unavailable"), "{}", text.text);
         }
         other => panic!("{other:?}"),
     }

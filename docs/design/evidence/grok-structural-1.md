@@ -59,13 +59,14 @@ from the fixture:
 
 - tool test ←
   [`grok-tools.json`](../../../crates/remuda-testing/fixtures/fake-harness/scenarios/grok-tools.json):
-  the `Bash` call's 900 ms becomes 30 000 ms so the Running window and the
-  `terminal/<callId>.log` tail stay observable on a loaded gate host. Prompt
+  the `Bash` call's 900 ms becomes 20 000 ms so the Running window and the
+  `terminal/<callId>.log` tail stay observable (the elapsed-reading
+  assertions need only a few seconds). Prompt
   prefix `GROK_TOOLS`; stdout the fixture's three lines
   (`one` / `two` / `three`).
 - question test ←
   [`grok-question.json`](../../../crates/remuda-testing/fixtures/fake-harness/scenarios/grok-question.json):
-  the `ask_user_question` call's 20 ms becomes 20 000 ms so the pending
+  the `ask_user_question` call's 20 ms becomes 25 000 ms so the pending
   interaction is genuinely live in the browser and in the approvals queue.
   Prompt prefix `QUESTION`; options Alpha/Beta, answered by the harness with
   `rawOutput.UserAnswered = Alpha`.
@@ -153,15 +154,20 @@ nativeName · phase · state):
    `carrier=native-tty`, with the option labels intact.
 7. **Waiting strip.** While the form is up the strip paints
    `data-phase="blocked"` — derived from the pending interaction
-   (turnEnd precedence 1), not a file-tier `blocked` phase (D-043 keeps that
-   screen-only).
+   (turnEnd precedence 1), not a file-tier `blocked` phase. The
+   blocked-is-screen-only rule is a ui-spec.md live-strip rule, not a D-043
+   one: D-043 (see decisions.md) covers only the grok frame translation, and
+   explicitly leaves the file-tier turn.live phases and the question
+   interaction to the later live/question work.
 8. **Approvals queue renders the native-tty surface.** Visiting
    `/approvals` while the question is pending, the row shows
    `来自终端屏幕 · 回答会发送按键` and `请打开会话查看完整终端提示`, and mounts
    **no** inline `question-form` (the dock owns the full terminal prompt).
-9. **Resolution and end.** The harness's own TUI answer clears the dock row,
-   and the turn ends file-decided. Alpha/Beta visibility and no horizontal
-   overflow are asserted at both widths.
+9. **Resolution and end.** After the ground-truth `turn_end`, the node no
+   longer reports a pending question (asserted on `/v1/interactions`), the
+   dock row clears on the next list poll, and the turn ends file-decided.
+   Alpha/Beta visibility of the pending form and no horizontal overflow are
+   asserted at both widths.
 
 ## Screenshots
 
@@ -192,10 +198,29 @@ carry no browser identifiers, hostnames, home paths or tokens:
   present (`assemble.ts` sets partial on a Partial result but never resets the
   node's completeness on a structured Final). Cosmetic; the Final text itself
   is correct and not duplicated (asserted exactly-once above).
+- **390 px running card clips inside the card head.** In
+  `grok-structural-1-tool-390.png` the running status column wraps and is cut
+  off inside the Bash card head — `runni`, `无`, `exit`, `不画成` are
+  truncated, and the 不完整 marker and the trailing call-id column drop out of
+  view. The document-level `scrollWidth − clientWidth <= 1` guard cannot see
+  this, because the clip is inside the card rather than page overflow. The
+  card still renders the title and the native-name label at 390 px (asserted
+  visible), but the in-card head needs a responsive layout follow-up.
+- **The session dock never consults `answerable`.** The dock mounts
+  `QuestionForm` for every pending question
+  (`SessionPage.tsx` question branch; `QuestionForm.tsx` derives `disabled`
+  from busy/state only, never from `answerable`), so a native-tty question
+  shows an enabled answer form in the session even though the entity is
+  `answerable=false` — only `/approvals` renders the
+  `来自终端屏幕 · 回答会发送按键` / `请打开会话查看完整终端提示` notes and
+  suppresses the inline form. The dock should disable or replace the form on
+  a non-answerable native-tty carrier. Product follow-up, not worked around
+  in this spec.
 
 ## Not shown / out of scope
 
-- **No `blocked` phase from the file tier** (D-043 scope; grok blocked comes
-  from the screen tier only).
+- **No `blocked` phase from the file tier.** Grok blocked comes from the
+  screen tier only (ui-spec.md live-strip rules); the file adapter never
+  emits it.
 - **Subagent / workflow assertions** — deferred to the 1.0.34 recapture
   (PR7/PR8).

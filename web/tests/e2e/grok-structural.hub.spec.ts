@@ -70,10 +70,10 @@ const shotDir = evidence
   ? path.join(root, "docs/design/evidence")
   : path.join(root, "web/test-results/evidence");
 
-/** The shell call runs long enough to stay observable on a loaded gate host. */
-const SHELL_TOOL_MS = 30_000;
-/** The question stays pending long enough to drive the approvals queue. */
-const QUESTION_TOOL_MS = 20_000;
+/** The shell call stays running long enough to observe partials + a tick. */
+const SHELL_TOOL_MS = 20_000;
+/** The question stays pending through both pages and the evidence captures. */
+const QUESTION_TOOL_MS = 25_000;
 
 async function shot(page: Page, name: string, redact: string[] = []) {
   if (!evidence) return;
@@ -105,6 +105,10 @@ async function shot(page: Page, name: string, redact: string[] = []) {
  * windows are observable. Every payload, tool name and match prefix stays
  * byte-for-byte from the fixture. Returns the patched scenario path and the
  * prompt prefix / thinking text / stdout lines the assertions read back.
+ *
+ * Every requested duration override must match a tool in the fixture (a
+ * rename must break this test loudly rather than silently no-op), and the
+ * returned facts the assertions depend on are pinned against the fixture.
  */
 async function patchedScenario(
   sourceName: string,
@@ -119,19 +123,28 @@ async function patchedScenario(
       tools: Array<{ name: string; duration_ms?: number; result?: string }>;
     }>;
   };
+  const matched = new Set<string>();
   for (const turn of scenario.turns) {
     for (const tool of turn.tools) {
-      if (Object.hasOwn(durations, tool.name)) tool.duration_ms = durations[tool.name];
+      if (Object.hasOwn(durations, tool.name)) {
+        tool.duration_ms = durations[tool.name];
+        matched.add(tool.name);
+      }
     }
+  }
+  for (const name of Object.keys(durations)) {
+    expect(matched.has(name), `fixture ${sourceName} has no tool named ${name} to slow down`).toBe(true);
   }
   await writeFile(destPath, JSON.stringify(scenario));
   const first = scenario.turns[0]!;
+  expect(first.thinking, `fixture ${sourceName} must stream a thought block`).toBeTruthy();
   const bash = first.tools.find((tool) => tool.name === "Bash");
+  const stdoutLines = (bash?.result ?? "").split("\n").filter((line) => line.length > 0);
   return {
     path: destPath,
     prefix: first.match_prefix ?? "",
     thinking: first.thinking ?? "",
-    stdoutLines: (bash?.result ?? "").split("\n").filter((line) => line.length > 0),
+    stdoutLines,
   };
 }
 
@@ -140,9 +153,13 @@ function quote(value: string): string {
 }
 
 async function command(page: Page, instanceId: string, operation: string, payload = {}) {
+  // Bound the POST: under host load the node can stall on acking, and an
+  // unbounded wait would consume the whole test budget. The hub queues and
+  // resends commands, so a timed-out write is retried by the caller below.
   const response = await page.request.post(`/v1/instances/${instanceId}/commands`, {
     headers: { Origin: new URL(page.url()).origin },
     data: { operation, payload },
+    timeout: 15_000,
   });
   expect(response.ok()).toBe(true);
 }
@@ -218,7 +235,8 @@ type Harness = {
   node: ChildProcess;
   hostId: string;
   enrollToken: string;
-  nodeLog: string;
+  /** Mutable sink the node's stdout/stderr are appended to for the whole run. */
+  log: { text: string };
   redact: string[];
   dataFd: Awaited<ReturnType<typeof open>> | undefined;
 };
@@ -242,7 +260,7 @@ async function startHarness(page: Page, testName: string): Promise<Harness> {
   const eventsFile = path.join(dir, "native-events.jsonl");
   const tokenFile = path.join(dir, "enroll-token");
   const shell = path.join(bin, "test-shell");
-  let nodeLog = "";
+  const log = { text: "" };
 
   await Promise.all([mkdir(bin), mkdir(workspace), mkdir(grokHome), mkdir(claudeHome)]);
   // The fake harness stands in for grok itself: it is `grok` on PATH, and
@@ -297,13 +315,13 @@ async function startHarness(page: Page, testName: string): Promise<Harness> {
     },
   });
   node.stdout?.on("data", (chunk) => {
-    nodeLog += String(chunk);
+    log.text += String(chunk);
   });
   node.stderr?.on("data", (chunk) => {
-    nodeLog += String(chunk);
+    log.text += String(chunk);
   });
   node.on("error", (error) => {
-    nodeLog += error.message;
+    log.text += error.message;
   });
 
   let hostId = "";
@@ -325,7 +343,7 @@ async function startHarness(page: Page, testName: string): Promise<Harness> {
     node,
     hostId,
     enrollToken,
-    nodeLog,
+    log,
     redact: [dir, workspace, grokHome, claudeHome],
     dataFd,
   };
@@ -413,12 +431,20 @@ async function finishHarness(
   testInfo: { outputPath: (name: string) => string },
 ) {
   if (id) {
-    await command(page, id, "instance.close").catch(() => {});
+    // Bound the close POST: under host load the node can stop acking, and an
+    // unawaited HTTP response would otherwise eat the whole test budget in
+    // teardown (stopNode reaps the process regardless).
+    await Promise.race([
+      command(page, id, "instance.close"),
+      new Promise((resolve) => setTimeout(resolve, 5_000)),
+    ]).catch(() => {});
   }
   await stopNode(h.node);
   h.dataFd?.close();
+  // Read the mutable sink only now, after the streams have closed, so the
+  // artefact carries promotion, the grok adapter and any late panic.
   // Scrub the token, the temp tree, the operator HOME and the host name.
-  const safeLog = h.nodeLog
+  const safeLog = h.log.text
     .replaceAll(h.enrollToken || "__unused__", "[redacted]")
     .replaceAll(h.dir, "$TEST_DIR")
     .replaceAll(process.env.HOME || "__unused__", "$HOME")
@@ -429,7 +455,7 @@ async function finishHarness(
 }
 
 test.describe("grok structural chain over a real fake-harness PTY session", () => {
-  test.setTimeout(180_000);
+  test.setTimeout(240_000);
 
   test("named running tool: native name + title, live stdout partials replaced once, file-decided end", async ({ page }, testInfo) => {
     test.skip(!binariesReady, "remuda/fake-harness/native_hub_e2e binaries not built");
@@ -441,6 +467,9 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
         Bash: SHELL_TOOL_MS,
       });
       expect(script.prefix).toBe("GROK_TOOLS");
+      // Pin the fixture-derived inputs the exactly-once loop depends on.
+      expect(script.thinking).not.toBe("");
+      expect(script.stdoutLines).toEqual(["one", "two", "three"]);
       const launched = await launchGrokSession(page, h, script.path, "grok-structural-tools");
       id = launched.id;
       const strip = launched.strip;
@@ -451,19 +480,17 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
       await new Promise((resolve) => setTimeout(resolve, 100));
       await rawKeys(page, id, "\r");
 
-      // Native thinking rides the file-tier turn.live lifecycle, and the
-      // fixture's thought text streams into the transcript.
-      await expect.poll(
-        async () =>
-          (await page.evaluate(() =>
-            (window as unknown as { __livePhases?: Array<{ phase: string | null }> }).__livePhases?.some(
-              (row) => row.phase === "thinking",
-            ),
-          ))
-            ? true
-            : false,
-        { timeout: 15_000, intervals: [50] },
-      ).toBe(true);
+      // Native thinking rides the file-tier turn.live lifecycle. With one
+      // thought chunk the thought, Pending and Running frames land within a
+      // single 250 ms adapter poll, so the painted strip can fold thinking
+      // away just like tool-started — assert the durable phase from the
+      // journal; the streaming transcript row covers what was painted.
+      await expect
+        .poll(async () => (await journalPhases(page, id!)).includes("thinking"), {
+          timeout: 15_000,
+          intervals: [50],
+        })
+        .toBe(true);
       const thoughtRow = page.locator('[data-testid="transcript-row"][data-kind="thought"]').first();
       await expect(thoughtRow).toContainText(script.thinking, { timeout: 5_000 });
 
@@ -534,24 +561,36 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
       await expect(strip).toHaveAttribute("data-phase", "turn-ended", { timeout: 15_000 });
       await expect(strip).toHaveAttribute("data-decided-by", "file");
       await expect(page.getByTestId("live-decided-by")).toHaveAttribute("data-channel", "file");
+      // Under host load a 2 s instance poll can momentarily drop the
+      // promoted file signalTier and flip the structured pane to the raw
+      // screen fallback; wait for it to re-hydrate before reading the card.
+      await expect(page.getByTestId("transcript")).toBeVisible({ timeout: 30_000 });
       const painted = await page.evaluate(() =>
         (window as unknown as { __livePhases?: Array<{ phase: string | null }> }).__livePhases?.map(
           (row) => row.phase,
         ),
       );
-      expect(painted).toEqual(expect.arrayContaining(["thinking", "turn-ended"]));
+      // turn-ended is stable and always painted; the coalescing thinking /
+      // tool-started edges are asserted from the durable journal instead.
+      expect(painted).toEqual(expect.arrayContaining(["turn-ended"]));
       const allPhases = await journalPhases(page, id);
       expect(allPhases).toEqual(
-        expect.arrayContaining(["tool-started", "tool-output", "tool-finished", "turn-ended"]),
+        expect.arrayContaining(["thinking", "tool-started", "tool-output", "tool-finished", "turn-ended"]),
       );
 
-      // The settled turn folds its tool card into the compact summary;
-      // expand it to assert the Final state.
+      // The transcript window is virtualized and follows the newest message,
+      // so the settled tool row is scrolled out of the drawn range by the
+      // streamed answer. Scroll to the top to mount it; the card may be
+      // inline or folded into the compact summary, so open the fold if
+      // present.
+      await page.getByTestId("transcript-scroller").evaluate((el) => {
+        el.scrollTop = 0;
+      });
+      await page.waitForTimeout(200);
       const fold = page.getByTestId("compact-fold").first();
-      await expect(fold).toBeVisible({ timeout: 10_000 });
-      await fold.click();
+      if (await fold.isVisible().catch(() => false)) await fold.click();
       const settledCard = page.getByTestId("tool-card").first();
-      await expect(settledCard).toContainText("exit 0", { timeout: 10_000 });
+      await expect(settledCard).toContainText("exit 0", { timeout: 15_000 });
       await expect(settledCard).not.toContainText(/running/);
 
       // c-grok-stdout regression class: the Final replaces the partial
@@ -645,17 +684,39 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
           () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
         );
         expect(overflow, `horizontal overflow at ${suffix}`).toBeLessThanOrEqual(1);
+        // Visibility, not just text presence: at 390 px the form and both
+        // options must actually render on screen (toContainText passes on
+        // hidden/clipped text).
         const pendingForm = page.getByTestId("question-form");
-        await expect(pendingForm).toContainText("Alpha");
-        await expect(pendingForm).toContainText("Beta");
+        await expect(pendingForm).toBeVisible();
+        await expect(pendingForm.getByRole("radio", { name: /Alpha/ })).toBeVisible();
+        await expect(pendingForm.getByRole("radio", { name: /Beta/ })).toBeVisible();
         await shot(page, `grok-structural-1-question-${suffix}.png`, h.redact);
       }
       await page.setViewportSize({ width: 1440, height: 900 });
 
-      // The harness answers in its own TUI and the turn finishes; the end is
-      // again file-decided.
-      await expect(page.getByTestId("question-form")).toHaveCount(0, { timeout: 20_000 });
-      await waitForNthEvent(h.eventsFile, "turn_end", 0, 30_000);
+      // Ground truth first: the harness answers in its own TUI and the turn
+      // ends. Only then does the node drop the interaction and the 2 s list
+      // poll clear the dock row.
+      await waitForNthEvent(h.eventsFile, "turn_end", 0, 45_000);
+      // The node must no longer report a pending question for this instance
+      // (authoritative, independent of the dock's poll cadence).
+      await expect
+        .poll(
+          async () => {
+            const res = await page.evaluate(async (iid) => {
+              const r = await fetch(`/v1/interactions?instanceId=${iid}`, { credentials: "include" });
+              return (await r.json()) as { items?: Array<{ state?: string; request?: { kind?: string } }> };
+            }, id);
+            return (res.items ?? []).some(
+              (item) => item.state === "pending" && item.request?.kind === "question",
+            );
+          },
+          { timeout: 15_000, intervals: [500] },
+        )
+        .toBe(false);
+      // The dock follows the cleared list.
+      await expect(page.getByTestId("question-form")).toHaveCount(0, { timeout: 15_000 });
       const endStrip = page.getByTestId("live-status-strip");
       await expect(endStrip).toHaveAttribute("data-phase", "turn-ended", { timeout: 10_000 });
       await expect(endStrip).toHaveAttribute("data-decided-by", "file");

@@ -112,26 +112,14 @@ pub fn instance_sockets_would_redirect(data_dir: &Path) -> bool {
     !remuda_signal::runtime_dir::path_fits_sun_path(&representative)
 }
 
-/// Re-export for callers that need the concrete path pair.
-pub(crate) type Placement = SocketPlacement;
-
-/// The secured per-user runtime directory remuda sockets live under.
-///
-/// Public so test fixtures can place fake unix sockets (e.g. fake-herdr) on a
-/// short, TMPDIR-independent root: `tempfile` honours a long `TMPDIR`, which
-/// would push `<tmp>/herdr/herdr.sock` past `sun_path`.
-pub fn runtime_socket_root() -> std::io::Result<PathBuf> {
-    remuda_signal::runtime_dir::per_user_runtime_dir()
-}
-
-/// All secured per-user runtime directory candidates, in preference order.
+/// All per-user runtime directory candidates in preference order (infallible:
+/// the list is environment-derived and never performs IO).
 ///
 /// Test fixtures walk these to pick the first under which their full socket
 /// address fits, the same way [`place_token_broker_socket`] chooses.
-pub fn runtime_socket_candidates() -> std::io::Result<Vec<PathBuf>> {
-    Ok(remuda_signal::runtime_dir::runtime_dir_candidates(
-        remuda_signal::runtime_dir::current_uid(),
-    ))
+#[must_use]
+pub fn runtime_socket_candidates() -> Vec<PathBuf> {
+    remuda_signal::runtime_dir::runtime_dir_candidates(remuda_signal::runtime_dir::current_uid())
 }
 
 /// The platform's usable `sockaddr_un.sun_path` length, in bytes.
@@ -139,6 +127,9 @@ pub fn runtime_socket_candidates() -> std::io::Result<Vec<PathBuf>> {
 pub fn runtime_socket_limit() -> usize {
     remuda_signal::runtime_dir::SUN_PATH_LIMIT
 }
+
+/// Re-export for callers that need the concrete path pair.
+pub(crate) type Placement = SocketPlacement;
 
 #[cfg(test)]
 mod tests {

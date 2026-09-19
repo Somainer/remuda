@@ -41,7 +41,7 @@ impl ShortTempDir {
         // (`test-<pid>-<nanos>-<seq>` ≈ 36 bytes); size the root against the
         // placeholder so no directory is created under a root that cannot fit.
         const PLACEHOLDER_LEAF: &str = "test-2147483647-18446744073709551615-4294967295";
-        for root in remuda_driver::runtime_socket_candidates()? {
+        for root in remuda_driver::runtime_socket_candidates() {
             let fits = root
                 .join(PLACEHOLDER_LEAF)
                 .join(socket_suffix)

@@ -1800,14 +1800,17 @@ mod tests {
     #[tokio::test]
     async fn orphan_sweep_leaves_another_nodes_workspace_untouched() {
         use remuda_herdr::{Client, WorkspaceCreateParams};
-        use remuda_testing::{FakeHerdrOptions, FakeHerdrServer};
+        use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ShortTempDir};
 
         let root = tempfile::tempdir().unwrap();
+        // The herdr socket sits on the TMPDIR-independent short root.
+        let socket_root = ShortTempDir::new().unwrap();
         let mut servers = Vec::new();
         let mut clients = Vec::new();
         for name in ["first", "second"] {
-            let config = NativeDriverConfig::new(root.path().join(name));
-            let socket_dir = config.herdr_socket_dir.unwrap();
+            let mut config = NativeDriverConfig::new(root.path().join(name));
+            config.herdr_socket_dir = Some(socket_root.path().join(name));
+            let socket_dir = config.herdr_socket_dir.clone().unwrap();
             std::fs::create_dir_all(&socket_dir).unwrap();
             let socket = socket_dir.join("herdr.sock");
             servers.push(FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap());
@@ -1823,12 +1826,16 @@ mod tests {
         }
         let other_before = clients[1].session_snapshot().await.unwrap();
         let first_dir = root.path().join("first");
-        let node = crate::compose(&crate::ServeConfig::native(
-            crate::DevServerConfig::loopback(0)
+        // The composed Node must look for "first" at the short socket root.
+        let mut native_config = NativeDriverConfig::new(first_dir.clone());
+        native_config.herdr_socket_dir = Some(socket_root.path().join("first"));
+        let node = crate::compose(&crate::ServeConfig {
+            http: crate::DevServerConfig::loopback(0)
                 .with_workspace_root(first_dir.clone())
                 .with_workspace_roots(vec![root.path().to_path_buf()]),
-            first_dir,
-        ))
+            data_dir: first_dir,
+            drivers: crate::LocalDrivers::Native(native_config),
+        })
         .unwrap();
         node.reconcile_herdr().await.unwrap();
         assert!(

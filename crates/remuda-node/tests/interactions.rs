@@ -251,12 +251,13 @@ async fn fake_can_use_tool_answered_via_hub_http() {
 async fn pty_approval_hub_cas_settlement_and_restart_do_not_replay() {
     use remuda_node::{MemoryStore, NativeDriverConfig, native_driver_registry};
     use remuda_testing::{
-        FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin,
+        FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ShortTempDir, ensure_workspace_bin,
         install_executable,
     };
     use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
-    let socket_dir = dir.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     std::fs::create_dir_all(&socket_dir).unwrap();
     let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
     fake_options.script = FakeHerdrScript::Approval;

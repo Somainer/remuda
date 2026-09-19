@@ -299,7 +299,7 @@ mod tests {
     use crate::{DevServerConfig, DriverRegistry, MemoryStore, NativeDriverConfig};
     use remuda_herdr::{Client, WorkspaceCreateParams};
     use remuda_protocol::{DriverKind, HostId, WorkspaceId};
-    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer};
+    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ShortTempDir};
     use std::{path::Path, time::Duration};
 
     /// Short steps so the tests measure behaviour, not wall-clock patience.
@@ -381,7 +381,8 @@ mod tests {
     #[tokio::test]
     async fn startup_reconcile_survives_a_shutting_down_predecessor() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().expect("short socket root");
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).expect("socket dir");
         let socket = socket_dir.join("herdr.sock");
         let client = Client::connect(&socket);
@@ -420,7 +421,8 @@ mod tests {
     #[tokio::test]
     async fn mid_session_carrier_loss_recovers_and_marks_the_instance() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().expect("short socket root");
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).expect("socket dir");
         let socket = socket_dir.join("herdr.sock");
         let client = Client::connect(&socket);
@@ -478,7 +480,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_is_a_no_op_while_the_carrier_is_healthy() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().expect("short socket root");
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).expect("socket dir");
         let socket = socket_dir.join("herdr.sock");
         let client = Client::connect(&socket);

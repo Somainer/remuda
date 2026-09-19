@@ -24,6 +24,7 @@ mod flags;
 mod parent_watch;
 mod paths;
 mod script;
+mod short_temp;
 mod stub;
 mod workspace_roots;
 
@@ -50,6 +51,7 @@ pub use paths::{
     hook_session_path, hook_workflow_fixture, script_kind_from_name, script_path,
 };
 pub use script::{load_script, load_script_from_env};
+pub use short_temp::ShortTempDir;
 pub use stub::install_executable;
 pub use workspace_roots::test_workspace_roots;
 

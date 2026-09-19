@@ -285,7 +285,13 @@ describe("EffortSlider tall catalog", () => {
     const user = userEvent.setup();
     const onModel = mountList();
     await user.click(screen.getByTestId("effort-open-list"));
+    // The open-list focus ride is scheduled on an animation frame; pressing
+    // End before it lands retargets body (the listbox keydown never runs),
+    // and the late focus ride leaves Enter to activate the tier row instead
+    // of the model row. Wait for the documented focus state after each key.
+    await waitFor(() => expect(screen.getByTestId("effort-tier-high")).toHaveFocus());
     await user.keyboard("{End}");
+    await waitFor(() => expect(screen.getByTestId("model-option-model-79")).toHaveFocus());
     await user.keyboard("{Enter}");
     expect(onModel).toHaveBeenCalledWith("gateway/model-79");
     expect(screen.getByTestId("effort-slider-panel")).toHaveAttribute("data-view", "slider");

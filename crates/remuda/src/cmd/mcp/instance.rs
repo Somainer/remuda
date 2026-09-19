@@ -266,5 +266,7 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
         title: opt_str(args, "title").map(str::to_string),
         prompt,
         command_id: opt_str(args, "commandId").map(str::to_string),
+        // The MCP surface does not offer per-launch host capabilities yet.
+        capabilities: Vec::new(),
     })
 }

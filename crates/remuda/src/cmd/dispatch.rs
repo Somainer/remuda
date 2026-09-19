@@ -59,6 +59,12 @@ pub(crate) struct DispatchArgs {
     /// Skip the local brief lint gate (not recommended; gate still scans).
     #[arg(long)]
     force_lint: bool,
+    /// Per-launch host capability grant (repeatable). Only `computer-use`
+    /// exists; it targets a macOS host reporting the installed capability and
+    /// runs with host-side approvals instead of the dispatcher's bypass default
+    /// (D-045).
+    #[arg(long = "capability")]
+    capabilities: Vec<String>,
 }
 
 impl Entrypoint for DispatchArgs {
@@ -69,6 +75,19 @@ impl Entrypoint for DispatchArgs {
 
 async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     let client = args.hub.connect()?;
+    super::capability::validate_requested(&args.capabilities)?;
+    if super::capability::requests_computer_use(&args.capabilities)
+        && !matches!(
+            args.harness.as_deref().unwrap_or("claude"),
+            "claude" | "codex"
+        )
+    {
+        anyhow::bail!(
+            "the \"computer-use\" capability is not supported for harness {:?} this batch; \
+             supported harnesses are claude and codex",
+            args.harness.as_deref().unwrap_or("claude")
+        );
+    }
     if args.task.is_none() && args.brief.is_none() {
         anyhow::bail!("dispatch needs a <task-id> or --brief FILE");
     }
@@ -96,6 +115,17 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     let brief_name = std::path::Path::new(&brief_path)
         .file_name()
         .map(|stem| stem.to_string_lossy().into_owned());
+    // D-045 gate 2 at the CLI when the host is explicit; placement-resolved
+    // dispatch is preflighted by the Hub after it picks the host.
+    if super::capability::requests_computer_use(&args.capabilities)
+        && let Some(host_id) = args.host.as_deref()
+    {
+        let host = client
+            .get(&format!("/v1/hosts/{host_id}"))
+            .await
+            .map_err(super::hub_client::hub_http_error)?;
+        super::capability::host_supports_computer_use(&host)?;
+    }
     let body = json!({
         "projectId": args.project,
         "brief": content,
@@ -108,6 +138,7 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "placement": args.placement,
         "driver": args.driver,
         "carrier": args.carrier,
+        "capabilities": args.capabilities,
     });
     let value = client
         .post("/v1/workers/dispatch", &body)

@@ -52,7 +52,8 @@
 | `web/tests/e2e/ux-modelpick.hub.spec.ts` | c-composer 同款守卫 | 与 ux-modelsync 相同的 stray-confirm 守卫（openModelList 同样的防御性 Esc） |
 | `web/tests/e2e/ux-usage.hub.spec.ts` | c-composer 后果适配 | 390px 用例：context chip 移入选项 sheet 后，先开 sheet 再断言 chip 与明细 sheet |
 | `web/tests/e2e/session-structured.spec.ts` | **handback 1 授权**（c-sessionchrome 拥有；c-toolfold 在改同文件） | 仅 107-117 行那个用例：compact 下先开选项 sheet 再断言只读 harness-chip |
-| `web/tests/e2e/session-chrome-evidence.spec.ts` | **handback 1 授权** | 400px 循环先开选项 sheet 再截 harness-label |
+| `web/tests/e2e/session-chrome-evidence.spec.ts` | **handback 1 授权** | 400px：golden 在 sheet 关闭状态截取，断言只读 harness-chip 时再临时打开 sheet；`shot()` 走 REMUDA_EVIDENCE 开关，默认运行写入 gitignored `test-results/`，不改动 tracked golden |
+| `web/tests/e2e/ux-touchhit.hub.spec.ts` | **round-4 授权**（c-touchhit 拥有） | D-042 后果：390px effort 卡片移入选项 sheet，探测 reset/list-back 44px 角点前显式 `scrollIntoView({block:"center"})`（293-315 行附近，仅该 390px 用例） |
 
 ## 兼容性迁移
 

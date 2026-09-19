@@ -84,6 +84,10 @@ async fn start() -> Run {
         std::fs::create_dir_all(&root).unwrap();
         (root, None)
     } else {
+        // Pinned to /tmp on purpose: a long $TMPDIR pushes the per-instance
+        // hook.sock past the AF_UNIX path limit; c-sockpath fixes that in the
+        // product. start_in adds this run root's parent to workspace_roots so
+        // the pin still holds when TMPDIR points elsewhere.
         let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
         (dir.path().to_path_buf(), Some(dir))
     };
@@ -111,10 +115,22 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         scenario.to_string_lossy().into_owned(),
     );
 
+    // The run root is pinned under /tmp for socket-length reasons (see start);
+    // allow its parent too, otherwise the workspace is rejected whenever
+    // TMPDIR points at a different directory. The REMUDA_TT_DIR debug root is
+    // arbitrary and gets the same treatment via its own parent.
+    let mut workspace_roots = remuda_testing::test_workspace_roots!();
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    if let Some(parent) = canonical_root.parent()
+        && !workspace_roots.iter().any(|held| parent.starts_with(held))
+    {
+        workspace_roots.push(parent.to_path_buf());
+    }
+
     let config = ServeConfig {
         http: DevServerConfig::loopback(0)
             .with_workspace_root(workspace.clone())
-            .with_workspace_roots(remuda_testing::test_workspace_roots!()),
+            .with_workspace_roots(workspace_roots),
         data_dir: data_dir.clone(),
         drivers: remuda_node::LocalDrivers::Native(native.clone()),
     };

@@ -209,12 +209,12 @@ fn granted_claude_writes_skill_tree_mcp_config_argv_and_env() {
         }
     }
 
-    // Every directory in the delivered tree is owner-only.
+    // Every directory in the delivered tree is owner-only, including the
+    // `native_home/skills` parent itself (round-4 item 3).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let tree_root = dirs.home.join("skills").join("codex-computer-use");
-        let _ = tree_root.clone();
+        let tree_root = dirs.home.join("skills");
         let mut stack = vec![tree_root.clone()];
         let mut checked = 0;
         while let Some(dir) = stack.pop() {
@@ -227,7 +227,8 @@ fn granted_claude_writes_skill_tree_mcp_config_argv_and_env() {
                 }
             }
         }
-        assert!(checked >= 2, "root + references/scripts dirs");
+        // skills/ + skills/codex-computer-use/ + references/ + scripts/.
+        assert!(checked >= 3, "skills root and its subdirs, got {checked}");
     }
 
     // Leg (b): 0600 per-instance config + 0755 launchers under launch/.
@@ -531,11 +532,11 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
 }
 
 #[test]
-fn granted_codex_on_a_non_shell_carrier_does_not_write_or_pin_a_partial_shadow_home() {
-    // The Node factory refuses this combination (a partial shadow home would
-    // lose the operator's codex login); the materializer itself must not create
-    // codex-home or pin CODEX_HOME either — the audit must not claim a delivery
-    // the carrier cannot provide.
+fn granted_codex_on_a_non_shell_carrier_is_refused_and_writes_nothing() {
+    // Codex delivery exists only on shell-pty + HookSession. Generic-pty (and
+    // every other non-shell driver) is refused at the materializer, mirroring
+    // the Node factory, so no mcp-cua.json/launchers/audit entry is produced —
+    // never a granted-but-undelivered recipe (§3.3).
     let dirs = dirs();
     let binary = stub_binary(dirs.root.path());
     let mut spec = load_spec();
@@ -543,25 +544,20 @@ fn granted_codex_on_a_non_shell_carrier_does_not_write_or_pin_a_partial_shadow_h
     spec.driver = DriverKind::GenericPty;
     grant(&mut spec);
 
-    let recipe = materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary)).unwrap();
+    let error = materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary))
+        .expect_err("granted codex on generic-pty must be refused by the materializer");
+    let message = error.to_string();
     assert!(
-        !dirs.launch.join("codex-home").exists(),
-        "no partial codex shadow home may be written on non-shell-pty"
+        message.contains("computer-use")
+            && message.contains("shell-pty")
+            && message.contains("REMUDA_PTY_HOOKS"),
+        "{message}"
     );
-    assert!(
-        !recipe
-            .materialized_files
-            .iter()
-            .any(|file| file.path.contains("codex-home")),
-        "the audit must not claim a shadow-config delivery"
-    );
-    assert!(
-        !recipe
-            .env_allowlist
-            .iter()
-            .any(|entry| entry.name == "CODEX_HOME"),
-        "no CODEX_HOME pin to a partial shadow home"
-    );
+    // Refusal writes nothing at all.
+    assert!(!dirs.launch.join("mcp-cua.json").exists());
+    assert!(!dirs.launch.join("cua").exists());
+    assert!(!dirs.launch.join("codex-home").exists());
+    assert!(!dirs.home.join(SKILL_ROOT).exists());
 }
 
 // ── refusals: named, before any file is written ───────────────────────────

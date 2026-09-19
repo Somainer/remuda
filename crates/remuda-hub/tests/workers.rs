@@ -182,10 +182,21 @@ impl Ctx {
         path: &str,
         body: Option<Value>,
     ) -> (reqwest::StatusCode, Value) {
+        self.request_with_token(method, path, body, &self.human)
+            .await
+    }
+
+    async fn request_with_token(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (reqwest::StatusCode, Value) {
         let mut builder = self
             .http
             .request(method.parse().unwrap(), format!("{}{}", self.base(), path))
-            .bearer_auth(&self.human);
+            .bearer_auth(token);
         if let Some(body) = body {
             builder = builder.json(&body);
         }
@@ -759,6 +770,57 @@ async fn dispatch_refuses_computer_use_for_every_harness_without_downgrading() {
             "harness {harness}: refused dispatch must not provision"
         );
     }
+}
+
+#[tokio::test]
+async fn agent_origin_create_with_computer_use_is_refused_before_placement() {
+    // D-045 gate 1 at the Hub: an instance-scoped agent credential may not
+    // grant computer-use to itself, regardless of host or permission mode.
+    let ctx = Ctx::spawn().await.unwrap();
+    // Seed a leaf instance and mint its instance token (origin = Agent).
+    let project = ctx.create_project(&["58940-58969"]).await;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let mut delegation =
+        remuda_hub::store_test_support::leaf_delegation(&project_id).expect("leaf delegation");
+    // prepare_create requires the Dispatch grant even for a same-host agent.
+    delegation.grants = vec!["dispatch".to_owned()];
+    let instance = ctx
+        .hub
+        .store()
+        .unwrap()
+        .insert_instance_delegated(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "claude-print".into(),
+            None,
+            json!({ "projectId": project_id }),
+            delegation,
+        )
+        .await
+        .expect("seed instance");
+    let agent_token =
+        remuda_hub::instance_token(ctx.hub.store().unwrap().clone(), instance.instance_id)
+            .await
+            .expect("agent token");
+
+    let body = json!({
+        "hostId": ctx.host,
+        "kind": "claude",
+        "driver": "claude-print",
+        "permissionMode": "manual",
+        "capabilities": ["computer-use"],
+        "prompt": "drive",
+    });
+    let (status, response) = ctx
+        .request_with_token("POST", "/v1/instances", Some(body), &agent_token)
+        .await;
+    assert_eq!(status, 400, "{response}");
+    let message = response["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("agent-originated") && message.contains("computer-use"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

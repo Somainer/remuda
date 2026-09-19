@@ -172,6 +172,12 @@ argv 的 kind 是 codex（它拿 shadow home），其余 kind 一律走 argv。�
 
 **绝不发 `--strict-mcp-config`。** 该 flag 被永久禁用（`flags.rs:15`），而这是
 **对的默认**：Remuda 提供的能力应该**增加** agent 自己的 server，绝不替换。
+
+> **D-045 实现注记（2026-09-19，c-cua-launch 落地）**：codex 的 shadow-home 投递
+> 只在 **`shell-pty` + HookSession（Node 配置 `pty_hooks = true`，默认关）** 下成立；
+> generic-pty 等无 HookSession 的 carrier 不会生成完整 shadow home，Node 工厂与
+> materializer 对这些组合的 codex `computer-use` 一律按名拒绝，直到 shadow home
+> 被完整播种（见 [D-045](./decisions.md)）。
 `--strict-mcp-config` 会让「授予桌面控制」附带「取消你原有的 MCP 工具」，
 这是两件不该绑在一起的事。
 

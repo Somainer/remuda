@@ -2377,7 +2377,10 @@ impl Store {
                 )?;
             }
             if let Some(host_os) = update.host_os {
-                conn.execute("UPDATE hosts SET os = ?1 WHERE id = ?2", params![host_os, host_id])?;
+                conn.execute(
+                    "UPDATE hosts SET os = ?1 WHERE id = ?2",
+                    params![host_os, host_id],
+                )?;
             }
             if let Some(transport) = update.transport {
                 conn.execute(

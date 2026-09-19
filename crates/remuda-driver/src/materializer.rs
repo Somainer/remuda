@@ -541,6 +541,7 @@ fn apply_capability_grant(
             origin: request.origin,
             permission: &request.spec.permission_mode,
             kind: request.spec.kind,
+            driver: request.spec.driver,
             launch_dir: &request.launch_dir,
             native_home: &request.native_home,
             native_home_managed: request.native_home_managed.unwrap_or(true),

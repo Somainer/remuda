@@ -1036,29 +1036,47 @@ pub async fn create_instance(
             .iter()
             .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
         {
+            // Gate 1 (D-045 §2): an agent-originated launch may never grant
+            // desktop control to itself — the client's incidental 403 is not
+            // the gate. Refuse at the Hub before placement/persistence.
+            if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
+                return Err(HubError::BadRequest(
+                    "an agent-originated launch may not grant \"computer-use\"; \
+                     only an explicit human or bot launch may request it"
+                        .into(),
+                ));
+            }
             // D-045 Q4, harness-agnostic: refuse unattended desktop control.
-            // Each harness names its own auto-approve spelling so the message
-            // names both (the Node driver gate is the final boundary).
-            let unattended = match body.kind.as_str() {
-                "claude" => matches!(
-                    body.permission_mode.as_deref(),
-                    Some("bypassPermissions" | "bypass")
+            // The message names the kind AND the exact refused spellings.
+            let (unattended, refused_spellings): (bool, &[&str]) = match body.kind.as_str() {
+                "claude" => (
+                    matches!(
+                        body.permission_mode.as_deref(),
+                        Some("bypassPermissions" | "bypass")
+                    ),
+                    &["bypassPermissions"],
                 ),
-                "codex" => matches!(
-                    body.permission_mode.as_deref(),
-                    // Codex auto-approves every action with `never` (CLI
-                    // `--ask-for-approval never`; legacy `no-request`).
-                    Some("never" | "no-request")
+                "codex" => (
+                    matches!(
+                        body.permission_mode.as_deref(),
+                        // Codex auto-approves every action with `never` (CLI
+                        // `--ask-for-approval never`; legacy `no-request`).
+                        Some("never" | "no-request")
+                    ),
+                    &["never", "no-request"],
                 ),
-                _ => false,
+                _ => (false, &[]),
             };
             if unattended {
                 return Err(HubError::BadRequest(format!(
                     "refusing \"computer-use\" together with unattended/skipped tool approvals \
-                     on the same {:?} launch (permissionMode {:?}): desktop control plus \
-                     auto-approved actions has no recovery path; remove one of the two",
+                     on the same {:?} launch (permissionMode {:?}; refused {} spellings: {}): \
+                     desktop control plus auto-approved actions has no recovery path; \
+                     remove one of the two",
                     body.kind,
-                    body.permission_mode.as_deref().unwrap_or("-")
+                    body.permission_mode.as_deref().unwrap_or("-"),
+                    body.kind,
+                    refused_spellings.join(", ")
                 )));
             }
             if !matches!(body.kind.as_str(), "claude" | "codex") {

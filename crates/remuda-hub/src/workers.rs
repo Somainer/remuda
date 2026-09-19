@@ -1473,6 +1473,11 @@ async fn host_capacity(
         "freeSlots": (max - running).max(0),
         "activeWorkers": active.len(),
         "portBlocksInUse": port_blocks,
+        // The capability block rides this payload rather than a second read of
+        // `GET /v1/hosts/{id}`: that route is operator-only, so a launched
+        // coordinator (which always carries `REMUDA_INSTANCE_ID`) could never
+        // see the capability at all. This route is the one an agent may call.
+        "computerUse": crate::inventory::computer_use_capability(&host),
     })))
 }
 

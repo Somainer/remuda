@@ -1025,7 +1025,7 @@ fn prefold_blocking(
             let folded = remuda_protocol::fold_tool_result(Some(content), Some(stager));
             outcomes.extend(folded.images.iter().cloned());
             block["content"] = serde_json::json!({
-                remuda_protocol::FOLDED_MARKER: folded.blocks,
+                remuda_protocol::folded_marker(): folded.blocks,
             });
         }
     }

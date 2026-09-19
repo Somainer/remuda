@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { MessagePayload, Observation, ToolCallPayload } from "../../types/observation";
+import type { MessagePayload, Observation, ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import type { WorkflowRunPayload } from "../../types/generated";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState, isToolFailure, type TranscriptNode } from "./assemble";
@@ -405,6 +405,51 @@ describe("assembleTranscript · streamed grok tool-result partials", () => {
     expect(toolText(events)).toBe("fresh head\nfresh tail");
   });
 
+  it("keeps facts established by an earlier Replace when a Partial Append omits them", async () => {
+    const { assembleTranscript } = await import("./assemble");
+    // A Replace established the exit code/outcome/structured result; the later
+    // Partial Append envelope does not emit them (unknown / empty). They must
+    // survive rather than be blanked (known-else-previous).
+    const partialAppend = obs(4, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "4",
+      baseRevision: "3",
+      operation: "append",
+      stage: "partial",
+      outcome: "unknown",
+      blocks: [{ type: "text", text: "more\n" }],
+      structuredResult: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      exitCode: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      changes: [],
+    });
+    const events = [
+      callMutation(1, 1, "open", "proposed"),
+      callMutation(2, 2, "replace"),
+      obs(3, "tool_result", {
+        nodeId: NODE,
+        toolCallId: NODE,
+        revision: "3",
+        baseRevision: "2",
+        operation: "replace",
+        stage: "partial",
+        outcome: "succeeded",
+        blocks: [{ type: "text", text: "first\n" }],
+        structuredResult: known({ done: true }),
+        exitCode: known(7),
+        changes: [],
+      }),
+      partialAppend,
+    ];
+    const node = assembleTranscript(events).find((n): n is Extract<TranscriptNode, { type: "tool" }> => n.type === "tool");
+    expect(node).toBeTruthy();
+    const result = node!.result!;
+    expect((result.exitCode as { value?: number }).value).toBe(7);
+    expect(result.outcome).toBe("succeeded");
+    expect((result.structuredResult as { value?: { done: boolean } }).value).toEqual({ done: true });
+    expect(toolText(events)).toBe("first\nmore\n");
+  });
+
   it("rejects out-of-order and duplicate mutations", () => {
     // The Final Close landed at revision 6…
     const finalResult = resultMutation(6, 6, "close", [{ type: "text", text: "one\ntwo\nthree\n" }], {
@@ -474,13 +519,56 @@ describe("assembleTranscript · streamed grok tool-result partials", () => {
     });
     const base = [callMutation(1, 1, "open", "proposed"), callClose(2), exitClose(3, 0)];
     const node = assembleTranscript(base).find((n) => n.type === "tool")!;
-    expect(node.type === "tool" && node.result?.stage).toBe("final");
-    expect(node.type === "tool" && (node.result?.exitCode as { value?: number }).value).toBe(0);
+    expect(node.result?.stage).toBe("final");
+    expect((node.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
     // A thinner re-delivery (no exit code) at the same revision is rejected —
     // the exit-bearing Final survives.
     const withRedelivery = [...base, exitClose(4, undefined)];
     const node2 = assembleTranscript(withRedelivery).find((n) => n.type === "tool")!;
-    expect(node2.type === "tool" && (node2.result?.exitCode as { value?: number }).value).toBe(0);
+    expect((node2.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+  });
+
+  it("applies a call Close arriving after a result Close at the same revision (resolved input)", () => {
+    // Print-stream shape: the input-resolving call Close and the result Close
+    // can share a revision, and the call Close may arrive second. The
+    // same-revision allowance is one Close per track, so it still applies.
+    const exitClose = obs(3, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "unknown", reason: "n/a", evidenceEventIds: [] },
+      exitCode: known(0),
+      changes: [],
+    });
+    const callClose = (seq: number) => obs(seq, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: "Bash",
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "echo resolved" }),
+      inputTextDelta: null,
+      state: "proposed",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+    });
+    // Result Close first, call Close second.
+    const node = assembleTranscript([callMutation(1, 1, "open", "proposed"), exitClose, callClose(4)])
+      .find((n) => n.type === "tool")!;
+    expect((node.call.input as { value?: { command: string } }).value?.command).toBe("echo resolved");
+    expect((node.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+    // A second call Close at the same revision is still rejected (duplicate).
+    const node2 = assembleTranscript([callMutation(11, 1, "open", "proposed"), exitClose, callClose(12), callClose(13)])
+      .find((n) => n.type === "tool")!;
+    expect((node2.call.input as { value?: { command: string } }).value?.command).toBe("echo resolved");
   });
 
   it("rejects an Append that arrives before its base even after a newer frame", () => {
@@ -520,6 +608,96 @@ describe("assembleTranscript · streamed grok tool-result partials", () => {
     const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
     expect(node?.type === "tool" && node.result?.outcome).toBe("succeeded");
     expect(toolText(events)).toBe("/workspace");
+  });
+
+  // A result on a chosen node. The promoted path projects one tool result from
+  // two channels on different nodes with different revisions/facts.
+  const resultOn = (
+    seq: number,
+    nodeId: Id,
+    revision: string,
+    operation: ToolResultPayload["operation"],
+    extra: Partial<ToolResultPayload>,
+  ) =>
+    obs(seq, "tool_result", {
+      nodeId,
+      toolCallId: NODE,
+      revision,
+      baseRevision: null,
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "not-applicable" },
+      exitCode: { state: "not-applicable" },
+      changes: [],
+      ...extra,
+      operation,
+    });
+
+  const exitOf = (events: Observation[]): unknown => {
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    return node?.type === "tool" ? (node.result?.exitCode as { value?: unknown } | undefined)?.value : undefined;
+  };
+  const outcomeOf = (events: Observation[]): string | undefined => {
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    return node?.type === "tool" ? node.result?.outcome : undefined;
+  };
+
+  it("keeps the hook's exit-code Close over a later transcript Open on another node, in either order", () => {
+    // The hook relay closes the result ON THE CALL NODE at revision 2 WITH the
+    // exit code; the transcript pump opens a result on a SEPARATE node at
+    // revision 1 WITHOUT an exit code. The cross-node result floor keeps the
+    // higher-revision exit-bearing result whichever arrives first.
+    const callNode = NODE;
+    const resultNode = "call_42:result" as Id;
+    const hookClose = resultOn(3, callNode, "2", "close", {
+      baseRevision: "1",
+      exitCode: known(0),
+      blocks: [{ type: "text", text: "done" }],
+    });
+    const transcriptOpen = resultOn(4, resultNode, "1", "open", {
+      exitCode: { state: "not-applicable" },
+    });
+    // Hook close first, then the late transcript open.
+    const callEvents = [
+      callMutation(1, 1, "open", "proposed"),
+      callMutation(2, 2, "replace"),
+      hookClose,
+      transcriptOpen,
+    ];
+    expect(exitOf(callEvents)).toBe(0);
+    // Transcript open first (arrives before the hook close): the open stands
+    // provisionally, then the higher-revision close wins.
+    const reversed = [
+      callMutation(11, 1, "open", "proposed"),
+      callMutation(12, 2, "replace"),
+      transcriptOpen,
+      hookClose,
+    ];
+    expect(exitOf(reversed)).toBe(0);
+  });
+
+  it("lets a revision-5 task-notification outrank a revision-4 SubagentStop close, in either order", () => {
+    // Shared-revision convention across channels (live.rs): the SubagentStop
+    // completion closes at rev 4 (succeeded); the transcript
+    // `<task-notification>` is the authoritative status and closes at rev 5
+    // (killed). Killed must win regardless of journal arrival order.
+    const callNode = NODE;
+    const subagentStop = resultOn(3, callNode, "4", "close", {
+      baseRevision: "3",
+      stage: "partial",
+      outcome: "succeeded",
+    });
+    const notification = resultOn(4, "call_42:result" as Id, "5", "close", {
+      baseRevision: "4",
+      outcome: "cancelled",
+      blocks: [{ type: "text", text: "killed" }],
+    });
+    const outcomeOfInner = outcomeOf;
+    expect(outcomeOfInner([callMutation(1, 1, "open", "proposed"), callMutation(2, 2, "replace"), subagentStop, notification]))
+      .toBe("cancelled");
+    expect(outcomeOfInner([callMutation(11, 1, "open", "proposed"), callMutation(12, 2, "replace"), notification, subagentStop]))
+      .toBe("cancelled");
   });
 });
 

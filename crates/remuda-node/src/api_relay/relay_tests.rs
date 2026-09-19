@@ -58,35 +58,66 @@ fn request_with(
 
 // ── wiring ─────────────────────────────────────────────────────────────────
 
+/// Direction a logged frame crossed the Hub-shaped test link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameDir {
+    /// Worker → Hub → proxy (e.g. api.open, api.body, api.cancel from W).
+    WtoH,
+    /// Proxy → Hub → worker (api.head, api.chunk, api.end, response credits).
+    HtoW,
+}
+
+/// One logged frame: its direction, method, and for `api.chunk` the ordering
+/// seq. Direction matters: W credits H for request bytes and H credits W for
+/// response bytes, so a one-list count could never prove the right side sent
+/// them.
+#[derive(Debug, Clone)]
+struct FrameLog {
+    dir: FrameDir,
+    method: String,
+    chunk_seq: Option<u32>,
+}
+
+fn record_frame(log: &Mutex<Vec<FrameLog>>, dir: FrameDir, frame: &Value) {
+    let Some(method) = frame.get("method").and_then(Value::as_str) else {
+        return;
+    };
+    let chunk_seq = (method == METHOD_API_CHUNK)
+        .then(|| {
+            frame
+                .pointer("/params/seq")
+                .and_then(Value::as_u64)
+                .map(|seq| seq as u32)
+        })
+        .flatten();
+    log.lock().unwrap().push(FrameLog {
+        dir,
+        method: method.to_owned(),
+        chunk_seq,
+    });
+}
+
 /// Connect two nodes' brokers the way the Hub would: every outbound frame on
-/// one is fed inbound to the other. `log` records the frame methods.
+/// one is fed inbound to the other. `log` records each frame's direction.
 fn wire_like_hub(
     state_w: &Arc<ApiRelayState>,
     state_h: &Arc<ApiRelayState>,
-    log: Arc<Mutex<Vec<String>>>,
+    log: Arc<Mutex<Vec<FrameLog>>>,
 ) -> (Arc<LinkBroker>, Arc<LinkBroker>, JoinHandle<()>) {
     let (broker_w, mut rx_w) = state_w.attach_link();
     let (broker_h, mut rx_h) = state_h.attach_link();
-    let (w, h, log) = (
-        Arc::clone(&broker_w),
-        Arc::clone(&broker_h),
-        Arc::clone(&log),
-    );
+    let (w, h) = (Arc::clone(&broker_w), Arc::clone(&broker_h));
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
                 frame = rx_w.recv() => {
                     let Some(frame) = frame else { break };
-                    if let Some(method) = frame.get("method").and_then(Value::as_str) {
-                        log.lock().unwrap().push(method.to_owned());
-                    }
+                    record_frame(&log, FrameDir::WtoH, &frame);
                     h.handle_frame(&frame).await;
                 }
                 frame = rx_h.recv() => {
                     let Some(frame) = frame else { break };
-                    if let Some(method) = frame.get("method").and_then(Value::as_str) {
-                        log.lock().unwrap().push(method.to_owned());
-                    }
+                    record_frame(&log, FrameDir::HtoW, &frame);
                     w.handle_frame(&frame).await;
                 }
             }
@@ -129,7 +160,7 @@ async fn hub_relay_fixture(
     Arc<ApiRelayState>,
     Arc<ApiRelayState>,
     FakeGateway,
-    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<FrameLog>>>,
     String,
     String,
 ) {
@@ -322,15 +353,41 @@ async fn hub_relay_streams_sse_with_credential_swap_in_order() {
     );
 
     let frames = log.lock().unwrap();
-    assert!(frames.iter().any(|m| m == METHOD_API_OPEN));
-    assert!(frames.iter().any(|m| m == METHOD_API_HEAD));
-    assert!(frames.iter().any(|m| m == METHOD_API_END));
+    assert!(frames.iter().any(|f| f.method == METHOD_API_OPEN));
+    assert!(frames.iter().any(|f| f.method == METHOD_API_HEAD));
+    assert!(frames.iter().any(|f| f.method == METHOD_API_END));
     // The default script is a few hundred bytes under the 16 KiB threshold;
     // at least one body chunk must still flow.
-    let chunks = frames.iter().filter(|m| **m == METHOD_API_CHUNK).count();
+    let chunks = frames
+        .iter()
+        .filter(|f| f.method == METHOD_API_CHUNK)
+        .count();
     assert!(chunks >= 1, "a coalesced SSE body rode api.chunk");
-    let credits = frames.iter().filter(|m| **m == METHOD_API_CREDIT).count();
-    assert!(credits >= chunks, "every chunk is drained and credited");
+    // Credits the W side returns for drained *response* chunks travel H←W;
+    // count that direction explicitly.
+    let credits = frames
+        .iter()
+        .filter(|f| f.dir == FrameDir::WtoH && f.method == METHOD_API_CREDIT)
+        .count();
+    assert!(
+        credits >= chunks,
+        "every response chunk is drained and credited"
+    );
+
+    // The seq on api.chunk is the Hub's ordering key: strictly increasing
+    // from zero with no repeats — the tail flush and the zero-byte last chunk
+    // included (a regression reused the tail's seq for the terminator).
+    let seqs: Vec<u32> = frames.iter().filter_map(|f| f.chunk_seq).collect();
+    assert_eq!(
+        *seqs.first().unwrap_or(&u32::MAX),
+        0,
+        "seqs start at 0: {seqs:?}"
+    );
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "api.chunk seqs must be contiguous and strictly increasing: {seqs:?}"
+    );
+    assert_eq!(seqs.len(), chunks, "every chunk carries one seq");
 }
 
 #[tokio::test]
@@ -350,11 +407,16 @@ async fn client_disconnect_sends_api_cancel() {
     let _first = stream.next().await;
     drop(stream); // client goes away mid-response
 
-    // The drive task must have sent api.cancel toward H.
+    // The drive task must have sent api.cancel toward H (W→H direction).
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if log.lock().unwrap().iter().any(|m| m == METHOD_API_CANCEL) {
+            let sent = log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|f| f.dir == FrameDir::WtoH && f.method == METHOD_API_CANCEL);
+            if sent {
                 return;
             }
         }
@@ -562,21 +624,35 @@ async fn request_body_larger_than_one_chunk_streams_to_gateway() {
         "the gateway got every request byte"
     );
     let frames = log.lock().unwrap();
+    // Request bytes ride W→H only.
     let body_frames = frames
         .iter()
-        .filter(|m| **m == remuda_protocol::hubnode::METHOD_API_BODY)
+        .filter(|f| {
+            f.dir == FrameDir::WtoH && f.method == remuda_protocol::hubnode::METHOD_API_BODY
+        })
         .count();
     assert!(
         body_frames > 4,
         "a ~1 MiB body rode more than the initial window of api.body frames"
     );
     assert!(
-        frames
+        !frames
             .iter()
-            .filter(|m| **m == remuda_protocol::hubnode::METHOD_API_CREDIT)
-            .count()
-            >= body_frames - 1,
-        "H credits each drained request-body chunk"
+            .any(|f| f.dir == FrameDir::HtoW
+                && f.method == remuda_protocol::hubnode::METHOD_API_BODY),
+        "api.body never travels H→W"
+    );
+    // The credits that pace an *upload* travel H→W, one per drained chunk —
+    // asserted by direction so response credits could not inflate the count.
+    let upload_credits = frames
+        .iter()
+        .filter(|f| {
+            f.dir == FrameDir::HtoW && f.method == remuda_protocol::hubnode::METHOD_API_CREDIT
+        })
+        .count();
+    assert!(
+        upload_credits >= body_frames - 1,
+        "H credits each drained request-body chunk (H→W): {upload_credits} vs {body_frames}"
     );
 }
 
@@ -1276,11 +1352,17 @@ async fn delayed_credits_keep_a_long_response_clean_to_its_last_chunk() {
     pump.abort();
 
     assert!(end.error.is_none(), "clean terminal end: {:?}", end.error);
-    assert!(chunks > 12, "many windows drained with delayed credits: {chunks}");
+    assert!(
+        chunks > 12,
+        "many windows drained with delayed credits: {chunks}"
+    );
     assert!(
         elapsed < Duration::from_secs(3),
         "ended well inside the 5 s hard cap (took {elapsed:?})"
     );
     // The zero-byte last chunk is present exactly once at the final seq.
-    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "seqs: {seqs:?}");
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "seqs: {seqs:?}"
+    );
 }

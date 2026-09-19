@@ -29,7 +29,7 @@ pub enum EnvAllowlistSource {
     Capability,
 }
 
-/// One env name that spawn may inject. Values never appear here.
+/// One env name that spawn may inject. Secret values never appear here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvAllowlistEntry {
@@ -37,9 +37,15 @@ pub struct EnvAllowlistEntry {
     pub name: String,
     /// How the value will be obtained at spawn.
     pub source: EnvAllowlistSource,
-    /// Secret or credential reference, if any.
+    /// Secret or credential *reference* (never a value), only for
+    /// [`EnvAllowlistSource::Credential`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
+    /// Driver-computed non-secret literal, e.g. the `1` on the D-045
+    /// capability handshake. Kept apart from [`Self::secret_ref`] so a granted
+    /// handshake is never audited as a credential reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// Role of a file the materializer wrote.

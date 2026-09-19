@@ -775,7 +775,7 @@ fn scrub_env(
             continue;
         }
         if entry.source == crate::recipe::EnvAllowlistSource::Capability {
-            if let Some(value) = entry.secret_ref.as_deref() {
+            if let Some(value) = entry.value.as_deref() {
                 command.env(&entry.name, value);
             }
             continue;

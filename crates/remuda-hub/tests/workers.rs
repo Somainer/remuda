@@ -762,6 +762,61 @@ async fn dispatch_refuses_computer_use_for_every_harness_without_downgrading() {
 }
 
 #[tokio::test]
+async fn instance_create_refuses_codex_unattended_spellings_with_computer_use() {
+    // D-045 Q4 at the create endpoint: the Hub gate must understand codex's
+    // auto-approve spellings (never / no-request), not only claude's
+    // bypassPermissions, and refuse before persistence.
+    let ctx = Ctx::spawn().await.unwrap();
+    for (kind, mode) in [
+        ("claude", "bypassPermissions"),
+        ("codex", "never"),
+        ("codex", "no-request"),
+    ] {
+        let body = json!({
+            "hostId": ctx.host,
+            "kind": kind,
+            "driver": "shell-pty",
+            "permissionMode": mode,
+            "capabilities": ["computer-use"],
+            "prompt": "drive",
+        });
+        let (status, response) = ctx.request("POST", "/v1/instances", Some(body)).await;
+        assert_eq!(
+            status, 400,
+            "kind={kind} mode={mode} must be refused: {response}"
+        );
+        let message = response["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unattended") && message.contains(kind),
+            "must name both the condition and the harness ({kind}/{mode}): {message}"
+        );
+    }
+
+    // A non-unattended codex spelling passes the Q4 gate and reaches the host
+    // preflight (which fails only because the fake node reports no row here).
+    let body = json!({
+        "hostId": ctx.host,
+        "kind": "codex",
+        "driver": "shell-pty",
+        "permissionMode": "on-request",
+        "capabilities": ["computer-use"],
+        "prompt": "drive",
+    });
+    let (status, response) = ctx.request("POST", "/v1/instances", Some(body)).await;
+    assert_eq!(
+        status, 400,
+        "expected the host preflight refusal, not success: {response}"
+    );
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not reported"),
+        "should reach the host-capability gate: {response}"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_rejects_unknown_capability_value() {
     let ctx = Ctx::spawn().await.unwrap();
     let project = ctx.create_project(&["58970-58999"]).await;

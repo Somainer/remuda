@@ -26,8 +26,7 @@ pub mod user;
 pub use overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
 pub use session::{HookSession, HookSessionOptions};
 pub use shadow::{
-    ShadowFile, ShadowHome, ShadowMcpServer, ShadowOptions, materialize_codex,
-    materialize_codex_mcp_servers, materialize_grok,
+    ShadowFile, ShadowHome, ShadowMcpServer, ShadowOptions, materialize_codex, materialize_grok,
 };
 pub use shim::{ShimSet, materialize_shims, shim_disabled};
 pub use user::{

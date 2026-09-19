@@ -411,20 +411,50 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     // Still send hostId when the CLI can resolve it so older Hubs that require
     // the field keep working; otherwise Hub pick_hosts runs.
     //
-    // A transport error is fatal: silently skipping would skip the D-045
-    // preflight, so list failures propagate instead of defaulting to empty.
-    let hosts = client.list_hosts().await?;
+    // GET /v1/hosts is operator-only: an agent-origin caller (the MCP
+    // `remuda_instance_create` tool with an instance token) gets 403. Listing
+    // is therefore *lazy*: an explicit `--host` needs no list at all, and
+    // label/any placement stays best-effort. Only the computer-use path needs
+    // the list, and only there may a listing failure refuse the launch
+    // (D-045 host preflight must not be silently skipped).
+    let computer_use = super::capability::requests_computer_use(&opts.capabilities);
+    let needs_host_list = computer_use || (!opts.labels.is_empty()) || opts.host.is_none();
+    let hosts = if needs_host_list {
+        match client.list_hosts().await {
+            Ok(hosts) => Some(hosts),
+            Err(error) if computer_use => {
+                // The grant's host preflight cannot be skipped on a transport
+                // error; refuse with the error rather than proceeding.
+                bail!("computer-use host preflight failed: {error}");
+            }
+            Err(error) => {
+                // Agent tokens and transient failures: placement still works
+                // when --host is explicit; label/any placement simply lets the
+                // Hub resolve.
+                eprintln!(
+                    "warning: host listing unavailable ({error}); letting the Hub resolve placement"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(host) = &opts.host {
         body["hostId"] = json!(host);
         body["placement"] = json!({ "host": host });
     } else if !opts.labels.is_empty() {
         body["placement"] = json!({ "labels": opts.labels });
-        if let Ok(host_id) = pick_host(&hosts, &opts.labels) {
+        if let Some(hosts) = &hosts
+            && let Ok(host_id) = pick_host(hosts, &opts.labels)
+        {
             body["hostId"] = json!(host_id);
         }
     } else {
         body["placement"] = json!({ "kind": "any" });
-        if let Ok(host_id) = pick_host(&hosts, &[]) {
+        if let Some(hosts) = &hosts
+            && let Ok(host_id) = pick_host(hosts, &[])
+        {
             body["hostId"] = json!(host_id);
         }
     }
@@ -433,7 +463,13 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     // whose Node reports the capability installed. Fail loud, never silently
     // skip: no resolved host, an unreported host id, or a failed check each
     // refuse with a retry direction. The Hub re-checks after placement too.
-    if super::capability::requests_computer_use(&opts.capabilities) {
+    if computer_use {
+        let Some(hosts) = &hosts else {
+            bail!(
+                "computer-use host preflight could not read the Hub's host inventory; \
+                 pick a Mac explicitly with --host"
+            );
+        };
         let Some(host_id) = body.get("hostId").and_then(Value::as_str) else {
             bail!(
                 "computer-use needs an explicit, resolvable target host: no host was selected \

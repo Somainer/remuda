@@ -535,7 +535,7 @@ impl ClaudePrintDriver {
                     }
                 }
                 EnvAllowlistSource::Capability => {
-                    if let Some(value) = entry.secret_ref.as_deref() {
+                    if let Some(value) = entry.value.as_deref() {
                         env.insert(entry.name.clone(), value.to_owned());
                     }
                 }

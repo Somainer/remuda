@@ -1036,16 +1036,30 @@ pub async fn create_instance(
             .iter()
             .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
         {
-            if matches!(
-                body.permission_mode.as_deref(),
-                Some("bypassPermissions" | "bypass")
-            ) {
-                return Err(HubError::BadRequest(
-                    "refusing \"computer-use\" together with bypassPermissions on the same \
-                     launch: unattended desktop control plus skipped tool approvals has no \
-                     recovery path; remove one of the two"
-                        .into(),
-                ));
+            // D-045 Q4, harness-agnostic: refuse unattended desktop control.
+            // Each harness names its own auto-approve spelling so the message
+            // names both (the Node driver gate is the final boundary).
+            let unattended = match body.kind.as_str() {
+                "claude" => matches!(
+                    body.permission_mode.as_deref(),
+                    Some("bypassPermissions" | "bypass")
+                ),
+                "codex" => matches!(
+                    body.permission_mode.as_deref(),
+                    // Codex auto-approves every action with `never` (CLI
+                    // `--ask-for-approval never`; legacy `no-request`).
+                    Some("never" | "no-request")
+                ),
+                _ => false,
+            };
+            if unattended {
+                return Err(HubError::BadRequest(format!(
+                    "refusing \"computer-use\" together with unattended/skipped tool approvals \
+                     on the same {:?} launch (permissionMode {:?}): desktop control plus \
+                     auto-approved actions has no recovery path; remove one of the two",
+                    body.kind,
+                    body.permission_mode.as_deref().unwrap_or("-")
+                )));
             }
             if !matches!(body.kind.as_str(), "claude" | "codex") {
                 return Err(HubError::BadRequest(format!(

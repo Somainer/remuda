@@ -446,6 +446,8 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
     );
     // The server entry carries the operator's REAL codex home (launcher-only),
     // never the shadow home the agent itself gets — the vendor app lives there.
+    // Assert only ambient-env-independent properties: absolute, distinct from
+    // the per-instance shadow/launch dirs.
     let real_home = server
         .env
         .iter()
@@ -453,8 +455,17 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
         .map(|(_, value)| value.as_str())
         .expect("MCP server entry must carry the real codex home");
     assert!(
-        real_home.ends_with(".codex"),
-        "real home should resolve to $HOME/.codex here: {real_home}"
+        Path::new(real_home).is_absolute(),
+        "real codex home must be absolute: {real_home}"
+    );
+    assert_ne!(
+        real_home,
+        dirs.launch.to_string_lossy().as_ref(),
+        "real home must not be the per-instance launch dir"
+    );
+    assert!(
+        !real_home.starts_with(&dirs.launch.to_string_lossy().to_string()),
+        "real home must not be inside the shadow launch dir"
     );
     // The agent-facing handshake allowlist never carries the real home.
     assert!(
@@ -464,10 +475,24 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
             .any(|entry| entry.name == "REMUDA_CODEX_HOME")
     );
 
-    // The shadow materializer splices the same server into config.toml and
-    // keeps [features] / [hooks.state] intact.
+    // The materializer writes NO codex shadow config itself on shell-pty:
+    // delivery is the real shell-pty HookSession's job (it calls
+    // materialize_codex on this exact launch dir). The shell-pty recipe DOES
+    // pin CODEX_HOME (per-kind preset home_env) at the real shadow path.
+    assert!(
+        !dirs.launch.join("codex-home").exists(),
+        "shell-pty recipe must not pre-write the codex shadow home"
+    );
+    assert!(
+        recipe
+            .env_allowlist
+            .iter()
+            .any(|entry| entry.name == "CODEX_HOME"
+                && entry.source == remuda_driver::EnvAllowlistSource::NativeHome),
+        "shell-pty recipe pins CODEX_HOME at the shadow home the HookSession writes"
+    );
     let shadow = remuda_driver::launch::materialize_codex(&remuda_driver::launch::ShadowOptions {
-        launch_dir: &dirs.launch.join("shadow-check"),
+        launch_dir: &dirs.launch,
         relay_binary: Path::new("/opt/remuda/bin/remuda"),
         socket_path: &dirs.root.path().join("hook.sock"),
         mcp_servers: &[remuda_driver::launch::ShadowMcpServer {
@@ -478,6 +503,12 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
         }],
     })
     .unwrap();
+    // Exactly the real shell-pty path the child CODEX_HOME points at.
+    assert_eq!(
+        shadow.home,
+        dirs.launch.join("codex-home"),
+        "HookSession shadow home must be <launch_dir>/codex-home"
+    );
     let toml_text = fs::read_to_string(shadow.home.join("config.toml")).unwrap();
     let parsed: toml::Value = toml_text.parse().unwrap();
     assert_eq!(parsed["features"]["hooks"].as_bool(), Some(true));
@@ -489,56 +520,47 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
         parsed["mcp_servers"]["codex-computer-use"]["env"][ENV_NAME].as_str(),
         Some("1")
     );
-    assert_eq!(
-        parsed["mcp_servers"]["codex-computer-use"]["env"]["REMUDA_CODEX_HOME"]
-            .as_str()
-            .map(|value| value.ends_with(".codex")),
-        Some(true)
+    assert!(
+        Path::new(
+            parsed["mcp_servers"]["codex-computer-use"]["env"]["REMUDA_CODEX_HOME"]
+                .as_str()
+                .unwrap()
+        )
+        .is_absolute()
     );
 }
 
 #[test]
-fn granted_codex_on_a_non_shell_carrier_writes_its_own_shadow_config() {
+fn granted_codex_on_a_non_shell_carrier_does_not_write_or_pin_a_partial_shadow_home() {
+    // The Node factory refuses this combination (a partial shadow home would
+    // lose the operator's codex login); the materializer itself must not create
+    // codex-home or pin CODEX_HOME either — the audit must not claim a delivery
+    // the carrier cannot provide.
     let dirs = dirs();
     let binary = stub_binary(dirs.root.path());
     let mut spec = load_spec();
     spec.kind = AgentKind::Codex;
-    // generic-pty, unlike shell-pty, has no HookSession: the materializer must
-    // deliver the codex `config.toml` itself (D-045 §3.3).
     spec.driver = DriverKind::GenericPty;
     grant(&mut spec);
 
     let recipe = materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary)).unwrap();
-
-    let config = dirs.launch.join("codex-home/config.toml");
-    assert!(config.is_file(), "codex shadow config must be materialized");
-    let parsed: toml::Value = fs::read_to_string(&config).unwrap().parse().unwrap();
-    assert_eq!(
-        parsed["mcp_servers"]["codex-computer-use"]["command"].as_str(),
-        Some("/bin/sh")
-    );
-    assert_eq!(
-        parsed["mcp_servers"]["codex-computer-use"]["env"][ENV_NAME].as_str(),
-        Some("1")
+    assert!(
+        !dirs.launch.join("codex-home").exists(),
+        "no partial codex shadow home may be written on non-shell-pty"
     );
     assert!(
-        recipe
+        !recipe
             .materialized_files
             .iter()
-            .any(|file| file.path.ends_with("codex-home/config.toml")
-                && file.role == FileRole::CapabilityMcpConfig),
-        "the shadow config is in the launch audit"
+            .any(|file| file.path.contains("codex-home")),
+        "the audit must not claim a shadow-config delivery"
     );
-    // The shadow home must be pinned as CODEX_HOME so the codex binary reads
-    // that config (generic-pty has no hook session to do it for it).
     assert!(
-        recipe
+        !recipe
             .env_allowlist
             .iter()
-            .any(|entry| entry.name == "CODEX_HOME"
-                && entry.source == remuda_driver::EnvAllowlistSource::NativeHome),
-        "CODEX_HOME must pin the shadow home: {:?}",
-        recipe.env_allowlist
+            .any(|entry| entry.name == "CODEX_HOME"),
+        "no CODEX_HOME pin to a partial shadow home"
     );
 }
 
@@ -709,14 +731,34 @@ fn recipe_json_records_the_grant_without_secret_shaped_values() {
     let json = serde_json::to_string(&recipe).unwrap();
     assert!(json.contains("computer-use"));
     assert!(json.contains("--mcp-config"));
-    // The handshake value is not secret, but it rides as a name on the
-    // allowlist, never as an inline env value on the recipe.
+    // The handshake rides a dedicated non-secret `value`, never `secretRef`:
+    // no credential reference named `1` may appear in the audit or the JSON.
+    assert!(
+        !json.contains("secretRef"),
+        "a no-credential grant must serialize no secretRef fields: {json}"
+    );
+    assert!(
+        json.contains("\"value\":\"1\""),
+        "handshake rides value slot"
+    );
+    // No credential references for a launch without provider credentials.
+    assert!(
+        recipe.audit.credential_refs.is_empty(),
+        "capability handshake must not be harvested into credential_refs: {:?}",
+        recipe.audit.credential_refs
+    );
+    // Round-trip and inspect the Capability entry specifically.
     let audit = serde_json::from_str::<LaunchRecipe>(&json).unwrap();
     assert_eq!(audit.capabilities, vec!["computer-use"]);
-    assert!(
-        audit
-            .env_allowlist
-            .iter()
-            .any(|entry| entry.name == ENV_NAME)
+    let handshake = audit
+        .env_allowlist
+        .iter()
+        .find(|entry| entry.name == ENV_NAME)
+        .expect("handshake entry present");
+    assert_eq!(handshake.secret_ref, None, "no secretRef on the handshake");
+    assert_eq!(
+        handshake.value.as_deref(),
+        Some("1"),
+        "non-secret value carries the handshake"
     );
 }

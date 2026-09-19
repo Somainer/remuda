@@ -57,7 +57,13 @@ async function openEffort(page: Page) {
 async function assertRequestedEffortUnknown(page: Page, name: string) {
   await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", name);
   const chip = page.getByTestId("model-effort-chip");
-  await expect(chip).toHaveAttribute("aria-label", `Select effort, ${name}; effective unknown`);
+  // D-042: the mobile collapsed trigger prefixes the permission word
+  // (`询问 · Select effort, …`); match the suffix so the helper works under
+  // both chromium and mobile-webkit projects.
+  await expect(chip).toHaveAttribute(
+    "aria-label",
+    new RegExp(`Select effort, ${name}; effective unknown$`),
+  );
   await expect(chip).toHaveAttribute("data-effort-effective", "unknown");
   await expect(chip).toHaveAttribute("data-effort-source", "unknown");
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");

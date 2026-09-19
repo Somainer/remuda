@@ -5,11 +5,9 @@
 use clap::Args;
 use serde_json::Value;
 
+use super::capability::COMPUTER_USE;
 use super::hub_client::{HubOpts, block_on, print_json};
 use super::registry::Entrypoint;
-
-/// `cli[]` kind the Computer Use presence row carries.
-const COMPUTER_USE_KIND: &str = "computer-use";
 
 /// `remuda hostcap` arguments.
 #[derive(Args)]
@@ -32,12 +30,35 @@ impl Entrypoint for HostcapArgs {
             // `/hostcap` is the placement arithmetic, the host row carries
             // `cli[]`. The capability row belongs to the second, so it is
             // attached here rather than by widening the capacity endpoint.
-            if let Ok(host) = client.get(&format!("/v1/hosts/{}", self.host)).await {
-                value["computerUse"] = computer_use_row(&host);
-            }
+            //
+            // A failed *second* read must not leave the key absent: a consumer
+            // reading `null` cannot tell "the host does not report this" from
+            // "remuda could not ask", and those call for different operator
+            // action. So the error becomes an explicit, reported state carrying
+            // its text, and the capacity payload — already fetched — still
+            // prints.
+            value["computerUse"] = capability_state(
+                client.get(&format!("/v1/hosts/{}", self.host)).await,
+            );
             print_json(&value)?;
             Ok(0)
         })
+    }
+}
+
+/// The capability block for `remuda hostcap`, from the host-row read.
+///
+/// Split out so the failure path is testable: a dropped error would leave the
+/// key absent, and a consumer reading `null` cannot tell "the host does not
+/// report this capability" from "remuda could not ask the Hub" — two states
+/// that call for different operator action.
+fn capability_state(host: Result<Value, impl std::fmt::Display>) -> Value {
+    match host {
+        Ok(host) => computer_use_row(&host),
+        Err(error) => serde_json::json!({
+            "reported": false,
+            "error": error.to_string(),
+        }),
     }
 }
 
@@ -51,7 +72,7 @@ fn computer_use_row(host: &Value) -> Value {
     let row = host
         .get("cli")
         .and_then(Value::as_array)
-        .and_then(|cli| cli.iter().find(|row| row["kind"] == COMPUTER_USE_KIND));
+        .and_then(|cli| cli.iter().find(|row| row["kind"] == COMPUTER_USE));
     match row {
         Some(row) => serde_json::json!({
             "installed": row["installed"].as_bool().unwrap_or(false),
@@ -116,5 +137,28 @@ mod tests {
 
         let no_cli = json!({});
         assert_eq!(computer_use_row(&no_cli)["reported"], false);
+    }
+
+    /// A failed host-row read must say so, not vanish into a missing key.
+    #[test]
+    fn a_failed_host_read_reports_the_error_instead_of_dropping_the_key() {
+        let state = capability_state(Err::<Value, _>("hub timed out"));
+        assert_eq!(state["reported"], false);
+        assert_eq!(
+            state["error"], "hub timed out",
+            "the operator needs the reason, not a bare null: {state}"
+        );
+        assert!(
+            state.get("installed").is_none(),
+            "a read failure claims nothing about the host: {state}"
+        );
+
+        // ...and a successful read still produces the ordinary row.
+        let ok = capability_state(Ok::<Value, String>(json!({
+            "cli": [{"kind": "computer-use", "installed": true, "auth": "unknown"}]
+        })));
+        assert_eq!(ok["reported"], true);
+        assert_eq!(ok["installed"], true);
+        assert!(ok.get("error").is_none(), "{ok}");
     }
 }

@@ -664,7 +664,7 @@ mod tests {
         assert!(path_byte_len(&bound) <= SUN_PATH_LIMIT);
         // A TMPDIR other than /tmp adds a distinct fallback ahead of the
         // fixed root.
-        if std::env::temp_dir() != PathBuf::from("/tmp") {
+        if std::env::temp_dir() != *Path::new("/tmp") {
             assert!(candidates.len() >= 2, "{candidates:?}");
         }
     }

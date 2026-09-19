@@ -33,7 +33,7 @@ use crate::NodeError;
 use bytes::Bytes;
 use remuda_protocol::hubnode::{
     ApiBodyParams, ApiCancelParams, ApiChunkParams, ApiCreditParams, ApiEndError, ApiEndParams,
-    ApiHeadParams, ApiOpenParams, METHOD_API_BODY, METHOD_API_CANCEL, METHOD_API_CHUNK,
+    ApiHeadParams, ApiHeader, ApiOpenParams, METHOD_API_BODY, METHOD_API_CANCEL, METHOD_API_CHUNK,
     METHOD_API_CREDIT, METHOD_API_END, METHOD_API_HEAD, METHOD_API_OPEN,
 };
 use serde::Serialize;
@@ -43,9 +43,73 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Semaphore, mpsc};
 
-/// Live `api.*` streams allowed per link (§7.6 default).
-const MAX_LINK_STREAMS: usize = 8;
-/// Live relay streams allowed per instance (§7.6 default).
+// ── api.egress (Hub→Node credential handoff) ───────────────────────────────
+//
+// The c-apiroute-hub branch adds these to `remuda-protocol::hubnode.rs`:
+// `METHOD_API_EGRESS` and `ApiEgressParams`, sent to the proxy host when the
+// route is decided at launch and again after reconnect, with `revoke: true`
+// on instance exit. They are defined locally here under the exact wire names
+// so adopting the protocol types on merge is mechanical; delete this block
+// once that branch lands. Credentials ride *only* this notification — never
+// `api.open` — stay in memory, and render redacted in Debug.
+
+/// Hub→Node notification: install (or revoke) one instance's egress context.
+pub(crate) const METHOD_API_EGRESS: &str = "api.egress";
+
+/// `api.egress` params, mirroring the hub-branch `hubnode` struct by the same
+/// name. `Debug` is hand-written to keep `authToken` out of logs.
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiEgressParams {
+    /// Instance whose gateway traffic this Node proxies.
+    pub instance_id: String,
+    /// Profile the gateway credential belongs to.
+    #[serde(default)]
+    pub profile_id: String,
+    /// Pinned gateway base URL, e.g. `https://gateway.example/v1`. Carried on
+    /// install; a revoke frame omits it.
+    #[serde(default)]
+    pub base_url: String,
+    /// Extra profile headers installed on every gateway request.
+    #[serde(default)]
+    pub headers: Vec<ApiHeader>,
+    /// Bearer gateway credential; `None` installs a context that adds no
+    /// credential of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// `true` removes the context and ends the instance's live streams.
+    #[serde(default)]
+    pub revoke: bool,
+}
+
+impl std::fmt::Debug for ApiEgressParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiEgressParams")
+            .field("instance_id", &self.instance_id)
+            .field("profile_id", &self.profile_id)
+            .field("base_url", &self.base_url)
+            .field("headers", &self.headers)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("revoke", &self.revoke)
+            .finish()
+    }
+}
+
+/// Whether an inbound notification method belongs to the `api.*` relay
+/// demux. Includes [`METHOD_API_EGRESS`], which is defined locally until
+/// the c-apiroute-hub protocol branch lands (its `HubNodeMethod` variant
+/// then makes the parse arm match and the literal check becomes dead).
+pub(crate) fn is_api_method(method: &str) -> bool {
+    remuda_protocol::hubnode::HubNodeMethod::parse(method).is_some_and(|kind| kind.is_api())
+        || method == METHOD_API_EGRESS
+}
+
+/// Live relay streams allowed per instance (§7.6 default; clamped to the
+/// negotiated per-link limit).
 const MAX_INSTANCE_STREAMS: usize = 2;
 /// Initial producer window, in chunks: at most this many chunks may be
 /// unacknowledged on one stream before the producer stalls for `api.credit`.
@@ -60,6 +124,27 @@ const STREAM_EVENT_CAPACITY: usize = 32;
 
 /// Hard lifetime of one relayed stream (§7.6): 30 minutes.
 pub(crate) const STREAM_HARD_CAP: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Negotiated D-048 relay limits for the current Hub link, read from the
+/// hello (`§7.4` `limits.maxApiStreams` / `limits.apiChunkBytes`). Defaults
+/// match the protocol defaults; a Hub that lowers either value is honoured so
+/// it never receives more live streams or larger chunks than it advertised.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelayLimits {
+    /// Raw bytes coalesced into one `api.chunk` / carried by one `api.body`.
+    pub(crate) chunk_bytes: usize,
+    /// Live `api.*` streams allowed on the link.
+    pub(crate) max_link_streams: usize,
+}
+
+impl RelayLimits {
+    fn from_hello() -> Self {
+        Self {
+            chunk_bytes: remuda_protocol::default_api_chunk_bytes() as usize,
+            max_link_streams: remuda_protocol::default_max_api_streams() as usize,
+        }
+    }
+}
 
 /// One demuxed `api.*` frame addressed to a stream owner.
 ///
@@ -123,6 +208,18 @@ impl std::fmt::Debug for Outbox {
     }
 }
 
+/// Why a gated send did not complete. The caller maps this to its own stream
+/// error code rather than guessing from a rendered message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatedSendError {
+    /// The stream's cancellation notify fired while waiting for a permit.
+    Cancelled,
+    /// The stream hard cap elapsed while waiting for a permit.
+    HardCap,
+    /// The carrier channel rejected the frame (link lost).
+    LinkLost,
+}
+
 impl Outbox {
     /// Stream this outbox addresses.
     #[must_use]
@@ -147,18 +244,30 @@ impl Outbox {
     /// Send one data chunk, consuming one credit permit. The permit is
     /// forgotten rather than dropped, because it represents the consumer's
     /// budget and is only returned through an inbound `api.credit`.
+    ///
+    /// The acquire is raced against the stream's cancellation notify and its
+    /// hard deadline: a consumer that stops acknowledging (or a link drop the
+    /// router notices) must end the send promptly, not park the producer past
+    /// the hard cap holding the upstream gateway connection.
     pub(crate) async fn send_gated<T: Serialize>(
         &self,
         method: &str,
         params: &T,
-    ) -> Result<(), NodeError> {
-        let permit = self
-            .window
-            .acquire()
-            .await
-            .expect("credit window semaphore is never closed");
-        permit.forget();
-        self.send_notification(method, params).await
+        cancelled: &tokio::sync::Notify,
+        hard_deadline: tokio::time::Instant,
+    ) -> Result<(), GatedSendError> {
+        tokio::select! {
+            acquired = self.window.acquire() => {
+                acquired
+                    .expect("credit window semaphore is never closed")
+                    .forget();
+                self.send_notification(method, params)
+                    .await
+                    .map_err(|_| GatedSendError::LinkLost)
+            }
+            _ = cancelled.notified() => Err(GatedSendError::Cancelled),
+            _ = tokio::time::sleep_until(hard_deadline) => Err(GatedSendError::HardCap),
+        }
     }
 
     /// Return `chunks` permits after the consumer drained them.
@@ -221,18 +330,23 @@ impl LinkBroker {
                 .streams
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
+            // The Hub-advertised link cap governs the table; the two-per-
+            // instance default is additionally clamped down to it (a Hub that
+            // lowers the link limit cannot be pushed past it per instance).
+            let link_cap = self.state.max_link_streams();
+            let instance_cap = MAX_INSTANCE_STREAMS.min(link_cap);
             let mut for_instance = 0usize;
             for slot in streams.values() {
                 if slot.instance_id == instance_id {
                     for_instance += 1;
                 }
             }
-            if for_instance >= MAX_INSTANCE_STREAMS {
+            if for_instance >= instance_cap {
                 return Err(NodeError::InvalidRequest(
                     "api relay instance stream limit reached".into(),
                 ));
             }
-            if streams.len() >= MAX_LINK_STREAMS {
+            if streams.len() >= link_cap {
                 return Err(NodeError::InvalidRequest(
                     "api relay link stream limit reached".into(),
                 ));
@@ -276,16 +390,18 @@ impl LinkBroker {
                 .streams
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            if streams.len() >= MAX_LINK_STREAMS || streams.contains_key(&open.stream_id) {
+            let link_cap = self.state.max_link_streams();
+            if streams.len() >= link_cap || streams.contains_key(&open.stream_id) {
                 return None;
             }
             // Defense in depth on H too: the Hub is supposed to cap at two
             // streams per instance, but a proxy Node must not rely on that.
+            let instance_cap = MAX_INSTANCE_STREAMS.min(link_cap);
             let for_instance = streams
                 .values()
                 .filter(|slot| slot.instance_id == open.instance_id)
                 .count();
-            if for_instance >= MAX_INSTANCE_STREAMS {
+            if for_instance >= instance_cap {
                 return None;
             }
             streams.insert(
@@ -337,6 +453,7 @@ impl LinkBroker {
         };
         match method {
             METHOD_API_OPEN => self.handle_open(params),
+            METHOD_API_EGRESS => self.handle_egress(params),
             METHOD_API_BODY => {
                 self.deliver(params, Some(Role::Proxy), |p| {
                     serde_json::from_value(p).ok().map(InboundEvent::Body)
@@ -431,6 +548,22 @@ impl LinkBroker {
         // stopped draining; backing up the read arm is then the correct answer.
         if tx.send(event).await.is_err() {
             tracing::debug!(stream_id, "api stream owner gone; frame ignored");
+        }
+    }
+
+    /// Inbound `api.egress`: install or revoke the per-instance gateway
+    /// context on this proxy host. The credential lives only in memory and is
+    /// rendered redacted everywhere; an `api.open` that arrives before an
+    /// install is refused `destination-refused` by the egress.
+    fn handle_egress(self: &Arc<Self>, params: Value) {
+        let Ok(egress) = serde_json::from_value::<ApiEgressParams>(params) else {
+            tracing::warn!("malformed api.egress; ignored");
+            return;
+        };
+        if egress.revoke {
+            self.state.revoke_egress(&egress.instance_id);
+        } else if let Err(error) = self.state.install_egress(egress) {
+            tracing::warn!(%error, "api.egress install rejected");
         }
     }
 
@@ -531,11 +664,16 @@ pub struct ApiRelayState {
     /// or detach to close that receiver.
     link: RwLock<Option<ActiveLink>>,
     next_link_id: AtomicU64,
-    /// Per-instance listeners that authenticated local requests may enter.
-    instances: Mutex<BTreeMap<String, Arc<listener::RelayInstance>>>,
+    /// Per-instance listeners that authenticated local requests may enter,
+    /// keyed by instance id. One entry per instance — registering a second
+    /// listener for the same id shuts the first down instead of silently
+    /// evicting it (which would orphan its port and bearer).
+    instances: Mutex<BTreeMap<String, Arc<InstanceRelay>>>,
     /// Proxy-side gateway contexts, keyed by instance id, pushed by the Hub
     /// before it routes an `api.open` here and revoked at instance end.
     egress: RwLock<HashMap<String, Arc<egress::EgressContext>>>,
+    /// Negotiated relay limits from the most recent Hub hello.
+    limits: RwLock<RelayLimits>,
     /// Shared direct-net / probe client. Redirects are never followed: a
     /// gateway redirect to another origin must not carry the credential.
     http: reqwest::Client,
@@ -545,6 +683,43 @@ struct ActiveLink {
     id: u64,
     broker: Arc<LinkBroker>,
     sender: mpsc::Sender<Value>,
+}
+
+/// One registered per-instance listener plus the observed route it bound.
+///
+/// The observed route is recorded so an idempotent retried `instance.create`
+/// can echo the *same* route the first attempt took — never `None`, never a
+/// re-decision (D-035). The proxy (H) listener does not participate in that
+/// echo, so its field is `None`.
+pub(crate) struct InstanceRelay {
+    listener: Arc<listener::RelayInstance>,
+    observed: Option<remuda_protocol::ApiRoute>,
+}
+
+impl InstanceRelay {
+    fn overlay(&self) -> RelayOverlay {
+        RelayOverlay {
+            base_url: self.listener.base_url(),
+            bearer: self.listener.bearer_token(),
+        }
+    }
+
+    /// The loopback base URL written into the overlay (tests/probes).
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> String {
+        self.listener.base_url()
+    }
+
+    /// The per-instance relay bearer written into the overlay (tests/probes).
+    #[cfg(test)]
+    pub(crate) fn bearer_token(&self) -> String {
+        self.listener.bearer_token()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_addr(&self) -> std::net::SocketAddr {
+        self.listener.local_addr()
+    }
 }
 
 impl std::fmt::Debug for ApiRelayState {
@@ -569,8 +744,58 @@ impl ApiRelayState {
             next_link_id: AtomicU64::new(1),
             instances: Mutex::new(BTreeMap::new()),
             egress: RwLock::new(HashMap::new()),
+            limits: RwLock::new(RelayLimits::from_hello()),
             http,
         })
+    }
+
+    /// Negotiated raw chunk size for `api.body`/`api.chunk` frames.
+    pub(crate) fn api_chunk_bytes(&self) -> usize {
+        self.limits
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .chunk_bytes
+    }
+
+    /// Negotiated live-stream cap for one link.
+    pub(crate) fn max_link_streams(&self) -> usize {
+        self.limits
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .max_link_streams
+    }
+
+    /// Adopt the relay limits advertised in a Hub `hello` result (or the full
+    /// response frame). Missing or malformed keys leave the defaults in place;
+    /// a zero value is ignored rather than used to shut the relay down.
+    pub fn apply_hello_limits(&self, hello: &Value) {
+        let limits_value = hello.get("result").unwrap_or(hello).get("limits");
+        let Some(limits_value) = limits_value else {
+            return;
+        };
+        let mut next = self
+            .limits
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .to_owned();
+        if let Some(chunk) = limits_value
+            .get("apiChunkBytes")
+            .and_then(Value::as_u64)
+            .filter(|bytes| (1..=1024 * 1024).contains(bytes))
+        {
+            next.chunk_bytes = chunk as usize;
+        }
+        if let Some(streams) = limits_value
+            .get("maxApiStreams")
+            .and_then(Value::as_u64)
+            .filter(|streams| *streams > 0)
+        {
+            next.max_link_streams = streams as usize;
+        }
+        *self
+            .limits
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = next;
     }
 
     /// Attach a carrier session's broker. The returned receiver is drained by
@@ -652,18 +877,31 @@ impl ApiRelayState {
         &self.http
     }
 
-    /// Register a live per-instance listener.
-    pub(crate) fn register_instance(&self, instance: Arc<listener::RelayInstance>) {
-        self.instances
+    /// Register a live per-instance listener. If an entry already exists for
+    /// this instance id it is shut down first: the axum task holds a strong
+    /// `Arc`, so overwriting the map without shutdown would keep the old port
+    /// and bearer alive with no revocation path.
+    pub(crate) fn register_instance(
+        &self,
+        listener: Arc<listener::RelayInstance>,
+        observed: Option<remuda_protocol::ApiRoute>,
+    ) {
+        let mut guard = self
+            .instances
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .insert(instance.instance_id(), instance);
+            .unwrap_or_else(|poison| poison.into_inner());
+        let previous = guard.insert(
+            listener.instance_id(),
+            Arc::new(InstanceRelay { listener, observed }),
+        );
+        drop(guard);
+        if let Some(previous) = previous {
+            previous.listener.shutdown();
+        }
     }
 
-    /// Look up a live instance's listener (authentication/probe use). Kept
-    /// for the task-2 Hub wiring; marked rather than deleted.
-    #[allow(dead_code)]
-    pub(crate) fn instance(&self, instance_id: &str) -> Option<Arc<listener::RelayInstance>> {
+    /// Look up a live instance's relay (retry/idempotency/probe use).
+    pub(crate) fn instance_relay(&self, instance_id: &str) -> Option<Arc<InstanceRelay>> {
         self.instances
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -671,18 +909,94 @@ impl ApiRelayState {
             .cloned()
     }
 
-    /// Proxy side: install the gateway context for an instance the Hub routes
-    /// here. Memory-only; nothing here is ever persisted.
-    ///
-    /// Production wiring arrives with the Hub-side relay session (api-routing
-    /// task 2). It is a public entry point so integration tests can drive the
-    /// egress without a Hub.
+    /// Record the observed route for a freshly bound worker listener, called
+    /// once after a successful provision (the listener is registered first
+    /// with no route, then annotated). Idempotent and ignored for an unknown
+    /// instance.
+    pub(crate) fn set_observed(&self, instance_id: &str, observed: remuda_protocol::ApiRoute) {
+        let mut instances = self
+            .instances
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(entry) = instances.get_mut(instance_id) {
+            // The Arc is shared with the axum task; rebuild it so the
+            // immutable entry's route can change without an interior lock.
+            let listener = Arc::clone(&entry.listener);
+            *entry = Arc::new(InstanceRelay {
+                listener,
+                observed: Some(observed),
+            });
+        }
+    }
+
+    /// The observed route a previous accepted attempt recorded for an instance,
+    /// so an idempotent retried create echoes the same value.
+    pub(crate) fn observed_route(&self, instance_id: &str) -> Option<remuda_protocol::ApiRoute> {
+        self.instances
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(instance_id)
+            .and_then(|entry| entry.observed.clone())
+    }
+
+    /// Proxy side: install a gateway context directly (tests and the
+    /// pre-`api.egress` wiring). Memory-only; nothing here is ever persisted.
+    /// Production installs arrive through [`Self::install_egress`].
     #[allow(dead_code)]
     pub fn set_egress_context(&self, context: Arc<egress::EgressContext>) {
         self.egress
             .write()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(context.instance_id().to_owned(), context);
+    }
+
+    /// Install an egress context from an inbound `api.egress` notification.
+    /// Memory-only; the credential is never persisted or rendered. Sent again
+    /// after every reconnect, so this replaces any prior context for the
+    /// instance.
+    pub(crate) fn install_egress(&self, params: ApiEgressParams) -> Result<(), NodeError> {
+        let ApiEgressParams {
+            instance_id,
+            profile_id: _,
+            base_url,
+            headers,
+            auth_token,
+            revoke: false,
+        } = params
+        else {
+            return Err(NodeError::InvalidRequest(
+                "api.egress install carried revoke=true".into(),
+            ));
+        };
+        let credential = match auth_token {
+            Some(token) => egress::CredentialKind::GatewayBearer(token),
+            None => egress::CredentialKind::None,
+        };
+        let context = egress::EgressContext::new(&instance_id, &base_url, credential)?
+            .with_profile_headers(
+                headers
+                    .into_iter()
+                    .map(|header| (header.name, header.value)),
+            );
+        self.egress
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(instance_id, context);
+        Ok(())
+    }
+
+    /// Revoke an egress context (`api.egress` with `revoke: true`, or instance
+    /// exit on H): drop it from memory and end the instance's live proxy
+    /// streams with a terminal `api.end` so no gateway call outlives the
+    /// credential that authorized it.
+    pub(crate) fn revoke_egress(&self, instance_id: &str) {
+        self.egress
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(instance_id);
+        if let Some(link) = self.active_link() {
+            link.cancel_instance(instance_id);
+        }
     }
 
     /// Look up an instance's proxy gateway context.
@@ -703,21 +1017,16 @@ impl ApiRelayState {
     /// taken, which is sufficient — the bearer is revoked immediately and new
     /// connections are refused.
     pub(crate) fn revoke_instance(&self, instance_id: &str) {
-        let listener = self
+        let relay = self
             .instances
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(instance_id);
-        if let Some(listener) = listener {
-            listener.shutdown();
+        if let Some(relay) = relay {
+            relay.listener.shutdown();
         }
-        self.egress
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(instance_id);
-        if let Some(link) = self.active_link() {
-            link.cancel_instance(instance_id);
-        }
+        // Also drop any proxy-side context and end live streams.
+        self.revoke_egress(instance_id);
     }
 }
 
@@ -772,12 +1081,27 @@ impl Drop for ProvisionGuard {
 /// relay: the loopback listener URL (plus base path) and the per-instance
 /// bearer. These *replace* the gateway base URL and credential for everything
 /// written into the 0600 settings file; the gateway values never reach W.
-#[derive(Debug, Clone)]
+///
+/// Like [`policy::RelayBearer`], the `Debug` impl redacts the bearer: this
+/// struct is embedded in `DriverLaunch`, which is logged through ordinary
+/// derive-Debug paths, so a plaintext derive would copy a credential into
+/// logs.
+#[derive(Clone)]
 pub(crate) struct RelayOverlay {
     /// `http://127.0.0.1:<port>` plus the profile's base path.
     pub base_url: String,
     /// Per-instance relay bearer.
     pub bearer: String,
+}
+
+impl std::fmt::Debug for RelayOverlay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayOverlay")
+            .field("base_url", &self.base_url)
+            .field("bearer", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Split body bytes into wire-sized chunks.
@@ -806,12 +1130,13 @@ mod tests {
 
     #[test]
     fn split_respects_chunk_size_and_order() {
-        let chunks = split_body_chunks(Bytes::from(vec![0u8; 3 * 65_536 + 7]), 65_536);
+        let chunk = remuda_protocol::default_api_chunk_bytes() as usize;
+        let chunks = split_body_chunks(Bytes::from(vec![0u8; 3 * chunk + 7]), chunk);
         assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].len(), 65_536);
+        assert_eq!(chunks[0].len(), chunk);
         assert_eq!(chunks[3].len(), 7);
-        assert!(split_body_chunks(Bytes::new(), 65_536).is_empty());
-        assert_eq!(split_body_chunks(Bytes::from_static(b"x"), 65_536).len(), 1);
+        assert!(split_body_chunks(Bytes::new(), chunk).is_empty());
+        assert_eq!(split_body_chunks(Bytes::from_static(b"x"), chunk).len(), 1);
     }
 }
 

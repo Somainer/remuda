@@ -719,6 +719,11 @@ async fn session_task(
         token = new_token.to_owned();
         config.token = token.clone();
     }
+    // D-048: adopt the Hub-advertised relay limits (maxApiStreams,
+    // apiChunkBytes) before any instance request rides this socket.
+    if let Some(rt) = runtime.as_ref() {
+        rt.node.api_relay().apply_hello_limits(&hello);
+    }
     // D-027: now that the durable host token is known — it is minted by this
     // very hello on first enroll — point the runtime at the Hub's object
     // store. The same credential authenticates this socket and
@@ -1008,9 +1013,7 @@ async fn handle_incoming(
     if frame
         .get("method")
         .and_then(Value::as_str)
-        .is_some_and(|method| {
-            remuda_protocol::hubnode::HubNodeMethod::parse(method).is_some_and(|kind| kind.is_api())
-        })
+        .is_some_and(crate::api_relay::is_api_method)
     {
         if let Some(broker) = api_broker
             && broker.handle_frame(&frame).await

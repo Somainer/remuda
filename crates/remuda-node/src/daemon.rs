@@ -589,9 +589,8 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 // D-048: api.* notifications route to the relay stream table.
                 if frame
                     .get("method")
-                    .and_then(Value::as_str)
-                    .and_then(remuda_protocol::hubnode::HubNodeMethod::parse)
-                    .is_some_and(|method| method.is_api())
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(crate::api_relay::is_api_method)
                 {
                     api_broker.handle_frame(&frame).await;
                     continue;
@@ -603,6 +602,8 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                             enroll::persist_host_token(&opts.data_dir,token)?;
                         }
                         hubnode::persist_hello_result(&opts.data_dir, &frame)?;
+                        // D-048: adopt the Hub-advertised relay limits.
+                        node.api_relay().apply_hello_limits(&frame);
                         sent = resume_watermarks(node, result)?;
                         *shared.acked.lock().await = sent.clone();
                         ready = true;

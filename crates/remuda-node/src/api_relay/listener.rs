@@ -46,10 +46,6 @@ const DIRECT_TTFT: Duration = Duration::from_secs(60);
 const DIRECT_IDLE: Duration = Duration::from_secs(120);
 /// Largest request body the listener will buffer or stream through.
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
-/// Request bodies larger than one wire chunk never ride `api.open` inline: a
-/// single coalesced axum read of, say, 2 MiB would base64-expand past the
-/// 1 MiB JSON frame cap. Everything above this is streamed as `api.body`.
-const INLINE_BODY_BYTES: usize = 64 * 1024;
 
 /// How a worker listener forwards accepted requests.
 #[derive(Debug, Clone)]
@@ -153,13 +149,22 @@ pub(crate) struct ProvisionedRoute {
     /// The observed route, echoed in the create result.
     pub(crate) observed: remuda_protocol::ApiRoute,
     /// Drop guard that revokes the listener unless the worker commits it.
-    pub(crate) guard: super::ProvisionGuard,
+    /// Present only for a listener bound by *this* attempt; a listener
+    /// reused from an earlier accepted attempt is already owned by that
+    /// instance's worker.
+    pub(crate) guard: Option<super::ProvisionGuard>,
 }
 
 /// Provision the relay for a create request, or return `None` for a direct
 /// delivery. Validates the one shape the wire leaves to the projector: a
 /// `via` request must name a host (D-047); a nameless `via` is a refusal,
 /// never a silent direct launch (D-035).
+///
+/// Idempotency: if a listener for this instance id is already registered
+/// (an earlier accepted attempt bound it), it is returned as-is rather than
+/// binding a second one. A second bind would evict the first listener from
+/// the registry without shutting it down, orphaning its port and bearer for
+/// the life of the Node.
 pub(crate) async fn provision_for_request(
     state: &Arc<ApiRelayState>,
     instance_id: &str,
@@ -176,6 +181,19 @@ pub(crate) async fn provision_for_request(
             "api route mode `via` requires a viaHostId".into(),
         ));
     };
+    // An earlier accepted attempt already bound this instance's relay. Echo
+    // the same overlay and observed route with no new guard: its lifetime is
+    // owned by the worker the first attempt spawned.
+    if let Some(existing) = state.instance_relay(instance_id) {
+        return Ok(Some(ProvisionedRoute {
+            overlay: existing.overlay(),
+            observed: existing
+                .observed
+                .clone()
+                .expect("a worker listener is always registered with its observed route"),
+            guard: None,
+        }));
+    }
     let profile_base_url = request
         .provider_overlay
         .as_ref()
@@ -187,6 +205,7 @@ pub(crate) async fn provision_for_request(
                 "api relay launch needs the profile baseUrl to bind its base path".into(),
             )
         })?;
+    let via_host_id_for_route = via_host_id.clone();
     let provision = provision_worker(
         state,
         instance_id,
@@ -199,10 +218,15 @@ pub(crate) async fn provision_for_request(
         base_url: provision.listener.base_url(),
         bearer: provision.listener.bearer_token(),
     };
+    let observed = remuda_protocol::ApiRoute::via(via_host_id_for_route, None, provision.kind);
+    state.set_observed(instance_id, observed.clone());
     Ok(Some(ProvisionedRoute {
         overlay,
-        observed: remuda_protocol::ApiRoute::via(via_host_id, None, provision.kind),
-        guard: super::ProvisionGuard::new(Arc::clone(state), instance_id.to_owned()),
+        observed,
+        guard: Some(super::ProvisionGuard::new(
+            Arc::clone(state),
+            instance_id.to_owned(),
+        )),
     }))
 }
 
@@ -254,13 +278,15 @@ pub(crate) async fn provision_worker_with_bearer(
         }
         ApiRouteMode::DirectNet => {
             let Some(endpoint) = endpoint.filter(|value| !value.trim().is_empty()) else {
-                return Err(NodeError::InvalidRequest(
-                    "api-via-unreachable: direct-net route named but no relay endpoint is configured on the proxy host".into(),
-                ));
+                return Err(NodeError::InvalidRequest(format!(
+                    "{}: direct-net route named but no relay endpoint is configured on the proxy host",
+                    remuda_protocol::ApiViaRefusal::ApiViaUnreachable.as_str()
+                )));
             };
             if !probe_endpoint(state, endpoint, instance_id, &bearer.encoded()).await {
                 return Err(NodeError::InvalidRequest(format!(
-                    "api-via-unreachable: probe of proxy relay endpoint {endpoint} failed"
+                    "{}: probe of proxy relay endpoint failed",
+                    remuda_protocol::ApiViaRefusal::ApiViaUnreachable.as_str(),
                 )));
             }
             let url = url::Url::parse(endpoint).map_err(|error| {
@@ -446,7 +472,7 @@ async fn start_serving(
             tracing::debug!(%error, "api relay listener exited");
         }
     });
-    state.register_instance(Arc::clone(&instance));
+    state.register_instance(Arc::clone(&instance), None);
     Ok(instance)
 }
 
@@ -598,9 +624,14 @@ async fn worker_inband(
         );
     };
 
+    // Wire chunk size negotiated with this Hub (protocol default until a
+    // hello lowers it): governs both the inline threshold and the uploader's
+    // frame split, so an oversized frame is never produced.
+    let chunk_bytes = instance.state.api_chunk_bytes();
+
     // Decide inline vs chunked body from the first two body reads.
     let mut data_stream = body.into_data_stream();
-    let body_mode = match read_body_opening(&mut data_stream).await {
+    let body_mode = match read_body_opening(&mut data_stream, chunk_bytes).await {
         Ok(mode) => mode,
         Err(message) => {
             return anthropic_response(StatusCode::BAD_REQUEST, "bad-request", &message);
@@ -641,6 +672,7 @@ async fn worker_inband(
             open,
             body_mode,
             data_stream,
+            chunk_bytes,
             head_tx,
             down_tx,
         )
@@ -696,7 +728,7 @@ enum BodyOpening {
     },
 }
 
-async fn read_body_opening<S>(stream: &mut S) -> Result<BodyOpening, String>
+async fn read_body_opening<S>(stream: &mut S, chunk_bytes: usize) -> Result<BodyOpening, String>
 where
     S: futures::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
 {
@@ -707,7 +739,7 @@ where
     // A second read distinguishes "whole small body inline" from "stream it".
     // A first read already over the wire threshold streams even when no
     // further data arrives: the inline frame is the base64-expansion limit.
-    if first.len() > INLINE_BODY_BYTES {
+    if first.len() > chunk_bytes {
         return Ok(BodyOpening::Chunked {
             first,
             peek: Bytes::new(),
@@ -735,9 +767,16 @@ async fn drive_inband(
     open: ApiOpenParams,
     body_mode: BodyOpening,
     data_stream: impl futures::Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,
+    chunk_bytes: usize,
     head_tx: oneshot::Sender<Result<ResponseHead, HeadFailure>>,
     down_tx: mpsc::Sender<BodyChunk>,
 ) {
+    // Stream cancellation shared by the event loop and the request-body
+    // uploader: a client disconnect, a remote `api.cancel`/error `api.end`, or
+    // the hard cap must wake a credit-gated uploader (and a parked body read)
+    // instead of leaving it parked past the cap holding the gateway call.
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let hard_deadline = tokio::time::Instant::now() + STREAM_HARD_CAP;
     let mut head_tx = Some(head_tx);
     if outbox
         .send_notification(METHOD_API_OPEN, &open)
@@ -754,14 +793,18 @@ async fn drive_inband(
     }
 
     // Request body upload (chunked case) runs concurrently with head/chunk
-    // handling. It shares the outbox permit pool: `api.credit` frames arriving
-    // below grant the upload's window through the shared `Arc<Semaphore>`.
+    // handling. It is credit-driven like every gated send: H returns one
+    // `api.credit` per request-body chunk it drained, so the initial window
+    // plus those credits keep any body size moving under the 32 MiB cap.
     if let BodyOpening::Chunked { first, peek } = body_mode {
         let uploader = InbandUploader {
             stream_id: open.stream_id.clone(),
             outbox: outbox.clone(),
             buffered: vec![first, peek],
             data_stream,
+            cancel: Arc::clone(&cancel),
+            chunk_bytes,
+            hard_deadline,
         };
         tokio::spawn(uploader.run());
     }
@@ -786,8 +829,12 @@ async fn drive_inband(
                     Err(_) => continue,
                 };
                 // A full/closed channel means the local HTTP client stopped
-                // reading: cancel upstream and end.
+                // reading: abort the stream (uploader included) and cancel
+                // upstream. `api.credit` is a control frame and is never gated:
+                // it answers for a response chunk the consumer already drained,
+                // so it is sent whether or not the request body finished.
                 if down_tx.send(Ok(bytes)).await.is_err() {
+                    cancel.notify_one();
                     let _ = outbox
                         .send_notification(
                             METHOD_API_CANCEL,
@@ -811,16 +858,20 @@ async fn drive_inband(
                     .await;
             }
             super::InboundEvent::Credit(credit) => outbox.grant(credit.chunks),
-            super::InboundEvent::Cancel(cancel) => {
+            super::InboundEvent::Cancel(cancel_reason) => {
+                cancel.notify_one();
                 let _ = down_tx
                     .send(Err(std::io::Error::new(
                         std::io::ErrorKind::ConnectionAborted,
-                        format!("relay cancelled: {}", cancel.reason),
+                        format!("relay cancelled: {}", cancel_reason.reason),
                     )))
                     .await;
                 break;
             }
             super::InboundEvent::End(end) => {
+                // Any terminal frame ends the stream: wake the uploader and
+                // surface the error (a clean end simply closes the body).
+                cancel.notify_one();
                 if let Some(error) = end.error {
                     if let Some(tx) = head_tx.take() {
                         let _ = tx.send(Err(HeadFailure {
@@ -851,6 +902,11 @@ struct InbandUploader<S> {
     /// Bytes read before the upload started (in order).
     buffered: Vec<Bytes>,
     data_stream: S,
+    /// Stream cancellation shared with the event loop.
+    cancel: Arc<tokio::sync::Notify>,
+    /// Negotiated wire chunk size.
+    chunk_bytes: usize,
+    hard_deadline: tokio::time::Instant,
 }
 
 impl<S> InbandUploader<S>
@@ -869,53 +925,68 @@ where
 
         let mut seq: u32 = 0;
         let mut total: usize = 0;
-        while let Some(item) = body.next().await {
-            let bytes = match item {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    let _ = self
-                        .outbox
-                        .send_notification(
-                            METHOD_API_CANCEL,
-                            &ApiCancelParams {
-                                stream_id: self.stream_id.clone(),
-                                reason: "request body read failed".into(),
-                            },
-                        )
-                        .await;
-                    return;
+        loop {
+            // Both the next body read and every gated send are abortable: a
+            // client that drops the request while a large upload is still in
+            // flight must stop the read instead of feeding a stream nobody
+            // consumes.
+            tokio::select! {
+                item = body.next() => {
+                    let Some(item) = item else { break; };
+                    let bytes = match item {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            let _ = self
+                                .outbox
+                                .send_notification(
+                                    METHOD_API_CANCEL,
+                                    &ApiCancelParams {
+                                        stream_id: self.stream_id.clone(),
+                                        reason: "request body read failed".into(),
+                                    },
+                                )
+                                .await;
+                            return;
+                        }
+                    };
+                    for piece in split_body_chunks(bytes, self.chunk_bytes) {
+                        total = total.saturating_add(piece.len());
+                        if total > MAX_REQUEST_BYTES {
+                            let _ = self
+                                .outbox
+                                .send_notification(
+                                    METHOD_API_CANCEL,
+                                    &ApiCancelParams {
+                                        stream_id: self.stream_id.clone(),
+                                        reason: "request body too large".into(),
+                                    },
+                                )
+                                .await;
+                            return;
+                        }
+                        let frame = ApiBodyParams {
+                            stream_id: self.stream_id.clone(),
+                            seq,
+                            data_base64: BASE64.encode(piece.as_ref()),
+                            last: false,
+                        };
+                        if self
+                            .outbox
+                            .send_gated(
+                                METHOD_API_BODY,
+                                &frame,
+                                &self.cancel,
+                                self.hard_deadline,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        seq += 1;
+                    }
                 }
-            };
-            for piece in split_body_chunks(bytes, 65_536) {
-                total = total.saturating_add(piece.len());
-                if total > MAX_REQUEST_BYTES {
-                    let _ = self
-                        .outbox
-                        .send_notification(
-                            METHOD_API_CANCEL,
-                            &ApiCancelParams {
-                                stream_id: self.stream_id.clone(),
-                                reason: "request body too large".into(),
-                            },
-                        )
-                        .await;
-                    return;
-                }
-                let frame = ApiBodyParams {
-                    stream_id: self.stream_id.clone(),
-                    seq,
-                    data_base64: BASE64.encode(piece.as_ref()),
-                    last: false,
-                };
-                if self
-                    .outbox
-                    .send_gated(METHOD_API_BODY, &frame)
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-                seq += 1;
+                _ = self.cancel.notified() => return,
             }
         }
         // Zero-byte terminator: the whole request body has been delivered.
@@ -925,7 +996,10 @@ where
             data_base64: String::new(),
             last: true,
         };
-        let _ = self.outbox.send_gated(METHOD_API_BODY, &last).await;
+        let _ = self
+            .outbox
+            .send_gated(METHOD_API_BODY, &last, &self.cancel, self.hard_deadline)
+            .await;
     }
 }
 
@@ -970,6 +1044,7 @@ async fn worker_direct(
     let response = match tokio::time::timeout(DIRECT_TTFT, request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) if error.is_timeout() => {
+            tracing::warn!(%error, "direct relay first-byte timeout");
             return anthropic_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
@@ -977,10 +1052,14 @@ async fn worker_direct(
             );
         }
         Ok(Err(error)) => {
+            // reqwest's Display carries the request URL; keep the detail in
+            // the W log (the direct endpoint is W-configured) and a fixed
+            // sentence in the body the harness renders.
+            tracing::warn!(%error, "direct relay request failed");
             return anthropic_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 remuda_protocol::hubnode::API_ERROR_VIA_HOST_OFFLINE,
-                &format!("direct relay unavailable: {error}").replace('"', "'"),
+                "direct relay unavailable",
             );
         }
         Err(_) => {
@@ -1011,10 +1090,11 @@ async fn worker_direct(
     let stream = futures::stream::unfold(upstream, |mut upstream| async move {
         match tokio::time::timeout(DIRECT_IDLE, upstream.next()).await {
             Ok(Some(Ok(bytes))) => Some((Ok(bytes), upstream)),
-            Ok(Some(Err(error))) => Some((
+            Ok(Some(Err(_))) => Some((
                 Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    error.to_string(),
+                    // Fixed text: a body error's Display can name the peer.
+                    "direct relay upstream body failed",
                 )),
                 upstream,
             )),
@@ -1048,19 +1128,32 @@ async fn proxy_direct(
     if !relayed_path_is_safe(suffix) {
         return refusal(StatusCode::NOT_FOUND);
     }
-    let mut collected = Vec::new();
-    let mut stream = body.into_data_stream();
-    while let Some(item) = stream.next().await {
-        match item {
+    // Stream the request body like the in-band leg, enforcing the 32 MiB cap
+    // at the stream boundary rather than buffering up to it on H first. An
+    // over-cap body fails as an upstream upload; H never holds more than one
+    // chunk.
+    let body_stream = body.into_data_stream();
+    let capped = futures::stream::unfold((body_stream, 0usize), |(mut data, total)| async move {
+        let item = data.next().await?;
+        let result = match item {
             Ok(bytes) => {
-                collected.extend_from_slice(&bytes);
-                if collected.len() > MAX_REQUEST_BYTES {
-                    return refusal(StatusCode::PAYLOAD_TOO_LARGE);
+                let total = total.saturating_add(bytes.len());
+                if total > MAX_REQUEST_BYTES {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request body too large",
+                    ))
+                } else {
+                    Ok(bytes)
                 }
             }
-            Err(_) => return refusal(StatusCode::BAD_REQUEST),
-        }
-    }
+            Err(error) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                format!("request body read failed: {error}"),
+            )),
+        };
+        Some((result, (data, total)))
+    });
     let api_headers: Vec<ApiHeader> = policy::filter_request_headers(
         headers
             .iter()
@@ -1077,17 +1170,29 @@ async fn proxy_direct(
         suffix,
         query,
         api_headers,
-        Some(Bytes::from(collected)),
+        reqwest::Body::wrap_stream(capped),
     )
     .await;
     let response = match result {
         Ok(response) => response,
         Err(error) => {
-            return anthropic_response(
-                StatusCode::BAD_GATEWAY,
-                remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
-                &error.to_string(),
-            );
+            // `direct_forward` already redacts its reqwest detail (it stays in
+            // H's log); render only a fixed sentence and stable code toward W.
+            let (status, code, message) =
+                if error.to_string().contains("timed out before first byte") {
+                    (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
+                        "upstream timed out before first byte",
+                    )
+                } else {
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
+                        "upstream relay request failed",
+                    )
+                };
+            return anthropic_response(status, code, message);
         }
     };
     let mut builder = axum::response::Response::builder().status(response.status());

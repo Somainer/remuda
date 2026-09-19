@@ -14,7 +14,7 @@
 //! another origin; request/response headers cross only through the allowlists.
 
 use super::policy::{filter_request_headers, filter_response_headers, relayed_path_is_safe};
-use super::{InboundEvent, LinkBroker, Outbox, STREAM_HARD_CAP};
+use super::{GatedSendError, InboundEvent, LinkBroker, Outbox, STREAM_HARD_CAP};
 use crate::NodeError;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -23,11 +23,12 @@ use futures::StreamExt;
 use remuda_protocol::hubnode::{
     API_ERROR_CANCELLED, API_ERROR_DESTINATION_REFUSED, API_ERROR_UPSTREAM_TIMEOUT, ApiChunkParams,
     ApiCreditParams, ApiEndError, ApiEndParams, ApiHeadParams, ApiHeader, ApiOpenParams,
-    METHOD_API_CHUNK, METHOD_API_CREDIT, METHOD_API_END,
+    METHOD_API_CHUNK, METHOD_API_CREDIT, METHOD_API_END, METHOD_API_HEAD,
 };
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 /// TCP connect timeout (§7.6): 10 s.
 pub(crate) const EGRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -53,6 +54,9 @@ pub enum CredentialKind {
     GatewayBearer(String),
     /// Direct-style profile: `x-api-key: …` (`ANTHROPIC_API_KEY`).
     ApiKey(String),
+    /// No credential: the gateway context was installed without an
+    /// `authToken` (public/fixture origin). The egress adds no auth header.
+    None,
 }
 
 impl std::fmt::Debug for CredentialKind {
@@ -60,6 +64,7 @@ impl std::fmt::Debug for CredentialKind {
         match self {
             Self::GatewayBearer(_) => formatter.write_str("GatewayBearer(<redacted>)"),
             Self::ApiKey(_) => formatter.write_str("ApiKey(<redacted>)"),
+            Self::None => formatter.write_str("None"),
         }
     }
 }
@@ -203,6 +208,7 @@ fn build_headers(ctx: &EgressContext, incoming: Vec<ApiHeader>) -> Vec<(String, 
         CredentialKind::ApiKey(token) => {
             headers.push(("x-api-key".into(), token.clone()));
         }
+        CredentialKind::None => {}
     }
     headers.extend(ctx.profile_headers.iter().cloned());
     headers
@@ -237,7 +243,9 @@ impl DirectResponse {
 }
 
 /// Run one direct-net request (H's direct listener → gateway). Same origin
-/// pin and credential swap as [`serve_inbound`], no frame layer.
+/// pin and credential swap as [`serve_inbound`], no frame layer. The body is
+/// streamed (the caller enforces its byte cap at the stream boundary), never
+/// fully buffered here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn direct_forward(
     ctx: &EgressContext,
@@ -246,24 +254,27 @@ pub(crate) async fn direct_forward(
     path: &str,
     query: &str,
     headers: Vec<ApiHeader>,
-    body: Option<Bytes>,
+    body: reqwest::Body,
 ) -> Result<DirectResponse, NodeError> {
     let url = build_url(ctx, path, query)?;
     let method = method
         .parse::<reqwest::Method>()
         .map_err(|error| NodeError::InvalidRequest(format!("method not allowed: {error}")))?;
-    let mut request = http
+    let request = http
         .request(method, url)
-        .headers(header_map(&build_headers(ctx, headers)));
-    if let Some(body) = body {
-        request = request.body(body);
-    }
+        .headers(header_map(&build_headers(ctx, headers)))
+        .body(body);
     let response = tokio::time::timeout(ctx.timeouts.ttft, request.send())
         .await
         .map_err(|_| {
             NodeError::Transport("api relay direct upstream timed out before first byte".into())
         })?
-        .map_err(|error| NodeError::Transport(format!("api relay direct upstream: {error}")))?;
+        .map_err(|error| {
+            // The reqwest Display carries the pinned URL (gateway origin): it
+            // is logged on H only and must not be rendered into a body W sees.
+            tracing::warn!(%error, "direct egress gateway request failed");
+            NodeError::Transport("api relay direct upstream request failed".into())
+        })?;
     Ok(DirectResponse {
         status: response.status(),
         headers: response_headers_from(&response),
@@ -300,7 +311,7 @@ struct Outcome {
 
 fn error_end(
     stream_id: &str,
-    started: Instant,
+    started: std::time::Instant,
     bytes_up: u64,
     bytes_down: u64,
     code: &str,
@@ -330,7 +341,7 @@ pub(crate) async fn serve_inbound(
     mut outbox: Outbox,
     events: tokio::sync::mpsc::Receiver<InboundEvent>,
 ) {
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let outcome = run_egress(state, broker, &open, &mut outbox, events, started).await;
     let _ = outbox.send_notification(METHOD_API_END, &outcome.end).await;
     broker.close_stream(&open.stream_id);
@@ -342,7 +353,7 @@ async fn run_egress(
     open: &ApiOpenParams,
     outbox: &mut Outbox,
     events: tokio::sync::mpsc::Receiver<InboundEvent>,
-    started: Instant,
+    started: std::time::Instant,
 ) -> Outcome {
     let Some(ctx) = state.egress_context(&open.instance_id) else {
         return error_end(
@@ -354,6 +365,10 @@ async fn run_egress(
             "no egress is authorized for this instance on the proxy host",
         );
     };
+    // The context's hard timeout governs every gated send: a producer parked
+    // waiting for credits must wake at the stream's own cap (test-tunable),
+    // not at the protocol-wide 30-minute ceiling.
+    let hard_deadline = Instant::now() + ctx.timeouts.hard;
     let url = match build_url(&ctx, &open.path, &open.query) {
         Ok(url) => url,
         Err(_) => {
@@ -402,7 +417,7 @@ async fn run_egress(
             return error_end(
                 &open.stream_id,
                 started,
-                0,
+                bytes_up.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 API_ERROR_DESTINATION_REFUSED,
                 "method is not allowed",
@@ -428,7 +443,7 @@ async fn run_egress(
                 return error_end(
                     &open.stream_id,
                     started,
-                    0,
+                    bytes_up.load(std::sync::atomic::Ordering::Relaxed),
                     0,
                     API_ERROR_DESTINATION_REFUSED,
                     "request body base64 was invalid",
@@ -444,12 +459,20 @@ async fn run_egress(
             result = &mut send => result,
             _ = cancelled.notified() => {
                 router_task.abort();
-                return error_end(&open.stream_id, started, 0, 0, API_ERROR_CANCELLED, "cancelled");
+                return error_end(
+                    &open.stream_id,
+                    started,
+                    bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    API_ERROR_CANCELLED,
+                    "cancelled",
+                );
             }
             _ = tokio::time::sleep(ctx.timeouts.ttft) => {
                 router_task.abort();
                 return error_end(
-                    &open.stream_id, started, 0, 0,
+                    &open.stream_id, started,
+                    bytes_up.load(std::sync::atomic::Ordering::Relaxed), 0,
                     API_ERROR_UPSTREAM_TIMEOUT, "timed out before first byte",
                 );
             }
@@ -465,21 +488,24 @@ async fn run_egress(
             return error_end(
                 &open.stream_id,
                 started,
-                0,
+                bytes_up.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 API_ERROR_UPSTREAM_TIMEOUT,
                 "could not reach the pinned gateway origin",
             );
         }
         Err(error) => {
+            // The reqwest Display carries the request URL (hence the gateway
+            // origin): log it on H only, never render it into the body W sees.
+            tracing::warn!(%error, "egress gateway request failed");
             router_task.abort();
             return error_end(
                 &open.stream_id,
                 started,
-                0,
+                bytes_up.load(std::sync::atomic::Ordering::Relaxed),
                 0,
                 API_ERROR_UPSTREAM_TIMEOUT,
-                &format!("gateway request failed: {error}").replace('"', "'"),
+                "gateway request failed",
             );
         }
     };
@@ -492,7 +518,7 @@ async fn run_egress(
         .collect();
     if outbox
         .send_notification(
-            "api.head",
+            METHOD_API_HEAD,
             &ApiHeadParams {
                 stream_id: open.stream_id.clone(),
                 status,
@@ -506,16 +532,19 @@ async fn run_egress(
         return error_end(
             &open.stream_id,
             started,
-            0,
+            bytes_up.load(std::sync::atomic::Ordering::Relaxed),
             0,
             remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST,
             "link closed while sending head",
         );
     }
 
-    // Stream and coalesce the body.
+    // Stream and coalesce the body. A Hub that negotiated a smaller
+    // `apiChunkBytes` must never receive oversized `api.chunk` frames, so the
+    // context's threshold (16 KiB by default) is clamped to the hello value.
+    let coalesce_bytes = ctx.coalesce_bytes.min(state.api_chunk_bytes());
     let mut upstream = response.bytes_stream();
-    let mut coalescer = Coalescer::new(ctx.coalesce_bytes);
+    let mut coalescer = Coalescer::new(coalesce_bytes);
     let mut tick = tokio::time::interval(COALESCE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // consume the immediate tick
@@ -531,7 +560,7 @@ async fn run_egress(
             failed = Some(error_end(
                 &open.stream_id,
                 started,
-                0,
+                bytes_up.load(std::sync::atomic::Ordering::Relaxed),
                 bytes_down,
                 API_ERROR_UPSTREAM_TIMEOUT,
                 "stream hard cap reached",
@@ -541,7 +570,9 @@ async fn run_egress(
         tokio::select! {
             _ = cancelled.notified() => {
                 failed = Some(error_end(
-                    &open.stream_id, started, 0, bytes_down,
+                    &open.stream_id, started,
+                    bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                    bytes_down,
                     API_ERROR_CANCELLED, "cancelled",
                 ));
                 break;
@@ -549,10 +580,12 @@ async fn run_egress(
             _ = tick.tick() => {
                 if let Some(chunk) = coalescer.flush() {
                     let len = chunk.len() as u64;
-                    if let Err(error) = send_chunk(outbox, &open.stream_id, seq, chunk, false).await {
-                        failed = Some(error_end(&open.stream_id, started, 0, bytes_down,
-                            remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST, &error.to_string()));
-                        break;
+                    match send_chunk(outbox, &open.stream_id, seq, chunk, false, &cancelled, hard_deadline).await {
+                        Ok(()) => {}
+                        Err(reason) => {
+                            failed = Some(gated_error_end(&open.stream_id, started, bytes_up.load(std::sync::atomic::Ordering::Relaxed), bytes_down, reason));
+                            break;
+                        }
                     }
                     seq += 1;
                     bytes_down += len;
@@ -565,9 +598,8 @@ async fn run_egress(
                         idle_deadline = tokio::time::Instant::now() + ctx.timeouts.idle;
                         for chunk in coalescer.push(bytes) {
                             let len = chunk.len() as u64;
-                            if let Err(error) = send_chunk(outbox, &open.stream_id, seq, chunk, false).await {
-                                failed = Some(error_end(&open.stream_id, started, 0, bytes_down,
-                                    remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST, &error.to_string()));
+                            if let Err(reason) = send_chunk(outbox, &open.stream_id, seq, chunk, false, &cancelled, hard_deadline).await {
+                                failed = Some(gated_error_end(&open.stream_id, started, bytes_up.load(std::sync::atomic::Ordering::Relaxed), bytes_down, reason));
                                 break;
                             }
                             seq += 1;
@@ -580,7 +612,9 @@ async fn run_egress(
                     }
                     Some(Err(_)) => {
                         failed = Some(error_end(
-                            &open.stream_id, started, 0, bytes_down,
+                            &open.stream_id, started,
+                            bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                            bytes_down,
                             API_ERROR_UPSTREAM_TIMEOUT, "gateway connection dropped",
                         ));
                         break;
@@ -590,7 +624,9 @@ async fn run_egress(
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
                 failed = Some(error_end(
-                    &open.stream_id, started, 0, bytes_down,
+                    &open.stream_id, started,
+                    bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                    bytes_down,
                     API_ERROR_UPSTREAM_TIMEOUT, "idle timeout waiting for gateway bytes",
                 ));
                 break;
@@ -598,41 +634,53 @@ async fn run_egress(
         }
     }
     router_task.abort();
-    let bytes_up = bytes_up.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes_up_total = bytes_up.load(std::sync::atomic::Ordering::Relaxed);
 
     // On success, flush the tail and send the zero-byte `last` chunk so the
     // worker side closes its body exactly once.
     if failed.is_none() {
         if let Some(chunk) = coalescer.flush() {
             let len = chunk.len() as u64;
-            if send_chunk(outbox, &open.stream_id, seq, chunk, false)
-                .await
-                .is_err()
+            if let Err(reason) = send_chunk(
+                outbox,
+                &open.stream_id,
+                seq,
+                chunk,
+                false,
+                &cancelled,
+                hard_deadline,
+            )
+            .await
             {
-                failed = Some(error_end(
+                failed = Some(gated_error_end(
                     &open.stream_id,
                     started,
-                    bytes_up,
+                    bytes_up_total,
                     bytes_down,
-                    remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST,
-                    "link closed",
+                    reason,
                 ));
             } else {
                 bytes_down += len;
             }
         }
         if failed.is_none()
-            && send_chunk(outbox, &open.stream_id, seq, Bytes::new(), true)
-                .await
-                .is_err()
+            && let Err(reason) = send_chunk(
+                outbox,
+                &open.stream_id,
+                seq,
+                Bytes::new(),
+                true,
+                &cancelled,
+                hard_deadline,
+            )
+            .await
         {
-            failed = Some(error_end(
+            failed = Some(gated_error_end(
                 &open.stream_id,
                 started,
-                bytes_up,
+                bytes_up_total,
                 bytes_down,
-                remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST,
-                "link closed",
+                reason,
             ));
         }
     }
@@ -641,11 +689,31 @@ async fn run_egress(
         end: ApiEndParams {
             stream_id: open.stream_id.clone(),
             error: None,
-            bytes_up,
+            bytes_up: bytes_up_total,
             bytes_down,
             ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         },
     })
+}
+
+/// Build the terminal outcome for a failed gated response send, mapping the
+/// wake reason to the stream code the worker listener renders.
+fn gated_error_end(
+    stream_id: &str,
+    started: std::time::Instant,
+    bytes_up: u64,
+    bytes_down: u64,
+    reason: GatedSendError,
+) -> Outcome {
+    let (code, message) = match reason {
+        GatedSendError::Cancelled => (API_ERROR_CANCELLED, "cancelled"),
+        GatedSendError::HardCap => (API_ERROR_UPSTREAM_TIMEOUT, "stream hard cap reached"),
+        GatedSendError::LinkLost => (
+            remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST,
+            "relay link closed",
+        ),
+    };
+    error_end(stream_id, started, bytes_up, bytes_down, code, message)
 }
 
 async fn send_chunk(
@@ -654,7 +722,9 @@ async fn send_chunk(
     seq: u32,
     data: Bytes,
     last: bool,
-) -> Result<(), NodeError> {
+    cancelled: &tokio::sync::Notify,
+    hard_deadline: tokio::time::Instant,
+) -> Result<(), GatedSendError> {
     outbox
         .send_gated(
             METHOD_API_CHUNK,
@@ -664,6 +734,8 @@ async fn send_chunk(
                 data_base64: BASE64.encode(data.as_ref()),
                 last,
             },
+            cancelled,
+            hard_deadline,
         )
         .await
 }
@@ -703,7 +775,9 @@ impl EventRouter {
                         // main loop is already finishing.
                         break;
                     }
-                    // One credit per drained request-body chunk.
+                    // One credit per drained request-body chunk. Credits are
+                    // control frames: they never take a data permit, so a
+                    // stalled response window cannot deadlock the upload.
                     let _ = self
                         .outbox
                         .send_notification(
@@ -723,7 +797,15 @@ impl EventRouter {
                     self.cancelled.notify_one();
                     break;
                 }
-                InboundEvent::End(_) => break,
+                // Any terminal frame ends this egress: abort an upload still
+                // in flight and close the upstream request. The main loop
+                // shares this Notify only through its `cancelled` selects;
+                // after a clean completion it has already left those selects,
+                // so the notify is a no-op there.
+                InboundEvent::End(_) => {
+                    self.cancelled.notify_one();
+                    break;
+                }
                 InboundEvent::Head(_) | InboundEvent::Chunk(_) => {}
             }
         }

@@ -1,7 +1,8 @@
 //! Integration tests for the D-047/D-048 relay, run in-crate so they can reach
-//! the listeners, brokers and egress directly. A tiny scripted axum gateway
-//! stands in for the real model origin (c-apiroute-fakegw had not landed when
-//! this was written).
+//! the listeners, brokers and egress directly. The model origin is the shared
+//! offline [`remuda_testing::FakeGateway`]: no test here ever reaches a real model
+//! or holds a real credential, and every fixture token carries the `fake-`
+//! segment required by `scripts/ci/secret-scan.sh`.
 
 use super::egress::{CredentialKind, EgressContext, EgressTimeouts};
 use super::listener;
@@ -9,20 +10,24 @@ use super::policy::RelayBearer;
 use super::{ApiRelayState, InboundEvent, LinkBroker};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use bytes::Bytes;
 use futures::StreamExt;
 use remuda_protocol::hubnode::{
-    METHOD_API_CANCEL, METHOD_API_CHUNK, METHOD_API_END, METHOD_API_HEAD, METHOD_API_OPEN,
+    ApiOpenParams, METHOD_API_CANCEL, METHOD_API_CHUNK, METHOD_API_CREDIT, METHOD_API_END,
+    METHOD_API_HEAD, METHOD_API_OPEN,
 };
 use remuda_protocol::{
     ApiRouteKind, ApiRouteMode, HostId, HostRelayBind, ProviderDeliveryMode, RequestedApiRoute,
 };
+use remuda_testing::{FakeGateway, SSE_CONTENT_TYPE, Script};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
 const INSTANCE: &str = "inst_relay_test";
+/// Fixture profile credential. The delimited `fake-` segment is mandatory for
+/// test credentials; the gateway compares the token and never exposes it.
+const GW_TOKEN: &str = "sk-fake-relay-profile-credential";
 
 fn via(route: ApiRouteMode) -> RequestedApiRoute {
     RequestedApiRoute {
@@ -49,124 +54,6 @@ fn request_with(
         value["apiRelayEndpoint"] = json!(endpoint);
     }
     serde_json::from_value(value).expect("request")
-}
-
-// ── scripted gateway ───────────────────────────────────────────────────────
-
-#[derive(Default)]
-struct GatewaySeen {
-    headers: Mutex<Vec<(String, String)>>,
-    path: Mutex<Option<String>>,
-}
-
-struct Gateway {
-    base_url: String,
-    seen: Arc<GatewaySeen>,
-}
-
-/// Behaviour the scripted origin plays.
-#[derive(Clone, Copy)]
-enum GatewayMode {
-    /// Answer `GET /v1/models` with a small JSON page.
-    Models,
-    /// Stream `chunks` SSE frames of `size` bytes spaced `gap_ms` apart.
-    Sse {
-        chunks: usize,
-        gap_ms: u64,
-        size: usize,
-    },
-    /// Wait before the first response byte.
-    SlowFirstByte { delay_ms: u64 },
-}
-
-#[derive(Clone)]
-struct GatewayState {
-    seen: Arc<GatewaySeen>,
-    mode: GatewayMode,
-}
-
-async fn models_handler(
-    axum::extract::State(state): axum::extract::State<GatewayState>,
-) -> impl axum::response::IntoResponse {
-    *state.seen.path.lock().unwrap() = Some("/v1/models".into());
-    axum::Json(json!({"data": []}))
-}
-
-async fn messages_handler(
-    axum::extract::State(state): axum::extract::State<GatewayState>,
-    request: axum::extract::Request,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    let (parts, _) = request.into_parts();
-    *state.seen.path.lock().unwrap() = Some(parts.uri.to_string());
-    for name in [
-        "authorization",
-        "x-api-key",
-        "cookie",
-        "x-custom-denied",
-        "x-profile-header",
-    ] {
-        if let Some(value) = parts.headers.get(name) {
-            state
-                .seen
-                .headers
-                .lock()
-                .unwrap()
-                .push((name.to_owned(), value.to_str().unwrap_or("").to_owned()));
-        }
-    }
-    match state.mode {
-        GatewayMode::Models => unreachable!(),
-        GatewayMode::Sse {
-            chunks,
-            gap_ms,
-            size,
-        } => sse_response(chunks, gap_ms, size),
-        GatewayMode::SlowFirstByte { delay_ms } => {
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            axum::Json(json!({"ok": true})).into_response()
-        }
-    }
-}
-
-async fn spawn_gateway(mode: GatewayMode) -> Gateway {
-    use axum::Router;
-    use axum::routing::get;
-
-    let seen = Arc::new(GatewaySeen::default());
-    let state = GatewayState {
-        seen: Arc::clone(&seen),
-        mode,
-    };
-    let app = Router::new()
-        .route("/v1/models", get(models_handler))
-        .route("/v1/messages", axum::routing::post(messages_handler))
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    Gateway {
-        base_url: format!("http://127.0.0.1:{}", addr.port()),
-        seen,
-    }
-}
-
-fn sse_response(chunks: usize, gap_ms: u64, size: usize) -> axum::response::Response {
-    let stream = futures::stream::iter(0..chunks).then(move |index| async move {
-        tokio::time::sleep(Duration::from_millis(if index == 0 { 0 } else { gap_ms })).await;
-        let mut frame = format!("event: chunk{index}\n").into_bytes();
-        frame.extend(std::iter::repeat_n(b'a', size));
-        frame.extend_from_slice(b"\n\n");
-        Ok::<_, std::io::Error>(Bytes::from(frame))
-    });
-    axum::response::Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("set-cookie", "must-not-cross=1")
-        .body(axum::body::Body::from_stream(stream))
-        .unwrap()
 }
 
 // ── wiring ─────────────────────────────────────────────────────────────────
@@ -216,13 +103,15 @@ fn http() -> reqwest::Client {
 }
 
 fn gateway_context(
-    gateway: &Gateway,
+    gateway: &FakeGateway,
     tuning: Option<(usize, EgressTimeouts)>,
 ) -> Arc<EgressContext> {
+    gateway.expect_credential(GW_TOKEN);
+    gateway.set_response_header("set-cookie", "must-not-cross=1");
     let mut context = EgressContext::new(
         INSTANCE,
-        &format!("{}/v1", gateway.base_url),
-        CredentialKind::GatewayBearer("gw-secret-token".into()),
+        &gateway.base_url_v1(),
+        CredentialKind::GatewayBearer(GW_TOKEN.into()),
     )
     .unwrap()
     .with_profile_headers([("x-profile-header", "profile-value")]);
@@ -230,6 +119,43 @@ fn gateway_context(
         context = context.with_test_tuning(coalesce, timeouts);
     }
     context
+}
+
+/// Provision W, install a credentialed FakeGateway context on H, and wire the
+/// two brokers Hub-style.
+async fn hub_relay_fixture(
+    scripts: Vec<Script>,
+) -> (
+    Arc<ApiRelayState>,
+    Arc<ApiRelayState>,
+    FakeGateway,
+    Arc<Mutex<Vec<String>>>,
+    String,
+    String,
+) {
+    let gateway = FakeGateway::start_with(scripts)
+        .await
+        .expect("fake gateway");
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    state_h.set_egress_context(gateway_context(&gateway, None));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (_bw, _bh, _hub) = wire_like_hub(&state_w, &state_h, Arc::clone(&log));
+
+    let bearer = RelayBearer::mint();
+    let provision = listener::provision_worker_with_bearer(
+        &state_w,
+        INSTANCE,
+        &gateway.base_url_v1(),
+        &via(ApiRouteMode::HubRelay),
+        None,
+        bearer,
+    )
+    .await
+    .unwrap();
+    let url = provision.listener.base_url();
+    let bearer = provision.listener.bearer_token();
+    (state_w, state_h, gateway, log, url, bearer)
 }
 
 // ── listener authorization ─────────────────────────────────────────────────
@@ -303,9 +229,7 @@ async fn worker_listener_auth_matrix() {
     let body = response.text().await.unwrap();
     assert!(body.contains("via-host-offline"), "{body}");
 
-    // Exit revokes the bearer and shuts the listener. A new request then
-    // either fails at the socket or answers 403, depending on how far the
-    // graceful shutdown got; both mean "the instance is gone".
+    // Exit revokes the bearer and shuts the listener.
     state.revoke_instance(INSTANCE);
     tokio::time::sleep(Duration::from_millis(50)).await;
     if let Ok(response) = client
@@ -322,37 +246,16 @@ async fn worker_listener_auth_matrix() {
     } // an Err means the listener already closed — equally refused
 }
 
-// ── hub-relay end to end ───────────────────────────────────────────────────
+// ── hub-relay streaming ──────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn hub_relay_forwards_and_streams_sse_with_credential_swap() {
-    // 8 KiB per SSE frame, ~30 ms apart: coalescing must merge them and the
-    // credit loop must keep the transfer moving.
-    let gateway = spawn_gateway(GatewayMode::Sse {
-        chunks: 6,
-        gap_ms: 30,
-        size: 8 * 1024,
-    })
-    .await;
-    let state_w = ApiRelayState::new();
-    let state_h = ApiRelayState::new();
-    state_h.set_egress_context(gateway_context(&gateway, None));
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let (_bw, _bh, _hub) = wire_like_hub(&state_w, &state_h, Arc::clone(&log));
-
-    let bearer = RelayBearer::mint();
-    let provision = listener::provision_worker_with_bearer(
-        &state_w,
-        INSTANCE,
-        &format!("{}/v1", gateway.base_url),
-        &via(ApiRouteMode::HubRelay),
-        None,
-        bearer,
-    )
-    .await
-    .unwrap();
-    let url = provision.listener.base_url();
-    let bearer = provision.listener.bearer_token();
+async fn hub_relay_streams_sse_with_credential_swap_in_order() {
+    // The fixture's deterministic SSE script: message_start,
+    // content_block_start, ordered content_block_delta tokens,
+    // content_block_stop, message_delta, message_stop — the relay must
+    // preserve the Anthropic event sequence, not byte-sort it.
+    let (_sw, _sh, gateway, log, url, bearer) =
+        hub_relay_fixture(vec![Script::default_messages()]).await;
 
     let response = http()
         .post(format!("{url}/messages"))
@@ -365,77 +268,76 @@ async fn hub_relay_forwards_and_streams_sse_with_credential_swap() {
         .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(
-        response.headers().get("content-type").unwrap(),
-        "text/event-stream"
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some(SSE_CONTENT_TYPE)
     );
-    // set-cookie is stripped by the response allowlist.
+    // The fixture advertises a set-cookie the relay response allowlist drops.
     assert!(response.headers().get("set-cookie").is_none());
     let body = response.text().await.unwrap();
-    assert!(body.contains("event: chunk0"));
-    assert!(body.contains("event: chunk5"));
-    assert_eq!(
-        body.len(),
-        6 * (b"event: chunkN\n".len() + 8 * 1024 + b"\n\n".len())
-    );
 
-    // The gateway saw the profile credential — never the relay bearer or a
-    // client-supplied cookie/header.
-    let seen = gateway.seen.headers.lock().unwrap();
+    // SSE order by sequence: the fixture's deterministic event order must
+    // survive coalescing and reassembly.
+    let ordered = [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ];
+    let mut cursor = 0usize;
+    for name in ordered {
+        let at = body[cursor..]
+            .find(name)
+            .unwrap_or_else(|| panic!("missing {name}"));
+        cursor += at;
+    }
+    // content_block_delta appears multiple times and strictly after the
+    // block start and before the block stop.
+    assert!(body.matches("content_block_delta").count() > 1);
+
+    // Credential swap, proven by value-free verdicts: the gateway saw exactly
+    // the fixture credential, never a mismatch (the relay bearer would have
+    // produced one), and the cookie/denied header never reached it.
+    gateway
+        .assert_presented_expected_credential()
+        .expect("egress installed the profile credential");
     assert!(
-        seen.iter()
-            .any(|(name, value)| name == "authorization" && value == "Bearer gw-secret-token"),
-        "{seen:?}"
+        !gateway.saw_credential_mismatch(),
+        "relay bearer never reached the gateway"
     );
-    assert!(!seen.iter().any(|(_, value)| value.contains(&bearer)));
-    assert!(!seen.iter().any(|(name, _)| name == "cookie"));
-    assert!(!seen.iter().any(|(name, _)| name == "x-custom-denied"));
+    let recorded = gateway.requests_to("/v1/messages");
+    let message = recorded.first().expect("gateway saw /v1/messages");
     assert!(
-        seen.iter()
-            .any(|(name, value)| name == "x-profile-header" && value == "profile-value"),
-        "profile headers are installed on the egress request"
+        message.has_header("x-profile-header"),
+        "profile header installed on egress"
     );
-    drop(seen);
+    assert!(!message.has_header("cookie"), "client cookie dropped");
+    assert!(
+        !message.has_header("x-custom-denied"),
+        "unlisted request header dropped"
+    );
 
     let frames = log.lock().unwrap();
     assert!(frames.iter().any(|m| m == METHOD_API_OPEN));
     assert!(frames.iter().any(|m| m == METHOD_API_HEAD));
     assert!(frames.iter().any(|m| m == METHOD_API_END));
-    // 48 KiB at a 16 KiB coalescing threshold plus the final flush must be
-    // several chunks, and every one of them rode a credit back from W.
+    // The default script is a few hundred bytes under the 16 KiB threshold;
+    // at least one body chunk must still flow.
     let chunks = frames.iter().filter(|m| **m == METHOD_API_CHUNK).count();
-    assert!((2..=8).contains(&chunks), "chunks={chunks}");
-    let credits = frames
-        .iter()
-        .filter(|m| **m == remuda_protocol::hubnode::METHOD_API_CREDIT)
-        .count();
+    assert!(chunks >= 1, "a coalesced SSE body rode api.chunk");
+    let credits = frames.iter().filter(|m| **m == METHOD_API_CREDIT).count();
     assert!(credits >= chunks, "every chunk is drained and credited");
 }
 
 #[tokio::test]
 async fn client_disconnect_sends_api_cancel() {
-    let gateway = spawn_gateway(GatewayMode::Sse {
-        chunks: 40,
-        gap_ms: 25,
-        size: 1024,
-    })
-    .await;
-    let state_w = ApiRelayState::new();
-    let state_h = ApiRelayState::new();
-    state_h.set_egress_context(gateway_context(&gateway, None));
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let (_bw, _bh, _hub) = wire_like_hub(&state_w, &state_h, Arc::clone(&log));
-
-    let provision = listener::provision_worker(
-        &state_w,
-        INSTANCE,
-        &format!("{}/v1", gateway.base_url),
-        &via(ApiRouteMode::HubRelay),
-        None,
-    )
-    .await
-    .unwrap();
-    let url = provision.listener.base_url();
-    let bearer = provision.listener.bearer_token();
+    // A script long enough to still be streaming when the client drops.
+    let (_sw, _sh, _gateway, log, url, bearer) =
+        hub_relay_fixture(vec![Script::messages("a".repeat(512 * 1024))]).await;
 
     let response = http()
         .post(format!("{url}/messages"))
@@ -462,8 +364,10 @@ async fn client_disconnect_sends_api_cancel() {
 }
 
 #[tokio::test]
-async fn slow_gateway_first_byte_is_a_504_api_error() {
-    let gateway = spawn_gateway(GatewayMode::SlowFirstByte { delay_ms: 2_000 }).await;
+async fn slow_first_byte_is_mapped_to_504_anthropic_body() {
+    let gateway = FakeGateway::start_with(vec![Script::slow_first_byte(Duration::from_secs(2))])
+        .await
+        .unwrap();
     let state_w = ApiRelayState::new();
     let state_h = ApiRelayState::new();
     let tuned = gateway_context(
@@ -483,7 +387,7 @@ async fn slow_gateway_first_byte_is_a_504_api_error() {
     let provision = listener::provision_worker(
         &state_w,
         INSTANCE,
-        &format!("{}/v1", gateway.base_url),
+        &gateway.base_url_v1(),
         &via(ApiRouteMode::HubRelay),
         None,
     )
@@ -499,12 +403,194 @@ async fn slow_gateway_first_byte_is_a_504_api_error() {
     assert_eq!(response.status(), 504);
     let body = response.text().await.unwrap();
     assert!(body.contains("upstream-timeout"), "{body}");
+    // The pinned gateway origin never appears in the body handed to W.
+    assert!(
+        !body.contains(&gateway.base_url_v1()),
+        "origin must not reach W"
+    );
+}
+
+// ── origin confinement on the error path ───────────────────────────────────
+
+#[tokio::test]
+async fn gateway_failure_body_never_carries_the_pinned_origin_to_w() {
+    // The happy path is covered by the credential-swap test; this exercises
+    // the reqwest *error* path end to end: a pinned origin that refuses the
+    // connection produces an Anthropic-shaped body on W containing only the
+    // stable code and fixed text — never the origin's host or port, which
+    // reqwest's Display would otherwise embed.
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let (_bw, _bh, _hub) = wire_like_hub(&state_w, &state_h, Arc::new(Mutex::new(Vec::new())));
+    let dead_origin = "http://127.0.0.1:9/v1".to_owned();
+    let context = EgressContext::new(
+        INSTANCE,
+        &dead_origin,
+        CredentialKind::GatewayBearer(GW_TOKEN.into()),
+    )
+    .unwrap();
+    state_h.set_egress_context(context);
+    let provision = listener::provision_worker(
+        &state_w,
+        INSTANCE,
+        &dead_origin,
+        &via(ApiRouteMode::HubRelay),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let response = http()
+        .post(format!("{}/messages", provision.listener.base_url()))
+        .bearer_auth(provision.listener.bearer_token())
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 504);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("upstream-timeout"), "{body}");
+    assert!(
+        !body.contains("127.0.0.1") && !body.contains(":9"),
+        "the pinned origin must never be rendered toward W: {body}"
+    );
+    assert!(
+        serde_json::from_str::<Value>(&body).is_ok(),
+        "the fixed error text still produces valid JSON"
+    );
+    state_w.revoke_instance(INSTANCE);
+}
+
+// ── status passthrough: 429 / 529 with retry-after ────────────────────────
+
+#[tokio::test]
+async fn scripted_429_and_529_pass_through_with_retry_after() {
+    for (code, error_type) in [(429u16, "rate_limit_error"), (529u16, "overloaded_error")] {
+        let gateway = FakeGateway::start_with(vec![Script::status(code)])
+            .await
+            .unwrap();
+        gateway.expect_credential(GW_TOKEN);
+        let state_w = ApiRelayState::new();
+        let state_h = ApiRelayState::new();
+        state_h.set_egress_context(gateway_context(&gateway, None));
+        let (_bw, _bh, _hub) = wire_like_hub(&state_w, &state_h, Arc::new(Mutex::new(Vec::new())));
+        let provision = listener::provision_worker(
+            &state_w,
+            INSTANCE,
+            &gateway.base_url_v1(),
+            &via(ApiRouteMode::HubRelay),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let response = http()
+            .post(format!("{}/messages", provision.listener.base_url()))
+            .bearer_auth(provision.listener.bearer_token())
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), code, "{error_type}");
+        assert!(
+            response.headers().contains_key("retry-after"),
+            "retry-after survives the response allowlist for {code}"
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains(error_type), "body carries the scripted error");
+        // The fixture's status body never carries the gateway origin.
+        assert!(!body.contains("127.0.0.1"), "origin must not reach W");
+        state_w.revoke_instance(INSTANCE);
+    }
+}
+
+// ── chunked request body ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn request_body_larger_than_one_chunk_streams_to_gateway() {
+    // Roughly one MiB: well beyond the initial four-chunk credit window, so a
+    // pass proves H's per-drained-chunk api.credit replies keep the whole
+    // upload moving (not just the first window). The fixture records only a
+    // byte count, so end-to-end delivery of every byte is the assertion.
+    let gateway = FakeGateway::start_with(vec![Script::messages_json("ok")])
+        .await
+        .unwrap();
+    gateway.expect_credential(GW_TOKEN);
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    state_h.set_egress_context(gateway_context(&gateway, None));
+    let (_bw, _bh, _hub) = wire_like_hub(&state_w, &state_h, Arc::clone(&log));
+    let provision = listener::provision_worker(
+        &state_w,
+        INSTANCE,
+        &gateway.base_url_v1(),
+        &via(ApiRouteMode::HubRelay),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // > one wire chunk: axum coalesces small reads but never reads a body this
+    // large inline, so this must take the api.body upload leg.
+    let body = json!({
+        "model": "haiku",
+        "padding": "z".repeat(1024 * 1024),
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let body_len = body_bytes.len();
+    assert!(
+        body_len > 4 * 64 * 1024,
+        "the fixture body must exceed the initial credit window"
+    );
+
+    let response = http()
+        .post(format!("{}/messages", provision.listener.base_url()))
+        .bearer_auth(provision.listener.bearer_token())
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    // The gateway received the whole body, in order, and the W-side log shows
+    // many body frames plus the zero-byte last terminator.
+    let recorded = gateway.requests_to("/v1/messages");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].body_bytes, body_len,
+        "the gateway got every request byte"
+    );
+    let frames = log.lock().unwrap();
+    let body_frames = frames
+        .iter()
+        .filter(|m| **m == remuda_protocol::hubnode::METHOD_API_BODY)
+        .count();
+    assert!(
+        body_frames > 4,
+        "a ~1 MiB body rode more than the initial window of api.body frames"
+    );
+    assert!(
+        frames
+            .iter()
+            .filter(|m| **m == remuda_protocol::hubnode::METHOD_API_CREDIT)
+            .count()
+            >= body_frames - 1,
+        "H credits each drained request-body chunk"
+    );
 }
 
 // ── egress policy ──────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn egress_refuses_path_escape_and_missing_context() {
+    // A live gateway watches for traffic the refused frames must never
+    // generate: the refusal happens before any socket is opened, so zero
+    // requests and zero credential-bearing material reach it.
+    let gateway = FakeGateway::start_with(vec![Script::default_messages()])
+        .await
+        .unwrap();
+    gateway.expect_credential(GW_TOKEN);
     let state_h = ApiRelayState::new();
     let (broker, mut rx) = state_h.attach_link();
 
@@ -512,8 +598,8 @@ async fn egress_refuses_path_escape_and_missing_context() {
     // the stream with destination-refused, never touching a network.
     let context = EgressContext::new(
         "pinned",
-        "http://127.0.0.1:1/v1",
-        CredentialKind::GatewayBearer("secret".into()),
+        &gateway.base_url_v1(),
+        CredentialKind::GatewayBearer(GW_TOKEN.into()),
     )
     .unwrap();
     state_h.set_egress_context(context);
@@ -531,6 +617,52 @@ async fn egress_refuses_path_escape_and_missing_context() {
         .await;
     let end = recv_method(&mut rx, METHOD_API_END).await;
     assert_eq!(end["params"]["error"]["code"], "destination-refused");
+
+    assert_eq!(
+        gateway.request_count(),
+        0,
+        "a refusal never reaches the gateway"
+    );
+    gateway
+        .assert_no_credentials()
+        .expect("no credential rides a refused open");
+}
+
+#[tokio::test]
+async fn hello_limits_lower_chunk_size_and_stream_cap() {
+    let state = ApiRelayState::new();
+    // Protocol defaults before a hello.
+    assert_eq!(
+        state.api_chunk_bytes(),
+        remuda_protocol::default_api_chunk_bytes() as usize
+    );
+    assert_eq!(
+        state.max_link_streams(),
+        remuda_protocol::default_max_api_streams() as usize
+    );
+    state.apply_hello_limits(&json!({
+        "result": {"limits": {"apiChunkBytes": 4096u32, "maxApiStreams": 3u32}}
+    }));
+    assert_eq!(state.api_chunk_bytes(), 4096);
+    assert_eq!(state.max_link_streams(), 3);
+
+    let (broker, _rx) = state.attach_link();
+    // Two per instance is still the smaller cap; spread three opens across
+    // instances so the fourth hits the Hub-lowered *link* cap.
+    // Held for their slots' lifetime; the assertion below is the point.
+    let _opened = [
+        broker.open_worker_stream("i-a").unwrap().0,
+        broker.open_worker_stream("i-a").unwrap().0,
+        broker.open_worker_stream("i-b").unwrap().0,
+    ];
+    assert!(
+        broker.open_worker_stream("i-c").is_err(),
+        "the Hub-lowered link cap is enforced"
+    );
+    // Garbage / zero values leave the negotiated limits in place.
+    state.apply_hello_limits(&json!({"result": {"limits": {"apiChunkBytes": 0}}}));
+    assert_eq!(state.api_chunk_bytes(), 4096);
+    broker.fail_all("x", "x");
 }
 
 fn open_frame(instance_id: &str, path: &str) -> Value {
@@ -567,7 +699,10 @@ async fn recv_method(rx: &mut tokio::sync::mpsc::Receiver<Value>, method: &str) 
 
 #[tokio::test]
 async fn direct_net_probe_and_request_end_to_end() {
-    let gateway = spawn_gateway(GatewayMode::Models).await;
+    let gateway = FakeGateway::start_with(vec![Script::default_messages()])
+        .await
+        .unwrap();
+    gateway.expect_credential(GW_TOKEN);
     let state_w = ApiRelayState::new();
     let state_h = ApiRelayState::new();
     let bearer = RelayBearer::mint();
@@ -592,7 +727,7 @@ async fn direct_net_probe_and_request_end_to_end() {
     let provision = listener::provision_worker_with_bearer(
         &state_w,
         INSTANCE,
-        &format!("{}/v1", gateway.base_url),
+        &gateway.base_url_v1(),
         &via(ApiRouteMode::Auto),
         Some(&endpoint),
         RelayBearer::from_encoded(proxy.bearer_token()),
@@ -656,7 +791,7 @@ async fn direct_net_refusals() {
     let context = EgressContext::new(
         INSTANCE,
         "http://gateway.invalid/v1",
-        CredentialKind::ApiKey("k".into()),
+        CredentialKind::ApiKey("sk-fake-bind-policy-placeholder".into()),
     )
     .unwrap();
     assert!(
@@ -778,6 +913,8 @@ async fn producer_waits_for_credits_then_moves() {
                     data_base64: BASE64.encode(b"x"),
                     last: false,
                 },
+                &tokio::sync::Notify::new(),
+                tokio::time::Instant::now() + Duration::from_secs(30),
             )
             .await
             .unwrap();
@@ -795,6 +932,8 @@ async fn producer_waits_for_credits_then_moves() {
                         data_base64: BASE64.encode(b"x"),
                         last: false,
                     },
+                    &tokio::sync::Notify::new(),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
                 )
                 .await
         }
@@ -853,5 +992,221 @@ async fn direct_request_provisions_nothing() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+// ── api.egress credential handoff ──────────────────────────────────────────
+
+/// Start one worker-side stream on the W broker and send `api.open` for
+/// POST /messages. Returns the opened stream id and outbox plus the event
+/// receiver the caller drains.
+async fn open_messages_stream(
+    broker: &Arc<LinkBroker>,
+) -> (
+    String,
+    super::Outbox,
+    tokio::sync::mpsc::Receiver<InboundEvent>,
+) {
+    let (stream_id, outbox, events) = broker.open_worker_stream(INSTANCE).unwrap();
+    outbox
+        .send_notification(
+            METHOD_API_OPEN,
+            &ApiOpenParams {
+                instance_id: INSTANCE.into(),
+                stream_id: stream_id.clone(),
+                method: "POST".into(),
+                path: "/messages".into(),
+                query: String::new(),
+                headers: vec![],
+                body_base64: Some(BASE64.encode(b"{}")),
+                body_chunked: false,
+                deadline_ms: 30_000,
+            },
+        )
+        .await
+        .unwrap();
+    (stream_id, outbox, events)
+}
+
+/// Pump outbound frames between the two brokers like the Hub would.
+fn pump_pair(
+    state_w: &Arc<ApiRelayState>,
+    state_h: &Arc<ApiRelayState>,
+) -> (Arc<LinkBroker>, Arc<LinkBroker>, JoinHandle<()>) {
+    let (broker_w, mut rx_w) = state_w.attach_link();
+    let (broker_h, mut rx_h) = state_h.attach_link();
+    let (w, h) = (Arc::clone(&broker_w), Arc::clone(&broker_h));
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                frame = rx_w.recv() => {
+                    let Some(frame) = frame else { break };
+                    h.handle_frame(&frame).await;
+                }
+                frame = rx_h.recv() => {
+                    let Some(frame) = frame else { break };
+                    w.handle_frame(&frame).await;
+                }
+            }
+        }
+    });
+    (broker_w, broker_h, task)
+}
+
+#[tokio::test]
+async fn api_open_before_egress_is_refused_after_install_succeeds_and_revoke_ends() {
+    // Script order: the refused open (step 1) never reaches the gateway, so
+    // request #1 is step 3 (fast success) and request #2 is step 4 — held at
+    // the head for 30 s so revoke lands while the stream is in flight.
+    let gateway = FakeGateway::start_with(vec![
+        Script::default_messages(),
+        Script::slow_first_byte(Duration::from_secs(30)),
+    ])
+    .await
+    .unwrap();
+    gateway.expect_credential(GW_TOKEN);
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let (broker_w, broker_h, pump) = pump_pair(&state_w, &state_h);
+
+    // 1. api.open before any api.egress: refused with destination-refused.
+    let (_id, _outbox, mut events) = open_messages_stream(&broker_w).await;
+    let end = recv_terminal(&mut events).await;
+    assert_eq!(
+        end.error.as_ref().map(|error| error.code.as_str()),
+        Some("destination-refused"),
+        "no context installed yet"
+    );
+
+    // 2. The context arrives as an api.egress notification — as a frame, the
+    //    way the Hub sends it after route decision / reconnect.
+    broker_h
+        .handle_frame(&json!({
+            "jsonrpc": "2.0",
+            "method": super::METHOD_API_EGRESS,
+            "params": {
+                "instanceId": INSTANCE,
+                "profileId": "prv_fake",
+                "baseUrl": gateway.base_url_v1(),
+                "headers": [{"name": "x-profile-header", "value": "profile-value"}],
+                "authToken": GW_TOKEN,
+                "revoke": false,
+            }
+        }))
+        .await;
+
+    // 3. An api.open after install reaches the gateway: api.head 200.
+    let (_id, _outbox, mut events) = open_messages_stream(&broker_w).await;
+    let mut saw_head = false;
+    let end = recv_terminal_while(&mut events, |event| {
+        if let InboundEvent::Head(head) = event {
+            assert_eq!(head.status, 200);
+            saw_head = true;
+        }
+    })
+    .await;
+    assert!(saw_head, "egress served the request after install");
+    assert!(end.error.is_none(), "clean end: {end:?}");
+    gateway
+        .assert_presented_expected_credential()
+        .expect("the egress credential came from api.egress");
+
+    // 4. revoke on a still-in-flight stream ends it with an api.end.
+    let (_id, _outbox, mut events) = open_messages_stream(&broker_w).await;
+    broker_h
+        .handle_frame(&json!({
+            "jsonrpc": "2.0",
+            "method": super::METHOD_API_EGRESS,
+            "params": {"instanceId": INSTANCE, "revoke": true}
+        }))
+        .await;
+    let end = recv_terminal(&mut events).await;
+    assert!(end.error.is_some(), "revoke ends a live stream: {end:?}");
+
+    // 5. After revoke the context is gone: the next open is refused again.
+    let (_id, _outbox, mut events) = open_messages_stream(&broker_w).await;
+    let end = recv_terminal(&mut events).await;
+    assert_eq!(
+        end.error.as_ref().map(|error| error.code.as_str()),
+        Some("destination-refused"),
+        "revoke clears the in-memory context"
+    );
+
+    pump.abort();
+}
+
+/// Wait for the terminal `api.end` of a stream.
+async fn recv_terminal(
+    events: &mut tokio::sync::mpsc::Receiver<InboundEvent>,
+) -> remuda_protocol::hubnode::ApiEndParams {
+    recv_terminal_while(events, |_| {}).await
+}
+
+/// Wait for the terminal frame, running `on_event` for every earlier frame.
+async fn recv_terminal_while(
+    events: &mut tokio::sync::mpsc::Receiver<InboundEvent>,
+    mut on_event: impl FnMut(&InboundEvent),
+) -> remuda_protocol::hubnode::ApiEndParams {
+    tokio::time::timeout(Duration::from_secs(10), async move {
+        while let Some(event) = events.recv().await {
+            if let InboundEvent::End(end) = event {
+                return end;
+            }
+            on_event(&event);
+        }
+        panic!("stream ended without an api.end frame");
+    })
+    .await
+    .expect("api.end within the timeout")
+}
+
+// ── credits / hard cap ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn credit_starved_egress_ends_at_the_hard_cap_after_four_chunks() {
+    // A reader on W that stops acknowledging once the initial four-chunk
+    // window is drained must not leave the egress parked holding the gateway
+    // connection: the fifth gated send races the stream's hard cap (tuned to
+    // one second here) and the stream ends upstream-timeout, exactly four
+    // chunks having left H. The test stands in for a W that never sends an
+    // api.credit.
+    let gateway = FakeGateway::start_with(vec![Script::messages("a".repeat(128 * 1024))])
+        .await
+        .unwrap();
+    gateway.expect_credential(GW_TOKEN);
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let tuned = EgressTimeouts {
+        ttft: Duration::from_secs(10),
+        idle: Duration::from_secs(30),
+        hard: Duration::from_secs(1),
+    };
+    state_h.set_egress_context(gateway_context(&gateway, Some((512, tuned))));
+    let (broker_w, _broker_h, pump) = pump_pair(&state_w, &state_h);
+
+    // Open from W and then deliberately never answer a chunk with a credit.
+    let (_id, _outbox, mut events) = open_messages_stream(&broker_w).await;
+
+    let mut chunks = 0usize;
+    let end = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.expect("event") {
+                InboundEvent::Chunk(_) => chunks += 1,
+                InboundEvent::End(end) => return end,
+                InboundEvent::Head(_) | InboundEvent::Credit(_) => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the hard cap ends the starved stream");
+    pump.abort();
+
+    assert_eq!(chunks, 4, "only the initial window drains without credits");
+    let error = end.error.expect("an error end");
+    assert_eq!(
+        error.code,
+        remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
+        "{error:?}"
     );
 }

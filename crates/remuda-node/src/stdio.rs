@@ -299,9 +299,8 @@ where
                 // the JSON-RPC dispatch table.
                 if frame
                     .get("method")
-                    .and_then(Value::as_str)
-                    .and_then(remuda_protocol::hubnode::HubNodeMethod::parse)
-                    .is_some_and(|method| method.is_api())
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(crate::api_relay::is_api_method)
                 {
                     api_broker.handle_frame(&frame).await;
                     continue;
@@ -408,6 +407,8 @@ async fn handle_stdio_frame(
         if let Err(error) = hubnode_codec::persist_hello_result(data_dir, &frame) {
             tracing::warn!(%error, "could not persist the hello result");
         }
+        // D-048: adopt the Hub-advertised relay limits from the hello result.
+        node.api_relay().apply_hello_limits(&frame);
         return Ok(FrameOutcome::none());
     }
     let request = match decode_request(&frame) {

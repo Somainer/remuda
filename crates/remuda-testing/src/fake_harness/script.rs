@@ -176,6 +176,32 @@ pub struct ToolSpec {
     /// `async_status` / `async_result`. Reproduces the c-tasktrack lifecycle.
     #[serde(default)]
     pub async_agent: Option<AsyncAgent>,
+    /// Selected option labels for a `ask_user_question` call, one per scripted
+    /// question. The completed grok frame echoes them in
+    /// `rawOutput.UserAnswered`.
+    #[serde(default)]
+    pub answer: Option<Vec<String>>,
+    /// Scripted file change for a write-style tool (`write` / `search_replace`):
+    /// the progress and completed grok frames carry a `{type:"diff"}` content
+    /// block. Absent for every other tool.
+    #[serde(default)]
+    pub diff: Option<DiffSpec>,
+}
+
+/// A scripted `{type:"diff"}` content block (grok write tools).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct DiffSpec {
+    /// Changed path. Defaults to `input.file_path`, the field the real client
+    /// puts in `locations[].path`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Replaced text (empty for a create).
+    #[serde(default)]
+    pub old_text: Option<String>,
+    /// Replacement text. Defaults to `input.content`.
+    #[serde(default)]
+    pub new_text: Option<String>,
 }
 
 /// A backgrounded Agent launch and its later completion.
@@ -242,6 +268,166 @@ impl ToolSpec {
     #[must_use]
     pub fn is_error(&self) -> bool {
         self.is_error.unwrap_or(false)
+    }
+
+    /// Stable grok tool name for a scripted call.
+    ///
+    /// The grok dialect writes `_meta["x.ai/tool"]{name,kind}` from *this*
+    /// value rather than the scripted `name`, because a grok scenario names the
+    /// tool the way the model calls it (`run_terminal_command`, `read_file`, …)
+    /// — the real client's namespace, not the Claude `Bash` the other dialects
+    /// normalize to. A scenario that still spells a Claude name (the shipped
+    /// `ok`/`slow` fixtures) gets the grok equivalent, so the same scenario
+    /// stays runnable under all three dialects.
+    #[must_use]
+    pub fn grok_name(&self) -> String {
+        grok_tool_name(&self.name).to_owned()
+    }
+
+    /// Frame `kind` for the scripted tool, from the same name table task
+    /// `c-grok-toolid` translates by (design §3.1): measured kinds are
+    /// `execute` / `write` / `edit` / `ask_user` / `other`.
+    ///
+    /// This is the **`_meta["x.ai/tool"].kind`** value, not the frame's
+    /// top-level `kind` — the two differ (see [`Self::grok_acp_kind`]).
+    #[must_use]
+    pub fn grok_kind(&self) -> &'static str {
+        grok_tool_kind(&self.grok_name())
+    }
+
+    /// The top-level `kind` on a progress frame: the ACP [`ToolKind`], which is
+    /// a *different* vocabulary from `x.ai/tool.kind`.
+    ///
+    /// Measured values: `execute` for a shell call, `edit` for a write, `other`
+    /// for `ask_user_question` (1.0.30 fixture frame 37; 1.0.34 ACP capture).
+    /// Everything else falls back to `other`, the ACP default for an
+    /// unclassified tool — deliberately *not* guessed into a more specific
+    /// kind, because the 1.0.30 fixture never exercised those tools.
+    ///
+    /// [`ToolKind`]: https://agentclientprotocol.com
+    #[must_use]
+    pub fn grok_acp_kind(&self) -> &'static str {
+        match self.grok_name().as_str() {
+            "run_terminal_command" => "execute",
+            "write" | "search_replace" => "edit",
+            _ => "other",
+        }
+    }
+
+    /// `x.ai/tool.label` — the short human label the real client ships.
+    #[must_use]
+    pub fn grok_label(&self) -> &'static str {
+        grok_tool_label(&self.grok_name())
+    }
+
+    /// `x.ai/tool.namespace`. The captures split two ways: the build's own
+    /// tools report `grok_build`, the file tools report `opencode`
+    /// (`fixtures/grok/grok-acp-session.jsonl`).
+    #[must_use]
+    pub fn grok_namespace(&self) -> &'static str {
+        match self.grok_name().as_str() {
+            "write" | "search_replace" | "read_file" | "list_dir" => "opencode",
+            _ => "grok_build",
+        }
+    }
+
+    /// Whether the real client marks the tool read-only.
+    #[must_use]
+    pub fn grok_read_only(&self) -> bool {
+        matches!(
+            self.grok_name().as_str(),
+            "read_file" | "list_dir" | "grep" | "web_search" | "web_fetch" | "ask_user_question"
+        )
+    }
+
+    /// Tool `variant` the progress frame normalizes `rawInput` into. Captured
+    /// values are `Bash` (shell) and `AskUserQuestion`; `Write` and
+    /// `SearchReplace` follow `rawOutput.type` in the captured write frames
+    /// ([U] for the search/replace spelling — the 1.0.30 fixture has no write).
+    #[must_use]
+    pub fn grok_variant(&self) -> &'static str {
+        grok_tool_variant(&self.grok_name())
+    }
+
+    /// Human display title for the progress frame, mirroring the captured
+    /// `Execute \`printf …\`` / `Write \`/tmp/…\`` / `Ask: …` shapes.
+    #[must_use]
+    pub fn grok_title(&self) -> String {
+        let input = self.input_object();
+        let field = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or_default();
+        match self.grok_name().as_str() {
+            "run_terminal_command" => format!("Execute `{}`", field("command")),
+            "read_file" | "write" | "search_replace" => {
+                format!("{} `{}`", capitalise(self.grok_label()), field("file_path"))
+            }
+            "list_dir" => format!("List `{}`", field("target_directory")),
+            "ask_user_question" => format!("Ask: {}", field("question")),
+            _ => self.grok_label().to_owned(),
+        }
+    }
+}
+
+/// Claude tool name → grok native name. Only the names the shipped scenarios
+/// use need an entry; anything else passes through unchanged so a grok-only
+/// scenario keeps its own spelling.
+fn grok_tool_name(name: &str) -> &str {
+    match name {
+        "Bash" => "run_terminal_command",
+        "Read" => "read_file",
+        "Write" => "write",
+        "Edit" => "search_replace",
+        "Glob" => "list_dir",
+        "Grep" => "grep",
+        "Task" | "Agent" => "spawn_subagent",
+        other => other,
+    }
+}
+
+/// Name → `kind`, the frame field the category fallback reads. Mirrors the
+/// `kind` column of the design doc §3.1 table.
+fn grok_tool_kind(name: &str) -> &'static str {
+    match name {
+        "run_terminal_command" => "execute",
+        "write" | "search_replace" => "write",
+        "ask_user_question" => "ask_user",
+        _ => "other",
+    }
+}
+
+/// Name → `label`, as the real client stamps it.
+fn grok_tool_label(name: &str) -> &'static str {
+    match name {
+        "run_terminal_command" => "Run Command",
+        "read_file" => "Read File",
+        "write" => "Write",
+        "search_replace" => "Search Replace",
+        "list_dir" => "List Directory",
+        "grep" => "Search",
+        "ask_user_question" => "Ask User",
+        "spawn_subagent" => "Spawn Subagent",
+        "workflow" => "Workflow",
+        _ => "Tool",
+    }
+}
+
+/// Name → `rawInput.variant` on the progress frame.
+fn grok_tool_variant(name: &str) -> &'static str {
+    match name {
+        "run_terminal_command" => "Bash",
+        "read_file" => "Read",
+        "write" => "Write",
+        "search_replace" => "SearchReplace",
+        "list_dir" => "ListDir",
+        "ask_user_question" => "AskUserQuestion",
+        _ => "Tool",
+    }
+}
+
+fn capitalise(label: &str) -> String {
+    let mut chars = label.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
     }
 }
 
@@ -412,5 +598,49 @@ mod tests {
     fn unknown_fields_are_rejected() {
         let err = Scenario::parse(r#"{"turns":[],"bogus":1}"#, "json").unwrap_err();
         assert!(err.contains("bogus"), "{err}");
+    }
+
+    fn tool(name: &str, input: Value) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            input,
+            ..ToolSpec::default()
+        }
+    }
+
+    #[test]
+    fn grok_identity_follows_the_name_table_not_the_scripted_dialect_name() {
+        // A claude-named scenario still yields grok's stable frame identity.
+        let bash = tool("Bash", serde_json::json!({ "command": "printf hi" }));
+        assert_eq!(bash.grok_name(), "run_terminal_command");
+        assert_eq!(bash.grok_kind(), "execute");
+        assert_eq!(bash.grok_label(), "Run Command");
+        assert_eq!(bash.grok_variant(), "Bash");
+        assert!(!bash.grok_read_only());
+        assert_eq!(
+            bash.grok_title(),
+            "Execute `printf hi`",
+            "title is the display sentence, not the name"
+        );
+    }
+
+    #[test]
+    fn grok_names_pass_through_and_carry_their_own_kind() {
+        let ask = tool(
+            "ask_user_question",
+            serde_json::json!({ "question": "Pick one." }),
+        );
+        assert_eq!(ask.grok_name(), "ask_user_question");
+        assert_eq!(ask.grok_kind(), "ask_user");
+        assert_eq!(ask.grok_variant(), "AskUserQuestion");
+        assert!(ask.grok_read_only());
+        assert_eq!(ask.grok_title(), "Ask: Pick one.");
+
+        let write = tool(
+            "write",
+            serde_json::json!({ "file_path": "/tmp/out.txt", "content": "OK" }),
+        );
+        assert_eq!(write.grok_kind(), "write");
+        assert_eq!(write.grok_title(), "Write `/tmp/out.txt`");
     }
 }

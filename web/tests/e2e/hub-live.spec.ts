@@ -15,14 +15,20 @@ async function shot(page: Page, name: string) {
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
-/** Answer every pending approval/question this instance currently has. */
+/**
+ * Answer every pending approval/question this instance currently has.
+ *
+ * Gate flake: a launch approval is journaled concurrently with the create
+ * response, so an interactions poll taken immediately after navigation can
+ * read 0 pending — the old helper passed as soon as pending read 0, before the
+ * approval existed, and the launch stayed blocked. We therefore wait until an
+ * interaction for the instance EXISTS in any state (proving the launch
+ * approval was created — it may already be answered, e.g. the hook-approval
+ * case resolves its card on /approvals before calling this helper), answer
+ * whatever is still pending, then wait for the pending list to clear.
+ */
 async function answerPendingApprovals(page: Page, instanceId: string) {
-  // Gate flake: a launch approval is journaled concurrently with the create
-  // response, so an interactions poll taken immediately after navigation can
-  // read 0 pending — a `.toBe(0)` poll then passes before the approval exists
-  // and the launch stays blocked forever (90s test timeout). Wait for the
-  // pending approval to APPEAR, answer it, then wait for the list to clear.
-  const pending = () =>
+  const items = () =>
     page.evaluate(async (id) => {
       const list = await fetch("/v1/interactions", { credentials: "include" });
       const body = (await list.json()) as {
@@ -33,14 +39,14 @@ async function answerPendingApprovals(page: Page, instanceId: string) {
           request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
         }[];
       };
-      return (body.items ?? []).filter((item) => item.instanceId === id && item.state === "pending");
+      return (body.items ?? []).filter((item) => item.instanceId === id);
     }, instanceId);
 
-  const mine = await expect
-    .poll(async () => (await pending()).length, { timeout: 20_000, message: "launch approval appears" })
-    .toBeGreaterThan(0)
-    .then(() => pending());
+  await expect
+    .poll(async () => (await items()).length, { timeout: 20_000, message: "launch approval exists" })
+    .toBeGreaterThan(0);
 
+  const mine = (await items()).filter((item) => item.state === "pending");
   for (const item of mine) {
     const optionId = item.request?.options?.[0]?.id;
     if (!optionId) continue;
@@ -59,7 +65,10 @@ async function answerPendingApprovals(page: Page, instanceId: string) {
   }
 
   await expect
-    .poll(async () => (await pending()).length, { timeout: 20_000, message: "approvals clear" })
+    .poll(
+      async () => (await items()).filter((item) => item.state === "pending").length,
+      { timeout: 20_000, message: "approvals clear" },
+    )
     .toBe(0);
 }
 

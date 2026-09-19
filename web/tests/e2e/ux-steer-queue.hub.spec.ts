@@ -99,10 +99,10 @@ async function createSession(page: Page, prompt: string): Promise<string> {
 }
 
 async function answerPending(page: Page, instanceId: string) {
-  // Wait for the launch approval to APPEAR first: an immediate poll can read
-  // 0 pending while the approval is still being journaled, which used to make
-  // this helper return with the launch still blocked (gate test timeout).
-  const pending = () =>
+  // Wait for the launch approval to EXIST (in any state) first: an immediate
+  // poll can read nothing while the approval is still being journaled, which
+  // used to make this helper return with the launch still blocked.
+  const items = () =>
     page.evaluate(
       async (id) => {
         const list = await fetch("/v1/interactions", { credentials: "include" });
@@ -115,17 +115,17 @@ async function answerPending(page: Page, instanceId: string) {
             request?: { inputDigest?: string; options?: { id: string }[] };
           }[];
         };
-        return (body.items ?? []).filter((item) => item.instanceId === id && item.state === "pending");
+        return (body.items ?? []).filter((item) => item.instanceId === id);
       },
       instanceId,
     );
-  const mine = await expect
-    .poll(() => pending().then((items) => items.length), {
+  await expect
+    .poll(() => items().then((list) => list.length), {
       timeout: 20_000,
-      message: "launch approval appears",
+      message: "launch approval exists",
     })
-    .toBeGreaterThan(0)
-    .then(() => pending());
+    .toBeGreaterThan(0);
+  const mine = (await items()).filter((item) => item.state === "pending");
   for (const item of mine) {
     const optionId = item.request?.options?.[0]?.id;
     if (!optionId) continue;
@@ -143,7 +143,7 @@ async function answerPending(page: Page, instanceId: string) {
     );
   }
   await expect
-    .poll(() => pending().then((items) => items.length), {
+    .poll(() => items().then((list) => list.filter((item) => item.state === "pending").length), {
       timeout: 20_000,
       message: "approvals clear",
     })

@@ -117,30 +117,31 @@ async function createClaudeSession(page: Page): Promise<string> {
 
 /** Resolve any pending approval the fake harness emits, same as ux-permmode. */
 async function clearApprovals(page: Page, instanceId: string) {
-  // Wait for the launch approval to APPEAR: an immediate empty read would
-  // return with the launch still blocked.
-  const pending = () =>
+  // Wait for the launch approval to EXIST (any state): an immediate empty read
+  // would return with the launch still blocked.
+  const items = () =>
     page.evaluate(async (id) => {
       const body = await (
         await fetch("/v1/interactions", { credentials: "include" })
       ).json();
       return (body.items ?? []).filter(
-        (item: { instanceId?: string; state?: string }) =>
-          item.instanceId === id && item.state === "pending",
+        (item: { instanceId?: string }) => item.instanceId === id,
       );
     }, instanceId);
-  const mine = await expect
-    .poll(() => pending().then((items: unknown[]) => items.length), {
+  await expect
+    .poll(() => items().then((list: unknown[]) => list.length), {
       timeout: 20_000,
-      message: "launch approval appears",
+      message: "launch approval exists",
     })
-    .toBeGreaterThan(0)
-    .then(() => pending());
-  for (const item of mine as {
+    .toBeGreaterThan(0);
+  const mine = (await items()).filter(
+    (item: { state?: string }) => item.state === "pending",
+  ) as {
     id: string;
     interactionId?: string;
     request?: { inputDigest?: string; options?: { id: string }[] };
-  }[]) {
+  }[];
+  for (const item of mine) {
     const optionId = item.request?.options?.[0]?.id;
     if (!optionId) continue;
     await page.evaluate(
@@ -161,10 +162,16 @@ async function clearApprovals(page: Page, instanceId: string) {
     );
   }
   await expect
-    .poll(() => pending().then((items: unknown[]) => items.length), {
-      timeout: 20_000,
-      message: "approvals clear",
-    })
+    .poll(
+      () =>
+        items().then(
+          (list) => (list as { state?: string }[]).filter((item) => item.state === "pending").length,
+        ),
+      {
+        timeout: 20_000,
+        message: "approvals clear",
+      },
+    )
     .toBe(0);
 }
 

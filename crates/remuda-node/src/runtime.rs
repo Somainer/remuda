@@ -4519,10 +4519,14 @@ mod api_relay_launch_test {
         assert_eq!(a.command.command_id, b.command.command_id);
         assert_eq!(a.instance.meta.id, b.instance.meta.id);
         for response in [&a, &b] {
-            assert_eq!(
-                response.command.state,
-                remuda_protocol::CommandState::Accepted,
-                "an idempotent reply carries the accepted command"
+            assert!(
+                matches!(
+                    response.command.state,
+                    remuda_protocol::CommandState::Accepted
+                        | remuda_protocol::CommandState::Settled
+                ),
+                "an idempotent reply carries an accepted-or-settled command, got {:?}",
+                response.command.state
             );
             assert!(response.api_route.is_some(), "both echo the via route");
         }

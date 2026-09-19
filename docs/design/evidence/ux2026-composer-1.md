@@ -52,8 +52,15 @@
 | `web/tests/e2e/ux-modelpick.hub.spec.ts` | c-composer 同款守卫 | 与 ux-modelsync 相同的 stray-confirm 守卫（openModelList 同样的防御性 Esc） |
 | `web/tests/e2e/ux-usage.hub.spec.ts` | c-composer 后果适配 | 390px 用例：context chip 移入选项 sheet 后，先开 sheet 再断言 chip 与明细 sheet |
 | `web/tests/e2e/session-structured.spec.ts` | **handback 1 授权**（c-sessionchrome 拥有；c-toolfold 在改同文件） | 仅 107-117 行那个用例：compact 下先开选项 sheet 再断言只读 harness-chip |
-| `web/tests/e2e/session-chrome-evidence.spec.ts` | **handback 1 授权** | 400px：golden 在 sheet 关闭状态截取，断言只读 harness-chip 时再临时打开 sheet；`shot()` 走 REMUDA_EVIDENCE 开关，默认运行写入 gitignored `test-results/`，不改动 tracked golden |
+| `web/tests/e2e/session-chrome-evidence.spec.ts` | **handback 1 授权** | 400px：golden 在 sheet 关闭、已进入会话页（`composer-bar` 可见 + `/s/` URL）的状态截取，断言只读 harness-chip 时再临时打开 sheet；tty 黄金先点「终端」并断言 `data-view=tty`（与 structured 不再字节相同）；`shot()` 走 REMUDA_EVIDENCE 开关，默认运行写入 gitignored `test-results/`，不改动 tracked golden |
 | `web/tests/e2e/ux-touchhit.hub.spec.ts` | **round-4 授权**（c-touchhit 拥有） | D-042 后果：390px effort 卡片移入选项 sheet，探测 reset/list-back 44px 角点前显式 `scrollIntoView({block:"center"})`（293-315 行附近，仅该 390px 用例） |
+
+### session-chrome 400px 黄金重生成（round-5）
+
+- 命令：默认 mock 配置（`pnpm exec playwright test -c playwright.local.config.ts --project=chromium`，VITE_MOCK=1 的本地 43141 端口）+ `REMUDA_EVIDENCE=1`，仅跑 `session-chrome-evidence.spec.ts`，重生成四张 `session-chrome-1-*-400.png`（switch-tty / switch-structured / harness-label / files）。
+- 触发原因：旧黄金是共享 dev server（他人 worktree 的旧 UI）截图，且 tty 与 structured 字节相同、harness-label 实际截到的是会话列表。
+- 脱敏检查（人工逐张核对）：画面仅含 mock fixture 标识——空间/主机 `sfe-root`、`valhalla`、`x-acpwire`、`x-codexdrv`（`web/src/lib/mock.ts` 的 wsp*）、`devbox-sg`；路径 `/home/devuser/Projects/...`、`/home/dev/projects/...`；会话 `ins_mock`/`ins_0199…`、提示词 `清一下 /tmp/coord-media`。**无** `bolt-devbox`、真实主机名、用户主目录路径或用户名。
+- 同步：390px 的 `composer-slider-5-{plain,top,ultra}-{night,ledger}-390.png` 六张因 effort 卡片在 sheet 内全宽无边框而重生成（同一 mock 配置 + REMUDA_EVIDENCE，仅跑 composer-effort ladder 用例）；1440/768 黄金不变。
 
 ## 兼容性迁移
 

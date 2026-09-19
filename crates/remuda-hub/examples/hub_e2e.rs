@@ -3958,8 +3958,11 @@ async fn append_cua_scenario(
     // of lingering on 等待发送.
     let node = command_id
         .map(|id| {
+            // Strip the prefix and use the bare UUID, exactly like
+            // append_command_user: obj_cmd_<uuid> is rejected by typed id
+            // consumers.
             id.strip_prefix("cmd_")
-                .map_or_else(|| format!("obj_node_{n}"), |_| format!("obj_{id}"))
+                .map_or_else(|| format!("obj_node_{n}"), |uuid| format!("obj_{uuid}"))
         })
         .unwrap_or_else(|| format!("obj_legacy_{n}"));
     n = append_user_message(ws, instance_id, n, prompt, command_id, &node).await?;

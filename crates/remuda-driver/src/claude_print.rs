@@ -959,19 +959,33 @@ fn value_has_unfolded_image(value: Option<&Value>) -> bool {
     };
     match value {
         Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("image")
-                && !map
-                    .get("remudaMedia")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                && (map.get("data").and_then(Value::as_str).is_some()
-                    || map
-                        .get("source")
-                        .and_then(Value::as_object)
-                        .and_then(|source| source.get("data"))
-                        .and_then(Value::as_str)
-                        .is_some())
-            {
+            // Case-insensitive type match and the same byte-bearing spellings
+            // the fold/scrub accept (`data`, `source.data`, `file.base64`),
+            // so prefold detection is a superset of what would be staged
+            // inline; an `Image`/`file.base64` item can't skip the blocking
+            // prefold onto a tokio worker.
+            let is_image = map
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.eq_ignore_ascii_case("image"));
+            let already = map
+                .get("remudaMedia")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_bytes = map.get("data").and_then(Value::as_str).is_some()
+                || map
+                    .get("source")
+                    .and_then(Value::as_object)
+                    .and_then(|source| source.get("data"))
+                    .and_then(Value::as_str)
+                    .is_some()
+                || map
+                    .get("file")
+                    .and_then(Value::as_object)
+                    .and_then(|file| file.get("base64"))
+                    .and_then(Value::as_str)
+                    .is_some();
+            if is_image && !already && has_bytes {
                 return true;
             }
             map.values()

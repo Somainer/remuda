@@ -63,8 +63,9 @@ export type ResultMedia = {
  * Image blocks of a result, in block order.
  *
  * Text stays with {@link resultText}; an image that could not be staged is a
- * text block on the producer side, so this never needs a broken-image branch
- * (ui-spec §2.2).
+ * text block on the producer side and never appears here. A block that WAS
+ * staged can still fail to load later (the object's 24 h TTL or a budget
+ * sweep), so the card renders an on-error note for that case (ui-spec §2.2).
  */
 export function resultMedia(result: ToolResultPayload | null): ResultMedia[] {
   if (!result) return [];

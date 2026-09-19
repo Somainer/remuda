@@ -526,8 +526,7 @@
   border: 1px solid var(--line);
 }
 
-/* The text shown when a staged object has expired or fails to load: keeps the
-   same bounded height as the thumbnail so swapping to it does not reflow. */
+/* The text shown when a staged object has expired or fails to load. */
 .toolMediaMissing {
   display: block;
   min-height: 48px;

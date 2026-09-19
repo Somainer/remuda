@@ -46,11 +46,22 @@ import {
 import { useAttachments } from "./useAttachments";
 import { useCodeQuotes } from "./useCodeQuotes";
 import { ContextUsagePopover } from "./ContextUsagePopover";
+import { ComposerConfirmDialog, ComposerOptionsSheet } from "./ComposerOptions";
 import type { UsageRollup } from "./contextUsage";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
 import css from "./session.module.css";
+import opt from "./composerOptions.module.css";
 
 type MenuId = "effort" | "permission" | "usage" | null;
+
+/** A Sheet-based confirmation replacing a `window.confirm` (D-042). */
+type ConfirmRequest = {
+  kind: "steer" | "interrupt";
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+};
 
 /** A held prompt row (c-steer). `id` is the local bubble id. */
 export type HeldItem = {
@@ -179,6 +190,11 @@ export function Composer({
 }) {
   const [text, setText] = useState(() => readDraft(instanceId));
   const [menu, setMenu] = useState<MenuId>(null);
+  // D-042: phone options sheet (attachments / harness / permission / effort),
+  // and the Sheet that replaces both window.confirm calls.
+  const [optionsOpen, setOptionsOpen] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+  const optionsTriggerRef = useRef<HTMLButtonElement>(null);
   // Mirrors of prompts posted straight into a harness-native queue (codex
   // Tab): the wire owns them, so these chips are display-only and never
   // cancelable here. Remuda-held rows arrive through the `held` prop.
@@ -277,6 +293,9 @@ export function Composer({
   // Read-only chips (generic-pty / other harnesses) render the native word;
   // interactive chips render the localized label from the harness table.
   const permLabel = onPermission ? permOption?.label ?? liveMode : permissionMode;
+  // D-042: yolo-class modes (绕过全部 / 不再询问 / 完全访问) must read as
+  // danger on the collapsed phone trigger, not only inside the sheet.
+  const permDanger = permOption?.danger === true;
   const permTag = permissionPending
     ? permissionPending.queued
       ? "排队中"
@@ -504,24 +523,33 @@ export function Composer({
   };
 
   /**
-   * c-steer 插队 (Cmd/Ctrl+Enter or the visible button): confirm, interrupt
-   * the running turn through the driver's own key path, and deliver this
-   * message first — the Node sends Esc, waits for turn-ended, and jumps it
-   * ahead of the held queue. Blocked (a question is open) never offers it.
+   * c-steer 插队 (Cmd/Ctrl+Enter or the visible button): open the Sheet
+   * confirmation, then interrupt the running turn through the driver's own
+   * key path and deliver this message first — the Node sends Esc, waits for
+   * turn-ended, and jumps it ahead of the held queue. Blocked (a question is
+   * open) never offers it. The draft is only cleared on confirm, so cancel
+   * leaves the text and staged attachments untouched.
    */
   const submitSteer = async () => {
     if (!canSubmit() || !controls.steer.available || phase !== "working") return;
-    const confirmed = window.confirm("打断当前 turn 并立即发送（插队）？已排队的消息仍会按顺序随后送出。");
-    if (!confirmed) return;
     const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
     const refs = images.refs(value);
     const staged = images.attachments;
-    clearBox();
-    // 已打断 is a receipt for an interrupt that actually happened: only raise
-    // it once the steer POST landed (a failure leaves 状态待确认, not a claim
-    // that the turn was interrupted).
-    const landed = await onSend(value, refs, staged, "steer");
-    if (landed !== false) setInterrupted(true);
+    setConfirm({
+      kind: "steer",
+      title: "插队发送",
+      message: "打断当前 turn 并立即发送（插队）？已排队的消息仍会按顺序随后送出。",
+      confirmLabel: "打断并发送",
+      onConfirm: () => {
+        clearBox();
+        // 已打断 is a receipt for an interrupt that actually happened: only
+        // raise it once the steer POST landed (a failure leaves 状态待确认).
+        void (async () => {
+          const landed = await onSend(value, refs, staged, "steer");
+          if (landed !== false) setInterrupted(true);
+        })();
+      },
+    });
   };
 
   const removeHeld = (id: string) => {
@@ -546,15 +574,26 @@ export function Composer({
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (composing(event)) return;
-    if (mobile) return;
-    // Esc while the composer is focused = 打断, with a confirm (desktop only).
+    // Esc while the composer is focused = 打断, with a Sheet confirm
+    // (desktop popover / phone sheet). Handled BEFORE the mobile early
+    // return: unlike Enter (a newline on phones), Esc is never a character,
+    // and a phone with a hardware keyboard sends a real Esc. window.confirm
+    // is gone (D-042): the native dialog covered the keyboard on Safari.
     if (event.key === "Escape" && busy && controls.interrupt.available) {
       event.preventDefault();
       event.stopPropagation();
-      const confirmed = window.confirm("打断当前 turn？会话与进程不会退出。");
-      if (confirmed) void doInterrupt();
+      setConfirm({
+        kind: "interrupt",
+        title: "打断当前 turn",
+        message: "打断当前 turn？会话与进程不会退出。",
+        confirmLabel: "打断",
+        onConfirm: () => void doInterrupt(),
+      });
       return;
     }
+    // The remaining shortcuts are desktop-keyboard semantics; on a phone
+    // Enter types a newline and Cmd/Ctrl+Enter is not bound.
+    if (mobile) return;
     // Cmd/Ctrl+Enter while working = 插队: interrupt and send this first.
     if (
       event.key === "Enter"
@@ -639,6 +678,274 @@ export function Composer({
       ? "会话已退出或为只读会话（observed-only），无法下发 instance.configure"
       : null
     : "此会话不支持模型切换（无 instance.configure 能力）";
+
+  // ── D-042: slot nodes shared by the desktop bar and the phone sheet ──────
+  // The permission rows and the effort slider are the SAME controls in both
+  // surfaces: desktop keeps its anchored popovers, the phone renders them
+  // once inside the options Sheet.
+  const attachHandlers = {
+    onFiles: (files: File[]) => insertForAttachments(images.add(files)),
+    onPasteClick: async () => insertForAttachments(await images.pasteFromClipboard()),
+  };
+
+  const harnessChipNode = caps.harness ? (
+    <span className={css.chip} data-testid="harness-chip" data-readonly="1">
+      <span className={css.chipMark}>{harnessChip.mark}</span>
+      <span>{mobile ? harnessChip.label.replace(" Code", "") : harnessChip.label}</span>
+    </span>
+  ) : null;
+
+  const effortSliderNode = caps.effort ? (
+    <EffortSlider
+      kind={harness}
+      model={caps.model ? model : undefined}
+      models={caps.model ? models : undefined}
+      modelEffective={caps.model ? modelEffective : null}
+      modelPending={caps.model ? modelPending : null}
+      modelSelectionPath={caps.model ? modelSelectionPath : null}
+      modelCatalog={caps.model ? (modelCatalog ?? null) : null}
+      modelLockedReason={modelLockedReason}
+      index={currentEffort.index}
+      ultracode={ultraOn}
+      disabled={effortLocked}
+      onChange={(next) => onEffort?.(next)}
+      onModel={caps.model ? onModel : undefined}
+      onClose={() => {
+        setMenu(null);
+        triggerRefs.effort.current?.focus();
+      }}
+    />
+  ) : null;
+
+  const renderPermRows = (inSheet: boolean) =>
+    permOptions.map((m) => {
+      const reachable = isLiveReachable(harness, m.id, launchPermissionMode);
+      const active = liveMode === m.id;
+      return (
+        <button
+          key={m.id}
+          type="button"
+          className={`${css.effortRow} ${active ? css.effortOn : ""}`}
+          data-testid={`permission-option-${m.id}`}
+          data-launch-only={m.launchOnly || !reachable ? "1" : undefined}
+          disabled={!reachable}
+          title={!reachable ? "该模式仅能在启动时选择" : m.description}
+          onClick={() => {
+            if (!reachable) return;
+            onPermission?.(m.id);
+            setMenu(null);
+            if (inSheet) setOptionsOpen(false);
+          }}
+        >
+          <span className={`${css.radio} ${active ? css.radioOn : ""}`} />
+          <span className={css.permissionName}>
+            {m.label}
+            {m.danger ? <span className={css.permissionDust}> · 危险</span> : null}
+            {m.launchOnly || !reachable ? (
+              <span className={css.launchOnlyTag}>仅启动时</span>
+            ) : null}
+          </span>
+          <span className={css.permissionNative}>{m.native}</span>
+        </button>
+      );
+    });
+
+  const permReadonlyNode = (
+    <span
+      className={css.chip}
+      data-testid="permission-chip"
+      data-readonly="1"
+      data-permission={liveMode}
+      title={permOption?.description}
+    >
+      {permLabel}
+    </span>
+  );
+
+  const effortSparks = ember ? (
+    <>
+      <span className={css.emberSpark} />
+      <span className={`${css.emberSpark} ${css.emberSpark2}`} />
+      <span className={`${css.emberSpark} ${css.emberSpark3}`} />
+    </>
+  ) : null;
+
+  const effortWordNode = (
+    <>
+      <span className={css.chipModel} data-testid="model-effort-chip-label">
+        {pendingLabel ?? (effectiveUnknown ? "?" : effectiveWord)}
+      </span>
+      {pendingLabel ? (
+        <span className={css.chipEffortPendingTag} data-testid="model-effort-pending">
+          {effortPending?.queued ? "排队中" : "切换中"}
+        </span>
+      ) : null}
+      {mismatch ? (
+        <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch">
+          请求 {mismatch.requested} → 实际 {mismatch.effective}
+        </span>
+      ) : null}
+    </>
+  );
+
+  const renderContextChip = (fused: boolean) =>
+    caps.context ? (
+      <button
+        ref={fused ? undefined : triggerRefs.usage}
+        type="button"
+        className={fused ? opt.contextSegment : css.chip}
+        data-testid="context-chip"
+        data-has-popover={usageRollup ? "1" : "0"}
+        aria-haspopup={usageRollup ? "dialog" : undefined}
+        aria-expanded={menu === "usage"}
+        aria-label={
+          usageRollup
+            ? `上下文用量 ${contextChipLabel}，查看明细`
+            : `上下文用量 ${contextChipLabel}`
+        }
+        onClick={() => {
+          // Idempotent, click-pinned open: mouseenter may already have opened
+          // it on precise pointers, and touch fires no hover. Pinning means a
+          // later pointer leave cannot dismiss the card; × / outside
+          // pointerdown / Escape unpin and close.
+          if (usageRollup) {
+            usagePinned.current = true;
+            cancelHoverClose();
+            setMenu("usage");
+          }
+        }}
+        onMouseEnter={() => {
+          if (usageRollup && hoverCapable()) {
+            cancelHoverClose();
+            setMenu("usage");
+          }
+        }}
+        onMouseLeave={scheduleHoverClose}
+      >
+        <span
+          className={css.contextRing}
+          style={{ ["--ctx-pct" as string]: contextPct == null ? "0%" : `${contextPct}%` }}
+        />
+        <span>{contextChipLabel}</span>
+      </button>
+    ) : null;
+
+  // D-042 phone trigger: one fused chip that ALWAYS names the current
+  // permissionMode word AND the effort tier (`manual · high`). Danger modes
+  // take danger styling right here, collapsed — the bypass state must never
+  // be visible only after opening the sheet.
+  const triggerModeWord = caps.permission ? permTag ?? permLabel : null;
+  const mobileTriggerNode = (
+    <span className={opt.triggerGroup}>
+      <button
+        ref={optionsTriggerRef}
+        type="button"
+        className={`${opt.trigger} ${permDanger ? opt.triggerDanger : ""} ${ember ? opt.triggerEmber : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
+        data-testid={caps.effort ? "model-effort-chip" : "composer-options-trigger"}
+        data-options-trigger="1"
+        data-ember={ember ? "1" : "0"}
+        data-permission={caps.permission ? liveMode : undefined}
+        data-permission-danger={caps.permission && permDanger ? "1" : "0"}
+        data-effort-effective={
+          caps.effort ? (pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord) : undefined
+        }
+        data-effort-pending={caps.effort && pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
+        data-effort-source={caps.effort ? effortEffective?.source ?? "unknown" : undefined}
+        data-effort-mismatch={caps.effort ? (mismatch ? "1" : "0") : undefined}
+        aria-haspopup="dialog"
+        aria-expanded={optionsOpen}
+        // Keep the same accessible name contract as the desktop effort chip;
+        // the permission word rides the visible fused span, its description
+        // rides the title.
+        aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
+        title={[permOption?.description, effortChipTitle].filter(Boolean).join("\n")}
+        // The trigger stays clickable for an exited/observed-only session so
+        // the sheet can still show the locked effort slider / launch-only
+        // permission rows; the actions inside carry their own disabled state.
+        onClick={() => setOptionsOpen(true)}
+      >
+        {effortSparks}
+        {triggerModeWord ? (
+          <span className={opt.triggerMode} data-testid="composer-trigger-permission">
+            {triggerModeWord}
+          </span>
+        ) : null}
+        {triggerModeWord && caps.effort ? <span className={opt.triggerSep}>·</span> : null}
+        {caps.effort ? effortWordNode : null}
+        {!caps.permission && !caps.effort ? (
+          <span className={opt.triggerMode}>选项</span>
+        ) : null}
+        <span className={css.chipCaret}>▾</span>
+      </button>
+      {renderContextChip(true)}
+    </span>
+  );
+
+  // D-028a: the three-state controls, queue chip and 「尚未验证」 note are
+  // facts of the current turn, not "options" — on the phone they stay OUTSIDE
+  // the sheet, identical on both surfaces.
+  const queueStatusNode = heldRows.length ? (
+    <span className={css.chip} data-testid="composer-queue-status">
+      已排队 {heldRows.length}
+    </span>
+  ) : null;
+  const interruptedNode = interrupted ? (
+    <span className={css.chip} data-testid="composer-interrupted-chip">
+      已打断
+    </span>
+  ) : null;
+  const capNoteNode = controls.note ? (
+    <span className={css.controlNote} data-testid="composer-cap-note" title={controls.note}>
+      {controls.note}
+    </span>
+  ) : null;
+  const actionButtonsNode = (
+    <>
+      {/* c-steer controls: Enter queues; 插队 interrupts and jumps; 打断 ends. */}
+      {busy && controls.steer.available ? (
+        <button
+          type="button"
+          className={css.queueBtn}
+          data-testid="composer-steer"
+          data-provision={controls.steer.provision}
+          disabled={disabled || sending || images.uploading || !text.trim()}
+          title={
+            controls.steer.note
+              ? `插队：打断当前 turn 并立即发送（${controls.steer.note}）`
+              : "插队：打断当前 turn 并立即发送（⌘/Ctrl+Enter）"
+          }
+          onClick={() => void submitSteer()}
+        >
+          插队
+          {mobile ? null : <span className={css.controlSub}>⌘/Ctrl+↵</span>}
+        </button>
+      ) : null}
+      {busy && controls.interrupt.available ? (
+        <button
+          type="button"
+          className={css.interruptBtn}
+          data-testid="composer-interrupt"
+          data-provision={controls.interrupt.provision}
+          disabled={disabled}
+          title={controls.interrupt.note ?? "打断当前 turn（会话与进程不退出）"}
+          onClick={() => void doInterrupt()}
+        >
+          打断
+          {controls.interrupt.note ? <span className={css.controlSub}>{controls.interrupt.note}</span> : null}
+        </button>
+      ) : null}
+      <button
+        type="submit"
+        className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
+        data-testid={primaryTestId}
+        data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
+        data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
+        disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
+      >
+        {primaryLabel}
+      </button>
+    </>
+  );
   return (
     <form
       ref={rootRef}
@@ -749,7 +1056,13 @@ export function Composer({
           data-testid="composer-input"
           value={text}
           disabled={disabled}
-          placeholder="输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送"
+          // D-042: phones get a plain hint — Enter is newline there and ⌘
+          // does not exist, so advertising desktop shortcuts would mislead.
+          placeholder={
+            mobile
+              ? "输入提示词…"
+              : "输入提示词…  Enter 排队 · ⌘/Ctrl+Enter 插队 · 工作中 Esc 打断 · IME 组字期间不送"
+          }
           onChange={(e) => {
             textRef.current = e.target.value;
             setText(e.target.value);
@@ -767,186 +1080,76 @@ export function Composer({
           onKeyDown={onKeyDown}
         />
       </div>
-      <div className={css.controlBar} data-testid="composer-bar">
-        <AttachButtons
-          className={css.chip}
-          disabled={disabled}
-          mobile={mobile}
-          onFiles={(files) => insertForAttachments(images.add(files))}
-          onPasteClick={async () => insertForAttachments(await images.pasteFromClipboard())}
-        />
-        {caps.harness ? (
-          <span className={css.chip} data-testid="harness-chip" data-readonly="1">
-            <span className={css.chipMark}>{harnessChip.mark}</span>
-            <span>{mobile ? harnessChip.label.replace(" Code", "") : harnessChip.label}</span>
-          </span>
-        ) : null}
-        {caps.effort ? (
-          <button
-            ref={triggerRefs.effort}
-            type="button"
-            className={`${css.chip} ${ember ? css.ember : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
-            data-testid="model-effort-chip"
-            data-ember={ember ? "1" : "0"}
-            data-effort-effective={pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord}
-            data-effort-pending={pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
-            data-effort-source={effortEffective?.source ?? "unknown"}
-            data-effort-mismatch={mismatch ? "1" : "0"}
-            aria-expanded={menu === "effort"}
-            aria-haspopup="dialog"
-            aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
-            title={effortChipTitle}
-            onClick={() => toggle("effort")}
-          >
-            {ember ? (
-              <>
-                <span className={css.emberSpark} />
-                <span className={`${css.emberSpark} ${css.emberSpark2}`} />
-                <span className={`${css.emberSpark} ${css.emberSpark3}`} />
-            </>
-            ) : null}
-            <span className={css.chipModel} data-testid="model-effort-chip-label">
-              {pendingLabel ?? (effectiveUnknown ? "?" : effectiveWord)}
-            </span>
-            {pendingLabel ? (
-              <span className={css.chipEffortPendingTag} data-testid="model-effort-pending">
-                {effortPending?.queued ? "排队中" : "切换中"}
-              </span>
-            ) : null}
-            {mismatch ? (
-              <span className={css.chipEffortMismatch} data-testid="model-effort-mismatch">
-                请求 {mismatch.requested} → 实际 {mismatch.effective}
-              </span>
-            ) : null}
-            <span className={css.chipCaret}>▾</span>
-          </button>
-        ) : null}
-        {caps.context ? (
-          <button
-            ref={triggerRefs.usage}
-            type="button"
-            className={css.chip}
-            data-testid="context-chip"
-            data-has-popover={usageRollup ? "1" : "0"}
-            aria-haspopup={usageRollup ? "dialog" : undefined}
-            aria-expanded={menu === "usage"}
-            aria-label={
-              usageRollup
-                ? `上下文用量 ${contextChipLabel}，查看明细`
-                : `上下文用量 ${contextChipLabel}`
-            }
-            onClick={() => {
-              // Idempotent, click-pinned open: mouseenter may already have
-              // opened it on precise pointers, and touch fires no hover.
-              // Pinning means the later pointer leave cannot dismiss the
-              // card; × / outside pointerdown / Escape unpin and close.
-              if (usageRollup) {
-                usagePinned.current = true;
-                cancelHoverClose();
-                setMenu("usage");
-              }
-            }}
-            onMouseEnter={() => {
-              if (usageRollup && hoverCapable()) {
-                cancelHoverClose();
-                setMenu("usage");
-              }
-            }}
-            onMouseLeave={scheduleHoverClose}
-          >
-            <span
-              className={css.contextRing}
-              style={{ ["--ctx-pct" as string]: contextPct == null ? "0%" : `${contextPct}%` }}
-            />
-            <span>{contextChipLabel}</span>
-          </button>
-        ) : null}
-        {caps.permission ? (
-          onPermission ? (
-            <button
-              ref={triggerRefs.permission}
-              type="button"
-              className={`${css.chip} ${permissionPending ? css.chipPending : ""}`}
-              data-testid="permission-chip"
-              data-permission={liveMode}
-              data-pending={permissionPending ? (permissionPending.queued ? "queued" : "switching") : undefined}
-              aria-expanded={menu === "permission"}
-              title={permOption?.description}
-              onClick={() => toggle("permission")}
-            >
-              {mobile ? permTag ?? permLabel : `权限 ${permTag ?? permLabel}`} ▾
-            </button>
-          ) : (
-            <span
+      <div className={css.controlBar} data-testid="composer-bar" data-collapsed={mobile ? "1" : "0"}>
+        {mobile ? (
+          <>
+            {/* D-042: one trigger + input + primary; options live in sheet. */}
+            {mobileTriggerNode}
+            {queueStatusNode}
+            {interruptedNode}
+            {capNoteNode}
+            <span className={css.barSpacer} />
+            {actionButtonsNode}
+          </>
+        ) : (
+          <>
+            <AttachButtons
               className={css.chip}
-              data-testid="permission-chip"
-              data-readonly="1"
-              data-permission={liveMode}
-              title={permOption?.description}
-            >
-              {permLabel}
-            </span>
-          )
-        ) : null}
-        {heldRows.length ? (
-          <span className={css.chip} data-testid="composer-queue-status">
-            已排队 {heldRows.length}
-          </span>
-        ) : null}
-        {interrupted ? (
-          <span className={css.chip} data-testid="composer-interrupted-chip">
-            已打断
-          </span>
-        ) : null}
-        {controls.note ? (
-          <span className={css.controlNote} data-testid="composer-cap-note" title={controls.note}>
-            {controls.note}
-          </span>
-        ) : null}
-        <span className={css.barSpacer} />
-        {/* c-steer controls: Enter queues; 插队 interrupts and jumps; 打断 ends. */}
-        {busy && controls.steer.available ? (
-          <button
-            type="button"
-            className={css.queueBtn}
-            data-testid="composer-steer"
-            data-provision={controls.steer.provision}
-            disabled={disabled || sending || images.uploading || !text.trim()}
-            title={
-              controls.steer.note
-                ? `插队：打断当前 turn 并立即发送（${controls.steer.note}）`
-                : "插队：打断当前 turn 并立即发送（⌘/Ctrl+Enter）"
-            }
-            onClick={() => void submitSteer()}
-          >
-            插队
-            <span className={css.controlSub}>⌘/Ctrl+↵</span>
-          </button>
-        ) : null}
-        {busy && controls.interrupt.available ? (
-          <button
-            type="button"
-            className={css.interruptBtn}
-            data-testid="composer-interrupt"
-            data-provision={controls.interrupt.provision}
-            disabled={disabled}
-            title={controls.interrupt.note ?? "打断当前 turn（会话与进程不退出）"}
-            onClick={() => void doInterrupt()}
-          >
-            打断
-            {controls.interrupt.note ? <span className={css.controlSub}>{controls.interrupt.note}</span> : null}
-          </button>
-        ) : null}
-        <button
-          type="submit"
-          className={controls.primary.kind === "queue" ? css.queueBtn : css.send}
-          data-testid={primaryTestId}
-          data-mode={controls.primary.kind === "queue" ? "queue" : controls.primary.mode}
-          data-holder={controls.primary.kind === "queue" ? controls.primary.holder : undefined}
-          disabled={disabled || sending || images.uploading || (!text.trim() && images.attachments.length === 0)}
-        >
-          {primaryLabel}
-        </button>
+              disabled={disabled}
+              mobile={mobile}
+              onFiles={attachHandlers.onFiles}
+              onPasteClick={attachHandlers.onPasteClick}
+            />
+            {harnessChipNode}
+            {caps.effort ? (
+              <button
+                ref={triggerRefs.effort}
+                type="button"
+                className={`${css.chip} ${ember ? css.ember : ""} ${pendingLabel ? css.chipEffortPending : ""}`}
+                data-testid="model-effort-chip"
+                data-ember={ember ? "1" : "0"}
+                data-effort-effective={pendingLabel ? "pending" : effectiveUnknown ? "unknown" : effectiveWord}
+                data-effort-pending={pendingLabel ? (effortPending?.queued ? "queued" : "switching") : "0"}
+                data-effort-source={effortEffective?.source ?? "unknown"}
+                data-effort-mismatch={mismatch ? "1" : "0"}
+                aria-expanded={menu === "effort"}
+                aria-haspopup="dialog"
+                aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
+                title={effortChipTitle}
+                onClick={() => toggle("effort")}
+              >
+                {effortSparks}
+                {effortWordNode}
+                <span className={css.chipCaret}>▾</span>
+              </button>
+            ) : null}
+            {renderContextChip(false)}
+            {caps.permission ? (
+              onPermission ? (
+                <button
+                  ref={triggerRefs.permission}
+                  type="button"
+                  className={`${css.chip} ${permissionPending ? css.chipPending : ""}`}
+                  data-testid="permission-chip"
+                  data-permission={liveMode}
+                  data-pending={permissionPending ? (permissionPending.queued ? "queued" : "switching") : undefined}
+                  aria-expanded={menu === "permission"}
+                  title={permOption?.description}
+                  onClick={() => toggle("permission")}
+                >
+                  {mobile ? permTag ?? permLabel : `权限 ${permTag ?? permLabel}`} ▾
+                </button>
+              ) : (
+                permReadonlyNode
+              )
+            ) : null}
+            {queueStatusNode}
+            {interruptedNode}
+            {capNoteNode}
+            <span className={css.barSpacer} />
+            {actionButtonsNode}
+          </>
+        )}
       </div>
       {menu === "usage" && usageRollup ? (
         <ContextUsagePopover
@@ -960,7 +1163,7 @@ export function Composer({
           onMouseLeave={scheduleHoverClose}
         />
       ) : null}
-      {menu === "effort" ? (
+      {!mobile && menu === "effort" ? (
         <div
           ref={menuRefs.effort}
           style={effortAnchor.style}
@@ -968,28 +1171,10 @@ export function Composer({
           data-testid="effort-menu"
           data-placement={effortAnchor.placement}
         >
-          <EffortSlider
-            kind={harness}
-            model={caps.model ? model : undefined}
-            models={caps.model ? models : undefined}
-            modelEffective={caps.model ? modelEffective : null}
-            modelPending={caps.model ? modelPending : null}
-            modelSelectionPath={caps.model ? modelSelectionPath : null}
-            modelCatalog={caps.model ? (modelCatalog ?? null) : null}
-            modelLockedReason={modelLockedReason}
-            index={currentEffort.index}
-            ultracode={ultraOn}
-            disabled={effortLocked}
-            onChange={(next) => onEffort?.(next)}
-            onModel={caps.model ? onModel : undefined}
-            onClose={() => {
-              setMenu(null);
-              triggerRefs.effort.current?.focus();
-            }}
-          />
+          {effortSliderNode}
         </div>
       ) : null}
-      {menu === "permission" ? (
+      {!mobile && menu === "permission" ? (
         <div
           ref={menuRefs.permission}
           style={permissionAnchor.style}
@@ -997,40 +1182,55 @@ export function Composer({
           data-testid="permission-menu"
           data-placement={permissionAnchor.placement}
         >
-          <div data-popover-scroll="1">
-          {permOptions.map((m) => {
-            const reachable = isLiveReachable(harness, m.id, launchPermissionMode);
-            const active = liveMode === m.id;
-            return (
-              <button
-                key={m.id}
-                type="button"
-                className={`${css.effortRow} ${active ? css.effortOn : ""}`}
-                data-testid={`permission-option-${m.id}`}
-                data-launch-only={m.launchOnly || !reachable ? "1" : undefined}
-                disabled={!reachable}
-                title={!reachable ? "该模式仅能在启动时选择" : m.description}
-                onClick={() => {
-                  if (!reachable) return;
-                  onPermission?.(m.id);
-                  setMenu(null);
-                }}
-              >
-                <span className={`${css.radio} ${active ? css.radioOn : ""}`} />
-                <span className={css.permissionName}>
-                  {m.label}
-                  {m.danger ? <span className={css.permissionDust}> · 危险</span> : null}
-                  {m.launchOnly || !reachable ? (
-                    <span className={css.launchOnlyTag}>仅启动时</span>
-                  ) : null}
-                </span>
-                <span className={css.permissionNative}>{m.native}</span>
-              </button>
-            );
-          })}
-          </div>
+          <div data-popover-scroll="1">{renderPermRows(false)}</div>
         </div>
       ) : null}
+      <ComposerOptionsSheet
+        open={mobile && optionsOpen}
+        onClose={() => setOptionsOpen(false)}
+        returnFocusRef={optionsTriggerRef}
+        attach={
+          <AttachButtons
+            className={opt.attachBtn}
+            disabled={disabled}
+            mobile
+            onFiles={attachHandlers.onFiles}
+            onPasteClick={attachHandlers.onPasteClick}
+          />
+        }
+        harness={harnessChipNode}
+        permission={
+          onPermission ? (
+            <div className={css.popover} data-testid="permission-menu" data-in-sheet="1">
+              <div data-popover-scroll="1">{renderPermRows(true)}</div>
+            </div>
+          ) : caps.permission ? (
+            permReadonlyNode
+          ) : null
+        }
+        effort={
+          caps.effort ? (
+            // The SAME compact card geometry as desktop rides inside the
+            // sheet, so the slider contract is identical.
+            <div className={`${css.popover} ${css.popoverCard}`} data-testid="effort-menu" data-placement="up" data-in-sheet="1">
+              {effortSliderNode}
+            </div>
+          ) : null
+        }
+      />
+      <ComposerConfirmDialog
+        open={confirm !== null}
+        variant={mobile ? "sheet" : "popover"}
+        title={confirm?.title ?? ""}
+        message={confirm?.message ?? ""}
+        confirmLabel={confirm?.confirmLabel ?? ""}
+        onCancel={() => setConfirm(null)}
+        onConfirm={() => {
+          const action = confirm?.onConfirm;
+          setConfirm(null);
+          action?.();
+        }}
+      />
     </form>
   );
 }

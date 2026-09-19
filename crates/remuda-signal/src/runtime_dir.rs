@@ -308,47 +308,93 @@ pub fn per_user_runtime_dir() -> io::Result<PathBuf> {
 /// an `O_NOFOLLOW|O_DIRECTORY` fd with `fchmod`, which can never follow a link
 /// swapped in after the lstat.
 fn secure_runtime_dir(dir: &Path, uid: u32) -> io::Result<()> {
-    let (metadata, pre_existing) = match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => (metadata, true),
+    let pre_existing = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            // Cheap refusal path; the authoritative checks run on the opened
+            // fd below, which cannot race.
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "runtime dir {} is a symlink; refusing an untrusted path",
+                        dir.display()
+                    ),
+                ));
+            }
+            if !metadata.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} exists and is not a directory", dir.display()),
+                ));
+            }
+            true
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             create_private_dir_all(dir)?;
-            (std::fs::symlink_metadata(dir)?, false)
+            false
         }
         Err(error) => return Err(error),
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "runtime dir {} is a symlink; refusing an untrusted path",
-                    dir.display()
-                ),
-            ));
-        }
-        if !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} exists and is not a directory", dir.display()),
-            ));
-        }
-        if metadata.uid() != uid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "runtime dir {} is owned by uid {} but this process is uid {}",
-                    dir.display(),
-                    metadata.uid(),
-                    uid
-                ),
-            ));
-        }
-        if pre_existing {
-            tighten_to_0700_nofollow(dir)?;
-        }
+    // Authoritative verification on the opened fd (O_NOFOLLOW+O_DIRECTORY):
+    // fstat describes only this directory, never a link swapped in after the
+    // lstat. A directory we created is born 0700; a pre-existing one is
+    // tightened to 0700 while the fd is held. The File closes on drop.
+    let dir_file = open_verified_dir(dir, uid)?;
+    if pre_existing {
+        fchmod_0700(&dir_file)?;
     }
+    Ok(())
+}
+
+/// Open `dir` with `O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC`, then verify on the
+/// resulting descriptor (via `fstat`) that it is a directory owned by `uid`.
+///
+/// Checking on the open file, rather than only on a prior `lstat`, closes the
+/// lstat-to-open swap window; the returned [`std::fs::File`] closes on drop,
+/// so callers cannot leak descriptors.
+#[cfg(unix)]
+fn open_verified_dir(dir: &Path, uid: u32) -> io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            (nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC)
+                .bits(),
+        )
+        .open(dir)?;
+    let stat = nix::sys::stat::fstat(file.as_raw_fd())?;
+    if !nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode)
+        .contains(nix::sys::stat::SFlag::S_IFDIR)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    if stat.st_uid != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime dir {} is owned by uid {} but this process is uid {uid}",
+                dir.display(),
+                stat.st_uid
+            ),
+        ));
+    }
+    Ok(file)
+}
+
+/// Set a verified directory descriptor to mode 0700.
+#[cfg(unix)]
+fn fchmod_0700(dir_file: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    nix::sys::stat::fchmod(
+        dir_file.as_raw_fd(),
+        nix::sys::stat::Mode::from_bits_truncate(0o700),
+    )?;
     Ok(())
 }
 
@@ -367,81 +413,204 @@ fn create_private_dir_all(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
-/// `fchmod(0700)` on a directory opened with `O_NOFOLLOW|O_DIRECTORY`.
-///
-/// `O_NOFOLLOW` fails with `ELOOP` if the path became a symlink after the
-/// lstat; `O_DIRECTORY` fails if it stopped being a directory. Neither window
-/// can therefore reach a file an attacker controls.
+/// Per-socket probe bound: a wedged peer must never stall Node start.
 #[cfg(unix)]
-fn tighten_to_0700_nofollow(dir: &Path) -> io::Result<()> {
-    use nix::fcntl::OFlag;
-    use nix::sys::stat::{Mode, fchmod};
-    use std::os::fd::AsRawFd;
-    let fd = nix::fcntl::open(
-        dir,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-        Mode::empty(),
-    )?;
-    let result = fchmod(fd.as_raw_fd(), Mode::from_bits_truncate(0o700));
-    result?;
-    Ok(())
-}
+const SWEEP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+/// Whole best-effort sweep bound, regardless of how many inodes exist.
+#[cfg(unix)]
+const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
-#[cfg(not(unix))]
-fn tighten_to_0700_nofollow(_dir: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-/// Remove dead socket inodes left in the runtime directories by crashed Nodes.
+/// Remove dead socket inodes left in the runtime directories by crashed
+/// Nodes.
 ///
-/// Every directory here is remuda-private (0700, this uid), so any `*.sock`
-/// socket inode is one of ours. A socket with a live listener answers a
-/// connection (it is left alone); a `ECONNREFUSED` means no process holds it
-/// — e.g. after a SIGKILL — and it is unlinked. Returns the number removed.
+/// Security: a candidate directory is accepted only after the same checks
+/// [`secure_runtime_dir`] performs, re-verified on an `O_NOFOLLOW|O_DIRECTORY`
+/// descriptor — lstat non-symlink directory, `fstat` owner is this uid — and
+/// it is read through that descriptor, so a symlink planted at a candidate
+/// path is never traversed and nothing in a foreign-owned directory is even
+/// listed. Each entry is `fstatat`-ed (`AT_SYMLINK_NOFOLLOW`) and unlinked
+/// only when it is a socket owned by this uid with a `.sock` name.
+///
+/// Liveness is a bounded non-blocking connect: immediate connection or an
+/// in-progress connect means a live (or merely slow-to-accept) listener and
+/// the inode is kept; `ECONNREFUSED` means no process holds it (SIGKILL,
+/// power loss) and it is reclaimed. The entire sweep is capped by
+/// [`SWEEP_BUDGET`]. Returns the number removed.
 #[cfg(unix)]
 pub fn sweep_dead_runtime_sockets() -> io::Result<usize> {
-    use std::os::unix::fs::FileTypeExt;
     let uid = current_uid();
+    let deadline = std::time::Instant::now() + SWEEP_BUDGET;
     let mut removed = 0;
     for dir in runtime_dir_candidates(uid) {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if !metadata.file_type().is_socket()
-                || path.extension().and_then(|ext| ext.to_str()) != Some("sock")
-            {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        // Accept the directory only after the authoritative checks, verified
+        // on an O_NOFOLLOW|O_DIRECTORY descriptor. A symlinked or
+        // foreign-owned candidate is never created, listed or traversed.
+        let dir_file = match open_verified_dir(&dir, uid) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::debug!(
+                    path = %dir.display(),
+                    %error,
+                    "skipping runtime sweep candidate"
+                );
                 continue;
             }
-            match std::os::unix::net::UnixStream::connect(&path) {
-                // A live listener accepted the probe; never touch it.
-                Ok(_stream) => {}
-                // Dead inode (SIGKILL, power loss): reclaim the name. The
-                // kernel reports ECONNREFUSED for a socket nobody listens on;
-                // std maps that to the portable `ConnectionRefused`.
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-                    match std::fs::remove_file(&path) {
-                        Ok(()) => removed += 1,
-                        Err(error) => tracing::debug!(
-                            path = %path.display(),
-                            %error,
-                            "could not sweep dead runtime socket"
-                        ),
+        };
+        let entries = match list_verified_entries(&dir, &dir_file) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(path = %dir.display(), %error, "cannot list runtime dir");
+                continue;
+            }
+        };
+        for (name, stat) in entries {
+            if std::time::Instant::now() >= deadline {
+                return Ok(removed);
+            }
+            let mode = nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode);
+            if !mode.contains(nix::sys::stat::SFlag::S_IFSOCK) || stat.st_uid != uid {
+                continue;
+            }
+            if !name.to_string_lossy().ends_with(".sock") {
+                continue;
+            }
+            let path = dir.join(&name);
+            match socket_has_live_listener(&path, deadline) {
+                SocketProbe::Live | SocketProbe::Uncertain => {}
+                SocketProbe::Dead => {
+                    if std::fs::remove_file(&path).is_ok() {
+                        removed += 1;
                     }
                 }
-                Err(error) => tracing::debug!(
-                    path = %path.display(),
-                    %error,
-                    "skipping runtime socket during sweep"
-                ),
             }
         }
     }
     Ok(removed)
+}
+
+/// Result of a bounded unix-socket connect probe.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketProbe {
+    /// A listener completed or is accepting the connection.
+    Live,
+    /// `ECONNREFUSED`: no process holds the socket inode.
+    Dead,
+    /// Timed out or got an unrelated error; assume live and keep the inode.
+    Uncertain,
+}
+
+/// Bounded non-blocking connect probe against `path`.
+///
+/// A listener that answers (immediately, or once the connect settles) reads
+/// as [`SocketProbe::Live`]; `ECONNREFUSED` means no process holds the inode
+/// ([`SocketProbe::Dead`]); a timeout or any other error is
+/// [`SocketProbe::Uncertain`] — assume live and never unlink. The owned
+/// descriptor closes on drop, so the probe neither leaks fds nor can stall
+/// Node start behind a peer whose accept backlog is full.
+#[cfg(unix)]
+fn socket_has_live_listener(path: &Path, deadline: std::time::Instant) -> SocketProbe {
+    use nix::sys::socket::{SockFlag, SockType, getsockopt, socket, sockopt};
+
+    let fd = match socket(
+        nix::sys::socket::AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return SocketProbe::Uncertain,
+    };
+    let addr = match nix::sys::socket::UnixAddr::new(path) {
+        Ok(addr) => addr,
+        Err(_) => return SocketProbe::Uncertain,
+    };
+    match nix::sys::socket::connect(std::os::fd::AsRawFd::as_raw_fd(&fd), &addr) {
+        Ok(()) => SocketProbe::Live,
+        Err(nix::errno::Errno::ECONNREFUSED) => SocketProbe::Dead,
+        Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINPROGRESS) => {
+            // Wait for the listener up to the per-probe bound or the rest of
+            // the sweep budget, whichever is shorter.
+            let timeout = deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(SWEEP_PROBE_TIMEOUT);
+            if timeout.is_zero() {
+                return SocketProbe::Uncertain;
+            }
+            let mut pollfd = nix::poll::PollFd::new(
+                std::os::fd::AsFd::as_fd(&fd),
+                nix::poll::PollFlags::POLLOUT,
+            );
+            match nix::poll::poll(
+                std::slice::from_mut(&mut pollfd),
+                nix::poll::PollTimeout::try_from(timeout.as_millis() as i64)
+                    .unwrap_or(nix::poll::PollTimeout::NONE),
+            ) {
+                Ok(0) => SocketProbe::Uncertain,
+                Ok(_) => match getsockopt(&fd, sockopt::SocketError) {
+                    Ok(0) => SocketProbe::Live,
+                    Ok(error) if error == nix::errno::Errno::ECONNREFUSED as i32 => {
+                        SocketProbe::Dead
+                    }
+                    Ok(_) | Err(_) => SocketProbe::Uncertain,
+                },
+                Err(_) => SocketProbe::Uncertain,
+            }
+        }
+        Err(_) => SocketProbe::Uncertain,
+    }
+}
+
+/// Open `path` with `O_NOFOLLOW|O_DIRECTORY` and list each direct entry with
+/// an `fstatat(AT_SYMLINK_NOFOLLOW)` taken relative to the verified pinning
+/// descriptor, so the name and stat always describe the same directory slot.
+#[cfg(unix)]
+fn list_verified_entries(
+    path: &Path,
+    pin: &std::fs::File,
+) -> io::Result<Vec<(std::ffi::OsString, nix::sys::stat::FileStat)>> {
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
+
+    let mut directory = nix::dir::Dir::open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut entries = Vec::new();
+    for entry in directory.iter() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let bytes = entry.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name = std::ffi::OsString::from(
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes),
+        );
+        if let Ok(stat) = fstatat_nofollow(pin, &name) {
+            entries.push((name, stat));
+        }
+    }
+    Ok(entries)
+}
+
+/// `fstatat(dirfd, name, AT_SYMLINK_NOFOLLOW)` against a verified directory.
+#[cfg(unix)]
+fn fstatat_nofollow(
+    dir_file: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> nix::Result<nix::sys::stat::FileStat> {
+    use std::os::fd::AsRawFd;
+    nix::sys::stat::fstatat(
+        Some(dir_file.as_raw_fd()),
+        name,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    )
 }
 
 /// Unlink the real socket an instance's `hook.sock` symlink points at.
@@ -688,6 +857,67 @@ mod tests {
         secure_runtime_dir(&dir, current_uid()).unwrap();
         let metadata = std::fs::symlink_metadata(&dir).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o700);
+    }
+
+    /// Regression for the round-3 fd leak: `open` returned a bare `RawFd` and
+    /// the fchmod path never closed it. The verifier is exercised on a
+    /// pre-existing directory (the only branch that opens), hundreds of times,
+    /// and this thread's open-descriptor count must not grow.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn securing_an_existing_dir_many_times_does_not_leak_descriptors() {
+        fn open_fd_count() -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+        }
+        let dir = testutil::ShortDir::new();
+        std::fs::write(dir.path().join("seed"), b"").unwrap();
+        // Prime caches and take the baseline.
+        secure_runtime_dir(dir.path(), current_uid()).unwrap();
+        let before = open_fd_count();
+        for _ in 0..400 {
+            secure_runtime_dir(dir.path(), current_uid()).unwrap();
+        }
+        let after = open_fd_count();
+        assert!(
+            after <= before + 2,
+            "descriptor count grew after 400 verifications: {before} -> {after}"
+        );
+    }
+
+    /// The sweep must never traverse a symlinked candidate, even when its
+    /// target contains dead socket inodes: the directory is rejected by the
+    /// verifier and the inodes are left exactly as found.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_skips_a_symlinked_candidate_and_leaves_its_target_alone() {
+        use std::os::unix::net::UnixListener;
+        let root = tmp_root();
+        let fixed = runtime_dir_candidates(current_uid())
+            .into_iter()
+            .find(|candidate| candidate.parent() == Some(Path::new("/tmp")))
+            .unwrap();
+        let unique = std::process::id();
+        let victim = root.path().join("victim-sockdir");
+        std::fs::create_dir_all(&victim).unwrap();
+        let dead_in_victim = victim.join(format!("sweep-evil-{unique}.sock"));
+        let listener = UnixListener::bind(&dead_in_victim).unwrap();
+        drop(listener);
+        // Swap the fixed candidate for a symlink into the victim tree.
+        let _ = std::fs::remove_dir_all(&fixed);
+        std::os::unix::fs::symlink(&victim, &fixed).unwrap();
+
+        let removed = sweep_dead_runtime_sockets().expect("sweep runs without error");
+        assert_eq!(removed, 0, "no inode under the symlink target is swept");
+        assert!(
+            dead_in_victim.exists(),
+            "the socket inode reached through the symlink is untouched"
+        );
+
+        // Restore a real directory so other tests are unaffected.
+        std::fs::remove_file(&fixed).unwrap();
+        std::fs::create_dir_all(&fixed).unwrap();
     }
 
     #[test]

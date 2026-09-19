@@ -304,7 +304,10 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
         BASELINE_BODY_TOP_390 - MIN_GAIN,
       );
 
-      await shot(page, "ux2026-chrome-1-390.png");
+      // Evidence captures the TOUCH context only (the no-touch run shares
+      // the same layout; capturing both would let one silently overwrite the
+      // other — see docs/design/evidence/ux2026-chrome-1.md).
+      if (touch) await shot(page, "ux2026-chrome-1-390.png");
     } finally {
       await context.close();
     }
@@ -360,10 +363,11 @@ test("1440px: diagnostics hide behind a collapsed per-device disclosure while ho
   await expect(meta).toContainText(/connected|offline|degraded|reconnecting/);
   await shot(page, "ux2026-chrome-1-1440-open.png");
 
-  // Per-device persistence: a reload keeps it open.
+  // Per-device persistence: a reload keeps it open. Distinct filename — this
+  // is the REOPENED state, never overwriting the collapsed golden above.
   await page.reload();
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
   expect(await page.getByTestId("run-details").evaluate((el) => (el as HTMLDetailsElement).open)).toBe(true);
 
-  await shot(page, "ux2026-chrome-1-1440.png");
+  await shot(page, "ux2026-chrome-1-1440-reopen.png");
 });

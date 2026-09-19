@@ -3,8 +3,10 @@
 //! One test per scripted behaviour the api-routing tasks rely on: SSE framing,
 //! the non-streaming shape, `429`/`529`/`401`, a slow first byte, a mid-stream
 //! abort, the two-listings-per-gateway `/v1/models` behaviour, and the header
-//! **name** recorder — including the one assertion that matters most, that no
-//! credential value is ever stored (or printable) by this fixture.
+//! **name** recorder — including the assertions that matter most, that no
+//! credential *value* is ever stored or printable, and that the fixture can
+//! still tell the profile credential from the worker's relay bearer by value
+//! while reporting only a boolean.
 //!
 //! Every test talks to the gateway over a real loopback socket: the point of
 //! this double is to exercise the HTTP path a relay will take, so a test that
@@ -148,7 +150,10 @@ async fn sse_stream_frames_the_documented_event_sequence() -> Result<()> {
     assert_eq!(end["delta"]["stop_reason"], "end_turn");
     assert!(end["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0);
 
-    let _ = gateway.assert_no_credentials();
+    // A credential-free request must not be flagged: this is the SSE path, but
+    // the audit covers every path, so a false positive here would break every
+    // relay test that relies on it.
+    gateway.assert_no_credentials()?;
     gateway.shutdown().await;
     Ok(())
 }
@@ -301,7 +306,7 @@ async fn an_abort_mid_stream_delivers_deltas_then_truncates() -> Result<()> {
 }
 
 #[tokio::test]
-async fn models_lists_two_catalogs_that_differ_per_header() -> Result<()> {
+async fn models_lists_two_catalogs_that_overlap_without_nesting() -> Result<()> {
     let gateway = FakeGateway::start().await?;
     let client = reqwest::Client::new();
 
@@ -312,15 +317,10 @@ async fn models_lists_two_catalogs_that_differ_per_header() -> Result<()> {
         .await?
         .json()
         .await?;
-    let plain_ids: Vec<&str> = plain["data"]
-        .as_array()
-        .context("plain data")?
-        .iter()
-        .filter_map(|item| item["id"].as_str())
-        .collect();
-    assert!(plain_ids.contains(&DEFAULT_MODEL));
+    let plain_ids = model_ids(&plain)?;
+    assert!(plain_ids.contains(&DEFAULT_MODEL.to_string()));
     assert!(
-        plain_ids.contains(&"passthrough/fake-evolving"),
+        plain_ids.contains(&"passthrough/fake-evolving".to_string()),
         "the plain listing is the broad OpenAI-style catalog: {plain_ids:?}"
     );
 
@@ -332,41 +332,73 @@ async fn models_lists_two_catalogs_that_differ_per_header() -> Result<()> {
         .await?
         .json()
         .await?;
-    let anthropic_ids: Vec<&str> = anthropic["data"]
-        .as_array()
-        .context("anthropic data")?
-        .iter()
-        .filter_map(|item| item["id"].as_str())
-        .collect();
-    assert!(anthropic_ids.contains(&"claude-fake-shared"));
+    let anthropic_ids = model_ids(&anthropic)?;
     assert!(
-        !anthropic_ids.contains(&"passthrough/fake-evolving"),
+        anthropic_ids.contains(&"claude-fake-only".to_string()),
+        "the anthropic surface has an id of its own: {anthropic_ids:?}"
+    );
+    assert!(
+        !anthropic_ids.contains(&"passthrough/fake-evolving".to_string()),
         "the anthropic surface is the short claude-* subset: {anthropic_ids:?}"
     );
 
-    // The two listings overlap on exactly one id, so a probe that read a
-    // single surface under-reports — the property the union exists for.
-    let shared: Vec<&&str> = plain_ids
+    // The two listings must *overlap*, not nest. If one were a subset of the
+    // other, a consumer that dropped the smaller surface would still have every
+    // id, and the design's whole reason for probing both (docs/design/
+    // providers.md §Two listings per gateway) would not be observable here.
+    let shared: Vec<&String> = plain_ids
         .iter()
         .filter(|id| anthropic_ids.contains(id))
         .collect();
-    assert_eq!(shared.len(), 3, "union is non-trivial: {shared:?}");
+    assert_eq!(
+        shared.len(),
+        1,
+        "exactly one shared id makes the union non-trivial: {shared:?}"
+    );
+    assert_eq!(shared[0], DEFAULT_MODEL);
+    // Each surface owns at least one id the other never serves, in both
+    // directions — that is what "overlap rather than nest" means.
+    assert!(
+        plain_ids.iter().any(|id| !anthropic_ids.contains(id)),
+        "the plain surface must have an id the anthropic one lacks"
+    );
+    assert!(
+        anthropic_ids.iter().any(|id| !plain_ids.contains(id)),
+        "the anthropic surface must have an id the plain one lacks"
+    );
+    let union: std::collections::BTreeSet<&String> =
+        plain_ids.iter().chain(anthropic_ids.iter()).collect();
+    assert_eq!(
+        union.len(),
+        plain_ids.len() + anthropic_ids.len() - shared.len(),
+        "the union is strictly larger than either surface"
+    );
 
     // A context window of 1M earns the `1m` tag downstream, so the fixture
     // has to report one.
-    let long = anthropic["data"]
+    let long = plain["data"]
         .as_array()
-        .context("anthropic data")?
+        .context("plain data")?
         .iter()
-        .find(|item| item["id"] == "fake/model-1m")
-        .context("fake/model-1m")?;
+        .find(|item| item["id"] == "fake/model-1-1m")
+        .context("fake/model-1-1m")?;
     assert!(
-        long["context_window"].as_u64().unwrap_or(0) >= 1_000_000,
+        long["context_length"].as_u64().unwrap_or(0) >= 1_000_000,
         "{long}"
     );
 
     gateway.shutdown().await;
     Ok(())
+}
+
+/// The ids of a `/v1/models` response body, in order.
+fn model_ids(body: &Value) -> Result<Vec<String>> {
+    Ok(body["data"]
+        .as_array()
+        .context("data")?
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_string))
+        .collect())
 }
 
 #[tokio::test]
@@ -382,7 +414,10 @@ async fn models_answers_under_a_base_path_too() -> Result<()> {
         .status()
         .as_u16();
     assert_eq!(status, 200);
-    assert_eq!(gateway.requests_to("/v1/models").len(), 1);
+    // The recorded path is the one that matched, so a base-path probe is
+    // distinguishable from a `/v1` one.
+    assert_eq!(gateway.requests_to("/models").len(), 1);
+    assert!(gateway.requests_to("/v1/models").is_empty());
     gateway.shutdown().await;
     Ok(())
 }
@@ -505,6 +540,296 @@ async fn a_credential_free_request_passes_the_audit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn x_stainless_headers_are_not_credential_bearing() -> Result<()> {
+    // The design's request-header allowlist forwards x-stainless-* verbatim
+    // (docs/design/api-routing.md §3), so a correct relay presents them and the
+    // audit must not fire. A classifier that flagged them would make every
+    // well-behaved relay fail `assert_no_credentials`.
+    let gateway = FakeGateway::start().await?;
+    let (status, _, _) = post_messages(
+        &gateway,
+        &[
+            ("x-stainless-lang", "js"),
+            ("x-stainless-package-version", "0.40.0"),
+            ("x-stainless-retry-count", "0"),
+        ],
+        &request_body(),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    assert!(
+        gateway.saw_header("x-stainless-lang"),
+        "the fixture records the name like any other: {:?}",
+        gateway.header_names()
+    );
+    gateway.assert_no_credentials()?;
+    assert!(
+        gateway.credential_violations().is_empty(),
+        "x-stainless-* is allowlisted upstream, not a credential: {:?}",
+        gateway.credential_violations()
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_mismatched_credential_is_refused_and_only_the_verdict_is_kept() -> Result<()> {
+    // The check that catches a relay forwarding the worker's per-instance
+    // bearer unchanged. The value is configured but never retrievable, and the
+    // failure is reported without quoting either value.
+    let gateway = FakeGateway::start().await?;
+    let configured = "sk-configured-0000";
+    let presented = "relay-bearer-from-the-worker-1111";
+    gateway.expect_credential(configured);
+
+    let (status, _, body) = post_messages(
+        &gateway,
+        &[("authorization", &format!("Bearer {presented}"))],
+        &request_body(),
+    )
+    .await?;
+    assert_eq!(status, 401, "a wrong credential must be refused");
+    let value: Value = serde_json::from_str(&body)?;
+    assert_eq!(value["error"]["type"], "authentication_error");
+
+    // The verdicts say what happened; neither value is anywhere in them.
+    assert!(gateway.saw_credential_mismatch());
+    assert!(!gateway.saw_expected_credential());
+    let violations = gateway.credential_violations();
+    assert!(
+        violations
+            .iter()
+            .any(|entry| entry.contains("not the configured one")),
+        "the mismatch must be reported: {violations:?}"
+    );
+    for leaked in [configured, presented, "relay-bearer", "sk-configured"] {
+        for violation in &violations {
+            assert!(
+                !violation.contains(leaked),
+                "the report quoted a value ({leaked}): {violations:?}"
+            );
+        }
+    }
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_configured_credential_is_accepted() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let configured = "sk-configured-2222";
+    // Configured as the bare token, so it matches whichever spelling arrives.
+    gateway.expect_credential(configured);
+
+    let (status, _, _) = post_messages(
+        &gateway,
+        &[("authorization", &format!("Bearer {configured}"))],
+        &request_body(),
+    )
+    .await?;
+    assert_eq!(status, 200, "the Bearer spelling is compared as the token");
+    assert!(gateway.saw_expected_credential());
+    assert!(!gateway.saw_credential_mismatch());
+
+    let (status, _, _) =
+        post_messages(&gateway, &[("x-api-key", configured)], &request_body()).await?;
+    assert_eq!(status, 200, "the x-api-key spelling is compared raw");
+
+    // The relay's real assertion: the *configured* credential reached the
+    // origin. `assert_no_credentials` is the wrong tool here and would flag a
+    // correct relay, because a relayed request does carry a credential.
+    gateway.assert_presented_expected_credential()?;
+    assert!(
+        !gateway.credential_violations().is_empty(),
+        "the audit does record the credential header — it just is not the \
+         credential-swap check"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn clearing_the_expected_credential_restores_the_permissive_default() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    gateway.expect_credential("sk-configured-3333");
+    gateway.clear_expected_credential();
+
+    let (status, _, _) = post_messages(
+        &gateway,
+        &[("authorization", "Bearer something-else-entirely")],
+        &request_body(),
+    )
+    .await?;
+    assert_eq!(status, 200, "no expectation means no comparison");
+    assert!(
+        !gateway.saw_expected_credential() && !gateway.saw_credential_mismatch(),
+        "an unconfigured comparison reports neither verdict"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_configured_response_header_is_sent_so_the_allowlist_can_drop_it() -> Result<()> {
+    // The relay's drop-set-cookie assertion is only meaningful if the origin
+    // actually sends one.
+    let gateway = FakeGateway::start().await?;
+    gateway.set_response_header("set-cookie", "session=abc; HttpOnly");
+    gateway.set_response_header("x-fake-extra", "present");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/messages", gateway.base_url()))
+        .header("content-type", "application/json")
+        .body(request_body())
+        .send()
+        .await?;
+    assert_eq!(
+        response
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok()),
+        Some("session=abc; HttpOnly"),
+        "the fixture must send the header the allowlist drops"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-fake-extra")
+            .and_then(|value| value.to_str().ok()),
+        Some("present")
+    );
+    assert_eq!(gateway.response_headers().len(), 2);
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_models_path_is_recorded_as_it_matched() -> Result<()> {
+    // Discovery probes `/v1/models` and `/v1/models/{id}` and may use a base
+    // path, so the recorder must report the path that actually matched rather
+    // than a constant.
+    let gateway = FakeGateway::start().await?;
+    let client = reqwest::Client::new();
+    for path in ["/v1/models", "/v1/models/fake-model-1", "/models"] {
+        let status = client
+            .get(format!("{}{path}", gateway.base_url()))
+            .send()
+            .await?
+            .status()
+            .as_u16();
+        assert_eq!(status, 200, "{path}");
+    }
+    let recorded: Vec<String> = gateway
+        .requests()
+        .iter()
+        .map(|request| request.path.clone())
+        .collect();
+    assert_eq!(
+        recorded,
+        vec!["/v1/models", "/v1/models/fake-model-1", "/models"],
+        "each request reports the path that matched"
+    );
+    assert_eq!(gateway.requests_to("/v1/models/fake-model-1").len(), 1);
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_529_carries_a_retry_after_too() -> Result<()> {
+    // Both statuses a real gateway retries with a hint are on the design's
+    // response allowlist, so both must send one.
+    for code in [429u16, 529] {
+        let gateway = FakeGateway::start_with(vec![Script::status(code)]).await?;
+        let (status, head, _) = post_messages(&gateway, &[], &request_body()).await?;
+        assert_eq!(status, code);
+        assert!(
+            head.contains("retry-after"),
+            "{code} must advertise retry-after: {head}"
+        );
+        gateway.shutdown().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_relay_bearer_instead_of_the_profile_credential_is_caught() -> Result<()> {
+    // The failure D-047 exists to prevent: a relay forwards the worker's
+    // per-instance bearer instead of swapping in the profile credential. The
+    // fixture must tell the two apart by value, which is the whole point of
+    // configuring an expected credential.
+    let gateway = FakeGateway::start().await?;
+    let profile_token = "sk-profile-credential-4444";
+    let worker_bearer = "relay-bearer-per-instance-5555";
+    assert_ne!(profile_token, worker_bearer);
+    gateway.expect_credential(profile_token);
+
+    // The worker's bearer arrives — a credential, but the wrong one.
+    let (status, _, _) = post_messages(
+        &gateway,
+        &[("authorization", &format!("Bearer {worker_bearer}"))],
+        &request_body(),
+    )
+    .await?;
+    assert_eq!(status, 401, "the worker's bearer must not be accepted");
+    assert!(
+        gateway.assert_presented_expected_credential().is_err(),
+        "the swap assertion must fail when the wrong credential arrives"
+    );
+    assert!(gateway.saw_credential_mismatch());
+
+    // The profile credential arrives — accepted, and the swap assertion holds.
+    gateway.reset_recorder();
+    let (status, _, _) = post_messages(
+        &gateway,
+        &[("authorization", &format!("Bearer {profile_token}"))],
+        &request_body(),
+    )
+    .await?;
+    assert_eq!(status, 200);
+    gateway.assert_presented_expected_credential()?;
+    assert!(!gateway.saw_credential_mismatch());
+
+    // Neither value is retrievable from the fixture in any rendered form.
+    for rendered in [
+        format!("{:?}", gateway.requests()),
+        format!("{:?}", gateway.credential_violations()),
+        gateway
+            .assert_presented_expected_credential()
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default(),
+    ] {
+        for leaked in [profile_token, worker_bearer] {
+            assert!(
+                !rendered.contains(leaked),
+                "the fixture rendered a credential value: {rendered}"
+            );
+        }
+    }
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn assert_presented_expected_credential_fails_when_nothing_was_configured() -> Result<()> {
+    // "Not checked" must never read as "passed": a test that forgot to arm the
+    // expectation would otherwise get a green run out of a check that never ran.
+    let gateway = FakeGateway::start().await?;
+    post_messages(
+        &gateway,
+        &[("authorization", "Bearer anything-at-all")],
+        &request_body(),
+    )
+    .await?;
+    assert!(
+        gateway.assert_presented_expected_credential().is_err(),
+        "an unconfigured comparison must not report success"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn expect_authorization_refuses_a_credential_free_request() -> Result<()> {
     // The origin can demand the profile credential without holding one: a
     // request with no credential at all is refused with a real 401, which is
@@ -518,7 +843,7 @@ async fn expect_authorization_refuses_a_credential_free_request() -> Result<()> 
     assert_eq!(value["error"]["type"], "authentication_error");
 
     // With a credential presented it answers normally — no value comparison is
-    // involved, because there is no expected value to compare against.
+    // involved, because no expected value was configured.
     let (status, _, _) = post_messages(
         &gateway,
         &[("authorization", "Bearer anything-at-all")],

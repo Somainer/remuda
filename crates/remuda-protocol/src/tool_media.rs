@@ -86,6 +86,14 @@ const MAX_MEDIA_TYPE_LEN: usize = 255;
 const MAX_IMAGE_DIMENSION: u32 = 8192;
 const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 
+/// Ceiling (characters) for text produced by serialising a non-array /
+/// non-marker tool-result content object, so an oversized JSON object cannot
+/// bloat a journal row or Hub frame.
+const OBJECT_TEXT_MAX_CHARS: usize = 4 * 1024;
+
+/// Marker appended when a serialised text block was truncated.
+const TRUNCATED_MARKER: &str = "…[truncated]";
+
 /// Field the producers put on a pre-folded content value: an array of
 /// already-built [`ContentBlock`]s. The key carries a per-process random
 /// nonce so agent-controlled native content cannot forge the marker (and so
@@ -183,13 +191,22 @@ pub fn fold_tool_result(
         };
     }
     let Value::Array(items) = content else {
-        // Bare string keeps the legacy shape; anything else (an object that is
-        // not a pre-fold marker) is serialised rather than silently dropped,
-        // matching the live driver's historical `to_string()` behaviour.
+        // Bare string keeps the legacy shape (bounded like every other text
+        // block). An object that is not a pre-fold marker is serialised for
+        // diagnostics, but NEVER verbatim: an image-typed object nested in
+        // it could carry a multi-MiB base64 payload straight into the journal
+        // and a Hub frame. Scrub any byte-bearing image fields first, then
+        // truncate the serialisation to a fixed ceiling.
         let text = match content {
             Value::String(s) => s.clone(),
-            other => other.to_string(),
+            other => {
+                let mut scrubbed = other.clone();
+                sanitize_tool_result_sidecar(&mut scrubbed, &[]);
+                let serialized = scrubbed.to_string();
+                truncate_text(&serialized, OBJECT_TEXT_MAX_CHARS)
+            }
         };
+        let text = truncate_text(&text, OBJECT_TEXT_MAX_CHARS);
         return FoldedToolResult {
             blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
             images: Vec::new(),
@@ -388,13 +405,12 @@ fn fold_image_item(
 /// Return a fixed reason when a PNG/JPEG header declares a canvas larger than
 /// the per-side or total-pixel ceiling.
 fn dimension_exceeds(bytes: &[u8]) -> Option<&'static str> {
-    if let Some((w, h)) = png_dimensions(bytes) {
-        if w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION {
-            return Some("over the 8192px image dimension limit");
-        }
-        if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
-            return Some("over the 40-megapixel image limit");
-        }
+    let (width, height) = png_dimensions(bytes).or_else(|| jpeg_dimensions(bytes))?;
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        return Some("over the 8192px image dimension limit");
+    }
+    if (width as u64) * (height as u64) > MAX_IMAGE_PIXELS {
+        return Some("over the 40-megapixel image limit");
     }
     None
 }
@@ -414,6 +430,62 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
     let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
     Some((width, height))
+}
+
+/// Read width/height from a baseline JPEG by walking the marker chain:
+/// SOI, then length-prefixed segments (APPn/COM/DQT/SOF/…); the first SOF
+/// marker (0xC0–0xCF except the standalone DHT/C4, DAC/CC and the non-frame
+/// RSTn/JPGn markers) carries height at +5 and width at +7. Stops at SOS
+/// (start of scan) where the entropy-coded data begins.
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            return None;
+        }
+        // Skip fill bytes.
+        while i < bytes.len() && bytes[i] == 0xFF {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        let marker = bytes[i];
+        i += 1;
+        // SOF0–SOF15: frame markers carrying the dimensions. Exclude DHT
+        // (0xC4), DAC (0xCC) and the non-frame 0xC8/JPG reserved marker.
+        let is_sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+        if is_sof {
+            if i + 8 > bytes.len() {
+                return None;
+            }
+            let height = u16::from_be_bytes([bytes[i + 3], bytes[i + 4]]) as u32;
+            let width = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+            return Some((width, height));
+        }
+        // Markers without a length payload (SOI already consumed; RSTn are
+        // inside scans we never reach).
+        if marker == 0xD8 || (0xD0..=0xD9).contains(&marker) || marker == 0x01 {
+            continue;
+        }
+        // Length-prefixed segment: two-byte length includes the length bytes.
+        if i + 2 > bytes.len() {
+            return None;
+        }
+        let seg_len = u16::from_be_bytes([bytes[i], bytes[i + 1]]) as usize;
+        if seg_len < 2 || i + seg_len > bytes.len() {
+            return None;
+        }
+        // SOS marks the start of entropy data; dimensions must precede it.
+        if marker == 0xDA {
+            return None;
+        }
+        i += seg_len;
+    }
+    None
 }
 
 /// Upper bound on the decoded byte length of a base64 string this long,
@@ -450,6 +522,11 @@ fn item_media_type(item: &Value) -> String {
 /// Validate a media-type claim to an `image/<token>` essence of at most
 /// [`MAX_MEDIA_TYPE_LEN`] ASCII bytes; otherwise return the default type.
 fn sanitize_media_type(raw: &str) -> String {
+    // Control characters (including CR/LF header injection) are rejected on
+    // the raw claim before any token parsing, so the check stays live.
+    if raw.chars().any(|ch| ch.is_ascii_control()) {
+        return DEFAULT_IMAGE_MEDIA_TYPE.to_owned();
+    }
     let essence = raw
         .split(';')
         .next()
@@ -466,12 +543,25 @@ fn sanitize_media_type(raw: &str) -> String {
         || !sub
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+' | '_'))
-        // Control characters / newlines never survive into journal text.
-        || essence.chars().any(|ch| ch.is_ascii_control())
     {
         return DEFAULT_IMAGE_MEDIA_TYPE.to_owned();
     }
     essence
+}
+
+/// Truncate a text block on a char boundary to `max` characters, appending a
+/// fixed marker when anything was removed.
+fn truncate_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let end = text
+        .char_indices()
+        .nth(max)
+        .map_or(text.len(), |(idx, _)| idx);
+    let mut out = text[..end].to_owned();
+    out.push_str(TRUNCATED_MARKER);
+    out
 }
 
 /// Truncate an arbitrary native item-type label for the opaque note, so a
@@ -913,6 +1003,111 @@ mod tests {
         assert_eq!(png_dimensions(b"not a png"), None);
     }
 
+    /// Build a minimal JPEG: SOI, an APP0/JFIF segment (skip chain), one
+    /// SOF0 (0xC0) declaring the given dimensions, SOS. No entropy data —
+    /// dimension parsing stops at SOS.
+    fn jpeg_header(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8];
+        // APP0 JFIF: length 16 (2 length bytes + 14 data), total 18.
+        let app0: [u8; 18] = [
+            0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+            0x00, 0x01, 0x00, 0x00,
+        ];
+        bytes.extend_from_slice(&app0);
+        // SOF0 baseline: length 17, precision 8, H, W, 1 component.
+        bytes.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08]);
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        // SOS marks the end of header parsing.
+        bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x01, 0x00]);
+        bytes
+    }
+
+    #[test]
+    fn over_dimension_jpeg_header_degrades() {
+        // 25000 px per side is over the 8192 side cap; the SOF0 marker chain
+        // must be walked (APP0 skipped) to read the frame dimensions.
+        let big = jpeg_header(25_000, 25_000);
+        assert_eq!(jpeg_dimensions(&big), Some((25_000, 25_000)));
+        let encoded = STANDARD.encode(&big);
+        let content = serde_json::json!([
+            {"type": "image",
+             "source": {"type": "base64", "mediaType": "image/jpeg", "data": encoded}}
+        ]);
+        let stager = FakeStager {
+            limit: 1024 * 1024,
+            ..FakeStager::default()
+        };
+        let folded = fold_tool_result(Some(&content), Some(&stager));
+        match &folded.blocks[0] {
+            ContentBlock::Text(text) => assert!(
+                text.text.contains("image/jpeg")
+                    && (text.text.contains("image dimension limit")
+                        || text.text.contains("megapixel")),
+                "{}",
+                text.text
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(stager.staged.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn normal_jpeg_header_is_accepted_for_the_cap() {
+        assert_eq!(jpeg_dimensions(&jpeg_header(640, 480)), Some((640, 480)));
+        assert!(dimension_exceeds(&jpeg_header(640, 480)).is_none());
+        // Non-JPEG bytes return None (not an error).
+        assert_eq!(jpeg_dimensions(b"\xff\xd8short"), None);
+    }
+
+    #[test]
+    fn object_content_with_image_bytes_is_scrubbed() {
+        // A small object whose image carries bytes: scrubbing removes the
+        // base64 and leaves the fixed note before any truncation.
+        let payload = "A".repeat(256);
+        let object = serde_json::json!({
+            "screenshot": {
+                "type": "image",
+                "source": {"type": "base64", "mediaType": "image/png", "data": payload}
+            }
+        });
+        let folded = fold_tool_result(Some(&object), None);
+        let text = match &folded.blocks[0] {
+            ContentBlock::Text(t) => &t.text,
+            other => panic!("{other:?}"),
+        };
+        assert!(!text.contains(&payload));
+        assert!(text.contains("remudaMedia"));
+        assert!(!text.contains("[truncated]"));
+    }
+
+    #[test]
+    fn object_content_with_image_bytes_is_scrubbed_and_truncated() {
+        // A large JSON-object content value (image bytes plus a big unrelated
+        // field) must neither keep the base64 nor exceed the text ceiling.
+        let payload = "A".repeat(20 * 1024);
+        let object = serde_json::json!({
+            "screenshot": {
+                "type": "image",
+                "source": {"type": "base64", "mediaType": "image/png", "data": payload}
+            },
+            "padding": "B".repeat(20 * 1024)
+        });
+        let folded = fold_tool_result(Some(&object), None);
+        assert_eq!(folded.blocks.len(), 1);
+        let text = match &folded.blocks[0] {
+            ContentBlock::Text(t) => &t.text,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            !text.contains(&"A".repeat(100)),
+            "base64 payload leaked into text block"
+        );
+        assert!(text.contains("[truncated]"), "truncation marker present");
+        assert!(text.chars().count() <= OBJECT_TEXT_MAX_CHARS + TRUNCATED_MARKER.chars().count());
+    }
+
     #[test]
     fn folded_marker_is_not_guessable_from_content() {
         // A content value carrying an "image" object and the literal old
@@ -945,6 +1140,39 @@ mod tests {
         });
         let folded = fold_tool_result(Some(&real), None);
         assert!(matches!(&folded.blocks[0], ContentBlock::Text(t) if t.text == "prefolded"));
+    }
+
+    #[test]
+    fn pre_folded_image_block_round_trips_through_marker() {
+        // The producers' prefold path replaces content with a marker carrying
+        // already-built blocks; a shape change here must not silently drop
+        // screenshots (a failed serde parse used to be swallowed).
+        let marker = folded_marker();
+        let object_id = Id::new("obj").unwrap();
+        let prefolded = serde_json::json!({
+            marker: [{
+                "type": "image",
+                "objectId": object_id,
+                "mediaType": "image/png",
+                "name": "screen-1.png",
+                "size": 1622
+            }]
+        });
+        let folded = fold_tool_result(Some(&prefolded), None);
+        assert_eq!(folded.blocks.len(), 1);
+        match &folded.blocks[0] {
+            ContentBlock::Image(media) => {
+                assert_eq!(media.object_id, object_id);
+                assert_eq!(media.media_type, "image/png");
+                assert_eq!(media.name.as_deref(), Some("screen-1.png"));
+                assert_eq!(media.size, Some(1622));
+            }
+            other => panic!("expected image block, got {other:?}"),
+        }
+        assert_eq!(folded.images.len(), 1);
+        assert_eq!(folded.images[0].object_id.as_ref(), Some(&object_id));
+        assert_eq!(folded.images[0].media_type, "image/png");
+        assert_eq!(folded.images[0].size, Some(1622));
     }
 
     #[test]

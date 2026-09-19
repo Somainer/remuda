@@ -1,0 +1,77 @@
+.runDetails {
+  flex: none;
+  font-family: var(--mono);
+}
+
+.runDetails > summary {
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: var(--text-aux);
+  color: var(--mute);
+  user-select: none;
+  border-radius: var(--radius);
+  padding: 2px 6px 2px 4px;
+}
+
+.runDetails > summary::-webkit-details-marker {
+  display: none;
+}
+
+.runDetails > summary:focus-visible {
+  outline: 2px solid var(--cold);
+  outline-offset: 1px;
+}
+
+.chev {
+  display: inline-flex;
+  width: 10px;
+  color: var(--mute);
+}
+
+.chev::before {
+  content: "▸";
+}
+
+.runDetails[open] .chev::before {
+  content: "▾";
+}
+
+.count {
+  color: var(--line);
+}
+
+.metaBody {
+  padding-top: 4px;
+}
+
+/* Compact: the trigger keeps a 21px visual row but gets the same invisible
+   44px reach as the glyph controls (ui-spec §3.4, D-039). Its zone would
+   otherwise rise into the header chip's, so the disclosure sits 14px below
+   the head row — the reclaimed space-chips row more than pays for it. The
+   pseudo spans the summary only, never sliding under the view switch. */
+@media (max-width: 767px) {
+  .runDetails {
+    margin-top: 14px;
+    /* The 44px pseudo is taller than the 21px row; keep its bottom 2px
+       inside the header so the following body pane never paints over it. */
+    margin-bottom: 3px;
+  }
+
+  .runDetails > summary {
+    position: relative;
+  }
+
+  .runDetails > summary::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 0;
+    height: var(--touch);
+    width: 100%;
+    transform: translateY(-50%);
+  }
+}

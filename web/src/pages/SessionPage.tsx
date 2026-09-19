@@ -3,12 +3,14 @@ import { Link, Navigate, useLocation, useNavigate, useParams } from "react-route
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
 import { Button } from "../components/Button";
+import { Sheet } from "../components/Sheet";
 import { ApprovalCard } from "../features/approvals/ApprovalCard";
 import { ElicitationCard } from "../features/approvals/ElicitationCard";
 import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
+import { RunDetails } from "../features/session/RunDetails";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
 import { Transcript } from "../features/session/Transcript";
@@ -31,6 +33,7 @@ import { hubStore, useHub } from "../lib/store";
 import type { Id } from "../types/wire";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
+import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
 import session from "../features/session/session.module.css";
@@ -42,10 +45,31 @@ export function SessionPage({
 }) {
   const { instanceId = "" } = useParams();
   const hub = useHub();
-  const { active: space, newHref } = useSpaceWorkbench();
+  const workbench = useSpaceWorkbench();
+  const { active: space, newHref } = workbench;
   const navigate = useNavigate();
   const location = useLocation();
   const { mobile, offsetTop } = useWorkbenchViewport();
+  // D-040 phone fold: below this width the header cannot hold every control
+  // without pushing Stop past the viewport edge, so Compact / 文件 / 原始事件
+  // move into the ⋯ sheet. Width-keyed (not coarsePointer) so a narrow
+  // window without touch keeps the same layout — folding is a layout question.
+  // 767px deliberately stays inline: the whole row fits there and the touch
+  // contract probes that exact width.
+  const [crowded, setCrowded] = useState(false);
+  useEffect(() => {
+    if (!mobile || typeof window.matchMedia !== "function") {
+      setCrowded(false);
+      return;
+    }
+    const media = window.matchMedia("(max-width: 640px)");
+    const update = () => setCrowded(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, [mobile]);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLButtonElement | null>(null);
   const [sendingIds, setSendingIds] = useState<string[]>([]);
   const sending = sendingIds.includes(instanceId);
   const setSending = (value: boolean) => setSendingIds((ids) => value ? [...new Set([...ids, instanceId])] : ids.filter((id) => id !== instanceId));
@@ -218,6 +242,103 @@ export function SessionPage({
   const promoted = isPromoted(instance);
   const binding = promoted ? transcriptBinding(events) : null;
   const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
+  const hostName = hubStore.hostName(instance.hostId);
+  const nativeRefShort = nativeShort(instance);
+  // "N 项运行信息" — every diagnostic field the disclosure can reveal, so the
+  // collapsed summary never hides the fact that there is something to unfold.
+  // driver · delegation · provider · lifecycle · seq · connectivity · the
+  // connection indicator, then host + cost on compact (they keep the desktop
+  // main row), plus the optional hint / native / binding items.
+  let detailsCount = 7 + (instance.providerSourceHint ? 1 : 0) + (nativeRefShort !== "—" ? 1 : 0) + (promoted ? 1 : 0);
+  if (structuredOnly && !showTerminal) detailsCount += 1;
+  if (mobile) {
+    // host + cost keep the desktop main row; on compact the disclosure is
+    // their only home, and provenance moves there too.
+    detailsCount += 2 + (instance.launchedBy ? 1 : 0);
+  }
+
+  const showViewExtras = resolvedView === "structured" || resolvedView === "files" || resolvedView === "events";
+  const closeMore = () => setMoreOpen(false);
+  const renderDensity = (menu: boolean) => (
+    <button
+      key="density"
+      type="button"
+      role={menu ? "menuitem" : undefined}
+      className={`${session.headBtn} ${hub.compact ? session.headBtnOn : ""} ${menu ? session.menuBtn : ""}`}
+      data-testid="density-toggle"
+      data-mode={hub.compact ? "compact" : "full"}
+      onClick={() => {
+        hubStore.setCompact(!hub.compact);
+        if (menu) closeMore();
+      }}
+    >
+      {hub.compact ? "Compact" : "Full"}
+    </button>
+  );
+  const renderFiles = (menu: boolean) => (
+    <button
+      key="files"
+      type="button"
+      role={menu ? "menuitem" : undefined}
+      className={`${resolvedView === "files" ? session.headBtnActive : session.headBtn} ${menu ? session.menuBtn : ""}`}
+      data-testid="files-toggle"
+      aria-pressed={resolvedView === "files"}
+      onClick={() => {
+        if (resolvedView === "files") navigate(backTo);
+        else openFiles();
+        if (menu) closeMore();
+      }}
+    >
+      文件
+    </button>
+  );
+  const renderEvents = (menu: boolean) => (
+    <button
+      key="events"
+      type="button"
+      role={menu ? "menuitem" : undefined}
+      className={`${resolvedView === "events" ? session.headBtnActive : session.headBtn} ${menu ? session.menuBtn : ""}`}
+      data-testid="events-toggle"
+      aria-pressed={resolvedView === "events"}
+      onClick={() => {
+        navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`);
+        if (menu) closeMore();
+      }}
+    >
+      原始事件
+    </button>
+  );
+  const resumeControl = canResume ? (
+    <span className={session.headRow} data-testid="resume-control">
+      {/* D-026: resume continues the same native session on a NEW
+          instance, so both targets navigate away from this one. */}
+      <Button
+        variant="primary"
+        disabled={resuming}
+        onClick={() => {
+          void startResume("structured");
+        }}
+      >
+        继续（结构化）
+      </Button>
+      <button
+        type="button"
+        className={session.headBtn}
+        data-testid="resume-terminal"
+        disabled={resuming}
+        onClick={() => {
+          void startResume("terminal");
+        }}
+      >
+        在终端中继续
+      </button>
+    </span>
+  ) : (
+    <Link to={newHref} className={session.inheritLink}>开新会话继承 cwd</Link>
+  );
+  // Two resume buttons cannot share the crowded 390px main row without
+  // wrapping over the disclosure; on phones they take their own header row.
+  const resumeOnOwnRow = status === "exited" && crowded && canResume;
 
   return (
     <div
@@ -240,19 +361,57 @@ export function SessionPage({
               ←
             </Link>
           ) : null}
-          <h1 className={session.title}>{workspace ? `${workspace} / ${title}` : title}</h1>
-          <span className={session.status} data-testid="session-status-label">
-            <StateDot status={status} />
-            {statusLabel}
-          </span>
-          {promoted ? (
-            <span className={session.status} data-testid="promoted-badge" title={
-              instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
-            }>
-              {instance.kind} · promoted
+          {/* D-040: on compact /s/:id* the whole chips strip folds into this
+              one current-space chip; it opens the unchanged spaces drawer. */}
+          {mobile ? (
+            <span className={session.headSpaceChip}>
+              <SpacesMobile
+                variant="chip"
+                spaces={workbench.spaces}
+                active={workbench.active}
+                prefs={workbench.prefs}
+                instanceId={workbench.instanceId}
+                onSelect={workbench.select}
+              />
             </span>
           ) : null}
-          <LaunchedByMark launchedBy={instance.launchedBy} />
+          {/* The chip already names the space, so the mobile title does not
+              repeat the "space / " prefix. */}
+          <h1 className={session.title} title={workspace ? `${workspace} / ${title}` : title}>
+            {workspace && !mobile ? `${workspace} / ${title}` : title}
+          </h1>
+          <span
+            className={session.status}
+            data-testid="session-status-label"
+            title={statusLabel}
+          >
+            <StateDot status={status} />
+            {/* At crowded phone widths only the dot shows; the word stays in
+                the DOM (tests, screen readers) and in the title tooltip. */}
+            <span className={session.statusWord}>{statusLabel}</span>
+          </span>
+          {/* Provenance/promotion badges stay in the diagnostic disclosure on a
+              phone; the main row has no room for them at 390px. */}
+          <span className={session.headBadges}>
+            {promoted ? (
+              <span className={session.status} data-testid="promoted-badge" title={
+                instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
+              }>
+                {instance.kind} · promoted
+              </span>
+            ) : null}
+            <LaunchedByMark launchedBy={instance.launchedBy} />
+          </span>
+          {!mobile ? (
+            <>
+              <span className={session.hostChip} data-testid="session-host" title={`主机 ${hostName}`}>
+                {hostName}
+              </span>
+              <span className={session.costChip} data-testid="session-cost">
+                {cost}
+              </span>
+            </>
+          ) : null}
           <span className={session.spacer} />
           {showTerminal ? (
             <ViewSwitch
@@ -260,69 +419,17 @@ export function SessionPage({
               onChange={(next) => navigate(`/s/${instance.id}/${next}`)}
             />
           ) : null}
-          <button
-            type="button"
-            className={`${session.headBtn} ${hub.compact ? session.headBtnOn : ""}`}
-            data-testid="density-toggle"
-            data-mode={hub.compact ? "compact" : "full"}
-            onClick={() => hubStore.setCompact(!hub.compact)}
-          >
-            {hub.compact ? "Compact" : "Full"}
-          </button>
-          {resolvedView === "structured" || resolvedView === "files" || resolvedView === "events" ? (
+          {crowded ? null : renderDensity(false)}
+          {crowded || !showViewExtras ? null : (
             <>
-              {/* 文件 was deskOnly, which hid the only entry to the fullscreen
-                  files route at ≤767px. It is now reachable on every width. */}
-              <button
-                type="button"
-                className={resolvedView === "files" ? session.headBtnActive : session.headBtn}
-                data-testid="files-toggle"
-                aria-pressed={resolvedView === "files"}
-                onClick={() => (resolvedView === "files" ? navigate(backTo) : openFiles())}
-              >
-                文件
-              </button>
-              <button
-                type="button"
-                className={resolvedView === "events" ? session.headBtnActive : session.headBtn}
-                data-testid="events-toggle"
-                aria-pressed={resolvedView === "events"}
-                onClick={() => navigate(resolvedView === "events" ? backTo : `/s/${instance.id}/events`)}
-              >
-                原始事件
-              </button>
+              {/* 文件/原始事件 stay inline whenever the row fits; only the
+                  crowded phone fold moves them into ⋯ (D-040). */}
+              {renderFiles(false)}
+              {renderEvents(false)}
             </>
-          ) : null}
-          {status === "exited" ? (
-            canResume ? (
-              <span className={session.headRow} data-testid="resume-control">
-                {/* D-026: resume continues the same native session on a NEW
-                    instance, so both targets navigate away from this one. */}
-                <Button
-                  variant="primary"
-                  disabled={resuming}
-                  onClick={() => {
-                    void startResume("structured");
-                  }}
-                >
-                  继续（结构化）
-                </Button>
-                <button
-                  type="button"
-                  className={session.headBtn}
-                  data-testid="resume-terminal"
-                  disabled={resuming}
-                  onClick={() => {
-                    void startResume("terminal");
-                  }}
-                >
-                  在终端中继续
-                </button>
-              </span>
-            ) : (
-              <Link to={newHref}>开新会话继承 cwd</Link>
-            )
-          ) : (
+          )}
+          {status === "exited" && !resumeOnOwnRow ? resumeControl : null}
+          {status !== "exited" ? (
             <button
               type="button"
               className={session.stopBtn}
@@ -333,11 +440,53 @@ export function SessionPage({
             >
               {mobile ? "■" : "■ 停止"}
             </button>
-          )}
+          ) : null}
+          {crowded ? (
+            <>
+              {/* The view switch and Stop are permanent main-row citizens;
+                  this ⋯ only ever holds Compact / 文件 / 原始事件. */}
+              <button
+                type="button"
+                className={session.moreBtn}
+                data-testid="session-more-open"
+                aria-label="更多会话操作"
+                aria-haspopup="menu"
+                aria-expanded={moreOpen}
+                ref={moreRef}
+                onClick={() => setMoreOpen((value) => !value)}
+              >
+                ⋯
+              </button>
+              <Sheet
+                open={moreOpen}
+                onClose={closeMore}
+                variant="sheet"
+                testId="session-more-sheet"
+                returnFocusRef={moreRef}
+              >
+                <div className={session.moreMenu} role="menu" aria-label="会话操作">
+                  {renderDensity(true)}
+                  {showViewExtras ? renderFiles(true) : null}
+                  {showViewExtras ? renderEvents(true) : null}
+                </div>
+              </Sheet>
+            </>
+          ) : null}
         </div>
-        <div className={session.meta} data-testid="session-meta">
-          <span className={session.metaHost}>{hubStore.hostName(instance.hostId)}</span>
-          <span className={session.dotSep}>·</span>
+        {resumeOnOwnRow ? (
+          <div className={session.resumeRow} data-testid="resume-row">
+            {resumeControl}
+          </div>
+        ) : null}
+        <RunDetails count={detailsCount}>
+          {mobile ? (
+            <>
+              <span className={session.metaHost}>{hostName}</span>
+              <span className={session.dotSep}>·</span>
+            </>
+          ) : null}
+          {mobile && instance.launchedBy ? <LaunchedByMark launchedBy={instance.launchedBy} /> : null}
+          {mobile && instance.launchedBy ? <span className={session.dotSep}>·</span> : null}
           <span data-testid="session-driver">
             {promoted ? `${instance.driver} · promoted` : instance.driver}
           </span>
@@ -357,19 +506,23 @@ export function SessionPage({
           <span>seq {events.at(-1)?.seq ?? instance.durableSeq}</span>
           <span className={session.dotSep}>·</span>
           <span>{instance.connectivity}</span>
-          <span className={session.dotSep}>·</span>
-          <span>{cost}</span>
-          {structuredOnly && !showTerminal && !mobile ? (
+          {mobile ? (
+            <>
+              <span className={session.dotSep}>·</span>
+              <span data-testid="session-cost">{cost}</span>
+            </>
+          ) : null}
+          {structuredOnly && !showTerminal ? (
             <>
               <span className={session.dotSep}>·</span>
               <span>structured-only — 无终端 tab</span>
             </>
           ) : null}
           <ConnectionIndicator status={connLabel} />
-          {nativeShort(instance) !== "—" ? (
+          {nativeRefShort !== "—" ? (
             <>
               <span className={session.dotSep}>·</span>
-              <span>native {nativeShort(instance)}</span>
+              <span>native {nativeRefShort}</span>
             </>
           ) : null}
           {promoted ? (
@@ -393,7 +546,7 @@ export function SessionPage({
           {journalStatus === "gap-backfill" ? " · 正在补事件" : ""}
           {journalStatus === "readonly-stale" ? " · 只读" : ""}
           {status === "idle" ? " · 回合结束、进程仍在" : ""}
-        </div>
+        </RunDetails>
       </header>
       {nodeRestarted ? (
         <div className={session.nodeRestart} data-testid="node-restart-banner">

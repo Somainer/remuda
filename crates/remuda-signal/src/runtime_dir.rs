@@ -12,9 +12,21 @@
 //!
 //! 1. When the preferred (under-instance / under-data-dir) path is short
 //!    enough, use it exactly as before.
-//! 2. Otherwise bind a short-named socket in a per-user runtime directory
-//!    (`$XDG_RUNTIME_DIR/remuda/`, else `${TMPDIR:-/tmp}/remuda-<uid>/`), and
-//!    leave a symlink with the preferred name pointing at the real socket.
+//! 2. Otherwise bind a short-named socket in the first usable per-user
+//!    runtime directory, and leave a symlink with the preferred name pointing
+//!    at the real socket. Candidates, in order:
+//!    1. `$XDG_RUNTIME_DIR/remuda/` when `XDG_RUNTIME_DIR` is set;
+//!    2. `${TMPDIR:-/tmp}/remuda-<uid>/`;
+//!    3. `/tmp/remuda-<uid>/` as a fixed last resort.
+//!
+//! The third candidate exists because the limit is measured against the
+//! *whole* address: on macOS `std::env::temp_dir()` is the ~48-byte
+//! `/var/folders/xx/yyyy/T/` with `XDG_RUNTIME_DIR` normally unset, and on any
+//! platform a long `TMPDIR` makes candidate 2 overflow even though it is the
+//! "short" branch. A per-user 0700 directory holding only socket inodes is the
+//! one place a fixed `/tmp` root is correct. A candidate counts as usable only
+//! when it (a) passes the security checks and (b) yields a bind path at or
+//! under [`SUN_PATH_LIMIT`]; an error is returned only when none fits.
 //!
 //! The symlink is *discovery*, not a route: connecting through the long link
 //! path hits the same `sun_path` rejection (verified empirically), so every
@@ -135,21 +147,41 @@ pub fn place_socket(preferred: &Path, runtime_name: &str) -> io::Result<SocketPl
             link_path: None,
         });
     }
-    let bind_path = per_user_runtime_dir()?.join(runtime_name);
-    let len = path_byte_len(&bind_path);
-    if len > SUN_PATH_LIMIT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "no AF_UNIX placement fits: runtime socket path is {len} bytes but the \
-                 platform limit is {SUN_PATH_LIMIT}; shorten XDG_RUNTIME_DIR/TMPDIR"
-            ),
-        ));
+    let uid = current_uid();
+    let mut attempts = Vec::new();
+    for candidate in runtime_dir_candidates(uid) {
+        let bind_path = candidate.join(runtime_name);
+        let len = path_byte_len(&bind_path);
+        if len > SUN_PATH_LIMIT {
+            // Too long to ever bind here; do not even create the directory.
+            attempts.push(format!("{} ({len} bytes)", bind_path.display()));
+            continue;
+        }
+        match secure_runtime_dir(&candidate, uid) {
+            Ok(()) => {
+                return Ok(SocketPlacement {
+                    bind_path,
+                    link_path: Some(preferred.to_path_buf()),
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "runtime dir candidate unusable for remuda sockets"
+                );
+                attempts.push(format!("{} ({error})", bind_path.display()));
+            }
+        }
     }
-    Ok(SocketPlacement {
-        bind_path,
-        link_path: Some(preferred.to_path_buf()),
-    })
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "no AF_UNIX placement fits for {}: {}; platform sun_path limit is {SUN_PATH_LIMIT}",
+            preferred.display(),
+            attempts.join("; ")
+        ),
+    ))
 }
 
 /// True when `path` is short enough to bind directly at its preferred name.
@@ -206,50 +238,81 @@ fn install_socket_symlink(_link: &Path, _target: &Path) -> io::Result<()> {
     ))
 }
 
-/// Locate (creating if needed) the 0700 per-user remuda runtime directory.
+/// Per-user runtime directory candidates in preference order.
 ///
-/// Preference order, per the XDG base directory spec:
-///
-/// 1. `$XDG_RUNTIME_DIR/remuda/` when the variable is set and the directory
-///    can be made ours (0700, this uid, not through a symlink).
-/// 2. `${TMPDIR:-/tmp}/remuda-<uid>/`, with the same guarantees.
-///
-/// A pre-existing directory that is a symlink or owned by another uid is
-/// refused, never repaired: in a shared tmp that is an attacker-controlled
-/// path, not something to chmod into trust.
-pub fn per_user_runtime_dir() -> io::Result<PathBuf> {
-    let uid = current_uid();
+/// Pure: it reads the environment but neither creates nor validates anything.
+/// The last element is the fixed `/tmp/remuda-<uid>` last resort, which is
+/// omitted when it is identical to the `TMPDIR` fallback (i.e. TMPDIR is unset
+/// or is itself `/tmp`).
+#[must_use]
+pub fn runtime_dir_candidates(uid: u32) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
     {
-        let candidate = xdg.join(XDG_SUBDIR);
+        candidates.push(xdg.join(XDG_SUBDIR));
+    }
+    let temp_fallback = std::env::temp_dir().join(format!("remuda-{uid}"));
+    candidates.push(temp_fallback.clone());
+    // Last resort: a fixed short root. It is the only placement that can stay
+    // under a 103-byte macOS sun_path when TMPDIR is the ~48-byte per-user
+    // Darwin temp dir (or any other long TMPDIR).
+    let fixed = PathBuf::from("/tmp").join(format!("remuda-{uid}"));
+    if fixed != temp_fallback {
+        candidates.push(fixed);
+    }
+    candidates
+}
+
+/// Locate (creating if needed) the first usable 0700 per-user remuda runtime
+/// directory, regardless of the socket name it will hold.
+///
+/// Callers that know the socket file name should use [`place_socket`]
+/// instead: it additionally rejects candidates whose join with the name would
+/// exceed `sun_path` and moves on to the next (fixed) root.
+pub fn per_user_runtime_dir() -> io::Result<PathBuf> {
+    let uid = current_uid();
+    let mut last_error = None;
+    for candidate in runtime_dir_candidates(uid) {
         match secure_runtime_dir(&candidate, uid) {
             Ok(()) => return Ok(candidate),
-            Err(error) => tracing::warn!(
-                path = %candidate.display(),
-                %error,
-                "XDG_RUNTIME_DIR unusable for remuda sockets; falling back to tmp"
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    path = %candidate.display(),
+                    %error,
+                    "runtime dir candidate unusable for remuda sockets"
+                );
+                last_error = Some(error);
+            }
         }
     }
-    let fallback = std::env::temp_dir().join(format!("remuda-{uid}"));
-    secure_runtime_dir(&fallback, uid)?;
-    Ok(fallback)
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no per-user runtime directory candidate was available",
+        )
+    }))
 }
 
 /// Verify `dir` is a real, own directory and make it 0700.
 ///
-/// Order matters: the symlink and owner checks run *before* the chmod, so a
+/// Order matters: the symlink and owner checks run *before* any chmod, so a
 /// path an attacker planted (a symlink into their tree, or a directory they
 /// own) is never written to.
+///
+/// A directory we create is born `0700` (recursive `DirBuilder` mode), so it
+/// is never momentarily group/world accessible. A pre-existing directory keeps
+/// whatever mode it had through the checks and is tightened afterwards through
+/// an `O_NOFOLLOW|O_DIRECTORY` fd with `fchmod`, which can never follow a link
+/// swapped in after the lstat.
 fn secure_runtime_dir(dir: &Path, uid: u32) -> io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(dir) {
-        Ok(metadata) => metadata,
+    let (metadata, pre_existing) = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => (metadata, true),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)?;
-            std::fs::symlink_metadata(dir)?
+            create_private_dir_all(dir)?;
+            (std::fs::symlink_metadata(dir)?, false)
         }
         Err(error) => return Err(error),
     };
@@ -282,19 +345,143 @@ fn secure_runtime_dir(dir: &Path, uid: u32) -> io::Result<()> {
                 ),
             ));
         }
+        if pre_existing {
+            tighten_to_0700_nofollow(dir)?;
+        }
     }
-    set_dir_mode_0700(dir)?;
     Ok(())
 }
 
+/// Recursively create `dir` with every new component born 0700.
 #[cfg(unix)]
-fn set_dir_mode_0700(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
 #[cfg(not(unix))]
-fn set_dir_mode_0700(_dir: &Path) -> io::Result<()> {
+fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// `fchmod(0700)` on a directory opened with `O_NOFOLLOW|O_DIRECTORY`.
+///
+/// `O_NOFOLLOW` fails with `ELOOP` if the path became a symlink after the
+/// lstat; `O_DIRECTORY` fails if it stopped being a directory. Neither window
+/// can therefore reach a file an attacker controls.
+#[cfg(unix)]
+fn tighten_to_0700_nofollow(dir: &Path) -> io::Result<()> {
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::{Mode, fchmod};
+    use std::os::fd::AsRawFd;
+    let fd = nix::fcntl::open(
+        dir,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let result = fchmod(fd.as_raw_fd(), Mode::from_bits_truncate(0o700));
+    result?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten_to_0700_nofollow(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Remove dead socket inodes left in the runtime directories by crashed Nodes.
+///
+/// Every directory here is remuda-private (0700, this uid), so any `*.sock`
+/// socket inode is one of ours. A socket with a live listener answers a
+/// connection (it is left alone); a `ECONNREFUSED` means no process holds it
+/// — e.g. after a SIGKILL — and it is unlinked. Returns the number removed.
+#[cfg(unix)]
+pub fn sweep_dead_runtime_sockets() -> io::Result<usize> {
+    use std::os::unix::fs::FileTypeExt;
+    let uid = current_uid();
+    let mut removed = 0;
+    for dir in runtime_dir_candidates(uid) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !metadata.file_type().is_socket()
+                || path.extension().and_then(|ext| ext.to_str()) != Some("sock")
+            {
+                continue;
+            }
+            match std::os::unix::net::UnixStream::connect(&path) {
+                // A live listener accepted the probe; never touch it.
+                Ok(_stream) => {}
+                // Dead inode (SIGKILL, power loss): reclaim the name. The
+                // kernel reports ECONNREFUSED for a socket nobody listens on;
+                // std maps that to the portable `ConnectionRefused`.
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => removed += 1,
+                        Err(error) => tracing::debug!(
+                            path = %path.display(),
+                            %error,
+                            "could not sweep dead runtime socket"
+                        ),
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    path = %path.display(),
+                    %error,
+                    "skipping runtime socket during sweep"
+                ),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Unlink the real socket an instance's `hook.sock` symlink points at.
+///
+/// Called when an instance is purged. Only the symlink itself sits in the
+/// (about-to-be-removed) instance directory; the live socket inode lives in a
+/// per-user runtime dir and would otherwise leak. The target is unlinked only
+/// when its parent is one of this process's own runtime candidates, so a link
+/// an attacker crafted at an arbitrary path can never direct a removal.
+///
+/// A direct (non-symlink) socket is left to the directory removal that
+/// follows; a missing file is not an error.
+#[cfg(unix)]
+pub fn unlink_resolved_socket_link(link: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(link) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let target = std::fs::read_link(link)?;
+    let uid = current_uid();
+    let trusted = runtime_dir_candidates(uid)
+        .iter()
+        .any(|candidate| target.parent() == Some(candidate.as_path()));
+    if !trusted {
+        tracing::warn!(
+            link = %link.display(),
+            target = %target.display(),
+            "hook.sock symlink resolves outside remuda runtime dirs; leaving target in place"
+        );
+        return Ok(());
+    }
+    match std::fs::remove_file(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
@@ -450,6 +637,50 @@ mod tests {
         secure_runtime_dir(&dir, current_uid()).unwrap();
         let metadata = std::fs::symlink_metadata(&dir).unwrap();
         assert_eq!(metadata.mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn candidates_end_in_the_fixed_tmp_root_and_a_uuid_name_always_fits() {
+        let candidates = runtime_dir_candidates(current_uid());
+        assert!(!candidates.is_empty());
+        // The last candidate is always the fixed `/tmp/remuda-<uid>` root
+        // (possibly the same as the temp fallback when TMPDIR is unset/`/tmp`,
+        // in which case it is listed exactly once).
+        let last = candidates.last().unwrap();
+        assert_eq!(last.parent(), Some(Path::new("/tmp")));
+        assert!(
+            last.file_name()
+                .unwrap()
+                .to_str()
+                .is_some_and(|name| name.starts_with("remuda-"))
+        );
+        // No duplicates (the fixed root is dropped when TMPDIR is /tmp).
+        let mut unique = candidates.clone();
+        unique.dedup();
+        assert_eq!(unique.len(), candidates.len());
+        // The product invariant: the 41-byte `<uuid>.sock` name fits at the
+        // fixed root on every supported platform (58 bytes ≤ 103).
+        let bound = last.join("01990000-0000-7000-8000-000000000001.sock");
+        assert!(path_byte_len(&bound) <= SUN_PATH_LIMIT);
+        // A TMPDIR other than /tmp adds a distinct fallback ahead of the
+        // fixed root.
+        if std::env::temp_dir() != PathBuf::from("/tmp") {
+            assert!(candidates.len() >= 2, "{candidates:?}");
+        }
+    }
+
+    #[test]
+    fn a_newly_created_runtime_dir_is_born_private() {
+        let root = tmp_root();
+        let dir = root.path().join("a/b/remuda-new");
+        secure_runtime_dir(&dir, current_uid()).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let parent = std::fs::symlink_metadata(root.path().join("a/b")).unwrap();
+        let leaf = std::fs::symlink_metadata(&dir).unwrap();
+        // Both created components are 0700, independent of the process umask.
+        assert_eq!(parent.mode() & 0o777, 0o700);
+        assert_eq!(leaf.mode() & 0o777, 0o700);
+        assert_eq!(leaf.uid(), current_uid());
     }
 
     #[cfg(unix)]

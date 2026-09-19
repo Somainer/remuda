@@ -70,10 +70,10 @@ const shotDir = evidence
   ? path.join(root, "docs/design/evidence")
   : path.join(root, "web/test-results/evidence");
 
-/** The shell call stays running long enough to observe partials + a tick. */
-const SHELL_TOOL_MS = 20_000;
+/** The shell call stays running long enough to race all the Running assertions. */
+const SHELL_TOOL_MS = 30_000;
 /** The question stays pending through both pages and the evidence captures. */
-const QUESTION_TOOL_MS = 25_000;
+const QUESTION_TOOL_MS = 30_000;
 
 async function shot(page: Page, name: string, redact: string[] = []) {
   if (!evidence) return;
@@ -386,8 +386,24 @@ async function launchGrokSession(
   );
   await expect(session).toHaveAttribute("data-mode", "promoted", { timeout: 20_000 });
   await page.getByTestId("view-switch-structured").click();
-  await expect(page.getByTestId("transcript")).toBeVisible();
+  await expectStructuredPane(page);
   return { id, strip: page.getByTestId("live-status-strip") };
+}
+
+/**
+ * Wait for the structured transcript pane to be mounted. The promoted
+ * shell-pty pane can transiently render the raw screen fallback while a
+ * 2 s instance poll is mid-flight (genericPty flips true until the file
+ * signalTier re-hydrates); if it does not settle, nudge a re-evaluation by
+ * toggling to the terminal view and back.
+ */
+async function expectStructuredPane(page: Page): Promise<void> {
+  const transcript = page.getByTestId("transcript");
+  if (await transcript.isVisible().catch(() => false)) return;
+  if (await transcript.waitFor({ state: "visible", timeout: 8_000 }).then(() => true).catch(() => false)) return;
+  await page.getByTestId("view-switch-tty").click();
+  await page.getByTestId("view-switch-structured").click();
+  await expect(transcript).toBeVisible({ timeout: 15_000 });
 }
 
 /** Record every data-phase transition the strip paints. */
@@ -563,16 +579,16 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
       await expect(page.getByTestId("live-decided-by")).toHaveAttribute("data-channel", "file");
       // Under host load a 2 s instance poll can momentarily drop the
       // promoted file signalTier and flip the structured pane to the raw
-      // screen fallback; wait for it to re-hydrate before reading the card.
-      await expect(page.getByTestId("transcript")).toBeVisible({ timeout: 30_000 });
+      // screen fallback; make sure it is mounted before reading the card.
+      await expectStructuredPane(page);
+      // The journal carries the full (possibly coalesced) episode; the
+      // painted recorder proves what the journal cannot — that the strip
+      // actually rendered a live phase before settling on turn-ended.
       const painted = await page.evaluate(() =>
-        (window as unknown as { __livePhases?: Array<{ phase: string | null }> }).__livePhases?.map(
-          (row) => row.phase,
-        ),
+        (window as unknown as { __livePhases?: Array<{ phase: string | null }> }).__livePhases ?? [],
       );
-      // turn-ended is stable and always painted; the coalescing thinking /
-      // tool-started edges are asserted from the durable journal instead.
-      expect(painted).toEqual(expect.arrayContaining(["turn-ended"]));
+      expect(painted.some((row) => row.phase), "strip never painted a live phase").toBe(true);
+      expect(painted.at(-1)?.phase).toBe("turn-ended");
       const allPhases = await journalPhases(page, id);
       expect(allPhases).toEqual(
         expect.arrayContaining(["thinking", "tool-started", "tool-output", "tool-finished", "turn-ended"]),
@@ -580,9 +596,12 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
 
       // The transcript window is virtualized and follows the newest message,
       // so the settled tool row is scrolled out of the drawn range by the
-      // streamed answer. Scroll to the top to mount it; the card may be
-      // inline or folded into the compact summary, so open the fold if
-      // present.
+      // streamed answer. Release the bottom-pin by scrolling the scroller
+      // to the top (its onScroll handler clears the pin so the layout effect
+      // does not snap back), then open the compact summary that swallowed
+      // the tool. expectStructuredPane also re-mounts the pane if it
+      // transiently fell back to the raw screen projection under load.
+      await expectStructuredPane(page);
       await page.getByTestId("transcript-scroller").evaluate((el) => {
         el.scrollTop = 0;
       });

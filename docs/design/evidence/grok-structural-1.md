@@ -59,15 +59,18 @@ from the fixture:
 
 - tool test ←
   [`grok-tools.json`](../../../crates/remuda-testing/fixtures/fake-harness/scenarios/grok-tools.json):
-  the `Bash` call's 900 ms becomes 20 000 ms so the Running window and the
-  `terminal/<callId>.log` tail stay observable (the elapsed-reading
-  assertions need only a few seconds). Prompt
+  the `Bash` call's 900 ms becomes 30 000 ms so the Running window covers
+  every Running-window assertion (card text, the strip elapsed tick, the
+  stdout-partial and tool-started polls, the one-shot no-exit-code check, and
+  both running-card screenshots). Prompt
   prefix `GROK_TOOLS`; stdout the fixture's three lines
   (`one` / `two` / `three`).
 - question test ←
   [`grok-question.json`](../../../crates/remuda-testing/fixtures/fake-harness/scenarios/grok-question.json):
-  the `ask_user_question` call's 20 ms becomes 25 000 ms so the pending
-  interaction is genuinely live in the browser and in the approvals queue.
+  the `ask_user_question` call's 20 ms becomes 30 000 ms so the pending
+  interaction stays live through the form/blocked checks, the interactions
+  read, the `/approvals` visit, the route-back form check and both evidence
+  captures.
   Prompt prefix `QUESTION`; options Alpha/Beta, answered by the harness with
   `rawOutput.UserAnswered = Alpha`.
 
@@ -138,9 +141,14 @@ nativeName · phase · state):
    marker, and every fixture stdout line appears **exactly once** as a whole
    line in the settled stdout block — the c-grok-stdout regression class
    (partial bytes concatenated into the Final).
-4. **Native thinking.** The strip paints the file-tier `thinking` phase and
-   the transcript shows the streaming `thought` block with the fixture's
-   thinking text.
+4. **Native thinking (journal + transcript; no painted assertion).** The
+   durable instance journal carries the file-tier `thinking` phase (asserted
+   via the journal REST snapshot), and the transcript shows a streaming
+   `thought` row with the fixture's thinking text. The painted strip is
+   deliberately **not** asserted for `thinking`: with one thought chunk, the
+   thought, Pending and Running frames land microseconds apart and one 250 ms
+   adapter poll can fold them, the same coalescing that hides
+   `tool-started`.
 5. **File-decided turn end.** After the ground-truth `turn_end`, the strip
    paints `data-phase="turn-ended"` and the decided-by chip reads
    `data-decided-by="file"` / `data-channel="file"` — no hook channel exists

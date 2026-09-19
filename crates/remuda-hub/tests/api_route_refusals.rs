@@ -165,6 +165,19 @@ impl Ctx {
         format!("http://{}{path}", self.hub.addr)
     }
 
+    async fn get(&self, host_id: &str) -> (reqwest::StatusCode, Value) {
+        let response = self
+            .http
+            .get(self.url(&format!("/v1/hosts/{host_id}")))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.json().await.unwrap_or(json!(null));
+        (status, body)
+    }
+
     async fn post(&self, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
         let response = self
             .http
@@ -279,6 +292,23 @@ async fn unknown_via_host_is_a_400_on_dispatch_and_create() -> Result<()> {
     Ok(())
 }
 
+/// Poll until the Hub reports `host_id` offline (or timeout), instead of a
+/// fixed sleep that races the shared devbox.
+async fn wait_host_offline(ctx: &Ctx, host_id: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, body) = ctx.get(host_id).await;
+        assert!(status.is_success(), "host GET failed: {body}");
+        if body["online"] == json!(false) && body["state"] != json!("online") {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("host {host_id} never went offline: {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn offline_via_host_is_a_409_before_allocation() -> Result<()> {
     let ctx = boot().await?;
@@ -286,7 +316,7 @@ async fn offline_via_host_is_a_409_before_allocation() -> Result<()> {
     let (worker, workspace) = connect_node(&ctx.hub, true).await?;
     // Enrolled but currently disconnected.
     let (offline_proxy, _offline_workspace) = connect_offline_node(&ctx.hub).await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_host_offline(&ctx, offline_proxy.as_id().as_str()).await?;
     let project_id = ctx
         .create_project(worker.as_id().as_str(), workspace.as_id().as_str())
         .await?;
@@ -296,6 +326,23 @@ async fn offline_via_host_is_a_409_before_allocation() -> Result<()> {
         json!({ "apiVia": offline_proxy.as_id().to_string(), "apiRoute": "hub-relay" }),
     );
     let (status, value) = ctx.post("/v1/workers/dispatch", body).await;
+    assert_eq!(status, 409, "{value}");
+    assert_eq!(value["code"], json!("api-via-host-offline"), "{value}");
+
+    // Same refusal on POST /v1/instances.
+    let (status, value) = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": worker.as_id(),
+                "kind": "claude",
+                "driver": "claude-print",
+                "delegation": "gateway",
+                "apiVia": offline_proxy.as_id().to_string(),
+                "apiRoute": "hub-relay"
+            }),
+        )
+        .await;
     assert_eq!(status, 409, "{value}");
     assert_eq!(value["code"], json!("api-via-host-offline"), "{value}");
     Ok(())
@@ -315,6 +362,22 @@ async fn old_worker_and_old_proxy_nodes_are_409_unsupported() -> Result<()> {
     assert_eq!(status, 409, "{value}");
     assert_eq!(value["code"], json!("api-via-unsupported"), "{value}");
 
+    // Same on POST /v1/instances.
+    let (status, value) = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": old_worker.as_id(),
+                "kind": "claude",
+                "driver": "claude-print",
+                "delegation": "gateway",
+                "apiVia": "self"
+            }),
+        )
+        .await;
+    assert_eq!(status, 409, "{value}");
+    assert_eq!(value["code"], json!("api-via-unsupported"), "{value}");
+
     // Worker capable, proxy old.
     let (worker, workspace) = connect_node(&ctx.hub, true).await?;
     let (old_proxy, _) = connect_node(&ctx.hub, false).await?;
@@ -328,6 +391,48 @@ async fn old_worker_and_old_proxy_nodes_are_409_unsupported() -> Result<()> {
     let (status, value) = ctx.post("/v1/workers/dispatch", body).await;
     assert_eq!(status, 409, "{value}");
     assert_eq!(value["code"], json!("api-via-unsupported"), "{value}");
+
+    // Same on POST /v1/instances.
+    let (status, value) = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": worker.as_id(),
+                "kind": "claude",
+                "driver": "claude-print",
+                "delegation": "gateway",
+                "apiVia": old_proxy.as_id().to_string(),
+                "apiRoute": "hub-relay"
+            }),
+        )
+        .await;
+    assert_eq!(status, 409, "{value}");
+    assert_eq!(value["code"], json!("api-via-unsupported"), "{value}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_old_worker_naming_a_bogus_host_gets_400_unknown_host_not_409_unsupported() -> Result<()>
+{
+    // The proxy-host lookup runs before the worker-capability check: an old
+    // worker whose apiVia names a host that does not exist gets 400, not 409.
+    let ctx = boot().await?;
+    ctx.create_gateway(None).await?;
+    let (old_worker, _workspace) = connect_node(&ctx.hub, false).await?;
+    let (status, value) = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": old_worker.as_id(),
+                "kind": "claude",
+                "driver": "claude-print",
+                "delegation": "gateway",
+                "apiVia": HostId::new().as_id().to_string()
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{value}");
+    assert_eq!(value["code"], json!("api-via-unknown-host"), "{value}");
     Ok(())
 }
 
@@ -347,6 +452,23 @@ async fn direct_net_without_a_relay_bind_is_409_and_auto_falls_back_to_hub_relay
         json!({ "apiVia": proxy.as_id().to_string(), "apiRoute": "direct-net" }),
     );
     let (status, value) = ctx.post("/v1/workers/dispatch", body).await;
+    assert_eq!(status, 409, "{value}");
+    assert_eq!(value["code"], json!("api-via-unreachable"), "{value}");
+
+    // Same refusal on POST /v1/instances.
+    let (status, value) = ctx
+        .post(
+            "/v1/instances",
+            json!({
+                "hostId": worker.as_id(),
+                "kind": "claude",
+                "driver": "claude-print",
+                "delegation": "gateway",
+                "apiVia": proxy.as_id().to_string(),
+                "apiRoute": "direct-net"
+            }),
+        )
+        .await;
     assert_eq!(status, 409, "{value}");
     assert_eq!(value["code"], json!("api-via-unreachable"), "{value}");
 

@@ -37,7 +37,8 @@ def emit(value):
 emit({'jsonrpc': '2.0', 'id': 'hello-1', 'method': 'node.hello', 'params': {
     'hostId': host, 'label': 'fixture', 'nodeVersion': '0.1.0', 'transport': 'ssh-stdio', 'bridge': True, 'daemon': True,
     'instances': [json.loads(instance_file.read_text())] if instance_file.exists() else [],
-    'host': {'hostname': 'fixture-node', 'labels': ['egress=gateway'], 'cli': [{'kind': 'codex', 'version': 'fixture', 'path': '/fixture/codex'}]}
+    'host': {'hostname': 'fixture-node', 'labels': ['egress=gateway'], 'cli': [{'kind': 'codex', 'version': 'fixture', 'path': '/fixture/codex'}]},
+    'capabilities': {'apiRelay': True, 'features': ['api-relay-v1']}
 }})
 for line in sys.stdin:
     frame = json.loads(line)
@@ -59,6 +60,9 @@ for line in sys.stdin:
         result = {'accepted': True, 'fixtureHostId': host}
     emit({'jsonrpc': '2.0', 'id': frame['id'], 'result': result})
     if method == 'instance.create':
+        spec = frame['params'].get('spec', {})
+        if 'apiRoute' in spec:
+            result['apiRoute'] = spec['apiRoute']
         instance_id = frame['params']['instanceId']
         instance_file.write_text(json.dumps({'id': instance_id, 'hostId': host, 'lifecycle': 'ready', 'activity': 'working', 'durableSeq': '1'}))
         entry = {'instanceId': instance_id, 'seq': '1', 'event': {'kind': 'lifecycle', 'payload': {'type': 'entity', 'state': 'ready'}}}

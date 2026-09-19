@@ -122,9 +122,13 @@ struct PatchProjectBody {
     #[serde(default)]
     provider: Option<ProjectProviderRef>,
     /// D-047 project-layer delivery override. `apiVia: null` clears it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::registry::double_option")]
     api_via: Option<Option<String>>,
-    #[serde(default, rename = "apiRoute")]
+    #[serde(
+        default,
+        rename = "apiRoute",
+        deserialize_with = "crate::registry::double_option"
+    )]
     api_route: Option<Option<String>>,
     #[serde(default)]
     default_effort: Option<Option<String>>,

@@ -537,6 +537,27 @@ pub async fn resolve_and_attach_with_project(
         profile.as_deref(),
     )?;
     apply_route_to_spec(state, host, spec, profile.as_deref(), choice).await?;
+    // D-048: when the resolved route proxies through another host, install
+    // the egress context (credential, base URL, headers) on H out of band via
+    // api.egress. The credential never rides api.open.
+    if let Some(profile) = profile.as_ref() {
+        let route: Option<remuda_protocol::ApiRoute> =
+            serde_json::from_value(spec.get("apiRoute").cloned().unwrap_or(json!(null))).ok();
+        if let Some(route) = route
+            .as_ref()
+            .filter(|route| route.is_via())
+            .filter(|route| matches!(route.route, Some(remuda_protocol::ApiRouteKind::HubRelay)))
+            && let Some(proxy_host) = route.via_host_id.as_ref()
+        {
+            let instance_id = spec.get("instanceId").and_then(Value::as_str).unwrap_or("");
+            if !instance_id.is_empty() {
+                state
+                    .api_relay
+                    .install_egress(state, proxy_host.as_id().as_str(), instance_id, profile)
+                    .await?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -659,6 +680,20 @@ pub(crate) async fn validate_via_target(
     profile: &ProviderRecord,
 ) -> Result<remuda_protocol::ApiRouteMode, HubError> {
     use remuda_protocol::{ApiRouteMode, ApiViaRefusal};
+    // Resolve the named proxy host (and verify it exists) before any worker-
+    // capability check: an old worker naming a bogus host must get 400
+    // api-via-unknown-host, not 409 api-via-unsupported.
+    let proxy_host: Option<HostRecord> = match &choice.target {
+        provider_resolve::ViaTarget::HubHost => None,
+        provider_resolve::ViaTarget::Host(id) => {
+            Some(state.store.get_host(id.clone()).await?.ok_or_else(|| {
+                HubError::api_via(
+                    ApiViaRefusal::ApiViaUnknownHost,
+                    format!("apiVia names unknown host {id}"),
+                )
+            })?)
+        }
+    };
     // The worker Node speaks the listener half; an old worker cannot launch a
     // proxied session at all.
     if !provider_resolve::node_supports_api_relay(worker) {
@@ -693,16 +728,7 @@ pub(crate) async fn validate_via_target(
         }
         provider_resolve::ViaTarget::Host(id) => id.clone(),
     };
-    let host = state
-        .store
-        .get_host(host_id.clone())
-        .await?
-        .ok_or_else(|| {
-            HubError::api_via(
-                ApiViaRefusal::ApiViaUnknownHost,
-                format!("apiVia names unknown host {host_id}"),
-            )
-        })?;
+    let host = proxy_host.expect("proxy host resolved above");
     // Refuse before any name/port/worktree allocation, mirroring the supply
     // refusals: a proxy host that is down cannot serve the first request.
     if state.nodes.kind_of(&host_id).await.is_none() {

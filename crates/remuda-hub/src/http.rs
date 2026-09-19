@@ -611,6 +611,10 @@ async fn stop_before_delete(
         .await
         .map_err(map_store)?
     {
+        state
+            .api_relay
+            .revoke_instance_egress(state, &instance.instance_id)
+            .await;
         crate::ws::publish_hub_diagnostic(
             state,
             &instance.instance_id,
@@ -1313,18 +1317,27 @@ pub async fn resume_instance(
         });
     }
     let host = crate::store::Store::with_live_link(host, true);
-    crate::providers::resolve_and_attach(
-        &state,
-        &host,
-        &mut spec,
-        crate::providers::RouteOverrides::default(),
-    )
-    .await?;
-    // D-047: a resumed session inherits the parent's *observed* route (the
-    // resume runs on the same worker host and the CLI gave no new override).
-    // Re-validate it — the proxy may have gone offline — and write the
-    // requested form back onto the child spec.
-    if let Some(observed) = parent.api_route.as_ref().filter(|route| route.is_via()) {
+    // D-047: a resumed session inherits the parent's *observed* route, not the
+    // profile/project waterfall. A parent that ran direct is forced direct
+    // even if the profile now says via; a parent that ran via is re-validated
+    // against the same proxy (which may have gone offline).
+    let parent_observed_via = parent
+        .api_route
+        .as_ref()
+        .filter(|route| route.is_via())
+        .cloned();
+    let resume_overrides = if parent_observed_via.is_none() {
+        // Force direct: do not let the profile's current delivery move a
+        // direct session onto a proxy on resume.
+        crate::providers::RouteOverrides {
+            via: Some(remuda_protocol::ApiViaOverride::Direct),
+            ..Default::default()
+        }
+    } else {
+        crate::providers::RouteOverrides::default()
+    };
+    crate::providers::resolve_and_attach(&state, &host, &mut spec, resume_overrides).await?;
+    if let Some(observed) = parent_observed_via.as_ref() {
         let target = match observed.via_host_id.as_ref() {
             Some(id) => crate::provider_resolve::ViaTarget::Host(id.as_id().to_string()),
             None => crate::provider_resolve::ViaTarget::HubHost,
@@ -1361,6 +1374,26 @@ pub async fn resume_instance(
             })?;
         crate::providers::validate_via_target(&state, &host, &choice, &profile).await?;
         crate::providers::write_requested_route(&mut spec, &choice)?;
+        // Re-install the egress context (credential) on the proxy host for
+        // the new instance; credentials ride api.egress, never api.open.
+        if let Some(proxy_host) = observed.via_host_id.as_ref() {
+            let new_instance_id = spec
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !new_instance_id.is_empty() {
+                state
+                    .api_relay
+                    .install_egress(
+                        &state,
+                        proxy_host.as_id().as_str(),
+                        &new_instance_id,
+                        &profile,
+                    )
+                    .await?;
+            }
+        }
     }
 
     let title = parent
@@ -2216,6 +2249,10 @@ async fn settle_stop_for_unknown_instance(
         .await
         .map_err(map_store)?
     {
+        state
+            .api_relay
+            .revoke_instance_egress(state, &instance_id)
+            .await;
         crate::ws::publish_hub_diagnostic(
             state,
             &instance_id,

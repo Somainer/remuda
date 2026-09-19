@@ -4,15 +4,15 @@
 //!
 //! * **Worker Node → proxy Node (`hub-relay` to another host).** The Hub is a
 //!   pure frame switch: `api.open/body/credit/cancel` from the worker host are
-//!   authorized against the instance, enriched with the profile's upstream
-//!   snapshot (base URL, headers, credential) and forwarded to the proxy host;
-//!   `api.head/chunk/end/cancel/credit` come back the other way. Every frame
-//!   is a notification with its own stream table, so a hot stream never spends
-//!   one of the 32 in-flight RPC slots.
+//!   authorized against the instance and forwarded to the proxy host; the
+//!   egress credential reaches H out of band via `api.egress` (never inside
+//!   `api.open`); `api.head/chunk/end/cancel/credit` come back the other way.
+//!   Every frame is a notification with its own stream table, so a hot stream
+//!   never spends one of the 32 in-flight RPC slots.
 //! * **Worker Node → the Hub process itself (`apiVia: self`).** The Hub is the
 //!   proxy host: it does the outbound `reqwest` in-process, loads the gateway
 //!   credential from the vault per stream, and emits `api.head/chunk/end`
-//!   itself. The credential exists only in this task's memory.
+//!   itself. The credential exists only in that task's memory.
 //!
 //! Either way the destination origin is pinned to the resolved profile's
 //! `baseUrl`, request and response headers are allowlisted, and `api.end`
@@ -26,26 +26,25 @@ use crate::error::HubError;
 use crate::store::StoreError;
 use base64::Engine as _;
 use remuda_protocol::hubnode::{
-    ApiBodyParams, ApiChunkParams, ApiCreditParams, ApiEndError, ApiEndParams, ApiHeadParams,
-    ApiOpenParams, METHOD_API_BODY, METHOD_API_CANCEL, METHOD_API_CHUNK, METHOD_API_CREDIT,
-    METHOD_API_END, METHOD_API_HEAD, METHOD_API_OPEN,
+    ApiBodyParams, ApiChunkParams, ApiCreditParams, ApiEgressParams, ApiEndError, ApiEndParams,
+    ApiHeadParams, ApiOpenParams, METHOD_API_BODY, METHOD_API_CANCEL, METHOD_API_CHUNK,
+    METHOD_API_CREDIT, METHOD_API_EGRESS, METHOD_API_END, METHOD_API_HEAD, METHOD_API_OPEN,
 };
 use remuda_protocol::{
     API_ROUTE_DOWN,
     hubnode::{
         API_ERROR_CANCELLED, API_ERROR_DESTINATION_REFUSED, API_ERROR_HUB_LINK_LOST,
-        API_ERROR_UPSTREAM_TIMEOUT, API_ERROR_VIA_HOST_OFFLINE,
+        API_ERROR_INSTANCE_GONE, API_ERROR_UPSTREAM_TIMEOUT, API_ERROR_VIA_HOST_OFFLINE,
     },
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify as AsyncNotify, mpsc};
 
-/// Convenience alias for the notification handlers: failures are delivered as
-/// the stream's terminal frame, never a JSON-RPC error.
+/// Convenience alias for the notification handlers.
 type RelayResult<T> = std::result::Result<T, String>;
 
 /// Streams one live link may hold (protocol §7.6; `maxApiStreams` default 8).
@@ -62,6 +61,10 @@ const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(60);
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Hard cap for one relayed stream (§7.6).
 const STREAM_HARD_CAP: Duration = Duration::from_secs(30 * 60);
+/// In-process egress coalescing: flush at this many buffered bytes or this
+/// long after the first buffered byte (D-048 §7.6).
+const COALESCE_BYTES: usize = 16 * 1024;
+const COALESCE_TIME: Duration = Duration::from_millis(50);
 
 /// Request headers the gateway may see. A cookie or proxy-auth header from the
 /// harness must never be forwarded to the model origin; the worker's listener
@@ -93,6 +96,31 @@ struct Registry {
     worker_legs: HashMap<(String, String), String>,
     /// (proxy host, hub-allocated stream id) → hub key.
     proxy_legs: HashMap<(String, String), String>,
+    /// Egress contexts installed for proxy hosts: (proxy host, instance id) →
+    /// the snapshot H needs. Credentials ride only `api.egress`, never
+    /// `api.open`.
+    egress_contexts: HashMap<(String, String), EgressSnapshot>,
+    /// Per-link frame queues. One drain task per host serializes frames so
+    /// `api.body` chunks are processed in wire order; the read loop only
+    /// `try_send`s and never blocks on a backpressured peer. A dropped sender
+    /// (session ended) stops the drain task.
+    link_queues: HashMap<String, mpsc::Sender<ApiFrame>>,
+}
+
+/// One inbound `api.*` notification queued from a Node read loop.
+#[derive(Debug, Clone)]
+struct ApiFrame {
+    method: String,
+    params: Value,
+}
+
+/// The credential-bearing snapshot pushed to a proxy Node via `api.egress`.
+#[derive(Clone)]
+struct EgressSnapshot {
+    profile_id: String,
+    base_url: String,
+    headers: std::collections::BTreeMap<String, String>,
+    secret: Option<String>,
 }
 
 /// One relayed request: two legs, one byte counter, one lifetime.
@@ -110,24 +138,28 @@ struct Stream {
     profile_id: String,
     /// Raw chunk cap from the link limits.
     chunk_limit: usize,
+    /// Single stream deadline, fixed at open: covers send, first byte, idle and
+    /// the credit park so nothing waits past the 30 min hard cap.
+    deadline: tokio::time::Instant,
     started: Instant,
     state: Mutex<StreamState>,
     /// Request-body channel the in-process egress drains (chunked bodies only).
     /// `None` here after the terminal chunk closes the receiver's loop.
     body_tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
-    /// H→W chunk window. Credits are tracked explicitly with an atomic counter
-    /// (not a semaphore): the permit must stay held from *send* until W drains
-    /// the frame, but the permit-drop happens on this same task when W credits,
-    /// which a `SemaphorePermit` held across `.await` cannot express without a
-    /// borrow conflict. The atomic mirrors that permit lifetime exactly.
-    down_credits: Arc<std::sync::atomic::AtomicU32>,
+    /// Remaining H→W producer credits (in-process leg). An `AtomicU32` rather
+    /// than a semaphore: the permit is released from a different task (the
+    /// `api.credit` handler) than the one holding it, which a `SemaphorePermit`
+    /// cannot express across tasks.
+    down_credits: Arc<AtomicU32>,
+    /// Woken when W credits chunks or the stream is cancelled.
+    down_waker: Arc<AsyncNotify>,
     /// Set by `api.cancel` / `api.end` / link loss so the egress task stops.
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
 struct StreamState {
-    /// Response status from `api.head`, for the counter journal.
+    /// Response status from `api.head`, for the journal.
     status: Option<u16>,
     /// Request bytes seen (pre-base64).
     bytes_up: u64,
@@ -154,6 +186,88 @@ impl ApiRelay {
         Self::default()
     }
 
+    /// Submit one inbound `api.*` frame for a link.
+    ///
+    /// Non-blocking by design (item 8): enqueues onto the link's dedicated
+    /// drain task and returns immediately so the Node read loop keeps
+    /// processing tty/control/RPC frames. A full queue (a saturated, unread
+    /// link) drops the frame and logs; the per-stream api.end deadline on the
+    /// peer then surfaces the failure rather than wedging this process.
+    pub async fn submit_frame(
+        &self,
+        state: &AppState,
+        host_id: &str,
+        method: String,
+        params: Value,
+    ) {
+        const LINK_QUEUE_CAPACITY: usize = 128;
+        let mut need_task = false;
+        let (tx, rx) = {
+            let mut registry = self.inner.lock().await;
+            match registry.link_queues.get(host_id) {
+                Some(tx) => (tx.clone(), None),
+                None => {
+                    let (tx, rx) = mpsc::channel(LINK_QUEUE_CAPACITY);
+                    registry.link_queues.insert(host_id.to_string(), tx.clone());
+                    need_task = true;
+                    (tx, Some(rx))
+                }
+            }
+        };
+        if need_task {
+            let relay = self.clone();
+            let state = state.clone();
+            let host = host_id.to_string();
+            let task_tx = tx.clone();
+            let mut rx = rx.expect("new channel has a receiver");
+            tokio::spawn(async move {
+                while let Some(ApiFrame { method, params }) = rx.recv().await {
+                    relay.dispatch_frame(&state, &host, &method, params).await;
+                }
+                let mut registry = relay.inner.lock().await;
+                if registry
+                    .link_queues
+                    .get(&host)
+                    .is_some_and(|queued| queued.same_channel(&task_tx))
+                {
+                    registry.link_queues.remove(&host);
+                }
+            });
+        }
+        if tx.try_send(ApiFrame { method, params }).is_err() {
+            tracing::error!(%host_id, "api.* link queue saturated; dropping frame");
+        }
+    }
+
+    /// Serial dispatch used by both the per-link drain task and the SSH
+    /// carrier's single read loop (which already serializes frames).
+    async fn dispatch_frame(&self, state: &AppState, host_id: &str, method: &str, params: Value) {
+        let result: RelayResult<()> = match method {
+            METHOD_API_OPEN => self.on_open(state, host_id, params).await,
+            METHOD_API_BODY => {
+                self.on_body(state, host_id, params).await;
+                Ok(())
+            }
+            METHOD_API_HEAD => self.on_head(state, host_id, params).await,
+            METHOD_API_CHUNK => self.on_chunk(state, host_id, params).await,
+            METHOD_API_END => self.on_end(state, host_id, params).await,
+            METHOD_API_CANCEL => self.on_cancel(state, host_id, params).await,
+            METHOD_API_CREDIT => self.on_credit(state, host_id, params).await,
+            // api.egress is Hub→Node only; a Node sending it is a protocol error.
+            METHOD_API_EGRESS => {
+                tracing::warn!(%host_id, "node sent a Hub-only api.egress frame");
+                Ok(())
+            }
+            other => {
+                tracing::warn!(method = other, "unknown api.* notification");
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!(%host_id, %method, error = %error, "api.* notification rejected");
+        }
+    }
+
     /// Handle one `api.*` notification from an authenticated Node link.
     ///
     /// Notification frames carry no RPC id and answer nothing: every failure is
@@ -166,24 +280,100 @@ impl ApiRelay {
         method: &str,
         params: Value,
     ) {
-        let result: RelayResult<()> = match method {
-            METHOD_API_OPEN => self.on_open(state, host_id, params).await,
-            METHOD_API_BODY => {
-                self.on_body(state, host_id, params).await;
-                Ok(())
-            }
-            METHOD_API_HEAD => self.on_head(state, host_id, params).await,
-            METHOD_API_CHUNK => self.on_chunk(state, host_id, params).await,
-            METHOD_API_END => self.on_end(state, host_id, params).await,
-            METHOD_API_CANCEL => self.on_cancel(state, host_id, params).await,
-            METHOD_API_CREDIT => self.on_credit(state, host_id, params).await,
-            other => {
-                tracing::warn!(method = other, "unknown api.* notification");
-                Ok(())
-            }
+        self.submit_frame(state, host_id, method.to_string(), params)
+            .await;
+    }
+
+    // ── egress context (api.egress, credentials never ride api.open) ─────────
+
+    /// Install (or revoke) the egress context for a proxied instance on host H.
+    ///
+    /// Called when a `via:<H>` route is decided at launch, when H reconnects,
+    /// and on instance exit/route-down (`revoke: true`). The snapshot carries
+    /// the gateway credential; `api.open` is always credential-free.
+    pub async fn install_egress(
+        &self,
+        state: &AppState,
+        proxy_host: &str,
+        instance_id: &str,
+        profile: &crate::store::ProviderRecord,
+    ) -> Result<(), HubError> {
+        let secret = load_upstream_secret(state, profile).await?;
+        let snapshot = EgressSnapshot {
+            profile_id: profile.id.clone(),
+            base_url: profile.base_url.clone(),
+            headers: profile.headers.clone(),
+            secret,
         };
-        if let Err(error) = result {
-            tracing::warn!(%host_id, %method, error = %error, "api.* notification rejected");
+        self.inner.lock().await.egress_contexts.insert(
+            (proxy_host.to_string(), instance_id.to_string()),
+            snapshot.clone(),
+        );
+        let params = serde_json::to_value(ApiEgressParams {
+            instance_id: instance_id.to_string(),
+            profile_id: snapshot.profile_id,
+            base_url: snapshot.base_url,
+            headers: snapshot
+                .headers
+                .iter()
+                .map(|(name, value)| remuda_protocol::hubnode::ApiHeader {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            auth_token: snapshot.secret,
+            revoke: false,
+        })
+        .map_err(|error| HubError::Internal(error.to_string()))?;
+        let delivered = state
+            .nodes
+            .notify(proxy_host, METHOD_API_EGRESS, params)
+            .await
+            .unwrap_or(false);
+        if !delivered {
+            return Err(HubError::Conflict(format!(
+                "api-via-host-offline: proxy host {proxy_host} is offline while installing egress"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Revoke an instance's egress context on H (instance exit / route down).
+    pub async fn revoke_egress(&self, state: &AppState, proxy_host: &str, instance_id: &str) {
+        self.inner
+            .lock()
+            .await
+            .egress_contexts
+            .remove(&(proxy_host.to_string(), instance_id.to_string()));
+        let params = json!({
+            "instanceId": instance_id,
+            "profileId": Value::Null,
+            "baseUrl": Value::Null,
+            "headers": [],
+            "authToken": Value::Null,
+            "revoke": true,
+        });
+        let _ = state
+            .nodes
+            .notify(proxy_host, METHOD_API_EGRESS, params)
+            .await;
+    }
+
+    /// Revoke every egress context held for an instance across all proxy hosts
+    /// (instance exit / deletion), regardless of whether a stream is live.
+    pub async fn revoke_instance_egress(&self, state: &AppState, instance_id: &str) {
+        let hosts: Vec<String> = {
+            self.inner
+                .lock()
+                .await
+                .egress_contexts
+                .keys()
+                .filter(|(_, instance)| instance == instance_id)
+                .map(|(host, _)| host.clone())
+                .collect()
+        };
+        for host in hosts {
+            self.revoke_egress(state, &host, instance_id).await;
         }
     }
 
@@ -198,36 +388,87 @@ impl ApiRelay {
             .store
             .get_instance(open.instance_id.clone())
             .await
-            .map_err(|error| format!("load instance: {error}"))?
-            .ok_or("api.open names an unknown instance")?;
+            .map_err(|error| format!("load instance: {error}"))?;
+        let Some(instance) = instance else {
+            self.reject_unregistered_open(
+                state,
+                host_id,
+                &open,
+                API_ERROR_INSTANCE_GONE,
+                "api.open names an unknown instance",
+            )
+            .await;
+            return Ok(());
+        };
         if instance.host_id != host_id {
-            return Err("api.open host is not the instance's host".into());
+            self.reject_unregistered_open(
+                state,
+                host_id,
+                &open,
+                API_ERROR_DESTINATION_REFUSED,
+                "api.open host is not the instance's host",
+            )
+            .await;
+            return Ok(());
         }
-        let route = instance
-            .api_route
-            .as_ref()
-            .filter(|route| route.is_via())
-            .ok_or("instance has no via apiRoute; nothing to relay")?;
+        let route = instance.api_route.as_ref();
+        let Some(route) = route.filter(|route| route.is_via()) else {
+            self.reject_unregistered_open(
+                state,
+                host_id,
+                &open,
+                API_ERROR_DESTINATION_REFUSED,
+                "instance has no via apiRoute; nothing to relay",
+            )
+            .await;
+            return Ok(());
+        };
         // Direct-net sessions bypass the Hub entirely (W opens a TCP connection
         // to H's relayBind). An api.* frame for one here means a Node that
         // misread its own echo — a protocol error, never a reroute.
         if !matches!(route.route, Some(remuda_protocol::ApiRouteKind::HubRelay)) {
-            return Err("api.open on a direct-net route must not traverse the Hub".into());
+            self.reject_unregistered_open(
+                state,
+                host_id,
+                &open,
+                API_ERROR_DESTINATION_REFUSED,
+                "api.open on a direct-net route must not traverse the Hub",
+            )
+            .await;
+            return Ok(());
         }
         let profile_id = instance
             .provider_profile_id
             .as_deref()
-            .filter(|id| crate::provider_resolve::is_real_profile_id(id))
-            .ok_or("via instance names no gateway profile")?;
+            .filter(|id| crate::provider_resolve::is_real_profile_id(id));
+        let Some(profile_id) = profile_id else {
+            self.reject_unregistered_open(
+                state,
+                host_id,
+                &open,
+                API_ERROR_DESTINATION_REFUSED,
+                "via instance names no gateway profile",
+            )
+            .await;
+            return Ok(());
+        };
         let profile = state
             .store
             .get_provider(profile_id.to_string())
             .await
-            .map_err(|error| format!("load profile: {error}"))?
-            .ok_or("the instance's gateway profile vanished")?;
-        // Re-check the pin against the pinned base URL, on every open. A
-        // rejected open still has a listener waiting for api.end: deliver the
-        // refusal to W, never a JSON-RPC error or silence.
+            .map_err(|error| format!("load profile: {error}"))?;
+        let Some(profile) = profile else {
+            self.reject_unregistered_open(
+                state,
+                host_id,
+                &open,
+                API_ERROR_DESTINATION_REFUSED,
+                "the instance's gateway profile vanished",
+            )
+            .await;
+            return Ok(());
+        };
+        // Re-check the pin against the pinned base URL, on every open.
         if let Err(message) = check_request_allowlist(&open.method, &open.path, &profile.base_url) {
             self.reject_unregistered_open(
                 state,
@@ -241,7 +482,7 @@ impl ApiRelay {
         }
         // The request-header allowlist: auth headers are stripped/swap targets,
         // the documented names (plus x-stainless-*) pass, anything else is a
-        // refusal — the Hub re-checks what the listener was supposed to drop.
+        // refusal.
         for header in &open.headers {
             let name = header.name.to_ascii_lowercase();
             let allowed = matches!(name.as_str(), "authorization" | "x-api-key" | "api-key")
@@ -263,20 +504,21 @@ impl ApiRelay {
         }
 
         let chunk_limit = state.config_relay_chunk_bytes();
-        // Inline bodies count as up-bytes at open; chunked bodies count per
-        // frame in `on_body`.
         let initial_bytes_up = match open.body_base64.as_deref() {
             Some(b64) => decode_b64(b64)?.len() as u64,
             None => 0,
         };
+        let deadline = tokio::time::Instant::now() + STREAM_HARD_CAP;
         let prepared = {
             let mut registry = self.inner.lock().await;
-            let owned = registry
+            if registry
                 .worker_legs
                 .keys()
                 .filter(|(host, _)| host == host_id)
-                .count();
-            if owned >= MAX_STREAMS_PER_LINK {
+                .count()
+                >= MAX_STREAMS_PER_LINK
+            {
+                drop(registry);
                 self.reject_unregistered_open(
                     state,
                     host_id,
@@ -287,13 +529,15 @@ impl ApiRelay {
                 .await;
                 return Ok(());
             }
-            let for_instance = registry
+            if registry
                 .worker_legs
                 .values()
                 .filter_map(|key| registry.streams.get(key))
                 .filter(|stream| stream.instance_id == open.instance_id)
-                .count();
-            if for_instance >= MAX_STREAMS_PER_INSTANCE {
+                .count()
+                >= MAX_STREAMS_PER_INSTANCE
+            {
+                drop(registry);
                 self.reject_unregistered_open(
                     state,
                     host_id,
@@ -308,7 +552,16 @@ impl ApiRelay {
                 .worker_legs
                 .contains_key(&(host_id.to_string(), open.stream_id.clone()))
             {
-                return Err("duplicate streamId on this link".into());
+                drop(registry);
+                self.reject_unregistered_open(
+                    state,
+                    host_id,
+                    &open,
+                    API_ERROR_DESTINATION_REFUSED,
+                    "duplicate streamId on this link",
+                )
+                .await;
+                return Ok(());
             }
             let suffix = crate::config::new_id("obj").map_err(|error| error.to_string())?;
             let key = format!("{}-{}", open.stream_id, suffix);
@@ -317,6 +570,8 @@ impl ApiRelay {
                 Some((tx, rx)) => (Some(tx), Some(rx)),
                 None => (None, None),
             };
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let down_waker = Arc::new(AsyncNotify::new());
             let stream = Arc::new(Stream {
                 key: key.clone(),
                 instance_id: open.instance_id.clone(),
@@ -326,6 +581,7 @@ impl ApiRelay {
                 proxy_stream: key.clone(),
                 profile_id: profile.id.clone(),
                 chunk_limit,
+                deadline,
                 started: Instant::now(),
                 state: Mutex::new(StreamState {
                     body_open: open.body_chunked,
@@ -333,8 +589,9 @@ impl ApiRelay {
                     ..Default::default()
                 }),
                 body_tx: Mutex::new(body_tx),
-                down_credits: Arc::new(std::sync::atomic::AtomicU32::new(INITIAL_CHUNK_CREDITS)),
-                cancelled: AtomicBool::new(false),
+                down_credits: Arc::new(AtomicU32::new(INITIAL_CHUNK_CREDITS)),
+                down_waker,
+                cancelled,
             });
             registry
                 .worker_legs
@@ -388,6 +645,27 @@ impl ApiRelay {
             open,
         } = prepared;
         if let Some(proxy_host) = stream.proxy_host.clone() {
+            // Proxy-Node leg. The credential lives in the installed egress
+            // context (pushed via api.egress at launch/reconnect); it is never
+            // attached to api.open.
+            let context_present = {
+                let registry = self.inner.lock().await;
+                registry
+                    .egress_contexts
+                    .contains_key(&(proxy_host.clone(), stream.instance_id.clone()))
+            };
+            if !context_present {
+                self.end_to_worker(
+                    state,
+                    &stream,
+                    Err(ApiEndError {
+                        code: API_ERROR_DESTINATION_REFUSED.into(),
+                        message: "no egress context installed for this proxy/instance (wait for api.egress)".into(),
+                    }),
+                )
+                .await;
+                return;
+            }
             if !crate::provider_resolve::secret_release_allowed(&profile, &proxy_host) {
                 self.end_to_worker(
                     state,
@@ -400,21 +678,7 @@ impl ApiRelay {
                 .await;
                 return;
             }
-            let secret = match load_upstream_secret(state, &profile).await {
-                Ok(secret) => secret,
-                Err(error) => {
-                    self.end_to_worker(
-                        state,
-                        &stream,
-                        Err(ApiEndError {
-                            code: API_ERROR_DESTINATION_REFUSED.into(),
-                            message: format!("credential unavailable: {error}"),
-                        }),
-                    )
-                    .await;
-                    return;
-                }
-            };
+            // api.open carries no credential; just re-address the stream.
             let mut params = match serde_json::to_value(&open) {
                 Ok(value) => value,
                 Err(error) => {
@@ -431,19 +695,7 @@ impl ApiRelay {
                 }
             };
             if let Some(obj) = params.as_object_mut() {
-                // The H leg addresses the stream by the Hub-allocated id.
                 obj.insert("streamId".into(), json!(stream.proxy_stream));
-                // The vault snapshot for this stream: the credential rides the
-                // authenticated Hub↔H link and exists nowhere on W.
-                obj.insert(
-                    "upstream".into(),
-                    json!({
-                        "profileId": profile.id,
-                        "baseUrl": profile.base_url,
-                        "headers": profile.headers,
-                        "authToken": secret,
-                    }),
-                );
             }
             let delivered = state
                 .nodes
@@ -462,16 +714,32 @@ impl ApiRelay {
                 .await;
             }
         } else {
-            // H is this Hub process: do the egress here.
+            // H is this Hub process: re-check the secret scope against the
+            // Hub host identity the create path used (item 5).
+            if !hub_self_secret_allowed(&profile) {
+                self.end_to_worker(
+                    state,
+                    &stream,
+                    Err(ApiEndError {
+                        code: API_ERROR_DESTINATION_REFUSED.into(),
+                        message:
+                            "api-via-forbidden: the profile's gateway secret is host-scoped to a different host; the Hub host may not load it"
+                                .into(),
+                    }),
+                )
+                .await;
+                return;
+            }
             let secret = match load_upstream_secret(state, &profile).await {
                 Ok(secret) => secret,
                 Err(error) => {
+                    tracing::warn!(%error, "hub egress credential unavailable");
                     self.end_to_worker(
                         state,
                         &stream,
                         Err(ApiEndError {
                             code: API_ERROR_DESTINATION_REFUSED.into(),
-                            message: format!("credential unavailable: {error}"),
+                            message: "credential unavailable on the Hub host".into(),
                         }),
                     )
                     .await;
@@ -500,9 +768,8 @@ impl ApiRelay {
     async fn on_body(&self, state: &AppState, host_id: &str, params: Value) {
         let result = self.on_body_inner(state, host_id, params).await;
         if let Err((stream, code, message)) = result {
-            // A notification cannot be answered with a JSON-RPC error: the
-            // failure shows up as the stream's terminal api.end instead.
             stream.cancelled.store(true, Ordering::SeqCst);
+            stream.down_waker.notify_waiters();
             self.end_to_worker(
                 state,
                 &stream,
@@ -524,14 +791,11 @@ impl ApiRelay {
         let body: ApiBodyParams = match serde_json::from_value(params) {
             Ok(body) => body,
             Err(error) => {
-                // No stream identity without a parsed frame; the listener's
-                // own timeout handles the orphan.
                 tracing::warn!(%error, "unparseable api.body");
                 return Ok(());
             }
         };
         let Some((stream, _)) = self.worker_stream(host_id, &body.stream_id).await else {
-            // Unknown stream: nothing to terminate; the Node timed the open.
             return Ok(());
         };
         let fail = |message: String| (stream.clone(), API_ERROR_DESTINATION_REFUSED, message);
@@ -560,13 +824,15 @@ impl ApiRelay {
             st.bytes_up = st.bytes_up.saturating_add(bytes.len() as u64);
             st.body_open = !last;
         }
-        if let Some(proxy_host) = stream.proxy_host.as_deref() {
+        if let Some(proxy_host) = stream.proxy_host.clone() {
             let mut params = serde_json::to_value(&body)
                 .map_err(|error| fail(format!("re-encode api.body: {error}")))?;
             params["streamId"] = json!(stream.proxy_stream);
+            // Never block the read loop on a backpressured peer: the forward
+            // path is non-blocking (item 8). Saturated peer ends the stream.
             let delivered = state
                 .nodes
-                .notify(proxy_host, METHOD_API_BODY, params)
+                .notify(&proxy_host, METHOD_API_BODY, params)
                 .await
                 .map_err(|error| fail(error.to_string()))?;
             if !delivered {
@@ -577,8 +843,9 @@ impl ApiRelay {
                 ));
             }
         } else {
-            // In-process leg: feed the egress task. Dropping the stored
-            // sender on the terminal chunk closes its receiver loop below.
+            // In-process leg: feed the egress task, then credit W for the
+            // consumed chunk (the in-process egress is the "producer" on the
+            // W→H direction and must return a credit just like a Node egress).
             let mut body_tx = stream.body_tx.lock().await;
             if let Some(tx) = body_tx.as_ref() {
                 if tx.send(bytes).is_err() {
@@ -588,12 +855,33 @@ impl ApiRelay {
                     *body_tx = None;
                 }
             }
+            drop(body_tx);
+            // Decrement the up-window and return a credit to W's listener so
+            // it can send the next chunk past its own 4-permit window.
+            {
+                let mut st = stream.state.lock().await;
+                st.up_in_flight = st.up_in_flight.saturating_sub(1);
+            }
+            let credit = json!({
+                "jsonrpc": "2.0",
+                "method": METHOD_API_CREDIT,
+                "params": { "streamId": stream.worker_stream, "chunks": 1 },
+            });
+            let _ = state
+                .nodes
+                .notify(
+                    &stream.worker_host,
+                    METHOD_API_CREDIT,
+                    json!({"streamId": stream.worker_stream, "chunks": 1}),
+                )
+                .await;
+            let _ = credit;
         }
         Ok(())
     }
 
-    /// A `api.credit` frame adds producer window. W credits the chunks H
-    /// produced; H credits the chunks W produced.
+    /// A `api.credit` frame adds producer window. W credits the chunks the
+    /// in-process egress (or H) produced; H credits the chunks W produced.
     async fn on_credit(&self, state: &AppState, host_id: &str, params: Value) -> RelayResult<()> {
         let credit: ApiCreditParams = serde_json::from_value(params)
             .map_err(|error| format!("api.credit params: {error}"))?;
@@ -607,10 +895,11 @@ impl ApiRelay {
             // Only the in-process egress consumes this window; credits on a
             // stream forwarded to a proxy Node are passed through unchanged.
             if stream.proxy_host.is_none() {
-                use std::sync::atomic::Ordering as AtomicOrdering;
+                let current = stream.down_credits.load(Ordering::Acquire);
                 stream
                     .down_credits
-                    .fetch_add(credit.chunks, AtomicOrdering::AcqRel);
+                    .store(current.saturating_add(credit.chunks), Ordering::Release);
+                stream.down_waker.notify_waiters();
             }
             if let Some(proxy_host) = stream.proxy_host.as_deref() {
                 let mut params = serde_json::to_value(&credit)
@@ -666,6 +955,7 @@ impl ApiRelay {
             return Ok(());
         };
         stream.cancelled.store(true, Ordering::SeqCst);
+        stream.down_waker.notify_waiters();
         if let Some(proxy_host) = stream.proxy_host.as_deref() {
             let params = json!({
                 "streamId": stream.proxy_stream,
@@ -676,12 +966,11 @@ impl ApiRelay {
                 .notify(proxy_host, METHOD_API_CANCEL, params)
                 .await;
         }
-        // No journal on a pure cancel: `api.end` is the auditable frame.
         self.remove(&stream.key).await;
         Ok(())
     }
 
-    /// W ending its side early (rare; end normally comes from the proxy).
+    /// W ending its side early.
     async fn on_end(&self, state: &AppState, host_id: &str, params: Value) -> RelayResult<()> {
         let end: ApiEndParams =
             serde_json::from_value(params).map_err(|error| format!("api.end params: {error}"))?;
@@ -691,6 +980,7 @@ impl ApiRelay {
         }
         if let Some((stream, _)) = self.worker_stream(host_id, &end.stream_id).await {
             stream.cancelled.store(true, Ordering::SeqCst);
+            stream.down_waker.notify_waiters();
             if let Some(proxy_host) = stream.proxy_host.as_deref() {
                 let _ = state
                     .nodes
@@ -798,22 +1088,29 @@ impl ApiRelay {
             .nodes
             .notify(&stream.worker_host, METHOD_API_END, params)
             .await;
+        // Revoke the egress context now that the instance's stream is over.
+        if let Some(proxy_host) = stream.proxy_host.as_deref() {
+            self.revoke_egress(state, proxy_host, &stream.instance_id)
+                .await;
+        }
         self.remove(&stream.key).await;
     }
 
     // ── link loss ───────────────────────────────────────────────────────────
 
-    /// A Node link dropped.
+    /// A Node link dropped (WebSocket session or SSH carrier).
     ///
     /// * Streams whose **proxy** host vanished end to W with
-    ///   `via-host-offline`, and instances routing through that host go
-    ///   `blocked{api-route-down}` — the request fails, it is never moved to
-    ///   `hub-relay` mid-session (Amendment A1).
+    ///   `via-host-offline`, revoke the egress context, and instances routing
+    ///   through that host go `blocked{api-route-down}` — the request fails, it
+    ///   is never moved to `hub-relay` mid-session (Amendment A1).
     /// * Streams whose **worker** host vanished are cancelled upstream so H (or
     ///   the in-process egress) stops reading the gateway.
     pub async fn on_link_lost(&self, state: &AppState, host_id: &str) {
-        // Capture the stream handles inside the lock: `by_key` after removal
-        // would find nothing.
+        // Remove this host's per-link queue so a reconnect creates a fresh
+        // drain task; dropping the sender ends the old task once queued
+        // frames are drained (or immediately if the session is gone).
+        self.inner.lock().await.link_queues.remove(host_id);
         let (worker_streams, proxy_streams) = {
             let mut registry = self.inner.lock().await;
             let worker_keys = remove_matching(&mut registry.worker_legs, host_id);
@@ -823,12 +1120,14 @@ impl ApiRelay {
             for key in worker_keys {
                 if let Some(stream) = registry.streams.remove(&key) {
                     stream.cancelled.store(true, Ordering::SeqCst);
+                    stream.down_waker.notify_waiters();
                     worker.push(stream);
                 }
             }
             for key in proxy_keys {
                 if let Some(stream) = registry.streams.remove(&key) {
                     stream.cancelled.store(true, Ordering::SeqCst);
+                    stream.down_waker.notify_waiters();
                     proxy.push(stream);
                 }
             }
@@ -844,10 +1143,25 @@ impl ApiRelay {
                 }),
             )
             .await;
+            // Revoke egress contexts this host held for all routed instances.
+            let contexts: Vec<String> = {
+                let registry = self.inner.lock().await;
+                registry
+                    .egress_contexts
+                    .keys()
+                    .filter(|(h, _)| h == host_id)
+                    .map(|(_, instance)| instance.clone())
+                    .collect()
+            };
+            for instance_id in contexts {
+                self.revoke_egress(state, host_id, &instance_id).await;
+            }
         }
-        if !proxy_streams.is_empty() {
-            self.block_instances_via(state, host_id).await;
-        }
+        // Block *every* instance routed through the lost proxy host, not only
+        // those with an in-flight stream: a session between requests is still
+        // routed via H, and its next model call cannot be served until H
+        // returns; the roster must surface api-route-down either way.
+        self.block_instances_via(state, host_id).await;
         for stream in &worker_streams {
             if let Some(proxy_host) = stream.proxy_host.as_deref() {
                 let _ = state
@@ -876,10 +1190,6 @@ impl ApiRelay {
             }
         };
         for instance_id in instance_ids {
-            // Block in-progress workers directly by host + instance, not by
-            // reading the row first: a dispatched worker may not have a screen
-            // and so get skipped by classify, but the blocked state itself is
-            // exactly what `remuda watch` reports.
             let Some(instance) = state
                 .store
                 .get_instance(instance_id.clone())
@@ -954,11 +1264,6 @@ impl ApiRelay {
         Some((stream, key))
     }
 
-    #[allow(dead_code)] // used by tests/future diagnostics
-    async fn by_key(&self, key: &str) -> Option<Arc<Stream>> {
-        self.inner.lock().await.streams.get(key).cloned()
-    }
-
     async fn remove(&self, key: &str) {
         let mut registry = self.inner.lock().await;
         if let Some(stream) = registry.streams.remove(key) {
@@ -976,6 +1281,7 @@ impl ApiRelay {
     /// Ask the proxy leg to abandon an upstream when W vanished.
     async fn cancel_upstream(&self, state: &AppState, stream: &Arc<Stream>, reason: &str) {
         stream.cancelled.store(true, Ordering::SeqCst);
+        stream.down_waker.notify_waiters();
         if let Some(proxy_host) = stream.proxy_host.as_deref() {
             let _ = state
                 .nodes
@@ -1039,6 +1345,13 @@ struct PreparedOpen {
     open: ApiOpenParams,
 }
 
+/// The Hub host's own enrolled host id may not be known at egress time; the
+/// create path treats an empty/"" scope as universal and passes otherwise.
+/// Replicate that decision here (item 5).
+fn hub_self_secret_allowed(profile: &crate::store::ProviderRecord) -> bool {
+    crate::provider_resolve::secret_release_allowed(profile, "")
+}
+
 /// Collect and remove the stream keys of one host from a leg index.
 fn remove_matching(index: &mut HashMap<(String, String), String>, host_id: &str) -> Vec<String> {
     let legs: Vec<(String, String)> = index
@@ -1099,22 +1412,22 @@ async fn drive_upstream(
     open: &ApiOpenParams,
     mut body_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> std::result::Result<(), ApiEndError> {
+    // One deadline for the whole stream (item 7): send, response loop and the
+    // credit park all finish by this instant.
+    let deadline = stream.deadline;
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .no_proxy()
+        // Never follow redirects: reqwest strips only its own sensitive-header
+        // set, and x-api-key would follow a 302 to an arbitrary origin (item 2).
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|error| ApiEndError {
+        .map_err(|_error| ApiEndError {
             code: API_ERROR_UPSTREAM_TIMEOUT.into(),
-            message: format!("client build: {error}"),
+            message: "relay client build failed".into(),
         })?;
     let url = pinned_url(base_url, &open.path, &open.query)?;
 
-    // Buffer the full request body BEFORE building/sending the upstream
-    // request. With an inline body this is instant; with `bodyChunked` the
-    // channel only closes on the final api.body, and awaiting it here (before
-    // any down-leg chunk can arrive) avoids the deadlock where an immediate
-    // gateway response fills the bounded credit window while this task is still
-    // parked awaiting a response whose body it has not begun to consume.
     let body_bytes = collect_request_body(open, body_rx.as_mut(), stream).await?;
 
     let method = match open.method.as_str() {
@@ -1129,12 +1442,14 @@ async fn drive_upstream(
     };
     let mut request = client.request(method, url);
 
-    // Strip any credentials the harness attached and keep only allowlisted
-    // request headers; the profile's credential is the one that goes out.
+    let mut has_anthropic_version = false;
     for header in &open.headers {
         let name = header.name.to_ascii_lowercase();
         if matches!(name.as_str(), "authorization" | "x-api-key" | "api-key") {
             continue;
+        }
+        if name == "anthropic-version" {
+            has_anthropic_version = true;
         }
         if REQUEST_HEADER_ALLOWLIST
             .iter()
@@ -1146,8 +1461,12 @@ async fn drive_upstream(
     if let Some(secret) = secret.as_deref().filter(|value| !value.is_empty()) {
         request = request
             .header("Authorization", format!("Bearer {secret}"))
-            .header("x-api-key", secret)
-            .header("anthropic-version", "2023-06-01");
+            .header("x-api-key", secret);
+        // Set the default version only when the caller did not supply one;
+        // RequestBuilder::header appends duplicates (item 11).
+        if !has_anthropic_version {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
     }
     for (name, value) in profile_headers {
         if !matches!(
@@ -1162,24 +1481,37 @@ async fn drive_upstream(
         request = request.body(body_bytes);
     }
 
-    let send = tokio::time::timeout(STREAM_HARD_CAP, request.send());
-    let response = send
+    let response = tokio::time::timeout_at(deadline, request.send())
         .await
         .map_err(|_| ApiEndError {
             code: API_ERROR_UPSTREAM_TIMEOUT.into(),
             message: "stream hard cap reached before the gateway responded".into(),
         })?
-        .map_err(|error| ApiEndError {
-            code: if error.is_timeout() {
-                API_ERROR_UPSTREAM_TIMEOUT
-            } else {
-                API_ERROR_DESTINATION_REFUSED
+        .map_err(|error| {
+            // Fixed message toward W; the detail is logged Hub-side (item 11).
+            tracing::warn!(%error, "relay upstream request failed");
+            ApiEndError {
+                code: if error.is_timeout() {
+                    API_ERROR_UPSTREAM_TIMEOUT
+                } else {
+                    API_ERROR_DESTINATION_REFUSED
+                }
+                .into(),
+                message: "the gateway request failed".into(),
             }
-            .into(),
-            message: format!("upstream request: {error}"),
         })?;
 
     let status = response.status().as_u16();
+    // Redirects are never followed (Policy::none above) and are themselves a
+    // refusal: a 3xx would otherwise read like a successful empty response and
+    // the gateway credential semantics would be hidden from the listener.
+    if (300..400).contains(&status) {
+        tracing::warn!(status, "relay gateway answered with a redirect; refusing");
+        return Err(ApiEndError {
+            code: API_ERROR_DESTINATION_REFUSED.into(),
+            message: "the gateway returned a redirect; relays never follow redirects".into(),
+        });
+    }
     let response_headers: Vec<remuda_protocol::hubnode::ApiHeader> = response
         .headers()
         .iter()
@@ -1227,27 +1559,40 @@ async fn drive_upstream(
     }
     project_supply_status_oneshot(state, stream, Some(status)).await;
 
-    // Stream the body in chunk_limit frames, respecting the down-leg window.
+    // Stream the body, coalescing to ≥16 KiB or 50 ms (item 6) and bounded by
+    // the per-stream deadline (item 7).
     let mut response = response;
     let mut seq = 0u32;
-    let mut leftover: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut buf_since: Option<tokio::time::Instant> = None;
     let mut first = true;
     loop {
-        let chunk = match tokio::time::timeout(
-            if first {
-                UPSTREAM_FIRST_BYTE_TIMEOUT
-            } else {
-                UPSTREAM_IDLE_TIMEOUT
-            },
-            response.chunk(),
-        )
-        .await
-        {
+        if stream.cancelled.load(Ordering::SeqCst) {
+            return Err(ApiEndError {
+                code: API_ERROR_CANCELLED.into(),
+                message: "stream cancelled".into(),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiEndError {
+                code: API_ERROR_UPSTREAM_TIMEOUT.into(),
+                message: "stream hard cap reached".into(),
+            });
+        }
+        let read_timeout = if first {
+            UPSTREAM_FIRST_BYTE_TIMEOUT
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        } else {
+            UPSTREAM_IDLE_TIMEOUT
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        };
+        let chunk = match tokio::time::timeout(read_timeout, response.chunk()).await {
             Ok(Ok(chunk)) => chunk,
             Ok(Err(error)) => {
+                tracing::warn!(%error, "relay upstream body read failed");
                 return Err(ApiEndError {
                     code: API_ERROR_DESTINATION_REFUSED.into(),
-                    message: format!("reading upstream body: {error}"),
+                    message: "reading the gateway response failed".into(),
                 });
             }
             Err(_) => {
@@ -1256,37 +1601,54 @@ async fn drive_upstream(
                     message: if first {
                         "no first byte within the 60s timeout"
                     } else {
-                        "no upstream chunk within the 120s idle timeout"
+                        "no gateway chunk within the 120s idle timeout"
                     }
                     .into(),
                 });
             }
         };
         first = false;
-        let Some(chunk) = chunk else {
-            break;
-        };
-        let mut bytes = std::mem::take(&mut leftover);
-        bytes.extend_from_slice(&chunk);
-        // Emit each bounded frame one at a time, yielding after every send so
-        // a buffered multi-megabyte upstream read cannot burst past the
-        // producer window: `send_down_chunk` blocks once the 4-chunk credits
-        // are outstanding, and the yield lets the credit-return future run
-        // before the next slice is attempted.
-        while bytes.len() > stream.chunk_limit {
-            let frame: Vec<u8> = bytes.drain(..stream.chunk_limit).collect();
-            send_down_chunk(state, stream, &mut seq, frame, false).await?;
-            tokio::task::yield_now().await;
+        match chunk {
+            Some(chunk) => {
+                if buf.is_empty() {
+                    buf_since = Some(tokio::time::Instant::now());
+                }
+                buf.extend_from_slice(&chunk);
+                // Flush full 64 KiB frames immediately; otherwise hold until
+                // 16 KiB or 50 ms.
+                while buf.len() >= stream.chunk_limit {
+                    let frame: Vec<u8> = buf.drain(..stream.chunk_limit).collect();
+                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
+                    buf_since = if buf.is_empty() {
+                        None
+                    } else {
+                        Some(tokio::time::Instant::now())
+                    };
+                }
+                if buf.len() >= COALESCE_BYTES {
+                    let frame = std::mem::take(&mut buf);
+                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
+                    buf_since = None;
+                } else if let Some(since) = buf_since
+                    && since.elapsed() >= COALESCE_TIME
+                {
+                    let frame = std::mem::take(&mut buf);
+                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
+                    buf_since = None;
+                }
+            }
+            None => {
+                // End of upstream body: flush remainder, then the terminal
+                // empty last chunk.
+                if !buf.is_empty() {
+                    let frame = std::mem::take(&mut buf);
+                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
+                }
+                send_down_chunk(state, stream, &mut seq, Vec::new(), true, deadline).await?;
+                break;
+            }
         }
-        leftover = bytes;
     }
-    if !leftover.is_empty() {
-        let frame = std::mem::take(&mut leftover);
-        send_down_chunk(state, stream, &mut seq, frame, false).await?;
-    }
-    // The empty terminal chunk carries last=true the same way the Node egress
-    // marks its final frame.
-    send_down_chunk(state, stream, &mut seq, Vec::new(), true).await?;
     Ok(())
 }
 
@@ -1296,35 +1658,46 @@ async fn send_down_chunk(
     seq: &mut u32,
     data: Vec<u8>,
     last: bool,
+    deadline: tokio::time::Instant,
 ) -> std::result::Result<(), ApiEndError> {
-    // Window: at most INITIAL_CHUNK_CREDITS chunks ahead of the consumer.
-    // Claim a credit atomically (never going negative); if none are left, park
-    // until W's api.credit tops the counter back up.
-    use std::sync::atomic::Ordering as AtomicOrdering;
+    // Claim a down-leg credit, bounded by the stream deadline (item 7).
     loop {
-        let current = stream.down_credits.load(AtomicOrdering::Acquire);
-        if current == 0
-            || stream
+        if stream.cancelled.load(Ordering::SeqCst) {
+            return Err(ApiEndError {
+                code: API_ERROR_CANCELLED.into(),
+                message: "stream cancelled".into(),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiEndError {
+                code: API_ERROR_UPSTREAM_TIMEOUT.into(),
+                message: "stream hard cap reached while waiting for credit".into(),
+            });
+        }
+        let current = stream.down_credits.load(Ordering::Acquire);
+        if current > 0 {
+            if stream
                 .down_credits
-                .compare_exchange_weak(
-                    current,
-                    current - 1,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                )
+                .compare_exchange(current, current - 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-        {
-            if current > 0 {
+            {
                 break;
             }
-            if stream.cancelled.load(AtomicOrdering::SeqCst) {
+            continue;
+        }
+        // Park until on_credit wakes us or the deadline passes (item 7: no
+        // unbounded 5 ms poll).
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let waker = stream.down_waker.notified();
+        tokio::pin!(waker);
+        match tokio::time::timeout(remaining, waker).await {
+            Ok(()) => continue,
+            Err(_) => {
                 return Err(ApiEndError {
-                    code: API_ERROR_CANCELLED.into(),
-                    message: "credit window closed".into(),
+                    code: API_ERROR_UPSTREAM_TIMEOUT.into(),
+                    message: "stream hard cap reached while waiting for credit".into(),
                 });
             }
-            // No credit available; wait to be woken by on_credit.
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
     {
@@ -1367,7 +1740,7 @@ async fn send_down_chunk(
 }
 
 /// Assemble the request body. Inline when it fit one frame; channel-fed and
-/// bounded by the stream hard cap otherwise.
+/// bounded by the stream deadline otherwise.
 async fn collect_request_body(
     open: &ApiOpenParams,
     body_rx: Option<&mut mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -1383,15 +1756,18 @@ async fn collect_request_body(
         return Ok(Vec::new());
     };
     let mut body = Vec::new();
-    let deadline = tokio::time::Instant::now() + STREAM_HARD_CAP;
-    // The listener sends the terminal body chunk then drops its sender; until
-    // then every channel read is another in-order chunk.
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+    while let Some(chunk) = rx.recv().await {
         body.extend_from_slice(&chunk);
         if stream.cancelled.load(Ordering::SeqCst) {
             return Err(ApiEndError {
                 code: API_ERROR_CANCELLED.into(),
                 message: "stream cancelled".into(),
+            });
+        }
+        if tokio::time::Instant::now() >= stream.deadline {
+            return Err(ApiEndError {
+                code: API_ERROR_UPSTREAM_TIMEOUT.into(),
+                message: "stream hard cap reached while reading the request body".into(),
             });
         }
     }
@@ -1400,13 +1776,11 @@ async fn collect_request_body(
 
 // ── validation helpers ───────────────────────────────────────────────────────
 
-/// Method/path allowlist plus the origin pin. The Node enforces this on its
-/// listener; the Hub re-checks before it touches a credential.
+/// Method/path allowlist plus the origin pin.
 pub fn check_request_allowlist(method: &str, path: &str, base_url: &str) -> RelayResult<()> {
     if !matches!(method, "GET" | "POST") {
         return Err(format!("method {method} is not allowlisted"));
     }
-    // Reuse the pin itself; it carries every path/traversal/origin rule.
     let _ = pinned_url(base_url, path, "").map_err(|error| error.message)?;
     Ok(())
 }
@@ -1434,8 +1808,6 @@ fn pinned_url(
             message: "relayed path must name a path under the profile base path".into(),
         });
     }
-    // No parent-directory traversal: a `..` segment could resolve back to the
-    // origin root even when the joined URL's origin matches.
     if path
         .split('/')
         .any(|segment| segment == ".." || segment.contains('\\'))
@@ -1446,9 +1818,6 @@ fn pinned_url(
         });
     }
     let joined = {
-        // Two legitimate shapes for a path pinned to a base ending in `/v1`:
-        // a root-relative `/v1/messages` (joined at the origin) and a
-        // base-relative `messages` (joined under the trailing base path).
         let origin_root = {
             let mut o = base.clone();
             o.set_path("");
@@ -1552,10 +1921,6 @@ async fn journal_end(
     }
 }
 
-/// Project the stream's observed gateway status into the supply-evidence path.
-///
-/// Uses the real HTTP status, not screen text. Only 429/529 match a signal;
-/// everything else is a no-op.
 async fn project_supply_status(state: &AppState, stream: &Arc<Stream>) {
     let status = stream.state.lock().await.status;
     project_supply_status_oneshot(state, stream, status).await;

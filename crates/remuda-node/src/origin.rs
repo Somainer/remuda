@@ -112,6 +112,7 @@ mod tests {
                 request: serde_json::from_value(json!({"agentCredential":credential})).unwrap(),
                 workspace_root: ".".into(),
                 registered_workspace_root: ".".into(),
+                api_relay: None,
             };
             let env = instance_env(&inherited);
             assert!(!env.keys().any(|name| name.starts_with("REMUDA_")));

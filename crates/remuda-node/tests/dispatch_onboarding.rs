@@ -203,8 +203,9 @@ fn run_child() {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
-
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         };
         let created = node
             .create_instance(request)

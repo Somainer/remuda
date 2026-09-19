@@ -37,6 +37,10 @@ pub struct DriverLaunch {
     pub workspace_root: PathBuf,
     /// Registered Node workspace boundary, before resolving an instance cwd.
     pub registered_workspace_root: PathBuf,
+    /// D-047 relay inputs for a `via` launch: the loopback listener URL and
+    /// the per-instance bearer replace the gateway base URL and credential in
+    /// the materialized overlay. `None` for direct delivery.
+    pub(crate) api_relay: Option<crate::api_relay::RelayOverlay>,
 }
 
 /// One operation delivered to an instance-local driver task.

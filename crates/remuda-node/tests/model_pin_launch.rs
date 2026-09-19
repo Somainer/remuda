@@ -131,6 +131,8 @@ async fn assert_pin_reaches_the_harness(mismatch: bool) {
             binary_sha256: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+            api_route: None,
+            api_relay_endpoint: None,
             provider_profile_id: "dev-fake".into(),
             permission_mode: "manual".into(),
             sandbox: None,

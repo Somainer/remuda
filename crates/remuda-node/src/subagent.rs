@@ -17,6 +17,7 @@ use remuda_protocol::{
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use crate::DevNode;
 use crate::LocalStore;
@@ -39,11 +40,19 @@ pub fn is_subagent_method(method: &str) -> bool {
 /// # Errors
 ///
 /// Propagates store, identity and read errors.
-pub fn handle_rpc(node: &DevNode, method: &str, params: &Value) -> Result<Value, NodeError> {
+pub async fn handle_rpc(node: &DevNode, method: &str, params: &Value) -> Result<Value, NodeError> {
     debug_assert_eq!(method, METHOD_SUBAGENT_TRANSCRIPT);
     let instance_id = parse_instance(params)?;
     let agent_id = parse_agent(params)?;
-    read_for_store(node.store(), &instance_id, &agent_id)
+    // The fold parks on the staging bridge while screenshots upload; run the
+    // whole blocking transcript read off the async RPC task (D-045 §6.2).
+    let stager = node.tool_media_stager();
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || {
+        read_for_store(node.store(), &instance_id, &agent_id, stager)
+    })
+    .await
+    .map_err(|error| NodeError::Driver(format!("subagent read task panicked: {error}")))?
 }
 
 fn parse_agent(params: &Value) -> Result<String, NodeError> {
@@ -66,6 +75,7 @@ pub fn read_for_store(
     store: &dyn LocalStore,
     instance_id: &InstanceId,
     agent_id: &str,
+    tool_media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 ) -> Result<Value, NodeError> {
     let instance = store.get_instance(instance_id)?;
 
@@ -101,7 +111,8 @@ pub fn read_for_store(
             _ => instance_id.as_id().to_string(),
         },
         SourceChannel::Transcript,
-    );
+    )
+    .with_media_stager(tool_media_stager);
 
     let Some(read) = read_subagent_transcript(&session_dir, agent_id, ctx).map_err(|error| {
         NodeError::InvalidRequest(format!("subagent transcript read failed: {error}"))

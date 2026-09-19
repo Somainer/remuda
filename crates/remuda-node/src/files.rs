@@ -180,19 +180,24 @@ pub(crate) const TOOL_MEDIA_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// async runtime; calling `Handle::block_on` from there would panic. Instead
 /// a dedicated OS thread owns a one-thread runtime and a job queue: the
 /// mapper hands over the upload future and parks on a std channel — a bounded
-/// (90 s client timeout) blocking recv that never re-enters the Node runtime,
-/// so it can neither deadlock it nor take down a carrier.
+/// blocking recv that never re-enters the Node runtime, so it can neither
+/// deadlock it nor take down a carrier. The staging thread is started
+/// lazily on the first image, so a Hub hello that installs the stager pays
+/// no thread cost for text-only sessions.
 pub(crate) struct HubToolMediaStager {
     inner: Arc<HubHostFileStager>,
-    jobs: std::sync::mpsc::Sender<StagingJob>,
-    /// Held for its `Drop` (joins the staging thread). The stager is moved
-    /// into an `Arc` after construction, so there is exactly one owner.
-    #[allow(dead_code)]
-    runtime: StagingRuntime,
+    /// Job queue; the receiver lives inside the lazily-started runtime.
+    jobs: std::sync::Mutex<Option<std::sync::mpsc::Sender<StagingJob>>>,
+    /// Lazily-started staging thread; `Some` once the first image is staged.
+    runtime: std::sync::Mutex<Option<StagingRuntime>>,
 }
 
 /// One queued upload: run the future on the staging thread and report back.
 type StagingJob = Box<dyn FnOnce(&tokio::runtime::Handle) + Send + 'static>;
+
+/// Bound on the blocking park: the staging HTTP client times out at 90 s;
+/// add only shutdown margin, then degrade to a text block.
+const STAGING_PARK: std::time::Duration = std::time::Duration::from_secs(95);
 
 impl std::fmt::Debug for HubToolMediaStager {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -208,17 +213,35 @@ impl HubToolMediaStager {
         token: String,
     ) -> Result<Self, NodeError> {
         let inner = Arc::new(HubHostFileStager::from_ws_url(ws_url, host_id, token)?);
-        let runtime = StagingRuntime::start()?;
         Ok(Self {
             inner,
-            jobs: runtime.jobs(),
-            runtime,
+            jobs: std::sync::Mutex::new(None),
+            runtime: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Start (once) the staging thread and hand back its job channel.
+    fn ensure_runtime(&self) -> Result<std::sync::mpsc::Sender<StagingJob>, NodeError> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| NodeError::Transport("tool-media lock poisoned".into()))?;
+        if let Some(sender) = jobs.as_ref() {
+            return Ok(sender.clone());
+        }
+        let runtime = StagingRuntime::start()?;
+        let sender = runtime.jobs();
+        *jobs = Some(sender.clone());
+        *self
+            .runtime
+            .lock()
+            .map_err(|_| NodeError::Transport("tool-media lock poisoned".into()))? = Some(runtime);
+        Ok(sender)
     }
 }
 
-/// A parked current-thread runtime on one OS thread plus its job channel;
-/// dropped (thread joined) when the stager goes away.
+/// A parked one-worker runtime on one OS thread plus its job channel; dropped
+/// (thread joined) when the stager goes away.
 struct StagingRuntime {
     // `Option` so Drop can close the queue *before* joining: the staging
     // loop exits on `recv` seeing no senders, and it must see this own sender
@@ -264,11 +287,21 @@ impl StagingRuntime {
     }
 }
 
-impl Drop for StagingRuntime {
+impl Drop for HubToolMediaStager {
     fn drop(&mut self) {
-        // Close the queue first so the loop's `recv` unblocks; only then join.
-        self.jobs.take();
-        if let Some(thread) = self.thread.take()
+        // Drop every job sender — the shared one AND the one held inside the
+        // runtime handle — BEFORE joining the staging thread: the loop exits
+        // on `recv` seeing zero senders, so a sender still held during the
+        // join would wait forever.
+        *self.jobs.get_mut().unwrap_or(&mut None) = None;
+        let Ok(mut holder) = self.runtime.lock() else {
+            return;
+        };
+        let Some(mut runtime) = holder.take() else {
+            return;
+        };
+        runtime.jobs = None;
+        if let Some(thread) = runtime.thread.take()
             && thread.join().is_err()
         {
             tracing::warn!("tool-media staging thread panicked on shutdown");
@@ -287,26 +320,29 @@ impl remuda_protocol::ToolMediaStager for HubToolMediaStager {
         media_type: &str,
         bytes: Vec<u8>,
     ) -> Result<remuda_protocol::Id, remuda_protocol::ToolMediaError> {
+        let Ok(jobs) = self.ensure_runtime() else {
+            return Err(remuda_protocol::ToolMediaError::Unstageable(
+                "staging thread unavailable".into(),
+            ));
+        };
         let inner = self.inner.clone();
         let name = name.to_owned();
         let media_type = media_type.to_owned();
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<StagedHostFile, NodeError>>();
-        let accepted = self
-            .jobs
-            .send(Box::new(move |handle: &tokio::runtime::Handle| {
-                handle.spawn(async move {
-                    let result = inner.stage_typed(&name, Some(&media_type), bytes).await;
-                    let _ = reply_tx.send(result);
-                });
-            }));
+        let accepted = jobs.send(Box::new(move |handle: &tokio::runtime::Handle| {
+            handle.spawn(async move {
+                let result = inner.stage_typed(&name, Some(&media_type), bytes).await;
+                let _ = reply_tx.send(result);
+            });
+        }));
         if accepted.is_err() {
             return Err(remuda_protocol::ToolMediaError::Unstageable(
                 "tool-media staging thread is shut down".into(),
             ));
         }
-        // Bounded park: the HTTP client itself caps at 90 s; give a small
-        // margin and then degrade rather than pinning a Node worker forever.
-        match reply_rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        // Bounded park at the HTTP client's timeout, then degrade rather than
+        // pinning the folding thread forever.
+        match reply_rx.recv_timeout(STAGING_PARK) {
             Ok(Ok(staged)) => remuda_protocol::Id::try_from(staged.object_id).map_err(|error| {
                 remuda_protocol::ToolMediaError::Unstageable(format!("bad object id: {error}"))
             }),
@@ -314,7 +350,7 @@ impl remuda_protocol::ToolMediaStager for HubToolMediaStager {
                 error.to_string(),
             )),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(
-                remuda_protocol::ToolMediaError::Unstageable("staging timed out after 120s".into()),
+                remuda_protocol::ToolMediaError::Unstageable("staging timed out".into()),
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
                 remuda_protocol::ToolMediaError::Unstageable("staging thread exited".into()),
@@ -1102,6 +1138,17 @@ impl crate::DevNode {
             *slot = stager;
         }
     }
+
+    /// The currently installed tool-media stager, if the Hub link attached
+    /// one (D-045 §6.2). Used to fold subagent/workflow-member screenshots
+    /// when their transcripts are replayed.
+    pub(crate) fn tool_media_stager(&self) -> Option<Arc<dyn remuda_protocol::ToolMediaStager>> {
+        self.inner
+            .tool_media_stager
+            .read()
+            .ok()
+            .and_then(|holder| holder.read().ok().and_then(|slot| slot.clone()))
+    }
 }
 
 #[cfg(test)]
@@ -1692,11 +1739,16 @@ mod tests {
     /// A one-off HTTP/1.1 server that reads one complete request (headers plus
     /// the declared body) and writes a fixed reply. The request must be fully
     /// read before replying: a blocking `read` into an oversized buffer would
-    /// hang on a small request the client keeps alive.
+    /// hang on a small request the client keeps alive. The listener polls, so
+    /// dropping the returned stop sender ends the loop instead of blocking
+    /// forever inside `accept` when no second request arrives.
     fn spawn_staging_server(
         reply: &'static str,
     ) -> (std::net::SocketAddr, std::sync::mpsc::Sender<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_nonblocking(true)
+            .expect("staging listener nonblocking");
         let addr = listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
@@ -1704,42 +1756,52 @@ mod tests {
                 if stop_rx.try_recv().is_ok() {
                     break;
                 }
-                let Ok((mut stream, _)) = listener.accept() else {
-                    continue;
-                };
-                use std::io::{Read, Write};
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-                let mut buf = Vec::new();
-                let mut chunk = [0u8; 256];
-                let header_end = loop {
-                    match stream.read(&mut chunk) {
-                        Ok(0) => return,
-                        Ok(n) => {
-                            buf.extend_from_slice(&chunk[..n]);
-                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                                break pos + 4;
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("staging stream blocking");
+                        use std::io::{Read, Write};
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 256];
+                        let header_end = loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => return,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                                    {
+                                        break pos + 4;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        };
+                        let content_length = String::from_utf8_lossy(&buf[..header_end])
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        while buf.len() < header_end + content_length {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                                Err(_) => break,
                             }
                         }
-                        Err(_) => return,
+                        let _ = stream.write_all(reply.as_bytes());
+                        let _ = stream.flush();
                     }
-                };
-                let content_length = String::from_utf8_lossy(&buf[..header_end])
-                    .lines()
-                    .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
-                    })
-                    .unwrap_or(0);
-                while buf.len() < header_end + content_length {
-                    match stream.read(&mut chunk) {
-                        Ok(0) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                        Err(_) => break,
+                    // No connection ready: back off and re-check the stop signal.
+                    Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
+                    Err(_) => break,
                 }
-                let _ = stream.write_all(reply.as_bytes());
-                let _ = stream.flush();
             }
         });
         (addr, stop_tx)
@@ -1772,6 +1834,7 @@ mod tests {
             )
         })
         .await
+        .map_err(|e| panic!("join: {e}"))
         .unwrap()
         .unwrap();
         assert!(id.as_str().starts_with("obj_"));

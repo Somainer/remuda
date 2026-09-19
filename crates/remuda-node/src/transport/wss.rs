@@ -274,6 +274,9 @@ fn attach_object_source(
             );
             link.node.set_object_source(Arc::new(broker.source()));
             link.node.set_host_file_stager(None);
+            // Drop the previous connection's tool-media stager too: it holds
+            // that connection's origin and host token, which must not survive.
+            link.node.set_tool_media_stager(None);
         }
     }
 }

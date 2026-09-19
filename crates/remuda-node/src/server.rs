@@ -898,7 +898,7 @@ async fn dispatch_rpc(
             crate::workspace_scm::handle_rpc_capped(node, method, &params).await
         }
         method if crate::subagent::is_subagent_method(method) => {
-            crate::subagent::handle_rpc(node, method, &params)
+            crate::subagent::handle_rpc(node, method, &params).await
         }
         "instance.list" => {
             let mut page = node.list_instances()?;

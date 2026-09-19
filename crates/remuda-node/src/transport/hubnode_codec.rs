@@ -251,7 +251,7 @@ pub async fn dispatch_frame(
         return crate::workspace_scm::handle_rpc_capped(node, method, &params).await;
     }
     if crate::subagent::is_subagent_method(method) {
-        return crate::subagent::handle_rpc(node, method, &params);
+        return crate::subagent::handle_rpc(node, method, &params).await;
     }
     if method == "instance.purge" {
         // Hub-driven session deletion: remove this Node's own rows and data

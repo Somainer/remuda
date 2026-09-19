@@ -47,22 +47,31 @@ export function HomeList() {
   // Live git branch per project, through the same read-only changes proxy
   // FilesView uses. Unknown/denied/unreachable simply leaves the branch off
   // the header — the group still renders by project name. Candidates are
-  // computed during render; the per-space fetch-once guard (a ref) is only
-  // read inside the effect.
+  // keyed by Space id (not the spaces array identity, which polling recreates
+  // every few seconds); the fetch guard lives in a ref and updates apply as
+  // long as the component is mounted.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   const fetchedBranches = useRef<Set<string>>(new Set());
+  const spaceKeys = spaces.map((space) => space.id).join(",");
   const branchCandidates = useMemo(
     () =>
       spaces
         .filter((space) => space.hostId && space.workspaceId)
         .map((space) => ({ id: space.id, hostId: space.hostId!, workspaceId: space.workspaceId! })),
-    [spaces],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [spaceKeys],
   );
   useEffect(() => {
     const targets = branchCandidates.filter(
       (target) => !fetchedBranches.current.has(target.id),
     );
     if (!targets.length) return;
-    let cancelled = false;
     for (const target of targets) fetchedBranches.current.add(target.id);
     void Promise.all(
       targets.map(async (target) => {
@@ -75,7 +84,7 @@ export function HomeList() {
         }
       }),
     ).then((results) => {
-      if (cancelled) return;
+      if (!mounted.current) return;
       setBranches((current) => {
         const next = { ...current };
         let changed = false;
@@ -88,9 +97,6 @@ export function HomeList() {
         return changed ? next : current;
       });
     });
-    return () => {
-      cancelled = true;
-    };
   }, [branchCandidates]);
 
   // Mirror SessionList's row hydration cadence: the store projects live

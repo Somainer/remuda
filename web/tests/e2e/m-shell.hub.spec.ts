@@ -156,9 +156,12 @@ test.describe("390px phone", () => {
     await expect(page).toHaveURL(`/m/inbox?focus=${interactionId}`);
     await expect(page.getByTestId("approvals-page")).toBeVisible();
 
-    // The /sessions redirect preserves its query as well.
-    await page.goto("/sessions?host=hst_demo");
-    await expect(page).toHaveURL(/\/m\?host=hst_demo$/);
+    // The /sessions redirect preserves its query as well. The list itself
+    // prunes host=/workspace= filters that its fixed Space scope cannot
+    // honour (existing desktop behaviour), so assert with a status filter
+    // plus an unrelated param, which the list never rewrites on mount.
+    await page.goto("/sessions?status=idle&focus=int_keep");
+    await expect(page).toHaveURL(/\/m\?status=idle&focus=int_keep$/);
 
     // Compact /sessions itself redirects.
     await page.goto("/sessions");

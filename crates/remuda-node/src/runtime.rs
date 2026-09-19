@@ -950,6 +950,7 @@ impl DevNode {
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
         let pumps = Arc::clone(&self.inner.pumps);
+        let tool_media_stager = self.tool_media_stager();
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             // Building the driver is materialization, not acceptance: it runs
@@ -1014,6 +1015,7 @@ impl DevNode {
                 objects,
                 carrier,
                 pumps,
+                tool_media_stager,
             ))
             .catch_unwind()
             .await;
@@ -1240,6 +1242,7 @@ fn spawn_observation_pump(
     mut observations: mpsc::Receiver<remuda_protocol::Observation>,
     driver: Arc<dyn Driver>,
     prompts: Arc<crate::prompt_correlation::PromptCorrelator>,
+    tool_media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // D-028 §7: `MessageDisplay` deltas are the only live text an
@@ -1250,7 +1253,10 @@ fn spawn_observation_pump(
         let mut promoted_hooks = crate::signal::PromotedHooks::default();
         // r-wfprod: hook-triggered Workflow run producer with a 250 ms file
         // drain tick.
-        let mut workflow = crate::workflow_producer::WorkflowProducer::new(instance_id.clone());
+        let mut workflow = crate::workflow_producer::WorkflowProducer::new(
+            instance_id.clone(),
+            tool_media_stager.clone(),
+        );
         let mut workflow_tick = tokio::time::interval(crate::workflow_producer::WORKFLOW_POLL);
         workflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // model-pin-1: refuse a launch the explicit pin did not reach. The gate
@@ -1487,6 +1493,9 @@ async fn materialize_instance(
     // the bug being fixed, and handing this worker a Node handle to fix it
     // would be a second way to do the same thing.
     pumps: Arc<tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>>,
+    // D-045 §6.2: host-token stager for screenshot blocks observed in
+    // workflow-member transcript tails.
+    tool_media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 ) -> Result<(), NodeError> {
     // C2: per-instance registry joining command-delivered prompts onto the
     // hook/transcript observations that confirm them.
@@ -1549,6 +1558,7 @@ async fn materialize_instance(
             observations,
             Arc::clone(&driver),
             Arc::clone(&prompts),
+            tool_media_stager,
         );
         pumps.lock().await.insert(instance_id.clone(), pump);
     }
@@ -2994,6 +3004,7 @@ mod tests {
             rx,
             Arc::new(FakeDriver::default()),
             Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+            None,
         );
         let mut session = native_lifecycle(
             remuda_protocol::LifecycleTopic::Hook,
@@ -3077,6 +3088,7 @@ mod tests {
             rx,
             Arc::new(FakeDriver::default()),
             Arc::new(crate::prompt_correlation::PromptCorrelator::default()),
+            None,
         );
 
         async fn settled(

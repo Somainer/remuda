@@ -115,7 +115,7 @@ fn rpc_serves_the_recorded_sidechain_transcript() {
         ))
         .unwrap();
 
-    let result = remuda_node::subagent::read_for_store(&store, &instance_id, AGENT).unwrap();
+    let result = remuda_node::subagent::read_for_store(&store, &instance_id, AGENT, None).unwrap();
     assert_eq!(result["available"], serde_json::json!(true));
     assert_eq!(result["meta"]["agentId"], serde_json::json!(AGENT));
     assert_eq!(result["meta"]["runId"], serde_json::json!(RUN));
@@ -136,11 +136,13 @@ fn rpc_serves_the_recorded_sidechain_transcript() {
 
     // A registered-but-unstarted agent reads as 启动中, not an error.
     let starting =
-        remuda_node::subagent::read_for_store(&store, &instance_id, "0000000000000000").unwrap();
+        remuda_node::subagent::read_for_store(&store, &instance_id, "0000000000000000", None)
+            .unwrap();
     assert_eq!(starting["available"], serde_json::json!(false));
 
     // Path-traversal agent ids are rejected before touching the filesystem.
-    let err = remuda_node::subagent::read_for_store(&store, &instance_id, "../etc").unwrap_err();
+    let err =
+        remuda_node::subagent::read_for_store(&store, &instance_id, "../etc", None).unwrap_err();
     assert!(
         err.to_string().to_lowercase().contains("agent"),
         "unexpected error: {err}"
@@ -151,5 +153,7 @@ fn rpc_serves_the_recorded_sidechain_transcript() {
 fn unknown_instance_is_a_store_error() {
     let tmp = tempfile::tempdir().unwrap();
     let store = MemoryStore::open_journaled(tmp.path().join("node"), 256).unwrap();
-    assert!(remuda_node::subagent::read_for_store(&store, &InstanceId::new(), AGENT).is_err());
+    assert!(
+        remuda_node::subagent::read_for_store(&store, &InstanceId::new(), AGENT, None).is_err()
+    );
 }

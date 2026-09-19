@@ -178,7 +178,7 @@ impl Harness {
             bus,
             rx: tokio::sync::Mutex::new(rx),
             store,
-            producer: WorkflowProducer::new(instance_id),
+            producer: WorkflowProducer::new(instance_id, None),
         }
     }
 

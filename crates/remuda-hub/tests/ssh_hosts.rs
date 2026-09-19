@@ -109,6 +109,12 @@ fn executable(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 fn fake_ssh(root: &Path, node: &Path) -> PathBuf {
+    fake_ssh_env(root, node, "")
+}
+
+/// Like [`fake_ssh`] but injects an extra `export` line into the wrapper, e.g.
+/// `REMUDA_FAKE_API_OPEN=1` to make the fake Node open a relay stream.
+fn fake_ssh_env(root: &Path, node: &Path, extra_export: &str) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(root.join("home")).unwrap();
@@ -117,7 +123,7 @@ fn fake_ssh(root: &Path, node: &Path) -> PathBuf {
     executable(
         &ssh,
         &format!(
-            "#!/bin/sh\nexport PATH='{}:/usr/bin:/bin'\nexport HOME='{}'\nfor arg do command=$arg; done\nexec /bin/sh -c \"$command\"\n",
+            "#!/bin/sh\nexport PATH='{}:/usr/bin:/bin'\nexport HOME='{}'\n{extra_export}\nfor arg do command=$arg; done\nexec /bin/sh -c \"$command\"\n",
             bin.display(),
             root.join("home").display()
         ),
@@ -602,5 +608,155 @@ async fn ssh_proxy_teardown_runs_api_relay_link_loss() {
     .expect("api_route_down diagnostic must be journaled when ssh proxy drops");
 
     answer_task.abort();
+    hub.shutdown().await;
+}
+
+// D-048 (round-3 item 12): the ssh-attached *worker* W dropping while a
+// relay stream is in flight must make the Hub forward api.cancel to the
+// ws-attached proxy host H (so H stops its upstream egress), not just end
+// the stream toward a worker nobody is listening to anymore.
+#[tokio::test]
+async fn ssh_worker_drop_forwards_api_cancel_to_proxy() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("node");
+    executable(&fixture, include_str!("fixtures/ssh/fake-node.py"));
+    let mut config = HubConfig::for_test(dir.path().join("hub"));
+    // Make the fake Node open one relay stream right after its instance
+    // create echo.
+    config.ssh_hosts.ssh_binary =
+        fake_ssh_env(dir.path(), &fixture, "export REMUDA_FAKE_API_OPEN=1");
+    config.host_lost_grace_ms = 25;
+    let hub = remuda_hub::spawn(config).await.unwrap();
+    let token = login(&hub).await;
+
+    // W: ssh-attached worker.
+    let (status, added) = request(
+        hub.addr,
+        "POST",
+        "/v1/hosts/ssh",
+        &token,
+        json!({"target":"relay-w","label":"relay worker"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{added}");
+    let worker_id = added["id"].as_str().unwrap().to_string();
+    wait_host(&hub, &token, &worker_id, |h| h["online"] == true).await;
+
+    // H: ws-attached D-048-capable proxy.
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .unwrap();
+    let mut upgrade = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .unwrap();
+    upgrade
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut h_socket, _) = tokio_tungstenite::connect_async(upgrade).await.unwrap();
+    h_socket
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"h","method":"node.hello","params":{
+                "hostId": remuda_protocol::HostId::new().as_id(),
+                "nodeVersion":"0.2.0-d048","label":"h",
+                "capabilities":{"apiRelay":true},
+                "host":{"maxInstances":8,"cli":[{"kind":"claude","auth":"gateway-logged-in"}]}}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let hello: Value =
+        serde_json::from_str(h_socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let proxy_id = hello["result"]["hostId"].as_str().unwrap().to_string();
+
+    // Gateway profile the egress credential is installed from.
+    let (status, profile) = request(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &token,
+        json!({"name":"g","kind":"gateway","baseUrl":"http://127.0.0.1:1/v1",
+               "authToken":"sk-fake-profile-0001","defaultGateway":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{profile}");
+    let profile_id = profile["id"].as_str().unwrap();
+
+    let (status, created) = request(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &token,
+        json!({
+            "hostId": worker_id,
+            "kind": "claude",
+            "driver": "claude-print",
+            "delegation": "gateway",
+            "providerProfileId": profile_id,
+            "apiVia": proxy_id,
+            "apiRoute": "hub-relay"
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{created}");
+
+    // Read H until the forwarded api.open for the worker's stream.
+    let forwarded = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(Ok(msg)) = h_socket.next().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").and_then(Value::as_str) == Some("api.open")
+                && frame
+                    .pointer("/params/streamId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("st_ssh_cancel"))
+            {
+                return frame;
+            }
+        }
+        panic!("proxy link closed before api.open");
+    })
+    .await
+    .unwrap();
+    let proxy_stream = forwarded["params"]["streamId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Drop the ssh worker: the Hub's link-loss handling must cancel the
+    // in-flight stream toward H with api.cancel.
+    let pid = fixture_pid(&worker_id);
+    std::process::Command::new("kill")
+        .args(["-TERM", pid.trim()])
+        .status()
+        .unwrap();
+
+    let cancelled = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(Ok(msg)) = h_socket.next().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").and_then(Value::as_str) == Some("api.cancel")
+                && frame.pointer("/params/streamId").and_then(Value::as_str)
+                    == Some(proxy_stream.as_str())
+            {
+                return frame;
+            }
+        }
+        panic!("proxy link closed without api.cancel for {proxy_stream}");
+    })
+    .await
+    .unwrap();
+    assert!(
+        cancelled["params"].get("reason").is_some(),
+        "api.cancel must carry a reason: {cancelled}"
+    );
+
     hub.shutdown().await;
 }

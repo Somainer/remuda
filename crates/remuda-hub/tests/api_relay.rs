@@ -1185,6 +1185,65 @@ async fn open_time_rejections_all_emit_a_terminal_end() -> Result<()> {
     .await?;
     assert_end_code(&mut no_route.node, "st_noroute", "destination-refused").await?;
 
+    // Direct-net: an observed direct-net route never traverses the Hub; an
+    // api.open arriving in-band is a misread echo and refused, not rerouted.
+    // The bind keeps `direct-net` resolvable at dispatch; the Node truthfully
+    // echoes it as the observed route.
+    let (mut direct, direct_proxy) = fixture_routed_via_h_with(
+        &gateway.base_url_v1(),
+        ViaOpts {
+            route: "direct-net",
+            relay_bind: true,
+        },
+    )
+    .await?;
+    notify(
+        &mut direct.node,
+        "api.open",
+        api_open_params(&direct.instance_id, "st_directnet", &messages_body()),
+    )
+    .await?;
+    assert_end_code(&mut direct.node, "st_directnet", "destination-refused").await?;
+    drop(direct_proxy);
+
+    // Missing profile: a via instance whose gateway profile was deleted after
+    // launch must be refused at open (the credential is gone), never opened
+    // against a bare base URL.
+    let (mut proficeless, proficeless_proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
+    let (status, _, instance_json) = http(
+        proficeless.addr,
+        "GET",
+        &format!("/v1/instances/{}", proficeless.instance_id),
+        &[("Cookie", &proficeless.cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "get instance {status} {instance_json}");
+    let instance_view: Value = serde_json::from_str(instance_json.trim())?;
+    let profile_id = instance_view
+        .pointer("/instance/providerProfileId")
+        .or_else(|| instance_view.pointer("/providerProfileId"))
+        .and_then(Value::as_str)
+        .with_context(|| format!("projected providerProfileId in {instance_view}"))?
+        .to_string();
+    let (status, _, rest) = http(
+        proficeless.addr,
+        "DELETE",
+        &format!("/v1/providers/{profile_id}"),
+        &[("Cookie", &proficeless.cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "delete profile {status} {rest}");
+    notify(
+        &mut proficeless.node,
+        "api.open",
+        api_open_params(&proficeless.instance_id, "st_noprofile", &messages_body()),
+    )
+    .await?;
+    assert_end_code(&mut proficeless.node, "st_noprofile", "destination-refused").await?;
+    drop(proficeless_proxy);
+
     // Per-link cap (maxApiStreams = 8): ten opens on a FRESH link, the 9th
     // and 10th refused. Use a gateway that holds every response open so the
     // first 8 streams stay registered while the remaining two are checked.
@@ -1194,6 +1253,26 @@ async fn open_time_rejections_all_emit_a_terminal_end() -> Result<()> {
     }])
     .await?;
     let mut capped = fixture_routed_self(&cap_gateway.base_url_v1()).await?;
+
+    // Per-instance cap (2 streams): the third concurrent open on the same
+    // instance is refused even though the link still has free slots.
+    for i in 0..3u32 {
+        notify(
+            &mut capped.node,
+            "api.open",
+            api_open_params(
+                &capped.instance_id,
+                &format!("st_inst_{i}"),
+                &messages_body(),
+            ),
+        )
+        .await?;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_end_code(&mut capped.node, "st_inst_2", "destination-refused").await?;
+
+    // Two slots are taken by st_inst_0/1, so the link cap bites after six
+    // more (the 9th/10th of these ten are refused).
     for i in 0..10u32 {
         notify(
             &mut capped.node,
@@ -1986,8 +2065,7 @@ async fn coalescing_separates_small_delayed_writes_into_sub_cap_frames() -> Resu
     );
     for frame in &data_frames {
         let b64 = frame["params"]["dataBase64"].as_str().unwrap_or("");
-        let bytes =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)?;
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)?;
         assert!(
             bytes.len() < API_CHUNK_BYTES,
             "every timer-flushed frame must stay under the {API_CHUNK_BYTES} cap, got {}",
@@ -2567,11 +2645,10 @@ async fn an_auto_route_against_a_relaybind_host_still_gets_egress() -> Result<()
     )
     .await?;
 
-    let frames = collect_notifications(
-        &mut fixture.node,
-        TIMEOUT,
-        |frame| frame["params"]["streamId"] == json!("st_auto") && frame["params"].get("bytesDown").is_some(),
-    )
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_auto")
+            && frame["params"].get("bytesDown").is_some()
+    })
     .await?;
     let end = frames_for(&frames, "st_auto")
         .into_iter()

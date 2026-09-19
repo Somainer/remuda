@@ -329,10 +329,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         // FIFO, which this same task drains, so awaiting them
                         // inline would park the reply once a proxy held ~32+
                         // routed instances (D-048 B.2).
-                        if is_hello {
-                            if let Some(h) = host_id.clone() {
-                                spawn_egress_reinstall(&state, h);
-                            }
+                        if is_hello
+                            && let Some(h) = host_id.clone()
+                        {
+                            spawn_egress_reinstall(&state, h);
                         }
                     }
                     Ok(None) => {}
@@ -650,7 +650,7 @@ pub(crate) async fn handle_node_method(
             if instance_terminated {
                 state
                     .api_relay
-                    .revoke_instance_egress(&state, &instance_id)
+                    .revoke_instance_egress(state, &instance_id)
                     .await;
             }
             let appended = last.ok_or_else(|| {

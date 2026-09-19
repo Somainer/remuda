@@ -1337,8 +1337,7 @@ async fn assert_end_codes(node: &mut NodeSocket, pairs: &[(&str, &str)]) -> Resu
         pairs.iter().map(|(id, _)| (*id).to_string()).collect();
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     while !pending.is_empty() && tokio::time::Instant::now() < deadline {
-        let frames =
-            collect_notifications(node, Duration::from_millis(500), |_| false).await?;
+        let frames = collect_notifications(node, Duration::from_millis(500), |_| false).await?;
         for params in frames.iter().filter_map(|f| f.get("params")) {
             let Some(stream_id) = params.get("streamId").and_then(Value::as_str) else {
                 continue;

@@ -858,8 +858,8 @@ mod tests {
     /// pane, the tab and the workspace once the grace expires.
     #[tokio::test]
     async fn stopping_a_pty_instance_closes_its_agent_pane_and_forgets_ownership() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket = socket_root.path().join("herdr.sock");
         let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
         let client = Client::connect(&socket);
         let store = Arc::new(MemoryStore::new(64));
@@ -910,8 +910,8 @@ mod tests {
 
     #[tokio::test]
     async fn stale_workspace_id_never_closes_a_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("herdr.sock");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket = socket_root.path().join("herdr.sock");
         let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
         let client = Client::connect(socket);
         let mut stale = resource(&client, None, "replacement").await;

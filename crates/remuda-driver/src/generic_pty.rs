@@ -269,6 +269,7 @@ impl GenericPtyDriver {
             binary,
             setting_sources: None,
             origin: self.options.origin,
+            native_home_managed: None,
             settings_overlay_path: None,
             secret_policy: None,
         };
@@ -307,6 +308,20 @@ impl GenericPtyDriver {
         // config dir the two drivers share must not be mistaken for a login.
         if crate::claude_onboarding::has_login_material(std::path::Path::new(&recipe.native_home)) {
             env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        }
+        // D-045: driver-computed capability handshakes, attached only when
+        // granted; they pass the REMUDA_ deny prefix that guards caller env.
+        for entry in recipe
+            .env_allowlist
+            .iter()
+            .filter(|entry| entry.source == crate::recipe::EnvAllowlistSource::Capability)
+            // Narrow hole: only the granted-handshake name passes the
+            // REMUDA_ deny prefix; the value rides the grant entry.
+            .filter(|entry| entry.name == crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV)
+        {
+            if let Some(value) = entry.value.as_deref() {
+                env.insert(entry.name.clone(), value.to_owned());
+            }
         }
         for (key, value) in &self.options.extra_env {
             if crate::child_env::is_denied(key) {

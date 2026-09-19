@@ -59,6 +59,12 @@ pub(crate) struct DispatchArgs {
     /// Skip the local brief lint gate (not recommended; gate still scans).
     #[arg(long)]
     force_lint: bool,
+    /// Per-launch host capability grant (repeatable). Only `computer-use`
+    /// exists; it targets a macOS host reporting the installed capability and
+    /// runs with host-side approvals instead of the dispatcher's bypass default
+    /// (D-045).
+    #[arg(long = "capability")]
+    capabilities: Vec<String>,
 }
 
 impl Entrypoint for DispatchArgs {
@@ -69,6 +75,19 @@ impl Entrypoint for DispatchArgs {
 
 async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     let client = args.hub.connect()?;
+    super::capability::validate_requested(&args.capabilities)?;
+    if super::capability::requests_computer_use(&args.capabilities) {
+        // D-045 Q4: dispatch workers are bot-originated and run unattended
+        // (every harness); desktop control without a human approving each
+        // action is refused for all of them, never silently downgraded.
+        anyhow::bail!(
+            "refusing --capability computer-use on dispatch for harness {:?}: dispatched \
+             workers run unattended, and desktop control without per-action human approvals \
+             has no recovery path; use `remuda instance create --capability computer-use` \
+             for an attended launch",
+            args.harness.as_deref().unwrap_or("claude")
+        );
+    }
     if args.task.is_none() && args.brief.is_none() {
         anyhow::bail!("dispatch needs a <task-id> or --brief FILE");
     }
@@ -96,6 +115,8 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     let brief_name = std::path::Path::new(&brief_path)
         .file_name()
         .map(|stem| stem.to_string_lossy().into_owned());
+    // D-045: dispatch refuses every computer-use grant above, so no host
+    // preflight is reachable here; the Hub repeats the refusal server-side.
     let body = json!({
         "projectId": args.project,
         "brief": content,
@@ -108,6 +129,7 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "placement": args.placement,
         "driver": args.driver,
         "carrier": args.carrier,
+        "capabilities": args.capabilities,
     });
     let value = client
         .post("/v1/workers/dispatch", &body)

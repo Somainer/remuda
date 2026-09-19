@@ -5,6 +5,7 @@ mod attachments;
 mod carrier;
 mod carrier_objects;
 mod carrier_recovery;
+pub(crate) mod computer_use;
 mod config;
 #[cfg(unix)]
 mod daemon;
@@ -59,6 +60,31 @@ pub use carrier::{
     OutboundWssCarrier, StdioCarrier,
 };
 pub use config::{DEFAULT_DEV_PORT, DevServerConfig};
+
+/// Test-only access to the `computer-use` host preflight (D-045). Production
+/// callers run it from the native driver factory; tests call this directly.
+pub fn computer_use_preflight_for_test(
+    kind: &remuda_protocol::AgentKind,
+) -> Result<(), remuda_driver::DriverError> {
+    computer_use::host_preflight(kind)
+}
+
+/// Pure preflight gate (D-045) with injectable host facts, for tests that
+/// cannot mutate process env (the workspace forbids `unsafe`, hence
+/// `set_var`).
+pub fn computer_use_evaluate(
+    kind: &remuda_protocol::AgentKind,
+    os: &str,
+    row: Option<&inventory::CliEntry>,
+) -> Result<(), remuda_driver::DriverError> {
+    computer_use::evaluate(kind, os, row)
+}
+
+/// Default CUA client install path (`$CODEX_HOME/computer-use/Codex Computer
+/// Use.app`) used in refusal messages; exposed for tests (D-045 round 5).
+pub fn computer_use_default_client_path() -> Option<std::path::PathBuf> {
+    computer_use::default_client_path()
+}
 #[cfg(unix)]
 pub use daemon::{
     DaemonControl, DaemonListener, DaemonWssLease, bind_daemon, connect_daemon_bridge,

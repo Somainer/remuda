@@ -7509,6 +7509,14 @@
           ],
           "description": "Expected digest of [`Self::binary_path`], for pin-on-record; §4.1.\n\nWhen present the Node's own pin must equal it or the launch is refused,\nso a caller that recorded a binary can detect it changing underneath."
         },
+        "capabilities": {
+          "default": [],
+          "description": "Per-launch host capabilities explicitly requested by a human or bot\n(`[\"computer-use\"]`; D-045). Empty by default; unknown values are\nrefused. Never inherited, never implied by installed host software.\nAlways serialized as `capabilities: []` so the wire form is canonical\n(the round-trip snapshot asserts byte stability).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "carrier": {
           "$ref": "#/$defs/CarrierSpec",
           "description": "`carrier`; protocol §4.1."
@@ -7639,6 +7647,7 @@
         "settingsOverlay",
         "nativeHome",
         "carrier",
+        "capabilities",
         "requiredCapabilities",
         "completionScope",
         "parent"

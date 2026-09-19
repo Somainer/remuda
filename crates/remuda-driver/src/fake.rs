@@ -100,6 +100,7 @@ impl FakeDriver {
                 name: "CLAUDE_CONFIG_DIR".into(),
                 source: EnvAllowlistSource::NativeHome,
                 secret_ref: None,
+                value: None,
             }],
             materialized_files: vec![],
             setting_sources: vec!["user".into(), "project".into(), "local".into()],
@@ -123,6 +124,8 @@ impl FakeDriver {
                 prompts: Some("none".into()),
                 extra_flags: vec![],
             },
+            capabilities: vec![],
+            mcp_servers: vec![],
             technical_debt: vec![crate::recipe::TECH_DEBT_M0_PERM_01.into()],
             audit: LaunchAudit {
                 env_names: vec!["CLAUDE_CONFIG_DIR".into()],

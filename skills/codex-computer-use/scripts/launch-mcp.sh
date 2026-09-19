@@ -7,7 +7,9 @@ if [ "$(uname -s)" != "Darwin" ]; then
   exit 1
 fi
 
-cu_root="${CODEX_HOME:-${HOME}/.codex}"
+# Same real-home rule as launch-cua-repl.sh: when Remuda shadows the agent's
+# CODEX_HOME, the operator's real home arrives as REMUDA_CODEX_HOME.
+cu_root="${REMUDA_CODEX_HOME:-${CODEX_HOME:-${HOME}/.codex}}"
 cu_client="${cu_root}/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
 
 if [ ! -x "$cu_client" ]; then

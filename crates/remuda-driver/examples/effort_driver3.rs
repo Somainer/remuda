@@ -143,6 +143,7 @@ async fn main() {
             native_home: host_claude_home.clone(),
             binary: Some(which_claude()),
             origin: LaunchOrigin::Human,
+            native_home_managed: true,
             settings_overlay: None,
         },
     );

@@ -1548,6 +1548,8 @@ async fn replace_worker(
         placement: None,
         driver: None,
         carrier: None,
+        // A respawn inherits the worker, never a new desktop grant (D-045).
+        capabilities: Vec::new(),
     };
 
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief

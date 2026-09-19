@@ -209,6 +209,37 @@ impl DriverFactory for NativeClaudeFactory {
     }
 
     fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
+        // D-045 gate 2, Node half: the CLI/Hub preflight is advisory over the
+        // wire; this is the boundary that actually controls materialization.
+        // Runs before any launch dir or home is written.
+        let computer_use = launch
+            .request
+            .capabilities
+            .iter()
+            .any(|value| value == crate::computer_use::CAPABILITY_COMPUTER_USE);
+        if computer_use {
+            // Fail closed for codex anywhere but shell-pty WITH hooks. Only the
+            // hook session materializes a usable shadow CODEX_HOME (the granted
+            // [mcp_servers] table spliced into the shadow config). Every other
+            // carrier would point codex at a shadow home holding only that
+            // table — no auth.json, no user config — silently losing the
+            // operator's login (overlay.rs documents the hazard). Checked
+            // before the host probe: the launch shape is unsupported here
+            // regardless of what the host reports.
+            if launch.request.kind == remuda_protocol::AgentKind::Codex
+                && !(self.kind == DriverKind::ShellPty && self.config.pty_hooks)
+            {
+                return Err(DriverError::Failed(format!(
+                    "the \"computer-use\" capability for codex on {:?} is not delivered: \
+                     only shell-pty with REMUDA_PTY_HOOKS=1 materializes the shadow CODEX_HOME \
+                     the granted MCP server needs; the other carriers would shadow the \
+                     operator's codex login",
+                    self.kind
+                )));
+            }
+            crate::computer_use::host_preflight(&launch.request.kind)
+                .map_err(|error| DriverError::Failed(error.to_string()))?;
+        }
         let instance_dir = self
             .config
             .data_dir
@@ -439,6 +470,13 @@ impl DriverFactory for NativeClaudeFactory {
                                 _ => None,
                             },
                             origin: launch.request.origin.into(),
+                            // D-045: the managed-home answer is per kind. The
+                            // shadow homes codex/grok get are always managed;
+                            // claude's is managed unless the operator home is
+                            // inherited (the `inherit_default_config` flag is a
+                            // claude-specific answer and reads wrong for codex).
+                            native_home_managed: kind != remuda_protocol::AgentKind::Claude
+                                || !inherit_default_config,
                             settings_overlay: overlay.clone(),
                         };
                         ShellPtyOptions::agent(launch.workspace_root.clone(), kind, agent)
@@ -1489,6 +1527,7 @@ fn instance_spec(
             store_id: object_id()?,
         },
         carrier,
+        capabilities: launch.request.capabilities.clone(),
         required_capabilities: Vec::new(),
         completion_scope: CompletionScope::NativeTurn,
         parent: None,
@@ -1678,6 +1717,8 @@ mod tests {
                 effort: None,
                 tui: None,
                 extra_env: std::collections::BTreeMap::new(),
+
+                capabilities: Default::default(),
             };
             registry
                 .build(
@@ -1880,6 +1921,8 @@ mod tests {
                 effort: None,
                 tui: None,
                 extra_env: std::collections::BTreeMap::new(),
+
+                capabilities: Default::default(),
             };
             let driver = registry
                 .build(
@@ -2124,6 +2167,8 @@ mod tests {
                 resumed_from: None,
                 effort: None,
                 tui: None,
+
+                capabilities: Default::default(),
             };
             let launch = DriverLaunch {
                 instance,
@@ -2179,6 +2224,8 @@ mod tests {
             resumed_from: None,
             effort: None,
             tui: None,
+
+            capabilities: Default::default(),
         };
         let launch = DriverLaunch {
             instance,
@@ -2225,6 +2272,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -2277,6 +2326,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         registry
             .build(
@@ -2332,6 +2383,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -2513,6 +2566,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -2870,6 +2925,89 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+            capabilities: Default::default(),
         }
+    }
+
+    /// D-045: granted codex is refused on a carrier whose shadow home the
+    /// hook session does not fully populate. The shape refusal fires before
+    /// the host probe, so it is observable on any host (incl. this Linux CI
+    /// box without the computer-use inventory row).
+    #[test]
+    fn granted_codex_is_refused_on_shell_pty_with_hooks_off() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = NativeDriverConfig::new(dir.path().join("data"));
+        assert!(!config.pty_hooks);
+        let registry = native_driver_registry(config).expect("registry");
+        let instance = crate::runtime::fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ShellPty,
+        )
+        .expect("instance");
+        let mut request = test_create_request();
+        request.kind = AgentKind::Codex;
+        request.driver = DriverKind::ShellPty;
+        request.host_id = Some(instance.host_id.clone());
+        request.workspace_id = Some(instance.workspace_id.clone());
+        request.instance_id = Some(instance.meta.id.clone());
+        request.capabilities = vec!["computer-use".to_owned()];
+        let error = registry
+            .build(
+                DriverKind::ShellPty,
+                crate::driver::DriverLaunch {
+                    instance,
+                    request,
+                    workspace_root: dir.path().to_path_buf(),
+                    registered_workspace_root: dir.path().to_path_buf(),
+                },
+            )
+            .map(drop)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("computer-use")
+                && message.contains("shell-pty")
+                && message.contains("REMUDA_PTY_HOOKS"),
+            "{message}"
+        );
+    }
+
+    /// Granted codex on generic-pty is likewise refused (no hook session at
+    /// all on that carrier).
+    #[test]
+    fn granted_codex_is_refused_on_generic_pty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = NativeDriverConfig::new(dir.path().join("data"));
+        config.pty_hooks = true; // hooks on, but the wrong carrier shape.
+        let registry = native_driver_registry(config).expect("registry");
+        let instance = crate::runtime::fixture_instance(
+            InstanceId::new(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::GenericPty,
+        )
+        .expect("instance");
+        let mut request = test_create_request();
+        request.kind = AgentKind::Codex;
+        request.driver = DriverKind::GenericPty;
+        request.host_id = Some(instance.host_id.clone());
+        request.workspace_id = Some(instance.workspace_id.clone());
+        request.instance_id = Some(instance.meta.id.clone());
+        request.capabilities = vec!["computer-use".to_owned()];
+        let error = registry
+            .build(
+                DriverKind::GenericPty,
+                crate::driver::DriverLaunch {
+                    instance,
+                    request,
+                    workspace_root: dir.path().to_path_buf(),
+                    registered_workspace_root: dir.path().to_path_buf(),
+                },
+            )
+            .map(drop)
+            .unwrap_err();
+        assert!(error.to_string().contains("computer-use"), "{error}");
     }
 }

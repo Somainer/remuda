@@ -182,10 +182,21 @@ impl Ctx {
         path: &str,
         body: Option<Value>,
     ) -> (reqwest::StatusCode, Value) {
+        self.request_with_token(method, path, body, &self.human)
+            .await
+    }
+
+    async fn request_with_token(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        token: &str,
+    ) -> (reqwest::StatusCode, Value) {
         let mut builder = self
             .http
             .request(method.parse().unwrap(), format!("{}{}", self.base(), path))
-            .bearer_auth(&self.human);
+            .bearer_auth(token);
         if let Some(body) = body {
             builder = builder.json(&body);
         }
@@ -725,4 +736,183 @@ async fn state_done_requires_sha_and_blocked_requires_reason() {
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["state"]["reason"], "need creds");
+}
+
+#[tokio::test]
+async fn dispatch_refuses_computer_use_for_every_harness_without_downgrading() {
+    // D-045 Q4: dispatch workers are unattended; the grant is refused for both
+    // harnesses (never silently flipped to host approvals) and the refusal
+    // arrives before provisioning, so no worktree is created.
+    for harness in ["claude", "codex"] {
+        let mut ctx = Ctx::spawn().await.unwrap();
+        let project = ctx.create_project(&["58940-58969"]).await;
+        let project_id = project["id"].as_str().unwrap();
+        ctx.drain_calls();
+
+        let mut body = ctx.dispatch_body(project_id);
+        body["harness"] = json!(harness);
+        body["capabilities"] = json!(["computer-use"]);
+        let (status, response) = ctx
+            .request("POST", "/v1/workers/dispatch", Some(body))
+            .await;
+        assert_eq!(status, 400, "harness {harness}: {response}");
+        let message = response["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("dispatch") && message.contains("unattended"),
+            "harness {harness}: {message}"
+        );
+
+        // No provisioning happened for the refused dispatch.
+        assert!(
+            !ctx.drain_calls()
+                .iter()
+                .any(|method| method == "worker.provision"),
+            "harness {harness}: refused dispatch must not provision"
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_origin_create_with_computer_use_is_refused_before_approval_and_placement() {
+    // D-045 Gate 1 hoisted ahead of pick_hosts/provider resolution/
+    // prepare_create: an instance-scoped agent credential may not grant
+    // computer-use. The launch uses shell-pty — the shape that WOULD raise a
+    // one-shot human Interaction via prepare_create — so the test also proves
+    // no approval ticket is created and burned on the refused replay.
+    let ctx = Ctx::spawn().await.unwrap();
+    // Seed a leaf instance and mint its instance token (origin = Agent).
+    let project = ctx.create_project(&["58940-58969"]).await;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    let mut delegation =
+        remuda_hub::store_test_support::leaf_delegation(&project_id).expect("leaf delegation");
+    // prepare_create requires the Dispatch grant even for a same-host agent.
+    delegation.grants = vec!["dispatch".to_owned()];
+    let instance = ctx
+        .hub
+        .store()
+        .unwrap()
+        .insert_instance_delegated(
+            ctx.host.clone(),
+            Some(ctx.workspace.clone()),
+            "claude".into(),
+            "shell-pty".into(),
+            None,
+            json!({ "projectId": project_id }),
+            delegation,
+        )
+        .await
+        .expect("seed instance");
+    let agent_token = remuda_hub::instance_token(
+        ctx.hub.store().unwrap().clone(),
+        instance.instance_id.clone(),
+    )
+    .await
+    .expect("agent token");
+
+    let body = json!({
+        "hostId": ctx.host,
+        "kind": "claude",
+        "driver": "shell-pty",
+        "permissionMode": "manual",
+        "capabilities": ["computer-use"],
+        "prompt": "drive",
+    });
+    let (status, response) = ctx
+        .request_with_token("POST", "/v1/instances", Some(body), &agent_token)
+        .await;
+    assert_eq!(status, 400, "{response}");
+    let message = response["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("agent-originated") && message.contains("computer-use"),
+        "{message}"
+    );
+    // The refusal must run before prepare_create: no Interaction ticket
+    // exists for the caller instance (the shell-pty shape would have required
+    // one had the gate fired later).
+    let interactions = ctx
+        .hub
+        .store()
+        .unwrap()
+        .list_interactions(None, Some(instance.instance_id.clone()), None, false)
+        .await
+        .expect("list interactions");
+    assert!(
+        interactions.is_empty(),
+        "refused agent grant must not create an approval Interaction: {interactions:?}"
+    );
+}
+
+#[tokio::test]
+async fn instance_create_refuses_codex_unattended_spellings_with_computer_use() {
+    // D-045 Q4 at the create endpoint: the Hub gate must understand codex's
+    // auto-approve spellings (never / no-request), not only claude's
+    // bypassPermissions, and refuse before persistence.
+    let ctx = Ctx::spawn().await.unwrap();
+    for (kind, mode) in [
+        ("claude", "bypassPermissions"),
+        ("codex", "never"),
+        ("codex", "no-request"),
+    ] {
+        let body = json!({
+            "hostId": ctx.host,
+            "kind": kind,
+            "driver": "shell-pty",
+            "permissionMode": mode,
+            "capabilities": ["computer-use"],
+            "prompt": "drive",
+        });
+        let (status, response) = ctx.request("POST", "/v1/instances", Some(body)).await;
+        assert_eq!(
+            status, 400,
+            "kind={kind} mode={mode} must be refused: {response}"
+        );
+        let message = response["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unattended") && message.contains(kind),
+            "must name both the condition and the harness ({kind}/{mode}): {message}"
+        );
+    }
+
+    // A non-unattended codex spelling passes the Q4 gate and reaches the host
+    // preflight (which fails only because the fake node reports no row here).
+    let body = json!({
+        "hostId": ctx.host,
+        "kind": "codex",
+        "driver": "shell-pty",
+        "permissionMode": "on-request",
+        "capabilities": ["computer-use"],
+        "prompt": "drive",
+    });
+    let (status, response) = ctx.request("POST", "/v1/instances", Some(body)).await;
+    assert_eq!(
+        status, 400,
+        "expected the host preflight refusal, not success: {response}"
+    );
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not reported"),
+        "should reach the host-capability gate: {response}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_rejects_unknown_capability_value() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = ctx.create_project(&["58970-58999"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    let mut body = ctx.dispatch_body(project_id);
+    body["capabilities"] = json!(["desktop"]);
+    let (status, response) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(body))
+        .await;
+    assert_eq!(status, 400, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"desktop\""),
+        "{response}"
+    );
 }

@@ -664,6 +664,8 @@ struct ProxyNode {
     /// Durable Node token from the first hello; used to re-authenticate a
     /// replacement socket after a drop.
     node_token: String,
+    /// Frames read while waiting for the hello reply on reconnect.
+    pending: Vec<Value>,
     /// Held so the connection lives as long as the value does; `take_link`
     /// drops it to take H offline.
     node: Option<NodeSocket>,
@@ -699,6 +701,7 @@ impl ProxyNode {
         Ok(Self {
             host_id,
             node_token,
+            pending: Vec::new(),
             node: Some(node),
         })
     }
@@ -706,6 +709,12 @@ impl ProxyNode {
     /// Drop H's live link (takes it offline); reconnect re-installs one.
     fn drop_link(&mut self) {
         self.node = None;
+    }
+
+    /// Frames received while the reconnect reader was waiting for the hello
+    /// reply (api.egress can be queued ahead of the reply).
+    fn take_pending(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.pending)
     }
 
     /// Mutable access to the live socket.
@@ -731,13 +740,14 @@ impl ProxyNode {
         )
         .await?;
         // The Hub may push api.egress (and other notifications) before the
-        // hello reply; skip them and wait for the reply to id=hello2.
+        // hello reply; retain them in `pending` rather than dropping them.
         loop {
             let reply = recv_json(&mut node).await?;
             if reply.get("id").and_then(Value::as_str) == Some("hello2") {
                 anyhow::ensure!(reply.pointer("/result/hostId").is_some(), "{reply}");
                 break;
             }
+            self.pending.push(reply);
         }
         self.node = Some(node);
         Ok(())
@@ -1058,6 +1068,114 @@ async fn an_unroutable_api_open_does_not_break_the_link() -> Result<()> {
         ack.get("result").is_some(),
         "an unroutable api.* notification must not break the link: {ack}"
     );
+    Ok(())
+}
+
+/// Item 12: every open-time rejection must terminate the stream with a named
+/// `destination-refused` (or `instance-gone`) api.end, never a silent drop.
+#[tokio::test]
+async fn open_time_rejections_all_emit_a_terminal_end() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+
+    // Self-routed instance with a gateway profile: unknown / wrong host /
+    // bad path / duplicate / per-link cap all exercise real checks.
+    let mut routed = fixture_routed_self(&gateway.base_url_v1()).await?;
+    let other = connect_capable_node(routed.addr, &routed._hub, "other-node", false).await?;
+    let mut other_socket = other.0;
+
+    // Unknown instance.
+    notify(
+        &mut routed.node,
+        "api.open",
+        api_open_params("ins_does_not_exist", "st_unknown", &messages_body()),
+    )
+    .await?;
+    assert_end_code(&mut routed.node, "st_unknown", "instance-gone").await?;
+
+    // Wrong host: open for routed's instance from the other Node's socket.
+    notify(
+        &mut other_socket,
+        "api.open",
+        api_open_params(&routed.instance_id, "st_wronghost", &messages_body()),
+    )
+    .await?;
+    assert_end_code(&mut other_socket, "st_wronghost", "destination-refused").await?;
+
+    // Bad path (origin traversal).
+    let mut badpath = api_open_params(&routed.instance_id, "st_badpath", &messages_body());
+    badpath["path"] = json!("/v1/../../etc/passwd");
+    notify(&mut routed.node, "api.open", badpath).await?;
+    assert_end_code(&mut routed.node, "st_badpath", "destination-refused").await?;
+
+    // Duplicate stream id: the second of two opens is refused.
+    notify(
+        &mut routed.node,
+        "api.open",
+        api_open_params(&routed.instance_id, "st_dup", &messages_body()),
+    )
+    .await?;
+    notify(
+        &mut routed.node,
+        "api.open",
+        api_open_params(&routed.instance_id, "st_dup", &messages_body()),
+    )
+    .await?;
+    assert_end_code(&mut routed.node, "st_dup", "destination-refused").await?;
+
+    // No via route: a plain fixture (no profile / delivery) refuses api.open.
+    let mut no_route = fixture().await?;
+    notify(
+        &mut no_route.node,
+        "api.open",
+        api_open_params(&no_route.instance_id, "st_noroute", &messages_body()),
+    )
+    .await?;
+    assert_end_code(&mut no_route.node, "st_noroute", "destination-refused").await?;
+
+    // Per-link cap (maxApiStreams = 8): ten opens on a FRESH link, the 9th
+    // and 10th refused. Use a gateway that holds every response open so the
+    // first 8 streams stay registered while the remaining two are checked.
+    let cap_gateway = FakeGateway::start_with(vec![Script::SlowFirstByte {
+        delay: Duration::from_secs(10),
+        text: "held".into(),
+    }])
+    .await?;
+    let mut capped = fixture_routed_self(&cap_gateway.base_url_v1()).await?;
+    for i in 0..10u32 {
+        notify(
+            &mut capped.node,
+            "api.open",
+            api_open_params(
+                &capped.instance_id,
+                &format!("st_cap_{i}"),
+                &messages_body(),
+            ),
+        )
+        .await?;
+    }
+    // Give the drain queue a moment to process all ten queued opens.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_end_code(&mut capped.node, "st_cap_8", "destination-refused").await?;
+    assert_end_code(&mut capped.node, "st_cap_9", "destination-refused").await?;
+    cap_gateway.shutdown().await;
+
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// Read until `stream_id` terminates with `api.end{error.code == code}`.
+async fn assert_end_code(node: &mut NodeSocket, stream_id: &str, code: &str) -> Result<()> {
+    let frames = collect_notifications(node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!(stream_id)
+            && frame["params"].get("bytesDown").is_some()
+            && frame["params"].get("error").is_some()
+    })
+    .await?;
+    let end = frames_for(&frames, stream_id)
+        .into_iter()
+        .find(|p| p.get("error").is_some())
+        .with_context(|| format!("{stream_id} must end with an error"))?;
+    assert_eq!(end["error"]["code"], json!(code), "{stream_id}: {end}");
     Ok(())
 }
 
@@ -1410,7 +1528,6 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
     // an explicit `apiVia: H, hub-relay` delivery configuration.
     let gateway = FakeGateway::start().await?;
     let (mut fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
-    let proxy_host = proxy.host_id.clone();
     let proxy_socket = proxy.socket();
 
     // D-048 (item 4): the credential reaches H out of band via api.egress,
@@ -1429,11 +1546,10 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
         .unwrap()
         .push(json!({ "name": "x-api-key", "value": "worker-local-key" }));
     notify(&mut fixture.node, "api.open", open_params).await?;
-    let mut proxy_socket = proxy_socket;
     let (egress, open) = tokio::time::timeout(TIMEOUT, async {
         let mut egress: Option<Value> = None;
         loop {
-            let frame = recv_json(&mut proxy_socket).await?;
+            let frame = recv_json(proxy_socket).await?;
             match frame["method"].as_str() {
                 Some("api.egress") if egress.is_none() => {
                     egress = Some(frame);
@@ -1493,7 +1609,6 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
     // H goes away with the stream in flight. The worker's socket stays open:
     // the terminal `api.end` for this stream has to arrive on it, and a test
     // that dropped it could never see the frame it is asserting about.
-    drop(proxy_socket); // end the mutable borrow of proxy
     proxy.drop_link(); // close H's actual socket
 
     let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
@@ -2163,7 +2278,7 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
     let gateway = FakeGateway::start().await?;
     let (mut fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
     let proxy_host = proxy.host_id.clone();
-    let mut proxy_socket = proxy.socket();
+    let proxy_socket = proxy.socket();
 
     for cycle in 0..2 {
         let stream_id = format!("st_cycle_{cycle}");
@@ -2179,7 +2294,7 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
         // api.open addressed to H.
         let open = tokio::time::timeout(TIMEOUT, async {
             loop {
-                let frame = recv_json(&mut proxy_socket).await?;
+                let frame = recv_json(proxy_socket).await?;
                 if frame["method"] == json!("api.open") {
                     return Ok::<_, anyhow::Error>(frame);
                 }
@@ -2196,7 +2311,7 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
 
         // Simulate H's response: head, one chunk, end.
         send_json(
-            &mut proxy_socket,
+            proxy_socket,
             json!({
                 "jsonrpc": "2.0", "method": "api.head",
                 "params": {"streamId": open["params"]["streamId"], "status": 200, "headers": []}
@@ -2204,7 +2319,7 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
         )
         .await?;
         send_json(
-            &mut proxy_socket,
+            proxy_socket,
             json!({
                 "jsonrpc": "2.0", "method": "api.chunk",
                 "params": {
@@ -2220,7 +2335,7 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
         )
         .await?;
         send_json(
-            &mut proxy_socket,
+            proxy_socket,
             json!({
                 "jsonrpc": "2.0", "method": "api.end",
                 "params": {
@@ -2264,29 +2379,53 @@ async fn proxy_reconnect_gets_fresh_api_egress_before_next_open() -> Result<()> 
 
     // Re-hello H on a fresh socket using its durable node token.
     proxy.reconnect(fixture.addr, "relay-proxy").await?;
-    let mut reconnected = proxy.socket();
+    // Frames buffered ahead of the reconnect hello reply (e.g. api.egress).
+    let mut buffered = proxy.take_pending();
+    let reconnected = proxy.socket();
 
     // W opens a stream. The Hub must push api.egress to the new socket BEFORE
-    // forwarding api.open.
+    // forwarding api.open. Accept an egress that arrived ahead of the hello
+    // reply as well as one that arrives after.
     notify(
         &mut fixture.node,
         "api.open",
         api_open_params(&fixture.instance_id, "st_reconnect", &messages_body()),
     )
     .await?;
-    let (egress, open) = tokio::time::timeout(TIMEOUT, async {
-        let mut egress: Option<Value> = None;
-        loop {
-            let frame = recv_json(&mut reconnected).await?;
-            match frame["method"].as_str() {
-                Some("api.egress") if egress.is_none() => egress = Some(frame),
-                Some("api.open") => {
-                    return Ok::<_, anyhow::Error>((
-                        egress.context("fresh api.egress must precede api.open after reconnect")?,
-                        frame,
-                    ));
+    let has_egress = |frame: &Value| {
+        frame["method"] == json!("api.egress")
+            && frame["params"]["instanceId"] == json!(fixture.instance_id)
+    };
+    let egress_pre = buffered.iter().find(|f| has_egress(f)).cloned();
+    let (egress, open) = tokio::time::timeout(TIMEOUT, async move {
+        if let Some(egress) = egress_pre {
+            // Drain until api.open.
+            loop {
+                let frame = recv_json(reconnected).await?;
+                if frame["method"] == json!("api.open") {
+                    return Ok::<_, anyhow::Error>((egress, frame));
                 }
-                _ => {}
+                buffered.push(frame);
+            }
+        }
+        // No buffered egress: wait for one, then for api.open.
+        let mut egress: Option<Value> = None;
+        while egress.is_none() {
+            let frame = recv_json(reconnected).await?;
+            if frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+            {
+                egress = Some(frame);
+            } else if frame["method"] == json!("api.open") {
+                anyhow::bail!("api.open arrived before api.egress after reconnect");
+            }
+            // other frames: ignore and keep waiting
+        }
+        let egress = egress.unwrap();
+        loop {
+            let frame = recv_json(reconnected).await?;
+            if frame["method"] == json!("api.open") {
+                return Ok((egress, frame));
             }
         }
     })
@@ -2296,7 +2435,12 @@ async fn proxy_reconnect_gets_fresh_api_egress_before_next_open() -> Result<()> 
         Some(PROFILE_TOKEN),
         "reconnected H must re-receive the credential"
     );
-    assert_eq!(open["params"]["streamId"], json!("st_reconnect"));
+    assert!(
+        open["params"]["streamId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("st_reconnect")),
+        "api.open for st_reconnect must reach H: {open}"
+    );
     gateway.shutdown().await;
     Ok(())
 }

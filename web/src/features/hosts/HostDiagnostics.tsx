@@ -9,27 +9,25 @@ export function HostDiagnostics({ hostId, online, cli }: { hostId: Id; online: b
 }
 
 /**
- * The `computer-use` row, in the three states the Node can actually report.
+ * The `computer-use` row, but **only when the host did not report it at all**.
  *
- * D-045 §3.4 / ui-spec §2.6: this is an ordinary CLI row, but the state that
- * has no precedent is "not reported" — an older Node omits the row entirely,
- * and that must never be drawn as "this host cannot". So the copy is explicit
- * and the two negatives stay visually distinct.
+ * ui-spec §2.6: the capability is an ordinary CLI row, and the host detail's
+ * CLI table already draws the two reported states (`installed → 已安装`,
+ * `installed: false → 未安装`). The one state that table *cannot* express is
+ * absence of the row itself — `installedCli` and `absentCli` both yield
+ * nothing there — so an older Node would silently show no capability line at
+ * all. That is the only case this renders; drawing the reported states here
+ * too would show the same fact twice on one page.
  */
 function ComputerUseRow({ cli }: { cli?: HostCli[] }) {
   const state = computerUseState(cli);
-  const label = !state.reported ? "未上报" : state.installed ? "已安装" : "未安装";
-  const detail = !state.reported
-    ? "该 Node 未回报此行；不代表本机不支持"
-    : state.installed
-      ? [state.version, state.path].filter(Boolean).join(" · ")
-      : "Codex Computer Use 客户端不在该 Node 的 CODEX_HOME 下";
-  return <div className={css.cliRow} data-testid="computer-use-row" data-state={
-    !state.reported ? "unreported" : state.installed ? "installed" : "absent"
-  }>
+  if (state.reported) return null;
+  return <div className={css.cliRow} data-testid="computer-use-row" data-state="unreported">
     <span className={css.cliKind}>{COMPUTER_USE_KIND}</span>
-    <span className={css.cliVer}>{label}</span>
-    <span className={css.cliVer} data-testid="computer-use-detail">{detail}</span>
+    <span className={css.cliVer}>未上报</span>
+    <span className={css.cliVer} data-testid="computer-use-detail">
+      该 Node 未回报此行；不代表本机不支持
+    </span>
   </div>;
 }
 

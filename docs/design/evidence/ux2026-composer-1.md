@@ -50,6 +50,7 @@
 | `web/tests/e2e/composer-effort.spec.ts` | c-composer 分叉 | mobile-webkit 项目按 D-042 打开 sheet；Grok 权限菜单改 `expect.poll` 确定性断言 |
 | `web/tests/e2e/ux-modelsync.hub.spec.ts` | c-composer 最小改动 | openModelList 的防御性 Esc 可能弹出新打断 Sheet，加同款 stray-confirm 守卫；**恢复**被误删的两处 clearApprovals 与 approval-card count=0 |
 | `web/tests/e2e/ux-modelpick.hub.spec.ts` | c-composer 同款守卫 | 与 ux-modelsync 相同的 stray-confirm 守卫（openModelList 同样的防御性 Esc） |
+| `web/tests/e2e/ux-usage.hub.spec.ts` | c-composer 后果适配 | 390px 用例：context chip 移入选项 sheet 后，先开 sheet 再断言 chip 与明细 sheet |
 | `web/tests/e2e/session-structured.spec.ts` | **handback 1 授权**（c-sessionchrome 拥有；c-toolfold 在改同文件） | 仅 107-117 行那个用例：compact 下先开选项 sheet 再断言只读 harness-chip |
 | `web/tests/e2e/session-chrome-evidence.spec.ts` | **handback 1 授权** | 400px 循环先开选项 sheet 再截 harness-label |
 

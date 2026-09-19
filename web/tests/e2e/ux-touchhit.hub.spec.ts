@@ -31,6 +31,44 @@ const shotDir = evidence
 
 const created: string[] = [];
 
+/**
+ * Make room on the fake node for every retry attempt's instances.
+ *
+ * The fake node advertises `maxInstances: 8` and every spec in this config
+ * shares one Hub serially; with CI retries enabled, a failed attempt's
+ * teardown can land after the retry has already re-created the same session,
+ * and leftovers from earlier specs pile up. A full host answers
+ * `POST /v1/instances` with 422 PLACEMENT_UNSATISFIABLE: the app still
+ * navigates to /s/<id>, but the session page never mounts — the
+ * "session-page not found" signature seen at the touchhit tests. Raising the
+ * cap (same fixture-level isolation ux-status/ux-code already use) removes
+ * the contention; the original value is restored in afterAll.
+ */
+async function raiseCap(page: Page, to: number): Promise<{ hostId: string; previous: number } | null> {
+  const hosts = await page.evaluate(async () => {
+    const response = await fetch("/v1/hosts", { credentials: "include" });
+    return response.json();
+  });
+  const host = (hosts.items ?? []).find((h: { label?: string }) => h.label === "e2e-fake-node");
+  if (!host) return null;
+  const hostId = (host.hostId ?? host.id) as string;
+  const previous = (host.maxInstances ?? 8) as number;
+  if (previous >= to) return { hostId, previous };
+  await page.evaluate(
+    ({ id, value }) =>
+      fetch(`/v1/hosts/${id}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ maxInstances: value }),
+      }),
+    { id: hostId, value: to },
+  );
+  return { hostId, previous };
+}
+
+let cap: { hostId: string; previous: number } | null = null;
+
 async function shot(page: Page, name: string) {
   await mkdir(shotDir, { recursive: true });
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
@@ -51,27 +89,38 @@ async function createClaudeSession(page: Page): Promise<string> {
     timeout: 20_000,
   });
   await page.getByTestId("new-session-prompt").fill("touch hit geometry");
+  // Assert the create itself: when the fake node is full the Hub answers 422
+  // PLACEMENT_UNSATISFIABLE and the app still navigates to /s/<id>, but the
+  // session page never mounts — the failure used to surface minutes later as
+  // a missing "session-page" testid. Track the id from the response so the
+  // afterEach cleanup deletes it even when navigation then fails on a retry.
+  const creating = page.waitForResponse(
+    (response) =>
+      response.request().method() === "POST" &&
+      new URL(response.url()).pathname === "/v1/instances",
+  );
   await page.getByTestId("new-session-start").click();
-  await page.waitForURL(/\/s\//, { timeout: 20_000 });
-  const id = new URL(page.url()).pathname.split("/").pop()!;
-  created.push(id);
+  const res = await creating;
+  expect(res.ok(), `instance create failed: ${res.status()} ${await res.text().catch(() => "")}`).toBe(true);
+  const instanceId = (await res.json()).instance.instanceId as string;
+  created.push(instanceId);
+  await expect(page).toHaveURL(new RegExp(`/s/${instanceId}`), { timeout: 20_000 });
   // The effort controls live in the structured-view composer dock; a fresh
   // shell-pty session may auto-resolve to the tty view, so pin structured.
-  await page.goto(`/s/${id}/structured`);
-  await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
-  await expect(page.getByTestId("session-page")).toHaveAttribute(
-    "data-lifecycle",
-    "running",
-    { timeout: 20_000 },
-  );
+  await page.goto(`/s/${instanceId}/structured`);
+  const sessionPage = page.getByTestId("session-page");
+  await expect(sessionPage).toHaveAttribute("data-view", "structured", { timeout: 20_000 });
+  await expect(sessionPage).toHaveAttribute("data-lifecycle", "running", { timeout: 20_000 });
   await expect(page.getByTestId("composer")).toBeVisible();
-  return id;
+  return instanceId;
 }
 
 /** Resolve any pending approval the fake harness emits, same as ux-permmode. */
 async function clearApprovals(page: Page, instanceId: string) {
-  await page.evaluate(async (id) => {
-    const listPending = async () => {
+  // Wait for the launch approval to APPEAR: an immediate empty read would
+  // return with the launch still blocked.
+  const pending = () =>
+    page.evaluate(async (id) => {
       const body = await (
         await fetch("/v1/interactions", { credentials: "include" })
       ).json();
@@ -79,31 +128,44 @@ async function clearApprovals(page: Page, instanceId: string) {
         (item: { instanceId?: string; state?: string }) =>
           item.instanceId === id && item.state === "pending",
       );
-    };
-    let mine = await listPending();
-    const deadline = Date.now() + 10_000;
-    for (const item of mine) {
-      const optionId = item.request?.options?.[0]?.id;
-      if (!optionId) continue;
-      await fetch(`/v1/interactions/${item.interactionId ?? item.id}/answer`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          answer: {
-            kind: "approval",
-            optionId,
-            inputDigest: item.request?.inputDigest ?? "",
-          },
+    }, instanceId);
+  const mine = await expect
+    .poll(() => pending().then((items: unknown[]) => items.length), {
+      timeout: 20_000,
+      message: "launch approval appears",
+    })
+    .toBeGreaterThan(0)
+    .then(() => pending());
+  for (const item of mine as {
+    id: string;
+    interactionId?: string;
+    request?: { inputDigest?: string; options?: { id: string }[] };
+  }[]) {
+    const optionId = item.request?.options?.[0]?.id;
+    if (!optionId) continue;
+    await page.evaluate(
+      ({ iid, optionId, digest }) =>
+        fetch(`/v1/interactions/${iid}/answer`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            answer: {
+              kind: "approval",
+              optionId,
+              inputDigest: digest ?? "",
+            },
+          }),
         }),
-      });
-    }
-    while (mine.length > 0 && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      mine = await listPending();
-    }
-    return mine;
-  }, instanceId);
+      { iid: item.interactionId ?? item.id, optionId, digest: item.request?.inputDigest },
+    );
+  }
+  await expect
+    .poll(() => pending().then((items: unknown[]) => items.length), {
+      timeout: 20_000,
+      message: "approvals clear",
+    })
+    .toBe(0);
 }
 
 async function forceDeleteAllInstances(page: Page) {
@@ -123,8 +185,13 @@ async function forceDeleteAllInstances(page: Page) {
 
 test.beforeEach(async ({ page }) => {
   await login(page);
+  if (!cap) cap = await raiseCap(page, 24);
 });
 
+// Runs after EVERY attempt, including a failed one immediately before its CI
+// retry, so leftovers cannot fill the fake node between attempts. Ids are
+// tracked from the create response, so an instance the Hub accepted is
+// cleaned even when the navigation afterwards failed.
 test.afterEach(async ({ page }) => {
   for (const id of created.splice(0)) {
     await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
@@ -133,9 +200,25 @@ test.afterEach(async ({ page }) => {
 
 test.afterAll(async ({ browser }) => {
   const cleanup = await browser.newPage();
-  await login(cleanup);
-  await forceDeleteAllInstances(cleanup).catch(() => undefined);
-  await cleanup.close();
+  try {
+    await login(cleanup);
+    await forceDeleteAllInstances(cleanup).catch(() => undefined);
+    if (cap) {
+      const { hostId, previous } = cap;
+      await cleanup.evaluate(
+        ({ id, value }) =>
+          fetch(`/v1/hosts/${id}`, {
+            method: "PATCH",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ maxInstances: value }),
+          }),
+        { id: hostId, value: previous },
+      );
+    }
+  } finally {
+    await cleanup.close();
+  }
 });
 
 type Box = { x: number; y: number; width: number; height: number };

@@ -102,6 +102,7 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
   // the picker opens (mirrors the reconnect path the effort spec exercises).
   await page.reload();
   await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await clearApprovals(page, instanceId);
   await openModelList(page);
   const panel = page.getByTestId("effort-slider-panel");
   // The launch snapshot's gateway catalog (not builtin opus/sonnet/haiku).
@@ -151,6 +152,7 @@ test("a typed alias resolving to a different id renders the mismatch", async ({ 
       await route.continue();
     }
   });
+  await clearApprovals(page, instanceId);
   await openModelList(page);
   await page.getByTestId("model-option-fast").click();
   // Wait for the read-back (queued/pending clears), then reopen the list.
@@ -264,6 +266,8 @@ async function clearApprovals(page: Page, instanceId: string) {
   }, instanceId);
   // Wait for the composer to become editable.
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 15_000 });
+  // Wait for the poll to drop the answered card before measuring popovers.
+  await expect(page.getByTestId("approval-card")).toHaveCount(0);
 }
 
 test.afterEach(async ({ page }) => {

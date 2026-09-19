@@ -213,6 +213,16 @@ pub enum Script {
         /// Text whose leading deltas are written before the connection dies.
         text: String,
     },
+    /// A 302 redirect to an arbitrary absolute URL.
+    ///
+    /// A client that follows redirects by default leaks `x-api-key` (reqwest
+    /// does not strip it on cross-host redirects) to the target. The relay sets
+    /// `redirect(Policy::none())`; this script proves the target is never
+    /// contacted with the credential.
+    Redirect {
+        /// Absolute `Location` URL.
+        location: String,
+    },
 }
 
 impl Script {
@@ -286,6 +296,7 @@ impl Script {
             Self::Messages { .. } | Self::SlowFirstByte { .. } | Self::MessagesJson { .. } => 200,
             Self::Status { code, .. } => *code,
             Self::AbortMidStream { .. } => 200,
+            Self::Redirect { .. } => 302,
         }
     }
 }
@@ -923,6 +934,11 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
             message,
             retry_after_secs,
         } => error_body(code, &error_type, &message, retry_after_secs),
+        Script::Redirect { location } => axum::response::Response::builder()
+            .status(302)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .expect("redirect response"),
     };
     let mut response = response;
     apply_configured_headers(response.headers_mut(), &gateway.response_headers());

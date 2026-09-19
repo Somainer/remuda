@@ -118,7 +118,7 @@ operator 的常见拓扑正是如此：H 是 Hub 主机，无公网入口，而 
 | `route: direct-net` 且探测失败 | 409 `api-via-unreachable` |
 | W 的 Node 绑不上监听器 | `instance.create` 带 reason code 拒绝；不启动 |
 | H 会话中途掉线 | 在途流收到 `api.end{error:"via-host-offline"}`；监听器答 503 与 Anthropic 形状的错误体；roster 观测变为 `blocked{reason:"api-route-down"}` |
-| profile 轮换/修订号变化 | H 按 `api.open` 时 Hub 发来的 vault 快照**逐流**重读凭据；中途轮换对下一个请求生效 |
+| profile 轮换/修订号变化 | H 按已安装的 `api.egress` 上下文在**新流**重读凭据（Hub 重发 `api.egress`）；中途轮换对下一个请求生效 |
 
 **任何情况下代理会话都不会回落到 `direct`。** 那会把请求——**连同凭据**——推到
 操作员明确排除的机器上，并让 UI 说谎（D-035）。所以协议里**没有**任何一个「回落
@@ -139,6 +139,7 @@ operator 的常见拓扑正是如此：H 是 Hub 主机，无公网入口，而 
 
 | 帧 | 方向 | params |
 | --- | --- | --- |
+| `api.egress` | Hub→H Node | `{instanceId, profileId, baseUrl, headers[], authToken?, revoke}` |
 | `api.open` | W Node→Hub，Hub→H Node | `{instanceId, streamId, method, path, query, headers[], bodyBase64?, bodyChunked, deadlineMs}` |
 | `api.body` | W Node→Hub→H Node | `{streamId, seq, dataBase64, last}` |
 | `api.head` | H→Hub→W Node | `{streamId, status, headers[]}` |
@@ -146,6 +147,14 @@ operator 的常见拓扑正是如此：H 是 Hub 主机，无公网入口，而 
 | `api.end` | 双向 | `{streamId, error?:{code,message}, bytesUp, bytesDown, ms}` |
 | `api.cancel` | 双向 | `{streamId, reason}` |
 | `api.credit` | 消费者→生产者 | `{streamId, chunks}` |
+
+* **B.2 凭据下发（`api.egress`）。** 凭据**绝不**搭在 `api.open` 上。Hub 在
+  `via:<H>` 路由启动决议时、以及 H 每次重连后，向 H 发一条 `api.egress`
+  notification，按 `instanceId` 安装出口上下文（`profileId`、`baseUrl`、
+  profile headers、`authToken`）；实例退出或路由失效时发 `revoke: true` 清除。
+  Node 按 instanceId 安装/清除，`revoke` 后、新 `api.egress` 到达前拒绝该实例的
+  新流（`destination-refused`）。凭据只存在于 H 内存、不经过 W、不出现在任何
+  数据流帧或 journal 中。
 
 * **独立的 stream 表，不进 RPC pending map。** 七个帧全是 notification，各自维护
   每链路 stream 注册表，因此**永不消耗**那个被 `instance.create`/`tty.*` 依赖的

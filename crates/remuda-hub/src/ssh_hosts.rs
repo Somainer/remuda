@@ -216,6 +216,8 @@ async fn remove_host(
     // Retire atomically before cancelling; this fences concurrent placement and hello.
     state.store.retire_managed_host(id.clone()).await?;
     supervisor.stop(&id).await;
+    // D-048: revoke/tear down relay streams before removing the live link.
+    state.api_relay.on_link_lost(&state, &id).await;
     state.nodes.remove(&id).await;
     state.store.mark_host_offline(id.clone()).await?;
     state
@@ -422,6 +424,10 @@ async fn supervise(state: AppState, host: ManagedHost) {
         {
             return;
         }
+        // D-048: tear down relay streams this SSH carrier owned, exactly as
+        // the WebSocket session teardown does — otherwise proxy-link losses
+        // never reach W, worker blocks never fire, and stream slots leak.
+        state.api_relay.on_link_lost(&state, &host.id).await;
         let _ = state.store.mark_host_offline(host.id.clone()).await;
         let message = match result {
             Ok(()) => "SSH connection closed".into(),

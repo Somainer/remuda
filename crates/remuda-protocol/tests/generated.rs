@@ -123,6 +123,7 @@ fn public_wire_types_are_registered_for_generation() {
         "ApiEndError",
         "ApiCancelParams",
         "ApiCreditParams",
+        "ApiEgressParams",
         // §9.1: pure transcript-mapper state shared between the driver and the
         // journal tailer; it is never serialized on the wire.
         "EffortTracker",

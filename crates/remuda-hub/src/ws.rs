@@ -741,9 +741,13 @@ pub(crate) async fn handle_node_method(
             Ok(Some(object_pull(state, host_id, &params, out_tx).await?))
         }
         method if HubNodeMethod::parse(method).is_some_and(HubNodeMethod::is_api) => {
-            // D-048: the seven api.* frames are notifications with their own
-            // stream table. They never enter the RPC pending map and answer
-            // nothing (`Ok(None)` suppresses any id-less reply).
+            // D-048: the api.* frames are notifications with their own stream
+            // table. They never enter the RPC pending map and answer nothing
+            // (`Ok(None)` suppresses any id-less reply).
+            //
+            // `handle_notification` only enqueues onto the per-link drain
+            // queue (try_send): it does not block the read loop on a
+            // backpressured peer, so tty/journal/RPC frames keep flowing.
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             state
                 .api_relay
@@ -929,6 +933,12 @@ async fn reconcile_lost_instances(
             %instance_id,
             "node epoch changed; instance lost"
         );
+        // D-048: revoke any egress context the lost instance held on proxy
+        // hosts; H must clear the credential.
+        state
+            .api_relay
+            .revoke_instance_egress(state, &instance_id)
+            .await;
         fail_workers_holding(state, host_id, &instance_id).await?;
         publish_hub_diagnostic(
             state,

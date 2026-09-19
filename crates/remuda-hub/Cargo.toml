@@ -30,7 +30,7 @@ remuda-push.workspace = true
 # `stream` backs the in-process Hub-host relay egress (D-048): the Hub is the
 # proxy host when `apiVia: self` names it, so it streams gateway responses the
 # same way a proxy Node would.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }
 serde.workspace = true

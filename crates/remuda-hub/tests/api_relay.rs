@@ -1311,8 +1311,10 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
     let (mut fixture, _proxy_host, proxy_socket) =
         fixture_routed_via_h(&gateway.base_url_v1()).await?;
 
-    // Drain the api.open the Hub forwards to H so the stream is live on both
-    // legs before H goes away.
+    // D-048 (item 4): the credential reaches H out of band via api.egress,
+    // which must arrive BEFORE the first api.open; the credential must never
+    // appear in any api.open frame. Egress was already pushed at launch; now
+    // open the stream and collect H's frames in wire order.
     notify(
         &mut fixture.node,
         "api.open",
@@ -1320,20 +1322,42 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
     )
     .await?;
     let mut proxy_socket = proxy_socket;
-    let open = tokio::time::timeout(TIMEOUT, async {
+    let (egress, open) = tokio::time::timeout(TIMEOUT, async {
+        let mut egress: Option<Value> = None;
         loop {
             let frame = recv_json(&mut proxy_socket).await?;
-            if frame["method"] == json!("api.open") {
-                return Ok::<_, anyhow::Error>(frame);
+            match frame["method"].as_str() {
+                Some("api.egress") if egress.is_none() => {
+                    egress = Some(frame);
+                }
+                Some("api.open") => {
+                    return Ok::<_, anyhow::Error>((
+                        egress.context("api.egress must precede api.open")?,
+                        frame,
+                    ));
+                }
+                other => eprintln!("H saw other frame: {other:?}"),
             }
-            eprintln!("H saw non-open frame: {frame}");
         }
     })
     .await??;
     assert_eq!(
-        open["params"]["upstream"]["authToken"].as_str(),
+        egress["params"]["authToken"].as_str(),
         Some(PROFILE_TOKEN),
-        "the open H receives carries the vault snapshot"
+        "api.egress carries the gateway credential: {egress}"
+    );
+    assert_eq!(
+        egress["params"]["instanceId"].as_str(),
+        Some(fixture.instance_id.as_str()),
+        "api.egress is bound to the instance: {egress}"
+    );
+    assert!(
+        open["params"].get("upstream").is_none(),
+        "api.open must carry no upstream/credential snapshot: {open}"
+    );
+    assert!(
+        open["params"].get("authToken").is_none(),
+        "the credential must never ride api.open: {open}"
     );
 
     // H goes away with the stream in flight. The worker's socket stays open:
@@ -1553,6 +1577,141 @@ async fn tty_attach_still_flows_while_a_relay_stream_is_hot() -> Result<()> {
 ///
 /// Risk 5: the relay must not become a general HTTP proxy. The Node pins origin
 /// and path; the Hub re-checks. A refused request must never reach the origin.
+#[tokio::test]
+async fn the_hub_egress_coalesces_and_delivers_incrementally_before_end() -> Result<()> {
+    // D-048: the Hub-host egress must flush at ≥16 KiB / 50 ms so a streaming
+    // completion arrives in pieces rather than only after the whole response is
+    // buffered. Assert at least two api.chunk frames arrive BEFORE api.end.
+    //
+    // The body is large enough to produce multiple 64 KiB wire chunks; the
+    // delayed head proves streaming starts as soon as the gateway flushes.
+    let gateway = FakeGateway::start_with(vec![Script::SlowFirstByte {
+        delay: Duration::from_millis(300),
+        text: "z".repeat(200 * 1024),
+    }])
+    .await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_incremental", &messages_body()),
+    )
+    .await?;
+
+    // Read the first burst of chunks (the producer window is 4), counting
+    // those that arrive before api.end.
+    let mut chunks_before_end = 0u32;
+    let early = collect_notifications(&mut fixture.node, Duration::from_secs(10), |frame| {
+        let params = &frame["params"];
+        if params["streamId"] == json!("st_incremental") && params.get("dataBase64").is_some() {
+            chunks_before_end += 1;
+            chunks_before_end >= 2
+        } else {
+            false
+        }
+    })
+    .await?;
+    assert!(
+        chunks_before_end >= 2,
+        "at least two chunks must stream out before the body is fully drained, \
+         got {chunks_before_end}: {early:?}"
+    );
+    // Act as a draining consumer: credit everything outstanding and more, so
+    // the producer can finish and emit api.end.
+    notify(
+        &mut fixture.node,
+        "api.credit",
+        json!({"streamId": "st_incremental", "chunks": 256}),
+    )
+    .await?;
+    let tail = collect_notifications(&mut fixture.node, Duration::from_secs(15), |frame| {
+        frame["params"]["streamId"] == json!("st_incremental")
+            && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+    let saw_end = frames_for(&tail, "st_incremental")
+        .iter()
+        .any(|params| params.get("bytesDown").is_some());
+    assert!(saw_end, "the stream must end after draining: {tail:?}");
+    gateway.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_302_redirect_never_leaks_the_credential_to_the_target() -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    // A bare TCP listener that records every request and answers 200. It is
+    // the redirect target; the gateway credential must never reach it.
+    let target_hits = Arc::new(AtomicU32::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let target_addr = listener.local_addr()?;
+    let target_url = format!("http://{target_addr}/stolen");
+    let target_hits_server = target_hits.clone();
+    let target_task = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            target_hits_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut buf = vec![0; 4096];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await;
+        }
+    });
+
+    // The gateway answers 302 → target.
+    let gateway = FakeGateway::start_with(vec![remuda_testing::fake_gateway::Script::Redirect {
+        location: target_url.clone(),
+    }])
+    .await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_redirect", &messages_body()),
+    )
+    .await?;
+
+    // The relay does not follow the redirect: the stream ends with a refusal
+    // (not a 200 from the target, not an upstream-timeout).
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_redirect")
+            && frame["params"].get("bytesDown").is_some()
+    })
+    .await?;
+    let end = frames_for(&frames, "st_redirect")
+        .into_iter()
+        .find(|params| params.get("bytesDown").is_some())
+        .context("redirect stream must terminate")?;
+    assert!(
+        end.get("error").is_some(),
+        "a 302 must end the stream with an error, not a silent success: {end}"
+    );
+    assert_eq!(
+        end["error"]["code"], "destination-refused",
+        "a redirect is a destination the relay refuses to follow: {end}"
+    );
+
+    // Give the target a beat: it must have received zero connections.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        target_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the redirect target must never be contacted; the credential would leak"
+    );
+    drop(target_task);
+    gateway.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_non_allowlisted_destination_is_refused() -> Result<()> {
     let gateway = FakeGateway::start().await?;

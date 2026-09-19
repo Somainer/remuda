@@ -447,3 +447,160 @@ async fn bridge_loss_preserves_instance_then_replays_from_hub_watermark() {
     hub.shutdown().await;
     std::fs::remove_dir_all(remote).unwrap();
 }
+
+// D-048: an SSH-attached proxy host H going down must still run the relay
+// teardown — api.egress revoke + api.end toward W + blocked{api-route-down}.
+// The observable Hub-side effect over HTTP is the api_route_down diagnostic
+// on an instance routed through H (the ws-attached worker W answers create).
+#[tokio::test]
+async fn ssh_proxy_teardown_runs_api_relay_link_loss() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("node");
+    executable(&fixture, include_str!("fixtures/ssh/fake-node.py"));
+    let mut config = HubConfig::for_test(dir.path().join("hub"));
+    config.ssh_hosts.ssh_binary = fake_ssh(dir.path(), &fixture);
+    config.host_lost_grace_ms = 25;
+    let hub = remuda_hub::spawn(config).await.unwrap();
+    let token = login(&hub).await;
+
+    // H: ssh-attached fake node (advertises apiRelay via the fixture).
+    let (status, added) = request(
+        hub.addr,
+        "POST",
+        "/v1/hosts/ssh",
+        &token,
+        json!({"target":"relay-h","label":"relay proxy"}),
+    )
+    .await;
+    assert_eq!(status, 201, "{added}");
+    let proxy_id = added["id"].as_str().unwrap().to_string();
+    wait_host(&hub, &token, &proxy_id, |h| h["online"] == true).await;
+
+    // W: ws-attached D-048 worker that answers instance.create and echoes the
+    // requested route, projecting an instance routed through the ssh host H.
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .unwrap();
+    let mut upgrade = format!("ws://{}/v1/node", hub.addr)
+        .into_client_request()
+        .unwrap();
+    upgrade
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse().unwrap());
+    let (mut ws_node, _) = tokio_tungstenite::connect_async(upgrade).await.unwrap();
+    ws_node
+        .send(Message::Text(
+            json!({"jsonrpc":"2.0","id":"h","method":"node.hello","params":{
+                "hostId": remuda_protocol::HostId::new().as_id(),
+                "nodeVersion":"0.2.0-d048","label":"w",
+                "capabilities":{"apiRelay":true},
+                "host":{"maxInstances":8,"cli":[{"kind":"claude","auth":"gateway-logged-in"}]}}})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let hello: Value =
+        serde_json::from_str(ws_node.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    let worker_id = hello["result"]["hostId"].as_str().unwrap().to_string();
+
+    // Gateway profile.
+    let (status, profile) = request(
+        hub.addr,
+        "POST",
+        "/v1/providers",
+        &token,
+        json!({"name":"g","kind":"gateway","baseUrl":"http://127.0.0.1:1/v1",
+               "authToken":"sk-fake-profile-0001","defaultGateway":true}),
+    )
+    .await;
+    assert_eq!(status, 200, "{profile}");
+
+    // Background task: answer the single instance.create RPC, echoing route.
+    let answer_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_node.next().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").and_then(Value::as_str) == Some("instance.create")
+                && let Some(id) = frame.get("id").cloned()
+            {
+                let route = frame
+                    .pointer("/params/spec/apiRoute")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let reply = json!({"jsonrpc":"2.0","id":id,
+                    "result":{"accepted":true,"instanceId":frame["params"]["instanceId"],
+                              "driver":"claude-print","apiRoute":route}});
+                let _ = ws_node.send(Message::Text(reply.to_string().into())).await;
+            }
+        }
+    });
+
+    let (status, created) = request(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &token,
+        json!({
+            "hostId": worker_id,
+            "kind": "claude",
+            "driver": "claude-print",
+            "delegation": "gateway",
+            "apiVia": proxy_id,
+            "apiRoute": "hub-relay"
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{created}");
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Kill the SSH proxy process → connect_once returns → on_link_lost runs.
+    let pid = fixture_pid(&proxy_id);
+    std::process::Command::new("kill")
+        .args(["-TERM", pid.trim()])
+        .status()
+        .unwrap();
+
+    // Confirm the ssh carrier actually dropped first.
+    wait_host(&hub, &token, &proxy_id, |h| h["online"] == false).await;
+    // The instance journal must carry the api_route_down Hub diagnostic.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (_, journal) = request(
+                hub.addr,
+                "GET",
+                &format!("/v1/instances/{instance_id}/journal"),
+                &token,
+                Value::Null,
+            )
+            .await;
+            let has = journal
+                .pointer("/events")
+                .and_then(Value::as_array)
+                .is_some_and(|events| {
+                    events.iter().any(|e| {
+                        e.pointer("/event/payload/nativeName")
+                            .and_then(Value::as_str)
+                            == Some("api_route_down")
+                    })
+                });
+            if has {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("api_route_down diagnostic must be journaled when ssh proxy drops");
+
+    answer_task.abort();
+    hub.shutdown().await;
+}

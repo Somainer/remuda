@@ -609,8 +609,6 @@ pub(crate) async fn dispatch_core(
         )
         .await?;
 
-        // An explicit --host pin over its CPU/mem ceiling was admitted, not
-        // refused: journal the saturation so the worker session shows why.
         for warning in &placement_warnings {
             crate::ws::publish_hub_diagnostic(
                 &state,

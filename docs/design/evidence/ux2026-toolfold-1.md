@@ -65,7 +65,7 @@ grok 卡保留共享 `NativeLabel`（标题≠原生名时才出现），折叠�
 
 ## 3. hub e2e（fake node，390×844，5 例）
 
-脚本场景：复用 `workflow card live`；新增 `toolfold settle`（call 帧 → 1.5s → final result 帧，
+脚本场景：复用 `workflow card live`；新增 `toolfold settle`（call 帧 → 3s → final result 帧，
 同一会话无 reload）与 `toolfold settle mcp`（已 settled 的超长
 `mcp__remuda-very-long-integration-server__search_files_everywhere` 卡）两个
 `crates/remuda-hub/examples/hub_e2e.rs` 分支，纯增量、不影响其他场景。
@@ -145,5 +145,14 @@ grep 过默认配置（非 `.hub.`、未被 `testIgnore`）下所有 spec，仅�
 - 桌面 testid 与结构零变化（非折叠仍渲染 `<div data-testid="tool-card" data-folded="0">`）。
 - c-grok-web 的共享 `NativeLabel` 守卫、按原生名分发的 grok presenter、grok 渲染卡测试
   全部保留并通过。
+- `web/tests/e2e/__screenshots__/1b-session-390.png` 是 write-only golden（`design-align-1b`
+  只写不比、仅在 chromium 截图）：D-041 后 390px 下 TaskManager spill 的工具卡已折成一行，
+  该 golden 内容已过期；本任务不刷新它（owner 属 design-align，且 mobile-webkit 下它本就不跑）。
+- round-4：D-041 折行现在与 in-transcript search 打通——当前 search hit 落在某张已折叠普通卡时
+  （含 compact-fold 子卡，`hitChildId === child.id`），该卡自动展开（`expandedTools.has(id) ||
+  searchCurrent`），与 CompactFold/SubagentFolds 既有的 hit 自动展开一致；单测覆盖
+  「折叠卡成为当前 search hit 后展开、清空后回到折叠默认」。此前这导致
+  `session-virtual.spec.ts` 的 batch-E 搜索用例在 mobile-webkit 下找不到藏在折行里的 result
+  文本，属于真实回归（已修）。
 - 全量 hub e2e 跑过一次（协调人修订前的版本）：唯一失败为 `ux-code` 的剪贴板权限环境 flake，
   隔离重跑 2/2 通过；修订后再次跑全量（见交付说明）。

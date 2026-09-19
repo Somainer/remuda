@@ -82,17 +82,19 @@ ux-chrome.hub.spec.ts 写入）：
 - `ux2026-chrome-1-390.png` — 390 收起态（**touch 上下文**；无 touch 布局相同，
   不另存，避免两次写同名文件互相覆盖）：单芯片入主行、Stop/分段/⋯ 在屏。
 - `ux2026-chrome-1-1440.png` — 1440 **收起**态：host + cost 在主行，运行详情收起。
-- `ux2026-chrome-1-1440-open.png` — 1440 **展开**态：driver/seq/connectivity/native 可读。
+- `ux2026-chrome-1-1440-open.png` — 1440 **展开**态：driver/seq/connectivity 可读
+  （native 仅在会话带 nativeRef 时才列出，本夹具没有该字段，故图中不出现；
+  disclosure 可容纳的完整字段清单见上文 1440px 一节）。
 - `ux2026-chrome-1-1440-reopen.png` — reload 后持久化的重开展开态（独立文件名，
   不覆盖收起 golden）。
 
 ## 测试
 
-- 新增 vitest `src/pages/SessionPage.chrome.test.tsx`（6 例）：桌面主行元素 +
+- 新增 vitest `src/pages/SessionPage.chrome.test.tsx`（7 例，其中 badge 用例 it.each 覆盖拥挤手机与 coarse compact-but-wide 两个分支）：桌面主行元素 +
   details 默认收起；手机 chips 折叠 + ⋯ sheet 只含三项且不含分段/Stop + 文件可经
   sheet 导航；767px 无 touch 的 compact 宽窗仍内联三按钮；**摘要 N 与实际渲染字段
-  数一致（desktop/compact 各一遍）**；**compact 下 provenance/promotion 只在
-  disclosure 里渲染一次**；展开态跨 remount 持久化。
+  数一致（desktop/compact 各一遍）**；**compact（含 coarse compact-but-wide）下 provenance/promotion 各只
+  在 disclosure 里渲染一次（promoted 夹具同时断言 promoted-badge）**；展开态跨 remount 持久化。
 - 新增 hub e2e `ux-chrome.hub.spec.ts`（2 例）：
   1. 390px 在 **hasTouch 与无 touch** 两种上下文断言：索引路由整条 chips 仍在；
      `/s/:id*` per-space chips 缺席而 header 单芯片在且开同一个抽屉；⋯ 内三项可达、
@@ -116,7 +118,7 @@ ux-chrome.hub.spec.ts 写入）：
   未改：`spaces-chips` / `spaces-drawer-open` testid 在折叠芯片上保留，抽屉行为
   逐字节复用 `SpacesMobile` 原实现。
 
-`pnpm --dir web test` 全绿（1193 例）；typecheck/lint 干净。
+`pnpm --dir web test` 全绿（1194 例）；typecheck/lint 干净。
 
 ### Mock Playwright 套件（web/playwright.config.ts，chromium + mobile-webkit 两 project）
 

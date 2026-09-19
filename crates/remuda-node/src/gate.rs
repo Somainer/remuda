@@ -1842,7 +1842,7 @@ mod tests {
     /// removed — and reports its real sha. The commit is left unreferenced, so
     /// only the runner's own pin can keep it alive.
     const PASSING_REAL_MERGE_SCRIPT: &str = r#"
-scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
 echo '{"name":"cargo-test","status":"ok","durationMs":22,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 base=$(git rev-parse main)
 # The shared fixture's branch points at main, so give it a commit of its own;
@@ -1865,7 +1865,7 @@ JSON
 "#;
 
     const PASSING_SCRIPT: &str = r#"
-scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 echo '{"name":"cargo-test","status":"ok","durationMs":22,"attempts":1,"retried":false}' >> "$scratch/gate.jsonl"
 echo 'gate: secret-scan' >&2
@@ -1880,7 +1880,7 @@ JSON
 
     const FAILING_CARGO_TEST_SCRIPT: &str = r#"
 set +e
-scratch=$(mktemp -d "/tmp/remuda-mq-fake.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/remuda-mq-fake.XXXXXX")
 echo '{"name":"secret-scan","status":"ok","durationMs":11,"attempts":1,"retried":false}' > "$scratch/gate.jsonl"
 emit_fail() {
     echo 'gate: cargo-test' >&2
@@ -2127,6 +2127,110 @@ JSON
         assert!(
             streamed.iter().any(|name| name == "cargo-test"),
             "{streamed:?}"
+        );
+    }
+
+    /// Regression for hosts where the coordinator exports `TMPDIR` outside
+    /// `/tmp` (the shared build host): the fake gate must flush its report
+    /// under `$TMPDIR` — the same root the runner's `std::env::temp_dir()`
+    /// tailer scans — or no Step events stream. Process-env mutation is
+    /// forbidden workspace-wide, so re-exec this binary with TMPDIR redirected
+    /// to a private scratch dir and run the ignored inner test there.
+    #[test]
+    fn step_streaming_honours_a_redirected_tmpdir() {
+        let scratch = TempDir::new().expect("private TMPDIR");
+        let exe = std::env::current_exe().expect("test binary");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "gate::tests::verify_streams_steps_with_redirected_tmpdir",
+                "--ignored",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("TMPDIR", scratch.path())
+            .output()
+            .expect("re-exec the gate streaming test under a redirected TMPDIR");
+        assert!(
+            output.status.success(),
+            "gate step streaming broke under a redirected TMPDIR\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // Guard against the inner test silently not running.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "the inner TMPDIR streaming test did not run: {stdout}"
+        );
+    }
+
+    /// Inner half of [`step_streaming_honours_a_redirected_tmpdir`]: runs in a
+    /// re-exec'd process whose TMPDIR is a private, non-`/tmp` directory. The
+    /// gate child inherits it through `host_env_snapshot`, so the fake gate's
+    /// mktemp and the in-process report tailer must resolve the same root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "re-exec'd by step_streaming_honours_a_redirected_tmpdir with TMPDIR redirected"]
+    async fn verify_streams_steps_with_redirected_tmpdir() {
+        let tmpdir = std::env::var_os("TMPDIR").expect("outer test must export TMPDIR");
+        assert_ne!(
+            std::path::Path::new(&tmpdir),
+            std::path::Path::new("/tmp"),
+            "the regression needs a TMPDIR that is not /tmp"
+        );
+        assert_eq!(
+            std::env::temp_dir(),
+            std::path::PathBuf::from(&tmpdir),
+            "the report tailer scans $TMPDIR"
+        );
+
+        let fixture = fixture(PASSING_SCRIPT);
+        let mut events = fixture.node.gate_registry().subscribe();
+        let result = fixture
+            .node
+            .run_gate_typed(params(&fixture, "verify"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status,
+            "passed",
+            "{}",
+            result.error.unwrap_or_default()
+        );
+        let mut streamed = Vec::new();
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_millis(300), events.recv()).await
+        {
+            if let GateEventKind::Step { step } = event.kind {
+                streamed.push(step.name);
+            }
+        }
+        assert!(
+            !streamed.is_empty(),
+            "no steps streamed under the redirected TMPDIR: {streamed:?}"
+        );
+        assert!(
+            streamed.iter().any(|name| name == "cargo-test"),
+            "{streamed:?}"
+        );
+
+        // The fake gate's scratch really landed under $TMPDIR, not hardcoded
+        // back under /tmp.
+        let scratches = std::fs::read_dir(&tmpdir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("remuda-mq-fake.")
+                    && entry.path().join("gate.jsonl").is_file()
+            })
+            .count();
+        assert!(
+            scratches > 0,
+            "the fake gate must flush gate.jsonl under $TMPDIR"
         );
     }
 

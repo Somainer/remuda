@@ -799,6 +799,47 @@ describe("Composer mobile options trigger (D-042)", () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it("does not call onInterrupt when ok is clicked after interrupt becomes unsupported", async () => {
+    const user = userEvent.setup();
+    const onInterrupt = vi.fn();
+    const { rerender } = render(
+      <Composer
+        instanceId="ins_intlate"
+        mobile={false}
+        onSend={vi.fn()}
+        onInterrupt={onInterrupt}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    // Open the Esc 打断 confirm.
+    await user.click(screen.getByTestId("composer-input"));
+    await user.keyboard("{Escape}");
+    const dialog = screen.getByTestId("composer-confirm");
+    expect(dialog).toBeInTheDocument();
+    expect(screen.getByTestId("composer-confirm-title")).toHaveTextContent("打断当前 turn");
+    // Phase stays working (so the auto-dismiss effect does NOT fire), but the
+    // live snapshot loses the interrupt capability. Clicking ok must re-check
+    // the ref and not cancel.
+    rerender(
+      <Composer
+        instanceId="ins_intlate"
+        mobile={false}
+        onSend={vi.fn()}
+        onInterrupt={onInterrupt}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap("unsupported"), queue: cap() })}
+      />,
+    );
+    expect(dialog).toBeInTheDocument();
+    await user.click(screen.getByTestId("composer-confirm-ok"));
+    expect(onInterrupt).not.toHaveBeenCalled();
+  });
+
   it("uses a plain placeholder on phones and keeps the shortcut hint on desktop", () => {
     const { rerender } = render(
       <Composer instanceId="ins_m4" mobile onSend={vi.fn()} />,

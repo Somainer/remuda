@@ -12,6 +12,7 @@ import {
   installedCli,
   isStaleOffline,
   sortHostsOnlineFirst,
+  supportedHarnessKinds,
   type HostCli,
   type Placement,
 } from "./model";
@@ -121,15 +122,26 @@ describe("computer-use host capability row (D-045 §3.4)", () => {
     expect(absentHost, "a fixture reports it absent").toBeTruthy();
   });
 
-  it("cannot turn the capability row into a launchable harness kind", () => {
-    // New Session derives `supportedKinds` from installedCli and tests
-    // membership against the harness ids. `computer-use` is not one of them,
-    // so the row may appear in the list without ever enabling a kind — the
-    // reason this capability is a host fact and not a launch option here.
-    const kinds = installedCli(HOST_FIXTURES.flatMap((host) => host.cli)).map((entry) => entry.kind);
-    expect(kinds).toContain(COMPUTER_USE_KIND);
-    for (const harness of ["claude", "codex", "grok", "agy", "terminal"]) {
-      expect(harness).not.toBe(COMPUTER_USE_KIND);
-    }
+  it("never turns the capability row into a launchable harness kind", () => {
+    // The regression this pins: New Session reads a *non-empty* supported
+    // list as "the host told us what it has" and stops falling back to
+    // claude. If the capability row counted, a host with the vendor client
+    // but no agent CLI on PATH would render every kind disabled.
+    const capabilityOnly: HostCli[] = [
+      { kind: COMPUTER_USE_KIND, version: "2.7.0", path: "/home/x/client", auth: "unknown", installed: true },
+    ];
+
+    expect(supportedHarnessKinds(capabilityOnly)).toEqual([]);
+    expect(supportedHarnessKinds(HOST_FIXTURES.flatMap((host) => host.cli)))
+      .not.toContain(COMPUTER_USE_KIND);
+
+    // The two states a real host actually presents, end to end.
+    const mixed: HostCli[] = [
+      ...capabilityOnly,
+      { kind: "claude", version: "2.1.268", path: "/usr/bin/claude", auth: "logged_in" },
+    ];
+    expect(supportedHarnessKinds(mixed)).toEqual(["claude"]);
+    expect(supportedHarnessKinds([])).toEqual([]);
+    expect(supportedHarnessKinds(undefined)).toEqual([]);
   });
 });

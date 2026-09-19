@@ -457,6 +457,8 @@ fn create_from_params(node: &DevNode, params: &Value) -> Result<CreateInstanceRe
         effort: None,
         tui: None,
         extra_env: std::collections::BTreeMap::new(),
+
+        capabilities: Default::default(),
     };
     request.apply_spec_launch_fields(spec);
     Ok(request)

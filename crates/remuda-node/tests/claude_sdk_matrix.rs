@@ -61,6 +61,7 @@ fn create_req(kind: AgentKind, driver: DriverKind) -> CreateInstanceRequest {
         effort: None,
         tui: None,
         extra_env: std::collections::BTreeMap::new(),
+        capabilities: Default::default(),
     }
 }
 

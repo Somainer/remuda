@@ -94,6 +94,8 @@ async fn capture_model_pin_evidence() {
             resume_session_id: None,
             resumed_from: None,
             effort: None,
+
+            capabilities: Default::default(),
         })
         .await
         .expect("create instance");

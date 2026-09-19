@@ -5,6 +5,7 @@ use remuda_protocol::{
     WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 fn default_agent_kind() -> AgentKind {
     AgentKind::Claude
@@ -148,6 +149,11 @@ pub struct CreateInstanceRequest {
     /// same deny list as the Node-wide env before launch.
     #[serde(default, rename = "extraEnv")]
     pub extra_env: std::collections::BTreeMap<String, String>,
+    /// Per-launch host capabilities explicitly granted by a human or bot
+    /// (`["computer-use"]`; D-045). Empty by default; the materializer refuses
+    /// unknown values. Never inherited or implied by installed host software.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 impl CreateInstanceRequest {
@@ -266,6 +272,18 @@ impl CreateInstanceRequest {
                 {
                     self.extra_env.insert(key.clone(), text.to_owned());
                 }
+            }
+        }
+        // D-045: the per-launch grant rides the Hub-stored spec verbatim. An
+        // older Hub omits the field, which reads as "no grant" — never as one.
+        if let Some(capabilities) = spec.get("capabilities").and_then(Value::as_array) {
+            let copied = capabilities
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !copied.is_empty() {
+                self.capabilities = copied;
             }
         }
     }

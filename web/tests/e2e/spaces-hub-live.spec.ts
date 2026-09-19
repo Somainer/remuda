@@ -245,8 +245,12 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
     await screenshot(page, "desktop-light.png", "ledger");
 
     await page.setViewportSize({ width: 400, height: 860 });
+    // D-049: on the compact /s/:id route the full chips strip is folded into
+    // the one header space chip (same spaces-chips wrapper testid) and the
+    // SpaceTabs row does not render at all; the header chip's drawer keeps
+    // the switching capability.
     await expect(page.getByTestId("spaces-chips")).toBeVisible();
-    await expect(strip).toBeVisible();
+    await expect(strip).toHaveCount(0);
     await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
     await screenshot(page, "phone-light.png", "ledger");
     await screenshot(page, "phone-dark.png", "night");
@@ -255,8 +259,11 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
     await screenshot(page, "phone-drawer-dark.png", "night");
     await space(page, secondary.id).click();
     await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
-    await expect(tab(page, other.instanceId)).toHaveAttribute("aria-selected", "true");
-    await expect(tab(page, first.instanceId)).toHaveCount(0);
+    // The drawer replaces the tabs row as the switcher: picking the other
+    // project navigates to its active session, and the tabs row stays gone
+    // on the compact session route (isolation still holds via the URL).
+    await expect(page).toHaveURL(new RegExp(`/s/${other.instanceId}(?:$|[/?])`));
+    await expect(strip).toHaveCount(0);
     const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }));
     expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
 

@@ -920,11 +920,119 @@ async fn handle_frame(inner: &Inner, frame: Outbound) -> DriverResult<()> {
     {
         return handle_can_use_tool(inner, env, req).await;
     }
+    // D-045 §6.2: stage tool-result images BEFORE taking the mapper lock. The
+    // staging bridge parks until the Hub answers; running it on a blocking
+    // thread keeps the tokio worker (and every other frame) moving.
+    let frame = prefold_user_frame(inner, frame).await?;
     let observations = {
         let mut mapper = inner.mapper.lock().await;
         map_outbound(&mut mapper, &frame)?
     };
     emit_all(inner, observations).await
+}
+
+/// Whether a user frame carries a tool_result whose content (or mirrored
+/// sidecar) still contains data-bearing image items.
+fn frame_needs_prefold(frame: &Outbound) -> bool {
+    let Outbound::User(msg) = frame else {
+        return false;
+    };
+    let blocks = match &msg.message.content {
+        UserContent::Blocks(blocks) => blocks.as_slice(),
+        UserContent::Text(_) => return false,
+    };
+    if blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        .any(|block| value_has_unfolded_image(block.get("content")))
+    {
+        return true;
+    }
+    value_has_unfolded_image(msg.tool_use_result.as_ref())
+}
+
+/// Depth-first presence check for an image item with inline data that was not
+/// already folded (no `remudaMedia` flag).
+fn value_has_unfolded_image(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("image")
+                && !map
+                    .get("remudaMedia")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                && (map.get("data").and_then(Value::as_str).is_some()
+                    || map
+                        .get("source")
+                        .and_then(Value::as_object)
+                        .and_then(|source| source.get("data"))
+                        .and_then(Value::as_str)
+                        .is_some())
+            {
+                return true;
+            }
+            map.values()
+                .any(|child| value_has_unfolded_image(Some(child)))
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(|child| value_has_unfolded_image(Some(child))),
+        _ => false,
+    }
+}
+
+/// Fold a frame's tool-result images off the async runtime, replacing native
+/// content with folded markers and scrubbing the `toolUseResult` mirror.
+async fn prefold_user_frame(inner: &Inner, frame: Outbound) -> DriverResult<Outbound> {
+    if !frame_needs_prefold(&frame) {
+        return Ok(frame);
+    }
+    let stager = {
+        let mapper = inner.mapper.lock().await;
+        mapper.media_stager.clone()
+    };
+    let Some(stager) = stager else {
+        // No object route: the synchronous mapper produces the honest text
+        // fallbacks; there is nothing to park on.
+        return Ok(frame);
+    };
+    tokio::task::spawn_blocking(move || prefold_blocking(frame, stager.as_ref()))
+        .await
+        .map_err(|error| {
+            DriverError::CarrierUnavailable(format!("tool-media staging task panicked: {error}"))
+        })?
+}
+
+fn prefold_blocking(
+    mut frame: Outbound,
+    stager: &dyn remuda_protocol::ToolMediaStager,
+) -> DriverResult<Outbound> {
+    let Outbound::User(msg) = &mut frame else {
+        return Ok(frame);
+    };
+    let mut outcomes = Vec::new();
+    if let UserContent::Blocks(blocks) = &mut msg.message.content {
+        for block in blocks.iter_mut() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(content) = block.get("content") else {
+                continue;
+            };
+            let folded = remuda_protocol::fold_tool_result(Some(content), Some(stager));
+            outcomes.extend(folded.images.iter().cloned());
+            block["content"] = serde_json::json!({
+                remuda_protocol::FOLDED_MARKER: folded.blocks,
+            });
+        }
+    }
+    if let Some(sidecar) = msg.tool_use_result.as_mut() {
+        remuda_protocol::sanitize_tool_result_sidecar(sidecar, &outcomes);
+    }
+    Ok(frame)
 }
 
 async fn handle_can_use_tool(
@@ -1201,14 +1309,23 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                         // Image items (an MCP screenshot, say) stage their
                         // bytes through the Node's object endpoint and ride as
                         // `objectId` references; unstageable ones degrade to a
-                        // text block naming media type and size. D-045 §6.2:
-                        // never inline the content array (its base64) into the
-                        // journal — the previous `to_string()` did exactly
-                        // that.
-                        let blocks = remuda_protocol::tool_result_content_blocks(
+                        // text block naming media type and size. In production
+                        // the frame is pre-folded on a blocking thread, so this
+                        // call is a cheap marker deserialization there. D-045
+                        // §6.2: never inline the content array (its base64)
+                        // into the journal — the previous `to_string()` did
+                        // exactly that.
+                        let folded = remuda_protocol::fold_tool_result(
                             block.get("content"),
                             mapper.media_stager.as_deref(),
                         );
+                        // Claude mirrors the content array into toolUseResult;
+                        // scrub any mirrored image data (idempotent when the
+                        // prefold pass already did it).
+                        let mut sanitized_sidecar = msg.tool_use_result.clone();
+                        if let Some(sidecar) = sanitized_sidecar.as_mut() {
+                            remuda_protocol::sanitize_tool_result_sidecar(sidecar, &folded.images);
+                        }
                         // A backgrounded (or build-deferred) subagent's launch
                         // tool_result is written *immediately* with
                         // `toolUseResult.isAsync`; the real completion arrives
@@ -1240,8 +1357,8 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                                 } else {
                                     ToolOutcome::Succeeded
                                 },
-                                blocks,
-                                structured_result: match msg.tool_use_result.clone() {
+                                blocks: folded.blocks,
+                                structured_result: match sanitized_sidecar {
                                     Some(value) => Knowledge::Known { value },
                                     None => Knowledge::NotApplicable,
                                 },

@@ -209,6 +209,18 @@ impl DriverFactory for NativeClaudeFactory {
     }
 
     fn build(&self, launch: DriverLaunch) -> Result<Arc<dyn Driver>, DriverError> {
+        // D-045 gate 2, Node half: the CLI/Hub preflight is advisory over the
+        // wire; this is the boundary that actually controls materialization.
+        // Runs before any launch dir or home is written.
+        if launch
+            .request
+            .capabilities
+            .iter()
+            .any(|value| value == crate::computer_use::CAPABILITY_COMPUTER_USE)
+        {
+            crate::computer_use::host_preflight(&launch.request.kind)
+                .map_err(|error| DriverError::Failed(error.to_string()))?;
+        }
         let instance_dir = self
             .config
             .data_dir
@@ -253,6 +265,23 @@ impl DriverFactory for NativeClaudeFactory {
                 .claude_native_home
                 .clone()
                 .unwrap_or_else(|| instance_dir.join("native-home"))
+        };
+        // D-045 §3.1/§3.3: a granted codex launch on a non-shell-pty carrier
+        // reads its `[mcp_servers]` from the shadow `<launch_dir>/codex-home`;
+        // shell-pty codex gets that home via HookSession regardless. Point
+        // CODEX_HOME at the shadow home here so the materialized config is
+        // actually read. Nothing else writes that home for these carriers.
+        let native_home = if launch.request.kind == remuda_protocol::AgentKind::Codex
+            && self.kind != DriverKind::ShellPty
+            && launch
+                .request
+                .capabilities
+                .iter()
+                .any(|value| value == crate::computer_use::CAPABILITY_COMPUTER_USE)
+        {
+            launch_dir.join("codex-home")
+        } else {
+            native_home
         };
         #[cfg(target_os = "macos")]
         if matches!(
@@ -439,6 +468,13 @@ impl DriverFactory for NativeClaudeFactory {
                                 _ => None,
                             },
                             origin: launch.request.origin.into(),
+                            // D-045: the managed-home answer is per kind. The
+                            // shadow homes codex/grok get are always managed;
+                            // claude's is managed unless the operator home is
+                            // inherited (the `inherit_default_config` flag is a
+                            // claude-specific answer and reads wrong for codex).
+                            native_home_managed: kind != remuda_protocol::AgentKind::Claude
+                                || !inherit_default_config,
                             settings_overlay: overlay.clone(),
                         };
                         ShellPtyOptions::agent(launch.workspace_root.clone(), kind, agent)
@@ -1489,6 +1525,7 @@ fn instance_spec(
             store_id: object_id()?,
         },
         carrier,
+        capabilities: launch.request.capabilities.clone(),
         required_capabilities: Vec::new(),
         completion_scope: CompletionScope::NativeTurn,
         parent: None,
@@ -1678,6 +1715,8 @@ mod tests {
                 effort: None,
                 tui: None,
                 extra_env: std::collections::BTreeMap::new(),
+
+                capabilities: Default::default(),
             };
             registry
                 .build(
@@ -1880,6 +1919,8 @@ mod tests {
                 effort: None,
                 tui: None,
                 extra_env: std::collections::BTreeMap::new(),
+
+                capabilities: Default::default(),
             };
             let driver = registry
                 .build(
@@ -2124,6 +2165,8 @@ mod tests {
                 resumed_from: None,
                 effort: None,
                 tui: None,
+
+                capabilities: Default::default(),
             };
             let launch = DriverLaunch {
                 instance,
@@ -2179,6 +2222,8 @@ mod tests {
             resumed_from: None,
             effort: None,
             tui: None,
+
+            capabilities: Default::default(),
         };
         let launch = DriverLaunch {
             instance,
@@ -2225,6 +2270,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -2277,6 +2324,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         registry
             .build(
@@ -2332,6 +2381,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -2513,6 +2564,8 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -2870,6 +2923,7 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+            capabilities: Default::default(),
         }
     }
 }

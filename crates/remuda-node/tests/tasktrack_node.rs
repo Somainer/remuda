@@ -151,6 +151,8 @@ async fn start_in(root: PathBuf, _dir: Option<tempfile::TempDir>) -> Run {
         resume_session_id: None,
         resumed_from: None,
         effort: None,
+
+        capabilities: Default::default(),
     };
 
     let created = node

@@ -426,6 +426,8 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
+
+            capabilities: Default::default(),
         },
     };
     // Honour the requested product or refuse it. An unrecognized kind/driver is

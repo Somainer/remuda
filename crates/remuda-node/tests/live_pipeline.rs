@@ -196,6 +196,8 @@ async fn start_run(hooks: bool) -> LiveRun {
         resume_session_id: None,
         resumed_from: None,
         effort: None,
+
+        capabilities: Default::default(),
     };
     let created = node
         .create_instance(request)

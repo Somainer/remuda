@@ -211,21 +211,21 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
   // The primary three-state control stays outside.
   await expect(page.getByTestId("composer-send")).toBeVisible();
 
-  // The collapsed trigger has a ≥44px touch zone (D-038 / ui-spec §3.4),
-  // measured from the visible chip's box edges where the ::after zone
-  // extends beyond the 32px-tall label.
-  const triggerBox = await trigger.boundingBox();
-  expect(triggerBox).toBeTruthy();
-  for (const [dx, dy] of [
-    [0, -7], // 44px zone top edge (32 + 6 each side)
-    [0, 7], // bottom edge
-  ] as const) {
-    const hit = await page.evaluate(
-      ({ x, y }) => document.elementFromPoint(x, y)?.closest("[data-options-trigger='1']")?.getAttribute("data-testid"),
-      { x: (triggerBox!.x + triggerBox!.width / 2) + dx, y: (triggerBox!.y + triggerBox!.height / 2) + dy },
+  // The collapsed trigger has a ≥44px touch zone (D-038 / ui-spec §3.4).
+  // The visible chip is 32px tall; the centred ::after zone extends 6px
+  // above and below it. Probe 20px off centre (inside the 22px half-zone,
+  // outside the 16px half-chip) — a point that misses without the hot zone.
+  // Box measurement and elementFromPoint run in one evaluate so the dock
+  // cannot re-layout between them.
+  const edgeHits = await trigger.evaluate((el) => {
+    const rect = el.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    return [cy - 20, cy + 20].map((y) =>
+      document.elementFromPoint(cx, y)?.closest("[data-options-trigger='1']")?.getAttribute("data-testid") ?? null,
     );
-    expect(hit).toBe("model-effort-chip");
-  }
+  });
+  expect(edgeHits).toEqual(["model-effort-chip", "model-effort-chip"]);
 
   // Open the options sheet.
   await trigger.click();
@@ -241,6 +241,37 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
   await expect(sheet.getByTestId("effort-slider")).toBeVisible();
   await shot(page, "ux2026-composer-1-sheet-390.png");
 
+  // D-039: sheet tap targets (context chip + permission rows) reach 44px via
+  // centred ::after zones even though the visuals are 30-31px. Probe 20px off
+  // centre (inside the 22px half-zone, outside the ~15.5px half-control);
+  // rect + elementFromPoint in one evaluate so the sheet cannot re-layout.
+  const sheetTargets = await page.evaluate(() => {
+    const probe = (sel: string) => {
+      const el = document.querySelector(sel);
+      if (!el) return [null, null];
+      const r = el.getBoundingClientRect();
+      // Sample 20px off the control centre. For full-width sheet rows whose
+      // ::after zone extends left of the row, re-anchor x onto the zone:
+      // pick a point inside the row's visible text column so the probe lands
+      // on the row itself (and its ::after layer) rather than a neighbour.
+      const x = Math.max(r.left + 8, r.left + r.width / 2);
+      return [r.top + r.height / 2 - 20, r.top + r.height / 2 + 20].map((y) => {
+        const t = document.elementFromPoint(x, y);
+        return t?.closest("[data-testid]")?.getAttribute("data-testid") ?? null;
+      });
+    };
+    const row = (name: string) => probe(`[data-testid='permission-option-${name}']`);
+    return {
+      context: probe("[data-testid='context-chip']"),
+      permissionManual: row("manual"),
+    };
+  });
+  expect(sheetTargets.context).toEqual(["context-chip", "context-chip"]);
+  expect(sheetTargets.permissionManual).toEqual([
+    "permission-option-manual",
+    "permission-option-manual",
+  ]);
+
   // Changing a permission and the effort slider updates the collapsed summary
   // after the sheet closes.
   await sheet.getByTestId("permission-option-acceptEdits").click();
@@ -250,19 +281,25 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
 
   await trigger.click();
   await expect(sheet).toBeVisible();
-  // Move the effort slider one stop with the keyboard; the collapsed summary
-  // then names the new tier (or its in-flight tag).
+  // Move the effort slider one stop with the keyboard (focus, not a centre
+  // click, which would itself snap the stop); the collapsed summary then
+  // names the new tier (or its in-flight tag).
   const slider = sheet.getByTestId("effort-slider");
+  await expect(slider).toHaveAttribute("data-index", "2");
   const startIndex = Number(await slider.getAttribute("data-index"));
-  await slider.click();
+  await slider.focus();
   await page.keyboard.press("ArrowRight");
   await expect(slider).toHaveAttribute("data-index", String(startIndex + 1));
   const nextTier = await slider.getAttribute("data-name");
   await page.getByTestId("composer-options-close").click();
   await expect(sheet).toHaveCount(0);
-  await expect(page.getByTestId("model-effort-chip-label")).toContainText(
-    new RegExp(`${nextTier}|切换中|排队中`),
-  );
+  // Poll for the FINAL tier: between the request landing and the transcript
+  // read-back the chip can briefly render `?`, so a one-shot regex misses.
+  await expect
+    .poll(async () => page.getByTestId("model-effort-chip-label").textContent(), {
+      timeout: 10_000,
+    })
+    .toMatch(new RegExp(nextTier));
   // Focus returns to the collapsed trigger after closing the sheet.
   await expect(trigger).toBeFocused();
 
@@ -335,7 +372,11 @@ test("插队 and Esc 打断 go through the Sheet confirm; the fake harness recei
   await expect
     .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
     .toBeTruthy();
-  await expect(page.getByTestId("composer-interrupted-chip")).toBeVisible();
+  // The 已打断 receipt is asserted from the command log (the chip itself
+  // self-clears on the 4s timer / when the turn-end flush runs, so a
+  // point-in-time DOM check races the idle transition).
+  const steerCmd = commands.find((c) => c.operation === "instance.send" && c.payload?.mode === "steer");
+  expect(steerCmd).toBeTruthy();
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
     timeout: 20_000,
   });

@@ -25,7 +25,7 @@
 | 2 | 识别结果只写 textarea，任何路径不发送；`composing()` 守卫不被绕过 | 语音路径不合成任何键盘事件，只走 `setText`/`writeDraft`（打字的同一路径）；代码中无 `onSend`/`submitPrimary` 引用；`viewport.ts` 未改。vitest 与浏览器记录 C 均断言 `onSend` 零调用、草稿在识别后保持完整 |
 | 3 | 设置页写明不上传音频、无云转写、iPhone 用系统键盘听写；开关默认关、按设备持久化 | SettingsPage 新段含三句保证与逐字「iOS Safari 没有 SpeechRecognition（WebKit 未实现）」；key 同其他本地偏好存 localStorage；两个 settings 用例 |
 | 4 | 终端段不出现麦克风 | 终端段（`/tty`，含 generic-pty）不挂 composer dock；浏览器记录 A 切到 tty 后 `composer-voice` 计数为 0 |
-| 5 | 桌面 testid 与布局零变化 | Composer.tsx 的改动全部在 `mobile` 分支或新增节点内，桌面 JSX 一个字符未动；浏览器记录 D：1280px 下本分支与任务基线（`d464ea47`，Composer 文件与当前 `origin/main` 同版）的 `[data-testid=composer]` outerHTML **逐字节相同（各 1877B）**，控制 bar 子元素几何（x/y/w/h）也完全相同 |
+| 5 | 桌面 testid 与布局零变化 | Composer.tsx 的改动全部在 `mobile` 分支或新增节点内，桌面 JSX 一个字符未动；浏览器记录 D：1280px 下本分支与 rebase 后的 `origin/main`（`83ad6d8e`，其 Composer 文件与任务基 `d464ea47` 同版）的 `[data-testid=composer]` outerHTML **逐字节相同（各 1871B）**，控制 bar 子元素几何（x/y/w/h）也完全相同 |
 
 ## 3. iOS 限制声明（逐字进设置页）
 
@@ -35,7 +35,7 @@ iPhone 上「能说」= 系统键盘麦克风：听写产生的是普通 `input`
 
 ## 4. 手工验证记录（真实浏览器）
 
-**环境**：Google Chrome for Testing 153.0.8010.12（Playwright Chromium 修订 1243），headless，移动模拟 390×844 / touch / isMobile；被测应用为 mock 后端的 Vite dev server（`VITE_MOCK=1`，回环地址，不连任何主机）。桌面对照为同一二进制在 1280×800 下跑任务基线 `d464ea47` 的临时 worktree，两台 dev server 仅本机端口不同。
+**环境**：Google Chrome for Testing 153.0.8010.12（Playwright Chromium 修订 1243），headless，移动模拟 390×844 / touch / isMobile；被测应用为 mock 后端的 Vite dev server（`VITE_MOCK=1`，回环地址，不连任何主机）。桌面对照为同一二进制在 1280×800 下跑 `origin/main`（`83ad6d8e`）的临时 worktree，两台 dev server 仅本机端口不同。
 
 **关于音频路径的诚实说明**：该 Linux 沙箱没有麦克风、也没有到浏览器厂商语音服务的网络通路，因此**没有**经过真实的拾音 → 厂商识别；验证方式是在 document-start 注入一个与浏览器同形的 `SpeechRecognition`（同时占住标准与 webkit 两个构造器名），由它按真实事件面（`onresult` 的 `resultIndex` / `results[i].isFinal` / `results[i][0].transcript`，以及 `onend`）吐出 interim 与 final 事件。被测代码（`speech.ts` + Composer）走的是与真浏览器完全相同的事件路径；能力探测本身在未注入的真实 Chromium 上验证（两个构造器均存在）。
 
@@ -45,7 +45,7 @@ iPhone 上「能说」= 系统键盘麦克风：听写产生的是普通 `input`
   - **口授内容**：`总结一下今天的改动，不要发送`
   - **结果**：textarea 最终值逐字等于该短语（interim 被替换、未重复追加）。
   - **没有任何东西被发送**：识别结束后草稿原样保留，发送按钮未被识别路径调用；mock 后端下发送只有显式点「发送」这一个出口——手工点击该按钮后草稿才清空（证明清空来自显式发送，而非听写）。
-- **D. 桌面零差异**：1280×800 下本分支与基线 `d464ea47` 各新建一个会话、切结构段，字体就绪后抓取 composer DOM 与控制条子元素几何：outerHTML 逐字节相同（1877B），8 个直接子元素的 x/y/宽/高全部一致；两侧都没有 `composer-voice`。
+- **D. 桌面零差异**：1280×800 下本分支与 `origin/main`（`83ad6d8e`）各新建一个会话、切结构段，字体就绪后抓取 composer DOM 与控制条子元素几何：outerHTML 逐字节相同（1871B），8 个直接子元素的 x/y/宽/高全部一致；两侧都没有 `composer-voice`。（首次测量对的是更早的 `d464ea47` 基线；rebase 拉入 c-sessionchrome 后基线改为 `83ad6d8e`，6 字节差异全部来自该合并经 SessionPage 传入的新 props，本分支与新基线重测后逐字节一致，几何在两个基线下均一致。）
 
 上述检查由一个**未提交**的临时脚本驱动（留在任务 scratch 目录，不属于仓库），连续运行三次均为 20/20 通过。
 
@@ -53,10 +53,10 @@ iPhone 上「能说」= 系统键盘麦克风：听写产生的是普通 `input`
 
 ## 5. 自动化测试
 
-- `pnpm --dir web test`：**131 个文件 / 1246 个用例全部通过**；本任务新增 21 例：`speech.test.ts` 14 例、`ComposerVoice.test.tsx` 5 例、`SettingsPage.test.tsx` 2 例。
+- `pnpm --dir web test`：rebase 到 `origin/main`（`83ad6d8e`）后的集成树上 **132 个文件 / 1253 个用例全部通过**；本任务新增 21 例：`speech.test.ts` 14 例、`ComposerVoice.test.tsx` 5 例、`SettingsPage.test.tsx` 2 例。
 - `pnpm --dir web typecheck`：通过。
 - `pnpm --dir web lint`：仅存量 warning（`Transcript.tsx` / `SessionPage.tsx` 等既有文件），新增文件无新增告警。
-- hub e2e：未新增语音 e2e。`SpeechRecognition` 在 Chromium/headless 下不稳定且需要拾音与厂商服务，计划明确它**不是闸口断言**；能力缺失分支由单测与 §4-B 的浏览器手工记录覆盖。
+- hub e2e（全量，`HUB_E2E_LISTEN=127.0.0.1:59170 HUB_E2E_WEB_PORT=59179 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59171`，flock `e2e.lock-b`，PW_CHANNEL=chromium）：rebase 后的全量运行 147 个用例 → **129 passed / 16 skipped / 2 failed**（23.5m）。16 个 skipped 是各 spec 既有的环境条件 skip（与其它全量运行逐一同集合：new-session 12、hub-live/ux-attach-files/ux-comment/ux-wfdrill 各 1）。2 个红用例（`promoted-claude.hub.spec.ts:89`、`ux-code.hub.spec.ts:257`）失败时机器 load 19–33（同机另有多个会话的 cargo 构建与 root 的 playwright 在跑），错误形态均为 fake Hub 状态未在超时内到达（session 停在 `starting` / 工具栏几何），与本任务文件无涉；两例单独重跑 **2 passed**；另外单独重跑 ux-composer-mobile / ux-chrome / new-session / ux-touchhit 共 **12 passed**（含三条 composer 手机用例）。语音功能本身在 e2e 里恒为休眠（每个测试都是全新浏览器上下文，开关从不写入，麦克风不可能渲染）。本任务未新增 e2e；`SpeechRecognition` 在 headless Chromium 下不稳定且需拾音与厂商服务，按计划不作为闸口断言。
 
 ## 6. 边界与不做项
 

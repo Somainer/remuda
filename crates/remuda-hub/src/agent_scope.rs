@@ -733,6 +733,24 @@ mod tests {
     }
 
     #[test]
+    fn only_the_exact_hostcap_shape_is_an_agent_read_target() {
+        // D-045: the coordinator's pre-dispatch host read.
+        assert!(hostcap_read_target("/v1/hosts/hst_1/hostcap"));
+        // Operator-only host routes must NOT ride along: admitting them here
+        // would hand an agent the whole host row (cli[], workspaces, ssh) that
+        // `require_operator` exists to withhold. The handler still re-checks
+        // grant + scope, but the middleware must not widen them either.
+        assert!(!hostcap_read_target("/v1/hosts/hst_1"));
+        assert!(!hostcap_read_target("/v1/hosts"));
+        assert!(!hostcap_read_target("/v1/hosts/hst_1/doctor"));
+        assert!(!hostcap_read_target("/v1/hosts/hst_1/workspaces"));
+        assert!(!hostcap_read_target("/v1/hosts/hst_1/hostcap/extra"));
+        assert!(!hostcap_read_target("/v1/hosts//hostcap"));
+        // A different route with the same suffix is not it.
+        assert!(!hostcap_read_target("/v1/workers/wkr_1/hostcap"));
+    }
+
+    #[test]
     fn only_the_node_stage_shape_skips_the_device_middleware() {
         assert!(is_node_host_file_stage("/v1/hosts/hst_1/files/objects"));
         // The operator routes never match: only the exact objects segment.

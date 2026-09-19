@@ -2152,9 +2152,15 @@ async fn a_302_redirect_never_leaks_the_credential_to_the_target() -> Result<()>
                 Ok(pair) => pair,
                 Err(_) => return,
             };
-            target_hits_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut buf = vec![0; 4096];
             let _ = socket.read(&mut buf).await;
+            // Count only a request that actually carries the credential: on a
+            // shared CI host unrelated processes (e.g. a Go-http-client port
+            // probe) occasionally connect to the freshly bound ephemeral port
+            // with a token-less GET /, which says nothing about the relay.
+            if String::from_utf8_lossy(&buf).contains(PROFILE_TOKEN) {
+                target_hits_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             let _ = socket
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
                 .await;

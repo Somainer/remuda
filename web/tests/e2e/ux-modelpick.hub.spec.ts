@@ -92,6 +92,15 @@ async function clearApprovals(page: Page, instanceId: string) {
 
 async function openModelList(page: Page) {
   await page.keyboard.press("Escape").catch(() => undefined);
+  // D-042: Escape from the focused composer during a still-running turn now
+  // opens the in-app 打断 Sheet (no native dialog to auto-dismiss). If that
+  // defensive Escape surfaced it, cancel it so its scrim does not block the
+  // chip click below.
+  const strayConfirm = page.getByTestId("composer-confirm");
+  await strayConfirm.waitFor({ state: "attached", timeout: 300 }).catch(() => undefined);
+  if (await strayConfirm.count()) {
+    await strayConfirm.getByTestId("composer-confirm-cancel").click();
+  }
   await page.getByTestId("model-effort-chip").click();
   const open = page.getByTestId("effort-open-list");
   await open.waitFor({ state: "visible", timeout: 10_000 });

@@ -571,10 +571,12 @@ pub fn computer_use_plist_path(env: &ProbeEnv) -> PathBuf {
 /// `auth` is deliberately `unknown`: Remuda does not probe this vendor's
 /// login state at all.
 ///
-/// `installed` is plain path existence, per the contract table. The vendor
-/// client is macOS-only, so on a Linux host this resolves to `false` with no
-/// path for the honest reason that the bundle is not there — not because the
-/// probe refuses to look.
+/// `installed` means **an executable regular file exists at the probed path**
+/// — the same `is_executable` test the PATH probes use, not bare existence of
+/// anything at that name (a directory, or a non-executable file, is not a
+/// client). The vendor client is macOS-only, so on a Linux host this resolves
+/// to `false` with no path for the honest reason that no such file is there —
+/// not because the probe refuses to look.
 fn probe_computer_use(env: &ProbeEnv) -> CliEntry {
     let root = codex_home(env);
     let path = root.join(COMPUTER_USE_CLIENT);
@@ -602,11 +604,25 @@ fn probe_computer_use(env: &ProbeEnv) -> CliEntry {
     }
 }
 
+/// Largest `Info.plist` this probe will parse.
+///
+/// Real bundle plists are a few KB. The cap matters because the launch
+/// preflight calls [`collect_fresh`], which bypasses the TTL cache, so a large
+/// or hostile file at the bundle path would otherwise be parsed on every
+/// launch rather than once per 30 s.
+const MAX_PLIST_BYTES: u64 = 1024 * 1024;
+
 /// `CFBundleShortVersionString` from a plist, or `None`.
 ///
 /// `plist::Value::from_file` sniffs the format, so this handles the binary
 /// plists a real app bundle ships as well as a hand-written XML fixture.
+/// Files above [`MAX_PLIST_BYTES`] are skipped unread, costing the version
+/// but never the row: `installed` is the stat, not this read.
 fn plist_version(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_PLIST_BYTES {
+        return None;
+    }
     let value = plist::Value::from_file(path).ok()?;
     let bundle = value.as_dictionary()?;
     let version = bundle.get("CFBundleShortVersionString")?.as_string()?;
@@ -1410,6 +1426,45 @@ mod tests {
         let entry = computer_use(&snap);
         assert!(entry.installed, "presence is the stat, not the plist");
         assert!(entry.version.is_none());
+    }
+
+    /// An oversized plist is skipped unread — never parsed on every launch.
+    ///
+    /// The launch preflight calls `collect_fresh`, which bypasses the TTL
+    /// cache, so an unbounded parse here would run per launch rather than per
+    /// 30 s. The row must still report `installed`: the cap costs the version,
+    /// never the presence fact.
+    #[test]
+    fn computer_use_skips_an_oversized_plist_without_losing_the_row() {
+        let bin = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codex");
+        write_fake_bundle(&root, None, "#!/bin/sh\nexit 1\n");
+        let plist_path = root.join(COMPUTER_USE_PLIST);
+        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        // Valid XML, but far past the cap — a parser would still read it all.
+        let mut xml = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>9.9.9</string>"#,
+        );
+        while (xml.len() as u64) <= MAX_PLIST_BYTES {
+            xml.push_str("<key>padding</key><string>pad</string>");
+        }
+        xml.push_str("</dict></plist>");
+        std::fs::write(&plist_path, xml).unwrap();
+        assert!(std::fs::metadata(&plist_path).unwrap().len() > MAX_PLIST_BYTES);
+
+        let collector = Collector::new(env_for(bin.path(), home.path()), Duration::from_secs(30));
+        let snap = collector.snapshot(&config_with(&[], None));
+        let entry = computer_use(&snap);
+        assert!(
+            entry.version.is_none(),
+            "an oversized plist is skipped, not parsed"
+        );
+        assert!(
+            entry.installed,
+            "the cap costs the version, never the presence fact"
+        );
     }
 
     /// A binary plist (what a real app bundle ships) parses the same way.

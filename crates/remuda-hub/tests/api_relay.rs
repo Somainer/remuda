@@ -764,6 +764,13 @@ impl ProxyNode {
         self.node = None;
     }
 
+    /// Detach and return the live socket without dropping it. Lets a test hold
+    /// the superseded socket open until the replacement hello has landed, then
+    /// close it at a chosen instant.
+    fn take_link(&mut self) -> Option<NodeSocket> {
+        self.node.take()
+    }
+
     /// Frames received while the reconnect reader was waiting for the hello
     /// reply (api.egress can be queued ahead of the reply).
     fn take_pending(&mut self) -> Vec<Value> {
@@ -2891,6 +2898,125 @@ async fn a_rescoped_profile_is_not_redelivered_on_proxy_reconnect() -> Result<()
         revoke["params"].get("authToken"),
         None,
         "a revoke never carries the credential: {revoke}"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
+/// Round-4 item 4: a late-closing socket that has already been superseded by a
+/// newer link must not run link-loss teardown — otherwise it revokes the
+/// egress contexts the new link just installed and blocks live instances.
+#[tokio::test]
+async fn a_superseded_socket_drop_does_not_tear_down_the_new_link() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let (mut fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
+
+    // Bring up replacement B while the original A is still open: B supersedes
+    // A in the registry while A's session is still alive.
+    let old_link = proxy.take_link().context("initial proxy link")?;
+    proxy.reconnect(fixture.addr, "relay-proxy").await?;
+
+    // B must receive a fresh install (from the post-hello reinstall).
+    let mut seen = proxy.take_pending();
+    let already_installed = seen.iter().any(|frame| {
+        frame["method"] == json!("api.egress")
+            && frame["params"]["instanceId"] == json!(fixture.instance_id)
+            && frame["params"].get("revoke") != Some(&json!(true))
+    });
+    if !already_installed {
+        seen.extend(
+            collect_notifications(proxy.socket(), TIMEOUT, |frame| {
+                frame["method"] == json!("api.egress")
+                    && frame["params"]["instanceId"] == json!(fixture.instance_id)
+            })
+            .await?,
+        );
+    }
+    assert!(
+        seen.iter().any(|frame| {
+            frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+                && frame["params"].get("revoke") != Some(&json!(true))
+        }),
+        "the new link must receive a fresh install egress: {seen:?}"
+    );
+
+    // Close the superseded socket and give the Hub time to process its
+    // disconnect. Its teardown must not touch the new link's contexts.
+    drop(old_link);
+    let stray =
+        collect_notifications(proxy.socket(), Duration::from_millis(1200), |_| false).await?;
+    let stray_revokes = stray
+        .iter()
+        .filter(|frame| {
+            frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+                && frame["params"]["revoke"] == json!(true)
+        })
+        .count();
+    assert_eq!(
+        stray_revokes, 0,
+        "a superseded socket must not revoke the new link's contexts: {stray:?}"
+    );
+
+    // Proof the context survived: a new api.open is forwarded to B and ends
+    // normally instead of being refused for a missing egress context.
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_supersede", &messages_body()),
+    )
+    .await?;
+    let open = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(proxy.socket()).await?;
+            if frame["method"] == json!("api.open") {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+        }
+    })
+    .await??;
+    assert!(
+        open["params"]["streamId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("st_supersede")),
+        "api.open must reach the live proxy link: {open}"
+    );
+    send_json(
+        proxy.socket(),
+        json!({
+            "jsonrpc": "2.0", "method": "api.head",
+            "params": {"streamId": open["params"]["streamId"], "status": 200, "headers": []}
+        }),
+    )
+    .await?;
+    send_json(
+        proxy.socket(),
+        json!({
+            "jsonrpc": "2.0", "method": "api.end",
+            "params": {
+                "streamId": open["params"]["streamId"],
+                "bytesUp": 10, "bytesDown": 0, "ms": 1
+            }
+        }),
+    )
+    .await?;
+    let frames = collect_notifications(
+        &mut fixture.node,
+        TIMEOUT,
+        |frame| {
+            frame["params"]["streamId"] == json!("st_supersede")
+                && frame["params"].get("bytesDown").is_some()
+        },
+    )
+    .await?;
+    let end = frames_for(&frames, "st_supersede")
+        .into_iter()
+        .find(|p| p.get("bytesDown").is_some())
+        .context("st_supersede must terminate")?;
+    assert!(
+        end.get("error").is_none(),
+        "the stream must end normally after a superseded-socket drop: {end}"
     );
     gateway.shutdown().await;
     Ok(())

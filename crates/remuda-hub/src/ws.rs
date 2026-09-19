@@ -362,10 +362,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     fail_all_pending(&pending);
 
     if let Some(host_id) = host_id {
-        // D-048: tear down relay streams this link owned. A vanished proxy
-        // host ends streams with via-host-offline and blocks routed
-        // instances; a vanished worker host cancels the upstream legs.
-        state.api_relay.on_link_lost(&state, &host_id).await;
+        // Resolve session staleness first: if a newer link for this host has
+        // already registered (a reconnect that superseded this socket), its
+        // teardown must not wipe the contexts the live link just installed and
+        // block instances that are reachable again.
         let stale = match session_generation {
             Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
             None => {
@@ -374,6 +374,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             }
         };
         if stale {
+            // D-048: tear down relay streams this link owned. A vanished proxy
+            // host ends streams with via-host-offline and blocks routed
+            // instances; a vanished worker host cancels the upstream legs.
+            state.api_relay.on_link_lost(&state, &host_id).await;
             let _ = state.store.mark_host_offline(host_id).await;
         }
     }

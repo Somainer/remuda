@@ -163,6 +163,18 @@ fn attachment_read(path: &str) -> bool {
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+/// `GET /v1/hosts/{id}/hostcap` — the coordinator's pre-dispatch host read.
+///
+/// D-045: a launched coordinator is always Agent origin and always carries an
+/// instance id, and this route is its only host read (`GET /v1/hosts/{id}` is
+/// operator-only). Admitting the path does not loosen the handler: it still
+/// requires the `dispatch` grant and re-checks the caller's host scope.
+fn hostcap_read_target(path: &str) -> bool {
+    path.strip_prefix("/v1/hosts/")
+        .and_then(|rest| rest.strip_suffix("/hostcap"))
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// `GET /v1/projects` or `GET /v1/projects/{id}`; design §2.4.
 ///
 /// The handler still filters by the caller's scope and requires the
@@ -664,6 +676,13 @@ pub async fn restrict_agent_routes(
                     || project_read_target(path)
                     || task_read_target(request.method(), path)
                     || path == "/v1/instances"
+                    // D-045: `remuda hostcap` is the coordinator's pre-dispatch
+                    // host fact, and a launched coordinator is always agent
+                    // origin. `GET /v1/hosts/{id}` is operator-only, so this is
+                    // the only host read an agent may make; the handler still
+                    // requires the `dispatch` grant and re-checks scope, and it
+                    // now carries the capability block for exactly this caller.
+                    || hostcap_read_target(path)
                     || match read_target(path) {
                         Some(id) => owns(&state, &device, id).await?,
                         None => false,
@@ -711,6 +730,24 @@ mod tests {
         assert!(!is_auth_establishing("/v1/auth/passkeys"));
         // Listing/management are not auth-establishing either.
         assert!(!is_auth_establishing("/v1/devices"));
+    }
+
+    #[test]
+    fn only_the_exact_hostcap_shape_is_an_agent_read_target() {
+        // D-045: the coordinator's pre-dispatch host read.
+        assert!(hostcap_read_target("/v1/hosts/hst_1/hostcap"));
+        // Operator-only host routes must NOT ride along: admitting them here
+        // would hand an agent the whole host row (cli[], workspaces, ssh) that
+        // `require_operator` exists to withhold. The handler still re-checks
+        // grant + scope, but the middleware must not widen them either.
+        assert!(!hostcap_read_target("/v1/hosts/hst_1"));
+        assert!(!hostcap_read_target("/v1/hosts"));
+        assert!(!hostcap_read_target("/v1/hosts/hst_1/doctor"));
+        assert!(!hostcap_read_target("/v1/hosts/hst_1/workspaces"));
+        assert!(!hostcap_read_target("/v1/hosts/hst_1/hostcap/extra"));
+        assert!(!hostcap_read_target("/v1/hosts//hostcap"));
+        // A different route with the same suffix is not it.
+        assert!(!hostcap_read_target("/v1/workers/wkr_1/hostcap"));
     }
 
     #[test]

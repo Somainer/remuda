@@ -21,6 +21,12 @@ impl Entrypoint for HostcapArgs {
     fn enter(self, _context: super::registry::Context) -> anyhow::Result<i32> {
         block_on(async move {
             let client = self.hub.connect()?;
+            // One read. The capability block arrives inside this payload
+            // because it is the only host route an *agent*-origin caller may
+            // use: `GET /v1/hosts/{id}` is operator-only, and every `remuda`
+            // run from inside a launched coordinator carries
+            // `REMUDA_INSTANCE_ID`, so a second GET there would fail for the
+            // very callers this verb exists for.
             let value = client
                 .get(&format!("/v1/hosts/{}/hostcap", self.host))
                 .await?;

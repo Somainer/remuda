@@ -87,6 +87,7 @@ fn test_control(path: &Path) -> DaemonControl {
             hostname: Some("fixture-node".into()),
             herdr_socket_env: None,
             xdg_config_home: None,
+            codex_home: None,
         },
         Duration::from_secs(60),
     )

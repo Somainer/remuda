@@ -311,11 +311,26 @@ where
 }
 
 async fn spawn_hub() -> Result<Hub> {
+    spawn_hub_with_cli(None).await
+}
+
+/// Same fixture, with optional extra `cli[]` rows on the fake Node's heartbeat.
+///
+/// The capability cases need a Node that reports a `computer-use` row; the
+/// default fake Node advertises only claude, which is the "not reported" shape.
+async fn spawn_hub_with_cli(extra_cli: Option<Value>) -> Result<Hub> {
     let dir = tempfile::tempdir()?;
     let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
     let token = hub.mint_device_token("dispatch-cli").await?;
     let host = remuda_protocol::HostId::new().as_id().to_string();
     let workspace = remuda_protocol::WorkspaceId::new().as_id().to_string();
+    let mut cli = vec![json!({
+        "kind": "claude", "version": "0.0.0",
+        "absolutePath": "/usr/bin/claude", "authState": "unknown"
+    })];
+    if let Some(extra) = extra_cli {
+        cli.push(extra);
+    }
 
     let enroll = hub
         .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
@@ -336,7 +351,7 @@ async fn spawn_hub() -> Result<Hub> {
                     "labels": {"toolchain": "rust"},
                     "maxInstances": 8,
                     "resources": {"cpuCount": 8, "cpuPct": 3, "memPct": 10, "diskFreeGb": 200.0},
-                    "cli": [{"kind":"claude","version":"0.0.0","absolutePath":"/usr/bin/claude","authState":"unknown"}],
+                    "cli": cli,
                     "herdr": {"version": "0.9.0", "socket": "/tmp/fake.sock"},
                     "workspaces": [{"workspaceId": workspace, "hostId": host, "root": "/tmp/repo"}],
                     "workspaceRevision": 1,
@@ -609,6 +624,17 @@ async fn dispatch_retire_hostcap_cli_lifecycle() -> Result<()> {
     assert_eq!(cap["cores"], 8);
     assert_eq!(cap["diskFreeGb"], 200.0);
     assert_eq!(cap["activeWorkers"], 1);
+    // This fake node's `cli[]` holds only claude, so the capability row is
+    // "not reported" — never a claim that the host cannot do it. The `error`
+    // check matters: without it this assertion would also pass when the read
+    // itself failed, which is a different state with a different remedy.
+    assert_eq!(cap["computerUse"]["reported"], false);
+    assert!(cap["computerUse"].get("installed").is_none());
+    assert!(
+        cap["computerUse"].get("error").is_none(),
+        "an unreported row is not a read failure: {}",
+        cap["computerUse"]
+    );
     assert_eq!(cap["portBlocksInUse"][0]["block"], "58600-58609");
 
     // Retire a still-working worker without --force exits non-zero.
@@ -625,5 +651,107 @@ async fn dispatch_retire_hostcap_cli_lifecycle() -> Result<()> {
     let body: Value = serde_json::from_slice(&output.stdout)?;
     assert_eq!(body["worker"]["state"]["state"], "retired");
     assert_eq!(body["node"]["reclaimedBytes"], "2048");
+    Ok(())
+}
+
+// ── hostcap: the computer-use capability block ────────────────────────────
+//
+// The capability rides `/v1/hosts/{id}/hostcap` rather than a second read of
+// `GET /v1/hosts/{id}`, because that route is operator-only. These cases drive
+// the real path: a fake Node that reports the row, and — for the agent case —
+// a caller that carries `REMUDA_INSTANCE_ID`, which is how every `remuda` run
+// from inside a launched coordinator identifies itself.
+
+/// Install a `computer-use` row on a fake Node's heartbeat.
+fn installed_computer_use_row() -> Value {
+    json!({
+        "kind": "computer-use",
+        "version": "2.7.0",
+        "path": "/x/.codex/computer-use/SkyComputerUseClient",
+        "auth": "unknown",
+        "installed": true
+    })
+}
+
+/// `remuda hostcap` from inside a launched coordinator.
+///
+/// This is the caller the verb exists for, and the one the operator-only host
+/// route refuses: the run sets `REMUDA_INSTANCE_ID`, so the Hub classifies it
+/// as agent origin. It must still see the capability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostcap_reports_the_capability_to_an_agent_origin_caller() -> Result<()> {
+    let hub = spawn_hub_with_cli(Some(installed_computer_use_row())).await?;
+
+    // A claude instance holding `dispatch` is what an agent caller needs to
+    // reach this route at all (require_grant reads the instance's grants).
+    let body = json!({
+        "hostId": hub.host,
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "grants": ["dispatch"],
+    });
+    let client =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    let created = client
+        .post("/v1/instances", &body)
+        .await
+        .context("create instance")?;
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+
+    let mut all = vec![
+        "hostcap", &hub.host, "--hub", &hub.base, "--token", &hub.token,
+    ];
+    let output = std::process::Command::new(bin())
+        .args(all.drain(..))
+        .env("REMUDA_INSTANCE_ID", &instance_id)
+        .output()
+        .expect("run remuda");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cap: Value = serde_json::from_slice(&output.stdout)?;
+    // The capability, visible to the agent — and no error key, which is what
+    // the old second-GET implementation always produced for this caller.
+    assert_eq!(cap["computerUse"]["installed"], true, "{cap}");
+    assert_eq!(cap["computerUse"]["reported"], true, "{cap}");
+    assert_eq!(cap["computerUse"]["version"], "2.7.0", "{cap}");
+    assert!(
+        cap["computerUse"].get("error").is_none(),
+        "an agent caller must read the capability, not a refusal: {}",
+        cap["computerUse"]
+    );
+    // The capacity keys still ride the same payload.
+    assert_eq!(cap["cores"], 8);
+    Ok(())
+}
+
+/// The reported-installed path, from an ordinary operator caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hostcap_reports_an_installed_computer_use_row() -> Result<()> {
+    let hub = spawn_hub_with_cli(Some(installed_computer_use_row())).await?;
+    let output = run(&["hostcap", &hub.host], &hub);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let cap: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(cap["computerUse"]["reported"], true, "{cap}");
+    assert_eq!(cap["computerUse"]["installed"], true, "{cap}");
+    assert_eq!(cap["computerUse"]["auth"], "unknown", "{cap}");
+    assert!(cap["computerUse"].get("error").is_none(), "{cap}");
+    assert!(
+        cap["computerUse"]["path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("SkyComputerUseClient")),
+        "{cap}"
+    );
     Ok(())
 }

@@ -112,6 +112,39 @@ const cliHost = {
   ],
 };
 
+/**
+ * A host with the vendor Computer Use client installed but **no agent CLI on
+ * PATH** — the shape that broke New Session before the capability row was
+ * filtered out of the harness list.
+ */
+function renderWithCapabilityOnly() {
+  const capabilityOnly = {
+    ...host,
+    cli: [
+      {
+        kind: "computer-use",
+        version: "2.7.0",
+        path: "/home/devuser/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+        auth: "unknown" as const,
+        installed: true,
+      },
+    ],
+  };
+  vi.mocked(store.useHub).mockReturnValue({
+    ...store.hubStore.getSnapshot(), hosts: [capabilityOnly], workspaces: [workspace], instances: [],
+  });
+  renderAt(["/sessions/new"]);
+}
+
+it("still offers claude on a host whose only installed CLI is the computer-use client", () => {
+  // The regression: a non-empty supported list suppresses the claude
+  // fallback, so counting the capability row left every kind disabled and
+  // New Session with nothing selectable.
+  renderWithCapabilityOnly();
+  expect(screen.getByTestId("new-session-kind-claude")).toBeEnabled();
+  expect(screen.getByTestId("new-session-start")).toBeInTheDocument();
+});
+
 function renderWithCli(entries = ["/sessions/new"]) {
   vi.mocked(store.useHub).mockReturnValue({
     ...store.hubStore.getSnapshot(), hosts: [cliHost], workspaces: [workspace], instances: [],

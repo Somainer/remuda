@@ -19,6 +19,25 @@ const claudeCli = (auth: HostCli["auth"] = "unknown"): HostCli => ({
   auth,
 });
 
+/**
+ * The three states of the `computer-use` row (D-045 §3.4), so a fixture-backed
+ * view can exercise "yes", "no" and "not reported" side by side.
+ */
+const COMPUTER_USE_CLIENT =
+  "computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+
+/** A macOS host that has the vendor client. */
+const computerUseInstalled: HostCli = {
+  kind: "computer-use",
+  version: "2.7.0",
+  path: `/home/devuser/.codex/${COMPUTER_USE_CLIENT}`,
+  auth: "unknown",
+  installed: true,
+};
+
+/** A host whose Node looked and did not find it. */
+const computerUseAbsent: HostCli = { kind: "computer-use", auth: "unknown", installed: false };
+
 export const HOST_FIXTURES: HostView[] = [
   {
     id: "hst_01993ab0-0000-7000-8000-00000000b001" as Id,
@@ -34,6 +53,7 @@ export const HOST_FIXTURES: HostView[] = [
       claudeCli("logged_in"),
       { kind: "codex", version: "0.147.0", path: "/home/devuser/.local/bin/codex", auth: "unknown" },
       { kind: "grok", version: "1.0.30", path: "/usr/local/bin/grok", auth: "unknown" },
+      computerUseInstalled,
     ],
     labels: ["region:sg", "herdr", "gateway"],
     maxInstances: 8,
@@ -51,7 +71,7 @@ export const HOST_FIXTURES: HostView[] = [
     lastSeenAt: "2026-09-12T00:00:00.000Z",
     rttMs: 48,
     agentVersion: "0.1.0",
-    cli: [claudeCli("logged_out")],
+    cli: [claudeCli("logged_out"), computerUseAbsent],
     labels: ["region:cn", "herdr"],
     maxInstances: 4,
     instanceCount: 1,

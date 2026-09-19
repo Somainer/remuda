@@ -2,8 +2,10 @@ import { Fragment, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AddHostForm,
+  COMPUTER_USE_KIND,
   HostLaunchDefaults,
   HostProviderBinding,
+  absentCli,
   cliSummary,
   hostRegistry,
   installedCli,
@@ -142,6 +144,17 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
       .catch(() => setProfiles([]));
   }, [host.id]);
 
+  // The CLI table's rows, computed once so the placeholder guard and the map
+  // cannot disagree. Installed CLIs, plus the capability's absent row — the
+  // Node probe reports every agent CLI it looked for, so listing absent rows
+  // generally would give a claude-only host five empty 未安装 rows, while a row
+  // that vanishes entirely reads as if the host never answered (ui-spec §2.6).
+  const installedRows = installedCli(host.cli);
+  const absentCapabilityRows = absentCli(host.cli).filter(
+    (cli) => cli.kind === COMPUTER_USE_KIND,
+  );
+  const cliRows = installedRows.length + absentCapabilityRows.length;
+
   return (
     <div className={css.board} data-testid="host-detail">
       <div className={css.detail}>
@@ -217,8 +230,8 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
         <div>
           <div className={css.sectionLabel}>CLI · 按本机盘点，绝对路径 + 版本</div>
           <div className={css.cliTable}>
-            {installedCli(host.cli).length === 0 ? <div className={css.cliRow}>尚无盘点</div> : null}
-            {installedCli(host.cli).map((cli) => (
+            {cliRows === 0 ? <div className={css.cliRow}>尚无盘点</div> : null}
+            {installedRows.map((cli) => (
               <div key={`${cli.kind}:${cli.path}`} className={css.cliRow} data-testid="host-cli">
                 <span className={css.cliKind}>
                   {cli.kind}
@@ -231,15 +244,32 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
                   {cli.auth}
                 </span>
                 <span className={css.cliVer} data-testid="host-cli-flags">
-                  {cli.installed === false ? "未安装" : "已安装"}
+                  已安装
                   {cli.kind === "claude" ? ` · nativeGateway ${cli.nativeGateway || cli.auth === "gateway-native" ? "true" : "false"}` : ""}
                 </span>
+              </div>
+            ))}
+            {/* The capability's absent row. `installedCli` (correctly) drops
+                it — there is no path to print — but it still needs a row, or
+                "未安装" is unreachable and the host reads as if it never
+                answered. The set is computed above so the placeholder guard
+                counts the same rows this map draws. */}
+            {absentCapabilityRows.map((cli) => (
+              <div key={`${cli.kind}:absent`} className={css.cliRow} data-testid="host-cli">
+                <span className={css.cliKind}>{cli.kind}</span>
+                <span className={css.cliPath} />
+                <span className={css.cliVer} />
+                <span className={css.cliAuth}>
+                  <span className={css.dotUnknown} />
+                  {cli.auth}
+                </span>
+                <span className={css.cliVer} data-testid="host-cli-flags">未安装</span>
               </div>
             ))}
           </div>
         </div>
         <WorkspaceList hostId={host.id} workspaces={workspaces} online={host.online} />
-        <HostDiagnostics hostId={host.id} online={host.online} />
+        <HostDiagnostics hostId={host.id} online={host.online} cli={host.cli} />
         <div className={css.fields}>
           <label className={ui.field}>
             显示名

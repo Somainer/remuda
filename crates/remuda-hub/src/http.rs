@@ -1980,6 +1980,30 @@ pub(crate) async fn forward_if_online(
         }
 
         Err(err) => {
+            if let HubError::NodeBusy { .. } = &err {
+                // NODE_BUSY is refused BEFORE the frame is queued, so the Node
+                // never saw this command. Unlike a lost ACK there is nothing to
+                // reconcile and no second create ambiguity: settle the row as
+                // rejected (a create/resume's fresh instance lands at
+                // `failed`, the same record an explicit Node rejection leaves)
+                // and propagate the retryable 503 to the caller.
+                if matches!(
+                    command.operation.as_str(),
+                    "instance.create" | "instance.resume"
+                ) && let Some(instance_id) = command.instance_id.clone()
+                {
+                    state
+                        .store
+                        .fail_instance(instance_id, err.to_string())
+                        .await?;
+                } else {
+                    state
+                        .store
+                        .reject_command(command.command_id.clone(), err.to_string())
+                        .await?;
+                }
+                return Err(err);
+            }
             tracing::warn!(error = %err, command_id = %command.command_id, "node rpc unknown; will not resend");
             // The request may still be executing on the Node (protocol §2.5:
             // never resend on a missing ACK). Mark reconciliation in progress;

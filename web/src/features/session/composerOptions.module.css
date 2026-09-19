@@ -265,3 +265,22 @@
   color: var(--danger-strong);
   font-weight: 600;
 }
+
+/* §4.8 voice mic (m-voice): the visible control stays the shared 30px
+   chip, but its tap reach is a centred var(--touch) (44px) ::after — hit
+   area by hit area, never a visual resize (ui-spec.md §3.4, D-039). The
+   compact composer row's flex gap keeps the zone clear of the textarea and
+   the options trigger. */
+.voiceMic {
+  position: relative;
+}
+
+.voiceMic::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--touch);
+  height: var(--touch);
+  transform: translate(-50%, -50%);
+}

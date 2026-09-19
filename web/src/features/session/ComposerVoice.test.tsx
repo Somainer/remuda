@@ -32,6 +32,10 @@ class FakeRecognition implements SpeechRecognitionLike {
     this.onresult?.(event);
   }
 
+  fail(code: string) {
+    this.onerror?.({ error: code });
+  }
+
   end() {
     this.onend?.();
   }
@@ -123,5 +127,73 @@ describe("Composer voice input (ui-spec §4.8, m-voice)", () => {
     FakeRecognition.instances[0].end();
     expect(onSend).not.toHaveBeenCalled();
     expect(screen.getByTestId("composer-input")).toHaveValue("");
+  });
+
+  it("names a denied microphone and a silent session in the hint slot", async () => {
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    localStorage.setItem(PREF_KEY, "1");
+    render(<Composer instanceId="ins_voice_err" mobile onSend={vi.fn()} />);
+    const mic = screen.getByTestId("composer-voice");
+
+    await userEvent.click(mic);
+    FakeRecognition.instances[0].fail("not-allowed");
+    const hint = await screen.findByTestId("composer-voice-hint");
+    expect(hint).toHaveAttribute("data-state", "error");
+    expect(hint).toHaveTextContent("麦克风被拒绝，请在浏览器里允许后重试");
+    expect(mic).toHaveAttribute("data-listening", "0");
+
+    await userEvent.click(mic);
+    FakeRecognition.instances[1].fail("no-speech");
+    expect(await screen.findByTestId("composer-voice-hint")).toHaveTextContent("没听到声音");
+  });
+
+  it("keeps text typed during a session when the next transcript replaces the span", async () => {
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    localStorage.setItem(PREF_KEY, "1");
+    render(<Composer instanceId="ins_voice_type" mobile onSend={vi.fn()} />);
+    const mic = screen.getByTestId("composer-voice");
+    const area = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+
+    await userEvent.click(mic);
+    const rec = FakeRecognition.instances[0];
+    rec.emit({ resultIndex: 0, results: [spoken("你好", false)] });
+    await waitFor(() => expect(area).toHaveValue("你好"));
+
+    // The user keeps typing while listening (external draft change).
+    area.focus();
+    await userEvent.type(area, "！！");
+    expect(area).toHaveValue("你好！！");
+
+    // The refined final replaces only the dictated span; the typed chars stay.
+    rec.emit({ resultIndex: 0, results: [spoken("你好吗", true)] });
+    await waitFor(() => expect(area).toHaveValue("你好吗！！"));
+  });
+
+  it("a late end/error from a replaced recognizer never touches the new session", async () => {
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    localStorage.setItem(PREF_KEY, "1");
+    render(<Composer instanceId="ins_voice_stale" mobile onSend={vi.fn()} />);
+    const mic = screen.getByTestId("composer-voice");
+    const area = screen.getByTestId("composer-input") as HTMLTextAreaElement;
+
+    await userEvent.click(mic);
+    const old = FakeRecognition.instances[0];
+    old.fail("no-speech");
+    await screen.findByTestId("composer-voice-hint");
+
+    // Start again: the stale recognizer is aborted before the replacement.
+    await userEvent.click(mic);
+    const fresh = FakeRecognition.instances[1];
+    expect(old.abort).toHaveBeenCalledTimes(1);
+    expect(mic).toHaveAttribute("data-listening", "1");
+
+    // Late events from the old recognizer must not end/clear the new session.
+    old.end();
+    old.fail("not-allowed");
+    expect(mic).toHaveAttribute("data-listening", "1");
+
+    fresh.emit({ resultIndex: 0, results: [spoken("第二轮", true)] });
+    await waitFor(() => expect(area).toHaveValue("第二轮"));
+    expect(mic).toHaveAttribute("data-listening", "1");
   });
 });

@@ -370,6 +370,7 @@ describe("voice input settings (ui-spec §4.8)", () => {
     expect(localStorage.getItem("runtime.voice-input.v1")).toBe("1");
     fireEvent.click(toggle);
     await waitFor(() => expect(toggle).not.toBeChecked());
-    expect(readDeviceSettings().autoRevealTty).toBe(false);
+    // The voice pref itself is cleared (not an unrelated device setting).
+    expect(localStorage.getItem("runtime.voice-input.v1")).toBeNull();
   });
 });

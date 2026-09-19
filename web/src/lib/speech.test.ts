@@ -109,16 +109,25 @@ describe("SpeechInput wrapper", () => {
     }).not.toThrow();
   });
 
-  it("configures interim results and a non-continuous session on start", () => {
+  it("configures lang, interim results and a non-continuous session on start", () => {
+    document.documentElement.lang = "zh-CN";
     vi.stubGlobal("SpeechRecognition", FakeRecognition);
     const input = new SpeechInput({ onTranscript: vi.fn() });
     expect(input.available).toBe(true);
     input.start();
     const rec = FakeRecognition.instances[0];
     expect(rec.start).toHaveBeenCalledTimes(1);
+    expect(rec.lang).toBe("zh-CN");
     expect(rec.interimResults).toBe(true);
     expect(rec.continuous).toBe(false);
     expect(input.listening).toBe(true);
+    document.documentElement.removeAttribute("lang");
+  });
+
+  it("falls back to the browser language when the page declares none", () => {
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    new SpeechInput({ onTranscript: vi.fn() }).start();
+    expect(FakeRecognition.instances[0].lang).toBe(navigator.language);
   });
 
   it("ignores a second start while a session is active", () => {

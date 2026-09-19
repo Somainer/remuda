@@ -120,6 +120,13 @@ export class SpeechInput {
     const recognition = Ctor ? new Ctor() : null;
     this.recognition = recognition;
     if (!recognition) return;
+    // Recognise in the page's declared language, falling back to the
+    // browser's UI language; without this Chrome follows its own locale
+    // regardless of the page being zh-CN.
+    recognition.lang =
+      (typeof document !== "undefined" && document.documentElement.lang) ||
+      (typeof navigator !== "undefined" && navigator.language) ||
+      "";
     // Interim results make the textarea fill while the user is still
     // speaking; non-continuous lets the browser end the session on its own
     // after a pause, which keeps the feature a single button.

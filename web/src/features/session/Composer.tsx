@@ -237,11 +237,14 @@ export function Composer({
   const voicePrefOn = useMemo(() => readVoiceInputEnabled(), []);
   const voiceAvailable = mobile && voiceSupported && voicePrefOn;
   const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
   const speechInputRef = useRef<SpeechInput | null>(null);
-  // Draft snapshot a running dictation session rewrites: the text captured
-  // at start and the caret it started from. The base split is fixed for the
-  // session — every update is prefix + transcript + original suffix.
-  const dictationSpanRef = useRef<{ base: string; caret: number } | null>(null);
+  // The dictated span INSIDE the live draft: where it starts, how many
+  // characters the transcript we last wrote occupies, and the exact draft
+  // that write produced. The last value distinguishes our own updates from
+  // text changed while listening (typing / a token insert), which re-anchors
+  // the span instead of discarding the externally added text.
+  const dictationSpanRef = useRef<{ start: number; length: number; own: string } | null>(null);
 
   /**
    * Write a recognition transcript into the draft through the SAME path as
@@ -253,10 +256,35 @@ export function Composer({
   const applyDictation = (transcript: string) => {
     const span = dictationSpanRef.current;
     if (!span) return;
-    // Interim updates replace the whole dictated span; the base's suffix
-    // starts at the ORIGINAL caret and never moves with transcript length.
-    const next =
-      span.base.slice(0, span.caret) + transcript + span.base.slice(span.caret);
+    const current = textRef.current;
+    let { start, length } = span;
+    if (current !== span.own) {
+      // The draft changed outside this callback while a session was live.
+      if (length > 0) {
+        // Re-anchor on our previous transcript (nearest occurrence to where
+        // the span used to be, in case the same text exists twice).
+        const previous = span.own.slice(span.start, span.start + length);
+        let at = -1;
+        let from = 0;
+        for (;;) {
+          const hit = current.indexOf(previous, from);
+          if (hit === -1) break;
+          if (at === -1 || Math.abs(hit - span.start) < Math.abs(at - span.start)) at = hit;
+          from = hit + 1;
+        }
+        if (at === -1) return; // our span was edited away; drop this stale result
+        start = at;
+      } else {
+        // Nothing of ours placed yet: continue at the end of the new text.
+        start = current.length;
+      }
+    }
+    // Interim results replace exactly the span the previous transcript
+    // occupied; text outside it (including anything typed meanwhile) survives.
+    const next = current.slice(0, start) + transcript + current.slice(start + length);
+    span.start = start;
+    span.length = transcript.length;
+    span.own = next;
     textRef.current = next;
     setText(next);
     writeDraft(instanceId, next);
@@ -265,22 +293,44 @@ export function Composer({
     // §4.1), and a controlled value naturally rests the caret at its end.
   };
 
+  /** Browser error codes worth naming; everything else gets a generic line. */
+  const voiceErrorText = (code: string): string => {
+    if (code === "not-allowed" || code === "service-not-allowed") {
+      return "麦克风被拒绝，请在浏览器里允许后重试";
+    }
+    if (code === "no-speech") return "没听到声音";
+    if (code === "audio-capture") return "没有可用的麦克风";
+    return "语音识别出错";
+  };
+
   const toggleDictation = () => {
     if (voiceListening) {
       speechInputRef.current?.stop();
       return;
     }
+    // Replace any stale recogniser: abort it BEFORE constructing the
+    // replacement, and every callback below guards on instance identity, so a
+    // late error/end from the old session can never null the new session's
+    // span or flip its listening state back.
+    speechInputRef.current?.abort();
+    setVoiceError(null);
     const area = inputRef.current;
-    const caret =
+    const start =
       area && area.selectionStart != null ? area.selectionStart : textRef.current.length;
-    dictationSpanRef.current = { base: textRef.current, caret };
+    dictationSpanRef.current = { start, length: 0, own: textRef.current };
     const speech = new SpeechInput({
-      onTranscript: applyDictation,
-      onError: () => {
+      onTranscript: (transcript) => {
+        if (speechInputRef.current !== speech) return;
+        applyDictation(transcript);
+      },
+      onError: (code) => {
+        if (speechInputRef.current !== speech) return;
         dictationSpanRef.current = null;
         setVoiceListening(false);
+        setVoiceError(voiceErrorText(code));
       },
       onEnd: () => {
+        if (speechInputRef.current !== speech) return;
         dictationSpanRef.current = null;
         setVoiceListening(false);
       },
@@ -303,7 +353,9 @@ export function Composer({
   useEffect(
     () => () => {
       // abort, not stop: leaving the page must not wait for a final flush.
-      speechInputRef.current?.abort();
+      const speech = speechInputRef.current;
+      speechInputRef.current = null;
+      speech?.abort();
     },
     [],
   );
@@ -1081,7 +1133,7 @@ export function Composer({
   const voiceNode = voiceAvailable ? (
     <button
       type="button"
-      className={css.chip}
+      className={`${css.chip} ${opt.voiceMic}`}
       data-testid="composer-voice"
       data-listening={voiceListening ? "1" : "0"}
       aria-pressed={voiceListening}
@@ -1108,9 +1160,14 @@ export function Composer({
     </button>
   ) : null;
   const voiceHintNode =
-    voiceAvailable && voiceListening ? (
-      <span className={css.controlNote} data-testid="composer-voice-hint">
-        正在聆听… 文字只进输入框，不会自动发送；再点麦克风结束
+    voiceAvailable && (voiceListening || voiceError) ? (
+      <span
+        className={css.controlNote}
+        data-testid="composer-voice-hint"
+        data-state={voiceError ? "error" : "listening"}
+        role={voiceError ? "alert" : undefined}
+      >
+        {voiceError ?? "正在聆听… 文字只进输入框，不会自动发送；再点麦克风结束"}
       </span>
     ) : null;
 

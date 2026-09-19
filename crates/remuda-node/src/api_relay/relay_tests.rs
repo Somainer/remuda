@@ -1210,3 +1210,77 @@ async fn credit_starved_egress_ends_at_the_hard_cap_after_four_chunks() {
         "{error:?}"
     );
 }
+
+#[tokio::test]
+async fn delayed_credits_keep_a_long_response_clean_to_its_last_chunk() {
+    // Regression: the EventRouter used to be aborted as soon as the upstream
+    // body loop ended, before the tail flush and the zero-byte last chunk were
+    // sent. Both sends need permits, and the router was the only thing that
+    // granted them from inbound api.credit frames, so a response several times
+    // the window long whose W reader drains with a lag parked on its terminal
+    // sends until the hard cap. Here the W-side consumer credits one chunk at a
+    // time after a short delay; the stream must end cleanly (error None) well
+    // inside the tuned cap.
+    // The fixture wraps every five text chars in an SSE event, so 16 KiB of
+    // text serializes to well over a dozen 8 KiB coalesced chunks — several
+    // credit windows.
+    let gateway = FakeGateway::start_with(vec![Script::messages("a".repeat(16 * 1024))])
+        .await
+        .unwrap();
+    gateway.expect_credential(GW_TOKEN);
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let tuned = EgressTimeouts {
+        ttft: Duration::from_secs(10),
+        idle: Duration::from_secs(10),
+        hard: Duration::from_secs(5),
+    };
+    state_h.set_egress_context(gateway_context(&gateway, Some((8 * 1024, tuned))));
+    let (broker_w, _broker_h, pump) = pump_pair(&state_w, &state_h);
+
+    let (_id, outbox, mut events) = open_messages_stream(&broker_w).await;
+
+    let started = std::time::Instant::now();
+    let mut chunks = 0usize;
+    let mut seqs: Vec<u32> = Vec::new();
+    let end = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                InboundEvent::Chunk(chunk) => {
+                    seqs.push(chunk.seq);
+                    chunks += 1;
+                    // Drain like a slightly lagging W harness: the tail must
+                    // still receive the final credits after upstream ends.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    outbox
+                        .send_notification(
+                            METHOD_API_CREDIT,
+                            &remuda_protocol::hubnode::ApiCreditParams {
+                                stream_id: outbox.stream_id().to_owned(),
+                                chunks: 1,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                InboundEvent::End(end) => return end,
+                InboundEvent::Head(_) | InboundEvent::Credit(_) => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        panic!("stream ended without api.end");
+    })
+    .await
+    .expect("clean end within the test timeout");
+    let elapsed = started.elapsed();
+    pump.abort();
+
+    assert!(end.error.is_none(), "clean terminal end: {:?}", end.error);
+    assert!(chunks > 12, "many windows drained with delayed credits: {chunks}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "ended well inside the 5 s hard cap (took {elapsed:?})"
+    );
+    // The zero-byte last chunk is present exactly once at the final seq.
+    assert!(seqs.windows(2).all(|pair| pair[0] < pair[1]), "seqs: {seqs:?}");
+}

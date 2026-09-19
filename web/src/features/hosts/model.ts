@@ -144,7 +144,14 @@ export type ComputerUseState =
 export function computerUseState(cli: HostCli[] | undefined): ComputerUseState {
   const entry = (cli ?? []).find((item) => item.kind === COMPUTER_USE_KIND);
   if (!entry) return { reported: false };
-  if (entry.installed === false) return { reported: true, installed: false };
+  // Same rule as `installedCli` / `absentCli`, so the three agree: a row's
+  // `installed` flag is authoritative, and without one the path/version
+  // heuristic decides. A flagless row carrying neither is *not* installed —
+  // claiming otherwise here would render a state the CLI table drops, which is
+  // the silent disappearance ui-spec §2.6 forbids.
+  const installed =
+    entry.installed === undefined ? Boolean(entry.path || entry.version) : entry.installed;
+  if (!installed) return { reported: true, installed: false };
   return { reported: true, installed: true, version: entry.version, path: entry.path };
 }
 

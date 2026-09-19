@@ -81,6 +81,24 @@ describe("computer-use host capability row (D-045 §3.4)", () => {
     expect(computerUseState(undefined)).toEqual({ reported: false });
   });
 
+  it("does not claim installed for a flagless row with nothing to show", () => {
+    // The shape review caught: no `installed` flag, no path, no version. The
+    // list helpers both drop it, so claiming `installed: true` here would
+    // render a state that appears nowhere — the silent disappearance ui-spec
+    // §2.6 forbids. It must agree with them.
+    const flagless: HostCli = { kind: COMPUTER_USE_KIND, auth: "unknown" };
+    expect(computerUseState([flagless])).toEqual({ reported: true, installed: false });
+    expect(installedCli([flagless])).toEqual([]);
+    expect(absentCli([flagless])).toEqual([]);
+
+    // A flagless row that *does* carry a version is still installed, matching
+    // the heuristic the list helpers use.
+    const flaglessVersioned: HostCli = { kind: COMPUTER_USE_KIND, version: "2.7.0", auth: "unknown" };
+    expect(computerUseState([flaglessVersioned]).reported).toBe(true);
+    expect(computerUseState([flaglessVersioned])).toMatchObject({ installed: true, version: "2.7.0" });
+    expect(installedCli([flaglessVersioned])).toEqual([flaglessVersioned]);
+  });
+
   it("drops a reported-absent row from the installed list but keeps it as absent", () => {
     const absent: HostCli = { kind: COMPUTER_USE_KIND, auth: "unknown", installed: false };
     expect(installedCli([absent])).toEqual([]);

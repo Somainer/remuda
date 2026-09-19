@@ -160,36 +160,66 @@ async function ownerAt(page: Page, x: number, y: number): Promise<string> {
  * A real tap target: visible box fully inside the viewport, and the four
  * corners of its 44×44 hot zone (centre ±21px) resolve to the control itself
  * — catching a missing transform, a covering sibling, and off-screen parking.
+ *
+ * The rect read and all four elementFromPoint probes happen in ONE evaluate:
+ * AnchoredPopover re-measures on animation frames (including the pill→list
+ * flip), so separate round-trips could observe a moving panel. A raw corner
+ * outside the viewport fails outright — it is never clamped back onto the
+ * visual box, which would certify a target with no hot zone at all.
  */
 async function assertTapTarget(page: Page, target: Locator, owner: string): Promise<Box> {
   await expect(target).toBeVisible();
-  const box = await target.boundingBox();
-  expect(box, `${owner} is rendered`).toBeTruthy();
-  const vp = page.viewportSize();
-  expect(vp).toBeTruthy();
-  expect(boxInViewport(box!, vp!.width, vp!.height), `${owner} box is inside viewport`).toBe(true);
+  return page.evaluate(({ owner: ownerName, half }) => {
+    const el = document.querySelector<HTMLElement>(
+      `[data-touchhit-owner="${ownerName}"]`,
+    );
+    if (!el) throw new Error(`${ownerName}: ownership marker missing`);
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) {
+      throw new Error(`${ownerName}: zero-size box`);
+    }
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const inside = (x: number, y: number) =>
+      x >= 0 && y >= 0 && x <= vw && y <= vh;
+    if (!inside(rect.left, rect.top) || !inside(rect.right, rect.bottom)) {
+      throw new Error(
+        `${ownerName}: visual box [${rect.left.toFixed(1)},${rect.top.toFixed(1)}–${rect.right.toFixed(1)},${rect.bottom.toFixed(1)}] not inside ${vw}x${vh}`,
+      );
+    }
 
-  const cx = box!.x + box!.width / 2;
-  const cy = box!.y + box!.height / 2;
-  // 0.5px inset keeps the probe inside the pseudo at sub-pixel rounding. A
-  // control flush against a viewport edge legitimately parks part of its
-  // 44px zone off-screen; clamp to the visible part of the zone instead of
-  // probing outside the document.
-  const clampX = (x: number) => Math.min(Math.max(x, 0.5), vp!.width - 0.5);
-  const clampY = (y: number) => Math.min(Math.max(y, 0.5), vp!.height - 0.5);
-  const probes = [
-    { name: "tl", x: clampX(cx - HALF + 0.5), y: clampY(cy - HALF + 0.5) },
-    { name: "tr", x: clampX(cx + HALF - 0.5), y: clampY(cy - HALF + 0.5) },
-    { name: "bl", x: clampX(cx - HALF + 0.5), y: clampY(cy + HALF - 0.5) },
-    { name: "br", x: clampX(cx + HALF - 0.5), y: clampY(cy + HALF - 0.5) },
-  ];
-  for (const p of probes) {
-    expect(await ownerAt(page, p.x, p.y), `${owner} owns its ${p.name} hot-zone corner`).toBe(owner);
-  }
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    // 0.5px inset keeps the probe inside the pseudo at sub-pixel rounding.
+    const corners = [
+      { name: "tl", x: cx - half + 0.5, y: cy - half + 0.5 },
+      { name: "tr", x: cx + half - 0.5, y: cy - half + 0.5 },
+      { name: "bl", x: cx - half + 0.5, y: cy + half - 0.5 },
+      { name: "br", x: cx + half - 0.5, y: cy + half - 0.5 },
+    ];
+    for (const corner of corners) {
+      if (!inside(corner.x, corner.y)) {
+        throw new Error(
+          `${ownerName}: ${corner.name} hot-zone corner (${corner.x.toFixed(1)},${corner.y.toFixed(1)}) is outside ${vw}x${vh}`,
+        );
+      }
+      const hit = document
+        .elementFromPoint(corner.x, corner.y)
+        ?.closest("[data-touchhit-owner]")
+        ?.getAttribute("data-touchhit-owner");
+      if (hit !== ownerName) {
+        throw new Error(
+          `${ownerName}: ${corner.name} corner (${corner.x.toFixed(1)},${corner.y.toFixed(1)}) resolved to "${hit ?? "none"}"`,
+        );
+      }
+    }
+    const box = { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    return box;
+  }, { owner, half: HALF });
   console.log(
-    `TOUCHHIT ${owner} visual ${Math.round(box!.width)}x${Math.round(box!.height)} at (${Math.round(box!.x)},${Math.round(box!.y)}) corners all self`,
+    `TOUCHHIT ${owner} visual ${Math.round(box.width)}x${Math.round(box.height)} at (${Math.round(box.x)},${Math.round(box.y)}) corners all self`,
   );
-  return box!;
+  return box;
 }
 
 async function mark(locator: Locator, owner: string) {
@@ -200,9 +230,15 @@ async function mark(locator: Locator, owner: string) {
 }
 
 async function markHeader(page: Page) {
+  // Stop is deliberately not marked here: an exited session swaps Stop for
+  // resume controls, and tests that never probe Stop would time out waiting
+  // for it. Mark Stop explicitly in the two tests that hit-test it.
   await mark(page.getByRole("link", { name: "返回" }), "back");
   await mark(page.getByTestId("view-switch-tty"), "seg-tty");
   await mark(page.getByTestId("view-switch-structured"), "seg-structured");
+}
+
+async function markStop(page: Page) {
   await mark(page.getByRole("button", { name: "Stop" }), "stop");
 }
 
@@ -289,13 +325,20 @@ test("Stop is a 44px target but currently parks off the 390px viewport (xfail un
     const instanceId = await createClaudeSession(page);
     await clearApprovals(page, instanceId);
     await markHeader(page);
+    await markStop(page);
+
+    // Hard regression guard for flex:none: the visible Stop square must keep
+    // its 32px even though the 390px headRow is overflowing (a flex-shrunk
+    // square would let the centred hot zone swallow the neighbour).
+    const stopBox = await page.getByRole("button", { name: "Stop" }).boundingBox();
+    expect(stopBox).toBeTruthy();
+    expect(stopBox!.width).toBeGreaterThanOrEqual(32);
+    expect(stopBox!.height).toBeGreaterThanOrEqual(32);
 
     // Document the current state honestly: the non-wrapping headRow parks
     // Stop past the right edge, so its (correct, non-overlapping) hot zone is
     // not reachable. This xfail must unwind when c-sessionchrome reclaims the
     // header — D-040 keeps Stop in the header permanently.
-    const stopBox = await page.getByRole("button", { name: "Stop" }).boundingBox();
-    expect(stopBox).toBeTruthy();
     const offscreen = stopBox!.x < -0.5 || stopBox!.x + stopBox!.width > 390.5;
     console.log(
       `TOUCHHIT stop visual ${Math.round(stopBox!.width)}x${Math.round(stopBox!.height)} at x=${Math.round(stopBox!.x)} (viewport 390) offscreen=${offscreen}`,
@@ -322,6 +365,7 @@ test("Stop hot zone never claims its neighbour (D-039), and narrow width without
   const instanceId = await createClaudeSession(page);
   await clearApprovals(page, instanceId);
   await markHeader(page);
+  await markStop(page);
   await mark(page.getByTestId("events-toggle"), "neighbour");
 
   const stop = page.getByRole("button", { name: "Stop" });

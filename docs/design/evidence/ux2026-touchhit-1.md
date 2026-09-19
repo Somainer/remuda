@@ -13,7 +13,7 @@
 | 元素 | 视觉（改前=改后） | 命中 | 手段 |
 |---|---|---|---|
 | `.back` 返回 | 20px 宽字形 | 44×44 `::after`（仅 ≤767px） | 热区 |
-| `.stopBtn` 停止 | 32×32 方块（手机） | 44×44 `::after`（仅 ≤767px），并新增 `flex: none` 防止 32px 被 headRow flex 收缩 | 热区 + 防收缩 |
+| `.stopBtn` 停止 | 32×32 方块（手机） | 44×44 `::after`（仅 ≤767px），并新增 `flex: none` 防止 32px 被 headRow flex 收缩 | 热区 + 防收缩。**390px 下该控件整体在视口外、不可点，见 §2** |
 | `.viewSeg` 终端/结构段 | 25px（桌面）/ 30px（手机） | 44×44 `::after`（仅 ≤767px） | 热区 |
 | `.effortIconBtn` 两个 26px 图标钮 | 26×26 字形 | 既有 `::after`，字面量 44px 改为 `var(--touch)` | token 化 |
 
@@ -32,6 +32,8 @@
 
 1. 控件可视盒必须完整落在 `page.viewportSize()` 之内；
 2. 以可视盒中心 ±21px 的四个角（44×44 热区角，0.5px 内缩）做 `document.elementFromPoint`，必须命回控件自身或其后代（每个控件打唯一 `data-touchhit-owner` 标记，用 `closest()` 归属）。
+
+第三轮加固（评审 r3）：rect 读取与四角 probe 合并进**同一个 `page.evaluate`** 同步完成 —— AnchoredPopover 会在 requestAnimationFrame（含 pill→list 翻转）时重新定位，跨往返采样可能读到移动中的面板；四角坐标用**原始值**并先断言在视口内，越界即失败，绝不钳回可视盒（否则零热区也能通过）。
 
 ### 390×844 hasTouch —— 在屏控件四角全部命中自己
 

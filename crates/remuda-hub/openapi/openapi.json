@@ -778,6 +778,17 @@
               "string",
               "null"
             ]
+          },
+          "relayBind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/HostRelayBind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "D-047 Amendment A1 explicit relay bind. Null clears it back to loopback-only; the Hub rejects 0.0.0.0/:: and public addresses."
           }
         },
         "type": "object"
@@ -826,7 +837,7 @@
                 "type": "null"
               }
             ],
-            "description": "Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+            "description": "Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the relay on loopback; the Hub refuses wildcards and public addresses, and `route: direct-net` is 409 `api-via-unreachable` until one is set."
           },
           "capabilities": {
             "additionalProperties": true,
@@ -1067,7 +1078,7 @@
       "InstanceCreate": {
         "properties": {
           "apiRoute": {
-            "description": "Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "description": "Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). `auto` probes the proxy host's relayBind and falls back to hub-relay; direct-net is a hard 409 `api-via-unreachable` when no bind is configured.",
             "enum": [
               "auto",
               "hub-relay",
@@ -1076,7 +1087,7 @@
             "type": "string"
           },
           "apiVia": {
-            "description": "Per-instance delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "description": "Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub process, or `none` to force direct. The D-047 waterfall is request > project > profile > direct; unknown/offline/unsupported targets refuse with the api-via-* codes, never a silent fallback.",
             "type": "string"
           },
           "args": {
@@ -2557,6 +2568,19 @@
           },
           "repoRemote": {
             "type": "string"
+          },
+          "apiVia": {
+            "description": "D-047 project-layer delivery override: a proxy host id, `self`, or `none`. Stored beside the project provider ref.",
+            "type": "string"
+          },
+          "apiRoute": {
+            "description": "D-047 route sub-mode for the project-layer apiVia: auto | hub-relay | direct-net.",
+            "enum": [
+              "auto",
+              "hub-relay",
+              "direct-net"
+            ],
+            "type": "string"
           }
         },
         "required": [
@@ -2852,6 +2876,19 @@
               "string",
               "null"
             ]
+          },
+          "apiVia": {
+            "description": "D-047 project-layer delivery override: a proxy host id, `self`, or `none`. Stored beside the project provider ref.",
+            "type": "string"
+          },
+          "apiRoute": {
+            "description": "D-047 route sub-mode for the project-layer apiVia: auto | hub-relay | direct-net.",
+            "enum": [
+              "auto",
+              "hub-relay",
+              "direct-net"
+            ],
+            "type": "string"
           }
         },
         "type": "object"
@@ -2924,7 +2961,7 @@
           },
           "delivery": {
             "$ref": "#/components/schemas/ProviderDeliveryInput",
-            "description": "Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+            "description": "How this profile's sessions reach the model API (D-047). Absent means direct / auto; the stored value is always read back."
           },
           "defaultModel": {
             "description": "Must be one of the enabled models.",
@@ -3247,7 +3284,7 @@
           },
           "delivery": {
             "$ref": "#/components/schemas/ProviderDeliveryInput",
-            "description": "Set the delivery mode (D-047). Accepted but not yet applied: the waterfall that acts on it lands with api-routing task 2. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+            "description": "Replace the model-API delivery (D-047). The waterfall resolves it per launch: request > project > this profile > direct."
           },
           "defaultModel": {
             "description": "Must be one of the enabled models.",
@@ -3305,7 +3342,7 @@
           },
           "delivery": {
             "$ref": "#/components/schemas/ProviderDelivery",
-            "description": "Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+            "description": "How this profile's sessions reach the model API (D-047). Absent means direct / auto; the stored value is always read back."
           },
           "headers": {
             "additionalProperties": {
@@ -4148,7 +4185,7 @@
         "type": "object",
         "properties": {
           "apiRoute": {
-            "description": "Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "description": "Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1).",
             "enum": [
               "auto",
               "hub-relay",
@@ -4157,7 +4194,7 @@
             "type": "string"
           },
           "apiVia": {
-            "description": "Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Omitted leaves the waterfall to the project and profile. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "description": "Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub process, or `none` to force direct. Omitted leaves the decision to the project and profile layers.",
             "type": "string"
           },
           "projectId": {
@@ -9880,388 +9917,388 @@
         }
       }
     },
-      "/v1/hosts/{id}/files": {
-        "get": {
-          "tags": [
-            "host-files"
-          ],
-          "operationId": "hostFilesList",
-          "summary": "List one directory on a host under a registered workspace (read-only)",
-          "description": "Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.list RPC; the Node confines the path to a registered workspace root or the /tmp/remuda-* scratch area. Never cached.",
-          "parameters": [
-            {
-              "$ref": "#/components/parameters/IdPath"
-            },
-            {
-              "name": "workspaceId",
-              "in": "query",
-              "required": true,
-              "description": "Registered workspace id, or 'tmp' for the /tmp/remuda-* scratch area on the Node.",
-              "schema": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "relPath",
-              "in": "query",
-              "required": false,
-              "description": "Workspace-relative path; absent names the workspace root.",
-              "schema": {
-                "type": "string"
-              }
+    "/v1/hosts/{id}/files": {
+      "get": {
+        "tags": [
+          "host-files"
+        ],
+        "operationId": "hostFilesList",
+        "summary": "List one directory on a host under a registered workspace (read-only)",
+        "description": "Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.list RPC; the Node confines the path to a registered workspace root or the /tmp/remuda-* scratch area. Never cached.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "name": "workspaceId",
+            "in": "query",
+            "required": true,
+            "description": "Registered workspace id, or 'tmp' for the /tmp/remuda-* scratch area on the Node.",
+            "schema": {
+              "type": "string"
             }
-          ],
-          "responses": {
-            "200": {
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object"
-                  }
-                }
-              },
-              "description": "Node answer"
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "409": {
-              "$ref": "#/components/responses/Error"
-            },
-            "422": {
-              "$ref": "#/components/responses/Error"
+          },
+          {
+            "name": "relPath",
+            "in": "query",
+            "required": false,
+            "description": "Workspace-relative path; absent names the workspace root.",
+            "schema": {
+              "type": "string"
             }
           }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Node answer"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
         }
-      },
-      "/v1/hosts/{id}/files/read": {
-        "post": {
-          "tags": [
-            "host-files"
-          ],
-          "operationId": "hostFilesRead",
-          "summary": "Read one regular file on a host and stage it as a Hub object (read-only)",
-          "description": "Operator (Human/Bot) only; Agent origin is 403. The Node validates containment, reads the regular file, uploads the bytes with its host token, and returns objectId/digest/size. Bytes are fetched separately via GET /v1/objects/{objectId}.",
-          "parameters": [
-            {
-              "$ref": "#/components/parameters/IdPath"
+      }
+    },
+    "/v1/hosts/{id}/files/read": {
+      "post": {
+        "tags": [
+          "host-files"
+        ],
+        "operationId": "hostFilesRead",
+        "summary": "Read one regular file on a host and stage it as a Hub object (read-only)",
+        "description": "Operator (Human/Bot) only; Agent origin is 403. The Node validates containment, reads the regular file, uploads the bytes with its host token, and returns objectId/digest/size. Bytes are fetched separately via GET /v1/objects/{objectId}.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "workspaceId"
+                ],
+                "properties": {
+                  "workspaceId": {
+                    "type": "string"
+                  },
+                  "relPath": {
+                    "type": "string"
+                  }
+                }
+              }
             }
-          ],
-          "requestBody": {
-            "required": true,
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Staged object reference",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "required": [
-                    "workspaceId"
+                    "objectId",
+                    "digest",
+                    "size"
                   ],
                   "properties": {
-                    "workspaceId": {
+                    "objectId": {
                       "type": "string"
                     },
-                    "relPath": {
+                    "digest": {
                       "type": "string"
+                    },
+                    "size": {
+                      "type": "integer",
+                      "format": "int64"
                     }
                   }
                 }
               }
             }
           },
-          "responses": {
-            "200": {
-              "description": "Staged object reference",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object",
-                    "required": [
-                      "objectId",
-                      "digest",
-                      "size"
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/v1/hosts/{id}/files/search": {
+      "post": {
+        "tags": [
+          "host-files"
+        ],
+        "operationId": "hostFilesSearch",
+        "summary": "Search file names or contents on a host under a registered workspace (read-only, bounded)",
+        "description": "Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.search RPC. The Node confines the walk to a registered workspace root or the /tmp/remuda-* scratch area, honours .gitignore, skips binary and irregular files, and bounds the scan by wall clock (10s), total bytes (10 MiB), per-file bytes (1 MiB) and result count (default 200); the reply carries truncated/truncatedReason when a bound is hit. A Node that does not implement the method answers with a JSON-RPC error, surfaced as a clean 400.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "workspaceId",
+                  "query"
+                ],
+                "properties": {
+                  "workspaceId": {
+                    "type": "string"
+                  },
+                  "relPath": {
+                    "type": "string",
+                    "description": "Workspace-relative subtree; absent names the workspace root."
+                  },
+                  "query": {
+                    "type": "string",
+                    "description": "Literal needle, or a regex when regex=true."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "name",
+                      "content"
                     ],
-                    "properties": {
-                      "objectId": {
-                        "type": "string"
-                      },
-                      "digest": {
-                        "type": "string"
-                      },
-                      "size": {
-                        "type": "integer",
-                        "format": "int64"
-                      }
-                    }
+                    "description": "name (default) matches entry names; content matches decoded file contents line by line."
+                  },
+                  "regex": {
+                    "type": "boolean",
+                    "default": false
+                  },
+                  "glob": {
+                    "type": "string",
+                    "description": "Optional glob narrowing (e.g. *.rs or src/**)."
+                  },
+                  "maxResults": {
+                    "type": "integer",
+                    "format": "uint32",
+                    "minimum": 1,
+                    "description": "Cap on returned matches; absent means the Node default (200)."
                   }
                 }
               }
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "409": {
-              "$ref": "#/components/responses/Error"
-            },
-            "413": {
-              "$ref": "#/components/responses/Error"
-            },
-            "422": {
-              "$ref": "#/components/responses/Error"
             }
           }
-        }
-      },
-      "/v1/hosts/{id}/files/search": {
-        "post": {
-          "tags": [
-            "host-files"
-          ],
-          "operationId": "hostFilesSearch",
-          "summary": "Search file names or contents on a host under a registered workspace (read-only, bounded)",
-          "description": "Operator (Human/Bot) only; Agent origin is 403. Proxied to the addressed online Node's host.files.search RPC. The Node confines the walk to a registered workspace root or the /tmp/remuda-* scratch area, honours .gitignore, skips binary and irregular files, and bounds the scan by wall clock (10s), total bytes (10 MiB), per-file bytes (1 MiB) and result count (default 200); the reply carries truncated/truncatedReason when a bound is hit. A Node that does not implement the method answers with a JSON-RPC error, surfaced as a clean 400.",
-          "parameters": [
-            {
-              "$ref": "#/components/parameters/IdPath"
-            }
-          ],
-          "requestBody": {
-            "required": true,
+        },
+        "responses": {
+          "200": {
+            "description": "Search result",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "required": [
                     "workspaceId",
-                    "query"
+                    "path",
+                    "mode",
+                    "query",
+                    "matches",
+                    "truncated",
+                    "filesScanned",
+                    "bytesScanned"
                   ],
                   "properties": {
                     "workspaceId": {
                       "type": "string"
                     },
-                    "relPath": {
-                      "type": "string",
-                      "description": "Workspace-relative subtree; absent names the workspace root."
-                    },
-                    "query": {
-                      "type": "string",
-                      "description": "Literal needle, or a regex when regex=true."
+                    "path": {
+                      "type": "string"
                     },
                     "mode": {
                       "type": "string",
                       "enum": [
                         "name",
                         "content"
-                      ],
-                      "description": "name (default) matches entry names; content matches decoded file contents line by line."
+                      ]
                     },
-                    "regex": {
-                      "type": "boolean",
-                      "default": false
+                    "query": {
+                      "type": "string"
                     },
-                    "glob": {
-                      "type": "string",
-                      "description": "Optional glob narrowing (e.g. *.rs or src/**)."
-                    },
-                    "maxResults": {
-                      "type": "integer",
-                      "format": "uint32",
-                      "minimum": 1,
-                      "description": "Cap on returned matches; absent means the Node default (200)."
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "responses": {
-            "200": {
-              "description": "Search result",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object",
-                    "required": [
-                      "workspaceId",
-                      "path",
-                      "mode",
-                      "query",
-                      "matches",
-                      "truncated",
-                      "filesScanned",
-                      "bytesScanned"
-                    ],
-                    "properties": {
-                      "workspaceId": {
-                        "type": "string"
-                      },
-                      "path": {
-                        "type": "string"
-                      },
-                      "mode": {
-                        "type": "string",
-                        "enum": [
-                          "name",
-                          "content"
-                        ]
-                      },
-                      "query": {
-                        "type": "string"
-                      },
-                      "matches": {
-                        "type": "array",
-                        "items": {
-                          "type": "object",
-                          "required": [
-                            "path",
-                            "line"
-                          ],
-                          "properties": {
-                            "path": {
-                              "type": "string"
-                            },
-                            "line": {
-                              "type": "integer",
-                              "format": "uint64",
-                              "description": "1-based content line; 0 for a name hit."
-                            },
-                            "column": {
-                              "type": "integer",
-                              "format": "uint64"
-                            },
-                            "snippet": {
-                              "type": "string"
-                            }
+                    "matches": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "path",
+                          "line"
+                        ],
+                        "properties": {
+                          "path": {
+                            "type": "string"
+                          },
+                          "line": {
+                            "type": "integer",
+                            "format": "uint64",
+                            "description": "1-based content line; 0 for a name hit."
+                          },
+                          "column": {
+                            "type": "integer",
+                            "format": "uint64"
+                          },
+                          "snippet": {
+                            "type": "string"
                           }
                         }
-                      },
-                      "truncated": {
-                        "type": "boolean"
-                      },
-                      "truncatedReason": {
-                        "type": "string"
-                      },
-                      "filesScanned": {
-                        "type": "integer",
-                        "format": "uint64"
-                      },
-                      "bytesScanned": {
-                        "type": "integer",
-                        "format": "uint64"
                       }
+                    },
+                    "truncated": {
+                      "type": "boolean"
+                    },
+                    "truncatedReason": {
+                      "type": "string"
+                    },
+                    "filesScanned": {
+                      "type": "integer",
+                      "format": "uint64"
+                    },
+                    "bytesScanned": {
+                      "type": "integer",
+                      "format": "uint64"
                     }
                   }
-                }
-              }
-            },
-            "400": {
-              "$ref": "#/components/responses/Error"
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "409": {
-              "$ref": "#/components/responses/Error"
-            },
-            "422": {
-              "$ref": "#/components/responses/Error"
-            }
-          }
-        }
-      },
-      "/v1/hosts/{id}/files/objects": {
-        "post": {
-          "tags": [
-            "host-files"
-          ],
-          "operationId": "hostFilesStageObject",
-          "summary": "Node-facing: stage bytes read from a host's workspace",
-          "description": "Authenticated with the addressed Node's durable host token (not a device token); a token bound to another host is 403. Raw octet-stream body capped by the Hub's attachmentMaxBytes. Stored as application/octet-stream with nosniff; bytes read back through GET /v1/objects/{objectId}.",
-          "parameters": [
-            {
-              "$ref": "#/components/parameters/IdPath"
-            },
-            {
-              "name": "name",
-              "in": "query",
-              "required": false,
-              "description": "Sanitized basename of the read file.",
-              "schema": {
-                "type": "string"
-              }
-            }
-          ],
-          "requestBody": {
-            "required": true,
-            "content": {
-              "application/octet-stream": {
-                "schema": {
-                  "type": "string",
-                  "format": "binary"
                 }
               }
             }
           },
-          "responses": {
-            "200": {
-              "description": "Staged object reference",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "type": "object",
-                    "required": [
-                      "objectId",
-                      "digest",
-                      "size"
-                    ],
-                    "properties": {
-                      "objectId": {
-                        "type": "string"
-                      },
-                      "digest": {
-                        "type": "string"
-                      },
-                      "size": {
-                        "type": "integer",
-                        "format": "int64"
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "401": {
-              "$ref": "#/components/responses/Error"
-            },
-            "403": {
-              "$ref": "#/components/responses/Error"
-            },
-            "404": {
-              "$ref": "#/components/responses/Error"
-            },
-            "413": {
-              "$ref": "#/components/responses/Error"
-            }
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
           }
         }
       }
+    },
+    "/v1/hosts/{id}/files/objects": {
+      "post": {
+        "tags": [
+          "host-files"
+        ],
+        "operationId": "hostFilesStageObject",
+        "summary": "Node-facing: stage bytes read from a host's workspace",
+        "description": "Authenticated with the addressed Node's durable host token (not a device token); a token bound to another host is 403. Raw octet-stream body capped by the Hub's attachmentMaxBytes. Stored as application/octet-stream with nosniff; bytes read back through GET /v1/objects/{objectId}.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "description": "Sanitized basename of the read file.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Staged object reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "objectId",
+                    "digest",
+                    "size"
+                  ],
+                  "properties": {
+                    "objectId": {
+                      "type": "string"
+                    },
+                    "digest": {
+                      "type": "string"
+                    },
+                    "size": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
   },
   "servers": [
     {

@@ -1462,11 +1462,17 @@ async fn relaunch_instance(
     {
         obj.insert("binaryPath".into(), json!(path));
     }
+    let project_route_doc = state
+        .store
+        .get_project_route_override(project.meta.id.as_id().to_string())
+        .await?;
     crate::providers::resolve_and_attach_with_project(
         state,
         &host,
         &mut spec,
         Some(&project.provider),
+        project_route_doc.as_ref(),
+        crate::providers::RouteOverrides::default(),
     )
     .await?;
 
@@ -1550,6 +1556,10 @@ async fn replace_worker(
         carrier: None,
         // A respawn inherits the worker, never a new desktop grant (D-045).
         capabilities: Vec::new(),
+        // A replace keeps the original request's delivery; the D-047
+        // waterfall re-resolves from the stored profile/project layers.
+        api_via: None,
+        api_route: None,
     };
 
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief

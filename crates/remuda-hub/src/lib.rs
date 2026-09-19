@@ -12,6 +12,7 @@
 pub mod agent_approvals;
 mod agent_scope;
 mod alerts;
+mod api_relay;
 mod attachments;
 mod auth;
 mod bot;
@@ -93,6 +94,8 @@ pub struct AppState {
     nodes: ConnectedNodes,
     bus: Bus,
     tty: crate::ws::TtyRelay,
+    /// D-048 relay stream registry (per-Hub-process).
+    api_relay: crate::api_relay::ApiRelay,
     push: Option<PushService>,
     followers: Followers,
     blocked: BlockedWatch,
@@ -103,6 +106,14 @@ pub struct AppState {
     /// When the pinned-ref retention sweep last ran. Per-Hub rather than a
     /// process static so concurrent instances (tests) never starve each other.
     gate_ref_swept_at: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+impl AppState {
+    /// Raw per-chunk cap for D-048 relay streams, from the D-048 protocol
+    /// default (`TransportLimits.apiChunkBytes`, 64 KiB).
+    pub(crate) fn config_relay_chunk_bytes(&self) -> usize {
+        remuda_protocol::default_api_chunk_bytes() as usize
+    }
 }
 
 /// Test-only constructors for types private modules would otherwise hide
@@ -599,6 +610,7 @@ async fn spawn_inner(
         nodes: crate::transport::ConnectedNodes::default(),
         bus: Bus::with_capacity(config.follow_buffer_events),
         tty: crate::ws::TtyRelay::default(),
+        api_relay: crate::api_relay::ApiRelay::new(),
         push,
         followers: Followers::default(),
         blocked: BlockedWatch::default(),

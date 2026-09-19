@@ -54,6 +54,19 @@ pub trait NodeTransport: Send + Sync {
         params: Value,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>>;
+
+    /// Send a JSON-RPC **notification** (no `id`).
+    ///
+    /// D-048's `api.*` frames are notifications by design: they must never
+    /// enter the 32-slot in-flight request map that `instance.create` and
+    /// `tty.write` depend on. The frame rides the same FIFO outbound channel
+    /// (so it cannot overtake queued RPC replies) but never registers a waiter.
+    /// Returns `Ok(false)` when the session is not writable.
+    fn notify(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HubError>> + Send + '_>>;
 }
 
 /// Live Node RPC channel, backed by a WebSocket or the SSH supervisor's writer.
@@ -126,6 +139,25 @@ impl NodeTransport for WssTransport {
             }
         })
     }
+
+    fn notify(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HubError>> + Send + '_>> {
+        let method = method.to_string();
+        Box::pin(async move {
+            let frame = json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            });
+            match self.outbound.send(frame).await {
+                Ok(()) => Ok(true),
+                Err(_) => Ok(false),
+            }
+        })
+    }
 }
 
 /// Legacy disconnected placeholder. Managed SSH uses the shared live RPC channel.
@@ -168,6 +200,14 @@ impl NodeTransport for ScriptedTransport {
     ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>> {
         Box::pin(std::future::ready(Ok(self.reply.clone())))
     }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(false)))
+    }
 }
 
 impl StdioTransport {
@@ -196,6 +236,14 @@ impl NodeTransport for StdioTransport {
         _timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>> {
         Box::pin(async { Ok(None) })
+    }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(false)))
     }
 }
 
@@ -229,6 +277,26 @@ impl ConnectedNodes {
             return Ok(None);
         };
         link.call(method, params, timeout).await
+    }
+
+    /// Send a notification (no `id`, no pending slot) to a connected Node.
+    /// `Ok(false)` = not connected / session not writable.
+    pub async fn notify(
+        &self,
+        host_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<bool, HubError> {
+        let Some(link) = self
+            .inner
+            .lock()
+            .await
+            .get(host_id)
+            .map(|slot| slot.link.clone())
+        else {
+            return Ok(false);
+        };
+        link.notify(method, params).await
     }
 
     /// Record a live session. Returns a generation used to retire only this session.

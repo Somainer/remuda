@@ -297,6 +297,7 @@ mod tests {
             default_tui: None,
             workspaces: vec![],
             workspace_revision: 0,
+            relay_bind: None,
         };
 
         // Installed row + macOS passes.

@@ -116,6 +116,12 @@ pub(crate) struct DispatchBody {
     /// capability is rejected with a named message rather than silently dropped.
     #[serde(default)]
     pub(crate) capabilities: Vec<String>,
+    /// D-047 per-dispatch proxy override: proxy host id, `self`, or `none`.
+    #[serde(default, rename = "apiVia")]
+    pub(crate) api_via: Option<String>,
+    /// D-047 route sub-mode for `apiVia`: auto | hub-relay | direct-net.
+    #[serde(default, rename = "apiRoute")]
+    pub(crate) api_route: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -255,6 +261,10 @@ pub(crate) async fn dispatch_core(
         return Err(HubError::BadRequest("brief is required".into()));
     }
     crate::inventory::validate_capabilities(&body.capabilities).map_err(HubError::BadRequest)?;
+    // Validate the D-047 overrides before any resource lookup: a malformed
+    // apiVia is a 400 whether or not the project exists.
+    let route_overrides =
+        crate::http::parse_route_overrides(body.api_via.as_deref(), body.api_route.as_deref())?;
     let harness = match body.harness.as_deref().unwrap_or("claude") {
         "claude" | "codex" | "grok" => body.harness.as_deref().unwrap_or("claude").to_string(),
         other => {
@@ -396,6 +406,61 @@ pub(crate) async fn dispatch_core(
         model = project.model_roles.workhorse.clone();
     }
 
+    // ── D-047 route refusal, before any name/port/worktree allocation ──────
+    // The supply refusals above and this block are the two hard gates the
+    // §B.5 contract names as "before allocation". resolve_and_attach re-runs
+    // the waterfall on the built spec later; this precheck exists so a dead or
+    // old proxy host costs nothing and no relay-capable path gets provisioned.
+    let project_route_doc = state
+        .store
+        .get_project_route_override(project.meta.id.as_id().to_string())
+        .await
+        .map_err(map_store)?;
+    {
+        let resolved = crate::provider_resolve::resolve(crate::provider_resolve::ResolveInput {
+            host: &host,
+            profiles: &profiles,
+            delegation: delegation.as_deref(),
+            provider_profile_id: provider_profile_id.as_deref(),
+            project_profile_id: project
+                .provider
+                .profile_id
+                .as_deref()
+                .filter(|id| crate::provider_resolve::is_real_profile_id(id)),
+            project_delegation: project
+                .provider
+                .delegation
+                .as_deref()
+                .filter(|value| !value.is_empty()),
+        })?;
+        let profile = match &resolved {
+            crate::provider_resolve::ResolvedProvider::Profile { profile, .. } => {
+                Some(profile.clone())
+            }
+            crate::provider_resolve::ResolvedProvider::Native { .. } => None,
+        };
+        let choice = crate::providers::resolve_route_choice(
+            &host.host_id,
+            project_route_doc.as_ref(),
+            &route_overrides,
+            profile.as_deref(),
+        )?;
+        if let Some(choice) = choice {
+            crate::providers::validate_via_target(
+                &state,
+                &host,
+                &choice,
+                profile.as_deref().ok_or_else(|| {
+                    HubError::BadRequest(
+                    "apiVia requires a gateway provider profile; the resolved provider is native"
+                        .into(),
+                )
+                })?,
+            )
+            .await?;
+        }
+    }
+
     // ── product-assigned name / branch / port block (§2.4) ─────────────────
     let slug_source = task
         .as_ref()
@@ -502,6 +567,8 @@ pub(crate) async fn dispatch_core(
         &host,
         &mut spec,
         Some(&project.provider),
+        project_route_doc.as_ref(),
+        route_overrides,
     )
     .await?;
 
@@ -1679,6 +1746,7 @@ mod driver_choice_tests {
             default_tui: None,
             workspaces: Vec::new(),
             workspace_revision: 0,
+            relay_bind: None,
         }
     }
 

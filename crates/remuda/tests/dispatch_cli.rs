@@ -3,7 +3,7 @@
 //! `worker.provision` / `worker.remove`. No real git or herdr: the Node side is
 //! covered by remuda-node's own worker tests on a temp repo.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, spawn};
 use serde_json::{Value, json};
@@ -285,6 +285,31 @@ where
     }
 }
 
+/// Next inbound frame worth answering, or `None` once the stream closed.
+///
+/// An idle timeout is retried rather than ending the fake Node: the Hub
+/// sends nothing between `runtime.hello` and the first dispatch RPC, while
+/// the CLI subprocesses before that dispatch can sit longer than the frame
+/// window on a loaded gate host. Letting the task exit dropped the socket,
+/// and the Hub then marked the host offline — the 422
+/// PLACEMENT_UNSATISFIABLE "host is offline" gate flake.
+async fn next_rpc_frame<S>(ws: &mut S) -> Option<Value>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        match tokio::time::timeout(Duration::from_secs(8), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str(&text) {
+                Ok(frame) => return Some(frame),
+                Err(_) => continue,
+            },
+            Ok(Some(Ok(_))) => continue,
+            Ok(None) | Ok(Some(Err(_))) => return None,
+            Err(_) => continue,
+        }
+    }
+}
+
 async fn spawn_hub() -> Result<Hub> {
     let dir = tempfile::tempdir()?;
     let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
@@ -325,10 +350,7 @@ async fn spawn_hub() -> Result<Hub> {
     let hello = recv_json(&mut node).await?;
     assert!(hello["result"]["nodeToken"].is_string());
     let task = tokio::spawn(async move {
-        loop {
-            let Ok(frame) = recv_json(&mut node).await else {
-                break;
-            };
+        while let Some(frame) = next_rpc_frame(&mut node).await {
             if let Some(id) = frame.get("id").cloned()
                 && frame.get("method").is_some()
             {
@@ -363,8 +385,27 @@ async fn spawn_hub() -> Result<Hub> {
             }
         }
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
     let base = format!("http://{}", hub.addr);
+    let liveness = remuda_hub_client::HubClient::new(base.clone(), Some(token.clone()), None)?;
+    // Wait for the hosts index to project the live link before any test
+    // dispatches, instead of racing it with a fixed sleep. Paired with the
+    // keepalive loop above this keeps the host online through the slow
+    // pre-dispatch CLI sequence on a loaded gate host.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if liveness.list_hosts().await.is_ok_and(|rows| {
+                rows.iter().any(|row| {
+                    row["hostId"].as_str() == Some(host.as_str()) && row["online"] == true
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .ok()
+    .context("fake host never reported online before dispatch")?;
     Ok(Hub {
         _dir: dir,
         _hub: hub,

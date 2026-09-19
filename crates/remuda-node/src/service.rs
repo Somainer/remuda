@@ -116,6 +116,14 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
             "Node data directory is long: per-instance hook sockets will bind in the per-user runtime dir and appear as symlinks under each instance directory"
         );
     }
+    // Reclaim redirected socket inodes left by Node processes that died hard
+    // (SIGKILL cannot run the session/daemon drop that unlinks them). Live
+    // listeners answer the sweep's probe and are never touched.
+    match remuda_signal::runtime_dir::sweep_dead_runtime_sockets() {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "reclaimed dead remuda runtime sockets"),
+        Err(error) => tracing::debug!(%error, "runtime socket sweep failed"),
+    }
     let store = Arc::new(MemoryStore::open_journaled(
         &config.data_dir,
         config.http.follow_buffer_capacity,

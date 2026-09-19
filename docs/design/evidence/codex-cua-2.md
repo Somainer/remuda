@@ -58,7 +58,7 @@ tests rather than by review:
 
 `crates/remuda-node/src/inventory.rs`: `ProbeEnv` gains `codex_home`
 (`CODEX_HOME`, defaulting to `<home>/.codex`), and `probe()` appends one row
-after the five PATH-probed CLIs (`cli[6]`, so every existing `cli[0]` /
+after the five PATH-probed CLIs (`cli[5]` of six, so every existing `cli[0]` /
 `cli[i]` consumer keeps reading what it always did — pinned by
 `computer_use_row_is_appended_last`).
 
@@ -107,6 +107,27 @@ A `CODEX_HOME` pointing at a regular file reports the same and does not panic
 bundle with an unreadable plist is still `installed: true` with no version —
 presence is the stat, not the plist.
 
+### `installed` means an executable regular file
+
+Not bare existence of anything at that name: the probe uses the same
+`is_executable` test as the PATH probes, so a directory or a non-executable
+file there is not a client (pinned by
+`computer_use_non_executable_file_is_not_a_client_on_posix`). The doc comment
+on the probe said "plain path existence" and was corrected to match the code,
+along with one line of the contract's §3.4 table (`docs/design/codex-cua.md`),
+which is the wording correction granted for this task:
+`installed` = 该路径上存在一个可执行常规文件.
+
+### The plist read is capped
+
+`plist_version` reads `metadata.len()` first and returns `None` above
+`MAX_PLIST_BYTES` (1 MiB) instead of parsing. Real bundle plists are a few KB,
+and the cap is load-bearing because `c-cua-launch`'s preflight calls
+`collect_fresh`, which **bypasses the 30 s TTL cache** — so an unbounded parse
+here would run on every launch, not once per TTL, against a file at a path a
+bundle could in principle supply. The cap costs the version and never the row
+(pinned by `computer_use_skips_an_oversized_plist_without_losing_the_row`).
+
 ## `remuda doctor`
 
 A new read-only `computer-use` check. It is deliberately a **warning**, not a
@@ -146,6 +167,18 @@ An older Node that never reports the row yields `{"reported": false}` with **no*
 `installed` key — three states stay distinguishable, and the integration test
 `dispatch_retire_hostcap_cli_lifecycle` asserts the unreported shape against a
 real Hub and a fake Node whose `cli[]` holds only claude.
+
+A **failed** host-row read is its own state, not an absent key. The first
+revision dropped the error in an `if let Ok(…)`, so `computerUse` simply
+vanished and a consumer read `null` — indistinguishable from "this host does
+not report the capability", which calls for different operator action than
+"remuda could not ask the Hub". It now emits
+`{"reported": false, "error": "<reason>"}` and still prints the capacity
+payload it already fetched (pinned by
+`a_failed_host_read_reports_the_error_instead_of_dropping_the_key`).
+
+The `cli[]` kind literal is `super::capability::COMPUTER_USE` rather than a
+third copy of the string.
 
 ## The row crosses the wire unchanged
 
@@ -189,9 +222,13 @@ type ComputerUseState =
   | { reported: true; installed: true; version?: string; path?: string };
 ```
 
-`HostDiagnostics` renders the row in all three states (`data-state` =
-`installed` / `absent` / `unreported`; copy 已安装 / 未安装 / 未上报, with 未上报
-explicitly reading "不代表本机不支持").
+`HostDiagnostics` renders the row in **one** state: `unreported` (`data-state`
+= `unreported`, copy 未上报, explicitly reading "不代表本机不支持"). The two
+*reported* states are the host detail's CLI table's to draw — `installed` →
+已安装, `installed: false` → 未安装 — and the `unreported` case is precisely the
+one that table cannot express, because both `installedCli` and `absentCli`
+yield nothing when the row is missing. Rendering the reported states in both
+places showed one fact twice on one page, which review caught.
 
 Two things were checked rather than assumed:
 
@@ -222,32 +259,86 @@ A reported-absent row also gets its own row in the `/hosts/:hostId` CLI table
 (`HostsPage`), since the installed list it used to live in can no longer carry
 it and a row that vanishes reads as if the host never answered.
 
-`computer-use` cannot become a launchable harness kind: New Session tests
-membership against the harness ids (`claude`/`codex`/`grok`/`agy`/`terminal`),
-and the capability is not one of them — pinned by
-`cannot turn the capability row into a launchable harness kind`.
+**The capability row must never reach the harness-kind list, and an earlier
+revision of this branch got that wrong.** New Session reads a *non-empty*
+`supportedKinds` as "the host told us what it has" and stops falling back to
+claude. Counting the capability row therefore made the list non-empty on a host
+that has the vendor client but no agent CLI on `PATH`, so `claude` was no
+longer offered and **every** kind rendered disabled — nothing selectable in New
+Session. The fix is `supportedHarnessKinds()` in `model.ts`, which filters the
+capability kind out, and it is pinned at both layers:
+
+- `never turns the capability row into a launchable harness kind` (model);
+- `still offers claude on a host whose only installed CLI is the computer-use
+  client` (the page, asserting the button is actually enabled).
+
+Both tests were confirmed non-vacuous by reverting the fix: each fails without
+it and passes with it.
 
 Fixtures carry all three states: `devbox-sg` installed, `devbox` absent,
 `runtime-local` / `forge-doloris` omitting the row.
+
+## Changes made in review
+
+Seven findings, all fixed on top of the reviewed commits:
+
+1. **Regression, and the important one**: the capability row counted as a
+   harness kind, so a host with the client but no agent CLI on `PATH` rendered
+   every New Session kind disabled. Fixed via `supportedHarnessKinds()`, pinned
+   at both the model and page layers, both proven non-vacuous by reverting the
+   fix.
+2. A model test that compared two string literals and could not fail was
+   replaced with one that asserts the actual list derivation.
+3. `remuda hostcap` dropped a failed host-row read in an `if let Ok(…)`, so
+   `computerUse` vanished; it now reports `{reported: false, error}`.
+4. The same fact rendered twice on one page (CLI table *and* under the
+   workspace-access heading); `HostDiagnostics` now draws only the `unreported`
+   state the CLI table cannot express.
+5. The `Info.plist` read is capped at 1 MiB before parsing, because the launch
+   preflight bypasses the cache and would otherwise parse per launch.
+6. The probe's doc comment said "plain path existence" while the code requires
+   an executable regular file — comment corrected to the code, plus the
+   one-line contract wording correction in `docs/design/codex-cua.md` §3.4.
+7. Hygiene: the `cli[]` kind literal reuses `super::capability::COMPUTER_USE`;
+   `cli[5]` not `cli[6]`; the dependency note now says `quick-xml` is the only
+   *new* lock entry (`plist` also declares base64/indexmap/time, all already
+   present); the flake table is in chronological order.
 
 ## Tests
 
 | Layer | What |
 |---|---|
-| Rust unit (`inventory.rs`) | present+version vs binary plist; absent; `CODEX_HOME` is a file; no plist; non-executable client; appended last; **no-spawn bomb** |
+| Rust unit (`inventory.rs`) | present+version vs binary plist; absent; `CODEX_HOME` is a file; no plist; non-executable client; appended last; **no-spawn bomb**; **oversized plist skipped** |
 | Rust unit (`diagnostics.rs`) | doctor check absent (names its path, warning) and present (ok, version) |
-| Rust unit (`hostcap.rs`) | reported-installed / reported-absent / unreported row shaping |
+| Rust unit (`hostcap.rs`) | reported-installed / reported-absent / unreported row shaping; **a failed host read reports its error instead of dropping the key** |
 | Rust integration (`dispatch_cli.rs`) | `remuda hostcap` against a real Hub + fake Node → `computerUse.reported == false` |
 | Rust integration (`wss.rs`) | the row survives a real WSS hello → Hub store → `/v1/hosts` round trip |
 | Rust integration (`computer_use_interop.rs`) | **the seam**: the row the probe really produces is fed to `c-cua-launch`'s gate — accepted on a simulated Mac, refused for absence, and "not reported" for a missing row |
-| vitest (`model.test.ts`) | the three states; `cliSummary` label survival; `installedCli`/`absentCli` truth table; not a launchable kind |
-| vitest (`HostDiagnostics.test.tsx`) | the three rendered states, incl. no "未安装" claim when unreported |
+| vitest (`model.test.ts`) | the three states; `cliSummary` label survival; `installedCli`/`absentCli` truth table; **`supportedHarnessKinds` excludes the capability row** |
+| vitest (`NewSessionPage.test.tsx`) | **the regression**: a host whose only installed CLI is the capability still offers claude |
+| vitest (`HostDiagnostics.test.tsx`) | the row renders *only* when unreported — a reported row is the CLI table's to draw |
 
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test -p remuda-node` (33 suites, 0 failures), `pnpm typecheck` and
-`vitest run` (1183 tests) were run on this branch, all green — on the tree
-rebased onto `c-cua-launch`, so both batches' tests ran together and against
-launch's gate.
+`vitest run` (1183 tests) were run on this branch — on the tree rebased onto
+`c-cua-launch`, so both batches' tests ran together and against launch's gate.
+
+**One vitest case is intermittently red on `origin/main`, not here.**
+`EffortSlider.test.tsx` › *"Enter picks the focused model row; Escape closes
+back to the slider"* fails on **pristine main**: sampled on the same day it gave
+**4 fails in 6 runs** on `origin/main` and **5 in 6** on this branch's HEAD in a
+fresh worktree — the same rate within noise, and both the spec and its only
+import (`EffortSlider.tsx`) are byte-identical to main. The assertion is
+`expect(onModel).toHaveBeenCalledWith("gateway/model-79")` with
+`Number of calls: 0`, i.e. the `{End}`+`{Enter}` sequence against a
+raf-scheduled roving focus. A single pristine pass was observed first and would
+have "cleared" this branch incorrectly; the rate comparison is what settles it.
+
+`pnpm test` therefore passes or fails as a whole depending on the draw: on the
+final tree it ran **129 files / 1183 tests, 0 failed**, and on the runs where
+this one case loses the race it is the only failure. No other test in `pnpm
+test` is affected, and this branch changes nothing the spec or its import
+touch.
 
 **Base of each figure, since the launch branch moved during this work:** the
 unit/integration figures above were re-run last on launch's **round-4** tip
@@ -265,17 +356,17 @@ property of this change.** Consecutive full runs of the same tree content:
 
 | Run | Result | The failure |
 |---|---|---|
-| r13 | 116 passed / 0 failed | — |
 | r12 | 115 passed / 1 failed | `ux-code.hub.spec.ts:235` |
+| r13 | 116 passed / 0 failed | — |
 | r14 | 117 passed / 1 failed | `ux-steer.hub.spec.ts:149` |
 | r15 | **120 passed / 0 failed** (`rc=0`, 17.1m) | — |
 
-Different specs, same content, alternating outcomes. `ux-steer.hub.spec.ts:149`
-passed in r13 and failed in r14; `ux-code` failed in r12 and passed in r13, r14
-and r15. The host is a contended 64-core shared box (peak load observed ~27
-with several other sessions' suites running), which is the documented flake
-class here — the same contention that earlier killed my `hub_e2e` process
-mid-run (r8: `Error: socket hang up`, then every later spec
+Same content every run, yet the outcome alternates and the failing spec moves:
+`ux-code` failed in r12 and passed in r13, r14 and r15; `ux-steer.hub.spec.ts:149`
+passed in r13 and failed in r14. That is the documented flake class for this
+contended 64-core shared box (peak load observed ~27 with several other
+sessions' suites running) — the same contention that earlier killed my
+`hub_e2e` process mid-run (r8: `Error: socket hang up`, then every later spec
 `connect ECONNREFUSED`).
 
 r15 is the run that counts: the whole suite green, including this task's
@@ -341,10 +432,15 @@ likewise not counted.
 ## Dependency
 
 One new crate: `plist = { version = "1.10.1", default-features = false }` in
-`remuda-node`, which pulls only `quick-xml` (both MIT, both `forbid(unsafe_code)`
-or unsafe-free, edition 2024). It is needed because a real app bundle ships a
-**binary** plist; `default-features = false` keeps the `serde` feature out —
-this is a two-key dictionary read, not a deserialization framework.
+`remuda-node` (MIT, edition 2024, and it contains no `unsafe`). It is needed
+because a real app bundle ships a **binary** plist; `default-features = false`
+keeps the `serde` feature out — this is a two-key dictionary read, not a
+deserialization framework.
+
+It declares `quick-xml` plus `base64`, `indexmap` and `time`; of those, **only
+`quick-xml` is new to the lock** — the other three were already in the graph at
+compatible versions (verified: the lock delta on this branch is exactly `plist`
+and `quick-xml`).
 
 ## Redaction note
 

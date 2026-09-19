@@ -4,12 +4,10 @@
    session.module.css and stay byte-identical; nothing here adds a media
    query — the mobile layout is a TSX conditional, not a CSS breakpoint. */
 
-/* Collapsed trigger group: one fused chip — mode word · effort tier — with a
-   trailing context segment. The ring is a glance indicator (and its detail
-   popover), the main segment opens the options sheet. The trigger declares
-   its own geometry rather than composing the shared `.chip` class: CSS
-   modules from different files have equal specificity and their cascade
-   order must not decide which border-radius wins. */
+/* The collapsed options trigger: the permission word · effort tier fused
+   pill. The trigger declares its own geometry rather than composing the
+   shared `.chip` class: CSS modules from different files have equal
+   specificity and their cascade order must not decide which border wins. */
 .triggerGroup {
   display: inline-flex;
   align-items: center;
@@ -19,8 +17,7 @@
 .trigger {
   height: 32px;
   border: 1px solid var(--line);
-  border-right: 1px solid var(--line);
-  border-radius: var(--radius) 0 0 var(--radius);
+  border-radius: var(--radius);
   background: transparent;
   color: var(--mute);
   font-family: var(--mono);
@@ -31,6 +28,20 @@
   gap: 6px;
   white-space: nowrap;
   position: relative;
+}
+
+/* ui-spec §3.4 / D-038: hit area by hit area, not visual size. The visible
+   chip stays 32px but a centred ::after hit zone extends the tap target to
+   var(--touch) (44px). It is the only control in the group now, so it never
+   overlaps a neighbour's zone. */
+.trigger::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--touch);
+  height: var(--touch);
+  transform: translate(-50%, -50%);
 }
 
 .triggerSep {
@@ -98,26 +109,6 @@
   50% {
     box-shadow: 0 0 10px 0 rgba(201, 132, 42, 0.35);
   }
-}
-
-/* The fused context segment: its own geometry (no `.chip` composition from
-   session.module.css) so the shared border between trigger and ring always
-   reads as one pill regardless of CSS module cascade order. */
-.contextSegment {
-  height: 32px;
-  border: 1px solid var(--line);
-  border-left-width: 0;
-  border-radius: 0 var(--radius) var(--radius) 0;
-  background: transparent;
-  color: var(--mute);
-  font-family: var(--mono);
-  font-size: 12px;
-  padding: 0 9px;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  white-space: nowrap;
-  position: relative;
 }
 
 /* Options sheet sections (Sheet panel already supplies surface/padding). */

@@ -23,6 +23,7 @@ export function ComposerOptionsSheet({
   returnFocusRef,
   attach,
   harness,
+  context,
   permission,
   effort,
 }: {
@@ -32,6 +33,7 @@ export function ComposerOptionsSheet({
   returnFocusRef?: RefObject<HTMLElement | null>;
   attach?: ReactNode;
   harness?: ReactNode;
+  context?: ReactNode;
   permission?: ReactNode;
   effort?: ReactNode;
 }) {
@@ -68,6 +70,12 @@ export function ComposerOptionsSheet({
         <section className={css.section}>
           <h3 className={css.sectionLabel}>载体</h3>
           {harness}
+        </section>
+      ) : null}
+      {context ? (
+        <section className={css.section}>
+          <h3 className={css.sectionLabel}>上下文</h3>
+          {context}
         </section>
       ) : null}
       {permission ? (

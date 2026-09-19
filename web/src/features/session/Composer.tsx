@@ -350,6 +350,12 @@ export function Composer({
     phase,
     capabilities ?? ({ capabilities: {} } as unknown as CapabilitySnapshot),
   );
+  // Latest-guard refs so a Sheet confirm re-checks the LIVE turn state at the
+  // moment the user confirms (unlike a blocking window.confirm, a Sheet lets
+  // the turn end while the dialog is open).
+  const controlsRef = useRef(controls);
+  controlsRef.current = controls;
+  const canSubmitRef = useRef<() => boolean>(() => false);
 
   const busy = phase === "working" || phase === "blocked";
   const remudaHeld = held.filter((item) => item.holder === "remuda");
@@ -357,6 +363,17 @@ export function Composer({
   /** 1-based queue ordinal among turn-wait Remuda-held rows. */
   const ordinalOf = (id: string) =>
     remudaHeld.filter((item) => item.reason === "turn").findIndex((item) => item.id === id) + 1;
+
+  // A Sheet confirm is only valid while its precondition holds. If the turn
+  // state changes while the dialog is open, dismiss it rather than let a later
+  // click post a steer/cancel against the wrong state (D-042): 插队 needs a
+  // working turn, 打断 needs any busy turn.
+  useEffect(() => {
+    if (!confirm) return;
+    if (confirm.kind === "steer" && phase !== "working") setConfirm(null);
+    if (confirm.kind === "interrupt" && !busy) setConfirm(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
 
   // c-steer: held prompts flush when the wait ends — a working turn goes idle
   // (or is interrupted into a steer), a pending question resolves (blocked →
@@ -391,6 +408,7 @@ export function Composer({
     if (images.uploading) return false;
     return true;
   };
+  canSubmitRef.current = canSubmit;
 
   /**
    * Insert `[Image #n]`/`[Code #n]` token at the textarea caret
@@ -492,6 +510,15 @@ export function Composer({
   };
 
   /**
+   * The interrupt Sheet confirm must act on the LIVE turn state: if the turn
+   * ended while the dialog was open there is nothing to cancel.
+   */
+  const confirmInterrupt = () => {
+    if (!busy || !controlsRef.current.interrupt.available) return;
+    void doInterrupt();
+  };
+
+  /**
    * Submit the PRIMARY control.
    * Idle → send a normal new turn immediately.
    * Working/blocked → queue: Remuda holds it (reason = turn end / question
@@ -532,15 +559,19 @@ export function Composer({
    */
   const submitSteer = async () => {
     if (!canSubmit() || !controls.steer.available || phase !== "working") return;
-    const value = expandCodeQuotes(text.trim(), codeQuotes.quotes);
-    const refs = images.refs(value);
-    const staged = images.attachments;
     setConfirm({
       kind: "steer",
       title: "插队发送",
       message: "打断当前 turn 并立即发送（插队）？已排队的消息仍会按顺序随后送出。",
       confirmLabel: "打断并发送",
       onConfirm: () => {
+        // Re-check the LIVE state: a Sheet (unlike the old blocking
+        // window.confirm) lets the turn end while the user reads the dialog.
+        if (phaseRef.current !== "working" || !controlsRef.current.steer.available) return;
+        if (!canSubmitRef.current()) return;
+        const value = expandCodeQuotes(textRef.current.trim(), codeQuotes.quotes);
+        const refs = images.refs(value);
+        const staged = images.attachments;
         clearBox();
         // 已打断 is a receipt for an interrupt that actually happened: only
         // raise it once the steer POST landed (a failure leaves 状态待确认).
@@ -587,7 +618,7 @@ export function Composer({
         title: "打断当前 turn",
         message: "打断当前 turn？会话与进程不会退出。",
         confirmLabel: "打断",
-        onConfirm: () => void doInterrupt(),
+        onConfirm: confirmInterrupt,
       });
       return;
     }
@@ -687,6 +718,21 @@ export function Composer({
     onFiles: (files: File[]) => insertForAttachments(images.add(files)),
     onPasteClick: async () => insertForAttachments(await images.pasteFromClipboard()),
   };
+  // Attachments started from the options Sheet must dismiss the Sheet FIRST:
+  // otherwise insertForAttachments focuses/scrolls the textarea behind the
+  // aria-modal scrim, violating the focus trap. After close the textarea
+  // focus is correct (the staged chip renders above the input).
+  const closeOptions = () => setOptionsOpen(false);
+  const sheetAttachHandlers = {
+    onFiles: (files: File[]) => {
+      closeOptions();
+      insertForAttachments(images.add(files));
+    },
+    onPasteClick: async () => {
+      closeOptions();
+      insertForAttachments(await images.pasteFromClipboard());
+    },
+  };
 
   const harnessChipNode = caps.harness ? (
     <span className={css.chip} data-testid="harness-chip" data-readonly="1">
@@ -713,6 +759,31 @@ export function Composer({
       onClose={() => {
         setMenu(null);
         triggerRefs.effort.current?.focus();
+      }}
+    />
+  ) : null;
+
+  // The same slider inside the phone options Sheet closes the SHEET and
+  // returns focus to its collapsed trigger (Sheet focus trap also restores
+  // focus, but the slider's own Escape path names the trigger explicitly).
+  const sheetEffortSliderNode = caps.effort ? (
+    <EffortSlider
+      kind={harness}
+      model={caps.model ? model : undefined}
+      models={caps.model ? models : undefined}
+      modelEffective={caps.model ? modelEffective : null}
+      modelPending={caps.model ? modelPending : null}
+      modelSelectionPath={caps.model ? modelSelectionPath : null}
+      modelCatalog={caps.model ? (modelCatalog ?? null) : null}
+      modelLockedReason={modelLockedReason}
+      index={currentEffort.index}
+      ultracode={ultraOn}
+      disabled={effortLocked}
+      onChange={(next) => onEffort?.(next)}
+      onModel={caps.model ? onModel : undefined}
+      onClose={() => {
+        setOptionsOpen(false);
+        optionsTriggerRef.current?.focus();
       }}
     />
   ) : null;
@@ -788,47 +859,79 @@ export function Composer({
     </>
   );
 
-  const renderContextChip = (fused: boolean) =>
-    caps.context ? (
-      <button
-        ref={fused ? undefined : triggerRefs.usage}
-        type="button"
-        className={fused ? opt.contextSegment : css.chip}
-        data-testid="context-chip"
-        data-has-popover={usageRollup ? "1" : "0"}
-        aria-haspopup={usageRollup ? "dialog" : undefined}
-        aria-expanded={menu === "usage"}
-        aria-label={
-          usageRollup
-            ? `上下文用量 ${contextChipLabel}，查看明细`
-            : `上下文用量 ${contextChipLabel}`
+  // Context usage rides INSIDE the phone options Sheet (dispatch plan §C
+  // default 4), not on the collapsed trigger. Tapping it opens the usage
+  // detail popover as a stacked bottom sheet on touch widths.
+  const contextChipInner = (
+    <>
+      <span
+        className={css.contextRing}
+        style={{ ["--ctx-pct" as string]: contextPct == null ? "0%" : `${contextPct}%` }}
+      />
+      <span>{contextChipLabel}</span>
+    </>
+  );
+  const contextChipNode = caps.context ? (
+    <button
+      type="button"
+      className={css.chip}
+      data-testid="context-chip"
+      data-has-popover={usageRollup ? "1" : "0"}
+      aria-haspopup={usageRollup ? "dialog" : undefined}
+      aria-expanded={menu === "usage"}
+      aria-label={
+        usageRollup
+          ? `上下文用量 ${contextChipLabel}，查看明细`
+          : `上下文用量 ${contextChipLabel}`
+      }
+      onClick={() => {
+        if (usageRollup) {
+          usagePinned.current = true;
+          cancelHoverClose();
+          setMenu("usage");
         }
-        onClick={() => {
-          // Idempotent, click-pinned open: mouseenter may already have opened
-          // it on precise pointers, and touch fires no hover. Pinning means a
-          // later pointer leave cannot dismiss the card; × / outside
-          // pointerdown / Escape unpin and close.
-          if (usageRollup) {
-            usagePinned.current = true;
-            cancelHoverClose();
-            setMenu("usage");
-          }
-        }}
-        onMouseEnter={() => {
-          if (usageRollup && hoverCapable()) {
-            cancelHoverClose();
-            setMenu("usage");
-          }
-        }}
-        onMouseLeave={scheduleHoverClose}
-      >
-        <span
-          className={css.contextRing}
-          style={{ ["--ctx-pct" as string]: contextPct == null ? "0%" : `${contextPct}%` }}
-        />
-        <span>{contextChipLabel}</span>
-      </button>
-    ) : null;
+      }}
+    >
+      {contextChipInner}
+    </button>
+  ) : null;
+  // Desktop keeps its hover-open chip anchored to its own trigger.
+  const desktopContextChip = caps.context ? (
+    <button
+      ref={triggerRefs.usage}
+      type="button"
+      className={css.chip}
+      data-testid="context-chip"
+      data-has-popover={usageRollup ? "1" : "0"}
+      aria-haspopup={usageRollup ? "dialog" : undefined}
+      aria-expanded={menu === "usage"}
+      aria-label={
+        usageRollup
+          ? `上下文用量 ${contextChipLabel}，查看明细`
+          : `上下文用量 ${contextChipLabel}`
+      }
+      onClick={() => {
+        // Idempotent, click-pinned open: mouseenter may already have opened
+        // it on precise pointers, and touch fires no hover. Pinning means a
+        // later pointer leave cannot dismiss the card; × / outside
+        // pointerdown / Escape unpin and close.
+        if (usageRollup) {
+          usagePinned.current = true;
+          cancelHoverClose();
+          setMenu("usage");
+        }
+      }}
+      onMouseEnter={() => {
+        if (usageRollup && hoverCapable()) {
+          cancelHoverClose();
+          setMenu("usage");
+        }
+      }}
+      onMouseLeave={scheduleHoverClose}
+    >
+      {contextChipInner}
+    </button>
+  ) : null;
 
   // D-042 phone trigger: one fused chip that ALWAYS names the current
   // permissionMode word AND the effort tier (`manual · high`). Danger modes
@@ -854,10 +957,10 @@ export function Composer({
         data-effort-mismatch={caps.effort ? (mismatch ? "1" : "0") : undefined}
         aria-haspopup="dialog"
         aria-expanded={optionsOpen}
-        // Keep the same accessible name contract as the desktop effort chip;
-        // the permission word rides the visible fused span, its description
-        // rides the title.
-        aria-label={`Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
+        // D-042: the accessible name must carry the permission word (and a
+        // explicit 危险 marker for yolo modes) as well as the effort tier,
+        // since this one trigger replaces both desktop chips.
+        aria-label={`${triggerModeWord ? `${triggerModeWord}${permDanger ? "（危险）" : ""} · ` : ""}Select effort, ${effortChipLabel}; effective ${pendingLabel ? `pending ${pendingLabel}` : effectiveUnknown ? "unknown" : effectiveWord}`}
         title={[permOption?.description, effortChipTitle].filter(Boolean).join("\n")}
         // The trigger stays clickable for an exited/observed-only session so
         // the sheet can still show the locked effort slider / launch-only
@@ -877,7 +980,6 @@ export function Composer({
         ) : null}
         <span className={css.chipCaret}>▾</span>
       </button>
-      {renderContextChip(true)}
     </span>
   );
 
@@ -1123,7 +1225,7 @@ export function Composer({
                 <span className={css.chipCaret}>▾</span>
               </button>
             ) : null}
-            {renderContextChip(false)}
+            {desktopContextChip}
             {caps.permission ? (
               onPermission ? (
                 <button
@@ -1194,11 +1296,12 @@ export function Composer({
             className={opt.attachBtn}
             disabled={disabled}
             mobile
-            onFiles={attachHandlers.onFiles}
-            onPasteClick={attachHandlers.onPasteClick}
+            onFiles={sheetAttachHandlers.onFiles}
+            onPasteClick={sheetAttachHandlers.onPasteClick}
           />
         }
         harness={harnessChipNode}
+        context={contextChipNode}
         permission={
           onPermission ? (
             <div className={css.popover} data-testid="permission-menu" data-in-sheet="1">
@@ -1213,7 +1316,7 @@ export function Composer({
             // The SAME compact card geometry as desktop rides inside the
             // sheet, so the slider contract is identical.
             <div className={`${css.popover} ${css.popoverCard}`} data-testid="effort-menu" data-placement="up" data-in-sheet="1">
-              {effortSliderNode}
+              {sheetEffortSliderNode}
             </div>
           ) : null
         }

@@ -90,7 +90,17 @@ flock "$E2E_LOCK" bash -c '
 
 ## 10. 运行记录
 
-（完整 hub 套件结果于本次运行后回填。）
+完整 hub 套件在**最终提交树**（rebase 到 `origin/main` @ 927bde54，含 c-cua-media 合并）上跑 1 次：`playwright test -c playwright.hub.config.ts`，1 worker，**162 用例：143 passed，19 skipped（REMUDA_EVIDENCE 未置位的证据用例），0 failed**（2026-09-20，派工端口 59200/59209/59201 + `e2e.lock-b` 槽，bundled chromium / `PW_CHANNEL=chromium`，约 22.3 分钟）。
+
+过程中另有一次较早的全量运行（rebase 前的 39d5bb73 树 + 我前 3 个提交，161 用例：139 passed / 1 failed / 21 skipped）：唯一失败是 `ux-question.hub.spec.ts:127`，发生在我执行 `git rebase` 的同一时刻——vite dev server 对规格文件的 HMR 替换使该 serial 组的第一个用例在新旧模块混合状态下运行，同组后两个用例连带跳过，**非被测行为失败**。在最终树上单跑该规格：3 passed；随后的完整套件 0 failed，确认环境性原因。
+
+本任务新改的三个既有规格在最终树全量运行中的结果：
+
+- `m-shell.hub.spec.ts`：4 passed / 2 evidence skipped（含改写后的 `/m/inbox` → `m-inbox` + `?focus=` 断言）；
+- `ux-question.hub.spec.ts`：3 passed（390 帧改走「去回答」→ `/s/:id` 卡片，1440 帧保持桌面审批中心）；
+- `m-inbox.hub.spec.ts`：4 passed / 1 evidence skipped。
+
+`ui-screenshots.spec.ts` 是 mock-client 规格（不被 hub 配置收录），其 390 `/approvals` 断言已按重定向更新；它与 `ux-question` 的截图快照由 `REMUDA_EVIDENCE=1` 人工再生成，闸口不依赖像素比对。
 
 ## 11. 兼容性说明
 

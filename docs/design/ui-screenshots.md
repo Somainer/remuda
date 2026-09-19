@@ -12,7 +12,7 @@ Visual authority: [Claude Design canvas](claude-design/Remuda%20UI%20Spec%20v0.2
 | `/s/:id` structured | [session-1440](../../web/tests/e2e/__screenshots__/session-1440.png) | [session-390](../../web/tests/e2e/__screenshots__/session-390.png) |
 | `/s/:id/tty` | [tty-1440](../../web/tests/e2e/__screenshots__/tty-1440.png) | [tty-390](../../web/tests/e2e/__screenshots__/tty-390.png) |
 | `/sessions/new` | [new-1440](../../web/tests/e2e/__screenshots__/new-1440.png) | [new-390](../../web/tests/e2e/__screenshots__/new-390.png) |
-| `/approvals` | [approvals-1440](../../web/tests/e2e/__screenshots__/approvals-1440.png) | approvals-390 → phone inbox [`/m/inbox`](../../web/tests/e2e/__screenshots__/approvals-390.png)（D-049 重定向，c-minbox） |
+| `/approvals` | [approvals-1440](../../web/tests/e2e/__screenshots__/approvals-1440.png) | 390 → `/m/inbox` 手机收件箱（D-049 重定向），见 [mobile-ui-4-inbox-390.png](./evidence/mobile-ui-4-inbox-390.png)（c-minbox） |
 | `/hosts` | [hosts-1440](../../web/tests/e2e/__screenshots__/hosts-1440.png) | [hosts-390](../../web/tests/e2e/__screenshots__/hosts-390.png) |
 | `/providers` | [providers-1440](../../web/tests/e2e/__screenshots__/providers-1440.png) | [providers-390](../../web/tests/e2e/__screenshots__/providers-390.png) |
 | `/bots` | [bots-1440](../../web/tests/e2e/__screenshots__/bots-1440.png) | [bots-390](../../web/tests/e2e/__screenshots__/bots-390.png) |

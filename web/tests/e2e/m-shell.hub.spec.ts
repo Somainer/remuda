@@ -35,7 +35,7 @@ async function shot(page: Page, name: string) {
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
-async function createSession(page: Page, prompt: string): Promise<string> {
+async function createSession(page: Page, prompt: string, workspaceId?: string): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -49,6 +49,7 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, {
     timeout: 20_000,
   });
+  if (workspaceId) await page.getByTestId("new-session-workspace").selectOption(workspaceId);
   await page.getByTestId("new-session-prompt").fill(prompt);
   await page.getByTestId("new-session-start").click();
   await page.waitForURL(/\/s\//, { timeout: 20_000 });
@@ -220,7 +221,8 @@ test.describe("390px phone", () => {
 
   test("evidence: phone home at 390px with a pending approval", async ({ page }) => {
     test.skip(!evidence, "set REMUDA_EVIDENCE=1 to capture the committed screenshot");
-    await createSession(page, "m shell evidence shot");
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await createSession(page, "m shell evidence shot", "wsp_g2_changed");
     await page.goto("/m");
     await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
     await expect(page.getByTestId("session-row")).toHaveCount(1, { timeout: 15_000 });
@@ -262,7 +264,8 @@ test.describe("1440px desktop", () => {
 
   test("evidence: desktop /sessions at 1440px with the same data", async ({ page }) => {
     test.skip(!evidence, "set REMUDA_EVIDENCE=1 to capture the committed screenshot");
-    await createSession(page, "m shell evidence shot");
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await createSession(page, "m shell evidence shot", "wsp_g2_changed");
     await page.goto("/sessions");
     await expect(page.getByTestId("session-row")).toHaveCount(1, { timeout: 15_000 });
     await shot(page, "mobile-ui-2-desktop-1440.png");

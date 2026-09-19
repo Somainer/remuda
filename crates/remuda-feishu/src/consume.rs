@@ -356,14 +356,18 @@ async fn run_one(
             biased;
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    // SIGTERM first (a child may treat stdin EOF, not the
+                    // signal, as its shutdown reason and must not observe EOF
+                    // first), then release stdin before the drain so a
+                    // signal-proof child that exits on EOF is not held.
                     if let Some(pid) = pid {
                         let _ = send_sigterm(pid);
                     }
-                    let reaped = drain_stdout(&mut child, &mut stdout, tx, settings, key, &mut line).await;
                     drop(stdin);
-                    if !reaped {
-                        let _ = timeout(Duration::from_secs(2), child.wait()).await;
-                    }
+                    drain_stdout(&mut stdout, tx, settings, key, &mut line).await;
+                    // Reap unconditionally: drain returns on EOF (the child
+                    // has exited) or on the bounded drain deadline.
+                    let _ = timeout(Duration::from_secs(2), child.wait()).await;
                     forget_pid(pids, pid);
                     return Ok(RunEnd::Shutdown);
                 }
@@ -426,35 +430,34 @@ async fn dispatch_line(
 /// Upper bound for reading the child's accepted stdout after SIGTERM.
 const SHUTDOWN_DRAIN: Duration = Duration::from_secs(8);
 
-/// Keep reading the SIGTERM-ed child's stdout to EOF, enqueuing every line,
-/// until the child exits, EOF, or the bounded drain window passes.
+/// Keep reading the SIGTERM-ed child's stdout to EOF, enqueuing every line.
 ///
 /// Closing the event channel before these buffered lines were read dropped
-/// accepted events on shutdown (a gate flake under host load). Returns whether
-/// the child was observed exiting; a child ignoring SIGTERM only loses its
-/// remaining stdout once [`SHUTDOWN_DRAIN`] passes.
+/// accepted events on shutdown (a gate flake under host load). This drains
+/// PURELY on `read_line`: the call site has just sent SIGTERM, so racing a
+/// `child.wait()` arm here would win on an already-reaped child and return
+/// with buffered bytes still in the pipe. `Ok(0)` is reached only when the
+/// child has exited and closed its stdout, i.e. after every buffered byte was
+/// consumed. [`SHUTDOWN_DRAIN`] bounds a child that ignores SIGTERM; the
+/// caller reaps afterwards regardless of which path ended the drain.
 async fn drain_stdout(
-    child: &mut Child,
     stdout: &mut BufReader<tokio::process::ChildStdout>,
     tx: &mpsc::Sender<ConsumeEvent>,
     settings: &ConsumeSettings,
     key: &str,
     line: &mut String,
-) -> bool {
+) {
     let deadline = sleep(SHUTDOWN_DRAIN);
     tokio::pin!(deadline);
     loop {
         line.clear();
         tokio::select! {
             biased;
-            _ = &mut deadline => return false,
-            status = child.wait() => return status.is_ok(),
-            result = stdout.read_line(line) => {
-                if let Ok(0) | Err(_) = result {
-                    return false;
-                }
-                dispatch_line(settings, key, tx, line).await;
-            }
+            _ = &mut deadline => break,
+            result = stdout.read_line(line) => match result {
+                Ok(0) | Err(_) => break,
+                Ok(_) => dispatch_line(settings, key, tx, line).await,
+            },
         }
     }
 }

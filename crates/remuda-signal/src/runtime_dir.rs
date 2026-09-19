@@ -445,50 +445,64 @@ pub fn sweep_dead_runtime_sockets() -> io::Result<usize> {
         if std::time::Instant::now() >= deadline {
             break;
         }
-        // Accept the directory only after the authoritative checks, verified
-        // on an O_NOFOLLOW|O_DIRECTORY descriptor. A symlinked or
-        // foreign-owned candidate is never created, listed or traversed.
-        let dir_file = match open_verified_dir(&dir, uid) {
-            Ok(file) => file,
-            Err(error) => {
-                tracing::debug!(
-                    path = %dir.display(),
-                    %error,
-                    "skipping runtime sweep candidate"
-                );
-                continue;
-            }
-        };
-        let entries = match list_verified_entries(&dir, &dir_file) {
-            Ok(entries) => entries,
-            Err(error) => {
-                tracing::debug!(path = %dir.display(), %error, "cannot list runtime dir");
-                continue;
-            }
-        };
-        for (name, stat) in entries {
-            if std::time::Instant::now() >= deadline {
-                return Ok(removed);
-            }
-            let mode = nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode);
-            if !mode.contains(nix::sys::stat::SFlag::S_IFSOCK) || stat.st_uid != uid {
-                continue;
-            }
-            if !name.to_string_lossy().ends_with(".sock") {
-                continue;
-            }
-            let path = dir.join(&name);
-            match socket_has_live_listener(&path, deadline) {
-                SocketProbe::Live | SocketProbe::Uncertain => {}
-                SocketProbe::Dead => {
-                    if std::fs::remove_file(&path).is_ok() {
-                        removed += 1;
-                    }
+        if let Some(count) = sweep_one_dir(&dir, uid, deadline) {
+            removed += count;
+        }
+    }
+    Ok(removed)
+}
+
+/// Sweep one candidate directory.
+///
+/// Returns `None` when the directory fails verification (symlink, non-dir,
+/// foreign uid) — it is skipped, never created or traversed. `Some(n)` is the
+/// number of dead inodes reclaimed.
+#[cfg(unix)]
+fn sweep_one_dir(dir: &Path, uid: u32, deadline: std::time::Instant) -> Option<usize> {
+    let mut removed = 0;
+    // Accept the directory only after the authoritative checks, verified on
+    // an O_NOFOLLOW|O_DIRECTORY descriptor. A symlinked or foreign-owned
+    // candidate is never created, listed or traversed.
+    let dir_file = match open_verified_dir(dir, uid) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::debug!(
+                path = %dir.display(),
+                %error,
+                "skipping runtime sweep candidate"
+            );
+            return None;
+        }
+    };
+    let entries = match list_verified_entries(dir, &dir_file) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(path = %dir.display(), %error, "cannot list runtime dir");
+            return Some(0);
+        }
+    };
+    for (name, stat) in entries {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let mode = nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode);
+        if !mode.contains(nix::sys::stat::SFlag::S_IFSOCK) || stat.st_uid != uid {
+            continue;
+        }
+        if !name.to_string_lossy().ends_with(".sock") {
+            continue;
+        }
+        let path = dir.join(&name);
+        match socket_has_live_listener(&path, deadline) {
+            SocketProbe::Live | SocketProbe::Uncertain => {}
+            SocketProbe::Dead => {
+                if std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
                 }
             }
         }
     }
-    Ok(removed)
+    Some(removed)
 }
 
 /// Result of a bounded unix-socket connect probe.
@@ -860,12 +874,25 @@ mod tests {
     }
 
     /// Regression for the round-3 fd leak: `open` returned a bare `RawFd` and
-    /// the fchmod path never closed it. The verifier is exercised on a
-    /// pre-existing directory (the only branch that opens), hundreds of times,
-    /// and this thread's open-descriptor count must not grow.
+    /// the fchmod path never closed it. The fd count is process-wide, so the
+    /// actual measurement runs in a subprocess that executes only this test
+    /// (parallel tests otherwise open listeners that muddy the count).
     #[cfg(all(unix, target_os = "linux"))]
     #[test]
     fn securing_an_existing_dir_many_times_does_not_leak_descriptors() {
+        if std::env::var_os("REMUDA_FDLEAK_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "runtime_dir::tests::securing_an_existing_dir_many_times_does_not_leak_descriptors",
+                    "--nocapture",
+                ])
+                .env("REMUDA_FDLEAK_CHILD", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "fd-leak child failed: {status:?}");
+            return;
+        }
         fn open_fd_count() -> usize {
             std::fs::read_dir("/proc/self/fd")
                 .map(|entries| entries.count())
@@ -888,36 +915,84 @@ mod tests {
 
     /// The sweep must never traverse a symlinked candidate, even when its
     /// target contains dead socket inodes: the directory is rejected by the
-    /// verifier and the inodes are left exactly as found.
+    /// verifier and the inodes are left exactly as found. Uses a private
+    /// directory tree (never the shared `/tmp/remuda-<uid>` root) so it cannot
+    /// race other tests.
     #[cfg(unix)]
     #[test]
     fn sweep_skips_a_symlinked_candidate_and_leaves_its_target_alone() {
         use std::os::unix::net::UnixListener;
-        let root = tmp_root();
-        let fixed = runtime_dir_candidates(current_uid())
-            .into_iter()
-            .find(|candidate| candidate.parent() == Some(Path::new("/tmp")))
-            .unwrap();
-        let unique = std::process::id();
+        // Short fixed root: tempfile honours TMPDIR and the victim socket
+        // itself must be bindable regardless of ambient TMPDIR length.
+        let root = testutil::ShortDir::new();
         let victim = root.path().join("victim-sockdir");
         std::fs::create_dir_all(&victim).unwrap();
+        let unique = std::process::id();
         let dead_in_victim = victim.join(format!("sweep-evil-{unique}.sock"));
         let listener = UnixListener::bind(&dead_in_victim).unwrap();
         drop(listener);
-        // Swap the fixed candidate for a symlink into the victim tree.
-        let _ = std::fs::remove_dir_all(&fixed);
-        std::os::unix::fs::symlink(&victim, &fixed).unwrap();
+        let link = root.path().join("symlinked-candidate");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
 
-        let removed = sweep_dead_runtime_sockets().expect("sweep runs without error");
-        assert_eq!(removed, 0, "no inode under the symlink target is swept");
+        let deadline = std::time::Instant::now() + SWEEP_BUDGET;
+        assert_eq!(
+            sweep_one_dir(&link, current_uid(), deadline),
+            None,
+            "a symlinked candidate is rejected, not swept"
+        );
         assert!(
             dead_in_victim.exists(),
             "the socket inode reached through the symlink is untouched"
         );
 
-        // Restore a real directory so other tests are unaffected.
-        std::fs::remove_file(&fixed).unwrap();
-        std::fs::create_dir_all(&fixed).unwrap();
+        // A directory claimed by a different uid is rejected the same way
+        // (same comparison production makes against an attacker-owned dir).
+        assert_eq!(
+            sweep_one_dir(&victim, current_uid().wrapping_add(1), deadline),
+            None
+        );
+        assert!(
+            dead_in_victim.exists(),
+            "foreign-uid candidate is untouched"
+        );
+    }
+
+    /// Positive control: a real own-uid directory does get its dead sockets
+    /// reclaimed and its live ones preserved, through the same inner routine.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_reclaims_own_dir_and_preserves_live_socket() {
+        use std::os::unix::net::UnixListener;
+        let dir = testutil::ShortDir::new();
+        let unique = std::process::id();
+        let dead = dir.path().join(format!("unit-dead-{unique}.sock"));
+        let live = dir.path().join(format!("unit-live-{unique}.sock"));
+        let dead_listener = UnixListener::bind(&dead).unwrap();
+        let live_listener = UnixListener::bind(&live).unwrap();
+        drop(dead_listener);
+        // A dead unix socket answers ECONNREFUSED, but the kernel state can
+        // briefly surface EINPROGRESS after the listener drops; wait for the
+        // stable "dead" reading before the sweep (bounded).
+        for _ in 0..50 {
+            match socket_has_live_listener(
+                &dead,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ) {
+                SocketProbe::Dead => break,
+                SocketProbe::Live | SocketProbe::Uncertain => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        let deadline = std::time::Instant::now() + SWEEP_BUDGET;
+        let reclaimed = sweep_one_dir(dir.path(), current_uid(), deadline);
+        assert!(
+            reclaimed == Some(1),
+            "the dead socket is reclaimed exactly once: {reclaimed:?}"
+        );
+        assert!(!dead.exists());
+        assert!(live.exists());
+        drop(live_listener);
     }
 
     #[test]

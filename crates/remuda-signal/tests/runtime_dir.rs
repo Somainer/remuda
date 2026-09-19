@@ -246,7 +246,17 @@ fn sweep_reclaims_dead_sockets_and_keeps_live_ones() {
     std::fs::write(&note, b"keep").unwrap();
     drop(dead_listener);
 
-    let removed = sweep_dead_runtime_sockets().unwrap();
+    // The dead socket's ECONNREFUSED state can surface a transient
+    // EINPROGRESS right after the listener drops (the sweep conservatively
+    // treats that as live); retry briefly until the inode is reclaimed.
+    let mut removed = 0;
+    for _ in 0..50 {
+        removed = sweep_dead_runtime_sockets().unwrap();
+        if !dead.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert!(removed >= 1, "at least the planted dead socket is swept");
     assert!(!dead.exists(), "dead socket is reclaimed");
     assert!(live.exists(), "a live listener's socket is untouched");

@@ -318,6 +318,72 @@ Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
   (shell-pty shape) asserts the 400 and that **no Interaction was created**.
 - Hub inventory unit tests: name validation + every host-shape classification.
 
+## hostcap: the capability reaches the callers the route exists for
+
+Added by `c-cua-hostcap` on this branch's history (round-3 review of its own
+work); the Hub-side gate above is launch's and is unchanged by it.
+
+**The defect.** `remuda hostcap` read its `computerUse` block from
+`GET /v1/hosts/{id}`. That route is operator-only (`registry.rs::get_host` is
+behind `require_operator`, which returns Forbidden for any device carrying an
+instance id), and every `remuda` invocation from inside a launched coordinator
+sets `REMUDA_INSTANCE_ID` (`hub_client.rs`). So the coordinator — the caller
+the pre-dispatch host fact is *for* — always read a refusal, never the
+capability.
+
+**The fix, in three parts**, because the second was not in the original
+finding and only surfaced when the test failed:
+
+1. `host_capacity` now carries `computerUse` in its own response
+   (`crates/remuda-hub/src/workers.rs`), shaped by
+   `inventory::computer_use_capability` — the same three states the CLI used to
+   build by hand.
+2. `agent_scope::restrict_agent_routes` admits `GET /v1/hosts/{id}/hostcap`
+   as a read target (`hostcap_read_target`). Without this the route 403s in the
+   middleware *before* the handler runs, so part 1 alone would have looked
+   correct and changed nothing. Verified: removing this line fails the new
+   agent-origin test with that 403.
+3. `crates/remuda/src/cmd/hostcap.rs` issues one read and no longer does a
+   second `GET`. Admitting the path does not loosen the handler — it still
+   requires the `dispatch` grant and re-checks host scope.
+
+**Tests** (`crates/remuda/tests/dispatch_cli.rs`, 9 cases total):
+
+- `hostcap_reports_the_capability_to_an_agent_origin_caller` — creates a
+  claude instance holding `dispatch`, runs the real CLI with
+  `REMUDA_INSTANCE_ID` set against a fake Node reporting an installed
+  `computer-use` row, and asserts `computerUse.installed == true` with **no**
+  `error` key. Non-vacuous: fails 403 without part 2.
+- `hostcap_reports_an_installed_computer_use_row` — the same row through an
+  operator caller, covering the reported-installed path end to end.
+- `dispatch_retire_hostcap_cli_lifecycle` — the not-reported case now also
+  asserts `computerUse` has **no** `error` key, so an unreported row and a
+  failed read cannot be confused (they passed identically before).
+- `inventory.rs` unit: `computer_use_capability_reports_all_three_states`.
+
+### Web, same round
+
+Four smaller findings from the same review, all in `c-cua-hostcap`'s files:
+
+- `computerUseState` now derives `installed` by the same rule as
+  `installedCli`/`absentCli`, so a flagless row with neither path nor version
+  no longer claims `installed: true` (a state the list helpers drop, i.e. the
+  silent disappearance ui-spec §2.6 forbids).
+- The absent-row block in `HostsPage` is scoped to the capability kind. The
+  Node reports every agent CLI it looked for, so an un-scoped list gave a
+  claude-only host five empty 未安装 rows for codex/grok/agy/gemini. Pinned by
+  a new component test that counts rows for exactly that host shape — it fails
+  with 5 rows instead of 1 without the filter.
+- A model test that compared two string literals (and so could never fail) was
+  replaced with one asserting the real derivation.
+
+### Restack base
+
+This branch carries `c-cua-hostcap`'s commits restacked onto **this branch's
+head** (`git rebase --onto <launch-head> 67362396`), replacing the older copies
+of the launch commits it previously replayed. No launch commit is re-pushed
+under a new hash: launch's real head is an ancestor of the hostcap branch.
+
 ## Q1 live probe — NOT PASSED
 
 The merge gate requires a real remuda-launched claude session on a host with

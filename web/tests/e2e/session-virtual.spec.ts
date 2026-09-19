@@ -90,19 +90,39 @@ test.describe("transcript virtualization and session chrome", () => {
   });
 
   test("Compact/Full persists and collapse-all folds tools", async ({ page }, info) => {
+    // Density lives inline on desktop; below the 640px compact fold it moves
+    // into the header ⋯ sheet (D-040), so open the sheet before every lookup
+    // — no viewport pin, so both chromium and mobile-webkit exercise it.
+    const compact = info.project.name === "mobile-webkit";
+    const densityToggle = () =>
+      compact
+        ? page.getByTestId("session-more-sheet").getByTestId("density-toggle")
+        : page.getByTestId("density-toggle");
+    const openDensityMenu = async () => {
+      if (compact) {
+        await page.getByTestId("session-more-open").click();
+        await expect(page.getByTestId("session-more-sheet")).toBeVisible();
+      }
+    };
+    const closeDensityMenu = async () => {
+      if (compact) await page.keyboard.press("Escape");
+    };
+
     await openNamedSession(page, "看 TaskManager spill");
     // D-041: a settled ordinary card is already folded by default on the
     // mobile-webkit (390px) project; the desktop project starts unfolded. The
     // point of this case is the explicit collapse-all that follows.
-    const mobile = info.project.name === "mobile-webkit";
-    await expect(page.getByTestId("density-toggle")).toHaveAttribute("data-mode", "compact");
-    await page.getByTestId("density-toggle").click();
-    await expect(page.getByTestId("density-toggle")).toHaveAttribute("data-mode", "full");
+    await openDensityMenu();
+    await expect(densityToggle()).toHaveAttribute("data-mode", "compact");
+    await densityToggle().click();
+    await closeDensityMenu();
     await page.reload();
-    await expect(page.getByTestId("density-toggle")).toHaveAttribute("data-mode", "full");
+    await openDensityMenu();
+    await expect(densityToggle()).toHaveAttribute("data-mode", "full");
+    await closeDensityMenu();
     await expect(page.getByTestId("tool-card").first()).toHaveAttribute(
       "data-folded",
-      mobile ? "1" : "0",
+      compact ? "1" : "0",
     );
     await page.getByTestId("collapse-all").click();
     await expect(page.getByTestId("tool-card").first()).toHaveAttribute("data-folded", "1");

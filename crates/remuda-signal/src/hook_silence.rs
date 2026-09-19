@@ -226,6 +226,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_long_instance_dir_probes_the_real_socket_not_the_symlink() {
+        // The silence probe is called with the live HookSession's socket
+        // path. Under a long data dir that is the short runtime path: the
+        // under-instance symlink cannot be connected (sun_path), so probing
+        // it would report a false socket-refused.
+        let root = tempfile::tempdir().unwrap();
+        let instance_dir = root
+            .path()
+            .join("x".repeat(80))
+            .join("instances/ins_01990000-0000-7000-8000-000000000002");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let preferred = instance_dir.join("hook.sock");
+        let placement = crate::runtime_dir::place_socket(
+            &preferred,
+            "01990000-0000-7000-8000-000000000002.sock",
+        )
+        .unwrap();
+        assert!(placement.redirected());
+        let listener = tokio::net::UnixListener::bind(placement.bind_path()).unwrap();
+        placement.install_link().unwrap();
+
+        assert!(
+            socket_listening(placement.bind_path()).await,
+            "the real short socket must answer the probe"
+        );
+        assert!(
+            !socket_listening(&preferred).await,
+            "the long symlink path is un-connectable and must read as not listening"
+        );
+        drop(listener);
+        placement.remove_link();
+        let _ = std::fs::remove_file(placement.bind_path());
+    }
+
     #[test]
     fn the_reason_spelling_is_stable() {
         assert_eq!(HookSilenceReason::RelayMissing.as_str(), "relay-missing");

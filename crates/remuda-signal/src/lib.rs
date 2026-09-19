@@ -24,6 +24,7 @@ pub mod live;
 pub mod map;
 pub mod pending;
 pub mod question;
+pub mod runtime_dir;
 pub mod socket;
 
 pub use approval::{ApprovalContext, approval_interaction, elicitation_interaction};

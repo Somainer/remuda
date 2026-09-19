@@ -610,6 +610,20 @@ async fn fake_node(
                         .and_then(Value::as_str)
                         .unwrap_or("hello");
                     let interaction_id = InteractionId::new();
+                    // c-nextstep list-row phrase: a create prompt containing
+                    // "row" raises NO approval and journals a workflow scenario
+                    // directly, staying in native status working. The suffix is
+                    // a sentinel rather than part of the scenario keyword, so
+                    // map the row prompt onto the known running scenarios
+                    // explicitly (plain "demo" completes the run and would
+                    // leave no phrase).
+                    let row_scenario: Option<&str> = if !prompt.contains("row") {
+                        None
+                    } else if prompt.contains("demo running") || prompt.contains(" live") {
+                        Some("demo-running")
+                    } else {
+                        workflow_kind(prompt)
+                    };
                     // A prompt naming the hook path raises the D-028 §4.4 tier A
                     // card instead: harness-hook carrier, the real tool input as
                     // its description, and an always-allow option built from the
@@ -634,10 +648,12 @@ async fn fake_node(
                         )
                     };
                     let terminal_answer = prompt.contains("ask-question-terminal");
-                    pending
-                        .lock()
-                        .await
-                        .insert(interaction_id.as_id().as_str().to_string(), card.clone());
+                    if row_scenario.is_none() {
+                        pending
+                            .lock()
+                            .await
+                            .insert(interaction_id.as_id().as_str().to_string(), card);
+                    }
                     if terminal_answer {
                         // Model the human answering in the agent's own TUI: the
                         // harness closes the dialog itself (PostToolUse with
@@ -669,7 +685,10 @@ async fn fake_node(
                         append_n =
                             append_journal(&mut ws, &instance_id, append_n, "assistant", &reply)
                                 .await?;
-                    } else {
+                    } else if row_scenario.is_none() {
+                        // c-nextstep row rows carry a workflow scenario below;
+                        // its own events must be the latest journal content so
+                        // the list projects the run phrase, not this echo.
                         append_n = append_journal(
                             &mut ws,
                             &instance_id,
@@ -691,6 +710,13 @@ async fn fake_node(
                     } else {
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "working")
                             .await?;
+                    }
+                    if let Some(scenario) = row_scenario {
+                        // Running workflow events follow the working status, so
+                        // the row projects a live-run phrase from the journal.
+                        append_n =
+                            append_workflow_scenario(&mut ws, &instance_id, append_n, scenario)
+                                .await?;
                     }
                     // §9.1 model-sync: the launch snapshot carries the
                     // gateway-discovered catalog and current model for any claude
@@ -1413,11 +1439,27 @@ async fn fake_node(
                     // the buffered line as a commandId-less journal user node so
                     // the C2 native-typing e2e can prove it renders once with no
                     // command attribution.
-                    let bytes = params
+                    //
+                    // The browser's per-row remote controls send logical key
+                    // names (`keys: ["esc"]`, mapped the same way the real Node
+                    // maps them in its `tty.write` arm) instead of dataBase64;
+                    // translate them here so the row-overflow e2e can prove the
+                    // key reached the fake harness.
+                    let mut bytes = params
                         .get("dataBase64")
                         .and_then(Value::as_str)
                         .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
                         .unwrap_or_default();
+                    if bytes.is_empty()
+                        && let Some(keys) = params.get("keys").and_then(Value::as_array)
+                    {
+                        let names = keys
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        bytes = remuda_driver::logical_keys_to_bytes(&names);
+                    }
                     let tty = ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
                     // Scripted alt-screen/progress transition: the sentinel
                     // produces the raw frame (so xterm paints it) and a tty.mode
@@ -1572,6 +1614,30 @@ async fn fake_node(
                 }
                 "tty.resize" => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
+                "tty.screen" => {
+                    // The list page polls this every few seconds for tty rows
+                    // (no follow subscription there). Replay the cooked screen
+                    // buffer as lines, the shape `GET /v1/instances/:id/screen`
+                    // documents; an instance that never had a TTY returns no
+                    // lines rather than an error.
+                    let limit = params.get("lines").and_then(Value::as_u64).unwrap_or(80) as usize;
+                    let lines = ttys
+                        .get(&instance_id)
+                        .map(|tty| {
+                            String::from_utf8_lossy(&tty.screen)
+                                .split(['\r', '\n'])
+                                .filter(|line| !line.is_empty())
+                                .rev()
+                                .take(limit)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    send_rpc_ok(&mut ws, id, json!({ "lines": lines })).await?;
                 }
                 _ => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;

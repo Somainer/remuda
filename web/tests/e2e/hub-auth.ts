@@ -33,10 +33,15 @@ export async function login(page: Page, name = "e2e-browser") {
   await page.getByTestId("login-device-name").fill(name);
   await page.getByTestId("login-bootstrap-token").fill(bootstrapToken);
   await page.getByTestId("login-submit").click();
-  // D-049: a compact viewport lands on the phone home /m; desktop lands on
-  // /sessions. The shared SessionsPage list renders under both shells.
+  // D-049: a compact viewport lands on the phone home /m (HomeList,
+  // m-home); desktop lands on /sessions (SessionList). The shared SessionsPage
+  // list renders only under the desktop shell.
   await expect(page).toHaveURL(/\/(sessions|m)(?:[/?]|$)/, { timeout: 20_000 });
-  await expect(page.getByTestId("session-list")).toBeVisible();
+  if (/\/m(?:[/?]|$)/.test(new URL(page.url()).pathname)) {
+    await expect(page.getByTestId("home-list")).toBeVisible();
+  } else {
+    await expect(page.getByTestId("session-list")).toBeVisible();
+  }
   await expectCookieSession(page);
 }
 

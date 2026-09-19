@@ -14,9 +14,9 @@ import { login } from "./hub-auth";
  *   (/s/:id, /sessions/new, /settings) are never rewritten.
  * - 1440px: /m* bounces to /sessions; start_url "/" lands on /sessions.
  *
- * Until m-home lands, /m renders the existing SessionsPage list; /m/inbox
- * renders the c-minbox phone inbox (Inbox), which replaced the ApprovalsPage
- * placeholder.
+ * /m renders the c-mhome phone home (HomeList) and /m/inbox renders the
+ * c-minbox phone inbox (Inbox); the interim SessionsPage/ApprovalsPage
+ * placeholders are gone.
  */
 test.describe.configure({ mode: "serial" });
 
@@ -144,8 +144,9 @@ test.describe("390px phone", () => {
     await expect(page.getByTestId("phone-nav-new")).toHaveAttribute("aria-label", "新建");
     await expect(page.getByTestId("phone-nav-more")).toContainText("更多");
 
-    // The interim home renders the existing sessions list (no new IA yet).
-    await expect(page.getByTestId("session-list")).toBeVisible();
+    // m-home: /m renders the phone HomeList groups (the placeholder
+    // SessionsPage list now only lives at /sessions on desktop).
+    await expect(page.getByTestId("home-list")).toBeVisible();
 
     // start_url "/" resolves to the phone home in compact.
     await page.goto("/");
@@ -229,7 +230,7 @@ test.describe("390px phone", () => {
     page,
   }) => {
     await page.goto("/m");
-    await expect(page.getByTestId("session-list")).toBeVisible();
+    await expect(page.getByTestId("home-list")).toBeVisible();
 
     // Sync to a poll boundary so the timer-driven refresh is ~2s away and the
     // only fetch that can follow the dispatched event is PhoneShell's own
@@ -257,7 +258,7 @@ test.describe("390px phone", () => {
     await createSession(page, "m shell evidence shot", "wsp_g2_changed");
     await page.goto("/m");
     await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
-    await expect(page.getByTestId("session-row")).toHaveCount(1, { timeout: 15_000 });
+    await expect(page.getByTestId("home-row")).toHaveCount(1, { timeout: 15_000 });
     await shot(page, "mobile-ui-2-home-390.png");
   });
 });

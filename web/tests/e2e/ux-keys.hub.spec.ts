@@ -343,7 +343,9 @@ test("does not collide with QuickFind: a digit pressed over the open finder stay
 test("at 390 px there is no hint, no badge and no handler", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/sessions");
-  await expect(page.getByTestId("session-list")).toBeVisible();
+  // Compact /sessions redirects into the /m phone home (D-049).
+  await expect(page).toHaveURL(/\/m$/);
+  await expect(page.getByTestId("home-list")).toBeVisible();
 
   await expect(page.getByTestId("session-switch-hint")).toHaveCount(0);
   await expect(page.locator("[data-held]")).toHaveCount(0);

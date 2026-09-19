@@ -259,9 +259,10 @@ async fn proxy_to_host(
 /// `POST /v1/hosts/{id}/files/objects` — stage bytes a Node read off disk.
 ///
 /// Host-token authenticated: the token must resolve to the host named in the
-/// path, so a host can only stage under its own key. Bytes are stored as
-/// `application/octet-stream` regardless of the filename; download serves them
-/// with `nosniff` and an attachment disposition.
+/// path, so a host can only stage under its own key. Without `mediaType` the
+/// bytes are stored as `application/octet-stream` (download with `nosniff`
+/// and an attachment disposition); with a validated image `mediaType` they
+/// are stored as that sniffed image type and served inline.
 async fn stage_object(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -305,20 +306,27 @@ async fn stage_object(
     };
     let digest = crate::config::sha256_hex(&body);
     // Without `mediaType`, host files stay deliberately untyped bytes. With
-    // it, only the sniffed image allowlist is accepted (same magic-byte
-    // contract as the operator uploader) so the object can render inline in
-    // a tool card; a claim the bytes do not back is a 400, never an
-    // octet-stream object masquerading as an image.
+    // it, the claim is length-capped and charset-validated by the same
+    // validator the operator uploader uses, and accepted only when it names
+    // an image whose magic bytes back it (so image/jpg matches a JPEG); a
+    // bad claim or missing magic is a 400, never an octet-stream object
+    // masquerading as an image.
     let (media_type, extension) = match query.media_type.as_deref() {
         None => ("application/octet-stream".to_owned(), "bin".to_owned()),
-        Some(claimed) => {
-            let claimed = crate::objects::media_type_essence(claimed);
+        Some(raw) => {
+            let claimed =
+                crate::objects::accepted_file_media_type(raw).map_err(HubError::BadRequest)?;
+            if !claimed.starts_with("image/") {
+                return Err(HubError::BadRequest(
+                    "host-file mediaType must name an image type".into(),
+                ));
+            }
             let Some((sniffed, sniffed_ext)) = crate::objects::sniff_image(&body) else {
                 return Err(HubError::BadRequest(format!(
                     "mediaType {claimed} does not match the staged bytes"
                 )));
             };
-            if claimed != sniffed {
+            if !crate::objects::declared_matches(&claimed, sniffed) {
                 return Err(HubError::BadRequest(format!(
                     "mediaType {claimed} disagrees with sniffed type {sniffed}"
                 )));

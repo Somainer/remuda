@@ -296,7 +296,11 @@ test("header controls that are on screen own their full 44px corners at 390px wi
     await page.getByTestId("model-effort-chip").click();
     await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
     await expect(page.getByTestId("effort-menu")).toBeVisible();
-    await page.getByTestId("effort-reset").scrollIntoViewIfNeeded();
+    // Explicit block:center (not the engine's nearest-edge default) so the
+    // glyph cannot park on the sheet panel edge.
+    await page.getByTestId("effort-reset").evaluate((el) =>
+      el.scrollIntoView({ block: "center" }),
+    );
     await mark(page.getByTestId("effort-reset"), "effort-reset");
     const resetBox = await assertTapTarget(page, page.getByTestId("effort-reset"), "effort-reset");
     expect(resetBox.width).toBeLessThan(27);
@@ -304,7 +308,9 @@ test("header controls that are on screen own their full 44px corners at 390px wi
 
     await page.getByTestId("effort-open-list").click();
     await expect(page.getByTestId("effort-slider-panel")).toBeVisible();
-    await page.getByTestId("effort-list-back").scrollIntoViewIfNeeded();
+    await page.getByTestId("effort-list-back").evaluate((el) =>
+      el.scrollIntoView({ block: "center" }),
+    );
     await mark(page.getByTestId("effort-list-back"), "effort-list-back");
     const listBackBox = await assertTapTarget(
       page,

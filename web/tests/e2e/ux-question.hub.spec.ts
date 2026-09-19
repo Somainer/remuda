@@ -178,12 +178,18 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
     await shot(page, `ask-user-question-1-card-${suffix}.png`);
   }
 
-  // It answers from the approvals page too.
+  // It answers from the approvals page too. The 390px frames redirect
+  // /approvals -> /m/inbox (D-049), and widening back bounces /m/inbox ->
+  // /sessions, so re-enter the approvals centre and re-locate the card.
   await page.setViewportSize({ width: 1440, height: 900 });
-  await card.getByRole("radio", { name: /继续排查 remuda 环境/ }).click();
-  await card.getByRole("tab", { name: /记忆/ }).click();
-  await card.getByRole("checkbox", { name: /保存端口/ }).click();
-  await card.getByTestId("question-submit").click();
+  await page.goto("/approvals");
+  const desktopRow = page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" }).first();
+  await expect(desktopRow).toBeVisible({ timeout: 20_000 });
+  const desktopCard = desktopRow.getByTestId("question-form");
+  await desktopCard.getByRole("radio", { name: /继续排查 remuda 环境/ }).click();
+  await desktopCard.getByRole("tab", { name: /记忆/ }).click();
+  await desktopCard.getByRole("checkbox", { name: /保存端口/ }).click();
+  await desktopCard.getByTestId("question-submit").click();
   await expect(page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" })).toHaveCount(0, {
     timeout: 15_000,
   });

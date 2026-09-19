@@ -33,7 +33,9 @@ export async function login(page: Page, name = "e2e-browser") {
   await page.getByTestId("login-device-name").fill(name);
   await page.getByTestId("login-bootstrap-token").fill(bootstrapToken);
   await page.getByTestId("login-submit").click();
-  await expect(page).toHaveURL(/\/sessions/, { timeout: 20_000 });
+  // D-049: a compact viewport lands on the phone home /m; desktop lands on
+  // /sessions. The shared SessionsPage list renders under both shells.
+  await expect(page).toHaveURL(/\/(sessions|m)(?:[/?]|$)/, { timeout: 20_000 });
   await expect(page.getByTestId("session-list")).toBeVisible();
   await expectCookieSession(page);
 }

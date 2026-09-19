@@ -6,9 +6,11 @@
 //! is checked against the *local* inventory (the heartbeat the Hub read can be
 //! stale) before any launch dir or managed home is written.
 //!
-//! Until the hostcap probe lands, the inventory has no `computer-use` row, so
-//! every grant is refused here with the "not reported" message — fail closed,
-//! exactly as the contract requires while the two batches are in flight.
+//! The inventory probe now appends the `computer-use` row unconditionally, so
+//! on a current Node the gate refuses on `installed: false` and names the path
+//! it looked for. The "not reported" arm remains for a Node that predates the
+//! probe — an absent row means nobody asked, which is refused too, but it is no
+//! longer the ordinary outcome.
 
 use remuda_driver::DriverError;
 use remuda_protocol::AgentKind;
@@ -18,15 +20,16 @@ use crate::inventory::{CliEntry, CollectRequest, ProbeEnv};
 /// The one capability name this batch grants.
 pub const CAPABILITY_COMPUTER_USE: &str = "computer-use";
 
-/// The default client path the hostcap probe would look for when the inventory
-/// carries no explicit path (mirrors
-/// `inventory::computer_use_client_path` in c-cua-hostcap; unified there).
+/// The default client path the hostcap probe looks for when the inventory
+/// carries no explicit path.
+///
+/// Derived from [`crate::inventory::computer_use_bundle_path`], which is the
+/// same constant the probe stats, so a refusal that names "where to install
+/// this" cannot point somewhere the probe never looked.
 pub fn default_client_path() -> Option<std::path::PathBuf> {
-    // `CODEX_HOME` override, else `$HOME/.codex`, then the app bundle.
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| Some(ProbeEnv::from_process().home.join(".codex")))?;
-    Some(codex_home.join("computer-use/Codex Computer Use.app"))
+    Some(crate::inventory::computer_use_bundle_path(
+        &ProbeEnv::from_process(),
+    ))
 }
 
 /// Verify this host may deliver `computer-use` for `kind`.
@@ -66,9 +69,9 @@ pub fn evaluate(kind: &AgentKind, os: &str, row: Option<&CliEntry>) -> Result<()
         )));
     };
     if !row.installed {
-        // Name the probed path: fall back to the default the hostcap probe
-        // resolves (c-cua-hostcap's computer_use_client_path) when the row
-        // carries no path, so the most common failure says where to install.
+        // Name the probed path: the row's own path when the probe reported one,
+        // else the same default the probe stats (via `default_client_path`), so
+        // the most common failure says where to install rather than shrugging.
         let probed = row
             .path
             .as_ref()

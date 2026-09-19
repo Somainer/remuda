@@ -294,12 +294,15 @@ pins the deterministic shape with a 60-byte TMPDIR).
 ```text
 $ env -u TMPDIR -u XDG_RUNTIME_DIR \
     cargo test -p remuda-signal -p remuda-driver -p remuda-node
-# signal: 106 lib + all integration tests green
-# driver: 446 lib tests + all integration tests green
-# node:   all lib tests (290) + all integration tests green
-$ env -u XDG_RUNTIME_DIR TMPDIR=<80-byte dir> \
+# 82 test binaries, all green; exit 0
+
+$ env -u XDG_RUNTIME_DIR \
+    TMPDIR="$HOME/Projects/remuda-agents/tmp/sockpath-long-tmpdir-0123456789" \
     cargo test -p remuda-signal -p remuda-driver -p remuda-node
-# same, all green
+# TMPDIR = 80 bytes; temp fallback = 147 bytes, over both platform limits;
+# every redirected socket binds under the fixed /tmp/remuda-<uid> root;
+# 82 test binaries green (1273 test cases), including live_pipeline; exit 0
+# lib units: signal 106, driver 448, node 290
 $ cargo clippy --workspace --all-targets -- -D warnings
 # clean
 $ cargo fmt --all

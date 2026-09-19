@@ -29,8 +29,8 @@ use crate::fake_harness::artifacts::{
     claude_user_record, codex_assistant_message, codex_command_item_completed, codex_function_call,
     codex_function_output, codex_session_index, codex_session_meta, codex_task_complete,
     codex_task_started, codex_token_usage, codex_turn_aborted, codex_user_item_completed,
-    codex_user_message, grok_chunk_update, grok_tool_call, grok_tool_update_completed,
-    grok_tool_update_failed, grok_turn_completed, grok_write_registry,
+    codex_user_message, grok_chunk_update, grok_tool_call, grok_tool_running,
+    grok_tool_update_completed, grok_tool_update_failed, grok_turn_completed, grok_write_registry,
 };
 use crate::fake_harness::clock::FakeClock;
 use crate::fake_harness::hooks::{
@@ -118,6 +118,8 @@ impl Default for Options {
 pub const DEFAULT_SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
 
 const TICK: Duration = Duration::from_millis(10);
+/// How often a running grok tool drips another line into its terminal log.
+const GROK_LOG_TICK: Duration = Duration::from_millis(180);
 const LONG_WAIT: Duration = Duration::from_secs(3600);
 
 // ---------------------------------------------------------------------------
@@ -160,6 +162,23 @@ struct TurnRun {
     /// Scripted spinner rows, advanced (and held) on the per-second repaint.
     spinner_frames: Vec<String>,
     spinner_idx: usize,
+    /// Grok `terminal/<callId>.log` for the shell tool currently running.
+    ///
+    /// Set in [`Engine::begin_tool_run`] for a shell call and cleared at the
+    /// matching `ToolFinish`, so it never outlives the tool that owns it: a
+    /// non-shell call that follows must neither inherit the previous tool's
+    /// log nor append to it. The completed frame points
+    /// `rawOutput.output_file` at this path.
+    grok_log: Option<GrokLog>,
+}
+
+/// One running shell call's terminal log.
+#[derive(Clone, Debug)]
+struct GrokLog {
+    /// The call that owns the log — written to `terminal/<this>.log`.
+    tool_call_id: String,
+    /// Lines written so far, including the `$ <command>` header.
+    lines: usize,
 }
 
 /// One prompt sitting in claude's native queue.
@@ -948,6 +967,22 @@ impl Engine {
                 if Instant::now() >= ends {
                     self.turn.as_mut().unwrap().step = Step::ToolFinish { idx, denied: None };
                 } else {
+                    // A running shell call drips its result into the terminal
+                    // log, so a poller sees stdout grow while the tool "runs" —
+                    // the live channel the completed frame's output_file points
+                    // at. The handle is per-tool, so a non-shell call (which
+                    // never sets one) neither streams nor has its run rounded
+                    // up to the log tick.
+                    let streaming = self.dialect == Dialect::Grok
+                        && self
+                            .turn
+                            .as_ref()
+                            .is_some_and(|turn| turn.grok_log.is_some());
+                    if streaming {
+                        self.stream_grok_terminal_line()?;
+                        // Wake often enough to drip lines out across the run.
+                        return Ok(Instant::now() + GROK_LOG_TICK);
+                    }
                     return Ok(ends);
                 }
             }
@@ -1252,7 +1287,7 @@ impl Engine {
         if self.dialect == Dialect::Grok {
             let _ = self.artifacts.grok_event(
                 &self.clock,
-                json!({ "type": "permission_requested", "tool_name": "run_terminal_command" }),
+                json!({ "type": "permission_requested", "tool_name": tool.grok_name() }),
             );
         }
     }
@@ -1332,16 +1367,21 @@ impl Engine {
         if self.dialect != Dialect::Grok {
             return;
         }
+        let name = self
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.spec.tools.get(idx))
+            .map(ToolSpec::grok_name)
+            .unwrap_or_default();
         let _ = self.artifacts.grok_event(
             &self.clock,
             json!({
                 "type": "permission_resolved",
-                "tool_name": "run_terminal_command",
+                "tool_name": name,
                 "decision": decision,
                 "wait_ms": 1
             }),
         );
-        let _ = idx;
     }
 }
 
@@ -1484,6 +1524,7 @@ impl Engine {
             streamed_text: String::new(),
             spinner_idx: 0,
             spinner_frames,
+            grok_log: None,
         });
         self.pending_redirect = redirect.map(str::to_owned);
         self.event("turn_start", json!({ "redirect": redirect }));
@@ -1787,15 +1828,19 @@ impl Engine {
             }
             Dialect::Grok => {
                 let ids = self.turn.as_ref().unwrap().grok_ids.clone();
+                // The frame identity comes from the name table, not from the
+                // scripted dialect name: a grok session's tools are named the
+                // way the real client names them (`run_terminal_command`), and
+                // carry the `_meta["x.ai/tool"]` block the translator reads.
                 self.artifacts.grok_update(
                     &self.clock,
                     &ids,
-                    grok_tool_call(&tool_id, "run_terminal_command", &tool.input_object()),
+                    grok_tool_call(&tool, &tool_id),
                     false,
                 )?;
                 self.artifacts.grok_event(
                     &self.clock,
-                    json!({ "type": "tool_started", "tool_name": "run_terminal_command" }),
+                    json!({ "type": "tool_started", "tool_name": tool.grok_name() }),
                 )?;
                 let label = tool
                     .input_object()
@@ -1910,8 +1955,77 @@ impl Engine {
         }
     }
 
+    /// Drip the next line of the running shell tool's result into its terminal
+    /// log. The scripted result is split across lines and released one per
+    /// [`GROK_LOG_TICK`], so the log genuinely grows during the run rather than
+    /// appearing whole at the end.
+    ///
+    /// Everything is read from the log handle itself rather than from the
+    /// current step's `idx`: the handle is the only thing that knows which call
+    /// owns the log and how many lines it already has, so a non-shell call can
+    /// never write into a previous call's log. A no-op once every line is out
+    /// or when no shell tool is running.
+    fn stream_grok_terminal_line(&mut self) -> Result<(), RunError> {
+        let Some(turn) = self.turn.as_ref() else {
+            return Ok(());
+        };
+        let Some(log) = turn.grok_log.clone() else {
+            return Ok(());
+        };
+        // The scripted result belongs to the call the handle names, not to
+        // whichever tool the machine happens to be running now.
+        let next = turn
+            .spec
+            .tools
+            .iter()
+            .zip(&turn.tool_ids)
+            .find(|(_, id)| **id == log.tool_call_id)
+            .map(|(tool, _)| result_lines(&tool.result_value()))
+            .unwrap_or_default()
+            .get(log.lines.saturating_sub(1))
+            .cloned();
+        let Some(next) = next else {
+            return Ok(());
+        };
+        self.artifacts
+            .grok_terminal_append(&log.tool_call_id, &next)?;
+        if let Some(turn) = self.turn.as_mut()
+            && let Some(log) = turn.grok_log.as_mut()
+        {
+            log.lines += 1;
+        }
+        Ok(())
+    }
+
     fn begin_tool_run(&mut self, idx: usize) -> Result<(), RunError> {
         let duration = self.turn.as_ref().unwrap().spec.tools[idx].duration();
+        let tool = self.turn.as_ref().unwrap().spec.tools[idx].clone();
+        let tool_id = self.turn.as_ref().unwrap().tool_ids[idx].clone();
+        if self.dialect == Dialect::Grok {
+            let ids = self.turn.as_ref().unwrap().grok_ids.clone();
+            // The statusless progress frame is grok's Running edge: it lands
+            // when the tool starts, not when it finishes.
+            self.artifacts.grok_update(
+                &self.clock,
+                &ids,
+                grok_tool_running(&tool, &tool_id),
+                false,
+            )?;
+            // A shell call streams its stdout to terminal/<callId>.log while it
+            // runs — grok's only live output channel. Only the shell call gets
+            // a handle; the previous tool's is cleared at its own ToolFinish.
+            let log = if tool.grok_name() == "run_terminal_command" {
+                self.artifacts
+                    .grok_terminal_append(&tool_id, &format!("$ {}", shell_command(&tool)))?
+                    .map(|_| GrokLog {
+                        tool_call_id: tool_id.clone(),
+                        lines: 1,
+                    })
+            } else {
+                None
+            };
+            self.turn.as_mut().unwrap().grok_log = log;
+        }
         self.turn.as_mut().unwrap().step = Step::ToolRun {
             idx,
             ends: Instant::now() + Duration::from_millis(duration),
@@ -1925,6 +2039,7 @@ impl Engine {
         match self.dialect {
             Dialect::Grok => {
                 let ids = self.turn.as_ref().unwrap().grok_ids.clone();
+                let name = tool.grok_name();
                 self.artifacts.grok_update(
                     &self.clock,
                     &ids,
@@ -1935,7 +2050,7 @@ impl Engine {
                     &self.clock,
                     json!({
                         "type": "permission_resolved",
-                        "tool_name": "run_terminal_command",
+                        "tool_name": name,
                         "decision": "deny",
                         "wait_ms": 0
                     }),
@@ -2173,21 +2288,23 @@ impl Engine {
                 }
                 Dialect::Grok => {
                     let ids = self.turn.as_ref().unwrap().grok_ids.clone();
-                    let command = tool
-                        .input_object()
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_owned();
+                    let name = tool.grok_name();
+                    // The completed frame is the *last* thing to read the log
+                    // handle; `finish_tool` clears it right after.
+                    let log = self.turn.as_ref().and_then(|turn| turn.grok_log.clone());
+                    let log_path = log
+                        .as_ref()
+                        .and_then(|log| self.artifacts.grok_terminal_path(&log.tool_call_id));
                     self.artifacts.grok_update(
                         &self.clock,
                         &ids,
                         grok_tool_update_completed(
+                            &tool,
                             &tool_id,
-                            &command,
                             &output,
                             exit_code,
                             &self.meta.cwd,
+                            log_path.as_deref(),
                             tool.is_error(),
                         ),
                         false,
@@ -2196,7 +2313,7 @@ impl Engine {
                         &self.clock,
                         json!({
                             "type": "tool_completed",
-                            "tool_name": "run_terminal_command",
+                            "tool_name": name,
                             "duration_ms": tool.duration(),
                             "outcome": "success",
                             "tool_call_id": tool_id
@@ -2210,6 +2327,18 @@ impl Engine {
             self.write_claude_boundary_attachments()?;
         }
         self.view.running_tool = None;
+        // The finished call's log handle must not survive into the next tool:
+        // it is what lets a non-shell call skip streaming entirely, and what
+        // keeps a shell call later in the turn from appending to this call's
+        // log.
+        //
+        // A denied call needs no clear of its own: denial happens at `ToolCall`
+        // or in the approval dialog, both before `begin_tool_run`, so the
+        // previous call's handle is already gone by then and this one never
+        // set one.
+        if let Some(turn) = self.turn.as_mut() {
+            turn.grok_log = None;
+        }
         Ok(())
     }
 
@@ -2774,6 +2903,25 @@ fn default_scenario() -> Scenario {
         "json",
     )
     .expect("default scenario")
+}
+
+/// The `$ command` line a real grok session writes to `terminal/<id>.log`
+/// before the command's own output.
+fn shell_command(tool: &ToolSpec) -> String {
+    tool.input_object()
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Lines a scripted result releases to the terminal log, one per tick.
+fn result_lines(result: &Value) -> Vec<String> {
+    let text = result.as_str().unwrap_or_default();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.lines().map(str::to_owned).collect()
 }
 
 fn split_chunks(text: &str, count: usize) -> Vec<String> {

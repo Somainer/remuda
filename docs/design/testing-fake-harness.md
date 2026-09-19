@@ -91,10 +91,18 @@ JSON（默认）或 YAML（按扩展名）。未知字段直接报错，避免�
   `hook_required`（无钩子裁决即拒绝）。
 - `chunks`/`think_chunks` 控制流式分块；`chunk_delay_ms` 是块间真实
   sleep，屏幕与 artifact 都按块推进。
+- `answer`（grok）：`ask_user_question` 的选中项标签数组，逐题对应，
+  写进 `rawOutput.UserAnswered`；缺省取该题首个选项。
+- `diff`（grok）：`{path, old_text, new_text}`，让写类工具的进度与完成帧
+  带 `{type:"diff"}` content 块（`path` 缺省取 `input.file_path`，
+  `new_text` 缺省取 `input.content`）。
 - `quit_after_turns` 到数自动退出，方便无人值守测试。
 
 夹具见 `fixtures/fake-harness/scenarios/`（`ok` / `approval` / `slow` /
-`hooks` / `demo.yaml`）。
+`hooks` / `grok-question` / `grok-tools` / `grok-ordered-tools` / `demo.yaml`）。
+`grok-*` 三个场景既被 `remuda-testing` 的单测解析，也被
+`remuda-driver` 的 `adapters_parity.rs` 直接以文件名加载（不再内联副本，
+两处不会漂移）。
 
 ## 4 屏幕方言
 
@@ -171,12 +179,46 @@ golden 覆盖三种方言 × idle/working/approval/trust × 80×24 与 40×20
   `tool_call_update`（`rawOutput.exit_code`），以及
   `_x.ai/session/update` 的 `turn_completed`（`stop_reason`
   `end_turn`/`cancelled`）；`eventId` 跨轮单调；
+- **工具帧按真实 Grok 1.0.30 形状写**（D-043 / `grok-structural-translation.md`）：
+  - `tool_call` 带 `_meta["x.ai/tool"]{version,name,kind,namespace,label,read_only}`；
+    `title` 仍是工具名，`name` 取自名字表（`Bash`→`run_terminal_command`，
+    场景写 Claude 名也能跑），不再是写死的 `run_terminal_command`；
+  - 工具起跑时补一帧**无 `status`** 的 `tool_call_update`（人类 `title`、
+    `locations`、`rawInput.variant`）—— 这是 Grok 的 Running 边，
+    translator 缺了它工具卡永远停在 Proposed。该帧顶层 `kind` 是 **ACP
+    `ToolKind`**（`execute`/`edit`/`other`），与 `_meta["x.ai/tool"].kind`
+    不是同一套词表：夹具帧 37 的 `ask_user_question` 顶层是 `other`、`_meta`
+    里是 `ask_user`；
+  - **完成帧是精简的**：只有 `status`、`content`、`rawOutput`（夹具帧 9/38），
+    不带 `kind`/`title`/`locations`/`rawInput`/`_meta`。所以从终帧「刷新」
+    `display_title` 的 translator 无法蒙混过关——卡片唯一能显示的标题来自
+    进度帧；
+  - `terminal/<toolCallId>.log` 在 `duration_ms` 内**逐行增长**（`GROK_LOG_TICK`
+    180 ms 一行，首行是 `$ <command>`），完成帧的 `rawOutput.output_file`
+    指向它（路径在 fake 自己的 session 目录内，绝不是采集机的绝对路径）；
+  - `ask_user_question`：`rawInput.questions[]` 规范化补 `multiSelect`，
+    完成帧 `rawOutput.UserAnswered.message` 回显脚本
+    `answer`（缺省取首个选项）；
+  - 写类工具（`write` / `search_replace`）可脚本
+    `diff: {path, old_text, new_text}`，`{type:"diff"}` content 块写在
+    **进度帧和完成帧**里（1.0.34 ACP 采集两处都有）；
 - events：`turn_started`（`turn_number`/`model_id`/`yolo_mode`）、
   `phase_changed`、`first_token`、`tool_started/completed`、
   `permission_requested/resolved`、`turn_ended`（`outcome`
   completed/cancelled + `cancellation_context.trigger`）；
+  `tool_name` 一律走名字表（不再写死 `run_terminal_command`）；
 - `active_sessions.json` 存活期一条（真实 TUI PID，发现路径，**不是
   liveness**），关闭前先移除成 `[]`（证据 A2）。
+
+`[U]`（**合成、非实测**）帧：`spawn_subagent` / `workflow` 的 `_meta`，
+以及 `search_replace` 的 `rawInput.variant`。1.0.30 TUI 夹具只有
+`run_terminal_command` 与 `ask_user_question`；`write` 的
+`_meta.namespace=opencode` 与 `rawOutput{type:"SearchReplace",EditsApplied}`
+取自仓内已提交的 ACP 采集
+（`crates/remuda-testing/fixtures/grok/grok-acp-session.jsonl`）。该采集
+**未记 CLI 版本**（`fixtures/SOURCES.md` 只写 `grok agent stdio`），它属于
+1.0.34 的说法是推断而非记录；正式重采前，这些形状**不得**被读成
+"Grok 不支持 X"。
 
 集成测试直接用 `remuda_driver` 的三个生产解析器解析这些文件，并用
 `locate_rollout_in` / `locate_session` 反查。

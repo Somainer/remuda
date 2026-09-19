@@ -1,0 +1,29 @@
+{
+  "turns": [
+    {
+      "match_prefix": "QUESTION",
+      "thinking": "The user has a choice to make.",
+      "text": "SPIKE_COMPLETE QUESTION",
+      "tools": [
+        {
+          "name": "ask_user_question",
+          "input": {
+            "questions": [
+              {
+                "question": "Choose the probe result.",
+                "options": [
+                  { "label": "Alpha", "description": "Record Alpha." },
+                  { "label": "Beta", "description": "Record Beta." }
+                ]
+              }
+            ]
+          },
+          "approval": "auto",
+          "duration_ms": 20,
+          "answer": ["Alpha"]
+        }
+      ]
+    }
+  ],
+  "quit_after_turns": 1
+}

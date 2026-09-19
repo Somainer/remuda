@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   AddHostForm,
+  COMPUTER_USE_KIND,
   HostLaunchDefaults,
   HostProviderBinding,
   absentCli,
@@ -240,21 +241,27 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
               </div>
             ))}
             {/* A reported-absent row has no path to print, so `installedCli`
-                (correctly) drops it; it still needs a row here, or "未安装"
-                is unreachable and the host reads as if it never answered
-                (ui-spec §2.6). */}
-            {absentCli(host.cli).map((cli) => (
-              <div key={`${cli.kind}:absent`} className={css.cliRow} data-testid="host-cli">
-                <span className={css.cliKind}>{cli.kind}</span>
-                <span className={css.cliPath} />
-                <span className={css.cliVer} />
-                <span className={css.cliAuth}>
-                  <span className={css.dotUnknown} />
-                  {cli.auth}
-                </span>
-                <span className={css.cliVer} data-testid="host-cli-flags">未安装</span>
-              </div>
-            ))}
+                (correctly) drops it; the capability still needs a row here, or
+                "未安装" is unreachable and the host reads as if it never
+                answered (ui-spec §2.6).
+                Scoped to the capability on purpose: the Node probe reports
+                every agent CLI it looked for, so an un-scoped list would give
+                a claude-only host five empty 未安装 rows for codex/grok/agy/
+                gemini — noise about binaries this page never claimed to have. */}
+            {absentCli(host.cli)
+              .filter((cli) => cli.kind === COMPUTER_USE_KIND)
+              .map((cli) => (
+                <div key={`${cli.kind}:absent`} className={css.cliRow} data-testid="host-cli">
+                  <span className={css.cliKind}>{cli.kind}</span>
+                  <span className={css.cliPath} />
+                  <span className={css.cliVer} />
+                  <span className={css.cliAuth}>
+                    <span className={css.dotUnknown} />
+                    {cli.auth}
+                  </span>
+                  <span className={css.cliVer} data-testid="host-cli-flags">未安装</span>
+                </div>
+              ))}
           </div>
         </div>
         <WorkspaceList hostId={host.id} workspaces={workspaces} online={host.online} />

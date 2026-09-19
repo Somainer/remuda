@@ -338,6 +338,7 @@ pub(crate) fn peer_allowed(peer: IpAddr, rules: &[PeerRule]) -> bool {
 pub(crate) fn status_for_error(code: &str) -> u16 {
     match code {
         API_ERROR_UPSTREAM_TIMEOUT => 504,
+        remuda_protocol::hubnode::API_ERROR_UPSTREAM_FAILED => 502,
         API_ERROR_VIA_HOST_OFFLINE | API_ERROR_HUB_LINK_LOST | API_ERROR_INSTANCE_GONE => 503,
         API_ERROR_CANCELLED => 502,
         _ => 502,

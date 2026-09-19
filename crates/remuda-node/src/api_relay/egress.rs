@@ -279,7 +279,7 @@ impl DirectForwardError {
         match self {
             Self::DestinationRefused => API_ERROR_DESTINATION_REFUSED,
             Self::GatewayUnreachable | Self::TimedOut => API_ERROR_UPSTREAM_TIMEOUT,
-            Self::UpstreamFailed => remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST,
+            Self::UpstreamFailed => remuda_protocol::hubnode::API_ERROR_UPSTREAM_FAILED,
         }
     }
 
@@ -557,8 +557,11 @@ async fn run_egress(
             );
         }
         Err(error) => {
-            // The reqwest Display carries the request URL (hence the gateway
-            // origin): log it on H only, never render it into the body W sees.
+            // A generic post-network failure (reset after connect, etc.):
+            // distinct from the unreachable/timeout ladder, and identical to
+            // the direct leg's mapping. The reqwest Display carries the
+            // request URL (hence the gateway origin): log it on H only, never
+            // render it into the body W sees.
             tracing::warn!(%error, "egress gateway request failed");
             router_task.abort();
             return error_end(
@@ -566,7 +569,7 @@ async fn run_egress(
                 started,
                 bytes_up.load(std::sync::atomic::Ordering::Relaxed),
                 0,
-                API_ERROR_UPSTREAM_TIMEOUT,
+                remuda_protocol::hubnode::API_ERROR_UPSTREAM_FAILED,
                 "gateway request failed",
             );
         }

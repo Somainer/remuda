@@ -223,6 +223,15 @@ pub enum Script {
         /// Absolute `Location` URL.
         location: String,
     },
+    /// A small SSE event flushed immediately, then a gap of `gap_ms`, then a
+    /// second small event. Proves a relay coalescer flushes on a timer rather
+    /// than waiting for the next upstream byte (D-048 §7.6 ≥50 ms).
+    DelayedSse {
+        /// Idle gap between the two flushed events, in milliseconds.
+        gap_ms: u64,
+        /// Text carried by each of the two `text_delta` events.
+        text: String,
+    },
 }
 
 impl Script {
@@ -297,6 +306,7 @@ impl Script {
             Self::Status { code, .. } => *code,
             Self::AbortMidStream { .. } => 200,
             Self::Redirect { .. } => 302,
+            Self::DelayedSse { .. } => 200,
         }
     }
 }
@@ -939,6 +949,7 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
             .header("location", location)
             .body(axum::body::Body::empty())
             .expect("redirect response"),
+        Script::DelayedSse { gap_ms, text } => delayed_sse_response(gap_ms, &text),
     };
     let mut response = response;
     apply_configured_headers(response.headers_mut(), &gateway.response_headers());
@@ -1082,6 +1093,64 @@ fn encode_response(
 /// close. That is the difference a mid-stream-abort test has to be able to
 /// observe, and it is why the abort body is a stream rather than a short
 /// `String`.
+/// Build a 200 SSE response that emits one small under-16 KiB event, flushes,
+/// sleeps `gap_ms`, then emits the terminal stop sequence — proving a
+/// time-based coalescer flushes within ~50 ms even during a long upstream gap.
+fn delayed_sse_response(gap_ms: u64, text: &str) -> Response {
+    let mut first = String::new();
+    push_event(
+        &mut first,
+        "message_start",
+        &json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_fake", "type": "message", "role": "assistant",
+                "model": DEFAULT_MODEL, "content": [],
+                "stop_reason": null, "stop_sequence": null,
+                "usage": { "input_tokens": 8, "output_tokens": 0 },
+            },
+        }),
+    );
+    push_event(
+        &mut first,
+        "content_block_start",
+        &json!({"type":"content_block_start","index":0,
+                 "content":{"type":"text","text":""}}),
+    );
+    push_event(
+        &mut first,
+        "content_block_delta",
+        &json!({"type":"content_block_delta","index":0,
+                 "delta":{"type":"text_delta","text":text}}),
+    );
+    let mut second = String::new();
+    push_event(
+        &mut second,
+        "content_block_stop",
+        &json!({"type":"content_block_stop","index":0}),
+    );
+    push_event(
+        &mut second,
+        "message_delta",
+        &json!({"type":"message_delta","delta":{"stop_reason":"end_token","stop_sequence":null},
+                 "usage":{"output_tokens": token_count(text)}}),
+    );
+    push_event(&mut second, "message_stop", &json!({"type":"message_stop"}));
+    let first_bytes = Bytes::from(first);
+    let second_bytes = Bytes::from(second);
+    let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(first_bytes) })
+        .chain(futures::stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+            Ok(second_bytes)
+        }));
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-store")
+        .body(Body::from_stream(stream))
+        .expect("delayed sse response")
+}
+
 fn sse_response(text: &str, abort: bool) -> Response {
     let mut out = String::new();
     push_event(

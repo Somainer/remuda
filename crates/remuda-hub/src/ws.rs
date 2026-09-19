@@ -472,6 +472,13 @@ pub(crate) async fn handle_node_method(
                 )
                 .await;
             *session_generation = Some(generation);
+            // D-048 B.2: re-push api.egress contexts this proxy host holds for
+            // live routed instances, so the first api.open after a reconnect
+            // reaches an H that already has the credential.
+            state
+                .api_relay
+                .reinstall_egress_on_connect(state, &host.host_id)
+                .await;
             let watermarks = state
                 .store
                 .list_instance_watermarks(host.host_id.clone())

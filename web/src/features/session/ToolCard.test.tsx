@@ -89,7 +89,7 @@ describe("ToolCard · image tool result (D-045 §6.2)", () => {
   });
 
   it("swaps an expired object to the fixed not-attached note instead of a broken image", () => {
-    const { container } = render(
+    render(
       <ToolCard
         driverKind="claude-pty"
         call={mcpCall()}

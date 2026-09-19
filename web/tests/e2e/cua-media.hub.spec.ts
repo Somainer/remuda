@@ -238,5 +238,14 @@ test("a computer-use screenshot renders as a bounded thumbnail from the object r
     );
   }
 
+  // Open the 结果 disclosure so the committed evidence shows the tool
+  // identity, the captured text and the bounded thumbnail (not a collapsed
+  // card) before capturing.
+  const resultSummary = card.locator("summary").filter({ hasText: "结果" });
+  if (await resultSummary.count()) {
+    await resultSummary.first().click();
+    await thumb.scrollIntoViewIfNeeded();
+  }
+
   await shot(page, "codex-cua-4-tool-card-thumbnail.png");
 });

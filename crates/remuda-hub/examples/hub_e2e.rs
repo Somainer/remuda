@@ -931,6 +931,7 @@ async fn fake_node(
                             &durable_token,
                             &instance_id,
                             prompt,
+                            command_id,
                             append_n,
                         )
                         .await?;
@@ -3941,6 +3942,7 @@ impl remuda_protocol::ToolMediaStager for CuaStager {
 /// object route, so what gets journaled is the object reference; the mirrored
 /// `toolUseResult` is scrubbed too. Drives the same path a production Node
 /// takes, rather than hand-building folded blocks (D-045 §6.2).
+#[allow(clippy::too_many_arguments)]
 async fn append_cua_scenario(
     ws: &mut NodeWs,
     addr: SocketAddr,
@@ -3948,10 +3950,19 @@ async fn append_cua_scenario(
     token: &str,
     instance_id: &str,
     prompt: &str,
+    command_id: Option<&str>,
     mut n: u64,
 ) -> Result<u64> {
-    // The composer's own bubble, like every other scenario.
-    n = append_journal(ws, instance_id, n, "user", prompt).await?;
+    // The composer's own bubble with the SAME commandId shape the normal
+    // composer-send path uses, so the optimistic bubble folds away instead
+    // of lingering on 等待发送.
+    let node = command_id
+        .map(|id| {
+            id.strip_prefix("cmd_")
+                .map_or_else(|| format!("obj_node_{n}"), |_| format!("obj_{id}"))
+        })
+        .unwrap_or_else(|| format!("obj_legacy_{n}"));
+    n = append_user_message(ws, instance_id, n, prompt, command_id, &node).await?;
 
     let http_base = format!("http://{addr}");
     let stager = std::sync::Arc::new(CuaStager {

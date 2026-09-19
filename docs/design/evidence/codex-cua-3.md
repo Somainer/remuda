@@ -127,13 +127,20 @@ host hst_… is not in the Hub's host inventory (offline or unknown);
 computer-use requires a connected macOS host — pick one with --host
 ```
 
-Node boundary (shell-pty codex, hooks off):
+Node boundary (granted codex on any carrier except shell-pty + hooks;
+the `{driver}` slot is the observed `DriverKind`, e.g. `ShellPty` with
+`pty_hooks=false` or `GenericPty`):
 
 ```
-the "computer-use" capability for codex on shell-pty requires
-REMUDA_PTY_HOOKS=1: without the hook session the granted MCP server cannot
-be delivered; enable pty hooks or launch codex on generic-pty
+the "computer-use" capability for codex on {driver} is not delivered:
+only shell-pty with REMUDA_PTY_HOOKS=1 materializes the shadow CODEX_HOME
+the granted MCP server needs; the other carriers would shadow the
+operator's codex login
 ```
+
+The materializer (`skills.rs`) carries the same refusal for any non-shell-pty
+driver, so no `mcp-cua.json`/launchers are written and the recipe records no
+grant for an undeliverable codex launch.
 
 ### Generated `mcp-cua.json` (granted, redacted)
 
@@ -229,7 +236,7 @@ Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
 
 ## Tests
 
-- `crates/remuda-driver/tests/cua_capability.rs` (17): embedded-vs-source
+- `crates/remuda-driver/tests/cua_capability.rs` (16): embedded-vs-source
   digest + file set + 0700 dirs (incl. `native_home/skills`); managed/
   inherited/shared homes and cleanup; claude argv mount; codex MCP entry
   carries the absolute real home (ambient-env-independent) while agent env
@@ -267,10 +274,18 @@ materialization **behind the explicit opt-in, default off**, as
 codex-cua.md §8 prescribes. Remaining Mac verification:
 
 1. Node reports `cli[kind=computer-use].installed = true` and `os = macos`.
-2. Attended `remuda instance create --host <mac> --capability computer-use`:
-   child sees the handshake, `mcp-cua.json` on argv, skill tree in its managed
-   home; the cua-repl MCP server starts (it resolves the vendor app via
-   `REMUDA_CODEX_HOME`, not the shadow `CODEX_HOME`) and lists tools.
-3. Granted codex (generic-pty and shell-pty+hooks): agent state stays in the
-   shadow home while the MCP server finds the vendor app.
+2. Attended `remuda instance create --host <mac> --capability computer-use`
+   (the Node must run with `REMUDA_PTY_HOOKS=1` / `pty_hooks = true`, which
+   defaults **off**): for a claude launch the child sees the handshake,
+   `mcp-cua.json` on argv, the skill tree in its managed home; the cua-repl
+   MCP server starts (it resolves the vendor app via `REMUDA_CODEX_HOME`, not
+   the shadow `CODEX_HOME`) and lists tools.
+3. Granted **codex** is delivered only on **shell-pty with the Node configured
+   `pty_hooks = true`**: run `REMUDA_PTY_HOOKS=1 …` (or set the config), then
+   `remuda instance create --host <mac> --kind codex --driver shell-pty
+   --capability computer-use`; the HookSession materializes
+   `<launch_dir>/codex-home/config.toml` with the granted server, agent state
+   stays in the shadow home while the MCP server finds the vendor app via
+   `REMUDA_CODEX_HOME`. Codex on generic-pty (and shell-pty without hooks)
+   must be refused with the named "not delivered" message — verify both.
 4. `dispatch --capability computer-use` refuses for both harnesses.

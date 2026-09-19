@@ -148,6 +148,21 @@ export function computerUseState(cli: HostCli[] | undefined): ComputerUseState {
   return { reported: true, installed: true, version: entry.version, path: entry.path };
 }
 
+/**
+ * The harness kinds this host can actually run — never the capability row.
+ *
+ * `computer-use` is a host fact, not a harness, so it must not appear here. It
+ * matters more than tidiness: New Session treats a non-empty list as "the host
+ * told us what it has" and stops falling back to claude, so leaving the
+ * capability in the list would disable *every* kind on a host that has the
+ * vendor client but no agent CLI on PATH.
+ */
+export function supportedHarnessKinds(cli: HostCli[] | undefined): string[] {
+  return installedCli(cli)
+    .map((entry) => entry.kind)
+    .filter((kind) => kind !== COMPUTER_USE_KIND);
+}
+
 export function sortHostsOnlineFirst<T extends HostSortable>(hosts: T[], recentIds: string[] = []): T[] {
   const rank = new Map(recentIds.map((id, i) => [id, i]));
   return hosts.slice().sort((a, b) => {

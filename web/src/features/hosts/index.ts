@@ -13,6 +13,7 @@ export {
   sortHostsOnlineFirst,
   computerUseState,
   COMPUTER_USE_KIND,
+  supportedHarnessKinds,
   STALE_OFFLINE_MS,
   type Carrier,
   type ComputerUseState,

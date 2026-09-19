@@ -1,6 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
+import css from "./session.module.css";
 import { ViewSwitch } from "./ViewSwitch";
 
 describe("ViewSwitch", () => {
@@ -37,5 +38,22 @@ describe("ViewSwitch", () => {
     onChange.mockClear();
     await user.keyboard("{ArrowLeft}");
     expect(onChange).toHaveBeenCalledWith("structured");
+  });
+
+  it("keeps the hit-area-bearing viewSeg class on both radios regardless of state", () => {
+    // Not a hit-box assertion: jsdom performs no layout and the stylesheet is
+    // not applied, so a class-string check cannot prove the ::after exists,
+    // is centred, or is unobstructed — the geometry binding lives in
+    // ux-touchhit.hub.spec.ts.
+    // This only guards the TSX invariant the hot zone relies on: the on-state
+    // class is additive, so toggling state never drops `.viewSeg` (the class
+    // the mobile ::after is keyed to) from a segment.
+    render(<ViewSwitch value="tty" onChange={vi.fn()} />);
+    const selected = screen.getByTestId("view-switch-tty");
+    const other = screen.getByTestId("view-switch-structured");
+    expect(selected.className.split(" ")).toContain(css.viewSeg);
+    expect(other.className.split(" ")).toContain(css.viewSeg);
+    expect(selected.className.split(" ")).toContain(css.viewSegOn);
+    expect(other.className.split(" ")).not.toContain(css.viewSegOn);
   });
 });

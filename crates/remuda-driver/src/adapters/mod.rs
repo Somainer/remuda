@@ -386,10 +386,31 @@ pub fn tool_call_payload(
 }
 
 /// A final tool result. `outcome` carries denial vs failure vs success.
+///
+/// Only text is ever present on the codex/grok adapters today; image-bearing
+/// producers use [`tool_result_payload_blocks`] (D-045 §6.2).
 #[must_use]
 pub fn tool_result_payload(
     tool_call_id: Id,
     text: Option<String>,
+    structured: Option<serde_json::Value>,
+    exit_code: Option<i32>,
+    outcome: ToolOutcome,
+) -> ObservationPayload {
+    let blocks = text
+        .filter(|value| !value.is_empty())
+        .map(|text| vec![ContentBlock::Text(Box::new(TextBlock { text }))])
+        .unwrap_or_default();
+    tool_result_payload_blocks(tool_call_id, blocks, structured, exit_code, outcome)
+}
+
+/// A final tool result carrying arbitrary content blocks — text plus image
+/// references staged into the object store (D-045 §6.2). Bytes never appear
+/// here; image blocks name an `objectId` only.
+#[must_use]
+pub fn tool_result_payload_blocks(
+    tool_call_id: Id,
+    blocks: Vec<ContentBlock>,
     structured: Option<serde_json::Value>,
     exit_code: Option<i32>,
     outcome: ToolOutcome,
@@ -404,10 +425,7 @@ pub fn tool_result_payload(
         tool_call_id,
         stage: remuda_protocol::ResultStage::Final,
         outcome,
-        blocks: text
-            .filter(|value| !value.is_empty())
-            .map(|text| vec![ContentBlock::Text(Box::new(TextBlock { text }))])
-            .unwrap_or_default(),
+        blocks,
         structured_result: structured.map_or_else(not_emitted, |value| Knowledge::Known { value }),
         exit_code: exit_code.map_or_else(
             || Knowledge::Unknown {

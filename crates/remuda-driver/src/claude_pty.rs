@@ -123,6 +123,10 @@ pub struct ClaudePtyOptions {
     /// therefore makes the driver's own nodes unaddressable by anything the
     /// Node derives for the same session (c-wfdrill2 C). `None` outside a Node.
     pub instance_id: Option<InstanceId>,
+    /// Node-supplied stager for image content blocks a tool result carries
+    /// (D-045 §6.2). `None` (default) degrades images to honest text blocks;
+    /// bytes are never inlined into observations.
+    pub media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 }
 
 impl ClaudePtyOptions {
@@ -153,6 +157,7 @@ impl ClaudePtyOptions {
             seed_onboarding: true,
             host_claude_config: None,
             instance_id: None,
+            media_stager: None,
         }
     }
 }
@@ -581,6 +586,7 @@ impl ClaudePtyDriver {
             }),
             Some(Arc::clone(&permission_bridge)),
             launch_permission,
+            self.options.media_stager.clone(),
         );
         let effort_io: Arc<dyn crate::effort::EffortSwitchIo> = Arc::new(HerdrEffortIo {
             client: client.clone(),
@@ -1356,6 +1362,7 @@ fn spawn_transcript_pump(
     model: Option<TranscriptModelSync>,
     permission_bridge: Option<Arc<crate::permission::PermissionBridge>>,
     launch_permission: Option<remuda_protocol::ClaudePermissionMode>,
+    media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut hydrator: Option<(crate::claude_transcript::TranscriptTail, TranscriptMapper)> =
@@ -1383,6 +1390,9 @@ fn spawn_transcript_pump(
                         ctx.session_id.clone(),
                         ctx.pin_version.clone(),
                     );
+                    if let Some(stager) = media_stager.clone() {
+                        mapper = mapper.with_media_stager(stager);
+                    }
                     if let Some(bridge) = &effort_bridge {
                         mapper = mapper.with_effort_bridge(Arc::clone(bridge), launch_effort);
                     }

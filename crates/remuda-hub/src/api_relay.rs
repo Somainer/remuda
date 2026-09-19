@@ -339,20 +339,31 @@ impl ApiRelay {
     }
 
     /// Revoke an instance's egress context on H (instance exit / route down).
+    ///
+    /// The frame is built from the typed [`ApiEgressParams`] so it round-trips
+    /// on the Node: `profileId`/`baseUrl` are the values of the removed
+    /// snapshot (empty strings when none is held), `authToken` is `None`,
+    /// `revoke` is true.
     pub async fn revoke_egress(&self, state: &AppState, proxy_host: &str, instance_id: &str) {
-        self.inner
+        let snapshot = self
+            .inner
             .lock()
             .await
             .egress_contexts
             .remove(&(proxy_host.to_string(), instance_id.to_string()));
-        let params = json!({
-            "instanceId": instance_id,
-            "profileId": Value::Null,
-            "baseUrl": Value::Null,
-            "headers": [],
-            "authToken": Value::Null,
-            "revoke": true,
-        });
+        let (profile_id, base_url) = snapshot
+            .map(|snapshot| (snapshot.profile_id, snapshot.base_url))
+            .unwrap_or_default();
+        let Ok(params) = serde_json::to_value(ApiEgressParams {
+            instance_id: instance_id.to_string(),
+            profile_id,
+            base_url,
+            headers: Vec::new(),
+            auth_token: None,
+            revoke: true,
+        }) else {
+            return;
+        };
         let _ = state
             .nodes
             .notify(proxy_host, METHOD_API_EGRESS, params)
@@ -374,6 +385,54 @@ impl ApiRelay {
         };
         for host in hosts {
             self.revoke_egress(state, &host, instance_id).await;
+        }
+    }
+
+    /// Re-install egress contexts on a proxy host that just (re)connected.
+    ///
+    /// Protocol §7.6 / B.2: the Hub sends api.egress at launch and **again
+    /// after every H reconnect**, before the next api.open reaches H. Called
+    /// from the WebSocket/SSH hello paths once a live link for the host is
+    /// recorded. Re-installs every instance whose observed route proxies
+    /// through `proxy_host`; missing profiles are skipped (the context is
+    /// gone with the instance's data).
+    pub async fn reinstall_egress_on_connect(&self, state: &AppState, proxy_host: &str) {
+        let instance_ids = match state
+            .store
+            .instances_routed_via(proxy_host.to_string())
+            .await
+        {
+            Ok(ids) => ids,
+            Err(error) => {
+                tracing::error!(%proxy_host, %error, "reconnect egress: cannot list instances");
+                return;
+            }
+        };
+        for instance_id in instance_ids {
+            let Ok(Some(instance)) = state.store.get_instance(instance_id.clone()).await else {
+                continue;
+            };
+            let Some(profile_id) = instance
+                .provider_profile_id
+                .as_deref()
+                .filter(|id| crate::provider_resolve::is_real_profile_id(id))
+            else {
+                continue;
+            };
+            let Ok(Some(profile)) = state.store.get_provider(profile_id.to_string()).await else {
+                continue;
+            };
+            if let Err(error) = self
+                .install_egress(state, proxy_host, &instance_id, &profile)
+                .await
+            {
+                tracing::warn!(
+                    %proxy_host,
+                    %instance_id,
+                    %error,
+                    "reconnect: api.egress reinstall failed"
+                );
+            }
         }
     }
 
@@ -678,8 +737,19 @@ impl ApiRelay {
                 .await;
                 return;
             }
-            // api.open carries no credential; just re-address the stream.
-            let mut params = match serde_json::to_value(&open) {
+            // api.open carries no credential; re-address the stream and
+            // strip any worker-supplied authorization/x-api-key/api-key
+            // headers before it is forwarded to H. The listener already
+            // rejects them on its own half; this is the Hub half of the
+            // two-sided guarantee, matching the in-process egress.
+            let mut stripped_open = open.clone();
+            stripped_open.headers.retain(|header| {
+                !matches!(
+                    header.name.to_ascii_lowercase().as_str(),
+                    "authorization" | "x-api-key" | "api-key"
+                )
+            });
+            let mut params = match serde_json::to_value(&stripped_open) {
                 Ok(value) => value,
                 Err(error) => {
                     self.end_to_worker(
@@ -862,11 +932,6 @@ impl ApiRelay {
                 let mut st = stream.state.lock().await;
                 st.up_in_flight = st.up_in_flight.saturating_sub(1);
             }
-            let credit = json!({
-                "jsonrpc": "2.0",
-                "method": METHOD_API_CREDIT,
-                "params": { "streamId": stream.worker_stream, "chunks": 1 },
-            });
             let _ = state
                 .nodes
                 .notify(
@@ -875,7 +940,6 @@ impl ApiRelay {
                     json!({"streamId": stream.worker_stream, "chunks": 1}),
                 )
                 .await;
-            let _ = credit;
         }
         Ok(())
     }
@@ -1088,11 +1152,10 @@ impl ApiRelay {
             .nodes
             .notify(&stream.worker_host, METHOD_API_END, params)
             .await;
-        // Revoke the egress context now that the instance's stream is over.
-        if let Some(proxy_host) = stream.proxy_host.as_deref() {
-            self.revoke_egress(state, proxy_host, &stream.instance_id)
-                .await;
-        }
+        // NOTE: the egress context is per *instance*, not per stream — the
+        // session may issue another model request after this stream ends, so
+        // it is NOT revoked here. Revocation happens on instance exit
+        // (`revoke_instance_egress`) or route-down (`on_link_lost`).
         self.remove(&stream.key).await;
     }
 
@@ -1143,19 +1206,22 @@ impl ApiRelay {
                 }),
             )
             .await;
-            // Revoke egress contexts this host held for all routed instances.
-            let contexts: Vec<String> = {
-                let registry = self.inner.lock().await;
-                registry
-                    .egress_contexts
-                    .keys()
-                    .filter(|(h, _)| h == host_id)
-                    .map(|(_, instance)| instance.clone())
-                    .collect()
-            };
-            for instance_id in contexts {
-                self.revoke_egress(state, host_id, &instance_id).await;
-            }
+        }
+        // Revoke every egress context this host held — once, not per stream,
+        // and including contexts with no in-flight stream (a session between
+        // requests must not leave a stale credential on a vanished H).
+        let contexts: Vec<String> = {
+            self.inner
+                .lock()
+                .await
+                .egress_contexts
+                .keys()
+                .filter(|(h, _)| h == host_id)
+                .map(|(_, instance)| instance.clone())
+                .collect()
+        };
+        for instance_id in contexts {
+            self.revoke_egress(state, host_id, &instance_id).await;
         }
         // Block *every* instance routed through the lost proxy host, not only
         // those with an in-flight stream: a session between requests is still
@@ -1403,6 +1469,19 @@ async fn run_hub_egress(state: AppState, relay: ApiRelay, stream: Arc<Stream>, e
     relay.end_to_worker(&state, &stream, result).await;
 }
 
+/// Coalescing buffer for the in-process egress: pending bytes and when the
+/// first of them arrived (drives the 50 ms time-based flush).
+struct CoalesceBuf {
+    bytes: Vec<u8>,
+    first_buffered_at: Option<tokio::time::Instant>,
+}
+
+impl CoalesceBuf {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
 async fn drive_upstream(
     state: &AppState,
     stream: &Arc<Stream>,
@@ -1559,14 +1638,18 @@ async fn drive_upstream(
     }
     project_supply_status_oneshot(state, stream, Some(status)).await;
 
-    // Stream the body, coalescing to ≥16 KiB or 50 ms (item 6) and bounded by
-    // the per-stream deadline (item 7).
+    // Stream the body, coalescing to ≥16 KiB or 50 ms (D-048 §7.6) and
+    // bounded by the per-stream deadline. The 50 ms trigger is a real timer
+    // raced against the upstream read: a small SSE prologue followed by a long
+    // gap must flush at 50 ms rather than being held until the next byte.
     let mut response = response;
     let mut seq = 0u32;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut buf_since: Option<tokio::time::Instant> = None;
+    let mut buf = CoalesceBuf {
+        bytes: Vec::new(),
+        first_buffered_at: None,
+    };
     let mut first = true;
-    loop {
+    'outer: loop {
         if stream.cancelled.load(Ordering::SeqCst) {
             return Err(ApiEndError {
                 code: API_ERROR_CANCELLED.into(),
@@ -1581,71 +1664,94 @@ async fn drive_upstream(
         }
         let read_timeout = if first {
             UPSTREAM_FIRST_BYTE_TIMEOUT
-                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
         } else {
             UPSTREAM_IDLE_TIMEOUT
-                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
-        };
-        let chunk = match tokio::time::timeout(read_timeout, response.chunk()).await {
-            Ok(Ok(chunk)) => chunk,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "relay upstream body read failed");
-                return Err(ApiEndError {
-                    code: API_ERROR_DESTINATION_REFUSED.into(),
-                    message: "reading the gateway response failed".into(),
-                });
+        }
+        .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+
+        // When the buffer holds unflushed bytes, race the read against the
+        // coalesce deadline; an empty buffer just waits for the next chunk.
+        let flush_at = (!buf.is_empty()).then(|| {
+            buf.first_buffered_at
+                .unwrap_or_else(tokio::time::Instant::now)
+                + COALESCE_TIME
+        });
+
+        tokio::select! {
+            biased;
+            _ = async {
+                if let Some(at) = flush_at {
+                    tokio::time::sleep_until(at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                // Coalesce timer fired with buffered bytes: flush them.
+                debug_assert!(!buf.bytes.is_empty());
+                let frame = std::mem::take(&mut buf.bytes);
+                send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
+                buf.first_buffered_at = None;
             }
-            Err(_) => {
-                return Err(ApiEndError {
-                    code: API_ERROR_UPSTREAM_TIMEOUT.into(),
-                    message: if first {
-                        "no first byte within the 60s timeout"
-                    } else {
-                        "no gateway chunk within the 120s idle timeout"
+            read = tokio::time::timeout(read_timeout, response.chunk()) => {
+                let chunk = match read {
+                    Ok(Ok(chunk)) => chunk,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "relay upstream body read failed");
+                        return Err(ApiEndError {
+                            code: API_ERROR_DESTINATION_REFUSED.into(),
+                            message: "reading the gateway response failed".into(),
+                        });
                     }
-                    .into(),
-                });
-            }
-        };
-        first = false;
-        match chunk {
-            Some(chunk) => {
-                if buf.is_empty() {
-                    buf_since = Some(tokio::time::Instant::now());
+                    Err(_) => {
+                        return Err(ApiEndError {
+                            code: API_ERROR_UPSTREAM_TIMEOUT.into(),
+                            message: if first {
+                                "no first byte within the 60s timeout"
+                            } else {
+                                "no gateway chunk within the 120s idle timeout"
+                            }
+                            .into(),
+                        });
+                    }
+                };
+                first = false;
+                match chunk {
+                    Some(chunk) => {
+                        if buf.bytes.is_empty() {
+                            buf.first_buffered_at = Some(tokio::time::Instant::now());
+                        }
+                        buf.bytes.extend_from_slice(&chunk);
+                        // Flush full 64 KiB frames immediately; smaller bytes
+                        // wait for the 16 KiB threshold or the 50 ms timer.
+                        while buf.bytes.len() >= stream.chunk_limit {
+                            let frame: Vec<u8> =
+                                buf.bytes.drain(..stream.chunk_limit).collect();
+                            send_down_chunk(state, stream, &mut seq, frame, false, deadline)
+                                .await?;
+                            buf.first_buffered_at = if buf.bytes.is_empty() {
+                                None
+                            } else {
+                                Some(tokio::time::Instant::now())
+                            };
+                        }
+                        if buf.bytes.len() >= COALESCE_BYTES {
+                            let frame = std::mem::take(&mut buf.bytes);
+                            send_down_chunk(state, stream, &mut seq, frame, false, deadline)
+                                .await?;
+                            buf.first_buffered_at = None;
+                        }
+                    }
+                    None => {
+                        if !buf.bytes.is_empty() {
+                            let frame = std::mem::take(&mut buf.bytes);
+                            send_down_chunk(state, stream, &mut seq, frame, false, deadline)
+                                .await?;
+                        }
+                        send_down_chunk(state, stream, &mut seq, Vec::new(), true, deadline)
+                            .await?;
+                        break 'outer;
+                    }
                 }
-                buf.extend_from_slice(&chunk);
-                // Flush full 64 KiB frames immediately; otherwise hold until
-                // 16 KiB or 50 ms.
-                while buf.len() >= stream.chunk_limit {
-                    let frame: Vec<u8> = buf.drain(..stream.chunk_limit).collect();
-                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
-                    buf_since = if buf.is_empty() {
-                        None
-                    } else {
-                        Some(tokio::time::Instant::now())
-                    };
-                }
-                if buf.len() >= COALESCE_BYTES {
-                    let frame = std::mem::take(&mut buf);
-                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
-                    buf_since = None;
-                } else if let Some(since) = buf_since
-                    && since.elapsed() >= COALESCE_TIME
-                {
-                    let frame = std::mem::take(&mut buf);
-                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
-                    buf_since = None;
-                }
-            }
-            None => {
-                // End of upstream body: flush remainder, then the terminal
-                // empty last chunk.
-                if !buf.is_empty() {
-                    let frame = std::mem::take(&mut buf);
-                    send_down_chunk(state, stream, &mut seq, frame, false, deadline).await?;
-                }
-                send_down_chunk(state, stream, &mut seq, Vec::new(), true, deadline).await?;
-                break;
             }
         }
     }

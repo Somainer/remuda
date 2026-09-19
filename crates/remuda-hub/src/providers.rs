@@ -537,27 +537,11 @@ pub async fn resolve_and_attach_with_project(
         profile.as_deref(),
     )?;
     apply_route_to_spec(state, host, spec, profile.as_deref(), choice).await?;
-    // D-048: when the resolved route proxies through another host, install
-    // the egress context (credential, base URL, headers) on H out of band via
-    // api.egress. The credential never rides api.open.
-    if let Some(profile) = profile.as_ref() {
-        let route: Option<remuda_protocol::ApiRoute> =
-            serde_json::from_value(spec.get("apiRoute").cloned().unwrap_or(json!(null))).ok();
-        if let Some(route) = route
-            .as_ref()
-            .filter(|route| route.is_via())
-            .filter(|route| matches!(route.route, Some(remuda_protocol::ApiRouteKind::HubRelay)))
-            && let Some(proxy_host) = route.via_host_id.as_ref()
-        {
-            let instance_id = spec.get("instanceId").and_then(Value::as_str).unwrap_or("");
-            if !instance_id.is_empty() {
-                state
-                    .api_relay
-                    .install_egress(state, proxy_host.as_id().as_str(), instance_id, profile)
-                    .await?;
-            }
-        }
-    }
+    // D-048: api.egress installation happens in placement::install_route_egress
+    // once the real instance id exists (both plain create and dispatch), and is
+    // re-sent by api_relay::reinstall_egress_on_connect after H reconnects.
+    // Nothing to install here: at resolve time there is no instance, and the
+    // credential must not ride api.open.
     Ok(())
 }
 

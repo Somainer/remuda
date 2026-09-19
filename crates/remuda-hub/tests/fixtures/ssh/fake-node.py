@@ -58,11 +58,12 @@ for line in sys.stdin:
         result = {'items': [], 'workspaceRoot': str(data / 'workspace'), 'fixtureHostId': host}
     else:
         result = {'accepted': True, 'fixtureHostId': host}
-    emit({'jsonrpc': '2.0', 'id': frame['id'], 'result': result})
     if method == 'instance.create':
         spec = frame['params'].get('spec', {})
         if 'apiRoute' in spec:
             result['apiRoute'] = spec['apiRoute']
+    emit({'jsonrpc': '2.0', 'id': frame['id'], 'result': result})
+    if method == 'instance.create':
         instance_id = frame['params']['instanceId']
         instance_file.write_text(json.dumps({'id': instance_id, 'hostId': host, 'lifecycle': 'ready', 'activity': 'working', 'durableSeq': '1'}))
         entry = {'instanceId': instance_id, 'seq': '1', 'event': {'kind': 'lifecycle', 'payload': {'type': 'entity', 'state': 'ready'}}}

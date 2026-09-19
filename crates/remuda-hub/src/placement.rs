@@ -588,7 +588,13 @@ pub async fn spawn_on_host(
     Ok((instance, command))
 }
 
-/// Push `api.egress` to the proxy host for a newly created hub-relay instance.
+/// Push `api.egress` to the proxy host for a newly created via instance.
+///
+/// Installed for **every** resolved via sub-mode — hub-relay, auto and
+/// direct-net — because api.egress is the only channel H may receive the
+/// gateway credential through; an auto route against a host with a
+/// relayBind keeps sub-mode auto so the Node can probe direct-net and fall
+/// back, and a direct-net route still egresses through H.
 async fn install_route_egress(state: &AppState, instance: &InstanceRecord, spec: &Value) {
     // The observed api_route column is only populated after the Node create
     // echo; at this point the requested route on the spec is authoritative.
@@ -600,9 +606,7 @@ async fn install_route_egress(state: &AppState, instance: &InstanceRecord, spec:
     if requested.mode != remuda_protocol::ProviderDeliveryMode::Via {
         return;
     }
-    if !matches!(requested.route, remuda_protocol::ApiRouteMode::HubRelay) {
-        return;
-    }
+    // Any via sub-mode (hub-relay / auto / direct-net) gets a context.
     let Some(proxy_host) = requested.via_host_id.as_ref() else {
         return;
     };

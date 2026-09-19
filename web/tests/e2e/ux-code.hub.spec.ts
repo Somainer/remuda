@@ -288,11 +288,25 @@ test.describe("390px", () => {
     await mkdir(evidence, { recursive: true });
     for (const theme of ["night", "ledger"]) {
       await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
-      await page.waitForTimeout(150);
-      // Re-query the block right before capturing: a late follow re-render can
-      // detach the element resolved earlier in the test.
+      // Gate failure on 54cad03e (main d1f4fe95, 390px): the code-block node
+      // resolved at the top of this loop detached between toBeVisible and
+      // screenshot right after the data-theme switch — a re-render swapped
+      // the transcript subtree at that moment. Could not reproduce locally
+      // (3/3 green on the branch), so harden the capture: re-locate the block
+      // AFTER the switch and wait for its geometry to settle (two equal
+      // heights) so the highlight/re-render wave is done before screenshotting.
       const shot = page.getByTestId("code-block").first();
       await expect(shot).toBeVisible();
+      await expect(shot.getByTestId("code-toolbar")).toBeVisible();
+      await expect.poll(
+        async () => {
+          const first = (await shot.boundingBox())?.height ?? 0;
+          await page.waitForTimeout(120);
+          const second = (await shot.boundingBox())?.height ?? -1;
+          return first > 0 && first === second ? first : 0;
+        },
+        { message: `${theme} code-block height settles before the evidence shot` },
+      ).toBeGreaterThan(0);
       await shot.screenshot({ path: path.join(evidence, `workbench-code-1-${theme}-390.png`) });
     }
   });

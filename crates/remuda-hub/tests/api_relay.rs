@@ -1292,10 +1292,18 @@ async fn open_time_rejections_all_emit_a_terminal_end() -> Result<()> {
         )
         .await?;
     }
-    // Give the drain queue a moment to process all ten queued opens.
+    // Give the drain queue a moment to process all ten queued opens, then
+    // assert both refusals in one poll (separate waits could have the first
+    // swallow the second's frame when both land in one read window).
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_end_code(&mut capped.node, "st_cap_8", "destination-refused").await?;
-    assert_end_code(&mut capped.node, "st_cap_9", "destination-refused").await?;
+    assert_end_codes(
+        &mut capped.node,
+        &[
+            ("st_cap_8", "destination-refused"),
+            ("st_cap_9", "destination-refused"),
+        ],
+    )
+    .await?;
     cap_gateway.shutdown().await;
 
     gateway.shutdown().await;
@@ -1315,6 +1323,41 @@ async fn assert_end_code(node: &mut NodeSocket, stream_id: &str, code: &str) -> 
         .find(|p| p.get("error").is_some())
         .with_context(|| format!("{stream_id} must end with an error"))?;
     assert_eq!(end["error"]["code"], json!(code), "{stream_id}: {end}");
+    Ok(())
+}
+
+/// Batched form of [`assert_end_code`] for refusal ends emitted in a burst.
+///
+/// Polling each stream separately lets the first wait consume (and discard)
+/// a sibling's terminal frame that landed in the same read window, so the
+/// second waits out the whole timeout. Poll in short windows until every
+/// named stream has its expected error code.
+async fn assert_end_codes(node: &mut NodeSocket, pairs: &[(&str, &str)]) -> Result<()> {
+    let mut pending: std::collections::HashSet<String> =
+        pairs.iter().map(|(id, _)| (*id).to_string()).collect();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !pending.is_empty() && tokio::time::Instant::now() < deadline {
+        let frames =
+            collect_notifications(node, Duration::from_millis(500), |_| false).await?;
+        for params in frames.iter().filter_map(|f| f.get("params")) {
+            let Some(stream_id) = params.get("streamId").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(code) = params.pointer("/error/code").and_then(Value::as_str) else {
+                continue;
+            };
+            if pairs
+                .iter()
+                .any(|(id, expected)| *id == stream_id && *expected == code)
+            {
+                pending.remove(stream_id);
+            }
+        }
+    }
+    anyhow::ensure!(
+        pending.is_empty(),
+        "missing terminal error ends for {pending:?}"
+    );
     Ok(())
 }
 

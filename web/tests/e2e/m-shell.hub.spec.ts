@@ -73,16 +73,31 @@ async function pendingInteractionId(page: Page, instanceId: string): Promise<str
 }
 
 async function forceDeleteAllInstances(page: Page) {
+  // Mirrors native-progress.hub.spec.ts: the raw list key is `instanceId`
+  // (not `id`) and the call must be an explicit DELETE — a GET to the
+  // item URL 405s, and a silently swept-under catch leaves live rows
+  // holding fake-node placement slots for later serial specs.
   await page.evaluate(async () => {
-    const body = (await (await fetch("/v1/instances", { credentials: "include" })).json()) as {
-      items?: { id: string }[];
+    const list = await fetch("/v1/instances", { credentials: "include" });
+    const body = (await list.json()) as {
+      items?: { instanceId?: string; lifecycle?: string }[];
     };
     await Promise.all(
-      (body.items ?? []).map((instance) =>
-        fetch(`/v1/instances/${instance.id}?force=1`, { credentials: "include" }).catch(
-          () => undefined,
-        ),
-      ),
+      (body.items ?? [])
+        .filter((instance) => instance.instanceId)
+        .filter(
+          (instance) =>
+            instance.lifecycle !== "exited" &&
+            instance.lifecycle !== "failed" &&
+            instance.lifecycle !== "closed",
+        )
+        .map(async (instance) => {
+          const response = await fetch(
+            `/v1/instances/${instance.instanceId}?force=1`,
+            { method: "DELETE", credentials: "include" },
+          );
+          if (!response.ok) throw new Error(`force delete failed: ${response.status}`);
+        }),
     );
   });
 }
@@ -170,10 +185,17 @@ test.describe("390px phone", () => {
 
     // 新建 keeps the shared new-session route (no redirect either side);
     // from home it carries the active space like the desktop rail's +.
+    // With no stored space preference the first space is the fixture's
+    // wsp_g2_changed ("changed" sorts first), so the carry is asserted
+    // concretely rather than accepting the bare route.
     await page.goto("/m");
     await page.getByTestId("phone-nav-new").click();
-    await expect(page).toHaveURL(/\/sessions\/new(?:\?|$)/);
+    await expect(page).toHaveURL(/\/sessions\/new\?/);
+    const newUrl = new URL(page.url());
+    expect(newUrl.searchParams.get("workspace")).toBe("wsp_g2_changed");
+    expect(newUrl.searchParams.get("host")).toBeTruthy();
     await expect(page.getByTestId("new-session-host")).toBeVisible();
+    await expect(page.getByTestId("new-session-workspace")).toHaveValue("wsp_g2_changed");
 
     // 更多 opens the workbench destinations; 更多 closes on navigation.
     await page.goto("/m");
@@ -234,6 +256,15 @@ test.describe("1440px desktop", () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await login(page);
+  });
+
+  // Same per-test drain as the 390 describe: without it the evidence
+  // test's instance outlives the test and holds a fake-node placement
+  // slot for later serial specs.
+  test.afterEach(async ({ page }) => {
+    for (const id of created.splice(0)) {
+      await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    }
   });
 
   test.afterAll(async ({ browser }) => {

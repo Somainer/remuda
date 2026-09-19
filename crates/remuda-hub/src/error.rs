@@ -76,6 +76,17 @@ pub enum HubError {
         /// Closest listed ids (≤5).
         suggestions: Vec<String>,
     },
+    /// The Node RPC link is saturated and the call was refused **before it was
+    /// sent**, so nothing happened on the Node. Retryable by construction:
+    /// bulk reads draw from a smaller sub-budget than control RPCs (see
+    /// `transport`), and `retryAfterMs` tells the client one poll cycle to
+    /// back off. Never mapped to 500: a refused read must not look like a
+    /// broken Hub (2026-09-19 demo: per-row screen reads surfaced INTERNAL).
+    #[error("node busy: too many in-flight node rpcs; retry after {retry_after_ms} ms")]
+    NodeBusy {
+        /// Hint for the client's next attempt.
+        retry_after_ms: u64,
+    },
     /// SQLite or journal actor mailbox.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
@@ -101,6 +112,7 @@ impl HubError {
             Self::SupplyDeferred { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::PinRefused { .. } => StatusCode::CONFLICT,
             Self::HostOffline { .. } => StatusCode::CONFLICT,
+            Self::NodeBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -120,6 +132,7 @@ impl HubError {
             Self::SupplyDeferred { .. } => "SUPPLY_DEFERRED",
             Self::PinRefused { .. } => "PIN_REFUSED",
             Self::HostOffline { .. } => "HOST_OFFLINE",
+            Self::NodeBusy { .. } => "NODE_BUSY",
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
     }
@@ -171,6 +184,12 @@ impl IntoResponse for HubError {
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert("hostId".into(), json!(host_id));
+        }
+        if let Self::NodeBusy { retry_after_ms } = &self
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("retryAfterMs".into(), json!(retry_after_ms));
+            obj.insert("retryable".into(), json!(true));
         }
         (status, Json(body)).into_response()
     }

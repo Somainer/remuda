@@ -672,10 +672,19 @@ async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     let code = `HTTP_${res.status}`;
     let message = text || `HTTP ${res.status}`;
     let reasons: string[] = [];
+    let retryAfterMs: number | undefined;
     try {
-      const body = JSON.parse(text) as { code?: string; error?: string; reasons?: unknown };
+      const body = JSON.parse(text) as {
+        code?: string;
+        error?: string;
+        reasons?: unknown;
+        retryAfterMs?: unknown;
+      };
       if (body.code) code = body.code;
       if (body.error) message = body.error;
+      if (typeof body.retryAfterMs === "number" && Number.isFinite(body.retryAfterMs)) {
+        retryAfterMs = body.retryAfterMs;
+      }
       if (Array.isArray(body.reasons)) {
         reasons = body.reasons.filter((reason): reason is string => typeof reason === "string" && reason.length > 0);
         if (reasons.length > 0) {
@@ -685,7 +694,7 @@ async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     } catch {
       /* raw */
     }
-    throw new HubHttpError(res.status, code, message, reasons);
+    throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -1358,7 +1367,19 @@ function createLiveApi(): HubApi {
       try {
         const body = await rest<unknown>(`/v1/instances/${instanceId}/screen?lines=${lines}`);
         return parseScreenBody(body);
-      } catch {
+      } catch (err) {
+        // The Hub refused this read to protect the control-RPC reservation
+        // (NODE_BUSY/503): nothing failed on the Node and the next poll cycle
+        // is expected to succeed. Surface it so the store backs off instead
+        // of hammering; every other failure (offline host, unsupported
+        // carrier, 404) stays an empty screen, same as before.
+        if (
+          err instanceof HubHttpError &&
+          (err.code === "NODE_BUSY" || err.status === 503)
+        ) {
+          // Honour the Hub's back-off hint; fall back to one poll cycle.
+          throw new ScreenNodeBusyError(err.retryAfterMs ?? 2500);
+        }
         return { lines: [] };
       }
     },
@@ -1709,6 +1730,25 @@ function createLiveApi(): HubApi {
       follows.clear();
     },
   };
+}
+
+/**
+ * A bulk screen read the Hub refused under load (HTTP 503 `NODE_BUSY`).
+ * Retryable by contract: the Hub reserves half the per-Node RPC budget for
+ * control calls, so a saturated list must wait one poll cycle rather than
+ * surface an error. The store catches this and backs off silently.
+ */
+export class ScreenNodeBusyError extends Error {
+  readonly retryAfterMs: number;
+  constructor(retryAfterMs = 2500) {
+    super("node busy");
+    this.name = "ScreenNodeBusyError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export function isScreenNodeBusy(err: unknown): err is ScreenNodeBusyError {
+  return err instanceof ScreenNodeBusyError;
 }
 
 export const api: HubApi = MOCK ? createMockApi() : createLiveApi();

@@ -188,22 +188,58 @@ export function SessionList({
   // The notice belongs to the Space that triggered it; a later Space retires it.
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
 
-  // Poll the data the rendered rows need: TTY screens for attachable rows
-  // and the projected live phrase for every rendered row. Scoped to this
-  // mounted list only (the store never adds this polling to refresh()); the
-  // store coalesces overlapping ticks and skips unchanged durableSeqs.
+  // Rows currently on screen (IntersectionObserver), so the screen poll can
+  // prefer them. The viewport root stays correct inside an overflow
+  // container: intersection accounts for clipping by intermediate scrollers.
+  const listRootRef = useRef<HTMLDivElement | null>(null);
+  const visibleRows = useRef<Set<Id>>(new Set());
+  const filteredKey = filtered.map((instance) => instance.id).join(",");
+
+  // Poll the data the rendered rows need: TTY screens for attachable rows and
+  // the projected live phrase for every rendered row. The store coalesces
+  // overlapping ticks and skips unchanged durableSeqs; screen reads run only
+  // on the live list route — this same component stays mounted (dimmed)
+  // behind the New Session sheet, and that fan-out is what saturated the Node
+  // link and refused instance.create on the phone. Phrase hydration has no RPC
+  // budget, so it keeps its own always-on tick.
   useEffect(() => {
     if (variant !== "full") return;
     const ttyIds = ptyKey ? (ptyKey.split(",") as Id[]) : [];
     const rowIds = rowKey ? (rowKey.split(",") as Id[]) : [];
+    const onList = location.pathname === "/sessions";
+    const visible = visibleRows.current;
+    // Caller order is list order; lift on-screen rows ahead of the 4-slot
+    // screen-read scheduler so it paints what the user sees.
+    const visibleFirst = (ids: Id[]) =>
+      [...ids].sort((a, b) => Number(visible.has(b)) - Number(visible.has(a)));
     const tick = () => {
-      if (ttyIds.length) void hubStore.refreshScreens(ttyIds);
+      if (onList && ttyIds.length) hubStore.refreshScreens(visibleFirst(ttyIds));
       void hubStore.hydrateRowSummaries(rowIds);
     };
     tick();
     const timer = window.setInterval(tick, 2500);
     return () => window.clearInterval(timer);
-  }, [variant, ptyKey, rowKey]);
+  }, [variant, ptyKey, rowKey, location.pathname]);
+
+  useEffect(() => {
+    if (variant !== "full" || location.pathname !== "/sessions") return;
+    const root = listRootRef.current;
+    if (!root || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.instanceId as Id | undefined;
+          if (!id) continue;
+          if (entry.isIntersecting) visibleRows.current.add(id);
+          else visibleRows.current.delete(id);
+        }
+      },
+      // Pre-load screens a little before the row scrolls fully into view.
+      { root: null, rootMargin: "120px 0px" },
+    );
+    root.querySelectorAll<HTMLElement>("[data-instance-id]").forEach((row) => observer.observe(row));
+    return () => observer.disconnect();
+  }, [variant, location.pathname, filteredKey]);
 
   const chips = selectedChips(conditions, {
     hostName: (id) => hubStore.hostName(id as Id),
@@ -285,7 +321,7 @@ export function SessionList({
   }
 
   return (
-    <div className={css.root} data-testid="session-list">
+    <div className={css.root} data-testid="session-list" ref={listRootRef}>
       <header className={css.top}>
         <div className={css.title}>{title}</div>
         <div className={css.count}>
@@ -575,6 +611,7 @@ export function SessionList({
                   key={instance.id}
                   className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""}`}
                   data-testid="board-card"
+                  data-instance-id={instance.id}
                   data-status={status}
                   data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}

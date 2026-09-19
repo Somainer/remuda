@@ -6,7 +6,7 @@ use crate::config::now_rfc3339;
 use crate::error::{HubError, rpc_error as rpc_err, rpc_ok};
 use crate::inventory;
 use crate::store::{HostAuthOutcome, HostAuthRequest, HostRecord, JournalRecord};
-use crate::transport::{TransportKind, WssTransport};
+use crate::transport::{TransportKind, WssTransport, fail_all_pending, new_pending_rpcs};
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::http::HeaderMap;
@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 
 /// Cap on remembered tty stream bindings across all hosts.
 const MAX_TTY_STREAMS: usize = 1_024;
@@ -259,8 +259,7 @@ pub async fn follow_socket(
 async fn node_session(state: AppState, socket: WebSocket, token: String) {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Value>(32);
-    let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let pending = new_pending_rpcs();
     let mut host_id: Option<String> = None;
     let mut hello_done = false;
     let mut session_generation: Option<u64> = None;
@@ -288,9 +287,12 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue; };
                 if frame.get("method").is_none() {
                     if let Some(id) = frame.get("id").and_then(Value::as_str)
-                        && let Some(waiter) = pending.lock().await.remove(id)
+                        && let Some(waiter) = pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(id)
                     {
-                        let _ = waiter.send(frame);
+                        let _ = waiter.tx.send(frame);
                     }
                     continue;
                 }
@@ -345,6 +347,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
         }
     }
 
+    // Drain every waiter first: calls in flight when the socket ends must not
+    // sit until their timeout (and must never leak as dead map entries).
+    fail_all_pending(&pending);
+
     if let Some(host_id) = host_id {
         let stale = match session_generation {
             Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
@@ -369,7 +375,7 @@ pub(crate) async fn handle_node_method(
     method: &str,
     params: Value,
     out_tx: &mpsc::Sender<Value>,
-    pending: &Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    pending: &crate::transport::PendingRpcs,
 ) -> Result<Option<Value>, HubError> {
     match method {
         "node.auth" => {

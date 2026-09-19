@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
@@ -88,8 +89,25 @@ async fn main() -> Result<()> {
     };
     let host_id = HostId::new();
     let pending: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+    // c-mobilenew e2e gate: while this file exists the fake Node parks replies
+    // to the methods specs use to saturate the Hub's per-link RPC budgets —
+    // tty.screen (the bulk-read half) and worktree.list (the control half) —
+    // for EVERY instance. Removing the file releases every parked call. It
+    // never exists by default, so with no gate every method answers exactly as
+    // before. The name is scoped to the listen port: the spec derives the same
+    // path from HUB_E2E_LISTEN, so concurrent hubs/specs never share a gate and
+    // no temp-dir identity has to be assumed across processes.
+    let rpc_gate = std::env::temp_dir().join(format!("remuda-e2e-rpc-gate-{}", addr.port()));
+    let _ = std::fs::remove_file(&rpc_gate);
     let (ready_tx, ready_rx) = oneshot::channel();
-    let node = tokio::spawn(fake_node(addr, enroll, host_id.clone(), pending, ready_tx));
+    let node = tokio::spawn(fake_node(
+        addr,
+        enroll,
+        host_id.clone(),
+        pending,
+        ready_tx,
+        rpc_gate.clone(),
+    ));
     ready_rx.await.context("fake node hello")?;
     // A stand-in Anthropic-Messages gateway so provider discovery has a real
     // /v1/models to read without reaching any live endpoint.
@@ -109,6 +127,7 @@ async fn main() -> Result<()> {
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
     tokio::signal::ctrl_c().await.ok();
+    let _ = std::fs::remove_file(&rpc_gate);
     node.abort();
     upstream_task.abort();
     drop(hub);
@@ -344,12 +363,20 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
     })
 }
 
+/// Methods whose replies park while the e2e gate file exists. They are the
+/// fan-out bulk read (tty.screen) and the cheap control RPCs the Hub issues
+/// before GET /v1/hosts/{id}/workspaces and /v1/worktrees (workspace.list and
+/// worktree.list), so a spec can fill the control half of the per-link budget
+/// with calls that park for their full node timeout.
+const GATED_METHODS: &[&str] = &["tty.screen", "workspace.list", "worktree.list"];
+
 async fn fake_node(
     addr: SocketAddr,
     enroll: String,
     host_id: HostId,
     pending: Arc<Mutex<HashMap<String, Value>>>,
     ready: oneshot::Sender<()>,
+    rpc_gate: PathBuf,
 ) -> Result<()> {
     let mut req = format!("ws://{addr}/v1/node")
         .into_client_request()
@@ -433,9 +460,16 @@ async fn fake_node(
     // web poll's interaction.list). Never drop RPCs: reprocess them as soon
     // as the current handler returns.
     let mut frame_queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // Parked frames re-enter this loop verbatim once the gate file is removed;
+    // they are then processed by their normal arm, so the reply is exactly the
+    // ungated one. The park task never touches the socket itself.
+    let (requeue_tx, mut requeue_rx) = tokio::sync::mpsc::channel::<String>(64);
     loop {
         tokio::select! {
             biased;
+            Some(frame) = requeue_rx.recv() => {
+                frame_queue.push_back(frame);
+            }
             Some((closed_instance, closed_iid, terminal_answers)) = close_rx.recv() => {
                 let Some(card) = pending.lock().await.remove(&closed_iid) else {
                     continue;
@@ -493,6 +527,25 @@ async fn fake_node(
                 continue;
             }
             let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+            // Gate switch: while the file exists, park the frame (it already
+            // occupies a Hub pending slot) and reprocess it verbatim once the
+            // file is removed, so its normal arm — and reply — is unchanged.
+            if GATED_METHODS.contains(&method) && rpc_gate.exists() {
+                let parked = text.clone();
+                let gate = rpc_gate.clone();
+                let requeue = requeue_tx.clone();
+                tokio::spawn(async move {
+                    let step = Duration::from_millis(100);
+                    let max = Duration::from_secs(60);
+                    let mut waited = Duration::ZERO;
+                    while gate.exists() && waited < max {
+                        tokio::time::sleep(step).await;
+                        waited += step;
+                    }
+                    let _ = requeue.send(parked).await;
+                });
+                continue;
+            }
             let id = frame.get("id").cloned().unwrap_or(Value::Null);
             let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
             let instance_id = params
@@ -1440,6 +1493,36 @@ async fn fake_node(
                     let agent_id = params.get("agentId").and_then(Value::as_str).unwrap_or("");
                     send_rpc_ok(&mut ws, id, drill_subagent_answer(agent_id)).await?;
                 }
+                "tty.screen" => {
+                    // ONE arm with a per-instance condition chain. Adding a
+                    // screen case means inserting a branch here, never a second
+                    // match arm (a later literal arm would be unreachable).
+                    //   1. an instance that opted in with the `screen-read`
+                    //      create sentinel replays its cooked buffer;
+                    //   2. default: exactly the old answer (ok, no lines), so
+                    //      every other spec's list rows keep journal text.
+                    // (The c-mobilenew e2e gate parks the frame earlier in the
+                    // loop when its switch file exists, so saturated reads
+                    // never reach this.)
+                    let limit = params.get("lines").and_then(Value::as_u64).unwrap_or(80) as usize;
+                    if screen_enabled.contains(&instance_id)
+                        && let Some(tty) = ttys.get(&instance_id)
+                    {
+                        let lines = String::from_utf8_lossy(&tty.screen)
+                            .split(['\r', '\n'])
+                            .filter(|line| !line.is_empty())
+                            .rev()
+                            .take(limit)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        send_rpc_ok(&mut ws, id, json!({ "lines": lines })).await?;
+                    } else {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    }
+                }
                 "tty.attach" => {
                     if claude_ptys.contains(&instance_id) && !ttys.contains_key(&instance_id) {
                         send_rpc_error(&mut ws, id, "instance has no TTY bridge").await?;
@@ -1649,37 +1732,6 @@ async fn fake_node(
                 }
                 "tty.resize" => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                }
-                "tty.screen" => {
-                    // ONE arm with a per-instance condition chain. Adding a new
-                    // screen case means inserting a branch here, never a second
-                    // match arm (a later literal arm would be unreachable).
-                    //   1. (future, c-mobilenew) a seeded exited instance —
-                    //      fold its case above this one when it lands.
-                    //   2. an instance that opted in with the `screen-read`
-                    //      create sentinel replays its cooked buffer.
-                    //   3. default: exactly the old answer (ok, no lines), so
-                    //      every other spec's list rows keep journal text.
-                    let limit = params.get("lines").and_then(Value::as_u64).unwrap_or(80) as usize;
-                    if screen_enabled.contains(&instance_id)
-                        && let Some(tty) = ttys.get(&instance_id)
-                    {
-                        let lines = String::from_utf8_lossy(&tty.screen)
-                            .split(['\r', '\n'])
-                            .filter(|line| !line.is_empty())
-                            .rev()
-                            .take(limit)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
-                        send_rpc_ok(&mut ws, id, json!({ "lines": lines })).await?;
-                    } else {
-                        // Exactly the pre-existing answer for every non
-                        // screen-enabled instance: no lines, no error.
-                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                    }
                 }
                 _ => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;

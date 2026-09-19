@@ -357,7 +357,11 @@
 .error {
   color: var(--dust);
   font-size: 13px;
+  line-height: 1.45;
   margin: 0;
+  /* A code plus host-derived reason can be long; never overflow the 390px
+     sheet or hide the text behind an ellipsis. */
+  overflow-wrap: anywhere;
 }
 
 /* P0-2.5: the create may have landed but the result is unknown. The block is

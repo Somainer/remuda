@@ -174,6 +174,17 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
     [390, 844, "ledger", "390-ledger"],
   ] as const) {
     await page.setViewportSize({ width, height });
+    // The width implies the shell: 390px redirects /approvals -> /m/inbox
+    // (D-049) and 1440px keeps /approvals. Wait for that asynchronous
+    // navigation and re-assert the card so the frame is never shot mid-
+    // redirect against the previous shell's stale tree.
+    await expect(page).toHaveURL(width < 768 ? /\/m\/inbox(?:\?|$)/ : /\/approvals(?:\?|$)/);
+    const frameCard = page
+      .getByTestId("approval-row")
+      .filter({ hasText: "AskUserQuestion" })
+      .first()
+      .getByTestId("question-form");
+    await expect(frameCard.getByText("接下来这个会话主要想做什么？")).toBeVisible();
     await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
     await shot(page, `ask-user-question-1-card-${suffix}.png`);
   }

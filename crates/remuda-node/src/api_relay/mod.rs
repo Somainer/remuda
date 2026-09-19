@@ -909,26 +909,6 @@ impl ApiRelayState {
             .cloned()
     }
 
-    /// Record the observed route for a freshly bound worker listener, called
-    /// once after a successful provision (the listener is registered first
-    /// with no route, then annotated). Idempotent and ignored for an unknown
-    /// instance.
-    pub(crate) fn set_observed(&self, instance_id: &str, observed: remuda_protocol::ApiRoute) {
-        let mut instances = self
-            .instances
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(entry) = instances.get_mut(instance_id) {
-            // The Arc is shared with the axum task; rebuild it so the
-            // immutable entry's route can change without an interior lock.
-            let listener = Arc::clone(&entry.listener);
-            *entry = Arc::new(InstanceRelay {
-                listener,
-                observed: Some(observed),
-            });
-        }
-    }
-
     /// The observed route a previous accepted attempt recorded for an instance,
     /// so an idempotent retried create echoes the same value.
     pub(crate) fn observed_route(&self, instance_id: &str) -> Option<remuda_protocol::ApiRoute> {

@@ -19,14 +19,38 @@ test.describe("structured session M0-13", () => {
     await expect(page.getByRole("navigation", { name: /主导航|手机底栏/ })).toBeVisible();
   });
 
-  test("working session shows compact fold, tool cards, usage, opaque", async ({ page }) => {
+  test("working session shows compact fold, tool cards, usage, opaque", async ({ page }, info) => {
     await page.goto("/sessions");
     await row(page, "看 TaskManager spill").click();
     await expect(page.getByTestId("session-page")).toBeVisible();
     await expect(page.getByTestId("transcript")).toBeVisible();
     await expect(page.getByText("You", { exact: false }).first()).toBeVisible();
     await expect(page.getByTestId("compact-fold")).toContainText("次工具");
-    await page.getByTestId("compact-fold").click();
+    const compactFold = page.getByTestId("compact-fold");
+    if (info.project.name === "mobile-webkit") {
+      // At 390px the floating composer dock can transiently cover the fold
+      // summary; scroll it clear of the dock and open via a direct click.
+      await compactFold.evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await compactFold.evaluate((el) => el.click());
+    } else {
+      await compactFold.click();
+    }
+    // D-041: at 390px (mobile-webkit) the settled Edit card mounts folded,
+    // so 已写入 lives only inside the expanded EditWriteCard — open the row
+    // first; its folded line already carries the src/exec.cc key argument.
+    if (info.project.name === "mobile-webkit") {
+      // The running Read card renders the same path too; distinguish the
+      // folded Edit row through its accessible toggle name.
+      const editToggle = page.getByRole("button", { name: "展开 Edit src/exec.cc" });
+      await expect(editToggle).toHaveCount(1);
+      // The floating composer dock may cover the row at 390px; the toggle is
+      // visible, so drive the click directly rather than fighting the overlay.
+      await editToggle.evaluate((el) => el.scrollIntoView({ block: "center" }));
+      await editToggle.evaluate((el) => el.click());
+      // Expanding unmounts the folded row (and the toggle with it); re-find
+      // the now-open Edit card by its card-body text.
+      await expect(page.getByText("已写入").first()).toBeVisible();
+    }
     await expect(page.getByText("Bash", { exact: true }).first()).toBeVisible();
     await expect(page.getByText("已写入").first()).toBeVisible();
     await expect(page.getByTestId("usage-row")).toContainText("usage");

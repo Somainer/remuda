@@ -434,8 +434,19 @@ test("live status strip: phase/elapsed/health over a real PTY turn", async ({ pa
     expect(phases).toContain("tool-started");
     expect(phases?.indexOf("turn-ended")).toBe(phases!.length - 1);
 
-    // 7 — Final: the elapsed stops ticking and exit 0 replaces "running".
-    await expect(card).toContainText("exit 0", { timeout: 5_000 });
+    // 7 — Final arrives at the 390px width (last viewport in the step-5
+    //     loop): D-041 folds the now-settled card the moment its result
+    //     lands, even though it was watched while running. Expand the row to
+    //     see the desktop-identical full card: elapsed stops, exit 0 shows.
+    await expect(card).toHaveAttribute("data-folded", "1", { timeout: 5_000 });
+    // At 390px the floating composer dock can cover the bottom-pinned row;
+    // scroll clear and drive the click directly rather than retrying under
+    // the overlay until the 90s test timeout.
+    const foldToggle = card.getByTestId("tool-fold-open");
+    await foldToggle.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await foldToggle.evaluate((el) => el.click());
+    await expect(card).toHaveAttribute("data-folded", "0");
+    await expect(card).toContainText("exit 0");
     await expect(card.getByTestId("tool-elapsed")).toHaveCount(0);
     // Hook tier spoke again at PostToolUse; the stall note clears.
     await expect(page.getByTestId("live-health-hook")).toHaveCount(0, { timeout: 5_000 });

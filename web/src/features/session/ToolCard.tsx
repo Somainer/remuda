@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString, jsonPreview } from "../../lib/format";
+import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
 import { DiffBlock } from "../../components/DiffBlock";
-import { familyFor, isGrokTool, splitGrokMcpName, splitMcpName } from "./toolRegistry";
-import { presentTool, resultCurrentDir } from "./toolPresenters";
+import { familyFor, isGrokTool, isInteractionTool, shouldFoldToolCard, splitGrokMcpName, splitMcpName } from "./toolRegistry";
+import { foldedKeyArgument, presentTool, resultCurrentDir } from "./toolPresenters";
 import { WorkflowTimelineCard } from "./workflow/WorkflowTimelineCard";
 import { LiveToolElapsed } from "./live/LiveStatusStrip";
 import type {
@@ -14,6 +15,7 @@ import type {
 } from "../../types/generated";
 import type { DiffState } from "./assemble";
 import css from "./session.module.css";
+import foldCss from "./transcript.module.css";
 
 function asTextBlocks(result: ToolResultPayload | null): string {
   if (!result) return "";
@@ -37,6 +39,28 @@ function diffStat(diff: string): string | null {
 function cwdOf(call: ToolCallPayload): string | null {
   const rec = asRecord(knowledgeValue(call.executor));
   return asString(rec?.workspaceId) ?? asString(rec?.cwd);
+}
+
+/**
+ * Whether the workbench is in the compact (mobile) layout. ToolCard owns the
+ * read so the D-041 default fold needs no prop plumbing through the
+ * transcript; a missing matchMedia (unit DOM) reads as the desktop default.
+ */
+function useCompactLayout(): boolean {
+  const read = () =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(COMPACT_WORKBENCH_QUERY).matches
+      : false;
+  const [compact, setCompact] = useState(read);
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(COMPACT_WORKBENCH_QUERY);
+    const update = () => setCompact(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return compact;
 }
 
 /**
@@ -303,6 +327,64 @@ function PresentedCard({
   );
 }
 
+/**
+ * The D-041 compact one-line row: family + key argument, truncated to width
+ * with the full value in `title`. Expanding mounts the exact same card the
+ * desktop layout renders — this row changes only the default open/close.
+ */
+function FoldedToolRow({
+  title,
+  nativeName,
+  displayTitle,
+  grok,
+  family,
+  call,
+  result,
+  onExpand,
+}: {
+  title: string;
+  nativeName: string;
+  displayTitle: string;
+  grok: boolean;
+  family: ReturnType<typeof familyFor>;
+  call: ToolCallPayload;
+  result: ToolResultPayload | null;
+  onExpand: () => void;
+}) {
+  const keyArg = foldedKeyArgument(nativeName, call, result);
+  // The family word is redundant when the heading already is that word
+  // (Claude Bash/Edit/Read/Write); Generic carries no family chip.
+  const showFamily = family !== "Generic" && (grok || nativeName !== family);
+  // Distinguishable name when N rows are folded: 展开 + heading + key arg.
+  const expandLabel = `展开 ${title}${keyArg ? ` ${keyArg.title}` : ""}`;
+  return (
+    <article className={foldCss.fold} data-testid="tool-card" data-folded="1" data-family={family}>
+      <div className={foldCss.foldHead}>
+        <span className={foldCss.foldTitle} title={title}>
+          {title}
+        </span>
+        {grok ? <NativeLabel heading={displayTitle} name={nativeName} /> : null}
+        {showFamily ? <span className={foldCss.foldFamily}>{family}</span> : null}
+        {keyArg ? (
+          <span className={foldCss.foldArg} data-testid="tool-fold-arg" title={keyArg.title}>
+            {keyArg.text}
+          </span>
+        ) : null}
+        <button
+          type="button"
+          className={`${css.openBtn} ${foldCss.foldOpen}`}
+          data-testid="tool-fold-open"
+          aria-expanded={false}
+          aria-label={expandLabel}
+          onClick={onExpand}
+        >
+          展开
+        </button>
+      </div>
+    </article>
+  );
+}
+
 export function ToolCard({
   driverKind,
   call,
@@ -312,6 +394,8 @@ export function ToolCard({
   workflow,
   defaultFolded = false,
   settle = true,
+  expanded: expandedProp,
+  onExpand: onExpandProp,
   workflowDismissed = false,
   onDismissWorkflow,
   onUndismissWorkflow,
@@ -331,12 +415,31 @@ export function ToolCard({
   };
   defaultFolded?: boolean;
   settle?: boolean;
+  /**
+   * D-041: controlled expansion state owned by the transcript. Rows virtualise
+   * away and remount, so a card-local latch would silently re-fold; callers
+   * without a store (nested subagent rows, unit tests) leave these undefined
+   * and the card falls back to local state.
+   */
+  expanded?: boolean;
+  onExpand?: () => void;
   /** c-wfcard: persisted open/dismissed state of the mounted workflow card. */
   workflowDismissed?: boolean;
   onDismissWorkflow?: () => void;
   onUndismissWorkflow?: () => void;
 }) {
-  const [folded, setFolded] = useState(defaultFolded);
+  // Local fallback for callers that do not own an expansion set.
+  const [localExpanded, setLocalExpanded] = useState(false);
+  const userExpanded = expandedProp ?? localExpanded;
+  const expand = () => {
+    setLocalExpanded(true);
+    onExpandProp?.();
+  };
+  // D-041: settled = call/result paired with a FINAL result (partial results
+  // mean the call is still running); error = failed/denied outcome.
+  const settled = settle && result?.stage === "final";
+  const failed = settled && (result.outcome === "failed" || result.outcome === "denied");
+  const compact = useCompactLayout();
   const shown = settle ? result : null;
   // Dispatch on the stable native name; the human title is the heading only.
   const nativeName = knowledgeValue(call.toolName) ?? "tool";
@@ -344,19 +447,32 @@ export function ToolCard({
   const family = familyFor(driverKind, nativeName);
   // grok's file-adapter observations are all stamped driverKind shell-pty.
   const grok = driverKind === "shell-pty" && isGrokTool(nativeName);
+  // The fold decision happens AFTER family is determined. Under the automatic
+  // compact fold a live card folds the instant its final result lands — a
+  // live phone session is the scroll problem D-041 exists for. The
+  // Workflow/error/interaction exemptions live inside shouldFoldToolCard.
+  const folded =
+    !userExpanded &&
+    shouldFoldToolCard({
+      family,
+      settled,
+      compact,
+      failed,
+      interaction: isInteractionTool(nativeName),
+      requested: defaultFolded,
+    });
   if (folded) {
     return (
-      <article className={css.tool} data-testid="tool-card" data-folded="1">
-        <div className={css.toolHead}>
-          <span className={css.toolTitle}>{grok ? displayTitle : nativeName}</span>
-          {grok ? <NativeLabel heading={displayTitle} name={nativeName} /> : null}
-          <span className={css.stat}>{family}</span>
-          <span className={css.spacer} />
-          <button type="button" className={css.openBtn} onClick={() => setFolded(false)}>
-            展开
-          </button>
-        </div>
-      </article>
+      <FoldedToolRow
+        title={grok ? displayTitle : nativeName}
+        nativeName={nativeName}
+        displayTitle={displayTitle}
+        grok={grok}
+        family={family}
+        call={call}
+        result={result}
+        onExpand={expand}
+      />
     );
   }
   // grok has no workflow engine in this round (WorkflowEngine::GrokWorkflow

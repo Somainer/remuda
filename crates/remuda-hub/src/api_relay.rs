@@ -298,6 +298,22 @@ impl ApiRelay {
         instance_id: &str,
         profile: &crate::store::ProviderRecord,
     ) -> Result<(), HubError> {
+        // SecretBroker gate. The profile's host scope is editable *after*
+        // launch, so every release path — launch install, resume and the
+        // reconnect re-send — consults the broker here rather than trusting
+        // the launch-time decision. On failure the secret is never built, and
+        // any snapshot an earlier (then-allowed) install left on this host is
+        // dropped and revoked so H does not keep a credential it may no longer
+        // hold.
+        if !crate::provider_resolve::secret_release_allowed(profile, proxy_host) {
+            tracing::warn!(
+                proxy_host,
+                profile_id = %profile.id,
+                "api.egress refused: profile scope no longer releases to this host; revoking"
+            );
+            self.revoke_egress(state, proxy_host, instance_id).await;
+            return Err(HubError::Forbidden);
+        }
         let secret = load_upstream_secret(state, profile).await?;
         let snapshot = EgressSnapshot {
             profile_id: profile.id.clone(),

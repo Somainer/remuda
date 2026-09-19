@@ -2812,3 +2812,87 @@ async fn proxy_reconnect_gets_fresh_api_egress_before_next_open() -> Result<()> 
     gateway.shutdown().await;
     Ok(())
 }
+
+/// Round-4 item 2: the reconnect re-send goes through the SecretBroker host
+/// scope gate like every other release path. A profile narrowed to *another*
+/// host after launch must not be re-delivered to the proxy when it
+/// reconnects — the Hub drops the stored snapshot and sends revoke instead.
+#[tokio::test]
+async fn a_rescoped_profile_is_not_redelivered_on_proxy_reconnect() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let (fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
+
+    // An unrelated third host becomes the profile's sole release target.
+    let (_scope_node, scope_host, _scope_ws, _scope_token) =
+        connect_capable_node(fixture.addr, &fixture._hub, "scope-owner", false).await?;
+
+    // The single gateway profile the fixture created.
+    let (status, _, rest) = http(
+        fixture.addr,
+        "GET",
+        "/v1/providers",
+        &[("Cookie", &fixture.cookie)],
+        None,
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "list providers {status} {rest}");
+    let listed: Value = serde_json::from_str(rest.trim())?;
+    let profile_id = listed["items"]
+        .as_array()
+        .context("items")?
+        .iter()
+        .find(|p| p["kind"] == json!("gateway"))
+        .and_then(|p| p["id"].as_str())
+        .context("gateway profile id")?
+        .to_string();
+
+    // Narrow the scope after launch: H is no longer allowed the secret.
+    let (status, _, rest) = http(
+        fixture.addr,
+        "PATCH",
+        &format!("/v1/providers/{profile_id}"),
+        &[("Cookie", &fixture.cookie)],
+        Some(&json!({ "scope": format!("host:{scope_host}") }).to_string()),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "scope patch {status} {rest}");
+
+    // H reconnects; the Hub re-runs egress installs for its routed instances.
+    proxy.reconnect(fixture.addr, "relay-proxy").await?;
+    let mut observed = proxy.take_pending();
+    observed.extend(
+        collect_notifications(proxy.socket(), Duration::from_millis(800), |_| false).await?,
+    );
+
+    // No install (secret-bearing) egress for the instance on this link.
+    let installs: Vec<&Value> = observed
+        .iter()
+        .filter(|frame| {
+            frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+                && frame["params"].get("revoke") != Some(&json!(true))
+        })
+        .collect();
+    assert!(
+        installs.is_empty(),
+        "the rescoped secret must not be re-delivered to H: {installs:?}"
+    );
+
+    // The previously installed snapshot is revoked, credential-free.
+    let revoke = observed
+        .iter()
+        .find(|frame| {
+            frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+                && frame["params"]["revoke"] == json!(true)
+        })
+        .context("a rescoped profile must revoke the stale snapshot on reconnect")?;
+    assert_eq!(
+        revoke["params"].get("authToken"),
+        None,
+        "a revoke never carries the credential: {revoke}"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+

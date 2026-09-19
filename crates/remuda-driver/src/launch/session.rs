@@ -411,27 +411,48 @@ mod tests {
         );
     }
 
-    /// The D-? defect: a 120+ character instance directory used to fail the
-    /// hook bind with `path must be shorter than SUN_LEN`. The session now
+    /// The defect: a data directory deep enough that
+    /// `<data-dir>/instances/<id>/hook.sock` exceeds `sun_path` used to fail
+    /// the hook bind with `path must be shorter than SUN_LEN`. The session now
     /// binds a short runtime socket, the overlay/relay receive that real path,
     /// and one SessionStart still round-trips onto the bus.
+    ///
+    /// The long part is the *prefix*; the last component is a real
+    /// `ins_<canonical uuid>`, because that is what determines the runtime
+    /// socket's file name (`<uuid>.sock`, 41 bytes) and therefore what must
+    /// fit on macOS's 103-byte limit.
     #[tokio::test]
     async fn a_long_instance_dir_binds_a_runtime_socket_and_round_trips() {
         let root = tempfile::tempdir().unwrap();
-        // The instance directory itself is longer than the whole Linux
-        // sun_path; its hook.sock address is far past the 107-byte limit.
-        let instance_dir = root.path().join("x".repeat(120));
-        assert!(instance_dir.as_os_str().len() >= 120);
+        let instance_id = "ins_01990000-0000-7000-8000-0000000000aa";
+        let instance_dir = root
+            .path()
+            .join("x".repeat(120))
+            .join("instances")
+            .join(instance_id);
+        // The filler segment alone is longer than this platform's whole
+        // sun_path.
+        assert!(
+            root.path().join("x".repeat(120)).as_os_str().len()
+                > remuda_signal::runtime_dir::SUN_PATH_LIMIT
+        );
         std::fs::create_dir_all(&instance_dir).unwrap();
         let preferred_hook = instance_dir.join("hook.sock");
-        assert!(preferred_hook.as_os_str().len() > 107);
+        assert!(preferred_hook.as_os_str().len() > remuda_signal::runtime_dir::SUN_PATH_LIMIT);
 
         let (bus, mut events) = bus();
         let session = HookSession::start(&options(&instance_dir), bus).unwrap();
 
         // The bound path is short and real; the under-instance name is a
-        // symlink pointing at it.
-        assert!(session.socket_path.as_os_str().len() <= 100);
+        // symlink pointing at it. The guarantee is the platform limit, not
+        // the (tighter) preferred-path threshold.
+        assert!(
+            session.socket_path.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+        );
+        assert_eq!(
+            session.socket_path.file_name().unwrap().to_str().unwrap(),
+            "01990000-0000-7000-8000-0000000000aa.sock"
+        );
         assert_ne!(session.socket_path, preferred_hook);
         let link_meta = std::fs::symlink_metadata(&preferred_hook).unwrap();
         assert!(link_meta.file_type().is_symlink());
@@ -489,19 +510,29 @@ mod tests {
         );
     }
 
-    /// Two redirected sessions on long instance dirs bind distinct runtime
-    /// sockets and serve independently.
+    /// Two redirected sessions on long instance dirs with real instance ids
+    /// bind distinct runtime sockets and serve independently.
     #[tokio::test]
     async fn two_long_instances_bind_distinct_runtime_sockets() {
         let root = tempfile::tempdir().unwrap();
-        let first_dir = root.path().join("a".repeat(120));
-        let second_dir = root.path().join("b".repeat(120));
+        let first_dir = root
+            .path()
+            .join("a".repeat(120))
+            .join("instances/ins_01990000-0000-7000-8000-000000000001");
+        let second_dir = root
+            .path()
+            .join("b".repeat(120))
+            .join("instances/ins_01990000-0000-7000-8000-000000000002");
         std::fs::create_dir_all(&first_dir).unwrap();
         std::fs::create_dir_all(&second_dir).unwrap();
         let a = start(&first_dir);
         let b = start(&second_dir);
         assert_ne!(a.socket_path, b.socket_path);
         assert!(a.socket_path.exists() && b.socket_path.exists());
+        assert!(
+            a.socket_path.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+                && b.socket_path.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+        );
         let cred_a = a.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone();
         let reply = remuda_signal::send_event(
             &a.socket_path,

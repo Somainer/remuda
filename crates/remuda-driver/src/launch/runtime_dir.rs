@@ -154,10 +154,7 @@ mod tests {
             instance_dir.join("hook.sock").as_path()
         );
         assert!(
-            placement.bind_path().as_os_str().len()
-                <= remuda_signal::runtime_dir::SAFE_SOCKET_PATH_BYTES
-                || placement.bind_path().as_os_str().len()
-                    <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+            placement.bind_path().as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
         );
     }
 

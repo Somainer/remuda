@@ -228,7 +228,7 @@ async fn token_broker_redirects_a_long_socket_path_and_serves_the_real_one() {
     assert!(placement.bind_path().as_os_str().len() <= 107);
 
     let store = FileSecretStore::open(root.path().join("vault")).unwrap();
-    store.put("anthropic", b"sk-long-runtime-socket").unwrap();
+    store.put("anthropic", b"sk-fake-broker-token").unwrap();
     let broker = TokenBroker::new(Arc::new(store), root.path().join("audit.jsonl"));
     let token = broker.issue_instance("ins_live");
     let task = tokio::spawn({
@@ -251,7 +251,7 @@ async fn token_broker_redirects_a_long_socket_path_and_serves_the_real_one() {
     let got = remuda_driver::request_secret(placement.bind_path(), "ins_live", &token, &secret_ref)
         .await
         .unwrap();
-    assert_eq!(got.expose_str().unwrap(), "sk-long-runtime-socket");
+    assert_eq!(got.expose_str().unwrap(), "sk-fake-broker-token");
 
     task.abort();
     let _ = task.await;

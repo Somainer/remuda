@@ -22,7 +22,6 @@ use remuda_protocol::{
     SchemaVersion, SourceChannel, U64,
 };
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// File-poll cadence, matching the driver's file-adapter tick.
@@ -36,26 +35,19 @@ pub struct WorkflowProducer {
     /// Run identity copied onto file-derived observations.
     last_run_id: Option<RunId>,
     last_run_generation: Option<U64>,
-    /// D-045 §6.2: stages screenshot blocks observed in workflow-member
-    /// transcript tails; `None` degrades them to text blocks.
-    tool_media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 }
 
 impl WorkflowProducer {
     /// Create an unbound producer. The first `SessionStart` binds the session
     /// directory.
     #[must_use]
-    pub fn new(
-        instance_id: InstanceId,
-        tool_media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
-    ) -> Self {
+    pub fn new(instance_id: InstanceId) -> Self {
         Self {
             instance_id,
             tailer: None,
             session_dir: None,
             last_run_id: None,
             last_run_generation: None,
-            tool_media_stager,
         }
     }
 
@@ -250,7 +242,11 @@ impl WorkflowProducer {
             SourceChannel::WorkflowJournal,
         );
         ctx.driver_kind = DriverKind::ShellPty;
-        ctx.with_media_stager(self.tool_media_stager.clone())
+        // The workflow tailer maps lifecycle/usage/terminal facts, never
+        // tool results, so no media stager is attached here; workflow-member
+        // screenshots fold through the `subagent.transcript` RPC path (D-045
+        // §6.2, codex-cua-4 evidence).
+        ctx
     }
 
     /// Turn a journal envelope into the driver-shaped observation the store
@@ -386,7 +382,7 @@ mod tests {
 
     #[test]
     fn launch_without_run_id_emits_nothing() {
-        let mut producer = WorkflowProducer::new(InstanceId::new(), None);
+        let mut producer = WorkflowProducer::new(InstanceId::new());
         let out = producer.on_observation(&hook_observation(
             "PostToolUse",
             BTreeMap::from([("toolName".into(), "Workflow".into())]),
@@ -396,7 +392,7 @@ mod tests {
 
     #[test]
     fn non_workflow_hooks_are_ignored() {
-        let mut producer = WorkflowProducer::new(InstanceId::new(), None);
+        let mut producer = WorkflowProducer::new(InstanceId::new());
         assert!(
             producer
                 .on_observation(&hook_observation(

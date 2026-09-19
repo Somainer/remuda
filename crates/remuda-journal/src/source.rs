@@ -24,7 +24,7 @@ pub trait Source {
 }
 
 /// Fields copied onto every envelope a tailer emits.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct MapContext {
     /// Instance these observations belong to.
     pub instance_id: InstanceId,
@@ -50,6 +50,10 @@ pub struct MapContext {
     pub channel: SourceChannel,
     /// Whether these records are live or replayed.
     pub delivery: SourceDelivery,
+    /// Node-supplied stager for image content blocks a tool result carries
+    /// (D-045 §6.2). Without one every image degrades to a text block naming
+    /// the media type and byte count; bytes are never inlined.
+    pub media_stager: Option<std::sync::Arc<dyn remuda_protocol::ToolMediaStager>>,
 }
 
 impl MapContext {
@@ -74,7 +78,18 @@ impl MapContext {
             native_session_id: native_session_id.into(),
             channel,
             delivery: SourceDelivery::Live,
+            media_stager: None,
         }
+    }
+
+    /// Attach the Node's tool-media stager (host-token object endpoint).
+    #[must_use]
+    pub fn with_media_stager(
+        mut self,
+        stager: std::sync::Arc<dyn remuda_protocol::ToolMediaStager>,
+    ) -> Self {
+        self.media_stager = Some(stager);
+        self
     }
 }
 

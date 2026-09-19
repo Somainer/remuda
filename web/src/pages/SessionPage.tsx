@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, Navigate, useLocation, useNavigate, useParams } from "react-router-dom";
 import { ConnectionIndicator } from "../components/ConnectionIndicator";
 import { StateDot } from "../components/StateDot";
@@ -244,19 +244,6 @@ export function SessionPage({
   const activity = instance.activity.state === "known" ? instance.activity.value : instance.activity.state;
   const hostName = hubStore.hostName(instance.hostId);
   const nativeRefShort = nativeShort(instance);
-  // "N 项运行信息" — every diagnostic field the disclosure can reveal, so the
-  // collapsed summary never hides the fact that there is something to unfold.
-  // driver · delegation · provider · lifecycle · seq · connectivity · the
-  // connection indicator, then host + cost on compact (they keep the desktop
-  // main row), plus the optional hint / native / binding items.
-  let detailsCount = 7 + (instance.providerSourceHint ? 1 : 0) + (nativeRefShort !== "—" ? 1 : 0) + (promoted ? 1 : 0);
-  if (structuredOnly && !showTerminal) detailsCount += 1;
-  if (mobile) {
-    // host + cost keep the desktop main row; on compact the disclosure is
-    // their only home, and provenance moves there too.
-    detailsCount += 2 + (instance.launchedBy ? 1 : 0);
-  }
-
   const showViewExtras = resolvedView === "structured" || resolvedView === "files" || resolvedView === "events";
   const closeMore = () => setMoreOpen(false);
   const renderDensity = (menu: boolean) => (
@@ -340,6 +327,71 @@ export function SessionPage({
   // wrapping over the disclosure; on phones they take their own header row.
   const resumeOnOwnRow = status === "exited" && crowded && canResume;
 
+  // The 运行详情 fields as one array: the summary advertises exactly the
+  // number of items it can reveal (ui-spec §2.2), so the count is derived,
+  // never hand-maintained. host/cost keep the desktop main row; on compact
+  // (and coarse-pointer compact, which also sets `mobile` above 640px) the
+  // disclosure is their only home — provenance and promotion move here too.
+  const diagnostics: ReactNode[] = [];
+  if (mobile) diagnostics.push(<span key="host" className={session.metaHost}>{hostName}</span>);
+  diagnostics.push(
+    <span key="driver" data-testid="session-driver">
+      {promoted ? `${instance.driver} · promoted` : instance.driver}
+    </span>,
+    <span key="delegation" data-testid="session-delegation">{instance.delegation ?? "none"}</span>,
+    <span key="provider" data-testid="session-provider">{instance.providerProfileId ?? "none"}</span>,
+  );
+  if (instance.providerSourceHint) {
+    diagnostics.push(<span key="provider-source" data-testid="session-provider-source">{instance.providerSourceHint}</span>);
+  }
+  diagnostics.push(
+    <span key="lifecycle" data-testid="session-lifecycle">{instance.lifecycle}</span>,
+    <span key="seq">seq {events.at(-1)?.seq ?? instance.durableSeq}</span>,
+    <span key="connectivity">{instance.connectivity}</span>,
+  );
+  if (mobile) diagnostics.push(<span key="cost" data-testid="session-cost">{cost}</span>);
+  if (structuredOnly && !showTerminal) {
+    diagnostics.push(<span key="structured-only">structured-only — 无终端 tab</span>);
+  }
+  if (mobile && promoted) {
+    diagnostics.push(
+      <span key="promoted" className={session.status} data-testid="promoted-badge" title={
+        instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
+      }>
+        {instance.kind} · promoted
+      </span>,
+    );
+  }
+  if (mobile && instance.launchedBy) {
+    diagnostics.push(<LaunchedByMark key="launched-by" launchedBy={instance.launchedBy} />);
+  }
+  diagnostics.push(<ConnectionIndicator key="connection" status={connLabel} />);
+  if (nativeRefShort !== "—") diagnostics.push(<span key="native">native {nativeRefShort}</span>);
+  if (promoted) {
+    diagnostics.push(
+      <span
+        key="binding"
+        data-testid="transcript-binding"
+        data-state={binding?.state ?? "unknown"}
+        title={
+          binding?.state === "degraded" && binding.reason
+            ? binding.reason
+            : promoted
+              ? "promoted 终端的 transcript 绑定状态（hook / pid 文件 / argv / 手动）"
+              : undefined
+        }
+      >
+        {binding ? bindingChipText(binding) : "transcript 绑定中…"}
+      </span>,
+    );
+  }
+  if (journalStatus === "gap-backfill") diagnostics.push(<span key="note-gap">正在补事件</span>);
+  if (journalStatus === "readonly-stale") diagnostics.push(<span key="note-readonly">只读</span>);
+  if (status === "idle") diagnostics.push(<span key="note-idle">回合结束、进程仍在</span>);
+  const diagnosticRows = diagnostics.flatMap((node, index) =>
+    index === 0 ? [node] : [<span key={`sep-${index}`} className={session.dotSep}>·</span>, node],
+  );
+
   return (
     <div
       className={session.page}
@@ -390,18 +442,21 @@ export function SessionPage({
                 the DOM (tests, screen readers) and in the title tooltip. */}
             <span className={session.statusWord}>{statusLabel}</span>
           </span>
-          {/* Provenance/promotion badges stay in the diagnostic disclosure on a
-              phone; the main row has no room for them at 390px. */}
-          <span className={session.headBadges}>
-            {promoted ? (
-              <span className={session.status} data-testid="promoted-badge" title={
-                instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
-              }>
-                {instance.kind} · promoted
-              </span>
-            ) : null}
-            <LaunchedByMark launchedBy={instance.launchedBy} />
-          </span>
+          {/* Provenance and promotion badges ride the desktop main row; on
+              compact (including the coarse-pointer compact clause) they are
+              rendered once, inside the 运行详情 disclosure. */}
+          {!mobile ? (
+            <span className={session.headBadges}>
+              {promoted ? (
+                <span className={session.status} data-testid="promoted-badge" title={
+                  instance.promotedAt ? `在终端里检测到 ${instance.kind}（${instance.promotedAt}）` : undefined
+                }>
+                  {instance.kind} · promoted
+                </span>
+              ) : null}
+              <LaunchedByMark launchedBy={instance.launchedBy} />
+            </span>
+          ) : null}
           {!mobile ? (
             <>
               <span className={session.hostChip} data-testid="session-host" title={`主机 ${hostName}`}>
@@ -478,75 +533,7 @@ export function SessionPage({
             {resumeControl}
           </div>
         ) : null}
-        <RunDetails count={detailsCount}>
-          {mobile ? (
-            <>
-              <span className={session.metaHost}>{hostName}</span>
-              <span className={session.dotSep}>·</span>
-            </>
-          ) : null}
-          {mobile && instance.launchedBy ? <LaunchedByMark launchedBy={instance.launchedBy} /> : null}
-          {mobile && instance.launchedBy ? <span className={session.dotSep}>·</span> : null}
-          <span data-testid="session-driver">
-            {promoted ? `${instance.driver} · promoted` : instance.driver}
-          </span>
-          <span className={session.dotSep}>·</span>
-          <span data-testid="session-delegation">{instance.delegation ?? "none"}</span>
-          <span className={session.dotSep}>·</span>
-          <span data-testid="session-provider">{instance.providerProfileId ?? "none"}</span>
-          {instance.providerSourceHint ? (
-            <>
-              <span className={session.dotSep}>·</span>
-              <span data-testid="session-provider-source">{instance.providerSourceHint}</span>
-            </>
-          ) : null}
-          <span className={session.dotSep}>·</span>
-          <span data-testid="session-lifecycle">{instance.lifecycle}</span>
-          <span className={session.dotSep}>·</span>
-          <span>seq {events.at(-1)?.seq ?? instance.durableSeq}</span>
-          <span className={session.dotSep}>·</span>
-          <span>{instance.connectivity}</span>
-          {mobile ? (
-            <>
-              <span className={session.dotSep}>·</span>
-              <span data-testid="session-cost">{cost}</span>
-            </>
-          ) : null}
-          {structuredOnly && !showTerminal ? (
-            <>
-              <span className={session.dotSep}>·</span>
-              <span>structured-only — 无终端 tab</span>
-            </>
-          ) : null}
-          <ConnectionIndicator status={connLabel} />
-          {nativeRefShort !== "—" ? (
-            <>
-              <span className={session.dotSep}>·</span>
-              <span>native {nativeRefShort}</span>
-            </>
-          ) : null}
-          {promoted ? (
-            <>
-              <span className={session.dotSep}>·</span>
-              <span
-                data-testid="transcript-binding"
-                data-state={binding?.state ?? "unknown"}
-                title={
-                  binding?.state === "degraded" && binding.reason
-                    ? binding.reason
-                    : promoted
-                      ? "promoted 终端的 transcript 绑定状态（hook / pid 文件 / argv / 手动）"
-                      : undefined
-                }
-              >
-                {binding ? bindingChipText(binding) : "transcript 绑定中…"}
-              </span>
-            </>
-          ) : null}
-          {journalStatus === "gap-backfill" ? " · 正在补事件" : ""}
-          {journalStatus === "readonly-stale" ? " · 只读" : ""}
-          {status === "idle" ? " · 回合结束、进程仍在" : ""}
-        </RunDetails>
+        <RunDetails count={diagnostics.length}>{diagnosticRows}</RunDetails>
       </header>
       {nodeRestarted ? (
         <div className={session.nodeRestart} data-testid="node-restart-banner">

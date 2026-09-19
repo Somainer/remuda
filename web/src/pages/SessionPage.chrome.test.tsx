@@ -116,6 +116,45 @@ it("a compact-but-wide (767px, no touch) window keeps the toggles inline", () =>
   expect(screen.getByTestId("events-toggle")).toBeVisible();
 });
 
+it("the collapsed trigger advertises the exact number of fields it reveals (desktop and compact)", () => {
+  const advertised = () =>
+    Number(screen.getByTestId("run-details-summary").textContent?.match(/(\d+) 项运行信息/)?.[1]);
+  // The meta body alternates field · separator, so fields = (children+1)/2.
+  const renderedFields = () =>
+    (screen.getByTestId("session-meta").children.length + 1) / 2;
+
+  // Desktop
+  mockViewportState.mobile = false;
+  let result = renderPage();
+  expect(advertised()).toBe(renderedFields());
+
+  // Compact: host + cost move into the disclosure, so the honest count rises.
+  result.unmount();
+  mockViewportState.mobile = true;
+  stubMatchMedia(() => true);
+  result = renderPage();
+  expect(advertised()).toBe(renderedFields());
+});
+
+it("compact renders provenance/promotion exactly once, inside the disclosure", () => {
+  
+  const withMarks = { ...grokInstance, launchedBy: "remuda" as const };
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [withMarks],
+    events: { [withMarks.id]: [] },
+  });
+  mockViewportState.mobile = true;
+  stubMatchMedia(() => true);
+  renderPage();
+
+  // One node, in the disclosure — not the CSS-hidden duplicate the old row
+  // rendered.
+  expect(screen.getAllByTestId("launched-by")).toHaveLength(1);
+  expect(screen.getByTestId("run-details")).toContainElement(screen.getByTestId("launched-by"));
+});
+
 it("remembers the run-details open state on this device across remounts", async () => {
   const result = renderPage();
   expect(screen.getByTestId("run-details")).not.toHaveAttribute("open");

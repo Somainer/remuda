@@ -2544,10 +2544,6 @@
     margin-left: 14px;
   }
 
-  .headBadges {
-    display: none;
-  }
-
   .meta {
     padding-left: 0;
     gap: 6px;
@@ -2756,8 +2752,6 @@
       min-height: 44px;
     }
 
-    /* 6px visual gap + this 6px margin = 12px between Stop and ⋯ so their
-       44px zones meet with no overlap (D-039). */
     /* 6px visual gap + this 8px margin = 14px between Stop and ⋯ so their
        44px zones clear each other (D-039 non-overlap). */
     .moreBtn {

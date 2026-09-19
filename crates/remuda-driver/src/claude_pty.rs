@@ -290,6 +290,7 @@ impl ClaudePtyDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
+            native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
         };
@@ -329,6 +330,15 @@ impl ClaudePtyDriver {
         let mut env = HashMap::new();
         if !self.options.inherit_default_config {
             env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        }
+        // D-045: driver-computed capability handshakes (e.g.
+        // REMUDA_CAPABILITY_COMPUTER_USE=1), attached only when granted.
+        for entry in recipe
+            .env_allowlist
+            .iter()
+            .filter(|entry| entry.source == crate::recipe::EnvAllowlistSource::Capability)
+        {
+            env.insert(entry.name.clone(), "1".to_owned());
         }
         for (key, value) in &self.options.extra_env {
             if crate::child_env::is_denied(key) {

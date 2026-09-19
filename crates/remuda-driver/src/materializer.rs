@@ -79,6 +79,10 @@ pub struct MaterializeRequest<'a> {
     pub setting_sources: Option<Vec<String>>,
     /// Who originated this launch. Bot/dispatcher specs cannot request bypass/yolo.
     pub origin: LaunchOrigin,
+    /// Whether `native_home` is a Remuda-managed home this launch may write the
+    /// skill tree into. `None` reads as managed (the default); `Some(false)` is
+    /// the inherited operator home, which is never written (D-045).
+    pub native_home_managed: Option<bool>,
     /// Host-validated `--settings` overlay. Contents are never logged.
     pub settings_overlay_path: Option<PathBuf>,
     /// Where `file:` / `helper:` secret refs are allowed to point (S3, S4).
@@ -179,6 +183,15 @@ fn materialize_inner(
     let extras = validate_spec_args(request.spec.driver, &request.spec.args)?;
     reject_spec_env(request.spec)?;
     reject_agent_launch_overrides(request.spec, request.origin)?;
+    // D-045 gate half: refuse unknown capability values, agent-originated
+    // grants, bypass+computer-use and unsupported kinds BEFORE any file is
+    // written. The grant itself is materialized below, once launch_dir exists.
+    crate::launch::skills::computer_use_requested(
+        &request.spec.capabilities,
+        request.origin,
+        &request.spec.permission_mode,
+        request.spec.kind,
+    )?;
     let setting_sources = setting_sources(request)?;
     // M2: the override is validated before any file is written, so a bad path
     // fails the launch without leaving an overlay or a shim behind.
@@ -407,6 +420,26 @@ fn materialize_inner(
             argv = extras;
             input_delivery = InputDelivery::Tty;
             session_id = None;
+            // A granted codex/grok needs its per-kind home pinned because its
+            // D-045 `[mcp_servers]` (or, for grok, the neutralised shadow)
+            // lives there. Only on grant: an ordinary generic-pty agent keeps
+            // inheriting the host's own home so its config/auth still work.
+            let granted = !request.spec.capabilities.is_empty();
+            if granted && request.spec.kind == AgentKind::Codex {
+                push_env(
+                    &mut env_allowlist,
+                    "CODEX_HOME",
+                    EnvAllowlistSource::NativeHome,
+                    None,
+                );
+            } else if granted && request.spec.kind == AgentKind::Grok {
+                push_env(
+                    &mut env_allowlist,
+                    "GROK_HOME",
+                    EnvAllowlistSource::NativeHome,
+                    None,
+                );
+            }
         }
         DriverKind::ShellPty => {
             // Login `$SHELL` under kind `terminal` / `generic`. The agent
@@ -418,6 +451,9 @@ fn materialize_inner(
     }
 
     collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
+
+    let (capabilities, mcp_servers) =
+        apply_capability_grant(request, &mut argv, &mut files, &mut env_allowlist)?;
 
     let settings_digest = files
         .iter()
@@ -464,6 +500,8 @@ fn materialize_inner(
             model_pin: pinned_model(request.spec),
         },
         permission,
+        capabilities,
+        mcp_servers,
         technical_debt: debt,
         audit: LaunchAudit {
             env_names,
@@ -495,6 +533,52 @@ fn is_agent_kind(kind: AgentKind) -> bool {
     )
 }
 
+/// D-045: materialize the granted capability into argv, the launch dir and
+/// (for claude) a managed home; push the handshake env; return what the recipe
+/// must audit. Does nothing — and writes nothing — when no capability is
+/// requested. Refusals happen before any write.
+#[allow(clippy::needless_pass_by_value)]
+fn apply_capability_grant(
+    request: &MaterializeRequest<'_>,
+    argv: &mut Vec<String>,
+    files: &mut Vec<MaterializedFile>,
+    env_allowlist: &mut Vec<EnvAllowlistEntry>,
+) -> DriverResult<(Vec<String>, Vec<crate::recipe::GrantedMcpServer>)> {
+    let Some(grant) =
+        crate::launch::skills::materialize_grant(&crate::launch::skills::GrantRequest {
+            capabilities: &request.spec.capabilities,
+            origin: request.origin,
+            permission: &request.spec.permission_mode,
+            kind: request.spec.kind,
+            driver: request.spec.driver,
+            launch_dir: &request.launch_dir,
+            native_home: &request.native_home,
+            native_home_managed: request.native_home_managed.unwrap_or(true),
+        })?
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if !grant.argv.is_empty() {
+        // A caller-supplied `--mcp-config` would either be duplicated or —
+        // worse, because Remuda's server is additive — shadow this one. Never
+        // silently choose: refuse and name the collision.
+        if argv.iter().any(|token| token == "--mcp-config") {
+            return Err(DriverError::InvalidLaunchSpec(
+                "--mcp-config is supplied by Remuda when the computer-use \
+                 capability is granted; remove it from the launch args"
+                    .into(),
+            ));
+        }
+        argv.extend(grant.argv);
+    }
+    let (name, value) = grant.env;
+    push_env(env_allowlist, name, EnvAllowlistSource::Capability, None);
+    // The value is a driver-computed constant; keep it off every log path.
+    debug_assert_eq!(value, "1");
+    files.extend(grant.files);
+    Ok((grant.capabilities, vec![grant.mcp_server]))
+}
+
 /// D-028 §5.1: recipe for an agent CLI running in a Remuda-owned native PTY.
 ///
 /// Unlike the Herdr path this produces a *complete* recipe — real env
@@ -511,6 +595,12 @@ fn materialize_shell_pty_agent(
 ) -> DriverResult<LaunchRecipe> {
     let preset = crate::presets::preset_for_spec(request.spec)?;
     let (permission, debt, approval) = permission_plan(request.spec, request.origin)?;
+    crate::launch::skills::computer_use_requested(
+        &request.spec.capabilities,
+        request.origin,
+        &request.spec.permission_mode,
+        request.spec.kind,
+    )?;
 
     fs::create_dir_all(&request.launch_dir)?;
     set_dir_mode(&request.launch_dir, 0o700)?;
@@ -637,6 +727,9 @@ fn materialize_shell_pty_agent(
     }
     collect_spec_env(request.spec, request.profile.delegation, &mut env_allowlist)?;
 
+    let (capabilities, mcp_servers) =
+        apply_capability_grant(request, &mut argv, &mut files, &mut env_allowlist)?;
+
     let settings_digest = files
         .iter()
         .find(|file| file.role == FileRole::Settings)
@@ -681,6 +774,8 @@ fn materialize_shell_pty_agent(
             model_pin: pinned_model(request.spec),
         },
         permission,
+        capabilities,
+        mcp_servers,
         technical_debt: debt,
         audit: LaunchAudit {
             env_names,

@@ -123,6 +123,8 @@ impl FakeDriver {
                 prompts: Some("none".into()),
                 extra_flags: vec![],
             },
+            capabilities: vec![],
+            mcp_servers: vec![],
             technical_debt: vec![crate::recipe::TECH_DEBT_M0_PERM_01.into()],
             audit: LaunchAudit {
                 env_names: vec!["CLAUDE_CONFIG_DIR".into()],

@@ -154,6 +154,7 @@ async fn real_claude_through_native_shell_pty() {
             native_home: host_claude_home.clone(),
             binary: Some(which_claude()),
             origin: LaunchOrigin::Human,
+            native_home_managed: true,
             settings_overlay: None,
         },
     );
@@ -291,6 +292,7 @@ async fn scoped_home_lists_gateway_models_in_model_picker() {
             native_home: native_home.clone(),
             binary: Some(which_claude()),
             origin: LaunchOrigin::Human,
+            native_home_managed: true,
             settings_overlay: None,
         },
     );

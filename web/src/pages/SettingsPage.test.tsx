@@ -334,3 +334,43 @@ describe("host renderer defaults use grouped explicit saves", () => {
     expect(screen.getByTestId("settings-identity-save")).toBeEnabled();
   });
 });
+
+describe("voice input settings (ui-spec §4.8)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("defaults the switch off and states the iOS limitation verbatim", () => {
+    renderSettings(["/settings"]);
+    expect(screen.getByTestId("settings-voice-input")).not.toBeChecked();
+    // jsdom has no SpeechRecognition: the switch is a dead control on purpose.
+    expect(screen.getByTestId("settings-voice-input")).toBeDisabled();
+    expect(screen.getByTestId("settings-voice-unsupported")).toBeInTheDocument();
+    const copy = screen.getByTestId("settings-voice-copy").textContent ?? "";
+    expect(copy).toContain("不录音");
+    expect(copy).toContain("不上传音频");
+    expect(copy).toContain("不做云端转写");
+    expect(screen.getByTestId("settings-group-appearance")).toHaveTextContent(
+      "iOS Safari 没有 SpeechRecognition（WebKit 未实现）",
+    );
+    expect(screen.getByTestId("settings-group-appearance")).toHaveTextContent("系统键盘的听写");
+  });
+
+  it("enables and persists the switch when SpeechRecognition exists", async () => {
+    class FakeRecognition {
+      start() {}
+      stop() {}
+      abort() {}
+    }
+    vi.stubGlobal("SpeechRecognition", FakeRecognition);
+    renderSettings(["/settings"]);
+    const toggle = screen.getByTestId("settings-voice-input");
+    expect(toggle).toBeEnabled();
+    expect(screen.queryByTestId("settings-voice-unsupported")).toBeNull();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(localStorage.getItem("runtime.voice-input.v1")).toBe("1");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    // The voice pref itself is cleared (not an unrelated device setting).
+    expect(localStorage.getItem("runtime.voice-input.v1")).toBeNull();
+  });
+});

@@ -17,6 +17,7 @@ import {
 } from "./permissions";
 import type { PermissionEffectiveView } from "./permissionEffective";
 import { composing } from "../../lib/viewport";
+import { SpeechInput, readVoiceInputEnabled, speechRecognitionSupported } from "../../lib/speech";
 import type { PromptMode } from "../../types/generated";
 import type { CapabilitySnapshot } from "../../types/nativeRef";
 import { AttachButtons, AttachmentChips, CodeQuoteChips } from "./AttachmentChips";
@@ -223,6 +224,141 @@ export function Composer({
   // previous insert just produced rather than a stale React closure.
   const textRef = useRef(text);
   textRef.current = text;
+
+  // ── §4.8 voice input (m-voice) ──────────────────────────────────────────
+  // Platform keyboard dictation is the primary path and needs no code. The
+  // mic is an enhancement rendered ONLY when the browser ships
+  // SpeechRecognition AND the per-device pref is on, on phones. iOS Safari
+  // has no SpeechRecognition (WebKit never implemented it) so nothing renders
+  // there; desktop keeps an identical composer DOM. Both values are facts for
+  // the component's life (the settings switch lives on another route), so
+  // they are read once on mount.
+  const voiceSupported = useMemo(() => speechRecognitionSupported(), []);
+  const voicePrefOn = useMemo(() => readVoiceInputEnabled(), []);
+  const voiceAvailable = mobile && voiceSupported && voicePrefOn;
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const speechInputRef = useRef<SpeechInput | null>(null);
+  // The dictated span INSIDE the live draft: where it starts, how many
+  // characters the transcript we last wrote occupies, and the exact draft
+  // that write produced. The last value distinguishes our own updates from
+  // text changed while listening (typing / a token insert), which re-anchors
+  // the span instead of discarding the externally added text.
+  const dictationSpanRef = useRef<{ start: number; length: number; own: string } | null>(null);
+
+  /**
+   * Write a recognition transcript into the draft through the SAME path as
+   * typing (setText + writeDraft). Recognition never focuses the textarea —
+   * stealing focus mid-dictation would raise the on-screen keyboard (§4.1) —
+   * and never sends: the composing() key guard is simply not in play because
+   * no key event is synthesised at all.
+   */
+  const applyDictation = (transcript: string) => {
+    const span = dictationSpanRef.current;
+    if (!span) return;
+    const current = textRef.current;
+    let { start, length } = span;
+    if (current !== span.own) {
+      // The draft changed outside this callback while a session was live.
+      if (length > 0) {
+        // Re-anchor on our previous transcript (nearest occurrence to where
+        // the span used to be, in case the same text exists twice).
+        const previous = span.own.slice(span.start, span.start + length);
+        let at = -1;
+        let from = 0;
+        for (;;) {
+          const hit = current.indexOf(previous, from);
+          if (hit === -1) break;
+          if (at === -1 || Math.abs(hit - span.start) < Math.abs(at - span.start)) at = hit;
+          from = hit + 1;
+        }
+        if (at === -1) return; // our span was edited away; drop this stale result
+        start = at;
+      } else {
+        // Nothing of ours placed yet: continue at the end of the new text.
+        start = current.length;
+      }
+    }
+    // Interim results replace exactly the span the previous transcript
+    // occupied; text outside it (including anything typed meanwhile) survives.
+    const next = current.slice(0, start) + transcript + current.slice(start + length);
+    span.start = start;
+    span.length = transcript.length;
+    span.own = next;
+    textRef.current = next;
+    setText(next);
+    writeDraft(instanceId, next);
+    // No focus() and no caret juggling: the textarea is not focused while the
+    // mic owns the gesture (focusing would raise the on-screen keyboard,
+    // §4.1), and a controlled value naturally rests the caret at its end.
+  };
+
+  /** Browser error codes worth naming; everything else gets a generic line. */
+  const voiceErrorText = (code: string): string => {
+    if (code === "not-allowed" || code === "service-not-allowed") {
+      return "麦克风被拒绝，请在浏览器里允许后重试";
+    }
+    if (code === "no-speech") return "没听到声音";
+    if (code === "audio-capture") return "没有可用的麦克风";
+    return "语音识别出错";
+  };
+
+  const toggleDictation = () => {
+    if (voiceListening) {
+      speechInputRef.current?.stop();
+      return;
+    }
+    // Replace any stale recogniser: abort it BEFORE constructing the
+    // replacement, and every callback below guards on instance identity, so a
+    // late error/end from the old session can never null the new session's
+    // span or flip its listening state back.
+    speechInputRef.current?.abort();
+    setVoiceError(null);
+    const area = inputRef.current;
+    const start =
+      area && area.selectionStart != null ? area.selectionStart : textRef.current.length;
+    dictationSpanRef.current = { start, length: 0, own: textRef.current };
+    const speech = new SpeechInput({
+      onTranscript: (transcript) => {
+        if (speechInputRef.current !== speech) return;
+        applyDictation(transcript);
+      },
+      onError: (code) => {
+        if (speechInputRef.current !== speech) return;
+        dictationSpanRef.current = null;
+        setVoiceListening(false);
+        setVoiceError(voiceErrorText(code));
+      },
+      onEnd: () => {
+        if (speechInputRef.current !== speech) return;
+        dictationSpanRef.current = null;
+        setVoiceListening(false);
+      },
+    });
+    speechInputRef.current = speech;
+    try {
+      // Constructed on a click so start() is inside the user-gesture window
+      // the mic-permission prompt requires.
+      speech.start();
+      setVoiceListening(true);
+    } catch {
+      // A rejected start (permission race) leaves no session and a resting
+      // button; the partial transcript span is discarded.
+      dictationSpanRef.current = null;
+      speechInputRef.current = null;
+      setVoiceListening(false);
+    }
+  };
+
+  useEffect(
+    () => () => {
+      // abort, not stop: leaving the page must not wait for a final flush.
+      const speech = speechInputRef.current;
+      speechInputRef.current = null;
+      speech?.abort();
+    },
+    [],
+  );
   const menuRefs = {
     effort: useRef<HTMLDivElement>(null),
     permission: useRef<HTMLDivElement>(null),
@@ -991,6 +1127,50 @@ export function Composer({
   // D-028a: the three-state controls, queue chip and 「尚未验证」 note are
   // facts of the current turn, not "options" — on the phone they stay OUTSIDE
   // the sheet, identical on both surfaces.
+  // §4.8 (m-voice): the mic sits beside the textarea, only where
+  // speechRecognitionSupported() and the settings opt-in agree. Its copy
+  // states the one guarantee that matters — text only, never auto-sent.
+  const voiceNode = voiceAvailable ? (
+    <button
+      type="button"
+      className={`${css.chip} ${opt.voiceMic}`}
+      data-testid="composer-voice"
+      data-listening={voiceListening ? "1" : "0"}
+      aria-pressed={voiceListening}
+      disabled={disabled}
+      title="语音输入：识别文字只填入输入框，不会自动发送"
+      aria-label="语音输入：识别文字只填入输入框，不会自动发送"
+      onClick={toggleDictation}
+    >
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true" focusable="false">
+        <path
+          d="M8 2.5a2 2 0 0 0-2 2v3.5a2 2 0 0 0 4 0V4.5a2 2 0 0 0-2-2Z"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.3"
+        />
+        <path
+          d="M4.5 7.5a3.5 3.5 0 0 0 7 0M8 11v2.5M6.5 13.5h3"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.3"
+          strokeLinecap="round"
+        />
+      </svg>
+    </button>
+  ) : null;
+  const voiceHintNode =
+    voiceAvailable && (voiceListening || voiceError) ? (
+      <span
+        className={css.controlNote}
+        data-testid="composer-voice-hint"
+        data-state={voiceError ? "error" : "listening"}
+        role={voiceError ? "alert" : undefined}
+      >
+        {voiceError ?? "正在聆听… 文字只进输入框，不会自动发送；再点麦克风结束"}
+      </span>
+    ) : null;
+
   const queueStatusNode = heldRows.length ? (
     <span className={css.chip} data-testid="composer-queue-status">
       已排队 {heldRows.length}
@@ -1186,12 +1366,14 @@ export function Composer({
           }}
           onKeyDown={onKeyDown}
         />
+        {voiceNode}
       </div>
       <div className={css.controlBar} data-testid="composer-bar" data-collapsed={mobile ? "1" : "0"}>
         {mobile ? (
           <>
             {/* D-042: one trigger + input + primary; options live in sheet. */}
             {mobileTriggerNode}
+            {voiceHintNode}
             {queueStatusNode}
             {interruptedNode}
             {capNoteNode}

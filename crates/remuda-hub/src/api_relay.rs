@@ -2056,3 +2056,51 @@ async fn project_supply_status_oneshot(
             .await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remuda_protocol::hubnode::ApiEgressParams;
+
+    /// Item 2: the revoke frame built from the typed struct must round-trip
+    /// through serde_json as ApiEgressParams — a hand-rolled null-valued frame
+    /// would fail to parse on the Node and silently keep the credential.
+    #[test]
+    fn revoke_frame_round_trips_as_typed_params() {
+        let frame = serde_json::to_value(ApiEgressParams {
+            instance_id: "ins_1".to_string(),
+            profile_id: String::new(),
+            base_url: String::new(),
+            headers: Vec::new(),
+            auth_token: None,
+            revoke: true,
+        })
+        .unwrap();
+        assert_eq!(frame["instanceId"], json!("ins_1"));
+        assert_eq!(frame["profileId"], json!(""));
+        assert_eq!(frame["baseUrl"], json!(""));
+        assert_eq!(frame["revoke"], json!(true));
+        assert!(frame.get("authToken").is_none());
+        // Must parse back.
+        let parsed: ApiEgressParams = serde_json::from_value(frame).unwrap();
+        assert!(parsed.revoke);
+        assert_eq!(parsed.instance_id, "ins_1");
+
+        // And an install frame round-trips with the credential.
+        let install = serde_json::to_value(ApiEgressParams {
+            instance_id: "ins_1".to_string(),
+            profile_id: "pvp_1".to_string(),
+            base_url: "http://gw/v1".to_string(),
+            headers: vec![remuda_protocol::hubnode::ApiHeader {
+                name: "x".into(),
+                value: "y".into(),
+            }],
+            auth_token: Some("sk-fake-token".into()),
+            revoke: false,
+        })
+        .unwrap();
+        let parsed: ApiEgressParams = serde_json::from_value(install).unwrap();
+        assert_eq!(parsed.auth_token.as_deref(), Some("sk-fake-token"));
+        assert!(!parsed.revoke);
+    }
+}

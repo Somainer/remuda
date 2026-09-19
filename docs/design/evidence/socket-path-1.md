@@ -316,23 +316,42 @@ pins the deterministic shape with a 60-byte TMPDIR).
 
 ## 4 Whole-suite verification
 
+Round 3 matrix (after the fd-leak, sweep-security, link-first and bounded
+probe changes):
+
 ```text
 $ env -u TMPDIR -u XDG_RUNTIME_DIR \
     cargo test -p remuda-signal -p remuda-driver -p remuda-node
-# 82 test binaries, all green; exit 0
+# 83 test binaries, all green; exit 0
 
-$ env -u XDG_RUNTIME_DIR \
-    TMPDIR="$HOME/Projects/remuda-agents/tmp/sockpath-long-tmpdir-0123456789" \
+# 68-byte TMPDIR built as /tmp/r3-<60 x's> (>= 60 bytes, per the brief):
+$ D=/tmp/r3-$(python3 -c "print('x'*60)")   # byte length: 68
+$ mkdir -p "$D"
+$ env -u XDG_RUNTIME_DIR TMPDIR="$D" \
     cargo test -p remuda-signal -p remuda-driver -p remuda-node
-# TMPDIR = 80 bytes; temp fallback = 147 bytes, over both platform limits;
-# every redirected socket binds under the fixed /tmp/remuda-<uid> root;
-# 82 test binaries green (1273 test cases), including live_pipeline; exit 0
-# lib units: signal 106, driver 448, node 290
+# TMPDIR >= 60 bytes with XDG unset: the temp fallback is 135 bytes and is
+# skipped in favour of the fixed /tmp/remuda-<uid> root; 83 test binaries
+# green, including live_pipeline; exit 0
 $ cargo clippy --workspace --all-targets -- -D warnings
 # clean
 $ cargo fmt --all
 # clean (cargo fmt --all --check)
 ```
+
+Notes from round 3:
+
+- the verifier fd-leak regression runs in a subprocess (the fd count is
+  process-wide) and asserts no growth across 400 verifications of a
+  pre-existing directory;
+- sweep dead/live assertions allow for the kernel's transient
+  `EINPROGRESS` right after a listener drops (retry until the stable
+  `ECONNREFUSED`), while production keeps conservatively treating anything
+  non-`ECONNREFUSED` as live;
+- `pty_lifecycle::a_reopened_store_vouches_for_an_empty_inventory` is a
+  pre-existing sqlite journal race in a file this branch never modifies
+  (`git diff origin/main -- crates/remuda-node/tests/pty_lifecycle.rs` is
+  empty); it passes in isolation and in repeated binary runs, and the
+  combined matrix is green on rerun.
 
 All commands above were re-run after rebasing onto the latest
 `origin/main` tip at push time.

@@ -110,9 +110,22 @@ the select arm. `left 0 right 1` was the lost send.
 - `ConsumeSupervisor` (`remuda-feishu/src/consume.rs`) gains `terminate()`
   (SIGTERM every child without waiting) and `join()` (wait for the reader
   workers, 30 s loaded-host budget); `shutdown()` is now terminate + join.
-- On the shutdown signal a reader SIGTERMs its child and keeps reading its
-  stdout to EOF — bounded at 8 s so a child ignoring SIGTERM cannot stall
-  shutdown — enqueuing every accepted line before its worker exits.
+- On the shutdown signal a reader SIGTERMs its child, **drops the child's
+  stdin**, and keeps reading its stdout to EOF — bounded at
+  `SHUTDOWN_DRAIN` = 8 s so a child ignoring SIGTERM cannot stall shutdown —
+  enqueuing every accepted line before its worker exits. stdin is closed
+  only *after* the SIGTERM syscall has been issued (the consume contract is
+  "SIGTERM first, never EOF first", covered by the
+  `sigterm_does_not_close_stdin_first` integration test); closing it before
+  the drain rather than after the reaping means a child that exits on stdin
+  EOF still leaves promptly instead of holding the drain for 8 s.
+- The drain races ONLY `read_line` against the 8 s deadline: a `child.wait()`
+  arm was removed because `terminate()` has already sent SIGTERM, and a
+  biased `wait()` arm would win on an already-reaped child and return with
+  buffered pipe bytes unread — which was the residual form of the original
+  flake. `Ok(0)` is reached only when the child has exited and closed its
+  stdout, i.e. after every buffered byte was consumed. The child is then
+  reaped unconditionally with a 2 s wait bound.
 - `supervise()` arms the draining state (follow polling stops; receiver left
   OPEN), terminates the children, then `join()`s the reader workers before the
   drive worker can finish: all reader senders drop only after the channel
@@ -122,10 +135,19 @@ the select arm. `left 0 right 1` was the lost send.
   follow polling now), and the direct-`drive` unit test drops its event
   sender on stop, mirroring the real shutdown contract.
 
-**Five-run result under load.** The test was repeated 30 times back-to-back
-while `cargo build --workspace --tests` hammered the host: 30/30 passed
-(slow runs ~5–9 s, proving the drain is exercised, not skipped). Full
-`cargo test -p remuda` and the remuda-feishu consume integration tests pass.
+This is deliberate **production** behaviour in `remuda-feishu`, not a test
+nudge: accepted Feishu events must survive a shutdown. Named budgets:
+post-SIGTERM stdout drain 8 s per child, reader `join()` 30 s, post-drain
+reap 2 s — only a child ignoring SIGTERM or stuck in the kernel can consume
+them; a well-behaved child hits EOF immediately and close is not delayed
+beyond the old behaviour except for the (now-correct) flush of its accepted
+lines. The flaky test itself no longer times any of this.
+
+**Result under load.** The test was repeated 30 times back-to-back while
+`cargo build --workspace --tests` hammered the host: 30/30 passed (slow runs
+~5–9 s, proving the drain is exercised, not skipped); after the round-2
+drain rewrite (read-only drain arm) another 25/25 under load. Full
+`cargo test -p remuda -p remuda-feishu` passes.
 
 ## 4. hub-live / ux-steer-queue / ux-modelsync — waits that could pass before the state existed
 
@@ -162,6 +184,11 @@ early (the mismatch case already polled the journal; the others did not).
   `GET /v1/interactions` returns answered rows, so existence is the right
   "the launch approval was created" predicate and tolerates a pre-resolved
   card.
+  Round 2 made the clear self-healing: the answer step now runs INSIDE the
+  clearing poll, which re-lists the pending set every attempt and answers
+  anything still open (an id is retried until its POST succeeds), so a
+  late-populated options array, a rejected answer, or a second approval
+  cannot strand the launch until the 20 s timeout.
 - `ux-modelsync` gains `waitForJournalFragment`, which waits on the
   `/journal` state the picker renders from: `model-queued` before the queued
   case, `model-degraded` before the not-found toast, and the `"slash"`
@@ -268,9 +295,10 @@ re-create, and leftovers from earlier specs accumulate toward the cap.
 touchhit did not.)
 
 **Fix (tests only).**
-- `createClaudeSession` waits for and asserts the create response
-  (`expect(res.ok())`) and derives the instance id from the response body, so
-  the id is tracked for cleanup even if the navigation afterwards fails.
+- `createClaudeSession` waits for and asserts the create response and reads
+  its body ONCE into a string (the assertion message and the id parse share
+  it — `res.text()`/`res.json()` consume the stream), so the id is tracked
+  for cleanup even if the navigation afterwards fails.
 - The file raises the fake-node cap to 24 in beforeEach (same fixture-level
   isolation as ux-status/ux-code) and restores the previous value in afterAll,
   after a force-delete sweep.
@@ -281,6 +309,43 @@ touchhit did not.)
 passed 5/5 under the b lock with the dedicated ports while the cargo-build
 load loop ran: 4 passed each run (46.8 s–1.5 min).
 
+## 7. remuda-driver close ladder — SIGKILLed child unreaped when the host is loaded
+
+**Signature (04:13, Rust step retry on main 54d825ae, host load average
+> 10).** `crates/remuda-driver/tests/claude_sdk_process.rs:601`
+`close_kills_a_child_that_ignores_both_eof_and_sigterm` panicked with
+`pid <n> survived a close that had to reach SIGKILL`; the test read
+`process_alive(pid)` immediately after `driver.close()` returned.
+
+**Cause.** The stop ladder (`shell_pty/lifecycle.rs`,
+`shell_pty.rs::stop_tree`) reaches group SIGKILL, then waits for the direct
+child to become reapable — a SIGKILLed child sits as a zombie until the
+parent `wait`s, and a zombie still answers `kill(pid, 0)`. That wait was
+capped at `REAP_EXITING_GRACE` = 3 s. On the loaded gate host the child can
+take more than 3 s to be scheduled through the kernel exit path and become
+a zombie the reaper reaches: the deadline expired, `close` returned, and the
+immediate liveness assertion saw a still-present pid. A fixed 150 ms sleep
+before the grandchild assertion had the same shape.
+
+**Fix (product + test).**
+- `REAP_EXITING_GRACE` is 30 s, matching the c-testbudget loaded-host
+  shutdown/reap budgets. The wait still returns the instant `try_wait`
+  succeeds (the normal transition is milliseconds), so a healthy close is
+  unchanged; only a genuinely slow exit gets the room it needs instead of
+  being abandoned as an unreaped child for the Node's lifetime.
+- The test now waits on the observable state — both the direct child and the
+  SIGKILLed grandchild are polled with `process_alive` on a 25 ms cadence up
+  to a 30 s bound instead of an immediate read / fixed 150 ms sleep. The
+  outer close timeout is 60 s (the configured rungs sum to ≈34.5 s worst
+  case: 2 s + 2 s signal rungs, 0.5 s SIGKILL window, 30 s reap), and the
+  "ladder is bounded" assertion names that ceiling.
+
+**Result under load.** `cargo test -p remuda-driver --test
+claude_sdk_process` passes (11 tests); the kill test was repeated 25 times
+alongside 25 repetitions of the dispatcher drain test (50 reps total) while a
+`cargo build --workspace --tests` loop held the host at load average 10–20:
+50/50 passed, zero failures.
+
 ## Verification environment
 
 Hub specs five times each under the shared b lock with dedicated ports
@@ -289,7 +354,13 @@ Hub specs five times each under the shared b lock with dedicated ports
 (`PW_CHANNEL=chromium`). Five-by-five: ux-code 2/2, ux-touchhit 4/4,
 ux-steer-queue 1/1, ux-modelsync 5/5 and hub-live 10/10, each 5/5 green.
 The full hub suite once on the final code: 131 passed, 16 skipped, 0 failed.
-Rust: `cargo test -p remuda` (all green; the flaky dispatcher test also
-30/30 under load), `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo fmt --all -- --check`. Web: `pnpm --dir web test` (1233 passed),
+Round 2: the three hub specs re-touched in review passed 3/3 each under the
+same lock/ports/load — hub-live 10/10 ×3, ux-steer-queue 1/1 ×3,
+ux-touchhit 4/4 ×3.
+Rust: `cargo test -p remuda -p remuda-feishu` (all green),
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`. Under load the two shutdown tests were each
+repeated 25 times after the round-2 rewrites (dispatcher drain and
+remuda-driver SIGKILL ladder): 50/50, zero failures, on top of the earlier
+30/30 dispatcher run. Web: `pnpm --dir web test` (1233 passed),
 `pnpm --dir web typecheck`, `pnpm --dir web lint` (no new warnings).

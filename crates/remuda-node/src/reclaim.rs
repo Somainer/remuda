@@ -458,6 +458,14 @@ impl DevNode {
             let _ = driver.execute(DriverRequest::Close).await;
         }
         self.inner.instance_drivers.write().await.clear();
+        // Same rationale as `shutdown`: the abort skipped worker termination.
+        if let Ok(instances) = self.inner.store.list_instances() {
+            for instance in instances {
+                self.inner
+                    .api_relay
+                    .revoke_instance(instance.meta.id.as_id().as_str());
+            }
+        }
     }
 
     /// Abort every observation pump and wait for it to actually stop.
@@ -498,6 +506,13 @@ impl DevNode {
             let _ = worker.await;
         }
         self.stop_pumps().await;
+        // Workers were aborted, so their terminal relay revocation never ran:
+        // shut every per-instance listener and fail every in-flight stream.
+        for instance in self.inner.store.list_instances()? {
+            self.inner
+                .api_relay
+                .revoke_instance(instance.meta.id.as_id().as_str());
+        }
         let mut tasks = tokio::task::JoinSet::new();
         for instance in self.inner.store.list_instances()? {
             let node = self.clone();

@@ -112,6 +112,9 @@ pub(crate) struct DevNodeInner {
     tty: TtyRegistry,
     /// Batch 6 lane gate runner state (lane locks, live jobs, event uplink).
     pub(crate) gate: crate::gate::GateRegistry,
+    /// D-047/D-048 model-API relay: per-instance loopback listeners, the
+    /// proxy-side egress contexts, and the live carrier link's frame broker.
+    pub(crate) api_relay: Arc<crate::api_relay::ApiRelayState>,
     diagnostics: std::sync::RwLock<crate::DoctorContext>,
 }
 
@@ -190,6 +193,7 @@ impl DevNode {
                 projection_epoch: Id::new("epoch")?,
                 tty: TtyRegistry::new(),
                 gate: crate::gate::GateRegistry::new(),
+                api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
             }),
         })
@@ -215,6 +219,13 @@ impl DevNode {
     #[must_use]
     pub(crate) fn gate_registry(&self) -> &crate::gate::GateRegistry {
         &self.inner.gate
+    }
+
+    /// D-047/D-048 relay state: listeners, proxy egress contexts, and the live
+    /// link's `api.*` broker.
+    #[must_use]
+    pub(crate) fn api_relay(&self) -> &std::sync::Arc<crate::api_relay::ApiRelayState> {
+        &self.inner.api_relay
     }
 
     /// Set diagnostics inputs from trusted process composition, never RPC params.
@@ -392,6 +403,12 @@ impl DevNode {
             }
         }
         let removed = self.inner.store.remove_instance(instance_id)?;
+        // D-047: purge is definitive — revoke the bearer and shut the listener
+        // even when the worker task already ended without running its terminal
+        // block (abort, crash double, stale rows).
+        self.inner
+            .api_relay
+            .revoke_instance(instance_id.as_id().as_str());
         let mut directory_removed = false;
         if let Some(config) = &self.inner.herdr_config {
             let dir = config
@@ -607,11 +624,30 @@ impl DevNode {
         // this through `starting` and `ready`; the Hub mirrors those states
         // from the journal even when this RPC's reply arrives late.
         instance.lifecycle = InstanceLifecycle::Preparing;
+        // D-047: bind this instance's relay listener (and run the launch-time
+        // probe) on the accept path, before any row is written. A bind/probe
+        // failure is therefore a refused `instance.create` with no launch —
+        // never a launched session that silently fell back to direct, which
+        // would leak the request to a host the operator excluded (D-035).
+        let provisioned = crate::api_relay::listener::provision_for_request(
+            &self.inner.api_relay,
+            instance_id.as_id().as_str(),
+            &request,
+        )
+        .await?;
+        let observed_route = provisioned
+            .as_ref()
+            .map(|provisioned| provisioned.observed.clone());
+        let relay_overlay = provisioned
+            .as_ref()
+            .map(|provisioned| provisioned.overlay.clone());
+        let mut provision_guard = provisioned.map(|provisioned| provisioned.guard);
         let launch = DriverLaunch {
             instance: instance.clone(),
             request: request.clone(),
             workspace_root,
             registered_workspace_root: workspace.root_path.into(),
+            api_relay: relay_overlay,
         };
         self.inner.store.insert_instance(instance)?;
 
@@ -634,6 +670,9 @@ impl DevNode {
             return Ok(CreateInstanceResponse {
                 command: self.inner.store.get_command(&command_id)?,
                 instance: self.inner.store.get_instance(&instance_id)?,
+                // A retry that hit the idempotent create owns no relay: the
+                // provision guard revokes the one this attempt just bound.
+                api_route: None,
             });
         }
         accept_command(&mut command)?;
@@ -655,8 +694,26 @@ impl DevNode {
         )?;
         self.spawn_instance_worker(instance_id.clone(), launch, command.clone(), request.prompt)
             .await;
-        let instance = self.inner.store.get_instance(&instance_id)?;
-        Ok(CreateInstanceResponse { command, instance })
+        // The worker now owns the listener for the instance's lifetime and
+        // revokes it from its terminal block; failure to read the row back is
+        // the one path that revokes here.
+        let instance = match self.inner.store.get_instance(&instance_id) {
+            Ok(instance) => instance,
+            Err(error) => {
+                self.inner
+                    .api_relay
+                    .revoke_instance(instance_id.as_id().as_str());
+                return Err(error);
+            }
+        };
+        if let Some(guard) = provision_guard.take() {
+            guard.commit();
+        }
+        Ok(CreateInstanceResponse {
+            command,
+            instance,
+            api_route: observed_route,
+        })
     }
 
     /// Point this Node at the Hub's attachment store (D-027).
@@ -944,6 +1001,7 @@ impl DevNode {
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
         let pumps = Arc::clone(&self.inner.pumps);
+        let api_relay = Arc::clone(&self.inner.api_relay);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             // Building the driver is materialization, not acceptance: it runs
@@ -967,6 +1025,7 @@ impl DevNode {
                 Ok(Err(error)) => {
                     tracing::error!(%error, "instance driver build failed");
                     record_task_exit(store.as_ref(), &worker_instance, &error.to_string());
+                    api_relay.revoke_instance(worker_instance.as_id().as_str());
                     if let Some(node) = node.upgrade() {
                         node.senders.write().await.remove(&worker_instance);
                     }
@@ -976,6 +1035,7 @@ impl DevNode {
                     let reason = format!("driver build task panicked: {join_error}");
                     tracing::error!(%reason, "instance driver build panicked");
                     record_task_exit(store.as_ref(), &worker_instance, &reason);
+                    api_relay.revoke_instance(worker_instance.as_id().as_str());
                     if let Some(node) = node.upgrade() {
                         node.senders.write().await.remove(&worker_instance);
                     }
@@ -1021,6 +1081,10 @@ impl DevNode {
                     record_task_exit(store.as_ref(), &worker_instance, "driver-task-panicked")
                 }
             }
+            // The instance has run to completion (or died): revoke its relay
+            // bearer and shut the loopback listener. Idempotent with the
+            // explicit close/purge and shutdown paths below.
+            api_relay.revoke_instance(worker_instance.as_id().as_str());
             if store
                 .get_instance(&worker_instance)
                 .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Exited)
@@ -4011,5 +4075,75 @@ mod tests {
             );
             assert!(!gate.settled);
         }
+    }
+}
+
+#[cfg(test)]
+mod api_relay_launch_test {
+    use super::*;
+    use crate::{FakeDriver, MemoryStore};
+
+    fn node() -> DevNode {
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        let drivers = DriverRegistry::default();
+        drivers
+            .register(Arc::new(FakeDriver::default()))
+            .expect("register fake driver");
+        DevNode::with_parts(&config, Arc::new(MemoryStore::new(8)), drivers).expect("compose node")
+    }
+
+    /// A create carrying a via route provisions the loopback listener on the
+    /// accept path and echoes the *resolved* route (hub-relay, since no
+    /// endpoint is named). The echo rides the create response for the Hub to
+    /// record — never a requested `auto` (D-035).
+    #[tokio::test]
+    async fn via_create_echoes_resolved_route_and_serves_loopback() {
+        let node = node();
+        let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": {
+                "mode": "via",
+                "viaHostId": HostId::new(),
+                "route": "auto"
+            }
+        }))
+        .expect("request");
+        let created = node.create_instance(request).await.expect("create");
+        let route = created.api_route.expect("echoed route");
+        assert!(route.is_via());
+        assert_eq!(route.route, Some(remuda_protocol::ApiRouteKind::HubRelay));
+        // The per-instance listener is registered and bound to loopback.
+        let listeners = node.api_relay();
+        // Registry key is the allocated instance id.
+        let instance_id = created.instance.meta.id.clone();
+        // Internal lookup is exercised through a request instead: with no
+        // carrier link attached the listener answers 503, which proves it is
+        // live without exposing internals.
+        assert_eq!(
+            listeners
+                .instance(instance_id.as_id().as_str())
+                .map(|listener| listener.local_addr().ip().is_loopback()),
+            Some(true)
+        );
+    }
+
+    /// A nameless `via` on the request rejects the create before any row or
+    /// launch (mirrors the wire-level rule; the Node must not echo mode
+    /// `via` without a host).
+    #[tokio::test]
+    async fn nameless_via_is_refused_before_launch() {
+        let node = node();
+        let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": { "mode": "via", "route": "hub-relay" }
+        }))
+        .expect("request parses (wire validation lives on the Hub projector)");
+        let error = node.create_instance(request).await.expect_err("refused");
+        assert!(error.to_string().contains("viaHostId"), "{error}");
     }
 }

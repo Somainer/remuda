@@ -47,11 +47,13 @@ Delivery (`remuda-driver/src/launch/skills.rs` + `materializer.rs`):
    agent environment; the agent keeps shadowed state). The real home is
    resolved in the Node/driver process before child shadow env is applied:
    `$REMUDA_CODEX_HOME` override, else `$CODEX_HOME`, else `$HOME/.codex`.
-2. **codex shell-pty with hooks off** no longer records an undelivered grant:
-   the Node fails closed with a named refusal (`REMUDA_PTY_HOOKS=1` required,
-   or generic-pty). Every other codex path writes the shadow `config.toml`
-   directly from the recipe (hooks-on shell-pty still gets the full
-   features+trust+MCP file from HookSession, appended idempotently).
+2. **codex delivery is hooks-on shell-pty only.** Granted codex on any
+   carrier without a HookSession is refused at the Node factory by name:
+   a shadow home populated with only the MCP table would contain no
+   `auth.json` / user config, silently losing the operator's codex login.
+   The recipe itself writes no codex shadow config; `HookSession::start`
+   materializes the complete home (`[features]` + `[hooks.state.*]` + the
+   granted server) from `recipe.mcp_servers`.
 3. **Q4 is harness-agnostic and refuses, never downgrades.** The materializer
    gate now matches `PermissionMode::Codex { approval_policy: Never }` as well
    as Claude `BypassPermissions`. Dispatch (bot/unattended) refuses

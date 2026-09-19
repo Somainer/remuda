@@ -131,6 +131,15 @@ test.describe("session chrome: view switch, locked harness, files route", () => 
   test("the composer shows no harness menu inside a session", async ({ page }) => {
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
+    // D-042 (c-composer): at compact widths the read-only harness chip rides
+    // inside the composer options sheet, so open it before the chip asserts.
+    // Minimal grant-scoped hunk (session-structured.spec.ts shared with
+    // c-sessionchrome); viewport check keeps desktop behaviour untouched.
+    const compact = (page.viewportSize()?.width ?? 1440) < 768;
+    if (compact) {
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+    }
     const chip = page.getByTestId("harness-chip");
     await expect(chip).toBeVisible();
     await expect(chip).toHaveAttribute("data-readonly", "1");

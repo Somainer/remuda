@@ -1,0 +1,267 @@
+/* c-composer / D-042 (ui-spec.md §2.2 compact composer 边界): mobile-only
+   styles for the collapsed options trigger, the options bottom sheet and the
+   Sheet-based confirm dialog. Desktop composer markup/styles are owned by
+   session.module.css and stay byte-identical; nothing here adds a media
+   query — the mobile layout is a TSX conditional, not a CSS breakpoint. */
+
+/* The collapsed options trigger: the permission word · effort tier fused
+   pill. The trigger declares its own geometry rather than composing the
+   shared `.chip` class: CSS modules from different files have equal
+   specificity and their cascade order must not decide which border wins. */
+.triggerGroup {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+}
+
+.trigger {
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  position: relative;
+}
+
+/* ui-spec §3.4 / D-038: hit area by hit area, not visual size. The visible
+   chip stays 32px but a centred ::after hit zone extends the tap target to
+   var(--touch) (44px). It is the only control in the group now, so it never
+   overlaps a neighbour's zone. */
+.trigger::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--touch);
+  height: var(--touch);
+  transform: translate(-50%, -50%);
+}
+
+.triggerSep {
+  color: var(--mute);
+}
+
+/* Danger permission modes (绕过全部 / 不再询问 / 完全访问) must be visible ON
+   THE COLLAPSED TRIGGER — hiding a bypass state inside the sheet is the
+   loudest thing D-042 forbids. */
+.triggerDanger {
+  border-color: var(--danger);
+  color: var(--danger-strong);
+}
+
+.triggerDanger .triggerSep {
+  color: var(--danger-strong);
+}
+
+/* The mode word keeps its danger colour even when the frame is ember
+   (bypass + ultracode together): both states must stay legible. */
+.triggerDanger .triggerMode {
+  color: var(--danger-strong);
+}
+
+.triggerMode {
+  font-weight: 600;
+}
+
+/* The ultracode stop's ember treatment on the collapsed trigger. Declared in
+   this module (not composed with session.module.css `.ember`) so the
+   cross-module cascade cannot drop the border colour on equal specificity.
+   The trigger keeps its light ember glow while collapsed. */
+.triggerEmber {
+  color: var(--dust);
+  border-color: var(--dust);
+  background-image: linear-gradient(90deg, transparent, rgba(201, 132, 42, 0.18), transparent);
+  background-size: 200% 100%;
+  animation: triggerEmber 4.5s linear infinite, triggerEmberGlow 3.4s ease-in-out infinite;
+}
+
+.triggerEmber .triggerSep {
+  color: var(--dust);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .triggerEmber {
+    animation: none;
+  }
+}
+
+@keyframes triggerEmber {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+@keyframes triggerEmberGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(201, 132, 42, 0);
+  }
+  50% {
+    box-shadow: 0 0 10px 0 rgba(201, 132, 42, 0.35);
+  }
+}
+
+/* In-sheet permission/effort nodes: frameless, full-width wrappers so the
+   sheet does not draw the desktop anchored-popover border/radius/300px cap
+   (which produced a double frame + dead strip at 390px). The inner effort
+   slider card keeps its own visuals. */
+.sheetMenu,
+.sheetCard {
+  width: 100%;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+
+.sheetMenu {
+  display: block;
+  overflow: visible;
+  z-index: auto;
+}
+
+.sheetCard {
+  display: block;
+  overflow: visible;
+  z-index: auto;
+}
+
+/* Options sheet sections (Sheet panel already supplies surface/padding). */
+.optionsPanel {
+  width: min(420px, 100%);
+}
+
+/* D-039 / ui-spec §3.4: tap targets inside the phone sheet must reach
+   var(--touch). The standalone context chip keeps its 30px visual height
+   and gets a centred ::after zone. Stacked permission rows cannot use an
+   ::after (adjacent 44px zones would overlap the ~31px rows), so the
+   sheet rows instead grow to a 44px pitch with centred content — the
+   "padding on the group" alternative D-038 allows. */
+.sheetTouch {
+  position: relative;
+}
+
+.sheetTouch::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--touch);
+  min-width: 100%;
+  height: var(--touch);
+  transform: translate(-50%, -50%);
+}
+
+/* Permission rows inside the sheet: 44px pitch, content centred. The
+   whole row is the hit area, so adjacent rows never share a zone. */
+.sheetPermRow {
+  min-height: var(--touch);
+  display: flex;
+  align-items: center;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sectionLabel {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: var(--text-aux);
+  color: var(--mute);
+  letter-spacing: 0.06em;
+  font-weight: 400;
+}
+
+.attachRow {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Touch sizing by hit area: standalone chip geometry (no `.chip`
+   composition from session.module.css) — 44px via --touch, never a
+   hard-coded pixel size. */
+.attachBtn {
+  height: auto;
+  min-height: var(--touch);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+  position: relative;
+}
+
+.optionList {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.confirmPanel {
+  width: min(380px, 100%);
+  gap: 14px;
+}
+
+.confirmTitle {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--paper);
+}
+
+.confirmMessage {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--paper);
+}
+
+.confirmActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.confirmCancel,
+.confirmOk {
+  border-radius: var(--radius);
+  background: transparent;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0 16px;
+  min-height: var(--touch);
+  display: inline-flex;
+  align-items: center;
+}
+
+.confirmCancel {
+  border: 1px solid var(--line);
+  color: var(--mute);
+}
+
+.confirmOk {
+  border: 1px solid var(--danger);
+  color: var(--danger-strong);
+  font-weight: 600;
+}

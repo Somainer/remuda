@@ -57,7 +57,13 @@ async function openEffort(page: Page) {
 async function assertRequestedEffortUnknown(page: Page, name: string) {
   await expect(page.getByTestId("composer")).toHaveAttribute("data-effort", name);
   const chip = page.getByTestId("model-effort-chip");
-  await expect(chip).toHaveAttribute("aria-label", `Select effort, ${name}; effective unknown`);
+  // D-042: the mobile collapsed trigger prefixes the permission word
+  // (`询问 · Select effort, …`); match the suffix so the helper works under
+  // both chromium and mobile-webkit projects.
+  await expect(chip).toHaveAttribute(
+    "aria-label",
+    new RegExp(`Select effort, ${name}; effective unknown$`),
+  );
   await expect(chip).toHaveAttribute("data-effort-effective", "unknown");
   await expect(chip).toHaveAttribute("data-effort-source", "unknown");
   await expect(page.getByTestId("model-effort-chip-label")).toHaveText("?");
@@ -149,15 +155,31 @@ async function assertSingleLine(chip: Locator) {
 
 test.describe("composer control bar and effort", () => {
   test("chips render collapsed with requested effort and unknown native read-back", async ({ page }) => {
+    const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
-    await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
-    await assertRequestedEffortUnknown(page, "high");
-    await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
-    await expect(page.getByTestId("context-chip")).toBeVisible();
-    await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
-    await expect(page.getByTestId("effort-menu")).toHaveCount(0);
+    if (mobile) {
+      // D-042: on phones the harness/context/permission controls ride inside
+      // the options sheet; the collapsed trigger keeps the permission word +
+      // effort tier only.
+      await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-permission", "manual");
+      await expect(page.getByTestId("context-chip")).toHaveCount(0);
+      await expect(page.getByTestId("harness-chip")).toHaveCount(0);
+      await page.getByTestId("model-effort-chip").click();
+      await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
+      await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      await expect(page.getByTestId("composer-trigger-permission")).toContainText(/询问|可改|全自动|绕过/);
+      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+    } else {
+      await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
+      await assertRequestedEffortUnknown(page, "high");
+      await expect(page.getByTestId("model-effort-chip")).not.toContainText(/opus|sonnet/);
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      await expect(page.getByTestId("permission-chip")).toContainText(/询问|可改|全自动|绕过/);
+      await expect(page.getByTestId("effort-menu")).toHaveCount(0);
+    }
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-bar.png");
     }
@@ -189,7 +211,15 @@ test.describe("composer control bar and effort", () => {
     await assertPillGeometry(page);
     const card = await menu.boundingBox();
     expect(card).toBeTruthy();
-    expect(card!.width).toBeLessThanOrEqual(301);
+    if (test.info().project.name === "chromium") {
+      // Desktop: compact ~300px anchored card.
+      expect(card!.width).toBeLessThanOrEqual(301);
+    } else {
+      // D-042: in the phone options sheet the card is intentionally
+      // frameless and full-width (wider than the 300px desktop card).
+      await expect(menu).toHaveAttribute("data-in-sheet", "1");
+      expect(card!.width).toBeGreaterThan(301);
+    }
     await assertFillReachesKnob(page);
     if (test.info().project.name === "chromium") {
       await shot(page, "composer-1-effort-menu.png");
@@ -331,8 +361,12 @@ test.describe("composer control bar and effort", () => {
   });
 
   test("an existing session shows the harness as a label, not a menu", async ({ page }) => {
+    const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "空闲会话").click();
+    // D-042: the read-only harness chip rides inside the options sheet on
+    // phones; open it before the chip assertions.
+    if (mobile) await page.getByTestId("model-effort-chip").click();
     const chip = page.getByTestId("harness-chip");
     await expect(chip).toHaveAttribute("data-readonly", "1");
     await expect(chip).toContainText(/Claude/);
@@ -456,6 +490,7 @@ test.describe("composer control bar and effort", () => {
   });
 
   test("structured Grok session shows four chips including its editable permission menu", async ({ page }) => {
+    const mobile = test.info().project.name === "mobile-webkit";
     await page.goto("/sessions");
     await row(page, "Grok 会话").click();
     await expect(page.getByTestId("session-page")).toBeVisible();
@@ -463,19 +498,42 @@ test.describe("composer control bar and effort", () => {
     await expect(structured).toBeVisible();
     await structured.click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
-    await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
     await expect(page.getByTestId("model-effort-chip")).toBeVisible();
-    await expect(page.getByTestId("context-chip")).toBeVisible();
     // This fixture reports a structured-workflow capability, so SessionPage
     // provides the permission menu rather than the raw-PTY read-only label.
-    const permission = page.getByTestId("permission-chip");
-    await expect(permission).toContainText("询问");
-    await expect(permission).toHaveAttribute("aria-expanded", "false");
-    await permission.click();
-    await expect(permission).toHaveAttribute("aria-expanded", "true");
-    await expect(page.getByTestId("permission-menu")).toBeVisible();
-    await expect(page.getByTestId("permission-option-manual")).toBeVisible();
-    await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+    if (mobile) {
+      // D-042: the harness chip, context chip and the permission control
+      // live in the options sheet; the fused trigger is the expanded anchor.
+      const trigger = page.getByTestId("model-effort-chip");
+      await expect(trigger).toHaveAttribute("aria-expanded", "false");
+      await trigger.click();
+      await expect(trigger).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
+      // Context usage also lives in the sheet (dispatch plan §C default 4).
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      // The structured-workflow capability can land a tick after the page
+      // paints; poll for the editable menu instead of accepting a read-only
+      // fallback the fixture must not end in.
+      await expect
+        .poll(
+          async () => page.getByTestId("permission-menu").count(),
+          { timeout: 10_000 },
+        )
+        .toBe(1);
+      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+      await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+    } else {
+      await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      const permission = page.getByTestId("permission-chip");
+      await expect(permission).toContainText("询问");
+      await expect(permission).toHaveAttribute("aria-expanded", "false");
+      await permission.click();
+      await expect(permission).toHaveAttribute("aria-expanded", "true");
+      await expect(page.getByTestId("permission-menu")).toBeVisible();
+      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+      await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
+    }
   });
 
   test("the fill reaches the knob at every stop; the ember field exists on ultracode alone", async ({ page }) => {
@@ -604,7 +662,17 @@ test.describe("composer control bar and effort", () => {
           await assertPillGeometry(page);
           const box = await page.getByTestId("effort-menu").boundingBox();
           expect(box).toBeTruthy();
-          expect(box!.width).toBeLessThanOrEqual(Math.min(width, 301));
+          if (width < 768) {
+            // D-042: at compact width the effort card is the full-width
+            // frameless node inside the options sheet.
+            await expect(page.getByTestId("effort-menu")).toHaveAttribute("data-in-sheet", "1");
+            expect(box!.width).toBeGreaterThan(301);
+            expect(box!.width).toBeLessThanOrEqual(width);
+          } else {
+            // Desktop/tablet: compact anchored card capped at 300px.
+            await expect(page.getByTestId("effort-menu")).not.toHaveAttribute("data-in-sheet", "1");
+            expect(box!.width).toBeLessThanOrEqual(Math.min(width, 301));
+          }
           await assertFillReachesKnob(page);
           await shotComposer(page, `composer-slider-5-${state}-${theme}-${tag}.png`);
         }

@@ -278,7 +278,8 @@ test("promoted Claude: hooks drive activity and 打断 sends a native Esc withou
       const interrupt = page.getByTestId("composer-interrupt");
       await expect(interrupt).toBeVisible();
       await expect(interrupt).toBeEnabled({ timeout: 5000 });
-      page.once("dialog", (dialog) => { void dialog.accept(); });
+      // The visible 打断 button is the direct action (D-042 puts the confirm
+      // only on 插队 and on Esc); no native dialog appears.
       await interrupt.click();
       await expect.poll(async () => (await nativeEvents(eventsFile)).filter((event) => event.event === "interrupt"),
         { timeout: 5000 }).toEqual(Array.from({ length: count }, () => expect.objectContaining({ by: "esc" })));

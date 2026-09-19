@@ -232,7 +232,10 @@ describe("composer attachments", () => {
   });
 
   it("offers a file picker and an explicit paste button", () => {
+    // D-042: on phones the attach controls ride inside the options sheet.
     render(<Composer instanceId="ins_buttons" mobile onSend={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("composer-options-sheet")).toBeTruthy();
     expect(screen.getByTestId("attach-file")).toBeTruthy();
     expect(screen.getByTestId("attach-camera")).toBeTruthy();
     expect(screen.getByTestId("attach-paste")).toBeTruthy();

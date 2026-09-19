@@ -115,6 +115,10 @@ async function createAgentSession(page: Page, prompt: string): Promise<string> {
 async function createTerminal(page: Page): Promise<string> {
   await page.goto("/sessions/new");
   await expect(page.getByTestId("new-session-host")).toBeVisible({ timeout: 20_000 });
+  // The `screen-read` initial input is the fake-node sentinel that opts this
+  // instance into real cooked lines on tty.screen (other terminals keep the
+  // empty-screen answer, so existing specs are unaffected).
+  await page.getByTestId("new-session-prompt").fill("screen-read terminal");
   await page.getByTestId("new-session-kind-terminal").click();
   await expect(page.getByTestId("new-session-start")).toBeEnabled();
   await page.getByTestId("new-session-start").click();
@@ -166,7 +170,7 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   // labelled "Review" and a queued "Verify", staying in native status working.
   // The working row's sentence must be projected from that live journal
   // instead of the constant 运行中….
-  const workflowPrompt = "workflow card demo running row phrase";
+  const workflowPrompt = "workflow card demo-running row-phrase";
   const workflowId = await createAgentSession(page, workflowPrompt);
   const interactionId = await pendingInteractionId(page, approvalId);
 
@@ -199,7 +203,7 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   const wire = approvalRow.getByTestId("session-wire");
   await expect(wire).not.toHaveAttribute("open", "", { timeout: 5_000 });
   await expect(approvalRow.getByTestId("session-lifecycle")).toBeHidden();
-  await wire.locator("summary").click();
+  await approvalRow.getByTestId("session-wire-toggle").click();
   await expect(approvalRow.getByTestId("session-lifecycle")).toBeVisible();
   await expect(approvalRow.getByTestId("session-lifecycle")).toContainText("connected");
   await expect(wire).toContainText(approvalId.slice(0, 8));
@@ -224,7 +228,7 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   // disclosure was already asserted above.
   await panel.press("Escape");
   if (await wire.evaluate((el) => el.open)) {
-    await wire.locator("summary").click();
+    await approvalRow.getByTestId("session-wire-toggle").click();
   }
   await page.setViewportSize({ width: 1440, height: 900 });
   await shot(page, "ux2026-nextstep-1-1440.png");
@@ -233,13 +237,11 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   // 390 px geometry, measured against bounding boxes (scrollHeight on a
   // nowrap element cannot fail).
   //
-  // Pre-change baseline, same fixture and viewport, measured on the parent
-  // of this commit with a Playwright getBoundingClientRect probe: the blocked
-  // row was 292.5 px tall and the terminal row 260.5 px (inline send form +
-  // wrapping wire meta). The redesigned rows must stay at or below those
-  // numbers, and both the headline and the next-step sentence must each be
-  // exactly one line high — height <= its computed line-height — so a
-  // wrapping title or sentence fails the spec.
+  // Post-change measured heights (same fixture/viewport, probe in the
+  // evidence doc): blocked row 152.6 px, terminal row 120.6 px in a quiet
+  // run; under full-suite load flex reflow can add ~54 px, so the gate
+  // below checks the one-line geometry and the exact baseline bound
+  // (292.5 / 260.5) rather than an absolute post-change height.
   const geometry = await approvalRow.evaluate((card) => {
     const lineMetrics = (selector: string) => {
       const el = card.querySelector(selector);
@@ -254,6 +256,10 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
       sentence: lineMetrics("[data-testid='session-next-step']"),
     };
   });
+  // Re-measure defensively: the absolute cardH flips between ~153 (wire
+  // fully collapsed) and ~207 (flex reflow under full-suite load) depending
+  // on timing; gate on the tight one-line geometry and the baseline bound,
+  // not on an absolute row height.
   expect(geometry.cardH).toBeLessThanOrEqual(292.5);
   expect(geometry.headline.oneLine, `headline ${JSON.stringify(geometry.headline)}`).toBe(true);
   expect(geometry.sentence.oneLine, `sentence ${JSON.stringify(geometry.sentence)}`).toBe(true);

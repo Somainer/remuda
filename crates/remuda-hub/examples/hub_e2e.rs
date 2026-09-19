@@ -410,6 +410,11 @@ async fn fake_node(
     // reached the process) and echoes printable input; CR additionally submits
     // a commandId-less journal user node (C2 native-typing correlation).
     let mut ttys: HashMap<String, TtyFake> = HashMap::new();
+    // Instances whose create explicitly opted into cooked screen replies on
+    // `tty.screen`. Other instances keep the pre-existing empty-screen
+    // answer (their rows fall back to journal text), so adding the screen
+    // arm does not change any existing spec.
+    let mut screen_enabled: HashSet<String> = HashSet::new();
     // A failed Claude launch must not acquire a TTY through lazy attach.
     let mut claude_ptys = HashSet::new();
     let mut instance_kinds: HashMap<String, String> = HashMap::new();
@@ -596,6 +601,18 @@ async fn fake_node(
                         // turns; its surface is the PTY stream the QuickFind test
                         // attaches to.
                         ttys.entry(instance_id.clone()).or_insert_with(TtyFake::new);
+                        // Opt-in: a create whose initial input carries the
+                        // `screen-read` sentinel gets real cooked screen lines
+                        // from `tty.screen` (c-nextstep key round trip). Every
+                        // other terminal keeps the empty-screen default answer.
+                        let terminal_prompt = params
+                            .pointer("/initialInput/text")
+                            .or_else(|| params.get("prompt"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if terminal_prompt.contains("screen-read") {
+                            screen_enabled.insert(instance_id.clone());
+                        }
                         send_rpc_ok(
                             &mut ws,
                             id,
@@ -610,20 +627,16 @@ async fn fake_node(
                         .and_then(Value::as_str)
                         .unwrap_or("hello");
                     let interaction_id = InteractionId::new();
-                    // c-nextstep list-row phrase: a create prompt containing
-                    // "row" raises NO approval and journals a workflow scenario
-                    // directly, staying in native status working. The suffix is
-                    // a sentinel rather than part of the scenario keyword, so
-                    // map the row prompt onto the known running scenarios
-                    // explicitly (plain "demo" completes the run and would
-                    // leave no phrase).
-                    let row_scenario: Option<&str> = if !prompt.contains("row") {
-                        None
-                    } else if prompt.contains("demo running") || prompt.contains(" live") {
-                        Some("demo-running")
-                    } else {
-                        workflow_kind(prompt)
-                    };
+                    // c-nextstep list-row phrase: a create prompt with the
+                    // `workflow card <scenario> row-phrase` form raises NO
+                    // approval and journals that workflow scenario directly,
+                    // staying in native status working. `row-phrase` is the
+                    // explicit sentinel; only a running scenario leaves a
+                    // phrase, so unknown scenarios raise the normal approval.
+                    let row_scenario: Option<&str> = prompt
+                        .strip_prefix("workflow card ")
+                        .and_then(|rest| rest.strip_suffix(" row-phrase"))
+                        .filter(|scenario| *scenario == "demo-running" || *scenario == "live");
                     // A prompt naming the hook path raises the D-028 §4.4 tier A
                     // card instead: harness-hook carrier, the real tool input as
                     // its description, and an always-allow option built from the
@@ -1616,28 +1629,35 @@ async fn fake_node(
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                 }
                 "tty.screen" => {
-                    // The list page polls this every few seconds for tty rows
-                    // (no follow subscription there). Replay the cooked screen
-                    // buffer as lines, the shape `GET /v1/instances/:id/screen`
-                    // documents; an instance that never had a TTY returns no
-                    // lines rather than an error.
+                    // ONE arm with a per-instance condition chain. Adding a new
+                    // screen case means inserting a branch here, never a second
+                    // match arm (a later literal arm would be unreachable).
+                    //   1. (future, c-mobilenew) a seeded exited instance —
+                    //      fold its case above this one when it lands.
+                    //   2. an instance that opted in with the `screen-read`
+                    //      create sentinel replays its cooked buffer.
+                    //   3. default: exactly the old answer (ok, no lines), so
+                    //      every other spec's list rows keep journal text.
                     let limit = params.get("lines").and_then(Value::as_u64).unwrap_or(80) as usize;
-                    let lines = ttys
-                        .get(&instance_id)
-                        .map(|tty| {
-                            String::from_utf8_lossy(&tty.screen)
-                                .split(['\r', '\n'])
-                                .filter(|line| !line.is_empty())
-                                .rev()
-                                .take(limit)
-                                .collect::<Vec<_>>()
-                                .into_iter()
-                                .rev()
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    send_rpc_ok(&mut ws, id, json!({ "lines": lines })).await?;
+                    if screen_enabled.contains(&instance_id)
+                        && let Some(tty) = ttys.get(&instance_id)
+                    {
+                        let lines = String::from_utf8_lossy(&tty.screen)
+                            .split(['\r', '\n'])
+                            .filter(|line| !line.is_empty())
+                            .rev()
+                            .take(limit)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        send_rpc_ok(&mut ws, id, json!({ "lines": lines })).await?;
+                    } else {
+                        // Exactly the pre-existing answer for every non
+                        // screen-enabled instance: no lines, no error.
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                    }
                 }
                 _ => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;

@@ -48,6 +48,7 @@ vi.mock("../../lib/store", () => ({
     modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
     modelCatalogOf: () => null,
     refreshScreens: vi.fn(),
+    hydrateRowSummaries: vi.fn().mockResolvedValue(undefined),
     broadcast: vi.fn(),
     send: vi.fn(),
     sendKeys: vi.fn(),
@@ -215,9 +216,14 @@ describe("SessionList scope and conditions", () => {
     renderList();
     const trigger = screen.getByTestId("session-filter-open");
     expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(trigger.getAttribute("aria-controls")).toBeNull();
     await user.click(trigger);
     expect(trigger).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByTestId("session-filter-panel")).toHaveAttribute("aria-modal", "true");
+    const filterPanel = screen.getByTestId("session-filter-panel");
+    expect(filterPanel).toHaveAttribute("aria-modal", "true");
+    // aria-controls resolves to the panel's real id.
+    expect(trigger.getAttribute("aria-controls")).toBe("session-filter-panel");
+    expect(filterPanel.getAttribute("id")).toBe("session-filter-panel");
     await user.keyboard("{Escape}");
     expect(trigger).toHaveAttribute("aria-expanded", "false");
     expect(trigger).toHaveFocus();
@@ -387,22 +393,27 @@ describe("SessionList rows: next step, wire disclosure and overflow sheet", () =
     expect(screen.getAllByTestId("session-lifecycle")[0]).not.toBeVisible();
     expect(row.textContent).not.toContain("waiting-interaction");
 
-    // The collapsed summary tooltip still carries the wire triple and the
+    // The row-side wire toggle's tooltip carries the wire triple and the
     // relative timestamp (the time is hidden from the mobile row itself).
-    const summaryTip = wire.querySelector("summary")?.getAttribute("title") ?? "";
+    const card = screen.getAllByTestId("board-card")[0];
+    const wireToggle = card.querySelector("[data-testid='session-wire-toggle']") as HTMLElement;
+    expect(wireToggle).toBeTruthy();
+    const summaryTip = wireToggle.getAttribute("title") ?? "";
     expect(summaryTip).toContain("ready");
     expect(summaryTip).toContain("connected");
     expect(summaryTip).toContain("alpha/sfe-root");
     // Relative timestamp (mock timestamps are "now"-ish, so formatListTime
     // yields either "刚刚" or a clock string).
     expect(summaryTip).toMatch(/刚刚|^\d{1,2}:\d{2}$/m);
+    // The toggle's aria-expanded/aria-controls describe the closed details.
+    expect(wireToggle.getAttribute("aria-expanded")).toBe("false");
+    expect(wireToggle.getAttribute("aria-controls")).toBe(wire.id);
   });
-
   it("renders no 'undefined' hole when the instance's workspace is absent from the snapshot", () => {
     hub.instances = [session("ins_a", { workspaceId: "wsp-missing" as Id })];    renderList();
     const card = screen.getAllByTestId("board-card")[0];
     expect(card.textContent).not.toContain("undefined");
-    const tip = card.querySelector("[data-testid='session-wire'] summary")?.getAttribute("title") ?? "";
+    const tip = card.querySelector("[data-testid='session-wire-toggle']")?.getAttribute("title") ?? "";
     expect(tip).not.toContain("undefined");
     expect(tip).not.toContain("/ ");
   });

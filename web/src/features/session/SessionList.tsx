@@ -136,6 +136,8 @@ export function SessionList({
   // trigger that opened it (useFocusTrap contract).
   const [actionFor, setActionFor] = useState<Id | null>(null);
   const actionReturnRef = useRef<HTMLButtonElement | null>(null);
+  // Which row's wire disclosure is open (drives the side trigger aria).
+  const [wireOpenFor, setWireOpenFor] = useState<Id | null>(null);
   const actionHeadingId = "session-row-actions-title";
 
   /**
@@ -154,6 +156,8 @@ export function SessionList({
     .filter((instance) => uiMode(instance) === "tty-attachable")
     .map((instance) => instance.id)
     .join(",");
+  // Stable key for the rows actually rendered; drives the phrase/screen poll.
+  const rowKey = filtered.map((instance) => instance.id).join(",");
 
   // Switching Space drops host/workspace conditions that the new fixed scope
   // cannot honour, in exactly one replace, keeping text and status (§4 risk 2).
@@ -181,13 +185,22 @@ export function SessionList({
   // The notice belongs to the Space that triggered it; a later Space retires it.
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
 
+  // Poll the data the rendered rows need: TTY screens for attachable rows
+  // and the projected live phrase for every rendered row. Scoped to this
+  // mounted list only (the store never adds this polling to refresh()); the
+  // store coalesces overlapping ticks and skips unchanged durableSeqs.
   useEffect(() => {
-    if (variant !== "full" || !ptyKey) return;
-    const ids = ptyKey.split(",") as Id[];
-    void hubStore.refreshScreens(ids);
-    const timer = window.setInterval(() => void hubStore.refreshScreens(ids), 2500);
+    if (variant !== "full") return;
+    const ttyIds = ptyKey ? (ptyKey.split(",") as Id[]) : [];
+    const rowIds = rowKey ? (rowKey.split(",") as Id[]) : [];
+    const tick = () => {
+      if (ttyIds.length) void hubStore.refreshScreens(ttyIds);
+      void hubStore.hydrateRowSummaries(rowIds);
+    };
+    tick();
+    const timer = window.setInterval(tick, 2500);
     return () => window.clearInterval(timer);
-  }, [variant, ptyKey]);
+  }, [variant, ptyKey, rowKey]);
 
   const chips = selectedChips(conditions, {
     hostName: (id) => hubStore.hostName(id as Id),
@@ -377,6 +390,7 @@ export function SessionList({
           labelledBy={filterHeadingId}
           returnFocusRef={filterBtnRef}
           testId="session-filter-panel"
+          panelId="session-filter-panel"
         >
           <div className={css.panelHead}>
             <h2 className={css.panelTitle} id={filterHeadingId}>
@@ -620,6 +634,34 @@ export function SessionList({
                   ) : null}
                   <div className={css.rowSide}>
                     <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
+                    {/* Wire disclosure trigger: opens the session-wire
+                        details without rendering anything when closed (the
+                        details is visually hidden until open). */}
+                    <button
+                      type="button"
+                      className={css.wireToggle}
+                      data-testid="session-wire-toggle"
+                      aria-expanded={wireOpenFor === instance.id}
+                      aria-controls={`session-wire-${instance.id}`}
+                      aria-label="运行详情"
+                      title={`${instance.lifecycle} · ${activity} · ${instance.connectivity} | ${hubStore.hostName(instance.hostId)}${
+                        worktree ? `/${worktree}` : ""
+                      } · ${instance.driver} · ${shortId(instance.id, 8)} · ${formatListTime(instance.updatedAt)}`}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const card = event.currentTarget.closest("[data-testid='board-card']");
+                        const details = card?.querySelector(
+                          "[data-testid='session-wire']",
+                        ) as HTMLDetailsElement | null;
+                        if (!details) return;
+                        const open = !details.open;
+                        details.open = open;
+                        setWireOpenFor(open ? instance.id : null);
+                      }}
+                    >
+                      详情
+                    </button>
                     <button
                       type="button"
                       className={css.moreBtn}
@@ -637,14 +679,8 @@ export function SessionList({
                       ⋯
                     </button>
                   </div>
-                  <details className={css.wire} data-testid="session-wire">
-                    <summary
-                      className={css.wireSummary}
-                      title={`${instance.lifecycle} · ${activity} · ${instance.connectivity} | ${hubStore.hostName(instance.hostId)}${
-                        worktree ? `/${worktree}` : ""
-                      } · ${instance.driver} · ${shortId(instance.id, 8)} · ${formatListTime(instance.updatedAt)}`}
-                    >
-                      运行详情
+                  <details className={css.wire} data-testid="session-wire" id={`session-wire-${instance.id}`}>
+                    <summary className={css.wireSummary} tabIndex={-1} aria-hidden="true">
                       {tty ? (
                         <span className={css.tty} title={nativeShort(instance)}>
                           终端

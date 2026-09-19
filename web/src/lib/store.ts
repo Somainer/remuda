@@ -1004,45 +1004,84 @@ class HubStore {
     this.hydrateUsageRollups(instances.items);
     this.hydrateModels(instances.items);
     this.hydratePermissionEffective(instances.items);
-    // The list rows show one projected live phrase; derive it from a bounded
-    // journal tail for live instances without opening the full follow stream
-    // (the session page does that on demand). Failures are non-fatal: the row
-    // simply shows its constant phrase.
-    void this.hydrateSummaries(instances.items.filter((instance) => {
-      const lifecycle = instance.lifecycle;
-      return lifecycle !== "exited" && lifecycle !== "failed" && lifecycle !== "unknown";
-    }));
+    // NOTE: list-row live phrases are NOT derived here. refresh() fans into
+    // every authenticated path (close/cancel/create/resume re-enter it) and
+    // must not add journal polling; the mounted SessionList hydrates phrases
+    // for the rows it renders via hydrateRowSummaries().
   }
 
-  private async hydrateSummaries(liveInstances: Instance[]) {
-    // The journal endpoint answers the newest bounded tail (up to 2000 rows,
-    // ascending). Ask for the last `SUMMARY_TAIL` rows by opening the window
-    // at durable - N, so a long journal costs one bounded read, not 2000 rows.
-    const entries = await Promise.all(
-      liveInstances.map(async (instance) => {
+  /** durableSeq already projected for a row phrase; unchanged seq = skip. */
+  private summarySeqs = new Map<Id, string>();
+  /** Ids this store currently projects phrases for (reconciled each tick). */
+  private summaryManaged = new Set<Id>();
+  /** Coalesces overlapping ticks so journal reads never overlap. */
+  private summariesInFlight: Promise<void> | null = null;
+
+  /**
+   * Project one live phrase per rendered list row from a bounded journal tail.
+   * Driven by the mounted SessionList poll (not refresh): the call is scoped
+   * to rendered row ids, skips instances whose durableSeq is unchanged, never
+   * overlaps itself, and clears phrases that no longer apply (finished run,
+   * row no longer rendered), so a row always falls back to its constant text
+   * rather than keeping a stale invented phrase.
+   */
+  hydrateRowSummaries(rowIds: Id[]): Promise<void> {
+    if (this.summariesInFlight) return this.summariesInFlight;
+    const job = this.projectRowSummaries(rowIds).finally(() => {
+      if (this.summariesInFlight === job) this.summariesInFlight = null;
+    });
+    this.summariesInFlight = job;
+    return job;
+  }
+
+  private async projectRowSummaries(rowIds: Id[]): Promise<void> {
+    const rows = rowIds.flatMap((id) => this.state.instances.find((row) => row.id === id) ?? []);
+    const current = new Map(rows.map((row) => [row.id, row]));
+    const results = await Promise.all(
+      rows.map(async (instance) => {
+        const seq = String(instance.durableSeq ?? "0");
+        if (this.summarySeqs.get(instance.id) === seq) {
+          return { instance, phrase: this.state.summaries[instance.id], unchanged: true } as const;
+        }
         try {
-          const head = await api.eventsRead({ journalId: instance.journalId, limit: 1 });
-          const durable = Number(head.durableSeq);
-          if (!Number.isFinite(durable) || durable === 0) return null;
-          const from = Math.max(0, durable - SUMMARY_TAIL);
+          // One bounded read: the journal endpoint serves the newest window
+          // (≤2000 rows ascending). Open at durable-N so the tail stays small.
+          const from = Math.max(0, Number(seq) - SUMMARY_TAIL);
           const page = await api.eventsRead({
             journalId: instance.journalId,
             afterSeq: String(from) as U64,
             limit: SUMMARY_TAIL,
           });
-          const phrase = liveSummary(page.events);
-          return phrase ? ([instance.id, phrase] as const) : null;
+          this.summarySeqs.set(instance.id, seq);
+          return { instance, phrase: liveSummary(page.events) ?? "", unchanged: false } as const;
         } catch {
           return null;
         }
       }),
     );
+
     const next = { ...this.state.summaries };
     let changed = false;
-    for (const entry of entries) {
-      if (!entry) continue;
-      if (next[entry[0]] !== entry[1]) {
-        next[entry[0]] = entry[1];
+    // Add/update the projected phrases for this render and drop keys whose
+    // row is no longer managed (space switch / unmount) so they cannot stick.
+    for (const id of this.summaryManaged) {
+      if (!current.has(id) && id in next) {
+        delete next[id];
+        this.summarySeqs.delete(id);
+        changed = true;
+      }
+    }
+    this.summaryManaged = new Set(current.keys());
+    for (const result of results) {
+      if (!result || result.unchanged) continue;
+      const { instance, phrase } = result;
+      if (phrase) {
+        if (next[instance.id] !== phrase) {
+          next[instance.id] = phrase;
+          changed = true;
+        }
+      } else if (instance.id in next) {
+        delete next[instance.id];
         changed = true;
       }
     }
@@ -1113,6 +1152,11 @@ class HubStore {
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
         const phrase = liveSummary(next);
+        // Clear a finished run's phrase so the row falls back to its
+        // constant sentence instead of keeping a stale (invented) status.
+        const summaries = { ...this.state.summaries };
+        if (phrase) summaries[instanceId] = phrase;
+        else delete summaries[instanceId];
         this.emit({
           instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
@@ -1123,9 +1167,7 @@ class HubStore {
                 [instanceId]: { lines: lastLines(screen.lines, 80), done: doneFromLines(screen.lines) },
               }
             : this.state.screens,
-          summaries: phrase
-            ? { ...this.state.summaries, [instanceId]: phrase }
-            : this.state.summaries,
+          summaries,
         });
       },
       onPrepend: (older) => {

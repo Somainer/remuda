@@ -46,18 +46,22 @@ test.describe("session chrome evidence", () => {
       await page.goto("/sessions");
       await row(page, "空闲会话").click();
       await expect(page.getByTestId("view-switch")).toHaveCount(0);
+      // The golden shows the composer bar without a modal scrim, so take the
+      // harness-label screenshot with the bar in its normal state.
+      await shot(page, `session-chrome-1-harness-label-${tag}.png`);
       // D-042 (c-composer): at compact widths the read-only harness chip
-      // rides inside the composer options sheet, not the collapsed bar.
+      // rides inside the composer options sheet; assert it there after the
+      // screenshot, then close the sheet (without regenerating the golden).
       const compact = w < 768;
       if (compact) {
+        await expect(page.getByTestId("harness-chip")).toHaveCount(0);
         await page.getByTestId("model-effort-chip").click();
         await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
-      }
-      await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
-      await shot(page, `session-chrome-1-harness-label-${tag}.png`);
-      if (compact) {
+        await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
         await page.getByTestId("composer-options-close").click();
         await expect(page.getByTestId("composer-options-sheet")).toHaveCount(0);
+      } else {
+        await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
       }
 
       // Files route: header kept, 文件 active, back affordance present.

@@ -596,8 +596,12 @@ test("a hook-carried approval shows the real tool input and an always-allow opti
     page.getByTestId("approval-row").filter({ hasText: "/tmp/hook-approval.txt" }),
   ).toHaveCount(0, { timeout: 20_000 });
 
-  // A blocking approval holds the composer; answering it releases the session.
-  await answerPendingApprovals(page, instanceId);
+  // The card WAS this instance's blocking launch approval; the click above has
+  // already answered it. Do NOT call answerPendingApprovals here: once the
+  // fake node's card is answered it leaves interaction.list (it serves only
+  // its pending map), so the helper's "an interaction exists" wait would time
+  // out on the already-resolved card. The enabled composer below is the
+  // release signal.
   await page.goto(`/s/${instanceId}`);
   await expect(page.getByTestId("session-page")).toBeVisible();
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });

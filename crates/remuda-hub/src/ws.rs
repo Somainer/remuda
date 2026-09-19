@@ -324,6 +324,16 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         if !id.is_null() {
                             let _ = out_tx.send(rpc_ok(id, result)).await;
                         }
+                        // Re-push api.egress contexts only after the hello
+                        // reply is queued: the egress sends share this bounded
+                        // FIFO, which this same task drains, so awaiting them
+                        // inline would park the reply once a proxy held ~32+
+                        // routed instances (D-048 B.2).
+                        if is_hello {
+                            if let Some(h) = host_id.clone() {
+                                spawn_egress_reinstall(&state, h);
+                            }
+                        }
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -367,6 +377,25 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             let _ = state.store.mark_host_offline(host_id).await;
         }
     }
+}
+
+/// Spawn the D-048 B.2 post-hello re-push of a host's api.egress contexts.
+///
+/// The task runs only after the `node.hello` reply has been queued: each
+/// `install_egress` send shares the session's bounded (32-slot) outbound
+/// FIFO, which the session task itself drains. Awaiting those sends inline
+/// would fill the FIFO ahead of the reply and park the 33rd, so the hello
+/// would never answer for a proxy routing ~32+ instances; below that, every
+/// egress frame queued ahead of the reply. The spawned task queues after the
+/// reply and is independently drained.
+pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        state
+            .api_relay
+            .reinstall_egress_on_connect(&state, &host_id)
+            .await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,13 +507,6 @@ pub(crate) async fn handle_node_method(
                 )
                 .await;
             *session_generation = Some(generation);
-            // D-048 B.2: re-push api.egress contexts this proxy host holds for
-            // live routed instances, so the first api.open after a reconnect
-            // reaches an H that already has the credential.
-            state
-                .api_relay
-                .reinstall_egress_on_connect(state, &host.host_id)
-                .await;
             let watermarks = state
                 .store
                 .list_instance_watermarks(host.host_id.clone())

@@ -538,6 +538,10 @@ async fn connect_once(
             result.unwrap_or(Value::Null),
         ))
         .await?;
+    // D-048 B.2: re-push this host's api.egress contexts only after the hello
+    // reply is on the wire — the frames ride out_rx (the select loop below),
+    // and awaiting many bounded sends inline would block the reply.
+    crate::ws::spawn_egress_reinstall(state, managed.id.clone());
     state
         .store
         .ssh_status(managed.id.clone(), "online", None)

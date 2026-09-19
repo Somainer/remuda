@@ -20,6 +20,10 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# geteuid for the per-user runtime directory ownership check (sun_path fix).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", default-features = false, features = ["user"] }
+
 [dev-dependencies]
 remuda-testing.workspace = true
 tempfile = "3"

@@ -1,7 +1,10 @@
 //! The per-instance hook socket (D-028 §4.2).
 //!
-//! One `SOCK_STREAM` unix socket per instance at `<instance dir>/hook.sock`,
-//! mode 0600, inside a 0700 directory. One connection carries one event: the
+//! One `SOCK_STREAM` unix socket per instance, conventionally at
+//! `<instance dir>/hook.sock`; when that path would exceed `sun_path` the
+//! driver binds a short name in the per-user runtime dir and leaves a
+//! `hook.sock` symlink under the instance dir (see [`crate::runtime_dir`]).
+//! Mode 0600, inside a 0700 directory. One connection carries one event: the
 //! relay writes a single JSON line and reads a single JSON line back.
 //!
 //! Security shape, in full:
@@ -93,7 +96,8 @@ impl HookServer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let listener = UnixListener::bind(path)?;
+        let listener = UnixListener::bind(path)
+            .map_err(|error| crate::runtime_dir::bind_io_error(path, error))?;
         set_mode(path, 0o600)?;
         let credential = Arc::new(credential);
         let task = tokio::spawn(async move {
@@ -496,5 +500,55 @@ mod tests {
             recorder.seen.lock().unwrap().is_empty(),
             "an oversized request must not reach the sink"
         );
+    }
+
+    /// A long data directory: the socket binds at a short runtime path and a
+    /// round trip works there; the under-instance symlink exists for discovery
+    /// but is not itself connectable (the `sun_path` limit applies to connect
+    /// as well as bind, which is exactly why clients get the real path).
+    #[tokio::test]
+    async fn a_socket_in_a_long_dir_serves_through_its_short_runtime_path() {
+        let root = tempfile::tempdir().unwrap();
+        // 80 filler segments push `<root>/<fill>/instances/<id>/hook.sock`
+        // comfortably past the 107-byte Linux limit.
+        let instance_dir = root
+            .path()
+            .join("x".repeat(80))
+            .join("instances/ins_01990000-0000-7000-8000-000000000001");
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let preferred = instance_dir.join("hook.sock");
+        let placement = crate::runtime_dir::place_socket(
+            &preferred,
+            "01990000-0000-7000-8000-000000000001.sock",
+        )
+        .unwrap();
+        assert!(placement.redirected());
+        assert!(placement.bind_path().as_os_str().len() <= crate::runtime_dir::SUN_PATH_LIMIT);
+        let recorder = Arc::new(Recorder::default());
+        let server = HookServer::bind(
+            placement.bind_path(),
+            "cred-a".into(),
+            Arc::new(Arc::clone(&recorder)),
+        )
+        .unwrap();
+        placement.install_link().unwrap();
+
+        // The discovery symlink is present under the (long) instance dir.
+        let link_meta = std::fs::symlink_metadata(&preferred).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&preferred).unwrap(),
+            placement.bind_path()
+        );
+
+        // Round trip over the real short path.
+        let reply = send_event(server.path(), &envelope("cred-a", "SessionStart"), WAIT).await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+        assert_eq!(recorder.seen.lock().unwrap().len(), 1);
+
+        // Connecting via the long symlink path is rejected at the syscall
+        // boundary before symlink resolution — clients must use bind_path().
+        let via_link = tokio::net::UnixStream::connect(&preferred).await;
+        assert!(via_link.is_err(), "long symlink path must not connect");
     }
 }

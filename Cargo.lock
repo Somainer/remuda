@@ -3438,6 +3438,7 @@ dependencies = [
 name = "remuda-signal"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "remuda-protocol",
  "remuda-testing",
  "serde",

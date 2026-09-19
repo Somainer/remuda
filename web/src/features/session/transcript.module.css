@@ -199,3 +199,28 @@
     transform: translate(-50%, -50%);
   }
 }
+
+/* D-049 compact chrome budget: the transcript action chips fold behind one
+   ⋯ trigger. Its chip look is unchanged; the 44px reach comes from the same
+   invisible ::after mechanism. Expanded, the chips are the same inline
+   buttons (same testids), allowed to wrap instead of overflowing 390px. */
+@media (max-width: 767px) {
+  .toolbar {
+    flex-wrap: wrap;
+  }
+
+  .toolsTrigger {
+    position: relative;
+    flex: none;
+  }
+
+  .toolsTrigger::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+  }
+}

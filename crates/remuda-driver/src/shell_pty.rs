@@ -2850,20 +2850,27 @@ fn agent_env(
         .env_allowlist
         .iter()
         .filter(|entry| {
-            matches!(
-                entry.source,
-                crate::recipe::EnvAllowlistSource::NativeHome
-                    | crate::recipe::EnvAllowlistSource::ProviderOverlay
-                    | crate::recipe::EnvAllowlistSource::Capability
-            )
+            // The granted handshake is the one REMUDA_-prefixed name allowed
+            // through; a Capability-tagged entry with any other name stays out.
+            let denied_but_not_handshake = crate::child_env::is_denied(&entry.name)
+                && entry.name != crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV;
+            !denied_but_not_handshake
+                && matches!(
+                    entry.source,
+                    crate::recipe::EnvAllowlistSource::NativeHome
+                        | crate::recipe::EnvAllowlistSource::ProviderOverlay
+                        | crate::recipe::EnvAllowlistSource::Capability
+                )
         })
         .filter_map(|entry| match entry.name.as_str() {
             "CODEX_HOME" | "GROK_HOME" => Some((entry.name.clone(), recipe.native_home.clone())),
             "GROK_DISABLE_AUTOUPDATER" => Some((entry.name.clone(), "1".to_owned())),
             _ if entry.source == crate::recipe::EnvAllowlistSource::Capability => {
-                // D-045 handshake: driver-computed, passes the REMUDA_ deny
-                // prefix that guards spec- and host-supplied names.
-                Some((entry.name.clone(), "1".to_owned()))
+                // D-045 handshake: value rides the grant entry.
+                entry
+                    .secret_ref
+                    .clone()
+                    .map(|value| (entry.name.clone(), value))
             }
             _ => None,
         })

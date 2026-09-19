@@ -337,8 +337,13 @@ impl ClaudePtyDriver {
             .env_allowlist
             .iter()
             .filter(|entry| entry.source == crate::recipe::EnvAllowlistSource::Capability)
+            // Narrow hole: only the granted-handshake name passes the
+            // REMUDA_ deny prefix; the value rides the grant entry.
+            .filter(|entry| entry.name == crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV)
         {
-            env.insert(entry.name.clone(), "1".to_owned());
+            if let Some(value) = entry.secret_ref.as_deref() {
+                env.insert(entry.name.clone(), value.to_owned());
+            }
         }
         for (key, value) in &self.options.extra_env {
             if crate::child_env::is_denied(key) {

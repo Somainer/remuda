@@ -212,14 +212,29 @@ impl DriverFactory for NativeClaudeFactory {
         // D-045 gate 2, Node half: the CLI/Hub preflight is advisory over the
         // wire; this is the boundary that actually controls materialization.
         // Runs before any launch dir or home is written.
-        if launch
+        let computer_use = launch
             .request
             .capabilities
             .iter()
-            .any(|value| value == crate::computer_use::CAPABILITY_COMPUTER_USE)
-        {
+            .any(|value| value == crate::computer_use::CAPABILITY_COMPUTER_USE);
+        if computer_use {
             crate::computer_use::host_preflight(&launch.request.kind)
                 .map_err(|error| DriverError::Failed(error.to_string()))?;
+            // Fail closed for codex on shell-pty with hooks off: that path has
+            // no HookSession to point CODEX_HOME at the shadow home and splice
+            // the granted [mcp_servers] config into it, so the grant would be
+            // recorded but undelivered. Refuse the combination by name.
+            if self.kind == DriverKind::ShellPty
+                && launch.request.kind == remuda_protocol::AgentKind::Codex
+                && !self.config.pty_hooks
+            {
+                return Err(DriverError::Failed(
+                    "the \"computer-use\" capability for codex on shell-pty requires \
+                     REMUDA_PTY_HOOKS=1: without the hook session the granted MCP server \
+                     cannot be delivered; enable pty hooks or launch codex on generic-pty"
+                        .into(),
+                ));
+            }
         }
         let instance_dir = self
             .config

@@ -478,8 +478,11 @@ impl ClaudePrintDriver {
             // Capability entries are driver-computed grants (D-045): the
             // REMUDA_ deny prefix guards spec- and host-supplied names, not
             // values the driver itself attaches only after the grant gates.
+            // The hole is narrow to the granted-handshake name only: any other
+            // denied (REMUDA_-prefixed) name is refused even when tagged
+            // Capability. The value rides the entry from the grant.
             if crate::child_env::is_denied(&entry.name)
-                && entry.source != EnvAllowlistSource::Capability
+                && entry.name != crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV
             {
                 debug!(name = %entry.name, "refusing a denied env name");
                 continue;
@@ -532,7 +535,9 @@ impl ClaudePrintDriver {
                     }
                 }
                 EnvAllowlistSource::Capability => {
-                    env.insert(entry.name.clone(), "1".to_owned());
+                    if let Some(value) = entry.secret_ref.as_deref() {
+                        env.insert(entry.name.clone(), value.to_owned());
+                    }
                 }
             }
         }

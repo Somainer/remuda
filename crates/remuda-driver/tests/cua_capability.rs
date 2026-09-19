@@ -100,6 +100,7 @@ fn grant(spec: &mut InstanceSpec) {
 
 const ENV_NAME: &str = "REMUDA_CAPABILITY_COMPUTER_USE";
 const SKILL_ROOT: &str = "skills/codex-computer-use";
+
 const EMBEDDED_FILES: &[&str] = &[
     "SKILL.md",
     "references/setup.md",
@@ -208,6 +209,27 @@ fn granted_claude_writes_skill_tree_mcp_config_argv_and_env() {
         }
     }
 
+    // Every directory in the delivered tree is owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tree_root = dirs.home.join("skills").join("codex-computer-use");
+        let _ = tree_root.clone();
+        let mut stack = vec![tree_root.clone()];
+        let mut checked = 0;
+        while let Some(dir) = stack.pop() {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "dir {} mode {mode:o}", dir.display());
+            checked += 1;
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+        assert!(checked >= 2, "root + references/scripts dirs");
+    }
+
     // Leg (b): 0600 per-instance config + 0755 launchers under launch/.
     let mcp_config = dirs.launch.join("mcp-cua.json");
     let repl = dirs.launch.join("cua/scripts/launch-cua-repl.sh");
@@ -283,6 +305,56 @@ fn granted_claude_writes_skill_tree_mcp_config_argv_and_env() {
         assert!(!String::from(file.content_digest.clone()).is_empty());
         assert_eq!(file.lifetime, FileLifetime::Launch);
     }
+}
+
+#[test]
+fn granted_skill_tree_in_a_shared_home_is_native_store_lifetime() {
+    // A configured shared dir lives OUTSIDE the per-instance launch dir, so its
+    // skill files must survive one instance's cleanup (review 6).
+    let tmp = tempfile::tempdir().unwrap();
+    let launch = tmp.path().join("instances/i/launch");
+    let shared_home = tmp.path().join("shared-claude-home");
+    fs::create_dir_all(&launch).unwrap();
+    fs::create_dir_all(&shared_home).unwrap();
+    let binary = stub_binary(tmp.path());
+    let mut spec = load_spec();
+    grant(&mut spec);
+
+    let recipe = materialize(&MaterializeRequest {
+        spec: &spec,
+        profile: Box::leak(Box::new(profile())),
+        launch_dir: launch.clone(),
+        native_home: shared_home.clone(),
+        session: SessionAction::New {
+            session_id: "01993ab0-0000-7000-8000-000000000003".into(),
+        },
+        launch_id: Id::new("launch").unwrap(),
+        binary: BinarySource::Pinned(BinaryPinShim::pin(&binary)),
+        setting_sources: None,
+        origin: LaunchOrigin::Human,
+        native_home_managed: Some(true),
+        settings_overlay_path: None,
+        secret_policy: None,
+    })
+    .unwrap();
+
+    let skill = recipe
+        .materialized_files
+        .iter()
+        .find(|file| file.role == FileRole::CapabilitySkill)
+        .expect("skill file recorded");
+    assert_eq!(
+        skill.lifetime,
+        FileLifetime::NativeStore,
+        "shared-home skill files must not be shredded on instance exit"
+    );
+    assert!(shared_home.join(SKILL_ROOT).join("SKILL.md").is_file());
+
+    // Launch cleanup leaves the shared-home tree intact.
+    for (path, error) in recipe.cleanup_launch_files() {
+        assert!(error.is_none(), "{path}");
+    }
+    assert!(shared_home.join(SKILL_ROOT).join("SKILL.md").is_file());
 }
 
 #[test]
@@ -372,6 +444,25 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
             .iter()
             .any(|(name, value)| name == ENV_NAME && value == "1")
     );
+    // The server entry carries the operator's REAL codex home (launcher-only),
+    // never the shadow home the agent itself gets — the vendor app lives there.
+    let real_home = server
+        .env
+        .iter()
+        .find(|(name, _)| name == "REMUDA_CODEX_HOME")
+        .map(|(_, value)| value.as_str())
+        .expect("MCP server entry must carry the real codex home");
+    assert!(
+        real_home.ends_with(".codex"),
+        "real home should resolve to $HOME/.codex here: {real_home}"
+    );
+    // The agent-facing handshake allowlist never carries the real home.
+    assert!(
+        !recipe
+            .env_allowlist
+            .iter()
+            .any(|entry| entry.name == "REMUDA_CODEX_HOME")
+    );
 
     // The shadow materializer splices the same server into config.toml and
     // keeps [features] / [hooks.state] intact.
@@ -397,6 +488,12 @@ fn granted_codex_delivers_only_the_mcp_server_record_for_the_shadow_home() {
     assert_eq!(
         parsed["mcp_servers"]["codex-computer-use"]["env"][ENV_NAME].as_str(),
         Some("1")
+    );
+    assert_eq!(
+        parsed["mcp_servers"]["codex-computer-use"]["env"]["REMUDA_CODEX_HOME"]
+            .as_str()
+            .map(|value| value.ends_with(".codex")),
+        Some(true)
     );
 }
 
@@ -485,7 +582,12 @@ fn bypass_permissions_plus_computer_use_is_refused() {
         interaction: ClaudeInteractionMode::Host,
     }));
     grant(&mut spec);
-    refuse_case(&mut spec, LaunchOrigin::Human, true, "bypassPermissions");
+    refuse_case(
+        &mut spec,
+        LaunchOrigin::Human,
+        true,
+        "unattended/skipped tool approvals",
+    );
 }
 
 #[test]
@@ -509,14 +611,70 @@ fn grok_and_other_kinds_are_refused_this_batch() {
 
 #[test]
 fn caller_supplied_mcp_config_collides_with_the_granted_one() {
+    for extra in [
+        vec!["--mcp-config".to_owned(), "/tmp/other.json".to_owned()],
+        vec!["--mcp-config=/tmp/other.json".to_owned()],
+    ] {
+        let dirs = dirs();
+        let binary = stub_binary(dirs.root.path());
+        let mut spec = load_spec();
+        grant(&mut spec);
+        spec.args = extra;
+        let error =
+            materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary)).unwrap_err();
+        assert!(error.to_string().contains("--mcp-config"), "{error}");
+        // Refused before any capability file exists.
+        assert!(!dirs.launch.join("mcp-cua.json").exists());
+        assert!(!dirs.home.join(SKILL_ROOT).exists());
+    }
+}
+
+#[test]
+fn a_capability_sourced_env_entry_with_another_name_is_still_denied() {
+    // The deny-prefix hole is the one handshake name, not the source tag:
+    // callers can't mint arbitrary REMUDA_ vars by tagging them Capability.
     let dirs = dirs();
     let binary = stub_binary(dirs.root.path());
     let mut spec = load_spec();
     grant(&mut spec);
-    spec.args = vec!["--mcp-config".to_owned(), "/tmp/other.json".to_owned()];
-    let error =
-        materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary)).unwrap_err();
-    assert!(error.to_string().contains("--mcp-config"), "{error}");
+    // Simulate a corrupted/other entry as the spawn sites would filter it.
+    let name = "REMUDA_SOMETHING_ELSE";
+    assert!(remuda_driver::child_env::is_denied(name));
+    assert_ne!(
+        name,
+        remuda_driver::launch::skills::CAPABILITY_COMPUTER_USE_ENV
+    );
+    // Sanity: materialize never creates such an entry.
+    let recipe = materialize(&request(&mut spec, &dirs.launch, &dirs.home, true, &binary)).unwrap();
+    let extra = recipe
+        .env_allowlist
+        .iter()
+        .filter(|entry| entry.source == remuda_driver::EnvAllowlistSource::Capability)
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        extra,
+        vec![remuda_driver::launch::skills::CAPABILITY_COMPUTER_USE_ENV],
+        "only the one handshake name may ride the Capability source"
+    );
+}
+
+#[test]
+fn codex_never_policy_is_refused_even_when_granted() {
+    // Q4 is harness-agnostic: codex ApprovalPolicy::Never + computer-use
+    // refuses (the old gate matched only Claude).
+    let mut spec = load_spec();
+    spec.kind = AgentKind::Codex;
+    spec.driver = DriverKind::GenericPty;
+    spec.permission_mode = PermissionMode::Codex(Box::new(remuda_protocol::CodexPermission {
+        approval_policy: remuda_protocol::ApprovalPolicy::Never,
+        approvals_reviewer: remuda_protocol::ApprovalsReviewer::User,
+        execution: remuda_protocol::CodexExecution::Sandbox(remuda_protocol::SandboxExecution {
+            sandbox: remuda_protocol::SandboxMode::WorkspaceWrite,
+        }),
+    }));
+    grant(&mut spec);
+    refuse_case(&mut spec, LaunchOrigin::Human, true, "unattended");
 }
 
 // ── audit and cleanup ─────────────────────────────────────────────────────

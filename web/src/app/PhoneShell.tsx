@@ -68,10 +68,14 @@ export function PhoneShell() {
     hubStore.clearToast();
   }, [hub.toast]);
 
-  const isActive = (id: (typeof PHONE_NAV)[number]["id"], to: string | null) => {
+  // Only the two in-tree destinations have an active state: 新建 leaves for
+  // the shared /sessions/new route and 更多 opens an overlay (and MORE_NAV
+  // destinations render under Shell, outside this /m* tree), so neither can
+  // be active here.
+  const isActive = (id: (typeof PHONE_NAV)[number]["id"]) => {
     if (id === "home") return location.pathname === "/m";
     if (id === "inbox") return location.pathname.startsWith("/m/inbox");
-    return to !== null && location.pathname.startsWith(to);
+    return false;
   };
 
   return (
@@ -102,14 +106,12 @@ export function PhoneShell() {
       </main>
       <nav className={css.bar} aria-label="手机底栏">
         {PHONE_NAV.map((item) => {
-          const active = isActive(item.id, item.to);
           if (item.id === "more") {
             return (
               <button
                 key={item.id}
                 type="button"
                 data-testid="phone-nav-more"
-                className={active ? css.barActive : ""}
                 aria-expanded={moreOpen}
                 aria-haspopup="menu"
                 onClick={() => setMoreOpen((v) => !v)}
@@ -137,7 +139,7 @@ export function PhoneShell() {
               key={item.id}
               to={item.to}
               data-testid={`phone-nav-${item.id}`}
-              className={active ? css.barActive : ""}
+              className={isActive(item.id) ? css.barActive : ""}
               aria-label={item.id === "inbox" && pending ? `${item.label}(${pending})` : item.label}
             >
               <span className={css.barGlyph}>{item.glyph}</span>

@@ -84,6 +84,10 @@ pub struct CreateInstanceBody {
     worktree: Option<String>,
     #[serde(default, rename = "requiredCapabilities")]
     required_capabilities: Option<Value>,
+    /// Per-launch host capability grants, e.g. `["computer-use"]` (D-045).
+    /// Stored on the spec and forwarded to the Node; the Node re-validates.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
     #[serde(default)]
     placement: Option<Value>,
     #[serde(default)]
@@ -802,6 +806,7 @@ pub async fn create_instance(
         "cwd": body.cwd,
         "worktree": body.worktree,
         "requiredCapabilities": body.required_capabilities,
+        "capabilities": body.capabilities,
     });
     if let Some(obj) = spec.as_object_mut() {
         if let Some(delegation) = &body.delegation {
@@ -1024,6 +1029,33 @@ pub async fn create_instance(
         &mut spec,
     )
     .await?;
+    // D-045: per-launch host capability gates, all before persistence.
+    if let Some(capabilities) = body.capabilities.as_ref().filter(|list| !list.is_empty()) {
+        crate::inventory::validate_capabilities(capabilities).map_err(HubError::BadRequest)?;
+        if capabilities
+            .iter()
+            .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
+        {
+            if matches!(
+                body.permission_mode.as_deref(),
+                Some("bypassPermissions" | "bypass")
+            ) {
+                return Err(HubError::BadRequest(
+                    "refusing \"computer-use\" together with bypassPermissions on the same \
+                     launch: unattended desktop control plus skipped tool approvals has no \
+                     recovery path; remove one of the two"
+                        .into(),
+                ));
+            }
+            if !matches!(body.kind.as_str(), "claude" | "codex") {
+                return Err(HubError::BadRequest(format!(
+                    "the \"computer-use\" capability is not supported for kind {:?} this batch",
+                    body.kind
+                )));
+            }
+            crate::inventory::computer_use_preflight(&host).map_err(HubError::BadRequest)?;
+        }
+    }
     let (instance, command) = crate::placement::spawn_on_host(
         &state,
         &host,

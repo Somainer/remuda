@@ -1449,6 +1449,9 @@ async fn relaunch_instance(
         project.meta.id.as_id().as_str(),
         worker.task_id.as_ref().map(|id| id.as_id().as_str()),
         extra_env,
+        // A respawn never carries a desktop grant (D-045); the DispatchBody
+        // reaching re-dispatch also defaults its capabilities to empty.
+        Vec::new(),
     );
     crate::agent_scope::prepare_create(state, headers, &device, &host.host_id, &driver, &mut spec)
         .await?;
@@ -1548,6 +1551,8 @@ async fn replace_worker(
         placement: None,
         driver: None,
         carrier: None,
+        // A respawn inherits the worker, never a new desktop grant (D-045).
+        capabilities: Vec::new(),
     };
 
     // Retire (force) reclaims worktree/target, then re-dispatch the same brief

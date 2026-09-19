@@ -4,7 +4,7 @@
 产品定位：unified remote agent runtime 的遥控面（方案草案称 Remuda；未拍板前 UI 文案用 **runtime**）。  
 **不是** harness，**不造** agent loop。界面只观察 + 下发控制；resume 权威是原生会话。
 
-**v0.2.2 changelog（2026-09-19，手机优先路由树，见 D-049）**：§1.2 路由表新增 `/m` 与 `/m/inbox`，并写明 compact/桌面双向重定向与 query 保留（`/s/:id` 永不重定向）；§1.3 手机线框区分「首页级屏」与「会话路由」两套铬，会话路由 compact 不渲染 app 底部导航栏与 §1.4 的 SpaceTabs 行；§4.5 补应用角标（badge）与推送权限横幅的位置；新增 §4.7「手机优先路由树与铬预算」（一条顶栏 `--top-mobile` + 一条底栏 `--bar`、正文 ≥ 60% 视口、截断优先级、`终端|结构` 分段与 Stop 永不截断/进溢出）与 §4.8「语音输入」（平台听写优先、先成文再发送、Web Speech API 仅增强且默认关、不做云转写、iOS Safari 无 `SpeechRecognition`、终端段不提供语音）；§4.6 PWA `start_url` 从 `/sessions` 改为 `/`。依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5 / §6 / §7.1 / §9 / §10-19 / §10-23 / §11.2 / §11.3 / §11.4 / §11.5。
+**v0.2.2 changelog（2026-09-19，手机优先路由树，见 D-049）**：§1.2 路由表新增 `/m` 与 `/m/inbox`，并写明 compact/桌面双向重定向与 query 保留（`/s/:id` 永不重定向）；§1.3 手机线框区分「首页级屏」与「会话路由」两套铬（compact 主行含状态点：返回 / space 芯片 / 标题 / 状态点 / 分段 / Stop / ⋯），会话路由 compact 不渲染 app 底部导航栏，§1.4 的 chips 行折成单芯片、tabs 行整行收起（两条 compact 例外分别挂 D-040 / D-049，列表路由不变）；compact 主行的 host 芯片与 cost 折进「运行详情」（仅 compact，D-040 的桌面主行规则不变）；§4.5 补应用角标（badge）与推送权限横幅的位置；新增 §4.7「手机优先路由树与铬预算」（一条顶栏 `--top-mobile` + 一条底栏 `--bar`、正文 ≥ 60% 视口、截断优先级、`终端|结构` 分段与 Stop 永不截断/进溢出）与 §4.8「语音输入」（平台听写优先、先成文再发送、Web Speech API 仅增强且默认关、不做云转写、iOS Safari 无 `SpeechRecognition`、终端段不提供语音）；§4.6 PWA `start_url` 从 `/sessions` 改为 `/`。依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5 / §6 / §7.1 / §9 / §10-19 / §10-23 / §11.2 / §11.3 / §11.4 / §11.5。
 
 **v0.2.1 changelog（2026-09-19，依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 的冲突核对，见 D-038…D-042）**：本修订只解除「规格与实施单互相矛盾」，不改变产品方向。四处增补——§1.3 顶栏把 `terminal|structured` 与 Stop 钉成永不进 ⋯ 溢出；§1.4 的 400px space chips 要求限定到列表路由，`/s/:id*` 允许折成单枚当前 space 芯片；§2.2 的 header 从「规范两行诊断」改为「主行 + 可折叠运行详情」，并新增手机工具卡折叠（含 Workflow / error / running 豁免）与 compact composer 边界；§3.4 新增全局的「命中尺寸只靠热区」与「`.meta` 类文本桌面手机同值、下限 `var(--text-aux)`」。**依据行号以本文件为准**（报告 §11.7 引的 `ui-spec.md:233` 实为修订前的 `:235`，该行现已随 §2.2 重画）。
 
@@ -52,7 +52,7 @@
 | id | 中文 | 职责 | 桌面落点 | 手机落点 |
 |---|---|---|---|---|
 | `sessions` | 会话 | 跨主机实例列表 + 打开会话 | 左栏列表；主列会话页 | 底栏「会话」 |
-| `approvals` | 审批 | 全局 pending Interaction | 顶栏铃铛 + `/approvals` | 底栏「审批」（有待办时红点） |
+| `approvals` | 审批 | 全局 pending Interaction | 顶栏铃铛 + `/approvals` | 底栏「审批」（有待办时红点；compact 下即 `/m/inbox`，D-049） |
 | `hosts` | 主机 | Node Agent 在线、CLI、登录态 | `/hosts` | 底栏「更多」→ 主机 |
 | `projects` | 项目 | Workspace（cwd / worktree）通讯录，按主机分组 | `/projects`；新建会话里的选择器 | 新建会话步骤里选 |
 | `providers` | Provider | profile、健康、与 astergate 关系 | `/providers` | 更多 → Provider |
@@ -135,19 +135,19 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 compact 下有**两套铬**，按路由切换（D-049，预算见 §4.7）：
 
 ```
-首页级屏（/m、/m/inbox …）              会话路由（/s/:id*：structured/tty/files）
-┌───────────────────────────┐          ┌───────────────────────────┐
-│ 顶栏：搜索 / 标题    52px   │          │ ←[space] 标题 [终端|结构]■⋯│ 52px
-│                           │          │ ▸ 运行详情（可选）  20px   │
-│                           │          │                           │
-│ 唯一一列（全屏，可滚动）     │          │ transcript / xterm 正文    │
-│                           │          │ ≥60% 视口（composer 收起） │
-│                           │          │                           │
-│                           │          ├───────────────────────────┤
-│                           │          │ composer 56／本地输入 44   │
-├───────────────────────────┤          │ ＋键盘条 44（仅终端段）     │
-│ 会话 收件箱·n 新建 更多 64 │          │ （无 app 底栏）            │
-└───────────────────────────┘          └───────────────────────────┘
+首页级屏（/m、/m/inbox …）               会话路由（/s/:id*：structured/tty/files）
+┌─────────────────────────────┐          ┌────────────────────────────────────────┐
+│ 顶栏：搜索 / 标题           │          │ ← [space] 标题 ● [终端|结构] ■ ⋯ 52px  │
+│                             │          │ ▸ 运行详情（host/cost 折入）20px       │
+│ 唯一一列（全屏，可滚动）    │          │                                        │
+│                             │          │ transcript / xterm 正文                │
+│                             │          │ ≥60% 视口（composer 收起）             │
+│                             │          │                                        │
+├─────────────────────────────┤          ├────────────────────────────────────────┤
+│ 会话 收件箱·n 新建 更多 64  │          │ composer 56／本地输入 44               │
+└─────────────────────────────┘          │ ＋键盘条 44（仅终端段）                │
+                                         │ （无 app 底栏）                        │
+                                         └────────────────────────────────────────┘
 ```
 
 **会话路由在 compact 下不渲染 app 底部导航栏（D-049，2026-09-19 增补）**：`/s/:instanceId*`（含 `/tty` `/structured` `/files` `/events`）只有一条顶栏；该路由的「底部条」由 composer（结构段，收起态 56px，D-042）或本地输入条 + 键盘条（终端段，各 44px，§2.3）担任，app 级底栏（`nav[aria-label="手机底栏"]`，今天是 `Shell.tsx` 的 `.bar`，`:310`）**不渲染**，§1.4 的 SpaceTabs 行（`Shell.tsx:306`）也**不渲染**。回列表靠顶栏返回键（`SessionPage.tsx:239`，字形不变、热区 ≥ 44px，D-039）；切空间/切 tab 由顶栏单枚 space 芯片的抽屉（D-040 的 `spaces-drawer-open`，能力不降级）与 Jump To sheet（§4.7）承担。
@@ -180,6 +180,7 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 - `/s/:instanceId` 及其子视图路由保持有效，直接打开会同时选中实例所属 space 和 tab。当前 space 的「新建」入口带入 host/workspace，cwd 默认该注册根目录；「其他」不虚构注册根。被移除或关闭的选中 tab 回退到该 space 可用 tab，无 tab 时显示该 space 的会话列表或空态。
 - 桌面快捷键：⌘/Ctrl+B 折叠面板，⌘/Ctrl+1..9 选择当前 space 的相应 tab，⌘/Ctrl+[ / ] 切换前后 space。约 400px 手机上显示可横向滚动的 space chips 与 tabs，左侧面板通过抽屉访问；使用现有 viewport 和 Night Corral 主题 tokens，深浅主题保持一致的布局及状态含义。
 - **compact 下的 space chips 例外（D-040，2026-09-19 增补，仅覆盖上面那句 chips 要求的应用范围）**：列表路由（`/sessions`、`/hosts`、`/projects`、`/approvals` 等工作台首页面）保持整条可横向滚动的 space chips 与抽屉入口不变。`/s/:instanceId` 及其子视图（`/s/:id/structured`、`/s/:id/tty`、`/s/:id/files`）在 compact 下**允许**把整条 chips 行折成**单枚当前 space 芯片**并入会话顶栏：点击该芯片打开同一个抽屉（`spaces-drawer-open` 行为与 testid 不变），切空间能力不降级，只是不再常驻一整行。理由：会话页在 400px 上同时叠 space chips、tabs、会话顶栏、审批卡、composer 与底栏，正文被挤到不足半屏；深链进入某一会话时「我现在在哪个 space」由单芯片回答即可。**`terminal|structured` 分段与 Stop 不受本条影响**：它们仍在顶栏，见 §1.3。
+- **compact 下的 tabs 行例外（D-049，2026-09-19 增补，仅覆盖上一条快捷键句子里「与 tabs」那半句的应用范围）**：上面那句「约 400px 手机上显示可横向滚动的 space chips 与 tabs」对 tabs 的要求**只在列表路由成立**；`/s/:instanceId` 及其子视图在 compact 下**不渲染 tabs 行**（即 §1.3 说的 SpaceTabs 行），切 tab 由顶栏单枚 space 芯片的抽屉与 Jump To sheet（§4.7）承担，能力不降级。列表路由（`/sessions`、`/hosts`、`/projects`、`/approvals` 等）的可滚动 tab 条保持不变。本条与上一条 D-040 chips 例外是同一形状的限定：chips 折成单芯片、tabs 整行收起，二者一起把会话路由的正文让回给 §4.7 的 60% 预算。
 
 本节只作用于会话工作台。fleet 与全局 approvals 的范围和入口不变，composer 继续以当前实例为控制目标。验收与桌面/400px、深浅主题截图见 [spaces-1.md](./evidence/spaces-1.md)；tab 语义增补的验收见 [tabs-1.md](./evidence/tabs-1.md)。
 
@@ -869,7 +870,7 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 - 任一手机屏最多**一条顶栏 + 一条底栏**。顶栏高 `var(--top-mobile)`（52px，`tokens.css:79`）；首页级屏底栏高 `var(--bar)`（64px，`tokens.css:77`）+ `var(--safe-bottom)`（`tokens.css:80`）。
 - **会话路由 `/s/:id*` 在 compact 下不渲染 app 底栏、也不渲染 SpaceTabs 行**（§1.3 / §1.4）：结构段底部只有收起态 composer（56px，D-042），终端段底部是本地输入条 44px + 键盘条 44px（§2.3）。顶栏返回键热区 ≥ `var(--touch)`（D-039）。
-- **正文（transcript 或 xterm）在 composer 收起、无软键盘时，可视高度 ≥ 视口高的 60%。** 结构段测 `data-testid="session-body"`（`SessionPage.tsx:416`），终端段测 xterm 容器。390×844 的预算余量：安全区 47 + 顶栏 52 + 「运行详情」触发行 20 + 正文 + composer 56 + 安全区底 34 ≈ 正文 635px ≈ **75%**；终端段（顶栏 72 + 正文 + 本地输入 44 + 键盘条 44 + 安全区）≈ 601px ≈ **71%**。**60% 是验收下限，不是设计目标。** 该比例只在无软键盘时测量；软键盘态的要求是 composer 不被遮挡（§4.1，新壳必须复用 `useWorkbenchViewport`，`viewport.ts:15`，不得自己算高度）。
+- **正文（transcript 或 xterm）在 composer 收起、无软键盘时，可视高度 ≥ 视口高的 60%。** 结构段测 `data-testid="session-body"`（`SessionPage.tsx:416`），终端段测 xterm 容器。390×844 的预算余量：安全区 47 + 顶栏 52 + 「运行详情」触发行 20 + 正文 + composer 56 + 安全区底 34 ≈ 正文 635px ≈ **75%**；终端段（同样是安全区 47 + 顶栏 52 + 触发行 20 + 正文 + 本地输入 44 + 键盘条 44 + 安全区底 34）≈ 正文 601px ≈ **71%**。**60% 是验收下限，不是设计目标。** 该比例只在无软键盘时测量；软键盘态的要求是 composer 不被遮挡（§4.1，新壳必须复用 `useWorkbenchViewport`，`viewport.ts:15`，不得自己算高度）。
 - 触控一律走热区（§3.4）：视觉字形不变，`::after` 或 padding 撑到 `var(--touch)`，热区不得互相重叠。
 
 **截断优先级（顶栏宽度不足时按此顺序牺牲）**
@@ -878,9 +879,13 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 2. 其次 **space 芯片**退成首字母（点开仍是 D-040 的同一个抽屉）；
 3. 再次是**状态文字**收起，只留 §2.1 的状态点（三维投影语义不降级，unknown 不得画成正向）。
 
+三步牺牲之后 compact 主行仍恒为：**返回 / space 芯片 / 标题 / 状态点 / `终端|结构` 分段 / Stop / ⋯**——状态点与三步牺牲无关，永远留在行上。
+
+**主机芯片与 cost 的 compact 例外（D-049，仅 compact；D-040 的桌面规则一字不动）**：D-040 钉的是**桌面**主行必须可见 host 芯片与 cost；compact 下二者移入第二行「运行详情」disclosure（§2.2），不删除、不猜值——顶栏那枚 space 芯片已经同时点名主机与项目（§1.4 的 `(hostId, workspaceId)` 归属），「这场要花多少钱、在哪个主机上」展开触发行即可读到。桌面主行的 host 芯片与 cost 保持原位，本条不改它。
+
 **`终端|结构` 分段与 Stop 在任何宽度下都不截断、不折行、不进 ⋯ 溢出菜单**（与 D-040 一致）：分段挂在 `SessionPage.tsx:258`（`ViewSwitch`），Stop 在 `:329`。另一个视图是一等主控件（报告 §10-19 要求做成主分段），不是可收纳的设置项；「一键回终端且不 fork」必须在最窄宽度下仍然一键可达。
 
-依据：报告 §5-P0-1（减铬）、§6（落地顺序把减铬放在第一）、§7.1（home 回答「连着谁、哪场还活着」）、§9（SOTA 一句话与「不要抄」：不抄顶栏/composer 盖住正文、绿色品牌/Space Grotesk/FAB/地球图标、DEV SERVERS 与 Kill 端口旁栏）、§10-19（Term｜结构 主分段）、§10-23（Jump To 不做第二套空间模型）、§11.2（分组 + 时钟/列表、搜索只命中标题/标签/工作区名）、§11.3（Inbox 两档、错误文案当正文、权限横幅位置）、§11.4（git 一行扫视串可学，硬裁不折行 diff 与列表行右侧的丢弃按钮不抄）、§11.5（桌面右栏的端口/Kill 面板与隧道列表**整体不抄**，D-031）。里程碑：**M1 = home、会话、收件箱、新建、登录、语音（§4.8）**；终端键盘条、分组 Jump To、推送 badge 与真机验证排 M2；git 面板五 tab 在 M2 之后，本规格不出任务。
+依据：报告 §5-P0-1（减铬）、§6（落地顺序把减铬放在第一）、§7.1（home 回答「连着谁、哪场还活着」）、§9（SOTA 一句话与「不要抄」：不抄顶栏/composer 盖住正文、绿色品牌/Space Grotesk/FAB/地球图标；该节对端口旁栏只说「有 artifact 再做、不要先做 Kill 端口面板」，并未说整体不抄）、§10-19（Term｜结构 主分段）、§10-23（Jump To 不做第二套空间模型）、§11.2（分组 + 时钟/列表、搜索只命中标题/标签/工作区名）、§11.3（Inbox 两档、错误文案当正文、权限横幅位置）、§11.4（git 一行扫视串可学，硬裁不折行 diff 与列表行右侧的丢弃按钮不抄）、§11.5（DEV SERVERS / Kill 端口旁栏与隧道列表**整体不抄**——不只是优先级问题，D-031）。里程碑：**M1 = home、会话、收件箱、新建、登录、语音（§4.8）**；终端键盘条、分组 Jump To、推送 badge 与真机验证排 M2；git 面板五 tab 在 M2 之后，本规格不出任务。
 
 ### 4.8 语音输入（D-049，2026-09-19）
 

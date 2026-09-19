@@ -150,6 +150,177 @@ function newerMutation(next: NodeMutation, current?: NodeMutation): boolean {
   return next.operation !== "append" || next.baseRevision === current.revision;
 }
 
+/**
+ * Mutation ordering for one tool card, across BOTH channels.
+ *
+ * Protocol.md §5.2 sequences mutations of a node through a per-node revision
+ * counter ("revision 必须是当前 node revision+1，baseRevision 必须匹配"), and
+ * the driver journals a tool's call and result on ONE node for grok, so:
+ *
+ *   open call 1 → replace call 2 → partial append result 3
+ *                 → replace call 4 → partial append result 5 → close result 6
+ *
+ * That needs TWO independent guards:
+ *
+ * 1. A node-scoped baseline per (nodeId, toolCallId): an Append needs its
+ *    exact node-scoped base, and snapshots are monotonic on the node. This is
+ *    what lets a Partial result Append whose baseRevision is the previous
+ *    *call* revision through, while still rejecting a hole. It also lets the
+ *    producer that keeps the result on its OWN node (the claude
+ *    `tool_result_id` shape) open that node at revision 1 even when the call
+ *    node is already at a higher revision.
+ *
+ * 2. A cross-node per-toolCallId RESULT revision floor. On the promoted path
+ *    the same result is projected by two channels on different nodes: the
+ *    hook relay closes the result on the call node at revision 2 WITH the
+ *    exit code (remuda-signal live.rs: call open 1 / close 2), while the
+ *    transcript pump opens a result on a separate node at revision 1 WITHOUT
+ *    an exit code (claude_print tool_result). A later SubagentStop closes at
+ *    revision 4 and a `<task-notification>` closes at revision 5 (killed must
+ *    win). Ordering those by the node-scoped guard alone makes "last in
+ *    journal order wins", so a transcript Open arriving after the hook Close
+ *    wipes the exit code and rev 4 can overwrite rev 5. The result floor
+ *    rejects any result below the highest result revision already applied
+ *    for the toolCallId, regardless of node — restoring cross-channel
+ *    precedence without affecting the independent-node test (a call
+ *    mutation never touches the result floor).
+ *
+ * The "not older" test is PER TRACK, not on the shared node revision. A call
+ * and a result on the same node advance independently: when PreToolUse was
+ * missed, the record mapper closes the call node at revision 2/3 while the
+ * hook relay emits an orphan result Close at revision 1 on that same node
+ * WITH the exit code (remuda-signal live.rs orphan branch), and the print/pty
+ * journal-parity fixtures open the result at revision 1 on a call node that
+ * is already at revision 2/3. Gating that on the node-wide revision would
+ * drop the exit-bearing result and leave the card stuck running. The node's
+ * current (highest) revision is used ONLY to validate an Append's exact
+ * baseRevision, which is the one rule the two tracks genuinely share.
+ *
+ * Same-revision cross-track Closes follow for free (each track only sees its
+ * own baseline), and a duplicate thinner re-delivery is rejected because it
+ * is not strictly newer on its own track — no explicit applied-set needed.
+ * No SINGLE producer emits both tracks' Close; rather the record mapper
+ * (claude_print_stream) and the hook relay (remuda-signal live) do, and they
+ * land on the same derived node, so the two tracks legitimately coincide.
+ */
+class NodeBaselines {
+  // The node's current revision = highest revision applied across BOTH
+  // tracks. Used only to validate an Append's exact baseRevision.
+  private readonly nodeRevision = new Map<string, string>();
+  // Last applied revision per node AND track: each track is independently
+  // strictly monotonic.
+  private readonly trackRevision = new Map<string, string>();
+  // Highest applied RESULT revision for the toolCallId across all nodes.
+  private readonly resultFloor = new Map<string, string>();
+
+  private static nodeKey(nodeId: string, toolCallId: string): string {
+    return `${nodeId} ${toolCallId}`;
+  }
+
+  private static trackKey(nodeId: string, toolCallId: string, track: "call" | "result"): string {
+    return `${nodeId} ${toolCallId} ${track}`;
+  }
+
+  /** Whether `next` may apply for the given call/result track. */
+  accepts(
+    next: NodeMutation,
+    toolCallId: string,
+    track: "call" | "result",
+  ): boolean {
+    // Cross-channel result precedence (guard 2): a result below the highest
+    // result revision already applied for the tool on any node is stale.
+    if (track === "result") {
+      const floor = this.resultFloor.get(toolCallId);
+      if (floor !== undefined && BigInt(next.revision) < BigInt(floor)) return false;
+    }
+    // Per-track monotonicity: strictly newer than the last applied mutation
+    // on THIS track. This rejects older frames and same-revision duplicates
+    // while letting a cross-track mutation at a lower node revision land.
+    const trackBaseline = this.trackRevision.get(NodeBaselines.trackKey(next.nodeId, toolCallId, track));
+    if (trackBaseline !== undefined && BigInt(next.revision) <= BigInt(trackBaseline)) return false;
+    // An Append needs the node's current revision (shared counter) as its
+    // exact base, regardless of which track wrote it.
+    if (next.operation === "append") {
+      const nodeBaseline = this.nodeRevision.get(NodeBaselines.nodeKey(next.nodeId, toolCallId));
+      if (nodeBaseline !== undefined && next.baseRevision !== nodeBaseline) return false;
+    }
+    return true;
+  }
+
+  set(next: NodeMutation, toolCallId: string, track: "call" | "result"): void {
+    const nodeKey = NodeBaselines.nodeKey(next.nodeId, toolCallId);
+    const nodeBaseline = this.nodeRevision.get(nodeKey);
+    if (nodeBaseline === undefined || BigInt(next.revision) > BigInt(nodeBaseline)) {
+      this.nodeRevision.set(nodeKey, next.revision);
+    }
+    // accepts() already proved this is strictly newer on the track.
+    this.trackRevision.set(NodeBaselines.trackKey(next.nodeId, toolCallId, track), next.revision);
+    if (track === "result") {
+      const floor = this.resultFloor.get(toolCallId);
+      if (floor === undefined || BigInt(next.revision) > BigInt(floor)) {
+        this.resultFloor.set(toolCallId, next.revision);
+      }
+    }
+  }
+}
+
+/**
+ * Fold one tool-result mutation into the card's accumulated result.
+ *
+ * Protocol.md §5.2 gives the result stream the same contract as messages:
+ * - `append` blocks carry only the NEW content (grok's terminal log streams
+ *   raw byte fragments with no block target), so text fragments concatenate
+ *   with NO separator into one text block — joining blocks later with "\n"
+ *   would double every embedded newline;
+ * - `replace` is the complete current value (a rotated log republishes as a
+ *   snapshot), so it resets the accumulated text;
+ * - `close` is the authoritative native item: it replaces the streamed
+ *   prefix outright and the Partial bytes are never concatenated into it.
+ *
+ * An Append's envelope carries only the new blocks; its outcome / exit code /
+ * structured result / changes are not emitted, so a Partial must keep whatever
+ * a preceding Replace already established (known-else-previous, as in
+ * live/supersede.ts's tier merge), never blank them out.
+ */
+function appendBlocks(current: ContentBlock[], next: ContentBlock[]): ContentBlock[] {
+  const blocks = current.slice();
+  const appended = next
+    .flatMap((block) => (block.type === "text" ? [block.text] : []))
+    .join("");
+  if (appended) {
+    const last = blocks.length - 1;
+    if (blocks[last]?.type === "text") {
+      blocks[last] = { type: "text", text: blocks[last].text + appended };
+    } else {
+      blocks.push({ type: "text", text: appended });
+    }
+  }
+  // New non-text blocks (image/file/resource/opaque) are kept after the text.
+  for (const block of next) {
+    if (block.type !== "text") blocks.push(block);
+  }
+  return blocks;
+}
+
+/** A known knowledge value wins; otherwise the previously established one stands. */
+function knownElse<T>(next: T & { state?: string }, current: T & { state?: string }): T {
+  return next.state === "known" ? next : current;
+}
+
+function mergeToolResult(current: ToolResultPayload | null, next: ToolResultPayload): ToolResultPayload {
+  if (next.operation !== "append" || !current) return next;
+  return {
+    ...next,
+    blocks: appendBlocks(current.blocks, next.blocks),
+    // The Partial envelope does not emit these; hold what a prior Replace
+    // established rather than resetting to unknown / empty.
+    exitCode: knownElse(next.exitCode, current.exitCode),
+    structuredResult: knownElse(next.structuredResult, current.structuredResult),
+    outcome: next.outcome === "unknown" ? current.outcome : next.outcome,
+    changes: next.changes.length > 0 ? next.changes : current.changes,
+  };
+}
+
 function messageBlocks(current: ContentBlock[], next: ContentBlock[], operation: NodeMutation["operation"], target: number | null): ContentBlock[] {
   if (operation === "close" && next.length === 0) return current;
   if (operation !== "append") return next;
@@ -276,6 +447,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   const messages = assembleMessages(events, anchors);
   const thoughts = new Map<string, { mutation: NodeMutation; node: Extract<TranscriptNode, { type: "thought" }> }>();
   const tools = new Map<string, ToolNode>();
+  // One applied revision per node, shared by the call and result tracks
+  // (protocol.md §5.2); see NodeBaselines.
+  const toolBaselines = new NodeBaselines();
   const workflows = new Map<
     string,
     { type: "workflow"; id: string; run: WorkflowRunPayload; phases: WorkflowPhasePayload[]; members: WorkflowMemberPayload[] }
@@ -339,7 +513,8 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       const call = ev.payload;
       const name = knowledgeValue(call.toolName) ?? "tool";
       const existing = tools.get(call.toolCallId);
-      if (!newerMutation(call, existing?.call)) continue;
+      if (!toolBaselines.accepts(call, call.toolCallId, "call")) continue;
+      toolBaselines.set(call, call.toolCallId, "call");
       const agentId = knowledgeValue(ev.source.nativeAgentId) ?? existing?.agentId;
       const node: ToolNode = {
         type: "tool",
@@ -374,10 +549,14 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       const result = ev.payload;
       const existing = tools.get(result.toolCallId);
       if (existing) {
-        if (!newerMutation(result, existing.result ?? undefined)) continue;
-        existing.result = result;
-        existing.diffState = diffState(existing.call, result, ev.completeness);
-        if (ev.completeness === "partial") existing.completeness = "partial";
+        if (!toolBaselines.accepts(result, result.toolCallId, "result")) continue;
+        toolBaselines.set(result, result.toolCallId, "result");
+        existing.result = mergeToolResult(existing.result, result);
+        existing.diffState = diffState(existing.call, existing.result, ev.completeness);
+        // A streamed Partial marks the card incomplete (ui-spec §3.3); the
+        // structured Final settles it as a normal card — the latch must not
+        // survive the Close that just replaced the streamed prefix.
+        existing.completeness = ev.completeness;
       }
       continue;
     }

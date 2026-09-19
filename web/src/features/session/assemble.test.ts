@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { MessagePayload, Observation, ToolCallPayload } from "../../types/observation";
+import type { MessagePayload, Observation, ToolCallPayload, ToolResultPayload } from "../../types/observation";
 import type { WorkflowRunPayload } from "../../types/generated";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState, isToolFailure, type TranscriptNode } from "./assemble";
+import print3TurnFixture from "../../../../crates/remuda/tests/fixtures/journal-parity/print-3turn.json";
+import pty3TurnFixture from "../../../../crates/remuda/tests/fixtures/journal-parity/pty-3turn.json";
 
 function obs(seq: number, kind: Observation["kind"], payload: unknown): Observation {
   return {
@@ -263,6 +265,527 @@ describe("assembleTranscript", () => {
     expect(wf?.type === "workflow" && wf.phases[0]?.label.state === "known" && wf.phases[0].label.value).toBe("compile");
     const opaque = nodes.find((n) => n.type === "opaque");
     expect(opaque?.type === "opaque" && opaque.kind).toBe("rate_limit_event");
+  });
+});
+
+describe("assembleTranscript · streamed grok tool-result partials", () => {
+  /**
+   * The real grok producer sequence (grok_terminal.rs, c-grok-stdout): the
+   * driver sequences every mutation on a node through ONE per-node counter
+   * (protocol.md §5.2) — the Proposed Open is 1, the Running Replace 2, each
+   * Partial Append takes the next revision, a second progress Replace
+   * follows on the SAME counter, and the Final Close lands one above the
+   * last mutation. nodeId === toolCallId: call and result share one node.
+   */
+  const NODE = "call_42" as Id;
+
+  function callMutation(
+    seq: number,
+    revision: number,
+    operation: "open" | "replace",
+    state: "proposed" | "running" = "running",
+    baseRevision?: number,
+  ): Observation {
+    return obs(seq, "tool_call", {
+      nodeId: NODE,
+      revision: String(revision),
+      operation,
+      baseRevision: operation === "open" ? null : String(baseRevision ?? revision - 1),
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("run_terminal_command"),
+      displayTitle: known(operation === "open" ? "run_terminal_command" : "Execute `printf`"),
+      category: "shell",
+      input: known(operation === "open" ? {} : { command: "printf 'one\\ntwo\\nthree\\n'" }),
+      inputTextDelta: null,
+      state: operation === "open" ? state : "running",
+      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+    });
+  }
+
+  function resultMutation(
+    seq: number,
+    revision: number,
+    operation: "append" | "replace" | "close",
+    blocks: { type: "text"; text: string }[],
+    extra: { stage?: "partial" | "final"; baseRevision?: number; outcome?: string; exitCode?: number } = {},
+  ): Observation {
+    const stage = extra.stage ?? (operation === "close" ? "final" : "partial");
+    // The real producer: a terminal-log tail is a partial-envelope
+    // observation; the terminal frame is structured.
+    const event = obs(seq, "tool_result", {
+      nodeId: NODE,
+      revision: String(revision),
+      operation,
+      baseRevision: extra.baseRevision === undefined ? String(revision - 1) : String(extra.baseRevision),
+      toolCallId: NODE,
+      stage,
+      outcome: extra.outcome ?? (stage === "final" ? "succeeded" : "unknown"),
+      blocks,
+      structuredResult: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      exitCode: extra.exitCode === undefined
+        ? { state: "unknown", reason: "not-emitted", evidenceEventIds: [] }
+        : known(extra.exitCode),
+      changes: [],
+    });
+    event.completeness = stage === "final" ? "structured" : "partial";
+    return event;
+  }
+
+  function toolText(events: Observation[]): string {
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    if (!node || node.type !== "tool") throw new Error("tool node missing");
+    return (node.result?.blocks ?? [])
+      .map((block) => (block.type === "text" ? block.text : ""))
+      .join("\n");
+  }
+
+  const realSequence: Observation[] = [
+    callMutation(1, 1, "open", "proposed"),
+    callMutation(2, 2, "replace"),
+    resultMutation(3, 3, "append", [{ type: "text", text: "$ printf 'one\\ntwo\\nthree\\n'\n" }]),
+    // A second statusless progress frame replaces on the CALL track at the
+    // next shared revision — a per-track baseline would reject the Partial
+    // whose base is this revision and freeze the card.
+    callMutation(4, 4, "replace"),
+    resultMutation(5, 5, "append", [{ type: "text", text: "one\n" }]),
+  ];
+
+  it("accepts a Partial Append whose base is a call-track revision and accumulates byte fragments", () => {
+    // After the first Partial (revision 3) the streamed prefix is visible.
+    expect(toolText(realSequence.slice(0, 3))).toBe("$ printf 'one\\ntwo\\nthree\\n'\n");
+    // After the second Running Replace (4) and its Partial Append (5), the
+    // fragment concatenates with NO separator: it is a raw byte stream, and
+    // joining with "\n" would double the embedded newline.
+    expect(toolText(realSequence)).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+    const node = assembleTranscript(realSequence).find((n) => n.type === "tool")!;
+    expect(node.type === "tool" && node.call.state).toBe("running");
+    expect(node.type === "tool" && node.result?.stage).toBe("partial");
+    // Streamed partials carry the partial envelope: the card renders as
+    // 不完整 until the Final settles it (ui-spec §3.3).
+    expect(node.type === "tool" && node.completeness).toBe("partial");
+  });
+
+  it("makes the Final Close authoritative: streamed bytes are never concatenated into it", () => {
+    const finalResult = resultMutation(
+      6,
+      6,
+      "close",
+      [{ type: "text", text: "one\ntwo\nthree\n" }],
+      { stage: "final", outcome: "succeeded", exitCode: 0 },
+    );
+    const text = toolText([...realSequence, finalResult]);
+    expect(text).toBe("one\ntwo\nthree\n");
+    expect(text).not.toContain("$ printf");
+    expect(text.match(/one/g)).toHaveLength(1);
+    const node = assembleTranscript([...realSequence, finalResult]).find((n) => n.type === "tool")!;
+    expect(node.type === "tool" && node.result?.stage).toBe("final");
+    expect(node.type === "tool" && node.result?.outcome).toBe("succeeded");
+    // The structured Final clears the partial marker (no lingering 不完整).
+    expect(node.type === "tool" && node.completeness).toBe("structured");
+  });
+
+  it("is stable under redelivery (re-follow): duplicate frames change nothing", () => {
+    const finalResult = resultMutation(7, 6, "close", [{ type: "text", text: "one\ntwo\nthree\n" }], {
+      stage: "final",
+      outcome: "succeeded",
+      exitCode: 0,
+    });
+    const events = [...realSequence, finalResult];
+    expect(toolText([...events, ...events])).toBe(toolText(events));
+    expect(toolText([...events, finalResult])).toBe(toolText(events));
+  });
+
+  it("resets accumulated text when a rotated log republishes as Replace, then appends after it", () => {
+    const events = [
+      ...realSequence,
+      // Rotation: the tail restarted at byte zero; the Partial Replace
+      // carries the complete new content.
+      resultMutation(6, 6, "replace", [{ type: "text", text: "fresh head\n" }], { stage: "partial" }),
+      resultMutation(7, 7, "append", [{ type: "text", text: "fresh tail" }], { stage: "partial" }),
+    ];
+    expect(toolText(events)).toBe("fresh head\nfresh tail");
+  });
+
+  it("keeps facts established by an earlier Replace when a Partial Append omits them", async () => {
+    const { assembleTranscript } = await import("./assemble");
+    // A Replace established the exit code/outcome/structured result; the later
+    // Partial Append envelope does not emit them (unknown / empty). They must
+    // survive rather than be blanked (known-else-previous).
+    const partialAppend = obs(4, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "4",
+      baseRevision: "3",
+      operation: "append",
+      stage: "partial",
+      outcome: "unknown",
+      blocks: [{ type: "text", text: "more\n" }],
+      structuredResult: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      exitCode: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      changes: [],
+    });
+    const events = [
+      callMutation(1, 1, "open", "proposed"),
+      callMutation(2, 2, "replace"),
+      obs(3, "tool_result", {
+        nodeId: NODE,
+        toolCallId: NODE,
+        revision: "3",
+        baseRevision: "2",
+        operation: "replace",
+        stage: "partial",
+        outcome: "succeeded",
+        blocks: [{ type: "text", text: "first\n" }],
+        structuredResult: known({ done: true }),
+        exitCode: known(7),
+        changes: [],
+      }),
+      partialAppend,
+    ];
+    const node = assembleTranscript(events).find((n): n is Extract<TranscriptNode, { type: "tool" }> => n.type === "tool");
+    expect(node).toBeTruthy();
+    const result = node!.result!;
+    expect((result.exitCode as { value?: number }).value).toBe(7);
+    expect(result.outcome).toBe("succeeded");
+    expect((result.structuredResult as { value?: { done: boolean } }).value).toEqual({ done: true });
+    expect(toolText(events)).toBe("first\nmore\n");
+  });
+
+  it("rejects out-of-order and duplicate mutations", () => {
+    // The Final Close landed at revision 6…
+    const finalResult = resultMutation(6, 6, "close", [{ type: "text", text: "one\ntwo\nthree\n" }], {
+      stage: "final",
+      outcome: "succeeded",
+      exitCode: 0,
+    });
+    const settled = [...realSequence, finalResult];
+    // …a late Partial Append (gap replay) with an older base cannot extend it.
+    const lateAppend = resultMutation(7, 5, "append", [{ type: "text", text: "LATE" }], {
+      stage: "partial",
+      baseRevision: 4,
+    });
+    expect(toolText([...settled, lateAppend])).toBe("one\ntwo\nthree\n");
+    // An older snapshot Replace cannot roll the node back.
+    const oldReplace = resultMutation(8, 3, "replace", [{ type: "text", text: "OLD" }], {
+      stage: "partial",
+      baseRevision: 2,
+    });
+    expect(toolText([...settled, oldReplace])).toBe("one\ntwo\nthree\n");
+    // An Append whose declared base is not the applied revision is dropped,
+    // even when its revision number happens to be newer.
+    const wrongBase = resultMutation(9, 9, "append", [{ type: "text", text: "WRONG" }], {
+      stage: "partial",
+      baseRevision: 2,
+    });
+    expect(toolText([...realSequence, wrongBase])).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+    // A duplicate Append (same revision/base, re-delivered) applies once.
+    const duplicate = resultMutation(10, 5, "append", [{ type: "text", text: "one\n" }]);
+    expect(toolText([...realSequence, duplicate])).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+    // A duplicate Close is idempotent: the Final stays exactly the Final.
+    expect(toolText([...settled, finalResult])).toBe("one\ntwo\nthree\n");
+  });
+
+  it("applies the cross-track Close at the call's revision but rejects a duplicate result Close", () => {
+    // The promoted-claude print path journals the call and result on the SAME
+    // node: the call closes at rev 2, then the result closes at rev 2. The
+    // cross-track result Close must apply (it carries the exit code), but a
+    // re-delivered result Close at the same revision must not overwrite it.
+    const callClose = (seq: number) => obs(seq, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "sleep 15" }),
+      inputTextDelta: null,
+      state: "proposed",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+    });
+    const exitClose = (seq: number, exitCode: number | undefined) => obs(seq, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "unknown", reason: "n/a", evidenceEventIds: [] },
+      exitCode: exitCode === undefined ? { state: "unknown", reason: "n/a" } : known(exitCode),
+      changes: [],
+    });
+    const base = [callMutation(1, 1, "open", "proposed"), callClose(2), exitClose(3, 0)];
+    const node = assembleTranscript(base).find((n) => n.type === "tool")!;
+    expect(node.result?.stage).toBe("final");
+    expect((node.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+    // A thinner re-delivery (no exit code) at the same revision is rejected —
+    // the exit-bearing Final survives.
+    const withRedelivery = [...base, exitClose(4, undefined)];
+    const node2 = assembleTranscript(withRedelivery).find((n) => n.type === "tool")!;
+    expect((node2.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+  });
+
+  it("applies a call Close arriving after a result Close at the same revision (resolved input)", () => {
+    // Print-stream shape: the input-resolving call Close and the result Close
+    // can share a revision, and the call Close may arrive second. The
+    // same-revision allowance is one Close per track, so it still applies.
+    const exitClose = obs(3, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "unknown", reason: "n/a", evidenceEventIds: [] },
+      exitCode: known(0),
+      changes: [],
+    });
+    const callClose = (seq: number) => obs(seq, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "echo resolved" }),
+      inputTextDelta: null,
+      state: "proposed",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+    });
+    // Result Close first, call Close second.
+    const node = assembleTranscript([callMutation(1, 1, "open", "proposed"), exitClose, callClose(4)])
+      .find((n) => n.type === "tool")!;
+    expect((node.call.input as { value?: { command: string } }).value?.command).toBe("echo resolved");
+    expect((node.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+    // A second call Close at the same revision is still rejected (duplicate).
+    const node2 = assembleTranscript([callMutation(11, 1, "open", "proposed"), exitClose, callClose(12), callClose(13)])
+      .find((n) => n.type === "tool")!;
+    expect((node2.call.input as { value?: { command: string } }).value?.command).toBe("echo resolved");
+  });
+
+  it("rejects an Append that arrives before its base even after a newer frame", () => {
+    // Revisions 1..5 applied, then an Append at 4 (base 3) replays late: its
+    // base is below the applied baseline and it must not attach.
+    const events = [
+      ...realSequence,
+      resultMutation(6, 4, "append", [{ type: "text", text: "HOLE" }], {
+        stage: "partial",
+        baseRevision: 3,
+      }),
+    ];
+    expect(toolText(events)).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+  });
+
+  it("keeps an independent result node (the claude tool_result_id shape) on its own counter", () => {
+    // Producers that journal the result on a different node open it at
+    // revision 1 even though the call node is already at revision 4.
+    const events = [
+      callMutation(1, 1, "open", "proposed"),
+      callMutation(2, 2, "replace"),
+      callMutation(4, 4, "replace"),
+      obs(10, "tool_result", {
+        nodeId: "call_42:result" as Id,
+        revision: "1",
+        operation: "close",
+        baseRevision: null,
+        toolCallId: NODE,
+        stage: "final",
+        outcome: "succeeded",
+        blocks: [{ type: "text", text: "/workspace" }],
+        structuredResult: { state: "known", value: { ok: true } },
+        exitCode: known(0),
+        changes: [],
+      }),
+    ];
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    expect(node?.type === "tool" && node.result?.outcome).toBe("succeeded");
+    expect(toolText(events)).toBe("/workspace");
+  });
+
+  // A result on a chosen node. The promoted path projects one tool result from
+  // two channels on different nodes with different revisions/facts.
+  const resultOn = (
+    seq: number,
+    nodeId: Id,
+    revision: string,
+    operation: ToolResultPayload["operation"],
+    extra: Partial<ToolResultPayload>,
+  ) =>
+    obs(seq, "tool_result", {
+      nodeId,
+      toolCallId: NODE,
+      revision,
+      baseRevision: null,
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "not-applicable" },
+      exitCode: { state: "not-applicable" },
+      changes: [],
+      ...extra,
+      operation,
+    });
+
+  const exitOf = (events: Observation[]): unknown => {
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    return node?.type === "tool" ? (node.result?.exitCode as { value?: unknown } | undefined)?.value : undefined;
+  };
+  const outcomeOf = (events: Observation[]): string | undefined => {
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    return node?.type === "tool" ? node.result?.outcome : undefined;
+  };
+
+  it("keeps the hook's exit-code Close over a later transcript Open on another node, in either order", () => {
+    // The hook relay closes the result ON THE CALL NODE at revision 2 WITH the
+    // exit code; the transcript pump opens a result on a SEPARATE node at
+    // revision 1 WITHOUT an exit code. The cross-node result floor keeps the
+    // higher-revision exit-bearing result whichever arrives first.
+    const callNode = NODE;
+    const resultNode = "call_42:result" as Id;
+    const hookClose = resultOn(3, callNode, "2", "close", {
+      baseRevision: "1",
+      exitCode: known(0),
+      blocks: [{ type: "text", text: "done" }],
+    });
+    const transcriptOpen = resultOn(4, resultNode, "1", "open", {
+      exitCode: { state: "not-applicable" },
+    });
+    // Hook close first, then the late transcript open.
+    const callEvents = [
+      callMutation(1, 1, "open", "proposed"),
+      callMutation(2, 2, "replace"),
+      hookClose,
+      transcriptOpen,
+    ];
+    expect(exitOf(callEvents)).toBe(0);
+    // Transcript open first (arrives before the hook close): the open stands
+    // provisionally, then the higher-revision close wins.
+    const reversed = [
+      callMutation(11, 1, "open", "proposed"),
+      callMutation(12, 2, "replace"),
+      transcriptOpen,
+      hookClose,
+    ];
+    expect(exitOf(reversed)).toBe(0);
+  });
+
+  it("lets a revision-5 task-notification outrank a revision-4 SubagentStop close, in either order", () => {
+    // Shared-revision convention across channels (live.rs): the SubagentStop
+    // completion closes at rev 4 (succeeded); the transcript
+    // `<task-notification>` is the authoritative status and closes at rev 5
+    // (killed). Killed must win regardless of journal arrival order.
+    const callNode = NODE;
+    const subagentStop = resultOn(3, callNode, "4", "close", {
+      baseRevision: "3",
+      stage: "partial",
+      outcome: "succeeded",
+    });
+    const notification = resultOn(4, "call_42:result" as Id, "5", "close", {
+      baseRevision: "4",
+      outcome: "cancelled",
+      blocks: [{ type: "text", text: "killed" }],
+    });
+    const outcomeOfInner = outcomeOf;
+    expect(outcomeOfInner([callMutation(1, 1, "open", "proposed"), callMutation(2, 2, "replace"), subagentStop, notification]))
+      .toBe("cancelled");
+    expect(outcomeOfInner([callMutation(11, 1, "open", "proposed"), callMutation(12, 2, "replace"), notification, subagentStop]))
+      .toBe("cancelled");
+  });
+
+  it("accepts the hook orphan result Close at revision 1 after the call node closed higher", () => {
+    // PreToolUse was missed: the record mapper closes the call node at
+    // revision 2 (open 1 / close 2), then the hook relay emits the orphan
+    // result Close at revision 1 on the SAME node WITH the exit code
+    // (live.rs orphan branch: "(U64(1), None, Final)"). The per-track
+    // monotonicity lets the result track open at 1 even though the call track
+    // is at 2 — gating on the shared node revision would leave the card
+    // stuck "running" with no exit.
+    const callOpen = obs(1, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "ls" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "1",
+      baseRevision: null,
+      operation: "open",
+    });
+    const callClose = obs(2, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "ls" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+    });
+    const orphanResult = obs(3, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "1",
+      baseRevision: null,
+      operation: "close",
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      exitCode: known(0),
+      changes: [],
+    });
+    const node = assembleTranscript([callOpen, callClose, orphanResult]).find((n) => n.type === "tool")!;
+    expect(node.result?.stage).toBe("final");
+    expect((node.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+  });
+});
+
+describe("assembleTranscript · journal-parity fixtures", () => {
+  // Drive the landed record/hook parity fixtures (the exact producer shapes)
+  // through the assembler rather than hand-typing copies. The fixtures hold
+  // raw observation objects under `events` (journal dump) or `observations`
+  // (snapshot), depending on source.
+  const asObservations = (fixture: unknown): Observation[] => {
+    const o = fixture as { events?: Observation[]; observations?: Observation[] };
+    return o.events ?? o.observations ?? [];
+  };
+  const firstTool = (events: Observation[]) =>
+    assembleTranscript(events).find(
+      (n): n is Extract<TranscriptNode, { type: "tool" }> => n.type === "tool" && n.result?.stage === "final",
+    );
+
+  it("print-3turn: result rev 1 on a call node at rev 3 keeps the exit code", () => {
+    // call open 1 / append 2 / replace 3, then tool_result rev 1 open on the
+    // SAME node carrying exit code 0 (record mapper shape).
+    const tool = firstTool(asObservations(print3TurnFixture));
+    expect(tool, "expected a settled tool in print-3turn").toBeTruthy();
+    expect((tool!.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+  });
+
+  it("pty-3turn: result rev 1 open alongside call rev 1 keeps the exit code", () => {
+    // call open 1 plus tool_result rev 1 open on the same node, exit 0.
+    const tool = firstTool(asObservations(pty3TurnFixture));
+    expect(tool, "expected a settled tool in pty-3turn").toBeTruthy();
+    expect((tool!.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
   });
 });
 

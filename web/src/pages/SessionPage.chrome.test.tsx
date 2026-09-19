@@ -136,9 +136,20 @@ it("the collapsed trigger advertises the exact number of fields it reveals (desk
   expect(advertised()).toBe(renderedFields());
 });
 
-it("compact renders provenance/promotion exactly once, inside the disclosure", () => {
-  
-  const withMarks = { ...grokInstance, launchedBy: "remuda" as const };
+it.each([
+  // Crowded phone (390px): every layout query matches.
+  ["crowded phone", () => true],
+  // Coarse-pointer compact-but-wide (e.g. 900×600): the workbench compact
+  // query matches but the 640px crowded one does not — mobile is true,
+  // crowded is false, and the badges must still render once in the
+  // disclosure rather than twice.
+  ["coarse compact-but-wide", (query: string) => !query.includes("640")],
+])("compact (%s) renders provenance and promotion exactly once, inside the disclosure", (_label, matchesFor) => {
+  const withMarks = {
+    ...grokInstance,
+    launchedBy: "remuda" as const,
+    mode: "promoted" as const,
+  };
   vi.spyOn(store, "useHub").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
@@ -146,13 +157,18 @@ it("compact renders provenance/promotion exactly once, inside the disclosure", (
     events: { [withMarks.id]: [] },
   });
   mockViewportState.mobile = true;
-  stubMatchMedia(() => true);
-  renderPage();
+  stubMatchMedia(matchesFor);
+  const result = renderPage();
 
-  // One node, in the disclosure — not the CSS-hidden duplicate the old row
-  // rendered.
+  // Exactly one of each badge, and it lives in the disclosure — never a
+  // CSS-hidden main-row duplicate plus a second disclosure node.
   expect(screen.getAllByTestId("launched-by")).toHaveLength(1);
-  expect(screen.getByTestId("run-details")).toContainElement(screen.getByTestId("launched-by"));
+  expect(screen.getAllByTestId("promoted-badge")).toHaveLength(1);
+  const details = screen.getByTestId("run-details");
+  expect(details).toContainElement(screen.getByTestId("launched-by"));
+  expect(details).toContainElement(screen.getByTestId("promoted-badge"));
+
+  result.unmount();
 });
 
 it("remembers the run-details open state on this device across remounts", async () => {

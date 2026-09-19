@@ -124,6 +124,22 @@ pub fn runtime_socket_root() -> std::io::Result<PathBuf> {
     remuda_signal::runtime_dir::per_user_runtime_dir()
 }
 
+/// All secured per-user runtime directory candidates, in preference order.
+///
+/// Test fixtures walk these to pick the first under which their full socket
+/// address fits, the same way [`place_token_broker_socket`] chooses.
+pub fn runtime_socket_candidates() -> std::io::Result<Vec<PathBuf>> {
+    Ok(remuda_signal::runtime_dir::runtime_dir_candidates(
+        remuda_signal::runtime_dir::current_uid(),
+    ))
+}
+
+/// The platform's usable `sockaddr_un.sun_path` length, in bytes.
+#[must_use]
+pub fn runtime_socket_limit() -> usize {
+    remuda_signal::runtime_dir::SUN_PATH_LIMIT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

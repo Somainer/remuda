@@ -485,8 +485,11 @@ pub fn unlink_resolved_socket_link(link: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// The effective user id of this process; used to name and verify per-user
+/// runtime directories. Exposed for callers (test fixtures) that enumerate
+/// candidates themselves.
 #[cfg(unix)]
-fn current_uid() -> u32 {
+pub fn current_uid() -> u32 {
     nix::unistd::geteuid().as_raw()
 }
 

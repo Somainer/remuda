@@ -26,7 +26,8 @@ pub mod user;
 
 pub use overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
 pub use runtime_dir::{
-    instance_sockets_would_redirect, place_token_broker_socket, runtime_socket_root,
+    instance_sockets_would_redirect, place_token_broker_socket, runtime_socket_candidates,
+    runtime_socket_limit, runtime_socket_root,
 };
 pub use session::{HookSession, HookSessionOptions};
 pub use shadow::{

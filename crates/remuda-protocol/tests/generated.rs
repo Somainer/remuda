@@ -148,6 +148,10 @@ fn public_wire_types_are_registered_for_generation() {
         // D-045 §6.2: producer-side outcome of staging a tool-result image
         // through the object route; a mapper error, never serialized.
         "ToolMediaError",
+        // D-045 §6.2: producer-side fold output and per-image staging
+        // outcome used to scrub the sidecar; never serialized on the wire.
+        "ImageOutcome",
+        "FoldedToolResult",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

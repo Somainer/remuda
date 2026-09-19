@@ -91,7 +91,19 @@ async function clearApprovals(page: Page, instanceId: string) {
 }
 
 async function openModelList(page: Page) {
-  await page.keyboard.press("Escape").catch(() => undefined);
+  // D-042: Escape from the focused composer during a still-running turn opens
+  // the in-app 打断 Sheet (there is no native dialog to auto-dismiss). Only
+  // send the defensive Escape when no interrupt Sheet is already up (a timed
+  // wait misses a late mount under gate load), then clear any Sheet it
+  // surfaces before clicking the chip so its scrim cannot intercept.
+  if ((await page.getByTestId("composer-interrupt").count()) === 0) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+  }
+  const strayConfirm = page.getByTestId("composer-confirm");
+  if (await strayConfirm.count()) {
+    await strayConfirm.getByTestId("composer-confirm-cancel").click();
+    await expect(strayConfirm).toHaveCount(0);
+  }
   await page.getByTestId("model-effort-chip").click();
   const open = page.getByTestId("effort-open-list");
   await open.waitFor({ state: "visible", timeout: 10_000 });

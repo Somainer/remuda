@@ -489,11 +489,11 @@ test("composer queue / steer / interrupt states on a working native session", as
   await shot(page, "native-pty-web-1-composer-working-400.png");
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.getByTestId("composer-input").fill("jump now");
-  page.once("dialog", (dialog) => {
-    expect(dialog.message()).toContain("插队");
-    void dialog.accept();
-  });
   await steer.click();
+  // D-042: the steer gesture confirms through the in-app Sheet, not
+  // window.confirm.
+  await expect(page.getByTestId("composer-confirm-title")).toHaveText("插队发送");
+  await page.getByTestId("composer-confirm-ok").click();
   await expect
     .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
     .toBeTruthy();
@@ -515,12 +515,12 @@ test("composer queue / steer / interrupt states on a working native session", as
     timeout: 10_000,
   });
   await expect(page.getByTestId("composer-interrupt")).toBeEnabled({ timeout: 10_000 });
-  page.once("dialog", (dialog) => {
-    expect(dialog.message()).toContain("打断");
-    void dialog.accept();
-  });
   await page.getByTestId("composer-input").focus();
   await page.keyboard.press("Escape");
+  // D-042: Esc opens the in-app Sheet confirm; Esc inside it cancels, so
+  // press the destructive action explicitly.
+  await expect(page.getByTestId("composer-confirm-title")).toHaveText("打断当前 turn");
+  await page.getByTestId("composer-confirm-ok").click();
   await expect
     .poll(() => commands.some((c) => c.operation === "instance.cancel"))
     .toBeTruthy();

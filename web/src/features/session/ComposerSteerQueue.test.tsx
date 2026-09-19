@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { Composer, type HeldItem } from "./Composer";
@@ -118,5 +118,40 @@ describe("Composer 插队发送 per-queued-row control", () => {
     expect(chips[1]).toHaveTextContent("第 2 条");
     expect(chips[1]).toHaveTextContent("queued beta");
     expect(chips[2]).toHaveTextContent("原生");
+  });
+});
+
+describe("Composer mobile (D-042): the three-state controls stay outside the options sheet", () => {
+  it("renders steer/interrupt/primary on the collapsed bar while options move into the sheet", () => {
+    render(
+      <Composer
+        instanceId="ins_steerq_m"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap() })}
+        held={held}
+        onSteerHeld={vi.fn()}
+        onRetractHeld={vi.fn()}
+      />,
+    );
+    // D-028a: three-state buttons and the queue chip are never options.
+    expect(screen.getByTestId("composer-steer")).toBeVisible();
+    expect(screen.getByTestId("composer-interrupt")).toBeVisible();
+    expect(screen.getByTestId("composer-queue")).toBeVisible();
+    expect(screen.getByTestId("composer-queued-row")).toBeVisible();
+    expect(screen.getByTestId("composer-queue-status")).toBeVisible();
+    // Per-row 插队发送 stays on the queue chips outside the sheet.
+    expect(screen.getAllByTestId("composer-queued-steer")).toHaveLength(2);
+    // The sheet is closed and contains none of the three-state controls.
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+    // Open the sheet: option-only controls are in there.
+    fireEvent.click(screen.getByTestId("model-effort-chip"));
+    const sheet = screen.getByTestId("composer-options-sheet");
+    expect(sheet).toBeVisible();
+    for (const id of ["composer-steer", "composer-interrupt", "composer-queue", "composer-queued-row"]) {
+      expect(sheet.querySelector(`[data-testid='${id}']`)).toBeNull();
+    }
   });
 });

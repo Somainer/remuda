@@ -154,15 +154,16 @@ test.describe("composer control bar and effort", () => {
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     if (mobile) {
-      // D-042: on phones the harness/permission controls ride inside the
-      // options sheet; the fused trigger keeps the permission word + effort
-      // tier and the context chip stays on the collapsed bar.
+      // D-042: on phones the harness/context/permission controls ride inside
+      // the options sheet; the collapsed trigger keeps the permission word +
+      // effort tier only.
       await expect(page.getByTestId("model-effort-chip")).toHaveAttribute("data-permission", "manual");
-      await expect(page.getByTestId("context-chip")).toBeVisible();
+      await expect(page.getByTestId("context-chip")).toHaveCount(0);
       await expect(page.getByTestId("harness-chip")).toHaveCount(0);
       await page.getByTestId("model-effort-chip").click();
       await expect(page.getByTestId("composer-options-sheet")).toBeVisible();
       await expect(page.getByTestId("harness-chip")).toContainText(/Claude/);
+      await expect(page.getByTestId("context-chip")).toBeVisible();
       await expect(page.getByTestId("composer-trigger-permission")).toContainText(/询问|可改|全自动|绕过/);
       await expect(page.getByTestId("permission-option-manual")).toBeVisible();
     } else {
@@ -484,28 +485,32 @@ test.describe("composer control bar and effort", () => {
     await structured.click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     await expect(page.getByTestId("model-effort-chip")).toBeVisible();
-    await expect(page.getByTestId("context-chip")).toBeVisible();
     // This fixture reports a structured-workflow capability, so SessionPage
     // provides the permission menu rather than the raw-PTY read-only label.
     if (mobile) {
-      // D-042: the harness chip and the permission control live in the
-      // options sheet; the fused trigger is the expanded anchor. The Grok
-      // fixture alternates between an editable wheel and a read-only label
-      // (same timing flake as desktop), so accept whichever one mounted.
+      // D-042: the harness chip, context chip and the permission control
+      // live in the options sheet; the fused trigger is the expanded anchor.
       const trigger = page.getByTestId("model-effort-chip");
       await expect(trigger).toHaveAttribute("aria-expanded", "false");
       await trigger.click();
       await expect(trigger).toHaveAttribute("aria-expanded", "true");
       await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
-      const editable = await page.getByTestId("permission-menu").count();
-      if (editable) {
-        await expect(page.getByTestId("permission-option-manual")).toBeVisible();
-        await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
-      } else {
-        await expect(page.getByTestId("permission-chip")).toHaveAttribute("data-readonly", "1");
-      }
+      // Context usage also lives in the sheet (dispatch plan §C default 4).
+      await expect(page.getByTestId("context-chip")).toBeVisible();
+      // The structured-workflow capability can land a tick after the page
+      // paints; poll for the editable menu instead of accepting a read-only
+      // fallback the fixture must not end in.
+      await expect
+        .poll(
+          async () => page.getByTestId("permission-menu").count(),
+          { timeout: 10_000 },
+        )
+        .toBe(1);
+      await expect(page.getByTestId("permission-option-manual")).toBeVisible();
+      await expect(page.getByTestId("permission-menu").getByRole("button")).toHaveCount(4);
     } else {
       await expect(page.getByTestId("harness-chip")).toHaveAttribute("data-readonly", "1");
+      await expect(page.getByTestId("context-chip")).toBeVisible();
       const permission = page.getByTestId("permission-chip");
       await expect(permission).toContainText("询问");
       await expect(permission).toHaveAttribute("aria-expanded", "false");

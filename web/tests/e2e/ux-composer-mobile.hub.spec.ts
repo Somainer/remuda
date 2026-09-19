@@ -202,25 +202,73 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
   await expect(page.getByTestId("composer-input")).toHaveAttribute("placeholder", "输入提示词…");
   await shot(page, "ux2026-composer-1-collapsed-390.png");
 
-  // Option-only controls are not on the collapsed bar.
+  // Option-only controls are not on the collapsed bar — including context
+  // usage, which belongs in the sheet per dispatch plan §C default 4.
   await expect(page.getByTestId("attach-file")).toHaveCount(0);
   await expect(page.getByTestId("harness-chip")).toHaveCount(0);
+  await expect(page.getByTestId("context-chip")).toHaveCount(0);
   await expect(page.getByTestId("permission-menu")).toHaveCount(0);
   // The primary three-state control stays outside.
   await expect(page.getByTestId("composer-send")).toBeVisible();
+
+  // The collapsed trigger has a ≥44px touch zone (D-038 / ui-spec §3.4),
+  // measured from the visible chip's box edges where the ::after zone
+  // extends beyond the 32px-tall label.
+  const triggerBox = await trigger.boundingBox();
+  expect(triggerBox).toBeTruthy();
+  for (const [dx, dy] of [
+    [0, -7], // 44px zone top edge (32 + 6 each side)
+    [0, 7], // bottom edge
+  ] as const) {
+    const hit = await page.evaluate(
+      ({ x, y }) => document.elementFromPoint(x, y)?.closest("[data-options-trigger='1']")?.getAttribute("data-testid"),
+      { x: (triggerBox!.x + triggerBox!.width / 2) + dx, y: (triggerBox!.y + triggerBox!.height / 2) + dy },
+    );
+    expect(hit).toBe("model-effort-chip");
+  }
 
   // Open the options sheet.
   await trigger.click();
   const sheet = page.getByTestId("composer-options-sheet");
   await expect(sheet).toBeVisible();
-  expect(sheet).toHaveAttribute("data-variant", "sheet");
+  await expect(sheet).toHaveAttribute("data-variant", "sheet");
   await expect(sheet.getByTestId("attach-file")).toBeVisible();
   await expect(sheet.getByTestId("attach-camera")).toBeVisible();
   await expect(sheet.getByTestId("attach-paste")).toBeVisible();
   await expect(sheet.getByTestId("harness-chip")).toBeVisible();
+  await expect(sheet.getByTestId("context-chip")).toBeVisible();
   await expect(sheet.getByTestId("permission-option-manual")).toBeVisible();
   await expect(sheet.getByTestId("effort-slider")).toBeVisible();
   await shot(page, "ux2026-composer-1-sheet-390.png");
+
+  // Changing a permission and the effort slider updates the collapsed summary
+  // after the sheet closes.
+  await sheet.getByTestId("permission-option-acceptEdits").click();
+  await expect(sheet).toHaveCount(0);
+  await expect(page.getByTestId("composer-trigger-permission")).toHaveText("可改文件");
+  await expect(trigger).toHaveAttribute("data-permission", "acceptEdits");
+
+  await trigger.click();
+  await expect(sheet).toBeVisible();
+  // Move the effort slider one stop with the keyboard; the collapsed summary
+  // then names the new tier (or its in-flight tag).
+  const slider = sheet.getByTestId("effort-slider");
+  const startIndex = Number(await slider.getAttribute("data-index"));
+  await slider.click();
+  await page.keyboard.press("ArrowRight");
+  await expect(slider).toHaveAttribute("data-index", String(startIndex + 1));
+  const nextTier = await slider.getAttribute("data-name");
+  await page.getByTestId("composer-options-close").click();
+  await expect(sheet).toHaveCount(0);
+  await expect(page.getByTestId("model-effort-chip-label")).toContainText(
+    new RegExp(`${nextTier}|切换中|排队中`),
+  );
+  // Focus returns to the collapsed trigger after closing the sheet.
+  await expect(trigger).toBeFocused();
+
+  // Reopen for the D-028a assertions on the working turn below.
+  await trigger.click();
+  await expect(sheet).toBeVisible();
   // D-028a: three-state controls are never options.
   expect(await sheet.getByTestId("composer-send").count()).toBe(0);
   expect(await sheet.getByTestId("composer-steer").count()).toBe(0);
@@ -274,7 +322,7 @@ test("插队 and Esc 打断 go through the Sheet confirm; the fake harness recei
   const confirm = page.getByTestId("composer-confirm");
   await expect(confirm).toBeVisible();
   await shot(page, "ux2026-composer-1-steer-confirm-390.png");
-  expect(confirm).toHaveAttribute("data-variant", "sheet");
+  await expect(confirm).toHaveAttribute("data-variant", "sheet");
   await expect(page.getByTestId("composer-confirm-title")).toHaveText("插队发送");
   await page.getByTestId("composer-confirm-cancel").click();
   await expect(confirm).toHaveCount(0);

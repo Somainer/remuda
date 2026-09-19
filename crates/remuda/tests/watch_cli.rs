@@ -4,7 +4,7 @@
 //! `--for-owner` change-driven report. Classification logic itself is covered
 //! in remuda-hub/tests/watch.rs.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, spawn};
 use serde_json::{Value, json};
@@ -42,6 +42,30 @@ where
     match tokio::time::timeout(Duration::from_secs(8), ws.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => Ok(serde_json::from_str(&text)?),
         other => Err(anyhow::anyhow!("unexpected frame {other:?}")),
+    }
+}
+
+/// Next inbound frame worth answering, or `None` once the stream closed.
+///
+/// An idle timeout is retried rather than ending the fake Node: the Hub
+/// sends nothing between `runtime.hello` and the first watch/dispatch RPC,
+/// while the CLI subprocesses before it can sit longer than the frame
+/// window on a loaded gate host. Letting the serving task exit dropped the
+/// socket and the Hub marked the host offline.
+async fn next_rpc_frame<S>(ws: &mut S) -> Option<Value>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        match tokio::time::timeout(Duration::from_secs(8), ws.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str(&text) {
+                Ok(frame) => return Some(frame),
+                Err(_) => continue,
+            },
+            Ok(Some(Ok(_))) => continue,
+            Ok(None) | Ok(Some(Err(_))) => return None,
+            Err(_) => continue,
+        }
     }
 }
 
@@ -93,10 +117,7 @@ async fn spawn_hub() -> Result<Hub> {
 
     let node_screen = screen.clone();
     let task = tokio::spawn(async move {
-        loop {
-            let Ok(frame) = recv_json(&mut node).await else {
-                break;
-            };
+        while let Some(frame) = next_rpc_frame(&mut node).await {
             // Drain scripted journal events before replying: the hub awaits
             // this reply before reading the journal tail, and sends no other
             // RPC meanwhile, so the inbound frames below are the acks.
@@ -108,7 +129,7 @@ async fn spawn_hub() -> Result<Hub> {
                 {
                     break;
                 }
-                if recv_json(&mut node).await.is_err() {
+                if next_rpc_frame(&mut node).await.is_none() {
                     break;
                 }
             }
@@ -157,8 +178,27 @@ async fn spawn_hub() -> Result<Hub> {
             }
         }
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
     let base = format!("http://{}", hub.addr);
+    let liveness = remuda_hub_client::HubClient::new(base.clone(), Some(token.clone()), None)?;
+    // Wait for the hosts index to project the live link before tests
+    // dispatch, instead of racing it with a fixed sleep; the keepalive
+    // serving loop above also keeps the host online through slow CLI
+    // subprocess sequences on a loaded gate host.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if liveness.list_hosts().await.is_ok_and(|rows| {
+                rows.iter().any(|row| {
+                    row["hostId"].as_str() == Some(host.as_str()) && row["online"] == true
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .ok()
+    .context("fake host never reported online before dispatch")?;
     Ok(Hub {
         _dir: dir,
         _hub: hub,

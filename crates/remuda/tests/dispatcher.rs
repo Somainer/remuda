@@ -66,7 +66,10 @@ async fn hub_with_dispatcher_uses_local_auth_and_sigterm_stops_both_consumers() 
         .kill_on_drop(true)
         .spawn()?;
     let exercise: Result<()> = async {
-        let address = tokio::time::timeout(Duration::from_secs(10), async {
+        // Readiness budget for a loaded gate host (shared with many worker
+        // builds), not the ~0.7 s an idle machine needs. The 20 ms poll and
+        // the early-exit check below are unchanged.
+        let address = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let text = std::fs::read_to_string(&log_path)?;
                 if text.contains("remuda dispatcher ready") {
@@ -130,7 +133,8 @@ async fn hub_with_dispatcher_uses_local_auth_and_sigterm_stops_both_consumers() 
             "SIGTERM failed"
         );
     }
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+    // Shutdown budget for the same loaded gate host.
+    let status = tokio::time::timeout(Duration::from_secs(30), child.wait())
         .await
         .context("combined mode shutdown")??;
     exercise?;

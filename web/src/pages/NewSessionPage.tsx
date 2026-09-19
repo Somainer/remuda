@@ -116,12 +116,23 @@ function newClientRequestId(): string {
 }
 
 /**
- * A 4xx (except 408) is a definite refusal the user can fix on the form.
- * Anything else — aborted connection, gateway timeout, 5xx — leaves the
- * server-side outcome unknown, and the page must not offer a second create.
+ * A refusal the user can fix (or safely retry) on the form: every 4xx except
+ * 408, plus 503 NODE_BUSY. That 503 is admitted here because the Hub refuses
+ * the call *before* a frame reaches the Node — no session can have been
+ * created, so 开始 again is safe. Anything else (aborted connection, gateway
+ * timeout, other 5xx) leaves the server-side outcome unknown, and the page
+ * must not offer a second create.
  */
 function isDefiniteFailure(err: unknown): err is HubHttpError {
-  return err instanceof HubHttpError && err.status >= 400 && err.status < 500 && err.status !== 408;
+  if (!(err instanceof HubHttpError)) return false;
+  if (err.status === 408) return false;
+  if (err.status >= 400 && err.status < 500) return true;
+  return err.status === 503 && err.code === "NODE_BUSY";
+}
+
+/** Inline failure text: machine code plus the Hub's human message. */
+function formatCreateError(err: HubHttpError): string {
+  return `${err.code} · ${err.message}`;
 }
 
 export function NewSessionPage() {
@@ -176,6 +187,14 @@ export function NewSessionPage() {
   // `error` is a definite, fixable refusal; `uncertain` means the create may
   // have reached the host and must never be automatically retried.
   const [error, setError] = useState<string | null>(null);
+  const errorRef = useRef<HTMLParagraphElement | null>(null);
+  // The alert sits at the end of the scrolling form; on a 390px sheet the
+  // keyboard-focused prompt sits at the top, so bring the failure into view
+  // (and screen-reader range) the moment it appears.
+  useEffect(() => {
+    // jsdom has no scrollIntoView; only call it where the browser provides it.
+    if (error) errorRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [error]);
   const [statusChecked, setStatusChecked] = useState(false);
   const [clientRequestId, setClientRequestId] = useState<string | null>(null);
   const [gatewayProfiles, setGatewayProfiles] = useState<ProviderProfile[]>([]);
@@ -507,8 +526,10 @@ export function NewSessionPage() {
             } catch (err) {
               if (isDefiniteFailure(err)) {
                 // Definite refusal: keep every input (and its draft) and let
-                // the user fix the form and submit once.
-                setError(err.message || "create failed");
+                // the user fix the form and submit once. The Hub's code and
+                // message stay visible inline (c-mobilenew: an opaque INTERNAL
+                // used to leave the phone with a dead 开始 button).
+                setError(formatCreateError(err));
                 setPhase("idle");
                 phaseRef.current = "idle";
               } else {
@@ -1020,7 +1041,7 @@ export function NewSessionPage() {
             ) : null}
           </div>
           {error ? (
-            <p data-testid="new-session-error" className={css.error} role="alert">
+            <p data-testid="new-session-error" className={css.error} role="alert" ref={errorRef}>
               {error}
             </p>
           ) : null}

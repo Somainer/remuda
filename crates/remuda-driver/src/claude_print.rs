@@ -82,6 +82,10 @@ pub struct ClaudePrintOptions {
     pub agent_mcp: Option<crate::agent_mcp::AgentMcpContext>,
     /// Override `--setting-sources`.
     pub setting_sources: Option<Vec<String>>,
+    /// Node-supplied stager for image content blocks a tool result carries
+    /// (D-045 §6.2). `None` (default) degrades images to text blocks; bytes
+    /// are never inlined into observations.
+    pub media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
     /// Initialize handshake timeout.
     pub handshake_timeout: Duration,
     /// Total bound for [`Driver::close`]. The ladder spends it in two equal
@@ -119,6 +123,7 @@ impl ClaudePrintOptions {
             handshake_timeout: Duration::from_secs(30),
             close_timeout: Duration::from_secs(10),
             settings_overlay_path: None,
+            media_stager: None,
         }
     }
 }
@@ -157,6 +162,9 @@ struct Mapper {
     driver_kind: DriverKind,
     /// Source channel for the same reason: `stdout` live, `transcript` on replay.
     channel: SourceChannel,
+    /// Stages image result bytes into the Hub object store (D-045 §6.2).
+    /// `None` carriers degrade every image to an honest text block.
+    media_stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
 }
 
 #[derive(Default)]
@@ -308,6 +316,7 @@ impl ClaudePrintDriver {
 
     /// [`Self::new`], stamping and launching `carrier` instead of `claude-print`.
     pub(crate) fn with_carrier(options: ClaudePrintOptions, carrier: DriverKind) -> Self {
+        let media_stager = options.media_stager.clone();
         Self {
             options,
             inner: Arc::new(Inner {
@@ -328,6 +337,7 @@ impl ClaudePrintDriver {
                     },
                     driver_kind: carrier,
                     channel: SourceChannel::Stdout,
+                    media_stager,
                 }),
                 policy: Mutex::new(PermissionPolicy::Host),
                 events: Mutex::new(None),
@@ -435,6 +445,7 @@ impl ClaudePrintDriver {
                 pin: recipe.binary.clone(),
                 driver_kind: self.carrier,
                 channel: SourceChannel::Stdout,
+                media_stager: self.options.media_stager.clone(),
             };
         }
         *self.inner.policy.lock().await = policy;
@@ -1187,11 +1198,17 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                         let (result_id, revision, operation) =
                             mapper.ids.tool_result_open(tool_use_id)?;
                         let is_error = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                        let text = match block.get("content") {
-                            Some(Value::String(s)) => s.clone(),
-                            Some(other) => other.to_string(),
-                            None => String::new(),
-                        };
+                        // Image items (an MCP screenshot, say) stage their
+                        // bytes through the Node's object endpoint and ride as
+                        // `objectId` references; unstageable ones degrade to a
+                        // text block naming media type and size. D-045 §6.2:
+                        // never inline the content array (its base64) into the
+                        // journal — the previous `to_string()` did exactly
+                        // that.
+                        let blocks = remuda_protocol::tool_result_content_blocks(
+                            block.get("content"),
+                            mapper.media_stager.as_deref(),
+                        );
                         // A backgrounded (or build-deferred) subagent's launch
                         // tool_result is written *immediately* with
                         // `toolUseResult.isAsync`; the real completion arrives
@@ -1223,7 +1240,7 @@ fn map_user(mapper: &mut Mapper, msg: &UserMessage) -> DriverResult<Vec<Observat
                                 } else {
                                     ToolOutcome::Succeeded
                                 },
-                                blocks: vec![ContentBlock::Text(Box::new(TextBlock { text }))],
+                                blocks,
                                 structured_result: match msg.tool_use_result.clone() {
                                     Some(value) => Knowledge::Known { value },
                                     None => Knowledge::NotApplicable,
@@ -2241,6 +2258,7 @@ impl StdoutMapper {
                 },
                 driver_kind: driver,
                 channel: SourceChannel::Stdout,
+                media_stager: None,
             },
         }
     }
@@ -2248,6 +2266,14 @@ impl StdoutMapper {
     /// Map one decoded stdout frame, exactly as the reader task does.
     pub fn map(&mut self, value: Value) -> DriverResult<Vec<Observation>> {
         map_outbound(&mut self.mapper, &Outbound::from_value(value))
+    }
+
+    /// Attach the tool-media stager so image result blocks become object
+    /// references instead of text fallbacks (D-045 §6.2).
+    #[must_use]
+    pub fn with_media_stager(mut self, stager: Arc<dyn remuda_protocol::ToolMediaStager>) -> Self {
+        self.mapper.media_stager = Some(stager);
+        self
     }
 
     /// Native session id the mapper has adopted from `system/init`.
@@ -2315,6 +2341,7 @@ impl TranscriptMapper {
                 },
                 driver_kind: driver,
                 channel: SourceChannel::Transcript,
+                media_stager: None,
             },
             group: records::Group::default(),
             seen_prompts: std::collections::HashSet::new(),
@@ -2330,6 +2357,17 @@ impl TranscriptMapper {
             permission: remuda_protocol::LivePermissionTracker::new(),
             permission_bridge: None,
         }
+    }
+
+    /// Attach the tool-media stager so image result blocks become object
+    /// references instead of text fallbacks (D-045 §6.2).
+    #[must_use]
+    pub(crate) fn with_media_stager(
+        mut self,
+        stager: Arc<dyn remuda_protocol::ToolMediaStager>,
+    ) -> Self {
+        self.mapper.media_stager = Some(stager);
+        self
     }
 
     /// Attach the §9.1 effort bridge so this mapper drives switch read-back and
@@ -3117,6 +3155,7 @@ pub mod review {
                     },
                     driver_kind: DriverKind::ClaudePrint,
                     channel: SourceChannel::Stdout,
+                    media_stager: None,
                 },
             }
         }
@@ -3146,6 +3185,7 @@ pub mod review {
             },
             driver_kind: DriverKind::ClaudePrint,
             channel: SourceChannel::Stdout,
+            media_stager: None,
         };
         map_outbound(&mut mapper, &frame)
     }

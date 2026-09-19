@@ -420,6 +420,7 @@ async fn pty_resume_keeps_settings_model_and_never_bare() {
 
     let driver = ClaudePtyDriver::new(ClaudePtyOptions {
         instance_id: None,
+        media_stager: None,
         profile: profile(),
         launch_dir: launch,
         native_home: home,

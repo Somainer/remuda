@@ -22,6 +22,7 @@
 
 pub mod codex_adapter;
 pub mod grok_adapter;
+pub mod grok_live;
 pub mod supervisor;
 
 use remuda_protocol::{
@@ -39,6 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use codex_adapter::CodexAdapter;
 pub use grok_adapter::GrokAdapter;
+pub use grok_live::{GrokLive, LiveIdentity};
 pub use supervisor::{AdapterCtx, spawn_file_adapters};
 
 /// One adapter-produced fact before it gets its envelope stamped.

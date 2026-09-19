@@ -1,0 +1,130 @@
+/*
+ * Phone shell for the /m* tree (D-049, ui-spec §4.7). This shell only ever
+ * mounts under the compact viewport gate, so unlike Shell.module.css there is
+ * no desktop branch here. Chromium budget: one content column plus one bottom
+ * bar — var(--bar) (64px) over var(--safe-bottom), every entry owning at least
+ * var(--touch) (44px) of hit area.
+ */
+.shell {
+  height: var(--workbench-height, 100dvh);
+  display: flex;
+  flex-direction: column;
+  background: var(--ink);
+  padding-top: env(safe-area-inset-top, 0px);
+  box-sizing: border-box;
+}
+
+.install {
+  flex: none;
+}
+
+.main {
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink);
+}
+
+.bar {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+  border-top: 1px solid var(--line);
+  background: var(--ink-0);
+  min-height: calc(var(--bar) + var(--safe-bottom));
+  padding-bottom: var(--safe-bottom);
+}
+
+.bar a,
+.bar button {
+  flex: 1 1 0;
+  min-width: var(--touch);
+  min-height: var(--touch);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0;
+  color: var(--mute);
+  background: transparent;
+  border: 0;
+  font-family: var(--font);
+  font-size: 11px;
+  position: relative;
+}
+
+.barGlyph {
+  font-family: var(--mono);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.barPlus {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--paper);
+  border-radius: var(--radius);
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: 17px;
+  color: var(--paper);
+}
+
+.barBadge {
+  position: absolute;
+  top: 6px;
+  left: calc(50% + 8px);
+  min-width: 14px;
+  height: 14px;
+  border-radius: 7px;
+  background: var(--dust);
+  color: var(--on-dust);
+  font-family: var(--mono);
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 3px;
+  box-sizing: border-box;
+}
+
+.barActive {
+  color: var(--paper);
+}
+
+.moreMenu {
+  position: fixed;
+  left: 12px;
+  right: 12px;
+  bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
+  min-width: 168px;
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 6px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.moreItem {
+  display: flex;
+  align-items: center;
+  min-height: var(--touch);
+  padding: 0 10px;
+  color: var(--paper);
+  border-radius: var(--radius);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.moreItem:hover,
+.moreItemActive {
+  background: var(--ink);
+}

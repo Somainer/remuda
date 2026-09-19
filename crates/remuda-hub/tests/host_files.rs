@@ -613,6 +613,43 @@ async fn staged_screenshot_is_typed_and_served_as_an_image() -> Result<()> {
     .await?;
     assert_eq!(status, 400);
 
+    // image/jpg is the legacy spelling of image/jpeg; it must be accepted
+    // when the magic bytes are JPEG (declared_matches, not strict equality).
+    let jpeg = [
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+    ];
+    let (status, head, body) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?name=screen.jpg&mediaType=image/jpg",
+            fixture.host_id
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        &jpeg,
+    )
+    .await?;
+    assert_eq!(status, 200, "{head}");
+    let staged = serde_json::from_str::<Value>(String::from_utf8_lossy(&body).trim())?;
+    assert!(staged["objectId"].as_str().is_some());
+
+    // An over-long / malformed media type is rejected on validation, before
+    // the bytes are inspected — the raw claim never reaches the 400 body.
+    let long_type = format!("image/{}", "x".repeat(256));
+    let (status, head, _) = raw_head(
+        fixture.addr,
+        &format!(
+            "/v1/hosts/{}/files/objects?mediaType={}",
+            fixture.host_id, long_type
+        ),
+        &fixture.node_token,
+        "application/octet-stream",
+        &png,
+    )
+    .await?;
+    assert_eq!(status, 400);
+    assert!(!head.contains(&long_type));
+
     fixture.hub.shutdown().await;
     Ok(())
 }

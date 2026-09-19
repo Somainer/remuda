@@ -123,7 +123,7 @@ pub(crate) fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> 
 }
 
 /// `image/jpeg` and `image/jpg` name the same format; everything else must match.
-fn declared_matches(declared: &str, sniffed: &str) -> bool {
+pub(crate) fn declared_matches(declared: &str, sniffed: &str) -> bool {
     let declared = media_type_essence(declared);
     if declared.is_empty() || declared == "application/octet-stream" {
         // No useful claim; the sniff stands on its own.
@@ -148,7 +148,7 @@ pub(crate) fn media_type_essence(raw: &str) -> String {
 /// well-formed tokens, length-capped. We never trust parameters and never
 /// store them. `application/octet-stream` (and an empty claim) stand for an
 /// unknown binary.
-fn accepted_file_media_type(raw: &str) -> Result<String, String> {
+pub(crate) fn accepted_file_media_type(raw: &str) -> Result<String, String> {
     let essence = media_type_essence(raw);
     if essence.is_empty() || essence == "application/octet-stream" {
         return Ok("application/octet-stream".to_owned());

@@ -159,6 +159,65 @@ describe("Transcript", () => {
     await user.keyboard("k");
     expect(container.querySelector("[data-anchor]")).toBeTruthy();
   });
+
+  it("does not rebuild row ResizeObservers on parent scroll re-renders", () => {
+    const ROW = 96;
+    const VIEW = 720;
+    const isScroller = (el: unknown) =>
+      el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? VIEW : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
+      return isScroller(this) ? 200 * ROW : 0;
+    });
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      height: ROW - 12, top: 0, left: 0, right: 0, bottom: 0, width: 0, x: 0, y: 0, toJSON() {},
+    } as DOMRect);
+
+    let observersCreated = 0;
+    const observersDisconnected = vi.fn();
+    class CountingResizeObserver {
+      constructor() {
+        observersCreated += 1;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {
+        observersDisconnected();
+      }
+    }
+    vi.stubGlobal("ResizeObserver", CountingResizeObserver);
+
+    const events = buildLongObservations({
+      instanceId: "ins_ro" as Id,
+      journalId: "obj_ro" as Id,
+      hostId: "hst_1" as Id,
+      count: 200,
+    });
+    const { unmount } = render(<Transcript events={events} compact={false} />);
+    const mountedRows = screen.getAllByTestId("transcript-row").length;
+    expect(mountedRows).toBeGreaterThan(0);
+    // StrictMode replays effects on mount, so observer count need not equal the
+    // row count; record the post-mount steady state instead.
+    const afterMount = observersCreated;
+
+    // Every scroll frame re-renders the parent (setScrollTop). Keep the deltas
+    // inside the first 96px row so the virtual window mounts exactly the same
+    // rows — any observer churn here is purely the unstable-callback defect,
+    // not virtualization mounting newly-visible rows.
+    const scroller = screen.getByTestId("transcript-scroller") as HTMLElement;
+    for (const top of [1, 2, 3, 4, 5]) {
+      (scroller as HTMLElement & { scrollTop: number }).scrollTop = top;
+      fireEvent.scroll(scroller);
+    }
+    expect(observersCreated).toBe(afterMount);
+    expect(observersDisconnected).not.toHaveBeenCalled();
+
+    unmount();
+    expect(observersDisconnected.mock.calls.length).toBeGreaterThan(0);
+    vi.unstubAllGlobals();
+  });
 });
 
 describe("Transcript search (batch E)", () => {

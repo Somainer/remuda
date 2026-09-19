@@ -1009,17 +1009,14 @@ class HubStore {
     this.hydrateModels([instance]);
     if (this.journals.has(instance.journalId)) return;
     this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: "live" } });
-    const history: Observation[] = [];
-    let afterSeq: Observation["seq"] | undefined;
-    for (;;) {
-      const page = await api.eventsRead({ journalId: instance.journalId, afterSeq, limit: 512 });
-      history.push(...page.events);
-      if (page.events.length < 512) break;
-      afterSeq = page.events[page.events.length - 1].seq;
-      if (history.length >= 8192) break;
-    }
+    // Seed from ONE bounded tail window (newest rows win). The old ascending
+    // 512-loop sliced the front of the tail, silently dropping everything
+    // below the middle of the window on a long journal. Older rows load on
+    // demand via JournalClient.loadEarlier.
+    const seed = await api.eventsRead({ journalId: instance.journalId, limit: 2000 });
     // Another mount may finish loading this journal while this read is pending.
     if (this.journals.has(instance.journalId)) return;
+    const history = seed.events;
     this.emit({
       instances: applyInstanceActivity(this.state.instances, history),
       events: { ...this.state.events, [instanceId]: history },
@@ -1043,6 +1040,7 @@ class HubStore {
       return api.eventsRead(args);
     };
     const last = history.at(-1)?.seq ?? ("0" as Observation["seq"]);
+    const seedAsOf = (Number(seed.durableSeq) >= Number(last) ? seed.durableSeq : last) as Observation["seq"];
     const client = new JournalClient(instance.journalId, read, {
       onEvents: (events) => {
         const current = this.state.events[instanceId] ?? [];
@@ -1072,6 +1070,27 @@ class HubStore {
             : this.state.screens,
         });
       },
+      onPrepend: (older) => {
+        const current = this.state.events[instanceId] ?? [];
+        const seen = new Set(current.map((e) => e.eventId));
+        const fresh = older.filter((e) => !seen.has(e.eventId));
+        if (!fresh.length) return;
+        // Load-earlier rows land above every loaded node. Merge by seq rather
+        // than trusting arrival order: assemble/Transcript anchor on it.
+        const merged = current.concat(fresh).sort((a, b) => Number(a.seq) - Number(b.seq));
+        for (const event of fresh) {
+          this.noteEffortObservation(instanceId, event);
+          this.noteEffortLifecycle(instanceId, event);
+          this.noteModelObservation(instanceId, event, false);
+          this.noteModelLifecycle(instanceId, event, false);
+          this.notePermissionObservation(instanceId, event);
+          this.notePermissionLifecycle(instanceId, event);
+        }
+        this.emit({
+          instances: applyInstanceActivity(this.state.instances, fresh),
+          events: { ...this.state.events, [instanceId]: merged },
+        });
+      },
       onStatus: (status) => {
         this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: status } });
       },
@@ -1085,22 +1104,39 @@ class HubStore {
     client.applySnapshot({
       projectionVersion: "v1",
       projectionEpoch: id("epoch_"),
-      asOfSeq: last,
+      asOfSeq: seedAsOf,
       instance: {} as Instance,
       runs: [],
       commands: [],
       pendingInteractions: [],
       nodes: [],
-      history: { earliestRetainedSeq: "1", complete: true },
+      // The seed is a bounded window: its floor is a window floor, and
+      // complete=false says older rows remain behind load-earlier. It is NOT
+      // fed as a retention floor anywhere (JournalClient uses it only as the
+      // load-earlier anchor and live-batch stale check).
+      history: { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq },
     });
-    const sub = await api.eventsSubscribe(instance.journalId, last, (batch) => {
-      const result = client.applyBatch(batch);
-      if (result.acked) void api.eventsAck(batch.subscriptionId, instance.journalId, result.acked);
-      if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
-    });
+    const sub = await api.eventsSubscribe(
+      instance.journalId,
+      last,
+      (batch) => {
+        const result = client.applyBatch(batch);
+        if (result.acked) void api.eventsAck(batch.subscriptionId, instance.journalId, result.acked);
+        if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
+      },
+      (windowFloor) => void client.fillResyncGap(windowFloor),
+    );
     this.subs.set(instance.journalId, sub.subscriptionId);
     if (Number(sub.snapshot.asOfSeq) >= Number(last)) {
-      client.applySnapshot(sub.snapshot);
+      // An EMPTY follow snapshot only says "no events past the afterSeq
+      // cursor" — it says nothing about retention below it. Preserve the REST
+      // seed's window floor/completeness instead of letting an empty snapshot
+      // reset the floor to 1 (which would hide load-earlier on a late attach).
+      const seedHistory =
+        sub.windowFromSeq === null
+          ? { earliestRetainedSeq: seed.windowFromSeq ?? "1", complete: seed.reachedAfterSeq }
+          : sub.snapshot.history;
+      client.applySnapshot({ ...sub.snapshot, history: seedHistory });
     }
     const tail = mockGappedTail(instance.journalId);
     if (tail) {
@@ -1109,10 +1145,18 @@ class HubStore {
         if (result.gap) void client.fillGap(result.gap.from, result.gap.to);
       }, 0);
     }
-    if (history.length === 0 && sub.snapshot.asOfSeq !== "0") {
-      const page = await api.eventsRead({ journalId: instance.journalId, limit: 512 });
-      this.emit({ events: { ...this.state.events, [instanceId]: page.events } });
-    }
+    // Events landing between the REST seed and the socket open arrive on the
+    // follow snapshot (filtered past `last`) and flow through applyBatch, so no
+    // second tail read is needed.
+  }
+
+  /** Fetch one window of older history for the transcript's load-earlier row. */
+  async loadEarlier(instanceId: Id) {
+    const instance = this.state.instances.find((i) => i.id === instanceId);
+    if (!instance) return null;
+    const client = this.journals.get(instance.journalId);
+    if (!client) return null;
+    return client.loadEarlier();
   }
 
   async catchup(instanceId: Id) {

@@ -22,7 +22,8 @@ function subscription(instance: Instance) {
     subscriptionId: `sub_${instance.id}`,
     journalId: instance.journalId,
     durableSeq: "1",
-    floorSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_effort_store",
@@ -52,7 +53,8 @@ async function startFollowing(idSuffix: string) {
   vi.spyOn(api, "eventsRead").mockResolvedValue({
     events: [],
     durableSeq: "1",
-    floorSeq: "1",
+    windowFromSeq: "1",
+    reachedAfterSeq: true,
   } as unknown as History);
   let deliver!: Parameters<typeof api.eventsSubscribe>[2];
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {

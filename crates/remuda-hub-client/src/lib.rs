@@ -273,15 +273,32 @@ impl HubClient {
     }
 
     /// `GET /v1/instances/{id}/journal`.
+    ///
+    /// `before_seq` is the inclusive high bound for descending below a bounded
+    /// tail window (the Hub ignores it on queries older than the
+    /// bounded-window change).
     pub async fn get_journal(
         &self,
         instance_id: &str,
         after_seq: Option<&str>,
+        before_seq: Option<&str>,
     ) -> Result<Value, ClientError> {
         let mut path = format!("/v1/instances/{instance_id}/journal");
+        let mut params: Vec<(&str, &str)> = Vec::new();
         if let Some(seq) = after_seq.filter(|s| !s.is_empty()) {
-            path.push_str("?afterSeq=");
-            path.push_str(seq);
+            params.push(("afterSeq", seq));
+        }
+        if let Some(seq) = before_seq.filter(|s| !s.is_empty()) {
+            params.push(("beforeSeq", seq));
+        }
+        if !params.is_empty() {
+            let query = params
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            path.push('?');
+            path.push_str(&query);
         }
         self.get(&path).await
     }
@@ -291,8 +308,9 @@ impl HubClient {
         &self,
         instance_id: &str,
         after_seq: Option<&str>,
+        before_seq: Option<&str>,
     ) -> Result<JournalPage, ClientError> {
-        let raw = self.get_journal(instance_id, after_seq).await?;
+        let raw = self.get_journal(instance_id, after_seq, before_seq).await?;
         Ok(serde_json::from_value(raw)?)
     }
 
@@ -621,5 +639,49 @@ mod tests {
     fn http_to_ws_rewrites_scheme() {
         assert_eq!(http_to_ws("http://127.0.0.1:9"), "ws://127.0.0.1:9");
         assert_eq!(http_to_ws("https://hub.example"), "wss://hub.example");
+    }
+
+    #[test]
+    fn journal_page_parses_old_three_key_and_new_window_shape() {
+        // A pre-window Hub answers with instanceId/durableSeq/events only.
+        // Missing metadata must default to "complete page" semantics so old
+        // Hubs keep working against the new client.
+        let old = json!({
+            "instanceId": "ins_1",
+            "durableSeq": "7",
+            "events": [{ "seq": "6" }, { "seq": "7" }],
+        });
+        let page: JournalPage = serde_json::from_value(old).expect("old page");
+        assert_eq!(page.instance_id, "ins_1");
+        assert_eq!(page.durable_seq, "7");
+        assert_eq!(page.events.len(), 2);
+        assert_eq!(page.from_seq, None);
+        assert!(page.reached_after_seq, "absent flag defaults to true");
+
+        // Bounded-window Hub adds fromSeq (nullable) and reachedAfterSeq.
+        let partial = json!({
+            "instanceId": "ins_1",
+            "durableSeq": "5000",
+            "fromSeq": "3001",
+            "reachedAfterSeq": false,
+            "events": [{ "seq": "3001" }, { "seq": "5000" }],
+        });
+        let page: JournalPage = serde_json::from_value(partial).expect("partial window");
+        assert_eq!(page.from_seq.as_deref(), Some("3001"));
+        assert!(!page.reached_after_seq);
+        assert_eq!(page.events.len(), 2);
+
+        // Empty window: fromSeq null but the range reached the cursor.
+        let empty = json!({
+            "instanceId": "ins_1",
+            "durableSeq": "5000",
+            "fromSeq": null,
+            "reachedAfterSeq": true,
+            "events": [],
+        });
+        let page: JournalPage = serde_json::from_value(empty).expect("empty window");
+        assert_eq!(page.from_seq, None);
+        assert!(page.reached_after_seq);
+        assert!(page.events.is_empty());
     }
 }

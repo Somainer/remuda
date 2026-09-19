@@ -6,8 +6,10 @@
 //! `CommandRecord` schema is diffed against the struct as it actually
 //! serializes, so neither a method nor a response field can drift unnoticed.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
 
@@ -326,4 +328,111 @@ fn overlapping_web_client_operations_exist() {
             "missing {method} {path}"
         );
     }
+}
+
+/// Minimal raw-HTTP helper: the documented JournalPage properties must match
+/// the keys the running handler actually serializes (the shape c-send's
+/// CommandRecord check pins for that record).
+async fn http_json(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Value {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read");
+    let text = String::from_utf8_lossy(&buf);
+    let (head, body) = text.split_once("\r\n\r\n").expect("http head");
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(body.trim()).expect("json body")
+}
+
+async fn login_cookie(addr: std::net::SocketAddr, bootstrap: &str) -> String {
+    let body = json!({ "bootstrapToken": bootstrap, "deviceName": "openapi-phone" }).to_string();
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "POST /v1/login HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.expect("write");
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read");
+    let text = String::from_utf8_lossy(&buf);
+    let head = text.split_once("\r\n\r\n").map_or(&*text, |(h, _)| h);
+    head.lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .and_then(|line| line.split_once(':')?.1.trim().split(';').next())
+        .expect("login set-cookie")
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn journal_page_schema_matches_the_serialized_response() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = remuda_hub::HubConfig::for_test(dir.path().join("data"));
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = remuda_hub::spawn(config).await.expect("spawn hub");
+    let cookie = login_cookie(hub.addr, &bootstrap).await;
+    let store = hub.store().expect("store");
+    let host_id = "hst_openapi_journal".to_string();
+    let instance_id = "ins_openapi_journal".to_string();
+    hub.test_insert_host(&host_id).await.expect("host");
+    store
+        .ensure_instance(host_id.clone(), instance_id.clone())
+        .await
+        .expect("instance");
+    // Two pages of seeded events force the bounded window: the tail response
+    // carries fromSeq as a string with reachedAfterSeq=false, so every
+    // documented key is present in the comparison.
+    let events: Vec<Value> = (1..=3_000)
+        .map(|n| json!({ "kind": "message", "payload": { "text": "x", "n": n } }))
+        .collect();
+    for chunk in events.chunks(512) {
+        store
+            .append_journal_batch(host_id.clone(), instance_id.clone(), None, chunk.to_vec())
+            .await
+            .expect("seed");
+    }
+
+    let serialized: BTreeSet<String> = http_json(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}/journal"),
+        &[("Cookie", &cookie)],
+    )
+    .await
+    .as_object()
+    .expect("response is an object")
+    .keys()
+    .cloned()
+    .collect();
+
+    let schema = &spec()["components"]["schemas"]["JournalPage"];
+    let documented: BTreeSet<String> = schema["properties"]
+        .as_object()
+        .expect("properties")
+        .keys()
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        serialized, documented,
+        "serialized JournalPage keys must match the documented properties"
+    );
+
+    hub.shutdown().await;
 }

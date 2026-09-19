@@ -736,6 +736,29 @@ async fn fake_node(
                         .and_then(Value::as_str)
                         .unwrap_or("hello");
                     let command_id = params.get("commandId").and_then(Value::as_str);
+                    // c-journalpage bounded-window seeding hook:
+                    // `__journal_burst__:<n>` appends n assistant message
+                    // events in one batched journal.append frame (plus idle),
+                    // and nothing else. It sits off every scripted path; the
+                    // journal-window hub e2e uses it to push a journal past
+                    // the 2000-row / 8MiB tail window before a late attach.
+                    if let Some(count) = prompt
+                        .strip_prefix("__journal_burst__:")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        append_n = append_burst(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            count,
+                            "__journal_burst__",
+                        )
+                        .await?;
+                        append_n =
+                            append_native_status(&mut ws, &instance_id, append_n, "idle").await?;
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        continue;
+                    }
                     // §9.1: a terminal-side `/effort <level>` typed in the PTY is
                     // observed as a hand-typed slash command — the fake node emits
                     // the matching effort observation attributed to `slash`, and
@@ -2166,6 +2189,46 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{:.1} MB", bytes as f64 / MB as f64)
     }
+}
+
+/// Append `count` assistant messages in ONE batched `journal.append` frame.
+///
+/// The Hub folds the batch into bounded writer chunks and assigns contiguous
+/// seqs; the single ack carries the final seq. Used by the journal-window
+/// e2e to push a journal past the bounded tail window quickly — one frame,
+/// not thousands of socket round trips.
+async fn append_burst(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    count: u64,
+    marker: &str,
+) -> Result<u64> {
+    let last_seq = n + count;
+    let events: Vec<Value> = (1..=count)
+        .map(|i| {
+            json!({
+                "kind": "message",
+                "completeness": "structured",
+                "payload": { "role": "assistant", "text": format!("{marker} event {}", n + i) }
+            })
+        })
+        .collect();
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0",
+            "id": format!("j{last_seq}"),
+            "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "events": events,
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    Ok(last_seq)
 }
 
 async fn append_journal(

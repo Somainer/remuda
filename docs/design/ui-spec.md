@@ -326,6 +326,17 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 
 Compact：回合结束后把 thinking + 中间 tool 折成「N 次工具 · M 段思考」，最终答案保留。默认 Compact（DSH `ui-chat` Compact 默认）。设置可改。
 
+**有界 journal 窗口与「加载更早」**
+
+Hub 的 journal 读是有界尾部窗口（至多 2000 行 / 8 MiB，新行优先）：attach 与 follow snapshot 只拿尾部，窗口元数据 `fromSeq`（窗口底，空窗口为 null）与 `reachedAfterSeq`（底是否到 afterSeq）随行返回，更深的历史用同一 `afterSeq` + `beforeSeq = fromSeq - 1` 向下翻页。
+
+- 初始加载只读一个尾部窗口；**禁止**再写「512 行循环向上翻」这类读法——有界窗口下它切的是尾部中段，下面的历史被静默丢弃。
+- snapshot 的 `fromSeq` 是**窗口底，不是保留底**：不得喂给 `applyBatch` 的 `from < floorSeq` 陈旧判定（那会把正常的深页误判 readonly-stale）。
+- gap 回填向下降页直到 `reachedAfterSeq=true`，缓冲后按 seq 顺序一次性 flush；翻页有界（约 16 页 / 20k 事件），预算耗尽时 flush 已连续的前缀、只报一次残余 gap、落到 readonly-stale，绝不永久缓冲。
+- 已加载底 > 1 时，transcript 顶部显示「加载更早的记录」行（JournalBanner 旁边的独立行）：一次点击取一页（`beforeSeq = floor - 1`），按 seq 升序 prepend；虚拟列表以点击前最顶部可见节点为锚，保持其视口偏移（padTop 增长只推动锚上方的留白）。到 seq 1 后该行消失。
+- banner 状态：补页中 `gap-backfill`（「正在补事件 · 工具卡暂不结算」），预算耗尽/分歧 `readonly-stale`，补齐回 `live`。
+- 已知缺口（待修，不在本期）：空的下降窗口目前按「已到达 afterSeq」处理，因此被删除行造成的真空缺（窗口有界但中间缺 seq）会被静默当作已补齐，客户端停在 `gap-backfill`。后续应区分「窗口底到达 afterSeq」与「范围内无洞」。
+
 **Tool 卡片（keyed registry，未知 → Generic）**
 
 注册键 = `driverKind + '.' + nativeToolName`，再映射到族。不要把 Codex `commandExecution` 硬叫 Bash（`deepseek-harness.md` §2.2）。

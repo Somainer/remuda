@@ -2227,7 +2227,11 @@ export interface components {
             events: {
                 [key: string]: unknown;
             }[];
+            /** @description Window floor (seq of events[0]); null for an empty window. */
+            fromSeq: string | null;
             instanceId: string;
+            /** @description False when rows below the window floor were cut; descend with beforeSeq=fromSeq-1. */
+            reachedAfterSeq: boolean;
         };
         LoginRequest: {
             bootstrapToken: string;
@@ -4496,6 +4500,8 @@ export interface operations {
         parameters: {
             query?: {
                 afterSeq?: string;
+                /** @description Inclusive upper bound for descending to older history below a tail window. */
+                beforeSeq?: string;
             };
             header?: never;
             path: {

@@ -141,7 +141,7 @@ impl InstanceApi for HubInstanceApi {
         let id = instance_id.as_id().as_str().to_string();
         async move {
             let page = client
-                .get_journal_typed(&id, Some(&after_seq.to_string()))
+                .get_journal_typed(&id, Some(&after_seq.to_string()), None)
                 .await
                 .map_err(hub_err)?;
             let next_seq = page.durable_seq.parse::<u64>().unwrap_or(after_seq);

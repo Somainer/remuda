@@ -1,8 +1,10 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Composer } from "./Composer";
 import { effortAt } from "./effort";
+import { printCapabilities } from "../../lib/capabilities";
+import type { Capability, CapabilityProvision, CapabilitySnapshot } from "../../types/nativeRef";
 
 describe("Composer shortcuts", () => {
   it("sends on plain Enter (primary) on desktop; Shift+Enter is a newline", async () => {
@@ -358,7 +360,7 @@ describe("Composer shortcuts", () => {
     expect(screen.queryByTestId("harness-option-terminal")).toBeNull();
   });
 
-  it("abbreviates the harness label on mobile but keeps it static", () => {
+  it("abbreviates the harness label on mobile but keeps it static, inside the options sheet", () => {
     render(
       <Composer
         instanceId="ins_locked_m"
@@ -369,6 +371,10 @@ describe("Composer shortcuts", () => {
         effort={effortAt("claude", 2)}
       />,
     );
+    // D-042: the read-only harness chip rides inside the options sheet, not
+    // the collapsed bar.
+    expect(screen.queryByTestId("harness-chip")).toBeNull();
+    fireEvent.click(screen.getByTestId("model-effort-chip"));
     const chip = screen.getByTestId("harness-chip");
     expect(chip).toHaveTextContent("Claude");
     expect(chip).not.toHaveTextContent("Claude Code");
@@ -564,5 +570,200 @@ describe("Composer held-queue flush (turn-end boundary)", () => {
       />,
     );
     expect(onFlushHeld).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * D-042 (ui-spec.md §2.2 compact composer 边界): on phones the bar collapses
+ * to one trigger naming the permission word + effort tier, options ride in a
+ * bottom sheet, and both window.confirm calls are Sheet dialogs.
+ */
+function caps(over: Partial<Record<"steer" | "queue" | "interrupt", Capability>> = {}): CapabilitySnapshot {
+  const base = printCapabilities();
+  return {
+    ...base,
+    capabilities: { ...base.capabilities, ...over } as CapabilitySnapshot["capabilities"],
+  };
+}
+function cap(state: Capability["state"] = "supported", p: CapabilityProvision = "native"): Capability {
+  return { state, provision: p, scope: [], reasonCode: "test", prerequisites: [], evidence: [] };
+}
+
+describe("Composer mobile options trigger (D-042)", () => {
+  it("names the permission word and the effort tier on the collapsed trigger", () => {
+    render(
+      <Composer
+        instanceId="ins_m1"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 2)}
+        effortEffective={{ name: "high", ultracode: null, source: "remuda", observedAt: "2026-09-19T00:00:00Z" }}
+        onPermission={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    expect(trigger).toHaveAttribute("data-options-trigger", "1");
+    expect(screen.getByTestId("composer-trigger-permission")).toHaveTextContent("询问");
+    expect(screen.getByTestId("model-effort-chip-label")).toHaveTextContent("high");
+    expect(trigger).toHaveTextContent(/询问.*high/);
+    expect(trigger).toHaveAttribute("data-permission", "manual");
+    expect(trigger).toHaveAttribute("data-permission-danger", "0");
+  });
+
+  it("marks the danger mode on the collapsed trigger, not only inside the sheet", () => {
+    render(
+      <Composer
+        instanceId="ins_m2"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 0)}
+        effortEffective={{ name: "low", ultracode: null, source: "remuda", observedAt: "2026-09-19T00:00:00Z" }}
+        permissionMode="bypassPermissions"
+        launchPermissionMode="bypassPermissions"
+        permissionEffective={{ mode: "bypassPermissions", source: "launch", observedAt: "2026-09-19T00:00:00Z" }}
+        onPermission={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    expect(trigger).toHaveAttribute("data-permission", "bypassPermissions");
+    expect(trigger).toHaveAttribute("data-permission-danger", "1");
+    // The danger word is readable without opening the sheet.
+    expect(screen.getByTestId("composer-trigger-permission")).toHaveTextContent("绕过全部");
+  });
+
+  it("keeps the option-only controls in the sheet and the primary control outside", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_m3"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        model="opus"
+        effort={effortAt("claude", 2)}
+        onPermission={vi.fn()}
+      />,
+    );
+    // Collapsed: no attach/harness/permission picker/effort slider in the bar.
+    expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
+    expect(screen.queryByTestId("attach-file")).toBeNull();
+    expect(screen.queryByTestId("harness-chip")).toBeNull();
+    expect(screen.queryByTestId("permission-option-manual")).toBeNull();
+    expect(screen.queryByTestId("effort-slider")).toBeNull();
+    // The three-state primary stays outside (D-028a).
+    expect(screen.getByTestId("composer-send")).toBeVisible();
+    // The fused context segment stays outside the sheet too.
+    expect(screen.getByTestId("context-chip")).toBeVisible();
+
+    await user.click(screen.getByTestId("model-effort-chip"));
+    const sheet = screen.getByTestId("composer-options-sheet");
+    expect(sheet).toHaveAttribute("data-variant", "sheet");
+    const sheetBody = within(sheet);
+    expect(sheetBody.getByTestId("attach-file")).toBeVisible();
+    expect(sheetBody.getByTestId("attach-camera")).toBeVisible();
+    expect(sheetBody.getByTestId("attach-paste")).toBeVisible();
+    expect(sheetBody.getByTestId("harness-chip")).toBeVisible();
+    expect(sheetBody.getByTestId("permission-option-manual")).toBeVisible();
+    expect(sheetBody.getByTestId("effort-slider")).toBeVisible();
+    // The primary control is not duplicated into the sheet.
+    expect(sheet.querySelector("[data-testid='composer-send']")).toBeNull();
+  });
+
+  it("uses a plain placeholder on phones and keeps the shortcut hint on desktop", () => {
+    const { rerender } = render(
+      <Composer instanceId="ins_m4" mobile onSend={vi.fn()} />,
+    );
+    expect(screen.getByTestId("composer-input")).toHaveAttribute("placeholder", "输入提示词…");
+    rerender(<Composer instanceId="ins_m4" mobile={false} onSend={vi.fn()} />);
+    expect(screen.getByTestId("composer-input").getAttribute("placeholder")).toContain("Enter 排队");
+  });
+});
+
+describe("Composer Sheet confirms replace window.confirm (D-042)", () => {
+  it("steer: cancel keeps the draft and sends nothing; ok POSTs mode=steer", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    const onInterrupt = vi.fn();
+    render(
+      <Composer
+        instanceId="ins_c1"
+        mobile={false}
+        onSend={onSend}
+        onInterrupt={onInterrupt}
+        kind="claude"
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    await user.click(screen.getByTestId("composer-input"));
+    await user.keyboard("jump now");
+    await user.click(screen.getByTestId("composer-steer"));
+    const dialog = screen.getByTestId("composer-confirm");
+    expect(dialog).toHaveAttribute("data-variant", "popover");
+    expect(screen.getByTestId("composer-confirm-title")).toHaveTextContent("插队发送");
+    expect(onSend).not.toHaveBeenCalled();
+
+    await user.click(screen.getByTestId("composer-confirm-cancel"));
+    expect(screen.queryByTestId("composer-confirm")).toBeNull();
+    expect(onSend).not.toHaveBeenCalled();
+    expect((screen.getByTestId("composer-input") as HTMLTextAreaElement).value).toBe("jump now");
+
+    await user.click(screen.getByTestId("composer-steer"));
+    await user.click(screen.getByTestId("composer-confirm-ok"));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0]).toBe("jump now");
+    expect(onSend.mock.calls[0][3]).toBe("steer");
+    expect(onInterrupt).not.toHaveBeenCalled();
+  });
+
+  it("Esc interrupt: cancel leaves the turn running; ok calls onInterrupt", async () => {
+    const user = userEvent.setup();
+    const onInterrupt = vi.fn();
+    render(
+      <Composer
+        instanceId="ins_c2"
+        mobile={false}
+        onSend={vi.fn()}
+        onInterrupt={onInterrupt}
+        kind="claude"
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    await user.click(screen.getByTestId("composer-input"));
+    await user.keyboard("{Escape}");
+    expect(screen.getByTestId("composer-confirm-title")).toHaveTextContent("打断当前 turn");
+    // Esc inside the dialog is cancel (focus trap).
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("composer-confirm")).toBeNull();
+    expect(onInterrupt).not.toHaveBeenCalled();
+
+    await user.keyboard("{Escape}");
+    await user.click(screen.getByTestId("composer-confirm-ok"));
+    expect(onInterrupt).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses the sheet variant on phones and returns focus to the steer trigger", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer
+        instanceId="ins_c3"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    await user.click(screen.getByTestId("composer-input"));
+    await user.keyboard("jump now");
+    await user.click(screen.getByTestId("composer-steer"));
+    expect(screen.getByTestId("composer-confirm")).toHaveAttribute("data-variant", "sheet");
+    await user.click(screen.getByTestId("composer-confirm-cancel"));
+    expect(screen.getByTestId("composer-steer")).toHaveFocus();
   });
 });

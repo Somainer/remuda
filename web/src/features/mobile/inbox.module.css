@@ -94,6 +94,19 @@
   color: var(--paper);
 }
 
+.bannerAction {
+  flex: none;
+  min-height: var(--touch);
+  padding: 0 var(--space-4);
+  background: var(--ink-2);
+  color: var(--paper);
+  border: 1px solid var(--cold);
+  border-radius: var(--radius);
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  white-space: nowrap;
+}
+
 .bannerClose {
   flex: none;
   width: var(--touch);

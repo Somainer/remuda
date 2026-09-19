@@ -399,7 +399,7 @@ export function Inbox() {
           {banner.mode === "homescreen" ? (
             <button
               type="button"
-              className={css.btnPrimary}
+              className={css.bannerAction}
               data-testid="m-inbox-push-enable"
               onClick={() => setShowHomeHint((v) => !v)}
             >
@@ -408,7 +408,7 @@ export function Inbox() {
           ) : (
             <button
               type="button"
-              className={css.btnPrimary}
+              className={css.bannerAction}
               data-testid="m-inbox-push-enable"
               onClick={() => void enablePush()}
             >

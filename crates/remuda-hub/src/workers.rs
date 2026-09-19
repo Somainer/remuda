@@ -111,6 +111,11 @@ pub(crate) struct DispatchBody {
     /// this explicit request, never silently.
     #[serde(default)]
     pub(crate) carrier: Option<String>,
+    /// Per-launch host capability grants, e.g. `["computer-use"]` (D-045).
+    /// Dispatch workers otherwise run with `bypassPermissions`, so a requested
+    /// capability is rejected with a named message rather than silently dropped.
+    #[serde(default)]
+    pub(crate) capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +254,7 @@ pub(crate) async fn dispatch_core(
     if body.brief.trim().is_empty() {
         return Err(HubError::BadRequest("brief is required".into()));
     }
+    crate::inventory::validate_capabilities(&body.capabilities).map_err(HubError::BadRequest)?;
     let harness = match body.harness.as_deref().unwrap_or("claude") {
         "claude" | "codex" | "grok" => body.harness.as_deref().unwrap_or("claude").to_string(),
         other => {
@@ -257,6 +263,16 @@ pub(crate) async fn dispatch_core(
             )));
         }
     };
+    let computer_use = body
+        .capabilities
+        .iter()
+        .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE);
+    if computer_use && harness == "grok" {
+        return Err(HubError::BadRequest(
+            "the \"computer-use\" capability is not supported for harness \"grok\" this batch"
+                .into(),
+        ));
+    }
 
     let project = state
         .store
@@ -273,6 +289,12 @@ pub(crate) async fn dispatch_core(
         body.placement.as_deref(),
     )
     .await?;
+    // D-045 gate 2: the resolved dispatch host must be macOS and report the
+    // installed capability, checked before anything is provisioned or
+    // persisted (the CLI only covers an explicit --host).
+    if computer_use {
+        crate::inventory::computer_use_preflight(&host).map_err(HubError::BadRequest)?;
+    }
     let workspace_id = project
         .members
         .iter()
@@ -446,6 +468,7 @@ pub(crate) async fn dispatch_core(
         project.meta.id.as_id().as_str(),
         task.as_ref().map(|task| task.meta.id.as_id().as_str()),
         extra_env,
+        body.capabilities.clone(),
     );
     crate::agent_scope::prepare_create(
         &state,
@@ -942,14 +965,27 @@ pub(crate) fn worker_launch_spec(
     project_id: &str,
     task_id: Option<&str>,
     extra_env: serde_json::Map<String, Value>,
+    capabilities: Vec<String>,
 ) -> Value {
+    let grants_computer_use = capabilities
+        .iter()
+        .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE);
     let mut spec = json!({
         "kind": harness,
         "driver": driver,
         "model": model,
         "providerProfileId": provider_profile_id,
         "delegation": delegation,
-        "permissionMode": "bypassPermissions",
+        // D-045/Q4: dispatched workers otherwise run bypassPermissions, which
+        // together with desktop control is the one refused combination. A
+        // computer-use worker therefore launches under host approvals
+        // (`default`); granting bypass on top would need its own explicit
+        // flag, which deliberately does not exist yet.
+        "permissionMode": if grants_computer_use && harness == "claude" {
+            "default"
+        } else {
+            "bypassPermissions"
+        },
         "workspaceId": workspace_id,
         "hostId": host_id,
         "cwd": cwd,
@@ -961,6 +997,9 @@ pub(crate) fn worker_launch_spec(
     });
     if let Some(task_id) = task_id {
         spec["taskId"] = json!(task_id);
+    }
+    if !capabilities.is_empty() {
+        spec["capabilities"] = json!(capabilities);
     }
     spec
 }
@@ -1638,6 +1677,7 @@ mod driver_choice_tests {
             resources: None,
             max_instances: 8,
             hostname: None,
+            host_os: None,
             ssh: None,
             last_error: None,
             provider_binding: "auto".into(),

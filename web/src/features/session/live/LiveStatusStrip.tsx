@@ -255,8 +255,9 @@ export function LiveStatusStrip({
         {!ended && phase?.toolName ? <span className={css.toolName}>{phase.toolName}</span> : null}
       </span>
       {ended && decision.decidedBy ? (
-        // Names the channel that decided the end (hook / screen / transcript),
-        // so a screen-decided end with no Stop hook is never mistaken for one.
+        // Names the channel that decided the end (hook / file / screen /
+        // transcript), so a screen-decided end with no Stop hook, or a grok
+        // file-tier end, is never mistaken for a hook-decided one.
         <span className={css.chip} data-testid="live-decided-by" data-channel={decision.decidedBy}>
           {decision.decidedBy}
         </span>

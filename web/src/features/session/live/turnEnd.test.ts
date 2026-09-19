@@ -227,6 +227,26 @@ describe("turnEnd", () => {
     expect(out.endedAt).toBe("2026-09-18T17:04:00.000Z");
   });
 
+  it("a file-tier turn-ended (grok) is decided by file, not mislabelled hook", () => {
+    // Grok's turn phases ride the file tier (no hook channel is expected for
+    // the run). Its terminal boundary is still a terminal word, but the chip
+    // must read `file` — crediting it to `hook` invents a channel.
+    const ended = phase("turn-ended", "2026-09-18T17:04:00.000Z");
+    ended.tier = "file";
+    const out = turnEnd(input({ phase: ended, hookHealth: undefined }));
+    expect(out.state).toBe("ended");
+    expect(out.decidedBy).toBe("file");
+    expect(out.endedAt).toBe("2026-09-18T17:04:00.000Z");
+  });
+
+  it("a file-tier interrupted turn is likewise decided by file", () => {
+    const interrupted = phase("interrupted", "2026-09-18T17:04:00.000Z");
+    interrupted.tier = "file";
+    const out = turnEnd(input({ phase: interrupted, hookHealth: undefined }));
+    expect(out.state).toBe("ended");
+    expect(out.decidedBy).toBe("file");
+  });
+
   it("the mid-turn screen idle edge is ignored while the hook tier is fresh (rule 6)", () => {
     const out = turnEnd(
       input({

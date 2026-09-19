@@ -17,7 +17,10 @@
  *    fresh hook `blocked` phase) keeps the turn `waiting` no matter how quiet the
  *    hook tier gets or what the spinner currently shows.
  * 2. A hook turn boundary (`turn-ended` / `interrupted`) wins outright, fresh or
- *    not — a boundary event is terminal; it is the harness's own word.
+ *    not — a boundary event is terminal; it is the harness's own word. A phase
+ *    tagged `tier=file` (grok's file adapter) decides `file` instead of `hook`,
+ *    so a file-tier turn end is never credited to a hook channel that does not
+ *    exist for the session.
  * 3. While the hook tier is *fresh* a hook active phase holds the turn open and
  *    the screen's idle edge is ignored (design §2.4 rule 6, raise-only).
  * 4. Once the hook tier is stalled or never-materialised it drops to advisory
@@ -42,7 +45,7 @@ import type { ScreenLiveStatus } from "./liveStatus";
 import type { LivePhase } from "./phase";
 
 export type TurnState = "working" | "waiting" | "ended" | "unknown";
-export type DecidedBy = "hook" | "screen" | "transcript";
+export type DecidedBy = "hook" | "file" | "screen" | "transcript";
 
 export type TurnDecision = {
   state: TurnState;
@@ -106,10 +109,12 @@ export function turnEnd(input: TurnEndInput): TurnDecision {
 
   // 2. A hook turn boundary is the harness's own terminal word and wins
   //    outright (a Stop that lands after a screen-decided end overrides
-  //    decidedBy but the consumer's ended→idle edge stays idempotent).
+  //    decidedBy but the consumer's ended→idle edge stays idempotent). A
+  //    boundary latched from the file tier (grok) is credited to `file`:
+  //    there is no hook channel in that run.
   if (hookEnded) {
     const at = phase!.since ?? phase!.observedAt;
-    if (at) return { state: "ended", decidedBy: "hook", endedAt: at };
+    if (at) return { state: "ended", decidedBy: phase!.tier === "file" ? "file" : "hook", endedAt: at };
   }
 
   // 4. The hook tier is advisory: a screen idle edge at/after this turn's phase

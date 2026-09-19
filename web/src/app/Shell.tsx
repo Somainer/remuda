@@ -306,34 +306,43 @@ export function Shell() {
       ) : null}
       <main className={css.main}>
         {onSessions && mobile && !onSessionPage ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} onSelect={workbench.select} /> : null}
-        {onSessions ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
+        {/* D-049: on compact /s/:id* the SpaceTabs row does not render — the
+            header chip's drawer (spaces-drawer-open) and Jump To keep every
+            switching capability. Index routes keep their tab strip. */}
+        {onSessions && !(mobile && onSessionPage) ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
         {onNew ? <SessionsPage dimmed /> : null}
         <Outlet />
       </main>
-      <nav className={css.bar} aria-label="手机底栏">
-        <Link className={onSessions && !location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/sessions">
-          <span className={css.barGlyph}>▤</span>
-          会话
-        </Link>
-        <Link className={location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/approvals">
-          <span className={css.barGlyph}>◆</span>
-          {pending ? <span className={css.barBadge}>{pending}</span> : null}
-          审批
-        </Link>
-        <button type="button" onClick={() => navigate(onSessions ? workbench.newHref : "/sessions/new")} aria-label="新建">
-          <span className={css.barPlus}>＋</span>
-        </button>
-        <button
-          type="button"
-          className={moreActive ? css.barActive : ""}
-          aria-expanded={moreOpen}
-          aria-haspopup="menu"
-          onClick={() => setMoreOpen((v) => !v)}
-        >
-          <span className={css.barGlyph}>⋯</span>
-          更多
-        </button>
-      </nav>
+      {/* D-049: compact /s/:id* renders no app bottom navigation bar — that
+          route's bottom strip is the collapsed composer (structured) or the
+          terminal input/key bars (tty). Back-to-list is the header back
+          link; desktop and the phone /m tree keep their own bars. */}
+      {!(mobile && onSessionPage) ? (
+        <nav className={css.bar} aria-label="手机底栏">
+          <Link className={onSessions && !location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/sessions">
+            <span className={css.barGlyph}>▤</span>
+            会话
+          </Link>
+          <Link className={location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/approvals">
+            <span className={css.barGlyph}>◆</span>
+            {pending ? <span className={css.barBadge}>{pending}</span> : null}
+            审批
+          </Link>
+          <button type="button" onClick={() => navigate(onSessions ? workbench.newHref : "/sessions/new")} aria-label="新建">
+            <span className={css.barPlus}>＋</span>
+          </button>
+          <button
+            type="button"
+            className={moreActive ? css.barActive : ""}
+            aria-expanded={moreOpen}
+            aria-haspopup="menu"
+            onClick={() => setMoreOpen((v) => !v)}
+          >
+            <span className={css.barGlyph}>⋯</span>
+            更多
+          </button>
+        </nav>
+      ) : null}
       {moreOpen ? (
         <div className={css.moreMenu} role="menu">
           {MORE_NAV.map((item) => (

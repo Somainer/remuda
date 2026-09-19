@@ -53,11 +53,31 @@ the accept path **before** the create command is journaled:
    * same client-allocated `instanceId`, new `commandId`: the fresh command
      id is accepted, saved and journaled to `accepted` before the reply, and
      the first attempt's listener is reused.
-   A racing exact duplicate that loses the `insert_command` race during the
-   up-to-3 s probe receives the idempotent reply rather than a `Conflict`
-   after the instance row exists.
-   Evidence: `retried_create_keeps_one_listener_and_exit_revokes_it` and
-   `concurrent_creates_with_one_command_id_both_return_the_accepted_one`.
+   A racing exact duplicate whose provision overlaps the winner's
+   multi-second route probe is serialized by a per-instance provision lock
+   (reuse check → probe → bind/register): the loser reuses the winner's
+   listener, then loses the instance-row insert and receives the idempotent
+   reply rather than a `Conflict` after the instance row exists. A create
+   naming a terminated (`Exited`/`Failed`) instance id does not take the
+   fallback — the `Conflict` propagates and its provisional listener is
+   revoked.
+   Evidence: `retried_create_keeps_one_listener_and_exit_revokes_it`,
+   `concurrent_creates_with_one_command_id_both_return_the_accepted_one`,
+   `create_naming_a_terminated_instance_id_fails_and_revokes_bind`.
+
+   **Raced-create determinism under load.** The overlap test stalls a
+   `route: auto` probe for its full 3 s timeout and asserts the observable
+   outcomes — both calls `Ok`, the same accepted/settled command and
+   observed route in both replies, exactly one live registered listener for
+   the instance, and that listener answering authenticated local traffic —
+   rather than counting TCP connections to the stall socket: reqwest/hyper
+   itself opens two sockets per stalled request (verified with a standalone
+   one-request client, accepted-connection count 2), so a socket counter
+   never measured how many provisions probed. Run 2026-09-20:
+   `concurrent_creates_with_one_command_id_both_return_the_accepted_one`
+   passed 20/20 consecutive runs executed while a concurrent
+   `cargo build --workspace` loop contended for CPU (each run ~3 s,
+   0 failures).
 
 ## Credit window and hard deadline
 

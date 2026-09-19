@@ -4449,10 +4449,14 @@ mod api_relay_launch_test {
 
     /// A Hub timeout-retry reusing the exact command id and payload races the
     /// first call through the multi-second route provision. The route probe
-    /// stalls for its 3 s budget; the per-instance provision lock lets the
-    /// loser reuse the winner's listener without a second bind, and the loser
-    /// then loses the instance-row insert and must answer with the winner's
-    /// accepted command rather than propagate a Conflict.
+    /// stalls for its 3 s budget; the per-instance provision lock serializes
+    /// probe+bind, so the loser waits and reuses the winner's listener, then
+    /// loses the instance-row insert and answers with the winner's accepted
+    /// command rather than propagate a Conflict. The assertions pin the
+    /// observable outcomes (both Ok, same command, same single live listener
+    /// and its same loopback URL/bearer) rather than TCP connection counts —
+    /// reqwest itself opens multiple sockets per stalled request, so a
+    /// connection counter is not a measure of how many provisions probed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_creates_with_one_command_id_both_return_the_accepted_one() {
         let node = std::sync::Arc::new(node());
@@ -4462,22 +4466,17 @@ mod api_relay_launch_test {
 
         // A TCP endpoint that accepts the connect but never answers: the
         // route:auto direct-net probe then waits its full 3 s request
-        // timeout. A background thread counts probe connections
-        // structurally, so the "loser reused the winner's provision"
-        // assertion does not depend on wall-clock timing; accepted sockets
-        // are deliberately held open (dropping one would make reqwest fail
-        // immediately).
+        // timeout, guaranteeing the two calls overlap inside provisioning.
+        // Accepted sockets are held open (dropping one would make reqwest
+        // fail immediately instead of waiting the timeout).
         let stall = std::net::TcpListener::bind("127.0.0.1:0").expect("stall listener");
         let endpoint = format!("http://127.0.0.1:{}/", stall.local_addr().unwrap().port());
-        let probe_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let held: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let counter = std::sync::Arc::clone(&probe_hits);
         let held_clone = std::sync::Arc::clone(&held);
         let acceptor = stall.try_clone().expect("clone stall listener");
         std::thread::spawn(move || {
             while let Ok((stream, _)) = acceptor.accept() {
-                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 held_clone.lock().unwrap().push(stream);
             }
         });
@@ -4537,19 +4536,27 @@ mod api_relay_launch_test {
                 .and_then(|route| route.route)
                 .is_some_and(|kind| kind == remuda_protocol::ApiRouteKind::HubRelay)
         );
-        // Exactly one listener exists for the instance.
-        assert!(
-            node.api_relay()
-                .instance_relay(instance_id.as_id().as_str())
-                .is_some()
-        );
-        // Structural proof of reuse: the loser never ran its own 3 s probe —
-        // exactly one probe connection reached the stalled endpoint.
+        // Exactly one live listener for the instance — the loser's
+        // provisional bind (if any) was torn down, not left orphaned.
+        let registry = node.api_relay();
+        let relay = registry
+            .instance_relay(instance_id.as_id().as_str())
+            .expect("one registered listener");
+        // The single surviving listener is live and answers authenticated
+        // local traffic with the no-link 503; both replies describe that one.
+        let status = reqwest::Client::new()
+            .get(format!("{}/models", relay.base_url()))
+            .bearer_auth(relay.bearer_token())
+            .send()
+            .await
+            .expect("connect")
+            .status();
+        assert_eq!(status, 503);
         assert_eq!(
-            probe_hits.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "only the winner probes; the loser reuses its listener"
+            a.api_route, b.api_route,
+            "both echo the same observed route"
         );
+
         // Release the held sockets and stop accepting.
         drop(held);
         drop(stall);

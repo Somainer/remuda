@@ -258,15 +258,33 @@ describe("subtitle: latest event text, errors first and verbatim", () => {
     expect(rows.pending[0].subtitle).toBe("API Error: Request rejected (429)");
   });
 
-  it("uses the verbatim live phrase when there is no error", () => {
+  it("prints the interaction request verbatim even when a journal phrase exists", () => {
+    // The raised request is the actionable event on a blocked turn; an older
+    // journal line must never bury the text the decision is about.
     const rows = deriveInboxRows(
       source({
         interactions: [interaction({ id: "int_1", instanceId: "ins_1" })],
         instances: [inst({ id: "ins_1" })],
+        phrases: { ins_1: "echo: m inbox allow once" },
+      }),
+    );
+    expect(rows.pending[0].subtitle).toBe("rm -rf /tmp/coord-media");
+  });
+
+  it("uses the verbatim live phrase on instance rows with no interaction", () => {
+    const rows = deriveInboxRows(
+      source({
+        instances: [
+          inst({
+            id: "ins_1",
+            lifecycle: "ready",
+            activity: known("idle"),
+          }),
+        ],
         phrases: { ins_1: "Bash ninja -C build" },
       }),
     );
-    expect(rows.pending[0].subtitle).toBe("Bash ninja -C build");
+    expect(rows.recent[0].subtitle).toBe("Bash ninja -C build");
   });
 
   it("falls back to the request text verbatim, never an invented status", () => {

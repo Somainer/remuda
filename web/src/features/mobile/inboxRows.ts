@@ -79,9 +79,12 @@ export function interactionRequestText(item: Interaction): string {
  *
  * Error-first by construction: `instance.lastError` wins whenever present and
  * is printed exactly as reported — never softened, translated or wrapped in a
- * status sentence. Then the live phrase projected from the journal tail
- * (`liveSummary`, itself verbatim message/workflow text), then the
- * interaction request's own text. `null` means "nothing to print" and the
+ * status sentence. For an interaction row the interaction's own request text
+ * comes next: on a blocked turn that request IS the latest actionable event,
+ * and showing it verbatim is what makes the one-tap decision possible (the
+ * §B.3.3 row is `Bash rm -rf …`), so an older journal phrase must never
+ * bury it. Only instance rows (进行中 · 最近) fall through to the live phrase
+ * projected from the journal tail. `null` means "nothing to print" and the
  * row renders no subtitle line.
  */
 export function latestEventText(
@@ -91,12 +94,12 @@ export function latestEventText(
 ): string | null {
   const error = instance?.lastError?.trim();
   if (error) return error;
-  const live = phrase?.trim();
-  if (live) return live;
   if (interaction) {
     const text = interactionRequestText(interaction).trim();
     if (text) return text;
   }
+  const live = phrase?.trim();
+  if (live) return live;
   return null;
 }
 

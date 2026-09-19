@@ -773,9 +773,12 @@ async fn dispatch_refuses_computer_use_for_every_harness_without_downgrading() {
 }
 
 #[tokio::test]
-async fn agent_origin_create_with_computer_use_is_refused_before_placement() {
-    // D-045 gate 1 at the Hub: an instance-scoped agent credential may not
-    // grant computer-use to itself, regardless of host or permission mode.
+async fn agent_origin_create_with_computer_use_is_refused_before_approval_and_placement() {
+    // D-045 Gate 1 hoisted ahead of pick_hosts/provider resolution/
+    // prepare_create: an instance-scoped agent credential may not grant
+    // computer-use. The launch uses shell-pty — the shape that WOULD raise a
+    // one-shot human Interaction via prepare_create — so the test also proves
+    // no approval ticket is created and burned on the refused replay.
     let ctx = Ctx::spawn().await.unwrap();
     // Seed a leaf instance and mint its instance token (origin = Agent).
     let project = ctx.create_project(&["58940-58969"]).await;
@@ -792,22 +795,24 @@ async fn agent_origin_create_with_computer_use_is_refused_before_placement() {
             ctx.host.clone(),
             Some(ctx.workspace.clone()),
             "claude".into(),
-            "claude-print".into(),
+            "shell-pty".into(),
             None,
             json!({ "projectId": project_id }),
             delegation,
         )
         .await
         .expect("seed instance");
-    let agent_token =
-        remuda_hub::instance_token(ctx.hub.store().unwrap().clone(), instance.instance_id)
-            .await
-            .expect("agent token");
+    let agent_token = remuda_hub::instance_token(
+        ctx.hub.store().unwrap().clone(),
+        instance.instance_id.clone(),
+    )
+    .await
+    .expect("agent token");
 
     let body = json!({
         "hostId": ctx.host,
         "kind": "claude",
-        "driver": "claude-print",
+        "driver": "shell-pty",
         "permissionMode": "manual",
         "capabilities": ["computer-use"],
         "prompt": "drive",
@@ -820,6 +825,20 @@ async fn agent_origin_create_with_computer_use_is_refused_before_placement() {
     assert!(
         message.contains("agent-originated") && message.contains("computer-use"),
         "{message}"
+    );
+    // The refusal must run before prepare_create: no Interaction ticket
+    // exists for the caller instance (the shell-pty shape would have required
+    // one had the gate fired later).
+    let interactions = ctx
+        .hub
+        .store()
+        .unwrap()
+        .list_interactions(None, Some(instance.instance_id.clone()), None, false)
+        .await
+        .expect("list interactions");
+    assert!(
+        interactions.is_empty(),
+        "refused agent grant must not create an approval Interaction: {interactions:?}"
     );
 }
 

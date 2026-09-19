@@ -184,13 +184,15 @@ fn materialize_inner(
     reject_spec_env(request.spec)?;
     reject_agent_launch_overrides(request.spec, request.origin)?;
     // D-045 gate half: refuse unknown capability values, agent-originated
-    // grants, bypass+computer-use and unsupported kinds BEFORE any file is
+    // grants, bypass+computer-use, unsupported kinds and the undeliverable
+    // codex carrier BEFORE any file (incl. the launch dir / overlay) is
     // written. The grant itself is materialized below, once launch_dir exists.
     crate::launch::skills::computer_use_requested(
         &request.spec.capabilities,
         request.origin,
         &request.spec.permission_mode,
         request.spec.kind,
+        request.spec.driver,
     )?;
     // D-045 leg (b) collision: refuse before any file is written, in both
     // `--mcp-config path` and `--mcp-config=path` forms.
@@ -582,6 +584,7 @@ fn materialize_shell_pty_agent(
         request.origin,
         &request.spec.permission_mode,
         request.spec.kind,
+        request.spec.driver,
     )?;
     // D-045 leg (b) collision: refuse before any file is written, in both
     // `--mcp-config path` and `--mcp-config=path` forms.

@@ -102,19 +102,41 @@ human approvals has no recovery path; use `remuda instance create
 --capability computer-use` for an attended launch
 ```
 
-Host gate (CLI/Hub), three shapes:
+Hub Gate 1 — agent-origin create (http.rs, hoisted before pick_hosts /
+provider resolution / prepare_create, so no Interaction is created):
+
+```
+an agent-originated launch may not grant "computer-use"; only an explicit
+human or bot launch may request it
+```
+
+Hub Q4 — unattended mode (names the kind's refused spellings; claude:
+`bypassPermissions` and `bypass`; codex: `never` and `no-request`):
+
+```
+refusing "computer-use" together with unattended/skipped tool approvals on
+the same "codex" launch (permissionMode "never"; refused codex spellings:
+never, no-request): desktop control plus auto-approved actions has no
+recovery path; remove one of the two
+```
+
+Host gate (CLI/Hub), three shapes. The absent/not-installed messages name
+the probed path, falling back to the default
+`$CODEX_HOME/computer-use/Codex Computer Use.app` (or `$HOME/.codex/...`)
+when the row carries none — never a bare `<no path reported>` placeholder:
 
 ```
 host hst_… is linux, but the "computer-use" capability requires macOS;
  pick a Mac with --host
 
 host hst_… has not reported the "computer-use" capability (no computer-use
-row in its inventory); update/run a Node that probes it, or pick another
-host with --host
+row in its inventory); enable Codex Computer Use at
+/Users/u/.codex/computer-use/Codex Computer Use.app, or update/run a Node
+that probes it, or pick another host with --host
 
-host hst_… reports "computer-use" as not installed; the Node probed
-/Users/u/.codex/computer-use/SkyComputerUseClient — enable Codex Computer
-Use on that Mac or pick another host with --host
+host hst_… reports "computer-use" as not installed; enable Codex Computer
+Use at /Users/u/.codex/computer-use/Codex Computer Use.app, or pick another
+host with --host
 ```
 
 CLI instance create, no resolvable/known host:
@@ -225,11 +247,16 @@ the granted server). The `child_env_with` shims export the recipe's
 session.rs test `codex_hook_session_splices_granted_mcp_server_into_shadow_config`
 asserts the real file parses with features+trust+server (table exactly once).
 
-**Codex on every other carrier is refused at the Node factory, not delivered:**
-the non-hook paths would point codex at a shadow home containing only the MCP
-table (no `auth.json`, no user config), silently losing the operator's login.
-Node tests `granted_codex_is_refused_on_shell_pty_with_hooks_off` and
-`..._on_generic_pty` assert the named refusal.
+**Codex on every other carrier is refused at the Node factory AND the
+materializer's pre-write gate, not delivered:** the non-hook paths would point
+codex at a shadow home containing only the MCP table (no `auth.json`, no user
+config), silently losing the operator's login. The hooks-only rule is recorded
+in the design at [codex-cua.md §3.3](../codex-cua.md) (D-045 note) and in
+[D-045](../decisions.md). Node tests
+`granted_codex_is_refused_on_shell_pty_with_hooks_off` and
+`..._on_generic_pty`, plus the driver test
+`granted_codex_on_a_non_shell_carrier_is_refused_and_writes_nothing`, assert
+the named refusal and that no files are written.
 
 Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
 `mcp-cua.json`, no `cua/`, no skill tree, no handshake env — the boundary.
@@ -252,7 +279,7 @@ Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
   ungranted sees neither.
 - `crates/remuda-node` lib tests (2): factory refusal for granted codex on
   shell-pty hooks-off and on generic-pty; pure `(kind, os, cli-row)` gate
-  classifications (5).
+  classifications (5) plus absent-row/no-path default-location tests (2).
 - `crates/remuda/tests/cua_cli.rs` (8) and
   `crates/remuda/tests/mcp_hub.rs::agent_scoped_…`: host/value/kind refusals;
   dispatch refused for claude and codex; an **instance-scoped agent token**
@@ -261,7 +288,9 @@ Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
   cannot be verified.
 - `crates/remuda-hub/tests/workers.rs`: dispatch refuses computer-use for both
   harnesses with no provisioning; unknown value refused; create refuses
-  claude `bypassPermissions` and codex `never`/`no-request` and names both.
+  claude `bypassPermissions`/`bypass` and codex `never`/`no-request` and names
+  both; `agent_origin_create_with_computer_use_is_refused_before_approval_and_placement`
+  (shell-pty shape) asserts the 400 and that **no Interaction was created**.
 - Hub inventory unit tests: name validation + every host-shape classification.
 
 ## Q1 live probe — NOT PASSED
@@ -274,14 +303,14 @@ materialization **behind the explicit opt-in, default off**, as
 codex-cua.md §8 prescribes. Remaining Mac verification:
 
 1. Node reports `cli[kind=computer-use].installed = true` and `os = macos`.
-2. Attended `remuda instance create --host <mac> --capability computer-use`
-   (the Node must run with `REMUDA_PTY_HOOKS=1` / `pty_hooks = true`, which
-   defaults **off**): for a claude launch the child sees the handshake,
-   `mcp-cua.json` on argv, the skill tree in its managed home; the cua-repl
-   MCP server starts (it resolves the vendor app via `REMUDA_CODEX_HOME`, not
-   the shadow `CODEX_HOME`) and lists tools.
-3. Granted **codex** is delivered only on **shell-pty with the Node configured
-   `pty_hooks = true`**: run `REMUDA_PTY_HOOKS=1 …` (or set the config), then
+2. Attended `remuda instance create --host <mac> --capability computer-use`:
+   for a claude launch the child sees the handshake, `mcp-cua.json` on argv
+   (`--mcp-config`, no HookSession involved), the skill tree in its managed
+   home; the cua-repl MCP server starts (it resolves the vendor app via
+   `REMUDA_CODEX_HOME`, not the shadow `CODEX_HOME`) and lists tools.
+3. Granted **codex** is delivered only on **shell-pty**, and requires the
+   Node to run with `REMUDA_PTY_HOOKS=1` / `pty_hooks = true` (defaults
+   **off**): with that precondition set, run
    `remuda instance create --host <mac> --kind codex --driver shell-pty
    --capability computer-use`; the HookSession materializes
    `<launch_dir>/codex-home/config.toml` with the granted server, agent state

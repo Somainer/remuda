@@ -247,12 +247,21 @@ impl DirectResponse {
 /// substring-matching rendered text. No variant carries the origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectForwardError {
-    /// The frame-named path/method was refused before any network call.
+    /// The frame-named path/method was refused before any network call; no
+    /// socket was opened.
     DestinationRefused,
-    /// The gateway could not be reached (connect refused/DNS/reset).
+    /// The TCP connection to the pinned gateway could not be established
+    /// (connect refused/DNS failure). Per the protocol's ladder this is an
+    /// upstream gateway failure, reported as `upstream-timeout` like the
+    /// framed leg — `via-host-offline` is reserved for an unreachable via host.
     GatewayUnreachable,
-    /// The first-byte ladder elapsed.
+    /// The gateway did not answer a first byte within the ladder budget,
+    /// either at the connect timeout or a reqwest request timeout.
     TimedOut,
+    /// The request reached the gateway (or the network stack) but failed for
+    /// an unclassified post-network reason (reset after connect, etc.). A
+    /// generic upstream failure, not a destination refusal and not a timeout.
+    UpstreamFailed,
 }
 
 impl DirectForwardError {
@@ -260,8 +269,8 @@ impl DirectForwardError {
     pub(crate) fn status(self) -> u16 {
         match self {
             Self::DestinationRefused => 502,
-            Self::GatewayUnreachable => 503,
-            Self::TimedOut => 504,
+            Self::GatewayUnreachable | Self::TimedOut => 504,
+            Self::UpstreamFailed => 502,
         }
     }
 
@@ -269,8 +278,8 @@ impl DirectForwardError {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::DestinationRefused => API_ERROR_DESTINATION_REFUSED,
-            Self::GatewayUnreachable => remuda_protocol::hubnode::API_ERROR_VIA_HOST_OFFLINE,
-            Self::TimedOut => API_ERROR_UPSTREAM_TIMEOUT,
+            Self::GatewayUnreachable | Self::TimedOut => API_ERROR_UPSTREAM_TIMEOUT,
+            Self::UpstreamFailed => remuda_protocol::hubnode::API_ERROR_HUB_LINK_LOST,
         }
     }
 
@@ -280,6 +289,7 @@ impl DirectForwardError {
             Self::DestinationRefused => "the relay request was refused",
             Self::GatewayUnreachable => "the pinned gateway origin was unreachable",
             Self::TimedOut => "upstream timed out before first byte",
+            Self::UpstreamFailed => "the upstream gateway request failed",
         }
     }
 }
@@ -298,6 +308,7 @@ pub(crate) async fn direct_forward(
     headers: Vec<ApiHeader>,
     body: reqwest::Body,
 ) -> Result<DirectResponse, DirectForwardError> {
+    // Pre-network validation: a bad path or method refuses before connect.
     let url = build_url(ctx, path, query).map_err(|_| DirectForwardError::DestinationRefused)?;
     let method = method
         .parse::<reqwest::Method>()
@@ -306,19 +317,25 @@ pub(crate) async fn direct_forward(
         .request(method, url)
         .headers(header_map(&build_headers(ctx, headers)))
         .body(body);
+    // The first-byte budget covers the whole send+response-head wait.
     let response = match tokio::time::timeout(ctx.timeouts.ttft, request.send()).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             // The reqwest Display carries the pinned URL (gateway origin): it
             // is logged on H only and must not be rendered into a body W sees.
             tracing::warn!(%error, "direct egress gateway request failed");
-            return if error.is_connect() || error.is_timeout() {
+            // reqwest's own timeout is a ladder timeout; a failed connect is
+            // an unreachable gateway; anything else is a post-network failure.
+            return if error.is_timeout() {
+                Err(DirectForwardError::TimedOut)
+            } else if error.is_connect() {
                 Err(DirectForwardError::GatewayUnreachable)
             } else {
-                Err(DirectForwardError::DestinationRefused)
+                Err(DirectForwardError::UpstreamFailed)
             };
         }
-        Err(_) => return Err(DirectForwardError::TimedOut),
+        // The wrapper's elapsed deadline fired while awaiting the first byte.
+        Err(_elapsed) => Err(DirectForwardError::TimedOut)?,
     };
     Ok(DirectResponse {
         status: response.status(),
@@ -828,9 +845,16 @@ impl EventRouter {
                     if let Some(tx) = self.body_tx.as_ref()
                         && tx.send(bytes).await.is_err()
                     {
-                        // Upstream pump gone (e.g. first byte failed); the
-                        // main loop is already finishing.
-                        break;
+                        // The upstream body pump is gone (the response head
+                        // failed or the response completed and the stream
+                        // dropped): drop the pump, but keep routing this
+                        // event loop. With a response larger than the
+                        // four-permit window outstanding, the main task's
+                        // tail/terminal gated sends still need this router to
+                        // turn inbound api.credit into permits; breaking here
+                        // would park them until the hard cap.
+                        self.body_tx = None;
+                        continue;
                     }
                     // One credit per drained request-body chunk. Credits are
                     // control frames: they never take a data permit, so a
@@ -854,11 +878,12 @@ impl EventRouter {
                     self.cancelled.notify_one();
                     break;
                 }
-                // Any terminal frame ends this egress: abort an upload still
-                // in flight and close the upstream request. The main loop
-                // shares this Notify only through its `cancelled` selects;
-                // after a clean completion it has already left those selects,
-                // so the notify is a no-op there.
+                // Any terminal frame ends an upload still in flight. The main
+                // task is deliberately allowed to outlive this router through
+                // its tail/terminal sends (the abort waits until those
+                // settle), at which point it is already past the cancelled
+                // selects, so the notify is harmless there; it still aborts a
+                // body read parked in this loop.
                 InboundEvent::End(_) => {
                     self.cancelled.notify_one();
                     break;

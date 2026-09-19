@@ -823,6 +823,67 @@ async fn direct_net_probe_and_request_end_to_end() {
 }
 
 #[tokio::test]
+async fn direct_net_unreachable_gateway_is_a_504_upstream_timeout() {
+    // The direct leg must classify a failed gateway connect the same way the
+    // framed leg does: 504 + upstream-timeout (the protocol defines that code
+    // as "gateway unreachable or timeout ladder breached"), never
+    // via-host-offline.
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let bearer = RelayBearer::mint();
+
+    // H's proxy listener answers its own probe (so the worker accepts
+    // direct-net) but its pinned gateway origin refuses connections.
+    let dead_origin = "http://127.0.0.1:9/v1".to_owned();
+    let context = EgressContext::new(
+        INSTANCE,
+        &dead_origin,
+        CredentialKind::GatewayBearer(GW_TOKEN.into()),
+    )
+    .unwrap();
+    let proxy = listener::start_proxy(
+        &state_h,
+        INSTANCE,
+        &HostRelayBind {
+            addr: "127.0.0.1:0".into(),
+            allow_from: Vec::new(),
+        },
+        context,
+        bearer,
+    )
+    .await
+    .unwrap();
+    let endpoint = format!("http://127.0.0.1:{}", proxy.local_addr().port());
+
+    let provision = listener::provision_worker_with_bearer(
+        &state_w,
+        INSTANCE,
+        &dead_origin,
+        &via(ApiRouteMode::DirectNet),
+        Some(&endpoint),
+        RelayBearer::from_encoded(proxy.bearer_token()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(provision.kind, ApiRouteKind::DirectNet);
+
+    let response = http()
+        .get(format!("{}/models", provision.listener.base_url()))
+        .bearer_auth(provision.listener.bearer_token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 504);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("upstream-timeout"), "{body}");
+    assert!(
+        !body.contains("via-host-offline") && !body.contains("127.0.0.1"),
+        "wrong code and no origin leak: {body}"
+    );
+    state_w.revoke_instance(INSTANCE);
+}
+
+#[tokio::test]
 async fn direct_net_refusals() {
     let state = ApiRelayState::new();
 

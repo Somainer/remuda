@@ -78,6 +78,9 @@ pub struct AgentLaunch {
     pub binary: Option<PathBuf>,
     /// Who asked for this launch. Gates yolo argv (D-011/D-017).
     pub origin: crate::materializer::LaunchOrigin,
+    /// Whether `native_home` is Remuda-managed (skill delivery allowed) or the
+    /// inherited operator home, which is never written (D-045).
+    pub native_home_managed: bool,
     /// Settings overlay to pass as `--settings`, when one was written.
     pub settings_overlay: Option<PathBuf>,
 }
@@ -129,6 +132,7 @@ pub fn agent_recipe(
         binary,
         setting_sources: None,
         origin: launch.origin,
+        native_home_managed: Some(launch.native_home_managed),
         settings_overlay_path: launch.settings_overlay.clone(),
         secret_policy: None,
     })

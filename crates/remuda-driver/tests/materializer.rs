@@ -66,6 +66,7 @@ fn request<'a>(
         binary,
         setting_sources: None,
         origin: LaunchOrigin::Human,
+        native_home_managed: None,
         settings_overlay_path: None,
         secret_policy: None,
     }

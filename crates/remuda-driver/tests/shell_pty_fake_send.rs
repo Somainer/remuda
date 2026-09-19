@@ -191,6 +191,7 @@ fn driver_for(root: &Path, scenario_path: &Path, events_path: &Path) -> ShellPty
             native_home: native_home.clone(),
             binary: Some(binary),
             origin: LaunchOrigin::Human,
+            native_home_managed: true,
             settings_overlay: None,
         },
     );

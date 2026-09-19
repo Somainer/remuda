@@ -371,6 +371,7 @@ impl ClaudePrintDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin.into(),
+            native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
         };
@@ -474,7 +475,12 @@ impl ClaudePrintDriver {
         for entry in &recipe.env_allowlist {
             // The materializer already refuses these, but this is the last
             // gate before the value reaches a process (security-review-2 S2).
-            if crate::child_env::is_denied(&entry.name) {
+            // Capability entries are driver-computed grants (D-045): the
+            // REMUDA_ deny prefix guards spec- and host-supplied names, not
+            // values the driver itself attaches only after the grant gates.
+            if crate::child_env::is_denied(&entry.name)
+                && entry.source != EnvAllowlistSource::Capability
+            {
                 debug!(name = %entry.name, "refusing a denied env name");
                 continue;
             }
@@ -524,6 +530,9 @@ impl ClaudePrintDriver {
                     if let Ok(value) = std::env::var(&entry.name) {
                         env.insert(entry.name.clone(), value);
                     }
+                }
+                EnvAllowlistSource::Capability => {
+                    env.insert(entry.name.clone(), "1".to_owned());
                 }
             }
         }

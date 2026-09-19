@@ -256,6 +256,7 @@ impl ClaudeBgDriver {
             binary: self.options.binary.clone(),
             setting_sources: self.options.setting_sources.clone(),
             origin: self.options.origin,
+            native_home_managed: Some(!self.options.inherit_default_config),
             settings_overlay_path: self.options.settings_overlay_path.clone(),
             secret_policy: None,
         };
@@ -764,7 +765,15 @@ fn scrub_env(
         command.env(key, value);
     }
     for entry in &recipe.env_allowlist {
-        if crate::child_env::is_denied(&entry.name) {
+        // Driver-computed capability handshakes (D-045) pass the REMUDA_ deny
+        // prefix; spec- and host-supplied names do not.
+        if crate::child_env::is_denied(&entry.name)
+            && entry.source != crate::recipe::EnvAllowlistSource::Capability
+        {
+            continue;
+        }
+        if entry.source == crate::recipe::EnvAllowlistSource::Capability {
+            command.env(&entry.name, "1");
             continue;
         }
         // `--bg` resolves credentials through the native home rather than the

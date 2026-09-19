@@ -269,6 +269,7 @@ impl GenericPtyDriver {
             binary,
             setting_sources: None,
             origin: self.options.origin,
+            native_home_managed: None,
             settings_overlay_path: None,
             secret_policy: None,
         };
@@ -307,6 +308,27 @@ impl GenericPtyDriver {
         // config dir the two drivers share must not be mistaken for a login.
         if crate::claude_onboarding::has_login_material(std::path::Path::new(&recipe.native_home)) {
             env.insert("CLAUDE_CONFIG_DIR".into(), recipe.native_home.clone());
+        }
+        // Per-kind shadow homes the materializer pinned (D-045 codex
+        // `[mcp_servers]` lives in `$CODEX_HOME/config.toml`). Entry-driven:
+        // the var is applied only when the recipe's allowlist names it.
+        for entry in recipe
+            .env_allowlist
+            .iter()
+            .filter(|entry| entry.source == crate::recipe::EnvAllowlistSource::NativeHome)
+        {
+            if matches!(entry.name.as_str(), "CODEX_HOME" | "GROK_HOME") {
+                env.insert(entry.name.clone(), recipe.native_home.clone());
+            }
+        }
+        // D-045: driver-computed capability handshakes, attached only when
+        // granted; they pass the REMUDA_ deny prefix that guards caller env.
+        for entry in recipe
+            .env_allowlist
+            .iter()
+            .filter(|entry| entry.source == crate::recipe::EnvAllowlistSource::Capability)
+        {
+            env.insert(entry.name.clone(), "1".to_owned());
         }
         for (key, value) in &self.options.extra_env {
             if crate::child_env::is_denied(key) {

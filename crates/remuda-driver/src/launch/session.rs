@@ -44,6 +44,9 @@ pub struct HookSessionOptions {
     /// native home with their own hook files (D-028 P6). `Claude` uses the
     /// `--settings` overlay; other kinds get neither.
     pub kind: remuda_protocol::AgentKind,
+    /// Granted MCP servers spliced into the codex shadow `config.toml`
+    /// (D-045 leg (b)); empty on every other path.
+    pub mcp_servers: Vec<crate::launch::ShadowMcpServer>,
 }
 
 /// A live hook path for one instance.
@@ -106,6 +109,7 @@ impl HookSession {
                         launch_dir: &launch_dir,
                         relay_binary: &options.relay_binary,
                         socket_path: &socket_path,
+                        mcp_servers: &options.mcp_servers,
                     },
                 )?)
             }
@@ -295,6 +299,7 @@ mod tests {
             tui: TuiMode::Fullscreen,
             base_settings: None,
             kind: AgentKind::Claude,
+            mcp_servers: Vec::new(),
         }
     }
 

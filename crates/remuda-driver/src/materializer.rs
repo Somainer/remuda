@@ -192,6 +192,12 @@ fn materialize_inner(
         &request.spec.permission_mode,
         request.spec.kind,
     )?;
+    // D-045 leg (b) collision: refuse before any file is written, in both
+    // `--mcp-config path` and `--mcp-config=path` forms.
+    crate::launch::skills::reject_caller_mcp_config(
+        &request.spec.capabilities,
+        &request.spec.args,
+    )?;
     let setting_sources = setting_sources(request)?;
     // M2: the override is validated before any file is written, so a bad path
     // fails the launch without leaving an overlay or a shim behind.
@@ -550,7 +556,6 @@ fn apply_capability_grant(
             origin: request.origin,
             permission: &request.spec.permission_mode,
             kind: request.spec.kind,
-            driver: request.spec.driver,
             launch_dir: &request.launch_dir,
             native_home: &request.native_home,
             native_home_managed: request.native_home_managed.unwrap_or(true),
@@ -559,22 +564,18 @@ fn apply_capability_grant(
         return Ok((Vec::new(), Vec::new()));
     };
     if !grant.argv.is_empty() {
-        // A caller-supplied `--mcp-config` would either be duplicated or —
-        // worse, because Remuda's server is additive — shadow this one. Never
-        // silently choose: refuse and name the collision.
-        if argv.iter().any(|token| token == "--mcp-config") {
-            return Err(DriverError::InvalidLaunchSpec(
-                "--mcp-config is supplied by Remuda when the computer-use \
-                 capability is granted; remove it from the launch args"
-                    .into(),
-            ));
-        }
         argv.extend(grant.argv);
     }
+    // The handshake name/value is defined by the grant in one place; the value
+    // rides the allowlist entry (Credential-shaped value slot) rather than
+    // being hardcoded at the spawn sites.
     let (name, value) = grant.env;
-    push_env(env_allowlist, name, EnvAllowlistSource::Capability, None);
-    // The value is a driver-computed constant; keep it off every log path.
-    debug_assert_eq!(value, "1");
+    push_env(
+        env_allowlist,
+        name,
+        EnvAllowlistSource::Capability,
+        Some(value.to_owned()),
+    );
     files.extend(grant.files);
     Ok((grant.capabilities, vec![grant.mcp_server]))
 }
@@ -600,6 +601,12 @@ fn materialize_shell_pty_agent(
         request.origin,
         &request.spec.permission_mode,
         request.spec.kind,
+    )?;
+    // D-045 leg (b) collision: refuse before any file is written, in both
+    // `--mcp-config path` and `--mcp-config=path` forms.
+    crate::launch::skills::reject_caller_mcp_config(
+        &request.spec.capabilities,
+        &request.spec.args,
     )?;
 
     fs::create_dir_all(&request.launch_dir)?;

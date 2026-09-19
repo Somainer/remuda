@@ -22,10 +22,11 @@ use crate::binary::hash_bytes;
 use crate::error::{DriverError, DriverResult};
 use crate::materializer::LaunchOrigin;
 use crate::recipe::{FileLifetime, FileRole, GrantedMcpServer, MaterializedFile};
-use remuda_protocol::{AgentKind, ClaudePermissionMode, PermissionMode};
+use remuda_protocol::{AgentKind, ApprovalPolicy, ClaudePermissionMode, PermissionMode};
+use serde_json::Value;
 use sha2::Digest as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The one capability name this batch knows (D-045).
 pub const CAPABILITY_COMPUTER_USE: &str = "computer-use";
@@ -34,6 +35,16 @@ pub const CAPABILITY_COMPUTER_USE: &str = "computer-use";
 /// not a boundary: anything with a shell can `export` it, so the real boundary
 /// is the absence of the materialized launcher when ungranted.
 pub const CAPABILITY_COMPUTER_USE_ENV: &str = "REMUDA_CAPABILITY_COMPUTER_USE";
+
+/// Handshake value; only `1` means granted.
+pub const CAPABILITY_COMPUTER_USE_VALUE: &str = "1";
+
+/// MCP-server-only env carrying the **operator's real** codex home. A granted
+/// codex launch shadows the agent's `CODEX_HOME` at a per-instance shadow home,
+/// but the vendor app lives under the real home; the launchers resolve it from
+/// this variable (skill scripts honor it first). Never set on the agent's own
+/// environment — only on the MCP server entry — so agent state stays shadowed.
+pub const CAPABILITY_REAL_CODEX_HOME_ENV: &str = "REMUDA_CODEX_HOME";
 
 /// MCP server name used in both `mcp-cua.json` and codex `[mcp_servers.*]`.
 pub const MCP_SERVER_NAME: &str = "codex-computer-use";
@@ -76,8 +87,10 @@ const EMBEDDED_SKILL: &[EmbeddedFile] = &[
     },
 ];
 
-/// Relative paths of the launchers materialized under `<launch_dir>/cua`.
+/// Relative path of the cua-repl launcher materialized under `<launch_dir>/cua`.
 const LAUNCHER_REPL: &str = "scripts/launch-cua-repl.sh";
+/// Relative path of the native-MCP launcher.
+const LAUNCHER_MCP: &str = "scripts/launch-mcp.sh";
 
 /// Everything a granted launch receives; computed and written together so the
 /// argv, env and audit record can never describe a file that does not exist.
@@ -90,7 +103,9 @@ pub(crate) struct CapabilityGrant {
     pub mcp_server: GrantedMcpServer,
     /// Argv tokens to append (claude only; empty for codex).
     pub argv: Vec<String>,
-    /// Env name+value to push onto the recipe's env allowlist.
+    /// Env name+value to push onto the recipe's env allowlist. The name is the
+    /// single allowlisted REMUDA_ variable; the value rides with the grant,
+    /// never hardcoded at the spawn sites.
     pub env: (&'static str, &'static str),
 }
 
@@ -123,15 +138,22 @@ pub fn computer_use_requested(
                  explicit human or bot launch may request it"
             )));
         }
-        // Q4: unattended desktop control plus skipped tool approvals is the
-        // one combination with no recovery path. Both are named.
-        if let PermissionMode::Claude(claude) = permission
-            && claude.mode == ClaudePermissionMode::BypassPermissions
-        {
+        // Q4, harness-agnostic: unattended/auto-approved desktop control is the
+        // one combination with no recovery path. Claude's spelling is
+        // bypassPermissions; codex's is approval policy `never` (auto-approve
+        // every action). Both are named in the refusal.
+        let unattended = match permission {
+            PermissionMode::Claude(claude) => {
+                claude.mode == ClaudePermissionMode::BypassPermissions
+            }
+            PermissionMode::Codex(codex) => codex.approval_policy == ApprovalPolicy::Never,
+            _ => false,
+        };
+        if unattended {
             return Err(DriverError::InvalidLaunchSpec(format!(
                 "refusing to grant {CAPABILITY_COMPUTER_USE:?} together with \
-                 bypassPermissions on the same launch: unattended desktop control plus \
-                 skipped tool approvals has no recovery path; remove one of the two"
+                 unattended/skipped tool approvals on the same {kind:?} launch: desktop \
+                 control plus auto-approved actions has no recovery path; remove one of the two"
             )));
         }
         // grok (and agy/generic/terminal) are not capability targets this batch.
@@ -150,17 +172,29 @@ pub fn computer_use_requested(
         .any(|value| value == CAPABILITY_COMPUTER_USE))
 }
 
-/// Materialize everything a granted launch is owed (D-045 §3.2/§3.3).
-///
-/// `native_home_managed` is the per-kind managed-home answer: true for claude
-/// when the launch uses a Remuda-scoped config dir, false for an inherited
-/// operator `~/.claude` (which is never written). It is ignored for codex,
-/// whose only delivery leg this batch is the MCP config.
-///
-/// `shadow_via_session` is true for the shell-pty carrier, whose `HookSession`
-/// materializes the codex shadow home (features + hook trust + MCP) after the
-/// recipe; in that case this function must not write the codex `config.toml`
-/// itself, or the second recipe materialization would erase the hook section.
+/// Refuse a caller-supplied `--mcp-config` that would collide with the granted
+/// server. Runs before any file is written; accepts both `--mcp-config path`
+/// and `--mcp-config=path` spellings (D-045 leg (b)).
+pub fn reject_caller_mcp_config(capabilities: &[String], args: &[String]) -> DriverResult<()> {
+    if !capabilities
+        .iter()
+        .any(|value| value == CAPABILITY_COMPUTER_USE)
+    {
+        return Ok(());
+    }
+    let collides = args
+        .iter()
+        .any(|arg| arg == "--mcp-config" || arg.starts_with("--mcp-config="));
+    if collides {
+        return Err(DriverError::InvalidLaunchSpec(
+            "--mcp-config is supplied by Remuda for the granted computer-use capability; \
+             a caller-supplied --mcp-config (including --mcp-config=<path>) collides with it"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Inputs for [`materialize_grant`], grouped to keep the grant's host facts
 /// together (the same grouping the materializer already uses for overlays).
 pub(crate) struct GrantRequest<'a> {
@@ -168,14 +202,28 @@ pub(crate) struct GrantRequest<'a> {
     pub capabilities: &'a [String],
     /// Who originated the launch — agents may not self-grant.
     pub origin: LaunchOrigin,
-    /// The launch's resolved permission mode (bypass gate).
+    /// The launch's resolved permission mode (unattended gate).
     pub permission: &'a PermissionMode,
     pub kind: AgentKind,
-    pub driver: remuda_protocol::DriverKind,
     pub launch_dir: &'a Path,
     pub native_home: &'a Path,
     /// Whether `native_home` is Remuda-managed (skill delivery allowed).
     pub native_home_managed: bool,
+}
+
+/// Whether a managed home is shared across instances (so its skill files must
+/// not be shredded on one instance's exit).
+///
+/// The Node roots a per-instance home at `<instance_dir>/native-home` (and the
+/// codex shadow at `<instance_dir>/launch/codex-home`); a configured shared
+/// dir (`REMUDA_CLAUDE_CONFIG_DIR`) or an explicit operator dir lives outside
+/// the instance dir. Path containment is the exact distinction the Node's home
+/// construction gives, so the materializer need not carry another flag.
+pub(crate) fn native_home_is_shared(launch_dir: &Path, native_home: &Path) -> bool {
+    let instance_dir = launch_dir.parent();
+    instance_dir
+        .map(|instance_dir| !native_home.starts_with(instance_dir))
+        .unwrap_or(false)
 }
 
 pub(crate) fn materialize_grant(
@@ -186,7 +234,6 @@ pub(crate) fn materialize_grant(
         origin,
         permission,
         kind,
-        driver,
         launch_dir,
         native_home,
         native_home_managed,
@@ -195,48 +242,74 @@ pub(crate) fn materialize_grant(
         return Ok(None);
     }
 
-    let shadow_via_session = driver == remuda_protocol::DriverKind::ShellPty;
     let mut files = Vec::new();
 
     // Leg (a) for claude: the embedded skill tree into a *managed* home only.
     // codex/grok have no skills-directory reader, so writing there would be
     // delivery into a black hole (design §3.2); the inherited operator home is
     // never written on any branch.
+    //
+    // Lifetime follows containment: files in a home outside this instance dir
+    // (configured shared dir / explicit operator dir) survive the launch and
+    // are not shredded; per-instance homes are cleaned up with it.
+    let skill_lifetime = if native_home_is_shared(launch_dir, native_home) {
+        FileLifetime::NativeStore
+    } else {
+        FileLifetime::Launch
+    };
     if kind == AgentKind::Claude && native_home_managed {
-        write_skill_tree(native_home, &mut files)?;
+        write_skill_tree(native_home, skill_lifetime, &mut files)?;
     }
 
     // The launchers the MCP config points at, always under `<launch_dir>/cua`
     // so they exist with or without a managed skill tree (claude inherited
     // home, codex shadow home).
     let cua_dir = launch_dir.join("cua");
-    let repl_rel = Path::new(LAUNCHER_REPL);
-    let repl_launcher = cua_dir.join(repl_rel);
-    let mcp_launcher = cua_dir.join("scripts/launch-mcp.sh");
-    for (rel, dest, mode) in [
-        (LAUNCHER_REPL, &repl_launcher, 0o755),
-        ("scripts/launch-mcp.sh", &mcp_launcher, 0o755),
+    let repl_launcher = cua_dir.join(LAUNCHER_REPL);
+    let mcp_launcher = cua_dir.join(LAUNCHER_MCP);
+    for (rel, dest) in [
+        (LAUNCHER_REPL, &repl_launcher),
+        (LAUNCHER_MCP, &mcp_launcher),
     ] {
         let bytes = embedded_bytes(rel)?;
-        write_private_file(dest, bytes, mode)?;
+        write_private_file(dest, bytes, 0o755)?;
         files.push(materialized_file(
             dest,
             FileRole::CapabilityScript,
-            mode,
+            0o755,
             bytes,
+            FileLifetime::Launch,
         )?);
     }
 
+    // The launchers locate the vendor app under the *operator's real* codex
+    // home; the agent itself keeps the shadowed CODEX_HOME, so the real home is
+    // handed to the launcher process only, via the MCP server entry env.
+    let real_codex_home = resolve_real_codex_home();
+
     // Leg (b): the one per-instance MCP config, 0600. It points at the
     // cua-repl launcher (the path for a host that is not an authenticated
-    // Codex session — the Remuda case) and carries the env handshake.
+    // Codex session — the Remuda case) and carries the handshake plus the
+    // launcher-only real codex home.
+    let mut server_env = vec![(
+        CAPABILITY_COMPUTER_USE_ENV.to_owned(),
+        CAPABILITY_COMPUTER_USE_VALUE.to_owned(),
+    )];
+    if let Some(real) = &real_codex_home {
+        server_env.push((CAPABILITY_REAL_CODEX_HOME_ENV.to_owned(), real.clone()));
+    }
+
     let config_path = launch_dir.join("mcp-cua.json");
+    let mut server_env_map = serde_json::Map::new();
+    for (key, value) in &server_env {
+        server_env_map.insert(key.clone(), Value::String(value.clone()));
+    }
     let config_json = serde_json::json!({
         "mcpServers": {
             MCP_SERVER_NAME: {
                 "command": "/bin/sh",
                 "args": [repl_launcher.to_string_lossy()],
-                "env": { CAPABILITY_COMPUTER_USE_ENV: "1" },
+                "env": server_env_map,
             }
         }
     });
@@ -247,6 +320,7 @@ pub(crate) fn materialize_grant(
         FileRole::CapabilityMcpConfig,
         0o600,
         &config_bytes,
+        FileLifetime::Launch,
     )?);
 
     let mcp_server = GrantedMcpServer {
@@ -254,14 +328,15 @@ pub(crate) fn materialize_grant(
         config_path: config_path.to_string_lossy().into_owned(),
         command: "/bin/sh".to_owned(),
         args: vec![repl_launcher.to_string_lossy().into_owned()],
-        env: vec![(CAPABILITY_COMPUTER_USE_ENV.to_owned(), "1".to_owned())],
+        env: server_env,
     };
 
     // Codex reads `[mcp_servers.*]` in its shadow `config.toml`, never argv.
-    // shell-pty gets the file from HookSession (hooks + this server); the
-    // other codex carriers have no hook session, so write the MCP-only config
-    // into their shadow home here.
-    if kind == AgentKind::Codex && !shadow_via_session {
+    // The file is written from the recipe on EVERY codex path: shell-pty with
+    // hooks on gets the complete file (features + hook trust + MCP) from
+    // HookSession, which overwrites this one; hooks off keeps it — so a grant
+    // is never silently granted-but-undelivered. Appending is idempotent.
+    if kind == AgentKind::Codex {
         let shadow_files = crate::launch::materialize_codex_mcp_servers(
             launch_dir,
             &[crate::launch::ShadowMcpServer {
@@ -283,8 +358,7 @@ pub(crate) fn materialize_grant(
     }
 
     // Mount by AgentKind, never by driver (design §3.3): codex takes the
-    // shadow config.toml; everything else capable this batch (claude, however
-    // hosted) takes argv.
+    // shadow config.toml; claude (however hosted) takes argv.
     let argv = if kind == AgentKind::Claude {
         vec![
             "--mcp-config".to_owned(),
@@ -299,14 +373,68 @@ pub(crate) fn materialize_grant(
         files,
         mcp_server,
         argv,
-        env: (CAPABILITY_COMPUTER_USE_ENV, "1"),
+        env: (CAPABILITY_COMPUTER_USE_ENV, CAPABILITY_COMPUTER_USE_VALUE),
     }))
 }
 
+/// Resolve the operator's real codex home the way the launchers do
+/// (`CODEX_HOME`, else `$HOME/.codex`). Runs in the Node process before any
+/// per-child shadow env is applied, so it never sees the shadow value.
+fn resolve_real_codex_home() -> Option<String> {
+    if let Some(path) = std::env::var_os(CAPABILITY_REAL_CODEX_HOME_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        // An explicit test/operator override wins.
+        return Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(path) = std::env::var_os("CODEX_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        return Some(path.to_string_lossy().into_owned());
+    }
+    std::env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(|home| {
+            PathBuf::from(home)
+                .join(".codex")
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
 /// Write the embedded skill tree into `<native_home>/skills/codex-computer-use`.
-/// Directories 0700, files 0600 (D-045).
-fn write_skill_tree(native_home: &Path, files: &mut Vec<MaterializedFile>) -> DriverResult<()> {
+/// Every directory in the created tree and every file are owner-only
+/// (0700 dirs, 0600 files; D-045). File lifetime follows the home: per-instance
+/// files are shredded with the launch; shared-home files survive it.
+fn write_skill_tree(
+    native_home: &Path,
+    lifetime: FileLifetime,
+    files: &mut Vec<MaterializedFile>,
+) -> DriverResult<()> {
     let root = native_home.join("skills").join(SKILL_DIR);
+
+    // Create + 0700 every directory component the files occupy, starting at
+    // the tree root (create_dir_all alone leaves intermediate dirs at umask).
+    let mut dirs: Vec<PathBuf> = EMBEDDED_SKILL
+        .iter()
+        .filter_map(|file| {
+            Path::new(file.rel)
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(|parent| root.join(parent))
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    fs::create_dir_all(&root)?;
+    set_dir_mode(&root, 0o700)?;
+    for dir in &dirs {
+        fs::create_dir_all(dir)?;
+        set_dir_mode(dir, 0o700)?;
+    }
+
     for embedded in EMBEDDED_SKILL {
         let dest = root.join(embedded.rel);
         write_private_file(&dest, embedded.bytes, 0o600)?;
@@ -315,6 +443,7 @@ fn write_skill_tree(native_home: &Path, files: &mut Vec<MaterializedFile>) -> Dr
             FileRole::CapabilitySkill,
             0o600,
             embedded.bytes,
+            lifetime,
         )?);
     }
     Ok(())
@@ -335,13 +464,14 @@ fn materialized_file(
     role: FileRole,
     mode: u32,
     bytes: &[u8],
+    lifetime: FileLifetime,
 ) -> DriverResult<MaterializedFile> {
     Ok(MaterializedFile {
         path: path.to_string_lossy().into_owned(),
         role,
         mode: format!("{mode:04o}"),
         content_digest: hash_bytes(bytes)?,
-        lifetime: FileLifetime::Launch,
+        lifetime,
     })
 }
 

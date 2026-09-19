@@ -267,11 +267,19 @@ pub(crate) async fn dispatch_core(
         .capabilities
         .iter()
         .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE);
-    if computer_use && harness == "grok" {
-        return Err(HubError::BadRequest(
-            "the \"computer-use\" capability is not supported for harness \"grok\" this batch"
-                .into(),
-        ));
+    // D-045 Q4: dispatch workers are bot-originated and run unattended
+    // (claude: bypassPermissions; codex: auto-approved without a human at the
+    // terminal). Desktop control over an unattended session is the one
+    // combination with no recovery path, so it is refused for EVERY harness
+    // rather than silently downgraded. Use an attended
+    // `remuda instance create --capability computer-use` instead.
+    if computer_use {
+        return Err(HubError::BadRequest(format!(
+            "refusing \"computer-use\" on `dispatch`: dispatched workers run unattended \
+             (harness {harness}), and desktop control without per-action human approvals \
+             has no recovery path; use `remuda instance create --capability computer-use` \
+             for an attended launch"
+        )));
     }
 
     let project = state
@@ -468,7 +476,6 @@ pub(crate) async fn dispatch_core(
         project.meta.id.as_id().as_str(),
         task.as_ref().map(|task| task.meta.id.as_id().as_str()),
         extra_env,
-        body.capabilities.clone(),
     );
     crate::agent_scope::prepare_create(
         &state,
@@ -965,27 +972,14 @@ pub(crate) fn worker_launch_spec(
     project_id: &str,
     task_id: Option<&str>,
     extra_env: serde_json::Map<String, Value>,
-    capabilities: Vec<String>,
 ) -> Value {
-    let grants_computer_use = capabilities
-        .iter()
-        .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE);
     let mut spec = json!({
         "kind": harness,
         "driver": driver,
         "model": model,
         "providerProfileId": provider_profile_id,
         "delegation": delegation,
-        // D-045/Q4: dispatched workers otherwise run bypassPermissions, which
-        // together with desktop control is the one refused combination. A
-        // computer-use worker therefore launches under host approvals
-        // (`default`); granting bypass on top would need its own explicit
-        // flag, which deliberately does not exist yet.
-        "permissionMode": if grants_computer_use && harness == "claude" {
-            "default"
-        } else {
-            "bypassPermissions"
-        },
+        "permissionMode": "bypassPermissions",
         "workspaceId": workspace_id,
         "hostId": host_id,
         "cwd": cwd,
@@ -994,12 +988,13 @@ pub(crate) fn worker_launch_spec(
         "prompt": null,
         "extraEnv": Value::Object(extra_env),
         "projectId": project_id,
+        // Dispatch never carries per-launch host capabilities: computer-use on
+        // an unattended worker is refused in dispatch_core (D-045 Q4), and
+        // respawn inherits no grant. Persist the canonical empty array.
+        "capabilities": json!([]),
     });
     if let Some(task_id) = task_id {
         spec["taskId"] = json!(task_id);
-    }
-    if !capabilities.is_empty() {
-        spec["capabilities"] = json!(capabilities);
     }
     spec
 }

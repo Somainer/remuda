@@ -76,15 +76,15 @@ impl Entrypoint for DispatchArgs {
 async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     let client = args.hub.connect()?;
     super::capability::validate_requested(&args.capabilities)?;
-    if super::capability::requests_computer_use(&args.capabilities)
-        && !matches!(
-            args.harness.as_deref().unwrap_or("claude"),
-            "claude" | "codex"
-        )
-    {
+    if super::capability::requests_computer_use(&args.capabilities) {
+        // D-045 Q4: dispatch workers are bot-originated and run unattended
+        // (every harness); desktop control without a human approving each
+        // action is refused for all of them, never silently downgraded.
         anyhow::bail!(
-            "the \"computer-use\" capability is not supported for harness {:?} this batch; \
-             supported harnesses are claude and codex",
+            "refusing --capability computer-use on dispatch for harness {:?}: dispatched \
+             workers run unattended, and desktop control without per-action human approvals \
+             has no recovery path; use `remuda instance create --capability computer-use` \
+             for an attended launch",
             args.harness.as_deref().unwrap_or("claude")
         );
     }
@@ -115,17 +115,8 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     let brief_name = std::path::Path::new(&brief_path)
         .file_name()
         .map(|stem| stem.to_string_lossy().into_owned());
-    // D-045 gate 2 at the CLI when the host is explicit; placement-resolved
-    // dispatch is preflighted by the Hub after it picks the host.
-    if super::capability::requests_computer_use(&args.capabilities)
-        && let Some(host_id) = args.host.as_deref()
-    {
-        let host = client
-            .get(&format!("/v1/hosts/{host_id}"))
-            .await
-            .map_err(super::hub_client::hub_http_error)?;
-        super::capability::host_supports_computer_use(&host)?;
-    }
+    // D-045: dispatch refuses every computer-use grant above, so no host
+    // preflight is reachable here; the Hub repeats the refusal server-side.
     let body = json!({
         "projectId": args.project,
         "brief": content,

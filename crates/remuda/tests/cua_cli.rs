@@ -284,11 +284,53 @@ async fn installed_capability_on_macos_passes_preflight_and_reaches_the_node() -
 }
 
 #[test]
-fn help_lists_the_capability_flag() -> Result<()> {
-    let output = std::process::Command::new(bin())
-        .args(["instance", "create", "--help"])
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("--capability"), "{stdout}");
+fn help_lists_the_capability_flag_on_create_and_dispatch() -> Result<()> {
+    for command in ["instance create --help", "dispatch --help"] {
+        let output = std::process::Command::new(bin())
+            .args(command.split_whitespace())
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("--capability"), "{command}: {stdout}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dispatch_refuses_computer_use_for_every_harness() -> Result<()> {
+    // D-045 Q4: dispatch workers are unattended; both harnesses are refused
+    // with a message naming both, never silently downgraded. No Hub needed —
+    // the CLI refuses before making the call.
+    for harness in ["claude", "codex"] {
+        let hub = spawn_hub(Some("macos"), None).await?;
+        let brief = hub._dir.path().join("brief.md");
+        std::fs::write(
+            &brief,
+            "Do the task.\nReply DONE <sha> or BLOCKED <reason>.\n",
+        )?;
+        let output = run(
+            &[
+                "dispatch",
+                "--project",
+                "p1",
+                "--brief",
+                brief.to_str().unwrap(),
+                "--harness",
+                harness,
+                "--host",
+                &hub.host,
+                "--capability",
+                "computer-use",
+            ],
+            &hub,
+        );
+        assert!(!output.status.success(), "harness {harness}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("dispatch") && stderr.contains("unattended"),
+            "harness {harness}: {stderr}"
+        );
+        // The refusal must not be the silent default-permission downgrade.
+        assert!(!stderr.contains("instanceId"), "{stderr}");
+    }
     Ok(())
 }

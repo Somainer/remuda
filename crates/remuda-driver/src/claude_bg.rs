@@ -767,13 +767,17 @@ fn scrub_env(
     for entry in &recipe.env_allowlist {
         // Driver-computed capability handshakes (D-045) pass the REMUDA_ deny
         // prefix; spec- and host-supplied names do not.
+        // Narrow to the granted-handshake name: a Capability entry with any
+        // other denied name is still refused.
         if crate::child_env::is_denied(&entry.name)
-            && entry.source != crate::recipe::EnvAllowlistSource::Capability
+            && entry.name != crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV
         {
             continue;
         }
         if entry.source == crate::recipe::EnvAllowlistSource::Capability {
-            command.env(&entry.name, "1");
+            if let Some(value) = entry.secret_ref.as_deref() {
+                command.env(&entry.name, value);
+            }
             continue;
         }
         // `--bg` resolves credentials through the native home rather than the

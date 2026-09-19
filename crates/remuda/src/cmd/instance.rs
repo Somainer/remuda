@@ -410,7 +410,10 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     // Hub placement (proposal.md §4.6) accepts hostId, labels[], or any.
     // Still send hostId when the CLI can resolve it so older Hubs that require
     // the field keep working; otherwise Hub pick_hosts runs.
-    let hosts = client.list_hosts().await.unwrap_or_default();
+    //
+    // A transport error is fatal: silently skipping would skip the D-045
+    // preflight, so list failures propagate instead of defaulting to empty.
+    let hosts = client.list_hosts().await?;
     if let Some(host) = &opts.host {
         body["hostId"] = json!(host);
         body["placement"] = json!({ "host": host });
@@ -427,18 +430,27 @@ pub(crate) async fn create(client: &HubClient, mut opts: CreateOpts) -> Result<V
     }
 
     // D-045 gate 2, before persistence: the target host must be a macOS host
-    // whose Node reports the capability installed. When placement is explicit
-    // (`--host`/labels resolved) we check the exact target; `kind:any` checks
-    // the Hub's pick when one was resolved. The Hub re-checks regardless.
-    if super::capability::requests_computer_use(&opts.capabilities)
-        && let Some(host_id) = body.get("hostId").and_then(Value::as_str)
-        && let Some(host) = hosts.iter().find(|host| {
+    // whose Node reports the capability installed. Fail loud, never silently
+    // skip: no resolved host, an unreported host id, or a failed check each
+    // refuse with a retry direction. The Hub re-checks after placement too.
+    if super::capability::requests_computer_use(&opts.capabilities) {
+        let Some(host_id) = body.get("hostId").and_then(Value::as_str) else {
+            bail!(
+                "computer-use needs an explicit, resolvable target host: no host was selected \
+                 for this placement; pick a Mac with --host (or matching labels)"
+            );
+        };
+        let Some(host) = hosts.iter().find(|host| {
             host.get("hostId")
                 .or_else(|| host.get("id"))
                 .and_then(Value::as_str)
                 == Some(host_id)
-        })
-    {
+        }) else {
+            bail!(
+                "host {host_id} is not in the Hub's host inventory (offline or unknown); \
+                 computer-use requires a connected macOS host — pick one with --host"
+            );
+        };
         super::capability::host_supports_computer_use(host)?;
     }
 

@@ -726,3 +726,57 @@ async fn state_done_requires_sha_and_blocked_requires_reason() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["state"]["reason"], "need creds");
 }
+
+#[tokio::test]
+async fn dispatch_refuses_computer_use_for_every_harness_without_downgrading() {
+    // D-045 Q4: dispatch workers are unattended; the grant is refused for both
+    // harnesses (never silently flipped to host approvals) and the refusal
+    // arrives before provisioning, so no worktree is created.
+    for harness in ["claude", "codex"] {
+        let mut ctx = Ctx::spawn().await.unwrap();
+        let project = ctx.create_project(&["58940-58969"]).await;
+        let project_id = project["id"].as_str().unwrap();
+        ctx.drain_calls();
+
+        let mut body = ctx.dispatch_body(project_id);
+        body["harness"] = json!(harness);
+        body["capabilities"] = json!(["computer-use"]);
+        let (status, response) = ctx
+            .request("POST", "/v1/workers/dispatch", Some(body))
+            .await;
+        assert_eq!(status, 400, "harness {harness}: {response}");
+        let message = response["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("dispatch") && message.contains("unattended"),
+            "harness {harness}: {message}"
+        );
+
+        // No provisioning happened for the refused dispatch.
+        assert!(
+            !ctx.drain_calls()
+                .iter()
+                .any(|method| method == "worker.provision"),
+            "harness {harness}: refused dispatch must not provision"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dispatch_rejects_unknown_capability_value() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = ctx.create_project(&["58970-58999"]).await;
+    let project_id = project["id"].as_str().unwrap();
+    let mut body = ctx.dispatch_body(project_id);
+    body["capabilities"] = json!(["desktop"]);
+    let (status, response) = ctx
+        .request("POST", "/v1/workers/dispatch", Some(body))
+        .await;
+    assert_eq!(status, 400, "{response}");
+    assert!(
+        response["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"desktop\""),
+        "{response}"
+    );
+}

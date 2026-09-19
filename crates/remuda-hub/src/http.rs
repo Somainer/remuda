@@ -806,7 +806,7 @@ pub async fn create_instance(
         "cwd": body.cwd,
         "worktree": body.worktree,
         "requiredCapabilities": body.required_capabilities,
-        "capabilities": body.capabilities,
+        "capabilities": body.capabilities.clone().unwrap_or_default(),
     });
     if let Some(obj) = spec.as_object_mut() {
         if let Some(delegation) = &body.delegation {

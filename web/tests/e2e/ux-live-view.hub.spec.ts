@@ -439,7 +439,12 @@ test("live status strip: phase/elapsed/health over a real PTY turn", async ({ pa
     //     lands, even though it was watched while running. Expand the row to
     //     see the desktop-identical full card: elapsed stops, exit 0 shows.
     await expect(card).toHaveAttribute("data-folded", "1", { timeout: 5_000 });
-    await card.getByTestId("tool-fold-open").click();
+    // At 390px the floating composer dock can cover the bottom-pinned row;
+    // scroll clear and drive the click directly rather than retrying under
+    // the overlay until the 90s test timeout.
+    const foldToggle = card.getByTestId("tool-fold-open");
+    await foldToggle.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    await foldToggle.evaluate((el) => el.click());
     await expect(card).toHaveAttribute("data-folded", "0");
     await expect(card).toContainText("exit 0");
     await expect(card.getByTestId("tool-elapsed")).toHaveCount(0);

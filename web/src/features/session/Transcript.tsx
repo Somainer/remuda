@@ -313,6 +313,17 @@ function TranscriptInner({
     return map;
   }, [matches, nodes, selectedIdx]);
 
+  const currentHitIds = useMemo(() => {
+    const set = new Set<string>();
+    const match = matches[selectedIdx];
+    if (!match) return set;
+    const located = locateNode(nodes, match.nodeId);
+    // For a hit inside a compact fold, both the fold row and the matched
+    // child tool card count as current (the card auto-expands).
+    if (located) set.add(match.nodeId);
+    return set;
+  }, [matches, selectedIdx, nodes]);
+
   const settle = journalStatus !== "gap-backfill";
   const defaultFolded = collapseTick > 0;
   const range = useMemo(
@@ -789,6 +800,7 @@ function TranscriptInner({
                 onToggleWorkflowDismiss={toggleWorkflowDismiss}
                 expandedTools={expandedTools}
                 onToggleToolExpand={toggleToolExpand}
+                currentHitIds={currentHitIds}
               />
             );
           })}
@@ -835,6 +847,7 @@ function TranscriptRow({
   onToggleWorkflowDismiss,
   expandedTools,
   onToggleToolExpand,
+  currentHitIds,
 }: {
   node: TranscriptNode;
   active: boolean;
@@ -854,6 +867,7 @@ function TranscriptRow({
   onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
   expandedTools: ReadonlySet<string>;
   onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
+  currentHitIds: ReadonlySet<string>;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
@@ -912,6 +926,8 @@ function TranscriptRow({
         onToggleWorkflowDismiss,
         expandedTools,
         onToggleToolExpand,
+        searchCurrent,
+        currentHitIds,
       })}    </div>
   );
 }
@@ -931,6 +947,7 @@ function ToolRow({
     onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
     expandedTools: ReadonlySet<string>;
     onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
+    searchCurrent: boolean;
   };
   hitChildId?: string | null;
 }): ReactNode {
@@ -947,7 +964,10 @@ function ToolRow({
       workflow={node.workflow}
       defaultFolded={failed ? false : opts.defaultFolded}
       settle={opts.settle}
-      expanded={opts.expandedTools.has(node.id)}
+      // A current in-transcript search hit inside this card must not stay
+      // hidden behind the D-041 fold (same auto-open the transcript gives
+      // CompactFold/SubagentFolds for a hit).
+      expanded={opts.expandedTools.has(node.id) || opts.searchCurrent}
       onExpand={() => opts.onToggleToolExpand(node.id, true)}
       workflowDismissed={workflowId ? opts.dismissedWorkflows.has(workflowId) : false}
       onDismissWorkflow={workflowId ? () => opts.onToggleWorkflowDismiss(workflowId, true) : undefined}
@@ -992,6 +1012,9 @@ function renderNode(
     onToggleWorkflowDismiss: (workflowId: string, dismiss: boolean) => void;
     expandedTools: ReadonlySet<string>;
     onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
+    searchCurrent: boolean;
+    /** Node ids carrying the CURRENT search hit (compact-fold children). */
+    currentHitIds?: ReadonlySet<string> | null;
   },
 ): ReactNode {
   if (node.type === "message") {
@@ -1148,8 +1171,7 @@ function renderNode(
   }
   if (node.type === "tool") {
     return <ToolRow node={node} opts={opts} hitChildId={opts.hitChildId ?? null} />;
-  }
-  if (node.type === "workflow") {
+  }  if (node.type === "workflow") {
     return <WorkflowTree run={node.run} phases={node.phases} members={node.members} />;
   }
   if (node.type === "usage") {
@@ -1176,6 +1198,11 @@ function renderNode(
                 onToggleWorkflowDismiss: opts.onToggleWorkflowDismiss,
                 expandedTools: opts.expandedTools,
                 onToggleToolExpand: opts.onToggleToolExpand,
+                // Compact-fold children take their hit status from THIS
+                // child's own always-current hit map — not from the
+                // CompactFold latch (which is not re-set when the selected
+                // hit moves between children of an already-open fold).
+                searchCurrent: Boolean(opts.currentHitIds?.has(child.id)),
               }}
               hitChildId={opts.hitChildId ?? null}
             />

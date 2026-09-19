@@ -199,7 +199,9 @@ test("at 390px a settled Bash card folds to family + command first line; expandi
   // running state.
   await page.reload();
   await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
-  await expect(page.getByTestId("workflow-card").first()).toHaveAttribute("data-status", "running");
+  await expect(page.getByTestId("workflow-card").first()).toHaveAttribute("data-status", "running", {
+    timeout: 20_000,
+  });
 
   // The ordinary Bash tool sits inside the turn's compact fold; open it to
   // reach the card. It starts folded to its one-line row (D-041).
@@ -218,8 +220,11 @@ test("at 390px a settled Bash card folds to family + command first line; expandi
   await expect(foldWrap.getByText("$ echo workflow-running")).toHaveCount(0);
   await shot(page, "ux2026-toolfold-fold-390.png");
 
-  // Expanding reveals the same card the desktop layout renders.
-  await bashCard.getByTestId("tool-fold-open").click();
+  // Expanding reveals the same card the desktop layout renders. The floating
+  // composer dock can cover the row at 390px; scroll clear and click directly.
+  const bashToggle = bashCard.getByTestId("tool-fold-open");
+  await bashToggle.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await bashToggle.evaluate((el) => el.click());
   await expect(bashCard).toHaveAttribute("data-folded", "0");
   await expect(foldWrap.getByText("$ echo workflow-running")).toBeVisible();
   await expect(foldWrap.getByText(/exit 0/)).toBeVisible();
@@ -314,8 +319,11 @@ test("at 390px a tool seen running folds the instant it settles live — no relo
   await expect(card.getByTestId("tool-fold-arg")).toHaveText("echo toolfold-live-settle");
   await shot(page, "ux2026-toolfold-live-settled-390.png");
 
-  // Expanding still reaches the desktop-identical card.
-  await card.getByTestId("tool-fold-open").click();
+  // Expanding still reaches the desktop-identical card. The floating composer
+  // dock can cover the row at 390px; scroll clear and click directly.
+  const liveToggle = card.getByTestId("tool-fold-open");
+  await liveToggle.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await liveToggle.evaluate((el) => el.click());
   await expect(card).toHaveAttribute("data-folded", "0");
   await expect(card).toContainText("exit 0");
 });

@@ -1216,23 +1216,10 @@ async fn proxy_direct(
     let response = match result {
         Ok(response) => response,
         Err(error) => {
-            // `direct_forward` already redacts its reqwest detail (it stays in
-            // H's log); render only a fixed sentence and stable code toward W.
-            let (status, code, message) =
-                if error.to_string().contains("timed out before first byte") {
-                    (
-                        StatusCode::GATEWAY_TIMEOUT,
-                        remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
-                        "upstream timed out before first byte",
-                    )
-                } else {
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
-                        "upstream relay request failed",
-                    )
-                };
-            return anthropic_response(status, code, message);
+            // The typed failure names the ladder stage; no rendered text is
+            // inspected and the generic failure is not masked as a timeout.
+            let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::BAD_GATEWAY);
+            return anthropic_response(status, error.code(), error.message());
         }
     };
     let mut builder = axum::response::Response::builder().status(response.status());

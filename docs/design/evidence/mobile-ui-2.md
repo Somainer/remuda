@@ -103,7 +103,7 @@ flock "$E2E_LOCK" bash -c '
 - **129 passed，18 skipped（REMUDA_EVIDENCE 未置位的证据用例），2 failed，4 did not run（serial 连带跳过）。**
 - 两条失败：`ux-chrome.hub.spec.ts:225`（390px 热区几何）与 `ux-touchhit.hub.spec.ts:251`（390px header 44px 角点），报错同为 `seg-tty 的 44px 热区右上角解析到 seg-structured`。两者都在共享的 `/s/:id` 路由上断言 `ViewSwitch`，**本任务 diff 不触碰该路由、`SessionPage`、`session.module.css` 或 `ViewSwitch`**。
 - **根因 = 运行环境缺 CJK 字形**：该机字体目录只有 DejaVu（22 个 face，无任何 CJK 字体），`终端`/`结构` 回退为等宽 `.notdef`，两个字形的视觉宽度从设计假设的 ≥43.5px 缩到约 24px，使 30px 段的相邻 44px `::after` 热区必然重叠——探针因此在两条段之间解析到邻居。几何探针是按字形渲染宽度设计的（`session.module.css:2731` 的 640px 规则注释明写「Keep each segment >=44px visual」）。
-- **验证**：在用户字体目录放入一个 CJK 字体（不改动仓库与系统 fontconfig）后单跑这两条规格：**6 passed**（ux-chrome 1 + ux-touchhit 5，全绿）。截图（§6）在同一字体环境下拍摄，字形正常。按协调人指示，闸机主机缺 CJK 字形不属本任务缺陷，不在代码中处理；合并闸机若同样缺字体，需要在主机字体层补齐 CJK face（与本代码无关）。
+- **验证**：在用户字体目录放入一个 CJK 字体（不改动仓库与系统 fontconfig）后单跑这两条规格：**6 passed**（ux-chrome 2 + ux-touchhit 4，全绿）。截图（§6）在同一字体环境下拍摄，字形正常。按协调人指示，闸机主机缺 CJK 字形不属本任务缺陷，不在代码中处理；合并闸机若同样缺字体，需要在主机字体层补齐 CJK face（与本代码无关）。
 - 除上述两条环境性失败外，其余 129 条全绿，包括全部 compact 会话路由规格（ux-composer-mobile / ux-files / ux-keys / ux-code / ux-usage / ux-toolfold / ux-wfdrill / ux-workflow-card / ux-attach-files / ux-live-view / ux-livephrase / ux-question 等）与本任务 m-shell 规格。
 
 ## 9. 对既有规格的兼容性说明

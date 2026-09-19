@@ -14,6 +14,11 @@ import { readAccessCode, writeAccessCode } from "../lib/accessCode";
 import { clipboardIo } from "../lib/clipboard";
 import { MORE_NAV } from "../lib/nav";
 import { readPushStatus, subscribePush, unsubscribePush, type PushStatus } from "../lib/push";
+import {
+  readVoiceInputEnabled,
+  speechRecognitionSupported,
+  writeVoiceInputEnabled,
+} from "../lib/speech";
 import { defaultPasskeyName, passkeyErrorText } from "../lib/passkeys";
 import { hubStore, useHub } from "../lib/store";
 import { LoginPage } from "./LoginPage";
@@ -480,6 +485,11 @@ export function SettingsPage() {
   const [pushPhase, setPushPhase] = useState<SavePhase>("idle");
   const [pushMessage, setPushMessage] = useState<string | null>(null);
   const [pairBusy, setPairBusy] = useState(false);
+  // §4.8 voice input: off by default, per device. The capability fact never
+  // changes for a browser, so it is probed once on mount; iPhone Safari has
+  // no SpeechRecognition and gets an explanation instead of a dead switch.
+  const [voiceSupported] = useState(() => speechRecognitionSupported());
+  const [voiceEnabled, setVoiceEnabled] = useState(() => readVoiceInputEnabled());
 
   useEffect(() => {
     applyTheme(readTheme());
@@ -551,6 +561,14 @@ export function SettingsPage() {
     });
 
   const toggleCompact = () => hubStore.setCompact(!hub.compact);
+
+  const commitVoice = (enabled: boolean) =>
+    appearance.run(() => {
+      writeVoiceInputEnabled(enabled);
+      // Re-read the stored value: with storage denied it stays off, so the
+      // checkbox never shows a choice that did not persist.
+      setVoiceEnabled(readVoiceInputEnabled());
+    });
 
   const saveIdentity = () =>
     identity.save((next) => {
@@ -709,6 +727,31 @@ export function SettingsPage() {
                 自动切 tty（autoRevealTty）
               </label>
               <p className={css.hint}>默认关。打开后仍须 capabilities.artifact；M3 才考虑生产打开。</p>
+            </div>
+
+            <div className={css.section}>
+              <div className={css.label}>语音输入</div>
+              <p className={css.hint} data-testid="settings-voice-copy">
+                默认用系统键盘自带的听写：Remuda 不录音、不上传音频、不做云端转写，识别出的文字只进入输入框，听写中途绝不自动发送。浏览器增强（SpeechRecognition）默认关，只在浏览器支持时显示麦克风按钮，音频是否离开设备由该浏览器决定，不经过 Remuda 的 Hub / Node。
+              </p>
+              <p className={css.hint}>
+                iOS Safari 没有 SpeechRecognition（WebKit 未实现）。iPhone 上请用系统键盘的听写按钮；把 Remuda 加到主屏幕后的标准 PWA 里键盘听写可用。终端段不提供语音，要说话请切到结构段。
+              </p>
+              <label className={css.check}>
+                <input
+                  type="checkbox"
+                  data-testid="settings-voice-input"
+                  checked={voiceEnabled}
+                  disabled={!voiceSupported}
+                  onChange={(e) => void commitVoice(e.target.checked)}
+                />
+                在支持 SpeechRecognition 的浏览器显示麦克风按钮（默认关）
+              </label>
+              {!voiceSupported ? (
+                <p className={css.hint} data-testid="settings-voice-unsupported">
+                  此浏览器没有 SpeechRecognition，开关不可用且不会显示麦克风；iPhone 请用系统键盘听写。
+                </p>
+              ) : null}
             </div>
 
             <SaveStatus testId="settings-appearance-status" phase={appearance.phase} message={appearance.message} />

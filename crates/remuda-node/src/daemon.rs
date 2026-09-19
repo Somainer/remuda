@@ -24,25 +24,39 @@ const MAX_FRAME: usize = 1_048_576;
 /// for AF_UNIX `sun_path` the daemon binds a short hashed name in the per-user
 /// runtime directory and leaves `node.sock` as a symlink; because connect(2)
 /// enforces the same length limit *before* symlink resolution, clients must
-/// connect to the resolved target rather than the long link. With no daemon
-/// running (no link present) the conventional long path is returned anyway;
-/// connecting to it then fails `NotFound` exactly as before.
+/// connect to the resolved target rather than the long link.
+///
+/// The short target is **derived deterministically** with the same chooser
+/// the binder uses — it does not depend on the symlink existing. That matters
+/// before the daemon's first start and during the binder's startup window (the
+/// link is installed last): without derivation a status/start probe would
+/// hand the kernel the over-long path, get `InvalidInput` instead of
+/// `NotFound`, and abort a launch that should simply start the daemon. The
+/// symlink target is consulted only when the derivation itself fails.
 pub fn daemon_socket_path(data_dir: &Path) -> PathBuf {
     let preferred = data_dir.join("node.sock");
     if remuda_signal::runtime_dir::path_fits_sun_path(&preferred) {
         return preferred;
     }
-    match std::fs::symlink_metadata(&preferred) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            if let Ok(target) = std::fs::read_link(&preferred)
-                && target.is_absolute()
-            {
-                return target;
-            }
-            preferred
-        }
-        _ => preferred,
+    // Same placement math as `bind_daemon`, without binding or installing the
+    // link. The call only prepares (creates/secures) the runtime directory;
+    // the socket itself stays absent until the daemon binds it.
+    if let Ok(placement) =
+        remuda_signal::runtime_dir::place_socket(&preferred, &daemon_runtime_name(data_dir))
+        && placement.redirected()
+    {
+        return placement.bind_path().to_path_buf();
     }
+    // Derivation failed (e.g. no candidate at all on a non-unix host): honor
+    // an existing link, then the conventional path.
+    if let Ok(metadata) = std::fs::symlink_metadata(&preferred)
+        && metadata.file_type().is_symlink()
+        && let Ok(target) = std::fs::read_link(&preferred)
+        && target.is_absolute()
+    {
+        return target;
+    }
+    preferred
 }
 
 /// Stable short socket file name for a data directory: `node-<hash>.sock`.

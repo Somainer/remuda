@@ -109,10 +109,7 @@ async fn start(
             .await
             .unwrap();
     });
-    eprintln!("DBG resolved={:?}", daemon_socket_path(data_dir));
-    let running = daemon_is_running(data_dir).await;
-    eprintln!("DBG running={running:?}");
-    assert!(running.unwrap());
+    assert!(daemon_is_running(data_dir).await.unwrap());
     task
 }
 
@@ -305,6 +302,40 @@ async fn daemon_socket_redirects_under_a_long_data_dir() {
         std::fs::symlink_metadata(&real).is_err(),
         "shutdown must remove the real socket"
     );
+}
+
+/// Before a daemon has ever started under a too-long data directory there is
+/// no `node.sock` symlink to resolve; the client path must nevertheless be
+/// derived deterministically and fit `sun_path`, and the status probe must
+/// report "not running" rather than fail with the kernel's `InvalidInput`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_status_under_a_long_data_dir_before_first_start_is_not_running() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("d".repeat(80)).join("node-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    assert!(data_dir.join("node.sock").as_os_str().len() > 107);
+    assert!(
+        std::fs::symlink_metadata(data_dir.join("node.sock")).is_err(),
+        "no daemon has run; no link may exist yet"
+    );
+
+    let resolved = daemon_socket_path(&data_dir);
+    assert!(
+        resolved.as_os_str().len() <= 107,
+        "derived socket must fit sun_path: {}",
+        resolved.display()
+    );
+    assert!(
+        !resolved.starts_with(&data_dir),
+        "derived socket must live in the per-user runtime dir: {}",
+        resolved.display()
+    );
+    let running = daemon_is_running(&data_dir)
+        .await
+        .expect("a missing derived socket must read as not-running, not an error");
+    assert!(!running);
+    // A second bind attempt for the same data dir derives the same name.
+    assert_eq!(resolved, daemon_socket_path(&data_dir));
 }
 
 fn journal_complete(node: &DevNode, instance: &InstanceId) -> bool {

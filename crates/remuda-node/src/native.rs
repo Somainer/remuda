@@ -1028,6 +1028,19 @@ fn resolve_claude_overlay(
     profile: &ProviderProfile,
     api_relay: Option<&crate::api_relay::RelayOverlay>,
 ) -> Result<Option<PathBuf>, DriverError> {
+    // A `generic-pty` carrier runs the CLI with the host operator's own
+    // environment. Routing a `via` model-API session through it would hand
+    // the harness the host's gateway base URL and credential, because a
+    // generic session owns no sealed settings of its own — exactly the D-035
+    // silent reroute the relay exists to forbid. The combination is refused
+    // at launch, never silently downgraded to direct.
+    if api_relay.is_some() && matches!(kind, DriverKind::GenericPty) {
+        return Err(DriverError::Failed(
+            "api route `via` is not supported by the generic-pty carrier; \
+             launch the relay with a claude/native driver (never rerouted to direct)"
+                .to_string(),
+        ));
+    }
     if matches!(kind, DriverKind::GenericPty) {
         return Ok(None);
     }
@@ -2652,6 +2665,60 @@ mod tests {
     }
 
     #[test]
+    fn via_route_is_refused_for_generic_pty_never_rerouted_to_direct() {
+        // D-035: a generic-pty launch carrying a via relay must fail closed —
+        // the generic session would otherwise run with the host's own gateway
+        // credential and base URL. No overlay is written, no direct fallback.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "generic-pty",
+            "delegation": "gateway",
+            "providerOverlay": { "kind": "gateway", "baseUrl": "https://gateway.example/v1" },
+            "providerAuthToken": "gateway-credential",
+        }))
+        .expect("request");
+        let relay = crate::api_relay::RelayOverlay {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            bearer: "relay-bearer".into(),
+        };
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://gateway.example".into(),
+            delegation: Delegation::Gateway,
+            secret_ref: None,
+            models: vec![],
+            health: ProviderHealth::Healthy,
+        };
+        let error = resolve_claude_overlay(
+            &request,
+            &dir.path().join("launch"),
+            DriverKind::GenericPty,
+            Delegation::Gateway,
+            &profile,
+            Some(&relay),
+        )
+        .expect_err("generic-pty + via must refuse");
+        assert!(
+            error.to_string().contains("generic-pty") && error.to_string().contains("via"),
+            "{error}"
+        );
+
+        // The same request without a relay is the ordinary generic launch and
+        // is unaffected by the new check.
+        let plain = resolve_claude_overlay(
+            &request,
+            &dir.path().join("launch"),
+            DriverKind::GenericPty,
+            Delegation::Gateway,
+            &profile,
+            None,
+        );
+        assert!(plain.is_ok(), "non-relay generic launch is untouched");
+    }
+
+    #[test]
     fn host_scoped_overlay_is_refused_on_the_wrong_host() {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
@@ -3099,6 +3166,7 @@ mod tests {
                     request,
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
+                    api_relay: None,
                 },
             )
             .map(drop)
@@ -3142,6 +3210,7 @@ mod tests {
                     request,
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
+                    api_relay: None,
                 },
             )
             .map(drop)

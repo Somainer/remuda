@@ -347,12 +347,20 @@ pub(crate) fn status_for_error(code: &str) -> u16 {
 /// Anthropic-shaped error body for a listener-synthesized failure. The CLI
 /// renders this as a model-API error page; the message carries the stable code
 /// but never a header, body, or credential.
+///
+/// Built with `serde_json::json!` rather than hand-quoted formatting so a
+/// backslash or control character in either field is escaped correctly and
+/// can never produce invalid JSON for the harness to parse.
 #[must_use]
 pub(crate) fn anthropic_error_body(code: &str, message: &str) -> String {
-    format!(
-        "{{\"type\":\"error\",\"error\":{{\"type\":\"api_error\",\"message\":\"{code}: {}\"}}}}",
-        message.replace('"', "'")
-    )
+    serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": format!("{code}: {message}"),
+        },
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -471,5 +479,17 @@ mod tests {
         assert_eq!(status_for_error(API_ERROR_VIA_HOST_OFFLINE), 503);
         assert_eq!(status_for_error(API_ERROR_HUB_LINK_LOST), 503);
         assert_eq!(status_for_error("anything-else"), 502);
+    }
+
+    #[test]
+    fn anthropic_error_body_is_valid_json_under_hostile_inputs() {
+        // Quotes, backslashes and a control character must all round-trip
+        // through a JSON parser instead of breaking the document.
+        let body = anthropic_error_body("bad\"code", "line1\\n\"line2\u{0007}");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        let message = value["error"]["message"].as_str().expect("message");
+        assert!(message.starts_with("bad\"code: line1\\n\"line2"));
+        // And never hand-rolled HTML-escaped or quote-stripped.
+        assert!(body.contains("bad\\\"code"));
     }
 }

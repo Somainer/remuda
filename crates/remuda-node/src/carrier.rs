@@ -205,6 +205,8 @@ impl HubCarrier for StdioCarrier {
                 };
                 if frame.get("method").is_none() {
                     let _ = crate::transport::hubnode::persist_hello_result(&data_dir, &frame);
+                    // D-048: adopt the Hub-advertised relay limits.
+                    node.api_relay().apply_hello_limits(&frame);
                     continue;
                 }
                 let id = frame.get("id").cloned().unwrap_or(Value::Null);

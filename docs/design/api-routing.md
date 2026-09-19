@@ -152,6 +152,8 @@ operator 的常见拓扑正是如此：H 是 Hub 主机，无公网入口，而 
   `via:<H>` 路由启动决议时、以及 H 每次重连后，向 H 发一条 `api.egress`
   notification，按 `instanceId` 安装出口上下文（`profileId`、`baseUrl`、
   profile headers、`authToken`）；实例退出或路由失效时发 `revoke: true` 清除。
+  **每次下发都按 profile 当前的主机作用域过 SecretBroker 校验**——作用域在启动
+  后被收窄时，重发不再向越界的 H 投递凭据，而是撤销其旧快照（`revoke: true`）。
   Node 按 instanceId 安装/清除，`revoke` 后、新 `api.egress` 到达前拒绝该实例的
   新流（`destination-refused`）。凭据只存在于 H 内存、不经过 W、不出现在任何
   数据流帧或 journal 中。

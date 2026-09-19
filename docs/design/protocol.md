@@ -1564,9 +1564,12 @@ Hub↔Node 链路——与 `object.pull` 同一条路径、同一套授权、同
 **凭据绝不在 `api.open` 里。** 网关凭据（`authToken`）只由 Hub 经
 `api.egress` 单独下发给 H：当一个 `via:<H>` 路由在启动时决议、以及 H 每次
 重连之后，Hub 按 `instanceId` 安装出口上下文（`baseUrl`、profile headers、
-凭据）；实例退出或路由失效时下发 `revoke: true` 清除。Node 按 instanceId
-安装/清除上下文，`revoke` 后在新的 `api.egress` 到达前拒绝该实例的新流。
-这样凭据只存在于 H 内存、不经过 W，也不搭在任何数据流帧上。
+凭据）；实例退出或路由失效时下发 `revoke: true` 清除。**每一次下发（含重连
+重发）都当场过 SecretBroker 的主机作用域校验**：profile 的作用域可在启动后
+收窄，重发时若 H 已不在作用域内，Hub 不发凭据、改为下发 `revoke: true` 清
+掉旧上下文。Node 按 instanceId 安装/清除上下文，`revoke` 后在新的
+`api.egress` 到达前拒绝该实例的新流。这样凭据只存在于 H 内存、不经过 W，也
+不搭在任何数据流帧上。
 
 `headers` 是**列表**而不是 map：HTTP 允许同名重复（`x-stainless-*` 就会），
 折叠成一个值会改变网关看到的请求。`query` 原样转发、从不重新编码；

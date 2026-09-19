@@ -453,6 +453,13 @@ pub struct InstanceSpec {
     pub native_home: NativeHome,
     /// `carrier`; protocol §4.1.
     pub carrier: CarrierSpec,
+    /// Per-launch host capabilities explicitly requested by a human or bot
+    /// (`["computer-use"]`; D-045). Empty by default; unknown values are
+    /// refused. Never inherited, never implied by installed host software.
+    /// Always serialized as `capabilities: []` so the wire form is canonical
+    /// (the round-trip snapshot asserts byte stability).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     /// `required_capabilities`; protocol §4.1.
     pub required_capabilities: Vec<CapabilityName>,
     /// `completion_scope`; protocol §4.1.

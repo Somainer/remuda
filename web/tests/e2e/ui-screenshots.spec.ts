@@ -41,7 +41,14 @@ test.describe("ui screenshots 1440 / 390", () => {
       await shot(page, `new-${tag}.png`);
 
       await page.goto("/approvals");
-      await expect(page.getByTestId("approvals-page")).toBeVisible();
+      // c-minbox: at 390 the /approvals entry redirects to the phone inbox
+      // /m/inbox (D-049); the desktop approvals centre is 1440-only.
+      if (w < 768) {
+        await expect(page).toHaveURL(/\/m\/inbox/);
+        await expect(page.getByTestId("m-inbox")).toBeVisible();
+      } else {
+        await expect(page.getByTestId("approvals-page")).toBeVisible();
+      }
       await shot(page, `approvals-${tag}.png`);
 
       await page.goto("/hosts");

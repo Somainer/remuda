@@ -282,6 +282,38 @@
     bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
     min-width: 0;
   }
+
+  /*
+   * D-049 tty-view budget: the app bar and tabs are gone, but the terminal's
+   * OWN chrome (mode toolbar, local-input dock, AuxKeys strip) still wraps to
+   * several rows at 390 and starves the xterm. Collapse each to one row that
+   * scrolls horizontally. Every button and every tty-key-* testid stays
+   * mounted and reachable — this only changes wrapping, not capabilities.
+   * The descendant hooks are stable public testids/attrs (TerminalView's
+   * hashed classes cannot be targeted from here); m-keybar rebuilds the key
+   * set on top of this single-row layout.
+   */
+  .shell[data-layout="session"] section[data-tty-lab] > header {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .shell[data-layout="session"] section[data-tty-lab] > header > * {
+    flex: none;
+  }
+
+  .shell[data-layout="session"] [data-testid="tty-keybar"] {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* The explanatory line under the local input is static documentation; in
+     compact it costs a wrapped row the 60% budget cannot afford. */
+  .shell[data-layout="session"] [data-testid="tty-dock"] form + p {
+    display: none;
+  }
 }
 
 .main > [data-testid="subagent-view"] {

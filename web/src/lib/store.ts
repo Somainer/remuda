@@ -1,9 +1,12 @@
 import { useSyncExternalStore } from "react";
+
+/** Bounded journal tail the list reads per live instance to project its phrase. */
+const SUMMARY_TAIL = 64;
 import type { Command } from "../types/command";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
-import type { Id } from "../types/wire";
+import type { Id, U64 } from "../types/wire";
 import type { PromptMode } from "../types/generated";
 import type { Workspace, WorkspaceSnapshot } from "../types/workspace";
 import type { AttachmentRef } from "./attachments";
@@ -58,6 +61,7 @@ import {
   normalizePermissionMode as normalizeKindPermissionMode,
 } from "../features/session/permissions";
 import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
+import { liveSummary } from "../features/session/liveSummary";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
 import { id, now } from "./ids";
@@ -289,6 +293,8 @@ export type HubState = {
   compact: boolean;
   answering: Record<string, true>;
   screens: Record<string, { lines: string[]; done: boolean }>;
+  /** List-row live phrases projected from each instance's journal tail. */
+  summaries: Record<string, string>;
 };
 
 const initial: HubState = {
@@ -322,6 +328,7 @@ const initial: HubState = {
   compact: typeof localStorage === "undefined" ? true : localStorage.getItem(COMPACT_KEY) !== "0",
   answering: {},
   screens: {},
+  summaries: {},
 };
 
 type Listener = () => void;
@@ -997,6 +1004,49 @@ class HubStore {
     this.hydrateUsageRollups(instances.items);
     this.hydrateModels(instances.items);
     this.hydratePermissionEffective(instances.items);
+    // The list rows show one projected live phrase; derive it from a bounded
+    // journal tail for live instances without opening the full follow stream
+    // (the session page does that on demand). Failures are non-fatal: the row
+    // simply shows its constant phrase.
+    void this.hydrateSummaries(instances.items.filter((instance) => {
+      const lifecycle = instance.lifecycle;
+      return lifecycle !== "exited" && lifecycle !== "failed" && lifecycle !== "unknown";
+    }));
+  }
+
+  private async hydrateSummaries(liveInstances: Instance[]) {
+    // The journal endpoint answers the newest bounded tail (up to 2000 rows,
+    // ascending). Ask for the last `SUMMARY_TAIL` rows by opening the window
+    // at durable - N, so a long journal costs one bounded read, not 2000 rows.
+    const entries = await Promise.all(
+      liveInstances.map(async (instance) => {
+        try {
+          const head = await api.eventsRead({ journalId: instance.journalId, limit: 1 });
+          const durable = Number(head.durableSeq);
+          if (!Number.isFinite(durable) || durable === 0) return null;
+          const from = Math.max(0, durable - SUMMARY_TAIL);
+          const page = await api.eventsRead({
+            journalId: instance.journalId,
+            afterSeq: String(from) as U64,
+            limit: SUMMARY_TAIL,
+          });
+          const phrase = liveSummary(page.events);
+          return phrase ? ([instance.id, phrase] as const) : null;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    const next = { ...this.state.summaries };
+    let changed = false;
+    for (const entry of entries) {
+      if (!entry) continue;
+      if (next[entry[0]] !== entry[1]) {
+        next[entry[0]] = entry[1];
+        changed = true;
+      }
+    }
+    if (changed) this.emit({ summaries: next });
   }
 
   async follow(instanceId: Id) {
@@ -1017,9 +1067,13 @@ class HubStore {
     // Another mount may finish loading this journal while this read is pending.
     if (this.journals.has(instance.journalId)) return;
     const history = seed.events;
+    const historyPhrase = liveSummary(history);
     this.emit({
       instances: applyInstanceActivity(this.state.instances, history),
       events: { ...this.state.events, [instanceId]: history },
+      summaries: historyPhrase
+        ? { ...this.state.summaries, [instanceId]: historyPhrase }
+        : this.state.summaries,
     });
     // §9.1: the Hub record usually already carries the latest effective level;
     // replay history effort edges too so a reconnect before refresh is honest.
@@ -1058,6 +1112,7 @@ class HubStore {
         }
         const next = current.concat(fresh);
         const screen = latestScreenFromObservations(next);
+        const phrase = liveSummary(next);
         this.emit({
           instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
@@ -1068,6 +1123,9 @@ class HubStore {
                 [instanceId]: { lines: lastLines(screen.lines, 80), done: doneFromLines(screen.lines) },
               }
             : this.state.screens,
+          summaries: phrase
+            ? { ...this.state.summaries, [instanceId]: phrase }
+            : this.state.summaries,
         });
       },
       onPrepend: (older) => {
@@ -1640,7 +1698,9 @@ class HubStore {
   }
 
   summaryOf(instanceId: Id) {
-    return api.summaryOf(instanceId);
+    // The live list projects the phrase from the journal tail into state;
+    // the mock client still supplies its scripted summaries directly.
+    return this.state.summaries[instanceId] ?? api.summaryOf(instanceId);
   }
 
   permissionModeOf(instanceId: Id) {

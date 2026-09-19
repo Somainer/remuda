@@ -150,6 +150,14 @@ function TranscriptInner({
     instanceId ? readDismissedWorkflows(instanceId) : new Set<string>(),
   );
 
+  // Bounded-window paging: true while the load-earlier row awaits its page.
+  // Declared before the route-switch reset below, which clears it per
+  // instance like the other per-route refs.
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  // Row heights keyed by STABLE NODE ID, never array index (see the `sizes`
+  // memo below); reset per session in the route-reset block.
+  const [rowHeights, setRowHeights] = useState<Map<string, number>>(new Map());
+
   // The route keeps this component mounted while the reader moves directly
   // between sessions (tab switch). Per-instance refs must therefore reset on
   // an id change, or one session's "already restored"/pin state would leak
@@ -167,6 +175,9 @@ function TranscriptInner({
     | { kind: "restore"; anchorId: string; offset: number; tries: number }
     | null
   >(null);
+  // Held anchor for a load-earlier prepend; repinned across post-prepend
+  // estimate/size changes (see the effect near the scroll math).
+  const prependAnchorRef = useRef<{ anchorId: string; offset: number; tries: number } | null>(null);
   // c-steer 插队发送 in-flight latch, mirroring the composer chip row: a double
   // click on a held transcript row posts exactly once.
   const steeringRef = useRef<Set<string>>(new Set());
@@ -176,7 +187,10 @@ function TranscriptInner({
     pinRef.current = saved ? saved.follow : true;
     scrollTopRef.current = 0;
     pendingScroll.current = null;
+    prependAnchorRef.current = null;
     steeringRef.current.clear();
+    setLoadingEarlier(false);
+    setRowHeights(new Map());
     if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
     setDismissedWorkflows(instanceId ? readDismissedWorkflows(instanceId) : new Set());
   }
@@ -207,7 +221,14 @@ function TranscriptInner({
   const [activeTurn, setActiveTurn] = useState<string | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewport, setViewport] = useState(720);
-  const [sizes, setSizes] = useState<number[]>([]);
+  // Derive the index-keyed size array the virtual window reads from. The
+  // heights map above is keyed by STABLE NODE ID: load-earlier prepends
+  // thousands of nodes without shifting index-keyed measurements, so padTop
+  // for the held anchor cannot jump.
+  const sizes = useMemo(
+    () => nodes.map((node) => rowHeights.get(node.id) ?? 0),
+    [nodes, rowHeights],
+  );
   const scrollerRef = useRef<HTMLDivElement>(null);
   // Latest scroll offset in a ref: passive-effect cleanup runs after refs are
   // detached on unmount, so the leave-session flush cannot read the DOM.
@@ -282,13 +303,56 @@ function TranscriptInner({
     [nodes.length, sizes, scrollTop, viewport, estimate],
   );
 
-  const setRowSize = useCallback((index: number, height: number) => {
+  // Bounded journal windows: the Hub serves only the newest ~2k rows on
+  // attach. While the lowest LOADED seq is above 1, older history is one
+  // load-earlier click away.
+  const loadedFloor = useMemo(
+    () => (events.length ? events.reduce((min, ev) => Math.min(min, Number(ev.seq)), Number(events[0].seq)) : 1),
+    [events],
+  );
+  const canLoadEarlier = nodes.length > 0 && loadedFloor > 1;
+  const onLoadEarlier = useCallback(async () => {
+    if (!instanceId || loadingEarlier || !canLoadEarlier) return;
+    const el = scrollerRef.current;
+    // Hold the topmost rendered row at its viewport offset while the older
+    // window expands padTop above it; the pendingScroll restore effect then
+    // corrects against measured row heights as the new rows mount.
+    const anchorId = nodesRef.current[range.start]?.id ?? null;
+    let offset = 0;
+    if (el && anchorId) {
+      const row = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(anchorId)}"]`);
+      if (row) offset = row.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    }
+    pinRef.current = false;
+    setLoadingEarlier(true);
+    try {
+      await hubStore.loadEarlier(instanceId);
+      if (anchorId) {
+        restoringRef.current = true;
+        pendingScroll.current = { kind: "restore", anchorId, offset, tries: 0 };
+        // Keep repinning as the prepended (unmeasured) rows settle; the
+        // one-shot restore effect alone stops before the average converges.
+        prependAnchorRef.current = { anchorId, offset, tries: 0 };
+      }
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
+
+  // Stable per-row size reporter keyed by node id. The identity MUST stay
+  // constant across parent re-renders (scroll fires setScrollTop on every
+  // frame): TranscriptRow's measuring effect depends on it, so an inline
+  // closure would tear down and rebuild a ResizeObserver (and force a layout
+  // read) for every visible row on every scroll frame.
+  const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
-    setSizes((prev) => {
-      const last = prev[index] ?? 0;
-      if (Math.abs(last - height) < 1) return prev;
-      const next = prev.slice();
-      next[index] = height;
+    // Sub-pixel tolerance: measured heights jitter by fractions of a px
+    // between frames; ignore deltas under 1 instead of thrashing state.
+    setRowHeights((prev) => {
+      const last = prev.get(id);
+      if (last !== undefined && Math.abs(last - height) < 1) return prev;
+      const next = new Map(prev);
+      next.set(id, height);
       return next;
     });
   }, []);
@@ -307,6 +371,34 @@ function TranscriptInner({
     const avg = measured.reduce((sum, h) => sum + h, 0) / measured.length;
     setEstimate((prev) => (Math.abs(prev - avg) / prev > 0.03 ? avg : prev));
   }, [sizes]);
+
+  // Load-earlier anchors (repin loop declared here so it sits by the scroll
+  // math it uses): the prepended window is mostly UNMEASURED rows rendered at
+  // `estimate` height. When the average later converges, padTop for thousands
+  // of rows shifts after the one-shot DOM restore finished — keep re-pinning
+  // the held anchor until sizes stop changing.
+  useLayoutEffect(() => {
+    const held = prependAnchorRef.current;
+    const el = scrollerRef.current;
+    if (!held || !el || !nodesRef.current.length) return;
+    const rowEl = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.anchorId)}"]`);
+    if (!rowEl) {
+      // Anchor not mounted yet (the pendingScroll restore runs after this
+      // effect and brings it in): do not burn the stable-pass budget.
+      return;
+    }
+    const delta = rowEl.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
+    if (Math.abs(delta) > 1) {
+      el.scrollTop += delta;
+      scrollTopRef.current = el.scrollTop;
+      held.tries = 0;
+      return;
+    }
+    held.tries += 1;
+    // Sizes/events arrive on separate commits; release after a few stable
+    // passes with no correction needed.
+    if (held.tries >= 4) prependAnchorRef.current = null;
+  }, [sizes, nodes, estimate]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
@@ -627,15 +719,26 @@ function TranscriptInner({
         }}
       >
         <div className={css.list}>
+          {canLoadEarlier ? (
+            <div data-testid="load-earlier-wrap" style={{ display: "flex", justifyContent: "center", padding: "8px 12px" }}>
+              <button
+                type="button"
+                className={ui.chip}
+                data-testid="load-earlier"
+                disabled={loadingEarlier}
+                onClick={() => void onLoadEarlier()}
+              >
+                {loadingEarlier ? "加载中…" : "加载更早的记录"}
+              </button>
+            </div>
+          ) : null}
           <div style={{ height: range.padTop }} aria-hidden />
-          {slice.map((node, i) => {
-            const index = range.start + i;
+          {slice.map((node) => {
             const hit = hitNodes.get(node.id);
             return (
               <TranscriptRow
                 key={node.id}
                 node={node}
-                index={index}
                 active={activeTurn === node.id}
                 defaultFolded={defaultFolded}
                 collapseTick={collapseTick}
@@ -686,7 +789,6 @@ function TranscriptInner({
 
 function TranscriptRow({
   node,
-  index,
   active,
   defaultFolded,
   collapseTick,
@@ -704,12 +806,11 @@ function TranscriptRow({
   onToggleWorkflowDismiss,
 }: {
   node: TranscriptNode;
-  index: number;
   active: boolean;
   defaultFolded: boolean;
   collapseTick: number;
   settle: boolean;
-  onSize: (index: number, height: number) => void;
+  onSize: (id: string, height: number) => void;
   searchHit: boolean;
   searchCurrent: boolean;
   expandTick: number;
@@ -725,13 +826,18 @@ function TranscriptRow({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = () => onSize(index, el.getBoundingClientRect().height + 12);
+    const report = () => onSize(node.id, el.getBoundingClientRect().height + 12);
     report();
     if (typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(report);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [index, onSize, node, collapseTick, expandTick]);
+    // Depend only on the stable id (and the stable onSize callback): fold /
+    // content changes resize the element, and this ResizeObserver fires for
+    // those automatically. Depending on the `node` object identity would
+    // rebuild the observer on every parent scroll re-render, since the
+    // assembled node list is re-created each render.
+  }, [onSize, node.id]);
   return (
     <div
       ref={ref}

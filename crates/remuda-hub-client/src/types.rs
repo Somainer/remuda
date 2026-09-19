@@ -109,9 +109,22 @@ pub struct JournalPage {
     pub instance_id: String,
     /// Durable seq as a decimal string.
     pub durable_seq: String,
+    /// Window floor (`events[0].seq`) as a decimal string; `None` on an empty
+    /// window. Hubs older than the bounded-window change omit the key.
+    #[serde(default)]
+    pub from_seq: Option<String>,
+    /// False when rows below the window floor were cut; the caller descends
+    /// with `before_seq = from_seq - 1`. Defaults to true for old Hubs whose
+    /// pages always covered the whole queried range.
+    #[serde(default = "default_true")]
+    pub reached_after_seq: bool,
     /// Mirrored events (`{seq, event, …}`).
     #[serde(default)]
     pub events: Vec<Value>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `POST /v1/login` request.

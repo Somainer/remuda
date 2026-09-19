@@ -4,6 +4,8 @@
 产品定位：unified remote agent runtime 的遥控面（方案草案称 Remuda；未拍板前 UI 文案用 **runtime**）。  
 **不是** harness，**不造** agent loop。界面只观察 + 下发控制；resume 权威是原生会话。
 
+**v0.2.2 changelog（2026-09-19，手机优先路由树，见 D-049）**：§1.2 路由表新增 `/m` 与 `/m/inbox`，并写明 compact/桌面双向重定向与 query 保留（`/s/:id` 永不重定向）；§1.3 手机线框区分「首页级屏」与「会话路由」两套铬，会话路由 compact 不渲染 app 底部导航栏与 §1.4 的 SpaceTabs 行；§4.5 补应用角标（badge）与推送权限横幅的位置；新增 §4.7「手机优先路由树与铬预算」（一条顶栏 `--top-mobile` + 一条底栏 `--bar`、正文 ≥ 60% 视口、截断优先级、`终端|结构` 分段与 Stop 永不截断/进溢出）与 §4.8「语音输入」（平台听写优先、先成文再发送、Web Speech API 仅增强且默认关、不做云转写、iOS Safari 无 `SpeechRecognition`、终端段不提供语音）；§4.6 PWA `start_url` 从 `/sessions` 改为 `/`。依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5 / §6 / §7.1 / §9 / §10-19 / §10-23 / §11.2 / §11.3 / §11.4 / §11.5。
+
 **v0.2.1 changelog（2026-09-19，依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 的冲突核对，见 D-038…D-042）**：本修订只解除「规格与实施单互相矛盾」，不改变产品方向。四处增补——§1.3 顶栏把 `terminal|structured` 与 Stop 钉成永不进 ⋯ 溢出；§1.4 的 400px space chips 要求限定到列表路由，`/s/:id*` 允许折成单枚当前 space 芯片；§2.2 的 header 从「规范两行诊断」改为「主行 + 可折叠运行详情」，并新增手机工具卡折叠（含 Workflow / error / running 豁免）与 compact composer 边界；§3.4 新增全局的「命中尺寸只靠热区」与「`.meta` 类文本桌面手机同值、下限 `var(--text-aux)`」。**依据行号以本文件为准**（报告 §11.7 引的 `ui-spec.md:233` 实为修订前的 `:235`，该行现已随 §2.2 重画）。
 
 **v0.2 changelog**（对照 `docs/research/review-consistency.md`）：DriverKind 三值（`claude-print` / `claude-bg` / `claude-pty`），UI `mode` 只是投影；手机默认 print、桌面仅在需要 `/workflows` 面板时才 pty；Artifact 不是 M0 门槛，自动切 tty 默认关且须 `capabilities.artifact`；Provider 页 M0–M2 只展示 `astergate-default`；主 UI 是结构化 transcript + 可选第二视图 tty，v1 无 herdr 分屏；herdrx 只抄交互/viewport 算法并重接 runtime API；路由钉 React Router、审批进底栏、只做深色；术语对齐 protocol（status 三维投影、Workspace、`outbound-wss`/`ssh-dev`、NativeRef）。
@@ -71,14 +73,16 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 | 路径 | 屏 | 备注 |
 |---|---|---|
 | `/login` | 设备登录 | 未登录唯一公开页 |
-| `/` | 重定向 `/sessions` | |
-| `/sessions` | 会话列表 | query：`?host=&workspace=&kind=&status=`（`status` 是 §2.1 投影名） |
-| `/sessions/new` | 新建会话 | query 可预填 `host` `workspace` `kind` |
-| `/s/:instanceId` | 会话页 | print 默认 structured；pty-backed（codex/grok/agy/`claude-pty`/`terminal`）默认终端 |
-| `/s/:instanceId/tty` | 会话页终端视图 | 无 tty 时回 structured 并 toast |
-| `/s/:instanceId/structured` | 会话页结构化视图 | pty-backed 的第二视图 |
-| `/s/:instanceId/files` | 会话页文件/diff（桌面右栏；手机全屏） | |
-| `/approvals` | 审批中心 | `?focus=:interactionId` 高亮一条；手机底栏一等入口 |
+| `/` | 按视口落点（D-049） | compact（§1.3 断点）→ `/m`；其余 → `/sessions`。PWA `start_url` 用 `/`（§4.6） |
+| `/sessions` | 会话列表 | query：`?host=&workspace=&kind=&status=`（`status` 是 §2.1 投影名）。compact 下 `<Navigate replace>` 到 `/m`（D-049） |
+| `/m` | 手机会话 home（D-049） | 手机优先路由树的首页（§4.7）：仅 compact 使用独立形态；桌面访问 `<Navigate replace>` 回 `/sessions` |
+| `/sessions/new` | 新建会话 | query 可预填 `host` `workspace` `kind`；compact 与桌面**都不重定向**（共享页） |
+| `/s/:instanceId` | 会话页 | print 默认 structured；pty-backed（codex/grok/agy/`claude-pty`/`terminal`）默认终端。**任何视口下都不重定向**（D-049） |
+| `/s/:instanceId/tty` | 会话页终端视图 | 无 tty 时回 structured 并 toast；不重定向 |
+| `/s/:instanceId/structured` | 会话页结构化视图 | pty-backed 的第二视图；不重定向 |
+| `/s/:instanceId/files` | 会话页文件/diff（桌面右栏；手机全屏） | 不重定向 |
+| `/approvals` | 审批中心 | `?focus=:interactionId` 高亮一条；桌面保留一等入口。compact 下 `<Navigate replace>` 到 `/m/inbox`，`?focus=` 等 query **原样保留**（D-049） |
+| `/m/inbox` | 手机收件箱（D-049） | 两档 + 沿用 `?kind=` / `?focus=`（§2.5、§4.7）；桌面访问 `<Navigate replace>` 回 `/sessions` |
 | `/hosts` | 主机列表 | |
 | `/hosts/:hostId` | 主机详情 | |
 | `/projects` | 项目列表（Workspace） | 路径保留「项目」文案 |
@@ -91,6 +95,18 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 | `/pair` | 设备配对（可选，herdrx `#pair=` 同类） | 第一里程碑可不做 |
 
 深链：Web Push `data.url`、飞书卡片「在 runtime 打开」都进 `/s/:id` 或 `/approvals?focus=`。
+
+重定向层（D-049，全部 `<Navigate replace>`，不新增鉴权、不改 query，详见 §4.7）：
+
+| 命中 | compact | 桌面 |
+|---|---|---|
+| `/sessions` | → `/m` | 原样 |
+| `/approvals?focus=…`（及其他 query） | → `/m/inbox?focus=…`，query 原样保留 | 原样 |
+| `/m`、`/m/inbox` | 原样 | → `/sessions` |
+| `/s/:instanceId*`（含 `/tty` `/structured` `/files` `/events`） | **永不重定向** | **永不重定向** |
+| `/sessions/new`、`/login`、`/pair`、`/settings` | 不重定向（共享页） | 不重定向 |
+
+推送深链因此在两套壳下都成立：`/s/:id` 是共享路由，`/approvals?focus=` 被重定向层带到 `/m/inbox?focus=`，`focus` 不丢。
 
 ### 1.3 桌面三栏 ↔ 手机单列
 
@@ -116,18 +132,25 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 
 **手机**
 
+compact 下有**两套铬**，按路由切换（D-049，预算见 §4.7）：
+
 ```
-┌─────────────────────────────┐
-│ 顶：标题 / 连接 / 铃铛        │
-│                             │
-│ 唯一一列（当前路由全屏）        │
-│                             │
-│ 会话页：transcript            │
-│ 底：composer（visualViewport）│
-├─────────────────────────────┤
-│ 会话 │ 审批·n │ ＋ │ 更多     │
-└─────────────────────────────┘
+首页级屏（/m、/m/inbox …）              会话路由（/s/:id*：structured/tty/files）
+┌───────────────────────────┐          ┌───────────────────────────┐
+│ 顶栏：搜索 / 标题    52px   │          │ ←[space] 标题 [终端|结构]■⋯│ 52px
+│                           │          │ ▸ 运行详情（可选）  20px   │
+│                           │          │                           │
+│ 唯一一列（全屏，可滚动）     │          │ transcript / xterm 正文    │
+│                           │          │ ≥60% 视口（composer 收起） │
+│                           │          │                           │
+│                           │          ├───────────────────────────┤
+│                           │          │ composer 56／本地输入 44   │
+├───────────────────────────┤          │ ＋键盘条 44（仅终端段）     │
+│ 会话 收件箱·n 新建 更多 64 │          │ （无 app 底栏）            │
+└───────────────────────────┘          └───────────────────────────┘
 ```
+
+**会话路由在 compact 下不渲染 app 底部导航栏（D-049，2026-09-19 增补）**：`/s/:instanceId*`（含 `/tty` `/structured` `/files` `/events`）只有一条顶栏；该路由的「底部条」由 composer（结构段，收起态 56px，D-042）或本地输入条 + 键盘条（终端段，各 44px，§2.3）担任，app 级底栏（`nav[aria-label="手机底栏"]`，今天是 `Shell.tsx` 的 `.bar`，`:310`）**不渲染**，§1.4 的 SpaceTabs 行（`Shell.tsx:306`）也**不渲染**。回列表靠顶栏返回键（`SessionPage.tsx:239`，字形不变、热区 ≥ 44px，D-039）；切空间/切 tab 由顶栏单枚 space 芯片的抽屉（D-040 的 `spaces-drawer-open`，能力不降级）与 Jump To sheet（§4.7）承担。
 
 映射规则：
 
@@ -803,9 +826,15 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 ### 4.5 Web Push
 
 事件：`interaction.requested`（审批/提问）、`activity=waiting-interaction` 持续、`lifecycle=exited` 且失败。不要对 `--bg` idle 发「已完成」。  
-载荷：`title, body, tag`（`interaction:{id}` 或 `instance:{id}` 去重）, `data.url`。
+载荷：`title, body, tag`（`interaction:{id}` 或 `instance:{id}` 去重）, `data.url`，外加一个**可选**整数字段 `badge`（D-049）：等于该设备当前 pending interaction 数。
 
 实现抄 herdrx：`GET /push/config` 公钥、`POST /push/subscriptions`（endpoint/p256dh/auth）、VAPID（`herdrx/internal/httpapi/push.go`、`internal/push/service.go`）。
+
+**应用角标 badge（D-049，2026-09-19 增补）**：service worker 在 `push` 事件里对支持的平台调 `navigator.setAppBadge(n)` / `clearAppBadge()`；站内 pending 归零时同步清零。**降级必须诚实**：Badging API 不存在的平台什么都不做，绝不用通知条数冒充角标数。载荷缺 `badge` 字段时行为与今天逐字节一致（老 Hub / 老客户端混搭不炸）——这是一个可选 Rust 字段，不新增推送事件类型。今天全库无 `setAppBadge` 调用，角标只有站内计数。
+
+**权限申请位置（D-049）**：绝不在 App 启动时弹——用户还没有待办时消耗唯一一次授权机会没有意义。只允许两处由用户手势触发：(a) compact 收件箱 `/m/inbox` 顶部横幅（报告 §11.3 实测 Moshi 同位置），点「开启」才调 `Notification.requestPermission()` 与 `subscribePush()`（`push.ts:108-114`），横幅可关闭；(b) 设置 → 通知（既有，`SettingsPage.tsx:724` 的通知组）。横幅文案随能力变：未加主屏幕的 iOS 改为「先加到主屏幕」并复用 `needsHomeScreenForNotifications()`（`push.ts:19`），点「开启推送」静默无效的情况不允许发生。
+
+**PWA 关闭态**：SW 仍被系统唤醒并 `showNotification`（`sw.src.js:97`），点按走 `notificationclick` 聚焦既有窗口或 `openWindow`（`sw.src.js:106-120`），落点仍是 `data.url`（`/s/:id` 或 compact 下重定向到的 `/m/inbox?focus=`，§1.2）。已知边界保持不变：Hub 在有设备正 follow 该实例时抑制推送（`crates/remuda-hub/src/alerts.rs:159-160`）——「PWA 关着」正是推送真正生效的场景，这条抑制规则不改。
 
 iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotifications()`）。设置页写明。HTTPS + `isSecureContext` 才能注册 SW。
 
@@ -813,11 +842,57 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 - `manifest.webmanifest`：`display: standalone`（herdrx；DSH 用 fullscreen，手机不要 fullscreen 以免挡状态栏）。
 - 图标 any + maskable 192/512。
-- `start_url: /sessions`。
+- `start_url: /`（D-049，2026-09-19 从 `/sessions` 改）：落点由 §1.2 的重定向层按视口判定——手机安装的 PWA 落 `/m`，桌面安装的落 `/sessions`。只有一份 manifest、一份 SW（SW 预缓存壳清单已含 `/`，`sw.src.js:9`）。
 - `theme_color` / `background_color` 跟 Night Corral（v1 无浅色）。
 - SW：预缓存壳；**不**缓存 journal API。更新策略抄 herdrx `pwa.ts`（waiting + `ACTIVATE_UPDATE`）。
 - `beforeinstallprompt` 横条「添加到主屏幕」。
 - 安装要求：**Hub 公网或内网 HTTPS**。明文 HTTP 无 Push、无 clipboard、无 SW。loopback 开发除外。
+
+### 4.7 手机优先路由树与铬预算（D-049，2026-09-19）
+
+**路由树：受限的 `/m`，会话本体不分叉。**
+
+手机首页级信息架构放在 `/m` 子树，与桌面路由共享同一个 Vite PWA、同一份 store / auth / SW；桌面路由零改动（报告 §5「明确不做」：不新做原生 iOS/Android，不改协议/wire）。`/m` **只拥有导航与「首页级」信息架构**，不拥有会话本体：
+
+| `/m` 子树内容 | 说明 |
+|---|---|
+| `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038） |
+| `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近），沿用 `ApprovalsPage` 的 kind 分段（§2.5） |
+| Jump To sheet | 从 home 顶栏与终端键盘条打开的覆盖层，不独占路由；分组 + 时钟/列表，**不做第二套空间模型**（报告 §10-23 / §11.2） |
+| phone 底栏 | 会话 · 收件箱(n) · 新建 · 更多，只挂在 `/m*` 外壳上（compact 底栏文案以本条为准，§1.1 的「审批」在手机上即「收件箱」） |
+
+**会话本体永远是共享的 `/s/:instanceId`（及 `/tty` `/structured` `/files` `/events`），不进 `/m`、不做第二份实现。** `/sessions/new`、`/login`、`/pair`、`/settings` 同样保持共享（它们已有 compact 形态）。理由是报告 §9 的 SOTA 一句话：**结构视图是 live session 的投影，不是第二个 agent；终端始终可一键回去且不 fork。** 会话页承载 journal follow、turn 裁决、composer 三态（D-028a）、terminal attach、内联审批与 resume（D-026）——复制它就是造第二个投影，并会让 transcript 实现分叉。手机上的改善靠这一条共享路由的 compact 形态（D-040 / D-041 / D-042 与本节预算），不靠第二份代码。
+
+**重定向与深链**：见 §1.2 表后那张重定向表。要点三连：compact 下 `/sessions`→`/m`、`/approvals?focus=`→`/m/inbox?focus=`（query 原样保留）；桌面下 `/m*`→`/sessions`；**`/s/:id` 永不重定向**——它在两套壳下是同一条路由。
+
+**铬预算（390×844 起测，全部可测量）**
+
+- 任一手机屏最多**一条顶栏 + 一条底栏**。顶栏高 `var(--top-mobile)`（52px，`tokens.css:79`）；首页级屏底栏高 `var(--bar)`（64px，`tokens.css:77`）+ `var(--safe-bottom)`（`tokens.css:80`）。
+- **会话路由 `/s/:id*` 在 compact 下不渲染 app 底栏、也不渲染 SpaceTabs 行**（§1.3 / §1.4）：结构段底部只有收起态 composer（56px，D-042），终端段底部是本地输入条 44px + 键盘条 44px（§2.3）。顶栏返回键热区 ≥ `var(--touch)`（D-039）。
+- **正文（transcript 或 xterm）在 composer 收起、无软键盘时，可视高度 ≥ 视口高的 60%。** 结构段测 `data-testid="session-body"`（`SessionPage.tsx:416`），终端段测 xterm 容器。390×844 的预算余量：安全区 47 + 顶栏 52 + 「运行详情」触发行 20 + 正文 + composer 56 + 安全区底 34 ≈ 正文 635px ≈ **75%**；终端段（顶栏 72 + 正文 + 本地输入 44 + 键盘条 44 + 安全区）≈ 601px ≈ **71%**。**60% 是验收下限，不是设计目标。** 该比例只在无软键盘时测量；软键盘态的要求是 composer 不被遮挡（§4.1，新壳必须复用 `useWorkbenchViewport`，`viewport.ts:15`，不得自己算高度）。
+- 触控一律走热区（§3.4）：视觉字形不变，`::after` 或 padding 撑到 `var(--touch)`，热区不得互相重叠。
+
+**截断优先级（顶栏宽度不足时按此顺序牺牲）**
+
+1. **标题先截断**（省略号，`title` 给全文）；
+2. 其次 **space 芯片**退成首字母（点开仍是 D-040 的同一个抽屉）；
+3. 再次是**状态文字**收起，只留 §2.1 的状态点（三维投影语义不降级，unknown 不得画成正向）。
+
+**`终端|结构` 分段与 Stop 在任何宽度下都不截断、不折行、不进 ⋯ 溢出菜单**（与 D-040 一致）：分段挂在 `SessionPage.tsx:258`（`ViewSwitch`），Stop 在 `:329`。另一个视图是一等主控件（报告 §10-19 要求做成主分段），不是可收纳的设置项；「一键回终端且不 fork」必须在最窄宽度下仍然一键可达。
+
+依据：报告 §5-P0-1（减铬）、§6（落地顺序把减铬放在第一）、§7.1（home 回答「连着谁、哪场还活着」）、§9（SOTA 一句话与「不要抄」：不抄顶栏/composer 盖住正文、绿色品牌/Space Grotesk/FAB/地球图标、DEV SERVERS 与 Kill 端口旁栏）、§10-19（Term｜结构 主分段）、§10-23（Jump To 不做第二套空间模型）、§11.2（分组 + 时钟/列表、搜索只命中标题/标签/工作区名）、§11.3（Inbox 两档、错误文案当正文、权限横幅位置）、§11.4（git 一行扫视串可学，硬裁不折行 diff 与列表行右侧的丢弃按钮不抄）、§11.5（桌面右栏的端口/Kill 面板与隧道列表**整体不抄**，D-031）。里程碑：**M1 = home、会话、收件箱、新建、登录、语音（§4.8）**；终端键盘条、分组 Jump To、推送 badge 与真机验证排 M2；git 面板五 tab 在 M2 之后，本规格不出任务。
+
+### 4.8 语音输入（D-049，2026-09-19）
+
+第一里程碑「能说」（报告 §5-P0）的定义：**平台键盘听写优先，先成文再发送，零云转写。**
+
+1. **默认路径 = 系统键盘自带的听写**（iOS / Android 键盘麦克风）。Remuda 不录音、不上传音频、不做云端转写、不新增协议字段——报告 §5「明确不做」禁止改协议/wire，且 Remuda 对会话的写入面只有 prompt / keys / 交互回答。
+2. **先成文再发送**：听写内容只进入 composer 输入框，听写中途**绝不自动发送**。手机 composer 本来就是按钮发送、Enter 换行（§2.2 / §4.2）；`isComposing` / `key=Process` / `keyCode 229` 守卫（`composing()`，`viewport.ts:67-68`）对听写产生的 input 事件同样适用，任何语音路径都不得绕过它，也不得在听写期间抢焦点或重排布局（§4.1）。
+3. **Web Speech API 只是「可用时的增强」，默认关**：先探测 `'SpeechRecognition' in window || 'webkitSpeechRecognition' in window`；能力不存在就**不渲染**麦克风按钮（不画一个点了没反应的按钮）；存在时也默认关闭，在设置里显式打开。识别结果**只写进输入框**，任何路径都不触发发送。音频不经过 Remuda 的 Hub / Node。
+4. **iOS Safari 没有 `SpeechRecognition`（WebKit 未实现）——这句话必须原样写进设置页文案。** iPhone 上的「能说」就是系统键盘的听写按钮，不需要 Remuda 写任何代码；标准 PWA（加到主屏幕）里键盘听写可用，Remuda 不承诺离线听写。
+5. **终端段不提供语音**：直接往 PTY 灌听写文本会把候选词与标点送进 TUI（§4.2 因此规定手机终端默认走本地输入条）。要说话就切到结构段，或在本地输入条成文后再送出。
+
+依据：报告 §5-P0「手机会话先能读、能批、**能说**」与 §5「明确不做」（不改协议）；§7.4（Moshi 的 composer 也是把 prompt 写回主机上的 live terminal、不经其服务器——可借鉴是「成文再写入」，不是云转写）。
 
 ---
 

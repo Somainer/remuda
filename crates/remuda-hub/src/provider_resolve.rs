@@ -1,7 +1,14 @@
 //! D-021 Claude provider resolution: request → host binding → scoped default → native.
+//!
+//! D-047 additionally resolves the model-API delivery waterfall
+//! (request `apiVia` > project > profile `delivery` > direct) into a
+//! [`ApiRouteChoice`]. The waterfall itself is a pure function — registry,
+//! liveness and capability checks live in `providers.rs` — so every refusal
+//! rule has a unit test without a Hub.
 
 use crate::error::HubError;
 use crate::store::{HostRecord, ProviderRecord};
+use remuda_protocol::{ApiRouteMode, ApiViaOverride, HostRelayBind, ProviderDelivery};
 use serde_json::{Value, json};
 
 /// Explicit request (profile id or `delegation`).
@@ -18,6 +25,233 @@ pub const SOURCE_HOST_INVENTORY: &str = "host-inventory";
 pub const SOURCE_NATIVE_FALLBACK: &str = "native-fallback";
 /// Project default provider, between explicit and host binding; design §6.
 pub const SOURCE_PROJECT: &str = "project-default";
+/// The route came from the profile's own `delivery` (D-047 waterfall).
+pub const SOURCE_PROFILE_DELIVERY: &str = "profile-delivery";
+
+// ── D-047 delivery waterfall ────────────────────────────────────────────────
+
+/// Where a proxied session's model API egresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ViaTarget {
+    /// `apiVia: "self"` — the Hub process itself is the egress host.
+    HubHost,
+    /// An enrolled host's Node is the egress host.
+    Host(String),
+}
+
+/// One waterfall layer's delivery say (request or project).
+#[derive(Clone, Debug)]
+pub struct ApiViaLayer {
+    /// `<hostId>` | `self` | `none`.
+    pub via: ApiViaOverride,
+    /// Optional sub-mode; absent means "fall through to the profile's route".
+    pub route: Option<ApiRouteMode>,
+}
+
+/// The waterfall's `via` answer: this session proxies through [`Self::target`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiRouteChoice {
+    /// Egress host.
+    pub target: ViaTarget,
+    /// Requested sub-mode. `auto` survives here; the launch-time resolver in
+    /// `providers.rs` downgrades it to `hub-relay` when the target has no
+    /// relay bind.
+    pub route: ApiRouteMode,
+    /// Waterfall step that named this route.
+    pub source: &'static str,
+}
+
+/// The waterfall's answer.
+///
+/// A layer's explicit say suppresses every lower layer even when that say is
+/// direct (`none`): without that, a profile-level `via` would resurrect behind
+/// a request that forced direct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteAnswer {
+    /// This session proxies through [`ApiRouteChoice::target`].
+    Via(ApiRouteChoice),
+    /// A layer explicitly forced direct; lower layers must not revive `via`.
+    Direct,
+}
+
+/// One explicit (request or project) layer's resolved say.
+#[must_use]
+pub fn resolve_api_route(
+    worker_host_id: &str,
+    request: Option<&ApiViaLayer>,
+    project: Option<&ApiViaLayer>,
+    profile: &ProviderDelivery,
+) -> Option<ApiRouteChoice> {
+    if let Some(layer) = request
+        && let Some(answer) = apply_layer(layer, profile.route, worker_host_id, SOURCE_REQUEST)
+    {
+        return answer.into_choice();
+    }
+    if let Some(layer) = project
+        && let Some(answer) = apply_layer(layer, profile.route, worker_host_id, SOURCE_PROJECT)
+    {
+        return answer.into_choice();
+    }
+    if profile.is_via() {
+        // Deserialization already guarantees a host id on `via`; the wire
+        // type's hand-written Deserialize rejects via-without-host.
+        if let Some(id) = profile.via_host_id.as_ref()
+            && id.as_id().as_str() != worker_host_id
+        {
+            return Some(ApiRouteChoice {
+                target: ViaTarget::Host(id.as_id().as_str().to_owned()),
+                route: profile.route,
+                source: SOURCE_PROFILE_DELIVERY,
+            });
+        }
+    }
+    None
+}
+
+/// Apply one explicit (request/project) layer. `None` means the layer did not
+/// speak (it should fall through); a present answer is final for the
+/// waterfall.
+fn apply_layer(
+    layer: &ApiViaLayer,
+    profile_route: ApiRouteMode,
+    worker_host_id: &str,
+    source: &'static str,
+) -> Option<RouteAnswer> {
+    match &layer.via {
+        // An explicit `none` is a decision, not an absence: it forces direct
+        // over the project and profile layers.
+        ApiViaOverride::Direct => Some(RouteAnswer::Direct),
+        ApiViaOverride::HubHost => Some(RouteAnswer::Via(ApiRouteChoice {
+            target: ViaTarget::HubHost,
+            route: layer.route.unwrap_or(profile_route),
+            source,
+        })),
+        ApiViaOverride::Host(id) if id.as_id().as_str() == worker_host_id => {
+            // Naming the worker host itself collapses to direct at the
+            // decision point — nothing to proxy.
+            Some(RouteAnswer::Direct)
+        }
+        ApiViaOverride::Host(id) => Some(RouteAnswer::Via(ApiRouteChoice {
+            target: ViaTarget::Host(id.as_id().as_str().to_owned()),
+            route: layer.route.unwrap_or(profile_route),
+            source,
+        })),
+    }
+}
+
+impl RouteAnswer {
+    fn into_choice(self) -> Option<ApiRouteChoice> {
+        match self {
+            Self::Via(choice) => Some(choice),
+            Self::Direct => None,
+        }
+    }
+}
+
+/// Whether a connected Node advertised the D-048 relay stream class.
+///
+/// Absence means "cannot": a host that never says it speaks `api.*` is refused
+/// with `api-via-unsupported` rather than having a launch fail at first
+/// request, and never silently downgraded to direct.
+#[must_use]
+pub fn node_supports_api_relay(host: &HostRecord) -> bool {
+    let caps = &host.capabilities;
+    if caps.get("apiRelay").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    caps.get("features")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str() == Some("api-relay-v1"))
+        })
+}
+
+/// Validate an operator-supplied relay bind (D-047 Amendment A1).
+///
+/// The bind is an explicit address a listener opens on, so the bar is the one
+/// the decision sets: no wildcard, no public address. Loopback and private /
+/// link-local ranges are what the feature exists for. `allowFrom` entries must
+/// each be a literal IP or an `ip/prefix` CIDR.
+pub fn validate_relay_bind(bind: &HostRelayBind) -> Result<(), String> {
+    let (host, port) = bind
+        .addr
+        .rsplit_once(':')
+        .ok_or_else(|| format!("relayBind.addr must be host:port, got {}", bind.addr))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip: std::net::IpAddr = host
+        .parse()
+        .map_err(|_| format!("relayBind.addr host must be an IP literal, got {host}"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("relayBind.addr port must be 0..=65535, got {port}"))?;
+    if port == 0 {
+        return Err("relayBind.addr port must be non-zero".into());
+    }
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            if ip.is_unspecified() {
+                return Err(
+                    "relayBind.addr must not be 0.0.0.0; name a loopback or private address".into(),
+                );
+            }
+            if !is_private_or_loopback_v4(ip) {
+                return Err(
+                    "relayBind.addr must be a loopback or private address, not a public one".into(),
+                );
+            }
+        }
+        std::net::IpAddr::V6(ip) => {
+            if ip.is_unspecified() {
+                return Err(
+                    "relayBind.addr must not be ::; name a loopback or private address".into(),
+                );
+            }
+            if !(ip.is_loopback() || is_private_v6(ip)) {
+                return Err(
+                    "relayBind.addr must be a loopback or private address, not a public one".into(),
+                );
+            }
+        }
+    }
+    for entry in &bind.allow_from {
+        validate_allow_from(entry)?;
+    }
+    Ok(())
+}
+
+fn is_private_or_loopback_v4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback() || ip.is_private() || ip.is_link_local()
+}
+
+fn is_private_v6(ip: std::net::Ipv6Addr) -> bool {
+    // Unique local addresses fc00::/7 plus fe80::/10 link-local.
+    let seg = ip.segments()[0];
+    (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+}
+
+fn validate_allow_from(entry: &str) -> Result<(), String> {
+    let (addr, prefix) = match entry.rsplit_once('/') {
+        Some((addr, prefix)) => (addr, Some(prefix)),
+        None => (entry, None),
+    };
+    let ip: std::net::IpAddr = addr
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| format!("allowFrom entry must be an IP or CIDR, got {entry}"))?;
+    if let Some(prefix) = prefix {
+        let prefix: u32 = prefix
+            .parse()
+            .map_err(|_| format!("allowFrom CIDR prefix must be a number, got {entry}"))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max {
+            return Err(format!("allowFrom CIDR prefix /{prefix} exceeds /{max}"));
+        }
+    }
+    Ok(())
+}
 
 /// Chosen Claude provider for one host.
 #[derive(Clone, Debug)]
@@ -436,6 +670,7 @@ mod tests {
             default_launch_args: None,
             claude_binary_path: None,
             default_tui: None,
+            relay_bind: None,
         }
     }
 
@@ -461,6 +696,7 @@ mod tests {
             created_at: "2026-09-13T00:00:00.000Z".into(),
             updated_at: "2026-09-13T00:00:00.000Z".into(),
             supply: Default::default(),
+            delivery: Default::default(),
         }
     }
 
@@ -654,5 +890,201 @@ mod tests {
             source: SOURCE_UNIVERSAL_DEFAULT,
         };
         assert_eq!(profile.hint(), "将使用 uni-gw (universal)");
+    }
+
+    // ── D-047 delivery waterfall ──────────────────────────────────────────
+
+    fn via_profile(id: &remuda_protocol::HostId, route: ApiRouteMode) -> ProviderDelivery {
+        ProviderDelivery::via(id.clone(), route)
+    }
+
+    fn layer(via: ApiViaOverride, route: Option<ApiRouteMode>) -> ApiViaLayer {
+        ApiViaLayer { via, route }
+    }
+
+    fn host_override(id: &remuda_protocol::HostId) -> ApiViaOverride {
+        ApiViaOverride::Host(id.clone())
+    }
+
+    fn host_variant(id: &remuda_protocol::HostId) -> ViaTarget {
+        ViaTarget::Host(id.as_id().as_str().to_string())
+    }
+
+    #[test]
+    fn waterfall_defaults_to_direct() {
+        let worker = remuda_protocol::HostId::new();
+        let choice = resolve_api_route(
+            worker.as_id().as_str(),
+            None,
+            None,
+            &ProviderDelivery::direct(),
+        );
+        assert_eq!(choice, None);
+    }
+
+    #[test]
+    fn profile_via_is_used_when_no_explicit_layer_speaks() {
+        let worker = remuda_protocol::HostId::new();
+        let proxy = remuda_protocol::HostId::new();
+        let delivery = via_profile(&proxy, ApiRouteMode::HubRelay);
+        let choice =
+            resolve_api_route(worker.as_id().as_str(), None, None, &delivery).expect("via");
+        assert_eq!(choice.target, host_variant(&proxy));
+        assert_eq!(choice.route, ApiRouteMode::HubRelay);
+        assert_eq!(choice.source, SOURCE_PROFILE_DELIVERY);
+    }
+
+    #[test]
+    fn request_layer_wins_over_project_and_profile() {
+        let worker = remuda_protocol::HostId::new();
+        let from_profile = remuda_protocol::HostId::new();
+        let from_project = remuda_protocol::HostId::new();
+        let from_request = remuda_protocol::HostId::new();
+        let delivery = via_profile(&from_profile, ApiRouteMode::HubRelay);
+        let request = layer(host_override(&from_request), None);
+        let project = layer(host_override(&from_project), None);
+        let choice = resolve_api_route(
+            worker.as_id().as_str(),
+            Some(&request),
+            Some(&project),
+            &delivery,
+        )
+        .expect("via");
+        assert_eq!(choice.target, host_variant(&from_request));
+        // Route falls through to the profile when the layer names no sub-mode.
+        assert_eq!(choice.route, ApiRouteMode::HubRelay);
+        assert_eq!(choice.source, SOURCE_REQUEST);
+    }
+
+    #[test]
+    fn project_layer_wins_over_profile_delivery() {
+        let worker = remuda_protocol::HostId::new();
+        let from_profile = remuda_protocol::HostId::new();
+        let from_project = remuda_protocol::HostId::new();
+        let delivery = via_profile(&from_profile, ApiRouteMode::Auto);
+        let project = layer(host_override(&from_project), Some(ApiRouteMode::DirectNet));
+        let choice = resolve_api_route(worker.as_id().as_str(), None, Some(&project), &delivery)
+            .expect("via");
+        assert_eq!(choice.target, host_variant(&from_project));
+        assert_eq!(choice.route, ApiRouteMode::DirectNet);
+        assert_eq!(choice.source, SOURCE_PROJECT);
+    }
+
+    #[test]
+    fn request_none_forces_direct_even_when_profile_and_project_say_via() {
+        let worker = remuda_protocol::HostId::new();
+        let from_profile = remuda_protocol::HostId::new();
+        let from_project = remuda_protocol::HostId::new();
+        let delivery = via_profile(&from_profile, ApiRouteMode::HubRelay);
+        let request = layer(ApiViaOverride::Direct, Some(ApiRouteMode::HubRelay));
+        let project = layer(host_override(&from_project), None);
+        let choice = resolve_api_route(
+            worker.as_id().as_str(),
+            Some(&request),
+            Some(&project),
+            &delivery,
+        );
+        assert_eq!(choice, None, "none forces direct over every lower layer");
+    }
+
+    #[test]
+    fn project_none_forces_direct_over_profile() {
+        let worker = remuda_protocol::HostId::new();
+        let from_profile = remuda_protocol::HostId::new();
+        let delivery = via_profile(&from_profile, ApiRouteMode::HubRelay);
+        let project = layer(ApiViaOverride::Direct, None);
+        let choice = resolve_api_route(worker.as_id().as_str(), None, Some(&project), &delivery);
+        assert_eq!(choice, None);
+    }
+
+    #[test]
+    fn via_the_worker_host_collapses_to_direct_in_every_layer() {
+        let worker = remuda_protocol::HostId::new();
+        let delivery = via_profile(&worker, ApiRouteMode::HubRelay);
+        assert_eq!(
+            resolve_api_route(worker.as_id().as_str(), None, None, &delivery),
+            None
+        );
+        let request = layer(host_override(&worker), None);
+        assert_eq!(
+            resolve_api_route(worker.as_id().as_str(), Some(&request), None, &delivery),
+            None
+        );
+        let project = layer(host_override(&worker), None);
+        assert_eq!(
+            resolve_api_route(
+                worker.as_id().as_str(),
+                None,
+                Some(&project),
+                &ProviderDelivery::direct()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn via_self_targets_the_hub_host_and_never_collapses() {
+        let worker = remuda_protocol::HostId::new();
+        let choice = resolve_api_route(
+            worker.as_id().as_str(),
+            Some(&layer(ApiViaOverride::HubHost, None)),
+            None,
+            &ProviderDelivery::direct(),
+        )
+        .expect("self proxies");
+        assert_eq!(choice.target, ViaTarget::HubHost);
+        assert_eq!(choice.route, ApiRouteMode::Auto);
+        assert_eq!(choice.source, SOURCE_REQUEST);
+    }
+
+    #[test]
+    fn request_route_overrides_profile_route() {
+        let worker = remuda_protocol::HostId::new();
+        let proxy = remuda_protocol::HostId::new();
+        let delivery = via_profile(&proxy, ApiRouteMode::HubRelay);
+        let request = layer(host_override(&proxy), Some(ApiRouteMode::DirectNet));
+        let choice = resolve_api_route(worker.as_id().as_str(), Some(&request), None, &delivery)
+            .expect("via");
+        assert_eq!(choice.route, ApiRouteMode::DirectNet);
+    }
+
+    #[test]
+    fn relay_capability_is_read_from_either_hello_shape() {
+        let mut host = host_rec("hst_h", "auto", false);
+        host.capabilities = json!({});
+        assert!(!node_supports_api_relay(&host));
+        host.capabilities = json!({ "apiRelay": true });
+        assert!(node_supports_api_relay(&host));
+        host.capabilities = json!({ "features": ["tty-v9", "api-relay-v1"] });
+        assert!(node_supports_api_relay(&host));
+        host.capabilities = json!({ "apiRelay": false, "features": [] });
+        assert!(!node_supports_api_relay(&host));
+    }
+
+    #[test]
+    fn relay_bind_validation_rejects_wildcards_and_public_addresses() {
+        let bind = |addr: &str| HostRelayBind {
+            addr: addr.into(),
+            allow_from: vec![],
+        };
+        assert!(validate_relay_bind(&bind("0.0.0.0:8443")).is_err());
+        assert!(validate_relay_bind(&bind("[::]:8443")).is_err());
+        assert!(validate_relay_bind(&bind("8.8.8.8:8443")).is_err());
+        assert!(validate_relay_bind(&bind("2001:4860:4860::8888:8443")).is_err());
+        assert!(validate_relay_bind(&bind("127.0.0.1:0")).is_err());
+        assert!(validate_relay_bind(&bind("not-an-ip:8443")).is_err());
+        assert!(validate_relay_bind(&bind("127.0.0.1:8443")).is_ok());
+        assert!(validate_relay_bind(&bind("192.168.1.10:8443")).is_ok());
+        assert!(validate_relay_bind(&bind("[fd00::1]:8443")).is_ok());
+        let with_allow = remuda_protocol::HostRelayBind {
+            addr: "10.0.0.1:8443".into(),
+            allow_from: vec!["10.0.0.0/8".into(), "fe80::1".into()],
+        };
+        assert!(validate_relay_bind(&with_allow).is_ok());
+        let bad_allow = remuda_protocol::HostRelayBind {
+            addr: "10.0.0.1:8443".into(),
+            allow_from: vec!["not-a-cidr".into()],
+        };
+        assert!(validate_relay_bind(&bad_allow).is_err());
     }
 }

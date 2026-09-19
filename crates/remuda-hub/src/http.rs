@@ -127,10 +127,50 @@ pub struct CreateInstanceBody {
     /// silent downgrade.
     #[serde(default, rename = "taskSpec")]
     task_spec: Option<remuda_protocol::TaskSpec>,
+    /// D-047 per-dispatch delivery override: a proxy host id, `self`, or
+    /// `none` to force direct. Parsed through [`remuda_protocol::ApiViaOverride`]
+    /// so a typo is a 400 rather than a quiet direct launch.
+    #[serde(default, rename = "apiVia")]
+    api_via: Option<String>,
+    /// D-047 route sub-mode for `apiVia`: `auto` | `hub-relay` | `direct-net`.
+    #[serde(default, rename = "apiRoute")]
+    api_route: Option<String>,
 }
 
 fn default_kind() -> String {
     "claude".into()
+}
+
+/// Parse the D-047 `apiVia`/`apiRoute` pair from a create/dispatch body.
+///
+/// Kept outside the serde derive because an unknown `apiVia` spelling must be
+/// a 400 (a mistyped host would otherwise read as "no override" and silently
+/// deliver direct — exactly the reroute D-047 forbids).
+pub(crate) fn parse_route_overrides(
+    api_via: Option<&str>,
+    api_route: Option<&str>,
+) -> Result<crate::providers::RouteOverrides, HubError> {
+    let via = match api_via.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => Some(
+            remuda_protocol::ApiViaOverride::parse(raw)
+                .map_err(|err| HubError::BadRequest(format!("apiVia: {err}")))?,
+        ),
+        None => None,
+    };
+    let route = match api_route.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => Some(
+            serde_json::from_value::<remuda_protocol::ApiRouteMode>(json!(raw))
+                .map_err(|err| HubError::BadRequest(format!("apiRoute: {err}")))?,
+        ),
+        None => None,
+    };
+    if route.is_some() && via.is_none() {
+        // A sub-mode without a target cannot name anything to route.
+        return Err(HubError::BadRequest(
+            "apiRoute requires apiVia to name a proxy host".into(),
+        ));
+    }
+    Ok(crate::providers::RouteOverrides { via, route })
 }
 #[derive(Deserialize)]
 pub struct CommandBody {
@@ -790,6 +830,9 @@ pub async fn create_instance(
                 .into(),
         ));
     }
+    // Validate the D-047 overrides before any resource lookup.
+    let route_overrides =
+        parse_route_overrides(body.api_via.as_deref(), body.api_route.as_deref())?;
     let title = body.title.clone().or(body.name.clone());
     // A create that names no carrier gets a multi-turn one. This defaulted to
     // `claude-print`, which is never a valid default: a print session ends after
@@ -881,6 +924,15 @@ pub async fn create_instance(
         )
     } else {
         None
+    };
+    let project_route_doc = match project.as_ref() {
+        Some(project) => {
+            state
+                .store
+                .get_project_route_override(project.meta.id.as_id().to_string())
+                .await?
+        }
+        None => None,
     };
     let placement_project_id = project
         .as_ref()
@@ -1001,10 +1053,20 @@ pub async fn create_instance(
                     &host,
                     &mut spec,
                     Some(provider),
+                    project_route_doc.as_ref(),
+                    route_overrides.clone(),
                 )
                 .await
             }
-            None => crate::providers::resolve_and_attach(&state, &host, &mut spec).await,
+            None => {
+                crate::providers::resolve_and_attach(
+                    &state,
+                    &host,
+                    &mut spec,
+                    route_overrides.clone(),
+                )
+                .await
+            }
         };
         match resolved {
             Ok(()) => {
@@ -1251,7 +1313,55 @@ pub async fn resume_instance(
         });
     }
     let host = crate::store::Store::with_live_link(host, true);
-    crate::providers::resolve_and_attach(&state, &host, &mut spec).await?;
+    crate::providers::resolve_and_attach(
+        &state,
+        &host,
+        &mut spec,
+        crate::providers::RouteOverrides::default(),
+    )
+    .await?;
+    // D-047: a resumed session inherits the parent's *observed* route (the
+    // resume runs on the same worker host and the CLI gave no new override).
+    // Re-validate it — the proxy may have gone offline — and write the
+    // requested form back onto the child spec.
+    if let Some(observed) = parent.api_route.as_ref().filter(|route| route.is_via()) {
+        let target = match observed.via_host_id.as_ref() {
+            Some(id) => crate::provider_resolve::ViaTarget::Host(id.as_id().to_string()),
+            None => crate::provider_resolve::ViaTarget::HubHost,
+        };
+        let mode = match observed.route {
+            Some(remuda_protocol::ApiRouteKind::HubRelay) => {
+                remuda_protocol::ApiRouteMode::HubRelay
+            }
+            Some(remuda_protocol::ApiRouteKind::DirectNet) => {
+                remuda_protocol::ApiRouteMode::DirectNet
+            }
+            None => remuda_protocol::ApiRouteMode::HubRelay,
+        };
+        let choice = crate::provider_resolve::ApiRouteChoice {
+            target,
+            route: mode,
+            source: "resume",
+        };
+        let profile_id = spec
+            .get("providerProfileId")
+            .and_then(Value::as_str)
+            .filter(|id| crate::provider_resolve::is_real_profile_id(id))
+            .ok_or_else(|| {
+                HubError::BadRequest(
+                    "the resumed via session has no gateway profile on its spec".into(),
+                )
+            })?;
+        let profile = state
+            .store
+            .get_provider(profile_id.to_string())
+            .await?
+            .ok_or_else(|| {
+                HubError::BadRequest("the resumed via session's gateway profile vanished".into())
+            })?;
+        crate::providers::validate_via_target(&state, &host, &choice, &profile).await?;
+        crate::providers::write_requested_route(&mut spec, &choice)?;
+    }
 
     let title = parent
         .title
@@ -1936,6 +2046,58 @@ pub(crate) async fn forward_if_online(
                         .store
                         .reconcile_instance_driver(instance_id.to_owned(), ran.to_owned())
                         .await?;
+                }
+                // D-047: project the Node-observed route, validated against
+                // the requested one. A via→direct silent reroute fails here.
+                if matches!(
+                    command.operation.as_str(),
+                    "instance.create" | "instance.resume"
+                ) {
+                    let echo: Option<remuda_protocol::ApiRoute> = result
+                        .get("apiRoute")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|err| HubError::Internal(format!("node apiRoute echo: {err}")))?;
+                    let projected =
+                        crate::providers::project_echoed_api_route(state, instance_id, echo)
+                            .await?;
+                    if let Some(route) = projected
+                        && route.is_via()
+                    {
+                        // Launch-time observation: no port/token, just the
+                        // routing fact, proven by the Node echo.
+                        if let Ok(Some(spec)) = state
+                            .store
+                            .get_instance_spec_json(instance_id.to_string())
+                            .await
+                        {
+                            let profile_id = spec
+                                .get("providerProfileId")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            let payload = json!({
+                                "type": "apiRoute",
+                                "mode": route.mode,
+                                "route": route.route,
+                                "viaHostId": route.via_host_id,
+                                "viaHostLabel": route.via_host_label,
+                                "profileId": profile_id,
+                                "listenerBound": true,
+                            });
+                            if let Ok(Some(record)) = state
+                                .store
+                                .append_hub_event(instance_id.to_string(), "lifecycle", payload)
+                                .await
+                            {
+                                state.bus.publish(crate::ws::FollowEvent::json(
+                                    instance_id.to_string(),
+                                    record.seq,
+                                    record.event.clone(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             let accepted = state

@@ -352,6 +352,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     fail_all_pending(&pending);
 
     if let Some(host_id) = host_id {
+        // D-048: tear down relay streams this link owned. A vanished proxy
+        // host ends streams with via-host-offline and blocks routed
+        // instances; a vanished worker host cancels the upstream legs.
+        state.api_relay.on_link_lost(&state, &host_id).await;
         let stale = match session_generation {
             Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
             None => {
@@ -741,6 +745,17 @@ pub(crate) async fn handle_node_method(
         "object.pull" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             Ok(Some(object_pull(state, host_id, &params, out_tx).await?))
+        }
+        method if HubNodeMethod::parse(method).is_some_and(HubNodeMethod::is_api) => {
+            // D-048: the seven api.* frames are notifications with their own
+            // stream table. They never enter the RPC pending map and answer
+            // nothing (`Ok(None)` suppresses any id-less reply).
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            state
+                .api_relay
+                .handle_notification(state, host_id, method, params)
+                .await;
+            Ok(None)
         }
         other => Err(HubError::BadRequest(format!("unknown method {other}"))),
     }

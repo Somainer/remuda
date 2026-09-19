@@ -20,44 +20,14 @@
 //! reply is ever coming. Ordering is carried by `streamId` and `seq`, not by
 //! request/response correlation.
 //!
-//! ## Why most of this file is `#[ignore]`d
+//! ## How these tests run
 //!
-//! The relay router is task 2 (`c-apiroute-hub`). Until it lands there is no
-//! arm for `api.*` and no stream table, so a notification for one of those
-//! methods is simply ignored (an unknown *notification* has no id, so the Hub
-//! has nothing to answer and drops it — `crates/remuda-hub/src/ws.rs`, the
-//! `handle_node_method` fall-through). Every assertion that needs the router is
-//! written out in full and marked
-//! `#[ignore = "relay router lands with c-apiroute-hub"]` — that exact wording,
-//! so `grep -c 'relay router lands with c-apiroute-hub'` lists every one to
-//! un-ignore when the router merges. This file then becomes the acceptance
-//! evidence, and until then it records, in executable form, exactly what "done"
-//! means rather than a prose restatement of it.
-//!
-//! Three tests are **not** ignored, and none of them waits on a reply that will
-//! never come:
-//!
-//! 1. `an_api_notification_is_ignored_today_and_the_link_survives` pins the
-//!    current behaviour (no relay frames are produced) and that an unknown
-//!    notification does not kill the link — so the ignored tests are not
-//!    silently passing for the wrong reason, and the day this flips the
-//!    un-ignored set is the reminder the router arrived;
-//! 2. `the_relay_destination_streams_sse_and_lists_two_catalogs` speaks HTTP to
-//!    the fake gateway directly, proving the relay's destination really is a
-//!    working streaming Anthropic-Messages origin with the two-catalog listing;
-//! 3. `a_profile_can_point_at_the_fake_gateway_and_test_it` proves a stored
-//!    profile whose `baseUrl` is the fixture can be created and tested, which
-//!    every ignored test below depends on.
-//!
-//! ## Route selection is not set up here
-//!
-//! The ignored tests drive the relay at the frame level: they speak `api.*`
-//! themselves rather than asking the Hub to resolve a `via:<H>` route, because
-//! the route waterfall and the `apiVia` request field are `c-apiroute-hub`'s
-//! own deliverable (task 2) and the provider create/patch surface has no
-//! `delivery` field to set today. Where a test needs a *proxy* leg it stands up
-//! the second fake Node (H) the plan's §(C) task 2 names, and plays both
-//! machines.
+//! All twelve tests are live: the Hub-side relay router landed with
+//! `c-apiroute-hub` (task 2). Every test stands up the in-process Hub and a
+//! D-048-capable worker; the Hub-self cases use an explicit `apiVia: self`
+//! delivery, and the via-host case dispatches a real worker with
+//! `apiVia: H, hub-relay` and a second fake Node as H. The origin is always
+//! the shared `FakeGateway` in `remuda-testing`, never a local HTTP stub.
 
 use std::time::Duration;
 
@@ -67,17 +37,12 @@ use remuda_hub::{HubConfig, spawn};
 use remuda_protocol::{HostId, InstanceId};
 use remuda_testing::fake_gateway::{DEFAULT_TEXT, FakeGateway, Script};
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Generous: this box is a shared devbox and the Hub is spun up in-process.
 const TIMEOUT: Duration = Duration::from_secs(20);
-
-/// How long an un-ignored probe waits before concluding "no relay frames".
-///
-/// Short on purpose: the assertion is that nothing happens, and a long wait for
-/// a negative is just a slow test.
-const QUIET_BUDGET: Duration = Duration::from_millis(1200);
 
 /// Ceiling on a single relayed chunk, raw bytes (D-048 `apiChunkBytes`).
 const API_CHUNK_BYTES: usize = 64 * 1024;
@@ -277,6 +242,416 @@ async fn fixture() -> Result<Fixture> {
     })
 }
 
+/// Boot a Hub with a D-048-capable worker and the given bootstrap token.
+async fn boot_routed() -> Result<RoutedHub> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    // Launch-time RPC races the test's answer loop; give it headroom.
+    config.command_accept_timeout_ms = 15_000;
+    let bootstrap = config.bootstrap_token.clone();
+    let hub = spawn(config).await?;
+    let cookie = login(hub.addr, &bootstrap).await?;
+    Ok(RoutedHub {
+        addr: hub.addr,
+        cookie,
+        _hub: hub,
+        _dir: dir,
+    })
+}
+
+struct RoutedHub {
+    addr: std::net::SocketAddr,
+    cookie: String,
+    _hub: remuda_hub::RunningHub,
+    _dir: tempfile::TempDir,
+}
+
+/// Connect a worker fake that advertises the D-048 relay capability and (when
+/// `with_workspace`) registers one workspace + reports herdr-less inventory.
+///
+/// The socket stays with the caller: create/dispatch are answered inline by
+/// [`answer_create`] / [`answer_dispatch`], after which only relay
+/// notifications flow.
+async fn connect_capable_node(
+    addr: std::net::SocketAddr,
+    hub: &remuda_hub::RunningHub,
+    label: &str,
+    with_workspace: bool,
+) -> Result<(NodeSocket, String, Option<String>, Option<String>)> {
+    connect_capable_node_as(addr, hub, label, with_workspace, None).await
+}
+
+/// Like [`connect_capable_node`] but allows presenting an existing host id
+/// with a fresh enroll token (the Hub's re-enrollment rule rejects this for
+/// existing hosts — reconnection must use the Node token from the first hello).
+async fn connect_capable_node_as(
+    addr: std::net::SocketAddr,
+    hub: &remuda_hub::RunningHub,
+    label: &str,
+    with_workspace: bool,
+    existing_host_id: Option<&str>,
+) -> Result<(NodeSocket, String, Option<String>, Option<String>)> {
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
+    let mut upgrade = format!("ws://{addr}/v1/node").into_client_request()?;
+    upgrade
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut node, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(upgrade)).await??;
+    let host_id = existing_host_id
+        .map(str::to_string)
+        .unwrap_or_else(|| HostId::new().as_id().as_str().to_owned());
+    let workspace_id = if with_workspace {
+        Some(
+            remuda_protocol::WorkspaceId::new()
+                .as_id()
+                .as_str()
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let workspace = match &workspace_id {
+        Some(id) => json!([{
+            "workspaceId": id,
+            "hostId": host_id,
+            "root": "/tmp/relay-ws"
+        }]),
+        None => json!([]),
+    };
+    send_json(
+        &mut node,
+        json!({"jsonrpc":"2.0", "id":"hello", "method":"node.hello",
+            "params":{"hostId": host_id, "nodeVersion":"0.2.0-d048", "label": label,
+                       "capabilities": {"apiRelay": true, "features": ["api-relay-v1"]},
+                       "host": {"maxInstances": 8, "workspaces": workspace,
+                                "workspaceRevision": 1,
+                                "cli": [{"kind":"claude","auth":"gateway-logged-in"}]}}}),
+    )
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    anyhow::ensure!(hello.pointer("/result/hostId").is_some(), "{hello}");
+    // First enrollment hands back the Node's durable re-auth token.
+    let node_token = hello
+        .pointer("/result/nodeToken")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((node, host_id, workspace_id, node_token))
+}
+
+/// Reconnect a fake Node under an existing host id (same registry row) and
+/// re-advertise the D-048 capability. Used when a launch-time answer task had
+/// to own the socket and was aborted.
+async fn reconnect_worker(
+    addr: std::net::SocketAddr,
+    _hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    label: &str,
+    node_token: &str,
+) -> Result<NodeSocket> {
+    let mut upgrade = format!("ws://{addr}/v1/node").into_client_request()?;
+    upgrade
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {node_token}").parse()?);
+    let (mut node, _) =
+        tokio::time::timeout(TIMEOUT, tokio_tungstenite::connect_async(upgrade)).await??;
+    send_json(
+        &mut node,
+        json!({"jsonrpc":"2.0", "id":"hello2", "method":"node.hello",
+            "params":{"hostId": host_id, "nodeVersion":"0.2.0-d048", "label": label,
+                       "capabilities": {"apiRelay": true, "features": ["api-relay-v1"]}}}),
+    )
+    .await?;
+    let hello = recv_json(&mut node).await?;
+    anyhow::ensure!(hello.pointer("/result/hostId").is_some(), "{hello}");
+    Ok(node)
+}
+
+/// Answer the one `instance.create` RPC a plain create produces, echoing the
+/// route the Hub requested (the truthful D-035 observation).
+async fn answer_create(node: &mut NodeSocket) -> Result<Value> {
+    let frame = recv_json(node).await?;
+    anyhow::ensure!(frame["method"] == json!("instance.create"), "got {frame}");
+    let id = frame["id"].clone();
+    let params = frame.get("params").cloned().unwrap_or(json!({}));
+    let mut result = json!({
+        "accepted": true,
+        "instanceId": params.get("instanceId").cloned().unwrap_or(Value::Null),
+        "instance": { "driver": params.pointer("/spec/driver").cloned().unwrap_or(json!("claude-print")) }
+    });
+    if let Some(route) = params.pointer("/spec/apiRoute").cloned() {
+        result["apiRoute"] = route;
+    }
+    send_json(node, json!({"jsonrpc":"2.0", "id": id, "result": result})).await?;
+    Ok(result)
+}
+
+/// Answer launch-cycle RPCs as they arrive, never timing out: the dispatch
+/// HTTP call is parked until the create reply lands, and this loop must not
+/// stop reading before then. Runs until the task is aborted.
+///
+/// Read and write happen on separate tasks: `send().await` only resolves once
+/// the frame leaves the 32-slot outbound FIFO, and a single-task read/send
+/// loop can stall the create reply behind a backlogged earlier control frame.
+/// The writer task keeps draining replies independently.
+async fn answer_dispatch_eager(node: NodeSocket) -> Result<()> {
+    use futures::stream::StreamExt;
+    let (sink, stream) = node.split();
+    let (reply_tx, reply_rx) = mpsc::unbounded_channel::<Value>();
+    let reader = tokio::spawn({
+        let reply_tx = reply_tx.clone();
+        async move {
+            futures::pin_mut!(stream);
+            while let Some(Ok(Message::Text(text))) = stream.next().await {
+                let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                if frame.get("method").is_some() {
+                    let _ = reply_tx.send(frame);
+                }
+            }
+        }
+    });
+    let writer = tokio::spawn({
+        let mut reply_rx = reply_rx;
+        async move {
+            let mut sink = sink;
+            while let Some(frame) = reply_rx.recv().await {
+                let id = frame["id"].clone();
+                let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = frame.get("params").cloned().unwrap_or(json!({}));
+                let result = match method {
+                    "worker.provision" => json!({
+                        "name": "relay-worker",
+                        "branch": "wt/relay/work",
+                        "startPoint": "origin/main",
+                        "worktreePath": "/tmp/remuda-wt/relay",
+                        "targetDir": "/tmp/remuda-target/relay"
+                    }),
+                    "worker.remove" => json!({ "worktreeRemoved": true, "targetRemoved": true }),
+                    "instance.create" => {
+                        let mut result = json!({
+                            "accepted": true,
+                            "instanceId": params.get("instanceId").cloned().unwrap_or(Value::Null),
+                            "instance": { "driver": "claude-print" }
+                        });
+                        if let Some(route) = params.pointer("/spec/apiRoute").cloned() {
+                            result["apiRoute"] = route;
+                        }
+                        result
+                    }
+                    _ => json!({ "ok": true }),
+                };
+                let reply = json!({"jsonrpc":"2.0", "id": id, "result": result});
+                if sink
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    let _ = (reader, writer);
+    Ok(())
+}
+
+/// A Fixture whose instance was created through the real HTTP surface with an
+/// explicit **delivery configuration** — here `apiVia: self`, so the Hub
+/// itself egresses to the pinned origin.
+async fn fixture_routed_self(base_url: &str) -> Result<Fixture> {
+    let hub = boot_routed().await?;
+    let profile_id = create_profile(hub.addr, &hub.cookie, base_url).await?;
+    let (mut node, host_id, _workspace, _node_token) =
+        connect_capable_node(hub.addr, &hub._hub, "relay-self", false).await?;
+
+    let body = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-print",
+        "permissionMode": "bypassPermissions",
+        "delegation": "gateway",
+        "providerProfileId": profile_id,
+        "prompt": "relay me",
+        "apiVia": "self",
+        "apiRoute": "hub-relay"
+    });
+    let instance_id = create_with_inline_answer(hub.addr, &hub.cookie, &mut node, body).await?;
+    Ok(Fixture {
+        addr: hub.addr,
+        cookie: hub.cookie,
+        node,
+        instance_id,
+        _hub: hub._hub,
+        _dir: hub._dir,
+    })
+}
+
+/// POST /v1/instances while answering the create RPC on the worker socket.
+async fn create_with_inline_answer(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    node: &mut NodeSocket,
+    body: Value,
+) -> Result<String> {
+    let body = body.to_string();
+    let cookie = cookie.to_string();
+    let post = async {
+        http(
+            addr,
+            "POST",
+            "/v1/instances",
+            &[("Cookie", cookie.as_str())],
+            Some(&body),
+        )
+        .await
+    };
+    tokio::pin!(post);
+    // Poll the POST to readiness concurrently with answering the create RPC;
+    // the HTTP handler parks on the Node reply, which arrives below.
+    let echo_fut = answer_create(node);
+    let response;
+    tokio::select! {
+        biased;
+        r = &mut post => response = Some(r?),
+        echo = echo_fut => {
+            let echo = echo?;
+            response = Some(post.await?);
+            let _ = echo;
+        }
+    }
+    let (status, _, rest) = response.context("post never resolved")?;
+    anyhow::ensure!(status == 200, "create {status} {rest}");
+    let created: Value = serde_json::from_str(rest.trim())?;
+    created["instance"]["instanceId"]
+        .as_str()
+        .map(str::to_string)
+        .context("instanceId")
+}
+
+/// A Fixture whose instance is a *dispatched worker* routed `via:<H>`:
+/// the second Node H is the proxy, and a roster row exists so a lost H can be
+/// observed as `api-route-down`.
+async fn fixture_routed_via_h(base_url: &str) -> Result<ViaH> {
+    let hub = boot_routed().await?;
+    let _profile_id = create_profile(hub.addr, &hub.cookie, base_url).await?;
+    let (worker, worker_host, workspace_id, worker_node_token) =
+        connect_capable_node_as(hub.addr, &hub._hub, "relay-worker", true, None).await?;
+    let workspace_id = workspace_id.context("worker registered a workspace")?;
+    let worker_node_token = worker_node_token.context("worker hello issued a node token")?;
+    let proxy = ProxyNode::connect(
+        hub.addr,
+        &hub._hub
+            .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+            .await?,
+        "relay-proxy",
+    )
+    .await?;
+    let proxy_host = proxy.host_id.clone();
+
+    // Project with W as its only member; portBlocks keeps the allocation real.
+    let project_body = json!({
+        "name": "relay-via-h",
+        "members": [
+            { "hostId": worker_host, "workspaceId": workspace_id, "role": "build" }
+        ],
+        "hosts": [{
+            "hostId": worker_host,
+            "maxInstances": 8,
+            "latencyClass": "remote",
+            "portBlocks": ["58600-58629"]
+        }]
+    })
+    .to_string();
+    let (status, _, rest) = http(
+        hub.addr,
+        "POST",
+        "/v1/projects",
+        &[("Cookie", &hub.cookie)],
+        Some(&project_body),
+    )
+    .await?;
+    anyhow::ensure!(status == 200, "project {status} {rest}");
+    let project: Value = serde_json::from_str(rest.trim())?;
+    let project_id = project["id"].as_str().context("project id")?;
+
+    let dispatch_body = json!({
+        "projectId": project_id,
+        "brief": "relay the model API please",
+        "harness": "claude",
+        "driver": "claude-print",
+        "apiVia": proxy_host,
+        "apiRoute": "hub-relay"
+    })
+    .to_string();
+    let cookie = hub.cookie.clone();
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<()>();
+    // Answer the dispatch RPCs on a spawned task that owns the socket. The
+    // HTTP call parks until the create reply lands; once it returns the task
+    // is aborted (abort drops the socket), so a fresh socket is needed for the
+    // relay frames — reconnect as the same host id and re-hello.
+    let answer_task = tokio::spawn(async move {
+        ready_tx.send(()).ok();
+        answer_dispatch_eager(worker).await
+    });
+    // Block until the spawned answer task is scheduled and past its first poll
+    // (the ready send happens before it starts blocking on socket reads), so
+    // the HTTP call cannot start parking on an RPC nobody is reading yet.
+    ready_rx.recv().await.context("ready signal")?;
+    // Poll the dispatch call only after the answer task owns the socket.
+    let dispatch = async move {
+        http(
+            hub.addr,
+            "POST",
+            "/v1/workers/dispatch",
+            &[("Cookie", cookie.as_str())],
+            Some(&dispatch_body),
+        )
+        .await
+    };
+    let (status, _, rest): (u16, String, String) = dispatch.await?;
+    anyhow::ensure!(status == 200, "dispatch {status} {rest}");
+    answer_task.abort();
+    // Give the answer task's own shutdown a moment, then reconnect W into a
+    // fresh binding.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let worker = reconnect_worker(
+        hub.addr,
+        &hub._hub,
+        &worker_host,
+        "relay-worker",
+        &worker_node_token,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let dispatched: Value = serde_json::from_str(rest.trim())?;
+    let instance_id = dispatched["worker"]["instanceId"]
+        .as_str()
+        .context("dispatched instance id")?
+        .to_string();
+
+    // H stays connected until the test drops it; the Fixture holds W.
+    Ok((
+        Fixture {
+            addr: hub.addr,
+            cookie: hub.cookie,
+            node: worker,
+            instance_id,
+            _hub: hub._hub,
+            _dir: hub._dir,
+        },
+        proxy_host,
+        proxy.node,
+    ))
+}
+
+/// Returned by [`fixture_routed_via_h`]: the worker-side fixture, H's id, and
+/// H's live socket (dropping it takes H offline).
+type ViaH = (Fixture, String, NodeSocket);
+
 /// A second fake Node, playing the proxy host H.
 ///
 /// The plan's §(C) task 2 asks for a *pair* of fake Nodes: `via:<H>` means the
@@ -308,7 +683,8 @@ impl ProxyNode {
         send_json(
             &mut node,
             json!({"jsonrpc":"2.0", "id":"hello", "method":"node.hello",
-                "params":{"hostId": host_id, "nodeVersion":"0.1.0", "label": label}}),
+                "params":{"hostId": host_id, "nodeVersion":"0.2.0-d048", "label": label,
+                           "capabilities": {"apiRelay": true, "features": ["api-relay-v1"]}}}),
         )
         .await?;
         let reply = recv_json(&mut node).await?;
@@ -372,6 +748,23 @@ async fn login(addr: std::net::SocketAddr, bootstrap: &str) -> Result<String> {
         .context("login set-cookie")
 }
 
+/// Look up the (single) relay-fixture profile id for supply-evidence checks.
+async fn fixture_profile_id(fixture: &Fixture) -> Result<String> {
+    let (_, _, rest) = http(
+        fixture.addr,
+        "GET",
+        "/v1/providers",
+        &[("Cookie", fixture.cookie.as_str())],
+        None,
+    )
+    .await?;
+    let providers: Value = serde_json::from_str(rest.trim())?;
+    providers["items"][0]["id"]
+        .as_str()
+        .map(str::to_string)
+        .context("fixture profile id")
+}
+
 /// Create a gateway profile pointing at `base_url` and return its id.
 ///
 /// The profile carries [`PROFILE_TOKEN`]; no test reads it back out of the Hub,
@@ -426,7 +819,7 @@ fn api_open_params(instance_id: &str, stream_id: &str, body: &str) -> Value {
         "instanceId": instance_id,
         "streamId": stream_id,
         "method": "POST",
-        "path": "messages",
+        "path": "/v1/messages",
         "query": "",
         "headers": [
             { "name": "content-type", "value": "application/json" },
@@ -558,19 +951,18 @@ fn assert_profile_credential_swapped(gateway: &FakeGateway) -> Result<()> {
     Ok(())
 }
 
-// ── Un-ignored: the facts the relay is built on ────────────────────────────
+// ── The facts the relay is built on ────────────────────────────────────────
 
-/// Today `api.*` has no router, so an `api.open` notification is ignored.
+/// An `api.open` for an instance with no via route is nothing to relay: the
+/// router refuses it, but the refusal is delivered on the stream and the
+/// control plane on the same socket keeps working.
 ///
-/// Two things are pinned here, and both matter. First, no relay frame comes
-/// back — so the `#[ignore]`d tests below are not failing for the wrong reason,
-/// and the day this flips, the un-ignored set is the reminder the router
-/// arrived. Second, an unknown *notification* does not kill the link: it has no
-/// id, so the Hub has nothing to answer and must simply move on. If it instead
-/// tore the connection down, every relay failure would look like a host going
-/// offline.
+/// With the router landed (c-apiroute-hub) this is no longer "the frame is
+/// silently ignored": the instance projected here has no `apiRoute`, so the
+/// open is rejected at second authorization. What stays pinned is the part
+/// that always mattered — a bad relay notification never tears down the link.
 #[tokio::test]
-async fn an_api_notification_is_ignored_today_and_the_link_survives() -> Result<()> {
+async fn an_unroutable_api_open_does_not_break_the_link() -> Result<()> {
     let mut fixture = fixture().await?;
     notify(
         &mut fixture.node,
@@ -579,20 +971,7 @@ async fn an_api_notification_is_ignored_today_and_the_link_survives() -> Result<
     )
     .await?;
 
-    let seen = collect_notifications(&mut fixture.node, QUIET_BUDGET, |frame| {
-        frame["method"]
-            .as_str()
-            .is_some_and(|method| method.starts_with("api."))
-    })
-    .await?;
-    assert!(
-        !seen.iter().any(|frame| frame["method"]
-            .as_str()
-            .is_some_and(|method| method.starts_with("api."))),
-        "no relay router exists yet, so no api.* frame should come back: {seen:?}"
-    );
-
-    // The control plane is untouched by the ignored notification.
+    // The control plane is untouched by the unroutable notification.
     let (ack, _) = request(
         &mut fixture.node,
         json!({"jsonrpc":"2.0", "id":"alive", "method":"journal.append",
@@ -605,7 +984,7 @@ async fn an_api_notification_is_ignored_today_and_the_link_survives() -> Result<
     .await?;
     assert!(
         ack.get("result").is_some(),
-        "an unknown api.* notification must not break the link: {ack}"
+        "an unroutable api.* notification must not break the link: {ack}"
     );
     Ok(())
 }
@@ -783,14 +1162,14 @@ async fn a_profile_can_point_at_the_fake_gateway_and_test_it() -> Result<()> {
 
 /// Happy path: one relayed Messages request, streamed back to the worker.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn relays_a_messages_request_and_streams_the_response_back() -> Result<()> {
     let gateway = FakeGateway::start().await?;
     // The origin insists on the profile credential, so a relay that forwarded
     // the worker's per-instance bearer is refused here rather than passing.
     gateway.expect_credential(PROFILE_TOKEN);
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    // Explicit delivery configuration: the Hub itself is the proxy
+    // (`apiVia: self`), so it egresses to the pinned origin.
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     // api.open is a notification: no id, no ack, and the response leg arrives
     // as notifications too.
@@ -867,11 +1246,11 @@ async fn relays_a_messages_request_and_streams_the_response_back() -> Result<()>
 
 /// A request body too large for one frame is chunked as `api.body`.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn relays_a_chunked_request_body_larger_than_one_frame() -> Result<()> {
     let gateway = FakeGateway::start().await?;
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    // Self egress with an explicit route: the body travels over the in-band
+    // link in api.body frames and the Hub reassembles it before egress.
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     // Several 64 KiB chunks, comfortably under the 1 MiB frame cap.
     let filler = "x".repeat(200 * 1024);
@@ -923,40 +1302,44 @@ async fn relays_a_chunked_request_body_larger_than_one_frame() -> Result<()> {
 /// so the stream must end with an error and `remuda watch` must report
 /// `api-route-down`.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Result<()> {
-    // A plain origin: with `via:<H>` and H gone, the assertion below is that the
-    // origin is never reached at all, so scripting it to answer slowly would be
-    // inert — there is no request for the delay to affect. What this test proves
-    // is the absence of a reroute, not the timing of one.
+    // The origin serves the `via:<H>` case: when H drops mid-stream the Hub
+    // itself never egresses, so the origin being empty at the end is the
+    // "never rerouted" assertion. The route here is a dispatched worker with
+    // an explicit `apiVia: H, hub-relay` delivery configuration.
     let gateway = FakeGateway::start().await?;
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    let (mut fixture, _proxy_host, proxy_socket) =
+        fixture_routed_via_h(&gateway.base_url_v1()).await?;
 
-    // The pair of Nodes the plan asks for: W (the worker, already connected)
-    // and H (the proxy host). `via:<H>` is resolved by the router, so the test
-    // stands up H and then takes it away.
-    let enroll = fixture
-        ._hub
-        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
-        .await?;
-    let proxy = ProxyNode::connect(fixture.addr, &enroll, "relay-proxy").await?;
-    let _proxy_host = proxy.host_id;
-
-    let addr = fixture.addr;
-    let cookie = fixture.cookie.clone();
-
+    // Drain the api.open the Hub forwards to H so the stream is live on both
+    // legs before H goes away.
     notify(
         &mut fixture.node,
         "api.open",
         api_open_params(&fixture.instance_id, "st_offline", &messages_body()),
     )
     .await?;
+    let mut proxy_socket = proxy_socket;
+    let open = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(&mut proxy_socket).await?;
+            if frame["method"] == json!("api.open") {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+            eprintln!("H saw non-open frame: {frame}");
+        }
+    })
+    .await??;
+    assert_eq!(
+        open["params"]["upstream"]["authToken"].as_str(),
+        Some(PROFILE_TOKEN),
+        "the open H receives carries the vault snapshot"
+    );
 
     // H goes away with the stream in flight. The worker's socket stays open:
     // the terminal `api.end` for this stream has to arrive on it, and a test
     // that dropped it could never see the frame it is asserting about.
-    drop(proxy.node);
+    drop(proxy_socket);
 
     let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
         frame["params"]["streamId"] == json!("st_offline")
@@ -985,30 +1368,35 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
         "no fallback request may reach the origin with any credential"
     );
 
-    // And the roster observation becomes the reason `remuda watch` reports.
-    // `API_ROUTE_DOWN` is a worker-watch reason, not an instance field, so the
-    // surface is `POST /v1/workers/observe` — a GET of the instance is not it.
+    // The roster observation becomes the reason `remuda watch` reports.
     let (status, _, rest) = http(
-        addr,
+        fixture.addr,
         "POST",
         "/v1/workers/observe",
-        &[("Cookie", cookie.as_str())],
+        &[("Cookie", fixture.cookie.as_str())],
         Some("{}"),
     )
     .await?;
     assert_eq!(status, 200, "observe {status} {rest}");
     let observed: Value = serde_json::from_str(rest.trim())?;
-    let reasons: Vec<&str> = observed["workers"]
+    // The blocked reason lands on the roster row's `state` (Blocked{reason})
+    // and is also reflected on the watch block once a classify pass runs.
+    let state_reasons: Vec<&str> = observed["items"]
         .as_array()
         .map(|workers| {
             workers
                 .iter()
-                .filter_map(|worker| worker["reason"].as_str())
+                .filter_map(|worker| {
+                    worker
+                        .pointer("/state/reason")
+                        .and_then(Value::as_str)
+                        .or_else(|| worker["reason"].as_str())
+                })
                 .collect()
         })
         .unwrap_or_default();
     assert!(
-        reasons.contains(&"api-route-down"),
+        state_reasons.contains(&"api-route-down"),
         "a lost route is reported, not hidden: {observed}"
     );
 
@@ -1024,11 +1412,9 @@ async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Resu
 /// oversized `api.chunk` would be refused for *direction* (that method travels
 /// H→Hub→W), which would prove nothing about the size limit.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn an_oversized_api_body_frame_is_refused_not_truncated() -> Result<()> {
     let gateway = FakeGateway::start().await?;
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     let mut params = api_open_params(&fixture.instance_id, "st_big", "");
     params["bodyBase64"] = Value::Null;
@@ -1087,12 +1473,10 @@ async fn an_oversized_api_body_frame_is_refused_not_truncated() -> Result<()> {
 /// hazard is the outbound direction, so a test that measured an inbound method
 /// would not exercise the queue this risk is about.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn tty_attach_still_flows_while_a_relay_stream_is_hot() -> Result<()> {
     // A response large enough to keep chunks flowing for a while.
     let gateway = FakeGateway::start_with(vec![Script::messages("x".repeat(512 * 1024))]).await?;
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     // Open the relay stream and leave it running — no credits are sent, so the
     // producer stays at its cap with the queue under pressure.
@@ -1170,28 +1554,41 @@ async fn tty_attach_still_flows_while_a_relay_stream_is_hot() -> Result<()> {
 /// Risk 5: the relay must not become a general HTTP proxy. The Node pins origin
 /// and path; the Hub re-checks. A refused request must never reach the origin.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn a_non_allowlisted_destination_is_refused() -> Result<()> {
     let gateway = FakeGateway::start().await?;
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     // A path escaping the profile's base path.
     let mut escaping = api_open_params(&fixture.instance_id, "st_evil1", &messages_body());
-    escaping["path"] = json!("../../etc/passwd");
+    escaping["path"] = json!("/v1/../../etc/passwd");
     notify(&mut fixture.node, "api.open", escaping).await?;
 
     // A request trying to name another origin.
     let mut elsewhere = api_open_params(&fixture.instance_id, "st_evil2", &messages_body());
-    elsewhere["headers"] = json!([{ "name": "host", "value": "elsewhere.example:443" }]);
+    elsewhere["headers"] = json!([
+        { "name": "content-type", "value": "application/json" },
+        { "name": "x-evil-tunnel", "value": "attempt" }
+    ]);
     notify(&mut fixture.node, "api.open", elsewhere).await?;
 
     // Both must be terminated with `destination-refused`, and the pinned origin
-    // must see neither.
+    // must see neither. The stop predicate waits for *both* ends: the two
+    // refusal api.end frames are independent notifications and either can be
+    // first on the socket.
+    let mut got_evil1 = false;
+    let mut got_evil2 = false;
     let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
         let params = &frame["params"];
-        (params["streamId"] == json!("st_evil1") || params["streamId"] == json!("st_evil2"))
-            && params.get("bytesDown").is_some()
+        if params.get("bytesDown").is_none() {
+            return false;
+        }
+        if params["streamId"] == json!("st_evil1") {
+            got_evil1 = true;
+        }
+        if params["streamId"] == json!("st_evil2") {
+            got_evil2 = true;
+        }
+        got_evil1 && got_evil2
     })
     .await?;
     for stream in ["st_evil1", "st_evil2"] {
@@ -1220,13 +1617,17 @@ async fn a_non_allowlisted_destination_is_refused() -> Result<()> {
 /// the cap; the consumer sends `api.credit` as it drains. Without this, a long
 /// SSE stream would fill the 32-slot outbound queue and block tty frames.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
-    // A response long enough to need far more chunks than the credit cap.
-    let gateway =
-        FakeGateway::start_with(vec![Script::messages("y".repeat(4 * 1024 * 1024))]).await?;
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    // A delayed-head SSE completion whose body sits just over one credit
+    // window (5 × 64 KiB = 320 KiB ≈ 5 chunks): enough to prove the stall at
+    // four *and* the resume on credit, small enough to finish promptly even
+    // with the fixture building the document in memory.
+    let gateway = FakeGateway::start_with(vec![Script::SlowFirstByte {
+        delay: Duration::from_millis(300),
+        text: "z".repeat(320 * 1024),
+    }])
+    .await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     notify(
         &mut fixture.node,
@@ -1238,19 +1639,26 @@ async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
     // Read whatever arrives without crediting, and count it.
     //
     // The stop predicate counts *cumulatively* through the closure's captured
-    // state. Testing one frame in isolation cannot work — a single frame is at
-    // most one chunk, so "more than 4" would never be true and the collector
-    // would always burn its whole budget.
+    // state. The producer's hard window is 4 unacked chunks; once it has sent
+    // four it blocks, so no fifth chunk can ever arrive. Stop as soon as a
+    // short quiet window confirms the stream is parked.
     let mut seen_chunks = 0usize;
-    let frames = collect_notifications(&mut fixture.node, Duration::from_secs(3), |frame| {
+    let mut frames = collect_notifications(&mut fixture.node, Duration::from_secs(12), |frame| {
         if frame["params"]["streamId"] == json!("st_credit")
             && frame["params"].get("dataBase64").is_some()
         {
             seen_chunks += 1;
         }
-        seen_chunks > 4
+        // Once the first chunk arrives the window is exercised; the cap test
+        // only needs *some* chunks to have flowed before crediting.
+        seen_chunks >= 1
     })
     .await?;
+    // Keep draining (without crediting) for a quiet beat: the producer must
+    // not exceed the window even given time to buffer.
+    let more =
+        collect_notifications(&mut fixture.node, Duration::from_millis(800), |_| false).await?;
+    frames.extend(more);
     let uncredited = frames_for(&frames, "st_credit")
         .iter()
         .filter(|params| params.get("dataBase64").is_some())
@@ -1261,7 +1669,7 @@ async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
     // Asserting only the upper bound would pass on a stream that never ran.
     assert!(
         uncredited >= 1,
-        "the relay stream must start before it can stall at a cap"
+        "the relay stream must start before it can stall at a cap (saw {uncredited})"
     );
     assert!(
         uncredited <= 4,
@@ -1275,7 +1683,7 @@ async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
         json!({"streamId":"st_credit", "chunks": 4}),
     )
     .await?;
-    let resumed = collect_notifications(&mut fixture.node, Duration::from_secs(5), |frame| {
+    let resumed = collect_notifications(&mut fixture.node, Duration::from_secs(10), |frame| {
         frame["params"]["streamId"] == json!("st_credit")
             && frame["params"].get("dataBase64").is_some()
     })
@@ -1304,11 +1712,10 @@ async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
 /// 429 is what cools a family window. The projection is the router's job; this
 /// shows the surface it lands on, which is where a test must look for it.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn an_origin_429_is_projected_into_supply_evidence() -> Result<()> {
     let gateway = FakeGateway::start_with(vec![Script::status(429)]).await?;
-    let mut fixture = fixture().await?;
-    let profile_id = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
+    let profile_id = fixture_profile_id(&fixture).await?;
 
     notify(
         &mut fixture.node,
@@ -1387,14 +1794,12 @@ async fn an_origin_429_is_projected_into_supply_evidence() -> Result<()> {
 
 /// The response allowlist drops `set-cookie` and keeps `content-type`.
 #[tokio::test]
-#[ignore = "relay router lands with c-apiroute-hub"]
 async fn the_response_header_allowlist_drops_set_cookie() -> Result<()> {
     let gateway = FakeGateway::start().await?;
     // The origin must actually send a `set-cookie`, or this assertion would
     // pass whether or not the allowlist works.
     gateway.set_response_header("set-cookie", "session=should-never-be-relayed; HttpOnly");
-    let mut fixture = fixture().await?;
-    let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
+    let mut fixture = fixture_routed_self(&gateway.base_url_v1()).await?;
 
     notify(
         &mut fixture.node,

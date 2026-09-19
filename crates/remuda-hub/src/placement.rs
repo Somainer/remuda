@@ -779,6 +779,7 @@ mod tests {
         HostRecord {
             workspaces: Vec::new(),
             workspace_revision: 0,
+            relay_bind: None,
             ssh: None,
             last_error: None,
             host_id: id.into(),

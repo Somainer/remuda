@@ -104,3 +104,59 @@ export function splitGrokMcpName(toolName: string): { server: string; tool: stri
 }
 
 export const TOOL_FAMILIES: ToolFamily[] = ["Bash", "Edit", "Read", "Write", "Workflow", "Task", "MCP", "Generic"];
+
+/**
+ * Native tool names whose call IS an interaction (ui-spec §2.2, D-041).
+ *
+ * These are normally projected onto `interaction.requested` and rendered as
+ * QuestionForm pinned above the composer, so no ToolCard mounts for them. The
+ * names below cover the fallback card — a tool-only frame the projection did
+ * not carry — which must stay open the same way: a pending question is never
+ * swept behind a fold.
+ */
+const INTERACTION_TOOL_NAMES = new Set(["AskUserQuestion", "ask_user_question"]);
+
+export function isInteractionTool(toolName: string | undefined | null): boolean {
+  return Boolean(toolName && INTERACTION_TOOL_NAMES.has(toolName));
+}
+
+/**
+ * Inputs to the D-041 compact default-fold decision (ui-spec.md §2.2 fold
+ * table). The decision is made AFTER the family is determined, so a fold
+ * branch can never swallow a family-specific card (the Workflow timeline).
+ */
+export type ToolFoldInput = {
+  /** Card family from {@link familyFor}. */
+  family: ToolFamily;
+  /** Call/result paired (final result), or the card explicitly failed. */
+  settled: boolean;
+  /** Compact workbench layout. The automatic default fold applies only here. */
+  compact: boolean;
+  /** result.outcome is failed/denied — error cards always stay open. */
+  failed?: boolean;
+  /** interaction.* fallback card — stays pinned above the composer. */
+  interaction?: boolean;
+  /** Reader explicitly pressed 全部折叠 (collapse-all). Folds every non-failed card. */
+  requested?: boolean;
+};
+
+/**
+ * Whether a tool card starts (and stays, until the reader expands it) folded
+ * to its one-line row. D-041, ui-spec.md §2.2:
+ *
+ * - an explicit collapse-all (`requested`) keeps main's exact behaviour:
+ *   every non-failed card folds, including running and Workflow cards —
+ *   D-041 exemptions govern only the AUTOMATIC compact fold;
+ * - the automatic fold applies only in compact layout;
+ * - Workflow, error and interaction.* cards are exempt there, no matter
+ *   how long they have been settled;
+ * - running / unsettled cards never fold automatically — but a card that
+ *   settles during a live session folds the moment it settles: a live phone
+ *   session is the scroll problem D-041 exists for.
+ */
+export function shouldFoldToolCard(input: ToolFoldInput): boolean {
+  if (input.requested) return !input.failed;
+  if (!input.compact) return false;
+  if (input.failed || input.interaction || input.family === "Workflow") return false;
+  return input.settled;
+}

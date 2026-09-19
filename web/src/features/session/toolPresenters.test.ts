@@ -13,6 +13,7 @@ import type { ToolCallPayload, ToolResultPayload } from "../../types/observation
 import { known, type Id } from "../../types/wire";
 import {
   compactInput,
+  foldedKeyArgument,
   humanDuration,
   parseWorkflowMeta,
   presentTool,
@@ -446,5 +447,75 @@ describe("humanDuration", () => {
     [0, "未设置"],
   ])("renders %ims as %s", (ms, expected) => {
     expect(humanDuration(ms)).toBe(expected);
+  });
+});
+
+describe("foldedKeyArgument · D-041 folded-row key argument", () => {
+  it("Bash: first physical line as text, the whole command as title", () => {
+    const one = foldedKeyArgument("Bash", call("Bash", { command: "echo workflow-running" }));
+    expect(one).toEqual({ text: "echo workflow-running", title: "echo workflow-running" });
+
+    const multi = foldedKeyArgument(
+      "Bash",
+      call("Bash", { command: "set -euxo pipefail\ncargo test -p remuda-hub\necho done" }),
+    );
+    expect(multi?.text).toBe("set -euxo pipefail");
+    expect(multi?.title).toBe("set -euxo pipefail\ncargo test -p remuda-hub\necho done");
+  });
+
+  it("Bash never comes back empty or brace-led: a command-less input degrades to a single-line preview", () => {
+    const arg = foldedKeyArgument("Bash", call("Bash", { argv: ["ls", "-l"] }));
+    // Single physical line, exact JSON — not the first line ("{") of a
+    // pretty-printed JSON dump.
+    expect(arg).toEqual({ text: '{"argv":["ls","-l"]}', title: '{"argv":["ls","-l"]}' });
+    expect(arg!.text).not.toContain("\n");
+    expect(arg!.text).not.toBe("{");
+
+    const scalar = foldedKeyArgument("Bash", call("Bash", { argv: "ls -l" }));
+    expect(scalar?.text).toBe('{"argv":"ls -l"}');
+  });
+
+  it("Edit / Write / Read / NotebookEdit carry the path (notebook_path included)", () => {
+    expect(foldedKeyArgument("Edit", call("Edit", { file_path: "/repo/src/main.rs" }))).toEqual({
+      text: "/repo/src/main.rs",
+      title: "/repo/src/main.rs",
+    });
+    expect(foldedKeyArgument("Write", call("Write", { file_path: "a/b.txt" }))?.text).toBe("a/b.txt");
+    expect(foldedKeyArgument("Read", call("Read", { file_path: "README.md" }))?.text).toBe("README.md");
+    expect(
+      foldedKeyArgument("NotebookEdit", call("NotebookEdit", { notebook_path: "nb.ipynb" }))?.text,
+    ).toBe("nb.ipynb");
+    // A call whose input omitted the path takes the result change path.
+    const changed = result("ok") as ToolResultPayload;
+    changed.changes = [{ path: "from-result.rs", diff: "", application: "applied" }];
+    expect(foldedKeyArgument("Edit", call("Edit", {}), changed)?.text).toBe("from-result.rs");
+  });
+
+  it("grok file tools use the native field names", () => {
+    expect(
+      foldedKeyArgument("run_terminal_command", call("run_terminal_command", { command: "printf x" })),
+    ).toEqual({ text: "printf x", title: "printf x" });
+    expect(
+      foldedKeyArgument("read_file", call("read_file", { target_file: "/a.rs" }))?.text,
+    ).toBe("/a.rs");
+    expect(
+      foldedKeyArgument("list_dir", call("list_dir", { target_directory: "/repo/src" }))?.text,
+    ).toBe("/repo/src");
+    expect(foldedKeyArgument("write", call("write", { file_path: "/grok/out" }))?.text).toBe(
+      "/grok/out",
+    );
+    expect(
+      foldedKeyArgument("search_replace", call("search_replace", { file_path: "/grok/edit.rs" }))
+        ?.text,
+    ).toBe("/grok/edit.rs");
+  });
+
+  it("families without a D-041 key argument return null", () => {
+    expect(foldedKeyArgument("TodoWrite", call("TodoWrite", { todos: [] }))).toBeNull();
+    expect(
+      foldedKeyArgument("mcp__srv__tool", call("mcp__srv__tool", { q: "x" })),
+    ).toBeNull();
+    expect(foldedKeyArgument("Task", call("Task", { description: "do work" }))).toBeNull();
+    expect(foldedKeyArgument("Workflow", call("Workflow", { script: "export const meta = {}" }))).toBeNull();
   });
 });

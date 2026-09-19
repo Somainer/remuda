@@ -124,3 +124,78 @@
   color: var(--danger);
   font-weight: 600;
 }
+
+/* D-041 compact folded tool row: family + key argument on one truncated
+   line. Visual frame matches .tool so an expanded card reads as the same
+   surface opening up. */
+.fold {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  overflow: hidden;
+}
+
+.foldHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  min-width: 0;
+}
+
+.foldTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--paper);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.foldFamily {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  flex: none;
+}
+
+.foldArg {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Anchor for the compact touch hot zone below; the visual 22px button box
+   is unchanged on every layout. */
+.foldOpen {
+  position: relative;
+  flex: none;
+  margin-left: auto;
+}
+
+/* ui-spec §3.4: the fold's only affordance gets a var(--touch) hit area in
+   compact via an invisible ::after, never a bigger visual glyph. The head
+   gets the same min-height so the 44px pseudo is never clipped by the
+   row's overflow:hidden (clipped pixels do not hit-test). */
+@media (max-width: 767px) {
+  .foldHead {
+    min-height: var(--touch);
+  }
+
+  .foldOpen::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+  }
+}

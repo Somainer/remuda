@@ -86,14 +86,21 @@ test.describe("transcript virtualization and session chrome", () => {
     await expect(page.getByTestId("session-meta")).toContainText("只读");
   });
 
-  test("Compact/Full persists and collapse-all folds tools", async ({ page }) => {
+  test("Compact/Full persists and collapse-all folds tools", async ({ page }, info) => {
     await openNamedSession(page, "看 TaskManager spill");
+    // D-041: a settled ordinary card is already folded by default on the
+    // mobile-webkit (390px) project; the desktop project starts unfolded. The
+    // point of this case is the explicit collapse-all that follows.
+    const mobile = info.project.name === "mobile-webkit";
     await expect(page.getByTestId("density-toggle")).toHaveAttribute("data-mode", "compact");
     await page.getByTestId("density-toggle").click();
     await expect(page.getByTestId("density-toggle")).toHaveAttribute("data-mode", "full");
     await page.reload();
     await expect(page.getByTestId("density-toggle")).toHaveAttribute("data-mode", "full");
-    await expect(page.getByTestId("tool-card").first()).toHaveAttribute("data-folded", "0");
+    await expect(page.getByTestId("tool-card").first()).toHaveAttribute(
+      "data-folded",
+      mobile ? "1" : "0",
+    );
     await page.getByTestId("collapse-all").click();
     await expect(page.getByTestId("tool-card").first()).toHaveAttribute("data-folded", "1");
   });

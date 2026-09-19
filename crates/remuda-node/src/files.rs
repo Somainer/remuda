@@ -176,14 +176,23 @@ pub(crate) const TOOL_MEDIA_MAX_BYTES: u64 = 25 * 1024 * 1024;
 /// object through the host-token route. Wraps [`HubHostFileStager`] rather
 /// than duplicating its HTTP shape.
 ///
-/// The mappers fold on a synchronous seam, so the upload runs on a private
-/// one-thread runtime and the calling thread parks on its handle: a bounded
-/// (90 s) blocking call, the same shape the transcript pump already makes for
-/// file reads. It never re-enters the Node runtime, so it cannot deadlock it.
+/// The mappers fold on a synchronous seam, but they run *inside* the Node's
+/// async runtime; calling `Handle::block_on` from there would panic. Instead
+/// a dedicated OS thread owns a one-thread runtime and a job queue: the
+/// mapper hands over the upload future and parks on a std channel — a bounded
+/// (90 s client timeout) blocking recv that never re-enters the Node runtime,
+/// so it can neither deadlock it nor take down a carrier.
 pub(crate) struct HubToolMediaStager {
-    inner: HubHostFileStager,
+    inner: Arc<HubHostFileStager>,
+    jobs: std::sync::mpsc::Sender<StagingJob>,
+    /// Held for its `Drop` (joins the staging thread). The stager is moved
+    /// into an `Arc` after construction, so there is exactly one owner.
+    #[allow(dead_code)]
     runtime: StagingRuntime,
 }
+
+/// One queued upload: run the future on the staging thread and report back.
+type StagingJob = Box<dyn FnOnce(&tokio::runtime::Handle) + Send + 'static>;
 
 impl std::fmt::Debug for HubToolMediaStager {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -198,63 +207,67 @@ impl HubToolMediaStager {
         host_id: String,
         token: String,
     ) -> Result<Self, NodeError> {
+        let inner = Arc::new(HubHostFileStager::from_ws_url(ws_url, host_id, token)?);
+        let runtime = StagingRuntime::start()?;
         Ok(Self {
-            inner: HubHostFileStager::from_ws_url(ws_url, host_id, token)?,
-            runtime: StagingRuntime::start()?,
+            inner,
+            jobs: runtime.jobs(),
+            runtime,
         })
     }
 }
 
-/// A parked current-thread runtime on one OS thread for the synchronous
-/// staging bridge; shut down when the stager drops.
+/// A parked current-thread runtime on one OS thread plus its job channel;
+/// dropped (thread joined) when the stager goes away.
 struct StagingRuntime {
-    handle: tokio::runtime::Handle,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    // `Option` so Drop can close the queue *before* joining: the staging
+    // loop exits on `recv` seeing no senders, and it must see this own sender
+    // gone or it would wait forever while the join blocks.
+    jobs: Option<std::sync::mpsc::Sender<StagingJob>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl StagingRuntime {
     fn start() -> Result<Self, NodeError> {
-        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(0);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<StagingJob>();
         let thread = std::thread::Builder::new()
             .name("remuda-tool-media".into())
             .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                // The runtime owns its own worker thread; this staging thread
+                // is only a std job loop, so a blocking `recv` parks it
+                // without stalling the upload future.
+                let Ok(runtime) = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
                     .enable_all()
                     .build()
                 else {
                     return;
                 };
                 let handle = runtime.handle().clone();
-                let _ = handle_tx.send(handle);
-                runtime.block_on(async move {
-                    let _ = shutdown_rx.await;
-                });
+                while let Ok(job) = job_rx.recv() {
+                    job(&handle);
+                }
+                // Sender dropped: shutting the runtime joins the worker.
+                drop(runtime);
             })
             .map_err(|error| {
                 NodeError::Transport(format!("staging thread spawn failed: {error}"))
             })?;
-        let handle = handle_rx.recv().map_err(|error| {
-            NodeError::Transport(format!("staging thread start failed: {error}"))
-        })?;
         Ok(Self {
-            handle,
-            shutdown: Some(shutdown_tx),
+            jobs: Some(job_tx),
             thread: Some(thread),
         })
     }
 
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        self.handle.block_on(future)
+    fn jobs(&self) -> std::sync::mpsc::Sender<StagingJob> {
+        self.jobs.as_ref().expect("staging queue open").clone()
     }
 }
 
 impl Drop for StagingRuntime {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+        // Close the queue first so the loop's `recv` unblocks; only then join.
+        self.jobs.take();
         if let Some(thread) = self.thread.take()
             && thread.join().is_err()
         {
@@ -274,16 +287,38 @@ impl remuda_protocol::ToolMediaStager for HubToolMediaStager {
         media_type: &str,
         bytes: Vec<u8>,
     ) -> Result<remuda_protocol::Id, remuda_protocol::ToolMediaError> {
-        let staged = self
-            .runtime
-            .block_on(self.inner.stage_typed(name, Some(media_type), bytes));
-        match staged {
-            Ok(staged) => remuda_protocol::Id::try_from(staged.object_id).map_err(|error| {
+        let inner = self.inner.clone();
+        let name = name.to_owned();
+        let media_type = media_type.to_owned();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Result<StagedHostFile, NodeError>>();
+        let accepted = self
+            .jobs
+            .send(Box::new(move |handle: &tokio::runtime::Handle| {
+                handle.spawn(async move {
+                    let result = inner.stage_typed(&name, Some(&media_type), bytes).await;
+                    let _ = reply_tx.send(result);
+                });
+            }));
+        if accepted.is_err() {
+            return Err(remuda_protocol::ToolMediaError::Unstageable(
+                "tool-media staging thread is shut down".into(),
+            ));
+        }
+        // Bounded park: the HTTP client itself caps at 90 s; give a small
+        // margin and then degrade rather than pinning a Node worker forever.
+        match reply_rx.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(Ok(staged)) => remuda_protocol::Id::try_from(staged.object_id).map_err(|error| {
                 remuda_protocol::ToolMediaError::Unstageable(format!("bad object id: {error}"))
             }),
-            Err(error) => Err(remuda_protocol::ToolMediaError::Unstageable(
+            Ok(Err(error)) => Err(remuda_protocol::ToolMediaError::Unstageable(
                 error.to_string(),
             )),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(
+                remuda_protocol::ToolMediaError::Unstageable("staging timed out after 120s".into()),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
+                remuda_protocol::ToolMediaError::Unstageable("staging thread exited".into()),
+            ),
         }
     }
 }
@@ -1652,5 +1687,94 @@ mod tests {
 
         fs::remove_dir_all(&scratch).ok();
         fs::remove_dir_all(&unrelated).ok();
+    }
+
+    /// A one-off HTTP/1.1 server that reads one complete request (headers plus
+    /// the declared body) and writes a fixed reply. The request must be fully
+    /// read before replying: a blocking `read` into an oversized buffer would
+    /// hang on a small request the client keeps alive.
+    fn spawn_staging_server(
+        reply: &'static str,
+    ) -> (std::net::SocketAddr, std::sync::mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            loop {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                let Ok((mut stream, _)) = listener.accept() else {
+                    continue;
+                };
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 256];
+                let header_end = loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break pos + 4;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                };
+                let content_length = String::from_utf8_lossy(&buf[..header_end])
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                while buf.len() < header_end + content_length {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                }
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (addr, stop_tx)
+    }
+
+    /// D-045 §6.2: the synchronous staging seam is called *from within* the
+    /// Node's async runtime; the bridge must hand off to its own thread
+    /// rather than `block_on` a tokio handle (which panics on an async
+    /// worker). Regression test for that handoff.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_media_stager_works_from_inside_a_tokio_worker() {
+        const BODY: &str = "{\"objectId\":\"obj_0193f7c2-8a41-79d1-9b2e-3c5f6a7b8c90\",\"digest\":\"d\",\"size\":10}";
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+            BODY.len()
+        );
+        let (addr, stop) = spawn_staging_server(Box::leak(reply.into_boxed_str()));
+        let ws_url = format!("ws://{addr}");
+        let stager =
+            HubToolMediaStager::from_ws_url(&ws_url, "hst_test".into(), "token".into()).unwrap();
+        // Call on a runtime worker (this test fn is one): before the fix this
+        // was a Handle::block_on that panicked with "Cannot start a runtime
+        // from within a runtime".
+        let id = tokio::task::spawn_blocking(move || {
+            <HubToolMediaStager as remuda_protocol::ToolMediaStager>::stage(
+                &stager,
+                "screen-1.png",
+                "image/png",
+                vec![0u8; 10],
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(id.as_str().starts_with("obj_"));
+        let _ = stop.send(());
     }
 }

@@ -289,7 +289,11 @@ test.describe("390px", () => {
     for (const theme of ["night", "ledger"]) {
       await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
       await page.waitForTimeout(150);
-      await first.screenshot({ path: path.join(evidence, `workbench-code-1-${theme}-390.png`) });
+      // Re-query the block right before capturing: a late follow re-render can
+      // detach the element resolved earlier in the test.
+      const shot = page.getByTestId("code-block").first();
+      await expect(shot).toBeVisible();
+      await shot.screenshot({ path: path.join(evidence, `workbench-code-1-${theme}-390.png`) });
     }
   });
 });

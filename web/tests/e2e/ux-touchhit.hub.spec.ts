@@ -9,16 +9,19 @@ import { login } from "./hub-auth";
  *
  * Visual glyph sizes stay as they were (back 20px, stop 32px, viewSeg
  * 25/30px); the 44px reach is supplied by an invisible `::after`, never by a
- * visual resize (ui-spec.md §3.4, D-039). jsdom cannot measure geometry, so
- * this spec is the binding check: it measures the real boxes in Chromium at
- * 390×844 with touch, and re-checks that the hit area is width-driven (it is
- * still there without a touch pointer) while desktop keeps the small visual
- * segment and no ::after.
+ * visual resize (ui-spec.md §3.4, D-039). Geometry — not getComputedStyle —
+ * is the contract: the control's box must be inside the viewport and
+ * elementFromPoint at the four hit-zone corners must land on the control. A
+ * computed ::after size cannot catch a deleted centring transform, a covered
+ * pseudo, or a target parked off-screen.
  *
  * A default Claude session on the fake Node launches on shell-pty, so it has
  * both the 终端 / 结构 ViewSwitch and the composer effort controls.
  */
 test.describe.configure({ mode: "serial" });
+
+const TOUCH = 44;
+const HALF = TOUCH / 2;
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const evidence = process.env.REMUDA_EVIDENCE === "1";
@@ -135,24 +138,72 @@ test.afterAll(async ({ browser }) => {
   await cleanup.close();
 });
 
+type Box = { x: number; y: number; width: number; height: number };
+
+function boxInViewport(box: Box, vw: number, vh: number) {
+  return box.x >= -0.5 && box.y >= -0.5 && box.x + box.width <= vw + 0.5 && box.y + box.height <= vh + 0.5;
+}
+
+/** Owner marker elementFromPoint should resolve to at a probed point. */
+async function ownerAt(page: Page, x: number, y: number): Promise<string> {
+  return page.evaluate(
+    ({ x, y }) =>
+      document
+        .elementFromPoint(x, y)
+        ?.closest("[data-touchhit-owner]")
+        ?.getAttribute("data-touchhit-owner") ?? "none",
+    { x, y },
+  );
+}
+
 /**
- * The clickable box of an element plus its invisible ::after. boundingBox()
- * is the visual box; the pseudo supplies the reach centred on it.
+ * A real tap target: visible box fully inside the viewport, and the four
+ * corners of its 44×44 hot zone (centre ±21px) resolve to the control itself
+ * — catching a missing transform, a covering sibling, and off-screen parking.
  */
-async function touchReach(locator: Locator) {
-  const box = await locator.boundingBox();
-  expect(box, "target is rendered").toBeTruthy();
-  const after = await locator.evaluate((el) => {
-    const pseudo = getComputedStyle(el, "::after");
-    return { width: parseFloat(pseudo.width), height: parseFloat(pseudo.height) };
-  });
-  return {
-    visual: { width: box!.width, height: box!.height },
-    reach: {
-      width: Math.max(box!.width, Number.isFinite(after.width) ? after.width : 0),
-      height: Math.max(box!.height, Number.isFinite(after.height) ? after.height : 0),
-    },
-  };
+async function assertTapTarget(page: Page, target: Locator, owner: string): Promise<Box> {
+  await expect(target).toBeVisible();
+  const box = await target.boundingBox();
+  expect(box, `${owner} is rendered`).toBeTruthy();
+  const vp = page.viewportSize();
+  expect(vp).toBeTruthy();
+  expect(boxInViewport(box!, vp!.width, vp!.height), `${owner} box is inside viewport`).toBe(true);
+
+  const cx = box!.x + box!.width / 2;
+  const cy = box!.y + box!.height / 2;
+  // 0.5px inset keeps the probe inside the pseudo at sub-pixel rounding. A
+  // control flush against a viewport edge legitimately parks part of its
+  // 44px zone off-screen; clamp to the visible part of the zone instead of
+  // probing outside the document.
+  const clampX = (x: number) => Math.min(Math.max(x, 0.5), vp!.width - 0.5);
+  const clampY = (y: number) => Math.min(Math.max(y, 0.5), vp!.height - 0.5);
+  const probes = [
+    { name: "tl", x: clampX(cx - HALF + 0.5), y: clampY(cy - HALF + 0.5) },
+    { name: "tr", x: clampX(cx + HALF - 0.5), y: clampY(cy - HALF + 0.5) },
+    { name: "bl", x: clampX(cx - HALF + 0.5), y: clampY(cy + HALF - 0.5) },
+    { name: "br", x: clampX(cx + HALF - 0.5), y: clampY(cy + HALF - 0.5) },
+  ];
+  for (const p of probes) {
+    expect(await ownerAt(page, p.x, p.y), `${owner} owns its ${p.name} hot-zone corner`).toBe(owner);
+  }
+  console.log(
+    `TOUCHHIT ${owner} visual ${Math.round(box!.width)}x${Math.round(box!.height)} at (${Math.round(box!.x)},${Math.round(box!.y)}) corners all self`,
+  );
+  return box!;
+}
+
+async function mark(locator: Locator, owner: string) {
+  await locator.evaluate(
+    (el, value) => el.setAttribute("data-touchhit-owner", value),
+    owner,
+  );
+}
+
+async function markHeader(page: Page) {
+  await mark(page.getByRole("link", { name: "返回" }), "back");
+  await mark(page.getByTestId("view-switch-tty"), "seg-tty");
+  await mark(page.getByTestId("view-switch-structured"), "seg-structured");
+  await mark(page.getByRole("button", { name: "Stop" }), "stop");
 }
 
 async function metaFontSize(page: Page): Promise<number> {
@@ -161,73 +212,7 @@ async function metaFontSize(page: Page): Promise<number> {
   );
 }
 
-async function assertTouchControls(page: Page) {
-  const table: Record<string, { visual: { w: number; h: number }; reach: { w: number; h: number } }> = {};
-  // Back (20px glyph) and Stop (32px square) reach 44px only via ::after.
-  const back = page.getByRole("link", { name: "返回" });
-  const stop = page.getByRole("button", { name: "Stop" });
-  await expect(back).toBeVisible();
-  await expect(stop).toBeVisible();
-  for (const [name, target] of [["back", back], ["stop", stop]] as const) {
-    const m = await touchReach(target);
-    table[name] = {
-      visual: { w: Math.round(m.visual.width), h: Math.round(m.visual.height) },
-      reach: { w: Math.round(m.reach.width), h: Math.round(m.reach.height) },
-    };
-    expect(m.reach.width).toBeGreaterThanOrEqual(44);
-    expect(m.reach.height).toBeGreaterThanOrEqual(44);
-  }
-
-  // Both segments of the 终端 / 结构 switch keep their visual height but have
-  // a 44px hit area, and the radiogroup semantics are untouched.
-  const switchBox = page.getByTestId("view-switch");
-  await expect(switchBox).toHaveAttribute("role", "radiogroup");
-  for (const id of ["tty", "structured"] as const) {
-    const seg = page.getByTestId(`view-switch-${id}`);
-    expect(seg).toHaveAttribute("role", "radio");
-    const m = await touchReach(seg);
-    table[`viewSeg-${id}`] = {
-      visual: { w: Math.round(m.visual.width), h: Math.round(m.visual.height) },
-      reach: { w: Math.round(m.reach.width), h: Math.round(m.reach.height) },
-    };
-    // The segment itself never grew to 44px…
-    expect(m.visual.height).toBeLessThan(44);
-    // …the invisible hit area did.
-    expect(m.reach.width).toBeGreaterThanOrEqual(44);
-    expect(m.reach.height).toBeGreaterThanOrEqual(44);
-  }
-
-  // The two 26px effort glyph buttons (reset on the pill; list-back on the
-  // tier list) keep their glyph box and an ::after, now on var(--touch).
-  await page.getByTestId("model-effort-chip").click();
-  await expect(page.getByTestId("effort-menu")).toBeVisible();
-  const reset = page.getByTestId("effort-reset");
-  let measured = await touchReach(reset);
-  table["effort-reset"] = {
-    visual: { w: Math.round(measured.visual.width), h: Math.round(measured.visual.height) },
-    reach: { w: Math.round(measured.reach.width), h: Math.round(measured.reach.height) },
-  };
-  expect(measured.visual.height).toBeLessThanOrEqual(26);
-  expect(measured.reach.width).toBeGreaterThanOrEqual(44);
-  expect(measured.reach.height).toBeGreaterThanOrEqual(44);
-
-  await page.getByTestId("effort-open-list").click();
-  await expect(page.getByTestId("effort-slider-panel")).toBeVisible();
-  const listBack = page.getByTestId("effort-list-back");
-  measured = await touchReach(listBack);
-  table["effort-list-back"] = {
-    visual: { w: Math.round(measured.visual.width), h: Math.round(measured.visual.height) },
-    reach: { w: Math.round(measured.reach.width), h: Math.round(measured.reach.height) },
-  };
-  expect(measured.visual.height).toBeLessThanOrEqual(26);
-  expect(measured.reach.width).toBeGreaterThanOrEqual(44);
-  expect(measured.reach.height).toBeGreaterThanOrEqual(44);
-
-  console.log(`TOUCHHIT-390 ${JSON.stringify(table)}`);
-  console.log(`TOUCHHIT-META-390 ${await metaFontSize(page)}`);
-}
-
-test("header controls carry 44px hit areas at 390px with touch while visuals stay small", async ({
+test("header controls that are on screen own their full 44px corners at 390px with touch", async ({
   browser,
 }) => {
   // hasTouch is a context property, not a viewport one: emulate a phone
@@ -241,28 +226,142 @@ test("header controls carry 44px hit areas at 390px with touch while visuals sta
     await login(page);
     const instanceId = await createClaudeSession(page);
     await clearApprovals(page, instanceId);
+    await markHeader(page);
 
     expect(await metaFontSize(page)).toBeGreaterThanOrEqual(12);
+
+    // Back: a ~20px arrow glyph (line-height makes its box 20.3px), 44px reach.
+    const backBox = await assertTapTarget(page, page.getByRole("link", { name: "返回" }), "back");
+    expect(backBox.width).toBeLessThanOrEqual(21);
+    expect(backBox.height).toBeLessThan(26);
+
+    // Both segments of the 终端 / 结构 switch keep radiogroup semantics and a
+    // 30px visual height while owning the 44px hit area.
+    const switchBox = page.getByTestId("view-switch");
+    await expect(switchBox).toHaveAttribute("role", "radiogroup");
+    for (const [id, owner] of [
+      ["tty", "seg-tty"],
+      ["structured", "seg-structured"],
+    ] as const) {
+      const seg = page.getByTestId(`view-switch-${id}`);
+      await expect(seg).toHaveAttribute("role", "radio");
+      const box = await assertTapTarget(page, seg, owner);
+      expect(box.height).toBeLessThan(44);
+    }
+
+    // Clean header shot before opening any popover.
     await shot(page, "ux2026-touchhit-1-390.png");
-    await assertTouchControls(page);
+
+    // The two 26px effort glyph buttons (reset on the pill; list-back on the
+    // tier list) keep their glyph box and own their ::after corners.
+    await page.getByTestId("model-effort-chip").click();
+    await expect(page.getByTestId("effort-menu")).toBeVisible();
+    await mark(page.getByTestId("effort-reset"), "effort-reset");
+    const resetBox = await assertTapTarget(page, page.getByTestId("effort-reset"), "effort-reset");
+    expect(resetBox.width).toBeLessThan(27);
+    expect(resetBox.height).toBeLessThan(27);
+
+    await page.getByTestId("effort-open-list").click();
+    await expect(page.getByTestId("effort-slider-panel")).toBeVisible();
+    await mark(page.getByTestId("effort-list-back"), "effort-list-back");
+    const listBackBox = await assertTapTarget(
+      page,
+      page.getByTestId("effort-list-back"),
+      "effort-list-back",
+    );
+    expect(listBackBox.width).toBeLessThan(27);
+    expect(listBackBox.height).toBeLessThan(27);
   } finally {
     await context.close();
   }
 });
 
-test("the 44px hit area is width-driven, so a 390px window without touch keeps it", async ({
+test("Stop is a 44px target but currently parks off the 390px viewport (xfail until c-sessionchrome, D-040)", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+  });
+  const page = await context.newPage();
+  try {
+    await login(page);
+    const instanceId = await createClaudeSession(page);
+    await clearApprovals(page, instanceId);
+    await markHeader(page);
+
+    // Document the current state honestly: the non-wrapping headRow parks
+    // Stop past the right edge, so its (correct, non-overlapping) hot zone is
+    // not reachable. This xfail must unwind when c-sessionchrome reclaims the
+    // header — D-040 keeps Stop in the header permanently.
+    const stopBox = await page.getByRole("button", { name: "Stop" }).boundingBox();
+    expect(stopBox).toBeTruthy();
+    const offscreen = stopBox!.x < -0.5 || stopBox!.x + stopBox!.width > 390.5;
+    console.log(
+      `TOUCHHIT stop visual ${Math.round(stopBox!.width)}x${Math.round(stopBox!.height)} at x=${Math.round(stopBox!.x)} (viewport 390) offscreen=${offscreen}`,
+    );
+    test.fail(
+      offscreen,
+      "Stop is off-viewport at 390px; reachable once c-sessionchrome reclaims the header (D-040)",
+    );
+    await assertTapTarget(page, page.getByRole("button", { name: "Stop" }), "stop");
+  } finally {
+    await context.close();
+  }
+});
+
+test("Stop hot zone never claims its neighbour (D-039), and narrow width without touch keeps the zone", async ({
   page,
 }) => {
-  // Compact layout is a width question; dropping touch must not silently
-  // shrink the hit area (the compact/coarse-pointer distinction).
-  await page.setViewportSize({ width: 390, height: 844 });
+  // At a compact width wide enough for the whole headRow to fit (still
+  // <=767px, so the mobile hot-zone rules apply), hit-test the border between
+  // Stop and its left neighbour, the 原始事件 toggle. With Stop held at
+  // flex:none the 44px ::after spills 6px into the 10px gap; the neighbour's
+  // edge must still resolve to the neighbour, not Stop.
+  await page.setViewportSize({ width: 767, height: 900 });
   const instanceId = await createClaudeSession(page);
   await clearApprovals(page, instanceId);
+  await markHeader(page);
+  await mark(page.getByTestId("events-toggle"), "neighbour");
 
-  const seg = page.getByTestId("view-switch-structured");
-  const { reach } = await touchReach(seg);
-  expect(reach.width).toBeGreaterThanOrEqual(44);
-  expect(reach.height).toBeGreaterThanOrEqual(44);
+  const stop = page.getByRole("button", { name: "Stop" });
+  const neighbour = page.getByTestId("events-toggle");
+  const stopBox = await stop.boundingBox();
+  const neighbourBox = await neighbour.boundingBox();
+  expect(stopBox).toBeTruthy();
+  expect(neighbourBox).toBeTruthy();
+  expect(boxInViewport(stopBox!, 767, 900)).toBe(true);
+  expect(boxInViewport(neighbourBox!, 767, 900)).toBe(true);
+
+  // Geometry first: the 44px zone centred on the 32px square extends 6px
+  // sideways; it must not reach the neighbour's visible box.
+  const stopHotLeft = stopBox!.x - (TOUCH - stopBox!.width) / 2;
+  console.log(
+    `TOUCHHIT border neighbour right=${Math.round(neighbourBox!.x + neighbourBox!.width)} stopHotLeft=${Math.round(stopHotLeft)} stopVisualLeft=${Math.round(stopBox!.x)}`,
+  );
+  expect(stopHotLeft).toBeGreaterThan(neighbourBox!.x + neighbourBox!.width - 0.5);
+
+  // Hit-testing across the border: the neighbour's right-edge column belongs
+  // to the neighbour; one pixel left of the Stop zone is gap; the zone edge
+  // and the visible square belong to Stop.
+  const cy = stopBox!.y + stopBox!.height / 2;
+  expect(await ownerAt(page, neighbourBox!.x + neighbourBox!.width - 1, cy)).toBe("neighbour");
+  expect(await ownerAt(page, stopHotLeft - 1, cy)).not.toBe("stop");
+  expect(await ownerAt(page, stopHotLeft + 0.5, cy)).toBe("stop");
+  expect(await ownerAt(page, stopBox!.x + 1, cy)).toBe("stop");
+
+  // Same non-touch page, narrowed to 390: the hot zone is a width question,
+  // so dropping touch (compact/coarsePointer distinction) must not shrink
+  // it. The session survives the viewport resize; the segment keeps owning
+  // its corners.
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mark(page.getByTestId("view-switch-structured"), "seg-structured");
+  const segBox = await assertTapTarget(
+    page,
+    page.getByTestId("view-switch-structured"),
+    "seg-structured",
+  );
+  expect(segBox.height).toBeLessThan(44);
 });
 
 test("desktop keeps the small visual segment with no ::after and .meta at 12px", async ({ page }) => {

@@ -41,10 +41,13 @@ describe("ViewSwitch", () => {
   });
 
   it("keeps the hit-area-bearing viewSeg class on both radios regardless of state", () => {
-    // The 44px touch reach is attached to `.viewSeg` via a mobile-only
-    // ::after (geometry is measured in ux-touchhit.hub.spec.ts; jsdom has no
-    // layout). The on-state class is additive, so toggling state must never
-    // detach the hit area from a segment.
+    // Not a hit-box assertion: jsdom performs no layout and the stylesheet is
+    // not applied, so a class-string check cannot prove the ::after exists,
+    // is centred, or is unobstructed — the geometry binding lives in
+    // ux-touchhit.hub.spec.ts.
+    // This only guards the TSX invariant the hot zone relies on: the on-state
+    // class is additive, so toggling state never drops `.viewSeg` (the class
+    // the mobile ::after is keyed to) from a segment.
     render(<ViewSwitch value="tty" onChange={vi.fn()} />);
     const selected = screen.getByTestId("view-switch-tty");
     const other = screen.getByTestId("view-switch-structured");

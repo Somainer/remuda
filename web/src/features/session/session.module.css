@@ -2466,6 +2466,11 @@
     min-height: 32px;
     padding: 0;
     justify-content: center;
+    /* Never let the crowded row flex-shrink the 32px square: a shrunk visual
+       centred under a 44px ::after would extend the Stop hot zone past the
+       10px headRow gap and swallow the neighbour's edge (D-039 non-overlap).
+       Kept at 32, the zone spills 6px into a 10px gap — 4px clearance. */
+    flex: none;
     /* The square stays 32px visually; the ::after below supplies the reach. */
     position: relative;
   }

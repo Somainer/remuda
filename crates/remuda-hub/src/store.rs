@@ -477,6 +477,18 @@ pub struct InstanceRecord {
     /// Operator-facing source line (`将使用 …` / `使用主机原生登录`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_source_hint: Option<String>,
+    /// Model-API route this instance actually uses (D-047). Absent on a direct
+    /// session, so an existing instance's JSON is unchanged.
+    ///
+    /// Set from the **Node's** create result, never from the request, so the
+    /// Session strip and `remuda watch` report what ran (D-035). Nothing
+    /// populates it yet: the write-back lands with the Hub's route resolution
+    /// (api-routing task 2/4). In particular it is deliberately **not** read
+    /// back off the spec, because the spec carries the *requested* route —
+    /// whose `route` may be `auto`, a value this observation type does not
+    /// have, since a resolved route is never `auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_route: Option<remuda_protocol::ApiRoute>,
     /// Current model id from create / `instance.configure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -6165,6 +6177,57 @@ mod tests {
             .expect("row")
     }
 
+    /// D-047: the instance projection carries the *observed* route, so it must
+    /// not be derived from the spec's *requested* route.
+    ///
+    /// The two types differ exactly where it matters: a request may say
+    /// `route: "auto"` (let the Hub decide), while an observation only ever
+    /// names a resolved route. Copying the spec's value into this field would
+    /// therefore either drop it (auto is not an `ApiRouteKind`) or, worse,
+    /// report what was asked for as what ran — the D-035 failure this field
+    /// exists to prevent. A spec that does carry a route must still read back
+    /// as "not proxied" until the Node's create result populates it.
+    #[tokio::test]
+    async fn instance_projection_never_infers_api_route_from_the_spec() {
+        let (_dir, store, host) = store_with_host("api-route-projection").await;
+        let routed = store
+            .insert_instance(
+                host.clone(),
+                None,
+                "claude".into(),
+                "shell-pty".into(),
+                None,
+                json!({
+                    "delegation": "gateway",
+                    "apiRoute": {
+                        "mode": "via",
+                        "viaHostId": "hst_01993ab0-0000-7000-8000-000000000007",
+                        "route": "hub-relay"
+                    }
+                }),
+            )
+            .await
+            .expect("insert instance");
+        let read = store
+            .get_instance(routed.instance_id.clone())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            read.api_route, None,
+            "the projection is an observation: it is set from the Node's create \
+             result, never copied off the requested route"
+        );
+
+        // And it stays absent on the wire, so an existing instance's JSON is
+        // byte-identical to what a pre-D-047 Hub emitted.
+        let wire = serde_json::to_value(&read).expect("serialize");
+        assert!(
+            wire.get("apiRoute").is_none(),
+            "an unproxied instance must not gain an apiRoute key"
+        );
+    }
+
     #[tokio::test]
     async fn promoted_hook_activity_is_mirrored_without_screen_or_subagent_override() {
         let (_dir, store, host) = store_with_host("hook-activity").await;
@@ -7006,6 +7069,13 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .get("providerSourceHint")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // D-047: no `apiRoute` projection yet. The field is populated from
+            // the Node's create result (api-routing task 4), so an instance
+            // reads as "not proxied" until that write-back exists — which is
+            // true, since nothing proxies without it. Reading the spec here
+            // would be wrong twice over: a spec written before D-047 has no
+            // route at all, and one that does carries the *requested* route
+            // (`Route` may be `auto`, which is not an observation).
             let model = spec
                 .get("model")
                 .and_then(Value::as_str)
@@ -7101,6 +7171,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_profile_id,
                 provider_source,
                 provider_source_hint,
+                api_route: None,
                 model,
                 tui: spec
                     .get("tui")

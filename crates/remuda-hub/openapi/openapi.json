@@ -490,7 +490,7 @@
       "ErrorBody": {
         "properties": {
           "code": {
-            "description": "Machine-readable error code. Instance creation uses PROVIDER_NOT_CONFIGURED for an explicit gateway request without a matching provider profile and PLACEMENT_UNSATISFIABLE for unsatisfied placement constraints.",
+            "description": "Machine-readable error code. Instance creation uses PROVIDER_NOT_CONFIGURED for an explicit gateway request without a matching provider profile and PLACEMENT_UNSATISFIABLE for unsatisfied placement constraints. A `via` delivery that cannot be honoured is refused with one of ApiViaRefusal (`api-via-unknown-host` 400, `api-via-host-offline` / `api-via-unsupported` / `api-via-unreachable` 409) rather than silently delivered direct.",
             "type": "string"
           },
           "error": {
@@ -817,6 +817,17 @@
       "HostView": {
         "additionalProperties": true,
         "properties": {
+          "relayBind": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HostRelayBind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+          },
           "capabilities": {
             "additionalProperties": true,
             "type": "object"
@@ -1055,6 +1066,19 @@
       },
       "InstanceCreate": {
         "properties": {
+          "apiRoute": {
+            "description": "Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "enum": [
+              "auto",
+              "hub-relay",
+              "direct-net"
+            ],
+            "type": "string"
+          },
+          "apiVia": {
+            "description": "Per-instance delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "type": "string"
+          },
           "args": {
             "description": "Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present.",
             "items": {
@@ -1271,6 +1295,11 @@
               "draining"
             ],
             "type": "string"
+          },
+          "apiRoute": {
+            "$ref": "#/components/schemas/ApiRoute",
+            "description": "Model-API route this instance actually uses (D-047); absent on a direct session.",
+            "readOnly": true
           },
           "connectivity": {
             "type": "string"
@@ -2880,6 +2909,10 @@
           "defaultGateway": {
             "type": "boolean"
           },
+          "delivery": {
+            "$ref": "#/components/schemas/ProviderDeliveryInput",
+            "description": "Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+          },
           "defaultModel": {
             "description": "Must be one of the enabled models.",
             "type": "string"
@@ -2939,6 +2972,145 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "ApiRoute": {
+        "description": "Model-API route an instance is actually using (D-047). Echoed by the Node, never set from the request, so a surface reports what ran.",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "direct",
+              "via"
+            ],
+            "type": "string"
+          },
+          "route": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ApiRouteKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "viaHostId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "viaHostLabel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
+      "ApiRouteKind": {
+        "description": "The route a via session actually took. `auto` is a request, never an observation.",
+        "enum": [
+          "direct-net",
+          "hub-relay"
+        ],
+        "type": "string"
+      },
+      "ApiRouteMode": {
+        "description": "Route a via delivery takes between the worker host and the proxy host. Decided once at launch (D-047 Amendment A1).",
+        "enum": [
+          "auto",
+          "hub-relay",
+          "direct-net"
+        ],
+        "type": "string"
+      },
+      "ApiViaRefusal": {
+        "description": "Why a `via` dispatch was refused (D-047). Every value is a refusal; there is no fallback-to-direct value. Returned as `ErrorBody.code` by the operations that resolve a route: `POST /v1/instances`, `POST /v1/workers/dispatch` and the provider write routes (`POST /v1/providers`, `PATCH /v1/providers/{id}`). The HTTP status is 400 for `api-via-unknown-host` and 409 for the other three.",
+        "enum": [
+          "api-via-unknown-host",
+          "api-via-host-offline",
+          "api-via-unsupported",
+          "api-via-unreachable"
+        ],
+        "type": "string"
+      },
+      "HostRelayBind": {
+        "description": "Explicit non-loopback relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback and every via session on hub-relay.",
+        "additionalProperties": false,
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "allowFrom": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "addr"
+        ],
+        "type": "object"
+      },
+      "ProviderDelivery": {
+        "description": "How a profile's sessions reach the model API (D-047), as stored and read back. Absent means {mode: direct, route: auto}. `mode: via` requires `viaHostId`. This is the read model: `route` is always emitted. Write bodies may omit it (see ProviderDeliveryInput).",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "direct",
+              "via"
+            ],
+            "type": "string"
+          },
+          "route": {
+            "$ref": "#/components/schemas/ApiRouteMode"
+          },
+          "viaHostId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode",
+          "route"
+        ],
+        "type": "object"
+      },
+      "ProviderDeliveryInput": {
+        "additionalProperties": false,
+        "description": "Delivery mode on a create/PATCH body (D-047). Same shape as ProviderDelivery except that `route` may be omitted, which means `auto`; the read model always emits it. `mode: via` requires `viaHostId`.",
+        "properties": {
+          "mode": {
+            "enum": [
+              "direct",
+              "via"
+            ],
+            "type": "string"
+          },
+          "route": {
+            "$ref": "#/components/schemas/ApiRouteMode",
+            "description": "Omitted means `auto`."
+          },
+          "viaHostId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ],
         "type": "object"
       },
       "ProviderHealth": {
@@ -3060,6 +3232,10 @@
           "defaultGateway": {
             "type": "boolean"
           },
+          "delivery": {
+            "$ref": "#/components/schemas/ProviderDeliveryInput",
+            "description": "Set the delivery mode (D-047). Accepted but not yet applied: the waterfall that acts on it lands with api-routing task 2. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
+          },
           "defaultModel": {
             "description": "Must be one of the enabled models.",
             "type": [
@@ -3113,6 +3289,10 @@
               "string",
               "null"
             ]
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/ProviderDelivery",
+            "description": "Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2."
           },
           "headers": {
             "additionalProperties": {
@@ -3954,6 +4134,19 @@
       "WorkerDispatch": {
         "type": "object",
         "properties": {
+          "apiRoute": {
+            "description": "Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "enum": [
+              "auto",
+              "hub-relay",
+              "direct-net"
+            ],
+            "type": "string"
+          },
+          "apiVia": {
+            "description": "Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Omitted leaves the waterfall to the project and profile. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.",
+            "type": "string"
+          },
           "projectId": {
             "pattern": "^prj_",
             "type": "string"

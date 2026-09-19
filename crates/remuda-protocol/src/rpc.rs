@@ -87,6 +87,31 @@ pub struct TransportLimits {
     pub lease_ttl_ms: u32,
     /// `max_wait_ms`; protocol §7.4.
     pub max_wait_ms: u32,
+    /// `max_api_streams`; protocol §7.4 (D-048).
+    ///
+    /// Live `api.*` relay streams allowed per link. Defaulted on read because
+    /// `hello.limits` written before D-048 has no such key, and a required
+    /// field would fail the whole handshake against an older Hub.
+    #[serde(default = "default_max_api_streams")]
+    pub max_api_streams: u32,
+    /// `api_chunk_bytes`; protocol §7.4 (D-048).
+    ///
+    /// Raw bytes coalesced into one `api.chunk` before base64: 64 KiB becomes
+    /// ~87 KiB on the wire, well under the 1 MiB `max_json_frame_bytes`.
+    #[serde(default = "default_api_chunk_bytes")]
+    pub api_chunk_bytes: u32,
+}
+
+/// §7.4 default for [`TransportLimits::max_api_streams`].
+#[must_use]
+pub const fn default_max_api_streams() -> u32 {
+    8
+}
+
+/// §7.4 default for [`TransportLimits::api_chunk_bytes`].
+#[must_use]
+pub const fn default_api_chunk_bytes() -> u32 {
+    65_536
 }
 
 /// ConnectionLease; `protocol.md` §7.1.
@@ -308,6 +333,18 @@ pub struct InstanceCreateResult {
     /// `run_id`; protocol §7.2.
     #[serde(deserialize_with = "crate::scalar::required_option")]
     pub run_id: Option<RunId>,
+    /// `api_route`; protocol §7.2 (D-047).
+    ///
+    /// The route the **Node** actually took, which is the only thing the Hub
+    /// may record on the instance projection (D-035 rule 4). Absent means no
+    /// proxy: a direct session, or a Node that predates D-047 and therefore
+    /// never proxied anything.
+    ///
+    /// This is where the observed route enters the Hub. The spec carries the
+    /// *requested* route ([`crate::RequestedApiRoute`], whose `route` may be
+    /// `auto`); this carries the resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_route: Option<crate::ApiRoute>,
 }
 
 /// InstanceAttachParams; `protocol.md` §7.2.

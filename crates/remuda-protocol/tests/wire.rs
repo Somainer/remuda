@@ -606,3 +606,164 @@ fn renderer_launch_preference_preserves_omission_and_both_modes() {
     value["tui"] = json!("auto");
     assert!(serde_json::from_value::<InstanceSpec>(value).is_err());
 }
+
+// ── D-047 / D-048 legacy-payload compatibility (2026-09-19) ────────────────
+
+/// `HelloResult.limits` is what a Hub sends a Node at handshake. A Hub that
+/// predates D-048 sends nine keys, not eleven, and the Node must still accept
+/// it: a required field here would fail the whole handshake, so the two new
+/// limits are defaulted on read.
+#[test]
+fn transport_limits_written_before_d048_still_parse() {
+    let legacy = json!({
+        "maxJsonFrameBytes": 1048576,
+        "maxBinaryChunkBytes": 65536,
+        "maxTtyInputBytes": 4096,
+        "maxInFlightRpc": 32,
+        "maxEventsPerBatch": 64,
+        "maxSubscriptionBufferEvents": 256,
+        "heartbeatIntervalMs": 15000,
+        "leaseTtlMs": 60000,
+        "maxWaitMs": 30000
+    });
+    let limits: TransportLimits = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(limits.max_in_flight_rpc, 32);
+    assert_eq!(limits.max_json_frame_bytes, 1_048_576);
+    assert_eq!(limits.max_api_streams, default_max_api_streams());
+    assert_eq!(limits.api_chunk_bytes, default_api_chunk_bytes());
+    // The D-048 defaults stay well under the frame cap once base64 expands
+    // them (~87 KiB of a 1 MiB budget), so a chunk never has to be split.
+    assert!((limits.api_chunk_bytes as f64 * 4.0 / 3.0) < limits.max_json_frame_bytes as f64);
+    assert_eq!(limits.max_api_streams, 8);
+    assert_eq!(limits.api_chunk_bytes, 65_536);
+
+    // A full round trip re-emits them, so a Hub and Node converge after one
+    // handshake rather than each keeping its own defaults forever.
+    let wire = serde_json::to_value(&limits).unwrap();
+    assert_eq!(wire["maxApiStreams"], json!(8));
+    assert_eq!(wire["apiChunkBytes"], json!(65536));
+    for key in legacy.as_object().unwrap().keys() {
+        assert_eq!(wire[key], legacy[key], "{key} must be preserved");
+    }
+}
+
+/// `InstanceSpec` is stored as JSON and re-read by the Node long after the Hub
+/// wrote it, so a spec with no `apiRoute` must parse and stay absent — absent
+/// means "no proxy", which is not the same as requesting the direct route.
+#[test]
+fn instance_spec_without_api_route_parses_and_stays_absent() {
+    let legacy = fixture("instance-spec.json");
+    assert!(legacy.get("apiRoute").is_none());
+    let spec = round_trip::<InstanceSpec>(legacy.clone());
+    assert_eq!(spec.api_route, None);
+
+    let mut with_route = legacy;
+    with_route["apiRoute"] = json!({
+        "mode": "via",
+        "viaHostId": "hst_01993ab0-0000-7000-8000-000000000007",
+        "route": "hub-relay"
+    });
+    let spec = round_trip::<InstanceSpec>(with_route.clone());
+    let route = spec.api_route.clone().expect("apiRoute");
+    assert_eq!(route.mode, ProviderDeliveryMode::Via);
+    assert_eq!(route.route, ApiRouteMode::HubRelay);
+    assert_eq!(serde_json::to_value(spec).unwrap(), with_route);
+}
+
+/// The three surface spellings the operator types stay distinct on the wire:
+/// `direct`, `via` (with a host), and `none` for the per-dispatch override.
+/// A per-dispatch `apiVia` is a plain string, not this struct.
+#[test]
+fn requested_api_route_distinguishes_direct_from_via() {
+    let direct = InstanceSpec {
+        api_route: Some(RequestedApiRoute {
+            mode: ProviderDeliveryMode::Direct,
+            via_host_id: None,
+            route: ApiRouteMode::Auto,
+        }),
+        ..serde_json::from_value::<InstanceSpec>(fixture("instance-spec.json")).unwrap()
+    };
+    let value = serde_json::to_value(&direct).unwrap();
+    assert_eq!(value["apiRoute"]["mode"], json!("direct"));
+    assert!(value["apiRoute"].get("viaHostId").is_none());
+}
+
+/// A profile row is persisted as JSON, so the read path must tolerate the
+/// pre-D-047 shape in every field combination the Hub writes.
+#[test]
+fn provider_profile_legacy_shapes_all_read_as_direct() {
+    let base = fixture("provider-profile.json");
+    for legacy in [base.clone(), {
+        let mut v = base.clone();
+        v["scope"] = json!("host:hst_01993ab0-0000-7000-8000-000000000007");
+        v
+    }] {
+        let profile: ProviderProfile = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(profile.delivery, ProviderDelivery::direct());
+        assert_eq!(serde_json::to_value(&profile).unwrap(), legacy);
+    }
+
+    // `headers` is `#[serde(default)]`, so a row stored without it reads back
+    // as an empty map and re-emits the key. That is the field's own
+    // long-standing behaviour, not a D-047 effect — what matters here is that
+    // dropping it does not disturb `delivery`, which stays the omitted default.
+    let mut without_headers = base;
+    without_headers.as_object_mut().unwrap().remove("headers");
+    let profile: ProviderProfile = serde_json::from_value(without_headers).unwrap();
+    assert!(profile.headers.is_empty());
+    assert_eq!(profile.delivery, ProviderDelivery::direct());
+    assert_eq!(
+        serde_json::to_value(&profile).unwrap()["headers"],
+        json!({})
+    );
+}
+
+/// D-047: the Node reports the route it took on the create result, and that is
+/// the only place the Hub may take the observed route from.
+///
+/// Without this field there was nothing to echo: the spec carries the
+/// *requested* route (whose `route` may be `auto`), so a projection filled from
+/// it would report intent as fact.
+#[test]
+fn instance_create_result_carries_the_node_reported_route() {
+    let base = json!({
+        "command": fixture("command.json"),
+        "instanceId": "ins_01993ab0-0000-7000-8000-000000000006",
+        "prepared": true,
+        "sendCommandId": "cmd_01993ab0-0000-7000-8000-000000000002",
+        "runId": null
+    });
+
+    // A direct session omits the field entirely, so a Node that predates D-047
+    // (and every pre-D-047 response body) is byte-identical.
+    let result = round_trip::<InstanceCreateResult>(base.clone());
+    assert_eq!(result.api_route, None);
+    assert!(
+        serde_json::to_value(&result)
+            .unwrap()
+            .get("apiRoute")
+            .is_none(),
+        "an unproxied create result must not gain an apiRoute key"
+    );
+
+    for (route, host) in [("hub-relay", Some("mac-host")), ("direct-net", None)] {
+        let mut value = base.clone();
+        let mut api_route = json!({"mode": "via", "route": route});
+        api_route["viaHostId"] = json!("hst_01993ab0-0000-7000-8000-000000000007");
+        if let Some(label) = host {
+            api_route["viaHostLabel"] = json!(label);
+        }
+        value["apiRoute"] = api_route;
+        let result = round_trip::<InstanceCreateResult>(value.clone());
+        let carried = result.api_route.clone().expect("apiRoute");
+        assert!(carried.is_via(), "{route}");
+        assert_eq!(carried.route.map(ApiRouteKind::as_str), Some(route));
+        assert_eq!(serde_json::to_value(result).unwrap(), value);
+    }
+
+    // `auto` is a request, not a report: a Node echoing it would be claiming to
+    // have decided nothing.
+    let mut bad = base;
+    bad["apiRoute"] = json!({"mode": "via", "route": "auto"});
+    assert!(serde_json::from_value::<InstanceCreateResult>(bad).is_err());
+}

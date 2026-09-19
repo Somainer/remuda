@@ -25,6 +25,8 @@
 | D-043 | 2026-09-19 | **Grok 结构通道以 TUI 落盘的 ACP 帧为权威，文件层按 protocol §5.7 翻译：工具稳定名取 `_meta["x.ai/tool"].name`（缺失即 unknown/not-emitted，绝不用人类 `title` 冒充；title 只作 `display_title`）；`category` 先走设计文档 §3.1 名字表、再按帧 `kind` 回落、最后 Other，不再恒 Shell；无 `status` 的 `tool_call_update` 与 `in_progress` 都是同 node 的 Running（`Replace`，revision+1，缺字段保持旧值）；只有 `completed/failed/denied/cancelled` 是终态（发 Final，revision 严格大于最后一次 ToolCall），`pending` 与未知 status 非终态、保持 opaque 不关节点；`content[]` 的 `content`/`diff`/`terminal` 分别译文本块/`FileChange`（Applied 仅 completed 且无 error）/terminal 引用文本标记，非 text 内容不再静默丢弃，且 `rawOutput.output_for_prompt` 只在没有 content 型文本块时兜底；thought 收尾改 `Close`+全文。零协议增量、不叠加第二条 grok-acp 进程（D-028）；共享的 `adapters/mod.rs` 构造函数不动，codex 字节级不变。`turn.live` file-tier 相位、question 升格 interaction、terminal log tail、1.0.34 实帧相关的 workflow/子代理下钻（PR8）不在本决策内；合成帧以 [U] 标注。 | coordinator 派发 c-grok-toolid | [grok-structural-translation.md](./grok-structural-translation.md)；[protocol.md](./protocol.md) §5.7 grok-acp；D-028 |
 | D-045 | 2026-09-19 | **computer-use 能力按次授权与投递（capability grant and delivery）**。新增能力名 **`computer-use`**：它**不是** host 属性、不是 driver 属性、不是全局开关，而是**按会话、按次、显式申请**的授权——只有 `remuda instance create` / `remuda dispatch` 上显式的 `--capability computer-use` 能授予，任何默认路径都不授予、不继承、不因「装了就可用」而生效。**两道门都必须过**：(1) 来源必须是 Human 或 Bot，`LaunchOrigin::Agent` 一律拒绝——一个 agent 永远不能为自己铸出桌面控制，门形照抄 `presets::merge_yolo_argv` 的双门（`crates/remuda-driver/src/presets.rs:151-166`）；(2) 目标主机的心跳 `cli[]` 必须回报已安装的 `computer-use` 行（[codex-cua.md](./codex-cua.md) §3.4），未回报即拒绝。**投递只有两条，两条都不碰操作员自己的配置**：(a) 仅当本次 launch 的 native home 是 **Remuda 管的**时，把 skill 字节**从 `remuda` 二进制内嵌物**化到 `<native_home>/skills/codex-computer-use/**`（目录 0700、文件 0600）——「受管」**逐 kind 定义**：claude 是它的作用域 config dir（**继承来的 `~/.claude` 不算受管**），codex 是 `<launch_dir>/codex-home`，grok 是 `<launch_dir>/grok-home`；**门不是 `inherit_default_config`**——那是 claude 专属标志，对一次 codex launch 同样为真（`crates/remuda-node/src/native.rs:238-240`），拿它当门会在 codex 上给出错误答案。继承来的操作员 home **只读不写**，即 `~/.claude`、`~/.codex`、`~/.grok` 在**任何**分支上都不会被打开写（`crates/remuda-driver/src/launch/overlay.rs:25-28` 是这条的权威表述，也是本决策存在的理由）；**codex 与 grok 本批只拿腿 (b)**：仓库与 skill 都没有证据表明它们读任何 skills 目录，往影子 home 写 skill 树没有读者，所以它们的投递**就是那份 per-instance MCP config**。(b) 一律写 per-instance `<launch_dir>/mcp-cua.json`（0600），并**按 `AgentKind` 而非 driver 挂载**：claude 走 argv `--mcp-config <path>`（`mcp-config` 早已在四族白名单且取值，`crates/remuda-driver/src/flags.rs:64,82,89,333`），codex 走 shadow `config.toml` 的 `[mcp_servers.codex-computer-use]`（`crates/remuda-driver/src/launch/shadow.rs:110-168`）——`shell-pty` 是 kind 多态的，跑 claude 时走 argv、跑 codex 时走 shadow home，**规则随 kind 不随 driver**。**环境变量握手**：`c-cua-launch` **只在能力被授予时**向子进程注入 `REMUDA_CAPABILITY_COMPUTER_USE=1`（硬化的 `launch-cua-repl.sh` 未见它即拒绝启动）；该变量是**信号不是边界**——任何有 shell 的东西都能自己导出它，**真边界是「没有授予就绝不物料化」**。**绝不发 `--strict-mcp-config`**（该 flag 被永久禁用，`flags.rs:15`）：Remuda 提供的能力只**增加** server，绝不替换 agent 自己的 server 集合。物料化文件带 digest 进 `LaunchRecipe.materialized_files`（`crates/remuda-driver/src/recipe.rs:157-179`），所以 launch 审计能说清这次到底授予了什么。**拒绝**各有独立消息：Agent 来源、主机未回报、非 macOS、launcher 缺失，以及 **`bypassPermissions` 与 `computer-use` 在同一次 launch 上同时申请**——无人值守的桌面控制叠加跳过的工具审批，是唯一没有回收路径的组合，两者同时出现即拒绝（不是「忽略其一」，也不是需要另一个隐含 flag）。所有拒绝都发生在 create/dispatch 被持久接受**之前**，绝不静默降级、绝不静默丢弃能力请求（同 D-035 的拒绝形状）。**本决策同时记下截图两条**（计划里曾分别为 D-038，因 id 已被占，合并入本行并加此标记）：(1) **截图进 journal 与 web** —— tool result 合法携带 `image` content block，字节只存对象库（Node 用宿主 token 走 `POST /v1/hosts/{id}/files/objects` 暂存，`crates/remuda-hub/src/host_files.rs:44`），`ContentBlock::Image` + `MediaBlock` 协议早已合法（`crates/remuda-protocol/src/observation.rs:143-155,189-195`）；**只发文本的 producer 是 bug，不是策略**（journal `crates/remuda-journal/src/claude.rs:1396,1470-1484`、driver `crates/remuda-driver/src/adapters/mod.rs:387-406`、web `web/src/features/session/toolPresenters.ts:44-51` 三处今天都丢弃非文本）；**不新增 `ObservationKind`**；截图**不是 artifact**，只有 agent 显式存盘才发 `artifact`；渲染规则见 ui-spec §2.2（卡内定高缩略图、`loading="lazy"`、点开 `/v1/objects/{id}`、绝不自动展开）。(2) **截图保留期** —— 沿用既有附件对象的生命周期与过期，**永不内联 journal、永不写日志**，提交的证据文档必须用脱敏或合成屏；更短的 CUA 专属 TTL 是 Hub 旋钮与第七个任务，不在本批。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §2/§3/§4/§6；各条约束的 file:line 见该文 §3.2；Q1–Q6 默认值见其 §8 |
 | D-046 | 2026-09-19 | **CUA 交互路由：`elicitation/create` 由 worker 自己答，但回答权被 launch 请求约束**。事实基础：agent 侧今天**只有一条** elicitation 桥，且只搭在 Claude 的 hook 事件上——`Elicitation` 已是注册事件、阻塞、可带 `action` 回复（`crates/remuda-signal/src/event.rs:114-135`），已能生成 `Interaction{kind: elicitation}` 卡（`crates/remuda-signal/src/approval.rs:153-208`），也能从 `InteractionAnswer::Elicitation` 回一个动作（`crates/remuda-signal/src/bus.rs:1017-1030`）。**但这条链路够不到 MCP 的 `elicitation/create`**：`cua-repl` 是 stdio MCP server，它的 elicitation 走 MCP 协议本身，而 codex shadow 的 `hooks.json` 只注册 `SessionStart` 与 `PermissionRequest` 两个事件（`CODEX_EVENTS`，`crates/remuda-driver/src/launch/shadow.rs:40-45`；grok 的 `GROK_EVENTS` 同样不含 elicitation 类事件，`shadow.rs:47-55`），**两者都不是 MCP 的 `elicitation/create`**，所以**今天没有任何路径能把一个 MCP server 的 `elicitation/create` 送到 `/approvals`**（缺的是一个从 harness 到 Hub 的 producer，不是 `InteractionCarrier` 取值——那个枚举已有七个值，见 [codex-cua.md](./codex-cua.md) §5.3）。因此本批的合同是：**worker 自己在 cua-repl 的 `initialize` 里声明 `capabilities.elicitation` 并自行回答**——按应用审批时 `accept` 且 `persist: session`，而**回答权被本次 launch 的请求约束**：只有请求中点名的 bundle id 可以批准，未点名的应用一律不批（`skills/codex-computer-use/SKILL.md` 的既有规则，本决策把它从「skill 的自律」升级为「能力授权语义的一部分」）。**同时如实记账**：这条路线意味着桌面审批没有 journal 行、没有 `/approvals` 卡、没有第二人复核，只有 worker 的一面之词——这是本批明确接受的代价，写进 D-045 的「后续」而不是假装它已解决。**后续**（不在本批，前置是一条 MCP 级 elicitation 桥：为不经过 Claude hook 的 harness 造 producer，并给它一个 `InteractionCarrier` 取值）：把回答权从 worker 交回人，`/approvals` 成为 CUA 审批的唯一出口。在那之前，`D-045` 的 bypass 拒绝与「只批准点名应用」共同构成唯一的边界。 | coordinator（批次 cua） | [codex-cua.md](./codex-cua.md) §5；[native-pty-first.md](./native-pty-first.md) §5 P5 残留（原文：`Elicitation` 仅按二进制读取端形状实现，**未取得实机 payload**）|
+| D-047 | 2026-09-19 | **模型 API 交付方式可选：`direct`（默认）或 `via:<hostId>` 经由某台机器出去（路由子模式 `auto`/`hub-relay`/`direct-net`）；拒绝而非改道（refuse-never-reroute）。** profile 上是 `ProviderProfile.delivery`（嵌套对象，缺省 = `{mode:direct, route:auto}`），逐次派发是 `apiVia`（字符串：`<hostId>` \| `self` \| `none`）加可选 `apiRoute`；瀑布 = 请求 > 项目 > profile > `direct`，在**放置之后**解析（`via:<W>` 收敛为 `direct`）。H 的属性 `relayBind` 未配置时 W 与 H 之间无直连路径，只能走 `hub-relay`。决议**只在启动时做一次**并写明在实例上；会话中途直连失败**不**静默切到 hub-relay，请求失败、实例报 `blocked{api-route-down}`。D-031 仍然成立：不装不探任何隧道工具、不监听非 loopback（除非操作员显式配置 `relayBind`）、单一固定 origin、实例作用域、字节走既有链路。 | coordinator（实现方，承接 owner 2026-09-19 指示） | [api-routing.md](./api-routing.md) §2/§3/§4/§5/§8、D-031、D-021、D-035；未落地（类型与线格式先落，行为在 tasks 2–6） |
+| D-048 | 2026-09-19 | **`api.*` 带内流类（`api.open`/`body`/`head`/`chunk`/`end`/`cancel`/`credit`）承载代理请求，与 `object.pull`/`object.chunk` 同构。** 全部是 notification，**自带每链路 stream 注册表**，绝不进 Hub→Node 的 32 槽 pending map（否则几条流就卡死 `instance.create`/`tty.write`）；新增 `TransportLimits.maxApiStreams`（默认 8/链路、2/实例）与 `apiChunkBytes`（默认 64 KiB 原始 ≈ 87 KiB base64，远低于 1 MiB 帧上限）；生产者每流最多 4 个未确认 chunk，消费者以 `api.credit` 放行，块间 `yield_now()`；SSE 必须合并（≥16 KiB 或 ≥50 ms 或流结束），body 是**不透明字节**、不按 SSE 解析。 | coordinator（实现方） | [api-routing.md](./api-routing.md) §7、protocol.md §7.4 object.pull 先例、ws.rs 出站队列容量 32 |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -671,3 +673,157 @@ native home 是不是继承来的（[codex-cua.md](./codex-cua.md) §3.1）；`-
   且**已知不足**：它约束的是 worker 的自律，不是一台会拒绝的机器。
 - 本批不为 grok 建能力目标：§5.3 的路由对 grok 无落点，且没有证据表明 grok 能
   消费该 MCP server。
+
+## D-047
+
+**2026-09-19 · 模型 API 交付方式：可选 `via:<hostId>` 代理、路由子模式、拒绝而非改道（D-031 例外条款）**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted（类型与线格式已落地；Hub/Node/CLI/web 行为见 api-routing 计划 tasks 2–6） |
+| 相关 | D-021（secret 只留一台机器）、D-031（禁隧道）、D-035（禁止静默替换，记录实跑值）、D-048（`api.*` 流类）、[api-routing.md](./api-routing.md) §2/§3/§4/§5 + §8、[protocol.md](./protocol.md) §4.4/§7.6 |
+
+**背景**：模型网关凭据是**主机绑定**的。操作员的 Mac 上跑着 claude-relay
+（`ANTHROPIC_BASE_URL` 指向内网网关 origin + 一个 token），而远端 devbox 上的
+worker 今天完全拿不到那条路径：凭据不能离开 Mac（D-021），即便把凭据发过去，
+那个 origin 从 devbox 也未必可路由。于是「只在 Mac relay 上可达的模型」**无法**
+交给远端 worker——要么放弃，要么把凭据发到一台可能到不了网关的机器上。
+owner 2026-09-19 指示：加一个**可选**参数，让一次派发的模型 API 请求都从指定
+机器出去，这台机器可以是本机（跑 Hub 的那台）也可以是远程机器。
+
+**决策**：
+
+1. **两种交付方式，一个可选参数。** `delivery = direct` 是今天的行为（baseUrl
+   与凭据一起送到 worker 主机 W）；`delivery = via:<hostId H>` 让该会话的所有
+   模型 API 请求从 H 出去。profile 上是嵌套对象
+   `ProviderProfile.delivery = {mode: direct|via, viaHostId?, route}`，缺省
+   `{mode: direct, route: auto}`——**线格式是嵌套的，CLI 的人话拼写
+   `--delivery direct|via:<host>` 由 CLI 解析**，两者不混为一谈。逐次派发是
+   `apiVia`（字符串 `<hostId>` \| `self` \| `none`）加可选 `apiRoute`。
+2. **瀑布**：请求 `apiVia` > 项目 `provider.apiVia` > profile `delivery` >
+   `direct`，与既有 provider 瀑布同构，并且在**主机放置之后**解析
+   （`providers.rs::resolve_and_attach_with_project`）——因为 `via:<H>` 在
+   `H == W` 时收敛为 `direct`：worker 主机自己就是出口主机，没有东西可代理。
+   收敛只发生在决议时，**不改写线上的值**。
+3. **路由子模式（Amendment A1）。** H 与 W 之间可能没有网络路径（owner 的实际
+   拓扑正是如此：Mac 无公网入口，D-031 禁止造一个）。因此 `via` 有一个路由
+   子模式：
+   - `auto`（默认）——H 配了非 loopback 的 `relayBind` 时，W 先探直连路径
+     （带实例 bearer 的 HEAD/OPTIONS，3 s）；没有配置或探测失败则回落
+     `hub-relay`。
+   - `hub-relay`——总是走既有 Hub↔Node 链路（W Node → Hub → H Node，或 H 就是
+     Hub 主机时由 Hub 进程自己出去）。这是**永远可行**的路径，也是 W 到不了 H
+     时唯一可行的路径。operator 的 Mac + SG devbox 就是这种情形。
+   - `direct-net`——要求直连；探测失败就在启动时以 `api-via-unreachable` 拒绝。
+   路由**只在启动时决议一次**，并由 Node 作为 `apiRoute: direct-net | hub-relay`
+   回显。会话中途直连失败**不静默切换**到 hub-relay：请求失败，实例报
+   `blocked{api-route-down}`，操作员重派（或后续任务加显式 re-route 命令）。
+4. **H 的 relay 端点**默认只绑 loopback；只有操作员在 host 上显式设置
+   `relayBind`（一个明确地址，默认绝不是 `0.0.0.0`，从不自动发现）才绑定
+   非 loopback。两条路径都要求每实例 bearer。
+5. **拒绝，绝不改道。** 所有失败都是**拒绝**，且没有一条路径会回落到
+   `direct`：H 未知/未注册 → 400 `api-via-unknown-host`；H 已注册但离线 →
+   409 `api-via-host-offline`（在任何名字/端口/worktree 分配之前，与
+   `workers.rs` 的供给拒绝同序）；H 的 Node 太旧不会说 `api.*` → 409
+   `api-via-unsupported`；`direct-net` 探测失败 → 409 `api-via-unreachable`。
+   代号与 HTTP 状态都由协议层 `ApiViaRefusal` 固定。落到 `direct` 会把请求
+   **连同凭据**推到操作员明确排除的机器上，并让 UI 说谎——这是最糟的一类 bug，
+   所以测试断言启动**失败**而不是改道。
+6. **记录实跑值（D-035 规则 4）。** 实例上存 `ApiRoute {mode, route,
+   viaHostId, viaHostLabel}`，与既有 `providerSource`/`providerSourceHint`
+   并列，**取 Node 的 create 回执**而非请求。`ApiRouteKind` 只有两个已决议的
+   值——`auto` 是请求、不是观测，记录里出现 `auto` 就等于 Hub 在报告「我要了
+   什么」而不是「实际跑了什么」。
+7. **secret**：网关凭据**只在 H**（或 H 就是 Hub 主机时的 Hub 进程里）加载，
+   从不落到 H 的磁盘上；W 拿到的是一枚每实例 relay bearer，在别处一文不值。
+   这**加强**了 D-021：`host:<hostId>` 作用域的 profile 现在能服务任意 worker，
+   而不必把凭据放出那台主机——`secret_release_allowed(profile, H)` 检查的是
+   **H**，不是 W。
+8. **usage** 仍记在 worker 实例上（`usage_events` 用真实网关 `profile_id`），
+   供给核算、429 park、预算区间零迁移；H 只记字节/流计数器，并把观测到的
+   真实 `429`/`529` 投影进既有供给证据路径（`remuda profile event
+   --http-status`），把限流检测从「读屏」升级成「真状态码」。
+
+**D-031 例外条款（本决策的边界，写下来以免日后重新争论）**：这是**不是**隧道。
+不安装、不探测任何隧道二进制；不用 `ssh -L/-R/-D`；默认配置下不在任何非
+loopback 接口上开端口（只有操作员显式设置 `relayBind` 才会）；不能到达任意
+主机。字节走的是**已经授权、已经审计**的 Hub↔Node 链路，和今天的
+`object.pull` 附件字节完全一样（[protocol.md](./protocol.md) §7.4 记录了为什么
+用 JSON 而非二进制 channel 2）。被转发的是一个**单一 origin、白名单、
+实例作用域**的应用请求——与 `host.files.read`、`tty.write` 同类，不是内网穿透。
+目标 origin 固定为 `profile.baseUrl` 的 origin，路径必须是 base path 下的后缀，
+请求头与响应头都有白名单（`set-cookie` 丢弃）。一个 relay 流只能到达恰好一个
+origin、为恰好一个活实例、只在该实例存活期间。
+
+**影响**：新增协议类型 `ProviderDelivery`/`ProviderDeliveryMode`/`ApiRoute`/
+`ApiRouteKind`/`ApiRouteMode`/`RequestedApiRoute`/`ApiViaOverride`/
+`ApiViaRefusal`/`HostRelayBind`；`ProviderProfile.delivery`、`InstanceSpec.apiRoute`、
+`Host.relayBind`、实例投影 `apiRoute`、`TransportLimits` 两个新字段；生成物
+schema/OpenAPI/web 客户端同步。全部**加性**：缺 `delivery` 反序列化为
+`direct`、缺 `apiRoute` 为 `None`、缺两个新 limit 取默认值，因此旧 Hub 与旧
+Node 仍能解析（测试 `profile_without_delivery_parses_as_direct_auto`、
+`instance_spec_without_api_route_parses_and_stays_absent`、
+`transport_limits_written_before_d048_still_parse`、`via_without_a_host_is_a_parse_error`）。
+Node 在 `InstanceCreateResult.apiRoute` 上回显**实跑**的路由——这是 Hub 唯一允许
+取观测值的地方，spec 上的是**请求**值（其 `route` 可能是 `auto`）。行为与 CLI/web
+面是 tasks 2–6。
+
+**与计划的一处用词差异**：`ProviderOverlaySpec` 带的是 `delivery` 而不是计划
+§B.8 写的 `route`。理由是同一份 profile 快照要能自描述完整的交付方式——只带一个
+`route` 的 overlay 描述不出 `mode` 与 `viaHostId`，而 Node 需要读 `delivery.mode`
+才决定要不要起 relay 监听器。真正的逐实例路由走 `InstanceSpec.apiRoute`，overlay
+只带 profile 级意图，两者职责不重叠。
+
+## D-048
+
+**2026-09-19 · `api.*` 带内流类：代理请求在既有 Hub↔Node 链路上的分帧、信用与分块**
+
+| 日期 | 2026-09-19 |
+|---|---|
+| 状态 | adopted（类型与线格式已落地；Hub/Node 行为见 api-routing 计划 tasks 2–3） |
+| 相关 | D-047、D-027a（`object.pull` 先例）、[protocol.md](./protocol.md) §7.4/§7.6、[api-routing.md](./api-routing.md) §7 |
+
+**背景**：`via` 交付（D-047）需要把一个 HTTP 请求/响应从 W 的 Node 搬到 H、
+再搬回来，而 W 到 H 之间唯一保证可达的通路就是既有的 Hub↔Node 链路。
+`object.pull`/`object.chunk` 已经证明了这类带内搬运可行且安全
+（[protocol.md](./protocol.md) §7.4：ssh-stdio 桥只逐帧转发 JSON 文本，所以
+二进制通道会改变桥的全部安全边界）。
+
+**决策**：新增七个 `api.*` 帧——`api.open`（W Node→Hub，或 Hub→H Node，
+`{instanceId, streamId, method, path, query, headers[], bodyBase64?,
+bodyChunked, deadlineMs}`）、`api.body`（请求体续帧）、`api.head`
+（H→Hub→W，`{streamId, status, headers[]}`）、`api.chunk`（响应体分块）、
+`api.end`（`{streamId, error?: {code, message}, bytesUp, bytesDown, ms}`）、
+`api.cancel`（客户端断开/超时/实例退出/链路丢失）、`api.credit`
+（消费者→生产者放行）。
+
+1. **独立的 stream 表，不进 RPC pending map。** 七个帧**全部是
+   notification**，各自维护每链路 stream 注册表，因此它们**永不消耗**那个
+   被 `instance.create`/`tty.*` 依赖的 32 槽在途 RPC 上限
+   （`transport.rs`）。`HubNodeMethod::is_api()` 就是这个分流的入口。
+2. **默认限额。** `TransportLimits.maxApiStreams`（默认 8/链路、2/实例）与
+   `apiChunkBytes`（默认 64 KiB 原始 ≈ 87 KiB base64，远低于 1 MiB 的
+   `maxJsonFrameBytes`）。两个字段都在读侧有默认值，所以 D-048 之前的
+   `hello.limits` 仍能解析。
+3. **信用，因为出站队列是 32 且与 tty 共享。** 一个生产者每流最多 4 个未确认
+   chunk，消费者边排空边发 `api.credit`；配合与 `object_pull` 同款的
+   `yield_now()` 纪律，一条长 SSE 流无法饿死 tty 帧。
+4. **SSE 必须合并。** 每个 token 一帧在 NDJSON/ssh-stdio 上是病态的；H 在
+   **≥16 KiB 或 ≥50 ms 或流结束** 时合并（严格保序——body 是**不透明字节**，
+   不按 SSE 解析）。
+5. **超时阶梯**：连接 10 s、首字节 60 s、块间空闲 120 s（SSE keepalive）、
+   硬上限 30 min。越界即向上游 `api.cancel`、向下游 `api.end{error}`，
+   监听器以 `504` 和 Anthropic 形状的错误体回答，让 CLI 渲染出真正的 API 错误。
+6. **审计只记计数器。** journal 从不带 body 或 header：启动时一条
+   `apiRoute` 观测，每条流在 `api.end` 时记 `{streamId, status, bytesUp,
+   bytesDown, ms, errorCode?}`。
+
+**为什么是一个可复用的类**：D-048 与 D-047 分开记录，因为它们可以独立评审，
+而且这个流类对**任何**未来的带内请求类型都可复用——有界队列上的多路复用、
+信用式流控、不透明字节分块，都不是模型 API 专有的。
+
+**影响**：`crates/remuda-protocol/src/hubnode.rs` 七个方法常量 +
+`HubNodeMethod` 七个变体 + `is_api()` + 九个参数类型；`TransportLimits` 两个
+字段。这些参数类型与其余 M1 Hub↔Node 操作帧同属一族，因此和
+`object.pull`/`tty.*` 的参数一样不进 `protocol.md` §12 的生成目录，而是在
+§7.6 以文档记录（carrier 按手写路径把它们路由进 stream 注册表）。

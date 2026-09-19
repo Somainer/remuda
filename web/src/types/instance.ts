@@ -52,6 +52,18 @@ export type Instance = EntityMeta & {
   providerProfileId?: string | null;
   providerSource?: string | null;
   providerSourceHint?: string | null;
+  /**
+   * Model-API route this instance actually uses (D-047). Absent on a direct
+   * session. Reported by the Node, never derived from the request, so the
+   * Session strip shows the route that ran rather than the one that was asked
+   * for (D-035).
+   */
+  apiRoute?: {
+    mode: "direct" | "via";
+    route?: "direct-net" | "hub-relay" | null;
+    viaHostId?: string | null;
+    viaHostLabel?: string | null;
+  } | null;
   model?: string | null;
   /** Requested launch renderer. Actual terminal mode comes from the tty snapshot. */
   tui?: TuiMode | null;

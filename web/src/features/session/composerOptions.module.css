@@ -116,6 +116,35 @@
   width: min(420px, 100%);
 }
 
+/* D-039 / ui-spec §3.4: tap targets inside the phone sheet must reach
+   var(--touch). The standalone context chip keeps its 30px visual height
+   and gets a centred ::after zone. Stacked permission rows cannot use an
+   ::after (adjacent 44px zones would overlap the ~31px rows), so the
+   sheet rows instead grow to a 44px pitch with centred content — the
+   "padding on the group" alternative D-038 allows. */
+.sheetTouch {
+  position: relative;
+}
+
+.sheetTouch::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--touch);
+  min-width: 100%;
+  height: var(--touch);
+  transform: translate(-50%, -50%);
+}
+
+/* Permission rows inside the sheet: 44px pitch, content centred. The
+   whole row is the hit area, so adjacent rows never share a zone. */
+.sheetPermRow {
+  min-height: var(--touch);
+  display: flex;
+  align-items: center;
+}
+
 .section {
   display: flex;
   flex-direction: column;

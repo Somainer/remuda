@@ -100,15 +100,19 @@ async function shot(page: Page, name: string, redact: string[] = []) {
 }
 
 /**
- * Load a committed scenario fixture and write a patched copy with ONLY
- * duration_ms overridden for the named tools, so live Running / pending
- * windows are observable. Every payload, tool name and match prefix stays
- * byte-for-byte from the fixture. Returns the patched scenario path and the
- * prompt prefix / thinking text / stdout lines the assertions read back.
+ * Load a committed scenario fixture and write a patched copy. Only two
+ * things are patched, both needed to observe settled state over the web:
  *
- * Every requested duration override must match a tool in the fixture (a
- * rename must break this test loudly rather than silently no-op), and the
- * returned facts the assertions depend on are pinned against the fixture.
+ *  - `duration_ms` for the named tools, so the live Running / pending window
+ *    is observable (the committed 900 ms / 20 ms values finish too fast);
+ *  - `quit_after_turns`, set to keep the fake harness alive after the turn.
+ *    The committed value (1) makes the process exit at turn end, which tears
+ *    down promotion and reverts the session to a plain terminal screen — so
+ *    no post-turn structured card could ever be observed.
+ *
+ * Every payload, tool name and match prefix stays byte-for-byte from the
+ * fixture. Every requested duration override must match a tool (a rename
+ * must break loudly), and the returned facts are pinned against the fixture.
  */
 async function patchedScenario(
   sourceName: string,
@@ -117,12 +121,17 @@ async function patchedScenario(
 ): Promise<{ path: string; prefix: string; thinking: string; stdoutLines: string[] }> {
   const source = path.join(fixtureDir, sourceName);
   const scenario = JSON.parse(await readFile(source, "utf8")) as {
+    quit_after_turns?: number;
     turns: Array<{
       match_prefix?: string;
       thinking?: string;
       tools: Array<{ name: string; duration_ms?: number; result?: string }>;
     }>;
   };
+  // Keep the harness alive after the turn so promotion (and thus the
+  // structured file-tier view) survives to the settled assertions; the test
+  // node is stopped in teardown.
+  scenario.quit_after_turns = 0;
   const matched = new Set<string>();
   for (const turn of scenario.turns) {
     for (const tool of turn.tools) {
@@ -394,16 +403,38 @@ async function launchGrokSession(
  * Wait for the structured transcript pane to be mounted. The promoted
  * shell-pty pane can transiently render the raw screen fallback while a
  * 2 s instance poll is mid-flight (genericPty flips true until the file
- * signalTier re-hydrates); if it does not settle, nudge a re-evaluation by
- * toggling to the terminal view and back.
+ * signalTier re-hydrates).
  */
-async function expectStructuredPane(page: Page): Promise<void> {
-  const transcript = page.getByTestId("transcript");
-  if (await transcript.isVisible().catch(() => false)) return;
-  if (await transcript.waitFor({ state: "visible", timeout: 8_000 }).then(() => true).catch(() => false)) return;
-  await page.getByTestId("view-switch-tty").click();
-  await page.getByTestId("view-switch-structured").click();
-  await expect(transcript).toBeVisible({ timeout: 15_000 });
+async function expectStructuredPane(page: Page, timeout = 30_000): Promise<void> {
+  await expect(page.getByTestId("transcript")).toBeVisible({ timeout });
+}
+
+/**
+ * Bring the settled tool card into the drawn range and return it. With the
+ * harness kept alive past the turn, promotion (and the file-tier structured
+ * view) does not tear down; the only remaining obstacle is the virtualized,
+ * bottom-pinned transcript. Release the bottom-pin by scrolling the scroller
+ * to the top (its onScroll handler clears the pin so the layout effect does
+ * not snap back), then open the compact summary that swallowed the tool.
+ * A guarded reload covers the rare hydration lag on a loaded host.
+ */
+async function settleStructuredToolCard(page: Page, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await page.getByTestId("transcript").isVisible().catch(() => false)) {
+      await page.getByTestId("transcript-scroller").evaluate((el) => {
+        el.scrollTop = 0;
+      });
+      await page.waitForTimeout(200);
+      const fold = page.getByTestId("compact-fold").first();
+      if (await fold.isVisible().catch(() => false)) await fold.click().catch(() => {});
+      const card = page.getByTestId("tool-card").first();
+      if (await card.count().catch(() => 0)) return card;
+    }
+    if (Date.now() >= deadline) throw new Error("structured tool card never settled");
+    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+    await page.waitForTimeout(800);
+  }
 }
 
 /** Record every data-phase transition the strip paints. */
@@ -577,13 +608,10 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
       await expect(strip).toHaveAttribute("data-phase", "turn-ended", { timeout: 15_000 });
       await expect(strip).toHaveAttribute("data-decided-by", "file");
       await expect(page.getByTestId("live-decided-by")).toHaveAttribute("data-channel", "file");
-      // Under host load a 2 s instance poll can momentarily drop the
-      // promoted file signalTier and flip the structured pane to the raw
-      // screen fallback; make sure it is mounted before reading the card.
-      await expectStructuredPane(page);
       // The journal carries the full (possibly coalesced) episode; the
       // painted recorder proves what the journal cannot — that the strip
-      // actually rendered a live phase before settling on turn-ended.
+      // actually rendered a live phase before settling on turn-ended. None
+      // of these need the structured transcript pane mounted.
       const painted = await page.evaluate(() =>
         (window as unknown as { __livePhases?: Array<{ phase: string | null }> }).__livePhases ?? [],
       );
@@ -594,21 +622,12 @@ test.describe("grok structural chain over a real fake-harness PTY session", () =
         expect.arrayContaining(["thinking", "tool-started", "tool-output", "tool-finished", "turn-ended"]),
       );
 
-      // The transcript window is virtualized and follows the newest message,
-      // so the settled tool row is scrolled out of the drawn range by the
-      // streamed answer. Release the bottom-pin by scrolling the scroller
-      // to the top (its onScroll handler clears the pin so the layout effect
-      // does not snap back), then open the compact summary that swallowed
-      // the tool. expectStructuredPane also re-mounts the pane if it
-      // transiently fell back to the raw screen projection under load.
-      await expectStructuredPane(page);
-      await page.getByTestId("transcript-scroller").evaluate((el) => {
-        el.scrollTop = 0;
-      });
-      await page.waitForTimeout(200);
-      const fold = page.getByTestId("compact-fold").first();
-      if (await fold.isVisible().catch(() => false)) await fold.click();
-      const settledCard = page.getByTestId("tool-card").first();
+      // Reading the settled card needs the structured pane mounted and the
+      // virtualized row drawn. Under host load the promoted file signalTier
+      // can lag (raw-screen fallback) and the transcript stays bottom-
+      // pinned; the helper retries hydration + scroll + fold open until the
+      // settled tool card is actually present.
+      const settledCard = await settleStructuredToolCard(page, 40_000);
       await expect(settledCard).toContainText("exit 0", { timeout: 15_000 });
       await expect(settledCard).not.toContainText(/running/);
 

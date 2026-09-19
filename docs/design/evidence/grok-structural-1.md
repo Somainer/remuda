@@ -53,9 +53,17 @@ stay git-clean.
 
 Each test loads one of the committed fake-harness scenarios, parses it, and
 writes a patched copy under the test temp dir pointing `--script` at that
-copy. **Only `duration_ms` is overridden**; every tool name, input payload,
+copy. **Only two fields are overridden**; every tool name, input payload,
 match prefix, thinking text, result text and answer label comes byte-for-byte
 from the fixture:
+
+- `duration_ms` for the named tool, so the live Running / pending window is
+  observable (the committed 900 ms / 20 ms values finish too fast);
+- `quit_after_turns` → `0`, so the fake harness stays alive after the turn.
+  The committed value (`1`) exits the process at turn end, which tears down
+  the D-025 promotion and reverts the session to a plain terminal screen —
+  after that no post-turn structured card could be observed. The test stops
+  the node in teardown.
 
 - tool test ←
   [`grok-tools.json`](../../../crates/remuda-testing/fixtures/fake-harness/scenarios/grok-tools.json):

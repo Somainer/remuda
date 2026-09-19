@@ -3,15 +3,24 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
+const here = path.dirname(fileURLToPath(import.meta.url));
+/**
+ * A default run must not rewrite the tracked goldens, so shots land in the
+ * gitignored `test-results/`. Re-capture the committed evidence with
+ * REMUDA_EVIDENCE=1.
+ */
+const shotDir =
+  process.env.REMUDA_EVIDENCE === "1"
+    ? path.join(here, "../../../docs/design/evidence")
+    : path.join(here, "../../test-results/session-chrome");
 
 function row(page: Page, text: string) {
   return page.getByTestId("session-row").filter({ hasText: text }).first();
 }
 
 async function shot(page: Page, name: string) {
-  await mkdir(evidence, { recursive: true });
-  await page.screenshot({ path: path.join(evidence, name), animations: "disabled" });
+  await mkdir(shotDir, { recursive: true });
+  await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }
 
 test.describe("session chrome evidence", () => {

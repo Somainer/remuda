@@ -70,6 +70,176 @@ fn brief_lint_exit_codes() -> Result<()> {
     Ok(())
 }
 
+// ── desktop control lint (D-045 / D-046) ───────────────────────────────────
+
+/// A brief that grants desktop control must carry the host and the bundle ids,
+/// and must not also ask for a bypassed permission posture.
+#[test]
+fn brief_lint_desktop_control_rule() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    // Vocabulary, no capability: rejected, and the message names the value.
+    let ungranted = dir.path().join("cua-ungranted.md");
+    std::fs::write(
+        &ungranted,
+        "Use computer-use to read the note in TextEdit.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", ungranted.to_str().unwrap()])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-capability"), "{stderr}");
+    assert!(stderr.contains("computer-use"), "{stderr}");
+
+    // The full grant: capability, host, bundle id — clean.
+    let granted = dir.path().join("cua-granted.md");
+    std::fs::write(
+        &granted,
+        "Read the note in TextEdit using computer-use.\n\
+         capability: computer-use\n\
+         host: hst_mac-mini\n\
+         Approved apps: com.apple.TextEdit only.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", granted.to_str().unwrap()])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The refused combination (D-045 §4 / Q4).
+    let bypassed = dir.path().join("cua-bypass.md");
+    std::fs::write(
+        &bypassed,
+        "Read the note in TextEdit using computer-use.\n\
+         capability: computer-use\n\
+         host: hst_mac-mini\n\
+         Approved apps: com.apple.TextEdit only.\n\
+         Launch with --dangerously-skip-permissions.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", bypassed.to_str().unwrap()])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("capability-bypass"), "{stderr}");
+    assert!(stderr.contains("D-045"), "{stderr}");
+
+    // JSON mode reports the rules machine-readably.
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", bypassed.to_str().unwrap(), "--json"])
+        .output()?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["ok"], false);
+    assert!(
+        report["violations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["rule"] == "capability-bypass")
+    );
+    Ok(())
+}
+
+/// Each of the three grant terms is required on its own: dropping any one is a
+/// separate rule id, and the message names what to add.
+#[test]
+fn brief_lint_desktop_control_missing_terms() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let contract = "Reply on one line: DONE <sha> or BLOCKED <reason>.\n";
+
+    for (name, head, rule) in [
+        (
+            "no-host",
+            "Read the note in TextEdit using computer-use.\n\
+             capability: computer-use\n\
+             Approved apps: com.apple.TextEdit only.\n",
+            "missing-host",
+        ),
+        (
+            "no-bundle-id",
+            "Read the note in TextEdit using computer-use.\n\
+             capability: computer-use\n\
+             host: hst_mac-mini\n",
+            "missing-bundle-id",
+        ),
+        (
+            "no-capability",
+            "Read the note in TextEdit using computer-use.\n\
+             host: hst_mac-mini\n\
+             Approved apps: com.apple.TextEdit only.\n",
+            "missing-capability",
+        ),
+    ] {
+        let path = dir.path().join(format!("cua-{name}.md"));
+        std::fs::write(&path, format!("{head}{contract}"))?;
+        let output = std::process::Command::new(bin())
+            .args(["brief", "lint", path.to_str().unwrap()])
+            .output()?;
+        assert_eq!(output.status.code(), Some(2), "{name} must be rejected");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(rule), "{name}: {stderr}");
+    }
+
+    // A brief that names a domain but no app bundle id is still missing one:
+    // a hostname is not an app.
+    let domain_only = dir.path().join("cua-domain-only.md");
+    std::fs::write(
+        &domain_only,
+        format!(
+            "Read the note in TextEdit using computer-use.\n\
+             capability: computer-use\n\
+             host: hst_mac-mini\n\
+             See docs.example.org for the vendor notes.\n\
+             {contract}"
+        ),
+    )?;
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", domain_only.to_str().unwrap()])
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("missing-bundle-id"), "{stderr}");
+    Ok(())
+}
+
+/// `--force-lint` is the documented override: the same brief dispatches with
+/// it. Proven at the lint layer rather than by a dispatch (which needs a Hub
+/// and would not reach the capability preflight this task does not own).
+#[test]
+fn brief_lint_desktop_rule_is_overridable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("cua-no-host.md");
+    std::fs::write(
+        &path,
+        "Read the note in TextEdit using computer-use.\n\
+         capability: computer-use\n\
+         Approved apps: com.apple.TextEdit only.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    // `remuda brief lint` has no --force-lint (it only reports); the override
+    // lives on dispatch. What this pins is that the rule is reported, not
+    // silently swallowed, so the dispatcher has something to override.
+    let output = std::process::Command::new(bin())
+        .args(["brief", "lint", path.to_str().unwrap(), "--json"])
+        .output()?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let rules: Vec<&str> = report["violations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v["rule"].as_str())
+        .collect();
+    assert_eq!(rules, vec!["missing-host"], "{report}");
+    Ok(())
+}
+
 #[test]
 fn help_lists_new_verbs() -> Result<()> {
     for (command, pieces) in [

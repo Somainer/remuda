@@ -26,36 +26,46 @@ const MAX_FRAME: usize = 1_048_576;
 /// enforces the same length limit *before* symlink resolution, clients must
 /// connect to the resolved target rather than the long link.
 ///
-/// The short target is **derived deterministically** with the same chooser
-/// the binder uses — it does not depend on the symlink existing. That matters
-/// before the daemon's first start and during the binder's startup window (the
-/// link is installed last): without derivation a status/start probe would
-/// hand the kernel the over-long path, get `InvalidInput` instead of
-/// `NotFound`, and abort a launch that should simply start the daemon. The
-/// symlink target is consulted only when the derivation itself fails.
+/// Resolution order:
+///
+/// 1. A usable installed `node.sock` symlink wins. Its target records where
+///    *the running daemon* actually bound, which matters when the daemon and
+///    the client see different environments (a cron shell versus a systemd
+///    user unit differ in `XDG_RUNTIME_DIR`/`TMPDIR`, so either side's
+///    derivation could pick a different candidate). The target is accepted
+///    only when it is an absolute path within `sun_path`.
+/// 2. Otherwise the target is **derived deterministically** with the same
+///    chooser the binder uses. That covers before-first-start and the
+///    binder's startup window (the link is installed last): without it a
+///    status/start probe would hand the kernel the over-long path, get
+///    `InvalidInput` instead of `NotFound`, and abort a launch that should
+///    simply start the daemon.
+/// 3. If both fail, the conventional path (connect fails `NotFound`).
 pub fn daemon_socket_path(data_dir: &Path) -> PathBuf {
     let preferred = data_dir.join("node.sock");
     if remuda_signal::runtime_dir::path_fits_sun_path(&preferred) {
         return preferred;
     }
-    // Same placement math as `bind_daemon`, without binding or installing the
-    // link. The call only prepares (creates/secures) the runtime directory;
-    // the socket itself stays absent until the daemon binds it.
+    // 1. Honor the running daemon's installed link when usable.
+    if let Ok(metadata) = std::fs::symlink_metadata(&preferred)
+        && metadata.file_type().is_symlink()
+        && let Ok(target) = std::fs::read_link(&preferred)
+        && target.is_absolute()
+        && target.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+    {
+        return target;
+    }
+    // 2. Derive the same target the binder would choose, without binding or
+    // installing the link. The call only prepares (creates/secures) the
+    // runtime directory; the socket itself stays absent until the daemon
+    // binds it.
     if let Ok(placement) =
         remuda_signal::runtime_dir::place_socket(&preferred, &daemon_runtime_name(data_dir))
         && placement.redirected()
     {
         return placement.bind_path().to_path_buf();
     }
-    // Derivation failed (e.g. no candidate at all on a non-unix host): honor
-    // an existing link, then the conventional path.
-    if let Ok(metadata) = std::fs::symlink_metadata(&preferred)
-        && metadata.file_type().is_symlink()
-        && let Ok(target) = std::fs::read_link(&preferred)
-        && target.is_absolute()
-    {
-        return target;
-    }
+    // 3.
     preferred
 }
 

@@ -185,20 +185,40 @@ function newerMutation(next: NodeMutation, current?: NodeMutation): boolean {
  *    precedence without affecting the independent-node test (a call
  *    mutation never touches the result floor).
  *
- * At one revision a Close from EITHER track is allowed once (tracked by the
- * applied track/operation pair), so a result Close and an input-resolving
- * call Close at the same revision both land in either order — that
- * print-stream shape (claude_print_stream.rs) is real — while a re-delivered
- * duplicate Close is rejected. No current producer closes both tracks on the
- * SAME node at the SAME revision; that exact shape exists only in the
- * assemble.test.ts cross-track fixture, which this rule also covers.
+ * The "not older" test is PER TRACK, not on the shared node revision. A call
+ * and a result on the same node advance independently: when PreToolUse was
+ * missed, the record mapper closes the call node at revision 2/3 while the
+ * hook relay emits an orphan result Close at revision 1 on that same node
+ * WITH the exit code (remuda-signal live.rs orphan branch), and the print/pty
+ * journal-parity fixtures open the result at revision 1 on a call node that
+ * is already at revision 2/3. Gating that on the node-wide revision would
+ * drop the exit-bearing result and leave the card stuck running. The node's
+ * current (highest) revision is used ONLY to validate an Append's exact
+ * baseRevision, which is the one rule the two tracks genuinely share.
+ *
+ * Same-revision cross-track Closes follow for free (each track only sees its
+ * own baseline), and a duplicate thinner re-delivery is rejected because it
+ * is not strictly newer on its own track — no explicit applied-set needed.
+ * No SINGLE producer emits both tracks' Close; rather the record mapper
+ * (claude_print_stream) and the hook relay (remuda-signal live) do, and they
+ * land on the same derived node, so the two tracks legitimately coincide.
  */
 class NodeBaselines {
-  private readonly nodes = new Map<string, { revision: string; applied: Set<string> }>();
+  // The node's current revision = highest revision applied across BOTH
+  // tracks. Used only to validate an Append's exact baseRevision.
+  private readonly nodeRevision = new Map<string, string>();
+  // Last applied revision per node AND track: each track is independently
+  // strictly monotonic.
+  private readonly trackRevision = new Map<string, string>();
+  // Highest applied RESULT revision for the toolCallId across all nodes.
   private readonly resultFloor = new Map<string, string>();
 
   private static nodeKey(nodeId: string, toolCallId: string): string {
     return `${nodeId} ${toolCallId}`;
+  }
+
+  private static trackKey(nodeId: string, toolCallId: string, track: "call" | "result"): string {
+    return `${nodeId} ${toolCallId} ${track}`;
   }
 
   /** Whether `next` may apply for the given call/result track. */
@@ -207,35 +227,34 @@ class NodeBaselines {
     toolCallId: string,
     track: "call" | "result",
   ): boolean {
-    // Cross-channel result precedence (guard 2).
+    // Cross-channel result precedence (guard 2): a result below the highest
+    // result revision already applied for the tool on any node is stale.
     if (track === "result") {
       const floor = this.resultFloor.get(toolCallId);
       if (floor !== undefined && BigInt(next.revision) < BigInt(floor)) return false;
     }
-    // Node-scoped baseline (guard 1).
-    const current = this.nodes.get(NodeBaselines.nodeKey(next.nodeId, toolCallId));
-    if (!current) return true;
-    const revision = BigInt(next.revision);
-    const baseline = BigInt(current.revision);
-    if (revision < baseline) return false;
-    if (revision === baseline) {
-      // One Close per track at a shared revision; any duplicate is rejected.
-      return next.operation === "close" && !current.applied.has(`${track}:close`);
+    // Per-track monotonicity: strictly newer than the last applied mutation
+    // on THIS track. This rejects older frames and same-revision duplicates
+    // while letting a cross-track mutation at a lower node revision land.
+    const trackBaseline = this.trackRevision.get(NodeBaselines.trackKey(next.nodeId, toolCallId, track));
+    if (trackBaseline !== undefined && BigInt(next.revision) <= BigInt(trackBaseline)) return false;
+    // An Append needs the node's current revision (shared counter) as its
+    // exact base, regardless of which track wrote it.
+    if (next.operation === "append") {
+      const nodeBaseline = this.nodeRevision.get(NodeBaselines.nodeKey(next.nodeId, toolCallId));
+      if (nodeBaseline !== undefined && next.baseRevision !== nodeBaseline) return false;
     }
-    return next.operation !== "append" || next.baseRevision === current.revision;
+    return true;
   }
 
   set(next: NodeMutation, toolCallId: string, track: "call" | "result"): void {
-    const key = NodeBaselines.nodeKey(next.nodeId, toolCallId);
-    const current = this.nodes.get(key);
-    if (!current || BigInt(next.revision) > BigInt(current.revision)) {
-      this.nodes.set(key, {
-        revision: next.revision,
-        applied: new Set([`${track}:${next.operation}`]),
-      });
-    } else {
-      current.applied.add(`${track}:${next.operation}`);
+    const nodeKey = NodeBaselines.nodeKey(next.nodeId, toolCallId);
+    const nodeBaseline = this.nodeRevision.get(nodeKey);
+    if (nodeBaseline === undefined || BigInt(next.revision) > BigInt(nodeBaseline)) {
+      this.nodeRevision.set(nodeKey, next.revision);
     }
+    // accepts() already proved this is strictly newer on the track.
+    this.trackRevision.set(NodeBaselines.trackKey(next.nodeId, toolCallId, track), next.revision);
     if (track === "result") {
       const floor = this.resultFloor.get(toolCallId);
       if (floor === undefined || BigInt(next.revision) > BigInt(floor)) {

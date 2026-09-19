@@ -3,6 +3,8 @@ import type { MessagePayload, Observation, ToolCallPayload, ToolResultPayload } 
 import type { WorkflowRunPayload } from "../../types/generated";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState, isToolFailure, type TranscriptNode } from "./assemble";
+import print3TurnFixture from "../../../../crates/remuda/tests/fixtures/journal-parity/print-3turn.json";
+import pty3TurnFixture from "../../../../crates/remuda/tests/fixtures/journal-parity/pty-3turn.json";
 
 function obs(seq: number, kind: Observation["kind"], payload: unknown): Observation {
   return {
@@ -493,7 +495,7 @@ describe("assembleTranscript · streamed grok tool-result partials", () => {
       nodeId: NODE,
       toolCallId: NODE,
       parentToolCallId: null,
-      toolName: "Bash",
+      toolName: known("Bash"),
       displayTitle: known("Bash"),
       category: "shell",
       input: known({ command: "sleep 15" }),
@@ -549,7 +551,7 @@ describe("assembleTranscript · streamed grok tool-result partials", () => {
       nodeId: NODE,
       toolCallId: NODE,
       parentToolCallId: null,
-      toolName: "Bash",
+      toolName: known("Bash"),
       displayTitle: known("Bash"),
       category: "shell",
       input: known({ command: "echo resolved" }),
@@ -698,6 +700,92 @@ describe("assembleTranscript · streamed grok tool-result partials", () => {
       .toBe("cancelled");
     expect(outcomeOfInner([callMutation(11, 1, "open", "proposed"), callMutation(12, 2, "replace"), notification, subagentStop]))
       .toBe("cancelled");
+  });
+
+  it("accepts the hook orphan result Close at revision 1 after the call node closed higher", () => {
+    // PreToolUse was missed: the record mapper closes the call node at
+    // revision 2 (open 1 / close 2), then the hook relay emits the orphan
+    // result Close at revision 1 on the SAME node WITH the exit code
+    // (live.rs orphan branch: "(U64(1), None, Final)"). The per-track
+    // monotonicity lets the result track open at 1 even though the call track
+    // is at 2 — gating on the shared node revision would leave the card
+    // stuck "running" with no exit.
+    const callOpen = obs(1, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "ls" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "1",
+      baseRevision: null,
+      operation: "open",
+    });
+    const callClose = obs(2, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "ls" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+    });
+    const orphanResult = obs(3, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "1",
+      baseRevision: null,
+      operation: "close",
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      exitCode: known(0),
+      changes: [],
+    });
+    const node = assembleTranscript([callOpen, callClose, orphanResult]).find((n) => n.type === "tool")!;
+    expect(node.result?.stage).toBe("final");
+    expect((node.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+  });
+});
+
+describe("assembleTranscript · journal-parity fixtures", () => {
+  // Drive the landed record/hook parity fixtures (the exact producer shapes)
+  // through the assembler rather than hand-typing copies. The fixtures hold
+  // raw observation objects under `events` (journal dump) or `observations`
+  // (snapshot), depending on source.
+  const asObservations = (fixture: unknown): Observation[] => {
+    const o = fixture as { events?: Observation[]; observations?: Observation[] };
+    return o.events ?? o.observations ?? [];
+  };
+  const firstTool = (events: Observation[]) =>
+    assembleTranscript(events).find(
+      (n): n is Extract<TranscriptNode, { type: "tool" }> => n.type === "tool" && n.result?.stage === "final",
+    );
+
+  it("print-3turn: result rev 1 on a call node at rev 3 keeps the exit code", () => {
+    // call open 1 / append 2 / replace 3, then tool_result rev 1 open on the
+    // SAME node carrying exit code 0 (record mapper shape).
+    const tool = firstTool(asObservations(print3TurnFixture));
+    expect(tool, "expected a settled tool in print-3turn").toBeTruthy();
+    expect((tool!.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
+  });
+
+  it("pty-3turn: result rev 1 open alongside call rev 1 keeps the exit code", () => {
+    // call open 1 plus tool_result rev 1 open on the same node, exit 0.
+    const tool = firstTool(asObservations(pty3TurnFixture));
+    expect(tool, "expected a settled tool in pty-3turn").toBeTruthy();
+    expect((tool!.result?.exitCode as { value?: number } | undefined)?.value).toBe(0);
   });
 });
 

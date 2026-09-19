@@ -4,6 +4,37 @@ Date: 2026-09-19 · Branch: `wt/c-cua-hostcap/b-cua-hostcap-md` · Task: `c-cua-
 Contract: [`docs/design/codex-cua.md`](../codex-cua.md) §3.4 (branch
 `wt/c-cua-adr/b-cua-adr-md`, commit `135d8aba`) · Decision D-045.
 
+## Relationship to `c-cua-launch`
+
+This branch rebases onto `wt/c-cua-launch/b-cua-launch-md`, which lands first.
+That task added the Hub-side grant preflight, including a `hosts.os` column and
+migration, so the two batches interlock through one shared fact rather than
+two: its preflight reads `os` from the **Node's existing** `HostSnapshot.os`
+(already emitted before either task) and reads this row from `cli[]` as
+`{kind, installed, path}`. **No second os column or source is added here** —
+this task contributes the row only, exactly as the coordinator directed.
+
+One housekeeping note from that rebase:
+
+- `c-cua-launch`'s first round wrote its document to
+  `docs/design/evidence/codex-cua-2.md`, which the plan assigns to *this* task
+  (launch is `codex-cua-3.md`), so the rebase surfaced an add/add conflict on
+  that path. Launch's round-3 commit resolved it from their side — their
+  document now lives at `codex-cua-3.md` with its own heading — so this task
+  only keeps `codex-cua-2.md` and performs no relocation.
+- Their interop section said this row "had not landed"; it has now, and the
+  interlock was re-verified against this task's real producer rather than their
+  hand-written fake node. That re-verification is a test, not an inspection:
+  `crates/remuda-node/tests/computer_use_interop.rs` lays down a fake
+  `CODEX_HOME`, runs the production probe over it, and hands the resulting row
+  straight to the production gate. It was checked for vacuity by renaming the
+  probe's `COMPUTER_USE_KIND` constant, which fails two of its three cases
+  immediately; the constant was then restored byte-identically.
+
+The two batches' own suites were run together on the rebased tree: both
+`computer_use_preflight` (launch, 5) and the probe's unit tests (hostcap) pass,
+as do the combined CLI suites (`cua_cli` 7, `dispatch_cli` 7, `doctor_cli` 1).
+
 ## What this lands
 
 `computer-use` becomes an ordinary, **presence-only** `cli[]` row on every
@@ -208,32 +239,87 @@ Fixtures carry all three states: `devbox-sg` installed, `devbox` absent,
 | Rust unit (`hostcap.rs`) | reported-installed / reported-absent / unreported row shaping |
 | Rust integration (`dispatch_cli.rs`) | `remuda hostcap` against a real Hub + fake Node → `computerUse.reported == false` |
 | Rust integration (`wss.rs`) | the row survives a real WSS hello → Hub store → `/v1/hosts` round trip |
+| Rust integration (`computer_use_interop.rs`) | **the seam**: the row the probe really produces is fed to `c-cua-launch`'s gate — accepted on a simulated Mac, refused for absence, and "not reported" for a missing row |
 | vitest (`model.test.ts`) | the three states; `cliSummary` label survival; `installedCli`/`absentCli` truth table; not a launchable kind |
 | vitest (`HostDiagnostics.test.tsx`) | the three rendered states, incl. no "未安装" claim when unreported |
 
 `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test -p remuda-node` (31 suites, 0 failures), `pnpm typecheck` and
-`vitest run` (1125 tests) were run on this branch, all green.
+`cargo test -p remuda-node` (33 suites, 0 failures), `pnpm typecheck` and
+`vitest run` (1183 tests) were run on this branch, all green — on the tree
+rebased onto `c-cua-launch`, so both batches' tests ran together and against
+launch's gate.
 
-The full web hub e2e suite was run on this branch as well. One run reported
-**113 passed / 0 failed / 16 skipped** (`rc=0`); the re-run after rebasing onto
-a newer main reported **111 passed / 1 failed**, the single failure being
-`ux-code.hub.spec.ts:158` — `locator.screenshot: Element is not attached to the
-DOM` while capturing an evidence screenshot of the code-block workbench.
+**Base of each figure, since the launch branch moved during this work:** the
+unit/integration figures above were re-run last on launch's **round-4** tip
+(`8d25bca8`); the hub-e2e runs in the table below were measured on its
+**round-3** tip (`c900f499`), which is the base the last full green run
+(`rc=0`) was taken on. Round 4 changed only driver/hub internals and docs
+(`materializer`, `launch/skills.rs`, `hub/http.rs`, `hub/store.rs`, their
+tests) — **no `web/` and no `hub_e2e.rs`** — so it cannot move an e2e verdict,
+and the e2e figures are not restated as if they were measured on it.
 
-That spec is a flake and not attributable to this change, on three grounds:
+### Hub-e2e flakes on this shared devbox, recorded rather than smoothed over
 
-- the **identical spec at the identical line passed** in the earlier run
-  (`✓ 62 … (8.8s)`) and failed in the later one (`✘ 62 … (8.4s)`), on a tree
-  whose difference for that spec is nil;
-- the failure is a virtualized-row detaching mid-`screenshot()`, which is a
-  timing class of failure, not an assertion about behaviour;
-- the spec touches host inventory only to read `hostId` / `maxInstances` from
-  `/v1/hosts` (`ux-code.hub.spec.ts:41-62`) — it never reads `cli[]`, which is
-  the only surface this change alters.
+**The suite does not produce a clean full pass on this host, and that is not a
+property of this change.** Consecutive full runs of the same tree content:
 
-It was re-run in isolation to confirm; its result is recorded here rather than
-smoothed over.
+| Run | Result | The failure |
+|---|---|---|
+| r13 | 116 passed / 0 failed | — |
+| r12 | 115 passed / 1 failed | `ux-code.hub.spec.ts:235` |
+| r14 | 117 passed / 1 failed | `ux-steer.hub.spec.ts:149` |
+| r15 | **120 passed / 0 failed** (`rc=0`, 17.1m) | — |
+
+Different specs, same content, alternating outcomes. `ux-steer.hub.spec.ts:149`
+passed in r13 and failed in r14; `ux-code` failed in r12 and passed in r13, r14
+and r15. The host is a contended 64-core shared box (peak load observed ~27
+with several other sessions' suites running), which is the documented flake
+class here — the same contention that earlier killed my `hub_e2e` process
+mid-run (r8: `Error: socket hang up`, then every later spec
+`connect ECONNREFUSED`).
+
+r15 is the run that counts: the whole suite green, including this task's
+nearest specs (`node-inventory.hub.spec.ts` ✓ 37, `new-session.spec.ts`
+✓ 34-36) and every spec that had flaked before (`ux-code` ✓ 63 and ✓ 64,
+`ux-steer` ✓ 115-118). Its one `✘` line is spec `ux-touchhit.hub.spec.ts:315`,
+an intentional `test.fail()` xfail ("xfail until c-sessionchrome, D-040") that
+main added, not a failure.
+
+**Ownership is settled by content, not by accumulating runs.** For each failure
+above, the spec and everything it depends on are byte-identical to pristine
+main, and this branch's entire web diff is `features/hosts/*`,
+`HostsPage.tsx` and launch's `generated.ts`:
+
+```
+git diff --quiet origin/main HEAD -- web/tests/e2e/ux-code.hub.spec.ts
+git diff --quiet origin/main HEAD -- web/tests/e2e/ux-steer.hub.spec.ts
+#   → both exit 0: byte-identical to main
+git diff --name-only origin/main...HEAD -- web/tests/e2e/hub-auth.ts \
+    web/src/features/session web/src/lib crates/remuda-hub/examples
+#   → prints nothing: no dependency of either spec differs from main
+git diff --name-only origin/main...HEAD -- web/src
+#   → prints only web/src/features/hosts/*, web/src/pages/HostsPage.tsx and
+#     launch's web/src/types/generated.ts — never features/session or lib
+```
+
+A green full run on this branch was also achieved (r13, `rc=0`, 16.0m) with
+this task's nearest specs green (`node-inventory.hub.spec.ts` ✓ 37,
+`new-session.spec.ts` ✓ 34-36) — so the branch can pass the suite; the host
+decides whether it does.
+
+#### The `ux-code` screenshot failure specifically
+
+Across runs it failed at three different declaration lines (158, 230, 235),
+always `locator.screenshot: Element is not attached to the DOM` while capturing
+an **evidence screenshot** of the code-block workbench. Main has since
+diagnosed that cause and the diagnosis matches:
+
+> Re-query the block right before capturing: a late follow re-render can
+> detach the element resolved earlier in the test.  (`5d11de1b`, `2cc1fa15`)
+
+That fix is present in the spec on this branch (lines 222-224 and 294-296) and
+one run (r12) still caught the race at line 296, so it narrowed rather than
+fully closed it — an open upstream residual, not this change's.
 
 No Hub e2e spec was added for this row: `crates/remuda-hub/examples/hub_e2e.rs`
 is owned by `c-cua-media` (plan §6 risk 6), and coverage here is unit +
@@ -243,10 +329,14 @@ component by design.
 
 Hub e2e runs here use this worker's assigned ports
 (`HUB_E2E_LISTEN=127.0.0.1:59030`, `HUB_E2E_WEB_PORT=59039`,
-`HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59031`). `58980/58989/58981` are the
+`HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59031`) and this worker's assigned lock slot
+(`/tmp/remuda-local-e2e.lock-b`; the host runs three slots now that a single
+shared lock had queued every run for hours). `58980/58989/58981` are the
 **remote gate's own** ports; two earlier runs on them were voided by collision
 with a live gate (`connect ECONNREFUSED 127.0.0.1:58980` mid-suite), and their
-results are not used here.
+results are not used here. A third early run died at startup on
+`Address already in use` — a teardown race from the run just before it — and is
+likewise not counted.
 
 ## Dependency
 

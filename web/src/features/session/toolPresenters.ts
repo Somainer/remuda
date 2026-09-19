@@ -49,6 +49,32 @@ export function resultText(result: ToolResultPayload | null): string {
     .join("\n");
 }
 
+/** One image a tool result staged in the Hub object store (D-045 §6.2). */
+export type ResultMedia = {
+  /** `obj_…` id the bytes are served from at `/v1/objects/{id}`. */
+  objectId: string;
+  /** Stored media type, e.g. `image/png`. */
+  mediaType: string;
+  /** Block name, used as the thumbnail's alt text. */
+  name: string;
+};
+
+/**
+ * Image blocks of a result, in block order.
+ *
+ * Text stays with {@link resultText}; an image that could not be staged is a
+ * text block on the producer side, so this never needs a broken-image branch
+ * (ui-spec §2.2).
+ */
+export function resultMedia(result: ToolResultPayload | null): ResultMedia[] {
+  if (!result) return [];
+  return result.blocks.flatMap((block) =>
+    block.type === "image"
+      ? [{ objectId: block.objectId, mediaType: block.mediaType, name: block.name ?? "image" }]
+      : [],
+  );
+}
+
 function status(result: ToolResultPayload | null): ToolPresentation["status"] {
   if (!result) return "running";
   return result.outcome === "failed" || result.outcome === "denied" ? "failed" : "done";

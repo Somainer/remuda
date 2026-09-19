@@ -5,7 +5,8 @@ import { asRecord, asString, jsonPreview } from "../../lib/format";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
 import { DiffBlock } from "../../components/DiffBlock";
 import { familyFor, isGrokTool, isInteractionTool, shouldFoldToolCard, splitGrokMcpName, splitMcpName } from "./toolRegistry";
-import { foldedKeyArgument, presentTool, resultCurrentDir } from "./toolPresenters";
+import { foldedKeyArgument, presentTool, resultCurrentDir, resultMedia } from "./toolPresenters";
+import { objectUrl } from "./AttachmentChips";
 import { WorkflowTimelineCard } from "./workflow/WorkflowTimelineCard";
 import { LiveToolElapsed } from "./live/LiveStatusStrip";
 import type {
@@ -23,6 +24,40 @@ function asTextBlocks(result: ToolResultPayload | null): string {
     .map((b) => (b.type === "text" ? b.text : ""))
     .filter(Boolean)
     .join("\n");
+}
+
+/**
+ * Bounded thumbnails for image blocks a tool result staged (D-045 §6.2,
+ * ui-spec §2.2): max-height lives in CSS, `loading="lazy"`, alt is the block
+ * name, and a click opens the object route — never an auto-expanded lightbox.
+ * An image the Node could not stage arrives as a text block, so there is no
+ * broken-image branch here.
+ */
+function ResultMedia({ result }: { result: ToolResultPayload | null }) {
+  const media = resultMedia(result);
+  if (media.length === 0) return null;
+  return (
+    <div className={css.toolMedia} data-testid="tool-media">
+      {media.map((image) => (
+        <a
+          key={image.objectId}
+          className={css.toolMediaLink}
+          href={objectUrl(image.objectId)}
+          target="_blank"
+          rel="noreferrer"
+          data-testid="tool-media-link"
+        >
+          <img
+            className={css.toolThumb}
+            src={objectUrl(image.objectId)}
+            alt={image.name}
+            loading="lazy"
+            data-testid="tool-thumb"
+          />
+        </a>
+      ))}
+    </div>
+  );
 }
 
 function diffStat(diff: string): string | null {
@@ -250,6 +285,7 @@ function McpCard({
         <summary className={css.stdoutHead}>参数</summary>
         <pre className={css.stdout}>{jsonPreview(knowledgeValue(call.input))}</pre>
       </details>
+      <ResultMedia result={result} />
       {result ? (
         <details>
           <summary className={css.stdoutHead}>结果</summary>

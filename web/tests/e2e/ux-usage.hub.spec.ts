@@ -272,6 +272,11 @@ test("context chip popover becomes a sheet at 390 px touch width", async ({ brow
     const instanceId = await createReadySession(narrow);
     created.push(instanceId);
     await sendUsageTurn(narrow, "4794,260,29496,0", false, true);
+    // D-042 (c-composer): at compact widths the context chip rides inside the
+    // composer options sheet, not the collapsed bar. Open the sheet first.
+    await expect(narrow.getByTestId("context-chip")).toHaveCount(0);
+    await narrow.getByTestId("model-effort-chip").click();
+    await expect(narrow.getByTestId("composer-options-sheet")).toBeVisible();
     const chip = narrow.getByTestId("context-chip");
     await expect(chip).toHaveText("17%", { timeout: 15_000 });
     await expect(chip).toHaveAttribute("data-has-popover", "1", { timeout: 10_000 });

@@ -1309,7 +1309,9 @@ export function Composer({
         context={contextChipNode}
         permission={
           onPermission ? (
-            <div className={css.popover} data-testid="permission-menu" data-in-sheet="1">
+            // composerOptions-owned frame: no desktop popover border/radius or
+            // 300px cap inside the sheet (that made a double frame + dead strip).
+            <div className={opt.sheetMenu} data-testid="permission-menu" data-in-sheet="1">
               <div data-popover-scroll="1">{renderPermRows(true)}</div>
             </div>
           ) : caps.permission ? (
@@ -1318,9 +1320,9 @@ export function Composer({
         }
         effort={
           caps.effort ? (
-            // The SAME compact card geometry as desktop rides inside the
-            // sheet, so the slider contract is identical.
-            <div className={`${css.popover} ${css.popoverCard}`} data-testid="effort-menu" data-placement="up" data-in-sheet="1">
+            // Full-width, frameless in the sheet; the slider's own card
+            // supplies its visuals.
+            <div className={opt.sheetCard} data-testid="effort-menu" data-placement="up" data-in-sheet="1">
               {sheetEffortSliderNode}
             </div>
           ) : null

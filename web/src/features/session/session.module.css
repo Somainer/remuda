@@ -2688,9 +2688,11 @@
      status label can shrink instead of flex: none and the main row keeps
      返回 · space chip · 标题 · 状态 · 分段 · Stop · ⋯ on one line at 390px. */
   @media (max-width: 640px) {
+    /* 12px left so the back arrow's un-clamped 44px hot corner stays inside
+       the viewport edge; 8px right balances it within the same width. */
     .header {
-      padding-left: 10px;
-      padding-right: 10px;
+      padding-left: 12px;
+      padding-right: 8px;
     }
 
     .headRow {
@@ -2715,8 +2717,9 @@
     }
 
     .headSpaceChip {
-      /* gap(5) + this 17 = 22 from the back glyph, so back's zone ends at 52
-         and the chip's zone starts there (D-039 non-overlap). */
+      /* Sized so the chip's 44px zone starts after the back arrow's zone
+         (D-039 non-overlap): back centre 22 + 21.5 = 43.7, chip x must be
+         >= 49.7 — the margin lands it at ~54. */
       margin-left: 17px;
     }
 

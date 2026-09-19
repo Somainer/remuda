@@ -83,6 +83,9 @@ test.describe("transcript virtualization and session chrome", () => {
     await page.goto("/s/ins_mock_stale");
     await expect(page.getByTestId("journal-banner")).toBeVisible({ timeout: 8_000 });
     await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "readonly-stale", { timeout: 8_000 });
+    // The diagnostic meta row now lives inside the 运行详情 disclosure
+    // (D-040); the 只读 suffix moves with it.
+    await page.getByTestId("run-details-summary").click();
     await expect(page.getByTestId("session-meta")).toContainText("只读");
   });
 

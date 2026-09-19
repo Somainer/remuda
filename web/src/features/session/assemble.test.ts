@@ -266,6 +266,263 @@ describe("assembleTranscript", () => {
   });
 });
 
+describe("assembleTranscript · streamed grok tool-result partials", () => {
+  /**
+   * The real grok producer sequence (grok_terminal.rs, c-grok-stdout): the
+   * driver sequences every mutation on a node through ONE per-node counter
+   * (protocol.md §5.2) — the Proposed Open is 1, the Running Replace 2, each
+   * Partial Append takes the next revision, a second progress Replace
+   * follows on the SAME counter, and the Final Close lands one above the
+   * last mutation. nodeId === toolCallId: call and result share one node.
+   */
+  const NODE = "call_42" as Id;
+
+  function callMutation(
+    seq: number,
+    revision: number,
+    operation: "open" | "replace",
+    state: "proposed" | "running" = "running",
+    baseRevision?: number,
+  ): Observation {
+    return obs(seq, "tool_call", {
+      nodeId: NODE,
+      revision: String(revision),
+      operation,
+      baseRevision: operation === "open" ? null : String(baseRevision ?? revision - 1),
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: known("run_terminal_command"),
+      displayTitle: known(operation === "open" ? "run_terminal_command" : "Execute `printf`"),
+      category: "shell",
+      input: known(operation === "open" ? {} : { command: "printf 'one\\ntwo\\nthree\\n'" }),
+      inputTextDelta: null,
+      state: operation === "open" ? state : "running",
+      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+    });
+  }
+
+  function resultMutation(
+    seq: number,
+    revision: number,
+    operation: "append" | "replace" | "close",
+    blocks: { type: "text"; text: string }[],
+    extra: { stage?: "partial" | "final"; baseRevision?: number; outcome?: string; exitCode?: number } = {},
+  ): Observation {
+    const stage = extra.stage ?? (operation === "close" ? "final" : "partial");
+    // The real producer: a terminal-log tail is a partial-envelope
+    // observation; the terminal frame is structured.
+    const event = obs(seq, "tool_result", {
+      nodeId: NODE,
+      revision: String(revision),
+      operation,
+      baseRevision: extra.baseRevision === undefined ? String(revision - 1) : String(extra.baseRevision),
+      toolCallId: NODE,
+      stage,
+      outcome: extra.outcome ?? (stage === "final" ? "succeeded" : "unknown"),
+      blocks,
+      structuredResult: { state: "unknown", reason: "not-emitted", evidenceEventIds: [] },
+      exitCode: extra.exitCode === undefined
+        ? { state: "unknown", reason: "not-emitted", evidenceEventIds: [] }
+        : known(extra.exitCode),
+      changes: [],
+    });
+    event.completeness = stage === "final" ? "structured" : "partial";
+    return event;
+  }
+
+  function toolText(events: Observation[]): string {
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    if (!node || node.type !== "tool") throw new Error("tool node missing");
+    return (node.result?.blocks ?? [])
+      .map((block) => (block.type === "text" ? block.text : ""))
+      .join("\n");
+  }
+
+  const realSequence: Observation[] = [
+    callMutation(1, 1, "open", "proposed"),
+    callMutation(2, 2, "replace"),
+    resultMutation(3, 3, "append", [{ type: "text", text: "$ printf 'one\\ntwo\\nthree\\n'\n" }]),
+    // A second statusless progress frame replaces on the CALL track at the
+    // next shared revision — a per-track baseline would reject the Partial
+    // whose base is this revision and freeze the card.
+    callMutation(4, 4, "replace"),
+    resultMutation(5, 5, "append", [{ type: "text", text: "one\n" }]),
+  ];
+
+  it("accepts a Partial Append whose base is a call-track revision and accumulates byte fragments", () => {
+    // After the first Partial (revision 3) the streamed prefix is visible.
+    expect(toolText(realSequence.slice(0, 3))).toBe("$ printf 'one\\ntwo\\nthree\\n'\n");
+    // After the second Running Replace (4) and its Partial Append (5), the
+    // fragment concatenates with NO separator: it is a raw byte stream, and
+    // joining with "\n" would double the embedded newline.
+    expect(toolText(realSequence)).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+    const node = assembleTranscript(realSequence).find((n) => n.type === "tool")!;
+    expect(node.type === "tool" && node.call.state).toBe("running");
+    expect(node.type === "tool" && node.result?.stage).toBe("partial");
+    // Streamed partials carry the partial envelope: the card renders as
+    // 不完整 until the Final settles it (ui-spec §3.3).
+    expect(node.type === "tool" && node.completeness).toBe("partial");
+  });
+
+  it("makes the Final Close authoritative: streamed bytes are never concatenated into it", () => {
+    const finalResult = resultMutation(
+      6,
+      6,
+      "close",
+      [{ type: "text", text: "one\ntwo\nthree\n" }],
+      { stage: "final", outcome: "succeeded", exitCode: 0 },
+    );
+    const text = toolText([...realSequence, finalResult]);
+    expect(text).toBe("one\ntwo\nthree\n");
+    expect(text).not.toContain("$ printf");
+    expect(text.match(/one/g)).toHaveLength(1);
+    const node = assembleTranscript([...realSequence, finalResult]).find((n) => n.type === "tool")!;
+    expect(node.type === "tool" && node.result?.stage).toBe("final");
+    expect(node.type === "tool" && node.result?.outcome).toBe("succeeded");
+    // The structured Final clears the partial marker (no lingering 不完整).
+    expect(node.type === "tool" && node.completeness).toBe("structured");
+  });
+
+  it("is stable under redelivery (re-follow): duplicate frames change nothing", () => {
+    const finalResult = resultMutation(7, 6, "close", [{ type: "text", text: "one\ntwo\nthree\n" }], {
+      stage: "final",
+      outcome: "succeeded",
+      exitCode: 0,
+    });
+    const events = [...realSequence, finalResult];
+    expect(toolText([...events, ...events])).toBe(toolText(events));
+    expect(toolText([...events, finalResult])).toBe(toolText(events));
+  });
+
+  it("resets accumulated text when a rotated log republishes as Replace, then appends after it", () => {
+    const events = [
+      ...realSequence,
+      // Rotation: the tail restarted at byte zero; the Partial Replace
+      // carries the complete new content.
+      resultMutation(6, 6, "replace", [{ type: "text", text: "fresh head\n" }], { stage: "partial" }),
+      resultMutation(7, 7, "append", [{ type: "text", text: "fresh tail" }], { stage: "partial" }),
+    ];
+    expect(toolText(events)).toBe("fresh head\nfresh tail");
+  });
+
+  it("rejects out-of-order and duplicate mutations", () => {
+    // The Final Close landed at revision 6…
+    const finalResult = resultMutation(6, 6, "close", [{ type: "text", text: "one\ntwo\nthree\n" }], {
+      stage: "final",
+      outcome: "succeeded",
+      exitCode: 0,
+    });
+    const settled = [...realSequence, finalResult];
+    // …a late Partial Append (gap replay) with an older base cannot extend it.
+    const lateAppend = resultMutation(7, 5, "append", [{ type: "text", text: "LATE" }], {
+      stage: "partial",
+      baseRevision: 4,
+    });
+    expect(toolText([...settled, lateAppend])).toBe("one\ntwo\nthree\n");
+    // An older snapshot Replace cannot roll the node back.
+    const oldReplace = resultMutation(8, 3, "replace", [{ type: "text", text: "OLD" }], {
+      stage: "partial",
+      baseRevision: 2,
+    });
+    expect(toolText([...settled, oldReplace])).toBe("one\ntwo\nthree\n");
+    // An Append whose declared base is not the applied revision is dropped,
+    // even when its revision number happens to be newer.
+    const wrongBase = resultMutation(9, 9, "append", [{ type: "text", text: "WRONG" }], {
+      stage: "partial",
+      baseRevision: 2,
+    });
+    expect(toolText([...realSequence, wrongBase])).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+    // A duplicate Append (same revision/base, re-delivered) applies once.
+    const duplicate = resultMutation(10, 5, "append", [{ type: "text", text: "one\n" }]);
+    expect(toolText([...realSequence, duplicate])).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+    // A duplicate Close is idempotent: the Final stays exactly the Final.
+    expect(toolText([...settled, finalResult])).toBe("one\ntwo\nthree\n");
+  });
+
+  it("applies the cross-track Close at the call's revision but rejects a duplicate result Close", () => {
+    // The promoted-claude print path journals the call and result on the SAME
+    // node: the call closes at rev 2, then the result closes at rev 2. The
+    // cross-track result Close must apply (it carries the exit code), but a
+    // re-delivered result Close at the same revision must not overwrite it.
+    const callClose = (seq: number) => obs(seq, "tool_call", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      parentToolCallId: null,
+      toolName: "Bash",
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "sleep 15" }),
+      inputTextDelta: null,
+      state: "proposed",
+      executor: known({ hostId: "hst", workspaceId: "ws", nativeAgentId: null }),
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+    });
+    const exitClose = (seq: number, exitCode: number | undefined) => obs(seq, "tool_result", {
+      nodeId: NODE,
+      toolCallId: NODE,
+      revision: "2",
+      baseRevision: "1",
+      operation: "close",
+      stage: "final",
+      outcome: "succeeded",
+      blocks: [],
+      structuredResult: { state: "unknown", reason: "n/a", evidenceEventIds: [] },
+      exitCode: exitCode === undefined ? { state: "unknown", reason: "n/a" } : known(exitCode),
+      changes: [],
+    });
+    const base = [callMutation(1, 1, "open", "proposed"), callClose(2), exitClose(3, 0)];
+    const node = assembleTranscript(base).find((n) => n.type === "tool")!;
+    expect(node.type === "tool" && node.result?.stage).toBe("final");
+    expect(node.type === "tool" && (node.result?.exitCode as { value?: number }).value).toBe(0);
+    // A thinner re-delivery (no exit code) at the same revision is rejected —
+    // the exit-bearing Final survives.
+    const withRedelivery = [...base, exitClose(4, undefined)];
+    const node2 = assembleTranscript(withRedelivery).find((n) => n.type === "tool")!;
+    expect(node2.type === "tool" && (node2.result?.exitCode as { value?: number }).value).toBe(0);
+  });
+
+  it("rejects an Append that arrives before its base even after a newer frame", () => {
+    // Revisions 1..5 applied, then an Append at 4 (base 3) replays late: its
+    // base is below the applied baseline and it must not attach.
+    const events = [
+      ...realSequence,
+      resultMutation(6, 4, "append", [{ type: "text", text: "HOLE" }], {
+        stage: "partial",
+        baseRevision: 3,
+      }),
+    ];
+    expect(toolText(events)).toBe("$ printf 'one\\ntwo\\nthree\\n'\none\n");
+  });
+
+  it("keeps an independent result node (the claude tool_result_id shape) on its own counter", () => {
+    // Producers that journal the result on a different node open it at
+    // revision 1 even though the call node is already at revision 4.
+    const events = [
+      callMutation(1, 1, "open", "proposed"),
+      callMutation(2, 2, "replace"),
+      callMutation(4, 4, "replace"),
+      obs(10, "tool_result", {
+        nodeId: "call_42:result" as Id,
+        revision: "1",
+        operation: "close",
+        baseRevision: null,
+        toolCallId: NODE,
+        stage: "final",
+        outcome: "succeeded",
+        blocks: [{ type: "text", text: "/workspace" }],
+        structuredResult: { state: "known", value: { ok: true } },
+        exitCode: known(0),
+        changes: [],
+      }),
+    ];
+    const node = assembleTranscript(events).find((n) => n.type === "tool" && n.id === NODE);
+    expect(node?.type === "tool" && node.result?.outcome).toBe("succeeded");
+    expect(toolText(events)).toBe("/workspace");
+  });
+});
+
 describe("assembleTranscript · C2 commandId correlation", () => {
   const userMessage = (seq: number, text: string, commandId?: string) =>
     obs(seq, "message", {

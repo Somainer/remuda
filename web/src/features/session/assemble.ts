@@ -150,6 +150,103 @@ function newerMutation(next: NodeMutation, current?: NodeMutation): boolean {
   return next.operation !== "append" || next.baseRevision === current.revision;
 }
 
+/**
+ * Node-scoped mutation baseline (protocol.md §5.2).
+ *
+ * Revisions are per NODE — "append/replace/close 的 revision 必须是当前 node
+ * revision+1，baseRevision 必须匹配" — and the driver sequences every
+ * mutation on a node (the call track AND its result track) through that one
+ * counter: grok's Proposed Open is 1, the Running Replace is 2, a streamed
+ * Partial Append is 3, another progress Replace is 4, and the Final Close is
+ * 5+. A per-track baseline therefore rejects the Partial whose base is the
+ * last *call* revision.
+ *
+ * The slot is (nodeId, toolCallId) rather than nodeId alone: grok journals
+ * call and result on the same node (nodeId == toolCallId), so both tracks
+ * share one slot here; producers that keep the result on its own node (the
+ * claude `tool_result_id` shape) get the independent counter the per-track
+ * code used to keep.
+ *
+ * The promoted-claude print path closes the call and the result on the SAME
+ * node at the SAME revision (call close rev 2, then result close rev 2): the
+ * two tracks legitimately coincide there. Track which kind of mutation holds
+ * the revision so that cross-track Close is applied once but a re-delivered
+ * result Close is treated as the duplicate it is — otherwise a replay with
+ * a thinner payload would overwrite the exit-bearing Final.
+ */
+class NodeBaselines {
+  private readonly held = new Map<string, { revision: string; track: "call" | "result" }>();
+
+  private static key(nodeId: string, toolCallId: string): string {
+    return `${nodeId} ${toolCallId}`;
+  }
+
+  /**
+   * Whether `next` may apply on top of the held node baseline. Snapshots
+   * (replace/close) need a strictly newer revision; an append needs its exact
+   * base, because its blocks carry just the new content. A Close at the SAME
+   * revision is accepted only while that revision is held by the *call*
+   * track (the cross-track promoted-claude Close), never once a result
+   * already holds it (so re-deliveries cannot overwrite the Final).
+   */
+  accepts(
+    next: NodeMutation,
+    toolCallId: string,
+    track: "call" | "result",
+  ): boolean {
+    const current = this.held.get(NodeBaselines.key(next.nodeId, toolCallId));
+    if (!current) return true;
+    const revision = BigInt(next.revision);
+    const baseline = BigInt(current.revision);
+    if (revision < baseline) return false;
+    if (revision === baseline) {
+      return next.operation === "close" && track === "result" && current.track === "call";
+    }
+    return next.operation !== "append" || next.baseRevision === current.revision;
+  }
+
+  set(nodeId: string, toolCallId: string, revision: string, track: "call" | "result"): void {
+    this.held.set(NodeBaselines.key(nodeId, toolCallId), { revision, track });
+  }
+}
+
+/**
+ * Fold one tool-result mutation into the card's accumulated result.
+ *
+ * Protocol.md §5.2 gives the result stream the same contract as messages:
+ * - `append` blocks carry only the NEW content (grok's terminal log streams
+ *   raw byte fragments with no block target), so text fragments concatenate
+ *   with NO separator into one text block — joining blocks later with "\n"
+ *   would double every embedded newline;
+ * - `replace` is the complete current value (a rotated log republishes as a
+ *   snapshot), so it resets the accumulated text;
+ * - `close` is the authoritative native item: it replaces the streamed
+ *   prefix outright and the Partial bytes are never concatenated into it.
+ */
+function mergeToolResult(current: ToolResultPayload | null, next: ToolResultPayload): ToolResultPayload {
+  if (next.operation !== "append" || !current) return next;
+  if (next.blocks.length === 0) return { ...next, blocks: current.blocks };
+  const appended = next.blocks
+    .flatMap((block) => (block.type === "text" ? [block.text] : []))
+    .join("");
+  const blocks = current.blocks.slice();
+  if (appended) {
+    const last = blocks.length - 1;
+    if (blocks[last]?.type === "text") {
+      blocks[last] = { type: "text", text: blocks[last].text + appended };
+    } else {
+      blocks.push({ type: "text", text: appended });
+    }
+  }
+  // New non-text blocks (image/file/resource/opaque) are kept after the
+  // streamed text; the Partial envelope's other facts (stage, outcome,
+  // revision) ride the merge.
+  for (const block of next.blocks) {
+    if (block.type !== "text") blocks.push(block);
+  }
+  return { ...next, blocks };
+}
+
 function messageBlocks(current: ContentBlock[], next: ContentBlock[], operation: NodeMutation["operation"], target: number | null): ContentBlock[] {
   if (operation === "close" && next.length === 0) return current;
   if (operation !== "append") return next;
@@ -276,6 +373,9 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
   const messages = assembleMessages(events, anchors);
   const thoughts = new Map<string, { mutation: NodeMutation; node: Extract<TranscriptNode, { type: "thought" }> }>();
   const tools = new Map<string, ToolNode>();
+  // One applied revision per node, shared by the call and result tracks
+  // (protocol.md §5.2); see NodeBaselines.
+  const toolBaselines = new NodeBaselines();
   const workflows = new Map<
     string,
     { type: "workflow"; id: string; run: WorkflowRunPayload; phases: WorkflowPhasePayload[]; members: WorkflowMemberPayload[] }
@@ -339,7 +439,8 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       const call = ev.payload;
       const name = knowledgeValue(call.toolName) ?? "tool";
       const existing = tools.get(call.toolCallId);
-      if (!newerMutation(call, existing?.call)) continue;
+      if (!toolBaselines.accepts(call, call.toolCallId, "call")) continue;
+      toolBaselines.set(call.nodeId, call.toolCallId, call.revision, "call");
       const agentId = knowledgeValue(ev.source.nativeAgentId) ?? existing?.agentId;
       const node: ToolNode = {
         type: "tool",
@@ -374,10 +475,14 @@ export function assembleTranscript(events: Observation[], bubbles: LocalBubble[]
       const result = ev.payload;
       const existing = tools.get(result.toolCallId);
       if (existing) {
-        if (!newerMutation(result, existing.result ?? undefined)) continue;
-        existing.result = result;
-        existing.diffState = diffState(existing.call, result, ev.completeness);
-        if (ev.completeness === "partial") existing.completeness = "partial";
+        if (!toolBaselines.accepts(result, result.toolCallId, "result")) continue;
+        toolBaselines.set(result.nodeId, result.toolCallId, result.revision, "result");
+        existing.result = mergeToolResult(existing.result, result);
+        existing.diffState = diffState(existing.call, existing.result, ev.completeness);
+        // A streamed Partial marks the card incomplete (ui-spec §3.3); the
+        // structured Final settles it as a normal card — the latch must not
+        // survive the Close that just replaced the streamed prefix.
+        existing.completeness = ev.completeness;
       }
       continue;
     }

@@ -438,7 +438,15 @@ async fn answer_dispatch_eager(node: NodeSocket) -> Result<()> {
                             "instance": { "driver": "claude-print" }
                         });
                         if let Some(route) = params.pointer("/spec/apiRoute").cloned() {
-                            result["apiRoute"] = route;
+                            // The observation echoes the route the Node
+                            // actually ended up on: this fake cannot probe
+                            // direct-net, so a requested `auto` reports the
+                            // hub-relay fallback (ApiRoute has no `auto` kind).
+                            let mut observed = route;
+                            if observed.get("route").and_then(Value::as_str) == Some("auto") {
+                                observed["route"] = json!("hub-relay");
+                            }
+                            result["apiRoute"] = observed;
                         }
                         result
                     }
@@ -536,6 +544,32 @@ async fn create_with_inline_answer(
 /// the second Node H is the proxy, and a roster row exists so a lost H can be
 /// observed as `api-route-down`.
 async fn fixture_routed_via_h(base_url: &str) -> Result<ViaH> {
+    fixture_routed_via_h_with(base_url, ViaOpts::default()).await
+}
+
+/// Launch options for the via-H fixture (item 3 exercises `auto`).
+#[derive(Clone)]
+struct ViaOpts {
+    /// Requested `apiRoute` sub-mode: `hub-relay` | `auto` | `direct-net`.
+    route: &'static str,
+    /// Patch a private `relayBind` onto H before dispatch, so a requested
+    /// `auto`/`direct-net` keeps its sub-mode at validation instead of
+    /// collapsing to hub-relay.
+    relay_bind: bool,
+}
+
+impl Default for ViaOpts {
+    fn default() -> Self {
+        Self {
+            route: "hub-relay",
+            relay_bind: false,
+        }
+    }
+}
+
+/// [`fixture_routed_via_h`] with control over the requested sub-mode and H's
+/// relayBind.
+async fn fixture_routed_via_h_with(base_url: &str, opts: ViaOpts) -> Result<ViaH> {
     let hub = boot_routed().await?;
     let _profile_id = create_profile(hub.addr, &hub.cookie, base_url).await?;
     let (worker, worker_host, workspace_id, worker_node_token) =
@@ -578,13 +612,32 @@ async fn fixture_routed_via_h(base_url: &str) -> Result<ViaH> {
     let project: Value = serde_json::from_str(rest.trim())?;
     let project_id = project["id"].as_str().context("project id")?;
 
+    // Item 3: a private relayBind on H keeps `auto`/`direct-net` resolved as
+    // requested (validation collapses auto to hub-relay only without one).
+    if opts.relay_bind {
+        let (status, _, rest) = http(
+            hub.addr,
+            "PATCH",
+            &format!("/v1/hosts/{proxy_host}"),
+            &[("Cookie", &hub.cookie)],
+            Some(
+                &json!({
+                    "relayBind": {"addr": "10.0.0.2:8443", "allowFrom": ["10.0.0.0/8"]}
+                })
+                .to_string(),
+            ),
+        )
+        .await?;
+        anyhow::ensure!(status == 200, "relayBind patch {status} {rest}");
+    }
+
     let dispatch_body = json!({
         "projectId": project_id,
         "brief": "relay the model API please",
         "harness": "claude",
         "driver": "claude-print",
         "apiVia": proxy_host,
-        "apiRoute": "hub-relay"
+        "apiRoute": opts.route
     })
     .to_string();
     let cookie = hub.cookie.clone();
@@ -2365,6 +2418,103 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
     Ok(())
 }
 
+/// Item 3: the egress context is installed for **every** resolved via route,
+/// not only an explicit hub-relay one. With `apiRoute: auto` against a host
+/// that advertises a relayBind the request keeps sub-mode auto at launch; the
+/// Node then falls back to hub-relay (the observation echoed here) and sends
+/// api.open — the Hub must already hold the credential and answer normally.
+/// The old code installed no context on this path, so the fallback open was
+/// refused with "no egress context installed".
+#[tokio::test]
+async fn an_auto_route_against_a_relaybind_host_still_gets_egress() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let (mut fixture, mut proxy) = fixture_routed_via_h_with(
+        &gateway.base_url_v1(),
+        ViaOpts {
+            route: "auto",
+            relay_bind: true,
+        },
+    )
+    .await?;
+    let proxy_socket = proxy.socket();
+
+    notify(
+        &mut fixture.node,
+        "api.open",
+        api_open_params(&fixture.instance_id, "st_auto", &messages_body()),
+    )
+    .await?;
+
+    // Egress may have landed at dispatch time or just now; either way it must
+    // be on the socket BEFORE the forwarded api.open.
+    let (egress, open) = tokio::time::timeout(TIMEOUT, async {
+        let mut egress: Option<Value> = None;
+        loop {
+            let frame = recv_json(proxy_socket).await?;
+            match frame["method"].as_str() {
+                Some("api.egress")
+                    if frame["params"]["instanceId"] == json!(fixture.instance_id) =>
+                {
+                    egress = Some(frame);
+                }
+                Some("api.open") => {
+                    return Ok::<_, anyhow::Error>((
+                        egress.context("auto route: api.egress must precede api.open")?,
+                        frame,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    })
+    .await??;
+    assert_eq!(
+        egress["params"]["authToken"].as_str(),
+        Some(PROFILE_TOKEN),
+        "auto route still installs the credential out of band: {egress}"
+    );
+    assert!(
+        open["params"]["streamId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("st_auto")),
+        "api.open for st_auto must reach H: {open}"
+    );
+
+    // H answers the fallback stream normally.
+    send_json(
+        proxy_socket,
+        json!({
+            "jsonrpc": "2.0", "method": "api.head",
+            "params": {"streamId": open["params"]["streamId"], "status": 200, "headers": []}
+        }),
+    )
+    .await?;
+    send_json(
+        proxy_socket,
+        json!({
+            "jsonrpc": "2.0", "method": "api.end",
+            "params": {"streamId": open["params"]["streamId"], "bytesUp": 10, "bytesDown": 0, "ms": 3}
+        }),
+    )
+    .await?;
+
+    let frames = collect_notifications(
+        &mut fixture.node,
+        TIMEOUT,
+        |frame| frame["params"]["streamId"] == json!("st_auto") && frame["params"].get("bytesDown").is_some(),
+    )
+    .await?;
+    let end = frames_for(&frames, "st_auto")
+        .into_iter()
+        .find(|p| p.get("bytesDown").is_some())
+        .context("st_auto must terminate")?;
+    assert!(
+        end.get("error").is_none(),
+        "the hub-relay fallback of an auto route must end normally, not refused: {end}"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
 /// Item 4: a proxy host that drops and re-hellos receives a fresh api.egress
 /// before the next api.open reaches it.
 #[tokio::test]

@@ -1621,10 +1621,11 @@ async fn relays_a_chunked_request_body_larger_than_one_frame() -> Result<()> {
 
     // The origin received the whole body — the only thing that proves the
     // chunking was lossless rather than merely accepted frame by frame.
-    let received = wait_for_origin(&gateway, &mut fixture.node, "st_chunked", |request| {
-        request.body_bytes == body.len()
-    })
-    .await?;
+    let (received, mut credit_frames) =
+        wait_for_origin(&gateway, &mut fixture.node, "st_chunked", |request| {
+            request.body_bytes == body.len()
+        })
+        .await?;
     assert_eq!(
         received.body_bytes,
         body.len(),
@@ -1632,11 +1633,14 @@ async fn relays_a_chunked_request_body_larger_than_one_frame() -> Result<()> {
     );
 
     // Count the api.credit frames the worker socket received for this stream.
-    // Draining with a short budget collects what already landed (the credits
-    // are emitted synchronously as each body chunk is consumed).
-    let frames =
-        collect_notifications(&mut fixture.node, Duration::from_millis(500), |_| false).await?;
-    let credits: u32 = frames
+    // wait_for_origin already drains this socket (200 ms per poll), so count
+    // what it handed back plus a short final drain for credits that land just
+    // after the origin recorded the request — counting only the post-wait
+    // drain would see whatever a slow first poll happened to throw away.
+    credit_frames.extend(
+        collect_notifications(&mut fixture.node, Duration::from_millis(500), |_| false).await?,
+    );
+    let credits: u32 = credit_frames
         .iter()
         .filter(|frame| {
             frame["method"] == json!("api.credit")
@@ -2449,28 +2453,34 @@ async fn the_response_header_allowlist_drops_set_cookie() -> Result<()> {
 /// The relay's own progress is invisible from either socket (both legs are
 /// notifications), so the origin's recorder is the honest place to observe that
 /// a request completed — and it is the only place a test can see the body the
-/// origin actually received.
+/// origin actually received. Returns every frame drained off the worker socket
+/// while waiting, so callers can assert on progress frames (api.credit) the
+/// poll loop would otherwise discard.
 async fn wait_for_origin<F>(
     gateway: &FakeGateway,
     node: &mut NodeSocket,
     stream_id: &str,
     mut predicate: F,
-) -> Result<remuda_testing::fake_gateway::RecordedRequest>
+) -> Result<(remuda_testing::fake_gateway::RecordedRequest, Vec<Value>)>
 where
     F: FnMut(&remuda_testing::fake_gateway::RecordedRequest) -> bool,
 {
+    let mut drained = Vec::new();
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     while tokio::time::Instant::now() < deadline {
         if let Some(request) = gateway.requests().into_iter().find(|req| predicate(req)) {
-            return Ok(request);
+            return Ok((request, drained));
         }
         // Drain the worker's socket so a producer blocked on credits can make
-        // progress; ignore whatever comes back.
-        let _ = collect_notifications(node, Duration::from_millis(200), |frame| {
-            frame["params"]["streamId"] == json!(stream_id)
-                && frame["params"].get("bytesDown").is_some()
-        })
-        .await?;
+        // progress; hand every frame back instead of dropping it — the
+        // api.credit frames this poll collects are part of what callers assert.
+        drained.extend(
+            collect_notifications(node, Duration::from_millis(200), |frame| {
+                frame["params"]["streamId"] == json!(stream_id)
+                    && frame["params"].get("bytesDown").is_some()
+            })
+            .await?,
+        );
     }
     Err(anyhow!(
         "the relayed request never reached the origin for {stream_id}"
@@ -2484,7 +2494,6 @@ where
 async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> {
     let gateway = FakeGateway::start().await?;
     let (mut fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
-    let proxy_host = proxy.host_id.clone();
     let proxy_socket = proxy.socket();
 
     for cycle in 0..2 {
@@ -2553,21 +2562,23 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
         )
         .await?;
 
-        // W sees the terminal end for this stream — both cycles.
+        // W sees the terminal end for this stream — both cycles — and it must
+        // be a *normal* end: a refusal also carries bytesDown, so asserting on
+        // that field alone would pass with the stream refused.
         let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
             frame["params"]["streamId"] == json!(stream_id)
                 && frame["params"].get("bytesDown").is_some()
         })
         .await?;
-        let saw_end = frames_for(&frames, &stream_id)
-            .iter()
-            .any(|params| params.get("bytesDown").is_some());
+        let end = frames_for(&frames, &stream_id)
+            .into_iter()
+            .find(|params| params.get("bytesDown").is_some())
+            .with_context(|| format!("cycle {cycle}: stream {stream_id} must terminate"))?;
         assert!(
-            saw_end,
-            "cycle {cycle}: stream {stream_id} must end normally"
+            end.get("error").is_none(),
+            "cycle {cycle}: stream {stream_id} must end normally, not refused: {end}"
         );
     }
-    let _ = proxy_host;
     gateway.shutdown().await;
     Ok(())
 }
@@ -3001,14 +3012,10 @@ async fn a_superseded_socket_drop_does_not_tear_down_the_new_link() -> Result<()
         }),
     )
     .await?;
-    let frames = collect_notifications(
-        &mut fixture.node,
-        TIMEOUT,
-        |frame| {
-            frame["params"]["streamId"] == json!("st_supersede")
-                && frame["params"].get("bytesDown").is_some()
-        },
-    )
+    let frames = collect_notifications(&mut fixture.node, TIMEOUT, |frame| {
+        frame["params"]["streamId"] == json!("st_supersede")
+            && frame["params"].get("bytesDown").is_some()
+    })
     .await?;
     let end = frames_for(&frames, "st_supersede")
         .into_iter()
@@ -3021,4 +3028,3 @@ async fn a_superseded_socket_drop_does_not_tear_down_the_new_link() -> Result<()
     gateway.shutdown().await;
     Ok(())
 }
-

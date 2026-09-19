@@ -324,7 +324,7 @@ test("header controls that are on screen own their full 44px corners at 390px wi
   }
 });
 
-test("Stop is a 44px target but currently parks off the 390px viewport (xfail until c-sessionchrome, D-040)", async ({
+test("Stop is a reachable 44px target on the 390px viewport (c-sessionchrome landed, D-040)", async ({
   browser,
 }) => {
   const context = await browser.newContext({
@@ -339,25 +339,21 @@ test("Stop is a 44px target but currently parks off the 390px viewport (xfail un
     await markHeader(page);
     await markStop(page);
 
-    // Hard regression guard for flex:none: the visible Stop square must keep
-    // its 32px even though the 390px headRow is overflowing (a flex-shrunk
-    // square would let the centred hot zone swallow the neighbour).
+    // Hard regression guard for flex:none: the visible Stop square keeps its
+    // 32px even on the crowded 390px row (a flex-shrunk square would let the
+    // centred hot zone swallow the neighbour).
     const stopBox = await page.getByRole("button", { name: "Stop" }).boundingBox();
     expect(stopBox).toBeTruthy();
     expect(stopBox!.width).toBeGreaterThanOrEqual(32);
     expect(stopBox!.height).toBeGreaterThanOrEqual(32);
 
-    // Document the current state honestly: the non-wrapping headRow parks
-    // Stop past the right edge, so its (correct, non-overlapping) hot zone is
-    // not reachable. This xfail must unwind when c-sessionchrome reclaims the
-    // header — D-040 keeps Stop in the header permanently.
-    const offscreen = stopBox!.x < -0.5 || stopBox!.x + stopBox!.width > 390.5;
+    // c-sessionchrome reclaimed the header (chips fold into one chip, the
+    // secondary toggles move into ⋯), so Stop is back inside the viewport and
+    // owns its full 44px corners — D-040 keeps it in the header permanently.
+    expect(stopBox!.x, "Stop stays inside the 390px viewport").toBeGreaterThanOrEqual(-0.5);
+    expect(stopBox!.x + stopBox!.width, "Stop never parks past the right edge").toBeLessThanOrEqual(390.5);
     console.log(
-      `TOUCHHIT stop visual ${Math.round(stopBox!.width)}x${Math.round(stopBox!.height)} at x=${Math.round(stopBox!.x)} (viewport 390) offscreen=${offscreen}`,
-    );
-    test.fail(
-      offscreen,
-      "Stop is off-viewport at 390px; reachable once c-sessionchrome reclaims the header (D-040)",
+      `TOUCHHIT stop visual ${Math.round(stopBox!.width)}x${Math.round(stopBox!.height)} at x=${Math.round(stopBox!.x)} (viewport 390)`,
     );
     await assertTapTarget(page, page.getByRole("button", { name: "Stop" }), "stop");
   } finally {

@@ -231,21 +231,28 @@ test.describe("mobile (390px)", () => {
     await page.goto(`/s/${instanceId}/structured`);
     await expect(page.getByTestId("session-page")).toBeVisible();
 
-    // The entry point was previously hidden by .deskOnly; it must now exist and
-    // be visible at phone width.
-    const toggle = page.getByTestId("files-toggle");
+    // Wait for the transcript scroller itself: the session page paints the
+    // loading state first, and driving scroll before the virtualized scroller
+    // mounts would capture 0 regardless of where the pin restores to.
+    const scroller = page.getByTestId("transcript-scroller");
+    await expect(scroller).toBeVisible();
+
+    // The entry point still exists at phone width; it is reachable on every
+    // width. D-040 moved 文件 into the header ⋯ sheet on compact, so open the
+    // sheet first — the toggle itself (and its testid) is unchanged.
+    const more = page.getByTestId("session-more-open");
+    await expect(more).toBeVisible();
+    await more.click();
+    const toggle = page.getByTestId("session-more-sheet").getByTestId("files-toggle");
     await expect(toggle).toBeVisible();
 
     // Drive the conversation scroll, then open files and come back. With the
     // short fake fixture the transcript may not overflow; capture whatever
     // position it accepts and require the same value after back.
-    await page.evaluate(() => {
-      const target = document.querySelector<HTMLElement>("[data-testid='transcript-scroller']");
-      if (target) target.scrollTop = target.scrollHeight;
+    await scroller.evaluate((target: HTMLElement) => {
+      target.scrollTop = target.scrollHeight;
     });
-    const scrollBefore = await page.evaluate(() =>
-      document.querySelector<HTMLElement>("[data-testid='transcript-scroller']")?.scrollTop ?? 0,
-    );
+    const scrollBefore = await scroller.evaluate((target: HTMLElement) => target.scrollTop);
 
     await toggle.click();
     await expect(page).toHaveURL(/\/files$/);

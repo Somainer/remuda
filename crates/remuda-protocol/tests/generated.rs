@@ -145,6 +145,9 @@ fn public_wire_types_are_registered_for_generation() {
         // model-pin-1: pure pin-vs-observed comparison shared by the Node gate
         // and the Hub watch classification; never serialized on the wire.
         "ModelPinVerdict",
+        // D-045 §6.2: producer-side outcome of staging a tool-result image
+        // through the object route; a mapper error, never serialized.
+        "ToolMediaError",
     ];
     for file in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap() {
         let file = file.unwrap().path();

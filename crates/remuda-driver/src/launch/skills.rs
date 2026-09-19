@@ -110,8 +110,12 @@ pub(crate) struct CapabilityGrant {
 }
 
 /// Validate a requested capability list independently of any filesystem:
-/// unknown values are refused (naming the value), and the origin/bypass/kind
-/// gates are exactly the D-045 gates every carrier must enforce.
+/// unknown values are refused (naming the value), and the origin/bypass/kind/
+/// carrier gates are exactly the D-045 gates every carrier must enforce.
+///
+/// `driver` is required because codex delivery exists only on shell-pty; the
+/// carrier gate runs here (before the materializer writes the launch dir or
+/// any overlay) so a refusal never leaves capability files behind.
 ///
 /// Returns true when `computer-use` is present. Callers that also need the
 /// files written use [`materialize_grant`].
@@ -120,6 +124,7 @@ pub fn computer_use_requested(
     origin: LaunchOrigin,
     permission: &PermissionMode,
     kind: AgentKind,
+    driver: remuda_protocol::DriverKind,
 ) -> DriverResult<bool> {
     for value in capabilities {
         if value != CAPABILITY_COMPUTER_USE {
@@ -165,6 +170,17 @@ pub fn computer_use_requested(
                      agent kind {other:?} this batch; supported kinds are claude and codex"
                 )));
             }
+        }
+        // Codex delivery exists only on shell-pty (HookSession splices the
+        // granted server into a complete shadow CODEX_HOME). Refuse before any
+        // file is written; the Node factory additionally requires hooks on.
+        if kind == AgentKind::Codex && driver != remuda_protocol::DriverKind::ShellPty {
+            return Err(DriverError::InvalidLaunchSpec(format!(
+                "the \"computer-use\" capability for codex on {driver:?} is not delivered: \
+                 only shell-pty with REMUDA_PTY_HOOKS=1 materializes the shadow CODEX_HOME \
+                 the granted MCP server needs; the other carriers would shadow the operator's \
+                 codex login"
+            )));
         }
     }
     Ok(capabilities
@@ -243,23 +259,8 @@ pub(crate) fn materialize_grant(
         native_home,
         native_home_managed,
     } = *request;
-    if !computer_use_requested(capabilities, origin, permission, kind)? {
+    if !computer_use_requested(capabilities, origin, permission, kind, driver)? {
         return Ok(None);
-    }
-
-    // Codex delivery exists only on shell-pty (where a HookSession splices the
-    // granted [mcp_servers] table into the complete shadow CODEX_HOME). Every
-    // other carrier would leave argv empty and write no shadow config, so the
-    // audit would claim a delivery the carrier cannot make (§3.3). Refuse here
-    // so no mcp-cua.json/launchers are written and the recipe records no grant;
-    // the Node factory additionally requires REMUDA_PTY_HOOKS=1.
-    if kind == AgentKind::Codex && driver != remuda_protocol::DriverKind::ShellPty {
-        return Err(DriverError::InvalidLaunchSpec(format!(
-            "the \"computer-use\" capability for codex on {driver:?} is not delivered: \
-             only shell-pty with REMUDA_PTY_HOOKS=1 materializes the shadow CODEX_HOME \
-             the granted MCP server needs; the other carriers would shadow the operator's \
-             codex login"
-        )));
     }
 
     let mut files = Vec::new();

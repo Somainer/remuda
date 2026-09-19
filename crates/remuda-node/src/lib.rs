@@ -79,6 +79,12 @@ pub fn computer_use_evaluate(
 ) -> Result<(), remuda_driver::DriverError> {
     computer_use::evaluate(kind, os, row)
 }
+
+/// Default CUA client install path (`$CODEX_HOME/computer-use/Codex Computer
+/// Use.app`) used in refusal messages; exposed for tests (D-045 round 5).
+pub fn computer_use_default_client_path() -> Option<std::path::PathBuf> {
+    computer_use::default_client_path()
+}
 #[cfg(unix)]
 pub use daemon::{
     DaemonControl, DaemonListener, DaemonWssLease, bind_daemon, connect_daemon_bridge,

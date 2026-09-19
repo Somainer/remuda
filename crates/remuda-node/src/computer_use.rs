@@ -13,10 +13,21 @@
 use remuda_driver::DriverError;
 use remuda_protocol::AgentKind;
 
-use crate::inventory::{CliEntry, CollectRequest};
+use crate::inventory::{CliEntry, CollectRequest, ProbeEnv};
 
 /// The one capability name this batch grants.
 pub const CAPABILITY_COMPUTER_USE: &str = "computer-use";
+
+/// The default client path the hostcap probe would look for when the inventory
+/// carries no explicit path (mirrors
+/// `inventory::computer_use_client_path` in c-cua-hostcap; unified there).
+pub fn default_client_path() -> Option<std::path::PathBuf> {
+    // `CODEX_HOME` override, else `$HOME/.codex`, then the app bundle.
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| Some(ProbeEnv::from_process().home.join(".codex")))?;
+    Some(codex_home.join("computer-use/Codex Computer Use.app"))
+}
 
 /// Verify this host may deliver `computer-use` for `kind`.
 pub fn host_preflight(kind: &AgentKind) -> Result<(), DriverError> {
@@ -45,21 +56,29 @@ pub fn evaluate(kind: &AgentKind, os: &str, row: Option<&CliEntry>) -> Result<()
         )));
     }
     let Some(row) = row else {
+        let probed = default_client_path()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<no path reported>".into());
         return Err(DriverError::InvalidLaunchSpec(format!(
             "this Node has not reported the {CAPABILITY_COMPUTER_USE:?} capability \
-             (no computer-use row in its inventory); run a Node version that probes it"
+             (no computer-use row in its inventory); install/enable Codex Computer Use at \
+             {probed}, or run a Node version that probes it"
         )));
     };
     if !row.installed {
+        // Name the probed path: fall back to the default the hostcap probe
+        // resolves (c-cua-hostcap's computer_use_client_path) when the row
+        // carries no path, so the most common failure says where to install.
         let probed = row
             .path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .filter(|path| !path.is_empty())
+            .or_else(|| default_client_path().map(|path| path.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "<no path reported>".into());
         return Err(DriverError::InvalidLaunchSpec(format!(
             "the {CAPABILITY_COMPUTER_USE:?} capability is not installed on this Node; \
-             it probed {probed}"
+             enable Codex Computer Use at {probed}"
         )));
     }
     Ok(())

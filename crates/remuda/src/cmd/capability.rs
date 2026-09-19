@@ -41,7 +41,37 @@ pub fn requests_computer_use(capabilities: &[String]) -> bool {
 /// `Ok(())` means the host reports an installed capability on macOS. Every
 /// error names the host id and what was actually observed, with a retry
 /// direction.
+/// The default client path the hostcap probe resolves on macOS,
+/// `$CODEX_HOME/computer-use/Codex Computer Use.app` (falls back to
+/// `$HOME/.codex/...`). Mirrors `remuda_node::computer_use::default_client_path`
+/// and c-cua-hostcap's `computer_use_client_path`; hostcap will unify these.
+fn default_client_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".codex"))
+        })?;
+    Some(home.join("computer-use").join("Codex Computer Use.app"))
+}
+
 pub fn host_supports_computer_use(host: &Value) -> Result<()> {
+    // Path named in the not-installed / not-reported messages: the row's path,
+    // else the default the probe looks for, else a placeholder.
+    let probed_path = || -> String {
+        let rows = host.get("cli").and_then(Value::as_array);
+        let row_path = rows
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.get("kind").and_then(Value::as_str) == Some("computer-use"))
+            })
+            .and_then(|row| row.get("path"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty());
+        row_path
+            .map(str::to_owned)
+            .or_else(|| default_client_path().map(|path| path.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "<no path reported>".into())
+    };
     let host_id = host
         .get("hostId")
         .and_then(Value::as_str)
@@ -66,21 +96,18 @@ pub fn host_supports_computer_use(host: &Value) -> Result<()> {
             .find(|row| row.get("kind").and_then(Value::as_str) == Some("computer-use"))
     });
     let Some(row) = row else {
+        let probed = probed_path();
         bail!(
             "host {host_id} has not reported the {COMPUTER_USE:?} capability \
-             (no computer-use row in its inventory); update/run a Node that probes it, \
-             or pick another host with --host"
+             (no computer-use row in its inventory); enable Codex Computer Use at {probed}, \
+             or update/run a Node that probes it, or pick another host with --host"
         );
     };
     if row.get("installed").and_then(Value::as_bool) != Some(true) {
-        let probed = row
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty())
-            .unwrap_or("<no path reported>");
+        let probed = probed_path();
         bail!(
-            "host {host_id} reports {COMPUTER_USE:?} as not installed; the Node probed \
-             {probed} — enable Codex Computer Use on that Mac or pick another host with --host"
+            "host {host_id} reports {COMPUTER_USE:?} as not installed; enable Codex Computer \
+             Use at {probed}, or pick another host with --host"
         );
     }
     Ok(())

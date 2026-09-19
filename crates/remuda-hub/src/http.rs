@@ -771,6 +771,25 @@ pub async fn create_instance(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
+    // D-045 Gate 1, before anything is placed, resolved or approved: an
+    // agent-originated launch may never grant desktop control to itself.
+    // Hoisted ahead of pick_hosts / provider resolution / prepare_create so
+    // a codex shell-pty shape (which would otherwise raise a one-shot human
+    // Interaction) cannot have its approval ticket created and burned on a
+    // replay before the refusal. Nothing is persisted for this request.
+    if body
+        .capabilities
+        .iter()
+        .flatten()
+        .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
+        && crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent
+    {
+        return Err(HubError::BadRequest(
+            "an agent-originated launch may not grant \"computer-use\"; \
+             only an explicit human or bot launch may request it"
+                .into(),
+        ));
+    }
     let title = body.title.clone().or(body.name.clone());
     // A create that names no carrier gets a multi-turn one. This defaulted to
     // `claude-print`, which is never a valid default: a print session ends after
@@ -1036,25 +1055,17 @@ pub async fn create_instance(
             .iter()
             .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
         {
-            // Gate 1 (D-045 §2): an agent-originated launch may never grant
-            // desktop control to itself — the client's incidental 403 is not
-            // the gate. Refuse at the Hub before placement/persistence.
-            if crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent {
-                return Err(HubError::BadRequest(
-                    "an agent-originated launch may not grant \"computer-use\"; \
-                     only an explicit human or bot launch may request it"
-                        .into(),
-                ));
-            }
             // D-045 Q4, harness-agnostic: refuse unattended desktop control.
             // The message names the kind AND the exact refused spellings.
+            // (Gate 1 origin refusal is hoisted to right after device binding,
+            // before placement/approval.)
             let (unattended, refused_spellings): (bool, &[&str]) = match body.kind.as_str() {
                 "claude" => (
                     matches!(
                         body.permission_mode.as_deref(),
                         Some("bypassPermissions" | "bypass")
                     ),
-                    &["bypassPermissions"],
+                    &["bypassPermissions", "bypass"],
                 ),
                 "codex" => (
                     matches!(

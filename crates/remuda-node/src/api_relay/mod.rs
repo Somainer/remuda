@@ -669,6 +669,11 @@ pub struct ApiRelayState {
     /// listener for the same id shuts the first down instead of silently
     /// evicting it (which would orphan its port and bearer).
     instances: Mutex<BTreeMap<String, Arc<InstanceRelay>>>,
+    /// Serializes worker provisioning (reuse check → route probe → bind →
+    /// register) per instance id, so a create that overlaps a retry during the
+    /// multi-second probe waits for the winner's listener and reuses it rather
+    /// binding a second one and shutting the winner down.
+    provision_locks: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Proxy-side gateway contexts, keyed by instance id, pushed by the Hub
     /// before it routes an `api.open` here and revoked at instance end.
     egress: RwLock<HashMap<String, Arc<egress::EgressContext>>>,
@@ -743,6 +748,7 @@ impl ApiRelayState {
             link: RwLock::new(None),
             next_link_id: AtomicU64::new(1),
             instances: Mutex::new(BTreeMap::new()),
+            provision_locks: Mutex::new(BTreeMap::new()),
             egress: RwLock::new(HashMap::new()),
             limits: RwLock::new(RelayLimits::from_hello()),
             http,
@@ -907,6 +913,17 @@ impl ApiRelayState {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(instance_id)
             .cloned()
+    }
+
+    /// Per-instance async lock covering the reuse check, route probe and
+    /// listener bind/register for one worker provision.
+    pub(crate) fn provision_lock(&self, instance_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.provision_locks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(instance_id.to_owned())
+            .or_default()
+            .clone()
     }
 
     /// The observed route a previous accepted attempt recorded for an instance,

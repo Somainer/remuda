@@ -541,6 +541,34 @@ impl DevNode {
         .await
     }
 
+    /// Wait briefly for a racing winner's create command to reach the ledger
+    /// in an accepted state. A create that lost the `insert_instance` race
+    /// must echo the winner's *accepted* command (the Hub rejects queued
+    /// replies), so the loser yields while the winner moves from insert
+    /// (queued) to accept + save. The window is bounded: a winner that
+    /// crashes mid-accept surfaces an error instead of an indefinite hang or
+    /// a queued reply.
+    async fn wait_for_recorded_create_command(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Command, NodeError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(command) = self.inner.store.get_command(command_id)
+                && matches!(
+                    command.state,
+                    CommandState::Accepted | CommandState::Settled
+                )
+            {
+                return Ok(command);
+            }
+            if std::time::Instant::now() >= deadline {
+                return self.inner.store.get_command(command_id);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Durably accept an Instance create, then materialize it in its worker.
     ///
     /// D-028 P2 follow-up: the reply must prove only the durable accept —
@@ -744,20 +772,39 @@ impl DevNode {
             registered_workspace_root: workspace.root_path.into(),
             api_relay: relay_overlay,
         };
-        self.inner.store.insert_instance(instance)?;
-        // An exact duplicate (same id, digest, operation and instance) means a
-        // Hub timeout-retry raced the duplicate pre-check during the up-to-3 s
-        // route probe: the store's `false` is the idempotent-replay signal (a
-        // genuine content difference raises its own Conflict above), so this
-        // attempt answers with the recorded accepted command instead of
-        // failing after the instance row was written.
+        // The instance insert is the idempotency point for two creates whose
+        // provisions overlapped the multi-second route probe (the per-instance
+        // provision lock keeps the listener bind single-writer, but the loser
+        // reaches this insert while the winner is accepting). A Conflict here
+        // means the winner owns the instance row: reply with its recorded
+        // accepted command rather than failing the create.
+        if let Err(insert_error) = self.inner.store.insert_instance(instance) {
+            if !matches!(insert_error, NodeError::Conflict(_)) {
+                return Err(insert_error);
+            }
+            if let Some(guard) = provision_guard.take() {
+                guard.commit();
+            }
+            let recorded = self.wait_for_recorded_create_command(&command_id).await?;
+            let existing_instance = self.inner.store.get_instance(&instance_id)?;
+            return Ok(CreateInstanceResponse {
+                command: recorded,
+                instance: existing_instance,
+                api_route: self
+                    .inner
+                    .api_relay
+                    .observed_route(instance_id.as_id().as_str())
+                    .or(observed_route),
+            });
+        }
+        // Defensive: with the provision lock and the instance-insert catch
+        // above, a false here can only come from another writer; answer
+        // idempotently rather than failing the create.
         let inserted = self
             .inner
             .store
             .insert_command(&instance_id, command.clone())?;
         if !inserted {
-            // This attempt reused the first one's listener (provision is
-            // idempotent per instance id); do not let the guard revoke it.
             if let Some(guard) = provision_guard.take() {
                 guard.commit();
             }
@@ -4337,15 +4384,24 @@ mod api_relay_launch_test {
         assert!(gone.is_ok(), "no live listener after revoke");
     }
 
-    /// A Hub timeout-retry reusing the exact command id and payload — including
-    /// one that races the first call through the accept path — is an
-    /// idempotent reply, never a Conflict after the instance row was written.
-    #[tokio::test]
+    /// A Hub timeout-retry reusing the exact command id and payload races the
+    /// first call through the multi-second route provision. The route probe
+    /// stalls for its 3 s budget; the per-instance provision lock lets the
+    /// loser reuse the winner's listener without a second bind, and the loser
+    /// then loses the instance-row insert and must answer with the winner's
+    /// accepted command rather than propagate a Conflict.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_creates_with_one_command_id_both_return_the_accepted_one() {
         let node = std::sync::Arc::new(node());
         let host = node.host().meta.id.clone();
         let instance_id = remuda_protocol::InstanceId::new();
         let command_id = remuda_protocol::CommandId::new();
+
+        // A TCP endpoint that completes the connect but never answers: the
+        // route:auto direct-net probe blocks for its full 3 s budget.
+        let stall = std::net::TcpListener::bind("127.0.0.1:0").expect("stall listener");
+        let endpoint = format!("http://127.0.0.1:{}/", stall.local_addr().unwrap().port());
+
         let mk = || -> CreateInstanceRequest {
             serde_json::from_value(serde_json::json!({
                 "kind": "claude",
@@ -4354,24 +4410,33 @@ mod api_relay_launch_test {
                 "commandId": command_id.as_id().to_string(),
                 "hostId": host,
                 "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+                "apiRelayEndpoint": endpoint,
                 "apiRoute": {
                     "mode": "via",
                     "viaHostId": HostId::new(),
-                    "route": "hub-relay"
+                    "route": "auto"
                 }
             }))
             .expect("request")
         };
 
-        // Launch both creates together so they can race the duplicate
-        // pre-check while the first one is binding/probing.
+        // Both enters the accept path together; the second one overlaps the
+        // winner's provision and races the instance insert.
         let node_a = std::sync::Arc::clone(&node);
         let node_b = std::sync::Arc::clone(&node);
         let req_a = mk();
         let req_b = mk();
+        let started = std::time::Instant::now();
         let (a, b) = tokio::join!(
             tokio::spawn(async move { node_a.create_instance(req_a).await }),
             tokio::spawn(async move { node_b.create_instance(req_b).await }),
+        );
+        // Only one 3 s probe should run (the loser reuses the winner's
+        // listener), not two end-to-end serial probes (~6 s).
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "no second end-to-end probe: {:?}",
+            started.elapsed()
         );
         let a = a.expect("task").expect("first create Ok");
         let b = b
@@ -4389,12 +4454,20 @@ mod api_relay_launch_test {
             );
             assert!(response.api_route.is_some(), "both echo the via route");
         }
+        // The failed probe fell back to hub-relay.
+        assert!(
+            a.api_route
+                .as_ref()
+                .and_then(|route| route.route)
+                .is_some_and(|kind| kind == remuda_protocol::ApiRouteKind::HubRelay)
+        );
         // Exactly one listener exists for the instance.
         assert!(
             node.api_relay()
                 .instance_relay(instance_id.as_id().as_str())
                 .is_some()
         );
+        drop(stall);
     }
 
     /// A nameless `via` on the request rejects the create before any row or

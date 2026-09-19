@@ -633,7 +633,11 @@ async fn run_egress(
             }
         }
     }
-    router_task.abort();
+    // The router task stays alive through the tail flush and the terminal
+    // chunk: it is the only thing that turns inbound api.credit frames into
+    // window permits, so aborting here could park a response whose four-chunk
+    // window is exhausted until the 30-minute hard cap. The abort waits until
+    // every gated send below is done.
     let bytes_up_total = bytes_up.load(std::sync::atomic::Ordering::Relaxed);
 
     // On success, flush the tail and send the zero-byte `last` chunk so the
@@ -684,6 +688,10 @@ async fn run_egress(
             ));
         }
     }
+
+    // Every gated send is settled: the inbound credit path is no longer
+    // needed. Dropping the task also closes the upstream body channel.
+    router_task.abort();
 
     failed.unwrap_or(Outcome {
         end: ApiEndParams {

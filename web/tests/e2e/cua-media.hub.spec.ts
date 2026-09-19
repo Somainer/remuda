@@ -34,8 +34,6 @@ async function shot(page: Page, name: string): Promise<void> {
 
 test.describe.configure({ mode: "serial" });
 
-test.skip(process.env.HUB_E2E_EXTERNAL === "1", "Needs the in-process fake Node");
-
 async function patchMaxInstances(page: Page, value: number): Promise<void> {
   await page.evaluate(async (next) => {
     const list = await fetch("/v1/hosts", { credentials: "include" });
@@ -161,13 +159,16 @@ test("a computer-use screenshot renders as a bounded thumbnail from the object r
   await page.getByTestId("composer-input").fill("cua screenshot of the safari window");
   await page.getByTestId("composer-send").click();
 
+
   // The MCP card names server/tool.
   const card = page.getByTestId("tool-card").filter({ hasText: "codex-computer-use" }).first();
   await expect(card).toBeVisible({ timeout: 20_000 });
   await expect(card).toContainText("get_app_state");
 
-  // The thumbnail resolves to the object route and actually decodes.
+  // The thumbnail resolves to the object route and actually decodes. Lazy
+  // images only load when visible, so scroll it into view first.
   const thumb = card.getByTestId("tool-thumb");
+  await thumb.scrollIntoViewIfNeeded();
   await expect(thumb).toHaveAttribute("src", /^\/v1\/objects\/obj_/);
   await expect(thumb).toHaveAttribute("alt", "screen-1.png");
   await expect(thumb).toHaveAttribute("loading", "lazy");
@@ -175,10 +176,16 @@ test("a computer-use screenshot renders as a bounded thumbnail from the object r
   await expect
     .poll(
       async () =>
-        thumb.evaluate((img) => (img as HTMLImageElement).naturalWidth > 0 ? 1 : 0),
+        thumb.evaluate((img) => ((img as HTMLImageElement).naturalWidth > 0 ? 1 : 0)),
       { timeout: 10_000 },
     )
     .toBe(1);
+
+  // The rendered box is bounded by the spec's 180px max-height even though
+  // the fixture is a larger 240px image.
+  const box = await thumb.boundingBox();
+  expect(box).not.toBeNull();
+  expect((box as { height: number }).height).toBeLessThanOrEqual(180);
 
   // The click target is the object route only (no lightbox).
   const link = card.getByTestId("tool-media-link");

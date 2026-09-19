@@ -32,10 +32,13 @@ function ViewportGate() {
   return <Outlet />;
 }
 
-/** PWA start_url "/": the same layer picks /m (compact) or /sessions. */
+/**
+ * PWA start_url "/": the same pure resolver picks /m (compact) or
+ * /sessions, so "/" carries no decision of its own.
+ */
 function RootLanding() {
   const { mobile } = useWorkbenchViewport();
-  return <Navigate to={mobile ? "/m" : "/sessions"} replace />;
+  return <Navigate to={resolveLanding("/", "", mobile) ?? "/sessions"} replace />;
 }
 
 export function AppRouter() {

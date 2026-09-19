@@ -7,6 +7,18 @@ describe("resolveLanding — compact landing resolution", () => {
     expect(resolveLanding("/approvals", "", true)).toBe("/m/inbox");
   });
 
+  it("treats a single trailing slash as absent", () => {
+    expect(resolveLanding("/sessions/", "", true)).toBe("/m");
+    expect(resolveLanding("/approvals/", "?focus=abc", true)).toBe("/m/inbox?focus=abc");
+    expect(resolveLanding("/m/inbox/", "", false)).toBe("/sessions");
+    expect(resolveLanding("/m/", "", false)).toBe("/sessions");
+    // Shared routes keep not redirecting with or without the slash.
+    expect(resolveLanding("/s/ins_1/", "", true)).toBeNull();
+    expect(resolveLanding("/settings/", "", false)).toBeNull();
+    // The bare root is untouched.
+    expect(resolveLanding("/", "", true)).toBe("/m");
+  });
+
   it("keeps the query string verbatim, without parsing or rebuilding it", () => {
     expect(resolveLanding("/approvals", "?focus=abc", true)).toBe("/m/inbox?focus=abc");
     expect(resolveLanding("/approvals", "?focus=abc&kind=approval", true)).toBe(

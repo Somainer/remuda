@@ -17,14 +17,18 @@
  *   projection under either shell and must never be rewritten.
  */
 export function resolveLanding(pathname: string, search: string, compact: boolean): string | null {
+  // Treat a single trailing slash as absent ("/sessions/" === "/sessions"),
+  // mirroring the /m/ tolerance already in the desktop branch. The bare
+  // root keeps its slash.
+  const path = pathname.length > 1 && pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
   // PWA start_url: no query belongs to the bare root.
-  if (pathname === "/") return compact ? "/m" : "/sessions";
+  if (path === "/") return compact ? "/m" : "/sessions";
   if (compact) {
-    if (pathname === "/sessions") return `/m${search}`;
-    if (pathname === "/approvals") return `/m/inbox${search}`;
+    if (path === "/sessions") return `/m${search}`;
+    if (path === "/approvals") return `/m/inbox${search}`;
     return null;
   }
   // Desktop never renders the phone tree (including unknown /m/* branches).
-  if (pathname === "/m" || pathname.startsWith("/m/")) return "/sessions";
+  if (path === "/m" || path.startsWith("/m/")) return "/sessions";
   return null;
 }

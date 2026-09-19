@@ -150,8 +150,10 @@ test.describe("session chrome: view switch, locked harness, files route", () => 
     await files.click();
     await expect(page).toHaveURL(/\/files$/);
     await expect(page.getByTestId("files-pane")).toBeVisible();
-    // The session header survives the route.
+    // The session header survives the route. The diagnostic meta row now
+    // lives one fold below the main row (D-040); expand it to check.
     await expect(page.getByTestId("session-page")).toBeVisible();
+    await page.getByTestId("run-details-summary").click();
     await expect(page.getByTestId("session-meta")).toBeVisible();
     await expect(page.getByTestId("files-toggle")).toHaveAttribute("aria-pressed", "true");
 
@@ -190,6 +192,7 @@ test.describe("session chrome: view switch, locked harness, files route", () => 
     await page.goto(`/s/${id}/files`);
     await expect(page.getByTestId("session-page")).toBeVisible();
     await expect(page.getByTestId("files-pane")).toBeVisible();
+    await page.getByTestId("run-details-summary").click();
     await expect(page.getByTestId("session-meta")).toBeVisible();
     await expect(page.getByTestId("files-back")).toBeVisible();
     await page.getByTestId("files-back").click();
@@ -205,6 +208,7 @@ test("the files route still has a back affordance at phone width", async ({ page
   const id = new URL(page.url()).pathname.split("/")[2];
   await page.goto(`/s/${id}/files`);
   await expect(page.getByTestId("files-pane")).toBeVisible();
+  await page.getByTestId("run-details-summary").click();
   await expect(page.getByTestId("session-meta")).toBeVisible();
   const back = page.getByTestId("files-back");
   await expect(back).toBeVisible();

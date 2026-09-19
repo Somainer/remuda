@@ -649,13 +649,40 @@ impl DevNode {
                 InstanceLifecycle::Exited | InstanceLifecycle::Failed
             )
         {
-            // Same-command-id retries echo the ledger's accepted command. A
-            // retry that only reused the instance id echoes the fresh command
-            // built for this call (still queued): the authoritative state is
-            // the instance plus the recorded route below, and the Hub
-            // converges command state from journal rows, exactly as it does
-            // when a create reply arrives late.
-            let command = self.inner.store.get_command(&command_id).unwrap_or(command);
+            let command = match self.inner.store.get_command(&command_id) {
+                // Same-command-id retry: echo the ledger's accepted command.
+                Ok(recorded) => recorded,
+                // A retry that reused only the instance id carries a fresh
+                // command id. It must not echo the *queued* command built
+                // above (the Hub accepts only accepted/settled rows and would
+                // log "node did not durably accept"): accept this command id
+                // durably first, journal the row, then reply with it. The
+                // instance and worker are the first attempt's; no second
+                // bind or launch happens.
+                Err(_) => {
+                    set_command_origin(&mut command, request.origin);
+                    accept_command(&mut command)?;
+                    // insert_command is the create path that links the
+                    // command to the instance's ledger; save_command only
+                    // replaces an existing row. A racing identical insert
+                    // answers with the recorded command instead.
+                    if self
+                        .inner
+                        .store
+                        .insert_command(&instance_id, command.clone())?
+                    {
+                        append_command_lifecycle(
+                            self.inner.store.as_ref(),
+                            &instance_id,
+                            &command,
+                            "accepted",
+                        )?;
+                        command
+                    } else {
+                        self.inner.store.get_command(&command_id)?
+                    }
+                }
+            };
             return Ok(CreateInstanceResponse {
                 command,
                 instance: existing_instance,
@@ -718,15 +745,31 @@ impl DevNode {
             api_relay: relay_overlay,
         };
         self.inner.store.insert_instance(instance)?;
+        // An exact duplicate (same id, digest, operation and instance) means a
+        // Hub timeout-retry raced the duplicate pre-check during the up-to-3 s
+        // route probe: the store's `false` is the idempotent-replay signal (a
+        // genuine content difference raises its own Conflict above), so this
+        // attempt answers with the recorded accepted command instead of
+        // failing after the instance row was written.
         let inserted = self
             .inner
             .store
             .insert_command(&instance_id, command.clone())?;
         if !inserted {
-            return Err(NodeError::Conflict(format!(
-                "command {} was reused with different content",
-                command_id.as_id()
-            )));
+            // This attempt reused the first one's listener (provision is
+            // idempotent per instance id); do not let the guard revoke it.
+            if let Some(guard) = provision_guard.take() {
+                guard.commit();
+            }
+            return Ok(CreateInstanceResponse {
+                command: self.inner.store.get_command(&command_id)?,
+                instance: self.inner.store.get_instance(&instance_id)?,
+                api_route: self
+                    .inner
+                    .api_relay
+                    .observed_route(instance_id.as_id().as_str())
+                    .or(observed_route),
+            });
         }
         accept_command(&mut command)?;
         // Journal first, reply second: a Hub that times out the RPC converges
@@ -4239,6 +4282,18 @@ mod api_relay_launch_test {
         second.command_id = Some(remuda_protocol::CommandId::try_from(command_key).unwrap());
         let retried = node.create_instance(second).await.expect("retry accepted");
         assert!(retried.api_route.is_some(), "retry still echoes the route");
+        // The retry carries a fresh command id; the reply's command must still
+        // be durably accepted (the Hub node_accepted gate rejects a queued
+        // command with no accepted journal row).
+        assert_eq!(
+            retried.command.state,
+            remuda_protocol::CommandState::Accepted,
+            "instance-id retry echoes an accepted command"
+        );
+        let ledger = node
+            .get_command(&retried.command.command_id)
+            .expect("the retry command id was accepted in the ledger");
+        assert_eq!(ledger.state, remuda_protocol::CommandState::Accepted);
         assert!(
             registry.instance_relay(&instance_key).is_some(),
             "exactly one registered listener"
@@ -4280,6 +4335,66 @@ mod api_relay_launch_test {
         })
         .await;
         assert!(gone.is_ok(), "no live listener after revoke");
+    }
+
+    /// A Hub timeout-retry reusing the exact command id and payload — including
+    /// one that races the first call through the accept path — is an
+    /// idempotent reply, never a Conflict after the instance row was written.
+    #[tokio::test]
+    async fn concurrent_creates_with_one_command_id_both_return_the_accepted_one() {
+        let node = std::sync::Arc::new(node());
+        let host = node.host().meta.id.clone();
+        let instance_id = remuda_protocol::InstanceId::new();
+        let command_id = remuda_protocol::CommandId::new();
+        let mk = || -> CreateInstanceRequest {
+            serde_json::from_value(serde_json::json!({
+                "kind": "claude",
+                "driver": "claude-print",
+                "instanceId": instance_id.as_id().to_string(),
+                "commandId": command_id.as_id().to_string(),
+                "hostId": host,
+                "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+                "apiRoute": {
+                    "mode": "via",
+                    "viaHostId": HostId::new(),
+                    "route": "hub-relay"
+                }
+            }))
+            .expect("request")
+        };
+
+        // Launch both creates together so they can race the duplicate
+        // pre-check while the first one is binding/probing.
+        let node_a = std::sync::Arc::clone(&node);
+        let node_b = std::sync::Arc::clone(&node);
+        let req_a = mk();
+        let req_b = mk();
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { node_a.create_instance(req_a).await }),
+            tokio::spawn(async move { node_b.create_instance(req_b).await }),
+        );
+        let a = a.expect("task").expect("first create Ok");
+        let b = b
+            .expect("task")
+            .expect("raced duplicate create Ok, not Conflict");
+
+        // Both replies identify the same accepted command and instance.
+        assert_eq!(a.command.command_id, b.command.command_id);
+        assert_eq!(a.instance.meta.id, b.instance.meta.id);
+        for response in [&a, &b] {
+            assert_eq!(
+                response.command.state,
+                remuda_protocol::CommandState::Accepted,
+                "an idempotent reply carries the accepted command"
+            );
+            assert!(response.api_route.is_some(), "both echo the via route");
+        }
+        // Exactly one listener exists for the instance.
+        assert!(
+            node.api_relay()
+                .instance_relay(instance_id.as_id().as_str())
+                .is_some()
+        );
     }
 
     /// A nameless `via` on the request rejects the create before any row or

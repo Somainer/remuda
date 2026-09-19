@@ -23,10 +23,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tokio::{
-    sync::{Mutex as AsyncMutex, mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 /// Local operator settings; API callers cannot choose executable paths or SSH options.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -497,9 +494,7 @@ async fn connect_once(
         "SSH Node hello identity/protocol mismatch; persistent daemon bridge required"
     );
     let (out_tx, mut out_rx) = mpsc::channel::<Value>(32);
-    let pending = Arc::new(AsyncMutex::new(
-        HashMap::<String, oneshot::Sender<Value>>::new(),
-    ));
+    let pending = crate::transport::new_pending_rpcs();
     let mut host_id = None;
     let mut hello_done = false;
     let mut params = hello["params"].clone();
@@ -550,7 +545,14 @@ async fn connect_once(
             incoming = carrier.recv_json() => {
                 let Some(frame) = incoming? else { break; };
                 if frame.get("method").is_none() {
-                    if let Some(id) = frame["id"].as_str() && let Some(tx) = pending.lock().await.remove(id) { let _ = tx.send(frame); }
+                    if let Some(id) = frame["id"].as_str()
+                        && let Some(call) = pending
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(id)
+                    {
+                        let _ = call.tx.send(frame);
+                    }
                     continue;
                 }
                 let method = frame["method"].as_str().unwrap_or("");
@@ -562,6 +564,8 @@ async fn connect_once(
             }
         }
     }
+    // Stop waiters hanging until their timeout once the stdio carrier is gone.
+    crate::transport::fail_all_pending(&pending);
     carrier.close().await?;
     Ok(())
 }

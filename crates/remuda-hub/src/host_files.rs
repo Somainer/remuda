@@ -130,6 +130,13 @@ struct StageQuery {
     /// Basename of the file as read on the Node; sanitised server-side.
     #[serde(default)]
     name: Option<String>,
+    /// Opt-in renderable media type (D-045 §6.2): a tool-result screenshot
+    /// stages as an `image/*` object so `GET /v1/objects/{id}` serves it
+    /// inline for the card thumbnail. Absent, host files keep their historical
+    /// `application/octet-stream` typing. The bytes' magic bytes must sniff as
+    /// exactly the claimed allowlisted image type.
+    #[serde(default, rename = "mediaType")]
+    media_type: Option<String>,
 }
 
 /// `GET /v1/hosts/{id}/files` — proxy a directory listing to the Node.
@@ -297,14 +304,35 @@ async fn stage_object(
         ),
     };
     let digest = crate::config::sha256_hex(&body);
+    // Without `mediaType`, host files stay deliberately untyped bytes. With
+    // it, only the sniffed image allowlist is accepted (same magic-byte
+    // contract as the operator uploader) so the object can render inline in
+    // a tool card; a claim the bytes do not back is a 400, never an
+    // octet-stream object masquerading as an image.
+    let (media_type, extension) = match query.media_type.as_deref() {
+        None => ("application/octet-stream".to_owned(), "bin".to_owned()),
+        Some(claimed) => {
+            let claimed = crate::objects::media_type_essence(claimed);
+            let Some((sniffed, sniffed_ext)) = crate::objects::sniff_image(&body) else {
+                return Err(HubError::BadRequest(format!(
+                    "mediaType {claimed} does not match the staged bytes"
+                )));
+            };
+            if claimed != sniffed {
+                return Err(HubError::BadRequest(format!(
+                    "mediaType {claimed} disagrees with sniffed type {sniffed}"
+                )));
+            }
+            (sniffed.to_owned(), sniffed_ext.to_owned())
+        }
+    };
     let record = state
         .store
         .insert_object(crate::store::NewObject {
             instance_id: staging_instance(&host_id),
             host_id: host_id.clone(),
-            // Never type host files as a renderable media kind.
-            media_type: "application/octet-stream".to_owned(),
-            extension: "bin".to_owned(),
+            media_type,
+            extension,
             original_name,
             digest,
             bytes: body.to_vec(),

@@ -106,7 +106,7 @@ async fn reject_oversize_upload(
 /// internal name.
 ///
 /// The sniffed type wins: a caller's `Content-Type` only has to agree with it.
-fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
+pub(crate) fn sniff_image(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some(("image/png", "png"));
     }
@@ -136,7 +136,7 @@ fn declared_matches(declared: &str, sniffed: &str) -> bool {
 }
 
 /// Lowercased MIME essence (`Image/PNG; charset=…` -> `image/png`).
-fn media_type_essence(raw: &str) -> String {
+pub(crate) fn media_type_essence(raw: &str) -> String {
     raw.split(';')
         .next()
         .unwrap_or_default()

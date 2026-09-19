@@ -68,6 +68,18 @@
    even though the glyph row sits on one strip. */
 .chip { flex: none; min-height: var(--touch); border: 1px solid var(--line); border-radius: var(--radius); background: transparent; padding: 4px 10px; color: var(--mute); font-size: var(--text-aux); max-width: 210px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: inline-flex; align-items: center; }
 .chip[aria-pressed="true"] { border-color: var(--dust); color: var(--paper); background: var(--ink-2); }
+/* D-040 folded chip in the compact session header: the button must NOT clip
+   its own 44px ::after hot zone (base .chip has overflow:hidden), so the
+   ellipsis clip moves onto the inner label. */
+.chipHeader {
+  position: relative;
+  overflow: visible;
+  /* It always names the current space, so it carries the active-chip look. */
+  border-color: var(--dust);
+  color: var(--paper);
+  background: var(--ink-2);
+}
+.chipText { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drawerBackdrop { position: fixed; inset: 0; z-index: 45; background: var(--scrim); }
 .drawer { width: min(340px, calc(100vw - 44px)); height: 100%; display: flex; flex-direction: column; background: var(--ink-0); border-right: 1px solid var(--line); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
 .drawer > .panel { min-height: 0; }

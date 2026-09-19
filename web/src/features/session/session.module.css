@@ -58,6 +58,54 @@
   flex: 1;
 }
 
+/* D-040: the one current-space chip folded into the compact session header.
+   The button keeps spaces.module.css's .chip look; here it only takes the
+   header's 32px height (44px touch reach comes from the mobile ::after below)
+   and a bounded width so a long space name ellipsises instead of pushing Stop
+   off the row. */
+.headSpaceChip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.headSpaceChip button {
+  position: relative;
+  height: 32px;
+  min-height: 32px;
+  max-width: 110px;
+  padding: 0 10px;
+}
+
+/* Provenance/promotion badges ride the desktop row; on compact they remain
+   readable inside the 运行详情 disclosure. */
+.headBadges {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+}
+
+.hostChip {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--text-aux);
+  color: var(--paper);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.costChip {
+  flex: none;
+  font-family: var(--mono);
+  font-size: var(--text-aux);
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+}
+
 .headBtn {
   height: 27px;
   white-space: nowrap;
@@ -154,6 +202,45 @@
   color: var(--paper);
   font-size: 12px;
   padding: 0 11px;
+}
+
+/* The compact ⋯ trigger: visually a 27px header button on desktop, a 32px
+   square with a 44px hot zone on phones (same rule as .stopBtn). */
+.moreBtn {
+  composes: headBtn;
+  flex: none;
+  justify-content: center;
+  padding: 0;
+  width: 34px;
+}
+
+.moreMenu {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+
+/* Crowded phones: the two resume buttons cannot share the main row, so the
+   exited session gets a dedicated second header row instead of wrapped,
+   overlapping buttons. */
+.resumeRow {
+  display: none;
+}
+
+.menuBtn {
+  width: 100%;
+  height: 44px;
+  min-height: 44px;
+  justify-content: flex-start;
+}
+
+/* The exited-but-not-resumable fallback link: never wraps the crowded row. */
+.inheritLink {
+  flex: none;
+  white-space: nowrap;
+  font-size: var(--text-aux);
+  color: var(--mute);
 }
 
 .meta {
@@ -2444,15 +2531,25 @@
   }
 
   .headRow {
-    gap: 10px;
+    gap: 8px;
   }
 
   .title {
     flex: 1;
   }
 
+  /* The chip's 44px ::after must not meet the back arrow's; visual separation
+     keeps their hot zones 2px apart (D-039 non-overlap). */
+  .headSpaceChip {
+    margin-left: 14px;
+  }
+
+  .headBadges {
+    display: none;
+  }
+
   .meta {
-    padding-left: 30px;
+    padding-left: 0;
     gap: 6px;
   }
 
@@ -2460,16 +2557,17 @@
     display: none;
   }
 
-  .stopBtn {
+  .stopBtn,
+  .moreBtn {
     width: 32px;
     height: 32px;
     min-height: 32px;
     padding: 0;
     justify-content: center;
     /* Never let the crowded row flex-shrink the 32px square: a shrunk visual
-       centred under a 44px ::after would extend the Stop hot zone past the
-       10px headRow gap and swallow the neighbour's edge (D-039 non-overlap).
-       Kept at 32, the zone spills 6px into a 10px gap — 4px clearance. */
+       centred under a 44px ::after would extend its hot zone past the gap and
+       swallow the neighbour's edge (D-039 non-overlap). Kept at 32, the zone
+       spills 6px into an 8px gap — 2px clearance. */
     flex: none;
     /* The square stays 32px visually; the ::after below supplies the reach. */
     position: relative;
@@ -2482,6 +2580,8 @@
    */
   .back::after,
   .stopBtn::after,
+  .moreBtn::after,
+  .headSpaceChip button::after,
   .viewSeg::after {
     content: "";
     position: absolute;
@@ -2582,6 +2682,84 @@
   .question {
     padding: 14px;
     gap: 13px;
+  }
+
+  /* D-040 crowded fold: the ⋯ sheet takes Compact / 文件 / 原始事件, so the
+     status label can shrink instead of flex: none and the main row keeps
+     返回 · space chip · 标题 · 状态 · 分段 · Stop · ⋯ on one line at 390px. */
+  @media (max-width: 640px) {
+    .header {
+      padding-left: 10px;
+      padding-right: 10px;
+    }
+
+    .headRow {
+      gap: 5px;
+    }
+
+    /* Only the dot shows on the crowded row; the word stays in textContent
+       and the title attribute, so the session title gets the freed width. */
+    .status {
+      gap: 0;
+    }
+
+    .statusWord {
+      display: none;
+    }
+
+    .status,
+    .title {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .headSpaceChip {
+      /* gap(5) + this 17 = 22 from the back glyph, so back's zone ends at 52
+         and the chip's zone starts there (D-039 non-overlap). */
+      margin-left: 17px;
+    }
+
+    .headSpaceChip button {
+      /* The active tab strip already carries the full session title; the
+         chip's job is naming the space, so keep the whole name rather than
+         splitting the truncation budget. */
+      max-width: 88px;
+    }
+
+    /* Keep each segment >=44px visual so adjacent segment hot zones never
+       overlap (glyph heights and radiogroup semantics unchanged). */
+    .viewSeg {
+      padding: 0 11px;
+    }
+
+    .stopBtn {
+      margin-left: 2px;
+    }
+
+    /* Desktop uses the spacer to push the controls right; on the crowded row
+       the session title must itself receive every free pixel. */
+    .spacer {
+      flex: 0 0 0;
+      width: 0;
+    }
+
+    .resumeRow {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .resumeRow button {
+      min-height: 44px;
+    }
+
+    /* 6px visual gap + this 6px margin = 12px between Stop and ⋯ so their
+       44px zones meet with no overlap (D-039). */
+    /* 6px visual gap + this 8px margin = 14px between Stop and ⋯ so their
+       44px zones clear each other (D-039 non-overlap). */
+    .moreBtn {
+      margin-left: 8px;
+    }
   }
 }
 

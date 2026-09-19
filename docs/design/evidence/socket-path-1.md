@@ -75,10 +75,37 @@ One chooser, `remuda_signal::runtime_dir::place_socket(preferred, name)`
    `broker-<sha256(path)>.sock`, so distinct data directories never collide
    and restarts resolve the same target.
 5. If even the runtime path exceeds `sun_path` (e.g. a 110-byte
-   `XDG_RUNTIME_DIR`), the chooser returns an error naming both lengths
-   instead of failing at bind with the cryptic kernel text.
+   `XDG_RUNTIME_DIR` or a >100-byte socket file name), the chooser returns an
+   error naming both lengths and every candidate tried, instead of failing at
+   bind with the cryptic kernel text.
 6. Every bind failure is reported with the path, its byte length, and the
    platform limit (`bind_io_error`).
+
+### Round 2: the fixed `/tmp` last resort
+
+Round 1 stopped at candidate 2, which does not hold in two real environments:
+on macOS `std::env::temp_dir()` is the ~48-byte per-user
+`/var/folders/xx/yyyy/T/` with `XDG_RUNTIME_DIR` normally unset, and a long
+`TMPDIR` makes candidate 2 itself overflow (the round-1 evidence conceded
+this under an 80-byte TMPDIR). The candidate chain is now:
+
+1. `$XDG_RUNTIME_DIR/remuda/` (when set);
+2. `${TMPDIR:-/tmp}/remuda-<uid>/`;
+3. `/tmp/remuda-<uid>/` — a fixed last resort, omitted only when it equals
+   candidate 2.
+
+A per-user 0700 directory holding nothing but socket inodes is the one place
+a fixed `/tmp` root is correct: `place_socket` walks the candidates and
+accepts the first that (a) passes the security checks **and** (b) yields a
+join with the socket name at or under `sun_path`; the 41-byte `<uuid>.sock`
+name at that root is 58 bytes, under even the 103-byte macOS limit. Only when
+every candidate fails does launch error.
+
+Round 2 also hardened directory creation: new components are born `0700` via
+a recursive `DirBuilder` mode (never briefly group/world accessible under the
+umask), and the mode repair on a pre-existing directory goes through an
+`O_NOFOLLOW|O_DIRECTORY` fd with `fchmod`, so a link swapped in after the
+lstat can never be followed.
 
 Connect side stays on the real path:
 
@@ -86,9 +113,14 @@ Connect side stays on the real path:
   shadow codex/grok hooks, and the hook-silence probe in the shell-pty
   promotion poller) is now the bind path; the overlay is asserted to contain
   the short path and never the long symlink.
-- Node daemon clients (`daemon_socket_path`, status probe, bridge) resolve the
-  symlink target and connect there; with no daemon running (no link) the
-  conventional path still yields `NotFound` as before.
+- Node daemon clients (`daemon_socket_path`, status probe, bridge) derive the
+  short target **deterministically** with the same chooser the binder uses —
+  the path no longer depends on the `node.sock` symlink existing. Before the
+  daemon's first start, and during the binder's startup window (the link is
+  installed last), the old code handed the kernel the over-long address, got
+  `InvalidInput` instead of `NotFound`, and `remuda node start` aborted
+  instead of launching. The symlink target is consulted only if derivation
+  itself fails.
 - The token-broker client connects to `place_token_broker_socket()` output;
   the digest is deterministic, matching the server's own placement.
 
@@ -96,6 +128,18 @@ Session/daemon end removes both the real socket and the discovery symlink
 (explicit owner-side cleanup; `SocketPlacement` deliberately has **no**
 `Drop` — an intermediate copy dropping must not unlink a socket another owner
 serves).
+
+Lifecycle hygiene for redirected sockets:
+
+- A SIGKILLed Node cannot run the drop that unlinks its runtime sockets.
+  `compose` sweeps every candidate at start: remuda `*.sock` inodes that
+  refuse a connection (`ECONNREFUSED`) are dead and unlinked; a listener that
+  accepts the probe is a live socket and is never touched; non-socket files
+  are ignored.
+- `purge_instance` unlinks the resolved target of `hook.sock` before removing
+  the instance directory, and only when the link resolves inside one of this
+  process's own runtime directories — a crafted link pointing elsewhere is
+  left intact (and logged).
 
 Node start (`compose`, the shared composition root for daemon, dev and
 stdio) logs one warning when a representative instance socket
@@ -124,11 +168,20 @@ Chooser unit tests (remuda-signal `runtime_dir.rs` + integration
 - cleanup removes both files (asserted in the driver round trip below);
 - foreign-uid runtime dir refused with `PermissionDenied`;
 - symlinked runtime dir refused; own 0777 dir tightened to 0700;
+- newly created directories (including intermediate components) are born
+  0700, independent of umask;
+- the candidate chain ends at the fixed `/tmp/remuda-<uid>` root (deduped
+  when TMPDIR is `/tmp`/unset), where the 41-byte uuid socket is 58 bytes and
+  therefore fits every supported platform;
 - `XDG_RUNTIME_DIR` used when set (0700, own uid, stable); unwritable XDG
   falls back to tmp (both exercised in subprocesses, since env mutation is
   unsafe and the crate forbids unsafe code);
-- runtime path still overflowing → explicit error; bind error text carries
-  path, byte length, and limit.
+- a 60-byte TMPDIR with `XDG_RUNTIME_DIR` unset (the macOS shape) makes the
+  temp fallback overflow at ~115 bytes; the chooser skips it and binds under
+  the fixed `/tmp/remuda-<uid>` root — verified with a real bind in a
+  subprocess;
+- runtime path still overflowing → explicit error naming every candidate;
+  bind error text carries path, byte length, and limit.
 
 remuda-signal long-dir tests: a bound hook socket under a >107-byte instance
 dir serves a round trip over the short runtime path, the long symlink path is
@@ -137,18 +190,39 @@ listening and the long link as not listening (`hook_silence.rs`).
 
 Driver round trip (requirement E;
 `remuda-driver/src/launch/session.rs::a_long_instance_dir_…`): a
-`HookSession` started under a 120-character instance directory binds a
-≤100-byte runtime socket, the under-instance `hook.sock` symlinks to it, the
-overlay carries the real path, and one `SessionStart` connects, authenticates,
-lands one event on the bus and binds the session; dropping the session
-removes **both** the real socket and the symlink. A second test runs two long
+`HookSession` started under an instance path carrying a 120-byte **prefix**
+ending in a real `instances/ins_<canonical-uuid>` segment binds a runtime
+socket at or under `SUN_PATH_LIMIT` (the 41-byte `<uuid>.sock` name is what
+matters on macOS), the under-instance `hook.sock` symlinks to it, the overlay
+carries the real path, and one `SessionStart` connects, authenticates, lands
+one event on the bus and binds the session; dropping the session removes
+**both** the real socket and the symlink. A second test runs two long
 instances on distinct sockets with independent credentials.
 
-Node daemon (`remuda-node/tests/daemon.rs::daemon_socket_redirects_…`):
-80-byte filler + `node-data` (preferred `node.sock` well past 107 bytes):
-daemon binds a short hashed runtime socket, `node.sock` is a symlink to it,
-status probe and a takeover bridge connect through the resolved path, the
-real socket is 0600, and shutdown removes both paths.
+Node daemon (`remuda-node/tests/daemon.rs`):
+
+- `…redirects_under_a_long_data_dir` — 80-byte filler + `node-data`
+  (preferred `node.sock` well past 107 bytes): daemon binds a short hashed
+  runtime socket, `node.sock` is a symlink to it, status probe and a takeover
+  bridge connect through the resolved path, the real socket is 0600, and
+  shutdown removes both paths.
+- `…before_first_start_is_not_running` — same shape, but with **no daemon ever
+  started** (no symlink yet): `daemon_socket_path` deterministically returns a
+  short path under the runtime dir and `daemon_is_running` is `Ok(false)`,
+  instead of propagating the kernel's `InvalidInput` from the over-long
+  address.
+
+Start-up warning (`remuda-node/tests/startup_warning.rs`, tracing capture):
+composing a Node under a >90-byte data dir emits exactly one WARN carrying
+`data_dir_len` and `safe_limit`; a data dir at most 39 bytes (so the
+representative instance socket stays ≤100 bytes) emits none.
+
+Lifecycle: the sweep unit test plants a dead socket (ECONNREFUSED) and a live
+one in the fixed runtime dir and asserts only the dead one is reclaimed while
+a non-socket file is untouched; the purge test asserts a symlinked
+`hook.sock` resolves its target into a runtime dir and unlinks only that
+target, while a link pointing outside every candidate (and its target) is
+left intact.
 
 Token broker (`remuda-driver/tests/secrets.rs`): a 90-char filler
 `broker.sock` is served at the chooser's short runtime path, the long path is
@@ -192,13 +266,40 @@ row ("journal condition never met") whenever TMPDIR exceeded ~25 characters;
 with the fix the hook session binds under the per-user runtime dir and the
 full real-PTY pipeline completes at both TMPDIR lengths.
 
+### Round-2 matrix (per the review)
+
+Full three-crate matrix after round 2, from the worktree root:
+
+```text
+$ env -u TMPDIR -u XDG_RUNTIME_DIR \
+    cargo test -p remuda-signal -p remuda-driver -p remuda-node
+# all three crates green (results in §4)
+
+$ env -u XDG_RUNTIME_DIR \
+    TMPDIR="$HOME/Projects/remuda-agents/tmp/sockpath-long-tmpdir-0123456789" \
+    cargo test -p remuda-signal -p remuda-driver -p remuda-node
+# TMPDIR = 80 bytes; temp fallback = 147 bytes, over both platform limits;
+# every redirected socket binds under the fixed /tmp/remuda-<uid> root;
+# all three crates green, including live_pipeline
+```
+
+Under the 80-byte TMPDIR the old (round-1) chooser hard-errored for the
+hook/daemon sockets (its only fallback was the 147-byte temp path); the fixed
+last-resort root makes the run green, which is the macOS-shaped failure mode
+the review called out (the subprocess test `a_long_tmpdir_without_xdg_…`
+pins the deterministic shape with a 60-byte TMPDIR).
+
 ## 4 Whole-suite verification
 
 ```text
-$ cargo test -p remuda-driver -p remuda-signal -p remuda-node
+$ env -u TMPDIR -u XDG_RUNTIME_DIR \
+    cargo test -p remuda-signal -p remuda-driver -p remuda-node
+# signal: 106 lib + all integration tests green
 # driver: 446 lib tests + all integration tests green
-# signal: 104 lib tests + all integration tests green
-# node:   all lib tests (288) + daemon/live_pipeline integration tests green
+# node:   all lib tests (290) + all integration tests green
+$ env -u XDG_RUNTIME_DIR TMPDIR=<80-byte dir> \
+    cargo test -p remuda-signal -p remuda-driver -p remuda-node
+# same, all green
 $ cargo clippy --workspace --all-targets -- -D warnings
 # clean
 $ cargo fmt --all

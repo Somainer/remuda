@@ -25,7 +25,9 @@ pub mod skills;
 pub mod user;
 
 pub use overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
-pub use runtime_dir::{instance_sockets_would_redirect, place_token_broker_socket};
+pub use runtime_dir::{
+    instance_sockets_would_redirect, place_token_broker_socket, runtime_socket_root,
+};
 pub use session::{HookSession, HookSessionOptions};
 pub use shadow::{
     ShadowFile, ShadowHome, ShadowMcpServer, ShadowOptions, materialize_codex, materialize_grok,

@@ -19,15 +19,16 @@
 
 use crate::error::{DriverError, DriverResult};
 use remuda_signal::runtime_dir::SocketPlacement;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// File name used inside the per-user runtime directory for one instance.
 ///
 /// The instance id is `ins_<uuid>`; the socket carries the bare canonical
 /// uuid so the runtime directory stays as short as it can. Inputs that do not
-/// have that shape fall back to a sanitized id-derived name rather than
-/// failing launch: uniqueness, not spelling, is what prevents collisions.
+/// have that shape cannot rely on a globally unique last component, so they
+/// get a digest of the full instance directory: two different directories can
+/// never collide on one runtime socket, however oddly they are named.
 fn runtime_socket_name(instance_dir: &Path) -> String {
     let id = instance_dir
         .file_name()
@@ -37,18 +38,15 @@ fn runtime_socket_name(instance_dir: &Path) -> String {
     if Uuid::parse_str(bare).is_ok() {
         format!("{bare}.sock")
     } else {
-        let sanitized: String = id
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' {
-                    ch
-                } else {
-                    '_'
-                }
-            })
-            .take(40)
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(instance_dir.as_os_str().as_encoded_bytes());
+        let digest = hasher.finalize();
+        let hex: String = digest[..10]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
             .collect();
-        format!("{sanitized}.sock")
+        format!("inst-{hex}.sock")
     }
 }
 
@@ -117,18 +115,54 @@ pub fn instance_sockets_would_redirect(data_dir: &Path) -> bool {
 /// Re-export for callers that need the concrete path pair.
 pub(crate) type Placement = SocketPlacement;
 
+/// The secured per-user runtime directory remuda sockets live under.
+///
+/// Public so test fixtures can place fake unix sockets (e.g. fake-herdr) on a
+/// short, TMPDIR-independent root: `tempfile` honours a long `TMPDIR`, which
+/// would push `<tmp>/herdr/herdr.sock` past `sun_path`.
+pub fn runtime_socket_root() -> std::io::Result<PathBuf> {
+    remuda_signal::runtime_dir::per_user_runtime_dir()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A temp root at a fixed short path.
+    ///
+    /// Ambient `TMPDIR` can itself be long enough to trigger redirection, so a
+    /// test asserting an *in-place* (non-redirected) socket must not use
+    /// `tempfile`; the layout must be short under every CI TMPDIR.
+    struct ShortTemp(PathBuf);
+
+    impl ShortTemp {
+        fn new(tag: &str) -> Self {
+            let dir = PathBuf::from(format!("/tmp/remuda-sptest-{}-{tag}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ShortTemp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn a_short_instance_dir_keeps_hook_sock_in_place() {
-        let root = tempfile::tempdir().unwrap();
+        // Fixed short root so ambient TMPDIR length cannot redirect.
+        let root = ShortTemp::new("short");
         let instance_dir = root
             .path()
             .join("instances/ins_01990000-0000-7000-8000-000000000001");
         std::fs::create_dir_all(&instance_dir).unwrap();
+        assert!(instance_dir.join("hook.sock").as_os_str().len() <= 100);
         let placement = place_instance_socket(&instance_dir).unwrap();
         assert!(!placement.redirected());
         assert_eq!(placement.bind_path(), instance_dir.join("hook.sock"));
@@ -171,19 +205,40 @@ mod tests {
     }
 
     #[test]
-    fn non_canonical_instance_ids_get_a_sanitized_name() {
+    fn non_canonical_instance_dirs_get_a_full_path_digest_name() {
         let root = tempfile::tempdir().unwrap();
-        let instance_dir = root
+        let odd = root
             .path()
             .join("x".repeat(70))
             .join("instances/not-an-id/with space");
-        std::fs::create_dir_all(&instance_dir).unwrap();
-        let placement = place_instance_socket(&instance_dir).unwrap();
-        let name = placement.bind_path().file_name().unwrap().to_string_lossy();
-        assert!(name.ends_with(".sock"));
+        let other = root
+            .path()
+            .join("x".repeat(70))
+            .join("instances/not-an-id/other space");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let odd_placement = place_instance_socket(&odd).unwrap();
+        let other_placement = place_instance_socket(&other).unwrap();
+        let name = odd_placement
+            .bind_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(
-            !name.contains('/') && !name.contains(' '),
-            "runtime file name must be plain and safe: {name}"
+            name.starts_with("inst-") && name.ends_with(".sock"),
+            "{name}"
+        );
+        assert!(!name.contains('/') && !name.contains(' '), "{name}");
+        assert_ne!(
+            odd_placement.bind_path(),
+            other_placement.bind_path(),
+            "distinct oddly-named dirs must not share a runtime socket"
+        );
+        // Stable for the same directory.
+        assert_eq!(
+            place_instance_socket(&odd).unwrap().bind_path(),
+            odd_placement.bind_path()
         );
     }
 

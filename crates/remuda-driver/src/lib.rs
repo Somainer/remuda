@@ -87,7 +87,7 @@ pub use launch::{
     HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,
     SHIM_DISABLE_ENV, ShimSet, TuiMode, apply_model_pin, instance_sockets_would_redirect,
     is_model_env, load_effective_user_settings, materialize_overlay, materialize_shims,
-    merge_settings_layers, place_token_broker_socket, shim_disabled,
+    merge_settings_layers, place_token_broker_socket, runtime_socket_root, shim_disabled,
 };
 pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,

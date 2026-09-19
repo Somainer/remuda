@@ -893,6 +893,26 @@ async fn fake_node(
                             append_workflow_scenario(&mut ws, &instance_id, append_n, kind).await?;
                         continue;
                     }
+                    // c-cua-media: a computer-use MCP call whose result carries
+                    // a screenshot staged through the host-token object route.
+                    if cua_screenshot_prompt(prompt) {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        append_n = append_cua_scenario(
+                            &mut ws,
+                            addr,
+                            host_id.as_id().as_str(),
+                            &durable_token,
+                            &instance_id,
+                            append_n,
+                        )
+                        .await?;
+                        continue;
+                    }
                     // C2: the journal user node for a composer send carries the
                     // exact commandId the HTTP response returned, so the web folds
                     // optimistic bubble and transcript node into one.
@@ -3669,6 +3689,121 @@ async fn append_workflow_scenario(
         ),
     )
     .await?;
+    Ok(n)
+}
+
+/// c-cua-media: the screenshot sentinel — a prompt with this prefix drives the
+/// synthetic computer-use tool result instead of the echo path.
+fn cua_screenshot_prompt(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("cua screenshot")
+}
+
+/// A generated 1x1 PNG. Never a real desktop capture
+/// (`codex-cua.md` §6.4): the bytes are a fixed synthetic fixture.
+fn cua_png_bytes() -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        )
+        .expect("synthetic png fixture")
+}
+
+/// c-cua-media: stage a PNG through the Node's host-token object route, then
+/// append one `mcp__codex-computer-use__get_app_state` call plus a result that
+/// carries text and an `image` block naming only the object id. The bytes
+/// travel the object store, never the journal event (D-045 §6.2).
+async fn append_cua_scenario(
+    ws: &mut NodeWs,
+    addr: SocketAddr,
+    host: &str,
+    token: &str,
+    instance_id: &str,
+    mut n: u64,
+) -> Result<u64> {
+    let png = cua_png_bytes();
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/hosts/{host}/files/objects"))
+        .bearer_auth(token)
+        .header("Content-Type", "application/octet-stream")
+        .query(&[("name", "screen-1.png"), ("mediaType", "image/png")])
+        .body(png.clone())
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    anyhow::ensure!(
+        status.is_success(),
+        "fake node could not stage cua screenshot: {status} {text}"
+    );
+    let staged: Value = serde_json::from_str(&text)?;
+    let object_id = staged["objectId"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("stage reply missing objectId: {text}"))?
+        .to_owned();
+    let size = staged["size"].as_u64().unwrap_or(png.len() as u64);
+
+    let tool_id = "obj_cua_get_app_state_1";
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "tool_call",
+        json!({
+            "nodeId": tool_id,
+            "revision": "1",
+            "operation": "open",
+            "baseRevision": null,
+            "toolCallId": tool_id,
+            "parentToolCallId": null,
+            "toolName": wf_known(json!("mcp__codex-computer-use__get_app_state")),
+            "displayTitle": wf_known(json!("mcp__codex-computer-use__get_app_state")),
+            "category": "mcp",
+            "input": wf_known(json!({ "app": "com.apple.Safari" })),
+            "inputTextDelta": null,
+            "state": "running",
+            "executor": wf_unknown(),
+        }),
+    )
+    .await?;
+    n = append_event(
+        ws,
+        instance_id,
+        n,
+        "tool_result",
+        json!({
+            "nodeId": tool_id,
+            "revision": "2",
+            "operation": "close",
+            "baseRevision": "1",
+            "toolCallId": tool_id,
+            "stage": "final",
+            "outcome": "succeeded",
+            "blocks": [
+                { "type": "text", "text": "window state captured" },
+                {
+                    "type": "image",
+                    "objectId": object_id,
+                    "mediaType": "image/png",
+                    "name": "screen-1.png",
+                    "size": size,
+                },
+            ],
+            "structuredResult": wf_unknown(),
+            "exitCode": wf_unknown(),
+            "changes": [],
+        }),
+    )
+    .await?;
+    n = append_journal(
+        ws,
+        instance_id,
+        n,
+        "assistant",
+        "cua screenshot staged through the object store",
+    )
+    .await?;
+    n = append_native_status(ws, instance_id, n, "idle").await?;
     Ok(n)
 }
 

@@ -415,6 +415,30 @@
   overflow: auto;
 }
 
+/* D-045 §6.2 / ui-spec §2.2: screenshot blocks a tool result staged. The
+   bound is a fixed max-height (never the card's), and opening one is a plain
+   link to /v1/objects/{id} — no lightbox, no auto-expand. */
+.toolMedia {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 12px 10px;
+}
+
+.toolMediaLink {
+  line-height: 0;
+  border-radius: 6px;
+}
+
+.toolThumb {
+  display: block;
+  max-height: 180px;
+  max-width: 100%;
+  width: auto;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
 .path {
   font-family: var(--mono);
   font-size: 12px;

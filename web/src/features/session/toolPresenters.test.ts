@@ -16,6 +16,8 @@ import {
   humanDuration,
   parseWorkflowMeta,
   presentTool,
+  resultMedia,
+  resultText,
   RHAI_META_OPENER,
 } from "./toolPresenters";
 
@@ -446,5 +448,69 @@ describe("humanDuration", () => {
     [0, "未设置"],
   ])("renders %ims as %s", (ms, expected) => {
     expect(humanDuration(ms)).toBe(expected);
+  });
+});
+
+describe("resultText / resultMedia (D-045 §6.2)", () => {
+  function resultWith(blocks: ToolResultPayload["blocks"]): ToolResultPayload {
+    return {
+      nodeId: "n" as Id,
+      revision: "2",
+      operation: "close",
+      baseRevision: "1",
+      toolCallId: "toolu_1" as Id,
+      stage: "final",
+      outcome: "succeeded",
+      blocks,
+      structuredResult: known({}),
+      exitCode: known(0),
+      changes: [],
+    };
+  }
+
+  it("exposes only text through resultText, byte-identical for text results", () => {
+    const result = resultWith([
+      { type: "text", text: "line one" },
+      { type: "text", text: "line two" },
+    ]);
+    expect(resultText(result)).toBe("line one\nline two");
+    expect(resultMedia(result)).toEqual([]);
+    expect(resultText(null)).toBe("");
+    expect(resultMedia(null)).toEqual([]);
+  });
+
+  it("exposes image blocks in order through resultMedia", () => {
+    const result = resultWith([
+      { type: "text", text: "seen" },
+      {
+        type: "image",
+        objectId: "obj_shot_1" as Id,
+        mediaType: "image/png",
+        name: "screen-1.png",
+        size: 70,
+      },
+      {
+        type: "image",
+        objectId: "obj_shot_2" as Id,
+        mediaType: "image/png",
+        name: null,
+      },
+    ]);
+    expect(resultText(result)).toBe("seen");
+    expect(resultMedia(result)).toEqual([
+      { objectId: "obj_shot_1", mediaType: "image/png", name: "screen-1.png" },
+      { objectId: "obj_shot_2", mediaType: "image/png", name: "image" },
+    ]);
+  });
+
+  it("treats a degraded image (a producer-side text fallback) as text", () => {
+    const result = resultWith([
+      {
+        type: "text",
+        text: "[image not attached: image/png, 70 bytes — over the 16-byte object limit]",
+      },
+    ]);
+    expect(resultMedia(result)).toEqual([]);
+    expect(resultText(result)).toContain("image/png");
   });
 });

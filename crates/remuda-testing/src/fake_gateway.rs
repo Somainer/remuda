@@ -14,26 +14,27 @@
 //!   traffic. [`FakeGateway::start`] answers every request with a small SSE
 //!   completion.
 //! * Only header **names** are recorded — no header value, no body byte, and no
-//!   query value is either stored or printable. A test can therefore assert
-//!   that the credential swap happened, and that a worker-side request never
-//!   carried the gateway credential, without a real token existing anywhere.
-//!   [`FakeGateway::assert_no_credentials`] is the explicit audit for the
-//!   direction that matters: nothing credential-bearing ever reached this
-//!   origin.
+//!   query value is either stored or printable, with one deliberate exception:
+//!   the credential *comparison* below, which keeps a verdict and no value.
+//!   [`FakeGateway::assert_no_credentials`] audits a path where nothing
+//!   credential-bearing belongs; it is **not** the relay's credential-swap
+//!   check, because a correctly relayed request does carry a credential.
 //!
-//! ## What this double cannot do
+//! ## Comparing the credential without holding one in the test
 //!
-//! It holds no credential of its own, so it cannot compare a presented bearer
-//! against an expected secret — there is no secret to compare against, by
-//! design, because a fixture that contained one would leak it into every test
-//! that printed a failure. Two honest substitutes are provided instead:
+//! [`FakeGateway::expect_credential`] configures the one credential the gateway
+//! will accept. A request whose `authorization`/`x-api-key` value differs is
+//! answered `401 authentication_error`, which is what catches a relay
+//! forwarding the worker's per-instance bearer instead of the profile
+//! credential. The value lives behind a private [`Secret`] that has no accessor
+//! and renders as `<redacted>`: the comparison is constant-time and the only
+//! thing a test can read afterwards is a boolean
+//! ([`FakeGateway::saw_expected_credential`] / [`FakeGateway::saw_credential_mismatch`]),
+//! so no test needs to hold, print or copy a token.
 //!
-//! * [`FakeGateway::set_expect_authorization`] makes the server refuse, with a
-//!   real `401 authentication_error`, any request that presents no credential
-//!   at all. That covers the "the relay forgot to attach the profile
-//!   credential" failure, which is the one this fixture is asked to catch.
-//! * [`Script::Status`] scripts a `401`/`403` for the value-mismatch case, so a
-//!   relay that forwards a *wrong* credential can still be tested end to end.
+//! [`FakeGateway::set_expect_authorization`] is the weaker check next to it:
+//! refuse any request that presents *no* credential at all, for the case where
+//! the relay dropped it entirely.
 //!
 //! Responses are scripted rather than modeled: the SSE event sequence is the
 //! documented Anthropic shape (`message_start`, `content_block_start`,
@@ -49,7 +50,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::{get, post};
 use futures::stream::StreamExt as _;
@@ -94,8 +95,20 @@ const CREDENTIAL_HEADER_NAMES: &[&str] = &[
     "x-anthropic-api-key",
 ];
 
-/// Header-name prefixes that carry a credential or a signed identity.
-const CREDENTIAL_HEADER_PREFIXES: &[&str] = &["x-stainless-", "x-amz-"];
+/// Credential header names whose *value* [`FakeGateway::expect_credential`]
+/// compares against the configured one.
+///
+/// Restricted to the two spellings a model gateway actually authenticates with,
+/// so the expected-credential check has one unambiguous place to look.
+const COMPARED_CREDENTIAL_HEADERS: &[&str] = &["authorization", "x-api-key"];
+
+/// Header-name prefixes that carry a signed identity.
+///
+/// Deliberately **not** `x-stainless-`: the design's request-header allowlist
+/// forwards `x-stainless-*` verbatim (`docs/design/api-routing.md` §3), so a
+/// correct relay presents those and `assert_no_credentials` must not fire on
+/// one. `x-amz-` is signed and is never on the allowlist.
+const CREDENTIAL_HEADER_PREFIXES: &[&str] = &["x-amz-"];
 
 /// Query-parameter names that would carry a credential inside the URL.
 const CREDENTIAL_QUERY_NAMES: &[&str] = &[
@@ -137,6 +150,19 @@ pub enum FakeGatewayError {
     /// [`FakeGateway::assert_no_credentials`].
     #[error("credential reached the fake gateway: {}", .0.join("; "))]
     CredentialLeak(Vec<String>),
+    /// The configured credential was never presented; see
+    /// [`FakeGateway::assert_presented_expected_credential`].
+    ///
+    /// Reports only whether a *different* credential showed up — never a value,
+    /// because none is stored.
+    #[error(
+        "the expected credential was never presented ({})",
+        if *.mismatched { "a different credential arrived" } else { "no credential was compared" }
+    )]
+    CredentialMismatch {
+        /// Whether a credential arrived that did not match.
+        mismatched: bool,
+    },
 }
 
 /// What the gateway does with the next request.
@@ -215,9 +241,15 @@ impl Script {
 
     /// A bare status using the canonical error type for that code.
     ///
-    /// `429` → `rate_limit_error` with a `retry-after` of one second, `529` →
-    /// `overloaded_error`, `401` → `authentication_error`. Any other code keeps
-    /// its canonical type when one is known and `api_error` otherwise.
+    /// `429` → `rate_limit_error`, `529` → `overloaded_error`, `401` →
+    /// `authentication_error`. Any other code keeps its canonical type when one
+    /// is known and `api_error` otherwise.
+    ///
+    /// A `retry-after` is advertised for both statuses a real gateway retries
+    /// with one — `429` (1 s) and `529` (2 s) — so the relay's response-header
+    /// allowlist has something to carry through in either case. The design's
+    /// allowlist names `retry-after` explicitly, and a fixture that never sent
+    /// one could not exercise that.
     pub fn status(code: u16) -> Self {
         Self::Status {
             code,
@@ -225,7 +257,7 @@ impl Script {
                 .unwrap_or("api_error")
                 .to_string(),
             message: format!("fake gateway: scripted {code}"),
-            retry_after_secs: u64::from(code == 429),
+            retry_after_secs: default_retry_after(code),
         }
     }
 
@@ -239,7 +271,7 @@ impl Script {
             code,
             error_type: error_type.into(),
             message: message.into(),
-            retry_after_secs: u64::from(code == 429),
+            retry_after_secs: default_retry_after(code),
         }
     }
 
@@ -272,6 +304,18 @@ fn canonical_error_type(code: u16) -> Option<&'static str> {
         529 => "overloaded_error",
         _ => return None,
     })
+}
+
+/// The `retry-after` a scripted status advertises, in seconds; `0` for none.
+///
+/// `429` and `529` are the two statuses a real gateway answers with a retry
+/// hint, and both are on the design's response-header allowlist.
+fn default_retry_after(code: u16) -> u64 {
+    match code {
+        429 => 1,
+        529 => 2,
+        _ => 0,
+    }
 }
 
 /// One request the gateway received, with header **names** only.
@@ -318,8 +362,74 @@ struct GatewayInner {
     scripts: Vec<Script>,
     /// Refuse a request that presents no credential at all.
     expect_authorization: AtomicBool,
+    /// The credential value to compare presented ones against; `None` disables
+    /// the comparison entirely.
+    ///
+    /// Held privately and never rendered: [`FakeGateway`] exposes only the
+    /// verdict, and the struct's `Debug` prints a fixed placeholder instead of
+    /// the value. See [`FakeGateway::expect_credential`].
+    expected_credential: Mutex<Option<Secret>>,
+    /// Extra response headers to attach to every answer.
+    ///
+    /// Exists so the relay's response-header allowlist has something to drop:
+    /// the plan's §3 names `set-cookie` specifically, and a fixture that never
+    /// sends one cannot make that test fail.
+    response_headers: Mutex<Vec<(String, String)>>,
     /// Recording, behind one lock so a handler and a test never interleave.
     recorded: Mutex<Recorded>,
+}
+
+/// A credential value that must never be printed.
+///
+/// The whole point of the fixture is that no test needs the value, so the only
+/// way out of this type is [`Secret::ct_eq`] — there is no `Deref`, no accessor,
+/// and `Debug`/`Display` render a placeholder. That makes "never stored or
+/// printed" a property of the type rather than a rule someone has to remember.
+struct Secret(String);
+
+impl Secret {
+    /// Constant-time equality.
+    ///
+    /// A byte-at-a-time loop over the full length with no early return, so the
+    /// comparison does not leak the length or the matching prefix of the
+    /// presented value through timing. Deliberately hand-written rather than a
+    /// dependency: this crate has no crypto dependency and one loop is not
+    /// worth adding one for.
+    fn ct_eq(&self, presented: &str) -> bool {
+        let expected = self.0.as_bytes();
+        let presented = presented.as_bytes();
+        // Fold the length difference into the same accumulator as the bytes:
+        // every iteration runs over the longer of the two, `unwrap_or(0)` pads
+        // the short one, and there is no early return anywhere.
+        let mut diff = expected.len() ^ presented.len();
+        for index in 0..expected.len().max(presented.len()) {
+            let a = expected.get(index).copied().unwrap_or(0);
+            let b = presented.get(index).copied().unwrap_or(0);
+            diff |= usize::from(a ^ b);
+        }
+        diff == 0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The outcome of comparing a presented credential against the configured one.
+///
+/// A three-state verdict rather than a `bool` so "no expectation configured"
+/// cannot be read as "did not match" — the distinction matters because only the
+/// configured case says anything about the relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// No expected credential was configured; nothing was compared.
+    Unconfigured,
+    /// The presented credential equalled the configured one.
+    Matched,
+    /// A credential was presented and it did not equal the configured one.
+    Mismatched,
 }
 
 #[derive(Default)]
@@ -330,6 +440,12 @@ struct Recorded {
     requests: Vec<RecordedRequest>,
     /// Credential-bearing material seen, described by key name only.
     violations: Vec<String>,
+    /// A request presented exactly the credential [`FakeGateway::expect_credential`]
+    /// was configured with. A verdict, never the value.
+    expected_credential_matched: bool,
+    /// A request presented a credential that did not match. A verdict, never
+    /// the value.
+    credential_mismatch: bool,
 }
 
 impl FakeGateway {
@@ -363,6 +479,8 @@ impl FakeGateway {
         let inner = Arc::new(GatewayInner {
             scripts,
             expect_authorization: AtomicBool::new(false),
+            expected_credential: Mutex::new(None),
+            response_headers: Mutex::new(Vec::new()),
             recorded: Mutex::new(Recorded::default()),
         });
         let router = Router::new()
@@ -415,6 +533,60 @@ impl FakeGateway {
             .store(expect, Ordering::SeqCst);
     }
 
+    /// Configure the one credential this gateway will accept.
+    ///
+    /// Pass the **token** — not a pre-formed `Bearer …` value. A request's
+    /// `authorization` is compared with any `Bearer ` scheme stripped, and an
+    /// `x-api-key` value is compared raw, so the same token matches whichever
+    /// spelling the relay used and the caller never has to know which one the
+    /// gateway expects.
+    ///
+    /// A request whose value does not equal the token is answered `401
+    /// authentication_error`. That is the check which catches a relay
+    /// forwarding the worker's per-instance bearer unchanged, and it needs no
+    /// test to hold a token: the comparison is constant-time and the only thing
+    /// exposed afterwards is a **boolean**
+    /// ([`Self::saw_expected_credential`]). Nothing stores or prints the value
+    /// — [`Self::credential_violations`] reports a mismatch by name alone.
+    pub fn expect_credential(&self, token: impl Into<String>) {
+        let mut expected = self.lock_expected();
+        *expected = Some(Secret(token.into()));
+    }
+
+    /// Stop comparing presented credentials against an expected one.
+    pub fn clear_expected_credential(&self) {
+        let mut expected = self.lock_expected();
+        *expected = None;
+    }
+
+    /// Whether a request presented exactly the configured credential.
+    ///
+    /// The only thing a test can learn about it. `false` when no expectation is
+    /// configured, so "not checked" can never be mistaken for "matched".
+    pub fn saw_expected_credential(&self) -> bool {
+        self.lock().expected_credential_matched
+    }
+
+    /// Whether a request presented a credential that did *not* match.
+    pub fn saw_credential_mismatch(&self) -> bool {
+        self.lock().credential_mismatch
+    }
+
+    /// Configure a response header the gateway sends on every answer.
+    ///
+    /// The plan's §3 response allowlist drops `set-cookie` unconditionally, so
+    /// the relay's drop-set-cookie test needs an origin that actually sends one
+    /// — otherwise the assertion passes whether or not the allowlist works.
+    pub fn set_response_header(&self, name: impl Into<String>, value: impl Into<String>) {
+        let mut headers = self.lock_response_headers();
+        headers.push((name.into(), value.into()));
+    }
+
+    /// The configured response headers, in insertion order.
+    pub fn response_headers(&self) -> Vec<(String, String)> {
+        self.lock_response_headers().clone()
+    }
+
     /// Requests answered so far, oldest first.
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.lock().requests.clone()
@@ -458,6 +630,11 @@ impl FakeGateway {
         let mut recorded = self.lock();
         recorded.requests.clear();
         recorded.violations.clear();
+        // The verdicts are part of the recording, not of the configuration:
+        // forgetting what was seen must forget them too, or a test that resets
+        // and then asserts would read a stale result from the earlier request.
+        recorded.expected_credential_matched = false;
+        recorded.credential_mismatch = false;
     }
 
     /// Credential-bearing material seen so far, described by key name only.
@@ -467,13 +644,18 @@ impl FakeGateway {
         self.lock().violations.clone()
     }
 
-    /// Fail if any request carried a credential; otherwise succeed.
+    /// Fail if any credential-bearing material arrived; otherwise succeed.
     ///
-    /// This is the audit for the direction the design cares about: a worker-side
-    /// request — and anything derived from one — must reach the gateway with the
-    /// profile credential attached and the *worker's* credential absent. It
-    /// takes the gateway's own recorded material as its evidence, so a failure
-    /// message can name the offending header without quoting it.
+    /// The audit for a path where **no** credential belongs — a discovery probe
+    /// that carries no token, or a request that should have been refused before
+    /// it ever reached an origin. It is deliberately *not* the relay's
+    /// credential-swap assertion: a correctly relayed request does carry the
+    /// profile credential, and this flags any credential header at all. Use
+    /// [`Self::expect_credential`] with
+    /// [`Self::assert_presented_expected_credential`] for that.
+    ///
+    /// The failure names the offending header and never quotes it, which is
+    /// possible precisely because no value is stored.
     pub fn assert_no_credentials(&self) -> Result<(), FakeGatewayError> {
         let violations = self.credential_violations();
         if violations.is_empty() {
@@ -481,6 +663,22 @@ impl FakeGateway {
         } else {
             Err(FakeGatewayError::CredentialLeak(violations))
         }
+    }
+
+    /// Fail unless a request presented exactly the configured credential.
+    ///
+    /// The relay's real assertion: the profile credential reached the origin.
+    /// Requires [`Self::expect_credential`] to have been called first — without
+    /// an expectation nothing can have matched, and this fails rather than
+    /// passing quietly, so a test cannot get a green run out of a check that
+    /// never ran.
+    pub fn assert_presented_expected_credential(&self) -> Result<(), FakeGatewayError> {
+        if self.saw_expected_credential() {
+            return Ok(());
+        }
+        Err(FakeGatewayError::CredentialMismatch {
+            mismatched: self.saw_credential_mismatch(),
+        })
     }
 
     /// Stop serving and release the port.
@@ -499,6 +697,20 @@ impl FakeGateway {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn lock_expected(&self) -> MutexGuard<'_, Option<Secret>> {
+        self.inner
+            .expected_credential
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_response_headers(&self) -> MutexGuard<'_, Vec<(String, String)>> {
+        self.inner
+            .response_headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl GatewayInner {
@@ -509,7 +721,17 @@ impl GatewayInner {
     }
 
     /// Record one answered request and any credential-bearing names it carried.
-    fn record(&self, request: RecordedRequest, query_names: &[String], body_keys: &[String]) {
+    ///
+    /// `credential_verdict` is [`Verdict::Unconfigured`] unless
+    /// [`FakeGateway::expect_credential`] was called; the value is never
+    /// available here, only the verdict.
+    fn record(
+        &self,
+        request: RecordedRequest,
+        query_names: &[String],
+        body_keys: &[String],
+        credential_verdict: Verdict,
+    ) {
         let mut violations = Vec::new();
         for name in &request.header_names {
             if is_credential_header(name) {
@@ -535,6 +757,48 @@ impl GatewayInner {
         let mut recorded = self.lock();
         recorded.requests.push(request);
         recorded.violations.extend(violations);
+        match credential_verdict {
+            Verdict::Unconfigured => {}
+            Verdict::Matched => recorded.expected_credential_matched = true,
+            Verdict::Mismatched => {
+                recorded.credential_mismatch = true;
+                // Named, never quoted: the whole point of the verdict type is
+                // that the value never escapes.
+                recorded.violations.push(
+                    "request presented a credential that is not the configured one".to_string(),
+                );
+            }
+        }
+    }
+
+    /// Compare the request's credential headers against the configured value.
+    ///
+    /// Returns the verdict only — the value itself never leaves
+    /// [`GatewayInner::expected_credential`].
+    fn credential_verdict(&self, headers: &HeaderMap, expected: &Option<Secret>) -> Verdict {
+        let Some(expected) = expected else {
+            return Verdict::Unconfigured;
+        };
+        let mut seen = false;
+        let mut matched = false;
+        for name in COMPARED_CREDENTIAL_HEADERS {
+            let Some(value) = headers.get(*name).and_then(|value| value.to_str().ok()) else {
+                continue;
+            };
+            seen = true;
+            // A bearer credential arrives as `Bearer <token>`; the gateway
+            // authenticates on the token, so compare the token when the scheme
+            // is present and the raw value otherwise (the `x-api-key` shape).
+            let presented = value.strip_prefix("Bearer ").unwrap_or(value);
+            matched |= expected.ct_eq(presented);
+        }
+        match (seen, matched) {
+            (_, true) => Verdict::Matched,
+            (true, false) => Verdict::Mismatched,
+            // No compared header at all: that is `expect_authorization`'s
+            // question, not this one.
+            (false, false) => Verdict::Unconfigured,
+        }
     }
 
     /// Take the script for the next request and advance the cursor.
@@ -543,6 +807,27 @@ impl GatewayInner {
         let index = recorded.served.min(self.scripts.len().saturating_sub(1));
         recorded.served += 1;
         self.scripts[index].clone()
+    }
+
+    /// Clone the configured expected credential, for one comparison.
+    ///
+    /// Cloned rather than borrowed so the comparison happens outside the lock:
+    /// a lock held across a request-handling path is the kind of thing that
+    /// turns a slow test into a hang.
+    fn expected_credential(&self) -> Option<Secret> {
+        let expected = self
+            .expected_credential
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        expected.as_ref().map(|secret| Secret(secret.0.clone()))
+    }
+
+    /// Clone the configured response headers, for one answer.
+    fn response_headers(&self) -> Vec<(String, String)> {
+        self.response_headers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Whether the request presented any credential at all.
@@ -588,7 +873,18 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
         header_names: header_names.clone(),
         body_bytes: body.len(),
     };
-    gateway.record(recorded, &query_names, &body_keys);
+    let verdict = gateway.credential_verdict(&parts.headers, &gateway.expected_credential());
+    gateway.record(recorded, &query_names, &body_keys, verdict);
+
+    if let Verdict::Mismatched = verdict {
+        return error_body(
+            401,
+            "authentication_error",
+            // Names the failure without quoting either value.
+            "fake gateway: presented credential is not the configured one",
+            0,
+        );
+    }
 
     if gateway.expect_authorization.load(Ordering::SeqCst)
         && !GatewayInner::presents_credential(&header_names)
@@ -601,7 +897,7 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
         );
     }
 
-    match gateway.next_script() {
+    let response = match gateway.next_script() {
         Script::Messages { text } => sse_response(&text, false),
         Script::AbortMidStream { text } => sse_response(&text, true),
         Script::SlowFirstByte { delay, text } => {
@@ -627,7 +923,10 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
             message,
             retry_after_secs,
         } => error_body(code, &error_type, &message, retry_after_secs),
-    }
+    };
+    let mut response = response;
+    apply_configured_headers(response.headers_mut(), &gateway.response_headers());
+    response
 }
 
 /// `/v1/models` — the two-listings-per-gateway behaviour.
@@ -639,35 +938,47 @@ async fn messages(State(gateway): State<Arc<GatewayInner>>, request: Request) ->
 /// one surface under-reports in a test the same way it does against the real
 /// thing.
 ///
-/// One id (`claude-fake-shared`) appears on both surfaces, which is what makes
-/// the union non-trivial, and one (`fake/model-1m`) reports a context window at
-/// or above `LONG_CONTEXT_TOKENS`, which is what earns the `1m` tag.
-async fn models(State(gateway): State<Arc<GatewayInner>>, headers: HeaderMap) -> Response {
+/// One id (`fake/model-1`) appears on both surfaces and each surface has one id
+/// the other never serves (`fake/model-1-1m`, `passthrough/fake-evolving` on the
+/// plain surface; `claude-fake-only` on the `anthropic-version` one). The two
+/// listings therefore **overlap** rather than nest, which is what makes dropping
+/// a surface visibly under-report: with a nested pair, a consumer that read only
+/// the wider listing would still have every id.
+///
+/// `fake/model-1-1m` reports a context window at or above
+/// `LONG_CONTEXT_TOKENS`, which is what earns the `1m` tag downstream.
+async fn models(
+    State(gateway): State<Arc<GatewayInner>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     // Recorded like `messages` is, so a test can assert what a discovery probe
     // sent (which surfaces it read, whether it presented a credential) without
-    // the fixture holding one.
+    // the fixture holding one. The path is the one that actually matched, so
+    // `/v1/models/{id}` and a base-path spelling are distinguishable.
     let header_names: Vec<String> = headers
         .keys()
         .map(|name| name.as_str().to_ascii_lowercase())
         .collect();
+    let path = uri.path().to_string();
+    let verdict = gateway.credential_verdict(&headers, &gateway.expected_credential());
     gateway.record(
         RecordedRequest {
             method: "GET".to_string(),
-            path: "/v1/models".to_string(),
+            path: path.clone(),
             header_names,
             body_bytes: 0,
         },
         &[],
         &[],
+        verdict,
     );
     let body = if headers.contains_key("anthropic-version") {
         json!({
             "data": [
                 { "type": "model", "id": DEFAULT_MODEL, "display_name": "Fake Model 1",
                   "context_window": 200_000 },
-                { "type": "model", "id": "fake/model-1m", "display_name": "Fake Model 1M",
-                  "context_window": 1_048_576 },
-                { "type": "model", "id": "claude-fake-shared", "display_name": "Claude Fake" }
+                { "type": "model", "id": "claude-fake-only", "display_name": "Claude Fake Only" }
             ],
             "has_more": false,
         })
@@ -676,17 +987,34 @@ async fn models(State(gateway): State<Arc<GatewayInner>>, headers: HeaderMap) ->
             "object": "list",
             "data": [
                 { "id": DEFAULT_MODEL, "object": "model", "context_length": 200_000 },
-                { "id": "fake/model-1m", "object": "model", "context_length": 1_048_576 },
-                { "id": "passthrough/fake-evolving", "object": "model" },
-                { "id": "claude-fake-shared", "object": "model" }
+                { "id": "fake/model-1-1m", "object": "model", "context_length": 1_048_576 },
+                { "id": "passthrough/fake-evolving", "object": "model" }
             ],
         })
     };
-    json_response(200, &body)
+    let mut response = json_response(200, &body);
+    apply_configured_headers(response.headers_mut(), &gateway.response_headers());
+    response
 }
 
 fn json_response(code: u16, body: &Value) -> Response {
     encode_response(code, "application/json", body.to_string(), None)
+}
+
+/// Attach the configured extra response headers.
+///
+/// Applied last so a test can override a default (`content-type`), and skipped
+/// silently for a name that is not a valid header — a fixture should not fail a
+/// test over its own configuration.
+fn apply_configured_headers(headers: &mut axum::http::HeaderMap, configured: &[(String, String)]) {
+    for (name, value) in configured {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::try_from(name.as_str()),
+            axum::http::HeaderValue::try_from(value.as_str()),
+        ) {
+            headers.append(name, value);
+        }
+    }
 }
 
 fn error_body(code: u16, error_type: &str, message: &str, retry_after_secs: u64) -> Response {
@@ -778,8 +1106,10 @@ fn sse_response(text: &str, abort: bool) -> Response {
             }),
         );
     }
-    // A truncated SSE document stops here: the last `data:` line has no
-    // terminating blank line, and the stream never reaches `message_stop`.
+    // A truncated SSE document: the deltas are there, but the stream stops
+    // before `content_block_stop` / `message_delta` / `message_stop`, so a
+    // consumer sees the answer begin and never complete. That is the failure a
+    // relay has to notice and report rather than pass off as a clean end.
     let body = if abort {
         out
     } else {

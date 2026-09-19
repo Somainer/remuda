@@ -6,6 +6,8 @@ use futures::{SinkExt, StreamExt};
 use remuda_hub::{HubConfig, spawn};
 use remuda_protocol::HostId;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -116,11 +118,17 @@ async fn connect_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -
 }
 
 /// Reads every RPC frame off the socket and never replies, so the Hub's
-/// pending table fills.
-fn park_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -> JoinHandle<()> {
+/// pending table fills. Returns a counter of inbound RPC frames the Node saw.
+fn park_node(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    host_id: &str,
+) -> (JoinHandle<()>, Arc<AtomicUsize>) {
     let bearer = bearer.to_string();
     let host_id = host_id.to_string();
-    tokio::spawn(async move {
+    let frames = Arc::new(AtomicUsize::new(0));
+    let node_frames = frames.clone();
+    let handle = tokio::spawn(async move {
         let Ok(mut node) = connect_node(addr, &bearer, &host_id).await else {
             return;
         };
@@ -131,6 +139,9 @@ fn park_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -> JoinHan
             let Ok(frame) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
+            if frame.get("method").is_some() && frame.get("id").is_some() {
+                node_frames.fetch_add(1, Ordering::SeqCst);
+            }
             if frame.get("method").and_then(Value::as_str) == Some("host.resources") {
                 let id = frame.get("id").cloned().unwrap_or(Value::Null);
                 let reply = json!({
@@ -147,7 +158,8 @@ fn park_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -> JoinHan
                 }
             }
         }
-    })
+    });
+    (handle, frames)
 }
 
 #[tokio::test]
@@ -156,7 +168,8 @@ async fn saturated_control_budget_refuses_create_with_503_and_fails_row() -> Res
     let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
     let cookie = login(hub.addr, &hub.bootstrap_token).await?;
     let host_id = HostId::new().as_id().as_str().to_string();
-    let _node = park_node(hub.addr, &enroll_token(hub.addr, &cookie).await?, &host_id);
+    let (_node, node_frames) =
+        park_node(hub.addr, &enroll_token(hub.addr, &cookie).await?, &host_id);
     // Wait for the link to register as online.
     for _ in 0..100 {
         let (status, _, body) =
@@ -189,7 +202,17 @@ async fn saturated_control_budget_refuses_create_with_503_and_fails_row() -> Res
             })
         })
         .collect();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Prove the precondition instead of sleeping: wait until the fake Node has
+    // actually received all 32 parked worktree.list frames, so each occupies a
+    // Hub pending slot. (A gated HTTP probe would itself park for 60 s.)
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while node_frames.load(Ordering::SeqCst) < 32 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("fake Node never received the 32 parked control frames");
 
     // The create frame is refused before it reaches the Node: 503 NODE_BUSY,
     // never a 200 with a reconciling command.

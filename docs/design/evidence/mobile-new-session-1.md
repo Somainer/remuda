@@ -2,7 +2,7 @@
 
 - 日期：2026-09-19
 - 分支：`wt/c-mobilenew/b-mobilenew-md` · 任务 c-mobilenew（a phone can always create a session; bulk screen reads must never starve control RPCs）
-- Base（round 2 后）：`origin/main` @ b0dd8389
+- Base（round 3 后）：`origin/main` @ d1f4fe95
 - 规格：本任务书 §1–§5；`web/tests/e2e/ux-mobile-new.hub.spec.ts`
 
 ## 1. 复现的拒绝（修前必红）
@@ -97,11 +97,14 @@ Rust 集成测试 `crates/remuda-hub/tests/node_busy.rs`：用一个永不回复
 ### 2.5 fake Node：运行时门控，无环境变量（`hub_e2e.rs`；评审 3/4/7）
 
 - 删除 round 1 的 `HUB_E2E_EXITED_INSTANCES` / `HUB_E2E_SCREEN_DELAY_MS` / READY 附加字段。
-- 唯一开关是运行时门控文件 `$TMPDIR/remuda-e2e-rpc-gate`：存在时 fake Node 把
-  **tty.screen（只读半区）和 worktree.list（控制半区）**的帧停在帧队列里（已占 Hub
-  pending 槽、不回复），删除后原帧重新入队、走各自常规分支。门控默认不存在，且文件在启动和
-  Ctrl-C 时都会被清掉；**不启用门控时 fake Node 的每一个回复与 base 完全一致**——
-  特别地，`tty.screen` 现在只有**一个** match arm：
+- 唯一开关是运行时门控文件，**文件名带监听端口**
+  `$TMPDIR/remuda-e2e-rpc-gate-<listen-port>`（hub_e2e 与 spec 用同一推导，不依赖两端
+  TMPDIR 是否同一个字面值，并发 hub/spec 不共享门控）：存在时 fake Node 把
+  **tty.screen（只读半区）、workspace.list 与 worktree.list（GET /v1/hosts/.../workspaces
+  与 /v1/worktrees 实际发的控制 RPC）**的帧停在帧队列里（已占 Hub pending 槽、不回复），
+  删除后原帧重新入队、走各自常规分支。门控默认不存在，且文件在启动和 Ctrl-C 时都会被清掉；
+  **不启用门控时 fake Node 的每一个回复与 base 完全一致**——
+  特别地，`tty.screen` 只有**一个** match arm：
   `if cooked-buffer（c-nextstep 的屏幕哨兵行；本分支留空钩子）→ 屏幕行`
   `else → send_rpc_ok({ ok: true })`（base 原回复），c-nextstep 落地时把哨兵集合折进同一个
   arm，不会产生重复字面 arm。
@@ -110,25 +113,32 @@ Rust 集成测试 `crates/remuda-hub/tests/node_busy.rs`：用一个永不回复
 
 `web/tests/e2e/ux-mobile-new.hub.spec.ts` 在**未改动的 `playwright.hub.config.ts`**、无任何
 额外环境变量下运行。已退出行由 spec 自己通过 `page.request` 真实创建 claude-pty 实例再
-`instance.close`（fake Node 会写真实 exited lifecycle 事件）得到；断言只统计本 run 创建的
-id 的 `/screen`，卡片数用「不少于」，落点显式校验属于本 run（评审 5）。三例：
+`instance.close`（fake Node 会写真实 exited lifecycle 事件）得到，并在 afterEach 用 force
+删除全部 42 行，恢复共享面板。断言只统计本 run 创建的 id 的 `/screen`，卡片数用「不少于」，
+落点显式打开本 run 的会话（不假设共享 hub 上首个 tab 是谁）。三例：
 
 1. **14 个已退出行：0 个 /screen、0 个 500，两次创建都打开新会话页**（列表一次、会话页
    dimmed 弹层一次）。
-2. **真实 Hub 控制半区饱和**：门控停住 32 个控制类调用（20 worktree.list + 占用其余槽的
-   screen），UI 真实点 开始 → POST 真正返回 **503 NODE_BUSY + retryAfterMs**，弹层就地显示
-   `NODE_BUSY · …`、表单保留、开始可再点；不再使用 `page.route` 桩（评审 2）。
-3. **读饱和时创建仍成功**：门控停住 16 个 screen，40 个并发读 → 多出来的为 503 NODE_BUSY、
-   0 个 500；UI 真实创建成功。
+2. **真实 Hub 全链路饱和（round 3 修正）**：门控停住 40 个**控制类** GET /v1/worktrees
+   （60 s node 超时，分布在 8 个独立 request context 上——单 context 的 ~6 条 HTTP/1.1
+   连接撑不起 32 个在途调用）；饱和先用「2 s 内必须拿到同步 503」的探针证明（被接纳的探针
+   保持 context 存活、不释放服务端槽），再打开弹层 UI 真实点 开始 → POST 真正返回
+   **503 NODE_BUSY + retryAfterMs**，弹层就地显示 `NODE_BUSY · …`、表单保留、开始可再点。
+   round 2 用 screen（5 s 超时）凑数的做法在负载下会自己放开槽位，已废弃。
+3. **读饱和时创建仍成功（round 3 修正）**：跨多个 request context 持续发出 screen 读，
+   **创建 POST 进行中保持 ≥16 个读在途**（1 s 再发一次，远短于 5 s 读超时；不再是发完就等），
+   同时再发的读拿到 503 NODE_BUSY；创建使用保留的控制半区返回 200，0 个 500。
 
 ```
-# 标准 hub config（仅给本 worker 分配端口），无 HUB_E2E_EXITED_*：
+# 标准 hub config（仅给本 worker 分配端口），无任何 *_EXITED_* 旋钮：
 HUB_E2E_LISTEN=127.0.0.1:59150 HUB_E2E_WEB_PORT=59159 \
 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59151 \
   playwright test --config playwright.hub.config.ts ux-mobile-new.hub.spec.ts
+# round 3 在 d1f4fe95 上连跑四遍：
 = 1 = 3 passed
 = 2 = 3 passed
 = 3 = 3 passed
+= 4 = 3 passed
 ```
 
 全量 hub e2e 套件（`flock e2e.lock-c`，同一套端口、未改 config、无旋钮）整跑通过：

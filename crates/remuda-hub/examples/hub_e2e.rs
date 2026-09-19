@@ -94,8 +94,10 @@ async fn main() -> Result<()> {
     // tty.screen (the bulk-read half) and worktree.list (the control half) —
     // for EVERY instance. Removing the file releases every parked call. It
     // never exists by default, so with no gate every method answers exactly as
-    // before.
-    let rpc_gate = std::env::temp_dir().join("remuda-e2e-rpc-gate");
+    // before. The name is scoped to the listen port: the spec derives the same
+    // path from HUB_E2E_LISTEN, so concurrent hubs/specs never share a gate and
+    // no temp-dir identity has to be assumed across processes.
+    let rpc_gate = std::env::temp_dir().join(format!("remuda-e2e-rpc-gate-{}", addr.port()));
     let _ = std::fs::remove_file(&rpc_gate);
     let (ready_tx, ready_rx) = oneshot::channel();
     let node = tokio::spawn(fake_node(
@@ -362,9 +364,11 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
 }
 
 /// Methods whose replies park while the e2e gate file exists. They are the
-/// fan-out bulk read (tty.screen) and a cheap control RPC (worktree.list), so
-/// a spec can fill either half of the Hub's per-link budget.
-const GATED_METHODS: &[&str] = &["tty.screen", "worktree.list"];
+/// fan-out bulk read (tty.screen) and the cheap control RPCs the Hub issues
+/// before GET /v1/hosts/{id}/workspaces and /v1/worktrees (workspace.list and
+/// worktree.list), so a spec can fill the control half of the per-link budget
+/// with calls that park for their full node timeout.
+const GATED_METHODS: &[&str] = &["tty.screen", "workspace.list", "worktree.list"];
 
 async fn fake_node(
     addr: SocketAddr,

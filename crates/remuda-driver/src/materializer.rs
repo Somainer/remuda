@@ -426,26 +426,10 @@ fn materialize_inner(
             argv = extras;
             input_delivery = InputDelivery::Tty;
             session_id = None;
-            // A granted codex/grok needs its per-kind home pinned because its
-            // D-045 `[mcp_servers]` (or, for grok, the neutralised shadow)
-            // lives there. Only on grant: an ordinary generic-pty agent keeps
-            // inheriting the host's own home so its config/auth still work.
-            let granted = !request.spec.capabilities.is_empty();
-            if granted && request.spec.kind == AgentKind::Codex {
-                push_env(
-                    &mut env_allowlist,
-                    "CODEX_HOME",
-                    EnvAllowlistSource::NativeHome,
-                    None,
-                );
-            } else if granted && request.spec.kind == AgentKind::Grok {
-                push_env(
-                    &mut env_allowlist,
-                    "GROK_HOME",
-                    EnvAllowlistSource::NativeHome,
-                    None,
-                );
-            }
+            // Note: a granted codex on generic-pty is refused at the Node
+            // factory — only shell-pty with hooks materializes the shadow
+            // CODEX_HOME the grant requires, so no CODEX_HOME pin is emitted
+            // here (a partial shadow home would lose the operator's login).
         }
         DriverKind::ShellPty => {
             // Login `$SHELL` under kind `terminal` / `generic`. The agent
@@ -469,6 +453,7 @@ fn materialize_inner(
     let env_names = env_allowlist.iter().map(|e| e.name.clone()).collect();
     let mut credential_refs: Vec<String> = env_allowlist
         .iter()
+        .filter(|e| e.source == EnvAllowlistSource::Credential)
         .filter_map(|e| e.secret_ref.clone())
         .collect();
     if api_key_helper_path.is_some()
@@ -567,15 +552,10 @@ fn apply_capability_grant(
         argv.extend(grant.argv);
     }
     // The handshake name/value is defined by the grant in one place; the value
-    // rides the allowlist entry (Credential-shaped value slot) rather than
-    // being hardcoded at the spawn sites.
+    // rides a dedicated non-secret entry slot (never `secret_ref`, so it is not
+    // audited as a credential reference), applied verbatim at the spawn sites.
     let (name, value) = grant.env;
-    push_env(
-        env_allowlist,
-        name,
-        EnvAllowlistSource::Capability,
-        Some(value.to_owned()),
-    );
+    push_env_value(env_allowlist, name, EnvAllowlistSource::Capability, value);
     files.extend(grant.files);
     Ok((grant.capabilities, vec![grant.mcp_server]))
 }
@@ -745,6 +725,7 @@ fn materialize_shell_pty_agent(
     let env_names = env_allowlist.iter().map(|e| e.name.clone()).collect();
     let credential_refs = env_allowlist
         .iter()
+        .filter(|e| e.source == EnvAllowlistSource::Credential)
         .filter_map(|e| e.secret_ref.clone())
         .collect();
 
@@ -1524,6 +1505,25 @@ fn push_env(
         name: name.to_string(),
         source,
         secret_ref,
+        value: None,
+    });
+}
+
+/// Push a driver-computed non-secret literal (the D-045 handshake value).
+fn push_env_value(
+    allowlist: &mut Vec<EnvAllowlistEntry>,
+    name: &str,
+    source: EnvAllowlistSource,
+    value: &str,
+) {
+    if allowlist.iter().any(|entry| entry.name == name) {
+        return;
+    }
+    allowlist.push(EnvAllowlistEntry {
+        name: name.to_string(),
+        source,
+        secret_ref: None,
+        value: Some(value.to_owned()),
     });
 }
 

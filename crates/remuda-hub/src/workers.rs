@@ -297,12 +297,10 @@ pub(crate) async fn dispatch_core(
         body.placement.as_deref(),
     )
     .await?;
-    // D-045 gate 2: the resolved dispatch host must be macOS and report the
-    // installed capability, checked before anything is provisioned or
-    // persisted (the CLI only covers an explicit --host).
-    if computer_use {
-        crate::inventory::computer_use_preflight(&host).map_err(HubError::BadRequest)?;
-    }
+    // D-045 host preflight is intentionally NOT here: the gate above already
+    // refuses every `computer-use` dispatch because dispatched workers run
+    // unattended (D-045 Q4). If attended dispatch is ever added, a resolved-host
+    // preflight belongs at this point.
     let workspace_id = project
         .members
         .iter()

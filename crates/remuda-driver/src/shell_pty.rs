@@ -2866,11 +2866,8 @@ fn agent_env(
             "CODEX_HOME" | "GROK_HOME" => Some((entry.name.clone(), recipe.native_home.clone())),
             "GROK_DISABLE_AUTOUPDATER" => Some((entry.name.clone(), "1".to_owned())),
             _ if entry.source == crate::recipe::EnvAllowlistSource::Capability => {
-                // D-045 handshake: value rides the grant entry.
-                entry
-                    .secret_ref
-                    .clone()
-                    .map(|value| (entry.name.clone(), value))
+                // D-045 handshake: non-secret value rides the grant entry.
+                entry.value.clone().map(|value| (entry.name.clone(), value))
             }
             _ => None,
         })

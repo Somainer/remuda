@@ -332,30 +332,11 @@ pub(crate) fn materialize_grant(
     };
 
     // Codex reads `[mcp_servers.*]` in its shadow `config.toml`, never argv.
-    // The file is written from the recipe on EVERY codex path: shell-pty with
-    // hooks on gets the complete file (features + hook trust + MCP) from
-    // HookSession, which overwrites this one; hooks off keeps it — so a grant
-    // is never silently granted-but-undelivered. Appending is idempotent.
-    if kind == AgentKind::Codex {
-        let shadow_files = crate::launch::materialize_codex_mcp_servers(
-            launch_dir,
-            &[crate::launch::ShadowMcpServer {
-                name: mcp_server.name.clone(),
-                command: mcp_server.command.clone(),
-                args: mcp_server.args.clone(),
-                env: mcp_server.env.clone(),
-            }],
-        )?;
-        for file in shadow_files {
-            files.push(MaterializedFile {
-                path: file.path.to_string_lossy().into_owned(),
-                role: FileRole::CapabilityMcpConfig,
-                mode: "0600".to_owned(),
-                content_digest: file.digest,
-                lifetime: FileLifetime::Launch,
-            });
-        }
-    }
+    // That shadow home is materialized by the shell-pty HookSession (the only
+    // codex carrier the Node gate permits for a grant); the session splices
+    // `mcp_server` into the complete features+trust+MCP config. The materializer
+    // itself writes no codex config.toml — a partial home would shadow the
+    // operator's login.
 
     // Mount by AgentKind, never by driver (design §3.3): codex takes the
     // shadow config.toml; claude (however hosted) takes argv.
@@ -413,10 +394,12 @@ fn write_skill_tree(
     lifetime: FileLifetime,
     files: &mut Vec<MaterializedFile>,
 ) -> DriverResult<()> {
-    let root = native_home.join("skills").join(SKILL_DIR);
+    let skills_root = native_home.join("skills");
+    let root = skills_root.join(SKILL_DIR);
 
     // Create + 0700 every directory component the files occupy, starting at
-    // the tree root (create_dir_all alone leaves intermediate dirs at umask).
+    // `native_home/skills` (create_dir_all alone leaves intermediate dirs at
+    // umask, including the skills root itself).
     let mut dirs: Vec<PathBuf> = EMBEDDED_SKILL
         .iter()
         .filter_map(|file| {
@@ -429,6 +412,7 @@ fn write_skill_tree(
     dirs.sort();
     dirs.dedup();
     fs::create_dir_all(&root)?;
+    set_dir_mode(&skills_root, 0o700)?;
     set_dir_mode(&root, 0o700)?;
     for dir in &dirs {
         fs::create_dir_all(dir)?;

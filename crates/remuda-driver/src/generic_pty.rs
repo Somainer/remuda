@@ -331,7 +331,7 @@ impl GenericPtyDriver {
             // REMUDA_ deny prefix; the value rides the grant entry.
             .filter(|entry| entry.name == crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV)
         {
-            if let Some(value) = entry.secret_ref.as_deref() {
+            if let Some(value) = entry.value.as_deref() {
                 env.insert(entry.name.clone(), value.to_owned());
             }
         }

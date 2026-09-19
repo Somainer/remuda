@@ -100,6 +100,7 @@ impl FakeDriver {
                 name: "CLAUDE_CONFIG_DIR".into(),
                 source: EnvAllowlistSource::NativeHome,
                 secret_ref: None,
+                value: None,
             }],
             materialized_files: vec![],
             setting_sources: vec!["user".into(), "project".into(), "local".into()],

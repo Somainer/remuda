@@ -290,6 +290,7 @@ mod tests {
     use super::*;
     use remuda_protocol::{AgentKind, HostId, Id, InstanceId, RunId};
     use remuda_signal::{BusContext, HookEnvelope};
+    use std::fs;
     use tokio::sync::mpsc;
 
     fn options(dir: &Path) -> HookSessionOptions {
@@ -420,5 +421,72 @@ mod tests {
         assert_eq!(binding.pid, 4242);
         assert_eq!(binding.session_id, "0199a1f0-0000-7000-8000-000000000000");
         assert_eq!(binding.transcript_path.as_deref(), Some("/w/s.jsonl"));
+    }
+
+    /// D-045 leg (b) real shell-pty path: the granted codex MCP server splices
+    /// into the complete shadow `config.toml` HookSession materializes, and a
+    /// pre-existing MCP table (e.g. a recipe-written partial file) survives the
+    /// full materialization intact rather than being erased.
+    #[tokio::test]
+    async fn codex_hook_session_splices_granted_mcp_server_into_shadow_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch_dir = dir.path().join("launch");
+        let shadow_home = launch_dir.join("codex-home");
+        fs::create_dir_all(&shadow_home).unwrap();
+        // Simulate the recipe's partial MCP-only config that would otherwise
+        // leave the granted server undelivered on a carrier without hooks.
+        let preexisting =
+            "[mcp_servers.\"codex-computer-use\"]\ncommand = \"/bin/sh\"\nargs = [\"/old\"]\n";
+        fs::write(shadow_home.join("config.toml"), preexisting).unwrap();
+
+        let mut options = options(dir.path());
+        options.kind = AgentKind::Codex;
+        options.mcp_servers = vec![crate::launch::ShadowMcpServer {
+            name: "codex-computer-use".to_owned(),
+            command: "/bin/sh".to_owned(),
+            args: vec!["/x/launch/cua/scripts/launch-cua-repl.sh".to_owned()],
+            env: vec![
+                ("REMUDA_CAPABILITY_COMPUTER_USE".to_owned(), "1".to_owned()),
+                ("REMUDA_CODEX_HOME".to_owned(), "/Users/u/.codex".to_owned()),
+            ],
+        }];
+        let session = HookSession::start(&options, bus().0).expect("hook session starts");
+        session.shadow.as_ref().expect("codex has a shadow home");
+
+        let text = fs::read_to_string(shadow_home.join("config.toml")).unwrap();
+        let parsed: toml::Table = text.parse().expect("shadow config parses");
+        // Features + hook trust (the full materialize_codex file) remain; the
+        // trust table key is `<hooks.json>:<event>:0:0`, so assert structurally.
+        assert_eq!(parsed["features"]["hooks"].as_bool(), Some(true));
+        assert!(
+            parsed["hooks"]["state"]
+                .as_table()
+                .is_some_and(|state| state
+                    .keys()
+                    .any(|key| key.contains(":permission_request:0:0"))),
+            "hook trust entry survives: {text}"
+        );
+        // Granted server is present exactly once, with the spliced env.
+        let server = &parsed["mcp_servers"]["codex-computer-use"];
+        assert_eq!(server["command"].as_str(), Some("/bin/sh"));
+        assert_eq!(
+            server["args"][0].as_str(),
+            Some("/x/launch/cua/scripts/launch-cua-repl.sh")
+        );
+        assert_eq!(
+            server["env"]["REMUDA_CAPABILITY_COMPUTER_USE"].as_str(),
+            Some("1")
+        );
+        assert_eq!(
+            server["env"]["REMUDA_CODEX_HOME"].as_str(),
+            Some("/Users/u/.codex")
+        );
+        assert_eq!(
+            text.matches("[mcp_servers.\"codex-computer-use\"]").count(),
+            1,
+            "the table must be spliced once, not duplicated: {text}"
+        );
+        // No stale /old argument survives.
+        assert!(!text.contains("/old"));
     }
 }

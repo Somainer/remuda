@@ -161,54 +161,98 @@ Claude, granted, managed home:
 ```text
 driver: ClaudePrint; kind: claude
 argv: … --mcp-config /…/launch/mcp-cua.json
-env_allowlist: [Capability REMUDA_CAPABILITY_COMPUTER_USE=<redacted handshake>]
+env_allowlist:
+  - { name: "REMUDA_CAPABILITY_COMPUTER_USE",
+      source: "capability",
+      # the handshake value rides a dedicated non-secret slot:
+      value: "1", secretRef: null }
 capabilities: ["computer-use"]
-mcp_servers: [{name: "codex-computer-use",
-               env: [REMUDA_CAPABILITY_COMPUTER_USE=1,
-                     REMUDA_CODEX_HOME=/Users/<operator>/.codex]}]
+mcp_servers:
+  - { name: "codex-computer-use",
+      configPath: "/…/launch/mcp-cua.json",
+      env: [ { "REMUDA_CAPABILITY_COMPUTER_USE": "1" },
+             { "REMUDA_CODEX_HOME": "/Users/<operator>/.codex" } ] }
 materialized_files:
   0600 /…/launch/mcp-cua.json                 CapabilityMcpConfig Launch
   0755 /…/launch/cua/scripts/launch-cua-repl.sh CapabilityScript   Launch
   0755 /…/launch/cua/scripts/launch-mcp.sh      CapabilityScript   Launch
   0600 <native-home>/skills/codex-computer-use/{5 files} CapabilitySkill
         (Launch for per-instance home; NativeStore for a shared dir)
-audit: prohibited_options_checked=true; approval_authority=RuntimeHost
+audit:
+  credentialRefs: []          # handshake rides value, never secretRef
+  prohibitedOptionsChecked: true
+  approvalAuthority: RuntimeHost
 ```
 
-Codex, granted (shell-pty hooks on):
+Codex, granted (shell-pty + hooks ON — the only delivered codex shape).
+
+The **LaunchRecipe** itself (what the materializer produces; faithful fields):
 
 ```text
 driver: ShellPty; kind: codex
-argv: <none for the MCP>   (server read from $CODEX_HOME/config.toml)
-env_allowlist: [NativeHome CODEX_HOME=/…/launch/codex-home,
-                Capability REMUDA_CAPABILITY_COMPUTER_USE=<redacted>]
-mcp_servers: same env as above
-materialized_files includes 0600
-  /…/launch/codex-home/config.toml           CapabilityMcpConfig Launch
-  ([features] hooks=true + [hooks.state.*] preserved; [mcp_servers] appended)
+argv: []                      # codex never gets --mcp-config
+env_allowlist:
+  - { name: "CODEX_HOME", source: "nativeHome" }
+        # resolved value = <instance>/launch/codex-home (the SHADOW home)
+  - { name: "REMUDA_CAPABILITY_COMPUTER_USE", source: "capability",
+      value: "1", secretRef: null }
+capabilities: ["computer-use"]
+mcp_servers:
+  - { name: "codex-computer-use",
+      env: [ { "REMUDA_CAPABILITY_COMPUTER_USE": "1" },
+             { "REMUDA_CODEX_HOME": "/Users/<operator>/.codex" } ] }
+materialized_files from the recipe: NO codex-home/config.toml
+        # the recipe does not write a partial shadow home; only HookSession does
 ```
+
+The shadow value and the `[mcp_servers.codex-computer-use]` table are applied
+**after** the recipe, by `HookSession::start` →
+`launch::shadow::materialize_codex` (session.rs), which reads
+`recipe.mcp_servers` and writes the complete shadow config at
+`<instance>/launch/codex-home/config.toml` (`[features]` + `[hooks.state.*]` +
+the granted server). The `child_env_with` shims export the recipe's
+`CODEX_HOME` (shadow) to the child, while the MCP server entry's
+`REMUDA_CODEX_HOME` (real home) reaches only the launcher process. The
+session.rs test `codex_hook_session_splices_granted_mcp_server_into_shadow_config`
+asserts the real file parses with features+trust+server (table exactly once).
+
+**Codex on every other carrier is refused at the Node factory, not delivered:**
+the non-hook paths would point codex at a shadow home containing only the MCP
+table (no `auth.json`, no user config), silently losing the operator's login.
+Node tests `granted_codex_is_refused_on_shell_pty_with_hooks_off` and
+`..._on_generic_pty` assert the named refusal.
 
 Ungranted (both kinds): `capabilities: []`, `mcp_servers: []`, no
 `mcp-cua.json`, no `cua/`, no skill tree, no handshake env — the boundary.
 
 ## Tests
 
-- `crates/remuda-driver/tests/cua_capability.rs` (16): embedded-vs-source
-  digest + file set + 0700 dirs; managed/inherited/shared homes and cleanup;
-  claude argv mount; codex MCP entry carries the real home while agent env
-  doesn't; generic-pty writes+pins its own shadow config; unknown/origin/
-  claude-bypass/**codex-never**/kind refusals; both `--mcp-config` forms
-  before writes; narrow deny hole; recipe JSON.
-- `crates/remuda-driver/src/launch/shadow/tests.rs`: MCP table parses while
-  features/trust survive.
+- `crates/remuda-driver/tests/cua_capability.rs` (17): embedded-vs-source
+  digest + file set + 0700 dirs (incl. `native_home/skills`); managed/
+  inherited/shared homes and cleanup; claude argv mount; codex MCP entry
+  carries the absolute real home (ambient-env-independent) while agent env
+  doesn't; non-shell codex writes/pins nothing; unknown/origin/claude-bypass/
+  **codex-never**/kind refusals; both `--mcp-config` forms before writes;
+  narrow deny hole (no other Capability-tagged REMUDA_ name); handshake rides
+  `value`, no `secretRef`, empty `credentialRefs`.
+- `crates/remuda-driver/src/launch/session.rs` test: the real shell-pty
+  HookSession output parses with features+trust+server (table exactly once),
+  including overwrite of a pre-existing partial config.
 - `crates/remuda-testing/tests/cua_capability.rs` (2): real ClaudePrintDriver
   spawn of an env/argv dumper — granted child sees handshake + config path;
   ungranted sees neither.
-- `crates/remuda-node/tests/computer_use_preflight.rs` (5): pure
-  `(kind, os, cli-row)` gate classifications.
-- `crates/remuda/tests/cua_cli.rs` (8): help on both verbs; unknown value;
-  unreported/not-installed/non-macOS hosts; happy preflight; dispatch refused
-  for **claude and codex**; kind refusal.
+- `crates/remuda-node` lib tests (2): factory refusal for granted codex on
+  shell-pty hooks-off and on generic-pty; pure `(kind, os, cli-row)` gate
+  classifications (5).
+- `crates/remuda/tests/cua_cli.rs` (8) and
+  `crates/remuda/tests/mcp_hub.rs::agent_scoped_…`: host/value/kind refusals;
+  dispatch refused for claude and codex; an **instance-scoped agent token**
+  creates without capabilities despite GET /v1/hosts returning 403, and is
+  refused loudly (not silently dispatched) with capabilities when the host
+  cannot be verified.
+- `crates/remuda-hub/tests/workers.rs`: dispatch refuses computer-use for both
+  harnesses with no provisioning; unknown value refused; create refuses
+  claude `bypassPermissions` and codex `never`/`no-request` and names both.
 - Hub inventory unit tests: name validation + every host-shape classification.
 
 ## Q1 live probe — NOT PASSED

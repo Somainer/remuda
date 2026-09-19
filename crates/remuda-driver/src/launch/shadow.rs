@@ -34,7 +34,6 @@ use crate::error::{DriverError, DriverResult};
 use remuda_protocol::{AgentKind, Digest};
 use serde_json::{Value, json};
 use sha2::Digest as _;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// (PascalCase event, snake_case hash-key event) for codex.
@@ -283,52 +282,6 @@ pub fn codex_trust_hash(event_snake: &str, command: &str, timeout_secs: u64) -> 
     let digest = sha2::Sha256::digest(canonical.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("sha256:{hex}")
-}
-
-/// Append granted MCP servers to the codex shadow home without owning the hook
-/// side of `config.toml`.
-///
-/// The shell-pty carrier materializes the whole shadow, with features and
-/// hook trust plus the MCP servers, through [`materialize_codex`] in
-/// `HookSession`; the generic-pty codex path has no hook session, so the
-/// materializer calls this to deliver the MCP leg on its own. An existing
-/// config is preserved byte-for-byte apart from the appended tables, and a
-/// duplicated re-grant does not double-write.
-pub fn materialize_codex_mcp_servers(
-    launch_dir: &Path,
-    servers: &[ShadowMcpServer],
-) -> DriverResult<Vec<ShadowFile>> {
-    if servers.is_empty() {
-        return Ok(Vec::new());
-    }
-    let home = launch_dir.join("codex-home");
-    fs::create_dir_all(&home)?;
-    let config_path = home.join("config.toml");
-    let existing = if config_path.is_file() {
-        fs::read_to_string(&config_path)?
-    } else {
-        String::new()
-    };
-    let mut config = existing.clone();
-    for server in servers {
-        let marker = format!("[mcp_servers.{}]", toml_basic_string(&server.name));
-        if config.contains(&marker) {
-            continue;
-        }
-        let section = render_mcp_servers(std::slice::from_ref(server));
-        if !config.is_empty() && !config.ends_with('\n') {
-            config.push('\n');
-        }
-        config.push_str(&section);
-    }
-    if config != existing {
-        write_private(&config_path, config.as_bytes(), 0o600)?;
-    }
-    Ok(vec![ShadowFile {
-        path: config_path,
-        role: "codex-config-mcp",
-        digest: hash_bytes(config.as_bytes())?,
-    }])
 }
 
 /// Render granted MCP servers as codex `config.toml` tables.

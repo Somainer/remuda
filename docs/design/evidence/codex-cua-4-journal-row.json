@@ -1,0 +1,45 @@
+{
+  "instanceId": "ins_01a0b84c-b2cb-77fb-bc9f-9dbac6ed27df",
+  "seq": 7,
+  "eventId": "evt_01a0b84c-bd15-77eb-a1c0-249cfea34744",
+  "event": {
+    "kind": "tool_result",
+    "payload": {
+      "nodeId": "obj_cua_get_app_state_1",
+      "revision": "2",
+      "operation": "close",
+      "baseRevision": "1",
+      "toolCallId": "obj_cua_get_app_state_1",
+      "stage": "final",
+      "outcome": "succeeded",
+      "blocks": [
+        {
+          "type": "text",
+          "text": "window state captured"
+        },
+        {
+          "type": "image",
+          "objectId": "obj_01a0b84c-bd0f-73d1-8f05-01bbe48084dd",
+          "mediaType": "image/png",
+          "name": "screen-1.png",
+          "size": 70
+        }
+      ],
+      "structuredResult": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "exitCode": {
+        "state": "unknown",
+        "reason": "not-emitted",
+        "evidenceEventIds": []
+      },
+      "changes": []
+    },
+    "eventId": "evt_01a0b84c-bd15-77eb-a1c0-249cfea34744",
+    "seq": "7",
+    "instanceId": "ins_01a0b84c-b2cb-77fb-bc9f-9dbac6ed27df"
+  },
+  "observedAt": "2026-09-19T06:13:52.021Z"
+}

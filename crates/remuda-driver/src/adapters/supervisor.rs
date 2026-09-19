@@ -21,8 +21,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::{
-    AdapterHome, AdapterObservation, CodexAdapter, FileSignalAdapter, GrokAdapter, StampCtx,
-    next_seq, stamp,
+    AdapterHome, AdapterObservation, CodexAdapter, FileSignalAdapter, GrokAdapter, GrokLive,
+    LiveIdentity, StampCtx, next_seq, stamp,
 };
 use crate::error::DriverResult;
 use crate::launch::HookSession;
@@ -114,7 +114,17 @@ pub fn spawn_file_adapters(
             }
             Ok(Some(run(adapter, ctx)))
         }
-        AgentKind::Grok => Ok(Some(run(GrokAdapter::new(ctx.home.clone()), ctx))),
+        AgentKind::Grok => {
+            // The file-tier live fold (turn.live phases, question
+            // interactions) wraps the plain frame translator.
+            let adapter = GrokAdapter::new(ctx.home.clone());
+            let identity = LiveIdentity {
+                instance_id: ctx.stamp.instance_id.clone(),
+                host_id: ctx.stamp.host_id.clone(),
+                run_id: ctx.stamp.run_id.clone(),
+            };
+            Ok(Some(run(GrokLive::new(adapter, identity), ctx)))
+        }
         _ => Ok(None),
     }
 }

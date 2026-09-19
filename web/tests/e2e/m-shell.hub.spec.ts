@@ -185,10 +185,17 @@ test.describe("390px phone", () => {
 
     // 新建 keeps the shared new-session route (no redirect either side);
     // from home it carries the active space like the desktop rail's +.
-    // With no stored space preference the first space is the fixture's
-    // wsp_g2_changed ("changed" sorts first), so the carry is asserted
-    // concretely rather than accepting the bare route.
+    // Select a known space first (this test's session lives in another
+    // space), then assert the carry concretely rather than accepting the
+    // bare route.
     await page.goto("/m");
+    const changedChip = page
+      .getByTestId("space-chip")
+      .filter({ hasText: /^changed/ })
+      .first();
+    await changedChip.click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(changedChip).toHaveAttribute("aria-pressed", "true");
     await page.getByTestId("phone-nav-new").click();
     await expect(page).toHaveURL(/\/sessions\/new\?/);
     const newUrl = new URL(page.url());

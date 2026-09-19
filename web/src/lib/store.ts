@@ -10,6 +10,7 @@ import type { AttachmentRef } from "./attachments";
 import { mapWorkspace, mergeHostWorkspaces } from "../features/workspaces/registry";
 import {
   api,
+  isScreenNodeBusy,
   observationText,
   type InstanceCreateSpec,
   type PasskeyAssertionBody,
@@ -87,6 +88,16 @@ export type EffortPending = {
 
 /** Pending entries older than this without a verdict are dropped. */
 const EFFORT_PENDING_MAX_AGE_MS = 30 * 60_000;
+
+/**
+ * Bulk screen reads fan out one per listed row; cap the fan-out so even a long
+ * list (the 2026-09-19 phone repro) stays far under the Hub's per-Node
+ * bulk-read sub-budget and can never press the control reservation.
+ */
+const SCREEN_READ_CONCURRENCY = 4;
+
+/** A process that is gone has no screen to read; never ask the Node for one. */
+const SCREEN_SKIP_LIFECYCLES: ReadonlySet<Instance["lifecycle"]> = new Set(["exited", "failed"]);
 
 /** A model switch in flight (mirrors EffortPending). */
 export type ModelPending = {
@@ -378,6 +389,13 @@ class HubStore {
   private subs = new Map<Id, Id>();
   private bootGen = 0;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Screen-read scheduler: queue, single-flight set, in-flight counter. */
+  private screenQueue: Id[] = [];
+  private screenPending = new Set<Id>();
+  private screenInFlight = 0;
+  /** Per-row NODE_BUSY back-off: don't re-enqueue before this timestamp. */
+  private screenBackoffUntil = new Map<Id, number>();
+  private screenBackoffTimers = new Map<Id, ReturnType<typeof setTimeout>>();
   private stopWorkspaceFollow: (() => void) | null = null;
 
   subscribe = (listener: Listener) => {
@@ -1397,7 +1415,7 @@ class HubStore {
 
   async sendKeys(instanceId: Id, key: PtyKey) {
     await api.instanceKeys(instanceId, key);
-    await this.refreshScreen(instanceId);
+    await this.refreshScreen(instanceId).catch(() => undefined);
   }
 
   async createWorktree(spec: WorktreeCreateSpec) {
@@ -1414,7 +1432,14 @@ class HubStore {
   }
 
   async refreshScreen(instanceId: Id) {
-    let read = await api.screenRead(instanceId, 80);
+    let read;
+    try {
+      read = await api.screenRead(instanceId, 80);
+    } catch (err) {
+      // NODE_BUSY is a refusal, not a screen: let the scheduler back off.
+      if (isScreenNodeBusy(err)) throw err;
+      read = { lines: [] };
+    }
     if (!read.lines.length) {
       read = latestScreenFromObservations(this.state.events[instanceId] ?? []);
     }
@@ -1427,8 +1452,77 @@ class HubStore {
     });
   }
 
-  async refreshScreens(instanceIds: Id[]) {
-    await Promise.all(instanceIds.map((id) => this.refreshScreen(id)));
+  /**
+   * Poll screens for a batch of rows under the bulk-read contract:
+   *
+   * - exited/failed instances are never asked (the process is gone);
+   * - at most {@link SCREEN_READ_CONCURRENCY} reads are in flight and each
+   *   row is single-flight, so the 2.5 s list poll cannot stack duplicates;
+   * - ids keep the caller's order — the list passes visible rows first;
+   * - a NODE_BUSY refusal parks the row for the Hub's retry hint instead of
+   *   logging or surfacing an error.
+   *
+   * Fire-and-forget on purpose: the list polls on an interval and must never
+   * await a fan-out.
+   */
+  refreshScreens(instanceIds: Id[]) {
+    const now = Date.now();
+    for (const id of instanceIds) {
+      if (this.screenPending.has(id)) continue;
+      if (now < (this.screenBackoffUntil.get(id) ?? 0)) continue;
+      const instance = this.state.instances.find((row) => row.id === id);
+      if (!instance || SCREEN_SKIP_LIFECYCLES.has(instance.lifecycle)) continue;
+      this.screenPending.add(id);
+      this.screenQueue.push(id);
+    }
+    this.pumpScreenReads();
+  }
+
+  /**
+   * Synchronous admission loop: it only launches (never awaits) reads, so the
+   * in-flight counter cannot race between two callers. Completion callbacks
+   * re-pump from outside this frame.
+   */
+  private pumpScreenReads() {
+    while (this.screenInFlight < SCREEN_READ_CONCURRENCY) {
+      const id = this.screenQueue.shift();
+      if (!id) break;
+      // Re-check at dequeue: a row may have exited while queued behind others.
+      const instance = this.state.instances.find((row) => row.id === id);
+      if (!instance || SCREEN_SKIP_LIFECYCLES.has(instance.lifecycle)) {
+        this.screenPending.delete(id);
+        continue;
+      }
+      this.screenInFlight += 1;
+      void this
+        .runScreenRead(id)
+        .catch(() => undefined)
+        .finally(() => {
+          this.screenInFlight -= 1;
+          this.screenPending.delete(id);
+          this.pumpScreenReads();
+        });
+    }
+  }
+
+  private async runScreenRead(instanceId: Id) {
+    try {
+      await this.refreshScreen(instanceId);
+    } catch (err) {
+      if (!isScreenNodeBusy(err)) return;
+      // Back off exactly this row for one poll cycle; intervening interval
+      // ticks skip it via screenBackoffUntil, and no error reaches the console.
+      const retryAfterMs = err.retryAfterMs;
+      this.screenBackoffUntil.set(instanceId, Date.now() + retryAfterMs);
+      const oldTimer = this.screenBackoffTimers.get(instanceId);
+      if (oldTimer) clearTimeout(oldTimer);
+      const timer = setTimeout(() => {
+        this.screenBackoffTimers.delete(instanceId);
+        this.screenBackoffUntil.delete(instanceId);
+        this.refreshScreens([instanceId]);
+      }, retryAfterMs);
+      this.screenBackoffTimers.set(instanceId, timer);
+    }
   }
 
   /**

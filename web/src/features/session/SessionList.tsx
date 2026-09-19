@@ -179,13 +179,50 @@ export function SessionList({
   // The notice belongs to the Space that triggered it; a later Space retires it.
   const notice = droppedNotice.spaceId === spaceId ? droppedNotice.chips : [];
 
+  // Rows currently on screen (IntersectionObserver), so the screen poll can
+  // prefer them. The viewport root stays correct inside an overflow
+  // container: intersection accounts for clipping by intermediate scrollers.
+  const listRootRef = useRef<HTMLDivElement | null>(null);
+  const visibleRows = useRef<Set<Id>>(new Set());
+  const filteredKey = filtered.map((instance) => instance.id).join(",");
+
   useEffect(() => {
-    if (variant !== "full" || !ptyKey) return;
-    const ids = ptyKey.split(",") as Id[];
-    void hubStore.refreshScreens(ids);
-    const timer = window.setInterval(() => void hubStore.refreshScreens(ids), 2500);
+    // Screen polls run only on the live list route. This same component stays
+    // mounted (dimmed) behind the New Session sheet, and that fan-out is what
+    // saturated the Node link and refused instance.create on the phone. On a
+    // session route the list is not mounted, so the session page never reads
+    // other sessions' screens.
+    if (variant !== "full" || !ptyKey || location.pathname !== "/sessions") return;
+    const visible = visibleRows.current;
+    // The caller's order is list order; lift the rows currently on screen to
+    // the front so the 4-slot store scheduler paints what the user sees.
+    const visibleFirst = (ids: Id[]) =>
+      [...ids].sort((a, b) => Number(visible.has(b)) - Number(visible.has(a)));
+    const poll = () => hubStore.refreshScreens(visibleFirst(ptyKey.split(",") as Id[]));
+    poll();
+    const timer = window.setInterval(poll, 2500);
     return () => window.clearInterval(timer);
-  }, [variant, ptyKey]);
+  }, [variant, ptyKey, location.pathname]);
+
+  useEffect(() => {
+    if (variant !== "full" || location.pathname !== "/sessions") return;
+    const root = listRootRef.current;
+    if (!root || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.instanceId as Id | undefined;
+          if (!id) continue;
+          if (entry.isIntersecting) visibleRows.current.add(id);
+          else visibleRows.current.delete(id);
+        }
+      },
+      // Pre-load screens a little before the row scrolls fully into view.
+      { root: null, rootMargin: "120px 0px" },
+    );
+    root.querySelectorAll<HTMLElement>("[data-instance-id]").forEach((row) => observer.observe(row));
+    return () => observer.disconnect();
+  }, [variant, location.pathname, filteredKey]);
 
   const chips = selectedChips(conditions, {
     hostName: (id) => hubStore.hostName(id as Id),
@@ -267,7 +304,7 @@ export function SessionList({
   }
 
   return (
-    <div className={css.root} data-testid="session-list">
+    <div className={css.root} data-testid="session-list" ref={listRootRef}>
       <header className={css.top}>
         <div className={css.title}>{title}</div>
         <div className={css.count}>
@@ -558,6 +595,7 @@ export function SessionList({
                   key={instance.id}
                   className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${compactRecent ? css.rowIdle : ""}`}
                   data-testid="board-card"
+                  data-instance-id={instance.id}
                   data-status={status}
                   data-lifecycle={instance.lifecycle}
                   data-kind={instance.kind}

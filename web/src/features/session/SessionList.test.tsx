@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import type { Instance } from "../../types/instance";
-import { known } from "../../types/wire";
+import { known, type Id } from "../../types/wire";
 import { detectPlatform, setPlatformForTest } from "../../lib/platform";
 import { SessionList } from "./SessionList";
 
@@ -40,7 +40,7 @@ vi.mock("../../lib/store", () => ({
   useHub: () => hub,
   hubStore: {
     titleOf: (id: string) => titles[id] ?? id,
-    summaryOf: () => "",
+    summaryOf: (id: string) => summaries[id] ?? "",
     hostName: (id: string) => hostNames[id] ?? id,
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: () => null,
@@ -57,6 +57,9 @@ vi.mock("../../lib/store", () => ({
 
 const titles: Record<string, string> = {};
 const hostNames: Record<string, string> = { "host-a": "alpha", "host-b": "beta" };
+/// Per-instance live phrases projected from journal tails; empty/absent means
+/// the working row falls back to its constant sentence.
+const summaries: Record<string, string> = {};
 /// Per-instance effective-model observations the mocked store hands back
 /// (model-pin-1). Empty by default: most rows have not read one back.
 const modelEffective: Record<
@@ -111,6 +114,7 @@ beforeEach(() => {
   hub.screens = {};
   titles.ins_a = "spill 抖动";
   titles.ins_b = "等待批准";
+  for (const key of Object.keys(summaries)) delete summaries[key];
 });
 
 describe("SessionList empty states", () => {
@@ -326,6 +330,190 @@ function renderKeyList() {
     </MemoryRouter>,
   );
 }
+
+function approvalInteraction(id: string, instanceId: string, description: string) {
+  return {
+    id,
+    revision: "1",
+    createdAt: "2026-09-19T00:00:00.000Z",
+    updatedAt: "2026-09-19T00:00:00.000Z",
+    instanceId,
+    runId: null,
+    hostId: "host-a",
+    kind: "approval",
+    state: "pending",
+    blocking: true,
+    answerable: true,
+    carrier: "claude-control",
+    request: {
+      kind: "approval",
+      title: "Bash",
+      description,
+      toolCallId: id,
+      actionRef: id,
+      options: [],
+      requestedPermissionsRef: null,
+      inputDigest: "sha256:00",
+    },
+    requestKey: {
+      native: { type: "rpc", valueType: "string", value: "ask" },
+      processGeneration: "1",
+      runGeneration: "1",
+      connectionEpoch: "host-a",
+    },
+    requestVersion: "1",
+    deadline: { state: "unknown", reason: "none", evidenceEventIds: [] },
+    deadlineSource: "none",
+    answer: { state: "not-applicable" },
+    delivery: "not-sent",
+    resolution: { state: "not-applicable" },
+  };
+}
+
+describe("SessionList rows: next step, wire disclosure and overflow sheet", () => {
+  it("renders the headline first and hides the wire triple inside a closed disclosure", () => {
+    renderList();
+    const row = screen.getAllByTestId("session-row")[0];
+    // The dot/title headline is the first child line; the next-step line follows.
+    const headline = row.firstElementChild!;
+    expect(headline.querySelector("[data-status]")).not.toBeNull();
+    expect(headline.textContent).toContain("等待批准");
+    expect(row.children[1].getAttribute("data-testid")).toBe("session-next-step");
+
+    const wire = screen.getAllByTestId("session-wire")[0] as HTMLDetailsElement;
+    expect(wire.open).toBe(false);
+    // lifecycle/activity/connectivity are present in the DOM but not in the
+    // default viewport: the closed details hides them.
+    expect(screen.getAllByTestId("session-lifecycle")[0]).not.toBeVisible();
+    expect(row.textContent).not.toContain("waiting-interaction");
+
+    // The collapsed summary tooltip still carries the wire triple and the
+    // relative timestamp (the time is hidden from the mobile row itself).
+    const summaryTip = wire.querySelector("summary")?.getAttribute("title") ?? "";
+    expect(summaryTip).toContain("ready");
+    expect(summaryTip).toContain("connected");
+    expect(summaryTip).toContain("alpha/sfe-root");
+    // Relative timestamp (mock timestamps are "now"-ish, so formatListTime
+    // yields either "刚刚" or a clock string).
+    expect(summaryTip).toMatch(/刚刚|^\d{1,2}:\d{2}$/m);
+  });
+
+  it("renders no 'undefined' hole when the instance's workspace is absent from the snapshot", () => {
+    hub.instances = [session("ins_a", { workspaceId: "wsp-missing" as Id })];    renderList();
+    const card = screen.getAllByTestId("board-card")[0];
+    expect(card.textContent).not.toContain("undefined");
+    const tip = card.querySelector("[data-testid='session-wire'] summary")?.getAttribute("title") ?? "";
+    expect(tip).not.toContain("undefined");
+    expect(tip).not.toContain("/ ");
+  });
+
+  it("projects the pending approval as the next step and keeps one go handle", () => {
+    hub.interactions = [approvalInteraction("int_b", "ins_b", "rm -rf /tmp/coord-media")];
+    renderList();
+    const blockedCard = screen
+      .getAllByTestId("board-card")
+      .find((card) => card.getAttribute("data-status") === "blocked")!;
+    const step = blockedCard.querySelector("[data-testid='session-next-step']");
+    expect(step?.textContent).toContain("rm -rf /tmp/coord-media");
+    expect(step?.textContent).not.toContain("waiting-interaction");
+    const go = blockedCard.querySelector("[data-testid='board-go-handle']");
+    expect(go?.getAttribute("href")).toBe("/approvals?focus=int_b");
+    expect(go?.textContent).toContain("去处理");
+  });
+
+  it("projects a working row's journal phrase and falls back to the constant", () => {
+    summaries.ins_a = "Workflow wf_9f3 · phase compile";
+    hub.instances = [session("ins_a", { activity: known("working") }), session("ins_b", { activity: known("waiting-interaction") })];
+    renderList();
+    const workingCard = screen
+      .getAllByTestId("board-card")
+      .find((card) => card.querySelector(`a[href="/s/ins_a"]`))!;
+    expect(workingCard.querySelector("[data-testid='session-next-step']")?.textContent).toBe(
+      "Workflow wf_9f3 · phase compile",
+    );
+
+    delete summaries.ins_a;
+  });
+
+  it("uses the constant working sentence when no phrase is known", () => {
+    hub.instances = [session("ins_a", { activity: known("working") }), session("ins_b", { activity: known("waiting-interaction") })];
+    renderList();
+    const workingCard = screen
+      .getAllByTestId("board-card")
+      .find((card) => card.querySelector(`a[href="/s/ins_a"]`))!;
+    expect(workingCard.querySelector("[data-testid='session-next-step']")?.textContent).toBe("运行中…");
+  });
+
+  it("does not render the go handle when the blocked row has no pending interaction", () => {
+    renderList();
+    const blockedCard = screen
+      .getAllByTestId("board-card")
+      .find((card) => card.getAttribute("data-status") === "blocked")!;
+    expect(blockedCard.querySelector("[data-testid='session-next-step']")?.textContent).toContain(
+      "等待处理交互",
+    );
+    expect(blockedCard.querySelector("[data-testid='board-go-handle']")).toBeNull();
+  });
+
+  it("keeps send/keys/stop testids inside the overflow sheet, which opens and closes", async () => {
+    const user = userEvent.setup();
+    renderList();
+    const card = screen.getAllByTestId("board-card")[0];
+    // The inline remote controls are gone; only the ⋯ trigger sits on the row.
+    expect(card.querySelector("[data-testid='board-prompt']")).toBeNull();
+    expect(card.querySelector("[data-testid='board-key-esc']")).toBeNull();
+
+    const trigger = card.querySelector("[data-testid='board-more']") as HTMLButtonElement;
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(trigger.getAttribute("aria-controls")).toBeNull();
+    await user.click(trigger);
+    const panel = screen.getByTestId("board-actions-panel");
+    expect(panel).toBeVisible();
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+    // aria-controls resolves to the panel's real id.
+    expect(trigger.getAttribute("aria-controls")).toBe("board-actions-panel");
+    expect(panel.getAttribute("id")).toBe("board-actions-panel");
+    expect(panel).toHaveAttribute("data-variant", "popover");
+    expect(panel.querySelector("[data-testid='board-prompt']")).not.toBeNull();
+    expect(panel.querySelector("[data-testid='board-send']")).not.toBeNull();
+    expect(panel.querySelector("[data-testid='board-key-enter']")).not.toBeNull();
+    expect(panel.querySelector("[data-testid='board-key-esc']")).not.toBeNull();
+    expect(panel.querySelector("[data-testid='board-key-ctrl-c']")).not.toBeNull();
+    expect(panel.querySelector("[data-testid='board-stop']")).not.toBeNull();
+
+    // Keys stay in the open sheet for rapid presses and still reach the store.
+    await user.click(panel.querySelector("[data-testid='board-key-esc']") as HTMLElement);
+    const store = await import("../../lib/store");
+    expect(store.hubStore.sendKeys).toHaveBeenCalledWith("ins_b", "esc");
+    expect(screen.getByTestId("board-actions-panel")).toBeVisible();
+
+    // Escape closes and focus returns to the row trigger.
+    await user.keyboard("{Escape}");
+    expect(screen.queryByTestId("board-actions-panel")).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("sends the prompt through the sheet and then closes it", async () => {
+    const user = userEvent.setup();
+    renderList();
+    const card = screen.getAllByTestId("board-card")[0];
+    await user.click(card.querySelector("[data-testid='board-more']") as HTMLElement);
+    const panel = screen.getByTestId("board-actions-panel");
+    await user.type(panel.querySelector("[data-testid='board-prompt']") as HTMLElement, "PAUSE");
+    await user.click(panel.querySelector("[data-testid='board-send']") as HTMLElement);
+    const store = await import("../../lib/store");
+    expect(store.hubStore.send).toHaveBeenCalledWith("ins_b", "PAUSE");
+    expect(screen.queryByTestId("board-actions-panel")).toBeNull();
+  });
+
+  it("uses the sheet variant under the mobile viewport", async () => {
+    const user = userEvent.setup();
+    mobileViewport = true;
+    renderList();
+    await user.click(screen.getAllByTestId("board-more")[0]);
+    expect(screen.getByTestId("board-actions-panel")).toHaveAttribute("data-variant", "sheet");
+  });
+});
 
 describe("SessionList hold-modifier badges (⌘1–9)", () => {
   beforeEach(() => {

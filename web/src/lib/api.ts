@@ -919,7 +919,7 @@ function createMockApi(): HubApi {
     async hostRemove() { throw new Error("演示模式无法移除真实 SSH 主机"); },
     async hostList() {
       return mockPage(mockDb.hosts.map((host) => ({ ...host, workspaces: mockDb.workspaces
-        .filter((w) => w.hostId === host.id).map((w) => ({ workspaceId: w.id, hostId: w.hostId, root: w.rootPath })) })));
+        .filter((w) => w.hostId === host.id).map((w) => ({ workspaceId: w.id, hostId: w.hostId, root: w.rootPath, worktreeLabel: w.worktreeLabel, branch: w.branch })) })));
     },
     async hostGet(hostId) {
       const found = mockDb.hosts.find((h) => h.id === hostId);

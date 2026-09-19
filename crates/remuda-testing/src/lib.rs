@@ -6,10 +6,18 @@
 //!
 //! `fake-herdr` impersonates herdr 0.9.0 JSON-RPC over a Unix socket so
 //! `remuda-herdr` tests can run offline.
+//!
+//! `fake-gateway` is an offline Anthropic-Messages-compatible HTTP origin on
+//! loopback, with scriptable SSE streams, `429`/`529`/`401` responses and
+//! mid-stream aborts. The api-routing tests use it as the gateway the Hub or a
+//! proxy host would relay to, so a relay can be proven end to end without a
+//! live model and without any credential existing in the test process. See
+//! [`fake_gateway`].
 
 mod bin_locator;
 mod client;
 mod fake;
+pub mod fake_gateway;
 pub mod fake_harness;
 mod fake_herdr;
 mod flags;
@@ -28,6 +36,10 @@ pub use client::{
     is_system_subtype, is_type, spawn_fake_claude, spawn_fake_claude_sdk, transcript_path,
 };
 pub use fake::{FakeClaudeError, run_fake_claude};
+pub use fake_gateway::{
+    ANTHROPIC_VERSION, DEFAULT_LISTEN, DEFAULT_MODEL, DEFAULT_TEXT, FakeGateway, FakeGatewayError,
+    RecordedRequest, SSE_CONTENT_TYPE, Script, parse_listen, parse_script, run_fake_gateway,
+};
 pub use fake_herdr::{
     FakeHerdrError, FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, fake_herdr_bin,
     herdr_frames_path, herdr_session_ok_path, run_fake_herdr, write_observe_frames,

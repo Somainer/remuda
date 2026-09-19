@@ -23,13 +23,19 @@ path = "src/bin/m0-print-stub.rs"
 name = "fake-harness"
 path = "src/bin/fake-harness.rs"
 
+[[bin]]
+name = "fake-gateway"
+path = "src/bin/fake-gateway.rs"
+
 [lints]
 workspace = true
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 fs2 = "0.4"
+futures.workspace = true
 nix = { version = "0.28", default-features = false, features = ["fs", "poll", "process", "signal", "term"] }
 portable-pty.workspace = true
 remuda-driver.workspace = true
@@ -54,5 +60,6 @@ async-trait = "0.1"
 remuda-driver.workspace = true
 remuda-journal.workspace = true
 remuda-protocol.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

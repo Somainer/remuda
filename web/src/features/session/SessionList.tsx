@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent }
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import type { Id } from "../../types/wire";
 import type { Instance, Kind, UiStatus } from "../../types/instance";
+import type { Interaction } from "../../types/interaction";
 import { knowledgeValue } from "../../types/command";
 import { Sheet } from "../../components/Sheet";
 import { StateDot } from "../../components/StateDot";
@@ -15,6 +16,7 @@ import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
 import { compareModelPin } from "./modelEffective";
+import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import {
   applyFilters,
@@ -64,13 +66,6 @@ function kindClass(kind: Kind): string {
 function stopRow(event: MouseEvent | FormEvent) {
   event.preventDefault();
   event.stopPropagation();
-}
-
-function pendingBadge(kind: string | undefined, title: string | undefined, fields: number | undefined): string | null {
-  if (kind === "approval") return `等你批准 ${title ?? ""}`.trim();
-  if (kind === "question") return `AskUserQuestion · ${fields ?? 0} 题`;
-  if (kind === "plan-review") return "计划待审";
-  return null;
 }
 
 export function SessionList({
@@ -135,6 +130,13 @@ export function SessionList({
   const [filterOpen, setFilterOpen] = useState(false);
   const filterBtnRef = useRef<HTMLButtonElement | null>(null);
   const filterHeadingId = "session-filter-title";
+
+  // Per-row remote controls (send / keys / stop) live in one overflow Sheet.
+  // Only one row can have it open; actionReturnRef restores focus to the ⋯
+  // trigger that opened it (useFocusTrap contract).
+  const [actionFor, setActionFor] = useState<Id | null>(null);
+  const actionReturnRef = useRef<HTMLButtonElement | null>(null);
+  const actionHeadingId = "session-row-actions-title";
 
   /**
    * Explicit condition changes push a history entry, so Back undoes exactly the
@@ -535,17 +537,12 @@ export function SessionList({
             </div>
             {items.map((instance) => {
               const status = projectStatus(instance);
-              const pending = hub.interactions.find((i) => i.instanceId === instance.id && i.state === "pending");
+              const pending: Interaction | undefined = hub.interactions.find(
+                (i) => i.instanceId === instance.id && i.state === "pending",
+              );
               const to = `/s/${instance.id}`;
               const workspace = hub.workspaces.find((w) => w.id === instance.workspaceId && w.hostId === instance.hostId);
-              const badge = pendingBadge(
-                pending?.request.kind,
-                pending && pending.request.kind !== "elicitation" ? pending.request.title : undefined,
-                pending?.request.kind === "question" ? pending.request.fields.length : undefined,
-              );
-              const summary = hubStore.summaryOf(instance.id);
               const tty = uiMode(instance) === "tty-attachable";
-              const compactRecent = status === "idle" || status === "exited" || status === "unknown";
               const title = hubStore.titleOf(instance.id);
               const activity = knowledgeValue(instance.activity) ?? "—";
               const screen = hub.screens[instance.id];
@@ -553,10 +550,13 @@ export function SessionList({
               const worktree = workspace?.worktreeLabel ?? workspace?.label;
               const branch = workspace?.branch;
               const slot = slotById.get(instance.id) ?? 0;
+              const step = nextStep(instance, pending ?? null, screen, hubStore.summaryOf(instance.id));
+              const exit = exitLabel(instance);
+              const sheetOpen = actionFor === instance.id;
               return (
                 <article
                   key={instance.id}
-                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""} ${compactRecent ? css.rowIdle : ""}`}
+                  className={`${css.row} ${status === "blocked" ? css.rowBlocked : ""}`}
                   data-testid="board-card"
                   data-status={status}
                   data-lifecycle={instance.lifecycle}
@@ -574,12 +574,87 @@ export function SessionList({
                   </label>
                   <Link
                     to={to}
-                    className={`${css.body} ${compactRecent ? css.bodyIdle : ""}`}
+                    className={css.body}
                     data-testid="session-row"
                     data-status={status}
                     data-kind={instance.kind}
                     aria-keyshortcuts={gestureEnabled && slot ? modifierAriaShortcut(slot, platform) : undefined}
                   >
+                    <div className={css.headline}>
+                      <StateDot status={status} />
+                      <span className={`${css.name} ${status === "starting" || status === "exited" || status === "unknown" ? css.nameMute : ""}`}>
+                        {title}
+                      </span>
+                      <span className={`${css.kind} ${kindClass(instance.kind)}`}>{instance.kind}</span>
+                      <LaunchedByMark launchedBy={instance.launchedBy} />
+                      {screen?.done ? (
+                        <span className={css.done} data-testid="board-done">
+                          DONE
+                        </span>
+                      ) : null}
+                      {gestureEnabled && slot ? (
+                        <span
+                          className={css.keyBadge}
+                          data-held={modifierHeld ? "1" : "0"}
+                          aria-hidden="true"
+                        >
+                          {modifierBadgeText(slot, platform)}
+                        </span>
+                      ) : null}
+                    </div>
+                    {/* ui-spec.md D-038 (§2.1): the row is dot + title + one
+                        next-step sentence. Wire triples and ids live in the
+                        disclosure. */}
+                    <div className={css.nextStep} data-testid="session-next-step" data-tone={step.tone} title={step.text}>
+                      {step.text}
+                    </div>
+                  </Link>
+                  {pending ? (
+                    <Link
+                      className={css.goHandle}
+                      data-testid="board-go-handle"
+                      to={`/approvals?focus=${encodeURIComponent(pending.id)}`}
+                    >
+                      去处理
+                    </Link>
+                  ) : null}
+                  <div className={css.rowSide}>
+                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
+                    <button
+                      type="button"
+                      className={css.moreBtn}
+                      data-testid="board-more"
+                      aria-haspopup="dialog"
+                      aria-expanded={sheetOpen}
+                      aria-controls={sheetOpen ? "board-actions-panel" : undefined}
+                      aria-label="会话遥控"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        actionReturnRef.current = event.currentTarget;
+                        setActionFor(instance.id);
+                      }}
+                    >
+                      ⋯
+                    </button>
+                  </div>
+                  <details className={css.wire} data-testid="session-wire">
+                    <summary
+                      className={css.wireSummary}
+                      title={`${instance.lifecycle} · ${activity} · ${instance.connectivity} | ${hubStore.hostName(instance.hostId)}${
+                        worktree ? `/${worktree}` : ""
+                      } · ${instance.driver} · ${shortId(instance.id, 8)} · ${formatListTime(instance.updatedAt)}`}
+                    >
+                      运行详情
+                      {tty ? (
+                        <span className={css.tty} title={nativeShort(instance)}>
+                          终端
+                        </span>
+                      ) : null}
+                    </summary>
+                    <div className={css.wireBody}>
+                      <span className={css.wireId}>{shortId(instance.id, 8)}</span>
+                      {exit ? <span className={css.exit}>{exit}</span> : null}
+                    </div>
                     <div className={css.meta} data-testid="session-lifecycle">
                       <span>{instance.lifecycle}</span>
                       <span className={css.sep}>·</span>
@@ -588,7 +663,7 @@ export function SessionList({
                       <span>{instance.connectivity}</span>
                       <span className={css.sep}>|</span>
                       <span className={css.metaHost}>{hubStore.hostName(instance.hostId)}</span>
-                      <span>/ {worktree}</span>
+                      {worktree ? <span>/ {worktree}</span> : null}
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
@@ -660,123 +735,108 @@ export function SessionList({
                           </>
                         );
                       })()}
-                      <span className={css.sep}>|</span>
-                      <span>{shortId(instance.id, 8)}</span>
-                    </div>
-                    <div className={css.headline}>
-                      <StateDot status={status} />
-                      <div className={`${css.name} ${status === "starting" || status === "exited" || status === "unknown" ? css.nameMute : ""}`}>
-                        {title}
-                      </div>
-                      <span className={`${css.kind} ${kindClass(instance.kind)}`}>{instance.kind}</span>
-                      <LaunchedByMark launchedBy={instance.launchedBy} />
-                      {screen?.done ? (
-                        <span className={css.done} data-testid="board-done">
-                          DONE
-                        </span>
-                      ) : null}
-                      {badge ? <div className={css.badge}>{badge}</div> : null}
-                      {exitLabel(instance) ? <div className={css.exit}>{exitLabel(instance)}</div> : null}
-                      {gestureEnabled && slot ? (
-                        <span
-                          className={css.keyBadge}
-                          data-held={modifierHeld ? "1" : "0"}
-                          aria-hidden="true"
-                        >
-                          {modifierBadgeText(slot, platform)}
-                        </span>
-                      ) : null}
                     </div>
                     {tty && screen?.lines.length ? (
                       <pre className={css.snippet} data-testid="board-snippet">
                         {screen.lines.join("\n")}
                       </pre>
-                    ) : status === "starting" ? (
-                      <div className={css.cmd}>正在拉起 · lifecycle={instance.lifecycle}</div>
-                    ) : status === "blocked" && pending?.request.kind === "approval" ? (
-                      <div className={css.cmd}>{pending.request.description}</div>
-                    ) : summary && status !== "blocked" ? (
-                      <div className={css.cmd}>{summary}</div>
-                    ) : status === "idle" ? (
-                      <div className={css.cmd}>回合结束、进程仍在 · 可继续 send</div>
-                    ) : status === "unknown" ? (
-                      <div className={css.cmd}>connectivity={instance.connectivity} · 不推断成功或结束</div>
                     ) : null}
-                  </Link>
-                  <form
-                    className={css.actions}
-                    onSubmit={(event) => {
-                      stopRow(event);
-                      const form = event.currentTarget;
-                      const input = form.elements.namedItem("prompt") as HTMLInputElement | null;
-                      const text = input?.value.trim() ?? "";
-                      if (text) {
-                        void hubStore.send(instance.id, text);
-                        if (input) input.value = "";
-                      }
-                    }}
+                  </details>
+                  <Sheet
+                    open={sheetOpen}
+                    onClose={() => setActionFor(null)}
+                    variant={mobile ? "sheet" : "popover"}
+                    labelledBy={actionHeadingId}
+                    returnFocusRef={actionReturnRef}
+                    testId="board-actions-panel"
+                    panelId="board-actions-panel"
                   >
-                    <input
-                      className={css.actionInput}
-                      name="prompt"
-                      data-testid="board-prompt"
-                      placeholder="send…"
-                      onClick={(event) => event.stopPropagation()}
-                    />
-                    <button type="submit" className={css.actionBtn} data-testid="board-send">
-                      发送
-                    </button>
-                    <button
-                      type="button"
-                      className={css.actionBtn}
-                      data-testid="board-key-enter"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void hubStore.sendKeys(instance.id, "enter");
+                    <div className={css.panelHead}>
+                      <h2 className={css.panelTitle} id={actionHeadingId}>
+                        会话遥控 · {title}
+                      </h2>
+                      <button
+                        type="button"
+                        className={css.panelClose}
+                        data-testid="board-actions-close"
+                        onClick={() => setActionFor(null)}
+                      >
+                        关闭
+                      </button>
+                    </div>
+                    <form
+                      className={css.actionSheet}
+                      onSubmit={(event) => {
+                        stopRow(event);
+                        const form = event.currentTarget;
+                        const input = form.elements.namedItem("prompt") as HTMLInputElement | null;
+                        const text = input?.value.trim() ?? "";
+                        if (text) {
+                          void hubStore.send(instance.id, text);
+                          if (input) input.value = "";
+                          setActionFor(null);
+                        }
                       }}
                     >
-                      enter
-                    </button>
-                    <button
-                      type="button"
-                      className={css.actionBtn}
-                      data-testid="board-key-esc"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void hubStore.sendKeys(instance.id, "esc");
-                      }}
-                    >
-                      esc
-                    </button>
-                    <button
-                      type="button"
-                      className={css.actionBtn}
-                      data-testid="board-key-ctrl-c"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void hubStore.sendKeys(instance.id, "ctrl+c");
-                      }}
-                    >
-                      ctrl+c
-                    </button>
-                    <button
-                      type="button"
-                      className={css.actionBtn}
-                      data-testid="board-stop"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        void hubStore.close(instance.id);
-                      }}
-                    >
-                      stop
-                    </button>
-                    {tty ? (
-                      <span className={css.tty} title={nativeShort(instance)}>
-                        终端
-                      </span>
-                    ) : null}
-                    <span className={css.time}>{status === "unknown" ? "—" : formatListTime(instance.updatedAt)}</span>
-                  </form>
+                      <input
+                        className={css.actionInput}
+                        name="prompt"
+                        data-testid="board-prompt"
+                        placeholder="向该会话发送文本…"
+                        onClick={(event) => event.stopPropagation()}
+                      />
+                      <div className={css.actionRow}>
+                        <button type="submit" className={css.actionBtn} data-testid="board-send">
+                          发送
+                        </button>
+                        <button
+                          type="button"
+                          className={css.actionBtn}
+                          data-testid="board-key-enter"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void hubStore.sendKeys(instance.id, "enter");
+                          }}
+                        >
+                          enter
+                        </button>
+                        <button
+                          type="button"
+                          className={css.actionBtn}
+                          data-testid="board-key-esc"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void hubStore.sendKeys(instance.id, "esc");
+                          }}
+                        >
+                          esc
+                        </button>
+                        <button
+                          type="button"
+                          className={css.actionBtn}
+                          data-testid="board-key-ctrl-c"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void hubStore.sendKeys(instance.id, "ctrl+c");
+                          }}
+                        >
+                          ctrl+c
+                        </button>
+                        <button
+                          type="button"
+                          className={css.actionBtn}
+                          data-testid="board-stop"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void hubStore.close(instance.id);
+                            setActionFor(null);
+                          }}
+                        >
+                          stop
+                        </button>
+                      </div>
+                    </form>
+                  </Sheet>
                 </article>
               );
             })}

@@ -355,10 +355,11 @@
 
 .row {
   display: flex;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 10px 14px;
   padding: 14px 20px;
   border-bottom: 1px solid var(--line);
-  align-items: flex-start;
+  align-items: center;
   color: inherit;
   text-align: left;
   background: transparent;
@@ -369,25 +370,105 @@
   background: var(--ink-1);
 }
 
-.rowIdle {
-  align-items: flex-start;
-  padding: 13px 20px;
-}
-
 .body {
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   color: inherit;
   text-decoration: none;
 }
 
-.bodyIdle {
-  flex-direction: row;
+/* The one next-step sentence under the title (ui-spec.md §2.1). One line at
+   every width; the title attribute carries the full text. */
+.nextStep {
+  font-size: 12px;
+  color: var(--mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.nextStep[data-tone="blocked"] {
+  color: var(--dust);
+}
+
+/* The single primary action a blocked row keeps outside the overflow sheet. */
+.goHandle {
+  flex: none;
+  align-self: center;
+  min-height: 32px;
+  display: inline-flex;
   align-items: center;
-  gap: 12px;
+  padding: 0 14px;
+  border: 1px solid var(--dust);
+  border-radius: var(--radius);
+  color: var(--dust);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.rowSide {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.moreBtn {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Collapsed by default: the wire triple, host/worktree, driver, model, effort
+   and the TTY snippet move here, out of the default viewport. An explicit
+   `[open]` gate is required: the author `display:flex` on `.meta` below
+   would otherwise beat the UA stylesheet's closed-details hiding. */
+.wire:not([open]) > :not(summary) {
+  display: none;
+}
+
+.wire {
+  flex: 0 0 100%;
+  min-width: 0;
+}
+
+.wireSummary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.wireSummary::-webkit-details-marker {
+  display: none;
+}
+
+.wireId {
+  font-family: var(--mono);
+  color: var(--mute);
+}
+
+.wireBody {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 4px;
 }
 
 .meta {
@@ -416,31 +497,26 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
 }
 
 .name {
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: 14px;
   color: var(--paper);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nameMute {
   color: var(--mute);
 }
 
-.badge {
-  height: 22px;
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  display: inline-flex;
-  align-items: center;
-  padding: 0 8px;
-  font-size: 12px;
-  color: var(--dust);
-  align-self: flex-start;
-}
-
 .kind {
+  flex: none;
   height: 20px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -473,6 +549,7 @@
 }
 
 .done {
+  flex: none;
   height: 20px;
   border: 1px solid var(--ok);
   border-radius: var(--radius);
@@ -491,7 +568,7 @@
 }
 
 .snippet {
-  margin: 0;
+  margin: 8px 0 0;
   padding: 8px 10px;
   background: var(--ink-0, #0f1319);
   border: 1px solid var(--line);
@@ -505,8 +582,7 @@
 
 .check {
   display: flex;
-  align-items: flex-start;
-  padding-top: 2px;
+  align-items: center;
 }
 
 .check input {
@@ -514,35 +590,39 @@
   height: 16px;
 }
 
-.actions {
+/* Remote controls live in the per-row overflow Sheet; this is its form. */
+.actionSheet {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.actionRow {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-  flex: none;
-  width: 220px;
+  gap: 8px;
 }
 
 .actionInput {
   width: 100%;
-  min-height: 32px;
+  min-height: 36px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--ink-0, #0f1319);
   color: var(--paper);
-  padding: 0 8px;
-  font-size: 12px;
+  padding: 0 10px;
+  font-size: 13px;
 }
 
 .actionBtn {
-  height: 28px;
+  min-height: 36px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: transparent;
   color: var(--mute);
-  padding: 0 8px;
+  padding: 0 12px;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
 }
 
 .fleet {
@@ -578,20 +658,6 @@
   padding: 0 14px;
 }
 
-.cmd {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-}
-
-.side {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 6px;
-  flex: none;
-}
-
 .time {
   font-family: var(--mono);
   font-size: 12px;
@@ -618,6 +684,7 @@
 }
 
 .exit {
+  flex: none;
   height: 20px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -627,14 +694,6 @@
   font-family: var(--mono);
   font-size: 11px;
   color: var(--mute);
-}
-
-.idleMeta {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-  width: 300px;
-  flex: none;
 }
 
 .empty {
@@ -735,21 +794,10 @@
     font-size: 11px;
   }
 
-  .row,
-  .rowIdle {
-    gap: 12px;
-    padding: 14px 16px;
-    align-items: flex-start;
-  }
-
-  .bodyIdle {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 5px;
-  }
-
-  .idleMeta {
-    width: auto;
+  .row {
+    gap: 10px 12px;
+    padding: 12px 16px;
+    align-items: center;
   }
 
   .name {
@@ -761,19 +809,19 @@
     font-size: 11px;
   }
 
-  .actions {
-    width: 100%;
-    padding: 0 16px 12px 44px;
+  /* The relative time costs the one row its single-line guarantee; the wire
+     disclosure's summary title carries the formatted timestamp instead. */
+  .rowSide .time {
+    display: none;
   }
 
-  .row,
-  .rowIdle {
-    flex-wrap: wrap;
+  .moreBtn {
+    width: var(--touch, 44px);
+    height: var(--touch, 44px);
   }
 
-  .body,
-  .bodyIdle {
-    width: calc(100% - 28px);
+  .goHandle {
+    min-height: var(--touch, 44px);
   }
 }
 

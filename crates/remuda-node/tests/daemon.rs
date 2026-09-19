@@ -109,7 +109,10 @@ async fn start(
             .await
             .unwrap();
     });
-    assert!(daemon_is_running(data_dir).await.unwrap());
+    eprintln!("DBG resolved={:?}", daemon_socket_path(data_dir));
+    let running = daemon_is_running(data_dir).await;
+    eprintln!("DBG running={running:?}");
+    assert!(running.unwrap());
     task
 }
 
@@ -240,6 +243,68 @@ async fn killed_bridge_keeps_fake_claude_alive_and_replays_completion_after_wate
     // Open SQLite again to prove completion was durable, not only broadcast.
     let restored = compose(&config).unwrap();
     assert!(journal_complete(&restored, &instance.meta.id));
+}
+
+/// A data directory longer than `sun_path`: the daemon binds the short
+/// runtime socket, the under-data-dir `node.sock` is a symlink, clients reach
+/// the daemon through the resolved real path, and shutdown removes both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_socket_redirects_under_a_long_data_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("d".repeat(80)).join("node-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let preferred = data_dir.join("node.sock");
+    assert!(
+        preferred.as_os_str().len() > 107,
+        "fixture must exceed the Linux sun_path limit: {}",
+        preferred.as_os_str().len()
+    );
+
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.clone(),
+    ))
+    .unwrap();
+    let task = start(node.clone(), &data_dir, test_control(&data_dir)).await;
+
+    // The discovery link under the data directory points at a short socket.
+    let link_meta = std::fs::symlink_metadata(&preferred).unwrap();
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "node.sock must be a symlink when redirected"
+    );
+    let real = daemon_socket_path(&data_dir);
+    assert_ne!(real, preferred, "clients must resolve to the real socket");
+    assert!(
+        real.as_os_str().len() <= 107,
+        "real socket must fit sun_path: {}",
+        real.display()
+    );
+    assert_eq!(
+        std::fs::read_link(&preferred).unwrap(),
+        real,
+        "node.sock must point at the resolved daemon path"
+    );
+    // The real socket is private; the status probe already proved it answers.
+    assert_eq!(
+        std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A bridge connects through the resolved path as well.
+    let peer = Peer::connect(&data_dir, true, json!([])).await;
+    drop(peer);
+
+    task.abort();
+    let _ = task.await;
+    node.shutdown().await.unwrap();
+    assert!(
+        std::fs::symlink_metadata(&preferred).is_err(),
+        "shutdown must remove the discovery symlink"
+    );
+    assert!(
+        std::fs::symlink_metadata(&real).is_err(),
+        "shutdown must remove the real socket"
+    );
 }
 
 fn journal_complete(node: &DevNode, instance: &InstanceId) -> bool {

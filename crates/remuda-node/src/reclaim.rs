@@ -688,7 +688,7 @@ mod tests {
     use crate::{DevServerConfig, DriverRegistry, MemoryStore};
     use remuda_herdr::{AgentStartParams, Client, WorkspaceCreateParams};
     use remuda_protocol::{CommandState, HostId, WorkspaceId};
-    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer};
+    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ShortTempDir};
 
     async fn resource(
         client: &Client,
@@ -739,7 +739,8 @@ mod tests {
     #[tokio::test]
     async fn restart_adopts_live_pane_sweeps_orphan_and_shutdown_cleans_durable_ownership() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let socket = socket_dir.join("herdr.sock");
         let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
@@ -814,7 +815,8 @@ mod tests {
     #[tokio::test]
     async fn opt_out_preserves_unknown_panes_but_shutdown_reclaims_owned_partial_launch() {
         let dir = tempfile::tempdir().unwrap();
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let socket = socket_dir.join("herdr.sock");
         let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();

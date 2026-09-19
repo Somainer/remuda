@@ -12,7 +12,9 @@ use remuda_protocol::{
     ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge, NativeRef, ObservationPayload,
     PermissionMode, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin, install_executable};
+use remuda_testing::{
+    FakeHerdrOptions, FakeHerdrServer, ShortTempDir, ensure_workspace_bin, install_executable,
+};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -405,7 +407,8 @@ fn ensure_sources_rejects_empty_and_leaves_normal_sources_implicit() {
 #[tokio::test]
 async fn pty_resume_keeps_settings_model_and_never_bare() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_fake_herdr_bin();

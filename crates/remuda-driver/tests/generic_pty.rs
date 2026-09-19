@@ -10,7 +10,8 @@ use remuda_protocol::{
     ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
 use remuda_testing::{
-    FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin, install_executable,
+    FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ShortTempDir, ensure_workspace_bin,
+    install_executable,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,7 +88,8 @@ fn yolo_presets_match_dogfood() {
 #[tokio::test]
 async fn fake_herdr_codex_start_send_wait_read_stop() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_workspace_bin("fake-herdr");
@@ -200,7 +202,8 @@ async fn fake_herdr_codex_start_send_wait_read_stop() {
 #[tokio::test]
 async fn fake_herdr_start_failure_emits_error_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_workspace_bin("fake-herdr");
@@ -274,7 +277,8 @@ async fn fake_herdr_start_failure_emits_error_lifecycle() {
 #[tokio::test]
 async fn fake_herdr_slow_start_emits_ready_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_workspace_bin("fake-herdr");
@@ -353,7 +357,8 @@ async fn fake_herdr_slow_start_emits_ready_lifecycle() {
 #[tokio::test]
 async fn fake_herdr_send_before_start_defers_without_blocking_control() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_workspace_bin("fake-herdr");
@@ -402,7 +407,8 @@ async fn fake_herdr_send_before_start_defers_without_blocking_control() {
 #[tokio::test]
 async fn fake_herdr_journals_bounded_screen_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_workspace_bin("fake-herdr");
@@ -492,7 +498,8 @@ async fn live_agy_pty_once() {
 #[tokio::test]
 async fn agent_origin_bypass_create_uses_non_yolo_preset() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let _fake =
         FakeHerdrServer::spawn(FakeHerdrOptions::new(socket_dir.join("herdr.sock"))).unwrap();

@@ -5,7 +5,8 @@ use remuda_driver::{
 };
 use remuda_protocol::*;
 use remuda_testing::{
-    FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ensure_workspace_bin, install_executable,
+    FakeHerdrOptions, FakeHerdrScript, FakeHerdrServer, ShortTempDir, ensure_workspace_bin,
+    install_executable,
 };
 use std::{collections::BTreeMap, time::Duration};
 
@@ -70,7 +71,8 @@ async fn all_pty_kinds_block_answer_once_and_settle_on_idle() {
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
         fake_options.script = script;
@@ -191,7 +193,8 @@ async fn all_pty_kinds_block_answer_once_and_settle_on_idle() {
 async fn same_kind_instances_keep_prompt_and_key_ownership() {
     for kind in [AgentKind::Codex, AgentKind::Claude] {
         let dir = tempfile::tempdir().unwrap();
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
         fake_options.script = FakeHerdrScript::Approval;
@@ -299,7 +302,8 @@ async fn same_kind_instances_keep_prompt_and_key_ownership() {
 async fn claude_trust_is_auto_answered_only_when_node_enabled_it() {
     for enabled in [false, true] {
         let dir = tempfile::tempdir().unwrap();
-        let socket_dir = dir.path().join("herdr");
+        let socket_root = ShortTempDir::new().unwrap();
+        let socket_dir = socket_root.path().join("herdr");
         std::fs::create_dir_all(&socket_dir).unwrap();
         let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
         fake_options.script = FakeHerdrScript::Trust;
@@ -401,7 +405,8 @@ async fn claude_trust_is_auto_answered_only_when_node_enabled_it() {
 #[tokio::test]
 async fn claude_onboarding_is_detected_answered_and_blocks_prompt_dispatch() {
     let dir = tempfile::tempdir().unwrap();
-    let socket_dir = dir.path().join("herdr");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     std::fs::create_dir_all(&socket_dir).unwrap();
     let mut fake_options = FakeHerdrOptions::new(socket_dir.join("herdr.sock"));
     fake_options.script = FakeHerdrScript::Onboarding;

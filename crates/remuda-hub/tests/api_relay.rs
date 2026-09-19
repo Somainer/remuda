@@ -87,7 +87,7 @@ const API_CHUNK_BYTES: usize = 64 * 1024;
 /// A synthetic value that exists only in this process. No test ever asserts on
 /// it directly: the gateway compares it in constant time and reports a boolean,
 /// so the value is never printed, copied into output, or written to a file.
-const PROFILE_TOKEN: &str = "sk-relay-fixture-token-0000";
+const PROFILE_TOKEN: &str = "sk-fake-profile-0001";
 
 /// The worker's per-instance relay bearer — the value a worker holds, and the
 /// one that must **never** reach the gateway.
@@ -97,7 +97,7 @@ const PROFILE_TOKEN: &str = "sk-relay-fixture-token-0000";
 /// presents a credential that does not match and is refused. The value is never
 /// sent anywhere in these tests and never printed; only the mismatch verdict is
 /// read.
-const WORKER_RELAY_BEARER: &str = "relay-bearer-per-instance-1111";
+const WORKER_RELAY_BEARER: &str = "fake-worker-bearer-0002";
 
 type NodeSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -925,12 +925,11 @@ async fn relays_a_chunked_request_body_larger_than_one_frame() -> Result<()> {
 #[tokio::test]
 #[ignore = "relay router lands with c-apiroute-hub"]
 async fn a_via_host_lost_mid_stream_ends_the_stream_and_never_reroutes() -> Result<()> {
+    // A plain origin: with `via:<H>` and H gone, the assertion below is that the
+    // origin is never reached at all, so scripting it to answer slowly would be
+    // inert — there is no request for the delay to affect. What this test proves
+    // is the absence of a reroute, not the timing of one.
     let gateway = FakeGateway::start().await?;
-    // A slow origin, so the stream is provably still in flight when H dies.
-    let gateway = {
-        gateway.shutdown().await;
-        FakeGateway::start_with(vec![Script::slow_first_byte(Duration::from_millis(600))]).await?
-    };
     let mut fixture = fixture().await?;
     let _ = create_profile(fixture.addr, &fixture.cookie, &gateway.base_url()).await?;
 
@@ -1237,12 +1236,19 @@ async fn a_producer_stalls_at_the_credit_cap() -> Result<()> {
     .await?;
 
     // Read whatever arrives without crediting, and count it.
+    //
+    // The stop predicate counts *cumulatively* through the closure's captured
+    // state. Testing one frame in isolation cannot work — a single frame is at
+    // most one chunk, so "more than 4" would never be true and the collector
+    // would always burn its whole budget.
+    let mut seen_chunks = 0usize;
     let frames = collect_notifications(&mut fixture.node, Duration::from_secs(3), |frame| {
-        frames_for(std::slice::from_ref(frame), "st_credit")
-            .iter()
-            .filter(|params| params.get("dataBase64").is_some())
-            .count()
-            > 4
+        if frame["params"]["streamId"] == json!("st_credit")
+            && frame["params"].get("dataBase64").is_some()
+        {
+            seen_chunks += 1;
+        }
+        seen_chunks > 4
     })
     .await?;
     let uncredited = frames_for(&frames, "st_credit")

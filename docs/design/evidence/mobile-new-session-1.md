@@ -2,7 +2,7 @@
 
 - 日期：2026-09-19
 - 分支：`wt/c-mobilenew/b-mobilenew-md` · 任务 c-mobilenew（a phone can always create a session; bulk screen reads must never starve control RPCs）
-- Base：`origin/main` @ 402c3670
+- Base（round 2 后）：`origin/main` @ b0dd8389
 - 规格：本任务书 §1–§5；`web/tests/e2e/ux-mobile-new.hub.spec.ts`
 
 ## 1. 复现的拒绝（修前必红）
@@ -26,128 +26,130 @@ HTTP 500 {"error":"too many in-flight node rpcs","code":"INTERNAL"}
 
 ### 1.2 修前失败的自动化证据
 
-e2e 第二个 case（`saturated screen reads still let instance.create through`）通过
-hub_e2e 的门控文件把 seeded 行的 `tty.screen` 回复停在 Node 侧，然后用带登录 cookie 的
-`page.request` 对 14 个已退出实例并发扇出 40 个 `/screen`，再在弹层里真正走一次创建。
-
-把 Hub 三个文件临时还原到 `origin/main`（example 的新旋钮保留、Web 新客户端在
-`page.request` 路径之外），该 case 在修前代码上**必红**，响应直方图：
+把 Hub 三个文件临时还原到修前代码，对 14 个已退出实例并发扇出 40 个 `/screen`
+（fake Node 的门控文件让先到的读停在 Node 侧）：
 
 ```
 OLDCODE_STATUS_HISTOGRAM [[500,40]]
-✘ saturated screen reads still let instance.create through
-  Error: excess reads get NODE_BUSY/503 — Expected: > 0, Received: 0
 ```
 
 40/40 全部 500 INTERNAL，0 个 503 —— 与 owner 现场逐字一致。修后同一 case：
-**40/40 全部 503 NODE_BUSY，0 个 500**（门控存在时先到的读占满 16 个只读子槽、在 Node 侧停到
-5s 读超时，超时也归 NODE_BUSY；后到的读在帧入队前即被拒。门控存在期间用 UI 真实走的
-instance.create 始终成功）。
+**40/40 全部 503 NODE_BUSY，0 个 500**；并且控制半区被 32 个停住的控制类 RPC 占满时，
+真正的 `POST /v1/instances` 直接拿到 503 NODE_BUSY（详见 §3 case 2 与
+`crates/remuda-hub/tests/node_busy.rs`）。
 
-## 2. 修复
+## 2. 修复（round 2 含评审修正）
 
 ### 2.1 Hub：控制 RPC 预留一半容量（`transport.rs` + `error.rs`）
 
 - 新增 `HubError::NodeBusy { retry_after_ms }` → HTTP **503**、code **NODE_BUSY**，
-  带 `retryAfterMs: 2500` 与 `retryable: true`。任何路径都不再把 RPC 预算拒绝映射成
-  500 INTERNAL。
-- 每条 Node 链路总预算仍为 32（与协议 `max_in_flight_rpc` 对齐）；
-  **批量只读子预算 16**（`is_bulk_read`：`tty.screen`、`subagent.transcript`、
-  `host.files.list/read/search` —— 会扇出的幂等 pull）。控制方法（create/cancel/steer/
-  写/placement 的 `host.resources`/开流的 `tty.attach` 等）始终保有至少 16 个槽。
-  批量读到 16 即 503 NODE_BUSY（帧入队**之前**拒绝，Node 侧零副作用）；控制类只有在
-  自己的半区也满时才拿 NODE_BUSY。
-- 挂起表从 `tokio::Mutex<HashMap>` 换成 `std::Mutex<HashMap<String, PendingCall>>`
-  （`PendingCall { tx, bulk }`），并由 `PendingGuard` 的同步 Drop 保证：回复、发送失败、
-  超时、future 被取消、链路断开——每条路径都恰好摘掉自己的槽，挂起表不可能留下死 waiter。
-  `ws.rs` 与 `ssh_hosts.rs` 在 socket/stdio 循环结束时 `fail_all_pending()`：dropping
-  senders 让在途调用立刻返回 `Ok(None)`（not writable），而不是挂到超时。批量读超时也归为
-  NODE_BUSY（慢一行是可重试噪声，不是 500）。
-- 单元测试（`transport.rs` budget_tests，fake transport + socket pump）：
-  `bulk_reads_cannot_starve_control`（40 并发 screen + 1 个 instance.create：create 成功、
-  多出的读全部 NODE_BUSY、无 INTERNAL、表归零）、`control_keeps_half_the_slots`、
-  `cancelled_call_frees_its_slot`、`link_drop_fails_all_waiters`。
+  带 `retryAfterMs: 2500` 与 `retryable: true`。任何路径都不再把预算拒绝映射成 500 INTERNAL。
+- 每条 Node 链路总预算仍为 32；**批量只读子预算 16**（`is_bulk_read`：`tty.screen`、
+  `subagent.transcript`、`host.files.list/read/search`）。控制方法（create/cancel/steer/
+  写/placement 的 `host.resources`/开流的 `tty.attach` 等）始终保有至少 16 个槽；
+  批量读到 16 即 503 NODE_BUSY（帧入队**之前**拒绝，Node 侧零副作用），控制半区也满时
+  控制调用同样拿 NODE_BUSY。批量读超时也归为 NODE_BUSY（慢一行是可重试噪声，不是 500）。
+- 挂起表为 `std::Mutex<HashMap<String, PendingCall>>`，由 `PendingGuard` 的同步 Drop 保证
+  回复/发送失败/超时/future 取消/链路断开每条路径都恰好摘掉自己的槽；`ws.rs` 与
+  `ssh_hosts.rs` 在循环结束时 `fail_all_pending()`。
+- **round 2 修正（评审 1）**：帧**入队前**的发送失败仍是 `Ok(None)`（=未连接/未写）；
+  帧已发出后 waiter 被链路拆除丢弃（`fail_all_pending`）或 oneshot 关闭时，必须是
+  `Err(Internal("node rpc dropped"))`，让 `forward_if_online` 走超时同款
+  `mark_reconciling`（Node 可能已执行）。单测 `post_send_link_drop_is_lost_reply_error` 与
+  `pre_send_failure_is_not_writable` 分别钉死两条路径；`bulk_reads_cannot_starve_control`
+  改为停在长超时上的确定性调度（不再和 150ms 真实超时赛跑），另加
+  `bulk_timeout_is_node_busy` 覆盖超时映射。
 
-### 2.2 Web：列表不再饿死创建（`store.ts` / `api.ts` / `SessionList.tsx`）
+### 2.2 Hub：create 的 NODE_BUSY 不能被吞成 200（`http.rs`；评审 2）
 
-- `api.screenRead` 识别 503 NODE_BUSY，抛 `ScreenNodeBusyError`（带 retryAfterMs）；其它
-  失败照旧返回空屏。
-- store 的屏幕轮询改为有界调度器：**exited/failed 永不读屏**；全局
-  **最多 4 个在途**且每行 single-flight；调用方顺序即列表顺序，
-  SessionList 用 IntersectionObserver 把**可视行提到队首**；NODE_BUSY 时只回退该行一个
-  轮询周期（retryAfterMs），不打 console、不报错。
-- SessionList 的轮询 effect 加了 `location.pathname === "/sessions"` 门：该组件在
-  `/sessions/new` 后面以 dimmed 状态常驻挂载（手机弹层正是那个扇出的现场），现在弹层和
-  `/s/<id>` 都不再为任何会话发 `/screen`；会话页本身从不轮询别的会话（见 §3 case 1：
-  在已退出会话页停 3 s、列表页停 6 s，收集到的 /screen 数为 0）。
+`forward_if_online` 原来把所有 `Err` 吞成 200 reconciling。NODE_BUSY 在构造上是
+**帧入队前拒绝**，Node 从未见过该命令，因此：
 
-### 2.3 Web：创建失败就地显示 Hub 错误（`NewSessionPage.tsx` / css）
+- 特殊分支：`instance.create`/`instance.resume` 的 NodeBusy 把刚插入的实例行
+  `fail_instance` 置 `failed`，其它命令 `reject_command`，然后**返回 Err** → 调用方拿到
+  带 `retryAfterMs` 的 503，可安全重试；
+- 只有「可能已到达 Node」的错误（超时、链路断开丢回复等）才 `mark_reconciling`，§2.5
+  不重发的语义不变。
 
-- 4xx（除 408）仍为「可就地修正的拒绝」；新增 **503 NODE_BUSY 同等待遇** —— 该 503 是
-  帧发出前的拒绝，绝不可能已建会话，允许原样再点 开始。错误文案改为
-  `CODE · message`（截图：`NODE_BUSY · node busy: too many in-flight node rpcs; retry after 2500 ms`），
-  `role="alert"` 就地显示、表单与草稿全保留、开始按钮重新可用；出现时滚入视口，css
-  `overflow-wrap: anywhere` 保证 390px 不溢出。既有的「创建结果没有确认」路径（504/断连/
-  其它 5xx → 状态待确认、绝不二次创建）原样保留。
+Rust 集成测试 `crates/remuda-hub/tests/node_busy.rs`：用一个永不回复的 fake Node 占满
+32 个控制槽，真实 `POST /v1/instances` 返回 503 NODE_BUSY、`retryable:true`、
+`retryAfterMs>0`，且该行 lifecycle 为 `failed` 而非 reconciling。
 
-### 2.4 iOS / 软键盘（best effort）
+### 2.3 Web：列表不再饿死创建（`store.ts` / `api.ts` / `SessionList.tsx`）
 
-- 本机 Ubuntu 20.04 无法安装 Playwright WebKit（`playwright install webkit`：
-  “does not support webkit on ubuntu20.04-x64”），**WebKit/iPhone 13 项目未能在本机执行**；
-  共享的浏览器 WS 端点（127.0.0.1:3177）是 Chromium CDP，不是 WebKit。
-- 几何验证在 390×844 iPhone 13 视口（Chromium，经 PW_TEST_CONNECT_WS_ENDPOINT 连共享
-  浏览器）做：focus prompt 后把 `visualViewport.height` 合成收缩到 504 / 400 / 320
-  （与既有 new-session.spec 的软键盘模拟同一手法），开始按钮盒模型全部落在收缩后视口内，
-  中心点 `elementFromPoint` 命中按钮本身：
+- `api.screenRead` 识别 503 NODE_BUSY 抛 `ScreenNodeBusyError`；**round 2 修正（评审 6）**：
+  `rest()` 解析响应里的 `retryAfterMs`（`HubHttpError` 透传），`ScreenNodeBusyError` 用该值，
+  store 的回退严格按 Hub 的提示走，2500ms 只是缺省。
+- store 屏幕轮询为有界调度器：**exited/failed 永不读屏**；全局**最多 4 个在途**且每行
+  single-flight；SessionList 用 IntersectionObserver 把可视行排到队首；NODE_BUSY 只回退该行
+  一个 Hub 提示周期，不打 console、不报错。
+- SessionList 轮询 effect 门控在 `location.pathname === "/sessions"`：该组件在
+  `/sessions/new` 后面 dimmed 常驻（手机弹层现场），会话页/弹层期间不再为任何会话发
+  `/screen`。
 
-  | visualViewport.height | 开始按钮 top | bottom | 在视口内 |
-  |---|---|---|---|
-  | 504 | 443 | 491 | ✓ |
-  | 400 | 339 | 387 | ✓ |
-  | 320 | 259 | 307 | ✓ |
+### 2.4 Web：创建失败就地显示 Hub 错误（`NewSessionPage.tsx` / css）
 
-  弹层 css 已经从 `--workbench-height`（`useWorkbenchViewport` 实时取
-  `window.visualViewport.height` / offsetTop）定尺寸，`Sheet.tsx` 无需改动。
-  **未能验证**：真机/Safari 上 visualViewport 事件时序与软键盘动画的最终像素。
+4xx（除 408）与 **503 NODE_BUSY** 都是「可就地修正/安全重试的拒绝」（503 拒绝发生在帧发出
+前，绝不可能已建会话）；错误文案为 `CODE · message`，`role="alert"` 就地显示、表单与草稿
+全保留、开始按钮重新可用、出现即滚入视口，css `overflow-wrap: anywhere` 保证 390px 不溢出。
+「创建结果没有确认」路径（504/断连/其它 5xx → 状态待确认、绝不二次创建）原样保留。
 
-## 3. e2e（390px，fake node 新旋钮）
+### 2.5 fake Node：运行时门控，无环境变量（`hub_e2e.rs`；评审 3/4/7）
 
-`crates/remuda-hub/examples/hub_e2e.rs` 仅新增旋钮（additive）：
-`HUB_E2E_EXITED_INSTANCES=n` 在 Node hello 之后经 in-process store 种 n 个已退出
-shell-pty 行（真实 journal lifecycle=exited 路径，Node inventory 仍为空）；
-`tty.screen` 对 seeded 行支持 `HUB_E2E_SCREEN_DELAY_MS` 与门控文件
-`$TMPDIR/remuda-e2e-screen-gate-<port>`（文件存在即停住回复，删除即放行）。READY 行带
-`screenGate`/`seededExitedIds`。默认（无旋钮）行为不变，全量既有套件不受影响。
+- 删除 round 1 的 `HUB_E2E_EXITED_INSTANCES` / `HUB_E2E_SCREEN_DELAY_MS` / READY 附加字段。
+- 唯一开关是运行时门控文件 `$TMPDIR/remuda-e2e-rpc-gate`：存在时 fake Node 把
+  **tty.screen（只读半区）和 worktree.list（控制半区）**的帧停在帧队列里（已占 Hub
+  pending 槽、不回复），删除后原帧重新入队、走各自常规分支。门控默认不存在，且文件在启动和
+  Ctrl-C 时都会被清掉；**不启用门控时 fake Node 的每一个回复与 base 完全一致**——
+  特别地，`tty.screen` 现在只有**一个** match arm：
+  `if cooked-buffer（c-nextstep 的屏幕哨兵行；本分支留空钩子）→ 屏幕行`
+  `else → send_rpc_ok({ ok: true })`（base 原回复），c-nextstep 落地时把哨兵集合折进同一个
+  arm，不会产生重复字面 arm。
 
-`web/tests/e2e/ux-mobile-new.hub.spec.ts`，390×844，三例：
+## 3. e2e：标准配置直接跑，无旋钮（390px）
 
-1. **14 个已退出行：0 个 /screen、0 个 500，两次创建都打开新会话页** —— 选空间会自动落
-   到首个 tab（已退出行），停 3 s 无 /screen；底栏「会话」回列表见「已退出 14」，停 6 s
-   /screen 数仍为 0；底栏 新建 → 开始 → `/s/<id>`；在会话页再底栏 新建（dimmed 列表在
-   弹层后）→ 第二次创建同样成功。全程收集响应，无 500。
-2. **503 NODE_BUSY 创建被拒：弹层就地显示 code+message，保留表单，开始可再点**；
-   「状态待确认」路径不受影响（既有 new-session.spec 覆盖）。
-3. **读饱和时创建仍成功**：门控停住 16 个入预算的 screen，40 个并发读 → 多出来的读为
-   503 NODE_BUSY、**0 个 500**，UI 里走真实创建成功。
+`web/tests/e2e/ux-mobile-new.hub.spec.ts` 在**未改动的 `playwright.hub.config.ts`**、无任何
+额外环境变量下运行。已退出行由 spec 自己通过 `page.request` 真实创建 claude-pty 实例再
+`instance.close`（fake Node 会写真实 exited lifecycle 事件）得到；断言只统计本 run 创建的
+id 的 `/screen`，卡片数用「不少于」，落点显式校验属于本 run（评审 5）。三例：
 
-验证记录（Chromium，经共享浏览器 WS；本机跑不起 WebKit）：
+1. **14 个已退出行：0 个 /screen、0 个 500，两次创建都打开新会话页**（列表一次、会话页
+   dimmed 弹层一次）。
+2. **真实 Hub 控制半区饱和**：门控停住 32 个控制类调用（20 worktree.list + 占用其余槽的
+   screen），UI 真实点 开始 → POST 真正返回 **503 NODE_BUSY + retryAfterMs**，弹层就地显示
+   `NODE_BUSY · …`、表单保留、开始可再点；不再使用 `page.route` 桩（评审 2）。
+3. **读饱和时创建仍成功**：门控停住 16 个 screen，40 个并发读 → 多出来的为 503 NODE_BUSY、
+   0 个 500；UI 真实创建成功。
 
 ```
+# 标准 hub config（仅给本 worker 分配端口），无 HUB_E2E_EXITED_*：
 HUB_E2E_LISTEN=127.0.0.1:59150 HUB_E2E_WEB_PORT=59159 \
-HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59151 HUB_E2E_EXITED_INSTANCES=14 \
+HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59151 \
   playwright test --config playwright.hub.config.ts ux-mobile-new.hub.spec.ts
-=== RUN 1 === 3 passed (43.9s)
-=== RUN 2 === 3 passed (44.1s)
-=== RUN 3 === 3 passed (43.9s)
+= 1 = 3 passed
+= 2 = 3 passed
+= 3 = 3 passed
 ```
+
+全量 hub e2e 套件（`flock e2e.lock-c`，同一套端口、未改 config、无旋钮）整跑通过：
+**120 passed, 19 skipped, 0 failed**——证明 §2.5 的无门控零行为改动（已有 spec 的列表摘要
+等回复不变）。
 
 ## 4. 390px 截图
 
-按本任务规则，截图快照**不入库**；以下三张在 390×844 用
-`REMUDA_EVIDENCE=1`（外加上述 HUB_E2E_* 旋钮）重跑本 spec 生成，可随时复现：
+按任务规则截图快照**不入库**；以下三张在 390×844 用 `REMUDA_EVIDENCE=1` 重跑本 spec 生成：
 
-- `mobile-new-session-1-list-390.png` — 底栏「会话」后的列表：`已退出 14`、14 个 exited
-  卡片、0 个 /screen 请求。
+- `mobile-new-session-1-list-390.png` — 「已退出」卡片、0 个 /screen 请求。
 - `mobile-new-session-1-session-390.png` — 创建后打开的新会话页。
-- `mobile-new-session-1-node-busy-390.png` — 创建收到 503 NODE_BUSY：弹层底部就地显示
+- `mobile-new-session-1-node-busy-390.png` — 真实 503 NODE_BUSY：弹层底部就地显示
   `NODE_BUSY · …retry after 2500 ms`，开始按钮仍在、可用。
+
+## 5. iOS / 软键盘（best effort）
+
+本机 Ubuntu 20.04 无法安装 Playwright WebKit（`playwright install webkit`：
+“does not support webkit on ubuntu20.04-x64”），共享浏览器 WS 端点是 Chromium CDP，
+**WebKit/iPhone 13 项目未能在本机执行**。几何验证在 390×844 iPhone 13 视口（Chromium）做：
+focus prompt 后合成收缩 `visualViewport.height` 到 504/400/320，开始按钮盒模型均落在收缩后
+视口内、中心点 `elementFromPoint` 命中按钮自身；弹层 css 已从
+`--workbench-height`（实时取 `window.visualViewport`）定尺寸，`Sheet.tsx` 未改。未能验证：
+真机/Safari 的 visualViewport 事件时序与软键盘动画最终像素。

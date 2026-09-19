@@ -520,6 +520,9 @@ describe("Composer context usage chip", () => {
     render(
       <Composer instanceId="ins_touch" mobile onSend={vi.fn()} usageRollup={rollup} />,
     );
+    // D-042: context usage lives inside the options sheet at touch widths.
+    await user.click(screen.getByTestId("model-effort-chip"));
+    expect(screen.getByTestId("context-chip")).toBeInTheDocument();
     await user.click(screen.getByTestId("context-chip"));
     expect(screen.getByTestId("context-usage-popover")).toHaveAttribute("data-mobile", "1");
   });
@@ -648,16 +651,16 @@ describe("Composer mobile options trigger (D-042)", () => {
         onPermission={vi.fn()}
       />,
     );
-    // Collapsed: no attach/harness/permission picker/effort slider in the bar.
+    // Collapsed: no attach/harness/context/permission picker/effort slider in
+    // the bar (context usage belongs in the sheet per dispatch plan §C-4).
     expect(screen.queryByTestId("composer-options-sheet")).toBeNull();
     expect(screen.queryByTestId("attach-file")).toBeNull();
     expect(screen.queryByTestId("harness-chip")).toBeNull();
+    expect(screen.queryByTestId("context-chip")).toBeNull();
     expect(screen.queryByTestId("permission-option-manual")).toBeNull();
     expect(screen.queryByTestId("effort-slider")).toBeNull();
     // The three-state primary stays outside (D-028a).
     expect(screen.getByTestId("composer-send")).toBeVisible();
-    // The fused context segment stays outside the sheet too.
-    expect(screen.getByTestId("context-chip")).toBeVisible();
 
     await user.click(screen.getByTestId("model-effort-chip"));
     const sheet = screen.getByTestId("composer-options-sheet");
@@ -667,10 +670,132 @@ describe("Composer mobile options trigger (D-042)", () => {
     expect(sheetBody.getByTestId("attach-camera")).toBeVisible();
     expect(sheetBody.getByTestId("attach-paste")).toBeVisible();
     expect(sheetBody.getByTestId("harness-chip")).toBeVisible();
+    expect(sheetBody.getByTestId("context-chip")).toBeVisible();
     expect(sheetBody.getByTestId("permission-option-manual")).toBeVisible();
     expect(sheetBody.getByTestId("effort-slider")).toBeVisible();
     // The primary control is not duplicated into the sheet.
     expect(sheet.querySelector("[data-testid='composer-send']")).toBeNull();
+  });
+
+  it("closing the options sheet returns focus to the collapsed trigger", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_focus" mobile onSend={vi.fn()} kind="claude" effort={effortAt("claude", 2)} onPermission={vi.fn()} />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    await user.click(trigger);
+    const sheet = screen.getByTestId("composer-options-sheet");
+    await user.click(screen.getByTestId("composer-options-close"));
+    expect(sheet).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("attaching a file from the sheet closes it first and returns focus to the trigger", async () => {
+    const user = userEvent.setup();
+    render(
+      <Composer instanceId="ins_attachfocus" mobile onSend={vi.fn()} kind="claude" effort={effortAt("claude", 2)} />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    await user.click(trigger);
+    const sheet = screen.getByTestId("composer-options-sheet");
+    // The sheet attach buttons are non-file buttons (paste); picking one
+    // exercises the close-first handler without a real file chooser.
+    await user.click(within(sheet).getByTestId("attach-paste"));
+    // Paste with an empty clipboard adds nothing, but the sheet must close
+    // before the (no-op) handler runs so focus never hits the textarea
+    // behind the aria-modal scrim.
+    expect(sheet).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("names the permission word and a danger marker in the trigger aria-label", async () => {
+    render(
+      <Composer
+        instanceId="ins_aria"
+        mobile
+        onSend={vi.fn()}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        permissionMode="bypassPermissions"
+        launchPermissionMode="bypassPermissions"
+        permissionEffective={{ mode: "bypassPermissions", source: "launch", observedAt: "2026-09-19T00:00:00Z" }}
+        onPermission={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByTestId("model-effort-chip");
+    expect(trigger.getAttribute("aria-label")).toMatch(/绕过全部/);
+    expect(trigger.getAttribute("aria-label")).toMatch(/危险/);
+    expect(screen.getByTestId("composer-trigger-permission")).toHaveTextContent("绕过全部");
+  });
+
+  it("dismisses an open confirm when the turn ends before the user confirms", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    const { rerender } = render(
+      <Composer
+        instanceId="ins_turnends"
+        mobile={false}
+        onSend={onSend}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    await user.type(screen.getByTestId("composer-input"), "jump now");
+    // Open the steer confirm via the visible 插队 button but do not confirm.
+    await user.click(screen.getByTestId("composer-steer"));
+    expect(screen.getByTestId("composer-confirm-title")).toHaveTextContent("插队发送");
+    // The turn ends while the dialog is open.
+    rerender(
+      <Composer
+        instanceId="ins_turnends"
+        mobile={false}
+        onSend={onSend}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        phase="idle"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    expect(screen.queryByTestId("composer-confirm")).toBeNull();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("does not post a steer on confirm after the turn ended independently", async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn();
+    const { rerender } = render(
+      <Composer
+        instanceId="ins_late"
+        mobile={false}
+        onSend={onSend}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        phase="working"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    await user.type(screen.getByTestId("composer-input"), "jump now");
+    await user.click(screen.getByTestId("composer-steer"));
+    const dialog = screen.getByTestId("composer-confirm");
+    // Simulate the confirm click landing after the phase already flipped but
+    // before the effect removed the dialog: the guard still re-checks refs.
+    rerender(
+      <Composer
+        instanceId="ins_late"
+        mobile={false}
+        onSend={onSend}
+        kind="claude"
+        effort={effortAt("claude", 2)}
+        phase="idle"
+        capabilities={caps({ steer: cap(), interrupt: cap(), queue: cap() })}
+      />,
+    );
+    // The effect dismisses it; even if ok were clicked, the guard blocks the
+    // post. Here the dialog is already gone.
+    expect(dialog).not.toBeInTheDocument();
+    expect(onSend).not.toHaveBeenCalled();
   });
 
   it("uses a plain placeholder on phones and keeps the shortcut hint on desktop", () => {

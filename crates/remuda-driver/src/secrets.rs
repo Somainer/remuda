@@ -616,29 +616,58 @@ impl fmt::Debug for BrokerResponse {
 }
 
 /// Serve JSON-line requests on a Unix socket (mode `0600`).
+///
+/// The chooser applies the same AF_UNIX placement rule as the hook socket:
+/// when `socket_path` is too long for `sun_path` the broker binds a short
+/// hashed name in the per-user runtime directory and leaves a symlink at
+/// `socket_path`. Clients cannot connect through a long symlink (the limit
+/// applies to connect as well as bind), so callers with long paths derive the
+/// real address with [`crate::launch::place_token_broker_socket`] and bake
+/// that into the `apiKeyHelper` bind; the digest is deterministic, so the
+/// caller's placement and this one resolve identically.
 #[cfg(unix)]
 pub async fn serve_token_broker(broker: TokenBroker, socket_path: &Path) -> DriverResult<()> {
     use tokio::net::UnixListener;
 
-    if socket_path.exists() {
-        fs::remove_file(socket_path)?;
+    let placement = crate::launch::place_token_broker_socket(socket_path)?;
+    let real_path = placement.bind_path();
+    if real_path.exists() {
+        fs::remove_file(real_path)?;
     }
-    if let Some(parent) = socket_path.parent() {
+    if let Some(parent) = real_path.parent() {
         fs::create_dir_all(parent)?;
         set_dir_mode(parent, 0o700)?;
     }
-    let listener = UnixListener::bind(socket_path)?;
-    set_file_mode(socket_path, 0o600)?;
-    info!(path = %socket_path.display(), "token broker listening");
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let broker = broker.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_broker_conn(broker, stream).await {
-                warn!(error = %err, "token broker connection");
+    let listener = UnixListener::bind(real_path).map_err(|error| {
+        DriverError::CredentialUnavailable(format!(
+            "token broker could not bind: {}",
+            remuda_signal::runtime_dir::bind_io_error(real_path, error)
+        ))
+    })?;
+    placement.install_link().map_err(|error| {
+        DriverError::CredentialUnavailable(format!(
+            "token broker discovery link could not be created: {error}"
+        ))
+    })?;
+    set_file_mode(real_path, 0o600)?;
+    info!(path = %real_path.display(), "token broker listening");
+    let result = loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let broker = broker.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = handle_broker_conn(broker, stream).await {
+                        warn!(error = %err, "token broker connection");
+                    }
+                });
             }
-        });
-    }
+            Err(error) => break Err::<(), _>(error),
+        }
+    };
+    placement.remove_link();
+    let _ = fs::remove_file(real_path);
+    result?;
+    Ok(())
 }
 
 #[cfg(unix)]

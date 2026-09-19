@@ -85,9 +85,9 @@ pub use flags::validate_spec_args as validate_launch_args;
 pub use generic_pty::{GenericPtyDriver, GenericPtyOptions, WaitUntil};
 pub use launch::{
     HOOKS_ENABLE_ENV, HookOverlay, HookSession, HookSessionOptions, OverlayOptions,
-    SHIM_DISABLE_ENV, ShimSet, TuiMode, apply_model_pin, is_model_env,
-    load_effective_user_settings, materialize_overlay, materialize_shims, merge_settings_layers,
-    shim_disabled,
+    SHIM_DISABLE_ENV, ShimSet, TuiMode, apply_model_pin, instance_sockets_would_redirect,
+    is_model_env, load_effective_user_settings, materialize_overlay, materialize_shims,
+    merge_settings_layers, place_token_broker_socket, shim_disabled,
 };
 pub use materializer::{
     BinarySource, LaunchOrigin, MaterializeRequest, SessionAction, TokenBrokerBind, materialize,

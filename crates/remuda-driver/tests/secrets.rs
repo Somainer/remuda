@@ -209,3 +209,52 @@ async fn keychain_put_and_resolve() {
         .output()
         .await;
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn token_broker_redirects_a_long_socket_path_and_serves_the_real_one() {
+    // The caller-derived placement is deterministic, so it matches the
+    // redirect serve_token_broker performs internally; clients then connect
+    // to the short real path even though the conventional path overflows
+    // sun_path.
+    let root = tempfile::tempdir().unwrap();
+    let long_dir = root.path().join("x".repeat(90));
+    fs::create_dir_all(&long_dir).unwrap();
+    let preferred = long_dir.join("broker.sock");
+    assert!(preferred.as_os_str().len() > 107);
+
+    let placement = remuda_driver::place_token_broker_socket(&preferred).unwrap();
+    assert!(placement.redirected());
+    assert!(placement.bind_path().as_os_str().len() <= 107);
+
+    let store = FileSecretStore::open(root.path().join("vault")).unwrap();
+    store.put("anthropic", b"sk-long-runtime-socket").unwrap();
+    let broker = TokenBroker::new(Arc::new(store), root.path().join("audit.jsonl"));
+    let token = broker.issue_instance("ins_live");
+    let task = tokio::spawn({
+        let preferred = preferred.clone();
+        async move {
+            let _ = remuda_driver::serve_token_broker(broker, &preferred).await;
+        }
+    });
+    for _ in 0..50 {
+        if placement.bind_path().exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let link = fs::symlink_metadata(&preferred).unwrap();
+    assert!(link.file_type().is_symlink());
+    assert_eq!(fs::read_link(&preferred).unwrap(), placement.bind_path());
+
+    let secret_ref = SecretRef::parse("store:anthropic").unwrap();
+    let got = remuda_driver::request_secret(placement.bind_path(), "ins_live", &token, &secret_ref)
+        .await
+        .unwrap();
+    assert_eq!(got.expose_str().unwrap(), "sk-long-runtime-socket");
+
+    task.abort();
+    let _ = task.await;
+    let _ = fs::remove_file(placement.bind_path());
+    let _ = fs::remove_file(&preferred);
+}

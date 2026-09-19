@@ -69,7 +69,10 @@ pub struct OverlayOptions {
     pub launch_dir: PathBuf,
     /// The `remuda` binary the relay runs as.
     pub relay_binary: PathBuf,
-    /// `<instance dir>/hook.sock`.
+    /// The real path the hook socket is bound at. Conventionally
+    /// `<instance dir>/hook.sock`; under a long data dir it is the short
+    /// per-user runtime path (the under-instance name is only a symlink,
+    /// which connect(2) cannot traverse once it exceeds `sun_path`).
     pub socket_path: PathBuf,
     /// Renderer to pin. Comes from the launch request.
     pub tui: TuiMode,

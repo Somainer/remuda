@@ -111,6 +111,11 @@ pub(crate) struct DispatchBody {
     /// this explicit request, never silently.
     #[serde(default)]
     pub(crate) carrier: Option<String>,
+    /// Per-launch host capability grants, e.g. `["computer-use"]` (D-045).
+    /// Dispatch workers otherwise run with `bypassPermissions`, so a requested
+    /// capability is rejected with a named message rather than silently dropped.
+    #[serde(default)]
+    pub(crate) capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +254,7 @@ pub(crate) async fn dispatch_core(
     if body.brief.trim().is_empty() {
         return Err(HubError::BadRequest("brief is required".into()));
     }
+    crate::inventory::validate_capabilities(&body.capabilities).map_err(HubError::BadRequest)?;
     let harness = match body.harness.as_deref().unwrap_or("claude") {
         "claude" | "codex" | "grok" => body.harness.as_deref().unwrap_or("claude").to_string(),
         other => {
@@ -257,6 +263,24 @@ pub(crate) async fn dispatch_core(
             )));
         }
     };
+    let computer_use = body
+        .capabilities
+        .iter()
+        .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE);
+    // D-045 Q4: dispatch workers are bot-originated and run unattended
+    // (claude: bypassPermissions; codex: auto-approved without a human at the
+    // terminal). Desktop control over an unattended session is the one
+    // combination with no recovery path, so it is refused for EVERY harness
+    // rather than silently downgraded. Use an attended
+    // `remuda instance create --capability computer-use` instead.
+    if computer_use {
+        return Err(HubError::BadRequest(format!(
+            "refusing \"computer-use\" on `dispatch`: dispatched workers run unattended \
+             (harness {harness}), and desktop control without per-action human approvals \
+             has no recovery path; use `remuda instance create --capability computer-use` \
+             for an attended launch"
+        )));
+    }
 
     let project = state
         .store
@@ -273,6 +297,10 @@ pub(crate) async fn dispatch_core(
         body.placement.as_deref(),
     )
     .await?;
+    // D-045 host preflight is intentionally NOT here: the gate above already
+    // refuses every `computer-use` dispatch because dispatched workers run
+    // unattended (D-045 Q4). If attended dispatch is ever added, a resolved-host
+    // preflight belongs at this point.
     let workspace_id = project
         .members
         .iter()
@@ -958,6 +986,10 @@ pub(crate) fn worker_launch_spec(
         "prompt": null,
         "extraEnv": Value::Object(extra_env),
         "projectId": project_id,
+        // Dispatch never carries per-launch host capabilities: computer-use on
+        // an unattended worker is refused in dispatch_core (D-045 Q4), and
+        // respawn inherits no grant. Persist the canonical empty array.
+        "capabilities": json!([]),
     });
     if let Some(task_id) = task_id {
         spec["taskId"] = json!(task_id);
@@ -1638,6 +1670,7 @@ mod driver_choice_tests {
             resources: None,
             max_instances: 8,
             hostname: None,
+            host_os: None,
             ssh: None,
             last_error: None,
             provider_binding: "auto".into(),

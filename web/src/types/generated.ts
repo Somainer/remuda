@@ -1647,6 +1647,7 @@ export type InstanceSpec = ({
   "binaryPath"?: (string | null);
   "binaryRef": Id;
   "binarySha256"?: (Digest | (null));
+  "capabilities": (((string))[]);
   "carrier": CarrierSpec;
   "completionScope": CompletionScope;
   "cwd": (string);

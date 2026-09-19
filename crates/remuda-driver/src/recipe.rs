@@ -22,9 +22,14 @@ pub enum EnvAllowlistSource {
     NativeHome,
     /// Non-secret provider overlay (base URL, discovery flags).
     ProviderOverlay,
+    /// A value Remuda itself attaches because a per-launch host capability
+    /// (`computer-use`; D-045) was granted. The value is driver-computed, never
+    /// read from the spec or the Node's environment — the `REMUDA_` deny
+    /// prefix applies to both of those sources, but not to this handshake.
+    Capability,
 }
 
-/// One env name that spawn may inject. Values never appear here.
+/// One env name that spawn may inject. Secret values never appear here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnvAllowlistEntry {
@@ -32,9 +37,15 @@ pub struct EnvAllowlistEntry {
     pub name: String,
     /// How the value will be obtained at spawn.
     pub source: EnvAllowlistSource,
-    /// Secret or credential reference, if any.
+    /// Secret or credential *reference* (never a value), only for
+    /// [`EnvAllowlistSource::Credential`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
+    /// Driver-computed non-secret literal, e.g. the `1` on the D-045
+    /// capability handshake. Kept apart from [`Self::secret_ref`] so a granted
+    /// handshake is never audited as a credential reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// Role of a file the materializer wrote.
@@ -47,6 +58,32 @@ pub enum FileRole {
     ApiKeyHelper,
     /// Codex/Grok config overlay.
     ProviderConfig,
+    /// Per-instance `mcp-cua.json` naming the granted MCP server (D-045).
+    CapabilityMcpConfig,
+    /// Launcher script written from the embedded skill bytes.
+    CapabilityScript,
+    /// One file of the embedded skill tree materialized into a managed home.
+    CapabilitySkill,
+}
+
+/// One MCP server a capability grant registered for this launch (D-045 §3.3).
+///
+/// Claude-shaped carriers receive the same server through the per-instance
+/// `mcp-cua.json` on argv; codex receives it as `[mcp_servers.<name>]` in its
+/// shadow `config.toml`. Values are non-secret launch facts, safe to audit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantedMcpServer {
+    /// MCP server name (`codex-computer-use`).
+    pub name: String,
+    /// Absolute path of the per-instance MCP config that names it.
+    pub config_path: String,
+    /// Executable the host runs for the stdio server.
+    pub command: String,
+    /// Executable arguments; the launcher script is the last entry.
+    pub args: Vec<String>,
+    /// Environment the server process receives (the capability handshake).
+    pub env: Vec<(String, String)>,
 }
 
 /// How long a materialized file must be retained.
@@ -182,6 +219,13 @@ pub struct LaunchRecipe {
     pub provider: RecipeProvider,
     /// Permission flags.
     pub permission: RecipePermission,
+    /// Per-launch host capabilities granted on this launch (D-045); empty
+    /// means nothing was granted and no capability file may exist.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// MCP servers the granted capabilities registered for this launch.
+    #[serde(default)]
+    pub mcp_servers: Vec<GrantedMcpServer>,
     /// Technical-debt tags such as [`TECH_DEBT_M0_PERM_01`].
     pub technical_debt: Vec<String>,
     /// Redacted audit record.

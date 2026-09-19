@@ -30,7 +30,12 @@ pub(super) fn tools() -> Vec<Tool> {
                     "name": { "type": "string" },
                     "title": { "type": "string" },
                     "prompt": { "type": "string" },
-                    "commandId": { "type": "string" }
+                    "commandId": { "type": "string" },
+                    "capabilities": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Per-launch host capabilities, e.g. [\"computer-use\"] (D-045); requires an explicit resolvable macOS host"
+                    }
                 }
             }),
             |client, args| {
@@ -266,5 +271,9 @@ fn create_opts_from_json(args: &Value) -> Result<CreateOpts> {
         title: opt_str(args, "title").map(str::to_string),
         prompt,
         command_id: opt_str(args, "commandId").map(str::to_string),
+        // D-045: per-launch host capabilities are exposed on the MCP surface
+        // too; the client-side preflight fails loudly for agent tokens (which
+        // cannot list hosts), so a grant can never be silently dispatched.
+        capabilities: string_list(args, "capabilities"),
     })
 }

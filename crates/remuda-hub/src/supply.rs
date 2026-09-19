@@ -1672,6 +1672,7 @@ mod tests {
             max_instances: max,
             default_tui: None,
             hostname: None,
+            host_os: None,
             provider_binding: "auto".into(),
             default_launch_args: None,
             claude_binary_path: None,

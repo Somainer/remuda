@@ -84,6 +84,10 @@ pub struct CreateInstanceBody {
     worktree: Option<String>,
     #[serde(default, rename = "requiredCapabilities")]
     required_capabilities: Option<Value>,
+    /// Per-launch host capability grants, e.g. `["computer-use"]` (D-045).
+    /// Stored on the spec and forwarded to the Node; the Node re-validates.
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
     #[serde(default)]
     placement: Option<Value>,
     #[serde(default)]
@@ -767,6 +771,25 @@ pub async fn create_instance(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
+    // D-045 Gate 1, before anything is placed, resolved or approved: an
+    // agent-originated launch may never grant desktop control to itself.
+    // Hoisted ahead of pick_hosts / provider resolution / prepare_create so
+    // a codex shell-pty shape (which would otherwise raise a one-shot human
+    // Interaction) cannot have its approval ticket created and burned on a
+    // replay before the refusal. Nothing is persisted for this request.
+    if body
+        .capabilities
+        .iter()
+        .flatten()
+        .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
+        && crate::agent_scope::origin(&device) == remuda_protocol::InputOrigin::Agent
+    {
+        return Err(HubError::BadRequest(
+            "an agent-originated launch may not grant \"computer-use\"; \
+             only an explicit human or bot launch may request it"
+                .into(),
+        ));
+    }
     let title = body.title.clone().or(body.name.clone());
     // A create that names no carrier gets a multi-turn one. This defaulted to
     // `claude-print`, which is never a valid default: a print session ends after
@@ -802,6 +825,7 @@ pub async fn create_instance(
         "cwd": body.cwd,
         "worktree": body.worktree,
         "requiredCapabilities": body.required_capabilities,
+        "capabilities": body.capabilities.clone().unwrap_or_default(),
     });
     if let Some(obj) = spec.as_object_mut() {
         if let Some(delegation) = &body.delegation {
@@ -1024,6 +1048,57 @@ pub async fn create_instance(
         &mut spec,
     )
     .await?;
+    // D-045: per-launch host capability gates, all before persistence.
+    if let Some(capabilities) = body.capabilities.as_ref().filter(|list| !list.is_empty()) {
+        crate::inventory::validate_capabilities(capabilities).map_err(HubError::BadRequest)?;
+        if capabilities
+            .iter()
+            .any(|value| value == crate::inventory::CAPABILITY_COMPUTER_USE)
+        {
+            // D-045 Q4, harness-agnostic: refuse unattended desktop control.
+            // The message names the kind AND the exact refused spellings.
+            // (Gate 1 origin refusal is hoisted to right after device binding,
+            // before placement/approval.)
+            let (unattended, refused_spellings): (bool, &[&str]) = match body.kind.as_str() {
+                "claude" => (
+                    matches!(
+                        body.permission_mode.as_deref(),
+                        Some("bypassPermissions" | "bypass")
+                    ),
+                    &["bypassPermissions", "bypass"],
+                ),
+                "codex" => (
+                    matches!(
+                        body.permission_mode.as_deref(),
+                        // Codex auto-approves every action with `never` (CLI
+                        // `--ask-for-approval never`; legacy `no-request`).
+                        Some("never" | "no-request")
+                    ),
+                    &["never", "no-request"],
+                ),
+                _ => (false, &[]),
+            };
+            if unattended {
+                return Err(HubError::BadRequest(format!(
+                    "refusing \"computer-use\" together with unattended/skipped tool approvals \
+                     on the same {:?} launch (permissionMode {:?}; refused {} spellings: {}): \
+                     desktop control plus auto-approved actions has no recovery path; \
+                     remove one of the two",
+                    body.kind,
+                    body.permission_mode.as_deref().unwrap_or("-"),
+                    body.kind,
+                    refused_spellings.join(", ")
+                )));
+            }
+            if !matches!(body.kind.as_str(), "claude" | "codex") {
+                return Err(HubError::BadRequest(format!(
+                    "the \"computer-use\" capability is not supported for kind {:?} this batch",
+                    body.kind
+                )));
+            }
+            crate::inventory::computer_use_preflight(&host).map_err(HubError::BadRequest)?;
+        }
+    }
     let (instance, command) = crate::placement::spawn_on_host(
         &state,
         &host,

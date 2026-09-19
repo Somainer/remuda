@@ -26,7 +26,11 @@ cua_node="${CUA_NODE:-/Applications/ChatGPT.app/Contents/Resources/cua_node}"
 node="${cua_node}/bin/node"
 repl="${cua_node}/lib/node_modules/@oai/cua-repl/bin/cua-repl.mjs"
 node_repl="${cua_node}/bin/node_repl"
-codex_home="${CODEX_HOME:-${HOME}/.codex}"
+# The vendor app lives in the *operator's* real codex home. When Remuda
+# shadows CODEX_HOME for the agent (per-instance shadow home), it passes the
+# resolved real home as REMUDA_CODEX_HOME on the MCP server entry only; the
+# shadow value must never be used to locate the vendor app.
+codex_home="${REMUDA_CODEX_HOME:-${CODEX_HOME:-${HOME}/.codex}}"
 sky_app="${codex_home}/computer-use/Codex Computer Use.app"
 
 if [ ! -x "$node" ] || [ ! -f "$repl" ] || [ ! -x "$node_repl" ]; then

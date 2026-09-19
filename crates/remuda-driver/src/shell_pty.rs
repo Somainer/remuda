@@ -1850,6 +1850,7 @@ fn prepare_launch_blocking(
         base_settings.clone(),
         seq,
         interrupt_pid,
+        &recipe,
     )?;
     if let Some(hooks) = &hooks {
         // The macOS retest failure showed only the emulator log; this line is
@@ -2041,10 +2042,23 @@ fn start_hooks_blocking(
     base_settings: Option<serde_json::Value>,
     seq: &Arc<AtomicU64>,
     interrupt_pid: &Arc<AtomicI32>,
+    recipe: &LaunchRecipe,
 ) -> DriverResult<Option<Arc<crate::launch::HookSession>>> {
     let Some(config) = options.hooks.clone() else {
         return Ok(None);
     };
+    // D-045 leg (b) for codex: the granted MCP servers splice into the shadow
+    // `config.toml` HookSession materializes.
+    let mcp_servers = recipe
+        .mcp_servers
+        .iter()
+        .map(|server| crate::launch::ShadowMcpServer {
+            name: server.name.clone(),
+            command: server.command.clone(),
+            args: server.args.clone(),
+            env: server.env.clone(),
+        })
+        .collect::<Vec<_>>();
     let bus = Arc::new(
         remuda_signal::SignalBus::new(bus_context(ctx), events.clone(), Arc::clone(seq))
             .with_interrupt_tracker(Arc::clone(interrupt_pid)),
@@ -2056,6 +2070,7 @@ fn start_hooks_blocking(
             tui: config.tui,
             base_settings,
             kind: options.target.agent_kind().unwrap_or(AgentKind::Claude),
+            mcp_servers,
         },
         bus,
     )?)))
@@ -2835,15 +2850,25 @@ fn agent_env(
         .env_allowlist
         .iter()
         .filter(|entry| {
-            matches!(
-                entry.source,
-                crate::recipe::EnvAllowlistSource::NativeHome
-                    | crate::recipe::EnvAllowlistSource::ProviderOverlay
-            )
+            // The granted handshake is the one REMUDA_-prefixed name allowed
+            // through; a Capability-tagged entry with any other name stays out.
+            let denied_but_not_handshake = crate::child_env::is_denied(&entry.name)
+                && entry.name != crate::launch::skills::CAPABILITY_COMPUTER_USE_ENV;
+            !denied_but_not_handshake
+                && matches!(
+                    entry.source,
+                    crate::recipe::EnvAllowlistSource::NativeHome
+                        | crate::recipe::EnvAllowlistSource::ProviderOverlay
+                        | crate::recipe::EnvAllowlistSource::Capability
+                )
         })
         .filter_map(|entry| match entry.name.as_str() {
             "CODEX_HOME" | "GROK_HOME" => Some((entry.name.clone(), recipe.native_home.clone())),
             "GROK_DISABLE_AUTOUPDATER" => Some((entry.name.clone(), "1".to_owned())),
+            _ if entry.source == crate::recipe::EnvAllowlistSource::Capability => {
+                // D-045 handshake: non-secret value rides the grant entry.
+                entry.value.clone().map(|value| (entry.name.clone(), value))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -3090,6 +3115,8 @@ fn shell_recipe(options: &ShellPtyOptions, cwd: &str) -> DriverResult<LaunchReci
             prompts: None,
             extra_flags: vec![],
         },
+        capabilities: vec![],
+        mcp_servers: vec![],
         technical_debt: vec![],
         audit: LaunchAudit {
             env_names: vec!["TERM".into(), "COLORTERM".into()],
@@ -3325,6 +3352,7 @@ mod tests {
                 native_home: dir.path().to_path_buf(),
                 binary: Some(PathBuf::from("/bin/sh")),
                 origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
                 settings_overlay: Some(operator.clone()),
             },
         );
@@ -3429,6 +3457,7 @@ mod tests {
                     native_home: native_home.clone(),
                     binary: Some(PathBuf::from("/bin/sh")),
                     origin: crate::materializer::LaunchOrigin::Human,
+                    native_home_managed: true,
                     settings_overlay: None,
                 },
             );
@@ -3614,6 +3643,7 @@ mod tests {
                     native_home: dir.path().join("scoped-native-home"),
                     binary: Some(PathBuf::from("/bin/sh")),
                     origin: crate::materializer::LaunchOrigin::Human,
+                    native_home_managed: true,
                     settings_overlay: None,
                 },
             );
@@ -3803,6 +3833,7 @@ mod tests {
                 native_home: dir.path().join("scoped-native-home"),
                 binary: Some(PathBuf::from("/bin/sh")),
                 origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: true,
                 settings_overlay: Some(provider_overlay.clone()),
             },
         );
@@ -3941,6 +3972,7 @@ mod tests {
                 native_home: dir.path().join("native-home"),
                 binary: Some(PathBuf::from("/bin/sh")),
                 origin: crate::materializer::LaunchOrigin::Human,
+                native_home_managed: false,
                 settings_overlay: None,
             },
         );

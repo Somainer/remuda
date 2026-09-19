@@ -20,11 +20,14 @@ pub mod overlay;
 pub mod session;
 mod shadow;
 pub mod shim;
+pub mod skills;
 pub mod user;
 
 pub use overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
 pub use session::{HookSession, HookSessionOptions};
-pub use shadow::{ShadowFile, ShadowHome, ShadowOptions, materialize_codex, materialize_grok};
+pub use shadow::{
+    ShadowFile, ShadowHome, ShadowMcpServer, ShadowOptions, materialize_codex, materialize_grok,
+};
 pub use shim::{ShimSet, materialize_shims, shim_disabled};
 pub use user::{
     apply_model_pin, is_model_env, is_overridden_provider_env, load_effective_user_settings,

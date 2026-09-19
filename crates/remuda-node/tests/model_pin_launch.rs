@@ -147,6 +147,8 @@ async fn assert_pin_reaches_the_harness(mismatch: bool) {
             resume_session_id: None,
             resumed_from: None,
             effort: None,
+
+            capabilities: Default::default(),
         })
         .await
         .expect("create instance");

@@ -345,6 +345,10 @@ pub struct HostRecord {
     /// Hostname or SSH alias.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Host operating system (`std::env::consts::OS`: `macos` / `linux` / …);
+    /// D-045 capability preflight input. Absent = Node has not reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_os: Option<String>,
     /// Hub-supervised SSH target and binary policy, absent for externally enrolled Nodes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<Value>,
@@ -2372,6 +2376,12 @@ impl Store {
                     params![hostname, host_id],
                 )?;
             }
+            if let Some(host_os) = update.host_os {
+                conn.execute(
+                    "UPDATE hosts SET os = ?1 WHERE id = ?2",
+                    params![host_os, host_id],
+                )?;
+            }
             if let Some(transport) = update.transport {
                 conn.execute(
                     "UPDATE hosts SET transport = ?1 WHERE id = ?2",
@@ -4032,7 +4042,8 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             herdr_json TEXT,
             resources_json TEXT,
             max_instances INTEGER NOT NULL DEFAULT 8,
-            hostname TEXT
+            hostname TEXT,
+            os TEXT
         );
         CREATE TABLE IF NOT EXISTS objects (
             id TEXT PRIMARY KEY,
@@ -4200,6 +4211,7 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "INTEGER NOT NULL DEFAULT 8",
     )?;
     ensure_column(&conn, "hosts", "hostname", "TEXT")?;
+    ensure_column(&conn, "hosts", "os", "TEXT")?;
     ensure_column(
         &conn,
         "hosts",
@@ -6915,7 +6927,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         .query_row(
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
-                    COALESCE(max_instances_override, max_instances), hostname, provider_binding,
+                    COALESCE(max_instances_override, max_instances), hostname, os, provider_binding,
                     default_launch_args, claude_binary_path, default_tui
              FROM hosts WHERE id = ?1",
             params![id],
@@ -6934,12 +6946,13 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                     row.get::<_, Option<String>>(10)?,
                     row.get::<_, i64>(11)?,
                     row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?
                         .filter(|s| !s.is_empty())
                         .unwrap_or_else(|| "auto".into()),
-                    row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
                     row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                 ))
             },
         )
@@ -6958,6 +6971,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         resources_json,
         max_instances,
         hostname,
+        host_os,
         provider_binding,
         default_launch_args,
         claude_binary_path,
@@ -7013,6 +7027,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         resources: resources_json.and_then(|raw| serde_json::from_str(&raw).ok()),
         max_instances,
         hostname,
+        host_os,
         provider_binding,
         // A column that fails to parse is treated as absent rather than
         // failing the read: a malformed default must not make the host

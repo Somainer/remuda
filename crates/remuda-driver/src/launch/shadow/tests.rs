@@ -21,6 +21,16 @@ impl TestOpts {
             launch_dir: &self.launch_dir,
             relay_binary: Path::new("/opt/remuda/bin/remuda"),
             socket_path: &self.socket,
+            mcp_servers: &[],
+        }
+    }
+
+    fn opts_with_mcp<'a>(&'a self, servers: &'a [ShadowMcpServer]) -> ShadowOptions<'a> {
+        ShadowOptions {
+            launch_dir: &self.launch_dir,
+            relay_binary: Path::new("/opt/remuda/bin/remuda"),
+            socket_path: &self.socket,
+            mcp_servers: servers,
         }
     }
 }
@@ -68,6 +78,38 @@ fn codex_shadow_writes_config_with_inline_trust_and_hooks() {
     }
     // Audit files are recorded.
     assert_eq!(shadow.files.len(), 2);
+}
+
+#[test]
+fn codex_shadow_appends_an_mcp_server_without_disturbing_features_or_trust() {
+    let root = tempfile::tempdir().unwrap();
+    let t = TestOpts::new(root.path());
+    let launcher = root.path().join("launch/cua/launch-cua-repl.sh");
+    let server = ShadowMcpServer {
+        name: "codex-computer-use".to_owned(),
+        command: "/bin/sh".to_owned(),
+        args: vec![launcher.to_string_lossy().into_owned()],
+        env: vec![("REMUDA_CAPABILITY_COMPUTER_USE".to_owned(), "1".to_owned())],
+    };
+    let shadow = materialize_codex(&t.opts_with_mcp(std::slice::from_ref(&server))).unwrap();
+    let config = std::fs::read_to_string(shadow.home.join("config.toml")).unwrap();
+
+    // Parse: the whole file must stay valid TOML for the app-server.
+    let parsed: toml::Value = config.parse().unwrap();
+    let mcp = &parsed["mcp_servers"]["codex-computer-use"];
+    assert_eq!(mcp["command"].as_str(), Some("/bin/sh"));
+    assert_eq!(
+        mcp["args"][0].as_str(),
+        Some(launcher.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        mcp["env"]["REMUDA_CAPABILITY_COMPUTER_USE"].as_str(),
+        Some("1")
+    );
+    // The pre-existing sections survive byte-for-byte in meaning.
+    assert_eq!(parsed["features"]["hooks"].as_bool(), Some(true));
+    assert!(config.contains("[hooks.state."));
+    assert!(config.contains("trusted_hash = \"sha256:"));
 }
 
 #[test]

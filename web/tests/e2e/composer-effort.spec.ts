@@ -217,7 +217,7 @@ test.describe("composer control bar and effort", () => {
     } else {
       // D-042: in the phone options sheet the card is intentionally
       // frameless and full-width (wider than the 300px desktop card).
-      expect(menu).toHaveAttribute("data-in-sheet", "1");
+      await expect(menu).toHaveAttribute("data-in-sheet", "1");
       expect(card!.width).toBeGreaterThan(301);
     }
     await assertFillReachesKnob(page);
@@ -662,7 +662,17 @@ test.describe("composer control bar and effort", () => {
           await assertPillGeometry(page);
           const box = await page.getByTestId("effort-menu").boundingBox();
           expect(box).toBeTruthy();
-          expect(box!.width).toBeLessThanOrEqual(Math.min(width, 301));
+          if (width < 768) {
+            // D-042: at compact width the effort card is the full-width
+            // frameless node inside the options sheet.
+            await expect(page.getByTestId("effort-menu")).toHaveAttribute("data-in-sheet", "1");
+            expect(box!.width).toBeGreaterThan(301);
+            expect(box!.width).toBeLessThanOrEqual(width);
+          } else {
+            // Desktop/tablet: compact anchored card capped at 300px.
+            await expect(page.getByTestId("effort-menu")).not.toHaveAttribute("data-in-sheet", "1");
+            expect(box!.width).toBeLessThanOrEqual(Math.min(width, 301));
+          }
           await assertFillReachesKnob(page);
           await shotComposer(page, `composer-slider-5-${state}-${theme}-${tag}.png`);
         }

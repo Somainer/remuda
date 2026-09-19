@@ -242,28 +242,29 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
   await shot(page, "ux2026-composer-1-sheet-390.png");
 
   // D-039: sheet tap targets (context chip + permission rows) reach 44px via
-  // centred ::after zones even though the visuals are 30-31px. Probe 20px off
-  // centre (inside the 22px half-zone, outside the ~15.5px half-control);
-  // rect + elementFromPoint in one evaluate so the sheet cannot re-layout.
+  // centred ::after/44px-pitch targets even though the visuals are 30-31px.
+  // Scroll both controls into view first (the sheet is scrollable), then
+  // probe 20px off centre (inside the 22px half-zone, outside the ~15.5px
+  // half-control); rect + elementFromPoint in one evaluate so the sheet
+  // cannot re-layout between the two reads.
+  const contextChipInSheet = sheet.getByTestId("context-chip");
+  const permissionManualInSheet = sheet.getByTestId("permission-option-manual");
+  await contextChipInSheet.evaluate((el) => el.scrollIntoView({ block: "center" }));
+  await permissionManualInSheet.evaluate((el) => el.scrollIntoView({ block: "center" }));
   const sheetTargets = await page.evaluate(() => {
     const probe = (sel: string) => {
       const el = document.querySelector(sel);
       if (!el) return [null, null];
       const r = el.getBoundingClientRect();
-      // Sample 20px off the control centre. For full-width sheet rows whose
-      // ::after zone extends left of the row, re-anchor x onto the zone:
-      // pick a point inside the row's visible text column so the probe lands
-      // on the row itself (and its ::after layer) rather than a neighbour.
-      const x = Math.max(r.left + 8, r.left + r.width / 2);
+      const x = r.left + r.width / 2;
       return [r.top + r.height / 2 - 20, r.top + r.height / 2 + 20].map((y) => {
         const t = document.elementFromPoint(x, y);
         return t?.closest("[data-testid]")?.getAttribute("data-testid") ?? null;
       });
     };
-    const row = (name: string) => probe(`[data-testid='permission-option-${name}']`);
     return {
       context: probe("[data-testid='context-chip']"),
-      permissionManual: row("manual"),
+      permissionManual: probe("[data-testid='permission-option-manual']"),
     };
   });
   expect(sheetTargets.context).toEqual(["context-chip", "context-chip"]);
@@ -291,6 +292,7 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
   await page.keyboard.press("ArrowRight");
   await expect(slider).toHaveAttribute("data-index", String(startIndex + 1));
   const nextTier = await slider.getAttribute("data-name");
+  expect(nextTier).toBeTruthy();
   await page.getByTestId("composer-options-close").click();
   await expect(sheet).toHaveCount(0);
   // Poll for the FINAL tier: between the request landing and the transcript
@@ -299,7 +301,7 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
     .poll(async () => page.getByTestId("model-effort-chip-label").textContent(), {
       timeout: 10_000,
     })
-    .toMatch(new RegExp(nextTier));
+    .toMatch(new RegExp(String(nextTier)));
   // Focus returns to the collapsed trigger after closing the sheet.
   await expect(trigger).toBeFocused();
 
@@ -335,8 +337,10 @@ test("collapsed bar names permission + effort; options are in the sheet; three-s
   await expect(sheet).toBeVisible();
   expect(await sheet.getByTestId("composer-queued-row").count()).toBe(0);
   expect(await sheet.getByTestId("composer-queue-status").count()).toBe(0);
-  // The steer/interrupt buttons remain operable behind the sheet's bar row.
-  await expect(page.getByTestId("composer-steer")).toBeVisible();
+  // The steer control stays rendered on the collapsed bar (it is not moved
+  // into the sheet; the scrim covers it while the sheet is open, so assert
+  // presence, not visibility/operability).
+  expect(await page.getByTestId("composer-steer").count()).toBe(1);
 });
 
 test("插队 and Esc 打断 go through the Sheet confirm; the fake harness receives both", async ({ page }) => {

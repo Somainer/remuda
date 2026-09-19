@@ -1418,6 +1418,18 @@ fn hub_self_secret_allowed(profile: &crate::store::ProviderRecord) -> bool {
     crate::provider_resolve::secret_release_allowed(profile, "")
 }
 
+/// Whether a journal event projects the instance into a terminal lifecycle
+/// (`exited` / `failed`). This is the normal session-end signal — there is no
+/// api.* frame for it — and is when §7.6 / B.2 require the egress context
+/// revoked from H. Delegates to the store's own derivation so the revoke
+/// trigger can never disagree with the lifecycle the append actually wrote.
+pub(crate) fn journal_event_ends_instance(event: &Value) -> bool {
+    matches!(
+        crate::store::derive_instance_state(event).0,
+        Some("exited" | "failed")
+    )
+}
+
 /// Collect and remove the stream keys of one host from a leg index.
 fn remove_matching(index: &mut HashMap<(String, String), String>, host_id: &str) -> Vec<String> {
     let legs: Vec<(String, String)> = index

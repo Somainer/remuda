@@ -2565,6 +2565,78 @@ async fn two_sequential_streams_on_one_via_instance_both_egress() -> Result<()> 
     Ok(())
 }
 
+/// Round-4 item 1: a normal session end arrives as a lifecycle journal event
+/// (`exited`), with no api.* frame on the path. The Hub must revoke the
+/// instance's egress context from H then — otherwise the gateway credential
+/// stays installed for the life of H's link.
+#[tokio::test]
+async fn an_exited_lifecycle_journal_revokes_egress_on_proxy() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let (mut fixture, mut proxy) = fixture_routed_via_h(&gateway.base_url_v1()).await?;
+    let proxy_socket = proxy.socket();
+
+    // The install frame was pushed at dispatch; consume it so the revoke
+    // frame is the next egress observed on H's socket.
+    let install = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(proxy_socket).await?;
+            if frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+            {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+        }
+    })
+    .await??;
+    assert!(
+        install["params"].get("revoke") != Some(&json!(true)),
+        "the launch-time frame installs, not revokes: {install}"
+    );
+
+    // W journals the instance exiting normally.
+    let (ack, _) = request(
+        &mut fixture.node,
+        json!({
+            "jsonrpc": "2.0", "id": "exit-1", "method": "journal.append",
+            "params": {
+                "instanceId": fixture.instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity", "entityType": "instance",
+                        "state": "exited", "reasonCode": "session-ended"
+                    }
+                }
+            }
+        }),
+        |_| false,
+    )
+    .await?;
+    assert!(ack.get("result").is_some(), "journal append: {ack}");
+
+    // H must receive revoke:true for this instance.
+    let revoke = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let frame = recv_json(proxy_socket).await?;
+            if frame["method"] == json!("api.egress")
+                && frame["params"]["instanceId"] == json!(fixture.instance_id)
+                && frame["params"]["revoke"] == json!(true)
+            {
+                return Ok::<_, anyhow::Error>(frame);
+            }
+        }
+    })
+    .await??;
+    assert_eq!(revoke["params"]["revoke"], json!(true), "{revoke}");
+    assert_eq!(
+        revoke["params"].get("authToken"),
+        None,
+        "a revoke never carries the credential: {revoke}"
+    );
+    gateway.shutdown().await;
+    Ok(())
+}
+
 /// Item 3: the egress context is installed for **every** resolved via route,
 /// not only an explicit hub-relay one. With `apiRoute: auto` against a host
 /// that advertises a relayBind the request keeps sub-mode auto at launch; the

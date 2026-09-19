@@ -7772,7 +7772,13 @@ fn normalize_activity(status: &str) -> Option<&'static str> {
 /// `activity=idle` is only set from a Node/herdr idle observation, never as a
 /// create default. Start-failure observations (`native-driver-start-failed`,
 /// entity `failed`) mark `lifecycle=failed`.
-fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
+/// Derive the `(lifecycle, activity)` state an event projects onto its
+/// instance.
+///
+/// `pub(crate)` so the api-relay revocation path can recognise the same
+/// terminal events (exited/failed) the projection applies, rather than
+/// re-deriving the event shape in a second place.
+pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
     let kind = event
         .get("kind")
         .and_then(Value::as_str)

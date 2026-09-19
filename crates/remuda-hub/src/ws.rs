@@ -582,6 +582,10 @@ pub(crate) async fn handle_node_method(
                 .map_err(map_host_store)?;
             let mut last = None;
             let mut next_seq = seq;
+            // Set when this frame carries a *fresh* terminal lifecycle event
+            // for the instance — the normal-exit path must revoke the egress
+            // context from H exactly once, after the batch is durable.
+            let mut instance_terminated = false;
             // Fold the frame into bounded writer jobs: one transaction per
             // chunk, awaited before the next so the writer yields between
             // batches instead of holding its single connection for a whole
@@ -606,10 +610,22 @@ pub(crate) async fn handle_node_method(
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
+                        if crate::api_relay::journal_event_ends_instance(&appended.record.event) {
+                            instance_terminated = true;
+                        }
                     }
                     next_seq = Some(appended.record.seq.saturating_add(1));
                     last = Some(appended);
                 }
+            }
+            // Normal instance exit/failure: revoke the gateway credential from
+            // every proxy host that held an egress context for it (§7.6 / B.2).
+            // There is no api.* frame on this path; the journal event is it.
+            if instance_terminated {
+                state
+                    .api_relay
+                    .revoke_instance_egress(&state, &instance_id)
+                    .await;
             }
             let appended = last.ok_or_else(|| {
                 HubError::BadRequest("journal.append requires event or events".into())

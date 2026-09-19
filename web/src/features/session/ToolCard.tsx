@@ -38,9 +38,11 @@ function ResultMedia({ result }: { result: ToolResultPayload | null }) {
   if (media.length === 0) return null;
   return (
     <div className={css.toolMedia} data-testid="tool-media">
-      {media.map((image) => (
+      {media.map((image, index) => (
         <a
-          key={image.objectId}
+          // The Hub dedupes identical bytes to one objectId, so the index
+          // keeps duplicate screenshots as distinct list items.
+          key={`${image.objectId}:${index}`}
           className={css.toolMediaLink}
           href={objectUrl(image.objectId)}
           target="_blank"

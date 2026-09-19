@@ -515,6 +515,12 @@
 .toolMediaLink {
   line-height: 0;
   border-radius: 6px;
+  /* Reserve the thumbnail's box while the lazy image decodes so the card does
+     not reflow when it arrives (D-045 §6.2). The 240/180 aspect matches the
+     bounded image area; smaller fixtures render at natural size inside it. */
+  display: block;
+  min-height: 48px;
+  min-width: 64px;
 }
 
 .toolThumb {

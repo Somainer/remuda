@@ -145,6 +145,34 @@ pub const COMPUTER_USE_CLIENT_SYMBOLIC: &str = "$CODEX_HOME/computer-use/Codex C
 /// The fallback symbolic location for a host with `CODEX_HOME` unset.
 pub const COMPUTER_USE_CLIENT_SYMBOLIC_DEFAULT: &str = "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
 
+/// The `computer-use` capability as a `hostcap` payload block.
+///
+/// Three states must stay distinguishable (ui-spec §2.6 / D-045 §3.4):
+/// reported-and-installed, reported-and-absent, and not reported at all by an
+/// older Node. Collapsing the last into `false` would read as "this host
+/// cannot" when the truth is "nobody asked it".
+///
+/// It lives here, next to [`computer_use_preflight`] which reads the same row,
+/// because `/v1/hosts/{id}/hostcap` is the only host read an *agent*-origin
+/// caller may make: `GET /v1/hosts/{id}` is operator-only, so a launched
+/// coordinator carrying `REMUDA_INSTANCE_ID` cannot fetch `cli[]` itself.
+pub fn computer_use_capability(host: &crate::store::HostRecord) -> Value {
+    let row = host.cli.as_array().and_then(|rows| {
+        rows.iter()
+            .find(|row| row.get("kind").and_then(Value::as_str) == Some(CAPABILITY_COMPUTER_USE))
+    });
+    match row {
+        Some(row) => json!({
+            "installed": row.get("installed").and_then(Value::as_bool).unwrap_or(false),
+            "version": row.get("version").cloned().unwrap_or(Value::Null),
+            "path": row.get("path").cloned().unwrap_or(Value::Null),
+            "auth": "unknown",
+            "reported": true,
+        }),
+        None => json!({ "reported": false }),
+    }
+}
+
 /// Validate requested capability spellings the same way the Node materializer
 /// does: an unknown value is an error naming it, never silently dropped.
 pub fn validate_capabilities(capabilities: &[String]) -> Result<(), String> {
@@ -270,9 +298,10 @@ mod tests {
         assert!(error.contains("\"desktop\""), "{error}");
     }
 
-    #[test]
-    fn computer_use_preflight_classifies_every_host_shape() {
-        let host = |os: Option<&str>, cli: Value| crate::store::HostRecord {
+    /// A `HostRecord` carrying `cli` and an optional `os`, for the capability
+    /// helpers below (both read the same two fields off the heartbeat).
+    fn host(os: Option<&str>, cli: Value) -> crate::store::HostRecord {
+        crate::store::HostRecord {
             host_id: "hst_x".to_owned(),
             label: "x".into(),
             state: "online".into(),
@@ -297,8 +326,47 @@ mod tests {
             default_tui: None,
             workspaces: vec![],
             workspace_revision: 0,
-        };
+        }
+    }
 
+    /// The `hostcap` capability block keeps the three states distinct — the
+    /// same contract the CLI used to shape by hand, now that the block rides
+    /// the `/hostcap` payload an agent-origin caller may read.
+    #[test]
+    fn computer_use_capability_reports_all_three_states() {
+        let installed = computer_use_capability(&host(
+            Some("macos"),
+            json!([{"kind":"computer-use","installed":true,"version":"2.7.0",
+                    "path":"/x/.codex/computer-use/SkyComputerUseClient"}]),
+        ));
+        assert_eq!(installed["reported"], true);
+        assert_eq!(installed["installed"], true);
+        assert_eq!(installed["version"], "2.7.0");
+        assert_eq!(installed["auth"], "unknown");
+        assert!(installed.get("error").is_none(), "{installed}");
+
+        let absent = computer_use_capability(&host(
+            Some("macos"),
+            json!([{"kind":"computer-use","installed":false,"auth":"unknown"}]),
+        ));
+        assert_eq!(absent["reported"], true, "the Node answered, and said no");
+        assert_eq!(absent["installed"], false);
+        assert!(absent["path"].is_null());
+
+        // No row: "not reported", never "unsupported" — and no `installed`
+        // key at all, so a consumer cannot read it as a claim either way.
+        let unreported = computer_use_capability(&host(
+            Some("macos"),
+            json!([
+                {"kind": "claude", "installed": true}
+            ]),
+        ));
+        assert_eq!(unreported["reported"], false);
+        assert!(unreported.get("installed").is_none(), "{unreported}");
+    }
+
+    #[test]
+    fn computer_use_preflight_classifies_every_host_shape() {
         // Installed row + macOS passes.
         let ok = host(
             Some("macos"),

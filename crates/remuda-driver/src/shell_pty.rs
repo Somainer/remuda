@@ -98,7 +98,12 @@ const EXIT_STATUS_GRACE: std::time::Duration = std::time::Duration::from_millis(
 /// The normal `E` → zombie transition takes milliseconds; this generous bound
 /// covers a loaded machine without stalling a close indefinitely on a process
 /// wedged in an uninterruptible kernel exit (which only init can outlast).
-const REAP_EXITING_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// 30 s matches the other loaded-host shutdown/reap budgets (c-testbudget):
+/// the landing gate runs on a shared host, and a SIGKILLed child can take
+/// several seconds to be scheduled through exit and become reapable there —
+/// a 3 s ceiling returned close while the child still answered `kill(pid, 0)`
+/// (a zombie the reaper had not reached), which the driver test caught.
+const REAP_EXITING_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Native lifecycle name for a PTY process that ended (§5.5).
 pub const NATIVE_EXIT: &str = "native_exit";

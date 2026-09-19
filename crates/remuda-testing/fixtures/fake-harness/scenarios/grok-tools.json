@@ -1,0 +1,30 @@
+{
+  "turns": [
+    {
+      "match_prefix": "GROK_TOOLS",
+      "thinking": "Two calls to make.",
+      "text": "SPIKE_COMPLETE GROK_TOOLS",
+      "tools": [
+        {
+          "name": "Bash",
+          "input": {
+            "command": "printf 'one\\ntwo\\nthree\\n'",
+            "description": "Emit three lines."
+          },
+          "approval": "auto",
+          "duration_ms": 900,
+          "result": "one\ntwo\nthree\n",
+          "exit_code": 0
+        },
+        {
+          "name": "write",
+          "input": { "file_path": "/work/grok-out.txt", "content": "OK" },
+          "approval": "auto",
+          "duration_ms": 20,
+          "diff": { "old_text": "", "new_text": "OK" }
+        }
+      ]
+    }
+  ],
+  "quit_after_turns": 1
+}

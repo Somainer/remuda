@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::fake_harness::clock::FakeClock;
-use crate::fake_harness::script::UsageSpec;
+use crate::fake_harness::script::{ToolSpec, UsageSpec};
 
 /// Files the harness owns for one running session.
 pub struct ArtifactSet {
@@ -165,6 +165,36 @@ impl ArtifactSet {
     #[must_use]
     pub fn grok_dir(&self) -> Option<&Path> {
         self.grok_dir.as_deref()
+    }
+
+    /// Append one line to the session's `terminal/<callId>.log` and return the
+    /// path. The real client streams a running command's stdout here, which is
+    /// grok's only live tool-output channel (design doc §3.2); the fake writes
+    /// it incrementally while the tool's `duration_ms` elapses. `None` for
+    /// non-grok dialects and before the session directory exists.
+    pub fn grok_terminal_append(
+        &mut self,
+        tool_call_id: &str,
+        line: &str,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let Some(path) = self.grok_terminal_path(tool_call_id) else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(path.parent().expect("terminal dir"))?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "{line}")?;
+        file.flush()?;
+        Ok(Some(path))
+    }
+
+    /// Where a call's terminal log lives, without creating or reading it.
+    /// `None` for non-grok dialects. The path is session-relative by
+    /// construction, so a consumer resolves it against the session rather than
+    /// trusting an absolute string from the frame.
+    #[must_use]
+    pub fn grok_terminal_path(&self, tool_call_id: &str) -> Option<PathBuf> {
+        let dir = self.grok_dir.as_ref()?;
+        Some(dir.join("terminal").join(format!("{tool_call_id}.log")))
     }
 }
 
@@ -983,51 +1013,295 @@ pub fn grok_chunk_update(kind: &str, text: &str, ids: &GrokTurnIds, model: &str)
     update
 }
 
-/// `tool_call` update.
+/// `_meta["x.ai/tool"]` — the identity block every real grok tool frame
+/// carries. The stable name lives here; `title` is the display sentence.
+///
+/// The namespace is per-tool in the captures: the build's own tools report
+/// `grok_build`, while the file tools come from the `opencode` namespace
+/// (`fixtures/grok/grok-acp-session.jsonl`).
 #[must_use]
-pub fn grok_tool_call(tool_call_id: &str, name: &str, input: &Value) -> Value {
+pub fn grok_tool_meta(tool: &ToolSpec) -> Value {
+    json!({
+        "version": 1,
+        "name": tool.grok_name(),
+        "kind": tool.grok_kind(),
+        "namespace": tool.grok_namespace(),
+        "label": tool.grok_label(),
+        "read_only": tool.grok_read_only()
+    })
+}
+
+/// `tool_call` update — Pending frame. `title` is the tool name here (the real
+/// client only grows the human sentence once the progress frame lands).
+#[must_use]
+pub fn grok_tool_call(tool: &ToolSpec, tool_call_id: &str) -> Value {
     json!({
         "sessionUpdate": "tool_call",
         "toolCallId": tool_call_id,
-        "title": name,
-        "rawInput": input
+        "title": tool.grok_name(),
+        "rawInput": tool.input_object(),
+        "_meta": { "x.ai/tool": grok_tool_meta(tool) }
     })
 }
 
-/// Completed `tool_call_update` with shell-style `rawOutput`.
+/// Statusless progress `tool_call_update` — the **Running** frame. The real
+/// client omits `status` entirely on this one (fixture frame 8), which is what
+/// `c-grok-toolid` reads as `ToolCallState::Running`.
+///
+/// There is deliberately no `status` key: it is the frame's defining feature,
+/// not an omission.
+///
+/// `kind` here is the top-level ACP `ToolKind` (`execute` / `edit` / `other`),
+/// which is a different vocabulary from `_meta["x.ai/tool"].kind`
+/// (`execute` / `write` / `ask_user` / …) — the real frames carry both, and the
+/// 1.0.30 fixture's `ask_user_question` progress frame is `other` on top with
+/// `ask_user` inside `_meta` (fixture frame 37).
 #[must_use]
-pub fn grok_tool_update_completed(
-    tool_call_id: &str,
-    command: &str,
-    output: &str,
-    exit_code: i32,
-    cwd: &Path,
-    failed: bool,
-) -> Value {
-    let status = if failed { "failed" } else { "completed" };
-    let prompt_output = format!("exit: {exit_code}\n");
+pub fn grok_tool_running(tool: &ToolSpec, tool_call_id: &str) -> Value {
+    let input = tool.input_object();
+    let mut normalized = input.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object.insert("variant".into(), json!(tool.grok_variant()));
+        // The captured `ask_user_question` progress frame normalizes each
+        // question with an explicit `multiSelect` (null when absent), which is
+        // what the live projection reads to pick SingleSelect vs MultiSelect.
+        if let Some(questions) = object.get_mut("questions").and_then(Value::as_array_mut) {
+            for question in questions {
+                if let Some(fields) = question.as_object_mut() {
+                    fields.entry("multiSelect").or_insert(Value::Null);
+                }
+            }
+        }
+    }
+    let locations = tool
+        .diff
+        .as_ref()
+        .and_then(|diff| diff.path.clone())
+        .or_else(|| {
+            input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .map(|path| json!([{ "path": path }]))
+        .unwrap_or_else(|| json!([]));
+    // A scripted diff rides the progress frame too: the captured write
+    // progress frame carries its `{type:"diff"}` block before the call has
+    // completed (1.0.34 ACP capture).
+    let content = match grok_diff_content(tool) {
+        Some(diff) => json!([diff]),
+        None => match input.get("description").and_then(Value::as_str) {
+            Some(description) => {
+                json!([{ "type": "content", "content": { "type": "text", "text": description } }])
+            }
+            // The captured `ask_user_question` progress frame carries no
+            // content block at all (fixture frame 37).
+            None => json!([]),
+        },
+    };
     json!({
         "sessionUpdate": "tool_call_update",
         "toolCallId": tool_call_id,
-        "status": status,
-        "content": [{ "type": "content", "content": { "type": "text", "text": output } }],
-        "locations": [],
-        "rawOutput": {
-            "type": "Bash",
-            "output": [],
-            "output_for_prompt": prompt_output,
-            "exit_code": if failed { Value::Null } else { json!(exit_code) },
-            "command": command,
-            "truncated": false,
-            "signal": null,
-            "timed_out": false,
-            "current_dir": cwd.to_string_lossy(),
-            "total_bytes": output.len()
-        }
+        "kind": tool.grok_acp_kind(),
+        "title": tool.grok_title(),
+        "content": content,
+        "locations": locations,
+        "rawInput": normalized,
+        "_meta": { "x.ai/tool": grok_tool_meta(tool) }
     })
 }
 
-/// Failed `tool_call_update` (hook deny).
+/// Completed `tool_call_update` with the dialect-appropriate `rawOutput`.
+///
+/// The frame is **minimal**: the captured terminal update carries only
+/// `status`, `content` and `rawOutput` (1.0.30 fixture frames 9 and 38;
+/// 1.0.34 ACP capture). It deliberately omits `kind`, `title`, `locations`,
+/// `rawInput` and `_meta`, so a translator that wrongly *refreshes*
+/// `display_title` from the terminal frame cannot pass: the only title the
+/// card may show is the one the progress frame set.
+///
+/// * shell (`run_terminal_command`) → `Bash` output with `exit_code`,
+///   `output_for_prompt` and `output_file` pointing at the session's
+///   `terminal/<callId>.log` (relocatable by construction — never the capture
+///   machine's absolute path);
+/// * `ask_user_question` → `AskUserQuestion.UserAnswered`;
+/// * everything else (`write`, …) → a `SearchReplace` / generic result.
+#[must_use]
+pub fn grok_tool_update_completed(
+    tool: &ToolSpec,
+    tool_call_id: &str,
+    output: &str,
+    exit_code: i32,
+    cwd: &Path,
+    log_path: Option<&Path>,
+    failed: bool,
+) -> Value {
+    let status = if failed { "failed" } else { "completed" };
+    let name = tool.grok_name();
+    let mut update = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "status": status,
+    });
+    if let Some(content) = grok_completed_content(tool, output) {
+        update["content"] = content;
+    }
+    update["rawOutput"] = match name.as_str() {
+        "run_terminal_command" => {
+            let prompt_output = format!("exit: {exit_code}\n{output}");
+            let mut raw = json!({
+                "type": "Bash",
+                "output": [],
+                "output_for_prompt": prompt_output,
+                "exit_code": if failed { Value::Null } else { json!(exit_code) },
+                "command": tool.input_object().get("command").cloned().unwrap_or(Value::Null),
+                "truncated": false,
+                "signal": null,
+                "timed_out": false,
+                "current_dir": cwd.to_string_lossy(),
+                "total_bytes": output.len()
+            });
+            if let Some(path) = log_path {
+                // Session-relative by construction: the fake writes the log
+                // into its own session dir, so a reader must resolve it
+                // relative to the session rather than trusting this string.
+                raw["output_file"] = json!(path.to_string_lossy());
+            }
+            raw
+        }
+        "ask_user_question" => {
+            let message = grok_answer_message(tool);
+            json!({ "type": "AskUserQuestion", "UserAnswered": { "message": message } })
+        }
+        // The captured write result is a `SearchReplace`/`EditsApplied` object,
+        // not a shell stream (fixtures/grok/grok-acp-session.jsonl).
+        "write" | "search_replace" => {
+            let path = tool
+                .diff
+                .as_ref()
+                .and_then(|diff| diff.path.clone())
+                .or_else(|| {
+                    tool.input_object()
+                        .get("file_path")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let summary = format!("The file {path} has been created.");
+            json!({
+                "type": "SearchReplace",
+                "EditsApplied": {
+                    "old_string": tool
+                        .diff
+                        .as_ref()
+                        .and_then(|diff| diff.old_text.clone())
+                        .unwrap_or_default(),
+                    "new_string": tool
+                        .diff
+                        .as_ref()
+                        .and_then(|diff| diff.new_text.clone())
+                        .unwrap_or_default(),
+                    "tool_output_for_prompt": summary,
+                    "tool_output_for_prompt_concise": summary,
+                    "absolute_path": path
+                }
+            })
+        }
+        _ => json!({ "type": tool.grok_variant() }),
+    };
+    update
+}
+
+/// The `{type:"diff"}` content block for a scripted file change.
+///
+/// Shape captured from the 1.0.34 ACP capture
+/// (`crates/remuda-testing/fixtures/grok/grok-acp-session.jsonl`):
+/// `{"type":"diff","path":…,"oldText":…,"newText":…}`. Returns `None` when the
+/// tool is not scripted with a diff.
+fn grok_diff_content(tool: &ToolSpec) -> Option<Value> {
+    let diff = tool.diff.as_ref()?;
+    let input = tool.input_object();
+    let path = diff
+        .path
+        .clone()
+        .or_else(|| {
+            input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let new_text = diff.new_text.clone().unwrap_or_else(|| {
+        input
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    });
+    Some(json!({
+        "type": "diff",
+        "path": path,
+        "oldText": diff.old_text.clone().unwrap_or_default(),
+        "newText": new_text
+    }))
+}
+
+/// Content blocks on a completed frame: the diff when scripted, else the
+/// result text as a `{type:"content"}` block. Both shapes are captured — the
+/// 1.0.34 ACP capture has a completed write frame carrying the `{type:"diff"}`
+/// block and a completed shell frame carrying `{type:"content"}`.
+fn grok_completed_content(tool: &ToolSpec, output: &str) -> Option<Value> {
+    if let Some(diff) = grok_diff_content(tool) {
+        return Some(json!([diff]));
+    }
+    if output.is_empty() {
+        return None;
+    }
+    Some(json!([{ "type": "content", "content": { "type": "text", "text": output } }]))
+}
+
+/// `rawOutput.UserAnswered.message`, phrased like the captured frame: the
+/// question and each answer as `"<question>"="<label>"`.
+fn grok_answer_message(tool: &ToolSpec) -> String {
+    let questions = tool
+        .input_object()
+        .get("questions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let answers = tool.answer.clone().unwrap_or_default();
+    let pairs: Vec<String> = questions
+        .iter()
+        .enumerate()
+        .map(|(idx, question)| {
+            let text = question
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // No scripted answer → the first option, which is what a real TUI
+            // session commits when Enter is pressed on the default selection.
+            let label = answers
+                .get(idx)
+                .cloned()
+                .or_else(|| {
+                    question
+                        .pointer("/options/0/label")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            format!("\"{text}\"=\"{label}\"")
+        })
+        .collect();
+    format!(
+        "User has answered your questions: {}. You can now continue with the user's answers in mind.",
+        pairs.join(", ")
+    )
+}
+
+/// Failed `tool_call_update` (hook deny) — the captured shape verbatim: only
+/// `status` and `content`, with no `rawOutput`, `kind`, `title` or `_meta`
+/// (`fixtures/grok/hook-deny-updates.jsonl`).
 #[must_use]
 pub fn grok_tool_update_failed(tool_call_id: &str, reason: &str) -> Value {
     json!({
@@ -1037,9 +1311,7 @@ pub fn grok_tool_update_failed(tool_call_id: &str, reason: &str) -> Value {
         "content": [{
             "type": "content",
             "content": { "type": "text", "text": format!("Hook denied: {reason}") }
-        }],
-        "rawOutput": null,
-        "locations": []
+        }]
     })
 }
 
@@ -1073,4 +1345,244 @@ pub fn grok_write_registry(
         .truncate(true)
         .open(home.join("active_sessions.json"))?;
     writeln!(file, "{}", body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fake_harness::script::ToolSpec;
+
+    fn tool(name: &str, input: Value) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            input,
+            ..ToolSpec::default()
+        }
+    }
+
+    /// The Pending frame carries the real identity block, not a bare title —
+    /// the shape whose absence made every fake-driven grok call `Unknown`.
+    #[test]
+    fn tool_call_carries_the_x_ai_tool_meta() {
+        let call = grok_tool_call(&tool("Bash", json!({ "command": "printf hi" })), "call-1");
+        assert_eq!(call["title"], "run_terminal_command");
+        assert_eq!(call["_meta"]["x.ai/tool"]["name"], "run_terminal_command");
+        assert_eq!(call["_meta"]["x.ai/tool"]["kind"], "execute");
+        assert_eq!(call["_meta"]["x.ai/tool"]["namespace"], "grok_build");
+        // The file tools report the other captured namespace.
+        let write = grok_tool_call(
+            &tool("write", json!({ "file_path": "/w/f", "content": "x" })),
+            "call-2",
+        );
+        assert_eq!(write["_meta"]["x.ai/tool"]["namespace"], "opencode");
+        assert_eq!(call["_meta"]["x.ai/tool"]["label"], "Run Command");
+        assert_eq!(call["_meta"]["x.ai/tool"]["read_only"], false);
+    }
+
+    /// The progress frame is defined by *not* having a status: that is what the
+    /// translator reads as Running.
+    #[test]
+    fn progress_frame_is_statusless_and_human_titled() {
+        let running = grok_tool_running(
+            &tool(
+                "Bash",
+                json!({ "command": "printf hi", "description": "Say hi" }),
+            ),
+            "call-1",
+        );
+        assert!(running.get("status").is_none(), "statusless by design");
+        assert_eq!(running["title"], "Execute `printf hi`");
+        assert_eq!(running["kind"], "execute");
+        assert_eq!(running["rawInput"]["variant"], "Bash");
+        assert_eq!(running["content"][0]["content"]["text"], "Say hi");
+        assert_eq!(
+            running["_meta"]["x.ai/tool"]["name"],
+            "run_terminal_command"
+        );
+    }
+
+    /// `output_file` must point inside the fake's own session directory — the
+    /// captured value is an absolute path from the machine that recorded it.
+    #[test]
+    fn completed_shell_frame_points_output_file_at_the_session_log() {
+        let root = Path::new("/tmp/fake-session");
+        let log = root.join("terminal/call-1.log");
+        let done = grok_tool_update_completed(
+            &tool("Bash", json!({ "command": "printf hi" })),
+            "call-1",
+            "hi\n",
+            0,
+            Path::new("/work"),
+            Some(&log),
+            false,
+        );
+        assert_eq!(done["status"], "completed");
+        assert_eq!(done["rawOutput"]["exit_code"], 0);
+        assert_eq!(done["rawOutput"]["output_for_prompt"], "exit: 0\nhi\n");
+        assert_eq!(
+            done["rawOutput"]["output_file"],
+            log.to_string_lossy().as_ref()
+        );
+        assert!(
+            done["rawOutput"]["output_file"]
+                .as_str()
+                .unwrap()
+                .starts_with("/tmp/fake-session/"),
+            "path is session-relative by construction"
+        );
+    }
+
+    /// A scripted diff becomes a `{type:"diff"}` block with a real path, so the
+    /// adapter has something to map into `FileChange`.
+    #[test]
+    fn scripted_diff_writes_a_diff_content_block() {
+        let spec = ToolSpec {
+            name: "write".into(),
+            input: json!({ "file_path": "/work/out.txt", "content": "OK" }),
+            diff: Some(crate::fake_harness::script::DiffSpec {
+                path: None,
+                old_text: Some(String::new()),
+                new_text: None,
+            }),
+            ..ToolSpec::default()
+        };
+        let running = grok_tool_running(&spec, "call-2");
+        assert_eq!(running["locations"][0]["path"], "/work/out.txt");
+        // The diff rides the progress frame as well as the completed one, and
+        // the progress frame's top-level kind is the ACP `edit` — while `_meta`
+        // keeps the x.ai `write`. The two vocabularies are distinct.
+        assert_eq!(running["content"][0]["type"], "diff");
+        assert_eq!(
+            running["kind"], "edit",
+            "top-level kind is the ACP ToolKind"
+        );
+        assert_eq!(running["_meta"]["x.ai/tool"]["kind"], "write");
+        let done =
+            grok_tool_update_completed(&spec, "call-2", "", 0, Path::new("/work"), None, false);
+        assert_eq!(done["content"][0]["type"], "diff");
+        assert_eq!(done["content"][0]["path"], "/work/out.txt");
+        assert_eq!(done["content"][0]["newText"], "OK");
+        // The completed frame is minimal: no kind/title/_meta at all.
+        assert!(
+            done.get("kind").is_none()
+                && done.get("title").is_none()
+                && done.get("_meta").is_none(),
+            "terminal update carries only status/content/rawOutput: {done}"
+        );
+    }
+
+    /// The top-level `kind` is the ACP `ToolKind`, which is a *different*
+    /// vocabulary from `_meta["x.ai/tool"].kind` — the 1.0.30 fixture's
+    /// `ask_user_question` progress frame is `other` on top with `ask_user`
+    /// inside `_meta` (frame 37).
+    #[test]
+    fn acp_kind_and_x_ai_kind_are_distinct_vocabularies() {
+        let ask = grok_tool_running(
+            &tool("ask_user_question", json!({ "question": "Pick." })),
+            "call-a",
+        );
+        assert_eq!(ask["kind"], "other", "ACP kind for a question tool");
+        assert_eq!(ask["_meta"]["x.ai/tool"]["kind"], "ask_user");
+
+        let bash = grok_tool_running(&tool("Bash", json!({ "command": "ls" })), "call-b");
+        assert_eq!(bash["kind"], "execute");
+        assert_eq!(bash["_meta"]["x.ai/tool"]["kind"], "execute");
+    }
+
+    /// The answer frame must echo the scripted label, in the captured phrasing.
+    #[test]
+    fn ask_user_completion_echoes_the_scripted_answer() {
+        let spec = ToolSpec {
+            name: "ask_user_question".into(),
+            input: json!({ "questions": [{
+                "question": "Choose the probe result.",
+                "options": [
+                    { "label": "Alpha", "description": "Record Alpha." },
+                    { "label": "Beta", "description": "Record Beta." }
+                ]
+            }]}),
+            answer: Some(vec!["Beta".into()]),
+            ..ToolSpec::default()
+        };
+        let done =
+            grok_tool_update_completed(&spec, "call-3", "", 0, Path::new("/work"), None, false);
+        let message = done["rawOutput"]["UserAnswered"]["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            message.contains("\"Choose the probe result.\"=\"Beta\""),
+            "{message}"
+        );
+    }
+
+    /// The bundled grok scenarios must stay loadable and keep producing the
+    /// frames the structural translation reads. Tasks 2 and 6 drive live
+    /// sessions from these files, so a field rename here would otherwise break
+    /// them silently.
+    #[test]
+    fn bundled_grok_scenarios_produce_the_expected_frames() {
+        let dir = crate::fixtures_dir().join("fake-harness/scenarios");
+        let question = crate::fake_harness::script::Scenario::load(&dir.join("grok-question.json"))
+            .expect("grok-question.json loads");
+        let ask = &question.turns[0].tools[0];
+        assert_eq!(ask.grok_name(), "ask_user_question");
+        assert!(
+            ask.answer
+                .as_ref()
+                .is_some_and(|a| a == &["Alpha".to_owned()]),
+            "the question turn scripts an answer: {:?}",
+            ask.answer
+        );
+        let running = grok_tool_running(ask, "call-q");
+        assert!(running.get("status").is_none(), "statusless progress frame");
+        assert_eq!(
+            running["rawInput"]["questions"][0]["multiSelect"],
+            Value::Null,
+            "normalized with an explicit multiSelect"
+        );
+        let done =
+            grok_tool_update_completed(ask, "call-q", "", 0, Path::new("/work"), None, false);
+        assert!(
+            done["rawOutput"]["UserAnswered"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("\"Alpha\""),
+            "the scripted answer is echoed"
+        );
+
+        let tools = crate::fake_harness::script::Scenario::load(&dir.join("grok-tools.json"))
+            .expect("grok-tools.json loads");
+        let specs = &tools.turns[0].tools;
+        assert_eq!(specs[0].grok_name(), "run_terminal_command");
+        assert!(specs[0].diff.is_none(), "the shell call carries no diff");
+        assert_eq!(specs[1].grok_name(), "write");
+        assert!(specs[1].diff.is_some(), "the write call carries a diff");
+        let done =
+            grok_tool_update_completed(&specs[1], "call-w", "", 0, Path::new("/work"), None, false);
+        assert_eq!(done["content"][0]["type"], "diff");
+    }
+
+    /// The terminal log really is a file the session dir grows.
+    #[test]
+    fn terminal_log_appends_under_the_session_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let meta = SessionMeta {
+            session_id: "s-1".into(),
+            cwd: PathBuf::from("/work"),
+            model: "spike".into(),
+            version: "1.0.30".into(),
+        };
+        let clock = FakeClock::new(0);
+        let (mut set, _paths) =
+            ArtifactSet::create(ArtifactKind::Grok, root.path(), meta, &clock).unwrap();
+        let path = set
+            .grok_terminal_append("call-9", "$ printf hi")
+            .unwrap()
+            .expect("grok log path");
+        set.grok_terminal_append("call-9", "hi").unwrap();
+        assert!(path.is_file());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "$ printf hi\nhi\n");
+        let dir = set.grok_dir().expect("session dir");
+        assert!(path.starts_with(dir), "log lives under the session dir");
+    }
 }

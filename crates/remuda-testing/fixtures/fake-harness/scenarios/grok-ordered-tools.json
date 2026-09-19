@@ -1,0 +1,34 @@
+{
+  "turns": [
+    {
+      "match_prefix": "GROK_ORDERED",
+      "thinking": "A shell call, then a read.",
+      "text": "SPIKE_COMPLETE GROK_ORDERED",
+      "tools": [
+        {
+          "name": "Bash",
+          "input": {
+            "command": "printf 'alpha\\nbravo\\n'",
+            "description": "Emit two lines."
+          },
+          "approval": "auto",
+          "duration_ms": 900,
+          "result": "alpha\nbravo\n",
+          "exit_code": 0
+        },
+        {
+          "name": "read_file",
+          "input": {
+            "target_file": "/work/notes.txt",
+            "offset": 1,
+            "limit": 10
+          },
+          "approval": "auto",
+          "duration_ms": 400,
+          "result": "one\ntwo\nthree\n"
+        }
+      ]
+    }
+  ],
+  "quit_after_turns": 1
+}

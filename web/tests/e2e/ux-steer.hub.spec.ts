@@ -192,13 +192,12 @@ test("queue two, cancel one, then 插队 jumps ahead of the remaining row", asyn
   ).toBeVisible();
   expect(sendsSince()).toBe(0);
 
-  // 插队 the third message: visible button + confirm.
+  // 插队 the third message: visible button + the in-app Sheet confirm
+  // (D-042 replaces window.confirm).
   await input.fill("jump first");
-  page.once("dialog", (dialog) => {
-    expect(dialog.message()).toContain("插队");
-    void dialog.accept();
-  });
   await page.getByTestId("composer-steer").click();
+  await expect(page.getByTestId("composer-confirm-title")).toHaveText("插队发送");
+  await page.getByTestId("composer-confirm-ok").click();
 
   // Steer POST lands first, carrying mode=steer; the interrupted-turn badge
   // shows; the idle evidence then flushes the surviving held row AFTER it.
@@ -262,12 +261,11 @@ test("Cmd/Ctrl+Enter is the 插队 gesture", async ({ page }) => {
   await page.getByTestId("composer-input").fill("keyboard jump");
   await expect(page.getByTestId("composer-queue")).toBeEnabled({ timeout: 10_000 });
 
-  page.once("dialog", (dialog) => {
-    expect(dialog.message()).toContain("插队");
-    void dialog.accept();
-  });
+  // D-042: the keyboard gesture opens the Sheet confirm, not window.confirm.
   const input = page.getByTestId("composer-input");
   await input.press("Control+Enter");
+  await expect(page.getByTestId("composer-confirm-title")).toHaveText("插队发送");
+  await page.getByTestId("composer-confirm-ok").click();
   await expect
     .poll(() => commands.some((c) => c.operation === "instance.send" && c.payload?.mode === "steer"))
     .toBeTruthy();

@@ -108,9 +108,10 @@ pub(crate) fn new_pending_rpcs() -> PendingRpcs {
     Arc::new(StdMutex::new(HashMap::new()))
 }
 
-/// Fail every waiter on link teardown. Dropping the senders makes the calls
-/// return `Ok(None)` ("session not writable") immediately instead of hanging
-/// until their timeout, and guarantees no dead waiter outlives the socket.
+/// Fail every waiter on link teardown. Dropping the senders makes calls
+/// return immediately (a lost-reply Err for frames already sent — callers
+/// reconcile those rather than claim they never ran — see the `call` match),
+/// and guarantees no dead waiter outlives the socket.
 pub(crate) fn fail_all_pending(pending: &PendingRpcs) {
     if let Ok(mut map) = pending.lock() {
         map.clear();
@@ -207,14 +208,19 @@ impl NodeTransport for WssTransport {
                 rpc_id: rpc_id.clone(),
             };
             if self.outbound.send(frame).await.is_err() {
+                // Pre-send failure: the Node never saw the frame. Callers read
+                // Ok(None) as "not connected / not writable" and leave queued
+                // commands resting, not executing.
                 return Ok(None);
             }
             match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(value)) => Ok(Some(value)),
-                // The session's reply table was dropped (link teardown): not a
-                // Hub fault and not a Node answer — "not writable", same as a
-                // failed outbound send.
-                Ok(Err(_)) => Ok(None),
+                // The frame was queued and the reply table was then dropped
+                // (link teardown). The Node may have run the command, so this
+                // must stay an Err that command forwarding treats like a lost
+                // reply (mark_reconciling); Ok(None) would falsely mean
+                // "not connected" and settle the row as never sent.
+                Ok(Err(_)) => Err(HubError::Internal("node rpc dropped".into())),
                 Err(_) => {
                     if bulk {
                         // A slow screen row is retryable noise, not a 500.
@@ -388,10 +394,9 @@ mod budget_tests {
     type CallResult = Result<Option<Value>, HubError>;
 
     /// Build a transport plus the socket side. The spawned pump answers
-    /// control calls through the shared reply table and leaves every bulk read
-    /// parked, modelling a Node slow to answer screen pulls. A frame carrying
-    /// `"park": true` is parked regardless of method so the control-full case
-    /// can be exercised too.
+    /// control calls through the shared reply table and leaves bulk reads and
+    /// any frame carrying `"park": true` parked, modelling a Node slow to
+    /// answer.
     fn harness() -> (WssTransport, PendingRpcs, Arc<AtomicUsize>) {
         let pending = new_pending_rpcs();
         let (outbound, mut inbound) = mpsc::channel::<Value>(64);
@@ -426,6 +431,18 @@ mod budget_tests {
         )
     }
 
+    /// A transport whose socket half already exited: every frame fails to
+    /// queue before it is sent, so calls must report Ok(None) ("not
+    /// writable"), not an Err that settles a command as maybe-executed.
+    fn dead_transport() -> (WssTransport, PendingRpcs) {
+        let pending = new_pending_rpcs();
+        let (outbound, inbound) = mpsc::channel::<Value>(4);
+        // Drop the receiver before any call: sends now fail without a frame
+        // ever being delivered.
+        drop(inbound);
+        (WssTransport::new(outbound, pending.clone()), pending)
+    }
+
     fn pending_len(pending: &PendingRpcs) -> usize {
         pending
             .lock()
@@ -444,7 +461,7 @@ mod budget_tests {
         assert_eq!(pending_len(pending), want, "waiters never parked");
     }
 
-    /// Spawn a caller that stays parked (timeout never elapses in the test).
+    /// Spawn a caller that stays parked (long timeout, never elapses).
     fn spawn_parked(
         transport: WssTransport,
         method: &'static str,
@@ -459,19 +476,21 @@ mod budget_tests {
 
     /// 40 concurrent screen reads plus one instance.create: the create uses
     /// the reserved control capacity and succeeds; excess reads get the
-    /// retryable NODE_BUSY and no call surfaces INTERNAL.
+    /// retryable NODE_BUSY immediately and no call surfaces INTERNAL.
+    ///
+    /// Deterministic: admitted reads park indefinitely in the pump (long
+    /// timeout), so there is no timeout to race; their futures are aborted at
+    /// the end, which also re-covers the cancellation cleanup path.
     #[tokio::test]
     async fn bulk_reads_cannot_starve_control() {
         let (transport, pending, answered) = harness();
 
-        // Admitted reads park in the pump; the short timeout makes them settle
-        // as the same retryable error the refused reads get immediately.
         let screens: Vec<JoinHandle<CallResult>> = (0..40)
             .map(|_| {
                 let transport = transport.clone();
                 tokio::spawn(async move {
                     transport
-                        .call(METHOD_TTY_SCREEN, json!({}), Duration::from_millis(150))
+                        .call(METHOD_TTY_SCREEN, json!({}), Duration::from_secs(3_600))
                         .await
                 })
             })
@@ -490,14 +509,35 @@ mod budget_tests {
         );
         assert_eq!(answered.load(Ordering::SeqCst), 1);
 
+        // 24 refusals are already NODE_BUSY; aborting the 16 parked reads
+        // before their long timeout still frees the slots.
+        let mut refused = 0usize;
         for handle in screens {
-            match handle.await.expect("screen task joins") {
-                Err(HubError::NodeBusy { .. }) => {}
-                other => panic!("expected NODE_BUSY, got {other:?}"),
+            handle.abort();
+            match handle.await {
+                // Cancellation: the admitted, parked calls.
+                Err(join) if join.is_cancelled() => {}
+                // Refused at admission: must be the retryable error.
+                Ok(Err(HubError::NodeBusy { .. })) => refused += 1,
+                other => panic!("unexpected screen outcome: {other:?}"),
             }
         }
-        // Refusals and timeouts free every slot; the table cannot fill with
-        // dead waiters.
+        assert_eq!(refused, 40 - MAX_IN_FLIGHT_BULK_READS);
+        assert_eq!(pending_len(&pending), 0);
+    }
+
+    /// A parked bulk read whose own timeout elapses maps to NODE_BUSY, not a
+    /// 500: a slow row is retryable noise.
+    #[tokio::test]
+    async fn bulk_timeout_is_node_busy() {
+        let (transport, pending, _answered) = harness();
+        let result = transport
+            .call(METHOD_TTY_SCREEN, json!({}), Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(result, Err(HubError::NodeBusy { .. })),
+            "{result:?}"
+        );
         assert_eq!(pending_len(&pending), 0);
     }
 
@@ -512,10 +552,23 @@ mod budget_tests {
         assert_eq!(pending_len(&pending), 0);
     }
 
-    /// Socket teardown drains the table: waiters return "not writable" rather
-    /// than hanging to their timeout.
+    /// A failed send *before* the frame is queued is Ok(None) ("not
+    /// connected"): callers must not mark such a command reconciling.
     #[tokio::test]
-    async fn link_drop_fails_all_waiters() {
+    async fn pre_send_failure_is_not_writable() {
+        let (transport, pending) = dead_transport();
+        let result = transport
+            .call(METHOD_INSTANCE_CREATE, json!({}), Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        assert_eq!(pending_len(&pending), 0);
+    }
+
+    /// A waiter dropped by fail_all_pending *after* a successful send is an
+    /// Err: the frame reached the Node and it may have executed, so command
+    /// forwarding must reconcile rather than read "not connected".
+    #[tokio::test]
+    async fn post_send_link_drop_is_lost_reply_error() {
         let (transport, pending, _answered) = harness();
         let parked = spawn_parked(transport, "tty.attach", json!({ "park": true }));
         wait_pending(&pending, 1).await;
@@ -524,7 +577,10 @@ mod budget_tests {
             .await
             .expect("caller finishes on teardown")
             .expect("task joins");
-        assert!(matches!(result, Ok(None)), "{result:?}");
+        match result {
+            Err(HubError::Internal(message)) if message == "node rpc dropped" => {}
+            other => panic!("expected dropped-reply Err, got {other:?}"),
+        }
         assert_eq!(pending_len(&pending), 0);
     }
 

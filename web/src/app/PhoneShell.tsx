@@ -126,7 +126,7 @@ export function PhoneShell() {
                 type="button"
                 data-testid="phone-nav-new"
                 aria-label={item.label}
-                onClick={() => navigate(item.to)}
+                onClick={() => navigate(onHome ? workbench.newHref : "/sessions/new")}
               >
                 <span className={css.barPlus}>{item.glyph}</span>
               </button>

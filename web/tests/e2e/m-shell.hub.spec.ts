@@ -167,10 +167,11 @@ test.describe("390px phone", () => {
     await page.goto("/sessions");
     await expect(page).toHaveURL(/\/m$/);
 
-    // 新建 keeps the shared new-session route (no redirect either side).
+    // 新建 keeps the shared new-session route (no redirect either side);
+    // from home it carries the active space like the desktop rail's +.
     await page.goto("/m");
     await page.getByTestId("phone-nav-new").click();
-    await expect(page).toHaveURL(/\/sessions\/new$/);
+    await expect(page).toHaveURL(/\/sessions\/new(?:\?|$)/);
     await expect(page.getByTestId("new-session-host")).toBeVisible();
 
     // 更多 opens the workbench destinations; 更多 closes on navigation.

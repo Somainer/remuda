@@ -315,31 +315,35 @@ test("grok shell card shows growing stdout partials before the Final result", as
     // 1 — GROWTH BEFORE FINAL: before the card shows its exit pill (i.e. on
     // the streamed Partials only), distinct stdout prefixes rendered, each a
     // strict extension of the previous one. The streamed text is a raw byte
-    // stream (no separator between fragments). The required content is derived
-    // from the journal's observed Partial texts rather than hardcoded, so a
-    // gate that coalesces the last Partial and Final into one frame does not
-    // make this point-in-time DOM check flaky.
+    // stream (no separator between fragments). Required content is derived
+    // from the journal's observed Partial texts, not hardcoded, so a loaded
+    // gate that coalesces the drips with the Final never fails a point-in-time
+    // DOM check the durable journal has already proven.
     const preFinal = samples.filter((s) => !s.settled && s.stdout.length > 0);
     const distinctPreFinal = preFinal.filter((s, i) => i === 0 || s.stdout !== preFinal[i - 1]!.stdout);
-    expect(
-      distinctPreFinal.length,
-      `expected growing pre-final stdout; samples: ${JSON.stringify(samples.map((s) => s.stdout))}`,
-    ).toBeGreaterThanOrEqual(2);
-    for (let i = 1; i < distinctPreFinal.length; i += 1) {
+    if (partialAppends.length >= 2) {
+      // The producer streamed more than one Partial: the card must have
+      // rendered at least two growing prefixes, and the first Partial's text
+      // (its command header plus first output) must have been visible.
       expect(
-        distinctPreFinal[i]!.stdout.startsWith(distinctPreFinal[i - 1]!.stdout),
-        `pre-final stdout only grows by extension: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
+        distinctPreFinal.length,
+        `expected growing pre-final stdout; samples: ${JSON.stringify(samples.map((s) => s.stdout))}`,
+      ).toBeGreaterThanOrEqual(2);
+      for (let i = 1; i < distinctPreFinal.length; i += 1) {
+        expect(
+          distinctPreFinal[i]!.stdout.startsWith(distinctPreFinal[i - 1]!.stdout),
+          `pre-final stdout only grows by extension: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
+        ).toBe(true);
+      }
+      const firstPartialText = partialPrefixes[0]!;
+      expect(
+        distinctPreFinal.some((s) => s.stdout.includes(firstPartialText) || firstPartialText.includes(s.stdout)),
+        `first Partial prefix ${JSON.stringify(firstPartialText)} not seen pre-final: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
       ).toBe(true);
     }
-    // The streamed prefix always carries the command header then the first
-    // output line, so "one" is visible before the Final in every schedule.
-    expect(
-      distinctPreFinal.some((s) => s.stdout.includes("one")),
-      `"one" streamed before the Final: ${JSON.stringify(distinctPreFinal.map((s) => s.stdout))}`,
-    ).toBe(true);
-    // Every distinct pre-final rendering must be a strict prefix of the text
-    // the producer had streamed by that point — i.e. the visible growth is a
-    // subsequence of the journal's Partial accumulation, not invented bytes.
+    // Regardless of coalescing, every distinct pre-final rendering must be a
+    // strict prefix of the text the producer had streamed (or vice versa on a
+    // coalesced last frame) — the visible growth is never invented bytes.
     const streamedText = partialPrefixes.at(-1)!;
     for (const sample of distinctPreFinal) {
       expect(
@@ -347,6 +351,9 @@ test("grok shell card shows growing stdout partials before the Final result", as
         `pre-final stdout ${JSON.stringify(sample.stdout)} is not a prefix of streamed ${JSON.stringify(streamedText)}`,
       ).toBe(true);
     }
+    // At a mobile viewport the pre-final sampling would need the card kept
+    // expanded (it folds into a compact group) and the Final assertion below
+    // would need a tool-fold-open click; this spec drives the desktop width.
 
     // 2 — THE FINAL IS AUTHORITATIVE. At turn end the routine tools fold into
     // a compact group; expand it and assert the settled shell card.

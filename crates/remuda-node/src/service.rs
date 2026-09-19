@@ -8,6 +8,12 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{sync::oneshot, task::JoinHandle};
 
 /// Driver set installed in a composed local Node.
+///
+/// The `Native` variant carries the full launch configuration (paths,
+/// timeouts, the D-045 tool-media stager slot). It is constructed once per
+/// composed Node and passed by clone (`Arc`s inside), so boxing the variant
+/// would add an indirection for a hot path that does not exist.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum LocalDrivers {
     /// Deterministic in-process driver used by API tests.
@@ -125,7 +131,13 @@ pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
         listeners: Vec::new(),
     })?;
     let node = match &config.drivers {
-        LocalDrivers::Native(native) => node.with_herdr_config(native.clone())?,
+        LocalDrivers::Native(native) => {
+            // D-045 §6.2: the factories and the runtime share one stager slot,
+            // so a Hub link connecting after startup fills it for every later
+            // instance build.
+            node.share_tool_media_stager_slot(native.tool_media_stager.clone());
+            node.with_herdr_config(native.clone())?
+        }
         LocalDrivers::Fake => node,
     };
     // D-027: attachments materialize under the Node data dir regardless of

@@ -96,6 +96,65 @@ impl HubHostFileStager {
     }
 }
 
+impl HubHostFileStager {
+    /// Stage bytes, optionally asking the Hub to type them as renderable
+    /// media (D-045 §6.2: a screenshot stages as `image/png` so the tool card
+    /// can serve it inline). The Hub re-validates the claimed type against
+    /// magic bytes; a mismatch is a refusal, not an octet-stream object.
+    async fn stage_typed(
+        &self,
+        name: &str,
+        media_type: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> Result<StagedHostFile, NodeError> {
+        let url = format!("{}/v1/hosts/{}/files/objects", self.base, self.host_id);
+        let mut query = vec![("name", name)];
+        if let Some(media_type) = media_type {
+            query.push(("mediaType", media_type));
+        }
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .query(&query)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_connect() || error.is_timeout() {
+                    NodeError::Transport(format!("Hub HTTP origin unreachable: {error}"))
+                } else {
+                    NodeError::InvalidRequest(format!("host file upload failed: {error}"))
+                }
+            })?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(NodeError::InvalidRequest(format!(
+                "Hub refused the host file upload with {status}: {body}"
+            )));
+        }
+
+        let value: Value = serde_json::from_str(&body).map_err(|error| {
+            NodeError::Transport(format!("Hub host file upload replied badly: {error}"))
+        })?;
+        Ok(StagedHostFile {
+            object_id: value
+                .get("objectId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| NodeError::Transport("Hub upload reply missing objectId".into()))?
+                .to_owned(),
+            digest: value
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+            size: value.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+        })
+    }
+}
+
 impl HostFileStager for HubHostFileStager {
     fn stage<'a>(
         &'a self,
@@ -103,51 +162,129 @@ impl HostFileStager for HubHostFileStager {
         bytes: Vec<u8>,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<StagedHostFile, NodeError>> + Send + 'a>>
     {
-        Box::pin(async move {
-            let url = format!("{}/v1/hosts/{}/files/objects", self.base, self.host_id);
-            let response = self
-                .client
-                .post(url)
-                .bearer_auth(&self.token)
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .query(&[("name", name.as_str())])
-                .body(bytes)
-                .send()
-                .await
-                .map_err(|error| {
-                    if error.is_connect() || error.is_timeout() {
-                        NodeError::Transport(format!("Hub HTTP origin unreachable: {error}"))
-                    } else {
-                        NodeError::InvalidRequest(format!("host file upload failed: {error}"))
-                    }
-                })?;
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return Err(NodeError::InvalidRequest(format!(
-                    "Hub refused the host file upload with {status}: {body}"
-                )));
-            }
+        Box::pin(async move { self.stage_typed(&name, None, bytes).await })
+    }
+}
 
-            let value: Value = serde_json::from_str(&body).map_err(|error| {
-                NodeError::Transport(format!("Hub host file upload replied badly: {error}"))
-            })?;
-            Ok(StagedHostFile {
-                object_id: value
-                    .get("objectId")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        NodeError::Transport("Hub upload reply missing objectId".into())
-                    })?
-                    .to_owned(),
-                digest: value
-                    .get("digest")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_owned(),
-                size: value.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
-            })
+/// Client-side preflight for tool-produced media. The Hub enforces the same
+/// ceiling on receipt; this only keeps a clearly-oversize screenshot from
+/// being serialized and POSTed (D-045 §6.2: such a result degrades to a text
+/// block naming the byte count).
+pub(crate) const TOOL_MEDIA_MAX_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Stages tool-result media (a computer-use screenshot) as a typed image
+/// object through the host-token route. Wraps [`HubHostFileStager`] rather
+/// than duplicating its HTTP shape.
+///
+/// The mappers fold on a synchronous seam, so the upload runs on a private
+/// one-thread runtime and the calling thread parks on its handle: a bounded
+/// (90 s) blocking call, the same shape the transcript pump already makes for
+/// file reads. It never re-enters the Node runtime, so it cannot deadlock it.
+pub(crate) struct HubToolMediaStager {
+    inner: HubHostFileStager,
+    runtime: StagingRuntime,
+}
+
+impl std::fmt::Debug for HubToolMediaStager {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.debug_struct("HubToolMediaStager")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HubToolMediaStager {
+    pub(crate) fn from_ws_url(
+        ws_url: &str,
+        host_id: String,
+        token: String,
+    ) -> Result<Self, NodeError> {
+        Ok(Self {
+            inner: HubHostFileStager::from_ws_url(ws_url, host_id, token)?,
+            runtime: StagingRuntime::start()?,
         })
+    }
+}
+
+/// A parked current-thread runtime on one OS thread for the synchronous
+/// staging bridge; shut down when the stager drops.
+struct StagingRuntime {
+    handle: tokio::runtime::Handle,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl StagingRuntime {
+    fn start() -> Result<Self, NodeError> {
+        let (handle_tx, handle_rx) = std::sync::mpsc::sync_channel(0);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("remuda-tool-media".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                let handle = runtime.handle().clone();
+                let _ = handle_tx.send(handle);
+                runtime.block_on(async move {
+                    let _ = shutdown_rx.await;
+                });
+            })
+            .map_err(|error| {
+                NodeError::Transport(format!("staging thread spawn failed: {error}"))
+            })?;
+        let handle = handle_rx.recv().map_err(|error| {
+            NodeError::Transport(format!("staging thread start failed: {error}"))
+        })?;
+        Ok(Self {
+            handle,
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        })
+    }
+
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.handle.block_on(future)
+    }
+}
+
+impl Drop for StagingRuntime {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::warn!("tool-media staging thread panicked on shutdown");
+        }
+    }
+}
+
+impl remuda_protocol::ToolMediaStager for HubToolMediaStager {
+    fn max_bytes(&self) -> u64 {
+        TOOL_MEDIA_MAX_BYTES
+    }
+
+    fn stage(
+        &self,
+        name: &str,
+        media_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<remuda_protocol::Id, remuda_protocol::ToolMediaError> {
+        let staged = self
+            .runtime
+            .block_on(self.inner.stage_typed(name, Some(media_type), bytes));
+        match staged {
+            Ok(staged) => remuda_protocol::Id::try_from(staged.object_id).map_err(|error| {
+                remuda_protocol::ToolMediaError::Unstageable(format!("bad object id: {error}"))
+            }),
+            Err(error) => Err(remuda_protocol::ToolMediaError::Unstageable(
+                error.to_string(),
+            )),
+        }
     }
 }
 
@@ -905,6 +1042,28 @@ impl crate::DevNode {
     /// Install the uploader `host.files.read` stages bytes through.
     pub(crate) fn set_host_file_stager(&self, stager: Option<Arc<dyn HostFileStager>>) {
         if let Ok(mut slot) = self.inner.host_file_stager.write() {
+            *slot = stager;
+        }
+    }
+
+    /// Adopt the shared stager slot the driver factories were built with, so
+    /// filling it from the Hub link reaches instances built afterwards
+    /// (D-045 §6.2).
+    pub(crate) fn share_tool_media_stager_slot(&self, slot: crate::ToolMediaStagerSlot) {
+        if let Ok(mut current) = self.inner.tool_media_stager.write() {
+            *current = slot;
+        }
+    }
+
+    /// Install (or clear on disconnect) the host-token stager for tool-result
+    /// images. Fills the shared slot the native factories read at build.
+    pub(crate) fn set_tool_media_stager(
+        &self,
+        stager: Option<Arc<dyn remuda_protocol::ToolMediaStager>>,
+    ) {
+        if let Ok(slot_holder) = self.inner.tool_media_stager.read()
+            && let Ok(mut slot) = slot_holder.write()
+        {
             *slot = stager;
         }
     }

@@ -101,6 +101,11 @@ pub(crate) struct DevNodeInner {
     /// Uploader for read-only host-file fetches (D-031-era host files slice).
     /// `None` until the outbound link gives us a Hub HTTP origin and token.
     pub(crate) host_file_stager: std::sync::RwLock<Option<Arc<dyn crate::files::HostFileStager>>>,
+    /// Shared slot holding the stager for image blocks in tool results
+    /// (D-045 §6.2). The same `Arc` is handed to the native driver factories
+    /// at compose time; the outbound link fills it on every hello. Writes go
+    /// through [`DevNode::set_tool_media_stager`].
+    pub(crate) tool_media_stager: std::sync::RwLock<crate::ToolMediaStagerSlot>,
     /// Root for materialized attachments. Set by `compose` from the Node data
     /// dir; `None` on an in-memory Node, where attachments are refused.
     pub(crate) attachment_root: std::sync::RwLock<Option<std::path::PathBuf>>,
@@ -182,6 +187,7 @@ impl DevNode {
                 herdr_config: None,
                 objects: std::sync::RwLock::new(None),
                 host_file_stager: std::sync::RwLock::new(None),
+                tool_media_stager: std::sync::RwLock::new(Arc::new(std::sync::RwLock::new(None))),
                 attachment_root: std::sync::RwLock::new(None),
                 queue_capacity: config.instance_queue_capacity,
                 host,

@@ -37,9 +37,8 @@ impl Entrypoint for HostcapArgs {
             // action. So the error becomes an explicit, reported state carrying
             // its text, and the capacity payload — already fetched — still
             // prints.
-            value["computerUse"] = capability_state(
-                client.get(&format!("/v1/hosts/{}", self.host)).await,
-            );
+            value["computerUse"] =
+                capability_state(client.get(&format!("/v1/hosts/{}", self.host)).await);
             print_json(&value)?;
             Ok(0)
         })

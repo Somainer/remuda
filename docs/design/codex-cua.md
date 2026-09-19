@@ -219,7 +219,7 @@ argv 的 kind 是 codex（它拿 shadow home），其余 kind 一律走 argv。�
 | 字段 | 值 |
 |---|---|
 | `kind` | `"computer-use"` |
-| `installed` | 路径是否存在 |
+| `installed` | 该路径上存在一个**可执行常规文件**（与 PATH probe 同一套 `is_executable` 判定，不是「这个名字下有任何东西」） |
 | `path` | `${CODEX_HOME:-$HOME/.codex}/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient` |
 | `version` | 读 app bundle 的 `Contents/Info.plist` 的 `CFBundleShortVersionString` |
 | `auth` | `"unknown"` —— **刻意不探测** |

@@ -132,6 +132,12 @@ describe("computer-use host capability row (D-045 §3.4)", () => {
     ];
 
     expect(supportedHarnessKinds(capabilityOnly)).toEqual([]);
+    // The other reported state is the same host shape for this purpose: a Node
+    // that looked and found no client still must not contribute a kind.
+    const capabilityAbsent: HostCli[] = [
+      { kind: COMPUTER_USE_KIND, auth: "unknown", installed: false },
+    ];
+    expect(supportedHarnessKinds(capabilityAbsent)).toEqual([]);
     expect(supportedHarnessKinds(HOST_FIXTURES.flatMap((host) => host.cli)))
       .not.toContain(COMPUTER_USE_KIND);
 

@@ -180,10 +180,10 @@ test("a via session shows its echoed proxy route, then api-route-down when the p
     // The strip clause is readable operator text, not a host id or the
     // requested value.
     await expect(clause).toHaveText("经 e2e-via-host Hub 中转");
-    expect(clause).toHaveAttribute("data-mode", "via");
-    expect(clause).toHaveAttribute("data-route", "hub-relay");
+    await expect(clause).toHaveAttribute("data-mode", "via");
+    await expect(clause).toHaveAttribute("data-route", "hub-relay");
     // Before the drop there is no error banner and no reroute clause.
-    expect(page.getByTestId("session-api-route-down")).toHaveCount(0);
+    await expect(page.getByTestId("session-api-route-down")).toHaveCount(0);
 
     // The clause lives inside the collapsed run-details disclosure; open it
     // for the evidence shot.
@@ -201,11 +201,11 @@ test("a via session shows its echoed proxy route, then api-route-down when the p
 
     const down = page.getByTestId("session-api-route-down");
     await expect(down).toBeVisible({ timeout: 30_000 });
-    expect(down).toHaveAttribute("role", "alert");
-    expect(down).toContainText("api-route-down");
+    await expect(down).toHaveAttribute("role", "alert");
+    await expect(down).toContainText("api-route-down");
     // The route clause did not reroute: the error names the same via route.
-    expect(page.getByTestId("session-api-route")).toHaveText("经 e2e-via-host Hub 中转");
-    expect(page.getByTestId("session-api-route")).toHaveAttribute("data-down", "1");
+    await expect(page.getByTestId("session-api-route")).toHaveText("经 e2e-via-host Hub 中转");
+    await expect(page.getByTestId("session-api-route")).toHaveAttribute("data-down", "1");
     await shot(page, "api-route-down.png");
 
     // Lifting the gate reconnects the proxy; a reconnect never silently

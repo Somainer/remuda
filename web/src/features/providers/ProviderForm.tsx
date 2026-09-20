@@ -290,7 +290,7 @@ export function ProviderForm({
                     const hostId = delivery.viaHostId || hosts[0]?.id || "";
                     setDelivery({
                       mode: "via",
-                      route: delivery.route === "auto" ? "auto" : delivery.route,
+                      route: delivery.route,
                       ...(hostId ? { viaHostId: hostId } : {}),
                     });
                   }}

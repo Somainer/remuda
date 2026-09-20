@@ -535,6 +535,26 @@ fn api_route_echo(spec: &Value) -> Option<Value> {
     Some(echo)
 }
 
+/// Build the `instance.create`/`instance.resume` result.
+///
+/// Default is byte-identical to the pre-D-047 fake (`ok` + `instanceId`
+/// only): the Hub then leaves `node_accepted()` false, as it always has, and
+/// every existing spec converges through the mirrored journal. Only with
+/// HUB_E2E_API_ROUTE=1 does the reply carry `accepted: true` (so the Hub's
+/// create projection runs) and the Node-echoed `apiRoute` — both are the
+/// D-047 fixture this file adds, and neither must change the default state
+/// machine.
+fn create_result(spec: &Value, instance_id: &str) -> Value {
+    if std::env::var("HUB_E2E_API_ROUTE").as_deref() != Ok("1") {
+        return json!({ "ok": true, "instanceId": instance_id });
+    }
+    let mut result = json!({ "accepted": true, "ok": true, "instanceId": instance_id });
+    if let Some(echo) = api_route_echo(spec) {
+        result["apiRoute"] = echo;
+    }
+    result
+}
+
 async fn fake_node(
     addr: SocketAddr,
     enroll: String,
@@ -812,12 +832,7 @@ async fn fake_node(
                             }),
                         )
                         .await?;
-                        let mut create_result =
-                            json!({ "accepted": true, "ok": true, "instanceId": instance_id });
-                        if let Some(echo) = api_route_echo(spec) {
-                            create_result["apiRoute"] = echo;
-                        }
-                        send_rpc_ok(&mut ws, id, create_result).await?;
+                        send_rpc_ok(&mut ws, id, create_result(spec, &instance_id)).await?;
                         continue;
                     }
                     if method == "instance.resume" {
@@ -1052,12 +1067,7 @@ async fn fake_node(
                         )
                         .await?;
                     }
-                    let mut create_result =
-                        json!({ "accepted": true, "ok": true, "instanceId": instance_id });
-                    if let Some(echo) = api_route_echo(spec) {
-                        create_result["apiRoute"] = echo;
-                    }
-                    send_rpc_ok(&mut ws, id, create_result).await?;
+                    send_rpc_ok(&mut ws, id, create_result(spec, &instance_id)).await?;
                 }
                 "instance.send" => {
                     let prompt = params

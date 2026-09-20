@@ -5,10 +5,18 @@ import css from "./TerminalView.module.css";
 export function LocalInput({
   disabled,
   mobile,
+  initialText = "",
   onSend,
 }: {
   disabled: boolean;
   mobile: boolean;
+  /**
+   * c-mkeybar: initial field content for THIS mount. The 史 key fills a chosen
+   * previous prompt without sending it; the parent remounts the dock with a
+   * fresh key to inject the value. The field stays locally controlled and the
+   * submit path is unchanged.
+   */
+  initialText?: string;
   /**
    * Delivers the BODY only. D-028 §5.2: text and Enter must be separate
    * writes (body, quiet wait, then `\r`); the `instance.send` driver path
@@ -17,7 +25,7 @@ export function LocalInput({
    */
   onSend: (text: string) => void;
 }) {
-  const [text, setText] = useState("");
+  const [text, setText] = useState(initialText);
 
   const submit = () => {
     if (!text || disabled) return;

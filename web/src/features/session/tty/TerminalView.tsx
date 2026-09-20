@@ -10,6 +10,8 @@ import { hubStore } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
+import { PhoneKeyBar } from "./PhoneKeyBar";
+import { clearTtyScrollLine, consumeTtyScrollLine, peekTtyScrollLine } from "./ttyScrollMemory";
 import { TuiModeIndicator } from "./TuiModeIndicator";
 import { TtyProgressBar } from "./TtyProgressBar";
 import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type TtyStatus } from "./client";
@@ -99,6 +101,10 @@ export function TerminalView({
   const instanceRef = useRef(instance);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  // c-mkeybar: the 史 key fills a chosen previous prompt into the local input
+  // strip. A new nonce remounts LocalInput with the text — fill never sends
+  // (D-028a write boundary).
+  const [inputFill, setInputFill] = useState<{ text: string; nonce: number } | null>(null);
   const [preview, setPreview] = useState("");
   const [rawTail, setRawTail] = useState("");
   const [ready, setReady] = useState(false);
@@ -459,6 +465,32 @@ export function TerminalView({
     applyStdinPolicy(termRef.current, { directInput, frozen });
   }, [directInput, frozen]);
 
+  // c-mkeybar: restore the scroll line remembered by the nine-key git key.
+  // The fresh attach replays the Hub screen snapshot, so the buffer builds a
+  // frame at a time — retry until the remembered line exists, then consume
+  // the memory exactly once. xterm v6 scrolls virtually (DOM scrollTop is
+  // inert), so the restore goes through the terminal scroll API.
+  useEffect(() => {
+    if (!ready) return;
+    if (peekTtyScrollLine(instance.id) == null) return;
+    let timer = 0;
+    let tries = 0;
+    const apply = () => {
+      const term = termRef.current;
+      const line = term
+        ? consumeTtyScrollLine(instance.id, term.buffer.active.length, term.rows)
+        : null;
+      if (line != null) {
+        term!.scrollToLine(line);
+        return;
+      }
+      if (term && ++tries >= 80) clearTtyScrollLine(instance.id);
+      else timer = window.setTimeout(apply, 50);
+    };
+    apply();
+    return () => window.clearTimeout(timer);
+  }, [ready, instance.id]);
+
   useEffect(() => {
     document.documentElement.dataset.ttyFullscreen = fullscreen ? "1" : "0";
     return () => {
@@ -654,10 +686,24 @@ export function TerminalView({
           {/* D-028 §5.2: the dock routes through instance.send so the driver
               performs body-then-Enter as two PTY writes; raw key buttons
               below stay on the binary channel. */}
-          <LocalInput disabled={frozen} mobile={mobile} onSend={(text) => void hubStore.send(instance.id, text)} />
+          <LocalInput
+            key={inputFill?.nonce ?? 0}
+            initialText={inputFill?.text ?? ""}
+            disabled={frozen}
+            mobile={mobile}
+            onSend={(text) => void hubStore.send(instance.id, text)}
+          />
         </div>
       ) : null}
-      {mobile ? <AuxKeys disabled={frozen} onKey={send} /> : null}
+      {mobile ? (
+        <PhoneKeyBar
+          instance={instance}
+          disabled={frozen}
+          onKey={send}
+          captureScrollLine={() => termRef.current?.buffer.active.baseY ?? 0}
+          onFillInput={(text) => setInputFill({ text, nonce: Date.now() })}
+        />
+      ) : null}
       {!mobile ? (
         <div className={css.note}>
           TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一 journal

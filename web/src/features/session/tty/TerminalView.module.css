@@ -414,3 +414,158 @@
     animation: none;
   }
 }
+
+/*
+ * c-mkeybar (mobile-ui plan B.3.2 / ui-spec §4.7): the compact terminal
+ * nine-key bar. One 44px row that scrolls horizontally — the same fold
+ * m-sessionfold gave the raw keys — so the xterm keeps its §4.7 >= 60% body
+ * budget instead of paying for a 3x3 grid. Visual glyph size is the hit size
+ * here on purpose: these are wide toolbar buttons, not glyphs inflated to
+ * squares (the 44px is their real box, so no ::after is needed and adjacent
+ * hit areas cannot overlap).
+ */
+.phoneBar {
+  flex: none;
+  background: var(--ink-2, #1a212b);
+  border-top: 1px solid var(--line);
+}
+
+.phoneRow {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+  /* An 8px tray, same inset the mobile AuxKeys strip always had: keys never
+     sit flush on the viewport edge, so their 44px hit corners clear the
+     browser's bottom boundary and the safe-area inset (D-039 / §4.7). Total
+     strip height stays 60px — identical to the previous single-row keybar,
+     so the xterm >=60% body budget is unchanged. */
+  padding: 8px;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  /* No classic scrollbar: its track would sit on the bottom edge of the row
+     and steal the lower hit corners (elementFromPoint over a scrollbar
+     resolves null). Touch swipe scrolling is unchanged. */
+  scrollbar-width: none;
+}
+
+.phoneRow::-webkit-scrollbar {
+  display: none;
+}
+
+/* The expanded raw-key row carries its own safe-area inset (.keys); the tray
+   must not stack a second one. */
+.phoneBar[data-aux="1"] .phoneRow {
+  padding-bottom: 8px;
+}
+
+.phoneKey {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: var(--touch);
+  min-width: var(--touch);
+  height: var(--touch);
+  min-height: var(--touch);
+  padding: 0;
+  /* Outline, not border: a 1px border ridge at the box edge makes a 0.5px-
+     inset corner hit-test round onto the parent (ux-touchhit probe). The
+     outline paints inside the 44px box, so the WHOLE hit surface — corners
+     included — is the key itself (D-039). */
+  border: 0;
+  outline: 1px solid var(--line);
+  outline-offset: -1px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+  font-family: var(--mono);
+  font-size: 13px;
+  touch-action: manipulation;
+}
+
+/* Square hit surface over the 4px rounded visual (the effortIconBtn /
+   ux-touchhit ::after precedent): the four 0.5px-inset 44px corners must
+   resolve to the key, and a rounded box clips its own corner hit region.
+   Keeps the visual radius without shrinking the tap surface to 40px. */
+.phoneKey::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.phoneKey:disabled {
+  opacity: 0.45;
+}
+
+/* Sticky Ctrl / 键 pressed state: dust outline instead of border-colour
+   (the phone keys frame themselves with an inset outline). */
+.phoneKey.keyOn {
+  outline-color: var(--dust);
+}
+
+/* The clipboard key's reason is visible INLINE, never only a hover title
+   (acceptance 4). Uses the aux-text token floor (ui-spec §3.4). */
+.clipReason {
+  margin: 0;
+  padding: 4px 12px 6px;
+  font-size: var(--text-aux);
+  line-height: 1.4;
+  color: var(--mute);
+}
+
+.historyHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.historyHead h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.historyClose {
+  flex: none;
+  min-height: var(--touch);
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+}
+
+.historyHint {
+  margin: 0;
+  font-size: var(--text-aux);
+  color: var(--mute);
+}
+
+.historyList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.historyItem {
+  min-height: var(--touch);
+  padding: 8px 12px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.historyEmpty {
+  margin: 0;
+  font-size: var(--text-aux);
+  color: var(--mute);
+}

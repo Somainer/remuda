@@ -40,7 +40,19 @@ test.describe("mobile visual QA", () => {
 
   test("tty key bar keys are at least 44px", async ({ page }) => {
     await page.goto(`/s/${TTY_LAB}/tty`);
-    await expect(page.getByTestId("tty-keybar")).toBeVisible({ timeout: 15_000 });
+    // c-mkeybar: the compact default is the nine-key action bar; the raw
+    // byte keys sit on the 键 second row with unchanged tty-key-* testids.
+    await expect(page.getByTestId("phone-keybar")).toBeVisible({ timeout: 15_000 });
+    for (const id of ["ctrl", "esc", "tab", "git", "jump", "clip", "history", "view", "keyboard"] as const) {
+      const key = page.getByTestId(`phone-key-${id}`);
+      await expect(key).toBeVisible();
+      const box = await key.boundingBox();
+      expect(box, id).toBeTruthy();
+      expect(box!.height, id).toBeGreaterThanOrEqual(44);
+      expect(box!.width, id).toBeGreaterThanOrEqual(44);
+    }
+    await page.getByTestId("phone-key-keyboard").click();
+    await expect(page.getByTestId("tty-keybar")).toBeVisible();
     for (const id of ["esc", "tab", "ctrl", "alt", "up", "down", "left", "right", "pgup", "pgdn", "ctrl-c"]) {
       const key = page.getByTestId(`tty-key-${id}`);
       await expect(key).toBeVisible();

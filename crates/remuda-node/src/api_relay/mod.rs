@@ -191,10 +191,14 @@ impl Outbox {
     /// forgotten rather than dropped, because it represents the consumer's
     /// budget and is only returned through an inbound `api.credit`.
     ///
-    /// The acquire is raced against the stream's cancellation notify and its
-    /// hard deadline: a consumer that stops acknowledging (or a link drop the
-    /// router notices) must end the send promptly, not park the producer past
-    /// the hard cap holding the upstream gateway connection.
+    /// A permit the consumer has already granted is used unconditionally:
+    /// elapsed hard-cap time can never confiscate an open window, so the
+    /// initial four chunks drain deterministically no matter how long the
+    /// executor or the network took beforehand. Only when the window is
+    /// empty does the acquire race the stream's cancellation notify and its
+    /// hard deadline: a consumer that stops acknowledging (or a link drop
+    /// the router notices) must end the send promptly, not park the producer
+    /// past the hard cap holding the upstream gateway connection.
     pub(crate) async fn send_gated<T: Serialize>(
         &self,
         method: &str,
@@ -202,17 +206,30 @@ impl Outbox {
         cancelled: &tokio::sync::Notify,
         hard_deadline: tokio::time::Instant,
     ) -> Result<(), GatedSendError> {
-        tokio::select! {
-            acquired = self.window.acquire() => {
-                acquired
-                    .expect("credit window semaphore is never closed")
-                    .forget();
+        match self.window.try_acquire() {
+            Ok(permit) => {
+                permit.forget();
                 self.send_notification(method, params)
                     .await
                     .map_err(|_| GatedSendError::LinkLost)
             }
-            _ = cancelled.notified() => Err(GatedSendError::Cancelled),
-            _ = tokio::time::sleep_until(hard_deadline) => Err(GatedSendError::HardCap),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                tokio::select! {
+                    acquired = self.window.acquire() => {
+                        acquired
+                            .expect("credit window semaphore is never closed")
+                            .forget();
+                        self.send_notification(method, params)
+                            .await
+                            .map_err(|_| GatedSendError::LinkLost)
+                    }
+                    _ = cancelled.notified() => Err(GatedSendError::Cancelled),
+                    _ = tokio::time::sleep_until(hard_deadline) => Err(GatedSendError::HardCap),
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                panic!("credit window semaphore is never closed")
+            }
         }
     }
 

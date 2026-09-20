@@ -220,8 +220,8 @@ retire_worker（crates/remuda-hub/src/workers.rs:1284）
 
 - 每张卡的**可拖性由当前 state 决定**：UI 用 `can_transition_to` 预计算该卡合法可达的目标列；不可达列在拖拽中禁用并提示，不是静默拒绝。
 - **待办 → 进行中**目标 state = `running`：对 `pending`/`deferred` 卡走多跳序列（`pending→placed→running` 或 `deferred→placed→running`），对 `placed`/`parked` 卡单跳 → `running`。每跳都是合法 `PATCH /v1/tasks/{id}`；任一跳非法则整体拒绝并复位。
-- **进行中 → 已完成**目标 state = `done`（仅 `running`/`stalled` 可达）。done 是声明；land 另走 gate。
-- **回拖（进行中 → 待办）**按 `can_transition_to` 选最近合法态（如 `running→parked`）。
+- **进行中 → 已完成**目标 state = `done`。注意 `can_transition_to` 只有 `running → done` 一条边（`task.rs:57`），**`stalled → done` 不合法**（`task.rs:58` 只允许 stalled → running/failed/parked）：因此 `running` 卡单跳 → `done`，`stalled` 卡走多跳 `stalled → running → done`，每跳都是合法 PATCH。
+- **回拖（进行中 → 待办）**按 `can_transition_to` 选最近合法态（如 `running→parked`；`stalled` 同样可直接 → `parked`）。
 - 归档不是列迁移，只走 `POST /v1/tasks/{id}/archive`，不改 state。
 
 ### 5.4 硬规则 I1：已完成列永不解锁依赖

@@ -779,7 +779,7 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 - **列投影（只读，权威是 8 态机）**：待办 = pending/placed/deferred/parked（+ failed 且无 placement）；进行中 = running/stalled（+ failed 且有 placement）；已完成 = **只有 done**。
 - **failed 卡**按 `placement` 归位（有→进行中，无→待办）并在卡上叠**红色 ⚠ 角标**，`blockedReason` 可见；不单开列、不折进已完成。角标只靠颜色不够，要带形状与文案。
 - **卡面字段**：`SE-nn` key、标题、所含 session 行（harness 字形 + 相对时间，复用 tab 渲染语义）、当前 profile 的 `default` 配置标签（点击回落 composer 模型/权限三元组，无新存储）、footer **「与 N 个 task 共用」**（lease refcount，顺序轮用语义）、failed 角标。
-- **拖卡合法性由当前 state 决定**：UI 用状态机的合法迁移预计算每卡可达列，不可达列在拖拽时禁用并给提示（不是静默拒绝，也不是松手后 4xx 才报错）；待办→进行中对 pending/deferred 卡走多跳（pending→placed→running），每跳都是合法 PATCH，任一跳非法整体复位。已完成列上的卡**不暴露 land 动作**——land 只走 gate；卡进已完成列不解锁依赖（I1）。
+- **拖卡合法性由当前 state 决定**：UI 用状态机的合法迁移预计算每卡可达列，不可达列在拖拽时禁用并给提示（不是静默拒绝，也不是松手后 4xx 才报错）；待办→进行中对 pending/deferred 卡走多跳（pending→placed→running），每跳都是合法 PATCH，任一跳非法整体复位。进行中→已完成同理：只有 running 卡能单跳 → done（状态机无 stalled→done 边），**stalled 卡走 stalled→running→done 多跳**；路径一律由 `can_transition_to` 计算，不发非法单跳。已完成列上的卡**不暴露 land 动作**——land 只走 gate；卡进已完成列不解锁依赖（I1）。
 - **门控按 grant 动词，UI 不假设「agent 一律禁写」**：拖卡发 `PATCH /v1/tasks/{id}`、归档发 `POST /v1/tasks/{id}/archive`，Hub 按 `GrantVerb::Dispatch` 门控；持 grant 的协调员 agent 可写，无 grant/越 scope 收 403，UI 照常渲染拒绝理由。
 - **看板详情 = 只读预览**：从卡片点开的详情面板渲染 task 的 mandate/title/blockedReason 正文（批注锚点 `①` 挂这个正文面），composer 禁用，面板标「**预览模式 · 在工作台打开以完整操作**」，入口跳共享 `/s/:id`（镜像归档 session 的只读态）。
 

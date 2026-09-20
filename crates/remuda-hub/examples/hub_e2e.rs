@@ -118,20 +118,152 @@ async fn main() -> Result<()> {
         .context("fake upstream")?;
     let upstream_addr = upstream.local_addr()?;
     let upstream_task = tokio::spawn(fake_upstream(upstream));
-    let line = json!({
+    let mut line = json!({
         "hub": format!("http://{addr}"),
         "token": BOOTSTRAP,
         "hostId": host_id.as_id().as_str(),
         "upstream": format!("http://{upstream_addr}"),
+        "viaHost": Value::Null,
     });
+    // D-047: an optional second relay-capable Node for the api-route spec.
+    let mut route_down_gate: Option<PathBuf> = None;
+    if let Some(hub) = &hub
+        && let Some((gate, _)) = maybe_spawn_via_proxy(addr, hub, &mut line).await?
+    {
+        route_down_gate = Some(gate);
+    }
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
     tokio::signal::ctrl_c().await.ok();
     let _ = std::fs::remove_file(&rpc_gate);
+    if let Some(gate) = &route_down_gate {
+        let _ = std::fs::remove_file(gate);
+    }
     node.abort();
     upstream_task.abort();
     drop(hub);
     Ok(())
+}
+
+/// D-047 operator-surface harness (api-route.hub.spec): when
+/// `HUB_E2E_API_ROUTE=1`, also enroll a second, relay-capable fake Node that
+/// acts purely as a proxy host `H`. Its host id is published in the
+/// HUB_E2E_READY line as `viaHost`.
+///
+/// The down gate (a port-scoped temp file, same convention as the rpc gate)
+/// is the smallest knob for the §B.5 scenario: while the file exists the
+/// proxy socket is closed, so the Hub's link-lost hook marks every via
+/// instance `blocked{api-route-down}` and publishes the diagnostic the strip
+/// renders as an error. Deleting the file reconnects the proxy with a new
+/// epoch; the block is deliberately not cleared by a reconnect, matching the
+/// Hub's "operator re-dispatches" rule.
+async fn maybe_spawn_via_proxy(
+    addr: SocketAddr,
+    hub: &remuda_hub::RunningHub,
+    ready_line: &mut Value,
+) -> Result<Option<(PathBuf, HostId)>> {
+    if std::env::var("HUB_E2E_API_ROUTE").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    let down_gate = std::env::temp_dir().join(format!("remuda-e2e-route-down-{}", addr.port()));
+    let _ = std::fs::remove_file(&down_gate);
+    let via_host = HostId::new();
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .context("mint via-host enroll token")?;
+    let gate = down_gate.clone();
+    let proxy = via_host.clone();
+    tokio::spawn(async move {
+        if let Err(error) = via_proxy_node(addr, enroll, proxy.clone(), gate).await {
+            eprintln!("via proxy node {proxy:?} exited: {error:#}");
+        }
+    });
+    ready_line["viaHost"] = json!(via_host.as_id().as_str());
+    Ok(Some((down_gate, via_host)))
+}
+
+/// Connect/reconnect loop for the D-047 proxy fake Node.
+async fn via_proxy_node(
+    addr: SocketAddr,
+    enroll: String,
+    host_id: HostId,
+    down_gate: PathBuf,
+) -> Result<()> {
+    let mut epoch = 1u64;
+    loop {
+        // Down: hold the link closed while the gate file exists. The Hub
+        // observes an immediate TCP close on the serving arm below; this arm
+        // covers "start while already down" and post-reconnect re-drops.
+        while down_gate.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            epoch = epoch.wrapping_add(1);
+        }
+        let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {enroll}").parse()?);
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
+                "params": {
+                    "hostId": host_id.as_id().as_str(),
+                    "nodeVersion": "0.1.0-e2e",
+                    "label": "e2e-via-host",
+                    "nodeEpoch": format!("epoch-e2e-via-{epoch}"),
+                    "instanceStoreFound": true,
+                    "instances": [],
+                    "host": {
+                        "hostname": "e2e-via-host.local",
+                        "workspaceRevision": 1,
+                        "workspaces": [],
+                        "maxInstances": 8,
+                    },
+                    // This Node exists to serve the proxy half; the worker
+                    // host advertises its own capability via HUB_E2E_API_ROUTE.
+                    "capabilities": { "apiRelay": true }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        // Serve until the gate drops or the socket ends. api.egress installs
+        // are notifications (no id) and need no answer; answer any RPC ok.
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    if down_gate.exists() {
+                        // Drop cleanly so the Hub's link-lost hook runs at
+                        // once; the outer loop reconnects when the gate clears.
+                        epoch = epoch.wrapping_add(1);
+                        break;
+                    }
+                }
+                frame = ws.next() => {
+                    match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(frame) = serde_json::from_str::<Value>(&text)
+                                && let Some(id) = frame.get("id").cloned()
+                            {
+                                let _ = ws.send(Message::Text(
+                                    json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})
+                                        .to_string()
+                                        .into(),
+                                )).await;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break,
+                    }
+                }
+            }
+        }
+        let _ = ws.close(None).await;
+        epoch = epoch.wrapping_add(1);
+        // Avoid a tight loop when the socket fails before the gate exists.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// A catalog big enough to need the bulk controls, served under `/bulk/v1`.
@@ -357,7 +489,14 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
                         "launchable": true,
                         "reasonCode": "fake-node-legacy"
                     }
-                ]
+                ],
+                // D-047 operator-surface knob (api-route.hub.spec): when
+                // HUB_E2E_API_ROUTE=1 the fake worker also claims the api.*
+                // relay class, so a `via` create is accepted and its create
+                // result echoes the requested apiRoute. Absent by default —
+                // every non-route spec then hits api-via-unsupported exactly
+                // as a pre-D-048 Node would.
+                "apiRelay": std::env::var("HUB_E2E_API_ROUTE").as_deref() == Ok("1"),
             }
         }
     })
@@ -369,6 +508,32 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
 /// worktree.list), so a spec can fill the control half of the per-link budget
 /// with calls that park for their full node timeout.
 const GATED_METHODS: &[&str] = &["tty.screen", "workspace.list", "worktree.list"];
+
+/// Build the D-047 create-result `apiRoute` echo from the requested spec.
+///
+/// The fake Node stands in for the real listener half: it accepts a via
+/// launch and reports which route the launch took. `auto` reaching this fake
+/// has already been resolved by the Hub (it writes `hub-relay` when the proxy
+/// host has no relayBind), so `auto` maps to `hub-relay` here as well. The
+/// Hub validates this echo against the requested route and projects only an
+/// echo it accepts (D-035), which is what the Session strip reads.
+fn api_route_echo(spec: &Value) -> Option<Value> {
+    let requested = spec.get("apiRoute")?;
+    if requested.get("mode").and_then(Value::as_str) != Some("via") {
+        return None;
+    }
+    let kind = match requested.get("route").and_then(Value::as_str) {
+        Some("direct-net") => "direct-net",
+        _ => "hub-relay",
+    };
+    let mut echo = json!({ "mode": "via", "route": kind });
+    // `self` (Hub-host proxy) carries no host id; a host proxy must echo the
+    // exact id the Hub named, or the Hub refuses to project the route.
+    if let Some(via_host_id) = requested.get("viaHostId") {
+        echo["viaHostId"] = via_host_id.clone();
+    }
+    Some(echo)
+}
 
 async fn fake_node(
     addr: SocketAddr,
@@ -389,17 +554,32 @@ async fn fake_node(
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
     let host = host_id.as_id().as_str();
-    let workspaces = json!([
-        { "workspaceId": "wsp_e2e", "hostId": host, "root": "/tmp/remuda-e2e" },
-        { "workspaceId": "wsp_e2e_second", "hostId": host, "root": "/tmp/remuda-e2e-second" },
+    let mut workspaces = vec![
+        json!({ "workspaceId": "wsp_e2e", "hostId": host, "root": "/tmp/remuda-e2e" }),
+        json!({ "workspaceId": "wsp_e2e_second", "hostId": host, "root": "/tmp/remuda-e2e-second" }),
         // G2 files-view synthetic scenarios (docs/design/files-view-contract.md §3.6).
-        { "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" },
-        { "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" },
-        { "workspaceId": "wsp_g2_nogit", "hostId": host, "root": "/tmp/remuda-g2/nogit" },
-        { "workspaceId": "wsp_g2_denied", "hostId": host, "root": "/tmp/remuda-g2/denied" },
-        { "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" },
-        { "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }
-    ]);
+        json!({ "workspaceId": "wsp_g2_changes", "hostId": host, "root": "/tmp/remuda-g2/changes" }),
+        json!({ "workspaceId": "wsp_g2_clean", "hostId": host, "root": "/tmp/remuda-g2/clean" }),
+        json!({ "workspaceId": "wsp_g2_nogit", "hostId": host, "root": "/tmp/remuda-g2/nogit" }),
+        json!({ "workspaceId": "wsp_g2_denied", "hostId": host, "root": "/tmp/remuda-g2/denied" }),
+        json!({ "workspaceId": "wsp_g2_trunc", "hostId": host, "root": "/tmp/remuda-g2/trunc" }),
+        json!({ "workspaceId": "wsp_g2_changed", "hostId": host, "root": "/tmp/remuda-g2/changed" }),
+    ];
+    // D-047 operator knob (HUB_E2E_API_ROUTE=1, api-route.hub.spec): project
+    // members require a branded workspace id from the host's acknowledged
+    // snapshot; the legacy `wsp_e2e` labels are deliberately non-branded.
+    // Announce one extra branded workspace on the e2e root (the hello and
+    // every workspace.list reply share this list, so the Hub never observes a
+    // revision-less change). Scoped to the flag; other specs see the unchanged
+    // snapshot.
+    if std::env::var("HUB_E2E_API_ROUTE").as_deref() == Ok("1") {
+        workspaces.push(json!({
+            "workspaceId": remuda_protocol::WorkspaceId::new().as_id().as_str(),
+            "hostId": host,
+            "root": "/tmp/remuda-e2e"
+        }));
+    }
+    let workspaces = Value::Array(workspaces);
     // The enroll hello announces an empty inventory — this process holds no
     // sessions yet — and a later restart re-announces whatever is still live.
     // The Hub reads a missing key as "cannot enumerate" and an empty array as
@@ -632,12 +812,12 @@ async fn fake_node(
                             }),
                         )
                         .await?;
-                        send_rpc_ok(
-                            &mut ws,
-                            id,
-                            json!({ "ok": true, "instanceId": instance_id }),
-                        )
-                        .await?;
+                        let mut create_result =
+                            json!({ "accepted": true, "ok": true, "instanceId": instance_id });
+                        if let Some(echo) = api_route_echo(spec) {
+                            create_result["apiRoute"] = echo;
+                        }
+                        send_rpc_ok(&mut ws, id, create_result).await?;
                         continue;
                     }
                     if method == "instance.resume" {
@@ -872,12 +1052,12 @@ async fn fake_node(
                         )
                         .await?;
                     }
-                    send_rpc_ok(
-                        &mut ws,
-                        id,
-                        json!({ "ok": true, "instanceId": instance_id }),
-                    )
-                    .await?;
+                    let mut create_result =
+                        json!({ "accepted": true, "ok": true, "instanceId": instance_id });
+                    if let Some(echo) = api_route_echo(spec) {
+                        create_result["apiRoute"] = echo;
+                    }
+                    send_rpc_ok(&mut ws, id, create_result).await?;
                 }
                 "instance.send" => {
                     let prompt = params
@@ -1790,6 +1970,40 @@ async fn fake_node(
                 }
                 "tty.resize" => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                }
+                "worker.provision" => {
+                    // Dispatch (api-route.hub.spec): provision a synthetic
+                    // worktree under the announced e2e root; no real git.
+                    let name = params.get("name").and_then(Value::as_str).unwrap_or("x");
+                    let branch = params
+                        .get("branch")
+                        .and_then(Value::as_str)
+                        .unwrap_or("wt/x/work");
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({
+                            "name": name,
+                            "branch": branch,
+                            "startPoint": "origin/main",
+                            "worktreePath": format!("/tmp/remuda-e2e/wt/{name}"),
+                            "targetDir": format!("/tmp/remuda-e2e/target/{name}"),
+                        }),
+                    )
+                    .await?;
+                }
+                "worker.remove" => {
+                    send_rpc_ok(
+                        &mut ws,
+                        id,
+                        json!({
+                            "name": params.get("name").and_then(Value::as_str).unwrap_or("x"),
+                            "worktreeRemoved": true,
+                            "targetRemoved": true,
+                            "reclaimedBytes": "2048",
+                        }),
+                    )
+                    .await?;
                 }
                 _ => {
                     send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;

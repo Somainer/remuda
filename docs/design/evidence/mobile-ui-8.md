@@ -114,10 +114,14 @@
 - `m-inbox.hub.spec.ts`：回归 1 次，**4 passed / 1 evidence skipped**。
 - `bash scripts/ci/secret-scan.sh`、`bash scripts/ci/no-tunnel-scan.sh`：pass。
 
-完整 web hub e2e 套件（`playwright test -c playwright.hub.config.ts`，1 worker）运行 **2 次**：
+完整 web hub e2e 套件（`playwright test -c playwright.hub.config.ts`，1 worker）运行 **2 次**（全部在派工端口 59240/59249/59241 + 锁槽 `e2e.lock-c`，bundled full Chromium；本任务的 3 个用例在整跑中编号 174–176，均 ✓）：
 
-1. 第一次（2026-09-20，约 25.6 分钟，派工端口/锁槽）：169 用例 **156 passed / 1 failed / 12 skipped（REMUDA_EVIDENCE 证据用例）**。唯一失败 `grok-structural.hub.spec.ts:507`（真实 fake-harness PTY，1.4 分钟时长的工具卡 settle 用例，报 "structured tool card never settled"）。**环境性原因，非被测行为**：该用例运行窗口（13:56:48 前后）vite dev server 日志出现 `hmr update /src/app/Root.tsx` 与 `/src/features/mobile/Inbox.tsx`——协调者指示的 main 历史改写 rebase（`git rebase --onto origin/main cccd62fb HEAD`）在套件运行中重写了工作树文件，dev server HMR 把正在跑的长用例页面热替换（与 mobile-ui-4 §10 记录的同类事故）。本任务的代码路径与 grok 工具卡无交集；该规格同组其余用例（`:651` 等）全部通过。
-2. 第二次：**在最终提交树（所有提交完成、rebase 与 squash 均已结束、工作树稳定后）整跑 1 次，0 failed**——结果随后补录（用例数 / skipped 数）。
+1. 第一次（约 25.6 分钟）：169 用例 **156 passed / 1 failed / 12 skipped**（skipped 均为未置 `REMUDA_EVIDENCE` 的证据用例）。唯一失败 `grok-structural.hub.spec.ts:507`（真实 fake-harness PTY，1.4 分钟工具卡 settle，"structured tool card never settled"）。该用例运行窗口内 vite 日志出现 `hmr update /src/app/Root.tsx`、`/src/features/mobile/Inbox.tsx`——协调者指示的 main 历史改写 rebase 在套件运行中重写了工作树（同 mobile-ui-4 §10 记录的 HMR 事故类），但见第 2 次结果。
+2. 第二次在**最终提交树、工作树完全静止后**整跑（约 27.1 分钟）：169 用例 **155 passed / 2 failed / 12 skipped**。两条失败均为**协调者确认的既有负载型 flaky 用例（plain main 同样失败，已立 follow-up），与本任务无关**：
+   - `web/tests/e2e/grok-structural.hub.spec.ts:507` — 「named running tool: … file-decided end」，`grok-structural.hub.spec.ts:434` 抛 "structured tool card never settled"（真实 PTY 1.4 分钟长用例）；
+   - `web/tests/e2e/ux-nextstep.hub.spec.ts:159` — 「row shows the approval summary…」，`ux-nextstep.hub.spec.ts:249` `locator.evaluate` 90s 超时（真实 PTY 1.5 分钟长用例）。
+
+   隔离复跑这两个规格（同锁槽/端口）：3 用例 2 passed / 1 failed——ux-nextstep 隔离通过，grok-structural:507 仍失败，符合「负载/环境时序」而非代码回归的定性；按协调者指示不再追跑全量。本任务相关的 `m-push.hub.spec.ts`（3×3 全绿）与 `m-inbox.hub.spec.ts`（4 passed / 1 evidence skipped）不受影响。
 
 合并闸口：计划 E4——改动含 `web/src/lib/push.ts`、`web/src/app/**`、`web/src/features/mobile/**`，不在 `remuda merge` 自动 `--web-e2e` 清单，合并时显式：`./scripts/ci/gate.sh --web --web-e2e`。
 

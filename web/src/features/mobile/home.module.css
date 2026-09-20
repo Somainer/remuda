@@ -20,7 +20,9 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  /* 4px each side + the 44px controls keeps this bar at the 52px
+     --top-mobile budget while every control owns var(--touch) (D-039). */
+  padding: var(--space-1) var(--space-3);
   background: var(--ink-0);
   border-bottom: 1px solid var(--line);
 }
@@ -28,7 +30,10 @@
 .search {
   flex: 1 1 auto;
   min-width: 0;
-  height: 36px;
+  /* min-height rather than height: a fractional device-pixel border must not
+     paint the box just under the 44px target (ui-spec §3.4). */
+  height: auto;
+  min-height: var(--touch);
   padding: 0 var(--space-3);
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -51,7 +56,7 @@
 }
 
 .order button {
-  min-height: 36px;
+  min-height: var(--touch);
   padding: 0 10px;
   border: 0;
   background: var(--ink-1);
@@ -170,10 +175,6 @@
 
 .rowBody[data-error="1"] {
   color: var(--danger-strong);
-}
-
-.rowBody[data-tone="blocked"] {
-  color: var(--dust);
 }
 
 /* The ring never shrinks the text column: it reserves its own 28px slot. */

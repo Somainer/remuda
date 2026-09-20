@@ -1761,7 +1761,7 @@ export interface components {
         BoardView: {
             columns: components["schemas"]["BoardColumns"];
             /** @description Project slice the board was projected for; null for every project in scope. */
-            project?: string;
+            project?: string | null;
         };
         CallerContext: {
             /** @description Direct children created by this instance; descendants do not inherit scope. */

@@ -3662,7 +3662,10 @@
           "project": {
             "description": "Project slice the board was projected for; null for every project in scope.",
             "pattern": "^prj_",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

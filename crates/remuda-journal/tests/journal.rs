@@ -57,6 +57,7 @@ fn open_journal(dir: &Path) -> Result<Journal> {
         dir,
         JournalOptions {
             fsync: FsyncPolicy::Never,
+            ..JournalOptions::default()
         },
     )?)
 }
@@ -687,5 +688,295 @@ async fn read_page_touches_only_its_limit() -> Result<()> {
     // The unbounded range read is unchanged, so existing callers keep working.
     let all = journal.read_range(&instance, U64(1), None).await?;
     assert_eq!(all.len(), durable.0 as usize);
+    Ok(())
+}
+
+// --- torn-tail recovery and the single-writer lock ---
+
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use tracing::field::{Field, Visit};
+use tracing::span::{Id as SpanId, Record as SpanRecord};
+use tracing::{Event, Level, Metadata};
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // level/target are recorded for failure diagnostics
+struct Captured {
+    level: Level,
+    target: String,
+    fields: Vec<(String, String)>,
+}
+
+#[derive(Default)]
+struct CaptureVisitor {
+    fields: Vec<(String, String)>,
+}
+
+impl Visit for CaptureVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields
+            .push((field.name().to_owned(), format!("{value:?}")));
+    }
+}
+
+struct CaptureSubscriber;
+
+/// Global event queue. The torn-tail warning fires on the journal's writer
+/// thread, so a thread-local subscriber would never see it; tests filter the
+/// queue by their unique instance id and drain their own entries.
+static CAPTURED: OnceLock<Mutex<VecDeque<Captured>>> = OnceLock::new();
+
+fn captured() -> &'static Mutex<VecDeque<Captured>> {
+    CAPTURED.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= &Level::WARN && metadata.target().starts_with("remuda_journal")
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> SpanId {
+        SpanId::from_u64(1)
+    }
+
+    fn record(&self, _: &SpanId, _: &SpanRecord<'_>) {}
+
+    fn record_follows_from(&self, _: &SpanId, _: &SpanId) {}
+
+    fn enter(&self, _: &SpanId) {}
+
+    fn exit(&self, _: &SpanId) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut visitor = CaptureVisitor::default();
+        event.record(&mut visitor);
+        if let Ok(mut queue) = captured().lock() {
+            queue.push_back(Captured {
+                level: *event.metadata().level(),
+                target: event.metadata().target().to_owned(),
+                fields: visitor.fields,
+            });
+        }
+    }
+}
+
+static CAPTURE_ONCE: OnceLock<()> = OnceLock::new();
+
+/// Install the process-global warning capture once per test binary. Events are
+/// buffered globally and drained per instance id, so parallel tests stay
+/// isolated.
+async fn with_warning_capture<F, T>(f: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CAPTURE_ONCE.get_or_init(|| {
+        tracing::subscriber::set_global_default(CaptureSubscriber)
+            .expect("global warning subscriber");
+    });
+    f.await
+}
+
+fn take_captured(instance: &str) -> Vec<Captured> {
+    let mut queue = captured().lock().expect("captured");
+    let matches = |captured: &Captured| {
+        captured
+            .fields
+            .iter()
+            .any(|(key, value)| key == "instance" && value.contains(instance))
+    };
+    let found = queue.iter().filter(|c| matches(c)).cloned().collect();
+    queue.retain(|c| !matches(c));
+    found
+}
+
+/// The gate failure, made deterministic: a JSONL file whose last record was
+/// cut mid-string by an unclean shutdown. Reopening must truncate the torn
+/// bytes with one warning, keep every complete record, pin the watermark down,
+/// and accept appends at the correct next seq.
+#[tokio::test]
+async fn reopen_truncates_a_torn_tail_and_keeps_complete_records() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (_, instance, _, map) = ctx("sess-torn");
+    let envelopes = map_file(include_str!("fixtures/claude-transcript-ok.jsonl"), &map)?;
+    assert!(envelopes.len() >= 4);
+    let surviving = envelopes.len() - 1;
+    let journal = open_journal(tmp.path())?;
+    for envelope in envelopes {
+        journal.append(&instance, envelope).await?;
+    }
+    let before = journal.read_range(&instance, U64(1), None).await?;
+    drop(journal);
+
+    // Tear the last record in half, including its newline: exactly what a
+    // writer killed between write and the next append's read leaves behind.
+    let path = tmp
+        .path()
+        .join("journal")
+        .join(format!("{}.jsonl", instance.as_id()));
+    let bytes = fs::read(&path)?;
+    let last_newline = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .expect("the last record is newline-terminated");
+    let previous_newline = bytes[..last_newline]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |pos| pos + 1);
+    // Halfway through the final record, with no terminating newline. After
+    // `set_len(cut)` the file ends `cut - previous_newline` bytes past its last
+    // newline: that is exactly the fragment recovery measures and reports.
+    let cut = previous_newline + (last_newline - previous_newline) / 2;
+    let torn_bytes = cut as u64 - previous_newline as u64;
+    let file = fs::OpenOptions::new().write(true).open(&path)?;
+    file.set_len(cut as u64)?;
+    drop(file);
+
+    with_warning_capture(async {
+        let journal = open_journal(tmp.path())?;
+        // Watermark follows the JSONL, not the stale SQLite row.
+        assert_eq!(
+            journal.durable_seq(&instance).await?.0,
+            surviving as u64,
+            "the torn seq must not count as durable"
+        );
+        let kept = journal.read_range(&instance, U64(1), None).await?;
+        assert_eq!(kept.len(), surviving, "complete records survive");
+        assert_eq!(
+            kept.first().map(|o| o.event_id.clone()),
+            before.first().map(|o| o.event_id.clone())
+        );
+        assert_eq!(
+            kept.last().map(|o| o.seq.0),
+            Some(surviving as u64),
+            "no gap before the torn tail"
+        );
+        // The next append takes the recycled seq and reads back whole: the
+        // gate symptom was this append's read dying on the torn JSONL line.
+        let repair = map_file(
+            r#"{"type":"user","uuid":"u-repair","timestamp":"2026-09-12T10:00:09.000Z","message":{"role":"user","content":"repaired"}}"#,
+            &map,
+        )?
+        .remove(0);
+        let seq = journal.append(&instance, repair).await?;
+        assert_eq!(seq.0, surviving as u64 + 1);
+        let read_back = journal.read_range(&instance, seq, Some(seq)).await?;
+        assert_eq!(
+            read_back.len(),
+            1,
+            "the repaired line parses, unlike the gate's json: EOF"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?;
+
+    let warnings = take_captured(instance.as_id().as_str());
+    assert_eq!(warnings.len(), 1, "exactly one torn-tail warning");
+    let warning = &warnings[0];
+    assert!(
+        warning
+            .fields
+            .iter()
+            .any(|(key, value)| key == "torn_bytes" && value == &torn_bytes.to_string()),
+        "warning must name the dropped byte count: {warning:?}"
+    );
+
+    // The torn fragment is physically gone and replaced by one complete
+    // record; reopening again is a clean no-op.
+    let repaired_bytes = fs::read(&path)?;
+    assert_eq!(
+        repaired_bytes.iter().filter(|b| **b == b'\n').count(),
+        surviving + 1,
+        "the torn line is gone, its seq holds one complete repair record"
+    );
+    assert!(
+        repaired_bytes.iter().rposition(|b| *b == b'\n') == Some(repaired_bytes.len() - 1),
+        "the file ends on a complete record again"
+    );
+    for line in repaired_bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        serde_json::from_slice::<serde_json::Value>(line).expect("every line is valid JSON");
+    }
+    let journal = open_journal(tmp.path())?;
+    assert!(take_captured(instance.as_id().as_str()).is_empty());
+    assert_eq!(
+        journal.durable_seq(&instance).await?.0,
+        surviving as u64 + 1
+    );
+    Ok(())
+}
+
+/// A malformed record that *is* newline-terminated is corruption in the
+/// committed prefix, not a torn append: recovery must fail rather than discard
+/// an acknowledged observation.
+#[tokio::test]
+async fn a_corrupt_complete_record_fails_recovery() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (_, instance, _, map) = ctx("sess-corrupt");
+    let envelopes = map_file(include_str!("fixtures/claude-transcript-ok.jsonl"), &map)?;
+    let journal = open_journal(tmp.path())?;
+    for envelope in envelopes {
+        journal.append(&instance, envelope).await?;
+    }
+    drop(journal);
+
+    let path = tmp
+        .path()
+        .join("journal")
+        .join(format!("{}.jsonl", instance.as_id()));
+    let mut bytes = fs::read(&path)?;
+    bytes[0] = b'X'; // destroy the opening brace of record 1
+    fs::write(&path, bytes)?;
+
+    assert!(
+        open_journal(tmp.path()).is_err(),
+        "a corrupt complete record must not be trimmed away"
+    );
+    Ok(())
+}
+
+/// Two openers of one data dir are never writers at once. A second opener
+/// waits (bounded) for a writer that is closing, but fails fast with a clear
+/// [`remuda_journal::Error::Locked`] when the first writer is genuinely still
+/// alive — it must never block a process startup forever.
+#[test]
+fn a_live_writer_makes_a_second_open_fail_locked_then_succeeds_on_close() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let quick = JournalOptions {
+        fsync: FsyncPolicy::Never,
+        writer_lock_wait: Duration::from_millis(100),
+    };
+    let held = Journal::open_with(tmp.path(), quick.clone())?;
+
+    // The live writer survives the bounded wait: the open fails Locked rather
+    // than hanging.
+    let started = std::time::Instant::now();
+    let err = match Journal::open_with(tmp.path(), quick.clone()) {
+        Ok(_) => panic!("a concurrent writer must make the second open fail"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, remuda_journal::Error::Locked { .. }),
+        "expected Error::Locked, got {err:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the lock wait must be bounded, took {:?}",
+        started.elapsed()
+    );
+
+    // Once the first writer closes, a concurrent opener acquires the lock on
+    // the next poll instead of racing it.
+    drop(held);
+    let reopened = Journal::open_with(
+        tmp.path(),
+        JournalOptions {
+            fsync: FsyncPolicy::Never,
+            writer_lock_wait: Duration::from_secs(5),
+        },
+    )?;
+    drop(reopened);
     Ok(())
 }

@@ -3360,6 +3360,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures",
+ "nix",
  "remuda-protocol",
  "rusqlite",
  "serde",

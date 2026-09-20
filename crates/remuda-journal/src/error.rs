@@ -59,6 +59,16 @@ pub enum Error {
     /// A required path was missing or not a file.
     #[error("path not found: {0}")]
     Path(PathBuf),
+    /// Another writer still holds the single-writer lock after the bounded wait.
+    #[error(
+        "journal at {path} is locked by another live writer after waiting {waited:?}; close the previous Node before reopening"
+    )]
+    Locked {
+        /// Data directory whose `journal.lock` is held.
+        path: PathBuf,
+        /// How long the opener waited.
+        waited: std::time::Duration,
+    },
 }
 
 impl From<WireValueError> for Error {

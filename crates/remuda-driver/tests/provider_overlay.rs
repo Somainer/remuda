@@ -131,9 +131,11 @@ fn via_mode_writes_listener_url_and_relay_bearer_without_gateway_credential() {
     );
     assert_eq!(json["model"], OVERLAY_MODEL);
 
-    // The gateway credential/origin never reach W: they are not arguments on
-    // this code path, so assert against the produced artefact rather than the
-    // absent input.
+    // At the driver level the gateway token is structurally absent: it is not
+    // an argument to this builder, so this assertion cannot fire here. It is
+    // kept as a boundary marker; the load-bearing sweep is the node test
+    // via_launch_artefacts_never_carry_the_gateway_token, where the delivered
+    // token genuinely sits on the request.
     assert!(!text.contains(GATEWAY_TOKEN), "gateway token on W: {text}");
     assert!(
         !text.contains("gateway.example"),
@@ -312,6 +314,10 @@ fn no_launch_artefact_or_log_carries_the_gateway_token() {
             }
             let bytes = fs::read(&path).unwrap();
             let text = String::from_utf8_lossy(&bytes);
+            // Vacuous at this layer — the gateway token never enters the
+            // driver dataflow; kept as a boundary marker. The load-bearing
+            // sweep is the node test
+            // via_launch_artefacts_never_carry_the_gateway_token.
             assert!(
                 !text.contains(GATEWAY_TOKEN),
                 "gateway token reached artefact {}",

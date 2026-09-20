@@ -4,9 +4,9 @@
 Date: 2026-09-20. Scope: task `c-apiroute-launch` (plan §C.4) — the overlay W
 writes for a `via` launch, the Node-reported `apiRoute` write-back, and the
 redaction guarantees around both.
-Design references: [D-047 / D-048](./decisions.md),
-[api-routing design](./api-routing.md), Amendment A1, and the sibling evidence
-[api-routing-node-1](./evidence/api-routing-node-1.md).
+Design references: [D-047 / D-048](../decisions.md),
+[api-routing design](../api-routing.md), Amendment A1, and the sibling evidence
+[api-routing-node-1](./api-routing-node-1.md).
 
 ## What this task changed
 
@@ -88,6 +88,14 @@ the `.log`/`.redacted`/`Debug` artefacts (it rides `ANTHROPIC_AUTH_TOKEN`,
 which `redact_settings` masks, and `RelayOverlay`/`ClaudeProviderOverlay`
 `Debug` redact it). The equivalent cross-layer sweep in the driver crate is
 `no_launch_artefact_or_log_carries_the_gateway_token` (output above).
+
+Coverage boundary: the node unit test sweeps the written overlay, the merged
+settings document and a synthesized merge-debug line rendered with
+`redact_settings` — it does not capture real `tracing` subscriber output or
+journal rows, so those channels are outside this sweep's evidence. The Hub e2e
+below covers the instance HTTP projection body only, not every Hub response;
+its credential claim is that the token rides solely the out-of-band
+`api.egress` notification to the proxy host.
 
 ## Evidence 3: the instance projection records the route the Node reported
 

@@ -13,6 +13,7 @@
 | `web/src/features/mobile/homeRows.test.ts` | 新增。分组、两种排序、blocked 置顶、错误优先、状态待确认不被覆盖、null 环、搜索边界、resume 能力 |
 | `web/src/features/mobile/ContextRing.tsx` / `.test.tsx` | 新增。SVG 剩余上下文环；`contextPct == null` 不渲染环也不渲染数字；0 与 100 边界、越界钳制 |
 | `web/src/features/mobile/HomeList.tsx` / `home.module.css` | 新增。`/m` 手机首页组件与样式 |
+| `web/src/features/mobile/HomeList.test.tsx` | 新增。恢复失败留在原地显错、成功时恢复中态的组件级覆盖（e2e 覆盖成功路径） |
 | `web/src/app/router.tsx` | 仅 `/m` index 元素：占位 `SessionsPage` → `HomeList`。桌面路由零改动 |
 | `web/tests/e2e/m-home.hub.spec.ts` | 新增。390px hub 规格（分组头/blocked 计数/置顶、context 环、错误当正文、搜索边界、排序记忆、一键恢复） |
 | `crates/remuda-hub/examples/hub_e2e.rs` | fake node 新增 `mhome-blocked`（approval + usage=50% + blocked）与 `mhome-exit`（native session id + 带 lastError 的 exited）两条合成场景；通用 `instance.resume` 回复补 journal `ready` |
@@ -59,7 +60,7 @@ vitest 另补一条：完整实例 id 作为 query 也无结果。
 
 | 检查 | 命令（锁槽 `flock …/locks/e2e.lock-c`，端口 59210/59219/59211，`PW_CHANNEL=chromium`） | 结果 |
 |---|---|---|
-| 单测 | `pnpm --dir web test` | 136 文件 / 1305 用例全绿（含新增 23） |
+| 单测 | `pnpm --dir web test` | 137 文件 / 1307 用例全绿（含新增 25：homeRows 23 + HomeList 2） |
 | 类型 | `pnpm --dir web typecheck` | 干净 |
 | lint | `pnpm --dir web lint` | 无 error（仅仓库既有 warning） |
 | 本规格 ×3 | `playwright test -c playwright.hub.config.ts m-home.hub.spec.ts` | 每次 4/4 通过（约 47s） |

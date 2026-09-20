@@ -101,7 +101,7 @@ fn lease_sized(repo: &Path, request: &LeaseParams, pool_size: usize) -> Result<V
                 request.name
             )));
         }
-        if record.state == WorktreeLeaseState::Parked {
+        if record.state == WorktreeLeaseState::Parked && record.pooled {
             // Parked pool slot by exact name: warm branch switch, no fetch.
             let warm = checkout_task_branch(&repo_root, &record, &request.task_id)?;
             let row = &mut catalog.worktrees[index];
@@ -174,11 +174,17 @@ fn lease_pool_slot(
     // Self-heal stale catalog rows before deciding.
     let _ = reconcile_with(repo_root, catalog);
 
+    // Only records the pool itself provisioned (`pooled`) with a slot-shaped
+    // name are pool slots. A standalone worktree that happens to carry the
+    // suffix (a pre-reservation catalog, an adopted dir) is never counted, so
+    // the pool cannot branch-switch or evict an operator's directory.
     let mut slot_indexes: Vec<usize> = catalog
         .worktrees
         .iter()
         .enumerate()
-        .filter_map(|(index, row)| slot_number(pool, &row.name).map(|_| index))
+        .filter_map(|(index, row)| {
+            (row.pooled && slot_number(pool, &row.name).is_some()).then_some(index)
+        })
         .collect();
 
     // Decision 1: a clean parked slot on this base is a warm hit.
@@ -296,6 +302,7 @@ fn lease_pool_slot(
         branch: "HEAD".into(),
         base: start_point.clone(),
         state: WorktreeLeaseState::Parked,
+        pooled: true,
         leased_by: Vec::new(),
     };
     upsert(catalog, record.clone());
@@ -410,20 +417,17 @@ fn return_sized(repo: &Path, request: &LeaseParams) -> Result<Value, NodeError> 
     }))
 }
 
-/// Whether a record behaves as a pool slot here: parked records and slots with
-/// a pool-shaped name reset; a standalone worktree returns to `free`.
 /// Whether a catalog record behaves as a pool slot (`pool`) or a standalone
-/// reused worktree (`reuse`). A slot rests detached (`Parked` / branch `HEAD`)
-/// or carries the reserved `<pool>-s<n>` name; everything else is standalone.
+/// reused worktree (`reuse`).
+///
+/// This is **authoritative**, read from [`crate::worktree::WorktreeRecord::pooled`]
+/// (set only where the pool provisions a slot). It deliberately never infers
+/// pool-ness from the name: a standalone worktree may legitimately be named
+/// `<x>-s<n>` and must get the zero-op reuse return, never `git clean -fd`.
+/// The reserved suffix is enforced at creation instead, so the two cannot
+/// collide; `is_slot_name` remains pool bookkeeping only.
 fn record_mode(record: &crate::worktree::WorktreeRecord) -> &'static str {
-    if record.state == WorktreeLeaseState::Parked
-        || record.branch == "HEAD"
-        || is_slot_name(&record.name)
-    {
-        "pool"
-    } else {
-        "reuse"
-    }
+    if record.pooled { "pool" } else { "reuse" }
 }
 
 /// Clean untracked files and detach the slot back at the pool base.
@@ -596,7 +600,7 @@ fn reconcile_with(repo_root: &Path, catalog: &mut Catalog) -> ReconcileReport {
         }
         let mut record = record;
         if record.state == WorktreeLeaseState::Leased && record.leased_by.is_empty() {
-            record.state = if record.branch == "HEAD" || is_slot_name(&record.name) {
+            record.state = if record.pooled {
                 WorktreeLeaseState::Parked
             } else {
                 WorktreeLeaseState::Free
@@ -635,14 +639,6 @@ fn slot_number(pool: &str, name: &str) -> Option<usize> {
         return None;
     }
     suffix.parse::<usize>().ok().filter(|n| *n >= 1)
-}
-
-/// Whether a name has the reserved pool-slot shape `<pool>-s<n>`.
-fn is_slot_name(name: &str) -> bool {
-    match name.rsplit_once("-s") {
-        Some((_, number)) => !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()),
-        None => false,
-    }
 }
 
 fn lease_payload(
@@ -1210,6 +1206,7 @@ mod tests {
                 branch: "wt/ghost/work".into(),
                 base: "origin/main".into(),
                 state: WorktreeLeaseState::Leased,
+                pooled: true,
                 leased_by: vec![],
             });
             save_catalog(&git_common, &catalog).unwrap();
@@ -1244,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn slot_number_and_slot_name_helpers() {
+    fn slot_number_helper_is_pool_bookkeeping_only() {
         assert_eq!(slot_number("alpha", "alpha-s1"), Some(1));
         assert_eq!(slot_number("alpha", "alpha-s12"), Some(12));
         assert_eq!(slot_number("alpha", "alpha-s"), None);
@@ -1253,11 +1250,98 @@ mod tests {
         assert_eq!(slot_number("alpha", "beta-s1"), None);
         // Hyphenated pool names keep working.
         assert_eq!(slot_number("c-pool", "c-pool-s2"), Some(2));
-        assert!(is_slot_name("pool-s3"));
-        assert!(is_slot_name("c-pool-s1"));
-        // Standalone worker-shaped names are not mistaken for slots.
-        assert!(!is_slot_name("agent-one"));
-        assert!(!is_slot_name("c-demo"));
+    }
+
+    /// The data-loss guard (review finding #1): an operator's standalone
+    /// worktree named exactly like a pool slot (`<x>-s<n>`) leases as `reuse`
+    /// and returns byte-identical — `git clean -fd`/detach never run because
+    /// the destructive path reads the authoritative `pooled` flag, not the
+    /// name. The reservation is enforced at the create boundary instead.
+    #[test]
+    fn standalone_worktree_named_like_a_slot_returns_byte_identical() {
+        let (_keep, root) = repo_fixture();
+        // One-shot create refuses the reserved suffix outright.
+        let refused = crate::worktree::handle_rpc(
+            &root,
+            "worktree.create",
+            &json!({ "name": "api-s1", "base": "main" }),
+        )
+        .expect("handled");
+        assert!(
+            refused.is_err(),
+            "the reserved pool-slot suffix is rejected on create: {refused:?}"
+        );
+
+        // Simulate a pre-existing/operator standalone worktree carrying that
+        // name (written to the catalog with pooled=false — the shape an adopt
+        // or older record would have), so the return path is proven on its
+        // own merit regardless of the create guard.
+        let t1 = TaskId::new();
+        let path = {
+            let repo_root = repo_root(Some(&root)).unwrap();
+            let git_common = git_common_dir(&repo_root).unwrap();
+            let abs = resolve_path(&repo_root, "legacy-s1", None).unwrap();
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            git(
+                &repo_root,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "wt/legacy-s1/work",
+                    &abs.to_string_lossy(),
+                    "main",
+                ],
+            )
+            .unwrap();
+            let real = abs.canonicalize().unwrap();
+            let mut catalog = load_catalog(&git_common).unwrap();
+            upsert(
+                &mut catalog,
+                crate::worktree::WorktreeRecord {
+                    name: "legacy-s1".into(),
+                    path: real.to_string_lossy().into(),
+                    branch: "wt/legacy-s1/work".into(),
+                    base: "main".into(),
+                    state: crate::worktree::WorktreeLeaseState::Free,
+                    pooled: false,
+                    leased_by: vec![],
+                },
+            );
+            save_catalog(&git_common, &catalog).unwrap();
+            real
+        };
+        // Put real untracked work in the operator's directory.
+        std::fs::write(path.join("notes.txt"), b"operator").unwrap();
+        let snapshot = tree_fingerprint(&path);
+
+        let leased = lease_sized(
+            &root,
+            &LeaseParams {
+                name: "legacy-s1".into(),
+                task_id: t1.clone(),
+                base: None,
+            },
+            4,
+        )
+        .expect("reuse lease by exact name");
+        assert_eq!(leased["mode"], "reuse", "{leased}");
+        assert_eq!(leased["warm"], true);
+
+        let returned = return_slot(
+            &root,
+            &json!({ "name": "legacy-s1", "taskId": t1.as_id().as_str() }),
+        )
+        .expect("reuse return");
+        assert_eq!(returned["mode"], "reuse");
+        assert_eq!(returned["state"], "free");
+        assert_eq!(tree_fingerprint(&path), snapshot, "untracked file survived");
+        assert!(path.join("notes.txt").exists());
+        // Still on its own branch — never detached.
+        let branch = git(&path, &["symbolic-ref", "--quiet", "--short", "HEAD"]).unwrap();
+        assert_eq!(branch, "wt/legacy-s1/work");
     }
 
     /// Recursive (relative path, bytes) fingerprint so an untouched tree

@@ -44,6 +44,14 @@ pub struct WorktreeRecord {
     /// Pool/reuse lease state; `free` for records written before t-pool.
     #[serde(default)]
     pub state: WorktreeLeaseState,
+    /// Authoritative origin of the worktree. **Only the pool** sets this when
+    /// it provisions a slot; every other path (one-shot `worktree.create`,
+    /// dispatch `provision_record`, adopted directories) leaves it `false`.
+    /// The destructive return path (`git clean -fd` + detached park) is gated
+    /// on this flag — never on the name shape: a standalone worktree may be
+    /// named `<x>-s<n>` and must still get the zero-op reuse return.
+    #[serde(default)]
+    pub pooled: bool,
     /// Tasks currently holding a lease on this worktree.
     #[serde(default)]
     pub leased_by: Vec<TaskId>,
@@ -94,6 +102,7 @@ pub fn provision_record(
     start_point: &str,
 ) -> Result<ProvisionedWorktree, NodeError> {
     validate_name(name)?;
+    reject_reserved_slot_name(name)?;
     crate::worker::validate_branch(branch)?;
     let repo_root = repo_root(Some(repo))?;
     let git_common = git_common_dir(&repo_root)?;
@@ -155,6 +164,7 @@ pub fn provision_record(
         branch: branch.to_string(),
         base: start_point.to_string(),
         state: WorktreeLeaseState::default(),
+        pooled: false,
         leased_by: Vec::new(),
     };
     upsert(&mut catalog, record);
@@ -308,6 +318,7 @@ fn create(repo: &Path, params: &Value) -> Result<Value, NodeError> {
         .and_then(Value::as_str)
         .ok_or_else(|| NodeError::InvalidRequest("worktree.create requires name".into()))?;
     validate_name(name)?;
+    reject_reserved_slot_name(name)?;
     let base = params
         .get("base")
         .and_then(Value::as_str)
@@ -364,6 +375,7 @@ fn create_record(
             branch: listed.1,
             base: base.to_string(),
             state: WorktreeLeaseState::default(),
+            pooled: false,
             leased_by: Vec::new(),
         };
         upsert(&mut catalog, record.clone());
@@ -398,6 +410,7 @@ fn create_record(
         branch,
         base: base.to_string(),
         state: WorktreeLeaseState::default(),
+        pooled: false,
         leased_by: Vec::new(),
     };
     upsert(&mut catalog, record.clone());
@@ -510,6 +523,35 @@ pub(crate) fn expand_home(raw: &str, home: Option<&Path>) -> Result<PathBuf, Nod
 pub(crate) fn validate_name(name: &str) -> Result<(), NodeError> {
     path_guard::safe_segment(name)
         .map_err(|error| NodeError::InvalidRequest(format!("worktree {error}")))
+}
+
+/// Whether `name` carries the reserved pool-slot suffix `<pool>-s<n>`.
+///
+/// The pool is the only allocator allowed to create these names (its slots).
+/// The suffix is reserved so a slot key `<name>` can never collide with a
+/// standalone worktree, and so destructive pool return behavior never has to
+/// be guessed from a name. Used for reservation on the create paths and for
+/// pool bookkeeping; the destructive gate itself reads
+/// [`WorktreeRecord::pooled`].
+pub(crate) fn is_reserved_slot_name(name: &str) -> bool {
+    match name.rsplit_once("-s") {
+        Some((pool, number)) => {
+            !pool.is_empty()
+                && !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Refuse the reserved pool-slot suffix on every non-pool allocation path.
+pub(crate) fn reject_reserved_slot_name(name: &str) -> Result<(), NodeError> {
+    if is_reserved_slot_name(name) {
+        return Err(NodeError::InvalidRequest(format!(
+            "worktree name {name} uses the reserved pool-slot suffix '<pool>-s<n>'"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn repo_root(repo: Option<&Path>) -> Result<PathBuf, NodeError> {

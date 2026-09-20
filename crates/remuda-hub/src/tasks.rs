@@ -573,6 +573,53 @@ async fn bind_task_directory(
     )
     .await
     .map_err(crate::http::lease_refusal)?;
+    // The Node decides mode from the catalog record, not the request: a pool
+    // name that collides with an operator's standalone worktree comes back as
+    // reuse. Never silently change modes — release the row and refuse (D-035).
+    let wire_mode = outcome
+        .result
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("pool");
+    if wire_mode
+        != match mode {
+            TaskBindingMode::Reuse => "reuse",
+            TaskBindingMode::Pool => "pool",
+        }
+    {
+        // Undo the lease on both sides: reuse return is a zero-op on disk
+        // (catalog refcount only), so this cannot disturb the directory.
+        let return_params = json!({
+            "hostId": member.host_id.as_id().as_str(),
+            "workspaceId": member.workspace_id.as_id().as_str(),
+            "name": path_name,
+            "taskId": task.meta.id.as_id().as_str(),
+        });
+        if let Err(error) = crate::http::call_node(
+            state,
+            member.host_id.as_id().as_str(),
+            "worktree.return",
+            return_params,
+        )
+        .await
+        {
+            tracing::warn!(%error, "mode-mismatch rollback: Node worktree.return failed; catalog reconciles on reconnect");
+        }
+        let _ = state
+            .store
+            .release_worktree_lease(
+                member.host_id.as_id().to_string(),
+                member.workspace_id.as_id().to_string(),
+                outcome.row.dir_key.clone(),
+                task.meta.id.as_id().to_string(),
+                "free".into(),
+                None,
+            )
+            .await;
+        return Err(HubError::Conflict(format!(
+            "requested a {mode:?} worktree but {path_name:?} is an existing directory of mode {wire_mode}; refusing to change modes"
+        )));
+    }
     let lease_id = remuda_protocol::Id::try_from(outcome.row.id.clone())
         .map_err(|error| HubError::Internal(format!("lease id from store: {error}")))?;
     let binding = TaskSpaceBinding {

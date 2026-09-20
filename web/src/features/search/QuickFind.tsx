@@ -14,6 +14,7 @@ import {
   rankQuickFind,
   readQuickFindOrder,
   writeQuickFindOrder,
+  type QuickFindGroup,
   type QuickFindHit,
   type QuickFindOrder,
 } from "./quickFindSearch";
@@ -190,6 +191,27 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
     [grouped, hits, spaces, workspacesWithBranch, order],
   );
 
+  // In grouped mode the DOM reads group-by-group — groups sorted by the
+  // chosen order, blocked leaves pinned inside each group — which differs
+  // from rankQuickFind's flat recency array. Cursor wrap, active index,
+  // option ids, aria-activedescendant and scroll must follow the VISUAL
+  // reading order, so flatten the groups in render order. Flat mode is the
+  // ranked array itself, so desktop behaviour is byte-identical.
+  const orderedHits = useMemo(
+    () => (grouped ? groups.flatMap((group) => group.hits) : hits),
+    [grouped, groups, hits],
+  );
+  // Visual index assigned to each leaf while walking the groups; this is the
+  // id/data-index the option carries and therefore what the cursor addresses.
+  const sections = useMemo(() => {
+    if (!grouped) return [] as { group: QuickFindGroup; leaves: { hit: QuickFindHit; index: number }[] }[];
+    let visualIndex = 0;
+    return groups.map((group) => ({
+      group,
+      leaves: group.hits.map((hit) => ({ hit, index: visualIndex++ })),
+    }));
+  }, [grouped, groups]);
+
   useEffect(() => {
     writeQuickFindOrder(order, localStorageAccess());
   }, [order]);
@@ -260,7 +282,7 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
   }
 
   // The query can shrink past the cursor; clamp at render instead of an effect.
-  const active = hits.length ? Math.min(cursor, hits.length - 1) : 0;
+  const active = orderedHits.length ? Math.min(cursor, orderedHits.length - 1) : 0;
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -285,19 +307,19 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
   function onInputKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
     if (event.key === "ArrowDown") {
       event.preventDefault();
-      if (hits.length) setCursor((value) => (value + 1) % hits.length);
+      if (orderedHits.length) setCursor((value) => (value + 1) % orderedHits.length);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      if (hits.length) setCursor((value) => (value - 1 + hits.length) % hits.length);
+      if (orderedHits.length) setCursor((value) => (value - 1 + orderedHits.length) % orderedHits.length);
     } else if (event.key === "Home" && event.ctrlKey) {
       event.preventDefault();
       setCursor(0);
     } else if (event.key === "End" && event.ctrlKey) {
       event.preventDefault();
-      setCursor(Math.max(0, hits.length - 1));
+      setCursor(Math.max(0, orderedHits.length - 1));
     } else if (event.key === "Enter") {
       event.preventDefault();
-      const hit = hits[active];
+      const hit = orderedHits[active];
       if (hit) choose(hit);
     }
   }
@@ -392,7 +414,7 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
       {hits.length ? (
         <div className={css.list} id={listId} role="listbox" aria-label="会话" ref={listRef}>
           {grouped
-            ? groups.map((group) => (
+            ? sections.map(({ group, leaves }) => (
                 <div
                   key={group.id}
                   className={css.group}
@@ -422,19 +444,16 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
                       {group.blockedCount} 待处理
                     </span>
                   </div>
-                  {group.hits.map((hit) => {
-                    const index = hits.indexOf(hit);
-                    return (
-                      <div key={hit.instance.id} data-index={index} className={css.optionSlot}>
-                        <ResultRow
-                          hit={hit}
-                          index={index}
-                          selected={index === active}
-                          onSelect={() => choose(hit)}
-                        />
-                      </div>
-                    );
-                  })}
+                  {leaves.map(({ hit, index }) => (
+                    <div key={hit.instance.id} data-index={index} className={css.optionSlot}>
+                      <ResultRow
+                        hit={hit}
+                        index={index}
+                        selected={index === active}
+                        onSelect={() => choose(hit)}
+                      />
+                    </div>
+                  ))}
                 </div>
               ))
             : hits.map((hit, index) => (

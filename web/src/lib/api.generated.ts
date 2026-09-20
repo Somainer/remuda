@@ -2850,7 +2850,13 @@ export interface components {
             title: string;
             /** Format: date-time */
             updatedAt: string;
+            workspaceBinding?: components["schemas"]["TaskSpaceBinding"];
         };
+        /**
+         * @description Directory binding mode (D-050): reuse an existing directory or lease an app-managed pool slot.
+         * @enum {string}
+         */
+        TaskBindingMode: "reuse" | "pool";
         /** @description Estimated budget envelope; amounts are estimates (§4.5). */
         TaskBudget: {
             maxTurns?: number;
@@ -2871,6 +2877,11 @@ export interface components {
             owns?: string[];
             projectId: string;
             title: string;
+            workspaceBinding?: components["schemas"]["TaskSpaceBinding"];
+        };
+        /** @description Created task; when a workspaceBinding was supplied the response additionally carries the lease sharing projection (refcount and serial-reuse queue state). */
+        TaskCreateResult: components["schemas"]["Task"] & {
+            sharing?: components["schemas"]["WorktreeSharing"];
         };
         /** @description Dependency edge; unlocks only from the referenced task's landed sha (§7 #8). */
         TaskDep: {
@@ -2896,6 +2907,15 @@ export interface components {
             instanceId?: string;
             model?: string;
             placementId?: string;
+        };
+        /** @description Per-task working-directory binding (D-050 §2), serialised inside the task doc_json. Reuse targets the registered root (no worktreeName) or an existing remuda-wt sibling; pool names the pool and records the Node-assigned slot name and wt/<slot>/<task-slug> branch. */
+        TaskSpaceBinding: {
+            branch?: string;
+            hostId: string;
+            leaseRefIds?: string[];
+            mode: components["schemas"]["TaskBindingMode"];
+            workspaceId: string;
+            worktreeName?: string;
         };
         /** @description remuda task split; parent and mandate chain come from the path id */
         TaskSplit: {
@@ -3161,6 +3181,13 @@ export interface components {
             refcount: number;
             /** @enum {string} */
             state: "leased" | "parked" | "free";
+        };
+        /** @description Read-only sharing projection for a freshly bound directory (D-050 §2.1): refcount is the number of tasks bound to the directory; queued/blockedReason mean another task holds the attach lock and this task waits for serial reuse. */
+        WorktreeSharing: {
+            blocked?: string | null;
+            dirKey: string;
+            queued: boolean;
+            refcount: number;
         };
     };
     responses: {
@@ -5963,7 +5990,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Task"];
+                    "application/json": components["schemas"]["TaskCreateResult"];
                 };
             };
             400: components["responses"]["Error"];

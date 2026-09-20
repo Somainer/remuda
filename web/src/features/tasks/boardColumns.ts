@@ -19,7 +19,11 @@ export const BOARD_COLUMNS = [
   "archived",
 ] as const satisfies readonly BoardColumn[];
 
-/** The three live work columns (everything except the archive group). */
+/**
+ * The three live work columns (everything except the archive group). Staged
+ * for the board UI in task 6 (t-board-ui), which renders these as columns
+ * and treats `archived` as a separate filter.
+ */
 export const WORK_COLUMNS = ["todo", "in-progress", "done"] as const;
 
 /** Legal ledger edges; mirrors `TaskState::can_transition_to` exactly. */

@@ -60,23 +60,28 @@
 建卡与状态迁移均为 200：`deferred 200｜placed 200｜running: placed→running 200/200｜stalled: placed→running→stalled 200/200/200｜done: placed→running→done 200/200/200｜failed(无 placement) 200｜failed(dispatch 后) 200`。
 
 ```jsonc
-// GET /v1/board?project=prj_e2e
+// GET /v1/board?project=prj_e2e —— 响应的【标注摘要】：真实卡片是完整 Task 文档
+// （含 id/revision/createdAt/updatedAt/projectId/title/mandate/class/owns/deps/
+// budget 等全部 Task 字段）外加 boardColumn 与 displayKey；下面为可读只保留与
+// 投影相关的字段。placement 在 None 时由 skip_serializing_if 省略（即键不
+// 存在），仅 failed(dispatch) 卡带真实 TaskPlacementRef 对象（字段已脱敏省略）。
 {
   "project": "prj_e2e",
   "columns": {
     "todo": [
-      { "id": "tsk_e2e", "state": "pending",  "boardColumn": "todo", "displayKey": "SE-01", "blockedReason": null,              "hasPlacement": false },
-      { "id": "tsk_e2e", "state": "deferred", "boardColumn": "todo", "displayKey": "SE-02", "blockedReason": null,              "hasPlacement": false },
-      { "id": "tsk_e2e", "state": "placed",   "boardColumn": "todo", "displayKey": "SE-03", "blockedReason": null,              "hasPlacement": false },
-      { "id": "tsk_e2e", "state": "failed",   "boardColumn": "todo", "displayKey": "SE-07", "blockedReason": "supply exhausted", "hasPlacement": false }
+      { "id": "tsk_e2e", "state": "pending",  "boardColumn": "todo", "displayKey": "SE-01", "blockedReason": null },
+      { "id": "tsk_e2e", "state": "deferred", "boardColumn": "todo", "displayKey": "SE-02", "blockedReason": null },
+      { "id": "tsk_e2e", "state": "placed",   "boardColumn": "todo", "displayKey": "SE-03", "blockedReason": null },
+      { "id": "tsk_e2e", "state": "failed",   "boardColumn": "todo", "displayKey": "SE-07", "blockedReason": "supply exhausted" }
     ],
     "in-progress": [
-      { "id": "tsk_e2e", "state": "running", "boardColumn": "in-progress", "displayKey": "SE-04", "blockedReason": null,            "hasPlacement": false },
-      { "id": "tsk_e2e", "state": "stalled", "boardColumn": "in-progress", "displayKey": "SE-05", "blockedReason": null,            "hasPlacement": false },
-      { "id": "tsk_e2e", "state": "failed",  "boardColumn": "in-progress", "displayKey": "SE-08", "blockedReason": "worker exited 42", "hasPlacement": true }
+      { "id": "tsk_e2e", "state": "running", "boardColumn": "in-progress", "displayKey": "SE-04", "blockedReason": null },
+      { "id": "tsk_e2e", "state": "stalled", "boardColumn": "in-progress", "displayKey": "SE-05", "blockedReason": null },
+      { "id": "tsk_e2e", "state": "failed",  "boardColumn": "in-progress", "displayKey": "SE-08", "blockedReason": "worker exited 42",
+        "placement": { /* 真实 TaskPlacementRef：placementId/hostId/instanceId/branch/model，此处脱敏省略 */ } }
     ],
     "done": [
-      { "id": "tsk_e2e", "state": "done", "boardColumn": "done", "displayKey": "SE-06", "blockedReason": null, "hasPlacement": false }
+      { "id": "tsk_e2e", "state": "done", "boardColumn": "done", "displayKey": "SE-06", "blockedReason": null }
     ],
     "archived": []
   }
@@ -86,12 +91,12 @@
 要点：failed 无 placement→待办、有 placement→进行中；`state` 仍是 `failed`（角标即状态本身），`blockedReason` 随行；只有 done 在已完成列；已归档列为空。
 
 ```jsonc
-// POST /v1/tasks/{id}/archive （归档那张 stalled 卡）
+// POST /v1/tasks/{id}/archive （归档那张 stalled 卡）—— 完整 Task 响应的标注摘要
 { "id": "tsk_e2e", "state": "stalled", "archivedAt": "2026-09-20T12:38:17.893Z" }
 // 再次 POST archive → HTTP 409
 ```
 
-归档后再 `GET /v1/board`：stalled 卡只出现在 `archived`（`{ "state": "stalled", "boardColumn": "archived" }`），进行中列不再含它，待办/已完成两列状态不变——归档移动卡片但不改 state。
+归档后再 `GET /v1/board`（下面同样为只留投影字段的标注摘要）：stalled 卡只出现在 `archived`（`{ "state": "stalled", "boardColumn": "archived" }`），进行中列不再含它，待办/已完成两列状态不变——归档移动卡片但不改 state。
 
 ```text
 非法捷径 PATCH state=running（pending→running）→ HTTP 409（整跳拒绝）

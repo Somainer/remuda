@@ -6668,7 +6668,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Pool, worktree name, or '.' for the registered workspace root. */
+                /** @description Pool or worktree name; the reserved token '-' addresses the registered workspace root (literal '.' segments are collapsed by HTTP clients). */
                 name: string;
             };
             cookie?: never;
@@ -6697,7 +6697,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Worktree/slot name (or '.'). */
+                /** @description Worktree/slot name, or '-' for the registered workspace root. */
                 name: string;
             };
             cookie?: never;

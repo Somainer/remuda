@@ -22,3 +22,20 @@ export function peekTtyScrollLine(instanceId: string): number | null {
 export function clearTtyScrollLine(instanceId: string): void {
   memory.delete(instanceId);
 }
+
+/**
+ * One-shot read: return the remembered line once the buffer can show it
+ * (more rows than one screen), clamped to the current maximum, and delete it.
+ * Returns null when there is no memory or the buffer has not filled yet — in
+ * that case the caller retries and the memory is kept.
+ */
+export function consumeTtyScrollLine(
+  instanceId: string,
+  bufferLength: number,
+  rows: number,
+): number | null {
+  const wanted = peekTtyScrollLine(instanceId);
+  if (wanted == null || bufferLength <= rows) return null;
+  clearTtyScrollLine(instanceId);
+  return Math.min(wanted, Math.max(0, bufferLength - rows));
+}

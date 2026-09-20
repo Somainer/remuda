@@ -1,7 +1,7 @@
 # 手机优先 UI · 任务 6：`m-keybar` — 终端段九键键盘条
 
 2026-09-20 · `wt/c-mkeybar/b-mkeybar-md` · mobile-ui 实施计划 §(C) 任务 6（B.3.2 九键表）
-规格权威：[ui-spec.md](../ui-spec.md) §1.3 / §3.4（D-039）/ §4.7（D-049），[decisions.md](../decisions.md) D-028a / D-039 / D-049；基线 `origin/main` @ 5da06fd9。
+规格权威：[ui-spec.md](../ui-spec.md) §1.3 / §3.4（D-039）/ §4.7（D-049），[decisions.md](../decisions.md) D-028a / D-039 / D-049；基线 `origin/main` @ 1468a2ba（rebase 于 mobile-ui-8 合入后）。
 
 ## 1. 交付物
 
@@ -10,8 +10,9 @@
 | `web/src/features/session/tty/AuxKeys.tsx` | 新增 `variant="phone"`：收起态九枚原始字节键（Esc/Tab/Ctrl/方向/PgUp/PgDn），展开态恢复完整 11 键 BAR（含 alt / ⌃C）。`stickyCtrl`/`onStickyCtrlChange` 让九键动作条与第二行共享同一个粘滞 Ctrl。BAR / STRIP 与 toolbar/bar 两个变体逐字节不变 |
 | `web/src/features/session/tty/PhoneKeyBar.tsx`（新） | 九键动作条组件：Ctrl · Esc · Tab · git · 跳转 · 贴 · 史 · 结构 · 键，全部接到既有能力 |
 | `web/src/features/session/tty/promptHistory.ts`（新） | 史键数据：经现有 `assembleTranscript` 投影取本实例 `origin==="human"` 的 user 消息（最新在前），外加未发送的 `lib/drafts.ts` 草稿；skill 注入体 / hook-context 由投影的 origin 过滤天然排除 |
-| `web/src/features/session/tty/ttyScrollMemory.ts`（新） | git 键往返时跨 xterm 卸载/重挂记住终端缓冲行（baseY）的小存储 |
-| `web/src/features/session/tty/TerminalView.tsx` | 仅移动底部区：移动分支由旧的整行 `AuxKeys` 换成 `PhoneKeyBar`；dock 的 LocalInput 加 `initialText` 注入（史键填入，靠 key 重挂）；ready 后按 `ttyScrollMemory` 用 xterm 滚动 API 恢复行；`__ttyLab` 增加 `scrollLine` / `scrollToLine`（测试/恢复用）；desktop 路径不动 |
+| `web/src/features/session/tty/ttyScrollMemory.ts`（新） | git 键往返时跨 xterm 卸载/重挂记住终端缓冲行（baseY）的小存储；`consumeTtyScrollLine` 在缓冲就绪后一次性消费并夹取 |
+| `web/src/features/session/tty/ttyScrollMemory.test.ts`（新） | 9 个 vitest：finite/negative/NaN/Infinity 守卫、零行合法、实例隔离、未就绪保留、就绪一次性消费+夹取 |
+| `web/src/features/session/tty/TerminalView.tsx` | 仅移动底部区：移动分支由旧的整行 `AuxKeys` 换成 `PhoneKeyBar`；dock 的 LocalInput 加 `initialText` 注入（史键填入，靠 key 重挂）；ready 后按 `ttyScrollMemory.consumeTtyScrollLine` 用 xterm 滚动 API 恢复行；desktop 路径不动 |
 | `web/src/features/session/tty/LocalInput.tsx` | 新增可选 `initialText`（本挂载的初始内容），提交路径与 D-028 body/Enter 分离完全不变 |
 | `web/src/lib/clipboard.ts` | 新增 `probeClipboardRead()` / `readClipboard()` / `clipboardIo.read`：同步事实（无 API / 非安全上下文）+ Permissions API denied 探测；Safari 不支持 query 时乐观、读取时拒绝再兜底 |
 | `web/src/features/session/tty/TerminalView.module.css` | 九键条样式：单行 44px、横向滚动、8px 托盘内边距（按键不贴视口边）、隐藏滚动条、圆角视觉 + 方形 `::after` 命中面、禁用原因行（`--text-aux`）、历史 sheet |
@@ -72,7 +73,7 @@ QuickFind 的 overlay 只在 spaces drawer 里挂载（compact `/s/:id` 无侧�
 
 在 hub 假节点 + bundled chromium（webgl/canvas 渲染器）下，xterm v6.0.0 的**程序化滚动**在本环境完全不改变 `buffer.active.baseY`：`scrollToLine` / `scrollLines` / `scrollToTop` 调用后 ydisp 不变；受信任 `mouse.wheel`、CDP `dispatchTouchEvent` 滑动同样不改变它（真实手机上的滚动路径是 `attachTerminalTouch` → `term.scrollLines`，触摸事件在桌面 chromium 下无法由自动化合成为等价的受信序列）。已排除：宽度无关、DPR 无关、renderer 无关（临时强制 DOM 渲染器亦同）、鼠标跟踪无关（`data-tty-mouse=none`）、disableStdin 无关。这是 xterm v6 虚拟滚动在该无头环境的行为；桌面 1440 规格只断言 toolbar 渲染，全仓此前也没有任何 hub 规格驱动过 xterm 回滚（`terminal-live` 的 wheel 断言属于需真实后端的非闸口配置）。
 
-因此 hub 规格在 390 无触控上下文（ui-spec §3.4 明确要求的「390 无触控」第二维度）断言：九键条在宽度驱动的 compact 布局下挂载、贴键字节进入同一 PTY、git 走 files 往返、返回后 xterm 重挂且重放的快照仍含该 marker（同一活终端、缓冲连续）。产品代码的行级捕获/恢复逻辑在真机回滚发生时即生效；该 headless 限制不影响任何真机能力，也未触碰产品渲染器。
+因此 hub 规格在 390 无触控上下文（ui-spec §3.4 明确要求的「390 无触控」第二维度）断言：九键条在宽度驱动的 compact 布局下挂载、贴键字节进入同一 PTY、git 走 files 往返、返回后 xterm 重挂且重放的快照仍含该 marker（同一活终端、缓冲连续）。**滚动行的捕获/恢复本身由 vitest 单元覆盖**（`ttyScrollMemory.test.ts`：finite/negative/NaN/Infinity 守卫、零行合法、按实例隔离、缓冲不足一行时保留记忆、就绪后一次性消费并按 `length-rows` 夹取、消费后再读为 null）；TerminalView 的 ready 后 effect 只是把该 one-shot 值交给 `term.scrollToLine` 的薄接线。该 headless 限制不影响任何真机能力，也未触碰产品渲染器。
 
 ## 6. 史 键与 D-028a（验收 5）
 

@@ -24,10 +24,14 @@ vi.mock("../../../lib/store", () => ({
 vi.mock("../../search/QuickFind", () => ({
   openQuickFind: (...args: unknown[]) => openQuickFind(...args),
 }));
-vi.mock("../../../lib/clipboard", () => ({
-  probeClipboardRead: (...args: unknown[]) => probeClipboardRead(...args),
-  readClipboard: (...args: unknown[]) => readClipboard(...args),
-}));
+vi.mock("../../../lib/clipboard", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../lib/clipboard")>();
+  return {
+    ...actual,
+    probeClipboardRead: (...args: unknown[]) => probeClipboardRead(...args),
+    readClipboard: (...args: unknown[]) => readClipboard(...args),
+  };
+});
 vi.mock("./promptHistory", () => ({
   promptHistory: () => ["git status", "ls -la"],
 }));

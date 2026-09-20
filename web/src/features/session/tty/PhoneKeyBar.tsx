@@ -5,7 +5,12 @@ import { hubStore, useHub } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import type { SessionView } from "../../../lib/viewPref";
 import { openQuickFind } from "../../search/QuickFind";
-import { probeClipboardRead, readClipboard, type ClipboardReadStatus } from "../../../lib/clipboard";
+import {
+  clipboardReadStatusSync,
+  probeClipboardRead,
+  readClipboard,
+  type ClipboardReadStatus,
+} from "../../../lib/clipboard";
 import { AuxKeys } from "./AuxKeys";
 import { promptHistory } from "./promptHistory";
 import { saveTtyScrollLine } from "./ttyScrollMemory";
@@ -76,12 +81,7 @@ export function PhoneKeyBar({
   const [ctrl, setCtrl] = useState(false);
   const [auxOpen, setAuxOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [clipboard, setClipboard] = useState<ClipboardReadStatus>(() => {
-    // probeClipboardRead is async (Permissions API); seed from the synchronous
-    // facts so the first paint never flashes an enabled button that cannot work.
-    const sync = typeof navigator !== "undefined" && typeof navigator.clipboard?.readText === "function";
-    return sync ? { state: "ready" } : { state: "blocked", reason: "剪贴板读取需要 HTTPS 安全上下文或浏览器授权" };
-  });
+  const [clipboard, setClipboard] = useState<ClipboardReadStatus>(clipboardReadStatusSync);
 
   useEffect(() => {
     let alive = true;

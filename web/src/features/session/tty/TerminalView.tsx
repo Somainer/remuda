@@ -11,7 +11,7 @@ import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
 import { PhoneKeyBar } from "./PhoneKeyBar";
-import { clearTtyScrollLine, peekTtyScrollLine } from "./ttyScrollMemory";
+import { clearTtyScrollLine, consumeTtyScrollLine, peekTtyScrollLine } from "./ttyScrollMemory";
 import { TuiModeIndicator } from "./TuiModeIndicator";
 import { TtyProgressBar } from "./TtyProgressBar";
 import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type TtyStatus } from "./client";
@@ -36,9 +36,6 @@ import css from "./TerminalView.module.css";
 export type TtyLabHandle = {
   disconnect: () => void;
   reconnect: () => void;
-  /** Current top-visible buffer line (xterm baseY). */
-  scrollLine: () => number;
-  scrollToLine: (line: number) => void;
 };
 
 declare global {
@@ -430,13 +427,6 @@ export function TerminalView({
         resetStreamRef.current = true;
         session.reconnectForTest();
       },
-      scrollLine: () => termRef.current?.buffer.active.baseY ?? 0,
-      scrollToLine: (line: number) => {
-        const term = termRef.current;
-        if (!term) return;
-        const max = Math.max(0, term.buffer.active.length - term.rows);
-        term.scrollToLine(Math.max(0, Math.min(line, max)));
-      },
     };
 
     return () => {
@@ -482,20 +472,20 @@ export function TerminalView({
   // inert), so the restore goes through the terminal scroll API.
   useEffect(() => {
     if (!ready) return;
-    const wanted = peekTtyScrollLine(instance.id);
-    if (wanted == null) return;
+    if (peekTtyScrollLine(instance.id) == null) return;
     let timer = 0;
     let tries = 0;
     const apply = () => {
       const term = termRef.current;
-      if (term && term.buffer.active.length > term.rows) {
-        const max = term.buffer.active.length - term.rows;
-        term.scrollToLine(Math.min(wanted, max));
-        clearTtyScrollLine(instance.id);
+      const line = term
+        ? consumeTtyScrollLine(instance.id, term.buffer.active.length, term.rows)
+        : null;
+      if (line != null) {
+        term!.scrollToLine(line);
         return;
       }
-      if (++tries < 80) timer = window.setTimeout(apply, 50);
-      else clearTtyScrollLine(instance.id);
+      if (term && ++tries >= 80) clearTtyScrollLine(instance.id);
+      else timer = window.setTimeout(apply, 50);
     };
     apply();
     return () => window.clearTimeout(timer);

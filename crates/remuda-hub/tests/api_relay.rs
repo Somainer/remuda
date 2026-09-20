@@ -1167,20 +1167,31 @@ async fn open_time_rejections_all_emit_a_terminal_end() -> Result<()> {
     notify(&mut routed.node, "api.open", badpath).await?;
     assert_end_code(&mut routed.node, "st_badpath", "destination-refused").await?;
 
-    // Duplicate stream id: the second of two opens is refused.
+    // Duplicate stream id while the first stream is still in flight: the
+    // second open is refused. The first open must genuinely be live — an
+    // instant-response origin lets stream #1 end and free its id before the
+    // drain judges #2 (ids are reusable after a normal end), which made this
+    // assertion race the egress under load. A gateway that holds the response
+    // head keeps stream #1 registered deterministically.
+    let dup_gateway = FakeGateway::start_with(vec![Script::SlowFirstByte {
+        delay: Duration::from_secs(10),
+        text: "held".into(),
+    }])
+    .await?;
+    let mut dup = fixture_routed_self(&dup_gateway.base_url_v1()).await?;
     notify(
-        &mut routed.node,
+        &mut dup.node,
         "api.open",
-        api_open_params(&routed.instance_id, "st_dup", &messages_body()),
+        api_open_params(&dup.instance_id, "st_dup", &messages_body()),
     )
     .await?;
     notify(
-        &mut routed.node,
+        &mut dup.node,
         "api.open",
-        api_open_params(&routed.instance_id, "st_dup", &messages_body()),
+        api_open_params(&dup.instance_id, "st_dup", &messages_body()),
     )
     .await?;
-    assert_end_code(&mut routed.node, "st_dup", "destination-refused").await?;
+    assert_end_code(&mut dup.node, "st_dup", "destination-refused").await?;
 
     // No via route: a plain fixture (no profile / delivery) refuses api.open.
     let mut no_route = fixture().await?;
@@ -1305,6 +1316,7 @@ async fn open_time_rejections_all_emit_a_terminal_end() -> Result<()> {
     )
     .await?;
     cap_gateway.shutdown().await;
+    dup_gateway.shutdown().await;
 
     gateway.shutdown().await;
     Ok(())

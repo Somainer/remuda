@@ -3,6 +3,7 @@ import { Link, useNavigate } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import type { Id } from "../../types/wire";
 import { hubStore, useHub } from "../../lib/store";
+import { uiMode } from "../../lib/status";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { fetchChanges } from "../files/filesApi";
 import {
@@ -99,23 +100,31 @@ export function HomeList() {
     });
   }, [branchCandidates]);
 
-  // Mirror SessionList's row hydration cadence: the store projects live
-  // phrases and TTY screen DONE markers the next-step sentence needs.
+  // Mirror SessionList's row hydration cadence exactly: the store projects
+  // live phrases for every rendered row, while /screen reads go to
+  // tty-attachable rows only (the store additionally skips exited/failed
+  // rows, so the phone home issues no screen traffic for dead sessions —
+  // c-mobilenew's no-/screen-500 contract).
+  const screenIds = useMemo(
+    () =>
+      hub.instances
+        .filter((instance) => instance.parent == null && uiMode(instance) === "tty-attachable")
+        .map((instance) => instance.id),
+    [hub.instances],
+  );
   const topLevelIds = useMemo(
     () => hub.instances.filter((instance) => instance.parent == null).map((instance) => instance.id),
     [hub.instances],
   );
   useEffect(() => {
     const tick = () => {
-      if (topLevelIds.length) {
-        void hubStore.refreshScreens(topLevelIds as Id[]);
-        void hubStore.hydrateRowSummaries(topLevelIds as Id[]);
-      }
+      if (screenIds.length) void hubStore.refreshScreens(screenIds as Id[]);
+      if (topLevelIds.length) void hubStore.hydrateRowSummaries(topLevelIds as Id[]);
     };
     tick();
     const timer = window.setInterval(tick, 2500);
     return () => window.clearInterval(timer);
-  }, [topLevelIds]);
+  }, [screenIds, topLevelIds]);
 
   const groups = useMemo(
     () =>

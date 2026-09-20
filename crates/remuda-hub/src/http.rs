@@ -2021,7 +2021,7 @@ pub async fn lease_worktree(
             obj.insert(
                 "blocked".into(),
                 json!({
-                    "reason": "directory is held by another attached task; queued for serial reuse"
+                    "reason": "dir-busy: directory is held by another attached task; queued for serial reuse"
                 }),
             );
         }

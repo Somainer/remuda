@@ -3,8 +3,10 @@
 Date: 2026-09-20. Scope: the Node worktree pool layered above
 `provision_record`, the Hub `worktree_leases` table and lease/return routes,
 and the lease-aware reclaim guards. Plan: `briefs/plans/task-model.md` §B.3
-and task 2 acceptance (1–9). Spec task `c-tspec` (D-050) runs in parallel;
-the PR description references D-050 as the pending design decision record.
+and task 2 acceptance (1–9); design decision
+[D-050](../decisions.md) (merged by `c-tspec`) fixes the table,
+`mode`/`dir_key` vocabulary and the lease-aware reclaim requirement this
+implements.
 
 No ports, no tunnels, no web suite: the pool touches only git worktrees, the
 Node catalog and Hub SQLite. Screenshots are not part of this task's
@@ -143,6 +145,16 @@ returns both. The test compares a recursive `(relative path, bytes)`
 fingerprint before leasing and after returning: the sequence is exactly
 equal — no `clean`/`reset`/`remove` ran, and `notes.txt` / `scratch/data.bin`
 are untouched. Reset/clean/park only ever run for `mode=pool`.
+
+### Task-archive boundary
+
+D-050 §2 gates the pool `clean -fd`/park on the last refcount returning *and*
+the task being archived. The Node `worktree.return` RPC deliberately knows
+nothing about task ledger state, so in this task the last return parks
+immediately (the directory is clean by the refuse-on-dirty guard); wiring
+"park only once the task row is done/archived" is the binding task's
+(`t-bind`) Hub-side responsibility. The blocked/queued reason carries the
+stable token `dir-busy:` (D-050 §2) so the board can discriminate it.
 
 ## Acceptance cross-reference
 

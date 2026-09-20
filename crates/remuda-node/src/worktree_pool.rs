@@ -154,7 +154,7 @@ fn reuse_record(
     });
     if queued {
         payload["blocked"] = json!({
-            "reason": "directory is held by another attached task; queued for serial reuse"
+            "reason": "dir-busy: directory is held by another attached task; queued for serial reuse"
         });
     }
     Ok(payload)

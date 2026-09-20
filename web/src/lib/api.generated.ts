@@ -1653,6 +1653,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/worktrees/{name}/lease": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Lease a warm pool slot (parked hit switches branch in place without fetching; full pool returns SUPPLY_DEFERRED, never a reroute) or attach to an existing worktree/root for serial reuse */
+        post: operations["worktreeLease"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/worktrees/{name}/return": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Return a lease (decrement refcount); pool slots are cleaned of untracked files and detached to base, reuse leases perform zero git operations */
+        post: operations["worktreeReturn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3056,6 +3090,44 @@ export interface components {
             /** @description Registered workspace containing the repository; omitted selects the Node default. */
             workspaceId?: string;
         };
+        WorktreeLeaseRequest: {
+            /** @description Pool base branch (default main); used only when a new slot is provisioned. */
+            base?: string;
+            hostId?: string;
+            /** @description tsk_… task holding the lease. */
+            taskId: string;
+            /** @description Registered workspace containing the repository; omitted selects the Node default. */
+            workspaceId?: string;
+        };
+        WorktreeLeaseResult: {
+            /** @description Oid the slot branched from (pool leases). */
+            baseOid?: string | null;
+            /** @description Present when the lease is shared: the directory is attach-locked and the caller is queued. */
+            blocked?: {
+                reason?: string;
+            };
+            branch?: string;
+            /** @description Directory key relative to the workspace root; '.' for the root itself. */
+            dirKey?: string;
+            hostId?: string;
+            /** @description Hub worktree_leases row id. */
+            leaseId?: string;
+            /**
+             * @description reuse (existing worktree/root, zero git ops on return) or pool (warm managed slot).
+             * @enum {string}
+             */
+            mode: "reuse" | "pool";
+            /** @description Worktree/slot name; '.' when the leased directory is the workspace root. */
+            name: string;
+            path?: string;
+            queued?: boolean;
+            /** @description Tasks sharing this directory. */
+            refcount: number;
+            /** @enum {string} */
+            state: "leased" | "parked" | "free";
+            /** @description True when a parked slot was reused without fetching. */
+            warm?: boolean;
+        };
         WorktreePage: {
             hostId?: string;
             items: components["schemas"]["WorktreeRecord"][];
@@ -3069,6 +3141,26 @@ export interface components {
             name: string;
             path: string;
             workspaceRoot?: string;
+        };
+        WorktreeReturnRequest: {
+            hostId?: string;
+            /** @description tsk_… task releasing the lease. */
+            taskId: string;
+            /** @description Registered workspace containing the repository; omitted selects the Node default. */
+            workspaceId?: string;
+        };
+        WorktreeReturnResult: {
+            dirKey?: string;
+            hostId?: string;
+            leaseId?: string;
+            /** @enum {string} */
+            mode: "reuse" | "pool";
+            name: string;
+            /** @description True when a pool slot was detached and parked warm. */
+            parked?: boolean;
+            refcount: number;
+            /** @enum {string} */
+            state: "leased" | "parked" | "free";
         };
     };
     responses: {
@@ -6569,6 +6661,64 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             422: components["responses"]["Error"];
+        };
+    };
+    worktreeLease: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Pool, worktree name, or '.' for the registered workspace root. */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorktreeLeaseRequest"];
+            };
+        };
+        responses: {
+            /** @description Leased pool slot or reused directory */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorktreeLeaseResult"];
+                };
+            };
+            401: components["responses"]["Error"];
+            429: components["responses"]["Error"];
+        };
+    };
+    worktreeReturn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Worktree/slot name (or '.'). */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WorktreeReturnRequest"];
+            };
+        };
+        responses: {
+            /** @description Lease returned; pool slot parked, reuse directory untouched */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorktreeReturnResult"];
+                };
+            };
+            401: components["responses"]["Error"];
+            409: components["responses"]["Error"];
         };
     };
 }

@@ -220,6 +220,13 @@ pub fn routes() -> Router<crate::AppState> {
         .route("/healthz", get(healthz))
         .route("/v1/login", post(login))
         .route("/v1/worktrees", get(list_worktrees).post(create_worktree))
+        .route("/v1/worktrees/{name}/lease", post(lease_worktree))
+        .route("/v1/worktrees/{name}/return", post(return_worktree))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WorktreeNamePath {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -251,6 +258,24 @@ pub struct CreateWorktreeBody {
     name: String,
     #[serde(default)]
     base: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LeaseWorktreeBody {
+    host_id: Option<String>,
+    workspace_id: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReturnWorktreeBody {
+    host_id: Option<String>,
+    workspace_id: Option<String>,
+    task_id: String,
 }
 
 const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -496,6 +521,76 @@ pub async fn delete_instance(
         stop_before_delete(&state, &instance).await?;
     }
 
+    // t-pool: a deleted session must not keep holding an attach lock. Before
+    // any Node reclaim, return each lease this instance held for its task
+    // (pool slots park warm; reuse dirs are untouched). Best effort like the
+    // purge below — an offline Node reconciles on reconnect, and the store
+    // delete clears holder_instance_id inside its transaction regardless.
+    let mut lease_returns = Vec::new();
+    if let Some(task_id) = instance.task_id.as_deref() {
+        let held = state
+            .store
+            .worktree_leases_held_by_instance(instance_id.clone())
+            .await
+            .map_err(map_store)?;
+        for lease in held {
+            if !lease.task_ids.iter().any(|id| id == task_id) {
+                continue;
+            }
+            let name = lease.worktree_name.clone().unwrap_or_else(|| ".".into());
+            let dir_key = lease.dir_key.clone();
+            let mode_was_reuse = lease.mode == "reuse";
+            match crate::http::call_node(
+                &state,
+                &lease.host_id,
+                "worktree.return",
+                json!({
+                    "hostId": lease.host_id,
+                    "workspaceId": lease.workspace_id,
+                    "name": name,
+                    "taskId": task_id,
+                }),
+            )
+            .await
+            {
+                Ok(returned) => {
+                    let node_state = returned
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("parked")
+                        .to_string();
+                    let branch = returned
+                        .get("branch")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    // Keep the Hub lease row consistent: pool slots park warm;
+                    // reuse rows drop at zero.
+                    let released = state
+                        .store
+                        .release_worktree_lease(
+                            lease.host_id.clone(),
+                            lease.workspace_id.clone(),
+                            dir_key.clone(),
+                            task_id.to_string(),
+                            node_state,
+                            branch,
+                        )
+                        .await
+                        .map_err(map_store)?;
+                    if released.is_some() || mode_was_reuse {
+                        lease_returns.push(dir_key);
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    instance_id = %instance_id,
+                    dir_key = %lease.dir_key,
+                    "worktree.return during instance delete failed; holder cleared locally"
+                ),
+            }
+        }
+    }
+
     // Ask the Node to drop its own copy first. A Node that is offline or has
     // never heard of the instance must not block the delete: the Hub row is
     // what the user asked to remove, and the Node reconciles on reconnect.
@@ -570,6 +665,7 @@ pub async fn delete_instance(
         "deleted": true,
         "instanceId": instance_id,
         "nodePurge": purge,
+        "leaseReturns": lease_returns,
     })))
 }
 
@@ -1802,6 +1898,198 @@ pub async fn create_worktree(
     });
     let created = call_node(&state, &host.host_id, "worktree.create", params).await?;
     Ok(Json(created))
+}
+
+/// Validate a worktree lease path segment.
+///
+/// `-` is the reserved HTTP-edge token for the registered workspace root:
+/// WHATWG URL parsing collapses literal/encoded `.` path segments
+/// (`/worktrees/%2E/lease` → `/worktrees/lease`), so the root can never be
+/// addressed by a `.` path parameter over HTTP. `-` cannot be a real worktree
+/// name (`safe_segment` requires a leading letter), so there is no collision;
+/// handlers map it to the Node/root key `"."`.
+fn validate_worktree_key(name: &str) -> Result<(), HubError> {
+    if name == "-" {
+        return Ok(());
+    }
+    remuda_protocol::path_guard::safe_segment(name)
+        .map_err(|error| HubError::BadRequest(format!("worktree {error}")))
+}
+
+/// Directory/Node name for a validated path key (`-` → root key `"."`).
+fn node_worktree_name(path_name: &str) -> &str {
+    if path_name == "-" { "." } else { path_name }
+}
+
+/// Parse a caller-supplied task id.
+fn parse_task_id(raw: &str) -> Result<remuda_protocol::TaskId, HubError> {
+    raw.parse::<remuda_protocol::TaskId>()
+        .map_err(|error| HubError::BadRequest(format!("invalid taskId: {error}")))
+}
+
+/// `POST /v1/worktrees/{name}/lease` — lease a pool slot or attach to an
+/// existing worktree/root for serial reuse.
+///
+/// The directory identity comes back from the Node (`dirKey`, resolved slot
+/// name); the Hub persists the authoritative refcount row. Only
+/// `{hostId, workspaceId, name, base, taskId}` is forwarded: no `path` or
+/// `repo` ever crosses the wire (security-review-2 M4).
+pub async fn lease_worktree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<WorktreeNamePath>,
+    Json(body): Json<LeaseWorktreeBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_device(&state.store, &headers).await?;
+    validate_worktree_key(&path.name)?;
+    let task = parse_task_id(&body.task_id)?;
+    let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
+    let node_name = node_worktree_name(&path.name);
+    // Explicit whitelist; extras from the body (path/repo included) are dropped
+    // here and the Node rejects them again defensively.
+    let mut params = json!({
+        "hostId": host.host_id,
+        "workspaceId": body.workspace_id,
+        "name": node_name,
+        "taskId": task.as_id().as_str(),
+    });
+    if let Some(base) = body.base.as_deref().filter(|raw| !raw.is_empty()) {
+        params["base"] = json!(base);
+    }
+    let result = call_node(&state, &host.host_id, "worktree.lease", params).await?;
+    // The pool is full and no clean slot exists: the Node refuses explicitly
+    // instead of rerouting, and the Hub projects the 429 vocabulary (D-035).
+    if result.get("deferred").and_then(Value::as_bool) == Some(true) {
+        return Err(HubError::SupplyDeferred {
+            decision: result.clone(),
+        });
+    }
+    let mode = result
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("pool")
+        .to_string();
+    let dir_key = result
+        .get("dirKey")
+        .and_then(Value::as_str)
+        .unwrap_or(path.name.as_str())
+        .to_string();
+    // reuse-to-root has no worktree name; every other lease carries one.
+    let worktree_name = if dir_key == "." {
+        None
+    } else {
+        result
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(path.name.clone()))
+    };
+    let branch = result
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let base_oid = result
+        .get("baseOid")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let row = state
+        .store
+        .record_worktree_lease(
+            mode,
+            host.host_id.clone(),
+            body.workspace_id.unwrap_or_default(),
+            dir_key,
+            worktree_name,
+            branch,
+            base_oid,
+            task.as_id().to_string(),
+            None,
+        )
+        .await
+        .map_err(map_store)?;
+    let mut value = result;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("refcount".into(), json!(row.refcount));
+        obj.insert("leaseId".into(), json!(row.id));
+        obj.insert("hostId".into(), json!(host.host_id));
+        // Sharing is serial: refcount > 1 means another task still holds the
+        // attach lock, so this lease is queued/blocked even if the Node did not
+        // phrase it that way (the store row is the sharing authority).
+        if row.refcount > 1 && !obj.contains_key("blocked") {
+            obj.insert("queued".into(), json!(true));
+            obj.insert(
+                "blocked".into(),
+                json!({
+                    "reason": "directory is held by another attached task; queued for serial reuse"
+                }),
+            );
+        }
+    }
+    Ok(Json(value))
+}
+
+/// `POST /v1/worktrees/{name}/return` — decrement the refcount; a pool slot is
+/// cleaned and parked, a reuse directory is left byte for byte.
+///
+/// Forwards only `{hostId, workspaceId, name, taskId}`.
+pub async fn return_worktree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<WorktreeNamePath>,
+    Json(body): Json<ReturnWorktreeBody>,
+) -> Result<Json<Value>, HubError> {
+    require_origin(&headers, &state.config)?;
+    require_device(&state.store, &headers).await?;
+    validate_worktree_key(&path.name)?;
+    let task = parse_task_id(&body.task_id)?;
+    let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
+    let node_name = node_worktree_name(&path.name);
+    let workspace_id = body.workspace_id.unwrap_or_default();
+    let params = json!({
+        "hostId": host.host_id,
+        "workspaceId": workspace_id,
+        "name": node_name,
+        "taskId": task.as_id().as_str(),
+    });
+    let result = call_node(&state, &host.host_id, "worktree.return", params).await?;
+    let dir_key = result
+        .get("dirKey")
+        .and_then(Value::as_str)
+        .unwrap_or(path.name.as_str())
+        .to_string();
+    let node_state = result
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or("parked")
+        .to_string();
+    let branch = result
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let row = state
+        .store
+        .release_worktree_lease(
+            host.host_id.clone(),
+            workspace_id,
+            dir_key,
+            task.as_id().to_string(),
+            node_state,
+            branch,
+        )
+        .await
+        .map_err(map_store)?;
+    let mut value = result;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("hostId".into(), json!(host.host_id));
+        if let Some(row) = &row {
+            obj.insert("refcount".into(), json!(row.refcount));
+            obj.insert("leaseId".into(), json!(row.id));
+        } else {
+            obj.insert("refcount".into(), json!(0));
+        }
+    }
+    Ok(Json(value))
 }
 
 async fn pick_worktree_host(

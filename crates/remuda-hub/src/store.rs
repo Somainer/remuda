@@ -1285,6 +1285,162 @@ impl InteractionRecord {
     }
 }
 
+/// One row of the `worktree_leases` table (task-model t-pool).
+///
+/// Identity is `(host_id, workspace_id, dir_key)`: the Space key plus the
+/// directory relative to the workspace root. A reuse-to-root lease has
+/// `dir_key = "."` and `worktree_name = NULL`; a pool slot carries its slot
+/// name. `refcount` is the number of tasks serially sharing that one
+/// directory, and `holder_instance_id` is the attach lock — `None` once every
+/// session has detached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeLeaseRow {
+    /// `wtl_…` row id.
+    pub id: String,
+    /// `reuse` | `pool`; reset/clean/park semantics are pool-only.
+    pub mode: String,
+    /// Owning host.
+    pub host_id: String,
+    /// Owning workspace.
+    pub workspace_id: String,
+    /// Directory key relative to the workspace root; `"."` is the root.
+    pub dir_key: String,
+    /// Worktree/slot name; `None` for a reuse-to-root lease.
+    pub worktree_name: Option<String>,
+    /// Branch checked out while leased.
+    pub branch: Option<String>,
+    /// Project this lease serves, when known.
+    pub project_id: Option<String>,
+    /// Number of tasks sharing the directory.
+    pub refcount: i64,
+    /// `leased` | `parked` | `provisioning`.
+    pub state: String,
+    /// Attach-lock holder; one session at a time.
+    pub holder_instance_id: Option<String>,
+    /// Tasks currently counted on this lease.
+    pub task_ids: Vec<String>,
+    /// Oid the slot parked at / branched from.
+    pub base_oid: Option<String>,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last state update.
+    pub updated_at: String,
+    /// When refcount last reached zero.
+    pub released_at: Option<String>,
+}
+
+/// Whether `dir_key` is a pool slot `<pool>-s<n>` of `pool`. The reserved
+/// `-s` suffix (mirrors the Node's slot naming) keeps a similarly named but
+/// distinct pool from matching: pool `a` does not own slot `ab-s1`.
+fn is_pool_slot_of(pool: &str, dir_key: &str) -> bool {
+    match dir_key.strip_prefix(&format!("{pool}-s")) {
+        Some(number) => !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()),
+        None => false,
+    }
+}
+
+impl WorktreeLeaseRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let task_ids_json: String = row.get("task_ids_json")?;
+        let task_ids: Vec<String> = serde_json::from_str(&task_ids_json).unwrap_or_default();
+        Ok(Self {
+            id: row.get("id")?,
+            mode: row.get("mode")?,
+            host_id: row.get("host_id")?,
+            workspace_id: row.get("workspace_id")?,
+            dir_key: row.get("dir_key")?,
+            worktree_name: row.get("worktree_name")?,
+            branch: row.get("branch")?,
+            project_id: row.get("project_id")?,
+            refcount: row.get("refcount")?,
+            state: row.get("state")?,
+            holder_instance_id: row.get("holder_instance_id")?,
+            task_ids,
+            base_oid: row.get("base_oid")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+            released_at: row.get("released_at")?,
+        })
+    }
+
+    pub(crate) fn load(
+        conn: &Connection,
+        host_id: &str,
+        workspace_id: &str,
+        dir_key: &str,
+    ) -> rusqlite::Result<Option<Self>> {
+        conn.query_row(
+            "SELECT * FROM worktree_leases
+             WHERE host_id = ?1 AND workspace_id = ?2 AND dir_key = ?3",
+            params![host_id, workspace_id, dir_key],
+            Self::from_row,
+        )
+        .optional()
+    }
+
+    fn load_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Self> {
+        conn.query_row(
+            "SELECT * FROM worktree_leases WHERE id = ?1",
+            params![id],
+            Self::from_row,
+        )
+    }
+
+    fn insert(&self, conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "INSERT INTO worktree_leases
+                (id, mode, host_id, workspace_id, dir_key, worktree_name, branch,
+                 project_id, refcount, state, holder_instance_id, task_ids_json,
+                 base_oid, created_at, updated_at, released_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14, ?15)",
+            params![
+                self.id,
+                self.mode,
+                self.host_id,
+                self.workspace_id,
+                self.dir_key,
+                self.worktree_name,
+                self.branch,
+                self.project_id,
+                self.refcount,
+                self.state,
+                self.holder_instance_id,
+                serde_json::to_string(&self.task_ids).expect("task ids"),
+                self.base_oid,
+                self.created_at,
+                self.released_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn save(&self, conn: &Connection) -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE worktree_leases SET
+                mode = ?2, worktree_name = ?3, branch = ?4, project_id = ?5,
+                refcount = ?6, state = ?7, holder_instance_id = ?8,
+                task_ids_json = ?9, base_oid = ?10, updated_at = ?11,
+                released_at = ?12
+             WHERE id = ?1",
+            params![
+                self.id,
+                self.mode,
+                self.worktree_name,
+                self.branch,
+                self.project_id,
+                self.refcount,
+                self.state,
+                self.holder_instance_id,
+                serde_json::to_string(&self.task_ids).expect("task ids"),
+                self.base_oid,
+                self.updated_at,
+                self.released_at,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
 impl Store {
     /// Open (or create) `hub.sqlite` on a dedicated writer thread, plus a
     /// read-only pool for reads that can be long (hub-store-1).
@@ -2119,6 +2275,16 @@ impl Store {
                 params![&instance_id],
             )?;
             tx.execute("DELETE FROM instances WHERE id = ?1", params![&instance_id])?;
+            // t-pool: a deleted instance must not keep holding an attach lock.
+            // The lease row itself is retained (it tracks the *directory* and
+            // its tasks; worktree reclaim is a separate, lease-aware path), but
+            // holder_instance_id is cleared here so a later lease is not blocked
+            // by a session that no longer exists.
+            tx.execute(
+                "UPDATE worktree_leases SET holder_instance_id = NULL, updated_at = ?2
+                 WHERE holder_instance_id = ?1",
+                params![&instance_id, now_rfc3339()],
+            )?;
             // Tombstone: a Node command that is still draining will keep
             // appending journal events for this id, and `ensure_instance`
             // would happily recreate the row. A deleted session must stay
@@ -2130,6 +2296,197 @@ impl Store {
             )?;
             tx.commit()?;
             Ok(true)
+        })
+        .await
+    }
+
+    // ── worktree leases (task-model t-pool) ───────────────────────────────
+
+    /// Fetch the lease row for one directory key, if any.
+    pub async fn get_worktree_lease(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+    ) -> Result<Option<WorktreeLeaseRow>, StoreError> {
+        self.run_named("get_worktree_lease", move |conn| {
+            Ok(WorktreeLeaseRow::load(
+                conn,
+                &host_id,
+                &workspace_id,
+                &dir_key,
+            )?)
+        })
+        .await
+    }
+
+    /// Fetch the active lease a worker reclaim must consult.
+    ///
+    /// Matches the exact directory key *and* a pool slot derived from the
+    /// worker name (`<name>-s<n>`): a dispatch can lease a pool named after
+    /// the worker, in which case the slot's dir key is the suffixed form while
+    /// the roster row carries the bare name. Only `leased`, refcount > 0 rows
+    /// qualify (a parked slot has no holder and is safe to reclaim).
+    pub async fn get_active_worktree_lease_for_name(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        name: &str,
+    ) -> Result<Option<WorktreeLeaseRow>, StoreError> {
+        let name = name.to_string();
+        self.run_named("get_active_worktree_lease_for_name", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM worktree_leases
+                 WHERE host_id = ?1 AND workspace_id = ?2
+                   AND state = 'leased' AND refcount > 0
+                 ORDER BY refcount DESC, created_at",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![&host_id, &workspace_id], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for id in ids {
+                let row = WorktreeLeaseRow::load_by_id(conn, &id)?;
+                if row.dir_key == name || is_pool_slot_of(&name, &row.dir_key) {
+                    return Ok(Some(row));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    /// Record (or extend) a lease after a successful Node `worktree.lease`.
+    ///
+    /// Sharing is serial: a task not already on the row bumps refcount; a
+    /// retry for a task already recorded is idempotent. The identity key is
+    /// `(host_id, workspace_id, dir_key)`, so a reuse-to-root lease (name
+    /// `None`, dir key `"."`) and a pool slot (`Some(slot)`) both land as
+    /// ordinary rows.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_worktree_lease(
+        &self,
+        mode: String,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+        worktree_name: Option<String>,
+        branch: Option<String>,
+        base_oid: Option<String>,
+        task_id: String,
+        holder_instance_id: Option<String>,
+    ) -> Result<WorktreeLeaseRow, StoreError> {
+        self.run_named("record_worktree_lease", move |conn| {
+            let now = now_rfc3339();
+            if let Some(mut row) = WorktreeLeaseRow::load(conn, &host_id, &workspace_id, &dir_key)?
+            {
+                if !row.task_ids.contains(&task_id) {
+                    row.task_ids.push(task_id.clone());
+                }
+                row.refcount = i64::try_from(row.task_ids.len()).unwrap_or(0);
+                row.state = "leased".into();
+                row.released_at = None;
+                if row.branch.is_none() {
+                    row.branch = branch.clone();
+                }
+                if row.base_oid.is_none() {
+                    row.base_oid = base_oid.clone();
+                }
+                if row.worktree_name.is_none() {
+                    row.worktree_name = worktree_name.clone();
+                }
+                if holder_instance_id.is_some() {
+                    row.holder_instance_id = holder_instance_id.clone();
+                }
+                row.updated_at = now;
+                row.save(conn)?;
+                return Ok(row);
+            }
+            let row = WorktreeLeaseRow {
+                id: new_id("wtl").map_err(|e| StoreError::Id(e.to_string()))?,
+                mode,
+                host_id,
+                workspace_id,
+                dir_key,
+                worktree_name,
+                branch,
+                project_id: None,
+                refcount: 1,
+                state: "leased".into(),
+                holder_instance_id,
+                task_ids: vec![task_id],
+                base_oid,
+                created_at: now.clone(),
+                updated_at: now,
+                released_at: None,
+            };
+            row.insert(conn)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    /// Remove one task from a lease row after `worktree.return`.
+    ///
+    /// Refcount decrements; at zero a pool slot row rests as `parked`
+    /// (warm slot, attach lock released), while a reuse row is deleted: the
+    /// directory is the operator's own and the Hub keeps no claim on it.
+    /// Returns `None` when no such row existed (or a reuse row was removed).
+    pub async fn release_worktree_lease(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+        task_id: String,
+        node_state: String,
+        branch: Option<String>,
+    ) -> Result<Option<WorktreeLeaseRow>, StoreError> {
+        self.run_named("release_worktree_lease", move |conn| {
+            let Some(mut row) = WorktreeLeaseRow::load(conn, &host_id, &workspace_id, &dir_key)?
+            else {
+                return Ok(None);
+            };
+            row.task_ids.retain(|id| id != &task_id);
+            row.refcount = i64::try_from(row.task_ids.len()).unwrap_or(0);
+            row.updated_at = now_rfc3339();
+            if row.refcount == 0 && row.mode == "reuse" {
+                conn.execute("DELETE FROM worktree_leases WHERE id = ?1", params![row.id])?;
+                return Ok(None);
+            }
+            if row.refcount == 0 {
+                row.state = if node_state == "parked" {
+                    "parked".to_string()
+                } else {
+                    "leased".to_string()
+                };
+                row.released_at = Some(now_rfc3339());
+                row.holder_instance_id = None;
+                row.branch = branch;
+            }
+            row.save(conn)?;
+            Ok(Some(row))
+        })
+        .await
+    }
+
+    /// Leases currently carrying `holder_instance_id` (attach-lock holders).
+    pub async fn worktree_leases_held_by_instance(
+        &self,
+        instance_id: String,
+    ) -> Result<Vec<WorktreeLeaseRow>, StoreError> {
+        self.run_named("worktree_leases_held_by_instance", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM worktree_leases WHERE holder_instance_id = ?1 ORDER BY created_at",
+            )?;
+            let ids: Vec<String> = stmt
+                .query_map(params![&instance_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            ids.into_iter()
+                .map(|id| WorktreeLeaseRow::load_by_id(conn, &id).map_err(StoreError::from))
+                .collect::<Result<Vec<_>, _>>()
         })
         .await
     }
@@ -4369,6 +4726,30 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
             project_id TEXT PRIMARY KEY,
             doc_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS worktree_leases (
+            id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            host_id TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            dir_key TEXT NOT NULL,
+            worktree_name TEXT,
+            branch TEXT,
+            project_id TEXT,
+            refcount INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL,
+            holder_instance_id TEXT,
+            task_ids_json TEXT NOT NULL DEFAULT '[]',
+            base_oid TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            released_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS worktree_leases_dir
+            ON worktree_leases(host_id, workspace_id, dir_key);
+        CREATE INDEX IF NOT EXISTS worktree_leases_holder
+            ON worktree_leases(holder_instance_id);
+        CREATE INDEX IF NOT EXISTS worktree_leases_state
+            ON worktree_leases(host_id, workspace_id, state);
         ",
     )?;
     ensure_column(&conn, "devices", "kind", "TEXT NOT NULL DEFAULT 'human'")?;

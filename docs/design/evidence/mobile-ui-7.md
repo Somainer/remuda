@@ -58,3 +58,10 @@
 - 不做 pane 层级：一实例一终端，组的叶子就是会话。
 - 不搜索正文/历史消息：作用域与 rankQuickFind 逐字一致。
 - 不改桌面 ⌘K 的扁平形态与任何既有 testid。
+
+## 7. Round 2 评审修复（键盘可视顺序缺陷）
+
+- **缺陷**：分组模式下光标回绕、active 下标、`quickfind-option-<n>` id、`aria-activedescendant` 与滚动都按 `rankQuickFind` 的扁平 recency 数组取下标，而 DOM 按「分组排序 + 组内 blocked 置顶」的分组顺序渲染，两者不一致时 ArrowDown 高亮乱序（三行两组时依次是第 1、3、2 行）。
+- **修复**：分组模式先把分组按渲染顺序 `flatMap` 成可视叶子序列 `orderedHits`，光标回绕、Enter 目标、option id 与 `data-index` 全部改由该序列驱动；扁平（桌面）模式仍直接用 ranked 数组，逐字不变。
+- **测试缺口**：原分组 ArrowDown 用例的扁平顺序恰与可视顺序相同，抓不到该缺陷。新增三行两组的时钟 fixture（组一 blocked 最旧置顶 + idle 09-12，组二 09-15 最新单叶）：扁平为 `[beta, alpha-idle, alpha-blocked]`、渲染为 `[beta, alpha-blocked, alpha-idle]`，断言 option id 按阅读顺序且 ArrowDown/ArrowUp 的 `data-selected` 落在可视相邻行；该用例在修复前实测失败（option id 为 0/2/1）、修复后通过。
+- **复验（2026-09-21，锁槽 `e2e.lock-b` / 59250-59251，自带 Chromium）**：`pnpm --dir web test` **149 文件 1466 用例全绿**；`typecheck`、`lint` 退出 0；`m-jumpto.hub.spec.ts` **5 passed**（59.0s）、`ux-keys.hub.spec.ts` **5 passed**（1.2m）；`secret-scan.sh` pass。

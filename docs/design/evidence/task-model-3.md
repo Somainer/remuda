@@ -122,7 +122,7 @@ Running 6 tests using 1 worker
   6 passed   # run 1 (47.5s), run 2 (1.2m), run 3 (46.2s)
 ```
 
-Representative request/response shapes (ids redacted; `/tmp/remuda-e2e`
+Representative request/response shapes (ids redacted; `/tmp/remuda-bind`
 is the fake Node's registered root):
 
 ```jsonc
@@ -137,7 +137,7 @@ is the fake Node's registered root):
     "branch": "wt/agent-one/work", "leaseRefIds": ["wtl_…"] },
   "sharing": { "dirKey": "agent-one", "refcount": 1, "queued": false, "blocked": null } }
 // POST /v1/instances {taskId} → GET /v1/instances/{id}
-// instance.cwd == "/tmp/remuda-e2e/remuda-wt/agent-one", worktree absent
+// instance.cwd == "/tmp/remuda-bind/remuda-wt/agent-one", worktree absent
 
 // POST /v1/tasks — pool
 { "workspaceBinding": { "mode": "pool", "hostId": "hst_…",
@@ -145,7 +145,7 @@ is the fake Node's registered root):
 // 200 — operator's pool name resolves to the Node-assigned slot/branch
 // workspaceBinding.worktreeName == "alpha-s1"
 // workspaceBinding.branch == "wt/alpha-s1/tsk-…"
-// instance.cwd == "/tmp/remuda-e2e/remuda-wt/alpha-s1" (worktree field)
+// instance.cwd == "/tmp/remuda-bind/remuda-wt/alpha-s1" (worktree field)
 
 // Second task on a leased reuse directory
 "sharing": { "dirKey": "agent-two", "refcount": 2, "queued": true,
@@ -162,12 +162,17 @@ POST /v1/instances {taskId: <root-bound>, hostId: "hst_not_a_member"}
 The full hub suite (`pnpm playwright test -c playwright.hub.config.ts`)
 is run once under the same lock in both trigger positions:
 
-- **default (unset):** all 165 pre-existing specs pass; the new
-  `task-model-bind` spec's `beforeEach` cannot find the gated branded
-  workspace, so it is the only failing file — proof the gated arms are
-  inert by design;
-- **`HUB_E2E_TASK_BIND=1`:** the same full suite including all six
-  binding cases passes together (transcript recorded in this file).
+- **default (unset):** all pre-existing hub-config specs pass (171
+  passed / 20 skipped / 0 failed without the new gated file, which
+  cannot find the gated branded workspace and is therefore the only
+  failing file — proof the gated arms are inert by design);
+- **`HUB_E2E_TASK_BIND=1`:** the full suite passes together — 171
+  passed / 20 skipped (the 20 are legacy-named specs the hub config does
+  not select) / 0 failed, including all six binding cases. The gated
+  branded workspace is announced on a **distinct** root
+  (`/tmp/remuda-bind`, not the legacy `/tmp/remuda-e2e`) so the phone
+  home's per-root space chips never shadow the `remuda-e2e` chip the
+  shared-hub mobile specs click.
 
 With the trigger unset the new match arms do not fire and the fake Node
 keeps its previous unknown-method answers, so no other spec changes
@@ -191,5 +196,5 @@ behaviour.
   back to the main checkout or substitutes a directory.
 - **Compliance.** Evidence uses generic terms and Remuda's own render
   only; no internal product names, internal documents, hostnames or
-  usernames appear (the `/tmp/remuda-e2e` path is the fake harness's
+  usernames appear (the `/tmp/remuda-bind` path is the gated fake harness's
   documented scratch root).

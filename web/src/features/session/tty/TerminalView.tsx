@@ -10,6 +10,7 @@ import { hubStore } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
+import { PhoneKeyBar } from "./PhoneKeyBar";
 import { TuiModeIndicator } from "./TuiModeIndicator";
 import { TtyProgressBar } from "./TtyProgressBar";
 import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type TtyStatus } from "./client";
@@ -99,6 +100,10 @@ export function TerminalView({
   const instanceRef = useRef(instance);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  // c-mkeybar: the 史 key fills a chosen previous prompt into the local input
+  // strip. A new nonce remounts LocalInput with the text — fill never sends
+  // (D-028a write boundary).
+  const [inputFill, setInputFill] = useState<{ text: string; nonce: number } | null>(null);
   const [preview, setPreview] = useState("");
   const [rawTail, setRawTail] = useState("");
   const [ready, setReady] = useState(false);
@@ -654,10 +659,18 @@ export function TerminalView({
           {/* D-028 §5.2: the dock routes through instance.send so the driver
               performs body-then-Enter as two PTY writes; raw key buttons
               below stay on the binary channel. */}
-          <LocalInput disabled={frozen} mobile={mobile} onSend={(text) => void hubStore.send(instance.id, text)} />
+          <LocalInput
+            key={inputFill?.nonce ?? 0}
+            initialText={inputFill?.text ?? ""}
+            disabled={frozen}
+            mobile={mobile}
+            onSend={(text) => void hubStore.send(instance.id, text)}
+          />
         </div>
       ) : null}
-      {mobile ? <AuxKeys disabled={frozen} onKey={send} /> : null}
+      {mobile ? (
+        <PhoneKeyBar instance={instance} disabled={frozen} onKey={send} onFillInput={(text) => setInputFill({ text, nonce: Date.now() })} />
+      ) : null}
       {!mobile ? (
         <div className={css.note}>
           TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一 journal

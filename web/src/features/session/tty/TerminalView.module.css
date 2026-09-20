@@ -414,3 +414,121 @@
     animation: none;
   }
 }
+
+/*
+ * c-mkeybar (mobile-ui plan B.3.2 / ui-spec §4.7): the compact terminal
+ * nine-key bar. One 44px row that scrolls horizontally — the same fold
+ * m-sessionfold gave the raw keys — so the xterm keeps its §4.7 >= 60% body
+ * budget instead of paying for a 3x3 grid. Visual glyph size is the hit size
+ * here on purpose: these are wide toolbar buttons, not glyphs inflated to
+ * squares (the 44px is their real box, so no ::after is needed and adjacent
+ * hit areas cannot overlap).
+ */
+.phoneBar {
+  flex: none;
+  background: var(--ink-2, #1a212b);
+  border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* When the raw-key second row is open it already carries the safe-area inset
+   (.keys compact padding); don't double it. */
+.phoneBar[data-aux="1"] {
+  padding-bottom: 0;
+}
+
+.phoneRow {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+  padding: 6px 8px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.phoneKey {
+  flex: none;
+  width: var(--touch);
+  min-width: var(--touch);
+  height: var(--touch);
+  min-height: var(--touch);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+  font-family: var(--mono);
+  font-size: 13px;
+  touch-action: manipulation;
+}
+
+.phoneKey:disabled {
+  opacity: 0.45;
+}
+
+/* The clipboard key's reason is visible INLINE, never only a hover title
+   (acceptance 4). Uses the aux-text token floor (ui-spec §3.4). */
+.clipReason {
+  margin: 0;
+  padding: 4px 12px 6px;
+  font-size: var(--text-aux);
+  line-height: 1.4;
+  color: var(--mute);
+}
+
+.historyHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.historyHead h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.historyClose {
+  flex: none;
+  min-height: var(--touch);
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+}
+
+.historyHint {
+  margin: 0;
+  font-size: var(--text-aux);
+  color: var(--mute);
+}
+
+.historyList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.historyItem {
+  min-height: var(--touch);
+  padding: 8px 12px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--paper);
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.historyEmpty {
+  margin: 0;
+  font-size: var(--text-aux);
+  color: var(--mute);
+}

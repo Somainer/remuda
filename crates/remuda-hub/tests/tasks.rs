@@ -92,6 +92,33 @@ impl Ctx {
         )
         .await
     }
+
+    async fn board(&self, project: &str) -> Result<Value> {
+        self.json_ok("GET", &format!("/v1/board?project={project}"), None)
+            .await
+    }
+
+    async fn archive(&self, task: &str) -> Result<reqwest::Response> {
+        self.request(
+            "POST",
+            &format!("/v1/tasks/{task}/archive"),
+            &self.human,
+            None,
+        )
+        .await
+    }
+}
+
+/// Map of `taskId → boardColumn` from a board response.
+fn column_index(board: &Value) -> serde_json::Map<String, Value> {
+    let mut index = serde_json::Map::new();
+    for (column, cards) in board["columns"].as_object().unwrap() {
+        for card in cards.as_array().unwrap() {
+            assert_eq!(card["boardColumn"].as_str(), Some(column.as_str()));
+            index.insert(card["id"].as_str().unwrap().to_string(), json!(column));
+        }
+    }
+    index
 }
 
 #[tokio::test]
@@ -781,5 +808,224 @@ async fn scoped_agents_are_enforced_on_task_routes() -> Result<()> {
         )
         .await?;
     assert_eq!(denied.status(), 403);
+
+    // The board is a read-shaped projection: the worker may read its own
+    // project slice, but never another project's cards.
+    let board: Value = ctx
+        .request("GET", "/v1/board", &worker_token, None)
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let ids: Vec<&str> = board["columns"]
+        .as_object()
+        .unwrap()
+        .values()
+        .flat_map(|cards| cards.as_array().unwrap())
+        .map(|card| card["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&a_id.as_str()));
+    assert!(!ids.contains(&b_id.as_str()));
+
+    // Archiving moves state-bearing ledger data, so it needs the dispatch
+    // grant the leaf worker does not hold (grant-verb gating, D-050).
+    let denied = ctx
+        .request(
+            "POST",
+            &format!("/v1/tasks/{a_id}/archive"),
+            &worker_token,
+            None,
+        )
+        .await?;
+    assert_eq!(denied.status(), 403);
+    Ok(())
+}
+
+#[tokio::test]
+async fn board_projects_states_placement_failures_and_the_archive_flag() -> Result<()> {
+    let ctx = Ctx::spawn().await?;
+    let project = ctx.create_project("board").await?;
+
+    // One card per work-column state.
+    let pending = ctx.add_task(&project, "pending", json!({})).await?;
+    let pending_id = pending["id"].as_str().unwrap().to_string();
+    let deferred = ctx.add_task(&project, "deferred", json!({})).await?;
+    let deferred_id = deferred["id"].as_str().unwrap().to_string();
+    assert_eq!(ctx.set_state(&deferred_id, "deferred").await?.status(), 200);
+    let parked = ctx.add_task(&project, "parked", json!({})).await?;
+    let parked_id = parked["id"].as_str().unwrap().to_string();
+    for state in ["placed", "running", "parked"] {
+        assert_eq!(ctx.set_state(&parked_id, state).await?.status(), 200);
+    }
+    let placed = ctx.add_task(&project, "placed", json!({})).await?;
+    let placed_id = placed["id"].as_str().unwrap().to_string();
+    assert_eq!(ctx.set_state(&placed_id, "placed").await?.status(), 200);
+
+    // In-progress states: running and stalled.
+    let running = ctx.add_task(&project, "running", json!({})).await?;
+    let running_id = running["id"].as_str().unwrap().to_string();
+    for state in ["placed", "running"] {
+        assert_eq!(ctx.set_state(&running_id, state).await?.status(), 200);
+    }
+    let stalled = ctx.add_task(&project, "stalled", json!({})).await?;
+    let stalled_id = stalled["id"].as_str().unwrap().to_string();
+    for state in ["placed", "running", "stalled"] {
+        assert_eq!(ctx.set_state(&stalled_id, state).await?.status(), 200);
+    }
+
+    // Failed with no placement (pre-dispatch failure) → to-do, carrying the
+    // machine-readable blocked reason for the badge.
+    let failed_todo = ctx.add_task(&project, "failed-early", json!({})).await?;
+    let failed_todo_id = failed_todo["id"].as_str().unwrap().to_string();
+    let response = ctx
+        .request(
+            "PATCH",
+            &format!("/v1/tasks/{failed_todo_id}"),
+            &ctx.human,
+            Some(json!({ "state": "failed", "reason": "supply exhausted" })),
+        )
+        .await?;
+    assert_eq!(response.status(), 200);
+
+    // Failed after dispatch: the dispatch placement row pins a slot, then the
+    // task fails mid-flight → in-progress, not a fifth column and not done.
+    let failed_mid = ctx.add_task(&project, "failed-mid", json!({})).await?;
+    let failed_mid_id = failed_mid["id"].as_str().unwrap().to_string();
+    ctx.json_ok(
+        "POST",
+        &format!("/v1/tasks/{failed_mid_id}/placements"),
+        Some(json!({
+            "kind": "dispatch",
+            "model": "workhorse-1",
+            "branch": "wt/w1/failed-mid",
+        })),
+    )
+    .await?;
+    let response = ctx
+        .request(
+            "PATCH",
+            &format!("/v1/tasks/{failed_mid_id}"),
+            &ctx.human,
+            Some(json!({ "state": "failed", "reason": "worker exited 42" })),
+        )
+        .await?;
+    assert_eq!(response.status(), 200);
+
+    let board = ctx.board(&project).await?;
+    assert_eq!(board["project"].as_str(), Some(project.as_str()));
+    let columns = &board["columns"];
+    let todo_ids: Vec<&str> = columns["todo"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap())
+        .collect();
+    assert!(todo_ids.contains(&pending_id.as_str()));
+    assert!(todo_ids.contains(&deferred_id.as_str()));
+    assert!(todo_ids.contains(&parked_id.as_str()));
+    assert!(todo_ids.contains(&placed_id.as_str()));
+    assert!(todo_ids.contains(&failed_todo_id.as_str()));
+    let progress_ids: Vec<&str> = columns["in-progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|card| card["id"].as_str().unwrap())
+        .collect();
+    assert!(progress_ids.contains(&running_id.as_str()));
+    assert!(progress_ids.contains(&stalled_id.as_str()));
+    assert!(progress_ids.contains(&failed_mid_id.as_str()));
+    let failed_mid_card = columns["in-progress"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["id"] == failed_mid_id.as_str())
+        .unwrap();
+    assert_eq!(failed_mid_card["state"], "failed", "the badge is the state");
+    assert_eq!(failed_mid_card["blockedReason"], "worker exited 42");
+    assert!(
+        failed_mid_card["placement"].is_object(),
+        "failed-mid keeps its placement reference"
+    );
+    assert!(columns["done"].as_array().unwrap().is_empty());
+    assert!(columns["archived"].as_array().unwrap().is_empty());
+
+    // Display-only per-project keys: oldest-first SE-01… numbering, and they
+    // are not a stored field (absent from the task document itself).
+    assert_eq!(columns["todo"][0]["displayKey"].as_str(), Some("SE-01"));
+    let raw_pending: Value = ctx
+        .json_ok("GET", &format!("/v1/tasks/{pending_id}"), None)
+        .await?;
+    assert!(raw_pending.get("displayKey").is_none());
+    // Pre-archive rows carry no archivedAt key at all (byte-identical).
+    assert!(raw_pending.get("archivedAt").is_none());
+
+    // Column moves reuse set_task_state: the pending card reaches in-progress
+    // through the legal multi-hop pending → placed → running, and the board
+    // follows without any board-specific move verb.
+    assert_eq!(ctx.set_state(&pending_id, "placed").await?.status(), 200);
+    assert_eq!(ctx.set_state(&pending_id, "running").await?.status(), 200);
+    let board = ctx.board(&project).await?;
+    let index = column_index(&board);
+    assert_eq!(index[pending_id.as_str()], json!("in-progress"));
+
+    // Only `done` projects to the done column.
+    assert_eq!(ctx.set_state(&running_id, "done").await?.status(), 200);
+    let board = ctx.board(&project).await?;
+    let index = column_index(&board);
+    assert_eq!(index[running_id.as_str()], json!("done"));
+
+    // Archiving is orthogonal: stamp the flag on the running stalled card,
+    // state stays `stalled`, the card moves only to the archive column.
+    let archived = ctx.archive(&stalled_id).await?;
+    assert_eq!(archived.status(), 200);
+    let archived: Value = archived.json().await?;
+    assert_eq!(archived["state"], "stalled");
+    assert!(archived["archivedAt"].as_str().is_some());
+    let board = ctx.board(&project).await?;
+    let index = column_index(&board);
+    assert_eq!(index[stalled_id.as_str()], json!("archived"));
+    assert!(
+        board["columns"]["in-progress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|card| card["id"] != stalled_id.as_str()),
+        "archived card leaves its state-derived column"
+    );
+    // Re-archiving is rejected; the task still reads as a task (404 stays
+    // reserved for unknown ids).
+    assert_eq!(ctx.archive(&stalled_id).await?.status(), 409);
+
+    // The done card never unlocks dependents by itself — even though it sits
+    // in the done column, the dependent's edge stays locked until a land.
+    let dep = ctx.add_task(&project, "dep", json!({})).await?;
+    let dep_id = dep["id"].as_str().unwrap().to_string();
+    for state in ["placed", "running", "done"] {
+        assert_eq!(ctx.set_state(&dep_id, state).await?.status(), 200);
+    }
+    let dependent = ctx
+        .add_task(
+            &project,
+            "dependent",
+            json!({ "deps": [{ "taskId": dep_id }] }),
+        )
+        .await?;
+    let dependent_id = dependent["id"].as_str().unwrap().to_string();
+    let view = ctx
+        .json_ok("GET", &format!("/v1/tasks/{dependent_id}"), None)
+        .await?;
+    assert_eq!(view["lockedDeps"].as_array().unwrap(), &[json!(dep_id)]);
+    let landed = ctx
+        .json_ok(
+            "POST",
+            &format!("/v1/tasks/{dep_id}/land"),
+            Some(json!({ "sha": "abcdef7" })),
+        )
+        .await?;
+    assert_eq!(landed["state"], "done");
+    let view = ctx
+        .json_ok("GET", &format!("/v1/tasks/{dependent_id}"), None)
+        .await?;
+    assert!(view["lockedDeps"].as_array().unwrap().is_empty());
     Ok(())
 }

@@ -213,6 +213,23 @@ export interface paths {
         patch: operations["passkeyRename"];
         trace?: never;
     };
+    "/v1/board": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read-only kanban projection of ledger states onto to-do / in-progress / done plus an archive column */
+        get: operations["boardGet"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/caller": {
         parameters: {
             query?: never;
@@ -1310,6 +1327,23 @@ export interface paths {
         patch: operations["taskSetState"];
         trace?: never;
     };
+    "/v1/tasks/{id}/archive": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Stamp the orthogonal archive flag without changing state (requires the dispatch grant) */
+        post: operations["taskArchive"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/tasks/{id}/land": {
         parameters: {
             query?: never;
@@ -1705,6 +1739,29 @@ export interface components {
             size: number;
             /** @description Derived internal blob name `<objectId>.<ext>`. */
             storedName: string;
+        };
+        /**
+         * @description Read-only kanban column derived from task state + archivedAt + placement; D-050.
+         * @enum {string}
+         */
+        BoardColumn: "todo" | "in-progress" | "done" | "archived";
+        /** @description Cards grouped by their derived board column; every task projects to exactly one column. */
+        BoardColumns: {
+            archived: components["schemas"]["BoardItem"][];
+            done: components["schemas"]["BoardItem"][];
+            "in-progress": components["schemas"]["BoardItem"][];
+            todo: components["schemas"]["BoardItem"][];
+        };
+        /** @description One board card: the task document plus its read-only projection fields. */
+        BoardItem: components["schemas"]["Task"] & {
+            boardColumn: components["schemas"]["BoardColumn"];
+            /** @description Display-only per-project key derived from oldest-first order (SE-nn); never stored. */
+            displayKey: string;
+        };
+        BoardView: {
+            columns: components["schemas"]["BoardColumns"];
+            /** @description Project slice the board was projected for; null for every project in scope. */
+            project?: string;
         };
         CallerContext: {
             /** @description Direct children created by this instance; descendants do not inherit scope. */
@@ -2736,6 +2793,11 @@ export interface components {
         };
         /** @description One row of the task ledger; design §2.2/§2.5/§8.1 row 4. */
         Task: {
+            /**
+             * Format: date-time
+             * @description Archive flag timestamp; orthogonal to state and never written by a state transition (D-050).
+             */
+            archivedAt?: string;
             blockedReason?: string;
             budget?: components["schemas"]["TaskBudget"];
             class: components["schemas"]["TaskClass"];
@@ -3391,6 +3453,31 @@ export interface operations {
             };
             401: components["responses"]["Error"];
             404: components["responses"]["Error"];
+        };
+    };
+    boardGet: {
+        parameters: {
+            query?: {
+                /** @description prj_… project id; omit for every project in scope */
+                project?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Board columns */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BoardView"];
+                };
+            };
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
         };
     };
     callerGet: {
@@ -5844,6 +5931,33 @@ export interface operations {
                 };
             };
             400: components["responses"]["Error"];
+            401: components["responses"]["Error"];
+            403: components["responses"]["Error"];
+            404: components["responses"]["Error"];
+            409: components["responses"]["Error"];
+        };
+    };
+    taskArchive: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description tsk_… id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Task */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
             401: components["responses"]["Error"];
             403: components["responses"]["Error"];
             404: components["responses"]["Error"];

@@ -211,14 +211,19 @@ fn project_write_target(path: &str) -> bool {
     }
 }
 
-/// `GET /v1/tasks…` / `GET /v1/own…`; design §2.2/§2.4. Handlers re-check
-/// scope, and write handlers require the `dispatch`/`land` grants.
+/// `GET /v1/tasks…` / `GET /v1/own…` / `GET /v1/board`; design §2.2/§2.4.
+/// Handlers re-check scope, and write handlers require the `dispatch`/`land`
+/// grants.
 fn task_read_target(method: &axum::http::Method, path: &str) -> bool {
     if method != axum::http::Method::GET && path != "/v1/own/check" {
         return false;
     }
     if path == "/v1/tasks" || path == "/v1/own" || path == "/v1/own/check" {
         return true;
+    }
+    // The board is a read-only projection of the task ledger (D-050).
+    if path == "/v1/board" {
+        return method == axum::http::Method::GET;
     }
     match path.strip_prefix("/v1/tasks/") {
         Some(rest) => {
@@ -250,6 +255,7 @@ fn task_write_target(method: &axum::http::Method, path: &str) -> bool {
                     (*sub, method),
                     ("split", &axum::http::Method::POST)
                         | ("land", &axum::http::Method::POST)
+                        | ("archive", &axum::http::Method::POST)
                         | ("own", &axum::http::Method::POST)
                         | ("own", &axum::http::Method::DELETE)
                         | ("placements", &axum::http::Method::POST)

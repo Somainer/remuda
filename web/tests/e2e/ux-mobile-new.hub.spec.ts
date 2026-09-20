@@ -91,8 +91,16 @@ function newFromBottomBar(page: Page) {
   return page.locator("nav[aria-label='手机底栏'] button[aria-label='新建']").click();
 }
 
-function sessionsFromBottomBar(page: Page) {
-  return page.locator("nav[aria-label='手机底栏'] a").filter({ hasText: "会话" }).click();
+/**
+ * D-049: a compact /s/:id route has no app bottom bar, so starting another
+ * session goes header-back to the phone home (/m) then its 新建. The shared
+ * /sessions/new route still mounts the dimmed SessionsPage behind the sheet
+ * under the desktop Shell — the no-fan-out surface this spec watches.
+ */
+async function newSessionFromSessionRoute(page: Page) {
+  await page.getByRole("link", { name: "返回" }).click();
+  await expect(page).toHaveURL(/\/m$/);
+  await page.getByTestId("phone-nav-new").click();
 }
 
 async function createSessionViaSheet(page: Page, prompt: string) {
@@ -315,8 +323,12 @@ test.describe("mobile new session (390px)", () => {
     await expect(page.getByTestId("session-page")).toBeVisible();
     // Exited session pages never pull /screen for anything.
     await page.waitForTimeout(3_000);
-    await sessionsFromBottomBar(page);
-    await expect(page).toHaveURL(/\/sessions$/);
+    // D-049: the compact /s/:id route renders no app bottom bar; leaving the
+    // session is the header back link, which lands on /sessions and bounces
+    // to the phone home /m (the old bottom-bar helper is gone on purpose).
+    await page.getByRole("link", { name: "返回" }).click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("session-list")).toBeVisible();
     // This space also holds other suites' rows; assert at least all 14 of
     // ours are rendered, scoped by the ids this test created. evaluateAll
     // serialises args as JSON, so pass an array (no Set across the boundary),
@@ -350,7 +362,8 @@ test.describe("mobile new session (390px)", () => {
     await shot(page, "mobile-new-session-1-session-390.png");
 
     // The dimmed list stays mounted behind this sheet; it must not fan out.
-    await newFromBottomBar(page);
+    // We're on /s/:firstId here, which has no app bottom bar in compact.
+    await newSessionFromSessionRoute(page);
     const secondId = await createSessionViaSheet(page, "mobile new session repro two");
     created.push(secondId);
 

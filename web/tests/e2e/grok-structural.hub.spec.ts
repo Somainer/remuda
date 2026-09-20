@@ -105,10 +105,13 @@ async function shot(page: Page, name: string, redact: string[] = []) {
  *
  *  - `duration_ms` for the named tools, so the live Running / pending window
  *    is observable (the committed 900 ms / 20 ms values finish too fast);
- *  - `quit_after_turns`, set to keep the fake harness alive after the turn.
+ *  - `quit_after_turns`, unset to keep the fake harness alive after the turn.
  *    The committed value (1) makes the process exit at turn end, which tears
  *    down promotion and reverts the session to a plain terminal screen — so
- *    no post-turn structured card could ever be observed.
+ *    no post-turn structured card could ever be observed. Note the field's
+ *    real semantics: it is a *count*, so 0 means "exit after zero turns" and
+ *    exits at the first turn end just as surely as 1; only an absent field
+ *    keeps the binary up (the test node is stopped in teardown).
  *
  * Every payload, tool name and match prefix stays byte-for-byte from the
  * fixture. Every requested duration override must match a tool (a rename
@@ -130,8 +133,12 @@ async function patchedScenario(
   };
   // Keep the harness alive after the turn so promotion (and thus the
   // structured file-tier view) survives to the settled assertions; the test
-  // node is stopped in teardown.
-  scenario.quit_after_turns = 0;
+  // node is stopped in teardown. The field must be *absent*: `quit_after_turns`
+  // counts turns, and 0 exits at the first turn end (a process exit within the
+  // promotion poller's next ~800 ms sample demotes the instance and clears its
+  // signal tier, so the post-turn transcript unmounts and the settled-card
+  // assertions race a plain terminal screen).
+  delete scenario.quit_after_turns;
   const matched = new Set<string>();
   for (const turn of scenario.turns) {
     for (const tool of turn.tools) {
@@ -410,30 +417,67 @@ async function expectStructuredPane(page: Page, timeout = 30_000): Promise<void>
 }
 
 /**
- * Bring the settled tool card into the drawn range and return it. With the
- * harness kept alive past the turn, promotion (and the file-tier structured
- * view) does not tear down; the only remaining obstacle is the virtualized,
- * bottom-pinned transcript. Release the bottom-pin by scrolling the scroller
- * to the top (its onScroll handler clears the pin so the layout effect does
- * not snap back), then open the compact summary that swallowed the tool.
- * A guarded reload covers the rare hydration lag on a loaded host.
+ * Bring the SETTLED shell tool card into the drawn range and return it.
+ *
+ * With the harness kept alive past the turn, promotion (and thus the file-tier
+ * structured view) never tears down, but two render layers hide the card on a
+ * fresh context under host load:
+ *
+ *  1. Transcript compact mode defaults ON (`runtime.compact`, store default
+ *     true): `compactTranscript` groups a turn's routine tool + thought rows
+ *     into ONE closed `compact-fold` group whose children are not mounted
+ *     until opened. This is the gate failure — the old helper waited on a
+ *     `tool-card` that only exists behind the closed group and retried
+ *     reloads for 40 s.
+ *  2. The transcript virtualises rows and bottom-pins on follow, so even an
+ *     open group's card can be scrolled out of the drawn window.
+ *
+ * Each iteration therefore: confirms the structured pane is mounted, scrolls
+ * the scroller to the top (its onScroll handler clears the bottom pin so the
+ * layout effect does not snap back), opens the compact group via its real
+ * `compact-fold` trigger when it is closed, and waits for a card's own
+ * terminal condition — the Final `exit 0` badge — rather than any tool card
+ * (a Running card caught mid-repaint must never count as settled). Reload
+ * only when the structured pane itself is absent (signal-tier hydration
+ * lag), never while the pane is up but a card is merely unscrolled.
  */
 async function settleStructuredToolCard(page: Page, timeoutMs: number) {
   const deadline = Date.now() + timeoutMs;
+  const settled = page.getByTestId("tool-card").filter({ hasText: "exit 0" }).first();
   for (;;) {
-    if (await page.getByTestId("transcript").isVisible().catch(() => false)) {
+    const paneVisible = await page.getByTestId("transcript").isVisible().catch(() => false);
+    if (paneVisible) {
       await page.getByTestId("transcript-scroller").evaluate((el) => {
         el.scrollTop = 0;
       });
-      await page.waitForTimeout(200);
-      const fold = page.getByTestId("compact-fold").first();
-      if (await fold.isVisible().catch(() => false)) await fold.click().catch(() => {});
-      const card = page.getByTestId("tool-card").first();
-      if (await card.count().catch(() => 0)) return card;
+      // Compact-mode process group: its children are not mounted while the
+      // group is closed; open it (aria-expanded flips false → true).
+      const groupFold = page.getByTestId("compact-fold").first();
+      if (await groupFold.isVisible().catch(() => false)) {
+        const expanded = await groupFold.getAttribute("aria-expanded").catch(() => null);
+        if (expanded === "false") await groupFold.click();
+      }
+      // A D-041 per-card compact row may still wrap the settled card inside
+      // the opened group; that trigger mounts the exact card.
+      const cardFold = page.getByTestId("tool-fold-open").first();
+      if (await cardFold.isVisible().catch(() => false)) await cardFold.click().catch(() => {});
+      // Wait on the terminal state (Final close rendered the exit code), not
+      // on mere card presence: the Running card carries no `exit 0`. Wait in
+      // place — never reload while the pane is up, a reload would reset the
+      // fold-open local state and re-hide the card we just exposed.
+      if (await settled.count().catch(() => 0)) {
+        await expect(settled).toBeVisible().catch(() => {});
+        return settled;
+      }
+      await expect(settled).toBeVisible({ timeout: 2_500 }).catch(() => {});
+      if (await settled.count().catch(() => 0)) return settled;
+    } else {
+      // The pane is absent (signal-tier hydration lag); reload and wait for
+      // it to actually re-hydrate (condition, not a fixed delay).
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await expect(page.getByTestId("transcript")).toBeVisible({ timeout: 5_000 }).catch(() => {});
     }
     if (Date.now() >= deadline) throw new Error("structured tool card never settled");
-    await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-    await page.waitForTimeout(800);
   }
 }
 

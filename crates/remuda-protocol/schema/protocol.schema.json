@@ -6703,7 +6703,7 @@
       ]
     },
     "Id": {
-      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "pattern": "^(hst|wsp|wkt|ins|run|cmd|int|evt|dev|prn|pvp|cred|obj|sub|tty|launch|epoch|hook|prj|tsk|plc|wkr|gjb|wtl)_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
       "type": "string"
     },
     "InputAccounting": {

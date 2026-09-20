@@ -188,6 +188,31 @@ pub mod store_test_support {
         Ok((store, host_id))
     }
 
+    /// Test fixture: settle an ensured instance as `exited` and bind it to a
+    /// task, the shape the t-pool delete/retire guards read.
+    pub async fn settle_exited_with_task(
+        store: &Store,
+        instance_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<()> {
+        let instance_id = instance_id.to_string();
+        let task_id = task_id.to_string();
+        store
+            .run_named("test.settle_exited_with_task", move |conn| {
+                let now = crate::config::now_rfc3339();
+                conn.execute(
+                    "UPDATE instances
+                        SET lifecycle = 'exited', activity = 'closed',
+                            task_id = ?2, updated_at = ?3
+                      WHERE id = ?1",
+                    rusqlite::params![instance_id, task_id, now],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Test fixture: occupy one reader-pool connection for `sleep`, exactly
     /// like a long read landing on the pool. The pool has more than one
     /// connection, so other reads and the writer thread must not wait.

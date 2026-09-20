@@ -49,6 +49,7 @@ mod workspace;
 mod workspace_access;
 mod workspace_scm;
 mod worktree;
+mod worktree_pool;
 
 pub use attachments::{
     HubObjectSource, MaterializedAttachment, ObjectSource, attachments_dir,

@@ -4050,6 +4050,168 @@
         ],
         "type": "object"
       },
+      "WorktreeLeaseRequest": {
+        "properties": {
+          "base": {
+            "description": "Pool base branch (default main); used only when a new slot is provisioned.",
+            "type": "string"
+          },
+          "hostId": {
+            "type": "string"
+          },
+          "taskId": {
+            "description": "tsk_… task holding the lease.",
+            "type": "string"
+          },
+          "workspaceId": {
+            "description": "Registered workspace containing the repository; omitted selects the Node default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId"
+        ],
+        "type": "object"
+      },
+      "WorktreeReturnRequest": {
+        "properties": {
+          "hostId": {
+            "type": "string"
+          },
+          "taskId": {
+            "description": "tsk_… task releasing the lease.",
+            "type": "string"
+          },
+          "workspaceId": {
+            "description": "Registered workspace containing the repository; omitted selects the Node default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "taskId"
+        ],
+        "type": "object"
+      },
+      "WorktreeLeaseResult": {
+        "properties": {
+          "baseOid": {
+            "description": "Oid the slot branched from (pool leases).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blocked": {
+            "description": "Present when the lease is shared: the directory is attach-locked and the caller is queued.",
+            "properties": {
+              "reason": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "dirKey": {
+            "description": "Directory key relative to the workspace root; '.' for the root itself.",
+            "type": "string"
+          },
+          "hostId": {
+            "type": "string"
+          },
+          "leaseId": {
+            "description": "Hub worktree_leases row id.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "reuse (existing worktree/root, zero git ops on return) or pool (warm managed slot).",
+            "enum": [
+              "reuse",
+              "pool"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "description": "Worktree/slot name; '.' when the leased directory is the workspace root.",
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "queued": {
+            "type": "boolean"
+          },
+          "refcount": {
+            "description": "Tasks sharing this directory.",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "leased",
+              "parked",
+              "free"
+            ],
+            "type": "string"
+          },
+          "warm": {
+            "description": "True when a parked slot was reused without fetching.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "mode",
+          "state",
+          "refcount"
+        ],
+        "type": "object"
+      },
+      "WorktreeReturnResult": {
+        "properties": {
+          "dirKey": {
+            "type": "string"
+          },
+          "hostId": {
+            "type": "string"
+          },
+          "leaseId": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "reuse",
+              "pool"
+            ],
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parked": {
+            "description": "True when a pool slot was detached and parked warm.",
+            "type": "boolean"
+          },
+          "refcount": {
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "leased",
+              "parked",
+              "free"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "mode",
+          "state",
+          "refcount"
+        ],
+        "type": "object"
+      },
       "TuiMode": {
         "enum": [
           "fullscreen",
@@ -8432,6 +8594,102 @@
           }
         },
         "summary": "Create a git worktree on a host (`git worktree add -b wt/<name>/…` from main) at the Node's fixed `../remuda-wt/<name>` location",
+        "tags": [
+          "worktrees"
+        ]
+      }
+    },
+    "/v1/worktrees/{name}/lease": {
+      "post": {
+        "operationId": "worktreeLease",
+        "parameters": [
+          {
+            "description": "Pool or worktree name; the reserved token '-' addresses the registered workspace root (literal '.' segments are collapsed by HTTP clients).",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorktreeLeaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorktreeLeaseResult"
+                }
+              }
+            },
+            "description": "Leased pool slot or reused directory"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Lease a warm pool slot (parked hit switches branch in place without fetching; full pool returns SUPPLY_DEFERRED, never a reroute) or attach to an existing worktree/root for serial reuse",
+        "tags": [
+          "worktrees"
+        ]
+      }
+    },
+    "/v1/worktrees/{name}/return": {
+      "post": {
+        "operationId": "worktreeReturn",
+        "parameters": [
+          {
+            "description": "Worktree/slot name, or '-' for the registered workspace root.",
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorktreeReturnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorktreeReturnResult"
+                }
+              }
+            },
+            "description": "Lease returned; pool slot parked, reuse directory untouched"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Return a lease (decrement refcount); pool slots are cleaned of untracked files and detached to base, reuse leases perform zero git operations",
         "tags": [
           "worktrees"
         ]

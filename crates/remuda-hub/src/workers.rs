@@ -1334,20 +1334,103 @@ pub(crate) async fn retire_core(
             .is_some();
         let _ = crate::http::forward_if_online(&state, close, live).await;
     }
-    let removed = crate::http::call_node(
-        &state,
-        worker.host_id.as_id().as_str(),
-        "worker.remove",
+
+    // t-pool: the reclaim main path ends at the Node's
+    // `git worktree remove --force`. Before sending `worker.remove`, consult
+    // the lease table (plan t-pool acceptance #2, blocker#2):
+    // * a slot shared by other tasks (refcount > 1, or held by a task that is
+    //   not this worker's) is refused outright — --force never deletes a
+    //   directory other tasks still hold;
+    // * a slot leased solely by this worker's own task is *returned* instead:
+    //   pool slots park warm (return-don't-delete), reuse dirs get a zero-op;
+    // * no active lease: the historical force-reclaim path is unchanged.
+    let lease = state
+        .store
+        .get_active_worktree_lease_for_name(
+            worker.host_id.as_id().to_string(),
+            worker.workspace_id.as_id().to_string(),
+            &worker.name,
+        )
+        .await
+        .map_err(map_store)?;
+    let mut returned_lease: Option<Value> = None;
+    let removed = if let Some(lease) = lease {
+        let own_task = worker.task_id.as_ref().map(|id| id.as_id().to_string());
+        let sole_holder = lease.refcount == 1
+            && own_task.is_some()
+            && lease.task_ids.first() == own_task.as_ref();
+        if !sole_holder {
+            return Err(HubError::Conflict(format!(
+                "worktree {} is leased by {} task(s); return those leases before retire (force-remove of a shared slot is refused)",
+                lease.worktree_name.as_deref().unwrap_or(&worker.name),
+                lease.refcount
+            )));
+        }
+        let task_id = own_task.expect("sole holder implies an own task");
+        // Return the actual slot directory (a pool lease names the
+        // `<worker>-s<n>` slot); the root key "." maps back to "." on the Node.
+        let node_name = lease.worktree_name.clone().unwrap_or_else(|| ".".into());
+        let returned = crate::http::call_node(
+            &state,
+            worker.host_id.as_id().as_str(),
+            "worktree.return",
+            json!({
+                "hostId": worker.host_id.as_id(),
+                "workspaceId": worker.workspace_id.as_id(),
+                "name": node_name,
+                "taskId": task_id,
+            }),
+        )
+        .await?;
+        // The lease row is released/parked on the store side too.
+        let node_state = returned
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("parked")
+            .to_string();
+        let branch = returned
+            .get("branch")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let row = state
+            .store
+            .release_worktree_lease(
+                worker.host_id.as_id().to_string(),
+                worker.workspace_id.as_id().to_string(),
+                lease.dir_key.clone(),
+                task_id,
+                node_state,
+                branch,
+            )
+            .await
+            .map_err(map_store)?;
+        returned_lease = Some(returned);
+        // Report a synthetic node payload: nothing was physically reclaimed.
         json!({
             "name": worker.name,
-            "workspaceId": worker.workspace_id.as_id(),
-            "instanceId": worker.instance_id.as_ref().map(|id| id.as_id()),
-        }),
-    )
-    .await?;
-    if let Some(bytes) = removed.get("reclaimedBytes").and_then(Value::as_u64) {
-        reclaimed = Some(U64(bytes));
-    }
+            "worktreeRemoved": false,
+            "targetRemoved": false,
+            "reclaimedBytes": "0",
+            "parked": true,
+            "leaseRefcount": row.as_ref().map(|r| r.refcount).unwrap_or(0),
+        })
+    } else {
+        let removed = crate::http::call_node(
+            &state,
+            worker.host_id.as_id().as_str(),
+            "worker.remove",
+            json!({
+                "name": worker.name,
+                "workspaceId": worker.workspace_id.as_id(),
+                "instanceId": worker.instance_id.as_ref().map(|id| id.as_id()),
+            }),
+        )
+        .await?;
+        if let Some(bytes) = removed.get("reclaimedBytes").and_then(Value::as_u64) {
+            reclaimed = Some(U64(bytes));
+        }
+        removed
+    };
 
     let updated = state
         .store
@@ -1365,11 +1448,19 @@ pub(crate) async fn retire_core(
             device.id,
             "worker.retire".into(),
             Some(updated.meta.id.as_id().to_string()),
-            json!({ "force": force, "reclaimedBytes": reclaimed }),
+            json!({
+                "force": force,
+                "reclaimedBytes": reclaimed,
+                "leasedReturn": returned_lease.is_some(),
+            }),
         )
         .await
         .map_err(map_store)?;
-    Ok(json!({ "worker": updated, "node": removed }))
+    let mut response = json!({ "worker": updated, "node": removed });
+    if let Some(lease) = returned_lease {
+        response["lease"] = lease;
+    }
+    Ok(response)
 }
 
 async fn set_worker_state(

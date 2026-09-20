@@ -11,6 +11,7 @@ import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
 import { PhoneKeyBar } from "./PhoneKeyBar";
+import { clearTtyScrollLine, peekTtyScrollLine } from "./ttyScrollMemory";
 import { TuiModeIndicator } from "./TuiModeIndicator";
 import { TtyProgressBar } from "./TtyProgressBar";
 import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type TtyStatus } from "./client";
@@ -35,6 +36,9 @@ import css from "./TerminalView.module.css";
 export type TtyLabHandle = {
   disconnect: () => void;
   reconnect: () => void;
+  /** Current top-visible buffer line (xterm baseY). */
+  scrollLine: () => number;
+  scrollToLine: (line: number) => void;
 };
 
 declare global {
@@ -426,6 +430,13 @@ export function TerminalView({
         resetStreamRef.current = true;
         session.reconnectForTest();
       },
+      scrollLine: () => termRef.current?.buffer.active.baseY ?? 0,
+      scrollToLine: (line: number) => {
+        const term = termRef.current;
+        if (!term) return;
+        const max = Math.max(0, term.buffer.active.length - term.rows);
+        term.scrollToLine(Math.max(0, Math.min(line, max)));
+      },
     };
 
     return () => {
@@ -463,6 +474,32 @@ export function TerminalView({
   useEffect(() => {
     applyStdinPolicy(termRef.current, { directInput, frozen });
   }, [directInput, frozen]);
+
+  // c-mkeybar: restore the scroll line remembered by the nine-key git key.
+  // The fresh attach replays the Hub screen snapshot, so the buffer builds a
+  // frame at a time — retry until the remembered line exists, then consume
+  // the memory exactly once. xterm v6 scrolls virtually (DOM scrollTop is
+  // inert), so the restore goes through the terminal scroll API.
+  useEffect(() => {
+    if (!ready) return;
+    const wanted = peekTtyScrollLine(instance.id);
+    if (wanted == null) return;
+    let timer = 0;
+    let tries = 0;
+    const apply = () => {
+      const term = termRef.current;
+      if (term && term.buffer.active.length > term.rows) {
+        const max = term.buffer.active.length - term.rows;
+        term.scrollToLine(Math.min(wanted, max));
+        clearTtyScrollLine(instance.id);
+        return;
+      }
+      if (++tries < 80) timer = window.setTimeout(apply, 50);
+      else clearTtyScrollLine(instance.id);
+    };
+    apply();
+    return () => window.clearTimeout(timer);
+  }, [ready, instance.id]);
 
   useEffect(() => {
     document.documentElement.dataset.ttyFullscreen = fullscreen ? "1" : "0";
@@ -669,7 +706,13 @@ export function TerminalView({
         </div>
       ) : null}
       {mobile ? (
-        <PhoneKeyBar instance={instance} disabled={frozen} onKey={send} onFillInput={(text) => setInputFill({ text, nonce: Date.now() })} />
+        <PhoneKeyBar
+          instance={instance}
+          disabled={frozen}
+          onKey={send}
+          captureScrollLine={() => termRef.current?.buffer.active.baseY ?? 0}
+          onFillInput={(text) => setInputFill({ text, nonce: Date.now() })}
+        />
       ) : null}
       {!mobile ? (
         <div className={css.note}>

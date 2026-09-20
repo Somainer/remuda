@@ -8,6 +8,7 @@ import { openQuickFind } from "../../search/QuickFind";
 import { probeClipboardRead, readClipboard, type ClipboardReadStatus } from "../../../lib/clipboard";
 import { AuxKeys } from "./AuxKeys";
 import { promptHistory } from "./promptHistory";
+import { saveTtyScrollLine } from "./ttyScrollMemory";
 import css from "./TerminalView.module.css";
 
 /**
@@ -30,40 +31,10 @@ import css from "./TerminalView.module.css";
 /**
  * The xterm unmounts across the tty → files → tty trip, so the SessionPage
  * preFilesScroll ref cannot capture its position (the header files toggle is
- * folded away on the tty route). We stash nothing about navigation — the
- * existing /s/:id/files route and SessionPage's restore stay the only path —
- * only the raw scrollTop of the tty scroller, so a scrolled-up prompt is
- * still there after the round trip.
+ * folded away on the tty route). Navigation still uses the existing
+ * /s/:id/files route; only the terminal's scroll LINE is stashed by the
+ * capture callback and replayed through the xterm scroll API on remount.
  */
-const ttyScrollMemory = new Map<string, number>();
-
-function rememberTtyScroll(instanceId: string): void {
-  const scroller = document.querySelector<HTMLElement>(".xterm-viewport");
-  if (scroller) ttyScrollMemory.set(instanceId, scroller.scrollTop);
-}
-
-/** After the fresh tty attach paints, put the scroller back where it was. */
-function useTtyScrollRestore(instanceId: string): void {
-  useEffect(() => {
-    if (!ttyScrollMemory.has(instanceId)) return;
-    let timer = 0;
-    let tries = 0;
-    const attempt = () => {
-      const ready = document.querySelector<HTMLElement>("[data-tty-ready='1']");
-      const scroller = document.querySelector<HTMLElement>(".xterm-viewport");
-      const wanted = ttyScrollMemory.get(instanceId);
-      if (ready && scroller && wanted != null && scroller.scrollHeight - scroller.clientHeight > 0) {
-        scroller.scrollTop = Math.min(wanted, scroller.scrollHeight - scroller.clientHeight);
-        ttyScrollMemory.delete(instanceId);
-        return;
-      }
-      if (++tries < 80) timer = window.setTimeout(attempt, 50);
-      else ttyScrollMemory.delete(instanceId);
-    };
-    attempt();
-    return () => window.clearTimeout(timer);
-  }, [instanceId]);
-}
 
 type ActionKey = {
   id: string;
@@ -89,12 +60,15 @@ export function PhoneKeyBar({
   instance,
   disabled,
   onKey,
+  captureScrollLine,
   onFillInput,
 }: {
   instance: Instance;
   /** TTY frozen (stale frame / reconnecting / failed): byte-writing keys gate. */
   disabled: boolean;
   onKey: (data: string) => void;
+  /** TerminalView owns the xterm instance; this reads its current baseY. */
+  captureScrollLine: () => number;
   onFillInput: (text: string) => void;
 }) {
   const navigate = useNavigate();
@@ -128,8 +102,6 @@ export function PhoneKeyBar({
     };
   }, []);
 
-  useTtyScrollRestore(instance.id);
-
   const prompts = useMemo(
     () => promptHistory(instance.id, hub.events[instance.id] ?? []),
     [hub.events, instance.id],
@@ -158,7 +130,7 @@ export function PhoneKeyBar({
         sendRaw("\t");
         return;
       case "git":
-        rememberTtyScroll(instance.id);
+        saveTtyScrollLine(instance.id, captureScrollLine());
         navigate(`/s/${instance.id}/files`);
         return;
       case "jump":

@@ -34,10 +34,18 @@ vi.mock("./promptHistory", () => ({
 
 const instance = { id: "ins_keybar" } as Instance;
 
+const captureScrollLine = vi.fn(() => 3);
+
 function renderBar(disabled = false) {
   return render(
     <MemoryRouter>
-      <PhoneKeyBar instance={instance} disabled={disabled} onKey={onKey} onFillInput={onFillInput} />
+      <PhoneKeyBar
+        instance={instance}
+        disabled={disabled}
+        onKey={onKey}
+        captureScrollLine={captureScrollLine}
+        onFillInput={onFillInput}
+      />
     </MemoryRouter>,
   );
 }
@@ -162,10 +170,11 @@ describe("clipboard key", () => {
 });
 
 describe("navigation keys", () => {
-  it("git opens the existing files route", async () => {
+  it("git captures the terminal scroll line then opens the existing files route", async () => {
     const user = userEvent.setup();
     renderBar();
     await user.click(screen.getByTestId("phone-key-git"));
+    expect(captureScrollLine).toHaveBeenCalledTimes(1);
     expect(navigate).toHaveBeenCalledWith("/s/ins_keybar/files");
   });
 

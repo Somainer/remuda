@@ -427,10 +427,6 @@ async fn run_egress(
             "no egress is authorized for this instance on the proxy host",
         );
     };
-    // The context's hard timeout governs every gated send: a producer parked
-    // waiting for credits must wake at the stream's own cap (test-tunable),
-    // not at the protocol-wide 30-minute ceiling.
-    let hard_deadline = Instant::now() + ctx.timeouts.hard;
     let url = match build_url(&ctx, &open.path, &open.query) {
         Ok(url) => url,
         Err(_) => {
@@ -604,6 +600,13 @@ async fn run_egress(
         );
     }
 
+    // The hard cap governs response delivery and starts when the head is
+    // committed: the pre-head wait is bounded by the first-byte timeout
+    // instead, so a slow connect under host load can never spend the
+    // consumer's delivery window — the initial credit window must drain no
+    // matter how long establishing the upstream response took.
+    let hard_deadline = Instant::now() + ctx.timeouts.hard;
+
     // Stream and coalesce the body. A Hub that negotiated a smaller
     // `apiChunkBytes` must never receive oversized `api.chunk` frames, so the
     // context's threshold (16 KiB by default) is clamped to the hello value.
@@ -621,17 +624,6 @@ async fn run_egress(
     // 50 ms tick and make the idle timeout unreachable.
     let mut idle_deadline = tokio::time::Instant::now() + ctx.timeouts.idle;
     loop {
-        if started.elapsed() >= ctx.timeouts.hard {
-            failed = Some(error_end(
-                &open.stream_id,
-                started,
-                bytes_up.load(std::sync::atomic::Ordering::Relaxed),
-                bytes_down,
-                API_ERROR_UPSTREAM_TIMEOUT,
-                "stream hard cap reached",
-            ));
-            break;
-        }
         tokio::select! {
             _ = cancelled.notified() => {
                 failed = Some(error_end(

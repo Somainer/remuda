@@ -24,9 +24,8 @@ import css from "./TerminalView.module.css";
  *   Ctrl · Esc · Tab · git · 跳转 · 贴 · 史 · 结构/终端 · 键
  *
  * Ctrl is the same sticky modifier as AuxKeys (shared state with the raw-key
- * second row). git navigates the existing /s/:id/files route; 跳转 is the
- * degraded openQuickFind() path task 7 replaces with the grouped sheet; 贴
- * reads the clipboard through lib/clipboard and sends the bytes on the raw
+ * second row). git navigates the existing /s/:id/files route; 跳转 opens the
+ * grouped QuickFind Jump To sheet; 贴 reads the clipboard through lib/clipboard and sends the bytes on the raw
  * tty channel, disabled with a visible reason without permission; 史 only
  * FILLS the local input strip (D-028a write boundary — it never sends); the
  * view key shares the top-bar ViewSwitch navigation; 键 raises/dismisses the
@@ -134,12 +133,11 @@ export function PhoneKeyBar({
         navigate(`/s/${instance.id}/files`);
         return;
       case "jump":
-        // Degraded path until task 7 lands the grouped sheet: the shared
-        // QuickFind overlay only mounts inside the spaces drawer on this route,
-        // so open that drawer and call the exported opener — no copy of its
-        // state or UI (acceptance 3).
+        // The shared QuickFind overlay only mounts inside the spaces drawer on
+        // this route, so open that drawer and call the exported opener in
+        // grouped mode — no copy of its state or UI (m-jumpto acceptance 4).
         document.querySelector<HTMLElement>("[data-testid='spaces-drawer-open']")?.click();
-        openQuickFind();
+        openQuickFind({ grouped: true });
         return;
       case "clip": {
         if (clipboard.state !== "ready") return;

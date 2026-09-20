@@ -1,6 +1,7 @@
 import { projectStatus } from "../../lib/status";
 import type { Instance, UiStatus } from "../../types/instance";
-import type { Space } from "../spaces/store";
+import type { Workspace } from "../../types/workspace";
+import { OTHER_SPACE, spaceKey, type Space } from "../spaces/store";
 
 /**
  * Cross-Space QuickFind ranking (exploration §5 P1-1).
@@ -166,4 +167,127 @@ export function rankQuickFind(input: QuickFindInput): QuickFindResult {
     total,
     cacheOnly: (input.connection ?? "live") !== "live",
   };
+}
+
+/**
+ * Grouped Jump To (ui-spec §4.7 / D-049): the phone sheet groups the ranked
+ * leaves by Space = (host, workspace). No second space model is built — the
+ * groups are a view over {@link rankQuickFind}'s hits and `buildSpaces()`
+ * data, and the leaves are always sessions (v1 has no pane hierarchy).
+ */
+
+export type QuickFindOrder = "clock" | "list";
+
+/** Device-local (never cross-device) last Jump To ordering, ui-spec §1.4 style. */
+export const QUICKFIND_ORDER_KEY = "remuda.mobile.quickfind.order.v1";
+
+type OrderStorage = Pick<Storage, "getItem" | "setItem"> | null | undefined;
+
+export function readQuickFindOrder(storage?: OrderStorage): QuickFindOrder {
+  try {
+    return storage?.getItem(QUICKFIND_ORDER_KEY) === "list" ? "list" : "clock";
+  } catch {
+    return "clock";
+  }
+}
+
+export function writeQuickFindOrder(order: QuickFindOrder, storage?: OrderStorage): void {
+  try {
+    storage?.setItem(QUICKFIND_ORDER_KEY, order);
+  } catch {
+    /* The ordering is a convenience; never break the finder on storage failure. */
+  }
+}
+
+export type QuickFindGroup = {
+  /** Space id, the (hostId, workspaceId) key from `spaceKey()`. */
+  id: string;
+  project: string;
+  hostName: string;
+  /** Git branch of the project; null when the Node gave no branch. */
+  branch: string | null;
+  /** Always the buildSpaces() count, even while a search hides some leaves. */
+  blockedCount: number;
+  /** The sessions under this project — the pane layer is deliberately absent. */
+  hits: QuickFindHit[];
+};
+
+/** The Space shape the grouper needs; structurally compatible with `Space`. */
+export type QuickFindGroupSpace = Pick<Space, "id" | "hostId" | "workspaceId" | "blockedCount">;
+
+/** The Workspace shape the grouper reads a branch from; structurally compatible. */
+export type QuickFindBranchWorkspace = Pick<Workspace, "id" | "hostId" | "branch">;
+
+function groupHitTime(hit: QuickFindHit): number {
+  // The web Instance carries updatedAt as its status-change timestamp (the
+  // same recency key rankQuickFind uses); there is no separate lastEventAt.
+  return Date.parse(hit.instance.updatedAt) || 0;
+}
+
+/**
+ * Group ranked hits for the phone Jump To sheet.
+ *
+ * The ordering rules mirror `homeRows.ts` `compareRows`/`compareGroups` (the
+ * phone home's grouped list): the Other Space sorts last; blocked leaves pin
+ * to the top of their group in every ordering (ui-spec §2.1 待处理置顶);
+ * clock = most recent status change first, list = project name then title.
+ * The rule is mirrored rather than imported so neither surface changes shape
+ * for the other — keep the two in step.
+ */
+export function groupQuickFind(
+  hits: QuickFindHit[],
+  spaces: readonly QuickFindGroupSpace[],
+  workspaces: readonly QuickFindBranchWorkspace[],
+  order: QuickFindOrder,
+): QuickFindGroup[] {
+  const blockedById = new Map(spaces.map((space) => [space.id, space.blockedCount]));
+  const branchBySpace = new Map<string, string>();
+  for (const workspace of workspaces) {
+    const branch = workspace.branch?.trim();
+    if (branch) branchBySpace.set(spaceKey(workspace.hostId, workspace.id), branch);
+  }
+
+  const groups = new Map<string, QuickFindGroup>();
+  for (const hit of hits) {
+    let group = groups.get(hit.spaceId);
+    if (!group) {
+      const space = spaces.find((row) => row.id === hit.spaceId);
+      const hostId = space?.hostId ?? hit.instance.hostId;
+      const workspaceId = space?.workspaceId ?? hit.instance.workspaceId;
+      const branchKey = hostId && workspaceId ? spaceKey(hostId, workspaceId) : hit.spaceId;
+      group = {
+        id: hit.spaceId,
+        project: hit.spaceName,
+        hostName: hit.hostName,
+        branch: branchBySpace.get(branchKey) ?? null,
+        blockedCount: blockedById.get(hit.spaceId) ?? 0,
+        hits: [],
+      };
+      groups.set(hit.spaceId, group);
+    }
+    group.hits.push(hit);
+  }
+
+  for (const group of groups.values()) {
+    group.hits.sort((a, b) => {
+      const aBlocked = a.status === "blocked";
+      const bBlocked = b.status === "blocked";
+      if (aBlocked !== bBlocked) return aBlocked ? -1 : 1;
+      if (order === "list") {
+        return a.title.localeCompare(b.title) || a.instance.id.localeCompare(b.instance.id);
+      }
+      return groupHitTime(b) - groupHitTime(a) || a.instance.id.localeCompare(b.instance.id);
+    });
+  }
+
+  return [...groups.values()].sort((a, b) => {
+    if (a.id === OTHER_SPACE) return 1;
+    if (b.id === OTHER_SPACE) return -1;
+    if (order === "list") {
+      return a.project.localeCompare(b.project) || a.id.localeCompare(b.id);
+    }
+    const latest = (candidate: QuickFindGroup) =>
+      candidate.hits.reduce((max, hit) => Math.max(max, groupHitTime(hit)), 0);
+    return latest(b) - latest(a) || a.id.localeCompare(b.id);
+  });
 }

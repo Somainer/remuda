@@ -2,8 +2,18 @@ import { describe, expect, it } from "vitest";
 import { mockDb } from "../../lib/mock";
 import { known } from "../../types/wire";
 import type { Instance } from "../../types/instance";
-import { spaceKey, type Space } from "../spaces/store";
-import { rankQuickFind, type QuickFindInput, type QuickFindSpace } from "./quickFindSearch";
+import type { Workspace } from "../../types/workspace";
+import { OTHER_SPACE, spaceKey, type Space } from "../spaces/store";
+import {
+  groupQuickFind,
+  QUICKFIND_ORDER_KEY,
+  rankQuickFind,
+  readQuickFindOrder,
+  writeQuickFindOrder,
+  type QuickFindGroupSpace,
+  type QuickFindInput,
+  type QuickFindSpace,
+} from "./quickFindSearch";
 
 /**
  * Fixture notes:
@@ -208,5 +218,226 @@ describe("rankQuickFind cache-only scope", () => {
     // Empty query: recency order, newest first.
     expect(result.hits[0]!.instance.id).toBe(many[6]!.id);
     expect(result.hits.every((hit) => hit.field === null)).toBe(true);
+  });
+});
+
+/**
+ * groupQuickFind fixtures. Hits always come out of rankQuickFind: the grouper
+ * is a view over the ranked list, never a second candidate source, so these
+ * tests exercise that exact hand-off.
+ */
+function blocked(id: string, hostId: string, workspaceId: string, updatedAt: string): Instance {
+  return instance(id, {
+    hostId,
+    workspaceId,
+    activity: known("waiting-interaction"),
+    updatedAt,
+  });
+}
+
+function idleAt(id: string, hostId: string, workspaceId: string, updatedAt: string): Instance {
+  return instance(id, { hostId, workspaceId, updatedAt });
+}
+
+function workspace(id: string, hostId: string, branch?: string): Workspace {
+  return { id, hostId, branch } as Workspace;
+}
+
+type GroupFixture = {
+  spaces: QuickFindSpace[];
+  groupSpaces: QuickFindGroupSpace[];
+  workspaces: Workspace[];
+  titles: Record<string, string>;
+};
+
+function groupFixture(): GroupFixture {
+  const a1 = blocked("ins_group-a1-0000-7000-8000-000000000001", "host-a", "wsp-a", "2026-09-01T00:00:00Z");
+  const a2 = idleAt("ins_group-a2-0000-7000-8000-000000000002", "host-a", "wsp-a", "2026-09-20T00:00:00Z");
+  const b1 = idleAt("ins_group-b1-0000-7000-8000-000000000003", "host-b", "wsp-b", "2026-09-21T00:00:00Z");
+  const alpha = space(spaceKey("host-a", "wsp-a"), "alpha", "host-a", "wsp-a", [a1, a2]);
+  const beta = space(spaceKey("host-b", "wsp-b"), "beta", "host-b", "wsp-b", [b1]);
+  const titles: Record<string, string> = {
+    [a1.id]: "blocked gate",
+    [a2.id]: "zebra work",
+    [b1.id]: "apple task",
+  };
+  return {
+    spaces: [alpha, beta],
+    // buildSpaces() would count exactly the one blocked row in alpha.
+    groupSpaces: [
+      { ...alpha, blockedCount: 1 },
+      { ...beta, blockedCount: 0 },
+    ],
+    workspaces: [workspace("wsp-a", "host-a", "feat/workbench-g2")],
+    titles,
+  };
+}
+
+function groupedHits(fixture: GroupFixture, query = "") {
+  return rankQuickFind({
+    spaces: fixture.spaces,
+    query,
+    titleOf: (id) => fixture.titles[id] ?? "会话",
+    hostNameOf: (hostId) => (hostId ? (HOSTS[hostId] ?? hostId) : ""),
+    connection: "live",
+  }).hits;
+}
+
+describe("groupQuickFind grouping and counts", () => {
+  it("groups ranked hits by (host, workspace) with project, host, branch and the buildSpaces blocked count", () => {
+    const fixture = groupFixture();
+    const groups = groupQuickFind(groupedHits(fixture), fixture.groupSpaces, fixture.workspaces, "clock");
+
+    expect(groups).toHaveLength(2);
+    const alpha = groups.find((group) => group.project === "alpha")!;
+    const beta = groups.find((group) => group.project === "beta")!;
+    expect(alpha.id).toBe(spaceKey("host-a", "wsp-a"));
+    expect(alpha!.project).toBe("alpha");
+    expect(alpha!.hostName).toBe("demo-node-1");
+    expect(alpha!.branch).toBe("feat/workbench-g2");
+    expect(alpha!.blockedCount).toBe(1);
+    expect(alpha!.hits.map((hit) => hit.instance.id)).toEqual([
+      "ins_group-a1-0000-7000-8000-000000000001",
+      "ins_group-a2-0000-7000-8000-000000000002",
+    ]);
+
+    // wsp-b registers without a branch: the header gets null, not an empty chip.
+    expect(beta!.project).toBe("beta");
+    expect(beta!.hostName).toBe("zzz-host-machine");
+    expect(beta!.branch).toBeNull();
+    expect(beta!.blockedCount).toBe(0);
+  });
+
+  it("keeps the whole-Space blocked count while a query hides leaves", () => {
+    const a1 = blocked("ins_hide-a1-0000-7000-8000-000000000001", "host-a", "wsp-a", "2026-09-01T00:00:00Z");
+    const a2 = blocked("ins_hide-a2-0000-7000-8000-000000000002", "host-a", "wsp-a", "2026-09-02T00:00:00Z");
+    const a3 = idleAt("ins_hide-a3-0000-7000-8000-000000000003", "host-a", "wsp-a", "2026-09-03T00:00:00Z");
+    const alpha = space(spaceKey("host-a", "wsp-a"), "alpha", "host-a", "wsp-a", [a1, a2, a3]);
+    const fixture: GroupFixture = {
+      spaces: [alpha],
+      groupSpaces: [{ ...alpha, blockedCount: 2 }],
+      workspaces: [],
+      titles: { [a1.id]: "one gate", [a2.id]: "two gate", [a3.id]: "UNIQUE-VISIBLE-TITLE" },
+    };
+
+    const hits = groupedHits(fixture, "UNIQUE-VISIBLE-TITLE");
+    expect(hits).toHaveLength(1);
+    const groups = groupQuickFind(hits, fixture.groupSpaces, fixture.workspaces, "clock");
+    expect(groups).toHaveLength(1);
+    // The header advertises both blocked sessions even though only one leaf
+    // matches the query (homeRows' same "whole Space count" rule).
+    expect(groups[0]!.blockedCount).toBe(2);
+    expect(groups[0]!.hits).toHaveLength(1);
+  });
+
+  it("returns no groups for no hits (empty state)", () => {
+    const fixture = groupFixture();
+    expect(groupQuickFind([], fixture.groupSpaces, fixture.workspaces, "clock")).toEqual([]);
+  });
+});
+
+describe("groupQuickFind clock ordering", () => {
+  it("orders groups by latest leaf change and pins blocked leaves above newer ones", () => {
+    const fixture = groupFixture();
+    const groups = groupQuickFind(groupedHits(fixture), fixture.groupSpaces, fixture.workspaces, "clock");
+
+    // beta's only leaf (09-21) is newer than anything in alpha (09-20), so
+    // beta opens the sheet even though alpha carries the blocked row.
+    expect(groups.map((group) => group.project)).toEqual(["beta", "alpha"]);
+
+    // Inside alpha the blocked leaf stays pinned despite being the oldest.
+    const alpha = groups.find((group) => group.project === "alpha")!;
+    expect(alpha.hits.map((hit) => hit.instance.id)).toEqual([
+      "ins_group-a1-0000-7000-8000-000000000001",
+      "ins_group-a2-0000-7000-8000-000000000002",
+    ]);
+  });
+
+  it("sorts the Other Space last regardless of recency", () => {
+    const orphan = idleAt("ins_other-0000-0000-7000-8000-000000000009", "host-x", "wsp-x", "2026-12-01T00:00:00Z");
+    const otherSpace: Space = {
+      id: OTHER_SPACE,
+      name: "其他",
+      instances: [orphan],
+      liveCount: 1,
+      blockedCount: 0,
+    };
+    const fixture = groupFixture();
+    const spaces = [...fixture.spaces, otherSpace];
+    const titles = { ...fixture.titles, [orphan.id]: "orphan from the future" };
+    const hits = rankQuickFind({
+      spaces,
+      query: "",
+      titleOf: (id) => titles[id] ?? "会话",
+      hostNameOf: (id) => (id ? (HOSTS[id] ?? id) : ""),
+      connection: "live",
+    }).hits;
+    const groupSpaces: QuickFindGroupSpace[] = [
+      ...fixture.groupSpaces,
+      { id: OTHER_SPACE, blockedCount: 0 },
+    ];
+
+    const clock = groupQuickFind(hits, groupSpaces, fixture.workspaces, "clock");
+    expect(clock.at(-1)!.id).toBe(OTHER_SPACE);
+    const list = groupQuickFind(hits, groupSpaces, fixture.workspaces, "list");
+    expect(list.at(-1)!.id).toBe(OTHER_SPACE);
+  });
+});
+
+describe("groupQuickFind list ordering", () => {
+  it("orders groups by project name and leaves by title, ties by id", () => {
+    const fixture = groupFixture();
+    const groups = groupQuickFind(groupedHits(fixture), fixture.groupSpaces, fixture.workspaces, "list");
+
+    expect(groups.map((group) => group.project)).toEqual(["alpha", "beta"]);
+    const alpha = groups[0]!;
+    // Blocked still pins; among the rest, title order ("blocked gate" < "zebra work").
+    expect(alpha.hits.map((hit) => hit.title)).toEqual(["blocked gate", "zebra work"]);
+    const beta = groups[1]!;
+    expect(beta.hits.map((hit) => hit.title)).toEqual(["apple task"]);
+  });
+
+  it("orders non-blocked leaves purely by title", () => {
+    const z = idleAt("ins_t-z00000-0000-7000-8000-000000000001", "h", "w", "2026-09-20T00:00:00Z");
+    const a = idleAt("ins_t-a00000-0000-7000-8000-000000000002", "h", "w", "2026-09-01T00:00:00Z");
+    const sole = space(spaceKey("h", "w"), "sole", "h", "w", [z, a]);
+    const fixture: GroupFixture = {
+      spaces: [sole],
+      groupSpaces: [{ ...sole, blockedCount: 0 }],
+      workspaces: [],
+      titles: { [z.id]: "z title", [a.id]: "a title" },
+    };
+    const groups = groupQuickFind(groupedHits(fixture), fixture.groupSpaces, [], "list");
+    expect(groups[0]!.hits.map((hit) => hit.instance.id)).toEqual([a.id, z.id]);
+  });
+});
+
+describe("Jump To order persistence", () => {
+  it("defaults to clock and only stores list explicitly", () => {
+    expect(readQuickFindOrder(undefined)).toBe("clock");
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => void values.set(key, value),
+    };
+    expect(readQuickFindOrder(storage)).toBe("clock");
+    writeQuickFindOrder("list", storage);
+    expect(values.get(QUICKFIND_ORDER_KEY)).toBe("list");
+    expect(readQuickFindOrder(storage)).toBe("list");
+    writeQuickFindOrder("clock", storage);
+    expect(readQuickFindOrder(storage)).toBe("clock");
+  });
+
+  it("survives a throwing storage without breaking", () => {
+    const broken = {
+      getItem: () => {
+        throw new Error("denied");
+      },
+      setItem: () => {
+        throw new Error("denied");
+      },
+    };
+    expect(readQuickFindOrder(broken)).toBe("clock");
+    expect(() => writeQuickFindOrder("list", broken)).not.toThrow();
   });
 });

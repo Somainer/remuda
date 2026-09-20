@@ -21,7 +21,7 @@ the per-test scratch directory.
 | Node | `crates/remuda-node/src/worktree.rs` | `WorktreeRecord.state` (`free`/`leased`/`parked`) + `leasedBy: Vec<TaskId>` with serde defaults; explicit `worktree.lease`/`worktree.return` dispatch; `remove_record` refuses while leased; catalog helpers exposed `pub(crate)` |
 | Node | `crates/remuda-node/src/worker.rs` | `worker.remove` honors `ReclaimOutcome::Retained` (skips the target-dir delete too, answers `retained/refcount`) |
 | Node | `crates/remuda-node/src/server.rs`, `runtime_link.rs`, `stdio.rs`, `transport/wss/runtime_wss.rs` | new methods route through `is_worktree_method` → `worktree_rpc_capped` on every carrier; dev server gets explicit match arms |
-| Hub | `crates/remuda-hub/src/store.rs` | new `worktree_leases` table (`mode`, `(host_id, workspace_id, dir_key)` unique key, nullable `worktree_name`, `holder_instance_id`, `task_ids_json`); record/release/held-by-instance methods; `delete_instance` clears the attach lock |
+| Hub | `crates/remuda-hub/src/store.rs` | new `worktree_leases` table (`mode`, `(host_id, workspace_id, dir_key)` unique key, nullable `worktree_name`, `holder_instance_id`, `task_ids_json`); record/release/task-scoped lookup methods; `delete_instance` returns the task's lease and clears the attach lock |
 | Hub | `crates/remuda-hub/src/http.rs` | `POST /v1/worktrees/{name}/lease` and `/return`, forwarding only `{hostId, workspaceId, name, base, taskId}`; full pool → 429 `SUPPLY_DEFERRED`; `delete_instance` returns held leases before purge |
 | Hub | `crates/remuda-hub/src/workers.rs` | `retire_core` checks the lease table before `worker.remove`: shared slot → 409, sole holder → return/park, no lease → legacy reclaim |
 | Wire | `crates/remuda-hub/openapi/openapi.json`, `web/src/lib/api.generated.ts` (regenerated), `crates/remuda-protocol/src/scalar.rs` (`wtl_` id prefix) + regenerated schema/types | additive only |
@@ -73,7 +73,7 @@ directory reused — `wt/<slot>/<task>`).
   "queued": true,
   "dirKey": "pool-s1",
   "blocked": {
-    "reason": "directory is held by another attached task; queued for serial reuse"
+    "reason": "dir-busy: directory is held by another attached task; queued for serial reuse"
   }
 }
 ```
@@ -146,7 +146,7 @@ fingerprint before leasing and after returning: the sequence is exactly
 equal — no `clean`/`reset`/`remove` ran, and `notes.txt` / `scratch/data.bin`
 are untouched. Reset/clean/park only ever run for `mode=pool`.
 
-### Task-archive boundary
+### Task-archive boundary and the attach-lock holder
 
 D-050 §2 gates the pool `clean -fd`/park on the last refcount returning *and*
 the task being archived. The Node `worktree.return` RPC deliberately knows
@@ -155,6 +155,30 @@ immediately (the directory is clean by the refuse-on-dirty guard); wiring
 "park only once the task row is done/archived" is the binding task's
 (`t-bind`) Hub-side responsibility. The blocked/queued reason carries the
 stable token `dir-busy:` (D-050 §2) so the board can discriminate it.
+
+`holder_instance_id` is likewise populated only when a launched session is
+**attached** to the leased directory — a step the binding task performs when
+it passes the lease into `instance.create`. A lease created through this
+task's HTTP route therefore has `holder = NULL`. So that delete-time reclaim
+is not dormant before `t-bind`, `delete_instance` does not key on the
+holder: it finds active leases whose `task_ids` contain the instance's
+`task_id` (`active_worktree_leases_for_task`) and returns exactly that task's
+share. The delete transaction still clears `holder_instance_id` for the
+future attached case. This is pinned by
+`deleting_an_instance_returns_its_task_lease_without_a_holder_row`
+(production HTTP lease, no fixture holder) and
+`delete_clears_a_preexisting_attach_holder_on_the_lease_row`.
+
+### Authoritative pool flag (data-loss guard)
+
+Whether a return is destructive (`git clean -fd` + detached park) is read
+from an authoritative serde-default `WorktreeRecord.pooled` flag, set **only**
+where the pool provisions a slot — never inferred from the `<pool>-s<n>` name
+shape. One-shot `worktree.create` and dispatch `provision_record` reject the
+reserved suffix, and pool bookkeeping counts only `pooled` records. This
+guarantees an operator's standalone worktree (even one named `<x>-s<n>`)
+leases as `reuse` and returns byte-identical; pinned by
+`standalone_worktree_named_like_a_slot_returns_byte_identical`.
 
 ## Acceptance cross-reference
 
@@ -170,7 +194,7 @@ stable token `dir-busy:` (D-050 §2) so the board can discriminate it.
 | 8 | Explicit dispatch, no `{ok:true}` silent no-op; unregistered method errors | `lease_return_dispatch_real_payloads_and_unknown_method_errors` |
 | 9 | Catalog path/name/branch consistency keeps the pre-trust flag | `native::tests::a_pooled_worktree_keeps_the_trust_flag_across_lease_and_park` (extends `native.rs:3189`-family coverage through a lease → park → warm re-lease cycle) |
 | — | Catalog reconcile (missing rows dropped, stuck leases healed) | `reconcile_drops_missing_rows_and_heals_stale_leases` |
-| — | Deleting the holder instance returns its lease and releases the attach lock | Hub `deleting_a_holder_instance_returns_its_lease_and_clears_the_lock`; store transaction clears `holder_instance_id` |
+| — | Deleting an instance returns its task's lease (production HTTP lease, no injected holder); a pre-existing attach holder is also cleared | Hub `deleting_an_instance_returns_its_task_lease_without_a_holder_row`, `delete_clears_a_preexisting_attach_holder_on_the_lease_row`; store transaction clears `holder_instance_id` |
 
 ### Root addressing over HTTP
 

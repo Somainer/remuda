@@ -3,12 +3,20 @@ import { createPortal } from "react-dom";
 import { useNavigate } from "react-router-dom";
 import { Sheet } from "../../components/Sheet";
 import { StateDot } from "../../components/StateDot";
+import { fetchChanges } from "../files/filesApi";
 import { isTypingTarget } from "../../lib/keyboardScope";
 import { hubStore, useHub } from "../../lib/store";
 import { useWorkbenchViewport } from "../../lib/viewport";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
-import { buildSpaces, spaceStore, useSpacesPrefs } from "../spaces/store";
-import { rankQuickFind, type QuickFindHit } from "./quickFindSearch";
+import { buildSpaces, spaceKey, spaceStore, useSpacesPrefs } from "../spaces/store";
+import {
+  groupQuickFind,
+  rankQuickFind,
+  readQuickFindOrder,
+  writeQuickFindOrder,
+  type QuickFindHit,
+  type QuickFindOrder,
+} from "./quickFindSearch";
 import css from "./quickfind.module.css";
 
 /**
@@ -18,6 +26,12 @@ import css from "./quickfind.module.css";
  * already loaded — no remote index, never message bodies. Opening it never
  * writes the URL or the active Space: Escape returns exactly where the user
  * was, and Enter is the only thing that navigates.
+ *
+ * Desktop ⌘K keeps the flat ranked listbox; the phone Jump To sheet (opened
+ * grouped from the terminal key bar) renders the same hits grouped by
+ * project + branch with the blocked count and a clock/list toggle. Both
+ * shapes are one panel over one ranked list — never a second space model
+ * (ui-spec §4.7 / §1.3: a group's leaves are sessions, no pane hierarchy).
  */
 
 /** The agreed shortcut (exploration §5 P1-1, UI spec §2.3): ⌘K / Ctrl+K. */
@@ -29,20 +43,28 @@ export const QUICKFIND_HINT = "⌘/Ctrl+K";
  * while the global shortcut lives in the always-mounted overlay; an event or
  * prop chain would make the panel re-render on every keystroke, and batch C
  * owns Shell.tsx where an app-wide provider would otherwise mount.
+ *
+ * `grouped` is the *requested* presentation: only the phone key bar asks for
+ * it, and the component still ANDs it with its compact viewport, so desktop
+ * ⌘K and every desktop trigger keep the flat listbox regardless.
  */
 let openState = false;
+let groupedRequest = false;
 const openListeners = new Set<() => void>();
 function emitOpen() {
   for (const listener of openListeners) listener();
 }
-export function openQuickFind() {
+export function openQuickFind(options?: { grouped?: boolean }) {
   if (openState) return;
+  groupedRequest = options?.grouped ?? false;
   openState = true;
   emitOpen();
 }
 export function closeQuickFind() {
   if (!openState) return;
   openState = false;
+  // The desktop ⌘K default must not inherit a phone session's grouped mode.
+  groupedRequest = false;
   emitOpen();
 }
 function subscribe(listener: () => void) {
@@ -123,10 +145,20 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
   const { mobile } = useWorkbenchViewport();
   const navigate = useNavigate();
   const open = useSyncExternalStore(subscribe, () => openState);
+  const groupedWanted = useSyncExternalStore(subscribe, () => groupedRequest);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const [cursor, setCursor] = useState(0);
+  // The phone home owns a sibling key; Jump To gets its own so a desktop
+  // user's flat ⌘K list never inherits the phone's last toggle.
+  const [order, setOrder] = useState<QuickFindOrder>(() => readQuickFindOrder(localStorageAccess()));
+  const [branches, setBranches] = useState<Record<string, string>>({});
+
+  // Grouped presentation exists only on the phone Jump To sheet: the opener
+  // asks for it AND the viewport is compact. Desktop ⌘K, the sidebar trigger
+  // and a window grown mid-session all keep the flat ranked listbox.
+  const grouped = open && groupedWanted && mobile;
 
   const spaces = useMemo(() => buildSpaces(hub.workspaces, hub.instances, prefs), [hub.workspaces, hub.instances, prefs]);
   const result = useMemo(
@@ -141,6 +173,79 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
     [spaces, query, hub],
   );
   const hits = result.hits;
+
+  // The registry's branch is absent on minimal Node replies; the live SCM
+  // branch fetched below overrides it per (host, workspace) key.
+  const workspacesWithBranch = useMemo(
+    () =>
+      hub.workspaces.map((workspace) => {
+        const live = branches[spaceKey(workspace.hostId, workspace.id)];
+        return live ? { ...workspace, branch: live } : workspace;
+      }),
+    [hub.workspaces, branches],
+  );
+
+  const groups = useMemo(
+    () => (grouped ? groupQuickFind(hits, spaces, workspacesWithBranch, order) : []),
+    [grouped, hits, spaces, workspacesWithBranch, order],
+  );
+
+  useEffect(() => {
+    writeQuickFindOrder(order, localStorageAccess());
+  }, [order]);
+
+  // Live git branch per project, the same read-only changes proxy the phone
+  // home uses (HomeList): one fetch per Space id, cached for the component's
+  // life; unknown/denied/unreachable simply leaves the branch off the header.
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const fetchedBranches = useRef<Set<string>>(new Set());
+  const spaceKeys = spaces.map((space) => space.id).join(",");
+  const branchCandidates = useMemo(
+    () =>
+      spaces
+        .filter((space) => space.hostId && space.workspaceId)
+        .map((space) => ({ id: space.id, hostId: space.hostId!, workspaceId: space.workspaceId! })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [spaceKeys],
+  );
+  useEffect(() => {
+    if (!grouped) return;
+    const targets = branchCandidates.filter(
+      (target) => !fetchedBranches.current.has(target.id),
+    );
+    if (!targets.length) return;
+    for (const target of targets) fetchedBranches.current.add(target.id);
+    void Promise.all(
+      targets.map(async (target) => {
+        try {
+          const status = await fetchChanges(target.hostId, target.workspaceId);
+          const branch = status.branch?.state === "known" ? status.branch.value?.trim() : "";
+          return { id: target.id, branch: branch ?? "" };
+        } catch {
+          return { id: target.id, branch: "" };
+        }
+      }),
+    ).then((results) => {
+      if (!mounted.current) return;
+      setBranches((current) => {
+        const next = { ...current };
+        let changed = false;
+        for (const { id, branch } of results) {
+          if (branch && next[id] !== branch) {
+            next[id] = branch;
+            changed = true;
+          }
+        }
+        return changed ? next : current;
+      });
+    });
+  }, [branchCandidates, grouped]);
 
   // Reset the query on the open transition. Adjusting state during render is
   // the React-sanctioned form of "reset when a prop/store value changes" — an
@@ -255,15 +360,88 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
       ) : null}
       <div className={css.listHead}>
         <span>{query.trim() ? `${result.total} 个匹配` : `${result.total} 个已缓存会话`}</span>
-        <span className={css.scopeNote}>仅已加载的标题 / 空间 / 主机 / ID</span>
+        {grouped ? (
+          <div className={css.order} role="group" aria-label="排序方式">
+            <button
+              type="button"
+              data-testid="quickfind-order-clock"
+              aria-pressed={order === "clock"}
+              onClick={() => {
+                setOrder("clock");
+                setCursor(0);
+              }}
+            >
+              时钟
+            </button>
+            <button
+              type="button"
+              data-testid="quickfind-order-list"
+              aria-pressed={order === "list"}
+              onClick={() => {
+                setOrder("list");
+                setCursor(0);
+              }}
+            >
+              列表
+            </button>
+          </div>
+        ) : (
+          <span className={css.scopeNote}>仅已加载的标题 / 空间 / 主机 / ID</span>
+        )}
       </div>
       {hits.length ? (
         <div className={css.list} id={listId} role="listbox" aria-label="会话" ref={listRef}>
-          {hits.map((hit, index) => (
-            <div key={hit.instance.id} data-index={index} className={css.optionSlot}>
-              <ResultRow hit={hit} index={index} selected={index === active} onSelect={() => choose(hit)} />
-            </div>
-          ))}
+          {grouped
+            ? groups.map((group) => (
+                <div
+                  key={group.id}
+                  className={css.group}
+                  role="group"
+                  aria-label={`${group.project} · ${group.hostName}`}
+                  data-testid="quickfind-group"
+                  data-blocked={group.blockedCount}
+                >
+                  <div className={css.groupHead} role="presentation">
+                    <span
+                      className={css.groupProject}
+                      data-testid="quickfind-group-project"
+                      title={`${group.project} · ${group.hostName}`}
+                    >
+                      {group.project}
+                    </span>
+                    {group.branch ? (
+                      <span className={css.groupBranch} data-testid="quickfind-group-branch">
+                        {group.branch}
+                      </span>
+                    ) : null}
+                    <span
+                      className={css.groupBlocked}
+                      data-testid="quickfind-group-blocked"
+                      data-zero={group.blockedCount === 0 ? "1" : "0"}
+                    >
+                      {group.blockedCount} 待处理
+                    </span>
+                  </div>
+                  {group.hits.map((hit) => {
+                    const index = hits.indexOf(hit);
+                    return (
+                      <div key={hit.instance.id} data-index={index} className={css.optionSlot}>
+                        <ResultRow
+                          hit={hit}
+                          index={index}
+                          selected={index === active}
+                          onSelect={() => choose(hit)}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              ))
+            : hits.map((hit, index) => (
+                <div key={hit.instance.id} data-index={index} className={css.optionSlot}>
+                  <ResultRow hit={hit} index={index} selected={index === active} onSelect={() => choose(hit)} />
+                </div>
+              ))}
         </div>
       ) : (
         <div className={css.empty} data-testid="quickfind-empty">
@@ -309,7 +487,7 @@ export function QuickFindTrigger({ collapsed = false }: { collapsed?: boolean })
         aria-label="快速查找会话"
         title={`快速查找（${QUICKFIND_HINT}）`}
         aria-haspopup="dialog"
-        onClick={openQuickFind}
+        onClick={() => openQuickFind()}
       >
         ⌕
       </button>
@@ -322,11 +500,19 @@ export function QuickFindTrigger({ collapsed = false }: { collapsed?: boolean })
       data-testid="quickfind-trigger"
       aria-haspopup="dialog"
       title={`快速查找（${QUICKFIND_HINT}）`}
-      onClick={openQuickFind}
+      onClick={() => openQuickFind()}
     >
       <span className={css.triggerIcon} aria-hidden="true">⌕</span>
       <span className={css.triggerText}>搜索所有空间…</span>
       <kbd className={css.kbd} aria-hidden="true">{QUICKFIND_HINT}</kbd>
     </button>
   );
+}
+
+function localStorageAccess(): Storage | null {
+  try {
+    return typeof localStorage === "undefined" ? null : localStorage;
+  } catch {
+    return null;
+  }
 }

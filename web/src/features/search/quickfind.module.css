@@ -74,6 +74,73 @@
   white-space: nowrap;
 }
 
+/* Clock/list toggle for the grouped phone Jump To sheet (ui-spec §4.7). */
+.order {
+  flex: none;
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.order button {
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  background: var(--ink-1);
+  color: var(--mute);
+  font-family: var(--font);
+  font-size: 12px;
+}
+
+.order button[aria-pressed="true"] {
+  background: var(--ink-2);
+  color: var(--paper);
+}
+
+/* Grouped Jump To: project + branch + blocked-count headers. The leaves are
+   always sessions (no pane hierarchy, ui-spec §1.3). */
+.groupHead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--ink-2);
+  font-size: 12px;
+}
+
+.groupProject {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--paper);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.groupBranch {
+  flex: none;
+  color: var(--cold);
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.groupBlocked {
+  flex: none;
+  color: var(--danger-strong);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.groupBlocked[data-zero="1"] {
+  color: var(--mute);
+}
+
 .list {
   /* The Sheet panel already scrolls; this just bounds the list on desktop. */
   max-height: min(46vh, 420px);
@@ -348,5 +415,9 @@
 
   .optionTime {
     display: none;
+  }
+
+  .order button {
+    min-height: 44px;
   }
 }

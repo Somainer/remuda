@@ -5,7 +5,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { Instance } from "../../types/instance";
 import type { Workspace } from "../../types/workspace";
 import { SPACES_PREFS_KEY, spaceStore } from "../spaces/store";
-import { QuickFind, QuickFindTrigger, closeQuickFind } from "./QuickFind.tsx";
+import { QuickFind, QuickFindTrigger, closeQuickFind, openQuickFind } from "./QuickFind.tsx";
 
 // vi.mock factories are hoisted above imports, so every value the mock closes
 // over has to be hoisted with it. These are plain objects cast to the entity
@@ -207,5 +207,101 @@ describe("QuickFind", () => {
     renderFinder();
     await user.click(screen.getByTestId("quickfind-trigger"));
     expect(screen.getByTestId("quickfind-cache-only")).toHaveTextContent(/只搜索本机已缓存/);
+  });
+});
+
+describe("QuickFind grouped Jump To (phone key bar)", () => {
+  const orderKey = "remuda.mobile.quickfind.order.v1";
+
+  function setCompact(compact: boolean) {
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: (query: string) => ({
+        matches: compact,
+        media: query,
+        onchange: null,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => false,
+      }),
+    });
+  }
+
+  afterEach(() => {
+    setCompact(false);
+    fixtures.instances[0].activity = { state: "known", value: "idle" };
+    localStorage.removeItem(orderKey);
+  });
+
+  it("opens grouped on compact with project headers, branch and blocked count, sessions as leaves", async () => {
+    setCompact(true);
+    // The first cached session is blocked: buildSpaces counts it and the
+    // header must advertise that exact count.
+    fixtures.instances[0].activity = { state: "known", value: "waiting-interaction" };
+    const user = userEvent.setup();
+    renderFinder();
+    act(() => openQuickFind({ grouped: true }));
+
+    expect(screen.getByTestId("quickfind-panel")).toBeInTheDocument();
+    const groups = screen.getAllByTestId("quickfind-group");
+    expect(groups).toHaveLength(2);
+
+    const first = groups[0]!;
+    expect(first).toHaveTextContent("alpha");
+    expect(first).toHaveTextContent("1 待处理");
+    expect(first).toHaveAttribute("data-blocked", "1");
+    expect(groups[1]).toHaveTextContent("beta");
+    expect(groups[1]).toHaveTextContent("0 待处理");
+
+    // The leaves are still plain session options inside the one listbox.
+    expect(screen.getAllByTestId("quickfind-result")).toHaveLength(2);
+    // The flat-list scope note yields its slot to the clock/list toggle.
+    expect(screen.getByTestId("quickfind-order-clock")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByText(/仅已加载的标题/)).not.toBeInTheDocument();
+
+    // The combobox/listbox/activedescendant contract survives grouping.
+    const box = screen.getByTestId("quickfind-input");
+    expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-0");
+    await user.keyboard("{ArrowDown}");
+    expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-1");
+    expect(screen.getAllByTestId("quickfind-result")[1]).toHaveAttribute("data-selected", "true");
+  });
+
+  it("remembers the clock/list choice per device", async () => {
+    setCompact(true);
+    const user = userEvent.setup();
+    let rendered = renderFinder();
+    act(() => openQuickFind({ grouped: true }));
+    await user.click(screen.getByTestId("quickfind-order-list"));
+    expect(screen.getByTestId("quickfind-order-list")).toHaveAttribute("aria-pressed", "true");
+    expect(localStorage.getItem(orderKey)).toBe("list");
+    act(() => closeQuickFind());
+    rendered.unmount();
+
+    // A fresh mount reads the persisted choice.
+    rendered = renderFinder();
+    act(() => openQuickFind({ grouped: true }));
+    expect(screen.getByTestId("quickfind-order-list")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("quickfind-order-clock")).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("ignores the grouped entry on desktop and for the plain trigger, keeping the flat list", () => {
+    // Desktop viewport even when the caller asked for grouped.
+    setCompact(false);
+    renderFinder();
+    act(() => openQuickFind({ grouped: true }));
+    expect(screen.queryAllByTestId("quickfind-group")).toHaveLength(0);
+    expect(screen.getAllByTestId("quickfind-result")).toHaveLength(2);
+    expect(screen.queryByTestId("quickfind-order-clock")).not.toBeInTheDocument();
+    expect(screen.getByText(/仅已加载的标题/)).toBeInTheDocument();
+    act(() => closeQuickFind());
+
+    // Compact but the plain opener (spaces drawer trigger / ⌘K) stays flat.
+    setCompact(true);
+    act(() => openQuickFind());
+    expect(screen.queryAllByTestId("quickfind-group")).toHaveLength(0);
+    expect(screen.getAllByTestId("quickfind-result")).toHaveLength(2);
   });
 });

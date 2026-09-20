@@ -64,8 +64,10 @@ vitest 另补一条：完整实例 id 作为 query 也无结果。
 | 类型 | `pnpm --dir web typecheck` | 干净 |
 | lint | `pnpm --dir web lint` | 无 error（仅仓库既有 warning） |
 | 本规格 ×3 | `playwright test -c playwright.hub.config.ts m-home.hub.spec.ts` | 每次 4/4 通过（约 47s） |
-| 全量 hub e2e | 同上不加过滤（chromium 单浏览器 hub 配置） | 见下「全量回归」 |
-| 密钥扫描 | `bash scripts/ci/secret-scan.sh` | 见下 |
+| 全量 hub e2e | 同上不加过滤（chromium 单浏览器 hub 配置） | 143 passed / 18 skipped / 0 failed（22.5m） |
+| 密钥扫描 | `bash scripts/ci/secret-scan.sh` | pass（`no-tunnel-scan.sh` 同机亦 pass） |
+
+全量回归备注：首次整串跑在另一 worker 同时占用本机（load ~11）时，`grok-structural.hub.spec.ts` 的实时 PTY 流用例（桌面 1440，驱动**真实** `native_hub_e2e`/fake-harness 二进制，非本任务修改的 in-process fake node；240s 预算、250ms 轮询时序）超时一次；该用例隔离重跑 2/2 通过，且后续整串（161 条）143 passed/0 failed。与本变更无关（桌面路由、真实节点、fixture prompt 不含 `mhome-*` sentinel）。
 
 闸口提醒（计划 §(C) 公共约定 / E4）：本任务新增的是 `web/src/features/mobile/**` 与 `app/router.tsx` 的一处替换，不在 `crates/remuda/src/cmd/merge/web_e2e.rs` 的自动 `--web-e2e` 清单内；`remuda merge` 时必须**显式传 `--web-e2e`**。闸口只跑 hub 配置（chromium）；390px 几何与 DOM 即验收，webkit 不进闸（E3），本任务未声称 iOS 实测。
 

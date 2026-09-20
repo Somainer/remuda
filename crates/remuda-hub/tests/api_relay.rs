@@ -2834,7 +2834,7 @@ async fn instance_projection_carries_the_node_reported_hub_relay_route() -> Resu
 
     // The echo is projected on the create-accept path that unblocks dispatch;
     // poll the real HTTP surface rather than assume ordering.
-    let projection = tokio::time::timeout(TIMEOUT, async {
+    let (projection, raw) = tokio::time::timeout(TIMEOUT, async {
         loop {
             let (status, _, body) = http(
                 fixture.addr,
@@ -2847,7 +2847,7 @@ async fn instance_projection_carries_the_node_reported_hub_relay_route() -> Resu
             if status == 200 {
                 let view: Value = serde_json::from_str(body.trim())?;
                 if view.get("apiRoute").is_some() {
-                    break Ok::<_, anyhow::Error>(view);
+                    break Ok::<_, anyhow::Error>((view, body));
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2873,6 +2873,14 @@ async fn instance_projection_carries_the_node_reported_hub_relay_route() -> Resu
         route["viaHostLabel"],
         json!("relay-proxy"),
         "the Hub attaches its registry label on write-back: {route}"
+    );
+
+    // No credential ever rides an HTTP response for a via launch: the
+    // gateway token lives on the proxy host out of band (api.egress), never
+    // in the instance projection the API serves.
+    assert!(
+        !raw.contains(PROFILE_TOKEN),
+        "gateway token appeared in the instance projection: {raw}"
     );
 
     gateway.shutdown().await;

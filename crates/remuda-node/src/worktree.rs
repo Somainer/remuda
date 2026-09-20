@@ -1,12 +1,32 @@
 //! Git worktree create/list used by Hub `worktree.create` / `worktree.list`.
 
 use crate::NodeError;
-use remuda_protocol::path_guard;
+use remuda_protocol::{TaskId, path_guard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Lease state of one catalogued worktree (task-model t-pool).
+///
+/// * [`Free`](WorktreeLeaseState::Free) — a standalone worktree resting on its
+///   own branch; a `reuse` lease takes it with zero git operations.
+/// * [`Leased`](WorktreeLeaseState::Leased) — currently held by one or more
+///   tasks (`WorktreeRecord::leased_by`); force-removal is refused.
+/// * [`Parked`](WorktreeLeaseState::Parked) — a pool slot resting at a
+///   detached HEAD on the pool base; the next pool lease claims it warm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WorktreeLeaseState {
+    /// Resting standalone worktree (also the default for pre-pool records).
+    #[default]
+    Free,
+    /// Held by one or more tasks.
+    Leased,
+    /// Pool slot resting at detached HEAD.
+    Parked,
+}
 
 /// Record stored in `<git-common-dir>/remuda-worktrees.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,24 +36,34 @@ pub struct WorktreeRecord {
     pub name: String,
     /// Absolute worktree path.
     pub path: String,
-    /// Branch created for the worktree (`wt/<name>/…`).
+    /// Branch checked out there (`wt/<name>/…`), or `HEAD` while a pool slot
+    /// rests detached.
     pub branch: String,
     /// Start-point used at creation.
     pub base: String,
+    /// Pool/reuse lease state; `free` for records written before t-pool.
+    #[serde(default)]
+    pub state: WorktreeLeaseState,
+    /// Tasks currently holding a lease on this worktree.
+    #[serde(default)]
+    pub leased_by: Vec<TaskId>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Catalog {
+pub(crate) struct Catalog {
     #[serde(default)]
-    worktrees: Vec<WorktreeRecord>,
+    pub(crate) worktrees: Vec<WorktreeRecord>,
 }
 
-/// Handle Hub JSON-RPC `worktree.create` / `worktree.list`.
+/// Handle Hub JSON-RPC `worktree.create` / `worktree.list` /
+/// `worktree.lease` / `worktree.return`.
 pub fn handle_rpc(repo: &Path, method: &str, params: &Value) -> Option<Result<Value, NodeError>> {
     match method {
         "worktree.list" => Some(list(repo)),
         "worktree.create" => Some(create(repo, params)),
+        "worktree.lease" => Some(crate::worktree_pool::lease(repo, params)),
+        "worktree.return" => Some(crate::worktree_pool::return_slot(repo, params)),
         _ => None,
     }
 }
@@ -124,6 +154,8 @@ pub fn provision_record(
         path: path.clone(),
         branch: branch.to_string(),
         base: start_point.to_string(),
+        state: WorktreeLeaseState::default(),
+        leased_by: Vec::new(),
     };
     upsert(&mut catalog, record);
     save_catalog(&git_common, &catalog)?;
@@ -147,10 +179,39 @@ pub fn has_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
     Ok(catalog.worktrees.iter().any(|row| row.name == name))
 }
 
+/// Outcome of a reclaim request (t-pool).
+pub(crate) enum ReclaimOutcome {
+    /// No record existed (`false`) or the worktree was physically removed
+    /// (`true`).
+    Removed(bool),
+    /// The record still carries active leases: the directory is retained
+    /// untouched — neither removed nor reset. The lease table (Hub) and
+    /// `worktree.return` own refcount decrement and parking.
+    Retained {
+        /// Recorded worktree path that was preserved.
+        path: String,
+        /// Active leases on it (`WorktreeRecord::leased_by`).
+        refcount: usize,
+    },
+}
+
+impl ReclaimOutcome {
+    pub(crate) fn removed(&self) -> bool {
+        matches!(self, Self::Removed(true))
+    }
+}
+
 /// Remove a worker's provisioned worktree with `git worktree remove --force`
 /// and drop it from the catalog. The branch itself is kept (gate/land owns
 /// branch deletion); only the working tree is reclaimed.
-pub fn remove_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
+///
+/// Lease-aware (t-pool): a record with active leases
+/// (`WorktreeRecord::leased_by`) is *never* force-removed — the reclaim main
+/// path (`worker.remove`) used to run here unconditionally, which on a slot
+/// shared by several tasks would delete the other tasks' working tree. Such a
+/// request returns [`ReclaimOutcome::Retained`] and leaves the tree byte for
+/// byte.
+pub(crate) fn remove_record(repo: &Path, name: &str) -> Result<ReclaimOutcome, NodeError> {
     validate_name(name)?;
     let repo_root = repo_root(Some(repo))?;
     let git_common = git_common_dir(&repo_root)?;
@@ -161,12 +222,27 @@ pub fn remove_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
         .find(|row| row.name == name)
         .cloned()
     else {
-        return Ok(false);
+        return Ok(ReclaimOutcome::Removed(false));
     };
+    // Root-cause guard (plan t-pool acceptance #2): the reclaim main path ends
+    // here. Refuse the physical removal while any task still holds the slot;
+    // the caller must return its lease first.
+    if !record.leased_by.is_empty() {
+        tracing::warn!(
+            name,
+            refcount = record.leased_by.len(),
+            "refusing force-remove of a leased worktree; directory retained"
+        );
+        return Ok(ReclaimOutcome::Retained {
+            path: record.path,
+            refcount: record.leased_by.len(),
+        });
+    }
     let path = PathBuf::from(&record.path);
     if path.exists() {
         // A worker can leave untracked/modified files behind; --force is the
-        // documented retire semantics (tab close → worktree remove → rm).
+        // documented retire semantics (tab close → worktree remove → rm) for a
+        // *single* retired worker. Leased slots never reach this branch.
         if let Err(error) = git(&repo_root, &["worktree", "remove", "--force", &record.path]) {
             // Fall back to manual removal + prune for a corrupt administrative
             // directory, then verify the path is actually gone.
@@ -179,12 +255,12 @@ pub fn remove_record(repo: &Path, name: &str) -> Result<bool, NodeError> {
     }
     catalog.worktrees.retain(|row| row.name != name);
     save_catalog(&git_common, &catalog)?;
-    Ok(true)
+    Ok(ReclaimOutcome::Removed(true))
 }
 
 /// `git fetch origin` (or the remote the start point namespaces). Unbounded:
 /// like worktree mutation, a large fetch must not be killed by a probe deadline.
-fn git_fetch(repo: &Path) -> Result<(), NodeError> {
+pub(crate) fn git_fetch(repo: &Path) -> Result<(), NodeError> {
     crate::workspace_access_check(repo)?;
     let output = Command::new("git")
         .arg("-C")
@@ -204,8 +280,15 @@ fn git_fetch(repo: &Path) -> Result<(), NodeError> {
 }
 
 /// True when `method` is a worktree Hub RPC.
+///
+/// `worktree.lease` / `worktree.return` must be listed explicitly: a method
+/// missing from here falls through to the catch-all dispatcher, which answers
+/// unknown methods with `{"ok":true}` and would fake a lease (t-pool E1).
 pub fn is_worktree_method(method: &str) -> bool {
-    matches!(method, "worktree.create" | "worktree.list")
+    matches!(
+        method,
+        "worktree.create" | "worktree.list" | "worktree.lease" | "worktree.return"
+    )
 }
 
 fn list(repo: &Path) -> Result<Value, NodeError> {
@@ -280,6 +363,8 @@ fn create_record(
             path: listed.0,
             branch: listed.1,
             base: base.to_string(),
+            state: WorktreeLeaseState::default(),
+            leased_by: Vec::new(),
         };
         upsert(&mut catalog, record.clone());
         save_catalog(&git_common, &catalog)?;
@@ -312,6 +397,8 @@ fn create_record(
         path,
         branch,
         base: base.to_string(),
+        state: WorktreeLeaseState::default(),
+        leased_by: Vec::new(),
     };
     upsert(&mut catalog, record.clone());
     save_catalog(&git_common, &catalog)?;
@@ -420,12 +507,12 @@ pub(crate) fn expand_home(raw: &str, home: Option<&Path>) -> Result<PathBuf, Nod
     Ok(home.join(suffix.trim_start_matches('/')))
 }
 
-fn validate_name(name: &str) -> Result<(), NodeError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), NodeError> {
     path_guard::safe_segment(name)
         .map_err(|error| NodeError::InvalidRequest(format!("worktree {error}")))
 }
 
-fn repo_root(repo: Option<&Path>) -> Result<PathBuf, NodeError> {
+pub(crate) fn repo_root(repo: Option<&Path>) -> Result<PathBuf, NodeError> {
     if let Some(repo) = repo {
         return Ok(if repo.is_absolute() {
             repo.to_path_buf()
@@ -436,7 +523,7 @@ fn repo_root(repo: Option<&Path>) -> Result<PathBuf, NodeError> {
     std::env::current_dir().map_err(NodeError::from)
 }
 
-fn git_common_dir(repo: &Path) -> Result<PathBuf, NodeError> {
+pub(crate) fn git_common_dir(repo: &Path) -> Result<PathBuf, NodeError> {
     let out = git(repo, &["rev-parse", "--git-common-dir"])?;
     let path = PathBuf::from(out);
     if path.is_absolute() {
@@ -450,7 +537,11 @@ fn git_common_dir(repo: &Path) -> Result<PathBuf, NodeError> {
 ///
 /// Mirrors `remuda::cmd::worktree::resolve_path`; both use the shared guard so
 /// the Hub RPC path cannot be looser than the CLI (`security-review-2.md` M4).
-fn resolve_path(repo: &Path, name: &str, path: Option<&Path>) -> Result<PathBuf, NodeError> {
+pub(crate) fn resolve_path(
+    repo: &Path,
+    name: &str,
+    path: Option<&Path>,
+) -> Result<PathBuf, NodeError> {
     let root = path_guard::worktree_root(repo)
         .map_err(|error| NodeError::InvalidRequest(format!("worktree {error}")))?;
     let raw = match path {
@@ -477,7 +568,7 @@ fn unique_branch(repo: &Path, name: &str) -> Result<String, NodeError> {
     )))
 }
 
-fn ref_exists(repo: &Path, branch: &str) -> Result<bool, NodeError> {
+pub(crate) fn ref_exists(repo: &Path, branch: &str) -> Result<bool, NodeError> {
     let spec = format!("refs/heads/{branch}");
     let mut command = Command::new("git");
     command
@@ -533,7 +624,7 @@ fn catalog_path(git_common: &Path) -> PathBuf {
     git_common.join("remuda-worktrees.json")
 }
 
-fn load_catalog(git_common: &Path) -> Result<Catalog, NodeError> {
+pub(crate) fn load_catalog(git_common: &Path) -> Result<Catalog, NodeError> {
     let path = catalog_path(git_common);
     if !path.exists() {
         return Ok(Catalog::default());
@@ -544,7 +635,7 @@ fn load_catalog(git_common: &Path) -> Result<Catalog, NodeError> {
         .map_err(|err| NodeError::InvalidRequest(format!("parse {}: {err}", path.display())))
 }
 
-fn save_catalog(git_common: &Path, catalog: &Catalog) -> Result<(), NodeError> {
+pub(crate) fn save_catalog(git_common: &Path, catalog: &Catalog) -> Result<(), NodeError> {
     let _ = fs::create_dir_all(git_common);
     let path = catalog_path(git_common);
     let body = serde_json::to_string_pretty(catalog)?;
@@ -552,12 +643,12 @@ fn save_catalog(git_common: &Path, catalog: &Catalog) -> Result<(), NodeError> {
         .map_err(|err| NodeError::InvalidRequest(format!("write {}: {err}", path.display())))
 }
 
-fn upsert(catalog: &mut Catalog, record: WorktreeRecord) {
+pub(crate) fn upsert(catalog: &mut Catalog, record: WorktreeRecord) {
     catalog.worktrees.retain(|row| row.name != record.name);
     catalog.worktrees.push(record);
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String, NodeError> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String, NodeError> {
     let mut command = Command::new("git");
     command.arg("-C").arg(repo).args(args);
     let output = if matches!(args, ["rev-parse", ..] | ["worktree", "list", ..]) {

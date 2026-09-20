@@ -3226,6 +3226,74 @@ mod tests {
     }
 
     #[test]
+    fn a_pooled_worktree_keeps_the_trust_flag_across_lease_and_park() {
+        // t-pool acceptance #9: leasing switches the slot's branch and parking
+        // detaches it, but the catalog record keeps the same name/path, so the
+        // exact-path pre-trust must survive the whole lease → return cycle and
+        // a second warm lease instead of re-triggering onboarding.
+        let (_keep, root) = onboard_init_repo();
+        let task = remuda_protocol::TaskId::new();
+        let lease = crate::worktree_pool::lease(
+            &root,
+            &serde_json::json!({
+                "name": "c-pool",
+                "taskId": task.as_id().as_str(),
+                "base": "main",
+            }),
+        )
+        .expect("lease");
+        assert_eq!(lease["mode"], "pool");
+        let worktree = PathBuf::from(lease["path"].as_str().unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let native_home = dir.path().join("scoped-home");
+        let seeded =
+            seed_shell_agent_prelaunch(&native_home, &worktree, &root, false, true, true, true)
+                .expect("seed while leased");
+        assert_eq!(
+            seeded.trust_containment,
+            Some("provisioned-worktree-record")
+        );
+
+        // Return parks the slot detached; the catalog row is the same path.
+        let returned = crate::worktree_pool::return_slot(
+            &root,
+            &serde_json::json!({
+                "name": lease["name"].as_str().unwrap(),
+                "taskId": task.as_id().as_str(),
+            }),
+        )
+        .expect("return");
+        assert_eq!(returned["state"], "parked");
+        assert_eq!(
+            crate::worktree::provisioned_worktree_named(&root, &worktree).as_deref(),
+            Some(lease["name"].as_str().unwrap()),
+            "provenance follows the same catalog path after parking"
+        );
+
+        // A second task taking the warm slot is still pre-trusted.
+        let task2 = remuda_protocol::TaskId::new();
+        let again = crate::worktree_pool::lease(
+            &root,
+            &serde_json::json!({
+                "name": "c-pool",
+                "taskId": task2.as_id().as_str(),
+                "base": "main",
+            }),
+        )
+        .expect("warm lease");
+        assert_eq!(again["warm"], true);
+        let reseeded =
+            seed_shell_agent_prelaunch(&native_home, &worktree, &root, false, true, true, true)
+                .expect("seed after warm re-lease");
+        assert_eq!(
+            reseeded.trust_containment,
+            Some("provisioned-worktree-record"),
+            "trust flag is not lost by the pool branch switch"
+        );
+    }
+
+    #[test]
     fn an_unregistered_cwd_gets_no_trust_flag() {
         let (_keep, root) = onboard_init_repo();
         let outside = root.parent().unwrap().join("not-a-worktree");

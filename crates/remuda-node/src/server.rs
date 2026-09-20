@@ -894,6 +894,9 @@ async fn dispatch_rpc(
             Ok(json!({ "resources": resources }))
         }
         "worktree.create" => node.worktree_rpc_capped(method, &params).await,
+        // Explicit arms: without them an unknown method falls to the catch-all
+        // and the lease/return would silently no-op (t-pool E1).
+        "worktree.lease" | "worktree.return" => node.worktree_rpc_capped(method, &params).await,
         method if crate::workspace_scm::is_scm_method(method) => {
             crate::workspace_scm::handle_rpc_capped(node, method, &params).await
         }

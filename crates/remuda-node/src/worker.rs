@@ -219,14 +219,10 @@ impl crate::runtime::DevNode {
             serde_json::from_value(params.clone()).map_err(|error| {
                 NodeError::InvalidRequest(format!("invalid worker.remove params: {error}"))
             })?;
-        let result = self.remove_worker_typed(request).await?;
-        serde_json::to_value(result).map_err(NodeError::from)
+        self.remove_worker_typed(request).await
     }
 
-    async fn remove_worker_typed(
-        &self,
-        request: WorkerRemoveParams,
-    ) -> Result<WorkerRemoveResult, NodeError> {
+    async fn remove_worker_typed(&self, request: WorkerRemoveParams) -> Result<Value, NodeError> {
         validate_worker_name(&request.name).map_err(NodeError::InvalidRequest)?;
         // Retiring a worker whose instance row this Node has lost must not wait
         // on that instance — that was the resume-over-a-dead-instance park. It
@@ -286,13 +282,24 @@ impl crate::runtime::DevNode {
         // deadline so a slow or stuck git can never own an async task or park
         // the carrier loop (a stuck git here is exactly what froze the ssh-stdio
         // Node for good).
+        //
+        // t-pool: when the worktree still carries leases, `remove_record`
+        // retains it and we skip the target-dir delete too (it is the shared
+        // warm scratch for that name). The Hub side additionally guards
+        // retire/delete before this RPC is ever sent; this is the on-disk
+        // root-cause guard for any caller that reaches the Node directly.
         let name = request.name.clone();
-        let (worktree_removed, target_removed, reclaimed_bytes) = tokio::time::timeout(
+        let reclaim = tokio::time::timeout(
             RECLAIM_DEADLINE,
             tokio::task::spawn_blocking(move || {
-                let worktree_removed = crate::worktree::remove_record(&workspace_root, &name)?;
-                let (target_removed, reclaimed_bytes) = remove_target_dir(&workspace_root, &name)?;
-                Ok::<_, NodeError>((worktree_removed, target_removed, reclaimed_bytes))
+                let worktree = crate::worktree::remove_record(&workspace_root, &name)?;
+                let (target_removed, reclaimed_bytes) = match &worktree {
+                    crate::worktree::ReclaimOutcome::Retained { .. } => (false, 0u64),
+                    crate::worktree::ReclaimOutcome::Removed(_) => {
+                        remove_target_dir(&workspace_root, &name)?
+                    }
+                };
+                Ok::<_, NodeError>((worktree, target_removed, reclaimed_bytes))
             }),
         )
         .await
@@ -303,12 +310,21 @@ impl crate::runtime::DevNode {
             ))
         })?
         .map_err(|error| NodeError::Driver(format!("worker.remove reclaim join: {error}")))??;
-        Ok(WorkerRemoveResult {
-            name: request.name,
-            worktree_removed,
+        let (worktree_reclaim, target_removed, reclaimed_bytes) = reclaim;
+        let worker_name = request.name.clone();
+        let mut result = serde_json::to_value(WorkerRemoveResult {
+            name: worker_name.clone(),
+            worktree_removed: worktree_reclaim.removed(),
             target_removed,
             reclaimed_bytes: remuda_protocol::U64(reclaimed_bytes),
-        })
+        })?;
+        if let crate::worktree::ReclaimOutcome::Retained { path, refcount } = &worktree_reclaim {
+            tracing::warn!(worker = %worker_name, refcount, "worker.remove retained a leased worktree instead of deleting it");
+            result["retained"] = serde_json::json!(true);
+            result["refcount"] = serde_json::json!(refcount);
+            result["worktreePath"] = serde_json::json!(path);
+        }
+        Ok(result)
     }
 
     /// Best-effort teardown of a worker's pty carrier, under its own deadline.
@@ -407,10 +423,18 @@ mod tests {
         let (removed, _bytes) = remove_target_dir(&root, "c-demo").expect("rm target");
         assert!(removed);
         assert!(!target.exists());
-        assert!(crate::worktree::remove_record(&root, "c-demo").expect("rm worktree"));
+        assert!(
+            crate::worktree::remove_record(&root, "c-demo")
+                .expect("rm worktree")
+                .removed()
+        );
         assert!(!Path::new(&provisioned.path).exists());
         // Idempotent remove.
-        assert!(!crate::worktree::remove_record(&root, "c-demo").unwrap());
+        assert!(
+            !crate::worktree::remove_record(&root, "c-demo")
+                .unwrap()
+                .removed()
+        );
         let (removed, _) = remove_target_dir(&root, "c-demo").unwrap();
         assert!(!removed);
     }

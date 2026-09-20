@@ -102,4 +102,21 @@ remuda merge --web-e2e   # 显式开 web hub e2e（web/src/app/** 改动不自�
 
 ## 9. 全量回归记录
 
-（全量 `pnpm test:e2e:hub` 结果在跑通后回填本节。）
+锁槽 `flock locks/e2e.lock`，端口 `HUB_E2E_LISTEN=127.0.0.1:59220` / `HUB_E2E_WEB_PORT=59229` / `HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59221`，`PW_CHANNEL=chromium`（本机未装 Google Chrome，用 hub 配置支持的 bundled Chromium；与闸口同为 chromium 单浏览器）。
+
+- `pnpm test:e2e:hub m-chrome.hub.spec.ts` 连跑 **3 次全绿**（3/3），三次几何数值完全一致（§5 表）。
+- `ux-chrome.hub.spec.ts`（2）、`ux-touchhit.hub.spec.ts`（4）、`ux-composer-mobile.hub.spec.ts`（3）：**9/9 PASS**。
+- 全量 `pnpm test:e2e:hub` 首轮：140 passed / 1 failed —— 唯一失败是 `spaces-hub-live.spec.ts:165` 的 400px 段仍断言 compact 会话路由**可见** `space-tabs`，即 D-049 明确推翻的旧行为。已把该段改为断言 tabs 不渲染、隔离性经抽屉导航的落点 URL 验证，并刷新 `spaces-1/fake-phone-*.png` 证据（desktop 三张仅重渲染、布局无变化）；单文件复跑 PASS。
+- 全量第二轮（rebase 到含 c-cua-hostcap / c-cua-media 的最新 `origin/main` 后；Playwright 在 rebase 落盘前完成了 spec 扫描，故该轮未收录新文件 `cua-media.hub.spec.ts`）：140 passed / 1 failed —— 唯一失败为 `grok-structural.hub.spec.ts:507`，240s 超时的重型 PTY 链路用例（本轮套件总时长 26.6min 下被饿死）；脱离套件单独复跑 **42.6s PASS**，属既有用时 flake，与本分支文件无交集。
+- 全量第三轮（最终树，含 cua-media；另有一次启动因 `pnpm --dir` 与已在 `web/` 的 cwd 拼成 `web/web` 而立即失败、未执行任何用例，不计）：141 passed / 18 skipped / 1 failed（22.6min，cua-media 用例全部在其中通过）。唯一失败仍是 `grok-structural.hub.spec.ts:507`，这次报「structured tool card never settled」——同一条假节点 PTY settle 等等待在套件负载下超时；整个 `grok-structural.hub.spec.ts` 单独复跑 **2/2 PASS（42.5s/条）**。
+  - **与本分支无关的证据**：该用例全程 1440 视口（`:604` 固定回 1440×900），而本分支所有改动要么挂 `(max-width: 767px)` 媒体查询、要么挂 `mobile &&` 渲染条件，1440 下代码路径与改前逐字节一致；本任务的 `m-chrome` 规格在套件中排第 23–25，该用例排第 8，不存在测试环境污染的先后关系。
+  - 时间线：c-cua-media 合入（**改了 `ToolCard.tsx`，正是这个用例 settle 的结构化工具卡组件**，见 `311006de`/`368b5b74`）前的首轮全量该用例 43.2s PASS；合入后的两轮全量都在负载下挂、单跑都过。
+  - 旁证跑：在裸 `origin/main`（3c24bbd8，无本分支任何提交）上用同一锁槽/端口跑一遍全量，结果见本节末「裸 main 旁证」。hub 闸口配置 CI `retries: 1` 也正是为这类负载 flake 设的。
+
+vitest（最终 rebase 后）：135 文件 / **1302 用例全绿**（c-cua 两批新增 23 个）；`typecheck` / `lint` / `secret-scan.sh` / `no-tunnel-scan.sh` 均 PASS。
+
+### 裸 main 旁证
+
+（`origin/main` @ 3c24bbd8 全量结果回填于此。）
+
+

@@ -33,6 +33,16 @@ wire_enum!(TaskClass, "4.3", {
     Docs => "docs",
 });
 
+// Read-only kanban projection of the ledger (D-050): a column is derived from
+// `state + archived_at + placement`, never stored, and it is not a second
+// state machine — column drags decompose into legal TaskState transitions.
+wire_enum!(BoardColumn, "2.2", {
+    Todo => "todo",
+    InProgress => "in-progress",
+    Done => "done",
+    Archived => "archived",
+});
+
 impl Default for TaskClass {
     // TaskClass is a wire_enum! (no per-variant Default attribute), so the
     // default is an explicit impl rather than a derive: §4.3 makes
@@ -230,6 +240,13 @@ pub struct Task {
     /// Reason carried on `failed` when the worker reported `BLOCKED <reason>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// Archive timestamp; an orthogonal flag (D-050), not a ninth state.
+    /// Archiving never changes `state` (terminal semantics stay untouched); a
+    /// task carrying a timestamp projects to the archive column from any
+    /// state. `None` on every row written before the column existed, and
+    /// skipped on serialise so such rows stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<Timestamp>,
 }
 
 fn default_task_class() -> TaskClass {
@@ -269,6 +286,7 @@ impl Task {
             placement: None,
             landed_sha: None,
             blocked_reason: None,
+            archived_at: None,
         }
     }
 
@@ -306,6 +324,7 @@ impl Task {
             placement: None,
             landed_sha: None,
             blocked_reason: None,
+            archived_at: None,
         }
     }
 
@@ -335,6 +354,41 @@ impl Task {
             })
             .map(|dep| dep.task_id.clone())
             .collect()
+    }
+
+    /// The read-only board column this task projects to; D-050.
+    ///
+    /// Derived purely from `archived_at`, `state` and `placement` — never
+    /// stored, and deliberately absent from [`TaskState::can_transition_to`].
+    /// Rules (plan B.4):
+    /// - `archived_at` is orthogonal and wins over every state without
+    ///   changing it;
+    /// - `pending`/`placed`/`deferred`/`parked` read as the to-do column;
+    /// - `running`/`stalled` read as in-progress;
+    /// - only `done` reads as done;
+    /// - `failed` has no history field, so it is placed deterministically from
+    ///   existing storage: a held placement means it failed mid-flight
+    ///   (in-progress), none means it never left to-do. The failure badge is
+    ///   the state itself, read by the caller; this never creates a fifth
+    ///   column or pre-fail storage.
+    pub fn board_column(&self) -> BoardColumn {
+        if self.archived_at.is_some() {
+            return BoardColumn::Archived;
+        }
+        match self.state {
+            TaskState::Pending | TaskState::Placed | TaskState::Deferred | TaskState::Parked => {
+                BoardColumn::Todo
+            }
+            TaskState::Running | TaskState::Stalled => BoardColumn::InProgress,
+            TaskState::Done => BoardColumn::Done,
+            TaskState::Failed => {
+                if self.placement.is_some() {
+                    BoardColumn::InProgress
+                } else {
+                    BoardColumn::Todo
+                }
+            }
+        }
     }
 }
 
@@ -676,6 +730,100 @@ mod tests {
         assert!(Done.is_terminal());
         assert!(Failed.is_terminal());
         assert!(!Running.is_terminal());
+    }
+
+    #[test]
+    fn board_column_projects_the_eight_states_onto_three_columns() {
+        use TaskState::*;
+        let now = Timestamp::try_from("2026-09-20T10:00:00.000Z".to_string()).unwrap();
+        let mut task = Task::new_root(
+            now,
+            ProjectId::new(),
+            "board".into(),
+            "project the states".into(),
+            TaskClass::Implement,
+            vec![],
+            vec![],
+            TaskBudget::default(),
+        );
+        // No placement yet: the four to-do states and a pre-flight failure.
+        for state in [Pending, Placed, Deferred, Parked, Failed] {
+            task.state = state;
+            task.placement = None;
+            assert_eq!(
+                task.board_column(),
+                BoardColumn::Todo,
+                "{state:?} with no placement"
+            );
+        }
+        // The working states; a failure after dispatch keeps the in-progress
+        // column but the state stays `failed` for the badge.
+        for state in [Running, Stalled] {
+            task.state = state;
+            assert_eq!(task.board_column(), BoardColumn::InProgress);
+        }
+        task.state = Failed;
+        task.placement = Some(TaskPlacementRef::default());
+        assert_eq!(task.board_column(), BoardColumn::InProgress);
+        task.placement = None;
+        assert_eq!(task.board_column(), BoardColumn::Todo);
+        // Only done reads as done.
+        task.state = Done;
+        assert_eq!(task.board_column(), BoardColumn::Done);
+    }
+
+    #[test]
+    fn board_column_archive_is_orthogonal_to_state_and_skipped_on_wire() {
+        let now = Timestamp::try_from("2026-09-20T10:00:00.000Z".to_string()).unwrap();
+        let mut task = Task::new_root(
+            now.clone(),
+            ProjectId::new(),
+            "archive".into(),
+            "archive without moving state".into(),
+            TaskClass::Implement,
+            vec![],
+            vec![],
+            TaskBudget::default(),
+        );
+        // A row without archived_at serialises without the key: old rows stay
+        // byte-identical (plan acceptance 6).
+        assert!(task.archived_at.is_none());
+        assert!(!serde_json::to_string(&task).unwrap().contains("archivedAt"));
+        assert_eq!(task.board_column(), BoardColumn::Todo);
+
+        // Archiving wins over every state and never changes the state itself.
+        task.archived_at = Some(now);
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::Done,
+            TaskState::Failed,
+        ] {
+            task.state = state;
+            assert_eq!(task.board_column(), BoardColumn::Archived);
+        }
+        assert_eq!(task.state, TaskState::Failed, "state is untouched");
+        assert!(
+            TaskState::Failed.is_terminal(),
+            "the state machine stays authoritative"
+        );
+
+        // An old document without the field still decodes as unarchived.
+        let legacy = serde_json::json!({
+            "id": TaskId::new(),
+            "revision": "1",
+            "createdAt": "2026-09-20T10:00:00.000Z",
+            "updatedAt": "2026-09-20T10:00:00.000Z",
+            "projectId": ProjectId::new(),
+            "title": "legacy",
+            "mandate": { "chain": [] },
+            "class": "implement",
+            "state": "running"
+        });
+        let decoded: Task = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.state, TaskState::Running);
+        assert!(decoded.archived_at.is_none());
+        assert_eq!(decoded.board_column(), BoardColumn::InProgress);
     }
 
     #[test]

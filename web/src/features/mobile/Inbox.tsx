@@ -348,7 +348,11 @@ export function Inbox() {
     if (result.ok) {
       setShowHomeHint(false);
     } else if (result.reason === "denied") {
-      setShowHomeHint(true);
+      // D-049: the single permission ask happened from this gesture and was
+      // refused; hide the banner and keep it hidden per device instead of
+      // nagging on every visit. Settings → 通知 still offers the switch.
+      dismissBanner();
+      setDismissed(true);
     }
   };
 

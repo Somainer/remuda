@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 const TIMEOUT: Duration = Duration::from_secs(8);
 
 struct FakePush {
-    hits: Mutex<Vec<String>>,
+    hits: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl Transport for FakePush {
@@ -24,21 +24,34 @@ impl Transport for FakePush {
         &self,
         url: String,
         _headers: Vec<(String, String)>,
-        _body: Vec<u8>,
+        body: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<u16, PushError>> + Send + '_>>
     {
-        self.hits.lock().expect("hits").push(url);
+        self.hits.lock().expect("hits").push((url, body));
         Box::pin(async { Ok(201) })
     }
 }
 
-fn sample_keys() -> (String, String) {
+fn sample_keys() -> (ece::crypto::EcKeyComponents, [u8; 16], String, String) {
     let (pair, auth) = ece::generate_keypair_and_auth_secret().expect("ece");
     use base64::Engine;
+    let components = pair.raw_components().expect("components");
     let p256dh =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pair.pub_as_raw().expect("pub"));
     let auth_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(auth);
-    (p256dh, auth_b64)
+    (components, auth, p256dh, auth_b64)
+}
+
+/// Decrypt the newest delivered push body and parse its JSON payload.
+fn latest_payload(
+    fake: &FakePush,
+    components: &ece::crypto::EcKeyComponents,
+    auth: &[u8; 16],
+) -> Value {
+    let hits = fake.hits.lock().expect("hits");
+    let (_, body) = hits.last().expect("at least one push delivered");
+    let plain = ece::decrypt(components, auth, body).expect("decrypt");
+    serde_json::from_slice(&plain).expect("payload json")
 }
 
 async fn http(
@@ -245,7 +258,7 @@ async fn pairing_list_revoke_and_push_with_follow_suppress() -> Result<()> {
     let list: Value = serde_json::from_str(list.trim())?;
     assert_eq!(list["items"].as_array().map(|a| a.len()), Some(1));
 
-    let (p256dh, auth_key) = sample_keys();
+    let (components, auth_bytes, p256dh, auth_key) = sample_keys();
     let sub = json!({
         "endpoint": "http://127.0.0.1:9/fake-push",
         "keys": { "p256dh": p256dh, "auth": auth_key }
@@ -270,8 +283,36 @@ async fn pairing_list_revoke_and_push_with_follow_suppress() -> Result<()> {
     )
     .await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !fake.hits.lock().expect("hits").is_empty(),
+        "expected push for interaction.requested"
+    );
+
+    // D-049 badge: the encrypted payload carries the device's current
+    // pending interaction count, alongside the existing deep link.
+    let payload = latest_payload(&fake, &components, &auth_bytes);
+    assert_eq!(payload["badge"], 1, "badge equals pending count: {payload}");
+    assert_eq!(payload["data"]["url"], "/approvals?focus=int_test_1");
+
+    // A second pending interaction on the same instance pushes again with
+    // the count raised to two.
+    append(
+        &mut node,
+        instance_id.as_id().as_str(),
+        json!({
+            "kind": "interaction.requested",
+            "interactionId": "int_test_2",
+            "payload": { "interactionId": "int_test_2" }
+        }),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let payload = latest_payload(&fake, &components, &auth_bytes);
+    assert_eq!(
+        payload["badge"], 2,
+        "badge tracks the pending total: {payload}"
+    );
     let after_first = fake.hits.lock().expect("hits").len();
-    assert!(after_first >= 1, "expected push for interaction.requested");
 
     let mut follow_req = format!(
         "ws://{}/v1/follow?instanceId={}",
@@ -329,5 +370,10 @@ async fn pairing_list_revoke_and_push_with_follow_suppress() -> Result<()> {
         after_block > after_exit,
         "blocked > push_block_ms should notify"
     );
+
+    // Neither interaction was answered, so non-interaction alerts (exited /
+    // still-waiting) carry the same pending total on every push.
+    let payload = latest_payload(&fake, &components, &auth_bytes);
+    assert_eq!(payload["badge"], 2, "badge on waiting alert: {payload}");
     Ok(())
 }

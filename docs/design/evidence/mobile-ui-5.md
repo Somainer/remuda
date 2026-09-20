@@ -115,8 +115,18 @@ remuda merge --web-e2e   # 显式开 web hub e2e（web/src/app/** 改动不自�
 
 vitest（最终 rebase 后）：135 文件 / **1302 用例全绿**（c-cua 两批新增 23 个）；`typecheck` / `lint` / `secret-scan.sh` / `no-tunnel-scan.sh` 均 PASS。
 
-### 裸 main 旁证
+### 新基线下的复核（rebase 到 6202e0af，含 m-voice / m-mobilenew 之后）
 
-（`origin/main` @ 3c24bbd8 全量结果回填于此。）
+`origin/main` 在本任务收尾时又合入 m-voice（改 `Composer.tsx`）与 m-mobilenew，已 rebase 并复核：
+
+- vitest 138 文件 / **1329 用例全绿**；typecheck / lint PASS。
+- `m-chrome.hub.spec.ts` 在新基线上再连跑 **3 次全绿**，三次几何与旧基线**逐像素一致**（0.761 / 0.658 / 0.887 / 0.717）——m-voice 的麦克风按钮按 D-049 §4.8 只在 `SpeechRecognition` 存在时渲染，闸口 chromium 无该能力，收起 composer 高度不变；证据 PNG 重新生成后 git 无差异。
+- `ux-chrome` / `ux-touchhit` / `ux-composer-mobile` 新基线上 **9/9 PASS**。
+- 最终树全量 hub e2e 结果：见下（回填）。
+
+### 裸 main 旁证（未完成，已放弃）
+
+曾在临时 worktree 的裸 3c24bbd8 上启动全量以做 flake 归因，因 main 随后又前进两个合并而主动中止（`TaskStop`，端口确认释放、worktree 已删除）；grok flake 的归因以上面四条证据（1440 视口下本分支代码路径零差异、单跑 42.5s 过、cua 改 ToolCard 后才出现、CI 配置 `retries: 1`）为准。
+
 
 

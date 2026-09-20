@@ -1627,6 +1627,25 @@ mod tests {
     use crate::runtime::fixture_instance;
     use remuda_protocol::{AgentKind, HostId, InstanceId, WorkspaceId};
 
+    /// Every file path under `root`, recursively (test artefact sweeps).
+    fn walkdir(root: &Path) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        files
+    }
+
     /// A stub executable standing in for the running `remuda` binary.
     fn write_relay_source(dir: &Path) -> PathBuf {
         let path = dir.join("remuda");
@@ -2621,7 +2640,12 @@ mod tests {
         // D-047: a `via` launch ignores the gateway base URL and delivered
         // token entirely — the 0600 overlay must point at the per-instance
         // loopback listener and carry the minted relay bearer. A gateway
-        // credential must never appear in the file (D-021/D-035).
+        // credential must never appear in the file (D-021/D-035). All
+        // credentials here are synthetic, `fake-`-delimited test values.
+        const GATEWAY_TOKEN: &str = "sk-fake-gateway-0001";
+        const GATEWAY_ORIGIN: &str = "https://gateway.example/v1";
+        const RELAY_BEARER: &str = "fake-relay-0002";
+        const LISTENER_URL: &str = "http://127.0.0.1:41317/v1";
         let dir = tempfile::tempdir().expect("tempdir");
         let host = HostId::new();
         let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
@@ -2633,11 +2657,123 @@ mod tests {
             "providerProfileId": "pvp_example",
             "providerOverlay": {
                 "kind": "gateway",
-                "baseUrl": "https://gateway.example/v1",
+                "baseUrl": GATEWAY_ORIGIN,
                 "model": "haiku",
                 "scope": format!("host:{}", host.as_id().as_str())
             },
-            "providerAuthToken": "gateway-secret-must-not-be-written"
+            "providerAuthToken": GATEWAY_TOKEN
+        }))
+        .expect("request");
+        // The delivered gateway token is on the request — the point of the
+        // test is that even present, it never reaches W's overlay.
+        assert_eq!(request.provider_auth_token.as_deref(), Some(GATEWAY_TOKEN));
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: String::new(),
+            delegation: Delegation::Gateway,
+            secret_ref: None,
+            models: vec!["haiku".into()],
+            health: ProviderHealth::Healthy,
+        };
+        let relay = crate::api_relay::RelayOverlay {
+            base_url: LISTENER_URL.into(),
+            bearer: RELAY_BEARER.into(),
+        };
+        let launch_root = dir.path().join("launch");
+        let path = resolve_claude_overlay(
+            &request,
+            &launch_root,
+            DriverKind::ClaudePty,
+            Delegation::Gateway,
+            &profile,
+            Some(&relay),
+        )
+        .expect("overlay")
+        .expect("path");
+        let bytes = std::fs::read(&path).unwrap();
+        let serialized = String::from_utf8(bytes).unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], LISTENER_URL);
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], RELAY_BEARER);
+        assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
+            "1"
+        );
+        assert_eq!(settings["model"], "haiku");
+        assert!(
+            !serialized.contains(GATEWAY_TOKEN),
+            "the gateway credential must never reach the worker overlay"
+        );
+        assert!(
+            !serialized.contains("gateway.example"),
+            "the gateway origin must never reach the worker overlay"
+        );
+        // Sweep every artefact under the launch root, not just the one file:
+        // nothing this launch wrote on W names the gateway.
+        for entry in walkdir(&launch_root) {
+            let text = std::fs::read_to_string(&entry).unwrap_or_default();
+            assert!(
+                !text.contains(GATEWAY_TOKEN),
+                "gateway token found in {}",
+                entry.display()
+            );
+            assert!(
+                !text.contains("gateway.example"),
+                "gateway origin found in {}",
+                entry.display()
+            );
+        }
+        // The relay bearer redacts in Debug (the overlay rides DriverLaunch,
+        // which is logged through ordinary derive-Debug paths).
+        assert!(
+            !format!("{relay:?}").contains(RELAY_BEARER),
+            "RelayOverlay Debug must redact the bearer"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+            );
+        }
+    }
+
+    #[test]
+    fn via_launch_artefacts_never_carry_the_gateway_token() {
+        // The redaction sweep at the W launch boundary: replay what the native
+        // carrier does with the overlay resolve_claude_overlay wrote — merge it
+        // over the host user's own settings, apply the dispatch pin, render the
+        // redacted log line — then grep *every file* the launch produced. The
+        // synthetic gateway token may appear in none of them; the relay bearer
+        // may appear only in the 0600 settings documents.
+        const GATEWAY_TOKEN: &str = "sk-fake-gateway-0001";
+        const GATEWAY_ORIGIN: &str = "https://gateway.example/v1";
+        const HOST_TOKEN: &str = "sk-fake-host-0003";
+        const HOST_ORIGIN: &str = "https://host-gateway.example/v1";
+        const RELAY_BEARER: &str = "fake-relay-0002";
+        const LISTENER_URL: &str = "http://127.0.0.1:41317/v1";
+        const PIN: &str = "model_hub/es1_orange_o50[1m]";
+        const HOST_MODEL: &str = "model_hub/host_default";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = HostId::new();
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-pty",
+            "hostId": host,
+            "model": "haiku",
+            "delegation": "gateway",
+            "providerProfileId": "pvp_example",
+            "providerOverlay": {
+                "kind": "gateway",
+                "baseUrl": GATEWAY_ORIGIN,
+                "model": "haiku",
+                "scope": format!("host:{}", host.as_id().as_str())
+            },
+            "providerAuthToken": GATEWAY_TOKEN
         }))
         .expect("request");
         let profile = ProviderProfile {
@@ -2650,12 +2786,13 @@ mod tests {
             health: ProviderHealth::Healthy,
         };
         let relay = crate::api_relay::RelayOverlay {
-            base_url: "http://127.0.0.1:41317/v1".into(),
-            bearer: "relay-bearer-value".into(),
+            base_url: LISTENER_URL.into(),
+            bearer: RELAY_BEARER.into(),
         };
-        let path = resolve_claude_overlay(
+        let launch_root = dir.path().join("instances").join("ins_x").join("launch");
+        let overlay_path = resolve_claude_overlay(
             &request,
-            &dir.path().join("launch"),
+            &launch_root,
             DriverKind::ClaudePty,
             Delegation::Gateway,
             &profile,
@@ -2663,39 +2800,87 @@ mod tests {
         )
         .expect("overlay")
         .expect("path");
-        let settings: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            settings["env"]["ANTHROPIC_BASE_URL"],
-            "http://127.0.0.1:41317/v1"
-        );
-        assert_eq!(
-            settings["env"]["ANTHROPIC_AUTH_TOKEN"],
-            "relay-bearer-value"
-        );
-        assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
-        assert_eq!(
-            settings["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
-            "1"
-        );
-        assert_eq!(settings["model"], "haiku");
-        let serialized = serde_json::to_string(&settings).unwrap();
-        assert!(
-            !serialized.contains("gateway-secret-must-not-be-written"),
-            "the gateway credential must never reach the worker overlay"
-        );
-        assert!(
-            !serialized.contains("gateway.example"),
-            "the gateway origin must never reach the worker overlay"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600,
+
+        // Replay shell_pty's merge: the host's own settings are the base layer.
+        let host_settings = serde_json::json!({
+            "model": HOST_MODEL,
+            "env": {
+                "ANTHROPIC_BASE_URL": HOST_ORIGIN,
+                "ANTHROPIC_AUTH_TOKEN": HOST_TOKEN,
+                "ANTHROPIC_API_KEY": HOST_TOKEN,
+                "ANTHROPIC_MODEL": HOST_MODEL,
+                "CLAUDE_CODE_SUBAGENT_MODEL": HOST_MODEL,
+            },
+            "theme": "dark",
+        });
+        let operator: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&overlay_path).unwrap()).unwrap();
+        let mut merged =
+            remuda_driver::launch::merge_provider_overlay_over_user(&host_settings, &operator);
+        remuda_driver::launch::apply_model_pin(&mut merged, PIN);
+        std::fs::write(
+            launch_root.join("settings.merged.json"),
+            serde_json::to_vec_pretty(&merged).unwrap(),
+        )
+        .unwrap();
+        // The only settings render that may reach a log.
+        let log_line = format!("{:?}", remuda_driver::launch::redact_settings(&merged));
+        std::fs::write(launch_root.join("merge-debug.log"), log_line).unwrap();
+
+        let mut saw_settings = 0usize;
+        for path in walkdir(dir.path()) {
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                !text.contains(GATEWAY_TOKEN),
+                "gateway token reached {}",
+                path.display()
             );
+            assert!(
+                !text.contains("gateway.example"),
+                "gateway origin reached {}",
+                path.display()
+            );
+            assert!(
+                !text.contains(HOST_TOKEN),
+                "host credential reached {}",
+                path.display()
+            );
+            assert!(
+                !text.contains("host-gateway.example"),
+                "host gateway origin reached {}",
+                path.display()
+            );
+            let settings_doc = name == "settings.json" || name == "settings.merged.json";
+            if !settings_doc {
+                assert!(
+                    !text.contains(RELAY_BEARER),
+                    "relay bearer leaked into non-settings artefact {}",
+                    path.display()
+                );
+            } else {
+                assert!(
+                    text.contains(RELAY_BEARER),
+                    "settings doc keeps the bearer: {name}"
+                );
+                assert!(
+                    text.contains(LISTENER_URL),
+                    "settings doc keeps the listener: {name}"
+                );
+                saw_settings += 1;
+            }
         }
+        assert_eq!(
+            saw_settings, 2,
+            "both produced settings documents were swept"
+        );
+        // And the final merged document actually serves the pin on the relay.
+        assert_eq!(merged["model"], PIN);
+        assert_eq!(merged["env"]["ANTHROPIC_BASE_URL"], LISTENER_URL);
+        assert_eq!(merged["env"]["ANTHROPIC_AUTH_TOKEN"], RELAY_BEARER);
     }
 
     #[test]
@@ -2709,12 +2894,12 @@ mod tests {
             "driver": "generic-pty",
             "delegation": "gateway",
             "providerOverlay": { "kind": "gateway", "baseUrl": "https://gateway.example/v1" },
-            "providerAuthToken": "gateway-credential",
+            "providerAuthToken": "sk-fake-gateway-0001",
         }))
         .expect("request");
         let relay = crate::api_relay::RelayOverlay {
             base_url: "http://127.0.0.1:9/v1".into(),
-            bearer: "relay-bearer".into(),
+            bearer: "fake-relay-0002".into(),
         };
         let profile = ProviderProfile {
             id: Id::new("pvp").expect("profile id"),

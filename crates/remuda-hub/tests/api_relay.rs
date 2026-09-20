@@ -2811,6 +2811,81 @@ async fn an_auto_route_against_a_relaybind_host_still_gets_egress() -> Result<()
     gateway.shutdown().await;
     Ok(())
 }
+
+/// c-apiroute-launch: the instance projection carries the route the **Node**
+/// reported even when it differs from the requested one. The dispatch asks
+/// `apiRoute: auto` against a host advertising a relayBind, so validation keeps
+/// `auto` on the stored spec; the fake Node cannot probe the private bind and
+/// echoes its one-time launch decision, `hub-relay`. The projected row must say
+/// `hub-relay` — `auto` is a request, never an observation (D-035) — and the
+/// requested route is never copied into that field.
+#[tokio::test]
+async fn instance_projection_carries_the_node_reported_hub_relay_route() -> Result<()> {
+    let gateway = FakeGateway::start().await?;
+    let (fixture, proxy) = fixture_routed_via_h_with(
+        &gateway.base_url_v1(),
+        ViaOpts {
+            route: "auto",
+            relay_bind: true,
+        },
+    )
+    .await?;
+    let proxy_host = proxy.host_id.clone();
+
+    // The echo is projected on the create-accept path that unblocks dispatch;
+    // poll the real HTTP surface rather than assume ordering.
+    let (projection, raw) = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (status, _, body) = http(
+                fixture.addr,
+                "GET",
+                &format!("/v1/instances/{}", fixture.instance_id),
+                &[("Cookie", &fixture.cookie)],
+                None,
+            )
+            .await?;
+            if status == 200 {
+                let view: Value = serde_json::from_str(body.trim())?;
+                if view.get("apiRoute").is_some() {
+                    break Ok::<_, anyhow::Error>((view, body));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting for the Node-reported apiRoute projection"))??;
+
+    let route = &projection["apiRoute"];
+    assert_eq!(route["mode"], json!("via"), "{route}");
+    assert_eq!(
+        route["route"],
+        json!("hub-relay"),
+        "the observation is the Node's hub-relay fallback; `auto` is a request and \
+         must never be recorded as what ran (D-035): {route}"
+    );
+    assert_eq!(
+        route["viaHostId"],
+        json!(proxy_host),
+        "the projected route names the proxy the Node used: {route}"
+    );
+    assert_eq!(
+        route["viaHostLabel"],
+        json!("relay-proxy"),
+        "the Hub attaches its registry label on write-back: {route}"
+    );
+
+    // No credential ever rides an HTTP response for a via launch: the
+    // gateway token lives on the proxy host out of band (api.egress), never
+    // in the instance projection the API serves.
+    assert!(
+        !raw.contains(PROFILE_TOKEN),
+        "gateway token appeared in the instance projection: {raw}"
+    );
+
+    gateway.shutdown().await;
+    Ok(())
+}
 /// Item 4: a proxy host that drops and re-hellos receives a fresh api.egress
 /// before the next api.open reaches it.
 #[tokio::test]

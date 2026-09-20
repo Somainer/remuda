@@ -4653,4 +4653,47 @@ mod api_relay_launch_test {
         let error = node.create_instance(request).await.expect_err("refused");
         assert!(error.to_string().contains("viaHostId"), "{error}");
     }
+
+    /// D-035 at the launch boundary: `route: direct-net` whose probe fails is
+    /// refused with the stable `api-via-unreachable` code. Nothing is bound,
+    /// no instance row exists, and there is no silent reroute to hub-relay.
+    #[tokio::test]
+    async fn direct_net_probe_failure_refuses_without_creating_an_instance() {
+        let node = node();
+        let instance_id = remuda_protocol::InstanceId::new();
+        let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "instanceId": instance_id.as_id().to_string(),
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            // Port 1 refuses immediately, so the launch-time probe fails fast.
+            "apiRelayEndpoint": "http://127.0.0.1:1/",
+            "apiRoute": {
+                "mode": "via",
+                "viaHostId": HostId::new(),
+                "route": "direct-net"
+            }
+        }))
+        .expect("request");
+        let error = node
+            .create_instance(request)
+            .await
+            .expect_err("direct-net must refuse when the probe fails");
+        assert!(
+            error.to_string().contains("api-via-unreachable"),
+            "the refusal names the stable code: {error}"
+        );
+        // No listener was bound for an instance that never launched.
+        assert!(
+            node.api_relay()
+                .instance_relay(instance_id.as_id().as_str())
+                .is_none(),
+            "a refused direct-net launch must leave no listener behind"
+        );
+        // And no instance row: the refusal precedes the create insert.
+        assert!(
+            node.store().get_instance(&instance_id).ok().is_none(),
+            "a refused launch creates no instance record"
+        );
+    }
 }

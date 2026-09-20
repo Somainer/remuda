@@ -474,16 +474,40 @@ fn trim_secret_bytes(mut bytes: Vec<u8>) -> Vec<u8> {
 ///
 /// The secret is written only into the 0600 settings file. Do not log this struct
 /// with a custom formatter that exposes [`Secret::expose`].
+///
+/// ## D-047 `via` delivery: the same shape, relay values
+///
+/// When the Hub resolved the dispatch to route through another host, the Node
+/// on the worker host W calls this with the *same* enum variant
+/// ([`Delegation::Gateway`]) but different values: [`Self::base_url`] is the
+/// Node-local per-instance loopback relay listener (`http://127.0.0.1:<port>/…`)
+/// and [`Self::secret`] is the per-instance relay bearer the Node minted, not
+/// the gateway credential. The gateway origin and its token never reach W, so
+/// they can never be arguments here on that path; the relay bearer is
+/// redacted and guarded exactly like a gateway token (0600 file, redacting
+/// [`Secret`] debug, stripped from logs), even though it is worthless anywhere
+/// but at the live loopback listener.
 pub struct ClaudeProviderOverlay<'a> {
     /// `gateway` writes `ANTHROPIC_AUTH_TOKEN`; `direct` writes `ANTHROPIC_API_KEY`.
+    ///
+    /// A D-047 `via` launch writes through the `gateway` arm too: its token is
+    /// the per-instance relay bearer and its URL is the loopback listener.
     pub delegation: Delegation,
     /// Ingress base URL. Required for [`Delegation::Gateway`].
+    ///
+    /// For a D-047 `via` launch this is the per-instance loopback listener URL
+    /// on the worker host — never the gateway origin.
     pub base_url: &'a str,
     /// Overlay `model` field (also passed as `--model` by the materializer).
     pub model: &'a str,
-    /// Auth token. Never log [`Secret::expose`].
+    /// Credential written into the overlay. For ordinary gateway delivery this
+    /// is the gateway bearer; for D-047 `via` it is the minted per-instance
+    /// relay bearer. Either way: never log [`Secret::expose`].
     pub secret: &'a Secret,
     /// Extra env names copied into `settings.env` (non-secret).
+    ///
+    /// Always empty on a `via` launch: profile headers are applied on the
+    /// egress host H, never written into W's settings.
     pub extra_env: &'a BTreeMap<String, String>,
 }
 
@@ -501,6 +525,12 @@ impl fmt::Debug for ClaudeProviderOverlay<'_> {
 }
 
 /// Build Claude `settings.json` for a gateway/direct profile. Never log the return.
+///
+/// The document shape is the same for a D-047 `via` launch, whose `gateway`
+/// values are then the worker host's loopback listener URL and the per-instance
+/// relay bearer: nothing about the relay is visible in the env key names, which
+/// is why the host's own `ANTHROPIC_*` keys are evicted by the same merge path
+/// (see [`crate::launch::merge_provider_overlay_over_user`]).
 pub fn claude_provider_settings_json(overlay: &ClaudeProviderOverlay<'_>) -> DriverResult<Value> {
     if overlay.delegation == Delegation::None {
         return Err(DriverError::InvalidLaunchSpec(

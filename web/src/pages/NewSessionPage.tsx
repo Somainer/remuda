@@ -198,6 +198,11 @@ export function NewSessionPage() {
   const [statusChecked, setStatusChecked] = useState(false);
   const [clientRequestId, setClientRequestId] = useState<string | null>(null);
   const [gatewayProfiles, setGatewayProfiles] = useState<ProviderProfile[]>([]);
+  // D-047 per-dispatch delivery override, shown next to the model source.
+  // "" = no override (request > project > profile > direct waterfall);
+  // "none"/"self"/<hostId> force the route for this one session.
+  const [apiVia, setApiVia] = useState("");
+  const [apiRouteMode, setApiRouteMode] = useState<"auto" | "hub-relay" | "direct-net">("auto");
 
   // Where the sheet was opened from. It has an origin when the browser history
   // already has an entry in this tab (real browser) or when the router
@@ -508,6 +513,9 @@ export function NewSessionPage() {
                 name: name || worktree || (plainTerminal ? "terminal" : undefined),
                 effortIndex: sessionEffort.index,
                 effortName: effortWireName(sessionEffort),
+                ...(apiVia
+                  ? { apiVia, apiRoute: apiVia === "none" ? undefined : apiRouteMode }
+                  : {}),
               });
               // The create is confirmed: this context's draft is spent.
               clearNewSessionDraft(authSubject, hostId, workspace.id);
@@ -873,6 +881,50 @@ export function NewSessionPage() {
                     // Showing `defaultModel` made the line contradict the run.
                     `${defaultGateway.name} · ${launchModel || "model"}`
                   : "请先在 Provider 页配置网关"}
+              </span>
+            ) : null}
+            {delegation === "gateway" ? (
+              <span className={css.hint} data-testid="new-session-api-via">
+                <label>
+                  模型 API 出口{" "}
+                  <select
+                    data-testid="new-session-api-via-select"
+                    value={apiVia}
+                    onChange={(e) => setApiVia(e.target.value)}
+                  >
+                    <option value="">按 profile（默认）</option>
+                    <option value="none">强制直连（none）</option>
+                    <option value="self">经 Hub 主机（self）</option>
+                    {hosts.map((host) => (
+                      <option key={host.id} value={host.id}>
+                        经 {host.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {apiVia && apiVia !== "none" ? (
+                  <label style={{ marginLeft: 8 }}>
+                    路由{" "}
+                    <select
+                      data-testid="new-session-api-route-select"
+                      value={apiRouteMode}
+                      onChange={(e) =>
+                        setApiRouteMode(e.target.value as typeof apiRouteMode)
+                      }
+                    >
+                      <option value="auto">自动</option>
+                      <option value="hub-relay">Hub 中转</option>
+                      <option value="direct-net">直连网络</option>
+                    </select>
+                  </label>
+                ) : null}
+                {apiVia && hosts.find((host) => host.id === apiVia)?.state !== "online"
+                  && hosts.find((host) => host.id === apiVia)?.state !== "enrolled"
+                  && apiVia !== "none" && apiVia !== "self" ? (
+                  <span data-testid="new-session-api-via-offline" style={{ color: "var(--dust)" }}>
+                    该主机当前离线，派发将被 Hub 拒绝（api-via-host-offline），不会改道
+                  </span>
+                ) : null}
               </span>
             ) : null}
             {claudeHint ? (

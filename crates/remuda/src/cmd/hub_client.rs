@@ -220,19 +220,32 @@ pub(crate) fn print_json(value: &Value) -> anyhow::Result<()> {
 pub(crate) fn hub_http_error(err: ClientError) -> anyhow::Error {
     if let ClientError::Http { status, body } = &err
         && let Ok(value) = serde_json::from_str::<Value>(body)
-        && value.get("code").and_then(Value::as_str) == Some("PIN_REFUSED")
     {
-        let headline = value
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("pin refused");
-        let mut lines = vec![format!("hub HTTP {status}: {headline}")];
-        if let Some(reasons) = value.get("reasons").and_then(Value::as_array) {
-            for reason in reasons.iter().filter_map(Value::as_str) {
-                lines.push(format!("  - {reason}"));
+        let code = value.get("code").and_then(Value::as_str).unwrap_or("");
+        if code == "PIN_REFUSED" {
+            let headline = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("pin refused");
+            let mut lines = vec![format!("hub HTTP {status}: {headline}")];
+            if let Some(reasons) = value.get("reasons").and_then(Value::as_array) {
+                for reason in reasons.iter().filter_map(Value::as_str) {
+                    lines.push(format!("  - {reason}"));
+                }
             }
+            return anyhow::anyhow!(lines.join("\n"));
         }
-        return anyhow::anyhow!(lines.join("\n"));
+        // D-047: a delivery refusal is terminal — dispatch exits non-zero and
+        // nothing retries another route. Surface the stable refusal code
+        // (`api-via-unknown-host` / `-host-offline` / `-unsupported` /
+        // `-unreachable`) on the first line instead of burying it in JSON.
+        if code.starts_with("api-via-") {
+            let headline = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("delivery refused");
+            return anyhow::anyhow!("hub HTTP {status}: {code}\n  {headline}");
+        }
     }
     anyhow::Error::new(err)
 }

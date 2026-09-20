@@ -258,6 +258,7 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     signalTier?: string | null;
     lastError?: string | null;
     usageRollup?: unknown;
+    apiRoute?: components["schemas"]["ApiRoute"] | null;
   };
   const ptyDriver = driver === "generic-pty" || driver === "claude-pty" || driver === "shell-pty";
   const capabilities =
@@ -374,6 +375,16 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,
     promotedAt: typeof extra.promotedAt === "string" ? extra.promotedAt : null,
     usageRollup: coerceUsageRollup(rec.usageRollup ?? extra.usageRollup),
+    // D-047: the Node-echoed route only; a direct session omits it and the
+    // requested route is never mapped here (D-035).
+    apiRoute: extra.apiRoute
+      ? {
+          mode: extra.apiRoute.mode === "via" ? ("via" as const) : ("direct" as const),
+          ...(extra.apiRoute.route ? { route: extra.apiRoute.route } : {}),
+          ...(extra.apiRoute.viaHostId ? { viaHostId: extra.apiRoute.viaHostId as string } : {}),
+          ...(extra.apiRoute.viaHostLabel ? { viaHostLabel: extra.apiRoute.viaHostLabel } : {}),
+        }
+      : null,
   };
 }
 
@@ -449,6 +460,14 @@ export type InstanceCreateSpec = {
   /** Composer/New Session effort. Stored in UI state; Hub ignores unknown create fields. */
   effortIndex?: number;
   effortName?: string;
+  /**
+   * D-047 per-dispatch delivery override: a proxy host id, `self` for the Hub
+   * host, or `none` to force direct. A target the Hub cannot honour refuses
+   * with an `api-via-*` code; it never reroutes.
+   */
+  apiVia?: string;
+  /** Route sub-mode for {@link InstanceCreateSpec.apiVia}. */
+  apiRoute?: "auto" | "hub-relay" | "direct-net";
 };
 
 export type InstanceConfigurePatch = {
@@ -506,6 +525,8 @@ export type HubProviderRow = {
   revision: string;
   secret: { present: boolean; last4?: string | null; fingerprint?: string | null };
   health?: { ok: boolean; checkedAt?: string | null; message?: string | null; status?: number | null; latencyMs?: number | null } | null;
+  /** D-047 model-API delivery; absent reads as direct/auto. */
+  delivery?: components["schemas"]["ProviderDelivery"];
   createdAt?: string;
   updatedAt?: string;
 };
@@ -1279,6 +1300,10 @@ function createLiveApi(): HubApi {
         args: spec.args?.length ? spec.args : undefined,
         binaryPath: spec.binaryPath || undefined,
         tui: spec.tui,
+        // D-047 per-dispatch delivery override; omitted when the operator
+        // leaves delivery to the profile/project waterfall.
+        apiVia: spec.apiVia || undefined,
+        apiRoute: spec.apiVia ? spec.apiRoute : undefined,
       };
       const created = await rest<HubJson<"/v1/instances", "post">>("/v1/instances", {
         method: "POST",

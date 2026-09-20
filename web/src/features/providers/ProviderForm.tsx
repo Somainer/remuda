@@ -4,20 +4,25 @@ import ui from "../../styles/ui.module.css";
 import css from "./providers.module.css";
 import { ModelList } from "./ModelList";
 import {
+  DELIVERY_ROUTE_LABELS,
+  DEFAULT_DELIVERY,
+  effectiveDelivery,
   mergeDiscovered,
+  type ApiRouteMode,
+  type DeliveryHost,
   type ProviderCreate,
+  type ProviderDelivery,
   type ProviderModel,
   type ProviderProfile,
 } from "./model";
-
-type HostOption = { id: string; label: string };
 
 type Props = {
   initial?: ProviderProfile;
   rotateOnly?: boolean;
   busy?: boolean;
   error?: string | null;
-  hosts?: HostOption[];
+  /** Hosts a `via` delivery can name; `online` drives the offline warning. */
+  hosts?: DeliveryHost[];
   /** Probe `{baseUrl}/v1/models` before the profile exists. */
   onDiscover?: (input: { baseUrl: string; token: string; profileId?: string }) => Promise<ProviderModel[]>;
   onSubmit: (body: ProviderCreate) => void;
@@ -53,12 +58,25 @@ export function ProviderForm({
   const [defaultGateway, setDefaultGateway] = useState(initial?.defaultGateway ?? true);
   const [scopeKind, setScopeKind] = useState<"universal" | "host">(initialScope.kind);
   const [scopeHostId, setScopeHostId] = useState(initialScope.hostId || hosts[0]?.id || "");
+  // D-047 交付方式: direct (default) or via a named host, plus the route
+  // sub-mode the launch decides once and echoes back.
+  const [delivery, setDelivery] = useState<ProviderDelivery>(
+    effectiveDelivery(initial?.delivery),
+  );
+  // Keep the selected proxy host where possible when the host list arrives
+  // after the form opened, the way the scope selector does.
+  const viaHostId = delivery.mode === "via"
+    ? (delivery.viaHostId || hosts[0]?.id || "")
+    : "";
+  const viaHost = hosts.find((host) => host.id === viaHostId);
+  const viaHostOffline = delivery.mode === "via" && viaHost?.online === false;
   const tokenRequired = !editing || rotateOnly;
   const canSave =
     name.trim() &&
     (kind === "direct" || baseUrl.trim()) &&
     (!tokenRequired || authToken.trim()) &&
-    (scopeKind !== "host" || Boolean(scopeHostId));
+    (scopeKind !== "host" || Boolean(scopeHostId)) &&
+    (kind !== "gateway" || delivery.mode !== "via" || Boolean(viaHostId));
 
   const discover = async () => {
     setDiscovering(true);
@@ -105,6 +123,20 @@ export function ProviderForm({
           authToken: authToken.trim(),
           defaultGateway: kind === "gateway" && defaultGateway,
           scope: scopeKind === "host" && scopeHostId ? `host:${scopeHostId}` : "universal",
+          // Always send the delivery on a gateway save so an edit that flips
+          // via back to direct actually clears the stored object (PATCH
+          // replaces, never merges, the delivery).
+          ...(kind === "gateway"
+            ? {
+                delivery: {
+                  mode: delivery.mode,
+                  route: delivery.route,
+                  ...(delivery.mode === "via" && viaHostId
+                    ? { viaHostId: viaHostId }
+                    : {}),
+                } satisfies ProviderDelivery,
+              }
+            : {}),
         });
       }}
     >
@@ -232,6 +264,89 @@ export function ProviderForm({
               />
               设为该范围的默认网关
             </label>
+          ) : null}
+          {kind === "gateway" ? (
+            <fieldset
+              className={ui.field}
+              style={{ border: 0, padding: 0, margin: 0 }}
+              data-testid="provider-delivery"
+              data-mode={delivery.mode}
+            >
+              <legend>交付方式</legend>
+              <div className={css.seg}>
+                <button
+                  type="button"
+                  className={`${css.choice} ${delivery.mode === "direct" ? css.choiceOn : ""}`}
+                  data-testid="provider-delivery-direct"
+                  onClick={() => setDelivery(DEFAULT_DELIVERY)}
+                >
+                  直连
+                </button>
+                <button
+                  type="button"
+                  className={`${css.choice} ${delivery.mode === "via" ? css.choiceOn : ""}`}
+                  data-testid="provider-delivery-via"
+                  onClick={() => {
+                    const hostId = delivery.viaHostId || hosts[0]?.id || "";
+                    setDelivery({
+                      mode: "via",
+                      route: delivery.route,
+                      ...(hostId ? { viaHostId: hostId } : {}),
+                    });
+                  }}
+                >
+                  经主机
+                </button>
+              </div>
+              {delivery.mode === "via" ? (
+                <>
+                  <label className={ui.field}>
+                    代理主机
+                    <select
+                      className={ui.input}
+                      data-testid="provider-delivery-host"
+                      value={viaHostId}
+                      onChange={(e) =>
+                        setDelivery((current) => ({ ...current, mode: "via", viaHostId: e.target.value }))
+                      }
+                    >
+                      {hosts.length === 0 ? <option value="">（无已登记主机）</option> : null}
+                      {hosts.map((host) => (
+                        <option key={host.id} value={host.id}>
+                          {host.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className={ui.field}>
+                    路由
+                    <select
+                      className={ui.input}
+                      data-testid="provider-delivery-route"
+                      value={delivery.route}
+                      onChange={(e) =>
+                        setDelivery((current) => ({
+                          ...current,
+                          route: e.target.value as ApiRouteMode,
+                        }))
+                      }
+                    >
+                      <option value="auto">{DELIVERY_ROUTE_LABELS.auto}（先探直连，回落 Hub 中转）</option>
+                      <option value="hub-relay">{DELIVERY_ROUTE_LABELS["hub-relay"]}（走 Hub↔Node 链路）</option>
+                      <option value="direct-net">{DELIVERY_ROUTE_LABELS["direct-net"]}（不通则拒绝）</option>
+                    </select>
+                  </label>
+                  {/* D-047: an offline proxy host is a launch refusal
+                      (api-via-host-offline); warn before the save, never
+                      silently reroute. */}
+                  {viaHostOffline ? (
+                    <p className={css.error} data-testid="provider-delivery-host-offline">
+                      代理主机 {viaHost?.label || viaHostId} 当前离线：经它的派发会在启动时被 Hub 拒绝（api-via-host-offline），不会改道直连。
+                    </p>
+                  ) : null}
+                </>
+              ) : null}
+            </fieldset>
           ) : null}
         </>
       )}

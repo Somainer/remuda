@@ -279,6 +279,32 @@
   color: var(--mute);
 }
 
+/* D-047 §B.5: the proxy host went away mid-session. An error, not a reroute:
+   the route clause above still names the via route that is now down. */
+.routeDown {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin: 8px 0;
+  border: 1px solid var(--danger, #e06c5c);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger, #e06c5c) 10%, transparent);
+  color: var(--paper);
+  font-size: 13px;
+}
+
+.routeDownTitle {
+  font-weight: 600;
+}
+
+.routeDownDetail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
 .dotSep {
   color: var(--line);
 }

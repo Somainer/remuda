@@ -137,10 +137,20 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
 
   await page.goto("/approvals");
   await expect(page.getByTestId("approvals-page")).toBeVisible();
-  const approval = page.getByTestId("approval-row").filter({ hasText: "echo e2e" });
+  // Gate flake: every create on the shared fake Node raises an identically
+  // labelled "echo e2e" card, so a leftover card from a retried attempt (the
+  // CI config retries once against the SAME long-lived fake Node) or from a
+  // neighbouring spec whose cleanup raced the gate can sit in this queue and
+  // make the text-only filter strict (3 rows). Own the row: scope it to THIS
+  // test's instance through the row's session link.
+  const ownApproval = () =>
+    page
+      .getByTestId("approval-row")
+      .filter({ has: page.locator(`a[href="/s/${createdId}"]`) });
+  const approval = ownApproval().filter({ hasText: "echo e2e" });
   await expect(approval).toBeVisible({ timeout: 20_000 });
   await approval.getByRole("button", { name: "允许一次" }).click();
-  await expect(page.getByTestId("approval-row").filter({ hasText: "echo e2e" })).toHaveCount(0, {
+  await expect(ownApproval()).toHaveCount(0, {
     timeout: 20_000,
   });
 

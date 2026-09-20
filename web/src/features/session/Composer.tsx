@@ -524,14 +524,24 @@ export function Composer({
       setMirrors([]);
       return;
     }
+    // Do NOT clear the 已打断 receipt here. A steer's idle status lands in the
+    // same burst as the held-row flush, while the steer POST only resolves
+    // (raising the receipt) a microtask later — under host load the
+    // working→idle edge is committed BEFORE the receipt, so clearing on this
+    // edge unrendered the chip before it ever painted (gate flake: the
+    // interrupted-chip assertion found no element). The receipt is bounded by
+    // its own timer below instead.
     setMirrors([]);
     void onFlushHeld?.();
-    setInterrupted(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
 
-  // The interrupted badge survives until the next idle turn (or 4 s, so a
-  // cancel whose idle signal is missed still clears).
+  // The interrupted badge survives past the interrupted turn's own idle edge
+  // (the edge that flushes the held queue behind a 插队), and clears 4 s after
+  // it was raised — so a cancel whose follow-up turn ends instantly still
+  // shows the receipt, while a missed phase transition clears it anyway. The
+  // flush effect above must not clear it: the receipt is raised only after
+  // the steer POST resolves, which under load commits after that same edge.
   useEffect(() => {
     if (!interrupted) return;
     const timer = window.setTimeout(() => setInterrupted(false), 4000);

@@ -212,6 +212,19 @@ test("column drags reuse legal state hops and reject illegal shortcuts whole", a
   expect(ids(board.columns["in-progress"])).toContain(pending.id);
   expect(ids(board.columns.todo)).not.toContain(pending.id);
 
+  // No stalled→done edge exists: a stalled card completes only through the
+  // stalled→running→done multi-hop. The shortcut is refused, then both legal
+  // hops land it in the done column.
+  const stalled = await createTask(page, project, `stalled hop ${suffix}`);
+  for (const state of ["placed", "running", "stalled"]) {
+    expect((await setState(page, stalled.id, state)).status()).toBe(200);
+  }
+  expect((await setState(page, stalled.id, "done")).status()).toBe(409);
+  expect((await setState(page, stalled.id, "running")).status()).toBe(200);
+  expect((await setState(page, stalled.id, "done")).status()).toBe(200);
+  board = await boardFor(page, project);
+  expect(ids(board.columns.done)).toContain(stalled.id);
+
   // Terminal states cannot be dragged: failed is refused any transition.
   const failed = await createTask(page, project, `terminal ${suffix}`);
   expect((await setState(page, failed.id, "failed")).status()).toBe(200);

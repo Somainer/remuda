@@ -1,6 +1,7 @@
 import { deletePushSubscription, fetchPushConfig, postPushSubscription } from "./api";
 import { isIosDevice, isStandalone } from "./pwa";
 import { readDeviceSettings } from "../features/settings";
+import { hubStore } from "./store";
 import { resolvePushDeepLink } from "./pushLink";
 
 const ENDPOINT_KEY = "runtime.push-endpoint.v1";
@@ -14,6 +15,13 @@ export type PushStatus = {
   subscribed: boolean;
   endpoint: string | null;
   needsHomeScreen: boolean;
+};
+
+/** The Badging API (https://w3c.github.io/badging/), present only on some
+ *  platforms (installed Chromium PWA, Android). Safari/iOS lacks it. */
+type NavigatorBadging = Navigator & {
+  setAppBadge?: (contents?: number) => Promise<void>;
+  clearAppBadge?: () => Promise<void>;
 };
 
 export function needsHomeScreenForNotifications(): boolean {
@@ -45,7 +53,18 @@ function rememberedEndpoint(): string | null {
   }
 }
 
-export function notificationFromPayload(raw: unknown): { title: string; options: NotificationOptions } {
+export type PushNotification = {
+  title: string;
+  options: NotificationOptions;
+  /**
+   * The Hub-stamped pending interaction count from the push payload
+   * (D-049 ui-spec §4.5). Absent for old-Hub payloads; never synthesized
+   * from a notification count.
+   */
+  badge?: number;
+};
+
+export function notificationFromPayload(raw: unknown): PushNotification {
   const body = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const tag = typeof body.tag === "string" ? body.tag : "";
   const data = body.data && typeof body.data === "object" ? (body.data as Record<string, unknown>) : {};
@@ -53,7 +72,7 @@ export function notificationFromPayload(raw: unknown): { title: string; options:
     tag,
     data: { url: typeof data.url === "string" ? data.url : undefined },
   });
-  return {
+  const notice: PushNotification = {
     title: typeof body.title === "string" && body.title ? body.title : "runtime",
     options: {
       body: typeof body.body === "string" ? body.body : "",
@@ -62,6 +81,69 @@ export function notificationFromPayload(raw: unknown): { title: string; options:
       ...(tag ? { renotify: true } : {}),
     } as NotificationOptions,
   };
+  // Optional integer only: missing / wrong-typed / negative payloads stay
+  // badge-less, which is exactly the old-client/old-Hub case.
+  if (typeof body.badge === "number" && Number.isInteger(body.badge) && body.badge >= 0) {
+    notice.badge = body.badge;
+  }
+  return notice;
+}
+
+/**
+ * Set the OS app badge to the device's pending interaction count, clearing
+ * at zero (D-049 ui-spec §4.5). Driven from the page while the PWA is open;
+ * the closed-state push path is the service worker's job. Honest
+ * degradation: where the Badging API does not exist this is a complete
+ * no-op — the notification count is never substituted. The badge is
+ * cosmetic, so a rejected promise is swallowed.
+ */
+export function syncAppBadge(pending: number): void {
+  const nav = navigator as NavigatorBadging;
+  if (pending > 0) {
+    if (typeof nav.setAppBadge !== "function") return;
+    void nav.setAppBadge(pending).catch(() => undefined);
+  } else if (typeof nav.clearAppBadge === "function") {
+    void nav.clearAppBadge().catch(() => undefined);
+  } else if (typeof nav.setAppBadge === "function") {
+    // setAppBadge(0) clears on platforms that ship the setter without the
+    // named clearer.
+    void nav.setAppBadge(0).catch(() => undefined);
+  }
+}
+
+/** Pending interactions, same rule the in-app badges use (Shell/PhoneShell). */
+export function pendingInteractionCount(): number {
+  return hubStore.getSnapshot().interactions.filter((item) => item.state === "pending").length;
+}
+
+let badgeUnsubscribe: (() => void) | null = null;
+let lastBadgeCount: number | null = null;
+
+/**
+ * Keep the OS badge in sync with the pending interaction count for the
+ * lifetime of the page. Idempotent: mounting twice (React StrictMode) keeps
+ * a single subscription. Returns the stop handle.
+ */
+export function startAppBadgeSync(): () => void {
+  if (!badgeUnsubscribe) {
+    const apply = () => {
+      const count = pendingInteractionCount();
+      if (count !== lastBadgeCount) {
+        lastBadgeCount = count;
+        syncAppBadge(count);
+      }
+    };
+    apply();
+    badgeUnsubscribe = hubStore.subscribe(apply);
+  }
+  return stopAppBadgeSync;
+}
+
+/** Test/lifecycle teardown: detach and forget the last synced count. */
+export function stopAppBadgeSync(): void {
+  badgeUnsubscribe?.();
+  badgeUnsubscribe = null;
+  lastBadgeCount = null;
 }
 
 async function ensureRegistration(): Promise<ServiceWorkerRegistration | null> {

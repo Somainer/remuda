@@ -250,6 +250,28 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
     expect(second.sharing?.refcount).toBe(2);
     expect(second.sharing?.queued).toBe(true);
     expect(second.sharing?.blocked ?? "").toContain("dir-busy");
+
+    // Sharing is serial: while the first session is attached, the second
+    // task's launch is refused dir-busy instead of running concurrently.
+    const blockedLaunch = await apiStatus(page, "POST", "/v1/instances", {
+      hostId: host,
+      workspaceId: wsp,
+      kind: "claude",
+      driver: "claude-pty",
+      taskId: second.id,
+      prompt: "must queue",
+    });
+    expect(blockedLaunch.status).toBe(409);
+    expect(blockedLaunch.body).toMatch(/dir-busy/);
+
+    // Once the holder detaches, the queued task can launch in the same cwd.
+    await page.request
+      .fetch(`/v1/instances/${firstInstance.instanceId ?? firstInstance.id}?force=1`, {
+        method: "DELETE",
+      })
+      .catch(() => undefined);
+    const secondInstance = await launchCwd(page, second.id);
+    expect(secondInstance.cwd).toBe(`${ROOT_CWD}/remuda-wt/${shareDir}`);
   });
 
   test("pool: the lease allocates a slot with its own wt/<slot>/<task> branch and folds into worktree", async ({

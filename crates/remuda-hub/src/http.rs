@@ -1304,6 +1304,22 @@ pub async fn create_instance(
                 "task does not hold an active lease on its bound directory".into(),
             ));
         }
+        // Attach lock (D-050 §2.3): a session from another task currently
+        // attached to this directory queues this launch rather than running
+        // concurrently; later sessions of the same task (its tabs) are allowed.
+        let bound_task_id = binding_task.as_ref().unwrap().meta.id.as_id().as_str();
+        if let Some(holder) = lease.holder_instance_id.as_ref()
+            && let Some(holder_instance) = state
+                .store
+                .get_instance(holder.clone())
+                .await
+                .map_err(map_store)?
+            && holder_instance.task_id.as_deref() != Some(bound_task_id)
+        {
+            return Err(HubError::Conflict(format!(
+                "dir-busy: directory is attached by instance {holder} of another task; queued for serial reuse"
+            )));
+        }
         let cwd = if binding.is_root() {
             // Root: let the Node resolve the registered root through
             // resolve_instance_cwd exactly as an unbound launch would.

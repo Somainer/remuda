@@ -207,6 +207,14 @@ fn merge_hooks_block(lower_map: &mut serde_json::Map<String, Value>, upper_hooks
 /// settings `model` key, `CLAUDE_CODE_SUBAGENT_MODEL` re-points subagents, and
 /// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` describes a window the Hub's model may not
 /// have (gateway-carryover-1, 2026-09-17).
+///
+/// D-047 `via` delivery needs no new entries and no new code path: the relay
+/// overlay is written as an ordinary `gateway` overlay whose `ANTHROPIC_BASE_URL`
+/// is the per-instance loopback listener and whose `ANTHROPIC_AUTH_TOKEN` is the
+/// minted relay bearer. Evicting the host's `ANTHROPIC_BASE_URL` /
+/// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` here is therefore also what
+/// keeps a proxied session from silently falling back onto the host's own
+/// gateway, and it happens exactly as it did before the relay existed.
 const OVERRIDDEN_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -330,6 +338,13 @@ pub fn is_overridden_provider_env(name: &str) -> bool {
 /// Use it only for `gateway`/`direct` delegation. `none` (跟随主机 / native
 /// login) is the case where the host's settings *are* the answer: pass them
 /// through with [`merge_settings_layers`] instead.
+///
+/// A D-047 `via` launch is a `gateway` merge as far as this function knows:
+/// the overlay's base URL is the worker's loopback relay listener and its
+/// token is the per-instance relay bearer, so stripping [`OVERRIDDEN_ENV`]
+/// leaves the session pointed at the listener and authenticated only by the
+/// bearer — never the host's gateway credential and never the real gateway
+/// origin, neither of which exists on the worker host.
 #[must_use]
 pub fn merge_provider_overlay_over_user(user: &Value, overlay: &Value) -> Value {
     let mut base = user.clone();
@@ -427,6 +442,10 @@ fn merge_explicit_hooks(base_map: &mut serde_json::Map<String, Value>, upper_hoo
 /// `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, provider keys and helper
 /// configs. Non-secret values — model ids, theme, statusline, gateway env
 /// names without credentials — stay visible for diagnostics.
+///
+/// D-047 needs no special case: a `via` overlay carries its per-instance relay
+/// bearer under the same `ANTHROPIC_AUTH_TOKEN` name, so a logged merged
+/// document redacts the bearer the same way it redacted the gateway token.
 #[must_use]
 pub fn redact_settings(value: &Value) -> Value {
     let mut redacted = value.clone();

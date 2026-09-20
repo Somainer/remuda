@@ -24,6 +24,12 @@ pub struct Notification {
     pub tag: String,
     /// Deep-link payload.
     pub data: HashMap<String, String>,
+    /// Pending interaction count for the receiving device, used for the OS
+    /// app badge (ui-spec §4.5 / D-049). Skipped at the serde boundary when
+    /// `None`, so a payload built without it is byte-for-byte the old wire
+    /// format — old Hubs and old clients interoperate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub badge: Option<u64>,
 }
 
 impl Notification {
@@ -41,7 +47,15 @@ impl Notification {
             body: body.into(),
             tag: tag.as_str(),
             data,
+            badge: None,
         }
+    }
+
+    /// Attach the device's pending interaction count for the OS badge. The
+    /// field stays absent from the JSON payload unless this is called.
+    pub fn with_badge(mut self, pending: u64) -> Self {
+        self.badge = Some(pending);
+        self
     }
 }
 
@@ -260,4 +274,58 @@ fn is_retryable(code: u16) -> bool {
 /// Expose encrypted bytes for tests.
 pub fn payload_bytes(message: &WebPushMessage) -> Option<&[u8]> {
     message.payload.as_ref().map(|p| p.content.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Notification {
+        Notification::new(
+            "Need input",
+            "Approve Bash?",
+            PushTag::Interaction { id: "int_1".into() },
+            "/approvals?focus=int_1",
+        )
+    }
+
+    #[test]
+    fn payload_without_badge_is_the_old_wire_shape() {
+        let payload = serde_json::to_string(&sample()).expect("serialize");
+        // The field is skipped, not rendered as null: old clients and old Hubs
+        // see exactly the pre-badge bytes (ui-spec §4.5 compatibility rule).
+        assert!(!payload.contains("badge"));
+        let value: serde_json::Value = serde_json::from_str(&payload).expect("json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "title": "Need input",
+                "body": "Approve Bash?",
+                "tag": "interaction:int_1",
+                "data": { "url": "/approvals?focus=int_1" },
+            })
+        );
+    }
+
+    #[test]
+    fn payload_with_badge_serialises_the_count_and_nothing_else_changes() {
+        let without = serde_json::to_value(sample()).expect("serialize");
+        let with = serde_json::to_value(sample().with_badge(2)).expect("serialize");
+        assert_eq!(with["badge"], 2);
+        // Every other field stays in place; the only difference is the badge.
+        let mut expected = without;
+        expected
+            .as_object_mut()
+            .expect("object")
+            .insert("badge".into(), serde_json::json!(2));
+        assert_eq!(with, expected);
+    }
+
+    #[test]
+    fn badge_zero_is_serialised_explicitly() {
+        // with_badge(0) means "known zero pending", which tells a client to
+        // clear; that must not collapse back into the absent field.
+        let value = serde_json::to_value(sample().with_badge(0)).expect("serialize");
+        assert_eq!(value["badge"], 0);
+    }
 }

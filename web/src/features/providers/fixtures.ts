@@ -1,5 +1,9 @@
 import { NATIVE_PROFILE, type ProviderProfile } from "./model";
 
+/** Synthetic proxy host the `gateway-via` fixture routes through (D-047). */
+export const FIXTURE_VIA_HOST_ID = "hst_fixture_via_00000000000000000000aa";
+export const FIXTURE_VIA_HOST_LABEL = "fixture-mac-relay";
+
 /** Mock ProviderProfile rows. Wire ids are none | gateway | direct (D-012). */
 export const PROVIDER_PROFILES: ProviderProfile[] = [
   NATIVE_PROFILE,
@@ -25,6 +29,29 @@ export const PROVIDER_PROFILES: ProviderProfile[] = [
     lastError: null,
     rotationOwner: "gateway",
     available: true,
+  },
+  {
+    // D-047: a gateway profile whose sessions egress on a named proxy host
+    // over the in-band hub-relay route.
+    id: "gateway-via",
+    profileId: "gateway-via",
+    name: "经主机网关",
+    delegation: "gateway",
+    kind: "gateway",
+    protocol: "anthropic-messages",
+    baseUrl: "https://relay.example/v1",
+    health: { ok: true, status: 200, latencyMs: 18, checkedAt: "2026-09-19T00:00:00.000Z" },
+    secret: { present: true, last4: "0001", fingerprint: "abcdef0123456789" },
+    secretRef: "0001",
+    models: [{ id: "passthrough/relay/auto", enabled: true, label: "Relay Auto" }],
+    defaultModel: "passthrough/relay/auto",
+    defaultGateway: false,
+    scope: "universal",
+    headers: {},
+    lastError: null,
+    rotationOwner: "gateway",
+    available: true,
+    delivery: { mode: "via", viaHostId: FIXTURE_VIA_HOST_ID, route: "hub-relay" },
   },
   {
     id: "direct",

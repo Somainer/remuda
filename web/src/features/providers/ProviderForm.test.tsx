@@ -209,3 +209,85 @@ describe("ProviderForm", () => {
     );
   });
 });
+
+describe("ProviderForm 交付方式 (D-047)", () => {
+  const hosts = [
+    { id: "hst_mac00000000000000000000000001", label: "mac-relay", online: true },
+    { id: "hst_sg00000000000000000000000002", label: "sg-box", online: false },
+  ];
+
+  it("defaults to direct and submits a direct delivery for a gateway", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(<ProviderForm hosts={hosts} onSubmit={onSubmit} onCancel={() => undefined} />);
+    await user.type(screen.getByTestId("provider-name"), "direct gw");
+    await user.type(screen.getByTestId("provider-base-url"), "http://127.0.0.1:1");
+    await user.type(screen.getByTestId("provider-token"), "sk-fake-direct-0001");
+    await user.click(screen.getByTestId("provider-save"));
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery: { mode: "direct", route: "auto" },
+      }),
+    );
+  });
+
+  it("picks a via host and route, submits the nested delivery, and warns offline", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(<ProviderForm hosts={hosts} onSubmit={onSubmit} onCancel={() => undefined} />);
+    await user.type(screen.getByTestId("provider-name"), "via gw");
+    await user.type(screen.getByTestId("provider-base-url"), "http://127.0.0.1:1");
+    await user.type(screen.getByTestId("provider-token"), "sk-fake-via-0001");
+    await user.click(screen.getByTestId("provider-delivery-via"));
+    // First host in the list is the online mac-relay; no offline warning yet.
+    expect(screen.queryByTestId("provider-delivery-host-offline")).toBeNull();
+    await user.selectOptions(screen.getByTestId("provider-delivery-host"), hosts[1].id);
+    // An offline proxy host shows the amber/red refusal warning, not a reroute.
+    expect(screen.getByTestId("provider-delivery-host-offline")).toBeVisible();
+    expect(screen.getByTestId("provider-delivery-host-offline")).toHaveTextContent(
+      "api-via-host-offline",
+    );
+    await user.selectOptions(screen.getByTestId("provider-delivery-route"), "hub-relay");
+    await user.click(screen.getByTestId("provider-save"));
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery: { mode: "via", viaHostId: hosts[1].id, route: "hub-relay" },
+      }),
+    );
+  });
+
+  it("flips via back to direct and clears the stored host", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const initial: ProviderProfile = {
+      id: "pvp_via",
+      profileId: "pvp_via",
+      name: "saved via gw",
+      delegation: "gateway",
+      kind: "gateway",
+      protocol: "anthropic-messages",
+      baseUrl: "http://127.0.0.1:1",
+      health: null,
+      secret: { present: true, last4: "0001", fingerprint: "abcdef0123456789" },
+      secretRef: "0001",
+      models: [{ id: "gw/via", enabled: true }],
+      defaultModel: "gw/via",
+      defaultGateway: false,
+      scope: "universal",
+      headers: {},
+      lastError: null,
+      rotationOwner: "gateway",
+      available: true,
+      delivery: { mode: "via", viaHostId: hosts[0].id, route: "hub-relay" },
+    };
+    render(<ProviderForm initial={initial} hosts={hosts} onSubmit={onSubmit} onCancel={() => undefined} />);
+    expect(screen.getByTestId("provider-delivery")).toHaveAttribute("data-mode", "via");
+    await user.click(screen.getByTestId("provider-delivery-direct"));
+    await user.click(screen.getByTestId("provider-save"));
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        delivery: { mode: "direct", route: "auto" },
+      }),
+    );
+  });
+});

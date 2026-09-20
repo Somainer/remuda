@@ -26,6 +26,7 @@ import { canShowTerminal, hasStructuredSignal, isTtyLabFixtureId, resolveTtyLabI
 import { ScreenView } from "../features/session/ScreenView";
 import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode, UI_STATUS_LABEL } from "../lib/status";
+import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute";
 import { projectCommandStatus } from "../lib/commandStatus";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
@@ -163,6 +164,13 @@ export function SessionPage({
   }
   const nodeRestarted = instance?.lastError === "node-epoch-changed";
   const resolvedView = view === "auto" ? baseView : view;
+
+  // D-047: the route this session actually got — the Node-echoed clause only,
+  // never the requested value (D-035). And the §B.5 block when its proxy host
+  // went away: an error, not a changed route.
+  const routeClause = instance ? apiRouteClause(instance.apiRoute) : null;
+  const routeKind = instance ? apiRouteKind(instance.apiRoute) : null;
+  const routeDown = routeKind ? routeDownMessage(events) : null;
 
   // Restore the saved reading position when leaving the files route. The
   // transcript is virtualized, so retry over a couple of frames after its rows
@@ -343,6 +351,19 @@ export function SessionPage({
   );
   if (instance.providerSourceHint) {
     diagnostics.push(<span key="provider-source" data-testid="session-provider-source">{instance.providerSourceHint}</span>);
+  }
+  if (routeClause) {
+    diagnostics.push(
+      <span
+        key="api-route"
+        data-testid="session-api-route"
+        data-mode={instance.apiRoute?.mode ?? "direct"}
+        data-route={routeKind ?? "direct"}
+        data-down={routeDown ? "1" : "0"}
+      >
+        {routeClause}
+      </span>,
+    );
   }
   diagnostics.push(
     <span key="lifecycle" data-testid="session-lifecycle">{instance.lifecycle}</span>,
@@ -549,6 +570,18 @@ export function SessionPage({
             Resume
           </Button>
           {!canResume ? <span className={session.nodeRestartNote}>该会话没有可续接的 transcript</span> : null}
+        </div>
+      ) : null}
+      {routeDown ? (
+        <div className={session.routeDown} role="alert" data-testid="session-api-route-down">
+          <span className={session.routeDownTitle}>
+            API 路由已断开（api-route-down）
+          </span>
+          {/* The route did not reroute: the strip still names it, and the
+              operator re-dispatches rather than watching a silent fallback
+              (D-035). */}
+          <span>{routeClause}</span>
+          <span className={session.routeDownDetail}>{routeDown}</span>
         </div>
       ) : null}
       <div

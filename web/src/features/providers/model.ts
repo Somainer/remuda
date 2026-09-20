@@ -1,5 +1,79 @@
 export type Delegation = "none" | "gateway" | "direct";
 
+/** D-047 route sub-mode between the worker host and the proxy host. */
+export type ApiRouteMode = "auto" | "hub-relay" | "direct-net";
+
+/**
+ * D-047 model-API delivery of one profile. Absent on rows written before
+ * D-047, which read as `{mode: "direct", route: "auto"}`.
+ */
+export type ProviderDelivery = {
+  mode: "direct" | "via";
+  /** Proxy host; required by `via`, meaningless for `direct`. */
+  viaHostId?: string | null;
+  route: ApiRouteMode;
+};
+
+/** A host the 交付方式 control can name, with its live state. */
+export type DeliveryHost = {
+  id: string;
+  label: string;
+  online?: boolean;
+};
+
+/** The D2 default every pre-D-047 row reads back as. */
+export const DEFAULT_DELIVERY: ProviderDelivery = { mode: "direct", route: "auto" };
+
+/** Normalize an absent/partial delivery to the direct/auto default. */
+export function effectiveDelivery(delivery: ProviderDelivery | null | undefined): ProviderDelivery {
+  if (!delivery) return DEFAULT_DELIVERY;
+  return {
+    mode: delivery.mode === "via" ? "via" : "direct",
+    ...(delivery.viaHostId ? { viaHostId: delivery.viaHostId } : {}),
+    route: delivery.route ?? "auto",
+  };
+}
+
+/** The proxy host id a `via` delivery names, or null for direct. */
+export function deliveryViaHostId(delivery: ProviderDelivery | null | undefined): string | null {
+  const resolved = effectiveDelivery(delivery);
+  return resolved.mode === "via" && resolved.viaHostId ? resolved.viaHostId : null;
+}
+
+export const DELIVERY_ROUTE_LABELS: Record<ApiRouteMode, string> = {
+  auto: "自动",
+  "hub-relay": "Hub 中转",
+  "direct-net": "直连网络",
+};
+
+/**
+ * Operator-facing delivery clause for the Provider page: `直连`, or
+ * `经由 <host label> · <route>`. The host label comes from the caller's host
+ * inventory; without it the id is shown rather than a guessed name.
+ */
+export function deliveryClause(
+  delivery: ProviderDelivery | null | undefined,
+  hosts: DeliveryHost[] = [],
+): string {
+  const resolved = effectiveDelivery(delivery);
+  if (resolved.mode !== "via" || !resolved.viaHostId) return "直连";
+  const host = hosts.find((entry) => entry.id === resolved.viaHostId);
+  const label = host?.label || resolved.viaHostId;
+  return `经由 ${label} · ${DELIVERY_ROUTE_LABELS[resolved.route]}`;
+}
+
+/** Whether the named proxy host is known to be offline right now. */
+export function deliveryHostOffline(
+  delivery: ProviderDelivery | null | undefined,
+  hosts: DeliveryHost[] = [],
+): boolean {
+  const viaHostId = deliveryViaHostId(delivery);
+  if (!viaHostId) return false;
+  // Only a known-offline host warns; an unknown host (missing from the list)
+  // is the Hub's refusal to give, not the form's guess.
+  return hosts.some((host) => host.id === viaHostId && host.online === false);
+}
+
 /** One entry of a profile's model catalog. `enabled` gates New Session. */
 export type ProviderModel = {
   id: string;
@@ -52,6 +126,8 @@ export type ProviderProfile = {
   lastError: string | null;
   rotationOwner: "native" | "gateway" | "runtime";
   available: boolean;
+  /** Model-API delivery (D-047); absent reads as direct/auto. */
+  delivery?: ProviderDelivery;
   revision?: string;
   createdAt?: string;
   updatedAt?: string;
@@ -67,6 +143,7 @@ export type ProviderCreate = {
   authToken: string;
   defaultGateway?: boolean;
   scope?: string;
+  delivery?: ProviderDelivery;
 };
 
 export type ProviderPatch = {
@@ -79,6 +156,7 @@ export type ProviderPatch = {
   authToken?: string;
   defaultGateway?: boolean;
   scope?: string;
+  delivery?: ProviderDelivery;
 };
 
 export type ProviderTestResult = {
@@ -366,6 +444,7 @@ type HubProvider = {
   revision?: string;
   secret?: { present?: boolean; last4?: string | null; fingerprint?: string | null };
   health?: ProviderHealth | null;
+  delivery?: ProviderDelivery;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -396,6 +475,7 @@ export function fromHub(row: HubProvider): ProviderProfile {
     lastError: row.health && !row.health.ok ? row.health.message ?? null : null,
     rotationOwner: kind === "direct" ? "runtime" : "gateway",
     available: true,
+    delivery: row.delivery ? effectiveDelivery(row.delivery) : undefined,
     revision: row.revision,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,

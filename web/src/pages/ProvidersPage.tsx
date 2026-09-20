@@ -6,11 +6,14 @@ import {
   DELEGATION_COPY,
   NATIVE_PROFILE,
   contextChip,
+  deliveryClause,
+  deliveryHostOffline,
   enabledModels,
   formatSecret,
   fromHub,
   healthLine,
   shouldAvoidUnhealthy,
+  type DeliveryHost,
   type ProviderCreate,
   type ProviderDiscoverBody,
   type ProviderModel,
@@ -26,6 +29,15 @@ function healthDot(ok: boolean | undefined) {
   return <span className={`${css.dot} ${ok === false ? css.dotOff : ""}`} aria-hidden />;
 }
 
+/** Host inventory for the delivery control: label plus live state. */
+function toDeliveryHosts(hosts: Host[]): DeliveryHost[] {
+  return hosts.map((host) => ({
+    id: host.id,
+    label: host.label,
+    online: host.online ?? host.state === "online",
+  }));
+}
+
 /** Probe a gateway for its catalog; the token is sent once and never stored. */
 async function discoverModels(input: ProviderDiscoverBody): Promise<ProviderModel[]> {
   const result = await api.providerDiscover(input);
@@ -35,7 +47,7 @@ async function discoverModels(input: ProviderDiscoverBody): Promise<ProviderMode
 
 function useProviderList() {
   const [items, setItems] = useState<ProviderProfile[]>([NATIVE_PROFILE]);
-  const [hosts, setHosts] = useState<{ id: string; label: string }[]>([]);
+  const [hosts, setHosts] = useState<DeliveryHost[]>([]);
   const [error, setError] = useState<string | null>(null);
   const reload = () => {
     void api
@@ -51,7 +63,7 @@ function useProviderList() {
     reload();
     void api
       .hostList()
-      .then((page) => setHosts(page.items.map((h: Host) => ({ id: h.id, label: h.label }))))
+      .then((page) => setHosts(toDeliveryHosts(page.items)))
       .catch(() => setHosts([]));
   }, []);
   return { items, hosts, error, reload };
@@ -101,6 +113,23 @@ export function ProvidersPage() {
               <div className={css.value}>{healthLine(p.health)}</div>
               <div className={css.label}>secret</div>
               <div className={css.value}>{formatSecret(p.secret)} · last4</div>
+              {p.kind === "gateway" ? (
+                <>
+                  <div className={css.label}>交付方式</div>
+                  <div
+                    className={css.value}
+                    data-testid="provider-delivery"
+                    data-via={p.delivery?.mode === "via" ? "1" : "0"}
+                    data-offline={
+                      p.delivery?.mode === "via" && deliveryHostOffline(p.delivery, hosts)
+                        ? "1"
+                        : "0"
+                    }
+                  >
+                    {deliveryClause(p.delivery, hosts)}
+                  </div>
+                </>
+              ) : null}
             </div>
             <div className={css.blurb}>{DELEGATION_COPY[p.delegation].hint}</div>
           </Link>
@@ -168,12 +197,12 @@ export function ProviderDetailPage() {
   const [rotating, setRotating] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [test, setTest] = useState<ProviderTestResult | null>(null);
-  const [hosts, setHosts] = useState<{ id: string; label: string }[]>([]);
+  const [hosts, setHosts] = useState<DeliveryHost[]>([]);
 
   useEffect(() => {
     void api
       .hostList()
-      .then((page) => setHosts(page.items.map((h: Host) => ({ id: h.id, label: h.label }))))
+      .then((page) => setHosts(toDeliveryHosts(page.items)))
       .catch(() => setHosts([]));
   }, []);
 
@@ -213,6 +242,9 @@ export function ProviderDetailPage() {
           defaultModel: body.defaultModel ?? null,
           defaultGateway: body.defaultGateway,
           scope: body.scope,
+          // D-047: the form always sends the delivery for a gateway; an
+          // absent key would leave a stale via object in place on PATCH.
+          ...(body.kind === "gateway" && body.delivery ? { delivery: body.delivery } : {}),
           ...(body.authToken ? { authToken: body.authToken } : {}),
         };
     void api
@@ -267,6 +299,23 @@ export function ProviderDetailPage() {
             <div className={css.value} data-testid="provider-default-model">
               {p.defaultModel ?? "—"}
             </div>
+            {p.kind === "gateway" ? (
+              <>
+                <div className={css.label}>交付方式</div>
+                <div
+                  className={css.value}
+                  data-testid="provider-delivery"
+                  data-via={p.delivery?.mode === "via" ? "1" : "0"}
+                  data-offline={
+                    p.delivery?.mode === "via" && deliveryHostOffline(p.delivery, hosts)
+                      ? "1"
+                      : "0"
+                  }
+                >
+                  {deliveryClause(p.delivery, hosts)}
+                </div>
+              </>
+            ) : null}
             <div className={css.label}>lastError</div>
             <div className={css.value}>{p.lastError ?? "—"}</div>
           </div>

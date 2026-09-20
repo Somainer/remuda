@@ -3,6 +3,9 @@ import { PROVIDER_PROFILES } from "./fixtures";
 import {
   DELEGATION_COPY,
   contextChip,
+  deliveryClause,
+  deliveryHostOffline,
+  effectiveDelivery,
   defaultGatewayProfile,
   enabledModels,
   filterModels,
@@ -26,7 +29,14 @@ import {
 
 describe("provider profiles D-012", () => {
   it("defaults to native none and exposes gateway + disabled direct", () => {
-    expect(PROVIDER_PROFILES.map((p) => p.delegation)).toEqual(["none", "gateway", "direct"]);
+    // native, the default gateway, the D-047 via-host gateway, and the v2
+    // direct placeholder.
+    expect(PROVIDER_PROFILES.map((p) => p.delegation)).toEqual([
+      "none",
+      "gateway",
+      "gateway",
+      "direct",
+    ]);
     expect(PROVIDER_PROFILES[0]?.profileId).toBe("none");
     expect(PROVIDER_PROFILES.find((p) => p.delegation === "direct")?.available).toBe(false);
   });
@@ -345,5 +355,65 @@ describe("splitModelId", () => {
 
   it("leaves a short id whole rather than splitting it for no gain", () => {
     expect(splitModelId("e2e/auto")).toEqual(["e2e/auto", ""]);
+  });
+});
+
+describe("D-047 provider delivery", () => {
+  const hosts = [
+    { id: "hst_on", label: "mac-relay", online: true },
+    { id: "hst_off", label: "sg-box", online: false },
+  ];
+
+  it("treats absent/partial delivery as the direct/auto default", () => {
+    expect(effectiveDelivery(undefined)).toEqual({ mode: "direct", route: "auto" });
+    expect(effectiveDelivery(null)).toEqual({ mode: "direct", route: "auto" });
+    expect(effectiveDelivery({ mode: "via" } as never)).toEqual({
+      mode: "via",
+      route: "auto",
+    });
+  });
+
+  it("renders the clause the Provider page prints", () => {
+    expect(deliveryClause(undefined, hosts)).toBe("直连");
+    expect(deliveryClause({ mode: "direct", route: "auto" }, hosts)).toBe("直连");
+    expect(
+      deliveryClause({ mode: "via", viaHostId: "hst_on", route: "hub-relay" }, hosts),
+    ).toBe("经由 mac-relay · Hub 中转");
+    expect(
+      deliveryClause({ mode: "via", viaHostId: "hst_on", route: "direct-net" }, hosts),
+    ).toBe("经由 mac-relay · 直连网络");
+    // A host missing from the inventory shows its id instead of a guessed name.
+    expect(deliveryClause({ mode: "via", viaHostId: "hst_x", route: "auto" }, hosts)).toBe(
+      "经由 hst_x · 自动",
+    );
+  });
+
+  it("warns offline only when the named host is known offline", () => {
+    expect(
+      deliveryHostOffline({ mode: "via", viaHostId: "hst_off", route: "auto" }, hosts),
+    ).toBe(true);
+    expect(
+      deliveryHostOffline({ mode: "via", viaHostId: "hst_on", route: "auto" }, hosts),
+    ).toBe(false);
+    // Unknown host = Hub refusal territory, not the form's offline guess.
+    expect(
+      deliveryHostOffline({ mode: "via", viaHostId: "hst_x", route: "auto" }, hosts),
+    ).toBe(false);
+    expect(deliveryHostOffline({ mode: "direct", route: "auto" }, hosts)).toBe(false);
+  });
+
+  it("maps the Hub row's delivery through fromHub", () => {
+    const mapped = fromHub({
+      id: "pvp_1",
+      name: "relay",
+      kind: "gateway",
+      baseUrl: "http://127.0.0.1:1/v1",
+      delivery: { mode: "via", viaHostId: "hst_on", route: "hub-relay" },
+    });
+    expect(mapped.delivery).toEqual({
+      mode: "via",
+      viaHostId: "hst_on",
+      route: "hub-relay",
+    });
   });
 });

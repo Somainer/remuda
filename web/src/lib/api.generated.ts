@@ -1898,6 +1898,8 @@ export interface components {
             name?: string;
             /** @description auto | native | profile:<id> */
             providerBinding?: string;
+            /** @description D-047 Amendment A1 explicit relay bind. Null clears it back to loopback-only; the Hub rejects 0.0.0.0/:: and public addresses. */
+            relayBind?: components["schemas"]["HostRelayBind"] | null;
         };
         /** @description Explicit non-loopback relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback and every via session on hub-relay. */
         HostRelayBind: {
@@ -1954,7 +1956,7 @@ export interface components {
             online: boolean;
             /** @description auto | native | profile:<id> */
             providerBinding?: string;
-            /** @description Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the listener on loopback. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            /** @description Explicit relay bind for direct-network routing (D-047 Amendment A1). Absent keeps the relay on loopback; the Hub refuses wildcards and public addresses, and `route: direct-net` is 409 `api-via-unreachable` until one is set. */
             relayBind?: components["schemas"]["HostRelayBind"] | null;
             /** @description Latest CPU/mem snapshot with Hub-stamped sample time. */
             resources?: components["schemas"]["HostResources"] | null;
@@ -1995,11 +1997,11 @@ export interface components {
         };
         InstanceCreate: {
             /**
-             * @description Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.
+             * @description Route sub-mode for apiVia: auto | hub-relay | direct-net (D-047 Amendment A1). `auto` probes the proxy host's relayBind and falls back to hub-relay; direct-net is a hard 409 `api-via-unreachable` when no bind is configured.
              * @enum {string}
              */
             apiRoute?: "auto" | "hub-relay" | "direct-net";
-            /** @description Per-instance delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5. */
+            /** @description Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub process, or `none` to force direct. The D-047 waterfall is request > project > profile > direct; unknown/offline/unsupported targets refuse with the api-via-* codes, never a silent fallback. */
             apiVia?: string;
             /** @description Extra native CLI arguments as an argv array, never a shell string. Checked against the per-driver launch allowlist; replaces the host default when present. */
             args?: string[];
@@ -2439,6 +2441,13 @@ export interface components {
             stallThresholdMins?: number;
         };
         ProjectCreate: {
+            /**
+             * @description D-047 route sub-mode for the project-layer apiVia: auto | hub-relay | direct-net.
+             * @enum {string}
+             */
+            apiRoute?: "auto" | "hub-relay" | "direct-net";
+            /** @description D-047 project-layer delivery override: a proxy host id, `self`, or `none`. Stored beside the project provider ref. */
+            apiVia?: string;
             branchPattern?: string;
             defaultBaseBranch?: string;
             defaultEffort?: string;
@@ -2524,6 +2533,13 @@ export interface components {
         };
         /** @description remuda project set. Enforced policy (D-031) is immutable after creation; only policy.configurable is applied. */
         ProjectPatch: {
+            /**
+             * @description D-047 route sub-mode for the project-layer apiVia: auto | hub-relay | direct-net.
+             * @enum {string}
+             */
+            apiRoute?: "auto" | "hub-relay" | "direct-net";
+            /** @description D-047 project-layer delivery override: a proxy host id, `self`, or `none`. Stored beside the project provider ref. */
+            apiVia?: string;
             branchPattern?: string;
             defaultBaseBranch?: string;
             defaultEffort?: string | null;
@@ -2559,7 +2575,7 @@ export interface components {
             defaultGateway?: boolean;
             /** @description Must be one of the enabled models. */
             defaultModel?: string;
-            /** @description Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            /** @description How this profile's sessions reach the model API (D-047). Absent means direct / auto; the stored value is always read back. */
             delivery?: components["schemas"]["ProviderDeliveryInput"];
             headers?: {
                 [key: string]: string;
@@ -2629,7 +2645,7 @@ export interface components {
             defaultGateway?: boolean;
             /** @description Must be one of the enabled models. */
             defaultModel?: string | null;
-            /** @description Set the delivery mode (D-047). Accepted but not yet applied: the waterfall that acts on it lands with api-routing task 2. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            /** @description Replace the model-API delivery (D-047). The waterfall resolves it per launch: request > project > this profile > direct. */
             delivery?: components["schemas"]["ProviderDeliveryInput"];
             headers?: {
                 [key: string]: string;
@@ -2647,7 +2663,7 @@ export interface components {
             defaultGateway: boolean;
             /** @description Must be one of the enabled models. */
             defaultModel?: string | null;
-            /** @description Delivery mode (D-047). Omitted means direct / auto. Accepted but not yet applied: the Hub parses it without error and ignores its value until the resolution that acts on it lands with api-routing task 2. */
+            /** @description How this profile's sessions reach the model API (D-047). Absent means direct / auto; the stored value is always read back. */
             delivery?: components["schemas"]["ProviderDelivery"];
             headers?: {
                 [key: string]: string;
@@ -2826,11 +2842,11 @@ export interface components {
         };
         WorkerDispatch: {
             /**
-             * @description Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1). Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5.
+             * @description Route sub-mode for --api-via: auto | hub-relay | direct-net (D-047 Amendment A1).
              * @enum {string}
              */
             apiRoute?: "auto" | "hub-relay" | "direct-net";
-            /** @description Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub host, or `none` to force direct. Omitted leaves the waterfall to the project and profile. Accepted but not yet applied: the Hub parses it without error and ignores its value until the CLI and Provider page control that sets it lands with api-routing task 5. */
+            /** @description Per-dispatch delivery override (D-047): a proxy host id, `self` for the Hub process, or `none` to force direct. Omitted leaves the decision to the project and profile layers. */
             apiVia?: string;
             /** @description Brief bytes (utf8); staged as an object attachment, never inlined. */
             brief: string;

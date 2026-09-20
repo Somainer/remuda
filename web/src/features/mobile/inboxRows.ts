@@ -113,6 +113,16 @@ function contextPctOf(
   return typeof pct === "number" && Number.isFinite(pct) ? pct : null;
 }
 
+/**
+ * Screen-reader (and tooltip) readout for the context remaining ring. A null
+ * pct renders no ring, so it returns null; otherwise the value is clamped to
+ * 0..100 the same way the SVG is.
+ */
+export function contextRingLabel(pct: number | null): string | null {
+  if (pct == null) return null;
+  return `上下文剩余 ${Math.max(0, Math.min(100, pct))}%`;
+}
+
 export type InboxInteractionRow = {
   rowType: "interaction";
   /** Focus target: equals the interaction id (?focus=). */

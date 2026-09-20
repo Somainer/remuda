@@ -1,4 +1,5 @@
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
+import { optionAnswerFor } from "./answers";
 import css from "../session/session.module.css";
 
 export function ApprovalCard({
@@ -26,13 +27,14 @@ export function ApprovalCard({
         <p className={css.preview}>{req.description}</p>
         {req.options.map((opt) => {
           const kind = opt.effect === "deny" ? css.denyBtn : opt.effect === "allow-once" ? css.allowBtn : css.quietBtn;
+          const answer = optionAnswerFor(interaction, opt.id);
           return (
             <button
               key={opt.id}
               type="button"
               className={kind}
-              disabled={disabled}
-              onClick={() => onRespond({ kind: "approval", optionId: opt.id, inputDigest: req.inputDigest })}
+              disabled={disabled || !answer}
+              onClick={() => answer && onRespond(answer)}
             >
               {opt.label}
             </button>

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import {
+  contextRingLabel,
   deriveInboxRows,
   derivePushBanner,
   INBOX_KINDS,
@@ -14,6 +15,7 @@ import {
 import { hubStore, useHub } from "../../lib/store";
 import { readPushStatus, subscribePush, type PushStatus } from "../../lib/push";
 import { thisDeviceId } from "../../lib/interactionStatus";
+import { optionAnswerFor } from "../approvals/answers";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
 import css from "./inbox.module.css";
 
@@ -41,9 +43,10 @@ function ContextRing({ pct }: { pct: number | null }) {
   const clamped = Math.max(0, Math.min(100, pct));
   const r = 11;
   const circ = 2 * Math.PI * r;
+  const label = contextRingLabel(clamped);
   return (
-    <span className={css.ring} title={`上下文剩余 ${clamped}%`} aria-hidden>
-      <svg viewBox="0 0 28 28" width="28" height="28">
+    <span className={css.ring} title={label ?? undefined} role="img" aria-label={label ?? ""}>
+      <svg viewBox="0 0 28 28" width="28" height="28" aria-hidden="true">
         <circle className={css.ringTrack} cx="14" cy="14" r={r} />
         <circle
           className={css.ringFill}
@@ -54,7 +57,7 @@ function ContextRing({ pct }: { pct: number | null }) {
           strokeDashoffset={circ * (1 - clamped / 100)}
         />
       </svg>
-      <span className={css.ringText}>{clamped}%</span>
+      <span className={css.ringText} aria-hidden="true">{clamped}%</span>
     </span>
   );
 }
@@ -115,35 +118,21 @@ function InteractionActions({
 
   const optionButtons =
     item.request.kind === "approval" || item.request.kind === "plan-review"
-      ? row.options.map((opt) => (
-          <button
-            key={opt.id}
-            type="button"
-            className={`${css.btn} ${opt.effect === "deny" ? css.btnDeny : css.btnPrimary}`}
-            disabled={disabled}
-            data-testid={`m-inbox-option-${opt.id}`}
-            onClick={() => {
-              if (item.request.kind !== "approval" && item.request.kind !== "plan-review") return;
-              if (item.request.kind === "approval") {
-                onRespond(item, {
-                  kind: "approval",
-                  optionId: opt.id,
-                  inputDigest: item.request.inputDigest,
-                });
-              } else {
-                onRespond(item, {
-                  kind: "plan-review",
-                  optionId: opt.id,
-                  planRevision: item.request.planRevision,
-                  planDigest: item.request.planDigest,
-                  feedback: null,
-                });
-              }
-            }}
-          >
-            {opt.label}
-          </button>
-        ))
+      ? row.options.map((opt) => {
+          const answer = optionAnswerFor(item, opt.id);
+          return (
+            <button
+              key={opt.id}
+              type="button"
+              className={`${css.btn} ${opt.effect === "deny" ? css.btnDeny : css.btnPrimary}`}
+              disabled={disabled || !answer}
+              data-testid={`m-inbox-option-${opt.id}`}
+              onClick={() => answer && onRespond(item, answer)}
+            >
+              {opt.label}
+            </button>
+          );
+        })
       : null;
 
   return (

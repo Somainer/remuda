@@ -4,6 +4,7 @@ import type { Interaction } from "../../types/interaction";
 import { known, na, unknownKnowledge, type Id } from "../../types/wire";
 import type { InboxSource } from "./inboxRows";
 import {
+  contextRingLabel,
   deriveInboxRows,
   derivePushBanner,
   interactionHeadline,
@@ -434,6 +435,13 @@ describe("context ring pct", () => {
     );
     expect(rows.pending[0].contextPct).toBe(78);
     expect(rows.recent.find((r) => r.instanceId === "ins_unknown")?.contextPct).toBeNull();
+  });
+
+  it("exposes the accessibility readout the ring's aria-label uses, null when no ring renders", () => {
+    expect(contextRingLabel(null)).toBeNull();
+    expect(contextRingLabel(78)).toBe("上下文剩余 78%");
+    expect(contextRingLabel(0)).toBe("上下文剩余 0%");
+    expect(contextRingLabel(142)).toBe("上下文剩余 100%");
   });
 });
 

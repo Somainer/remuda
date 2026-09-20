@@ -1,7 +1,7 @@
 # 手机优先 UI · 任务 3：`/m` 会话 home（分组 + 下一步 + context 环 + 错误当正文）
 
 2026-09-20 · `wt/c-mhome/b-mhome-md` · mobile-ui 实施计划 §(C) 任务 3（c-mhome）
-规格权威：[ui-spec.md](../ui-spec.md) §1.3 / §2.1 / §4.7，[decisions.md](../decisions.md) D-038、D-049；基线 `origin/main` @ 39d5bb73（c-mshell、c-nextstep 已落地），rebase 后基于 927bde54。
+规格权威：[ui-spec.md](../ui-spec.md) §1.3 / §2.1 / §4.7，[decisions.md](../decisions.md) D-038、D-049；基线 `origin/main` @ 39d5bb73（c-mshell、c-nextstep 已落地），round 2 rebase 后基于 5fef0447（c-minbox 已落地，`/m/inbox` 为 Inbox）。
 
 截图：`mobile-ui-3-home-390.png`（390×844，合成数据，来自 in-process fake node；无主机路径 / 用户名 / 真实主机名）。
 
@@ -55,6 +55,8 @@ vitest 另补一条：完整实例 id 作为 query 也无结果。
 
 - 成功：`resume` 返回新实例 id → `navigate('/s/<newId>')`；e2e 用 fake node 走完整 HTTP resume（父行带 native session id，节点对通用 `instance.resume` 回 ready），断言新 id ≠ 父 id 且落在 `session-page`。
 - 失败：`resume` 返回 `null`（store 已 toast Hub 的 409 原因）→ 行留在原地，显示「恢复失败，请重试」（`home-resume-error`，按钮恢复可点）。
+
+fake node 的通用 `instance.resume` 分支现在会 journal 子实例 `ready`（未按 prompt 加门），这是**有意的共享路径改动**：它只影响此前对该 RPC 只回 `{ok:true}` 的通用（非 claude-pty）分支，行为对既存规格保持一致——`resume-overlay.hub.spec.ts` 走自己的 claude-pty/providerOverlay 分支，`tabs-semantics` 与 `spaces-hub-live` 从不点 resume。
 
 ## 6. 验证
 

@@ -184,7 +184,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // instances/hosts ensure_column block); SQLite's ALTER TABLE has no
     // IF NOT EXISTS, so the house idempotent idiom is `ensure_column`. Old
     // rows get NULL and their doc_json is untouched (byte-identical).
-    crate::store::ensure_column(&conn, "tasks", "archived_at", "TEXT")?;
+    crate::store::ensure_column(conn, "tasks", "archived_at", "TEXT")?;
     Ok(())
 }
 

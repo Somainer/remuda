@@ -24,6 +24,7 @@ import { dismissWorkflow, readDismissedWorkflows, undismissWorkflow } from "./wo
 import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSearch";
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
+import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
 
 /**
  * c-steer 插队发送 from a transcript held row. The page supplies it so the
@@ -57,6 +58,29 @@ function isInjected(node: TranscriptNode): boolean {
 
 /** Where a node id lives in the top-level list: directly or in a compact fold. */
 type NodeLocation = { index: number; compactId: string | null };
+
+/**
+ * Whether the workbench is in the compact (mobile) layout. Mirrors the hook
+ * ToolCard owns for the D-041 fold: the toolbar fold (D-049) is a layout
+ * question, not the `compact` density prop, and a missing matchMedia (unit
+ * DOM) reads as the desktop default where chips stay inline.
+ */
+function useCompactLayout(): boolean {
+  const read = () =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(COMPACT_WORKBENCH_QUERY).matches
+      : false;
+  const [compact, setCompact] = useState(read);
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(COMPACT_WORKBENCH_QUERY);
+    const update = () => setCompact(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return compact;
+}
 
 function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocation | null {
   for (let i = 0; i < nodes.length; i += 1) {
@@ -273,6 +297,13 @@ function TranscriptInner({
 
   // --- in-transcript search -------------------------------------------------
   const [searchOpen, setSearchOpen] = useState(false);
+  // D-049 compact chrome budget: on a compact layout the toolbar's action
+  // chips fold behind one ⋯ trigger; expanding mounts the same buttons with
+  // the same testids, and choosing an action folds the row back so at most
+  // one toolbar strip is ever visible.
+  const compactLayout = useCompactLayout();
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const toolsFolded = compactLayout && !toolsOpen;
   const [query, setQuery] = useState("");
   const [selectedIdx, setSelectedIdx] = useState(-1);
   const lastMatchRef = useRef<SearchMatch | null>(null);
@@ -654,45 +685,69 @@ function TranscriptInner({
   return (
     <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
-      <div className={css.toolbar}>
-        <button
-          type="button"
-          className={ui.chip}
-          data-testid="collapse-all"
-          onClick={() => {
-            // Explicit collapse wins over a prior reader expansion; the
-            // bumped row key remounts each card with its local latch reset.
-            setExpandedTools(new Set());
-            setCollapseTick((n) => n + 1);
-          }}
-        >
-          全部折叠
-        </button>
-        <button
-          ref={openButtonRef}
-          type="button"
-          className={ui.chip}
-          data-testid="transcript-search-open"
-          aria-expanded={searchOpen}
-          onClick={() => (searchOpen ? closeSearch() : openSearch())}
-        >
-          搜索正文
-        </button>
-        {injectedCount > 0 ? (
+      <div className={css.toolbar} data-tools-fold={toolsFolded ? "1" : "0"}>
+        {toolsFolded ? (
           <button
             type="button"
-            className={ui.chip}
-            data-testid="toggle-injected"
-            aria-pressed={showInjected}
-            onClick={() => {
-              const next = !showInjected;
-              setShowInjected(next);
-              writeShowInjected(next);
-            }}
+            className={`${ui.chip} ${css.toolsTrigger}`}
+            data-testid="transcript-tools-open"
+            aria-label="transcript 操作"
+            // Plain disclosure: expanding swaps this trigger out for the
+            // inline chips (no menu role, no focus move, no Escape surface),
+            // so there is no haspopup and expanded stays false here.
+            aria-expanded={false}
+            onClick={() => setToolsOpen(true)}
           >
-            {showInjected ? `隐藏注入内容 · ${injectedCount}` : `显示注入内容 · ${injectedCount}`}
+            ⋯
           </button>
-        ) : null}
+        ) : (
+          <>
+            <button
+              type="button"
+              className={ui.chip}
+              data-testid="collapse-all"
+              onClick={() => {
+                // Explicit collapse wins over a prior reader expansion; the
+                // bumped row key remounts each card with its local latch reset.
+                setExpandedTools(new Set());
+                setCollapseTick((n) => n + 1);
+                if (compactLayout) setToolsOpen(false);
+              }}
+            >
+              全部折叠
+            </button>
+            <button
+              ref={openButtonRef}
+              type="button"
+              className={ui.chip}
+              data-testid="transcript-search-open"
+              aria-expanded={searchOpen}
+              onClick={() => {
+                if (searchOpen) closeSearch();
+                else openSearch();
+                if (compactLayout) setToolsOpen(false);
+              }}
+            >
+              搜索正文
+            </button>
+            {injectedCount > 0 ? (
+              <button
+                type="button"
+                className={ui.chip}
+                data-testid="toggle-injected"
+                aria-pressed={showInjected}
+                onClick={() => {
+                  const next = !showInjected;
+                  setShowInjected(next);
+                  writeShowInjected(next);
+                  if (compactLayout) setToolsOpen(false);
+                }}
+              >
+                {showInjected ? `隐藏注入内容 · ${injectedCount}` : `显示注入内容 · ${injectedCount}`}
+              </button>
+            ) : null}
+          </>
+        )}
       </div>
       {searchOpen ? (
         <div className={css.searchbar} role="search" aria-label="正文搜索">

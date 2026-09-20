@@ -404,7 +404,9 @@ describe("D-041 fold vs in-transcript search hit", () => {
     expect(card.getAttribute("data-folded")).toBe("1");
     expect(screen.queryByText("zorpto-searchfind-4711")).toBeNull();
 
-    // Search for text that exists ONLY in the tool result.
+    // Search for text that exists ONLY in the tool result. The D-049 compact
+    // fold hides the chip behind the ⋯ trigger on this layout; open it first.
+    await user.click(screen.getByTestId("transcript-tools-open"));
     await user.click(screen.getByTestId("transcript-search-open"));
     await user.type(screen.getByTestId("transcript-search-input"), "zorpto-searchfind-4711");
 
@@ -421,5 +423,77 @@ describe("D-041 fold vs in-transcript search hit", () => {
     await expect
       .poll(() => screen.getByTestId("tool-card").getAttribute("data-folded"))
       .toBe("1");
+  });
+});
+
+/** A user-role message the agent did not write: hook context injection. */
+function injectedMessage(seq: number, text: string): Observation {
+  const event = userMessage(seq, text);
+  return {
+    ...event,
+    payload: { ...(event.payload as Record<string, unknown>), origin: "hook-context" },
+  } as Observation;
+}
+
+describe("D-049 compact transcript toolbar fold", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("folds the three action chips behind one trigger and reaches all three testids after expanding", async () => {
+    stubCompactLayout();
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "跑一下"),
+        injectedMessage(2, "injected hook body msesfold-4711"),
+        assistantMessage(3, "done"),
+      ],
+      "/s/ins_fold",
+    );
+
+    // Folded: just the trigger; the three chips are not mounted at all.
+    const trigger = screen.getByTestId("transcript-tools-open");
+    expect(trigger).toBeTruthy();
+    expect(screen.queryByTestId("collapse-all")).toBeNull();
+    expect(screen.queryByTestId("transcript-search-open")).toBeNull();
+    expect(screen.queryByTestId("toggle-injected")).toBeNull();
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    // Plain disclosure, not a menu: the chips expand inline in its place.
+    expect(trigger.getAttribute("aria-haspopup")).toBeNull();
+    expect(trigger.textContent).toContain("⋯");
+
+    // Expanding mounts the exact same buttons with the unchanged testids.
+    await user.click(trigger);
+    expect(screen.getByTestId("collapse-all")).toBeTruthy();
+    expect(screen.getByTestId("transcript-search-open")).toBeTruthy();
+    const injected = screen.getByTestId("toggle-injected");
+    expect(injected.textContent).toContain("注入内容 · 1");
+  });
+
+  it("re-folds the row after an action is chosen", async () => {
+    stubCompactLayout();
+    const user = userEvent.setup();
+    renderRouted([userMessage(1, "跑一下"), assistantMessage(2, "done")], "/s/ins_refold");
+
+    await user.click(screen.getByTestId("transcript-tools-open"));
+    // 搜索正文 opens the dedicated search strip and folds the chips again.
+    await user.click(screen.getByTestId("transcript-search-open"));
+    expect(screen.getByTestId("transcript-search-input")).toBeTruthy();
+    expect(screen.getByTestId("transcript-tools-open")).toBeTruthy();
+    expect(screen.queryByTestId("transcript-search-open")).toBeNull();
+
+    // 全部折叠 likewise leaves the single trigger, not the expanded row.
+    await user.click(screen.getByTestId("transcript-tools-open"));
+    await user.click(screen.getByTestId("collapse-all"));
+    expect(screen.getByTestId("transcript-tools-open")).toBeTruthy();
+    expect(screen.queryByTestId("collapse-all")).toBeNull();
+  });
+
+  it("keeps the chips inline with no trigger on a desktop-width layout", () => {
+    // No matchMedia stub: jsdom has no matchMedia, which reads as the desktop
+    // default (same guard ToolCard's layout hook uses).
+    renderRouted([userMessage(1, "跑一下"), assistantMessage(2, "done")], "/s/ins_wide", false);
+    expect(screen.getByTestId("collapse-all")).toBeTruthy();
+    expect(screen.getByTestId("transcript-search-open")).toBeTruthy();
+    expect(screen.queryByTestId("transcript-tools-open")).toBeNull();
   });
 });

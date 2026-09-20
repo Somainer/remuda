@@ -11,28 +11,31 @@ test.describe("mobile visual QA", () => {
   // touch) deliberately stays in 直连 and has no 发送 button.
   test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
 
-  test("composer stays above the bottom bar", async ({ page }) => {
+  test("composer is the bottom strip on a compact session route (D-049: no app bar)", async ({ page }) => {
     await page.goto("/sessions");
     await page.getByTestId("session-row").filter({ hasText: "看 TaskManager spill" }).first().click();
     await expect(page.getByTestId("composer")).toBeVisible();
     const composer = await page.getByTestId("composer").boundingBox();
-    const bar = await page.getByRole("navigation", { name: "手机底栏" }).boundingBox();
     expect(composer).toBeTruthy();
-    expect(bar).toBeTruthy();
-    expect(composer!.y + composer!.height).toBeLessThanOrEqual(bar!.y + 2);
+    // D-049 removed the app bottom bar on /s/:id*; the collapsed composer IS
+    // the route's bottom strip and must end at the viewport edge — never
+    // clipped below it.
+    expect(composer!.y + composer!.height).toBeLessThanOrEqual(page.viewportSize()!.height + 2);
+    await expect(page.getByRole("navigation", { name: "手机底栏" })).toHaveCount(0);
   });
 
-  test("tty dock stays above the bottom bar", async ({ page }) => {
+  test("tty send dock is the bottom strip on a compact session route (D-049: no app bar)", async ({ page }) => {
     await page.goto(`/s/${TTY_LAB}/tty`);
     await expect(page.locator("[data-tty-ready='1']")).toBeVisible({ timeout: 15_000 });
     const send = page.getByRole("button", { name: "发送" });
     await expect(send).toBeVisible();
     const box = await send.boundingBox();
-    const bar = await page.getByRole("navigation", { name: "手机底栏" }).boundingBox();
     expect(box).toBeTruthy();
-    expect(bar).toBeTruthy();
-    expect(box!.y + box!.height).toBeLessThanOrEqual(bar!.y + 2);
+    // The local-input send sits in the route's own bottom dock, which ends at
+    // the viewport edge; no app bottom bar renders below it (D-049).
+    expect(box!.y + box!.height).toBeLessThanOrEqual(page.viewportSize()!.height + 2);
     expect(box!.height).toBeGreaterThanOrEqual(44);
+    await expect(page.getByRole("navigation", { name: "手机底栏" })).toHaveCount(0);
   });
 
   test("tty key bar keys are at least 44px", async ({ page }) => {

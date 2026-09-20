@@ -6,7 +6,10 @@ import { mockDb } from "../lib/mock";
 import { SessionPage } from "./SessionPage";
 
 const mockViewportState = { mobile: false };
-vi.mock("../lib/viewport", () => ({
+// Keep the module's real exports (e.g. COMPACT_WORKBENCH_QUERY, read by the
+// Transcript/ToolCard layout hooks) while pinning the viewport state.
+vi.mock("../lib/viewport", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/viewport")>()),
   useWorkbenchViewport: () => ({ mobile: mockViewportState.mobile, offsetTop: 0 }),
   composing: () => false,
 }));

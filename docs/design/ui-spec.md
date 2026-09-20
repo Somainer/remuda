@@ -4,6 +4,8 @@
 产品定位：unified remote agent runtime 的遥控面（方案草案称 Remuda；未拍板前 UI 文案用 **runtime**）。  
 **不是** harness，**不造** agent loop。界面只观察 + 下发控制；resume 权威是原生会话。
 
+**v0.2.3 changelog（2026-09-20，task 优先模型，见 D-050）**：新增 §1.5「Task 层」（Task 是 instance 之上的聚合而非第二状态机；看板列只读投影；目录绑定 reuse\|pool 与 attach-lock；任务空间=文件视图过滤投影；批注=composer 草稿；工作台多 session 用 tab 不分屏；/m 任务分组）与 §2.9「任务列表与看板 `/board`」（三列+已归档过滤、failed 角标按 placement 归位、拖卡多跳、`SE-nn` 派生 key、父子嵌套、「需要你」首组、只读预览、任务/项目空间面板、批注徽标、项目切换器）；§1.1 projects 行与「项目」段改为采纳 Hub `Project` 实体（Space 键不放松，D-024）；§1.2 路由表新增 `/board`；§1.3 映射表补看板 compact 落点；§4.7 `/m` 子树补任务分组与看板单列过滤。机械细节（表结构、RPC/路由形状、迁移预算、grant 门控）以 [task-model.md](./task-model.md) 为准。
+
 **v0.2.2 changelog（2026-09-19，手机优先路由树，见 D-049）**：§1.2 路由表新增 `/m` 与 `/m/inbox`，并写明 compact/桌面双向重定向与 query 保留（`/s/:id` 永不重定向）；§1.3 手机线框区分「首页级屏」与「会话路由」两套铬（compact 主行含状态点：返回 / space 芯片 / 标题 / 状态点 / 分段 / Stop / ⋯），会话路由 compact 不渲染 app 底部导航栏，§1.4 的 chips 行折成单芯片、tabs 行整行收起（两条 compact 例外分别挂 D-040 / D-049，列表路由不变）；compact 主行的 host 芯片与 cost 折进「运行详情」（仅 compact，D-040 的桌面主行规则不变）；§4.5 补应用角标（badge）与推送权限横幅的位置；新增 §4.7「手机优先路由树与铬预算」（一条顶栏 `--top-mobile` + 一条底栏 `--bar`、正文 ≥ 60% 视口、截断优先级、`终端|结构` 分段与 Stop 永不截断/进溢出）与 §4.8「语音输入」（平台听写优先、先成文再发送、Web Speech API 仅增强且默认关、不做云转写、iOS Safari 无 `SpeechRecognition`、终端段不提供语音）；§4.6 PWA `start_url` 从 `/sessions` 改为 `/`。依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5 / §6 / §7.1 / §9 / §10-19 / §10-23 / §11.2 / §11.3 / §11.4 / §11.5。
 
 **v0.2.1 changelog（2026-09-19，依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §11.7 的冲突核对，见 D-038…D-042）**：本修订只解除「规格与实施单互相矛盾」，不改变产品方向。四处增补——§1.3 顶栏把 `terminal|structured` 与 Stop 钉成永不进 ⋯ 溢出；§1.4 的 400px space chips 要求限定到列表路由，`/s/:id*` 允许折成单枚当前 space 芯片；§2.2 的 header 从「规范两行诊断」改为「主行 + 可折叠运行详情」，并新增手机工具卡折叠（含 Workflow / error / running 豁免）与 compact composer 边界；§3.4 新增全局的「命中尺寸只靠热区」与「`.meta` 类文本桌面手机同值、下限 `var(--text-aux)`」。**依据行号以本文件为准**（报告 §11.7 引的 `ui-spec.md:233` 实为修订前的 `:235`，该行现已随 §2.2 重画）。
@@ -54,12 +56,12 @@
 | `sessions` | 会话 | 跨主机实例列表 + 打开会话 | 左栏列表；主列会话页 | 底栏「会话」 |
 | `approvals` | 审批 | 全局 pending Interaction | 顶栏铃铛 + `/approvals` | 底栏「审批」（有待办时红点；compact 下即 `/m/inbox`，D-049） |
 | `hosts` | 主机 | Node Agent 在线、CLI、登录态 | `/hosts` | 底栏「更多」→ 主机 |
-| `projects` | 项目 | Workspace（cwd / worktree）通讯录，按主机分组 | `/projects`；新建会话里的选择器 | 新建会话步骤里选 |
+| `projects` | 项目 | Hub `Project` 实体（任务看板、任务列表、项目切换器；`members[]` 引用 Space 键，D-024/D-050） | `/projects`、`/board`；顶栏项目切换器；新建会话里的选择器 | 新建会话步骤里选；compact 看板塌缩进 `/m` |
 | `providers` | Provider | profile、健康、与 astergate 关系 | `/providers` | 更多 → Provider |
 | `bots` | Bot | 飞书 / Telegram 绑定、白名单、会话键 | `/bots` | 更多 → Bot |
 | `settings` | 设置 | 设备、推送、权限默认（v1 无浅色开关） | `/settings` | 更多 → 设置 |
 
-「项目」是 UI 文案，**不是**独立实体、也不是 vibe-kanban 看板。协议实体是 **Workspace**（主机上的 cwd 通讯录，id=`workspaceId`）。给新建会话和过滤器提供稳定 `workspaceId`（host + path + 可选 worktree）。
+「项目」对应 Hub **`Project` 实体**（D-050 起 Web 采纳；`members[]` 是 `(hostId, workspaceId)` 列表，直接引用 Space 键，不合并同名/跨主机目录，D-024 不变）。任务列表与看板按 projectId 过滤，顶栏有 全局▸项目 切换器。已注册目录的协议实体仍是 **Workspace**（主机上的 cwd 通讯录，id=`workspaceId`），为新建会话、文件视图与过滤器提供稳定 `workspaceId`（host + path + 可选 worktree）；Project 引用 Workspace，不替代它。task 聚合层与看板投影见 §1.5 / §2.9。
 
 会话页内部两个视图，**不是**两个顶层导航，也**不是** herdr 多 pane 工作台：
 
@@ -85,7 +87,8 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 | `/m/inbox` | 手机收件箱（D-049） | 两档 + 沿用 `?kind=` / `?focus=`（§2.5、§4.7）；桌面访问 `<Navigate replace>` 回 `/sessions` |
 | `/hosts` | 主机列表 | |
 | `/hosts/:hostId` | 主机详情 | |
-| `/projects` | 项目列表（Workspace） | 路径保留「项目」文案 |
+| `/board` | 任务看板（D-050，§2.9） | query：`?project=`（缺省=全局，全部项目）。三列只读投影 + 已归档过滤；compact 下不进桌面看板，改由 `/m` 单列分段过滤承载（§4.7） |
+| `/projects` | 项目列表（Hub `Project` 实体，D-050） | 路径保留「项目」文案；旧 Workspace 通讯录内容移到新建会话的主机/目录选择与项目详情 |
 | `/projects/:workspaceId` | Workspace 详情（最近会话、默认 kind/model） | |
 | `/providers` | Provider 列表 | |
 | `/providers/:profileId` | profile 详情 | |
@@ -162,6 +165,7 @@ compact 下有**两套铬**，按路由切换（D-049，预算见 §4.7）：
 | 终端视图 | 全屏 xterm + 本地输入条 + 辅助键（仅 `tty-attachable`） |
 | hover 预览 / 拖拽排序 | 禁止；改长按菜单 |
 | 多 pane 分屏 | **v1 不做**（不是 herdr 工作台；一实例一终端） |
+| 看板（桌面三列，§2.9） | **不复制看板**：compact 塌缩为 `/m` 单列分段过滤（待办/进行中/已完成/已归档，同一投影一次一列；D-049/D-050） |
 
 Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mobile-panels.md`）。本产品更简单：列表和会话是路由，不是手势抽屉。审批用独立底栏入口，避免 DSH「折叠组不汇总待交互」的坑（`deepseek-harness.md` §2.2 会话列表）。
 
@@ -183,6 +187,19 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 - **compact 下的 tabs 行例外（D-049，2026-09-19 增补，仅覆盖上一条快捷键句子里「与 tabs」那半句的应用范围）**：上面那句「约 400px 手机上显示可横向滚动的 space chips 与 tabs」对 tabs 的要求**只在列表路由成立**；`/s/:instanceId` 及其子视图在 compact 下**不渲染 tabs 行**（即 §1.3 说的 SpaceTabs 行），切 tab 由顶栏单枚 space 芯片的抽屉与 Jump To sheet（§4.7）承担，能力不降级。列表路由（`/sessions`、`/hosts`、`/projects`、`/approvals` 等）的可滚动 tab 条保持不变。本条与上一条 D-040 chips 例外是同一形状的限定：chips 折成单芯片、tabs 整行收起，二者一起把会话路由的正文让回给 §4.7 的 60% 预算。
 
 本节只作用于会话工作台。fleet 与全局 approvals 的范围和入口不变，composer 继续以当前实例为控制目标。验收与桌面/400px、深浅主题截图见 [spaces-1.md](./evidence/spaces-1.md)；tab 语义增补的验收见 [tabs-1.md](./evidence/tabs-1.md)。
+
+### 1.5 Task 层：任务聚合、看板列、目录绑定与任务空间（D-050，2026-09-20）
+
+本节是 task 优先模型的界面口径；实体字段、表结构、RPC/路由形状、迁移预算与门控动词以 [task-model.md](./task-model.md) 为机械权威，ADR 为 [D-050](./decisions.md)。
+
+- **Task 是 instance（会话）之上的聚合层，不是第二套状态机。** Hub 的 Task 台账 8 态（pending/placed/running/stalled/done/failed/parked/deferred）是唯一权威；看板列、任务分组、人读 key、共用计数全是只读派生投影，UI 不把投影写回为状态。
+- **一个 task 聚合多个 session**：实例经既有 `instances.task_id` 归属 task。一个 task 的多个 session 用 **tab/卡片**呈现（复用 §1.4 的 `visibleTabs`/`spaceSessions` 语义，`spaces/store.ts:93-108`），点开进共享 `/s/:id`。**不做并排多 pane 工作台**：§1.3 映射表「v1 不做多 pane 分屏（一实例一终端）」对 task 面同样成立；某参考看板产品的并排多面板不抄。
+- **看板列是只读投影**：待办 / 进行中 / 已完成 三列 + 已归档过滤（不是第五列）。投影表、failed 按 placement 归位 + 角标、拖卡列→列多跳映射、done≠解锁见 §2.9 与 [task-model.md](./task-model.md) §5。
+- **目录绑定二选一**（task 创建时显式选择，按项目记忆，无静默默认）：`reuse` = 复用注册根或既有 `remuda-wt` 兄弟目录，一目录一分支、attach 期间独占、多 task 顺序轮用，归还对目录零操作；`pool` = app 管理的 worktree 池，detached-HEAD 停放、租借时切 `wt/<slot>/<task-slug>`、归还时 reset/clean/park 但不删除。池满、目录忙、分支冲突一律显式 `blocked`（卡片/行显示理由），**绝不静默换目录或回退主 checkout**（D-035）。「与 N 个 task 共用」= 同目录 lease 的引用计数，是顺序轮用不是并发；Space 键 `(hostId, workspaceId)` 不放松（D-024）。
+- **项目空间 vs 任务空间**：项目空间 = 既有文件视图（轴 `hostId+workspaceId`，[files-view-contract.md](./files-view-contract.md)），即 worktree 全树；任务空间 = 同一视图按 task 的 session 集合 + `owns[]` glob 的**客户端过滤投影**，空态「还没有文件」，不新增端点。两空间在会话右栏/`/s/:id/files` 内以 tab 切换。
+- **批注是设备本地 composer 草稿**（不是 wire 字段、不是表）：卡片级或消息内锚点 `①` 两级载体，composer 显示「本次发送带 N 条批注」，随下一次发送拼进 prompt 前缀后清零。
+- **手机（D-049）**：`/m` home 在既有 项目+branch 分组上叠加 task 分组；桌面看板在 compact 塌缩为单列分段过滤（§4.7），不复制看板；会话本体与文件视图永远是共享 `/s/:id`、`/s/:id/files`，不造第二份 transcript。
+- **看板与任务列表是 project 维度的表面，不取代会话主导航**：§1.1 的会话区仍是一等导航；看板不是整站 IA（§5.1 对四栏看板产品「不要把主 IA 做成看板」的保留成立——主 IA 仍是会话，看板是项目内的任务表面）。
 
 ---
 
@@ -731,6 +748,58 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 
 ---
 
+## 2.9 任务列表与看板 `/board`（D-050，2026-09-20）
+
+消费 Hub Task 台账（`GET /v1/board?project=` 与 task 列表），把任务而不是会话作为左栏/看板的卡片单位。机械规则（状态→列投影、lease、refcount、迁移预算）见 [task-model.md](./task-model.md)；本节只定界面。
+
+**桌面线框（看板）**
+
+```
+┌ 航轨 ┬─ 任务清单（280） ─┬─ 看板  全局 ▾ [搜索 Task]  归档过滤 ─────────────┐
+│      │ 需要你 · 2        │  待办            进行中           已完成          │
+│ 会话 │  ▸ SE-03 适配…  2 │ ┌───────────┐  ┌───────────┐   ┌───────────┐   │
+│ 任务 │ 项目 remuda ▾     │ │SE-05 ⚠    │  │SE-02      │   │SE-01 done │   │
+│ …    │  ├ SE-07 子任务   │ │修 spill   │  │worktree 池│   │landed a1b2│   │
+│      │  └ SE-08 子任务   │ │claude ●   │  │2 session  │   │1 session  │   │
+│      │  已归档 · 3       │ │与 2 个共用 │  │SE-nn default│  │           │   │
+│      │                   │ └───────────┘  └───────────┘   └───────────┘   │
+└──────┴───────────────────┴────────────────────────────────────────────────┘
+```
+
+**任务列表（左栏；手机形态见 §4.7）**
+
+- **首组「需要你 · N」**：有待人类 Interaction 或 blocked 待所有者处理的 task 置顶，关联既有 Interaction 收件箱（`/m/inbox`）与 space 的 `blockedCount`（`spaces/store.ts:73-74`）；这是 attention/inbox 聚合，区别于原始 blocked 计数。
+- 其余按 **project + git branch** 分组（复用 `buildSpaces()` / `buildHomeGroups` 形态，`spaces/store.ts:53`、`web/src/features/mobile/homeRows.ts:171`）；组内按 **`parentTaskId` 嵌套父子任务**——父行显示 `▸ N` 子计数，子任务嵌在父下，与 project/branch 分组并存。
+- 每行：派生 **`SE-nn`** 人读 key（project 内顺序派生，display-only，无 schema 改动；不显示裸 `tsk_…`）、标题、session 数、一句下一步；归档 task 折进「已归档 · N」。
+- 顶部「搜索 Task」复用既有会话过滤机制（`web/src/features/session/sessionFilters.ts`），不新造搜索栈。
+
+**看板**
+
+- **三列**：待办 / 进行中 / 已完成；已归档是过滤器（或折叠组），**不是第五列**，归档不改 task state。
+- **列投影（只读，权威是 8 态机）**：待办 = pending/placed/deferred/parked（+ failed 且无 placement）；进行中 = running/stalled（+ failed 且有 placement）；已完成 = **只有 done**。
+- **failed 卡**按 `placement` 归位（有→进行中，无→待办）并在卡上叠**红色 ⚠ 角标**，`blockedReason` 可见；不单开列、不折进已完成。角标只靠颜色不够，要带形状与文案。
+- **卡面字段**：`SE-nn` key、标题、所含 session 行（harness 字形 + 相对时间，复用 tab 渲染语义）、当前 profile 的 `default` 配置标签（点击回落 composer 模型/权限三元组，无新存储）、footer **「与 N 个 task 共用」**（lease refcount，顺序轮用语义）、failed 角标。
+- **拖卡合法性由当前 state 决定**：UI 用状态机的合法迁移预计算每卡可达列，不可达列在拖拽时禁用并给提示（不是静默拒绝，也不是松手后 4xx 才报错）；待办→进行中对 pending/deferred 卡走多跳（pending→placed→running），每跳都是合法 PATCH，任一跳非法整体复位。进行中→已完成同理：只有 running 卡能单跳 → done（状态机无 stalled→done 边），**stalled 卡走 stalled→running→done 多跳**；路径一律由 `can_transition_to` 计算，不发非法单跳。已完成列上的卡**不暴露 land 动作**——land 只走 gate；卡进已完成列不解锁依赖（I1）。
+- **门控按 grant 动词，UI 不假设「agent 一律禁写」**：拖卡发 `PATCH /v1/tasks/{id}`、归档发 `POST /v1/tasks/{id}/archive`，Hub 按 `GrantVerb::Dispatch` 门控；持 grant 的协调员 agent 可写，无 grant/越 scope 收 403，UI 照常渲染拒绝理由。
+- **看板详情 = 只读预览**：从卡片点开的详情面板渲染 task 的 mandate/title/blockedReason 正文（批注锚点 `①` 挂这个正文面），composer 禁用，面板标「**预览模式 · 在工作台打开以完整操作**」，入口跳共享 `/s/:id`（镜像归档 session 的只读态）。
+
+**右栏 tab：详情 / 文件（项目空间·任务空间）/ 变更**
+
+- **详情 tab**：mandate/title/blockedReason 正文；批注锚点选中此正文或 transcript 生成 `①`。
+- **项目空间** = worktree 全树（既有文件视图，轴 `hostId+workspaceId`）；**任务空间** = 同视图按 task 的 session 集合 + `owns[]` glob 过滤的投影，空态「还没有文件」，无新端点；非 git/离线/权限不足透传契约六可用性状态，不伪造基准。
+- **变更** tab 是一等 diff 入口（复用文件视图的 SCM 数据），不藏进二级菜单。
+
+**批注（composer 草稿，零 wire）**
+
+- 两级载体：卡片级（挂 task 卡）/ 消息内锚点（选中详情或 transcript 正文生成 `①`）；批注面板有 卡片/标记 两个 tab。
+- composer 上方徽标「本次发送带 N 条批注」；发送时批注作结构化前缀拼进 prompt，发送后清零；终端段不提供批注；看板只读预览不可批注。
+
+**项目切换器**：顶栏 `全局 ▾ <project>`，按 projectId 过滤任务列表与看板，全局不过滤；`Project.members[]` 映射到 Space（复用 `(hostId, workspaceId)` 键，D-024）；`/projects` 页读 `Project` 实体，不再是 Workspace 通讯录 stub。
+
+**手机（compact）**：不渲染三列看板；`/m` home 在 project+branch 组上叠 task 分组，看板需求由单列分段过滤承载（待办/进行中/已完成/已归档，一次一段，§4.7）；任务空间/项目空间在共享 `/s/:id/files` 内作 tab；批注在手机只读，建锚点桌面优先。会话本体永不分叉（D-049）。
+
+---
+
 ## 3. 实时性与状态语义
 
 ### 3.1 两路数据，不要混
@@ -857,7 +926,8 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 | `/m` 子树内容 | 说明 |
 |---|---|
-| `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038） |
+| `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038）；D-050 起在项目/branch 分组上**叠加 task 分组层**（「需要你」首组、父子任务嵌套、`SE-nn` 派生 key、已归档折叠，§2.9） |
+| 看板的 compact 形态 | 不复制桌面三列：单列滚动 + 待办/进行中/已完成/已归档分段过滤（`GET /v1/board` 同一投影，一次一段；D-050）；桌面 `/board` 在 compact 不重定向到一个新页面，分段过滤就是 `/m` 子树内的看板形态 |
 | `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近），沿用 `ApprovalsPage` 的 kind 分段（§2.5） |
 | Jump To sheet | 从 home 顶栏与终端键盘条打开的覆盖层，不独占路由；分组 + 时钟/列表，**不做第二套空间模型**（报告 §10-23 / §11.2） |
 | phone 底栏 | 会话 · 收件箱(n) · 新建 · 更多，只挂在 `/m*` 外壳上（compact 底栏文案以本条为准，§1.1 的「审批」在手机上即「收件箱」） |
@@ -949,7 +1019,7 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 - claudecodeui：`/` + `/session/:id`、手机 viewport hook、PTY+结构化双通道——双通道是会话的 structured / tty **两个视图**，driver 是 `claude-print` vs `claude-pty`/`claude-bg`，不引入它的 Express 后端。
 - paseo：手机三态面板、hooks 判 `needs-input`；我们用 Interaction 队列，不靠 Notification 字符串。
-- vibe-kanban：四栏工作区、任务看板——**不要**把主 IA 做成看板；权限 hook 是 Node Agent 的事，不是 UI。
+- vibe-kanban：四栏工作区、任务看板——借看板的列投影与卡片形态（D-050 的 `/board` 是项目维度表面，§2.9），但**不要把主 IA 做成看板**（会话仍是一等导航，§1.5）；权限 hook 是 Node Agent 的事，不是 UI。
 
 **自写**
 

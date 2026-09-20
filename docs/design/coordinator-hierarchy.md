@@ -4,7 +4,7 @@
 - 状态：设计（待用户拍板后按 §8 派工）
 - 基线：`origin/main` = `9df9099`（三份输入报告写于 `3f68061`；本文引用的 `file:line` 已在 `9df9099` 上重新核对）
 - 输入：`<coord-scratch>/coordinator/{remuda-surfaces,playbook,prior-art}.md`
-- 相关决策：D-002、D-005、D-011、D-013、D-014/D-015、D-017、D-021、D-023、D-024、D-026、D-028、D-031
+- 相关决策：D-002、D-005、D-011、D-013、D-014/D-015、D-017、D-021、D-023、D-024、D-026、D-028、D-031、D-050（Task/Project 台账的人向浮现，见 §2.6）
 - 本文不改仓库任何代码；§8 的批次才是可派工单元
 
 ---
@@ -111,6 +111,18 @@ owner 的评审意见：三层不能写死。对照先例（Erlang supervision t
 **由此自然得到的拓扑**：单项目用户 = 2 层（owner 直接对持有 dispatch 的项目节点说话，无人持有 address-owner 也可以——bot 直连该节点）；标准 = 3 层；worker 派 spike = 4 层（受深度上限约束，spike 节点无 `land`）；跨项目发布 coordinator = scope 覆盖多个 project 而无 address-owner 的节点；review agent、gate 失败交回原 worker = 同级 handoff（消息，不是树边）。
 
 **对批次的影响**：批 1（co-project）实现 `scope`/`grants` 两列与预设，唯一性约束改为「每个 Hub 至多一个活跃的 `address-owner` 持有者」+「每个项目默认至多一个活跃 `dispatch` 持有者（策略可放宽）」；批 4 的 task ledger 带 `parentTaskId`；批 5 的 `dispatch` 动词在创建子节点时校验收窄与 DAG。§2.1–§2.4 中所有「T1/T2 不得…」的 403 规则一律读作「不在 scope/grants 内的动作」。
+
+---
+
+### 2.6 修订：Task / Project 台账向人向表面浮现（2026-09-20，D-050）
+
+§1.2 非目标 2「本轮不做 Web UI」限定的是 §8 的 coordinator 批次（只动 `crates/` 与 `skills/`）。task-model 批次（D-050，[task-model.md](./task-model.md)、[ui-spec.md §1.5/§2.9](./ui-spec.md)）把那时只对 coordinator 动词存在的两张台账**浮现给人**：
+
+- **Task 台账浮现为任务列表与看板**：桌面 `/board` 三列（待办/进行中/已完成）+ 已归档过滤、左栏任务清单（「需要你」首组、project/branch 分组、`parentTaskId` 父子嵌套、派生 `SE-nn` key），compact 塌缩进既有 `/m`（D-049，不造第二份实现）。看板列是 8 态台账的**只读投影**（含 failed 按 placement 归位 + 角标），台账与状态机仍是唯一权威；拖卡只是合法 state 迁移的 UI，done 列不解锁依赖（I1，§7 #8 不变）。
+- **Project 台账浮现为项目实体与切换器**：Web 采纳 §3.2 的 Hub `Project` 实体（替换 Workspace 通讯录 stub），顶栏切换器按 projectId 过滤列表/看板。`members[]` 的 `(hostId, workspaceId)` 仍是 Space 键（D-024 不放松，§3.2 reuse 说明不变）；bot 的 `defaultProject` 仍是全仓唯一把 project 当路由概念处。
+- **task 写操作的门控按 §2.5 的 grant/scope 读法**：task 创建/迁移/落地不是 human-only——门控是 `GrantVerb::Dispatch`/`GrantVerb::Land`（详见 D-050 第 6 条与 [task-model.md](./task-model.md) §6 的 file:line），持 grant 且在 project scope 内的 launched coordinator agent 被授权；D-017 的「agent 403」仍只限于跨实例控制 / 跨 host create / agent keys。
+- **每个 task 的目录承载显式化**：`workspaceBinding{reuse|pool}` 与 `worktree_leases` 把「多 task 顺序轮用一目录一分支」建模为 task 层引用计数 + attach-lock，而不是合并 Space；§6 缺口表中 Task「GAP」、Space「UI-only」、Bots 配置页 MOCK 三行由 task-model 批次任务 4–8 接续关闭，本文不回改该表（它记录的是 §8 批次当时的状态）。
+- coordinator 流程（brief/review/gate/land）不变：看板只**浮现**既有流程，证据/密钥/gate 规则照旧。
 
 ---
 

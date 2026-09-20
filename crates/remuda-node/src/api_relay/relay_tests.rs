@@ -1349,6 +1349,92 @@ async fn credit_starved_egress_ends_at_the_hard_cap_after_four_chunks() {
 }
 
 #[tokio::test]
+async fn actively_credited_stream_still_ends_at_the_hard_cap() {
+    // D-048 hard cap is a whole-stream ceiling, not merely the empty-window
+    // anti-park guard: a well-behaved consumer that answers every chunk with
+    // an api.credit while the gateway keeps emitting must still be cut off
+    // at the cap. The fixture emits a small SSE event every 60 ms for ~5 s
+    // (well past the tuned 2 s hard cap, far inside the 10 s idle gap), and
+    // every drained chunk is credited immediately, so the producer never
+    // blocks on an empty window.
+    let gateway = FakeGateway::start_with(vec![Script::SseWithGaps {
+        gap_ms: 60,
+        text: "x".to_owned(),
+        events: 80,
+    }])
+    .await
+    .unwrap();
+    gateway.expect_credential(GW_TOKEN);
+    let state_w = ApiRelayState::new();
+    let state_h = ApiRelayState::new();
+    let tuned = EgressTimeouts {
+        ttft: Duration::from_secs(10),
+        idle: Duration::from_secs(10),
+        hard: Duration::from_secs(2),
+    };
+    // Below one SSE event's size so each delivered event is its own chunk as
+    // soon as it arrives rather than waiting on the coalesce timer.
+    state_h.set_egress_context(gateway_context(&gateway, Some((256, tuned))));
+    let (broker_w, _broker_h, pump) = pump_pair(&state_w, &state_h);
+
+    let (_id, outbox, mut events) = open_messages_stream(&broker_w).await;
+
+    let started = std::time::Instant::now();
+    let mut chunks = 0usize;
+    let end = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                InboundEvent::Chunk(_) => {
+                    chunks += 1;
+                    // Steady consumer: grant the next permit immediately, so
+                    // the window is never empty when the producer looks.
+                    outbox
+                        .send_notification(
+                            METHOD_API_CREDIT,
+                            &remuda_protocol::hubnode::ApiCreditParams {
+                                stream_id: outbox.stream_id().to_owned(),
+                                chunks: 1,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                InboundEvent::End(end) => return end,
+                InboundEvent::Head(_) | InboundEvent::Credit(_) => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        panic!("stream ended without an api.end frame");
+    })
+    .await
+    .expect("hard cap ends the flowing stream");
+    let elapsed = started.elapsed();
+    pump.abort();
+
+    // More than the four-chunk initial window: credits actually carried a
+    // continuously flowing stream, and the cap still ended it.
+    assert!(
+        chunks > 4,
+        "a steadily credited stream flowed past the initial window: {chunks}"
+    );
+    let error = end.error.expect("a hard-cap error end");
+    assert_eq!(
+        error.code,
+        remuda_protocol::hubnode::API_ERROR_UPSTREAM_TIMEOUT,
+        "{error:?}"
+    );
+    assert_eq!(error.message, "stream hard cap reached", "{error:?}");
+    assert!(
+        elapsed >= Duration::from_millis(1_500),
+        "ended at the hard cap, not earlier ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "ended at the 2 s cap, not at idle or natural end ({elapsed:?})"
+    );
+}
+
+#[tokio::test]
 async fn delayed_credits_keep_a_long_response_clean_to_its_last_chunk() {
     // Regression: the EventRouter used to be aborted as soon as the upstream
     // body loop ended, before the tail flush and the zero-byte last chunk were

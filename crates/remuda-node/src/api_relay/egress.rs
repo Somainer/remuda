@@ -688,6 +688,19 @@ async fn run_egress(
                 ));
                 break;
             }
+            // Whole-stream ceiling (D-048), measured from the committed head:
+            // even an actively flowing, steadily credited stream ends at the
+            // hard cap, so a gateway that keeps emitting cannot hold the
+            // upstream connection and this task past it.
+            _ = tokio::time::sleep_until(hard_deadline) => {
+                failed = Some(error_end(
+                    &open.stream_id, started,
+                    bytes_up.load(std::sync::atomic::Ordering::Relaxed),
+                    bytes_down,
+                    API_ERROR_UPSTREAM_TIMEOUT, "stream hard cap reached",
+                ));
+                break;
+            }
         }
     }
     // The router task stays alive through the tail flush and the terminal

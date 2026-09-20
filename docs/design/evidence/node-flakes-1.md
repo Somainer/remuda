@@ -56,18 +56,28 @@ upstream response head; under load the loopback connect, gateway scheduling
 and head delivery consumed the whole second before a single chunk was
 produced — a diagnostic probe on failing runs recorded zero bytes downstream
 and an end at 1.43–1.50 s — so the assertion sampled an unopened window
-instead of a drained one. Two minimal product changes in the relay make the
-window's size structural: (1) the egress hard deadline now starts when the
-response head commits — the pre-head wait is already bounded by the
-first-byte timeout, so connect latency can no longer spend the consumer's
-delivery budget; (2) a gated send with a permit already granted (an open
-window) no longer races the clock — only an *empty* window races
-cancellation and the hard deadline, preserving the anti-park guarantee for a
-consumer that stops acknowledging. The duplicate open-armed elapsed check at
-the top of the body loop, which could fire before any chunk was ever eligible
-to send, is removed. Upload-side gated sends on the worker listener keep
-their existing deadline; nothing else in the relay or runtime modules
-changed.
+instead of a drained one. Three minimal product changes in the relay make
+the window's size structural without weakening the cap: (1) the egress hard
+deadline now starts when the response head commits — the pre-head wait is
+already bounded by the first-byte timeout, so connect latency can no longer
+spend the consumer's delivery budget; (2) a gated send with a permit already
+granted (an open window) no longer races the clock — only an *empty* window
+races cancellation and the hard deadline, preserving the anti-park guarantee
+for a consumer that stops acknowledging; (3) the D-048 whole-stream ceiling
+is retained rather than removed: the body loop's per-iteration cap guard,
+which the base measured from stream open via `started.elapsed()`, is re-based
+onto the head-armed `hard_deadline` as a `sleep_until(hard_deadline)` select
+arm, so an actively flowing, steadily credited stream that never parks on an
+empty window is still cut off at the cap with the existing
+`upstream-timeout` end. The new
+`actively_credited_stream_still_ends_at_the_hard_cap` test proves both halves
+(a gateway emitting an event every 60 ms for ~5 s, every chunk credited
+immediately, cap tuned to 2 s): it ends at ~2 s having drained more than the
+initial window, and fails (runs to the ~4.8 s natural end) when the ceiling
+arm is removed. Upload-side gated sends on the worker listener keep their
+existing deadline; nothing else in the relay or runtime modules changed.
+The restored-ceiling test is itself 20/20 green under the same locked stress
+harness (three full-suite sibling binaries plus the build, two pinned cores).
 
 ## Verification
 

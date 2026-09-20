@@ -82,7 +82,7 @@
 | typecheck / lint | `pnpm --dir web typecheck`、`lint` | PASS（lint 余告警为 Transcript 既有的 react-hooks 风格告警，非本次引入） |
 | 本任务 hub 规格 | `m-chrome.hub.spec.ts` ×3 连跑 | 3/3 PASS，三次几何数值一致 |
 | 相关规格各一遍 | `ux-chrome.hub.spec.ts`（2）、`ux-touchhit.hub.spec.ts`（4）、`ux-composer-mobile.hub.spec.ts`（3） | 9/9 PASS |
-| 全量 hub e2e | `pnpm test:e2e:hub`（hub 配置全量，本锁槽内） | 见文末「全量回归记录」 |
+| 全量 hub e2e | `pnpm test:e2e:hub`（hub 配置全量，本锁槽内） | **149 passed / 19 skipped / 0 failed**（`CI=1` 闸口等价，见 §9 历次记录） |
 
 **闸口开闸方式**：本分支含 `web/src/app/Shell.tsx` / `Shell.module.css` 改动，不在 `crates/remuda/src/cmd/merge/web_e2e.rs` 的自动清单内（清单含 `web/src/features/session/**`，Transcript 改动本身会自动开闸，但 app/ 不会），`remuda merge` 时必须**显式传 `--web-e2e`**：
 
@@ -108,25 +108,25 @@ remuda merge --web-e2e   # 显式开 web hub e2e（web/src/app/** 改动不自�
 - `ux-chrome.hub.spec.ts`（2）、`ux-touchhit.hub.spec.ts`（4）、`ux-composer-mobile.hub.spec.ts`（3）：**9/9 PASS**。
 - 全量 `pnpm test:e2e:hub` 首轮：140 passed / 1 failed —— 唯一失败是 `spaces-hub-live.spec.ts:165` 的 400px 段仍断言 compact 会话路由**可见** `space-tabs`，即 D-049 明确推翻的旧行为。已把该段改为断言 tabs 不渲染、隔离性经抽屉导航的落点 URL 验证，并刷新 `spaces-1/fake-phone-*.png` 证据（desktop 三张仅重渲染、布局无变化）；单文件复跑 PASS。
 - 全量第二轮（rebase 到含 c-cua-hostcap / c-cua-media 的最新 `origin/main` 后；Playwright 在 rebase 落盘前完成了 spec 扫描，故该轮未收录新文件 `cua-media.hub.spec.ts`）：140 passed / 1 failed —— 唯一失败为 `grok-structural.hub.spec.ts:507`，240s 超时的重型 PTY 链路用例（本轮套件总时长 26.6min 下被饿死）；脱离套件单独复跑 **42.6s PASS**，属既有用时 flake，与本分支文件无交集。
-- 全量第三轮（最终树，含 cua-media；另有一次启动因 `pnpm --dir` 与已在 `web/` 的 cwd 拼成 `web/web` 而立即失败、未执行任何用例，不计）：141 passed / 18 skipped / 1 failed（22.6min，cua-media 用例全部在其中通过）。唯一失败仍是 `grok-structural.hub.spec.ts:507`，这次报「structured tool card never settled」——同一条假节点 PTY settle 等等待在套件负载下超时；整个 `grok-structural.hub.spec.ts` 单独复跑 **2/2 PASS（42.5s/条）**。
-  - **与本分支无关的证据**：该用例全程 1440 视口（`:604` 固定回 1440×900），而本分支所有改动要么挂 `(max-width: 767px)` 媒体查询、要么挂 `mobile &&` 渲染条件，1440 下代码路径与改前逐字节一致；本任务的 `m-chrome` 规格在套件中排第 23–25，该用例排第 8，不存在测试环境污染的先后关系。
-  - 时间线：c-cua-media 合入（**改了 `ToolCard.tsx`，正是这个用例 settle 的结构化工具卡组件**，见 `311006de`/`368b5b74`）前的首轮全量该用例 43.2s PASS；合入后的两轮全量都在负载下挂、单跑都过。
-  - 旁证跑：在裸 `origin/main`（3c24bbd8，无本分支任何提交）上用同一锁槽/端口跑一遍全量，结果见本节末「裸 main 旁证」。hub 闸口配置 CI `retries: 1` 也正是为这类负载 flake 设的。
+- 全量第三轮（rebase 到 6202e0af，含 m-voice / m-mobilenew；另一次启动因 `pnpm --dir` 与已在 `web/` 的 cwd 拼成 `web/web` 立即失败、未执行用例，不计）：144 passed / 18 skipped / 1 failed（24.6min，cua-media / m-voice / m-mobilenew 用例全部在其中通过；本轮 grok #8 已 **42.6s PASS**）。
+  - 唯一失败是 `ux-mobile-new.hub.spec.ts:286`，**这条确由本任务引起、已修**：c-mobilenew 的分支基线是 a997e8a2（早于 c-mshell），它在 compact `/s/:id` 上用 app 底栏的「会话/新建」做导航；D-049 摘掉该底栏后选择器超时。经裸 6202e0af 插桩确认，旧的 `toHaveURL(/\/sessions$/)` 断言本来就只命中 c-mshell `/sessions→/m` 重定向前约 1–2s 的过渡 URL（插桩日志：点击后立即读为 `/sessions`，+2s 为 `/m`），是已存在的时序脆点。修复：会话页离开走顶栏「返回」→ 落到 `/m`（D-049 §E9 的回列表路径）；第二次新建从 `/m` 的 `phone-nav-new` 走；列表页上的新建选择器不动。修复后该规格 **3/3 PASS**。
+  - 同批修掉 mock 配置（非闸口）的 `mobile-qa.spec.ts`：两个会话路由用例改为断言 composer/tty 发送栏自身即底部条、app 底栏计数为 0。该文件另有 3 个用例（`/sessions` 上的 space chips / 安装条 / 底栏 44px）在裸 6202e0af 上**同样失败**——c-mshell 后这些表面已在 PhoneShell 的 `/m` 下，属 c-mshell 既有的非闸口遗留、不在本任务归属内，本分支对该文件**不引入任何新失败**（修前修后都是同样这 3 个红）。
 
-vitest（最终 rebase 后）：135 文件 / **1302 用例全绿**（c-cua 两批新增 23 个）；`typecheck` / `lint` / `secret-scan.sh` / `no-tunnel-scan.sh` 均 PASS。
+vitest（rebase 到 f0842597 后）：138 文件 / **1329 用例全绿**；`typecheck` / `lint` / `secret-scan.sh` / `no-tunnel-scan.sh` 均 PASS。
 
-### 新基线下的复核（rebase 到 6202e0af，含 m-voice / m-mobilenew 之后）
+### 新基线下的 m-chrome 复核（含 m-voice / m-mobilenew）
 
-`origin/main` 在本任务收尾时又合入 m-voice（改 `Composer.tsx`）与 m-mobilenew，已 rebase 并复核：
+- `m-chrome.hub.spec.ts` 在 6202e0af 基线上连跑 **3 次全绿**，三次几何与旧基线**逐像素一致**（0.761 / 0.658 / 0.887 / 0.717）——m-voice 的麦克风按钮按 D-049 §4.8 只在 `SpeechRecognition` 存在时渲染，闸口 chromium 无该能力，收起 composer 高度不变；证据 PNG 重新生成后 git 无差异。
+- `ux-chrome` / `ux-touchhit` / `ux-composer-mobile` 新基线上 **9/9 PASS**；修复后的 `ux-mobile-new.hub.spec.ts` **3/3 PASS**。
+- 最终基线 f0842597（c-sockpath，**零 web 改动**，`remuda-hub` 与 `hub_e2e` 无差异）上的闸口等价全量（`CI=1`，Playwright 内部 `retries:1`，同闸口配置）：**149 passed / 19 skipped / 0 failed / 无 flaky 重试**（168 用例，23.8min，EXIT=0）。`m-chrome` 三条、修后的 `ux-mobile-new` 三条、`spaces-hub-live`、`ux-chrome`、`ux-touchhit`、`ux-composer-mobile` 全部在其中一次通过（日志含 MCHROME 0.761/0.658 与各 CHROME 几何探针输出）。
 
-- vitest 138 文件 / **1329 用例全绿**；typecheck / lint PASS。
-- `m-chrome.hub.spec.ts` 在新基线上再连跑 **3 次全绿**，三次几何与旧基线**逐像素一致**（0.761 / 0.658 / 0.887 / 0.717）——m-voice 的麦克风按钮按 D-049 §4.8 只在 `SpeechRecognition` 存在时渲染，闸口 chromium 无该能力，收起 composer 高度不变；证据 PNG 重新生成后 git 无差异。
-- `ux-chrome` / `ux-touchhit` / `ux-composer-mobile` 新基线上 **9/9 PASS**。
-- 最终树全量 hub e2e 结果：见下（回填）。
+### grok flake 归因（备查）
+
+`grok-structural.hub.spec.ts:507` 在两轮无重试全量中因套件负载超时（一次 240s、一次「tool card never settled」），整文件单独跑 **2/2 PASS（均 42.5s）**。该用例全程固定 1440×900 视口，本分支所有改动挂 767px 媒体查询或 `mobile &&` 条件，1440 下代码路径与改前一致；`m-chrome` 规格在套件中排第 23–25，该用例排第 8，无先后污染；其失败首次出现紧跟 c-cua-media 对 `ToolCard.tsx` 的改动之后（该用例 settle 的正是结构化工具卡）。闸口 `CI retries:1` 即为此类负载 flake 而设。
 
 ### 裸 main 旁证（未完成，已放弃）
 
-曾在临时 worktree 的裸 3c24bbd8 上启动全量以做 flake 归因，因 main 随后又前进两个合并而主动中止（`TaskStop`，端口确认释放、worktree 已删除）；grok flake 的归因以上面四条证据（1440 视口下本分支代码路径零差异、单跑 42.5s 过、cua 改 ToolCard 后才出现、CI 配置 `retries: 1`）为准。
+曾在临时 worktree 的裸 3c24bbd8 上启动全量以做 flake 归因，因 main 随后又前进两个合并而主动中止（`TaskStop`，端口确认释放、worktree 已删除）；grok flake 的归因以上面证据为准。
 
 
 

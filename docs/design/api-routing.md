@@ -53,8 +53,9 @@ profile 上的 `delivery` 是一个**对象**，因为路由子模式（§4）�
 ```
 
 缺省（也即早于本决策的每一行）是 `{ "mode": "direct", "route": "auto" }`。
-CLI 保留人话拼写 `provider set --delivery direct | via:<host> [--route …]`，
-由 CLI 负责解析——两种拼法不在同一层，不混为一谈。
+CLI 保留人话拼写 `remuda profile delivery <pvp_id> --delivery direct | via:<host>
+[--route auto|hub-relay|direct-net]`，由 CLI 负责解析——两种拼法不在同一层，不混为
+一谈。
 
 `via` 而缺 `viaHostId` 是**解析错误**，不是默认值：它没有指明任何出口机器，
 接受它只会把失败推迟到启动时，而那时操作员已经被告知派发已被受理。

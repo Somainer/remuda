@@ -38,6 +38,20 @@ enum ProfileCommand {
         /// `pvp_…` profile id.
         id: String,
     },
+    /// Set a profile's model-API delivery (D-047): `--delivery direct` or
+    /// `--delivery via:<hst_host>`, optionally with `--route`.
+    Delivery {
+        /// `pvp_…` profile id.
+        id: String,
+        /// `direct` (today's behaviour) or `via:<hostId>` (egress every model
+        /// API request on that host).
+        #[arg(long)]
+        delivery: String,
+        /// Route between worker and proxy host: `auto` (default),
+        /// `hub-relay`, or `direct-net`.
+        #[arg(long)]
+        route: Option<String>,
+    },
     /// Declare/replace supply for a profile (observed cooldowns are kept).
     Declare {
         /// `pvp_…` profile id.
@@ -138,7 +152,28 @@ fn run(hub: HubOpts, command: ProfileCommand) -> anyhow::Result<()> {
             ProfileCommand::Catalog => client.get("/v1/supply/catalog").await?,
             ProfileCommand::List => client.get("/v1/providers").await?,
             ProfileCommand::Show { id } => {
-                client.get(&format!("/v1/providers/{id}/supply")).await?
+                // The supply envelope predates D-047 and carries no delivery;
+                // merge the profile's `delivery` so `show` prints the delivery
+                // and route alongside the declared supply.
+                let mut value = client.get(&format!("/v1/providers/{id}/supply")).await?;
+                let profile = client.get(&format!("/v1/providers/{id}")).await?;
+                if let (Some(out), Some(delivery)) =
+                    (value.as_object_mut(), profile.get("delivery"))
+                {
+                    out.insert("delivery".into(), delivery.clone());
+                }
+                value
+            }
+            ProfileCommand::Delivery {
+                id,
+                delivery,
+                route,
+            } => {
+                let body = delivery_body(&delivery, route.as_deref())?;
+                client
+                    .patch(&format!("/v1/providers/{id}"), &body)
+                    .await
+                    .map_err(hub_http_error)?
             }
             ProfileCommand::Declare {
                 id,
@@ -277,6 +312,47 @@ fn run(hub: HubOpts, command: ProfileCommand) -> anyhow::Result<()> {
     })
 }
 
+/// Build the PATCH body for `profile delivery` from the CLI's human spelling.
+///
+/// `direct` / `via:<hostId>` is the CLI-side form D-047 keeps separate from the
+/// nested wire object; parsing here means a typo never reaches the Hub as
+/// something it has to guess at.
+fn delivery_body(raw_delivery: &str, raw_route: Option<&str>) -> anyhow::Result<Value> {
+    let route = match raw_route {
+        Some(raw) => {
+            serde_json::from_value::<remuda_protocol::ApiRouteMode>(json!(raw)).map_err(|err| {
+                anyhow::anyhow!("--route must be auto, hub-relay or direct-net: {err}")
+            })?
+        }
+        None => remuda_protocol::ApiRouteMode::default(),
+    };
+    let delivery = match raw_delivery.trim() {
+        "direct" => remuda_protocol::ProviderDelivery {
+            route,
+            ..Default::default()
+        },
+        named => {
+            let host_id = named
+                .strip_prefix("via:")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("--delivery must be `direct` or `via:<hostId>`, got {named:?}")
+                })?
+                .trim();
+            if host_id.is_empty() {
+                anyhow::bail!("--delivery via:<hostId> needs a host id");
+            }
+            let host_id: remuda_protocol::HostId =
+                host_id
+                    .parse()
+                    .map_err(|err: remuda_protocol::WireValueError| {
+                        anyhow::anyhow!("--delivery via host: {err}")
+                    })?;
+            remuda_protocol::ProviderDelivery::via(host_id, route)
+        }
+    };
+    Ok(json!({ "delivery": delivery }))
+}
+
 /// Parse `id:families[:durationMins]` into a declared window object.
 fn declared_window(raw: &str) -> anyhow::Result<Value> {
     let parts: Vec<&str> = raw.split(':').collect();
@@ -314,5 +390,31 @@ mod tests {
         assert_eq!(window["appliesTo"], json!(["es1", "seed"]));
         assert!(window.get("windowDurationMins").is_none());
         assert!(declared_window("nope").is_err());
+    }
+
+    #[test]
+    fn delivery_body_maps_the_cli_spelling_to_the_wire_object() {
+        // Direct, default route: the D2 default object.
+        let body = delivery_body("direct", None).unwrap();
+        assert_eq!(body["delivery"]["mode"], json!("direct"));
+        assert_eq!(body["delivery"]["route"], json!("auto"));
+        assert!(body["delivery"].get("viaHostId").is_none());
+
+        // via with an explicit sub-mode.
+        let host = remuda_protocol::HostId::new().as_id().to_string();
+        let body = delivery_body(&format!("via:{host}"), Some("hub-relay")).unwrap();
+        assert_eq!(body["delivery"]["mode"], json!("via"));
+        assert_eq!(body["delivery"]["route"], json!("hub-relay"));
+        assert_eq!(body["delivery"]["viaHostId"], json!(host));
+
+        // A route left off defaults to auto, even on via.
+        let body = delivery_body(&format!("via:{host}"), None).unwrap();
+        assert_eq!(body["delivery"]["route"], json!("auto"));
+
+        // Bad spellings fail locally, never ship as "no override".
+        assert!(delivery_body("sideways", None).is_err());
+        assert!(delivery_body("via:", None).is_err());
+        assert!(delivery_body("via:not-a-host", None).is_err());
+        assert!(delivery_body(&format!("via:{host}"), Some("tunnel")).is_err());
     }
 }

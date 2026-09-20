@@ -21,6 +21,10 @@ use super::registry::Entrypoint;
 /// Default follow poll interval (seconds).
 const DEFAULT_INTERVAL_SECS: u64 = 3;
 
+/// Roster reason for a proxied session whose proxy host went away (D-047
+/// §B.5). Adjacent to `idle-api-error`; defined on the protocol layer.
+const API_ROUTE_DOWN: &str = remuda_protocol::API_ROUTE_DOWN;
+
 #[derive(Args)]
 #[command(
     about = "Classify live workers from their screens (working/done/blocked/idle/stalled/gone/failed)."
@@ -77,19 +81,104 @@ async fn run(args: WatchArgs) -> anyhow::Result<i32> {
     } else {
         let value = client.post("/v1/workers/observe", &body).await?;
         let gates = fetch_gate_jobs(&client, args.project.as_deref()).await;
+        let routes = fetch_instance_routes(&client).await;
+        let rows = attach_routes(items(&value), &routes);
         if args.json {
             let mut combined = serde_json::Map::new();
             if let Some(object) = value.as_object() {
-                combined.extend(object.clone());
+                for (key, item) in object {
+                    if key == "items" {
+                        combined.insert(key.clone(), Value::Array(rows.clone()));
+                    } else {
+                        combined.insert(key.clone(), item.clone());
+                    }
+                }
             }
             combined.insert("gateJobs".into(), Value::Array(gates));
             super::hub_client::print_json(&Value::Object(combined))?;
         } else {
-            print_table(items(&value), true);
+            print_table(rows, true);
             print_gate_jobs(&gates, true);
         }
         Ok(0)
     }
+}
+
+/// Fetch the instance-indexed echoed routes (D-047). The roster row never
+/// carries `apiRoute` — the instance projection does — so one fleet read per
+/// tick supplies the ROUTE column without touching any Hub surface.
+async fn fetch_instance_routes(
+    client: &remuda_hub_client::HubClient,
+) -> std::collections::BTreeMap<String, Value> {
+    let Ok(value) = client.get("/v1/instances").await else {
+        return std::collections::BTreeMap::new();
+    };
+    value
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("instanceId").and_then(Value::as_str)?;
+                    // Attach only a real echo; a direct session omits the key,
+                    // and a row must not gain a route the Node never reported.
+                    Some((id.to_string(), item.get("apiRoute")?.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Attach each row's Node-echoed `apiRoute` in place; returns the same rows.
+/// Done client-side from the instance fleet read (see
+/// [`fetch_instance_routes`]) so the roster schema stays untouched.
+fn attach_routes(
+    mut rows: Vec<Value>,
+    routes: &std::collections::BTreeMap<String, Value>,
+) -> Vec<Value> {
+    for row in &mut rows {
+        if let Some(instance_id) = row
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .or_else(|| row.pointer("/instance/id").and_then(Value::as_str))
+            && let Some(route) = routes.get(instance_id)
+            && let Some(obj) = row.as_object_mut()
+        {
+            obj.insert("apiRoute".into(), route.clone());
+        }
+    }
+    rows
+}
+
+/// Render the echoed apiRoute as one watch clause: `direct`; `via <label>
+/// hub-relay|direct-net`; the Hub host reads as `via self …`.
+///
+/// `None` only when the value carries no `mode` (absent echo), which the ROUTE
+/// column renders as `-`.
+pub(crate) fn route_clause(api_route: &Value) -> Option<String> {
+    let mode = api_route.get("mode").and_then(Value::as_str)?;
+    if mode != "via" {
+        return Some("direct".to_string());
+    }
+    let host = api_route
+        .get("viaHostLabel")
+        .and_then(Value::as_str)
+        .filter(|label| !label.is_empty())
+        .or_else(|| api_route.get("viaHostId").and_then(Value::as_str))
+        .unwrap_or("self");
+    let kind = api_route
+        .get("route")
+        .and_then(Value::as_str)
+        .unwrap_or("hub-relay");
+    Some(format!("via {host} {kind}"))
+}
+
+/// Whether the row is a proxied session whose route went down mid-flight
+/// (roster `Blocked{api-route-down}`, D-047 §B.5).
+fn is_route_down(row: &Value) -> bool {
+    row.pointer("/state/reason").and_then(Value::as_str) == Some(API_ROUTE_DOWN)
+        || row.pointer("/watch/reason").and_then(Value::as_str) == Some(API_ROUTE_DOWN)
 }
 
 /// Fetch active gate jobs (batch 6 co-lanes).
@@ -196,8 +285,9 @@ async fn follow(
     let mut first = true;
     loop {
         let value = client.post("/v1/workers/observe", &body).await?;
-        let items = items(&value);
         let gates = fetch_gate_jobs(client, project.as_deref()).await;
+        let routes = fetch_instance_routes(client).await;
+        let items = attach_routes(items(&value), &routes);
         if as_json {
             for row in &items {
                 let signature = signature(row);
@@ -357,6 +447,14 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
         name: "MODEL",
         cells: Vec::new(),
     };
+    // The API route the session actually got (D-047), from the instance's
+    // Node-echoed `apiRoute`: `direct` or `via <host> hub-relay|direct-net`.
+    // A `api-route-down` block is appended here rather than replacing the
+    // route — the route did not reroute, it went down (D-035).
+    let mut route = Col {
+        name: "ROUTE",
+        cells: Vec::new(),
+    };
     let mut evidence = Col {
         name: "SHA/REASON",
         cells: Vec::new(),
@@ -380,6 +478,22 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
                 .to_string(),
         );
         model.cells.push(truncate(model_label(row), 48));
+        let route_cell = match row.get("apiRoute") {
+            Some(api_route) => truncate(
+                route_clause(api_route)
+                    .map(|clause| {
+                        if is_route_down(row) {
+                            format!("{clause} · {API_ROUTE_DOWN}")
+                        } else {
+                            clause
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string()),
+                48,
+            ),
+            None => "-".to_string(),
+        };
+        route.cells.push(route_cell);
         evidence.cells.push(truncate(sha_or_reason(row), 40));
         detail.cells.push(truncate(
             row.get("watch")
@@ -390,7 +504,7 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
             48,
         ));
     }
-    let cols = [&name, &status, &driver, &model, &evidence, &detail];
+    let cols = [&name, &status, &driver, &model, &route, &evidence, &detail];
     let widths: Vec<usize> = cols
         .iter()
         .map(|col| {
@@ -410,8 +524,9 @@ fn print_table(rows: Vec<Value>, with_header: bool) {
         print!("{:<width$}  ", status.cells[i], width = widths[1]);
         print!("{:<width$}  ", driver.cells[i], width = widths[2]);
         print!("{:<width$}  ", model.cells[i], width = widths[3]);
-        print!("{:<width$}  ", evidence.cells[i], width = widths[4]);
-        print!("{:<width$}", detail.cells[i], width = widths[5]);
+        print!("{:<width$}  ", route.cells[i], width = widths[4]);
+        print!("{:<width$}  ", evidence.cells[i], width = widths[5]);
+        print!("{:<width$}", detail.cells[i], width = widths[6]);
         println!();
     }
 }
@@ -563,5 +678,63 @@ mod tests {
             cell.contains("model_hub/es1_orange_o48"),
             "the observed id must remain in a 48-char cell: {cell}"
         );
+    }
+
+    /// D-047: the ROUTE column renders the Node-echoed route — direct, or via
+    /// a named host over the resolved kind.
+    #[test]
+    fn route_column_renders_the_echoed_route() {
+        assert_eq!(
+            route_clause(&json!({"mode": "direct"})).as_deref(),
+            Some("direct")
+        );
+        assert_eq!(
+            route_clause(&json!({
+                "mode": "via",
+                "route": "hub-relay",
+                "viaHostId": "hst_mac000000000000000000000000000a",
+                "viaHostLabel": "mac-host"
+            }))
+            .as_deref(),
+            Some("via mac-host hub-relay")
+        );
+        // No label: the id names the host; never a blank or the requested id.
+        assert_eq!(
+            route_clause(&json!({
+                "mode": "via",
+                "route": "direct-net",
+                "viaHostId": "hst_sg0000000000000000000000000000b"
+            }))
+            .as_deref(),
+            Some("via hst_sg0000000000000000000000000000b direct-net")
+        );
+        // `self` (the Hub host) carries no host id on the echo.
+        assert_eq!(
+            route_clause(&json!({"mode": "via", "route": "hub-relay"})).as_deref(),
+            Some("via self hub-relay")
+        );
+        // No echo at all: an empty cell, not a guessed direct.
+        assert_eq!(route_clause(&json!({})), None);
+    }
+
+    /// D-047 §B.5: the route-down block is detected from either the durable
+    /// worker state or the point-in-time watch reason.
+    #[test]
+    fn route_down_is_detected_from_state_or_watch() {
+        let row = json!({
+            "state": {"state": "blocked", "reason": "api-route-down"},
+            "watch": {"status": "working"}
+        });
+        assert!(is_route_down(&row));
+        let row = json!({
+            "state": {"state": "working"},
+            "watch": {"status": "blocked", "reason": "api-route-down"}
+        });
+        assert!(is_route_down(&row));
+        let row = json!({
+            "state": {"state": "blocked", "reason": "first-run dialog"},
+            "watch": {"status": "blocked", "reason": "first-run dialog"}
+        });
+        assert!(!is_route_down(&row));
     }
 }

@@ -861,7 +861,8 @@ type ApiViaRefusal = "api-via-unknown-host" | "api-via-host-offline"
   记录里出现 `auto` 就等于在报告「要了什么」而不是「跑了什么」（D-035）。
 * 每个拒绝码的 HTTP 状态由协议层固定：`api-via-unknown-host` 是 400，其余
   三个冲突是 409。**没有**任何「回落到 direct」的码，因为不存在这样的路径。
-* CLI 的人话拼写是 `provider set --delivery direct|via:<host>` 与
+* CLI 的人话拼写是 `profile delivery <pvp_id> --delivery direct|via:<host>
+  [--route auto|hub-relay|direct-net]` 与
   `dispatch --api-via <hostId|self|none> [--api-route auto|hub-relay|direct-net]`；
   线格式是上面的嵌套对象。逐次覆盖 `apiVia` 之所以保持**字符串**，是因为它
   三个值里有两个是关键字、只有一个带 id。

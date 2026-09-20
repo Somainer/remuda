@@ -65,6 +65,17 @@ pub(crate) struct DispatchArgs {
     /// (D-045).
     #[arg(long = "capability")]
     capabilities: Vec<String>,
+    /// D-047 per-dispatch model-API delivery override: a proxy host id
+    /// (`hst_…`), `self` (the Hub host), or `none` (force direct for this one
+    /// dispatch). A target the Hub cannot honour is a non-zero refusal, never
+    /// a silent reroute.
+    #[arg(long = "api-via", value_name = "HOST_ID|self|none")]
+    api_via: Option<String>,
+    /// D-047 route between the worker and the proxy host: `auto` (default),
+    /// `hub-relay` (always in-band), or `direct-net` (refuse if unreachable).
+    /// Requires `--api-via`.
+    #[arg(long = "api-route")]
+    api_route: Option<String>,
 }
 
 impl Entrypoint for DispatchArgs {
@@ -90,6 +101,20 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
     }
     if args.task.is_none() && args.brief.is_none() {
         anyhow::bail!("dispatch needs a <task-id> or --brief FILE");
+    }
+    // D-047: validate the `--api-via` / `--api-route` pair before reading the
+    // brief or posting anything, so a typo fails here with the same vocabulary
+    // the Hub refuses with instead of reading as "no override". The Hub
+    // re-validates; these parses only mirror its rules.
+    if let Some(raw) = args.api_via.as_deref() {
+        remuda_protocol::ApiViaOverride::parse(raw)
+            .map_err(|err| anyhow::anyhow!("--api-via {raw:?}: {err}"))?;
+    }
+    if let Some(raw) = args.api_route.as_deref() {
+        if args.api_via.is_none() {
+            anyhow::bail!("--api-route requires --api-via to name a proxy host");
+        }
+        parse_route_mode(raw)?;
     }
     let brief_path = args.brief.clone().ok_or_else(|| {
         anyhow::anyhow!("--brief FILE is required (briefs always travel as files, never inline)")
@@ -130,6 +155,8 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         "driver": args.driver,
         "carrier": args.carrier,
         "capabilities": args.capabilities,
+        "apiVia": args.api_via,
+        "apiRoute": args.api_route,
     });
     let value = client
         .post("/v1/workers/dispatch", &body)
@@ -137,4 +164,10 @@ async fn run(args: DispatchArgs) -> anyhow::Result<i32> {
         .map_err(hub_http_error)?;
     print_json(&value)?;
     Ok(0)
+}
+
+/// Parse the D-047 route sub-mode spelling shared with `remuda profile`.
+pub(super) fn parse_route_mode(raw: &str) -> anyhow::Result<remuda_protocol::ApiRouteMode> {
+    serde_json::from_value::<remuda_protocol::ApiRouteMode>(json!(raw))
+        .map_err(|err| anyhow::anyhow!("--api-route must be auto, hub-relay or direct-net: {err}"))
 }

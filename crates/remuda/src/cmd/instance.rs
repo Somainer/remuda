@@ -88,6 +88,12 @@ pub(crate) enum InstanceCommand {
     /// List instances (`name`, `kind`, `status`, `cwd`, `host`).
     #[command(visible_alias = "ls")]
     List(super::agents::ListArgs),
+    /// Show one instance's projection, including the API route it actually
+    /// got (D-047: the Node-echoed `apiRoute`, never the requested one).
+    Show {
+        /// Instance id (`ins_…`) or name.
+        instance_id: String,
+    },
     /// Send a prompt / steer to a running instance.
     Send {
         /// Instance id (`ins_…`) or `--name`.
@@ -238,6 +244,17 @@ pub(crate) fn run(hub: HubOpts, command: InstanceCommand) -> Result<()> {
             }
             InstanceCommand::List(args) => {
                 super::agents::list(std::sync::Arc::new(client), args).await
+            }
+            InstanceCommand::Show { instance_id } => {
+                let instance_id = resolve_instance_id(&client, &instance_id).await?;
+                let value = client.get(&format!("/v1/instances/{instance_id}")).await?;
+                // D-047: print the route this instance actually got (the
+                // Node-echoed clause, same one `remuda watch` shows) as a
+                // human-readable line; JSON stays the stdout contract.
+                if let Some(clause) = value.get("apiRoute").and_then(super::watch::route_clause) {
+                    eprintln!("route: {clause}");
+                }
+                print_json(&value)
             }
             InstanceCommand::Send {
                 instance_id,

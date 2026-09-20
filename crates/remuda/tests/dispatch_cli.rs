@@ -245,7 +245,14 @@ fn help_lists_new_verbs() -> Result<()> {
     for (command, pieces) in [
         (
             "dispatch",
-            &["--project", "--brief", "--harness", "--host"][..],
+            &[
+                "--project",
+                "--brief",
+                "--harness",
+                "--host",
+                "--api-via",
+                "--api-route",
+            ][..],
         ),
         ("retire", &["--force"][..]),
         ("hostcap", &[] as &[&str]),
@@ -355,7 +362,12 @@ async fn spawn_hub_with_cli(extra_cli: Option<Value>) -> Result<Hub> {
                     "herdr": {"version": "0.9.0", "socket": "/tmp/fake.sock"},
                     "workspaces": [{"workspaceId": workspace, "hostId": host, "root": "/tmp/repo"}],
                     "workspaceRevision": 1,
-                }
+                },
+                // D-047: the fake worker speaks the api.* relay class, so a
+                // `--api-via self` refusal tests reach the Hub-host checks
+                // (direct-net unreachable) instead of stopping at
+                // api-via-unsupported.
+                "capabilities": {"apiRelay": true}
             }
         })
         .to_string()
@@ -752,6 +764,336 @@ async fn hostcap_reports_an_installed_computer_use_row() -> Result<()> {
             .as_str()
             .is_some_and(|path| path.ends_with("SkyComputerUseClient")),
         "{cap}"
+    );
+    Ok(())
+}
+
+// ── D-047 --api-via / --api-route: flag parsing and Hub refusals ───────────
+
+/// Local validation: a misspelt host or an orphan --api-route fails on the CLI
+/// before any dispatch is posted (never silently read as "no override").
+#[test]
+fn api_via_flags_validate_locally() -> Result<()> {
+    // Not a host id and not `self`/`none`: rejected by the protocol parser.
+    let output = std::process::Command::new(bin())
+        .args([
+            "dispatch",
+            "--project",
+            "prj_x",
+            "--brief",
+            "brief.md",
+            "--api-via",
+            "sideways",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("sideways"), "{stderr}");
+
+    // --api-route without --api-via names nothing to route.
+    let output = std::process::Command::new(bin())
+        .args([
+            "dispatch",
+            "--project",
+            "prj_x",
+            "--brief",
+            "brief.md",
+            "--api-route",
+            "hub-relay",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--api-route requires --api-via"),
+        "{stderr}"
+    );
+
+    // A typo'd route is a CLI error, not a quiet auto.
+    let output = std::process::Command::new(bin())
+        .args([
+            "dispatch",
+            "--project",
+            "prj_x",
+            "--brief",
+            "brief.md",
+            "--api-via",
+            "self",
+            "--api-route",
+            "tunnel",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("auto, hub-relay or direct-net"), "{stderr}");
+    Ok(())
+}
+
+/// A second enrolled host (relay-capable) for the offline-proxy refusal.
+struct ViaNode {
+    host: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn enroll_via_node(hub: &Hub) -> Result<ViaNode> {
+    let host = remuda_protocol::HostId::new().as_id().to_string();
+    let enroll = hub
+        ._hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await?;
+    let mut request = format!("ws://{}/v1/node", hub._hub.addr).into_client_request()?;
+    request
+        .headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await?;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "hello", "method": "runtime.hello",
+            "params": {
+                "hostId": host,
+                "nodeVersion": "0.1.0-test",
+                "label": "fake-cli-via-host",
+                "host": {
+                    "hostname": "fake-via-host",
+                    "maxInstances": 8,
+                    "workspaces": [],
+                    "workspaceRevision": 1,
+                },
+                "capabilities": {"apiRelay": true}
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let task = tokio::spawn(async move {
+        while let Some(frame) = next_rpc_frame(&mut ws).await {
+            if let Some(id) = frame.get("id").cloned() {
+                let response = json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}});
+                if ws
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    let liveness =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if liveness.list_hosts().await.is_ok_and(|rows| {
+                rows.iter().any(|row| {
+                    row["hostId"].as_str() == Some(host.as_str()) && row["online"] == true
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .ok()
+    .context("via host never reported online")?;
+    Ok(ViaNode { host, task })
+}
+
+/// Create a project hosting on the fake worker and a universal gateway
+/// profile with the one model `via-cli/auto`, returning their ids.
+async fn setup_project_and_gateway(hub: &Hub, name: &str) -> Result<(String, String)> {
+    let client =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    let output = run(&["project", "create", "--name", name], hub);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let project: Value = serde_json::from_slice(&output.stdout)?;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    client
+        .post(
+            &format!("/v1/projects/{project_id}/members"),
+            &json!({"hostId": hub.host, "workspaceId": hub.workspace, "role": "build"}),
+        )
+        .await?;
+    client
+        .patch(
+            &format!("/v1/projects/{project_id}"),
+            &json!({
+                "hosts": [{
+                    "hostId": hub.host, "maxInstances": 8, "maxBuilding": 4,
+                    "diskBudgetGb": 10, "portBlocks": ["59100-59129"],
+                    "requires": ["toolchain=rust"], "latencyClass": "remote",
+                }],
+            }),
+        )
+        .await?;
+    // Synthetic credential only: the delimited `fake-` segment is what the
+    // secret scanner keys on; no real token ever appears in a fixture.
+    let profile = client
+        .post(
+            "/v1/providers",
+            &json!({
+                "name": "cli-via-relay",
+                "kind": "gateway",
+                "baseUrl": "http://127.0.0.1:1",
+                "authToken": "sk-fake-profile-0001",
+                "models": [
+                    {"id": "passthrough/via-cli/auto", "family": "synth",
+                     "role": "workhorse", "priority": 20}
+                ]
+            }),
+        )
+        .await?;
+    Ok((project_id, profile["id"].as_str().unwrap().to_string()))
+}
+
+/// Every D-047 refusal the Hub defines is printed with its stable code and
+/// exits non-zero; the CLI never retries another route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_via_refusals_exit_nonzero_with_the_hub_code() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let (project_id, _profile_id) = setup_project_and_gateway(&hub, "cli-apivia-refuse").await?;
+    let brief = hub._dir.path().join("via-brief.md");
+    std::fs::write(
+        &brief,
+        "Complete the trivial task in your worktree.\n\
+         Rules: never run deploy/ scripts or probe tunnels.\n\
+         Reply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    let model = "passthrough/via-cli/auto";
+    let dispatch = |extra: &[&str]| {
+        let mut args = vec![
+            "dispatch",
+            "--project",
+            &project_id,
+            "--brief",
+            brief.to_str().unwrap(),
+            "--model",
+            model,
+        ];
+        args.extend_from_slice(extra);
+        run(&args, &hub)
+    };
+
+    // 1. Unknown proxy host → 400 api-via-unknown-host.
+    let unknown = remuda_protocol::HostId::new().as_id().to_string();
+    let output = dispatch(&["--api-via", &unknown]);
+    assert!(!output.status.success(), "unknown host must refuse");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("api-via-unknown-host"), "{stderr}");
+    assert!(
+        stderr.contains(&unknown),
+        "the refusal names the host: {stderr}"
+    );
+
+    // 2. direct-net to the Hub host (which binds no relay) → 409
+    //    api-via-unreachable.
+    let output = dispatch(&["--api-via", "self", "--api-route", "direct-net"]);
+    assert!(!output.status.success(), "direct-net to self must refuse");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("api-via-unreachable"), "{stderr}");
+
+    // 3. An enrolled proxy host that is offline → 409 api-via-host-offline,
+    //    before any name/port/worktree allocation.
+    let via = enroll_via_node(&hub).await?;
+    via.task.abort();
+    let liveness =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let offline = liveness.list_hosts().await.is_ok_and(|rows| {
+                rows.iter().any(|row| {
+                    row["hostId"].as_str() == Some(via.host.as_str()) && row["online"] == false
+                })
+            });
+            if offline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .ok()
+    .context("via host never went offline")?;
+    let output = dispatch(&["--api-via", &via.host]);
+    assert!(!output.status.success(), "offline host must refuse");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("api-via-host-offline"), "{stderr}");
+
+    // 4. `none` is a valid override: the dispatch is taken and the worker
+    //    launches (no reroute machinery, plain direct delivery).
+    let output = dispatch(&["--name", "c-apivia-none", "--api-via", "none"]);
+    assert!(
+        output.status.success(),
+        "force-direct dispatch launches: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(body["worker"]["state"]["state"], "working");
+    // Clean up so the Hub shuts down with no in-flight fake instance.
+    let output = run(&["retire", "c-apivia-none", "--force"], &hub);
+    assert!(output.status.success());
+    Ok(())
+}
+
+/// `--api-via self` with no gateway profile resolves to native and is refused
+/// with the Hub's own bad-request wording (the "no profile" case): the CLI
+/// surfaces the message and exits non-zero rather than launching direct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_via_without_a_gateway_profile_is_refused() -> Result<()> {
+    let hub = spawn_hub().await?;
+    let client =
+        remuda_hub_client::HubClient::new(hub.base.clone(), Some(hub.token.clone()), None)?;
+    let output = run(&["project", "create", "--name", "cli-apivia-native"], &hub);
+    let project: Value = serde_json::from_slice(&output.stdout)?;
+    let project_id = project["id"].as_str().unwrap().to_string();
+    client
+        .post(
+            &format!("/v1/projects/{project_id}/members"),
+            &json!({"hostId": hub.host, "workspaceId": hub.workspace, "role": "build"}),
+        )
+        .await?;
+    client
+        .patch(
+            &format!("/v1/projects/{project_id}"),
+            &json!({
+                "hosts": [{
+                    "hostId": hub.host, "maxInstances": 8, "maxBuilding": 4,
+                    "diskBudgetGb": 10, "portBlocks": ["59130-59139"],
+                    "requires": ["toolchain=rust"], "latencyClass": "remote",
+                }],
+            }),
+        )
+        .await?;
+    let brief = hub._dir.path().join("via-native-brief.md");
+    std::fs::write(
+        &brief,
+        "Do the trivial work.\nReply on one line: DONE <sha> or BLOCKED <reason>.\n",
+    )?;
+    // No provider exists: the resolved provider is native, which has nothing to
+    // relay through the Hub host.
+    let output = run(
+        &[
+            "dispatch",
+            "--project",
+            &project_id,
+            "--brief",
+            brief.to_str().unwrap(),
+            "--api-via",
+            "self",
+        ],
+        &hub,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("apiVia requires a gateway provider profile"),
+        "{stderr}"
     );
     Ok(())
 }

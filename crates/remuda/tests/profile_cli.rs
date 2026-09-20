@@ -64,7 +64,7 @@ async fn profile_help_lists_subcommands() -> Result<()> {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     for sub in [
-        "catalog", "list", "show", "declare", "event", "usage", "probe",
+        "catalog", "list", "show", "declare", "event", "usage", "probe", "delivery",
     ] {
         assert!(stdout.contains(sub), "help must list `{sub}`: {stdout}");
     }
@@ -281,6 +281,151 @@ async fn profile_declare_event_and_probe_dry_run_against_hub() -> Result<()> {
             .iter()
             .any(|p| p["id"] == profile_id)
     );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// D-047: `profile delivery` writes ProviderDelivery, and `show`/`list` print
+/// the delivery and route back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_delivery_mutation_and_display() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("hub"))).await?;
+    let token = hub.mint_device_token("profile-cli-delivery").await?;
+    let base = format!("http://{}", hub.addr);
+    let run = |args: &[&str]| Command::new(bin()).args(args).output();
+
+    // A gateway profile with a synthetic, delimited fake- credential.
+    let client = remuda_hub_client::HubClient::new(&base, Some(token.clone()), None)?;
+    let profile = client
+        .post(
+            "/v1/providers",
+            &serde_json::json!({
+                "name": "cli-via-delivery",
+                "kind": "gateway",
+                "baseUrl": "http://127.0.0.1:1/v1",
+                "authToken": "sk-fake-profile-0001",
+                "models": [{"id": "passthrough/via/auto", "family": "synth",
+                            "role": "workhorse", "priority": 20}]
+            }),
+        )
+        .await?;
+    let profile_id = profile["id"].as_str().unwrap().to_string();
+
+    // Absent delivery reads back as the direct/auto default.
+    let out = run(&["profile", "list", "--hub", &base, "--token", &token])?;
+    let list: Value = serde_json::from_slice(&out.stdout)?;
+    let row = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == profile_id)
+        .unwrap();
+    assert_eq!(row["delivery"]["mode"], "direct");
+    assert_eq!(row["delivery"]["route"], "auto");
+
+    // Set a via delivery with an explicit route.
+    let via_host = remuda_protocol::HostId::new().as_id().to_string();
+    let out = run(&[
+        "profile",
+        "delivery",
+        &profile_id,
+        "--delivery",
+        &format!("via:{via_host}"),
+        "--route",
+        "hub-relay",
+        "--hub",
+        &base,
+        "--token",
+        &token,
+    ])?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let patched: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(patched["delivery"]["mode"], "via");
+    assert_eq!(patched["delivery"]["route"], "hub-relay");
+    assert_eq!(patched["delivery"]["viaHostId"], via_host.as_str());
+
+    // show (the supply envelope) now also prints the delivery and route.
+    let out = run(&[
+        "profile",
+        "show",
+        &profile_id,
+        "--hub",
+        &base,
+        "--token",
+        &token,
+    ])?;
+    assert!(out.status.success());
+    let shown: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(shown["delivery"]["mode"], "via");
+    assert_eq!(shown["delivery"]["route"], "hub-relay");
+    assert_eq!(shown["delivery"]["viaHostId"], via_host.as_str());
+
+    // A route left off defaults to auto; a bad spelling fails locally.
+    let out = run(&[
+        "profile",
+        "delivery",
+        &profile_id,
+        "--delivery",
+        &format!("via:{via_host}"),
+        "--hub",
+        &base,
+        "--token",
+        &token,
+    ])?;
+    let patched: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(patched["delivery"]["route"], "auto");
+
+    let out = run(&[
+        "profile",
+        "delivery",
+        &profile_id,
+        "--delivery",
+        "sideways",
+        "--hub",
+        &base,
+        "--token",
+        &token,
+    ])?;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("direct` or `via:<hostId>"));
+    let out = run(&[
+        "profile",
+        "delivery",
+        &profile_id,
+        "--delivery",
+        "direct",
+        "--route",
+        "nope",
+        "--hub",
+        &base,
+        "--token",
+        &token,
+    ])?;
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("auto, hub-relay or direct-net"));
+
+    // Reset to direct: the stored row reads back direct/auto.
+    let out = run(&[
+        "profile",
+        "delivery",
+        &profile_id,
+        "--delivery",
+        "direct",
+        "--hub",
+        &base,
+        "--token",
+        &token,
+    ])?;
+    let patched: Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(patched["delivery"]["mode"], "direct");
+    assert_eq!(patched["delivery"]["route"], "auto");
+    assert!(patched["delivery"].get("viaHostId").is_none());
 
     hub.shutdown().await;
     Ok(())

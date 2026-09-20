@@ -113,6 +113,9 @@ test.describe("390px phone home", () => {
     await expect(exitedBody).toHaveAttribute("data-error", "1");
     await expect(exitedBody).toHaveText(/MHOME_EXIT_SENTINEL/);
     expect(await exitedBody.getAttribute("title")).toMatch(/MHOME_EXIT_SENTINEL \(429\)/);
+    // No usage observation ever landed on that session: null contextPct
+    // means neither ring nor number renders (ui-spec §3.3).
+    await expect(exitedRow.getByTestId("context-ring")).toHaveCount(0);
 
     // Acceptance 1 (D-038 text-regex rule): no wire triplet, short id, driver
     // or model anywhere in the rendered home, not just hidden behind testids.

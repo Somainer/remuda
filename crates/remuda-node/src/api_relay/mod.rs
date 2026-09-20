@@ -32,9 +32,10 @@ mod policy;
 use crate::NodeError;
 use bytes::Bytes;
 use remuda_protocol::hubnode::{
-    ApiBodyParams, ApiCancelParams, ApiChunkParams, ApiCreditParams, ApiEndError, ApiEndParams,
-    ApiHeadParams, ApiHeader, ApiOpenParams, METHOD_API_BODY, METHOD_API_CANCEL, METHOD_API_CHUNK,
-    METHOD_API_CREDIT, METHOD_API_END, METHOD_API_HEAD, METHOD_API_OPEN,
+    ApiBodyParams, ApiCancelParams, ApiChunkParams, ApiCreditParams, ApiEgressParams, ApiEndError,
+    ApiEndParams, ApiHeadParams, ApiOpenParams, METHOD_API_BODY, METHOD_API_CANCEL,
+    METHOD_API_CHUNK, METHOD_API_CREDIT, METHOD_API_EGRESS, METHOD_API_END, METHOD_API_HEAD,
+    METHOD_API_OPEN,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -43,69 +44,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{Semaphore, mpsc};
 
-// ── api.egress (Hub→Node credential handoff) ───────────────────────────────
-//
-// Local mirror of `remuda_protocol::hubnode::{METHOD_API_EGRESS, ApiEgressParams}`
-// (added by c-apiroute-hub); delete this block and import the protocol types
-// in a one-commit switch once that branch lands. The Hub sends it to the
-// proxy host when the route is decided at launch and again after reconnect,
-// with `revoke: true` on instance exit. Credentials ride *only* this
-// notification — never `api.open` — stay in memory, and render redacted in
-// Debug.
-
-/// Hub→Node notification: install (or revoke) one instance's egress context.
-pub(crate) const METHOD_API_EGRESS: &str = "api.egress";
-
-/// `api.egress` params, mirroring the hub-branch `hubnode` struct by the same
-/// name. `Debug` is hand-written to keep `authToken` out of logs.
-#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct ApiEgressParams {
-    /// Instance whose gateway traffic this Node proxies.
-    pub instance_id: String,
-    /// Profile the gateway credential belongs to.
-    #[serde(default)]
-    pub profile_id: String,
-    /// Pinned gateway base URL, e.g. `https://gateway.example/v1`. Carried on
-    /// install; a revoke frame omits it.
-    #[serde(default)]
-    pub base_url: String,
-    /// Extra profile headers installed on every gateway request.
-    #[serde(default)]
-    pub headers: Vec<ApiHeader>,
-    /// Bearer gateway credential; `None` installs a context that adds no
-    /// credential of its own.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
-    /// `true` removes the context and ends the instance's live streams.
-    #[serde(default)]
-    pub revoke: bool,
-}
-
-impl std::fmt::Debug for ApiEgressParams {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ApiEgressParams")
-            .field("instance_id", &self.instance_id)
-            .field("profile_id", &self.profile_id)
-            .field("base_url", &self.base_url)
-            .field("headers", &self.headers)
-            .field(
-                "auth_token",
-                &self.auth_token.as_ref().map(|_| "<redacted>"),
-            )
-            .field("revoke", &self.revoke)
-            .finish()
-    }
-}
+// The Hub→proxy `api.egress` credential handoff (`METHOD_API_EGRESS` and
+// [`ApiEgressParams`]) is defined once, in `remuda_protocol::hubnode`; the
+// protocol type's hand-written `Debug` renders `authToken` as `<redacted>`.
 
 /// Whether an inbound notification method belongs to the `api.*` relay
-/// demux. Includes [`METHOD_API_EGRESS`], which is defined locally until
-/// the c-apiroute-hub protocol branch lands (its `HubNodeMethod` variant
-/// then makes the parse arm match and the literal check becomes dead).
+/// demux, including the Hub→proxy `api.egress` credential handoff.
 pub(crate) fn is_api_method(method: &str) -> bool {
     remuda_protocol::hubnode::HubNodeMethod::parse(method).is_some_and(|kind| kind.is_api())
-        || method == METHOD_API_EGRESS
 }
 
 /// Live relay streams allowed per instance (§7.6 default; clamped to the

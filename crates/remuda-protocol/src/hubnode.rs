@@ -1031,14 +1031,22 @@ pub struct ApiOpenParams {
 /// `revoke: true` clears the context when the instance exits or its route goes
 /// down; after a revoke the Node refuses new streams for that instance until a
 /// fresh context arrives.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// `Debug` is intentionally absent from the derive below: a generated impl
+/// would print `auth_token`. The hand-written impl renders it redacted so the
+/// credential can never reach a log through an ordinary `{:?}` path.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiEgressParams {
     /// Instance the context belongs to.
     pub instance_id: String,
-    /// Gateway profile id; identifies the pinned origin.
+    /// Gateway profile id; identifies the pinned origin. A revoke frame may
+    /// omit it, so deserialization defaults to empty.
+    #[serde(default)]
     pub profile_id: String,
-    /// Pinned gateway base URL (origin + base path).
+    /// Pinned gateway base URL (origin + base path). A revoke frame may omit
+    /// it, so deserialization defaults to empty.
+    #[serde(default)]
     pub base_url: String,
     /// Extra profile headers; auth headers never appear here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1050,6 +1058,23 @@ pub struct ApiEgressParams {
     /// True clears the installed context (instance exit / route down).
     #[serde(default)]
     pub revoke: bool,
+}
+
+impl std::fmt::Debug for ApiEgressParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApiEgressParams")
+            .field("instance_id", &self.instance_id)
+            .field("profile_id", &self.profile_id)
+            .field("base_url", &self.base_url)
+            .field("headers", &self.headers)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("revoke", &self.revoke)
+            .finish()
+    }
 }
 
 /// One header, name and value; D-048.
@@ -1979,5 +2004,42 @@ mod tests {
         let rendered = format!("{params:?}");
         assert!(!rendered.contains("host-secret"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// D-048: `api.egress` is the only frame carrying a gateway credential, so
+    /// its `Debug` must never render `authToken` in clear text.
+    #[test]
+    fn api_egress_params_debug_redacts_auth_token() {
+        let params = ApiEgressParams {
+            instance_id: "ins_1".into(),
+            profile_id: "prv_1".into(),
+            base_url: "https://gateway.example/v1".into(),
+            headers: vec![ApiHeader {
+                name: "x-profile".into(),
+                value: "profile-value".into(),
+            }],
+            auth_token: Some("sk-fake-egress-test".into()),
+            revoke: false,
+        };
+        let rendered = format!("{params:?}");
+        assert!(
+            !rendered.contains("sk-fake-egress-test"),
+            "credential leaked into Debug: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    /// A revoke frame carries only `instanceId`/`revoke` (the Node mirror
+    /// tolerated the omitted fields); deserialization must default them.
+    #[test]
+    fn api_egress_revoke_frame_without_profile_or_base_url_round_trips() {
+        let parsed: ApiEgressParams =
+            serde_json::from_value(json!({"instanceId": "ins_1", "revoke": true}))
+                .expect("revoke frame decodes with profileId/baseUrl omitted");
+        assert!(parsed.revoke);
+        assert_eq!(parsed.instance_id, "ins_1");
+        assert_eq!(parsed.profile_id, "");
+        assert_eq!(parsed.base_url, "");
+        assert_eq!(parsed.auth_token, None);
     }
 }

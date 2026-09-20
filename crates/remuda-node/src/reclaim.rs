@@ -506,6 +506,10 @@ impl DevNode {
             let _ = worker.await;
         }
         self.stop_pumps().await;
+        // The interaction pump and sweeper hold store clones and append
+        // observations; stop them before the journal closes below so a graceful
+        // shutdown leaves no late writers.
+        self.inner.interactions.shutdown();
         // Workers were aborted, so their terminal relay revocation never ran:
         // shut every per-instance listener and fail every in-flight stream.
         for instance in self.inner.store.list_instances()? {
@@ -536,6 +540,12 @@ impl DevNode {
                 Err(error) => failure = Some(node_error(error)),
             }
         }
+        // Close the journal last: close_ended_instance above journals the
+        // terminal lifecycle, and once this returns the single-writer lock is
+        // released even though this `DevNode` may stay in scope — a compose on
+        // the same data dir (a restart in the same process, takeover tests)
+        // must not meet this shutdown's writer. Idempotent with `Drop`.
+        self.inner.store.shutdown_journal();
         if let Some(error) = failure {
             return Err(error);
         }

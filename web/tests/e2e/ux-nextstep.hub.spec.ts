@@ -97,19 +97,86 @@ test.afterEach(async ({ page }) => {
   }
 });
 
-async function createAgentSession(page: Page, prompt: string): Promise<string> {
+/**
+ * Confirm the Hub now projects the newly created instance as a connected,
+ * listed row (and, for scripted agents, with the exact activity the board
+ * assertions read). create() returns as soon as the Node acks the RPC and the
+ * store refreshes once, but the fake node fire-and-forgets its journal frames
+ * ahead of that ack; on a loaded shared node the frames that move the row out
+ * of `requested` and set its activity can land a beat later. The list poll
+ * then self-heals within seconds, and a board assertion fired in that window
+ * raced a missing/wrong row for its whole budget. Wait on the real server
+ * projection rather than a fixed delay.
+ */
+async function waitForProjectedInstance(
+  page: Page,
+  instanceId: string,
+  expectedActivity?: string,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const res = await page.evaluate(
+          async ({ id, want }) => {
+            const r = await fetch(`/v1/instances`, { credentials: "include" });
+            const body = (await r.json()) as {
+              items?: Array<{
+                instanceId?: string;
+                connectivity?: string;
+                activity?: string | { state?: string; value?: string };
+              }>;
+            };
+            const row = body.items?.find((item) => item.instanceId === id);
+            if (!row || row.connectivity !== "connected") return false;
+            if (!want) return true;
+            const activity =
+              typeof row.activity === "string" ? row.activity : (row.activity?.value ?? null);
+            return activity === want;
+          },
+          { id: instanceId, want: expectedActivity ?? null },
+        );
+        return res;
+      },
+      { timeout: 30_000 },
+    )
+    .toBe(true);
+}
+
+async function createAgentSession(page: Page, prompt: string, expectedActivity: string): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
   const hostId = await hostPicker.locator("option").filter({ hasText: "e2e-fake-node" }).getAttribute("value");
   await hostPicker.selectOption(hostId!);
-  await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, { timeout: 20_000 });
+  await pinWorkspace(page);
   await page.getByTestId("new-session-prompt").fill(prompt);
   await page.getByTestId("new-session-start").click();
   await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
   const instanceId = new URL(page.url()).pathname.split("/").at(-1)!;
   created.push(instanceId);
+  await waitForProjectedInstance(page, instanceId, expectedActivity);
   return instanceId;
+}
+
+/**
+ * Pin the canonical fake-node workspace for every session this spec creates.
+ *
+ * Without an explicit choice the helper used to accept the picker's first
+ * option, which is only implicitly wsp_e2e: the host advertises eight
+ * workspaces and the picker order is the server's array order re-sorted by an
+ * operator recent-workspace preference once one exists. All three of this
+ * spec's sessions are asserted by href on ONE Space-scoped board, so a
+ * different implicit default (different space) makes every card lookup fail
+ * for the whole budget. wsp_e2e is the fake node's stock workspace in
+ * hub_e2e.rs; select it explicitly so the create, the board filter and the
+ * href assertions always address the same Space regardless of ordering.
+ */
+async function pinWorkspace(page: Page): Promise<void> {
+  const workspacePicker = page.getByTestId("new-session-workspace");
+  await expect(workspacePicker.locator("option")).not.toHaveCount(0, { timeout: 20_000 });
+  const option = workspacePicker.locator('option[value="wsp_e2e"]');
+  await expect(option).toHaveCount(1);
+  await workspacePicker.selectOption("wsp_e2e");
 }
 
 async function createTerminal(page: Page): Promise<string> {
@@ -118,6 +185,10 @@ async function createTerminal(page: Page): Promise<string> {
   // The `screen-read` initial input is the fake-node sentinel that opts this
   // instance into real cooked lines on tty.screen (other terminals keep the
   // empty-screen answer, so existing specs are unaffected).
+  const hostPicker = page.getByTestId("new-session-host");
+  const hostId = await hostPicker.locator("option").filter({ hasText: "e2e-fake-node" }).getAttribute("value");
+  await hostPicker.selectOption(hostId!);
+  await pinWorkspace(page);
   await page.getByTestId("new-session-prompt").fill("screen-read terminal");
   await page.getByTestId("new-session-kind-terminal").click();
   await expect(page.getByTestId("new-session-start")).toBeEnabled();
@@ -125,6 +196,7 @@ async function createTerminal(page: Page): Promise<string> {
   await expect(page).toHaveURL(/\/s\//, { timeout: 20_000 });
   const instanceId = new URL(page.url()).pathname.split("/").at(-1)!;
   created.push(instanceId);
+  await waitForProjectedInstance(page, instanceId);
   return instanceId;
 }
 
@@ -156,6 +228,59 @@ async function screenLines(page: Page, instanceId: string): Promise<string> {
   }, instanceId);
 }
 
+/**
+ * Keep the desktop SessionList mounted under a phone-width CSS viewport.
+ *
+ * D-049's ViewportGate (web/src/app/router.tsx) redirects /sessions to /m as
+ * soon as COMPACT_WORKBENCH_QUERY starts matching, so shrinking the page to
+ * 390 px unmounts every board-card: the geometry measurement used to resolve
+ * a card handle around that navigation and read the now-detached headline at
+ * zero height with `line-height: normal` ({"h":0,"lineH":null}).
+ *
+ * The geometry gate is about the FULL board row under 390 px *CSS* rules —
+ * CSS media queries key off the real viewport, so they still apply — and not
+ * the /m HomeList (a separate component with its own rows). Pin the app's
+ * compact JavaScript reading to non-compact while the layout really runs at
+ * 390 px. Per-instance patching does not work: Chromium hands each
+ * matchMedia() call a fresh MediaQueryList wrapper, so intercept the
+ * prototype getter for the compact query only (change events still fire; the
+ * listeners read the pinned value). No sleep, no retry — the fresh browser
+ * context per test restores the prototype.
+ */
+async function holdDesktopShellAtPhoneWidth(page: Page) {
+  await page.evaluate(() => {
+    const compactMedia = window.matchMedia(
+      "(max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px)",
+    ).media;
+    const proto = MediaQueryList.prototype;
+    if (Object.getOwnPropertyDescriptor(proto, "matches")?.get?.name === "pinnedCompact") return;
+    const native = Object.getOwnPropertyDescriptor(proto, "matches")?.get;
+    Object.defineProperty(proto, "matches", {
+      configurable: true,
+      enumerable: true,
+      get: function pinnedCompact() {
+        if (this.media === compactMedia) return false;
+        return native ? native.call(this) : undefined;
+      },
+    });
+  });
+}
+
+/**
+ * Resolved px line-height of an attached, laid-out element; 0 while it is
+ * detached or display:none (computed line-height stays `normal` there). The
+ * geometry measurement waits on this real condition rather than reading a
+ * node mid-navigation.
+ */
+async function laidOutLineHeight(scope: ReturnType<Page["locator"]>, selector: string): Promise<number> {
+  return scope.evaluate((card, sel) => {
+    const el = card.querySelector(sel);
+    if (!(el instanceof HTMLElement) || el.offsetParent === null) return 0;
+    const lineH = parseFloat(getComputedStyle(el).lineHeight);
+    return Number.isFinite(lineH) && lineH > 0 ? lineH : 0;
+  }, selector);
+}
+
 test("row shows the approval summary, tucks wire fields into a disclosure, and keys still reach the harness", async ({
   page,
 }) => {
@@ -163,7 +288,7 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   // `blocked` with the same scripted approval card raised, so the row lands in
   // the 待处理 group (dot = waiting-interaction projection).
   const prompt = "nextstep blocked-question approval row";
-  const approvalId = await createAgentSession(page, prompt);
+  const approvalId = await createAgentSession(page, prompt, "blocked");
   const terminalId = await createTerminal(page);
   // The "workflow card … row" create sentinel raises no approval and journals
   // a running workflow.run (nativeRunId wf-native-demo) with a running phase
@@ -171,7 +296,7 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   // The working row's sentence must be projected from that live journal
   // instead of the constant 运行中….
   const workflowPrompt = "workflow card demo-running row-phrase";
-  const workflowId = await createAgentSession(page, workflowPrompt);
+  const workflowId = await createAgentSession(page, workflowPrompt, "working");
   const interactionId = await pendingInteractionId(page, approvalId);
 
   await page.goto("/sessions");
@@ -225,7 +350,10 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   await expect(terminalRow.getByTestId("board-snippet")).toContainText("QUICKFIND_ESC_RECEIVED", { timeout: 15_000 });
 
   // Evidence shots show the default (collapsed) row shape; the expanded
-  // disclosure was already asserted above.
+  // disclosure was already asserted above. Hold the desktop list mounted
+  // before shrinking: at 390 px D-049 otherwise redirects /sessions to /m
+  // and unmounts these cards mid-measurement.
+  await holdDesktopShellAtPhoneWidth(page);
   await panel.press("Escape");
   if (await wire.evaluate((el) => el.open)) {
     await approvalRow.getByTestId("session-wire-toggle").click();
@@ -233,6 +361,9 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   await page.setViewportSize({ width: 1440, height: 900 });
   await shot(page, "ux2026-nextstep-1-1440.png");
   await page.setViewportSize({ width: 390, height: 844 });
+  // The seam keeps the desktop route at phone width; the genuine 390 px CSS
+  // media rules still drive the layout.
+  await expect(page).toHaveURL(/\/sessions/);
 
   // 390 px geometry, measured against bounding boxes (scrollHeight on a
   // nowrap element cannot fail). Two bounds per row:
@@ -246,6 +377,17 @@ test("row shows the approval summary, tucks wire fields into a disclosure, and k
   const BASELINE_TERMINAL_H = 260.5;
   const REDESIGN_BLOCKED_H = 215;
   const REDESIGN_TERMINAL_H = 185;
+  // Wait for the rows to be laid out at 390 px: attached (offsetParent
+  // non-null) with a resolved px line-height. Measuring immediately after the
+  // resize used to catch detached nodes; this polls a real layout condition.
+  await expect
+    .poll(() => laidOutLineHeight(approvalRow, "a[data-testid='session-row'] > div:first-child"), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThan(0);
+  await expect
+    .poll(() => laidOutLineHeight(approvalRow, "[data-testid='session-next-step']"), { timeout: 10_000 })
+    .toBeGreaterThan(0);
   const geometry = await approvalRow.evaluate((card) => {
     const lineMetrics = (selector: string) => {
       const el = card.querySelector(selector);

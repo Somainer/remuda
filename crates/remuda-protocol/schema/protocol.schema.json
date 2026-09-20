@@ -18394,6 +18394,17 @@
         "updatedAt": {
           "$ref": "#/$defs/Timestamp",
           "description": "`updated_at`; protocol §1.1."
+        },
+        "workspaceBinding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskSpaceBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Working-directory binding chosen at creation (D-050). Lives in\n`doc_json` with a serde default, so rows written before t-bind decode\nas `None` and serialise byte-identically (no migration)."
         }
       },
       "required": [
@@ -18409,6 +18420,21 @@
         "budget"
       ],
       "type": "object"
+    },
+    "TaskBindingMode": {
+      "description": "TaskBindingMode wire values; `protocol.md` §2.2.",
+      "oneOf": [
+        {
+          "const": "reuse",
+          "description": "Wire value `reuse`.",
+          "type": "string"
+        },
+        {
+          "const": "pool",
+          "description": "Wire value `pool`.",
+          "type": "string"
+        }
+      ]
     },
     "TaskBudget": {
       "description": "Estimated budget envelope; design §4.3. Amounts are estimates (§4.5).",
@@ -18624,6 +18650,50 @@
           "description": "Latest placement-ledger row describing this slot."
         }
       },
+      "type": "object"
+    },
+    "TaskSpaceBinding": {
+      "description": "The operator's per-task working-directory choice (D-050 §1.1/§2).\n\nSerialised inside the task's existing `doc_json` column, so old task rows\nneed no migration: the field defaults to `None` and is skipped on the wire\nwhen absent. The binding routes dispatch two ways without a new dispatch\nfield — `reuse` folds into the existing `cwd` admission, `pool` into the\nexisting `worktree` field backed by a `worktree_leases` row.",
+      "properties": {
+        "branch": {
+          "description": "Branch checked out while leased. Record only — reuse never switches\nbranches, and the pool derives its branch on the Node.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostId": {
+          "$ref": "#/$defs/HostId",
+          "description": "Host whose workspace backs the directory."
+        },
+        "leaseRefIds": {
+          "description": "`worktree_leases` rows backing this binding (one today).",
+          "items": {
+            "$ref": "#/$defs/Id"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskBindingMode",
+          "description": "Reuse an existing directory, or lease an app-managed pool slot."
+        },
+        "workspaceId": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "Registered workspace the directory belongs to."
+        },
+        "worktreeName": {
+          "description": "Worktree/slot name. `None` (reuse only) means the registered workspace\nroot itself. For `pool` this is the leased slot name; the directory key\nrelative to the workspace root is then `remuda-wt/<name>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "hostId",
+        "workspaceId"
+      ],
       "type": "object"
     },
     "TaskSpec": {

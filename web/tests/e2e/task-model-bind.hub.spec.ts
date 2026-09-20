@@ -93,8 +93,8 @@ async function hostId(page: Page): Promise<string> {
   return host.id;
 }
 
-const ROOT_CWD = "/tmp/remuda-e2e";
-const SIBLING_CWD = "/tmp/remuda-e2e/remuda-wt/agent-one";
+const ROOT_CWD = "/tmp/remuda-bind";
+const SIBLING_CWD = "/tmp/remuda-bind/remuda-wt/agent-one";
 // The fake Node announces one branded workspace (HUB_E2E_TASK_BIND=1); project
 // membership rejects the legacy non-branded `wsp_e2e` label, so discover it.
 const BRANDED_WSP = /^wsp_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;

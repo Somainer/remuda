@@ -600,12 +600,14 @@ async fn fake_node(
         }));
     }
     // t-bind: project membership needs a branded workspace id, so announce one
-    // extra workspace on the e2e root behind the bind trigger.
+    // extra workspace behind the bind trigger. It uses a distinct root
+    // (/tmp/remuda-bind) so the mobile home's per-root space chips never merge
+    // with or shadow the legacy wsp_e2e "remuda-e2e" chip other specs click.
     if task_bind_enabled() {
         workspaces.push(json!({
             "workspaceId": remuda_protocol::WorkspaceId::new().as_id().as_str(),
             "hostId": host,
-            "root": "/tmp/remuda-e2e"
+            "root": "/tmp/remuda-bind"
         }));
     }
     let workspaces = Value::Array(workspaces);
@@ -2520,7 +2522,7 @@ impl BindLeaseState {
             "agent-one".into(),
             BindWorktree {
                 name: "agent-one".into(),
-                path: "/tmp/remuda-e2e/remuda-wt/agent-one".into(),
+                path: "/tmp/remuda-bind/remuda-wt/agent-one".into(),
                 branch: "wt/agent-one/work".into(),
                 pooled: false,
                 leased_by: Vec::new(),
@@ -2533,7 +2535,7 @@ impl BindLeaseState {
                 name.into(),
                 BindWorktree {
                     name: name.into(),
-                    path: format!("/tmp/remuda-e2e/remuda-wt/{name}"),
+                    path: format!("/tmp/remuda-bind/remuda-wt/{name}"),
                     branch: format!("wt/{name}/work"),
                     pooled: false,
                     leased_by: Vec::new(),
@@ -2546,7 +2548,7 @@ impl BindLeaseState {
     fn list(&self) -> Value {
         let mut items: Vec<Value> = self.catalog.values().map(BindWorktree::to_json).collect();
         items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        json!({ "workspaceRoot": "/tmp/remuda-e2e", "items": items, "nextCursor": null })
+        json!({ "workspaceRoot": "/tmp/remuda-bind", "items": items, "nextCursor": null })
     }
 
     /// Model `worktree.lease`. Returns Ok(result) or Err(message).
@@ -2561,7 +2563,7 @@ impl BindLeaseState {
         if name == "." {
             return Ok(json!({
                 "name": ".",
-                "path": "/tmp/remuda-e2e",
+                "path": "/tmp/remuda-bind",
                 "branch": "main",
                 "base": Value::Null,
                 "mode": "reuse",
@@ -2619,7 +2621,7 @@ impl BindLeaseState {
         let slot = format!("{name}-s{number}");
         let task_slug = task.replace('_', "-");
         let branch = format!("wt/{slot}/{task_slug}");
-        let path = format!("/tmp/remuda-e2e/remuda-wt/{slot}");
+        let path = format!("/tmp/remuda-bind/remuda-wt/{slot}");
         self.catalog.insert(
             slot.clone(),
             BindWorktree {

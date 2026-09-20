@@ -14,9 +14,9 @@ import { login } from "./hub-auth";
  *   (/s/:id, /sessions/new, /settings) are never rewritten.
  * - 1440px: /m* bounces to /sessions; start_url "/" lands on /sessions.
  *
- * Until m-home / m-inbox land, /m renders the existing SessionsPage list and
- * /m/inbox the existing ApprovalsPage inside PhoneShell (interim IA, noted in
- * docs/design/evidence/mobile-ui-2.md).
+ * Until m-home lands, /m renders the existing SessionsPage list; /m/inbox
+ * renders the c-minbox phone inbox (Inbox), which replaced the ApprovalsPage
+ * placeholder.
  */
 test.describe.configure({ mode: "serial" });
 
@@ -162,15 +162,18 @@ test.describe("390px phone", () => {
     // Badge rule identical to Shell.tsx: pending interactions only.
     await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
 
-    // 收件箱 opens the interim inbox (existing ApprovalsPage).
+    // 收件箱 opens the phone inbox (c-minbox replaced the interim
+    // ApprovalsPage placeholder here; the desktop centre is unchanged).
     await page.getByTestId("phone-nav-inbox").click();
     await expect(page).toHaveURL(/\/m\/inbox$/);
-    await expect(page.getByTestId("approvals-page")).toBeVisible();
+    await expect(page.getByTestId("m-inbox")).toBeVisible();
 
-    // Deep link: /approvals?focus= is carried to /m/inbox?focus= verbatim.
+    // Deep link: /approvals?focus= is carried to /m/inbox?focus= verbatim,
+    // and the phone inbox marks the focused interaction row.
     await page.goto(`/approvals?focus=${interactionId}`);
     await expect(page).toHaveURL(`/m/inbox?focus=${interactionId}`);
-    await expect(page.getByTestId("approvals-page")).toBeVisible();
+    await expect(page.getByTestId("m-inbox")).toBeVisible();
+    await expect(page.locator(`[data-interaction-id="${interactionId}"][data-focus="true"]`)).toBeVisible();
 
     // The /sessions redirect preserves its query as well. The list itself
     // prunes host=/workspace= filters that its fixed Space scope cannot

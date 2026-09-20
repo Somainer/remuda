@@ -170,20 +170,43 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
   for (const [width, height, theme, suffix] of [
     [1440, 900, "night", "1440-night"],
     [1440, 900, "ledger", "1440-ledger"],
-    [390, 844, "night", "390-night"],
-    [390, 844, "ledger", "390-ledger"],
   ] as const) {
     await page.setViewportSize({ width, height });
-    // The width implies the shell: 390px redirects /approvals -> /m/inbox
-    // (D-049) and 1440px keeps /approvals. Wait for that asynchronous
-    // navigation and re-assert the card so the frame is never shot mid-
-    // redirect against the previous shell's stale tree.
-    await expect(page).toHaveURL(width < 768 ? /\/m\/inbox(?:\?|$)/ : /\/approvals(?:\?|$)/);
+    // Desktop keeps /approvals and the inline card.
+    await expect(page).toHaveURL(/\/approvals(?:\?|$)/);
     const frameCard = page
       .getByTestId("approval-row")
       .filter({ hasText: "AskUserQuestion" })
       .first()
       .getByTestId("question-form");
+    await expect(frameCard.getByText("接下来这个会话主要想做什么？")).toBeVisible();
+    await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
+    await shot(page, `ask-user-question-1-card-${suffix}.png`);
+  }
+
+  // 390px frames: the phone inbox (c-minbox, ui-spec §2.5) never embeds the
+  // multi-question form — the row offers 去回答 and the same card renders on
+  // the shared /s/:id session page, which is where the frame is shot.
+  for (const [width, height, theme, suffix] of [
+    [390, 844, "night", "390-night"],
+    [390, 844, "ledger", "390-ledger"],
+  ] as const) {
+    await page.setViewportSize({ width, height });
+    await page.goto("/approvals");
+    await expect(page).toHaveURL(/\/m\/inbox(?:\?|$)/);
+    const phoneRow = page
+      .getByTestId("m-inbox-row")
+      .filter({ hasText: "AskUserQuestion" })
+      .first();
+    await expect(phoneRow).toBeVisible({ timeout: 20_000 });
+    await expect(phoneRow.getByTestId("question-form")).toHaveCount(0);
+    await expect(phoneRow.getByRole("link", { name: "去回答" })).toHaveAttribute(
+      "href",
+      `/s/${terminal}`,
+    );
+    await phoneRow.getByRole("link", { name: "去回答" }).click();
+    await expect(page).toHaveURL(new RegExp(`/s/${terminal}$`));
+    const frameCard = page.getByTestId("question-form");
     await expect(frameCard.getByText("接下来这个会话主要想做什么？")).toBeVisible();
     await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
     await shot(page, `ask-user-question-1-card-${suffix}.png`);

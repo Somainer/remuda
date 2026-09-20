@@ -552,7 +552,25 @@ async fn serve(options: FakeHerdrOptions) -> Result<(), FakeHerdrError> {
     if let Some(parent) = options.socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let listener = UnixListener::bind(&options.socket)?;
+    // Keep the path/limit in the error: fake bind paths come from test
+    // tempdirs, and a long TMPDIR failing here must not look like a harness
+    // bug.
+    let listener = UnixListener::bind(&options.socket).map_err(|error| {
+        #[cfg(target_os = "linux")]
+        let limit = 107_usize;
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let limit = 103_usize;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+        let limit = 103_usize;
+        io::Error::new(
+            error.kind(),
+            format!(
+                "fake-herdr AF_UNIX bind failed at {} ({} bytes; sun_path limit {limit}): {error}",
+                options.socket.display(),
+                options.socket.as_os_str().len()
+            ),
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

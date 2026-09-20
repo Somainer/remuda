@@ -17,6 +17,7 @@
 //! `SessionStart` hook both fire).
 
 pub mod overlay;
+pub(crate) mod runtime_dir;
 pub mod session;
 mod shadow;
 pub mod shim;
@@ -24,6 +25,10 @@ pub mod skills;
 pub mod user;
 
 pub use overlay::{HookOverlay, OverlayOptions, TuiMode, materialize_overlay};
+pub use runtime_dir::{
+    instance_sockets_would_redirect, place_token_broker_socket, runtime_socket_candidates,
+    runtime_socket_limit,
+};
 pub use session::{HookSession, HookSessionOptions};
 pub use shadow::{
     ShadowFile, ShadowHome, ShadowMcpServer, ShadowOptions, materialize_codex, materialize_grok,

@@ -53,16 +53,34 @@ pub struct HookSessionOptions {
 pub struct HookSession {
     /// Bound socket. Dropping it unlinks the socket file.
     _server: HookServer,
+    /// Where the socket actually binds (short when the instance dir is long),
+    /// and the discovery symlink left under the instance dir. Dropping removes
+    /// the symlink; the server drop removes the real socket.
+    placement: crate::launch::runtime_dir::Placement,
     /// The merged per-session settings file.
     pub overlay: HookOverlay,
     /// Generated shims and their directory.
     pub shims: ShimSet,
-    /// `<instance dir>/hook.sock`.
+    /// Path every wire client connects to.
+    ///
+    /// The real short bind path — *not* the `hook.sock` symlink under the
+    /// instance directory: the AF_UNIX `sun_path` limit applies to connect as
+    /// well as bind, so connecting through a long symlink fails. The symlink
+    /// is discovery for operators and tooling only.
     pub socket_path: PathBuf,
     /// Shadow `CODEX_HOME` / `GROK_HOME`, when the agent kind has one (P6).
     pub shadow: Option<crate::launch::ShadowHome>,
     /// The bus serving this socket, so the driver can read what it learned.
     bus: Arc<SignalBus>,
+}
+
+impl Drop for HookSession {
+    fn drop(&mut self) {
+        // Runs before the field drops: the discovery link goes first, then the
+        // server unlinks the real socket. A purged instance directory already
+        // removed the link, so a missing file is expected.
+        self.placement.remove_link();
+    }
 }
 
 impl HookSession {
@@ -73,7 +91,12 @@ impl HookSession {
     /// its `SessionStart`.
     pub fn start(options: &HookSessionOptions, bus: Arc<SignalBus>) -> DriverResult<Self> {
         let launch_dir = options.instance_dir.join("launch");
-        let socket_path = options.instance_dir.join("hook.sock");
+        let placement = crate::launch::runtime_dir::place_instance_socket(&options.instance_dir)?;
+        // The path every generated hook command and relay actually connects
+        // to. When the instance directory is long this is the short runtime
+        // path; the under-instance `hook.sock` symlink is installed below for
+        // discovery only.
+        let socket_path = placement.bind_path().to_path_buf();
         let credential = mint_credential();
         // `REMUDA_SHIM=off` is honoured twice: the generated shim reads it at
         // run time (so a session already under way degrades cleanly), and here
@@ -90,6 +113,10 @@ impl HookSession {
                     "hook socket could not be bound: {error}"
                 ))
             })?;
+        // Bind first, link second: the symlink never advertises a socket that
+        // failed to come up, and it is installed only after all the fallible
+        // materialization below, so a failed launch leaves no dangling link
+        // (the server drop unlinks the real socket).
         let overlay = materialize_overlay(&OverlayOptions {
             launch_dir: launch_dir.clone(),
             relay_binary: options.relay_binary.clone(),
@@ -143,8 +170,14 @@ impl HookSession {
             "REMUDA_HOOK_RELAY".into(),
             options.relay_binary.to_string_lossy().into_owned(),
         );
+        placement.install_link().map_err(|error| {
+            crate::error::DriverError::SettingsIsolationUnavailable(format!(
+                "hook socket discovery link could not be created: {error}"
+            ))
+        })?;
         Ok(Self {
             _server: server,
+            placement,
             overlay,
             shims,
             socket_path,
@@ -376,6 +409,146 @@ mod tests {
             !socket.exists(),
             "a closed instance must not leave a live socket behind"
         );
+    }
+
+    /// The defect: a data directory deep enough that
+    /// `<data-dir>/instances/<id>/hook.sock` exceeds `sun_path` used to fail
+    /// the hook bind with `path must be shorter than SUN_LEN`. The session now
+    /// binds a short runtime socket, the overlay/relay receive that real path,
+    /// and one SessionStart still round-trips onto the bus.
+    ///
+    /// The long part is the *prefix*; the last component is a real
+    /// `ins_<canonical uuid>`, because that is what determines the runtime
+    /// socket's file name (`<uuid>.sock`, 41 bytes) and therefore what must
+    /// fit on macOS's 103-byte limit.
+    #[tokio::test]
+    async fn a_long_instance_dir_binds_a_runtime_socket_and_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let instance_id = "ins_01990000-0000-7000-8000-0000000000aa";
+        let instance_dir = root
+            .path()
+            .join("x".repeat(120))
+            .join("instances")
+            .join(instance_id);
+        // The filler segment alone is longer than this platform's whole
+        // sun_path.
+        assert!(
+            root.path().join("x".repeat(120)).as_os_str().len()
+                > remuda_signal::runtime_dir::SUN_PATH_LIMIT
+        );
+        std::fs::create_dir_all(&instance_dir).unwrap();
+        let preferred_hook = instance_dir.join("hook.sock");
+        assert!(preferred_hook.as_os_str().len() > remuda_signal::runtime_dir::SUN_PATH_LIMIT);
+
+        let (bus, mut events) = bus();
+        let session = HookSession::start(&options(&instance_dir), bus).unwrap();
+
+        // The bound path is short and real; the under-instance name is a
+        // symlink pointing at it. The guarantee is the platform limit, not
+        // the (tighter) preferred-path threshold.
+        assert!(
+            session.socket_path.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+        );
+        assert_eq!(
+            session.socket_path.file_name().unwrap().to_str().unwrap(),
+            "01990000-0000-7000-8000-0000000000aa.sock"
+        );
+        assert_ne!(session.socket_path, preferred_hook);
+        let link_meta = std::fs::symlink_metadata(&preferred_hook).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&preferred_hook).unwrap(),
+            session.socket_path
+        );
+
+        // The relay connects to exactly the path the overlay was materialized
+        // with — the short real one.
+        let settings = std::fs::read_to_string(&session.overlay.path).unwrap();
+        assert!(
+            settings.contains(&*session.socket_path.to_string_lossy()),
+            "overlay must point hooks at the short real socket"
+        );
+        assert!(
+            !settings.contains(&*preferred_hook.to_string_lossy()),
+            "overlay must never hand the relay the long symlink path"
+        );
+
+        let credential = session
+            .child_env("")
+            .get("REMUDA_HOOK_CREDENTIAL")
+            .cloned()
+            .expect("credential");
+        let reply = remuda_signal::send_event(
+            &session.socket_path,
+            &HookEnvelope {
+                credential,
+                event: "SessionStart".into(),
+                ppid: 777,
+                payload: serde_json::json!({
+                    "session_id": "0199a1f0-0000-7000-8000-0000000000aa",
+                    "transcript_path": "/w/s.jsonl",
+                }),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+        let observation = events.recv().await.expect("event on the bus");
+        assert_eq!(
+            observation.source.channel,
+            remuda_protocol::SourceChannel::Hook
+        );
+        assert!(session.binding().is_some());
+
+        // Session end removes BOTH the real socket and the discovery symlink.
+        let real_socket = session.socket_path.clone();
+        drop(session);
+        assert!(!real_socket.exists(), "real socket must be unlinked");
+        assert!(
+            std::fs::symlink_metadata(&preferred_hook).is_err(),
+            "discovery symlink must be removed"
+        );
+    }
+
+    /// Two redirected sessions on long instance dirs with real instance ids
+    /// bind distinct runtime sockets and serve independently.
+    #[tokio::test]
+    async fn two_long_instances_bind_distinct_runtime_sockets() {
+        let root = tempfile::tempdir().unwrap();
+        let first_dir = root
+            .path()
+            .join("a".repeat(120))
+            .join("instances/ins_01990000-0000-7000-8000-000000000001");
+        let second_dir = root
+            .path()
+            .join("b".repeat(120))
+            .join("instances/ins_01990000-0000-7000-8000-000000000002");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let a = start(&first_dir);
+        let b = start(&second_dir);
+        assert_ne!(a.socket_path, b.socket_path);
+        assert!(a.socket_path.exists() && b.socket_path.exists());
+        assert!(
+            a.socket_path.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+                && b.socket_path.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+        );
+        let cred_a = a.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone();
+        let reply = remuda_signal::send_event(
+            &a.socket_path,
+            &HookEnvelope {
+                credential: cred_a.clone(),
+                event: "Stop".into(),
+                ppid: 1,
+                payload: serde_json::json!({}),
+            },
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(reply.to_hook_json(), serde_json::json!({}));
+        // b's credential must not authenticate against a, and vice versa.
+        let cred_b = b.child_env("")["REMUDA_HOOK_CREDENTIAL"].clone();
+        assert_ne!(cred_a, cred_b);
     }
 
     #[tokio::test]

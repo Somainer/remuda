@@ -18,9 +18,72 @@ use tokio::task::JoinSet;
 
 const MAX_FRAME: usize = 1_048_576;
 
-/// Socket owned by the persistent Node, below its data directory.
+/// Path clients use to reach the Node daemon.
+///
+/// Conventionally `<data_dir>/node.sock`. When the data directory is too long
+/// for AF_UNIX `sun_path` the daemon binds a short hashed name in the per-user
+/// runtime directory and leaves `node.sock` as a symlink; because connect(2)
+/// enforces the same length limit *before* symlink resolution, clients must
+/// connect to the resolved target rather than the long link.
+///
+/// Resolution order:
+///
+/// 1. A usable installed `node.sock` symlink wins. Its target records where
+///    *the running daemon* actually bound, which matters when the daemon and
+///    the client see different environments (a cron shell versus a systemd
+///    user unit differ in `XDG_RUNTIME_DIR`/`TMPDIR`, so either side's
+///    derivation could pick a different candidate). The target is accepted
+///    only when it is an absolute path within `sun_path`.
+/// 2. Otherwise the target is **derived deterministically** with the same
+///    chooser the binder uses. That covers before-first-start and the
+///    binder's startup window (the link is installed last): without it a
+///    status/start probe would hand the kernel the over-long path, get
+///    `InvalidInput` instead of `NotFound`, and abort a launch that should
+///    simply start the daemon.
+/// 3. If both fail, the conventional path (connect fails `NotFound`).
 pub fn daemon_socket_path(data_dir: &Path) -> PathBuf {
-    data_dir.join("node.sock")
+    let preferred = data_dir.join("node.sock");
+    if remuda_signal::runtime_dir::path_fits_sun_path(&preferred) {
+        return preferred;
+    }
+    // 1. Honor the running daemon's installed link when usable.
+    if let Ok(metadata) = std::fs::symlink_metadata(&preferred)
+        && metadata.file_type().is_symlink()
+        && let Ok(target) = std::fs::read_link(&preferred)
+        && target.is_absolute()
+        && target.as_os_str().len() <= remuda_signal::runtime_dir::SUN_PATH_LIMIT
+    {
+        return target;
+    }
+    // 2. Derive the same target the binder would choose, without binding or
+    // installing the link. The call only prepares (creates/secures) the
+    // runtime directory; the socket itself stays absent until the daemon
+    // binds it.
+    if let Ok(placement) =
+        remuda_signal::runtime_dir::place_socket(&preferred, &daemon_runtime_name(data_dir))
+        && placement.redirected()
+    {
+        return placement.bind_path().to_path_buf();
+    }
+    // 3.
+    preferred
+}
+
+/// Stable short socket file name for a data directory: `node-<hash>.sock`.
+///
+/// A digest, never the path itself: it is unique per data directory, stable
+/// across restarts (so the symlink keeps naming the same target), and leaks
+/// nothing into a shared runtime directory.
+fn daemon_runtime_name(data_dir: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data_dir.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest[..10]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("node-{hex}.sock")
 }
 
 /// Probe the daemon without acquiring or replacing its controller.
@@ -243,7 +306,10 @@ impl DaemonWssFence {
 }
 
 struct SocketGuard {
+    /// Real bound socket (in the per-user runtime dir when redirected).
     socket: PathBuf,
+    /// Discovery symlink under the data dir, when the socket was redirected.
+    link: Option<PathBuf>,
     pid: PathBuf,
 }
 
@@ -257,6 +323,9 @@ impl Drop for TtyPump {
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
+        if let Some(link) = &self.link {
+            let _ = std::fs::remove_file(link);
+        }
         let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_file(&self.pid);
     }
@@ -300,7 +369,17 @@ pub async fn bind_daemon(data_dir: &Path) -> Result<DaemonListener, NodeError> {
         .map_err(|(_, error)| {
             NodeError::Conflict(format!("Node daemon data directory is locked: {error}"))
         })?;
-    let path = daemon_socket_path(data_dir);
+    // AF_UNIX placement: bind the short real path; the under-data-dir
+    // node.sock is a direct socket or a discovery symlink to it.
+    // (The "data dir is long" start-up warning is emitted in `compose`, the
+    // common node-start path shared with dev/stdio.)
+    let preferred = data_dir.join("node.sock");
+    let placement =
+        remuda_signal::runtime_dir::place_socket(&preferred, &daemon_runtime_name(data_dir))
+            .map_err(|error| {
+                NodeError::InvalidConfig(format!("daemon socket placement: {error}"))
+            })?;
+    let path = placement.bind_path().to_path_buf();
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
         if !metadata.file_type().is_socket() {
             return Err(NodeError::InvalidConfig(
@@ -315,9 +394,12 @@ pub async fn bind_daemon(data_dir: &Path) -> Result<DaemonListener, NodeError> {
             Err(error) => return Err(error.into()),
         }
     }
-    let listener = UnixListener::bind(&path)?;
+    let listener = UnixListener::bind(&path).map_err(|error| {
+        NodeError::Transport(remuda_signal::runtime_dir::bind_io_error(&path, error).to_string())
+    })?;
     let _socket = SocketGuard {
         socket: path.clone(),
+        link: placement.link_path().map(Path::to_path_buf),
         pid: data_dir.join("node.pid"),
     };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
@@ -333,6 +415,11 @@ pub async fn bind_daemon(data_dir: &Path) -> Result<DaemonListener, NodeError> {
     )?;
     pid_file.sync_all()?;
     std::fs::rename(temporary_pid, &_socket.pid)?;
+    // Advertise only once everything else is reserved; a failure here drops
+    // the guard, which removes the real socket and pid file.
+    placement.install_link().map_err(|error| {
+        NodeError::InvalidConfig(format!("daemon socket discovery link: {error}"))
+    })?;
     Ok(DaemonListener {
         listener,
         _socket,

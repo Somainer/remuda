@@ -433,10 +433,10 @@ async fn pty_pending_bound_preserves_control_access() {
 #[tokio::test]
 async fn stopping_a_pty_instance_reclaims_its_durable_carrier_ownership() {
     use remuda_driver::PtyResource;
-    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer};
+    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ShortTempDir};
 
-    let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("herdr.sock");
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket = socket_root.path().join("herdr.sock");
     let _fake = FakeHerdrServer::spawn(FakeHerdrOptions::new(&socket)).unwrap();
     let client = remuda_herdr::Client::connect(&socket);
     let (node, driver) = node(DriverKind::ClaudePty, 4);

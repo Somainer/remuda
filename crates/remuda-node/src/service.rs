@@ -112,6 +112,24 @@ impl Drop for RunningNode {
 
 /// Compose the durable Node runtime without binding an HTTP listener.
 pub fn compose(config: &ServeConfig) -> Result<DevNode, NodeError> {
+    // One start-up warning when the data directory pushes per-instance hook
+    // sockets past AF_UNIX `sun_path`: operators then know why `hook.sock`
+    // under an instance dir is a symlink and where the real sockets live.
+    if remuda_driver::instance_sockets_would_redirect(&config.data_dir) {
+        tracing::warn!(
+            data_dir_len = config.data_dir.as_os_str().len(),
+            safe_limit = remuda_signal::runtime_dir::SAFE_SOCKET_PATH_BYTES,
+            "Node data directory is long: per-instance hook sockets will bind in the per-user runtime dir and appear as symlinks under each instance directory"
+        );
+    }
+    // Reclaim redirected socket inodes left by Node processes that died hard
+    // (SIGKILL cannot run the session/daemon drop that unlinks them). Live
+    // listeners answer the sweep's probe and are never touched.
+    match remuda_signal::runtime_dir::sweep_dead_runtime_sockets() {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "reclaimed dead remuda runtime sockets"),
+        Err(error) => tracing::debug!(%error, "runtime socket sweep failed"),
+    }
     let store = Arc::new(MemoryStore::open_journaled(
         &config.data_dir,
         config.http.follow_buffer_capacity,

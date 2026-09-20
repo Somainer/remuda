@@ -20,6 +20,11 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# geteuid, O_NOFOLLOW fchmod and friends for the per-user runtime directory
+# ownership/mode checks (sun_path fix).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28", default-features = false, features = ["dir", "fs", "user", "poll", "net", "socket"] }
+
 [dev-dependencies]
 remuda-testing.workspace = true
 tempfile = "3"

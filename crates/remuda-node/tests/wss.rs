@@ -640,7 +640,7 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     use remuda_node::{
         DevNode, DevServerConfig, MemoryStore, NativeDriverConfig, native_driver_registry,
     };
-    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin};
+    use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ShortTempDir, ensure_workspace_bin};
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().expect("tmp");
@@ -648,7 +648,8 @@ async fn wss_create_is_accepted_before_ten_second_fake_herdr_start() {
     hub_config.command_accept_timeout_ms = 2_000;
     let hub = remuda_hub::spawn(hub_config).await.expect("hub");
 
-    let socket_dir = dir.path().join("herdr");
+    let socket_root = ShortTempDir::new().expect("short socket root");
+    let socket_dir = socket_root.path().join("herdr");
     std::fs::create_dir_all(&socket_dir).expect("herdr dir");
     let fake_herdr = FakeHerdrServer::spawn(
         FakeHerdrOptions::new(socket_dir.join("herdr.sock")).with_agent_start_delay(SLOW_START),

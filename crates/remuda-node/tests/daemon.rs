@@ -9,7 +9,7 @@ use remuda_node::{
 use remuda_protocol::{InstanceId, U64};
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -241,6 +241,146 @@ async fn killed_bridge_keeps_fake_claude_alive_and_replays_completion_after_wate
     // Open SQLite again to prove completion was durable, not only broadcast.
     let restored = compose(&config).unwrap();
     assert!(journal_complete(&restored, &instance.meta.id));
+}
+
+/// A data directory longer than `sun_path`: the daemon binds the short
+/// runtime socket, the under-data-dir `node.sock` is a symlink, clients reach
+/// the daemon through the resolved real path, and shutdown removes both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_socket_redirects_under_a_long_data_dir() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("d".repeat(80)).join("node-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let preferred = data_dir.join("node.sock");
+    assert!(
+        preferred.as_os_str().len() > 107,
+        "fixture must exceed the Linux sun_path limit: {}",
+        preferred.as_os_str().len()
+    );
+
+    let node = compose(&ServeConfig::fake(
+        DevServerConfig::loopback(0).with_workspace_roots(remuda_testing::test_workspace_roots!()),
+        data_dir.clone(),
+    ))
+    .unwrap();
+    let task = start(node.clone(), &data_dir, test_control(&data_dir)).await;
+
+    // The discovery link under the data directory points at a short socket.
+    let link_meta = std::fs::symlink_metadata(&preferred).unwrap();
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "node.sock must be a symlink when redirected"
+    );
+    let real = daemon_socket_path(&data_dir);
+    assert_ne!(real, preferred, "clients must resolve to the real socket");
+    assert!(
+        real.as_os_str().len() <= 107,
+        "real socket must fit sun_path: {}",
+        real.display()
+    );
+    assert_eq!(
+        std::fs::read_link(&preferred).unwrap(),
+        real,
+        "node.sock must point at the resolved daemon path"
+    );
+    // The real socket is private; the status probe already proved it answers.
+    assert_eq!(
+        std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // A bridge connects through the resolved path as well.
+    let peer = Peer::connect(&data_dir, true, json!([])).await;
+    drop(peer);
+
+    task.abort();
+    let _ = task.await;
+    node.shutdown().await.unwrap();
+    assert!(
+        std::fs::symlink_metadata(&preferred).is_err(),
+        "shutdown must remove the discovery symlink"
+    );
+    assert!(
+        std::fs::symlink_metadata(&real).is_err(),
+        "shutdown must remove the real socket"
+    );
+}
+
+/// Before a daemon has ever started under a too-long data directory there is
+/// no `node.sock` symlink to resolve; the client path must nevertheless be
+/// derived deterministically and fit `sun_path`, and the status probe must
+/// report "not running" rather than fail with the kernel's `InvalidInput`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_status_under_a_long_data_dir_before_first_start_is_not_running() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("d".repeat(80)).join("node-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    assert!(data_dir.join("node.sock").as_os_str().len() > 107);
+    assert!(
+        std::fs::symlink_metadata(data_dir.join("node.sock")).is_err(),
+        "no daemon has run; no link may exist yet"
+    );
+
+    let resolved = daemon_socket_path(&data_dir);
+    assert!(
+        resolved.as_os_str().len() <= 107,
+        "derived socket must fit sun_path: {}",
+        resolved.display()
+    );
+    assert!(
+        !resolved.starts_with(&data_dir),
+        "derived socket must live in the per-user runtime dir: {}",
+        resolved.display()
+    );
+    let running = daemon_is_running(&data_dir)
+        .await
+        .expect("a missing derived socket must read as not-running, not an error");
+    assert!(!running);
+    // A second bind attempt for the same data dir derives the same name.
+    assert_eq!(resolved, daemon_socket_path(&data_dir));
+}
+
+/// The installed symlink wins over local derivation: a client whose
+/// XDG_RUNTIME_DIR/TMPDIR differ from the daemon's must connect where the
+/// running daemon actually is, not where the client would have derived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_socket_path_honors_the_installed_link_over_local_derivation() {
+    let root = tempfile::tempdir().unwrap();
+    let data_dir = root.path().join("d".repeat(80)).join("node-data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    assert!(data_dir.join("node.sock").as_os_str().len() > 107);
+
+    // Simulate the daemon's environment: serve the status RPC at a short path
+    // the current process would not derive, and publish it through node.sock.
+    let external = PathBuf::from(format!(
+        "/tmp/remuda-linktest-{}/node-foreign.sock",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(external.parent().unwrap()).unwrap();
+    let listener = tokio::net::UnixListener::bind(&external).unwrap();
+    let server = tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"status\",\"result\":{\"running\":true}}\n")
+            .await
+            .unwrap();
+    });
+    std::os::unix::fs::symlink(&external, data_dir.join("node.sock")).unwrap();
+
+    assert_eq!(daemon_socket_path(&data_dir), external);
+    assert!(
+        daemon_is_running(&data_dir)
+            .await
+            .expect("link target is live")
+    );
+    server.await.unwrap();
+    let _ = std::fs::remove_file(data_dir.join("node.sock"));
+    let _ = std::fs::remove_file(&external);
+    let _ = std::fs::remove_dir_all(external.parent().unwrap());
 }
 
 fn journal_complete(node: &DevNode, instance: &InstanceId) -> bool {

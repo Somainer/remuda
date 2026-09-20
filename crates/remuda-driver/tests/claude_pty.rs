@@ -10,7 +10,9 @@ use remuda_protocol::{
     Completeness, ContentBlock, DriverInput, InputOrigin, InstanceSpec, Knowledge,
     LifecyclePayload, ObservationPayload, PromptInput, PromptMode, TextBlock,
 };
-use remuda_testing::{FakeHerdrOptions, FakeHerdrServer, ensure_workspace_bin, install_executable};
+use remuda_testing::{
+    FakeHerdrOptions, FakeHerdrServer, ShortTempDir, ensure_workspace_bin, install_executable,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,7 +63,9 @@ fn prompt(text: &str) -> DriverInput {
 #[tokio::test]
 async fn fake_herdr_start_prompt_idle_close() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    // Fake-herdr sockets must live on a TMPDIR-independent short root.
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_fake_herdr_bin();
@@ -259,7 +263,9 @@ async fn poll_alt_screen(driver: &ClaudePtyDriver, want: Option<bool>) {
 #[tokio::test]
 async fn claude_pty_alt_screen_flips_when_the_harness_enters_fullscreen() {
     let tmp = tempfile::tempdir().unwrap();
-    let socket_dir = tmp.path().join("herdr");
+    // Fake-herdr sockets must live on a TMPDIR-independent short root.
+    let socket_root = ShortTempDir::new().unwrap();
+    let socket_dir = socket_root.path().join("herdr");
     fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join("herdr.sock");
     let fake_bin = ensure_fake_herdr_bin();

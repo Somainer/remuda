@@ -1274,6 +1274,17 @@ impl ShellPtyDriver {
             *self.adapters.lock().await = Some(handle);
         }
         if self.options.promote {
+            // Built before `hooks` moves into the poller: the silence probe
+            // needs the live session's *real* socket path. Under a long data
+            // dir `instance_dir/hook.sock` is only a discovery symlink
+            // (connecting through it exceeds sun_path), so probing the link
+            // would report a false socket-refused.
+            let silence_paths = self.options.hooks.as_ref().and_then(|config| {
+                hooks.as_ref().map(|session| promotion::HookSilencePaths {
+                    relay: config.relay_binary.clone(),
+                    socket: session.socket_path.clone(),
+                })
+            });
             *self.poller.lock().await = Some(promotion::spawn(
                 Arc::clone(&state),
                 hook_ctx.clone(),
@@ -1305,15 +1316,10 @@ impl ShellPtyDriver {
                 self.options.target.agent_kind().map(|kind| {
                     crate::promote::LaunchAlias::new(kind, recipe.binary.abs_path.clone())
                 }),
-                // The relay this launch exec'd and its per-instance hook socket,
-                // so the poller can name why a quiet hook tier went silent.
-                self.options
-                    .hooks
-                    .as_ref()
-                    .map(|hooks| promotion::HookSilencePaths {
-                        relay: hooks.relay_binary.clone(),
-                        socket: hooks.instance_dir.join("hook.sock"),
-                    }),
+                // The relay this launch exec'd and the real per-instance hook
+                // socket the poller probes when a quiet hook tier goes silent
+                // (captured above before `hooks` moved into the poller).
+                silence_paths,
             ));
             // A login shell has no agent at spawn; once promotion identifies a
             // hand-typed codex/grok, start its file adapter against the native

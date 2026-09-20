@@ -404,6 +404,19 @@ impl DevNode {
                 .data_dir
                 .join("instances")
                 .join(instance_id.as_id().as_str());
+            // Under a long data dir the real hook socket lives in the
+            // per-user runtime dir and `hook.sock` here is only a symlink;
+            // remove_dir_all would unlink the link but leak the inode.
+            // Best-effort: log but do not fail purge if the target is gone.
+            if let Err(error) =
+                remuda_signal::runtime_dir::unlink_resolved_socket_link(&dir.join("hook.sock"))
+            {
+                tracing::debug!(
+                    instance = %instance_id.as_id(),
+                    %error,
+                    "could not unlink the redirected hook socket while purging"
+                );
+            }
             // `instances/<id>` is Node-owned: launch recipes, overlays, pty
             // logs. Never a path the user chose.
             match std::fs::remove_dir_all(&dir) {

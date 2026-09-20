@@ -894,6 +894,31 @@
       ],
       "type": "object"
     },
+    "BoardColumn": {
+      "description": "BoardColumn wire values; `protocol.md` §2.2.",
+      "oneOf": [
+        {
+          "const": "todo",
+          "description": "Wire value `todo`.",
+          "type": "string"
+        },
+        {
+          "const": "in-progress",
+          "description": "Wire value `in-progress`.",
+          "type": "string"
+        },
+        {
+          "const": "done",
+          "description": "Wire value `done`.",
+          "type": "string"
+        },
+        {
+          "const": "archived",
+          "description": "Wire value `archived`.",
+          "type": "string"
+        }
+      ]
+    },
     "BoolLiteral_false": {
       "const": false,
       "type": "boolean"
@@ -18264,6 +18289,17 @@
     "Task": {
       "description": "One row of the task ledger; design §2.2/§8.1 row 4.",
       "properties": {
+        "archivedAt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Archive timestamp; an orthogonal flag (D-050), not a ninth state.\nArchiving never changes `state` (terminal semantics stay untouched); a\ntask carrying a timestamp projects to the archive column from any\nstate. `None` on every row written before the column existed, and\nskipped on serialise so such rows stay byte-identical."
+        },
         "blockedReason": {
           "description": "Reason carried on `failed` when the worker reported `BLOCKED <reason>`.",
           "type": [

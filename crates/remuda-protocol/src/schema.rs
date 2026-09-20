@@ -51,6 +51,7 @@ pub fn schema_document() -> Value {
         BinaryChannel,
         BinaryHeader,
         BlobLocator,
+        BoardColumn,
         BoolLiteral<false>,
         BoolLiteral<true>,
         Capability,

@@ -185,6 +185,9 @@ export type BlobLocator = ({
   [key: string]: unknown;
 });
 
+/** BoardColumn wire values; `protocol.md` §2.2. */
+export type BoardColumn = ("todo" | "in-progress" | "done" | "archived");
+
 export type BoolLiteral_false = false;
 
 export type BoolLiteral_true = true;
@@ -4103,6 +4106,7 @@ export type SupplyState = ("available" | "degraded" | "cooling" | "exhausted" | 
 
 /** One row of the task ledger; design §2.2/§8.1 row 4. */
 export type Task = ({
+  "archivedAt"?: (Timestamp | (null));
   "blockedReason"?: (string | null);
   "budget": TaskBudget;
   "class": TaskClass;

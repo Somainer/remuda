@@ -3583,9 +3583,104 @@
         ],
         "type": "object"
       },
+      "BoardColumn": {
+        "description": "Read-only kanban column derived from task state + archivedAt + placement; D-050.",
+        "enum": [
+          "todo",
+          "in-progress",
+          "done",
+          "archived"
+        ],
+        "type": "string"
+      },
+      "BoardColumns": {
+        "description": "Cards grouped by their derived board column; every task projects to exactly one column.",
+        "properties": {
+          "archived": {
+            "items": {
+              "$ref": "#/components/schemas/BoardItem"
+            },
+            "type": "array"
+          },
+          "done": {
+            "items": {
+              "$ref": "#/components/schemas/BoardItem"
+            },
+            "type": "array"
+          },
+          "in-progress": {
+            "items": {
+              "$ref": "#/components/schemas/BoardItem"
+            },
+            "type": "array"
+          },
+          "todo": {
+            "items": {
+              "$ref": "#/components/schemas/BoardItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "todo",
+          "in-progress",
+          "done",
+          "archived"
+        ],
+        "type": "object"
+      },
+      "BoardItem": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Task"
+          },
+          {
+            "properties": {
+              "boardColumn": {
+                "$ref": "#/components/schemas/BoardColumn"
+              },
+              "displayKey": {
+                "description": "Display-only per-project key derived from oldest-first order (SE-nn); never stored.",
+                "pattern": "^SE-[0-9]{2,}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "boardColumn",
+              "displayKey"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "One board card: the task document plus its read-only projection fields."
+      },
+      "BoardView": {
+        "properties": {
+          "columns": {
+            "$ref": "#/components/schemas/BoardColumns"
+          },
+          "project": {
+            "description": "Project slice the board was projected for; null for every project in scope.",
+            "pattern": "^prj_",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "columns"
+        ],
+        "type": "object"
+      },
       "Task": {
         "description": "One row of the task ledger; design §2.2/§2.5/§8.1 row 4.",
         "properties": {
+          "archivedAt": {
+            "description": "Archive flag timestamp; orthogonal to state and never written by a state transition (D-050).",
+            "format": "date-time",
+            "type": "string"
+          },
           "blockedReason": {
             "type": "string"
           },
@@ -5061,6 +5156,44 @@
         "summary": "Rename a passkey",
         "tags": [
           "passkeys"
+        ]
+      }
+    },
+    "/v1/board": {
+      "get": {
+        "operationId": "boardGet",
+        "parameters": [
+          {
+            "description": "prj_… project id; omit for every project in scope",
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BoardView"
+                }
+              }
+            },
+            "description": "Board columns"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Read-only kanban projection of ledger states onto to-do / in-progress / done plus an archive column",
+        "tags": [
+          "tasks"
         ]
       }
     },
@@ -7857,6 +7990,50 @@
           }
         },
         "summary": "Move a task along the state machine (illegal jumps → 409)",
+        "tags": [
+          "tasks"
+        ],
+        "parameters": [
+          {
+            "description": "tsk_… id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/v1/tasks/{id}/archive": {
+      "post": {
+        "operationId": "taskArchive",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Task"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "summary": "Stamp the orthogonal archive flag without changing state (requires the dispatch grant)",
         "tags": [
           "tasks"
         ],

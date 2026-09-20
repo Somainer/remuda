@@ -179,14 +179,22 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS placements_task ON placements(task_id);
         CREATE INDEX IF NOT EXISTS placements_project ON placements(project_id);",
     )?;
+    // D-050: the archive flag is one additive nullable column. The migration
+    // lives here with the rest of the task tables (not in store.rs's
+    // instances/hosts ensure_column block); SQLite's ALTER TABLE has no
+    // IF NOT EXISTS, so the house idempotent idiom is `ensure_column`. Old
+    // rows get NULL and their doc_json is untouched (byte-identical).
+    crate::store::ensure_column(conn, "tasks", "archived_at", "TEXT")?;
     Ok(())
 }
 
 /// Routes for `/v1/tasks` and `/v1/own`.
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/v1/board", get(board))
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task_http).patch(set_task_state))
+        .route("/v1/tasks/{id}/archive", post(archive_task))
         .route("/v1/tasks/{id}/split", post(split_task))
         .route("/v1/tasks/{id}/land", post(land_task))
         .route("/v1/tasks/{id}/own", post(claim_own).delete(release_own))
@@ -229,6 +237,15 @@ struct ListQuery {
     state: Option<String>,
 }
 
+/// `GET /v1/board?project=…` — the board has no state filter (all eight
+/// states project into columns), only the project slice.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BoardQuery {
+    #[serde(default)]
+    project: Option<String>,
+}
+
 /// `GET /v1/tasks?project=…&state=…`
 async fn list_tasks(
     State(state): State<AppState>,
@@ -250,6 +267,63 @@ async fn list_tasks(
         items.retain(|task| task.state == wanted);
     }
     Ok(Json(json!({ "items": items, "nextCursor": null })))
+}
+
+/// `GET /v1/board?project=…` — the read-only kanban projection (D-050).
+///
+/// The eight ledger states project onto three work columns plus an orthogonal
+/// archive column; the projection is derived at read time from
+/// `state + archived_at + placement` ([`Task::board_column`]) and is never
+/// stored. Cards additionally carry the display-only per-project key `SE-nn`
+/// (derived from oldest-first order, D12 — not persisted). Column drags are
+/// not a board verb: the UI decomposes them into legal `set_task_state`
+/// PATCHes, so the state machine stays authoritative.
+async fn board(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BoardQuery>,
+) -> Result<Json<Value>, HubError> {
+    let (_, scope) = require_project_scope(&state, &headers).await?;
+    let items = state
+        .store
+        .list_tasks(query.project.clone())
+        .await
+        .map_err(map_store)?;
+    let mut columns = json!({
+        "todo": [],
+        "in-progress": [],
+        "done": [],
+        "archived": [],
+    });
+    let groups = columns.as_object_mut().expect("four board columns");
+    // `list_tasks` returns oldest first; number per project independently.
+    let mut display_seq: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for task in items {
+        if !scope.allows_project(task.project_id.as_id().as_str()) {
+            continue;
+        }
+        let seq = display_seq
+            .entry(task.project_id.as_id().to_string())
+            .or_insert(0);
+        *seq += 1;
+        let column = task.board_column();
+        let column = serde_json::to_value(column)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "todo".to_string());
+        let mut card = json!(task);
+        card["boardColumn"] = json!(column);
+        card["displayKey"] = json!(format!("SE-{:02}", seq));
+        groups
+            .get_mut(&column)
+            .and_then(Value::as_array_mut)
+            .expect("every projection maps to a documented column")
+            .push(card);
+    }
+    Ok(Json(
+        json!({ "project": query.project, "columns": columns }),
+    ))
 }
 
 /// `POST /v1/tasks` — `remuda task add`.
@@ -365,6 +439,48 @@ async fn set_task_state(
             "task.state".into(),
             Some(id),
             json!({ "state": body.state, "reason": body.reason }),
+        )
+        .await
+        .map_err(map_store)?;
+    Ok(Json(json!(updated)))
+}
+
+/// `POST /v1/tasks/{id}/archive` — set the orthogonal archive flag (D-050).
+///
+/// Archiving only stamps `archived_at`; it never moves `state`, so terminal
+/// semantics and the dependency gate are untouched and the card keeps its
+/// place in the state machine while projecting onto the archive column.
+/// Re-archiving is a 409 (the flag is one-way for now).
+async fn archive_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, HubError> {
+    let device = require_dispatch(&state, &headers).await?;
+    let (_, scope) = require_project_scope(&state, &headers).await?;
+    let archived_at = now_timestamp()?;
+    let updated = state
+        .store
+        .mutate_task(id.clone(), move |task, _conn| {
+            if !scope.allows_project(task.project_id.as_id().as_str()) {
+                return Err(StoreError::Forbidden("project outside scope".into()));
+            }
+            if task.archived_at.is_some() {
+                return Err(StoreError::Conflict("task is already archived".into()));
+            }
+            task.archived_at = Some(archived_at.clone());
+            Ok(())
+        })
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    state
+        .store
+        .append_audit(
+            device.id,
+            "task.archive".into(),
+            Some(id),
+            json!({ "archivedAt": updated.archived_at }),
         )
         .await
         .map_err(map_store)?;
@@ -1195,8 +1311,8 @@ fn insert_task_row(conn: &mut Connection, task: &Task, created_by: &str) -> Resu
     }
     conn.execute(
         "INSERT INTO tasks
-            (id, project_id, parent_task_id, title, state, landed_sha, doc_json, revision, created_by, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?9)",
+            (id, project_id, parent_task_id, title, state, landed_sha, archived_at, doc_json, revision, created_by, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?10)",
         params![
             task.meta.id.as_id().to_string(),
             task.project_id.as_id().to_string(),
@@ -1207,6 +1323,7 @@ fn insert_task_row(conn: &mut Connection, task: &Task, created_by: &str) -> Resu
                 .and_then(|value| value.as_str().map(str::to_string))
                 .unwrap_or_default(),
             task.landed_sha,
+            task.archived_at.clone().map(String::from),
             serde_json::to_string(task).expect("task json"),
             created_by,
             now
@@ -1229,13 +1346,14 @@ fn update_task_row(conn: &Connection, task: &Task) -> rusqlite::Result<()> {
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_default();
     conn.execute(
-        "UPDATE tasks SET title = ?1, state = ?2, landed_sha = ?3, doc_json = ?4,
-                         revision = ?5, updated_at = ?6
-         WHERE id = ?7",
+        "UPDATE tasks SET title = ?1, state = ?2, landed_sha = ?3, archived_at = ?4,
+                         doc_json = ?5, revision = ?6, updated_at = ?7
+         WHERE id = ?8",
         params![
             task.title,
             state,
             task.landed_sha,
+            task.archived_at.clone().map(String::from),
             serde_json::to_string(task).expect("task json"),
             task.meta.revision.0 as i64,
             now,
@@ -1256,4 +1374,69 @@ fn load_task(conn: &Connection, id: &str) -> Result<Option<Task>, StoreError> {
     raw.map(|raw| serde_json::from_str(&raw))
         .transpose()
         .map_err(StoreError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn migrate_adds_archived_at_to_a_legacy_tasks_table_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The exact pre-D-050 schema; a db created before the column existed.
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_task_id TEXT,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL,
+                landed_sha TEXT,
+                doc_json TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+            INSERT INTO tasks (id, project_id, title, state, doc_json, created_at, updated_at)
+            VALUES ('tsk_legacy', 'prj_x', 'old', 'running', '{}',
+                    '2026-09-19T10:00:00.000Z', '2026-09-19T10:00:00.000Z');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        let columns = table_columns(&conn, "tasks");
+        assert!(columns.contains(&"archived_at".to_string()));
+        // Old rows default to NULL — no backfill, doc untouched. Pair the
+        // nullable column with the id so NULL is distinguished from no row.
+        let (id, archived): (String, Option<String>) = conn
+            .query_row(
+                "SELECT id, archived_at FROM tasks WHERE id = 'tsk_legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(id, "tsk_legacy");
+        assert_eq!(archived, None);
+
+        // Idempotent: running again on a current db neither errors nor resets.
+        migrate(&conn).unwrap();
+        let again = table_columns(&conn, "tasks");
+        assert_eq!(again.iter().filter(|c| *c == "archived_at").count(), 1);
+    }
+
+    #[test]
+    fn migrate_on_a_fresh_db_creates_the_archive_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        assert!(table_columns(&conn, "tasks").contains(&"archived_at".to_string()));
+    }
 }

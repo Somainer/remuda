@@ -105,14 +105,27 @@ burners on those cores (`taskset`, `--test-threads=1`), 30 iterations, the whole
 loop wrapped in
 `flock …/locks/gate-e2e.lock` so it serializes against the landing gate:
 
-- **Before the fix:** PASS=26 FAIL=4 of 30. All four failures died in
-  `reconcile` at the same call site as the gate; the captured interleaving
-  showed the dropped Node's writer (`gen=0`) appending seq 6 at a stale offset
-  after the reopened Node (`gen=1`) had already written its own seq 6,
-  producing `UNIQUE constraint failed: events.instance_id, events.seq`
-  (the gate run hit the JSON-fragment twin symptom).
-- **After the fix:** 30/30 pass under the same pinned-and-burned loop; see the
-  deterministic tests below.
+- **Before the fix:** PASS=26 FAIL=4 of 30. All four died in `reconcile` at
+  the gate's call site: three with
+  `UNIQUE constraint failed: events.instance_id, events.seq` and one with the
+  gate's exact string,
+  `reconcile: Driver("journal append failed: json: EOF while parsing a string
+  at line 1 column 5335")` — same column 5335 the landing gate reported,
+  confirming the same mechanism rather than a coincidental parse error. The
+  captured writer trace showed the dropped Node's writer (`gen=0`) appending
+  seq 6 at a stale offset after the reopened Node (`gen=1`) had already
+  written its own seq 6; O_APPEND landed the bytes at EOF while the SQLite
+  index claimed the old offset.
+- **After the fix:** 30/30 pass under the same pinned-and-burned loop. After
+  rebasing onto the main that landed meanwhile (one unrelated hunk in
+  `runtime.rs`, applied cleanly), the journal suite and the node library,
+  daemon, pty-lifecycle and restart binaries were re-run green (360 library
+  tests; 8 + 11 + 4 integration tests, 0 failed); the real-PTY `live_pipeline`
+  binary takes ~180 s but is deterministic and unrelated.
+- **Known flake during development (not a residual test flake):** the first
+  interlock version blocked in `flock(2)` with no timeout and wedged the
+  daemon suite for 36 minutes while holding the gate lock; it was replaced by
+  the bounded wait above before anything landed (see "Lock shape" below).
 
 ## Deterministic tests
 

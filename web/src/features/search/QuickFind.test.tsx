@@ -232,6 +232,11 @@ describe("QuickFind grouped Jump To (phone key bar)", () => {
   afterEach(() => {
     setCompact(false);
     fixtures.instances[0].activity = { state: "known", value: "idle" };
+    fixtures.instances[0].updatedAt = "2026-09-10T00:00:00Z";
+    fixtures.instances[1].updatedAt = "2026-09-09T00:00:00Z";
+    for (const extra of fixtures.instances.splice(2)) {
+      delete fixtures.titles[extra.id];
+    }
     localStorage.removeItem(orderKey);
   });
 
@@ -267,6 +272,80 @@ describe("QuickFind grouped Jump To (phone key bar)", () => {
     await user.keyboard("{ArrowDown}");
     expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-1");
     expect(screen.getAllByTestId("quickfind-result")[1]).toHaveAttribute("data-selected", "true");
+  });
+
+  it("ArrowDown walks the visual grouped order even when it diverges from the flat recency array", async () => {
+    setCompact(true);
+    // Fixture where rankQuickFind's flat order is NOT the rendered order:
+    //   alpha group (wsp-a): blocked oldest (09-10, pinned) + idle (09-12)
+    //   beta group  (wsp-b): idle (09-15, newest single leaf)
+    // Flat recency is [beta, alpha-idle, alpha-blocked]; grouped clock renders
+    // the beta group first (latest leaf is newest), then alpha with the blocked
+    // leaf pinned: [beta, alpha-blocked, alpha-idle].
+    const alphaBlocked = fixtures.instances[0]!;
+    const beta = fixtures.instances[1]!;
+    alphaBlocked.updatedAt = "2026-09-10T00:00:00Z";
+    alphaBlocked.activity = { state: "known", value: "waiting-interaction" };
+    beta.updatedAt = "2026-09-15T00:00:00Z";
+    const alphaIdle = {
+      id: "ins_alpha002-0000-7000-8000-000000000003",
+      hostId: "host-a",
+      workspaceId: "wsp-a",
+      kind: "claude",
+      lifecycle: "ready",
+      connectivity: "connected",
+      activity: { state: "known", value: "idle" },
+      createdAt: "2026-09-01T00:00:00Z",
+      updatedAt: "2026-09-12T00:00:00Z",
+    } as unknown as Instance;
+    fixtures.instances.push(alphaIdle);
+    fixtures.titles[alphaIdle.id] = "middle alpha row";
+
+    const user = userEvent.setup();
+    renderFinder();
+    act(() => openQuickFind({ grouped: true }));
+
+    const rowsInVisualOrder = () =>
+      Array.from(
+        document.querySelectorAll<HTMLElement>("#quickfind-listbox [role='option']"),
+      );
+    const instanceIdsInVisualOrder = () =>
+      rowsInVisualOrder().map((row) => row.getAttribute("data-instance-id"));
+
+    // Rendered (document) order is the grouped order, and the option ids match
+    // that reading order — option-1 is the pinned blocked row, not flat[1].
+    expect(instanceIdsInVisualOrder()).toEqual([beta.id, alphaBlocked.id, alphaIdle.id]);
+    expect(rowsInVisualOrder().map((row) => row.id)).toEqual([
+      "quickfind-option-0",
+      "quickfind-option-1",
+      "quickfind-option-2",
+    ]);
+
+    const box = screen.getByTestId("quickfind-input");
+    const selectedId = () =>
+      rowsInVisualOrder()
+        .find((row) => row.getAttribute("data-selected") === "true")
+        ?.getAttribute("data-instance-id");
+
+    expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-0");
+    expect(selectedId()).toBe(beta.id);
+
+    // One ArrowDown must highlight the visually next row — the blocked row
+    // pinned at the top of the second group — not flat[1] (the 09-12 row).
+    await user.keyboard("{ArrowDown}");
+    expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-1");
+    expect(selectedId()).toBe(alphaBlocked.id);
+    expect(
+      rowsInVisualOrder().find((row) => row.getAttribute("data-instance-id") === alphaIdle.id),
+    ).toHaveAttribute("data-selected", "false");
+
+    // Second ArrowDown lands on the visually third row; ArrowUp reverses.
+    await user.keyboard("{ArrowDown}");
+    expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-2");
+    expect(selectedId()).toBe(alphaIdle.id);
+    await user.keyboard("{ArrowUp}");
+    expect(box).toHaveAttribute("aria-activedescendant", "quickfind-option-1");
+    expect(selectedId()).toBe(alphaBlocked.id);
   });
 
   it("remembers the clock/list choice per device", async () => {

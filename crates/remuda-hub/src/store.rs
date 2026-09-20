@@ -2320,6 +2320,31 @@ impl Store {
         .await
     }
 
+    /// Stamp the attach-lock holder on a leased directory (t-bind dispatch
+    /// fold): one attached session at a time; instance delete clears it. A
+    /// missing holder id (unknown instance) or missing row is a no-op.
+    pub async fn attach_worktree_lease_holder(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+        holder_instance_id: Option<String>,
+    ) -> Result<(), StoreError> {
+        let Some(holder) = holder_instance_id else {
+            return Ok(());
+        };
+        self.run_named("attach_worktree_lease_holder", move |conn| {
+            if let Some(mut row) = WorktreeLeaseRow::load(conn, &host_id, &workspace_id, &dir_key)?
+            {
+                row.holder_instance_id = Some(holder);
+                row.updated_at = now_rfc3339();
+                row.save(conn)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Fetch the active lease a worker reclaim must consult.
     ///
     /// Matches the exact directory key *and* a pool slot derived from the

@@ -906,7 +906,7 @@ pub(crate) fn resolve_delegation(
 pub async fn create_instance(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateInstanceBody>,
+    Json(mut body): Json<CreateInstanceBody>,
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
@@ -951,6 +951,73 @@ pub async fn create_instance(
         .filter(|value| !value.is_empty())
         .unwrap_or("claude-pty")
         .to_string();
+    // t-bind: when the launch names a task carrying a `workspaceBinding`, fold
+    // it into the *existing* fields (hostId/workspaceId/cwd/worktree) — no new
+    // dispatch wire field (D-050 §3.4). The binding pins the host so placement
+    // cannot land the session on a different directory; a mismatching explicit
+    // host is a hard conflict, never a silent reroute (D-035).
+    let binding_task = match body.task_id.as_deref() {
+        Some(raw) => {
+            let task_id = remuda_protocol::TaskId::try_from(raw.to_string())
+                .map_err(|err| HubError::BadRequest(format!("taskId: {err}")))?;
+            state
+                .store
+                .get_task(task_id.as_id().to_string())
+                .await
+                .map_err(map_store)?
+        }
+        None => None,
+    };
+    let binding = binding_task
+        .as_ref()
+        .and_then(|task| task.workspace_binding.clone());
+    if let Some(binding) = &binding {
+        let pinned_host = binding.host_id.as_id().as_str();
+        match body.host_id.as_deref() {
+            Some(explicit) if explicit != pinned_host => {
+                return Err(HubError::Conflict(format!(
+                    "task is bound to host {pinned_host}; refusing to launch on {explicit}"
+                )));
+            }
+            None => body.host_id = Some(pinned_host.to_string()),
+            _ => {}
+        }
+        let pinned_workspace = binding.workspace_id.as_id().as_str();
+        match body.workspace_id.as_deref() {
+            Some(explicit) if explicit != pinned_workspace => {
+                return Err(HubError::Conflict(format!(
+                    "task is bound to workspace {pinned_workspace}; refusing to launch in {explicit}"
+                )));
+            }
+            None => body.workspace_id = Some(pinned_workspace.to_string()),
+            _ => {}
+        }
+        // Explicit directory fields on the wire must agree with the binding;
+        // the binding is authoritative and a mismatch refuses rather than
+        // silently launching in another directory (D-035).
+        if binding.is_root()
+            && let Some(cwd) = body
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+        {
+            return Err(HubError::Conflict(format!(
+                "task is bound to the workspace root; refusing an explicit cwd {cwd:?}"
+            )));
+        }
+        if let Some(worktree) = body
+            .worktree
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+            && binding.mode == remuda_protocol::TaskBindingMode::Reuse
+        {
+            return Err(HubError::Conflict(format!(
+                "task is bound to reuse an existing directory ({worktree}); no pool worktree field is allowed"
+            )));
+        }
+    }
     let workspace_id = body.workspace_id.clone();
     let mut spec = json!({
         "kind": body.kind,
@@ -1200,6 +1267,108 @@ pub async fn create_instance(
             }
         }
     })?;
+    // t-bind directory fold. The lease row is the authority: the task must
+    // currently hold a lease on its bound directory, and the concrete cwd is
+    // read back from the Node catalog (root → omit cwd so the Node applies
+    // `resolve_instance_cwd` to the registered root itself). A vanished
+    // directory or missing lease refuses the launch — never substitutes
+    // another cwd (D-035).
+    let mut binding_lease_key: Option<(String, String, String)> = None;
+    if let Some(binding) = &binding {
+        let host_id = binding.host_id.as_id().to_string();
+        let wsp_id = binding.workspace_id.as_id().to_string();
+        let dir_key = binding.dir_key().to_string();
+        if host.host_id != host_id {
+            return Err(HubError::Conflict(format!(
+                "placement resolved host {} but the task binding pins {host_id}; refusing to switch directory",
+                host.host_id
+            )));
+        }
+        let lease = state
+            .store
+            .get_worktree_lease(host_id.clone(), wsp_id.clone(), dir_key.clone())
+            .await
+            .map_err(map_store)?
+            .ok_or_else(|| {
+                HubError::Conflict(
+                    "task directory has no active lease; lease it before launching".into(),
+                )
+            })?;
+        if lease.state != "leased"
+            || !lease
+                .task_ids
+                .iter()
+                .any(|id| id == binding_task.as_ref().unwrap().meta.id.as_id().as_str())
+        {
+            return Err(HubError::Conflict(
+                "task does not hold an active lease on its bound directory".into(),
+            ));
+        }
+        let cwd = if binding.is_root() {
+            // Root: let the Node resolve the registered root through
+            // resolve_instance_cwd exactly as an unbound launch would.
+            None
+        } else {
+            let name = binding
+                .worktree_name
+                .as_deref()
+                .expect("non-root binding carries a worktree name");
+            let catalog = call_node(
+                &state,
+                &host_id,
+                "worktree.list",
+                json!({ "hostId": host_id, "workspaceId": wsp_id }),
+            )
+            .await?;
+            let path = catalog
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|item| item.get("path").and_then(Value::as_str))
+                .ok_or_else(|| {
+                    HubError::Conflict(format!(
+                        "bound worktree {name:?} is gone from the Node catalog; refusing to launch in another directory"
+                    ))
+                })?
+                .to_string();
+            if let Some(explicit) = body
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                && explicit != path
+            {
+                return Err(HubError::Conflict(format!(
+                    "task is bound to {path:?}; refusing explicit cwd {explicit:?}"
+                )));
+            }
+            Some(path)
+        };
+        if let Some(obj) = spec.as_object_mut() {
+            obj["cwd"] = json!(cwd);
+            // A pool binding flows through the existing worktree field; reuse
+            // is admitted purely through cwd (resolve_instance_cwd semantics).
+            if binding.mode == remuda_protocol::TaskBindingMode::Pool
+                && let Some(name) = binding.worktree_name.as_deref()
+            {
+                if let Some(explicit) = body
+                    .worktree
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                    && explicit != name
+                {
+                    return Err(HubError::Conflict(format!(
+                        "task leased slot {name:?}; refusing explicit worktree {explicit:?}"
+                    )));
+                }
+                obj["worktree"] = json!(name);
+            }
+        }
+        binding_lease_key = Some((host_id, wsp_id, dir_key));
+    }
     crate::agent_scope::prepare_create(
         &state,
         &headers,
@@ -1276,6 +1445,23 @@ pub async fn create_instance(
         },
     )
     .await?;
+    // t-bind attach-lock: the launched session now holds the bound directory
+    // exclusively until it is deleted (delete_instance clears the holder and
+    // returns the lease). Sharing stays serial — a second bound task was
+    // queued/blocked at lease time.
+    if let Some((host_id, workspace_id, dir_key)) = binding_lease_key
+        && let Err(error) = state
+            .store
+            .attach_worktree_lease_holder(
+                host_id,
+                workspace_id,
+                dir_key,
+                Some(instance.instance_id.clone()),
+            )
+            .await
+    {
+        tracing::warn!(%error, "could not stamp attach-lock holder on worktree lease");
+    }
     // §5.6 placement ledger: the same reasons[]/rejected[] JSON that goes to
     // the bot card and the audit trail.
     if let Some(decision) = supply_decision {
@@ -1942,21 +2128,57 @@ pub async fn lease_worktree(
     require_origin(&headers, &state.config)?;
     require_device(&state.store, &headers).await?;
     validate_worktree_key(&path.name)?;
-    let task = parse_task_id(&body.task_id)?;
     let host = pick_worktree_host(&state, body.host_id.as_deref()).await?;
-    let node_name = node_worktree_name(&path.name);
+    let outcome = lease_on_host(
+        &state,
+        &host.host_id,
+        &body.workspace_id.clone().unwrap_or_default(),
+        &path.name,
+        body.base.as_deref(),
+        &body.task_id,
+    )
+    .await?;
+    Ok(Json(outcome.result))
+}
+
+/// A lease recorded on the Hub after a successful Node `worktree.lease`.
+pub(crate) struct LeaseOutcome {
+    /// Authoritative refcount row.
+    pub(crate) row: crate::store::WorktreeLeaseRow,
+    /// The Node result augmented with `refcount`/`leaseId`/`hostId` and, for a
+    /// shared directory, the serial-reuse `blocked` marker.
+    pub(crate) result: Value,
+    /// True when another task still holds the attach lock on this directory.
+    pub(crate) queued: bool,
+}
+
+/// Core lease flow shared by the HTTP route and task creation (t-bind): call
+/// the Node, persist the refcount row, and surface serial sharing as a
+/// `dir-busy` marker. `path_name` is the HTTP-safe key (`-` for root,
+/// otherwise a safe segment); only the whitelisted params cross the wire.
+pub(crate) async fn lease_on_host(
+    state: &AppState,
+    host_id: &str,
+    workspace_id: &str,
+    path_name: &str,
+    base: Option<&str>,
+    task_id: &str,
+) -> Result<LeaseOutcome, HubError> {
+    validate_worktree_key(path_name)?;
+    let task = parse_task_id(task_id)?;
+    let node_name = node_worktree_name(path_name);
     // Explicit whitelist; extras from the body (path/repo included) are dropped
     // here and the Node rejects them again defensively.
     let mut params = json!({
-        "hostId": host.host_id,
-        "workspaceId": body.workspace_id,
+        "hostId": host_id,
+        "workspaceId": workspace_id,
         "name": node_name,
         "taskId": task.as_id().as_str(),
     });
-    if let Some(base) = body.base.as_deref().filter(|raw| !raw.is_empty()) {
+    if let Some(base) = base.map(str::trim).filter(|raw| !raw.is_empty()) {
         params["base"] = json!(base);
     }
-    let result = call_node(&state, &host.host_id, "worktree.lease", params).await?;
+    let result = call_node(state, host_id, "worktree.lease", params).await?;
     // The pool is full and no clean slot exists: the Node refuses explicitly
     // instead of rerouting, and the Hub projects the 429 vocabulary (D-035).
     if result.get("deferred").and_then(Value::as_bool) == Some(true) {
@@ -1972,7 +2194,7 @@ pub async fn lease_worktree(
     let dir_key = result
         .get("dirKey")
         .and_then(Value::as_str)
-        .unwrap_or(path.name.as_str())
+        .unwrap_or(path_name)
         .to_string();
     // reuse-to-root has no worktree name; every other lease carries one.
     let worktree_name = if dir_key == "." {
@@ -1982,7 +2204,7 @@ pub async fn lease_worktree(
             .get("name")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| Some(path.name.clone()))
+            .or_else(|| Some(path_name.to_string()))
     };
     let branch = result
         .get("branch")
@@ -1996,8 +2218,8 @@ pub async fn lease_worktree(
         .store
         .record_worktree_lease(
             mode,
-            host.host_id.clone(),
-            body.workspace_id.unwrap_or_default(),
+            host_id.to_string(),
+            workspace_id.to_string(),
             dir_key,
             worktree_name,
             branch,
@@ -2008,14 +2230,15 @@ pub async fn lease_worktree(
         .await
         .map_err(map_store)?;
     let mut value = result;
+    let queued = row.refcount > 1;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("refcount".into(), json!(row.refcount));
         obj.insert("leaseId".into(), json!(row.id));
-        obj.insert("hostId".into(), json!(host.host_id));
+        obj.insert("hostId".into(), json!(host_id));
         // Sharing is serial: refcount > 1 means another task still holds the
         // attach lock, so this lease is queued/blocked even if the Node did not
         // phrase it that way (the store row is the sharing authority).
-        if row.refcount > 1 && !obj.contains_key("blocked") {
+        if queued && !obj.contains_key("blocked") {
             obj.insert("queued".into(), json!(true));
             obj.insert(
                 "blocked".into(),
@@ -2025,7 +2248,21 @@ pub async fn lease_worktree(
             );
         }
     }
-    Ok(Json(value))
+    Ok(LeaseOutcome {
+        row,
+        result: value,
+        queued,
+    })
+}
+
+/// Map a Node-side lease refusal (dirty tree, branch conflict, vanished
+/// directory) to an explicit 409 blocked for task creation: the task is not
+/// created and the caller is never rerouted to another directory (D-035).
+pub(crate) fn lease_refusal(error: HubError) -> HubError {
+    match error {
+        HubError::SupplyDeferred { .. } => error,
+        other => HubError::Conflict(format!("directory binding blocked: {other}")),
+    }
 }
 
 /// `POST /v1/worktrees/{name}/return` — decrement the refcount; a pool slot is

@@ -163,8 +163,21 @@ async fn fanout(
     let Ok(subs) = push.subscriptions() else {
         return;
     };
-    let notification = Notification::new(title, body, tag.clone(), url);
+    // The badge is this device's pending interaction count (ui-spec §4.5 /
+    // D-049). Pending is global durable state — every subscribed device is
+    // shown the same queue — so the count is read once per fanout, durable
+    // Hub truth only: a device live-following the instance got no push at
+    // all thanks to the suppression above. The durable index is the same
+    // list the web boot gate and `/v1/interactions` serve.
+    let pending = state
+        .store
+        .list_interactions(None, None, None, true)
+        .await
+        .map(|rows| u64::try_from(rows.len()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let base = Notification::new(title, body, tag.clone(), url);
     for sub in subs {
+        let notification = base.clone().with_badge(pending);
         if let Err(err) = push.notify(&sub, &notification, &tag).await {
             tracing::debug!(error = %err, endpoint = %sub.endpoint, "push notify failed");
         }

@@ -823,7 +823,8 @@ async fn fake_node(
                     if prompt.contains("mhome-blocked") {
                         if let Some(usage) = scripted_usage("usage:40000,500,60000,0") {
                             append_n =
-                                append_event(&mut ws, &instance_id, append_n, "usage", usage).await?;
+                                append_event(&mut ws, &instance_id, append_n, "usage", usage)
+                                    .await?;
                         }
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
                             .await?;

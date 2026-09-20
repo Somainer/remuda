@@ -597,6 +597,9 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
     let (carrier_tx, mut carrier_rx) = tokio::sync::mpsc::channel(16);
     let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     node.set_object_source(std::sync::Arc::new(object_broker.source()));
+    // D-048: the api.* stream table for this controller session. Dropping the
+    // controller fails every relay stream and detaches the broker.
+    let (api_broker, mut api_rx) = node.api_relay().attach_link();
     // Controller exit (takeover/disconnect) fails every pull immediately; the
     // retry either rides the next controller's source or surfaces the loss.
     struct FailOnDrop(std::sync::Arc<crate::carrier_objects::CarrierObjectBroker>);
@@ -631,6 +634,15 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                 }
             }
+            frame = api_rx.recv() => {
+                let Some(frame) = frame else { return Ok(()); };
+                tokio::select! {
+                    _ = changed.changed() => return Ok(()),
+                    result = tokio::time::timeout(Duration::from_secs(30), write_frame(write, &frame)) => {
+                        result.map_err(|_| NodeError::Transport("api frame write timed out".into()))??;
+                    }
+                }
+            }
             frame = tty_rx.recv(), if ready => {
                 if let Some(frame) = frame {write_frame(write, &frame).await?;}
             }
@@ -661,6 +673,15 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                 if object_broker.handle_frame(&frame) {
                     continue;
                 }
+                // D-048: api.* notifications route to the relay stream table.
+                if frame
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(crate::api_relay::is_api_method)
+                {
+                    api_broker.handle_frame(&frame).await;
+                    continue;
+                }
                 if frame.get("method").is_none() {
                     if frame.get("id").and_then(Value::as_str) == Some("hello-1") {
                         let result = frame.get("result").ok_or_else(|| NodeError::Transport("Hub rejected daemon hello".into()))?;
@@ -668,6 +689,8 @@ async fn serve_controller<R: AsyncBufRead + Unpin, W: AsyncWrite + Unpin>(
                             enroll::persist_host_token(&opts.data_dir,token)?;
                         }
                         hubnode::persist_hello_result(&opts.data_dir, &frame)?;
+                        // D-048: adopt the Hub-advertised relay limits.
+                        node.api_relay().apply_hello_limits(&frame);
                         sent = resume_watermarks(node, result)?;
                         *shared.acked.lock().await = sent.clone();
                         ready = true;

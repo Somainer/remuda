@@ -280,6 +280,7 @@ mod tests {
                 request,
                 workspace_root: directory.path().into(),
                 registered_workspace_root: directory.path().into(),
+                api_relay: None,
             },
         );
         let error = match result {

@@ -1571,9 +1571,12 @@ Hub↔Node 链路——与 `object.pull` 同一条路径、同一套授权、同
 各有白名单（`set-cookie` 丢弃）。**拒绝码**：`api-via-unknown-host`（400）、
 `api-via-host-offline`（409）、`api-via-unsupported`（409）、
 `api-via-unreachable`（409）；`api.end.error.code` 用稳定小写码
-（`via-host-offline`、`hub-link-lost`、`upstream-timeout`、`instance-gone`、
+（`via-host-offline`、`hub-link-lost`、`upstream-timeout`、`upstream-failed`、`instance-gone`、
 `destination-refused`、`cancelled`），监听器把每个映射成 Anthropic 形状的
 HTTP 错误，让 harness 渲染出真正的模型 API 失败而不是传输故障。
+`upstream-timeout`（504）表示网关不可达或超时阶梯被突破；
+`upstream-failed`（502）表示请求已到达网络但因不可归类的上游故障失败
+（连接后重置、上游 body 失败），两条中继腿（带内与直连）使用同一映射。
 
 **信用与限额。** Hub→Node 出站队列容量 32 且与 tty 帧共享，因此生产者每流最多
 4 个未确认 chunk，消费者边排空边发 `api.credit`，块间 `yield_now()`。

@@ -280,6 +280,7 @@ impl DriverFactory for NativeClaudeFactory {
             self.kind,
             delegation,
             &profile,
+            launch.api_relay.as_ref(),
         )?;
         let explicit_config_dir = launch
             .request
@@ -1052,7 +1053,21 @@ fn resolve_claude_overlay(
     kind: DriverKind,
     delegation: Delegation,
     profile: &ProviderProfile,
+    api_relay: Option<&crate::api_relay::RelayOverlay>,
 ) -> Result<Option<PathBuf>, DriverError> {
+    // A `generic-pty` carrier runs the CLI with the host operator's own
+    // environment. Routing a `via` model-API session through it would hand
+    // the harness the host's gateway base URL and credential, because a
+    // generic session owns no sealed settings of its own — exactly the D-035
+    // silent reroute the relay exists to forbid. The combination is refused
+    // at launch, never silently downgraded to direct.
+    if api_relay.is_some() && matches!(kind, DriverKind::GenericPty) {
+        return Err(DriverError::Failed(
+            "api route `via` is not supported by the generic-pty carrier; \
+             launch the relay with a claude/native driver (never rerouted to direct)"
+                .to_string(),
+        ));
+    }
     if matches!(kind, DriverKind::GenericPty) {
         return Ok(None);
     }
@@ -1066,7 +1081,7 @@ fn resolve_claude_overlay(
         .filter(|path| !path.is_empty())
         .map(resolve_overlay_path)
         .transpose()?;
-    if matches!(delegation, Delegation::None) {
+    if matches!(delegation, Delegation::None) && api_relay.is_none() {
         return Ok(user);
     }
     // Under the native carrier the hook session owns `<launch>/settings.json`
@@ -1077,6 +1092,36 @@ fn resolve_claude_overlay(
         DriverKind::ShellPty => launch_dir.join("provider"),
         _ => launch_dir.to_path_buf(),
     };
+    // D-047 `via`: the overlay points at the per-instance loopback listener
+    // with the minted relay bearer. The gateway base URL and credential never
+    // reach this host: neither the delivered token nor the generated env
+    // fallback may run, or this machine would hold a secret the route was
+    // meant to keep on H (D-035/D-021).
+    if let Some(relay) = api_relay {
+        let model = request
+            .provider_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(request.model.as_str());
+        let secret = Secret::new(relay.bearer.as_bytes().to_vec());
+        return write_claude_provider_overlay(
+            &overlay_dir,
+            &ClaudeProviderOverlay {
+                delegation: Delegation::Gateway,
+                base_url: &relay.base_url,
+                model,
+                secret: &secret,
+                // Profile headers are applied on the egress host H, not sent
+                // to the local listener: W's settings need only the loopback
+                // target and the relay bearer.
+                extra_env: &BTreeMap::new(),
+            },
+        )
+        .map(Some)
+        .map_err(map_driver_error);
+    }
     if let Some(path) = try_write_delivered_overlay(request, &overlay_dir)? {
         return Ok(Some(path));
     }
@@ -1558,9 +1603,11 @@ fn instance_spec(
         required_capabilities: Vec::new(),
         completion_scope: CompletionScope::NativeTurn,
         parent: None,
-        // D-047: the request carries no resolved route, so this spec means
-        // "no proxy". A `via` route is written by the Hub after placement.
-        api_route: None,
+        // D-047: carry the Hub-resolved requested route through the spec the
+        // native launch records. The *observed* route (what actually bound) is
+        // echoed separately on the create result; this stays intent, never an
+        // observation.
+        api_route: launch.request.api_route.clone(),
     })
 }
 
@@ -1744,8 +1791,9 @@ mod tests {
                 effort: None,
                 tui: None,
                 extra_env: std::collections::BTreeMap::new(),
-
                 capabilities: Default::default(),
+                api_route: None,
+                api_relay_endpoint: None,
             };
             registry
                 .build(
@@ -1755,6 +1803,7 @@ mod tests {
                         request,
                         workspace_root: dir.path().to_path_buf(),
                         registered_workspace_root: dir.path().to_path_buf(),
+                        api_relay: None,
                     },
                 )
                 .expect("build must succeed even when the pin fails");
@@ -1955,8 +2004,9 @@ mod tests {
                 effort: None,
                 tui: None,
                 extra_env: std::collections::BTreeMap::new(),
-
                 capabilities: Default::default(),
+                api_route: None,
+                api_relay_endpoint: None,
             };
             let driver = registry
                 .build(
@@ -1966,6 +2016,7 @@ mod tests {
                         request,
                         workspace_root: dir.path().to_path_buf(),
                         registered_workspace_root: dir.path().to_path_buf(),
+                        api_relay: None,
                     },
                 )
                 .expect("build driver");
@@ -2186,6 +2237,8 @@ mod tests {
                 binary_path: None,
                 binary_sha256: None,
                 extra_env: std::collections::BTreeMap::new(),
+                api_route: None,
+                api_relay_endpoint: None,
                 provider_profile_id: "native".into(),
                 permission_mode: spelling.into(),
                 sandbox: None,
@@ -2209,6 +2262,7 @@ mod tests {
                 request,
                 workspace_root: dir.path().to_path_buf(),
                 registered_workspace_root: dir.path().to_path_buf(),
+                api_relay: None,
             };
             let profile = provider_profile(&launch, Delegation::None).expect("profile");
             let spec = instance_spec(&launch, &config, &profile).expect("spec");
@@ -2243,6 +2297,8 @@ mod tests {
             binary_path: None,
             binary_sha256: None,
             extra_env: std::collections::BTreeMap::new(),
+            api_route: None,
+            api_relay_endpoint: None,
             provider_profile_id: "native".into(),
             permission_mode: "no-such-mode".into(),
             sandbox: None,
@@ -2266,6 +2322,7 @@ mod tests {
             request,
             workspace_root: dir.path().to_path_buf(),
             registered_workspace_root: dir.path().to_path_buf(),
+            api_relay: None,
         };
         let profile = provider_profile(&launch, Delegation::None).expect("profile");
         let spec = instance_spec(&launch, &config, &profile).expect("spec");
@@ -2306,8 +2363,9 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
-
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         };
         assert_eq!(parse_delegation(&request), Delegation::Gateway);
         request.delegation = None;
@@ -2360,8 +2418,9 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
-
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         };
         registry
             .build(
@@ -2371,6 +2430,7 @@ mod tests {
                     request,
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
+                    api_relay: None,
                 },
             )
             .expect("user overlay must be accepted while generated overlay is unavailable");
@@ -2417,8 +2477,9 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
-
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -2427,6 +2488,7 @@ mod tests {
                 request,
                 workspace_root: dir.path().to_path_buf(),
                 registered_workspace_root: dir.path().to_path_buf(),
+                api_relay: None,
             },
         ) {
             Ok(_) => panic!("gateway without overlay must fail closed"),
@@ -2480,6 +2542,7 @@ mod tests {
                 DriverKind::ClaudePty,
                 Delegation::Gateway,
                 &profile,
+                None,
             )
         };
         let create_path = resolve(&request, &dir.path().join("create"))
@@ -2554,6 +2617,142 @@ mod tests {
     }
 
     #[test]
+    fn via_route_materializes_loopback_overlay_with_relay_bearer() {
+        // D-047: a `via` launch ignores the gateway base URL and delivered
+        // token entirely — the 0600 overlay must point at the per-instance
+        // loopback listener and carry the minted relay bearer. A gateway
+        // credential must never appear in the file (D-021/D-035).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = HostId::new();
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-pty",
+            "hostId": host,
+            "model": "haiku",
+            "delegation": "gateway",
+            "providerProfileId": "pvp_example",
+            "providerOverlay": {
+                "kind": "gateway",
+                "baseUrl": "https://gateway.example/v1",
+                "model": "haiku",
+                "scope": format!("host:{}", host.as_id().as_str())
+            },
+            "providerAuthToken": "gateway-secret-must-not-be-written"
+        }))
+        .expect("request");
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: String::new(),
+            delegation: Delegation::Gateway,
+            secret_ref: None,
+            models: vec!["haiku".into()],
+            health: ProviderHealth::Healthy,
+        };
+        let relay = crate::api_relay::RelayOverlay {
+            base_url: "http://127.0.0.1:41317/v1".into(),
+            bearer: "relay-bearer-value".into(),
+        };
+        let path = resolve_claude_overlay(
+            &request,
+            &dir.path().join("launch"),
+            DriverKind::ClaudePty,
+            Delegation::Gateway,
+            &profile,
+            Some(&relay),
+        )
+        .expect("overlay")
+        .expect("path");
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:41317/v1"
+        );
+        assert_eq!(
+            settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+            "relay-bearer-value"
+        );
+        assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(
+            settings["env"]["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"],
+            "1"
+        );
+        assert_eq!(settings["model"], "haiku");
+        let serialized = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !serialized.contains("gateway-secret-must-not-be-written"),
+            "the gateway credential must never reach the worker overlay"
+        );
+        assert!(
+            !serialized.contains("gateway.example"),
+            "the gateway origin must never reach the worker overlay"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+            );
+        }
+    }
+
+    #[test]
+    fn via_route_is_refused_for_generic_pty_never_rerouted_to_direct() {
+        // D-035: a generic-pty launch carrying a via relay must fail closed —
+        // the generic session would otherwise run with the host's own gateway
+        // credential and base URL. No overlay is written, no direct fallback.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let request: crate::CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "generic-pty",
+            "delegation": "gateway",
+            "providerOverlay": { "kind": "gateway", "baseUrl": "https://gateway.example/v1" },
+            "providerAuthToken": "gateway-credential",
+        }))
+        .expect("request");
+        let relay = crate::api_relay::RelayOverlay {
+            base_url: "http://127.0.0.1:9/v1".into(),
+            bearer: "relay-bearer".into(),
+        };
+        let profile = ProviderProfile {
+            id: Id::new("pvp").expect("profile id"),
+            kind: ProviderKind::Anthropic,
+            base_url: "https://gateway.example".into(),
+            delegation: Delegation::Gateway,
+            secret_ref: None,
+            models: vec![],
+            health: ProviderHealth::Healthy,
+        };
+        let error = resolve_claude_overlay(
+            &request,
+            &dir.path().join("launch"),
+            DriverKind::GenericPty,
+            Delegation::Gateway,
+            &profile,
+            Some(&relay),
+        )
+        .expect_err("generic-pty + via must refuse");
+        assert!(
+            error.to_string().contains("generic-pty") && error.to_string().contains("via"),
+            "{error}"
+        );
+
+        // The same request without a relay is the ordinary generic launch and
+        // is unaffected by the new check.
+        let plain = resolve_claude_overlay(
+            &request,
+            &dir.path().join("launch"),
+            DriverKind::GenericPty,
+            Delegation::Gateway,
+            &profile,
+            None,
+        );
+        assert!(plain.is_ok(), "non-relay generic launch is untouched");
+    }
+
+    #[test]
     fn host_scoped_overlay_is_refused_on_the_wrong_host() {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry = native_driver_registry(NativeDriverConfig::new(dir.path().to_path_buf()))
@@ -2600,8 +2799,9 @@ mod tests {
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
-
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         };
         let error = match registry.build(
             DriverKind::ClaudePrint,
@@ -2610,6 +2810,7 @@ mod tests {
                 request,
                 workspace_root: dir.path().to_path_buf(),
                 registered_workspace_root: dir.path().to_path_buf(),
+                api_relay: None,
             },
         ) {
             Ok(_) => panic!("wrong-host scoped overlay must fail"),
@@ -2661,6 +2862,7 @@ mod tests {
             DriverKind::ShellPty,
             Delegation::Gateway,
             &profile,
+            None,
         )
         .expect("overlay resolves")
         .expect("the native carrier must get an overlay");
@@ -2731,6 +2933,7 @@ mod tests {
                 DriverKind::ShellPty,
                 Delegation::None,
                 &profile,
+                None,
             )
             .expect("native delegation resolves"),
             None,
@@ -2960,6 +3163,8 @@ mod tests {
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         }
     }
 
@@ -2995,6 +3200,7 @@ mod tests {
                     request,
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
+                    api_relay: None,
                 },
             )
             .map(drop)
@@ -3038,6 +3244,7 @@ mod tests {
                     request,
                     workspace_root: dir.path().to_path_buf(),
                     registered_workspace_root: dir.path().to_path_buf(),
+                    api_relay: None,
                 },
             )
             .map(drop)

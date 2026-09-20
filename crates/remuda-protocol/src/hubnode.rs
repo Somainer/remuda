@@ -1089,6 +1089,9 @@ pub const API_ERROR_VIA_HOST_OFFLINE: &str = "via-host-offline";
 pub const API_ERROR_HUB_LINK_LOST: &str = "hub-link-lost";
 /// The gateway was unreachable, or the timeout ladder was breached.
 pub const API_ERROR_UPSTREAM_TIMEOUT: &str = "upstream-timeout";
+/// The gateway was reached but the request failed for an unclassified
+/// post-network reason (reset after connect, upstream body failure).
+pub const API_ERROR_UPSTREAM_FAILED: &str = "upstream-failed";
 /// The operator ended the instance while a stream was in flight.
 pub const API_ERROR_INSTANCE_GONE: &str = "instance-gone";
 /// The request named a destination outside the profile's pinned origin.

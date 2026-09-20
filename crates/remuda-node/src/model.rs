@@ -154,6 +154,18 @@ pub struct CreateInstanceRequest {
     /// unknown values. Never inherited or implied by installed host software.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Resolved model-API route the Hub placed on the spec (D-047). `None` (or
+    /// `mode: direct`) means the listener is never started and the launch is a
+    /// plain direct delivery. A `via` request missing its host is invalid: the
+    /// wire type deserializes that shape, but the Node refuses to project it
+    /// rather than silently launching direct (D-035 — refuse, never reroute).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_route: Option<remuda_protocol::RequestedApiRoute>,
+    /// Explicit direct-net endpoint of the proxy host's relay listener, named
+    /// by the Hub at launch for `route: auto | direct-net` (Amendment A1).
+    /// Absent forces `hub-relay`; it is never discovered by the Node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_relay_endpoint: Option<String>,
 }
 
 impl CreateInstanceRequest {
@@ -286,6 +298,20 @@ impl CreateInstanceRequest {
                 self.capabilities = copied;
             }
         }
+        if self.api_route.is_none() {
+            self.api_route = spec
+                .get("apiRoute")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+        }
+        if self.api_relay_endpoint.is_none() {
+            self.api_relay_endpoint = spec
+                .get("apiRelayEndpoint")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned);
+        }
     }
 }
 
@@ -313,6 +339,11 @@ pub struct CreateInstanceResponse {
     pub command: Command,
     /// Created Instance projection.
     pub instance: Instance,
+    /// The model-API route this Node actually bound for the instance (D-047).
+    /// Absent for a direct session. This is the observation the Hub records,
+    /// never the requested route copied off the spec (D-035).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_route: Option<remuda_protocol::ApiRoute>,
 }
 
 /// Operations accepted by `POST /v1/instances/:id/commands`.

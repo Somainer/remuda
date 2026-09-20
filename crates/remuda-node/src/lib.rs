@@ -1,6 +1,7 @@
 //! Node instance management and outbound Hub connection.
 
 mod adapter_registry;
+mod api_relay;
 mod attachments;
 mod carrier;
 mod carrier_objects;

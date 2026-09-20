@@ -204,6 +204,9 @@ where
     let (carrier_tx, mut carrier_rx) = mpsc::channel(16);
     let object_broker = crate::carrier_objects::CarrierObjectBroker::new(carrier_tx);
     node.set_object_source(Arc::new(object_broker.source()));
+    // D-048: one api.* stream table for this stdio session. It fails its
+    // streams when the bridge closes (`serve_stdio` returns / drop).
+    let (api_broker, mut api_rx) = node.api_relay().attach_link();
     let (gate_tx, mut gate_rx) = mpsc::channel(JOURNAL_QUEUE_CAPACITY);
     // Long carrier methods park for minutes (a gate run/then/land/unpin, a
     // worker provision/remove that shells out to git and reclaims a cargo
@@ -227,6 +230,10 @@ where
                 }
             }
             frame = carrier_rx.recv() => {
+                let Some(frame) = frame else { break; };
+                write_ndjson(&mut output, &frame).await?;
+            }
+            frame = api_rx.recv() => {
                 let Some(frame) = frame else { break; };
                 write_ndjson(&mut output, &frame).await?;
             }
@@ -286,6 +293,16 @@ where
                 // object.pull replies and object.chunk notifications complete
                 // attachment fetches; they never become instance RPCs.
                 if object_broker.handle_frame(&frame) {
+                    continue;
+                }
+                // D-048: api.* notifications go to the relay stream table, not
+                // the JSON-RPC dispatch table.
+                if frame
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(crate::api_relay::is_api_method)
+                {
+                    api_broker.handle_frame(&frame).await;
                     continue;
                 }
                 // Long carrier methods can park for minutes: a gate
@@ -390,6 +407,8 @@ async fn handle_stdio_frame(
         if let Err(error) = hubnode_codec::persist_hello_result(data_dir, &frame) {
             tracing::warn!(%error, "could not persist the hello result");
         }
+        // D-048: adopt the Hub-advertised relay limits from the hello result.
+        node.api_relay().apply_hello_limits(&frame);
         return Ok(FrameOutcome::none());
     }
     let request = match decode_request(&frame) {

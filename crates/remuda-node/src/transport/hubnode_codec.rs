@@ -426,8 +426,9 @@ async fn dispatch_create(node: &DevNode, params: Value) -> Result<Value, NodeErr
             effort: None,
             tui: None,
             extra_env: std::collections::BTreeMap::new(),
-
             capabilities: Default::default(),
+            api_route: None,
+            api_relay_endpoint: None,
         },
     };
     // Honour the requested product or refuse it. An unrecognized kind/driver is
@@ -844,14 +845,16 @@ fn resume_cursors(watermarks: &HashMap<String, SeqWatermark>) -> Vec<Value> {
 /// can actually launch an agent on this host. Shared by the stdio and outbound
 /// WSS hello builders so the two transports can never advertise differently.
 ///
-/// A host without a `driverInventory` sends **no** capabilities (`None`),
-/// never `{}`: absence reads as "not reported", and a Node too old to describe
-/// itself must not have its silence rendered as a refusal.
+/// `apiRelay: true` (D-047) rides alongside it: this is the capability the Hub
+/// checks before routing a `via` session to a host, refusing
+/// `api-via-unsupported` rather than downgrading. The blob stays absent
+/// entirely when this Node cannot even report an inventory — absence reads as
+/// "an older Node", which must not be rendered as a positive claim.
 #[must_use]
 pub fn hello_capabilities(host: &Value) -> Option<Value> {
     host.get("driverInventory")
         .filter(|inventory| !inventory.is_null())
-        .map(|inventory| json!({ "driverInventory": inventory }))
+        .map(|inventory| json!({ "driverInventory": inventory, "apiRelay": true }))
 }
 
 /// Build stdio hello params from a nested host inventory value.

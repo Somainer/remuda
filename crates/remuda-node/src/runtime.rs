@@ -117,6 +117,9 @@ pub(crate) struct DevNodeInner {
     tty: TtyRegistry,
     /// Batch 6 lane gate runner state (lane locks, live jobs, event uplink).
     pub(crate) gate: crate::gate::GateRegistry,
+    /// D-047/D-048 model-API relay: per-instance loopback listeners, the
+    /// proxy-side egress contexts, and the live carrier link's frame broker.
+    pub(crate) api_relay: Arc<crate::api_relay::ApiRelayState>,
     diagnostics: std::sync::RwLock<crate::DoctorContext>,
 }
 
@@ -196,6 +199,7 @@ impl DevNode {
                 projection_epoch: Id::new("epoch")?,
                 tty: TtyRegistry::new(),
                 gate: crate::gate::GateRegistry::new(),
+                api_relay: crate::api_relay::ApiRelayState::new(),
                 diagnostics: std::sync::RwLock::new(crate::DoctorContext::default()),
             }),
         })
@@ -221,6 +225,13 @@ impl DevNode {
     #[must_use]
     pub(crate) fn gate_registry(&self) -> &crate::gate::GateRegistry {
         &self.inner.gate
+    }
+
+    /// D-047/D-048 relay state: listeners, proxy egress contexts, and the live
+    /// link's `api.*` broker.
+    #[must_use]
+    pub(crate) fn api_relay(&self) -> &std::sync::Arc<crate::api_relay::ApiRelayState> {
+        &self.inner.api_relay
     }
 
     /// Set diagnostics inputs from trusted process composition, never RPC params.
@@ -398,6 +409,12 @@ impl DevNode {
             }
         }
         let removed = self.inner.store.remove_instance(instance_id)?;
+        // D-047: purge is definitive — revoke the bearer and shut the listener
+        // even when the worker task already ended without running its terminal
+        // block (abort, crash double, stale rows).
+        self.inner
+            .api_relay
+            .revoke_instance(instance_id.as_id().as_str());
         let mut directory_removed = false;
         if let Some(config) = &self.inner.herdr_config {
             let dir = config
@@ -543,6 +560,83 @@ impl DevNode {
         .await
     }
 
+    /// Resolve the command a raced loser must echo after losing the
+    /// `insert_instance` race against a *live* existing instance:
+    ///
+    /// * the winner's row for this command id already accepted → echo it;
+    /// * the winner's row exists but is still Queued → bounded wait for it to
+    ///   reach Accepted/Settled, erroring on the deadline rather than
+    ///   returning a queued row the Hub would reject;
+    /// * no row exists for this command id (the loser carried a fresh id) →
+    ///   durably accept the loser's own command against the existing instance
+    ///   and journal it, without launching anything.
+    async fn command_for_raced_create(
+        &self,
+        instance_id: &InstanceId,
+        mut command: Command,
+    ) -> Result<Command, NodeError> {
+        match self.inner.store.get_command(&command.command_id) {
+            Ok(recorded)
+                if matches!(
+                    recorded.state,
+                    CommandState::Accepted | CommandState::Settled
+                ) =>
+            {
+                Ok(recorded)
+            }
+            Ok(_) => {
+                self.wait_for_accepted_create_command(&command.command_id)
+                    .await
+            }
+            Err(_) => {
+                accept_command(&mut command)?;
+                if self
+                    .inner
+                    .store
+                    .insert_command(instance_id, command.clone())?
+                {
+                    append_command_lifecycle(
+                        self.inner.store.as_ref(),
+                        instance_id,
+                        &command,
+                        "accepted",
+                    )?;
+                }
+                Ok(command)
+            }
+        }
+    }
+
+    /// Wait briefly for a racing winner's create command to reach the ledger
+    /// in an accepted state. A create that lost the `insert_instance` race
+    /// must echo the winner's *accepted* command (the Hub rejects queued
+    /// replies), so the loser yields while the winner moves from insert
+    /// (queued) to accept + save. The window is bounded: a winner that stalls
+    /// mid-accept surfaces an error instead of a queued reply.
+    async fn wait_for_accepted_create_command(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Command, NodeError> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(command) = self.inner.store.get_command(command_id)
+                && matches!(
+                    command.state,
+                    CommandState::Accepted | CommandState::Settled
+                )
+            {
+                return Ok(command);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(NodeError::Conflict(format!(
+                    "command {} did not reach an accepted state in time",
+                    command_id.as_id()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Durably accept an Instance create, then materialize it in its worker.
     ///
     /// D-028 P2 follow-up: the reply must prove only the durable accept —
@@ -626,14 +720,9 @@ impl DevNode {
         // this through `starting` and `ready`; the Hub mirrors those states
         // from the journal even when this RPC's reply arrives late.
         instance.lifecycle = InstanceLifecycle::Preparing;
-        let launch = DriverLaunch {
-            instance: instance.clone(),
-            request: request.clone(),
-            workspace_root,
-            registered_workspace_root: workspace.root_path.into(),
-        };
-        self.inner.store.insert_instance(instance)?;
 
+        // Command ids default to the empty string in the dev runtime; allocate
+        // the rest of the idempotency bookkeeping once, up front.
         let command_id = request.command_id.clone().unwrap_or_default();
         let mut command = new_command(
             command_id.clone(),
@@ -644,15 +733,171 @@ impl DevNode {
             None,
             payload_digest,
         )?;
+
+        // Idempotency, instance-id form: a retried create may carry a fresh
+        // command id but the same client-allocated instance id. If that
+        // instance already exists and has not terminated, this is the same
+        // intent — echo its recorded projection and first-bound route without
+        // launching a second worker or binding a second listener.
+        if let Ok(existing_instance) = self.inner.store.get_instance(&instance_id)
+            && !matches!(
+                existing_instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            )
+        {
+            let command = match self.inner.store.get_command(&command_id) {
+                // Same-command-id retry: echo the ledger's accepted command.
+                Ok(recorded) => recorded,
+                // A retry that reused only the instance id carries a fresh
+                // command id. It must not echo the *queued* command built
+                // above (the Hub accepts only accepted/settled rows and would
+                // log "node did not durably accept"): accept this command id
+                // durably first, journal the row, then reply with it. The
+                // instance and worker are the first attempt's; no second
+                // bind or launch happens.
+                Err(_) => {
+                    set_command_origin(&mut command, request.origin);
+                    accept_command(&mut command)?;
+                    // insert_command is the create path that links the
+                    // command to the instance's ledger; save_command only
+                    // replaces an existing row. A racing identical insert
+                    // answers with the recorded command instead.
+                    if self
+                        .inner
+                        .store
+                        .insert_command(&instance_id, command.clone())?
+                    {
+                        append_command_lifecycle(
+                            self.inner.store.as_ref(),
+                            &instance_id,
+                            &command,
+                            "accepted",
+                        )?;
+                        command
+                    } else {
+                        self.inner.store.get_command(&command_id)?
+                    }
+                }
+            };
+            return Ok(CreateInstanceResponse {
+                command,
+                instance: existing_instance,
+                api_route: self
+                    .inner
+                    .api_relay
+                    .observed_route(instance_id.as_id().as_str()),
+            });
+        }
+
         set_command_origin(&mut command, request.origin);
+        // Idempotency pre-check before the instance row exists: an exact
+        // command-id + payload match means an earlier attempt accepted it, so
+        // return its recorded projection without binding anything new.
+        let duplicate = {
+            let existing = self.inner.store.get_command(&command_id).ok();
+            matches!(
+                existing,
+                Some(existing)
+                    if existing.payload_digest == command.payload_digest
+                        && existing.operation == command.operation
+            )
+        };
+        if duplicate {
+            return Ok(CreateInstanceResponse {
+                command: self.inner.store.get_command(&command_id)?,
+                instance: self.inner.store.get_instance(&instance_id)?,
+                // Echo the route the first accepted attempt recorded, never
+                // None and never a re-decision (D-035).
+                api_route: self
+                    .inner
+                    .api_relay
+                    .observed_route(instance_id.as_id().as_str()),
+            });
+        }
+        // New command: now bind the relay. Provisioning is idempotent per
+        // instance id, so even here an existing listener is reused rather than
+        // evicted. A bind/probe failure fails this command with no launch —
+        // never a silent fallback to direct (D-035).
+        let mut provisioned = crate::api_relay::listener::provision_for_request(
+            &self.inner.api_relay,
+            instance_id.as_id().as_str(),
+            &request,
+        )
+        .await?;
+        let observed_route = provisioned
+            .as_ref()
+            .map(|provisioned| provisioned.observed.clone());
+        let mut provision_guard = provisioned
+            .as_mut()
+            .and_then(|provisioned| provisioned.guard.take());
+        let relay_overlay = provisioned
+            .as_ref()
+            .map(|provisioned| provisioned.overlay.clone());
+        let launch = DriverLaunch {
+            instance: instance.clone(),
+            request: request.clone(),
+            workspace_root,
+            registered_workspace_root: workspace.root_path.into(),
+            api_relay: relay_overlay,
+        };
+        // The instance insert is the idempotency point for two creates whose
+        // provisions overlapped the multi-second route probe (the per-instance
+        // provision lock keeps the listener bind single-writer, but the loser
+        // reaches this insert while the winner is accepting). The Conflict
+        // fallback is scoped to a raced create of a *live* instance: a
+        // terminated (Exited/Failed) row keeps the original error, and the
+        // provision guard below is dropped on that error so the freshly bound
+        // listener is revoked.
+        if let Err(insert_error) = self.inner.store.insert_instance(instance) {
+            if !matches!(insert_error, NodeError::Conflict(_)) {
+                return Err(insert_error);
+            }
+            let existing_instance = self.inner.store.get_instance(&instance_id)?;
+            if matches!(
+                existing_instance.lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ) {
+                return Err(NodeError::Conflict(format!(
+                    "instance {} already exists",
+                    instance_id.as_id()
+                )));
+            }
+            let command = self.command_for_raced_create(&instance_id, command).await?;
+            // Fallback succeeded: this listener is the winner's (provision is
+            // idempotent per instance id), so commit rather than revoke. Any
+            // error return above drops the guard and revokes the bind.
+            if let Some(guard) = provision_guard.take() {
+                guard.commit();
+            }
+            return Ok(CreateInstanceResponse {
+                command,
+                instance: existing_instance,
+                api_route: self
+                    .inner
+                    .api_relay
+                    .observed_route(instance_id.as_id().as_str())
+                    .or(observed_route),
+            });
+        }
+        // Defensive: with the provision lock and the instance-insert catch
+        // above, a false here can only come from another writer; answer
+        // idempotently rather than failing the create.
         let inserted = self
             .inner
             .store
             .insert_command(&instance_id, command.clone())?;
         if !inserted {
+            if let Some(guard) = provision_guard.take() {
+                guard.commit();
+            }
             return Ok(CreateInstanceResponse {
                 command: self.inner.store.get_command(&command_id)?,
                 instance: self.inner.store.get_instance(&instance_id)?,
+                api_route: self
+                    .inner
+                    .api_relay
+                    .observed_route(instance_id.as_id().as_str())
+                    .or(observed_route),
             });
         }
         accept_command(&mut command)?;
@@ -674,8 +919,26 @@ impl DevNode {
         )?;
         self.spawn_instance_worker(instance_id.clone(), launch, command.clone(), request.prompt)
             .await;
-        let instance = self.inner.store.get_instance(&instance_id)?;
-        Ok(CreateInstanceResponse { command, instance })
+        // The worker now owns the listener for the instance's lifetime and
+        // revokes it from its terminal block; failure to read the row back is
+        // the one path that revokes here.
+        let instance = match self.inner.store.get_instance(&instance_id) {
+            Ok(instance) => instance,
+            Err(error) => {
+                self.inner
+                    .api_relay
+                    .revoke_instance(instance_id.as_id().as_str());
+                return Err(error);
+            }
+        };
+        if let Some(guard) = provision_guard.take() {
+            guard.commit();
+        }
+        Ok(CreateInstanceResponse {
+            command,
+            instance,
+            api_route: observed_route,
+        })
     }
 
     /// Point this Node at the Hub's attachment store (D-027).
@@ -963,6 +1226,7 @@ impl DevNode {
         let worker_instance = instance_id.clone();
         let carrier = self.carrier_supervisor();
         let pumps = Arc::clone(&self.inner.pumps);
+        let api_relay = Arc::clone(&self.inner.api_relay);
         let node = Arc::downgrade(&self.inner);
         let worker = tokio::spawn(async move {
             // Building the driver is materialization, not acceptance: it runs
@@ -986,6 +1250,7 @@ impl DevNode {
                 Ok(Err(error)) => {
                     tracing::error!(%error, "instance driver build failed");
                     record_task_exit(store.as_ref(), &worker_instance, &error.to_string());
+                    api_relay.revoke_instance(worker_instance.as_id().as_str());
                     if let Some(node) = node.upgrade() {
                         node.senders.write().await.remove(&worker_instance);
                     }
@@ -995,6 +1260,7 @@ impl DevNode {
                     let reason = format!("driver build task panicked: {join_error}");
                     tracing::error!(%reason, "instance driver build panicked");
                     record_task_exit(store.as_ref(), &worker_instance, &reason);
+                    api_relay.revoke_instance(worker_instance.as_id().as_str());
                     if let Some(node) = node.upgrade() {
                         node.senders.write().await.remove(&worker_instance);
                     }
@@ -1040,6 +1306,10 @@ impl DevNode {
                     record_task_exit(store.as_ref(), &worker_instance, "driver-task-panicked")
                 }
             }
+            // The instance has run to completion (or died): revoke its relay
+            // bearer and shut the loopback listener. Idempotent with the
+            // explicit close/purge and shutdown paths below.
+            api_relay.revoke_instance(worker_instance.as_id().as_str());
             if store
                 .get_instance(&worker_instance)
                 .is_ok_and(|instance| instance.lifecycle == InstanceLifecycle::Exited)
@@ -4030,5 +4300,357 @@ mod tests {
             );
             assert!(!gate.settled);
         }
+    }
+}
+
+#[cfg(test)]
+mod api_relay_launch_test {
+    use super::*;
+    use crate::{FakeDriver, MemoryStore};
+
+    fn node() -> DevNode {
+        let config = crate::DevServerConfig::loopback(0)
+            .with_workspace_roots(remuda_testing::test_workspace_roots!());
+        let drivers = DriverRegistry::default();
+        drivers
+            .register(Arc::new(FakeDriver::default()))
+            .expect("register fake driver");
+        DevNode::with_parts(&config, Arc::new(MemoryStore::new(8)), drivers).expect("compose node")
+    }
+
+    /// A create carrying a via route provisions the loopback listener on the
+    /// accept path and echoes the *resolved* route (hub-relay, since no
+    /// endpoint is named). The echo rides the create response for the Hub to
+    /// record — never a requested `auto` (D-035).
+    #[tokio::test]
+    async fn via_create_echoes_resolved_route_and_serves_loopback() {
+        let node = node();
+        let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": {
+                "mode": "via",
+                "viaHostId": HostId::new(),
+                "route": "auto"
+            }
+        }))
+        .expect("request");
+        let created = node.create_instance(request).await.expect("create");
+        let route = created.api_route.expect("echoed route");
+        assert!(route.is_via());
+        assert_eq!(route.route, Some(remuda_protocol::ApiRouteKind::HubRelay));
+        // The per-instance listener is registered and bound to loopback.
+        let registry = node.api_relay();
+        // Registry key is the allocated instance id.
+        let instance_id = created.instance.meta.id.clone();
+        // Internal lookup is exercised through a request instead: with no
+        // carrier link attached the listener answers 503, which proves it is
+        // live without exposing internals.
+        assert_eq!(
+            registry
+                .instance_relay(instance_id.as_id().as_str())
+                .map(|relay| relay.local_addr().ip().is_loopback()),
+            Some(true)
+        );
+    }
+
+    /// An idempotent retried create reuses the first attempt's listener: it
+    /// must not bind a second one (which would orphan the first), and the
+    /// single live listener is revoked when the instance exits.
+    #[tokio::test]
+    async fn retried_create_keeps_one_listener_and_exit_revokes_it() {
+        let node = node();
+        let registry = node.api_relay();
+        let host = node.host().meta.id.clone();
+        let instance_id = remuda_protocol::InstanceId::new();
+        let instance_key = instance_id.as_id().to_string();
+        let mut value = serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "instanceId": instance_key.clone(),
+            "hostId": host,
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": {
+                "mode": "via",
+                "viaHostId": HostId::new(),
+                "route": "hub-relay"
+            }
+        });
+        // Probe the bound port from outside: 503 with no link proves liveness.
+        async fn listener_status(node: &DevNode, key: &str) -> reqwest::StatusCode {
+            let relay = node
+                .api_relay()
+                .instance_relay(key)
+                .expect("registered listener");
+            reqwest::Client::new()
+                .get(format!("{}/models", relay.base_url()))
+                .bearer_auth(relay.bearer_token())
+                .send()
+                .await
+                .expect("connect")
+                .status()
+        }
+
+        let first: CreateInstanceRequest = serde_json::from_value(value.clone()).expect("request");
+        node.create_instance(first)
+            .await
+            .expect("first create accepted");
+        assert!(registry.instance_relay(&instance_key).is_some());
+        assert_eq!(
+            listener_status(&node, &instance_key).await,
+            503,
+            "first listener is live"
+        );
+
+        // Fresh command id but the same client-allocated instance id: the
+        // instance-id idempotency path, not a new bind.
+        let command_key = remuda_protocol::CommandId::new().as_id().to_string();
+        value["commandId"] = serde_json::json!(command_key);
+        let mut second: CreateInstanceRequest = serde_json::from_value(value).expect("request");
+        second.command_id = Some(remuda_protocol::CommandId::try_from(command_key).unwrap());
+        let retried = node.create_instance(second).await.expect("retry accepted");
+        assert!(retried.api_route.is_some(), "retry still echoes the route");
+        // The retry carries a fresh command id; the reply's command must still
+        // be durably accepted (the Hub node_accepted gate rejects a queued
+        // command with no accepted journal row).
+        assert_eq!(
+            retried.command.state,
+            remuda_protocol::CommandState::Accepted,
+            "instance-id retry echoes an accepted command"
+        );
+        let ledger = node
+            .get_command(&retried.command.command_id)
+            .expect("the retry command id was accepted in the ledger");
+        assert_eq!(ledger.state, remuda_protocol::CommandState::Accepted);
+        assert!(
+            registry.instance_relay(&instance_key).is_some(),
+            "exactly one registered listener"
+        );
+        let relay = registry
+            .instance_relay(&instance_key)
+            .expect("registered listener");
+        let listener_url = relay.base_url().to_owned();
+        let listener_bearer = relay.bearer_token().to_owned();
+        assert_eq!(
+            listener_status(&node, &instance_key).await,
+            503,
+            "the same listener is still live"
+        );
+
+        // Instance exit (the worker's terminal block calls this) revokes the
+        // bearer and shuts the listener; poll until the port is gone — axum's
+        // graceful shutdown drains in-flight keep-alive connections, so the
+        // exact frame is nondeterministic, but within a second every new
+        // connection fails at the socket (not merely 403).
+        registry.revoke_instance(&instance_key);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if registry.instance_relay(&instance_key).is_none()
+                    && reqwest::Client::builder()
+                        .pool_max_idle_per_host(0)
+                        .build()
+                        .unwrap()
+                        .get(format!("{listener_url}/models"))
+                        .bearer_auth(&listener_bearer)
+                        .send()
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "no live listener after revoke");
+    }
+
+    /// A Hub timeout-retry reusing the exact command id and payload races the
+    /// first call through the multi-second route provision. The route probe
+    /// stalls for its 3 s budget; the per-instance provision lock serializes
+    /// probe+bind, so the loser waits and reuses the winner's listener, then
+    /// loses the instance-row insert and answers with the winner's accepted
+    /// command rather than propagate a Conflict. The assertions pin the
+    /// observable outcomes (both Ok, same command, same single live listener
+    /// and its same loopback URL/bearer) rather than TCP connection counts —
+    /// reqwest itself opens multiple sockets per stalled request, so a
+    /// connection counter is not a measure of how many provisions probed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_creates_with_one_command_id_both_return_the_accepted_one() {
+        let node = std::sync::Arc::new(node());
+        let host = node.host().meta.id.clone();
+        let instance_id = remuda_protocol::InstanceId::new();
+        let command_id = remuda_protocol::CommandId::new();
+
+        // A TCP endpoint that accepts the connect but never answers: the
+        // route:auto direct-net probe then waits its full 3 s request
+        // timeout, guaranteeing the two calls overlap inside provisioning.
+        // Accepted sockets are held open (dropping one would make reqwest
+        // fail immediately instead of waiting the timeout).
+        let stall = std::net::TcpListener::bind("127.0.0.1:0").expect("stall listener");
+        let endpoint = format!("http://127.0.0.1:{}/", stall.local_addr().unwrap().port());
+        let held: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held_clone = std::sync::Arc::clone(&held);
+        let acceptor = stall.try_clone().expect("clone stall listener");
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = acceptor.accept() {
+                held_clone.lock().unwrap().push(stream);
+            }
+        });
+
+        let mk = || -> CreateInstanceRequest {
+            serde_json::from_value(serde_json::json!({
+                "kind": "claude",
+                "driver": "claude-print",
+                "instanceId": instance_id.as_id().to_string(),
+                "commandId": command_id.as_id().to_string(),
+                "hostId": host,
+                "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+                "apiRelayEndpoint": endpoint,
+                "apiRoute": {
+                    "mode": "via",
+                    "viaHostId": HostId::new(),
+                    "route": "auto"
+                }
+            }))
+            .expect("request")
+        };
+
+        // Both enter the accept path together; the second overlaps the
+        // winner's provision and races the instance insert.
+        let node_a = std::sync::Arc::clone(&node);
+        let node_b = std::sync::Arc::clone(&node);
+        let req_a = mk();
+        let req_b = mk();
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move { node_a.create_instance(req_a).await }),
+            tokio::spawn(async move { node_b.create_instance(req_b).await }),
+        );
+        let a = a.expect("task").expect("first create Ok");
+        let b = b
+            .expect("task")
+            .expect("raced duplicate create Ok, not Conflict");
+
+        // Both replies identify the same accepted command and instance.
+        assert_eq!(a.command.command_id, b.command.command_id);
+        assert_eq!(a.instance.meta.id, b.instance.meta.id);
+        for response in [&a, &b] {
+            assert!(
+                matches!(
+                    response.command.state,
+                    remuda_protocol::CommandState::Accepted
+                        | remuda_protocol::CommandState::Settled
+                ),
+                "an idempotent reply carries an accepted-or-settled command, got {:?}",
+                response.command.state
+            );
+            assert!(response.api_route.is_some(), "both echo the via route");
+        }
+        // The failed probe fell back to hub-relay.
+        assert!(
+            a.api_route
+                .as_ref()
+                .and_then(|route| route.route)
+                .is_some_and(|kind| kind == remuda_protocol::ApiRouteKind::HubRelay)
+        );
+        // Exactly one live listener for the instance — the loser's
+        // provisional bind (if any) was torn down, not left orphaned.
+        let registry = node.api_relay();
+        let relay = registry
+            .instance_relay(instance_id.as_id().as_str())
+            .expect("one registered listener");
+        // The single surviving listener is live and answers authenticated
+        // local traffic with the no-link 503; both replies describe that one.
+        let status = reqwest::Client::new()
+            .get(format!("{}/models", relay.base_url()))
+            .bearer_auth(relay.bearer_token())
+            .send()
+            .await
+            .expect("connect")
+            .status();
+        assert_eq!(status, 503);
+        assert_eq!(
+            a.api_route, b.api_route,
+            "both echo the same observed route"
+        );
+
+        // Release the held sockets and stop accepting.
+        drop(held);
+        drop(stall);
+    }
+
+    /// Reusing a *terminated* (Exited) instance id with a fresh command id is
+    /// not an idempotent replay: the create returns the store's Conflict, and
+    /// because the fallback is scoped to live rows, the listener it bound for
+    /// the refused attempt is revoked rather than left alive.
+    #[tokio::test]
+    async fn create_naming_a_terminated_instance_id_fails_and_revokes_bind() {
+        let node = node();
+        let host = node.host().meta.id.clone();
+        let instance_id = remuda_protocol::InstanceId::new();
+        let value = serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "instanceId": instance_id.as_id().to_string(),
+            "hostId": host,
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": { "mode": "via", "viaHostId": HostId::new(), "route": "hub-relay" }
+        });
+        node.create_instance(serde_json::from_value(value.clone()).expect("request"))
+            .await
+            .expect("first create accepted");
+        let registry = node.api_relay();
+        assert!(
+            registry
+                .instance_relay(instance_id.as_id().as_str())
+                .is_some()
+        );
+
+        // Mark the instance exited the way the terminal worker path does.
+        journal_instance_phase(
+            node.store(),
+            &instance_id,
+            InstanceLifecycle::Exited,
+            "ready",
+            "test-exit",
+        )
+        .expect("mark exited");
+        registry.revoke_instance(instance_id.as_id().as_str());
+
+        // Fresh command id on the same terminated instance id: provision
+        // succeeds (bind), but the insert conflict must propagate, and the
+        // dropped guard must revoke the new listener.
+        let mut retry: CreateInstanceRequest = serde_json::from_value(value).expect("request");
+        retry.command_id = Some(remuda_protocol::CommandId::new());
+        let error = node
+            .create_instance(retry)
+            .await
+            .expect_err("terminated instance id is a Conflict");
+        assert!(matches!(error, NodeError::Conflict(_)), "{error:?}");
+        assert!(
+            registry
+                .instance_relay(instance_id.as_id().as_str())
+                .is_none(),
+            "the refused attempt's listener is revoked"
+        );
+    }
+
+    /// A nameless `via` on the request rejects the create before any row or
+    /// launch (mirrors the wire-level rule; the Node must not echo mode
+    /// `via` without a host).
+    #[tokio::test]
+    async fn nameless_via_is_refused_before_launch() {
+        let node = node();
+        let request: CreateInstanceRequest = serde_json::from_value(serde_json::json!({
+            "kind": "claude",
+            "driver": "claude-print",
+            "providerOverlay": { "kind": "gateway", "baseUrl": "http://gateway.example/v1" },
+            "apiRoute": { "mode": "via", "route": "hub-relay" }
+        }))
+        .expect("request parses (wire validation lives on the Hub projector)");
+        let error = node.create_instance(request).await.expect_err("refused");
+        assert!(error.to_string().contains("viaHostId"), "{error}");
     }
 }

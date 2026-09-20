@@ -722,8 +722,119 @@ async fn retire_without_a_lease_uses_the_legacy_remove_path() -> Result<()> {
 }
 
 #[tokio::test]
-async fn deleting_a_holder_instance_returns_its_lease_and_clears_the_lock() -> Result<()> {
+async fn deleting_an_instance_returns_its_task_lease_without_a_holder_row() -> Result<()> {
+    // Production path: the lease is created through the HTTP route, which never
+    // sets holder_instance_id (attach is wired by the later binding task). The
+    // delete-time return is keyed on the instance's task_id, so it must still
+    // fire rather than relying on an injected holder.
     let mut ctx = Ctx::spawn().await?;
+    let task = remuda_protocol::TaskId::new();
+    let instance_id = remuda_protocol::InstanceId::new();
+
+    // Lease over HTTP exactly like a caller would (holder stays NULL).
+    let (status, lease) = ctx
+        .post(
+            "/v1/worktrees/slot-del/lease",
+            json!({
+                "hostId": ctx.host_id,
+                "workspaceId": ctx.workspace_id,
+                "taskId": task.as_id().as_str(),
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "{lease}");
+    assert_eq!(lease["dirKey"], "slot-del");
+    let _ = ctx.drain_calls();
+
+    let pre = ctx
+        .store()
+        .get_worktree_lease(
+            ctx.host_id.clone(),
+            ctx.workspace_id.clone(),
+            "slot-del".into(),
+        )
+        .await?
+        .expect("lease row");
+    assert!(
+        pre.holder_instance_id.is_none(),
+        "no holder is set at lease time"
+    );
+    assert_eq!(pre.refcount, 1);
+
+    // A settled instance bound to that task (no holder fixture).
+    ctx.hub.test_insert_host(&ctx.host_id).await?;
+    ctx.store()
+        .ensure_instance(ctx.host_id.clone(), instance_id.as_id().to_string())
+        .await?;
+    remuda_hub::store_test_support::settle_exited_with_task(
+        ctx.store(),
+        instance_id.as_id().as_str(),
+        task.as_id().as_str(),
+    )
+    .await?;
+
+    let (status, value) = ctx
+        .delete(&format!("/v1/instances/{}", instance_id.as_id()))
+        .await;
+    assert_eq!(status, 200, "{value}");
+    assert!(value["deleted"].as_bool().unwrap_or(false));
+    assert_eq!(
+        value["leaseReturns"],
+        json!(["slot-del"]),
+        "the task lease is returned on delete"
+    );
+
+    let calls = ctx.drain_calls();
+    let returned = calls
+        .iter()
+        .find(|call| call.method == "worktree.return")
+        .context("delete returns the task's lease off its task_id")?;
+    assert_eq!(returned.params["name"], "slot-del");
+    assert_eq!(returned.params["taskId"], task.as_id().as_str());
+    assert!(returned.params.get("path").is_none());
+
+    let row = ctx
+        .store()
+        .get_worktree_lease(
+            ctx.host_id.clone(),
+            ctx.workspace_id.clone(),
+            "slot-del".into(),
+        )
+        .await?
+        .expect("parked row kept after delete");
+    assert_eq!(row.state, "parked");
+    assert_eq!(row.refcount, 0);
+
+    // A second delete of another instance for a *different* task must not
+    // return an unrelated lease (the lookup is task-scoped).
+    let other_instance = remuda_protocol::InstanceId::new();
+    ctx.store()
+        .ensure_instance(ctx.host_id.clone(), other_instance.as_id().to_string())
+        .await?;
+    remuda_hub::store_test_support::settle_exited_with_task(
+        ctx.store(),
+        other_instance.as_id().as_str(),
+        remuda_protocol::TaskId::new().as_id().as_str(),
+    )
+    .await?;
+    let (status, value) = ctx
+        .delete(&format!("/v1/instances/{}", other_instance.as_id()))
+        .await;
+    assert_eq!(status, 200, "{value}");
+    let calls = ctx.drain_calls();
+    assert!(
+        !calls.iter().any(|call| call.method == "worktree.return"),
+        "a different task's instance returns nothing: {calls:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_clears_a_preexisting_attach_holder_on_the_lease_row() -> Result<()> {
+    // Forward-compatible: even if holder_instance_id was populated (the future
+    // binding task sets it on attach), the delete transaction releases it so
+    // the row never keeps a dead session as the attach lock.
+    let ctx = Ctx::spawn().await?;
     let task = remuda_protocol::TaskId::new();
     let instance_id = remuda_protocol::InstanceId::new();
 
@@ -737,14 +848,15 @@ async fn deleting_a_holder_instance_returns_its_lease_and_clears_the_lock() -> R
         task.as_id().as_str(),
     )
     .await?;
+    // Directly simulate the attached state the binding task will produce.
     ctx.store()
         .record_worktree_lease(
             "pool".into(),
             ctx.host_id.clone(),
             ctx.workspace_id.clone(),
-            "slot-del".into(),
-            Some("slot-del".into()),
-            Some("wt/slot-del/work".into()),
+            "slot-att".into(),
+            Some("slot-att".into()),
+            Some("wt/slot-att/work".into()),
             None,
             task.as_id().to_string(),
             Some(instance_id.as_id().to_string()),
@@ -755,30 +867,20 @@ async fn deleting_a_holder_instance_returns_its_lease_and_clears_the_lock() -> R
         .delete(&format!("/v1/instances/{}", instance_id.as_id()))
         .await;
     assert_eq!(status, 200, "{value}");
-    assert!(value["deleted"].as_bool().unwrap_or(false));
-
-    let calls = ctx.drain_calls();
-    let returned = calls
-        .iter()
-        .find(|call| call.method == "worktree.return")
-        .context("delete returns the held lease")?;
-    assert_eq!(returned.params["name"], "slot-del");
-    assert_eq!(returned.params["taskId"], task.as_id().as_str());
-
     let row = ctx
         .store()
         .get_worktree_lease(
             ctx.host_id.clone(),
             ctx.workspace_id.clone(),
-            "slot-del".into(),
+            "slot-att".into(),
         )
         .await?
-        .expect("parked row kept after delete");
+        .expect("parked row kept");
     assert_eq!(row.state, "parked");
     assert_eq!(row.refcount, 0);
     assert!(
         row.holder_instance_id.is_none(),
-        "the attach lock is released with the instance"
+        "a pre-existing attach holder is cleared by the delete transaction"
     );
     Ok(())
 }

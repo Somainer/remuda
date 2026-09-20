@@ -521,22 +521,21 @@ pub async fn delete_instance(
         stop_before_delete(&state, &instance).await?;
     }
 
-    // t-pool: a deleted session must not keep holding an attach lock. Before
-    // any Node reclaim, return each lease this instance held for its task
-    // (pool slots park warm; reuse dirs are untouched). Best effort like the
-    // purge below — an offline Node reconciles on reconnect, and the store
-    // delete clears holder_instance_id inside its transaction regardless.
+    // t-pool: a deleted session must not leave its worktree lease pinned.
+    // Key on the instance's task (not the attach-lock holder, which is only
+    // populated once the binding task attaches a session): return every active
+    // lease this task holds on the host before any Node reclaim. Pool slots
+    // park warm; reuse dirs are untouched. Best effort like the purge below —
+    // an offline Node reconciles on reconnect, and the delete transaction
+    // clears holder_instance_id regardless.
     let mut lease_returns = Vec::new();
     if let Some(task_id) = instance.task_id.as_deref() {
         let held = state
             .store
-            .worktree_leases_held_by_instance(instance_id.clone())
+            .active_worktree_leases_for_task(instance.host_id.clone(), task_id.to_string())
             .await
             .map_err(map_store)?;
         for lease in held {
-            if !lease.task_ids.iter().any(|id| id == task_id) {
-                continue;
-            }
             let name = lease.worktree_name.clone().unwrap_or_else(|| ".".into());
             let dir_key = lease.dir_key.clone();
             let mode_was_reuse = lease.mode == "reuse";
@@ -585,7 +584,7 @@ pub async fn delete_instance(
                     %error,
                     instance_id = %instance_id,
                     dir_key = %lease.dir_key,
-                    "worktree.return during instance delete failed; holder cleared locally"
+                    "worktree.return during instance delete failed; lease reconciled on reconnect"
                 ),
             }
         }

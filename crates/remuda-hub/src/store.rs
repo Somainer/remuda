@@ -2491,6 +2491,48 @@ impl Store {
         .await
     }
 
+    /// Active leases a task currently holds on a host.
+    ///
+    /// This is the production key for delete-time lease return: a session is
+    /// deleted for a specific `task_id`, and `worktree.return` releases exactly
+    /// that task's share (the refcount drops, a shared directory survives). It
+    /// deliberately does not depend on `holder_instance_id`, which is only
+    /// populated once a session is *attached* to the directory (the binding
+    /// task wires attach; see evidence/task-model-2.md).
+    pub async fn active_worktree_leases_for_task(
+        &self,
+        host_id: String,
+        task_id: String,
+    ) -> Result<Vec<WorktreeLeaseRow>, StoreError> {
+        self.run_named("active_worktree_leases_for_task", move |conn| {
+            // Match the task on the decoded array so `task_ids_json` stays an
+            // internal detail rather than leaking a JSON1 expression to callers.
+            let mut stmt = conn.prepare(
+                "SELECT id, task_ids_json FROM worktree_leases
+                 WHERE host_id = ?1 AND state = 'leased' AND refcount > 0
+                 ORDER BY created_at",
+            )?;
+            let matched: Vec<String> = stmt
+                .query_map(params![&host_id], |row| {
+                    let id: String = row.get(0)?;
+                    let raw: String = row.get(1)?;
+                    Ok((id, raw))
+                })?
+                .filter_map(|row| row.ok())
+                .filter_map(|(id, raw)| {
+                    let ids: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                    ids.contains(&task_id).then_some(id)
+                })
+                .collect();
+            drop(stmt);
+            matched
+                .into_iter()
+                .map(|id| WorktreeLeaseRow::load_by_id(conn, &id).map_err(StoreError::from))
+                .collect()
+        })
+        .await
+    }
+
     /// Append a Hub-authored terminal diagnostic to an instance journal.
     ///
     /// Only for instances the Node has abandoned (epoch changed, create never

@@ -65,6 +65,28 @@ fn observations(events: &[JournalEvent]) -> Vec<Observation> {
         .collect()
 }
 
+/// A minimal public-protocol lifecycle observation for direct store appends.
+fn native_lifecycle_observation(native_name: &str) -> ObservationPayload {
+    use remuda_protocol::{Knowledge, LifecyclePayload, LifecycleTopic, NativeLifecycle, Severity};
+    use std::collections::BTreeMap;
+    ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+        NativeLifecycle {
+            topic: LifecycleTopic::Session,
+            native_name: native_name.to_owned(),
+            native_id: Knowledge::Known {
+                value: native_name.to_owned(),
+            },
+            status: Knowledge::Known {
+                value: "started".to_owned(),
+            },
+            related_ids: BTreeMap::new(),
+            data_ref: None,
+            severity: Severity::Info,
+            affects_completion: false,
+        },
+    ))))
+}
+
 async fn wait_for_settlement(node: &remuda_node::DevNode, command_id: &remuda_protocol::CommandId) {
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -205,4 +227,160 @@ async fn fake_claude_kill_mid_session_replays_identical_folds() {
         recipe.is_some(),
         "native fake-claude launch recipe must survive restart"
     );
+}
+
+/// A journal reopened on a torn tail must reconcile and keep complete records.
+///
+/// This is the landing-gate failure of 2026-09-21
+/// (`reconcile: Driver("journal append failed: json: EOF while parsing a
+/// string ...")`) made deterministic: the last JSONL line is cut mid-record as
+/// a hard-killed writer can leave it, then a fresh Node reopens the data dir
+/// and runs the restart sweep. Reconcile must succeed (the torn seq never
+/// reaches the append it triggers), every complete record must survive, and the
+/// next append must reuse the recycled seq cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_after_a_torn_journal_tail_reconciles_and_keeps_complete_records() {
+    use remuda_node::LocalStore;
+
+    let data = tempfile::tempdir().expect("data dir");
+    let config = ServeConfig::fake(loopback_config(data.path()), data.path().to_path_buf());
+    let id = {
+        let node = compose(&config).expect("compose");
+        let created = node
+            .create_instance(create_req("durable hello"))
+            .await
+            .expect("create");
+        wait_for_settlement(&node, &created.command.command_id).await;
+        created.instance.meta.id.clone()
+    };
+
+    // Find the instance's JSONL and cut its final record in half, exactly as a
+    // writer interrupted between the byte write and the newline would.
+    let journal_dir = data.path().join("journal");
+    let path = journal_dir.join(format!("{}.jsonl", id.as_id().as_str()));
+    let bytes = std::fs::read(&path).expect("jsonl");
+    assert!(bytes.iter().filter(|b| **b == b'\n').count() >= 2);
+    let last_newline = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .expect("newline-terminated tail");
+    let previous_newline = bytes[..last_newline]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |pos| pos + 1);
+    let complete_records = bytes[..last_newline]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count();
+    let cut = previous_newline + (last_newline - previous_newline) / 2;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("open jsonl for truncation");
+    file.set_len(cut as u64).expect("truncate torn tail");
+    drop(file);
+
+    let restarted = compose(&config).expect("reopen over a torn tail");
+    restarted
+        .reconcile_herdr()
+        .await
+        .expect("reconcile over a torn journal tail");
+    assert!(
+        matches!(
+            restarted.get_instance(&id).expect("instance").lifecycle,
+            InstanceLifecycle::Exited | InstanceLifecycle::Failed
+        ),
+        "the sweep settles a session it cannot vouch for"
+    );
+    // Every complete record survived the reopen with its original seq; the torn
+    // one is gone, so the seqs are a dense prefix and the tail parses.
+    let journal_id = restarted.get_instance(&id).expect("instance").journal_id;
+    let page = restarted
+        .read_journal(&journal_id, None, 256)
+        .expect("read the recovered journal");
+    let kept = observations(&page.events);
+    assert!(
+        kept.len() >= complete_records,
+        "every complete record survives; reconcile may add settle events"
+    );
+    assert_eq!(
+        page.durable_seq.0 as usize,
+        kept.len(),
+        "the watermark follows surviving JSONL records: no torn seq, no hole"
+    );
+    for (index, observation) in kept.iter().take(complete_records).enumerate() {
+        assert_eq!(
+            observation.seq.0 as usize,
+            index + 1,
+            "complete records keep their original dense seqs"
+        );
+    }
+
+    // The next append lands at watermark + 1 and reads back whole — the exact
+    // operation that died with `json: EOF` in the gate. The composed Node owns
+    // its store, so drop it and reopen one the way a later process would.
+    let durable = page.durable_seq.0;
+    drop(restarted);
+    let store = remuda_node::MemoryStore::open_journaled(data.path(), 64).expect("reopen store");
+    let appended = store
+        .append_observation(
+            &id,
+            None,
+            remuda_protocol::Completeness::Structured,
+            native_lifecycle_observation("after-torn-tail"),
+        )
+        .expect("append after torn-tail recovery");
+    assert_eq!(appended.seq.0, durable + 1);
+    let read_back = store
+        .read_events(&journal_id, Some(remuda_protocol::U64(durable)), 1)
+        .expect("the repaired line parses, unlike the gate's json: EOF");
+    assert_eq!(read_back.events.len(), 1);
+}
+
+/// A hard-dropped Node (no graceful shutdown, the way a real process dies)
+/// must close its journal writer before a second Node reopens the same data
+/// dir, even under CPU contention. Before the fix the dropped Node's spawned
+/// workers kept journaling after the reopen and the two writers raced seq
+/// allocation (`UNIQUE constraint failed: events.instance_id, events.seq`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hard_dropped_node_cannot_write_after_its_successor_reopens() {
+    for _ in 0..5 {
+        let data = tempfile::tempdir().expect("data dir");
+        let config = ServeConfig::fake(loopback_config(data.path()), data.path().to_path_buf());
+        let id = {
+            let node = compose(&config).expect("compose");
+            let created = node
+                .create_instance(create_req("drop race"))
+                .await
+                .expect("create");
+            // Drop immediately while materialization is still in flight: the
+            // teardown must abort the store-owning tasks and close the journal
+            // before the next compose can reopen it.
+            created.instance.meta.id.clone()
+        };
+        let restarted = compose(&config).expect("reopen must not meet a live old writer");
+        restarted
+            .reconcile_herdr()
+            .await
+            .expect("reconcile after a hard drop");
+        assert!(
+            matches!(
+                restarted.get_instance(&id).expect("instance").lifecycle,
+                InstanceLifecycle::Exited | InstanceLifecycle::Failed
+            ),
+            "the successor settles the session the dropped Node left behind"
+        );
+        // Give a writer that escaped teardown a chance to corrupt the tail;
+        // with the fix it has no journal handle left to write through.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let instance = restarted.get_instance(&id).expect("instance");
+        let page = restarted
+            .read_journal(&instance.journal_id, None, 256)
+            .expect("journal remains readable");
+        assert_eq!(
+            page.events.len(),
+            page.durable_seq.0 as usize,
+            "no stale-offset writer can leave an unindexed or torn tail"
+        );
+    }
 }

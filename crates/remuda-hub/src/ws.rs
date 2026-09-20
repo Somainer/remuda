@@ -324,6 +324,16 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
                         if !id.is_null() {
                             let _ = out_tx.send(rpc_ok(id, result)).await;
                         }
+                        // Re-push api.egress contexts only after the hello
+                        // reply is queued: the egress sends share this bounded
+                        // FIFO, which this same task drains, so awaiting them
+                        // inline would park the reply once a proxy held ~32+
+                        // routed instances (D-048 B.2).
+                        if is_hello
+                            && let Some(h) = host_id.clone()
+                        {
+                            spawn_egress_reinstall(&state, h);
+                        }
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -352,6 +362,10 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
     fail_all_pending(&pending);
 
     if let Some(host_id) = host_id {
+        // Resolve session staleness first: if a newer link for this host has
+        // already registered (a reconnect that superseded this socket), its
+        // teardown must not wipe the contexts the live link just installed and
+        // block instances that are reachable again.
         let stale = match session_generation {
             Some(generation) => state.nodes.remove_generation(&host_id, generation).await,
             None => {
@@ -360,9 +374,32 @@ async fn node_session(state: AppState, socket: WebSocket, token: String) {
             }
         };
         if stale {
+            // D-048: tear down relay streams this link owned. A vanished proxy
+            // host ends streams with via-host-offline and blocks routed
+            // instances; a vanished worker host cancels the upstream legs.
+            state.api_relay.on_link_lost(&state, &host_id).await;
             let _ = state.store.mark_host_offline(host_id).await;
         }
     }
+}
+
+/// Spawn the D-048 B.2 post-hello re-push of a host's api.egress contexts.
+///
+/// The task runs only after the `node.hello` reply has been queued: each
+/// `install_egress` send shares the session's bounded (32-slot) outbound
+/// FIFO, which the session task itself drains. Awaiting those sends inline
+/// would fill the FIFO ahead of the reply and park the 33rd, so the hello
+/// would never answer for a proxy routing ~32+ instances; below that, every
+/// egress frame queued ahead of the reply. The spawned task queues after the
+/// reply and is independently drained.
+pub(crate) fn spawn_egress_reinstall(state: &AppState, host_id: String) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        state
+            .api_relay
+            .reinstall_egress_on_connect(&state, &host_id)
+            .await;
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -571,6 +608,10 @@ pub(crate) async fn handle_node_method(
                 .map_err(map_host_store)?;
             let mut last = None;
             let mut next_seq = seq;
+            // Set when this frame carries a *fresh* terminal lifecycle event
+            // for the instance — the normal-exit path must revoke the egress
+            // context from H exactly once, after the batch is durable.
+            let mut instance_terminated = false;
             // Fold the frame into bounded writer jobs: one transaction per
             // chunk, awaited before the next so the writer yields between
             // batches instead of holding its single connection for a whole
@@ -595,10 +636,22 @@ pub(crate) async fn handle_node_method(
                         crate::alerts::observe(state, &appended.record);
                         crate::usage_store::observe_journal(state, &appended.record).await;
                         crate::supply::observe_journal_text(state, &appended.record).await;
+                        if crate::api_relay::journal_event_ends_instance(&appended.record.event) {
+                            instance_terminated = true;
+                        }
                     }
                     next_seq = Some(appended.record.seq.saturating_add(1));
                     last = Some(appended);
                 }
+            }
+            // Normal instance exit/failure: revoke the gateway credential from
+            // every proxy host that held an egress context for it (§7.6 / B.2).
+            // There is no api.* frame on this path; the journal event is it.
+            if instance_terminated {
+                state
+                    .api_relay
+                    .revoke_instance_egress(state, &instance_id)
+                    .await;
             }
             let appended = last.ok_or_else(|| {
                 HubError::BadRequest("journal.append requires event or events".into())
@@ -741,6 +794,21 @@ pub(crate) async fn handle_node_method(
         "object.pull" => {
             let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
             Ok(Some(object_pull(state, host_id, &params, out_tx).await?))
+        }
+        method if HubNodeMethod::parse(method).is_some_and(HubNodeMethod::is_api) => {
+            // D-048: the api.* frames are notifications with their own stream
+            // table. They never enter the RPC pending map and answer nothing
+            // (`Ok(None)` suppresses any id-less reply).
+            //
+            // `handle_notification` only enqueues onto the per-link drain
+            // queue (try_send): it does not block the read loop on a
+            // backpressured peer, so tty/journal/RPC frames keep flowing.
+            let host_id = host_id.as_ref().ok_or(HubError::Unauthenticated)?;
+            state
+                .api_relay
+                .handle_notification(state, host_id, method, params)
+                .await;
+            Ok(None)
         }
         other => Err(HubError::BadRequest(format!("unknown method {other}"))),
     }
@@ -920,6 +988,12 @@ async fn reconcile_lost_instances(
             %instance_id,
             "node epoch changed; instance lost"
         );
+        // D-048: revoke any egress context the lost instance held on proxy
+        // hosts; H must clear the credential.
+        state
+            .api_relay
+            .revoke_instance_egress(state, &instance_id)
+            .await;
         fail_workers_holding(state, host_id, &instance_id).await?;
         publish_hub_diagnostic(
             state,

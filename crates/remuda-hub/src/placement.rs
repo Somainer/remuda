@@ -579,7 +579,63 @@ pub async fn spawn_on_host(
         )
         .await?;
     let command = crate::http::forward_if_online(state, command, true).await?;
+    // D-048: once the instance exists and create was forwarded, install the
+    // egress context (credential, base URL, headers) on the proxy Node for a
+    // hub-relay route. The credential rides api.egress, never api.open; this
+    // is the point at which the real instance id exists for both the plain
+    // create path and the dispatch path.
+    install_route_egress(state, &instance, &request.spec).await;
     Ok((instance, command))
+}
+
+/// Push `api.egress` to the proxy host for a newly created via instance.
+///
+/// Installed for **every** resolved via sub-mode — hub-relay, auto and
+/// direct-net — because api.egress is the only channel H may receive the
+/// gateway credential through; an auto route against a host with a
+/// relayBind keeps sub-mode auto so the Node can probe direct-net and fall
+/// back, and a direct-net route still egresses through H.
+async fn install_route_egress(state: &AppState, instance: &InstanceRecord, spec: &Value) {
+    // The observed api_route column is only populated after the Node create
+    // echo; at this point the requested route on the spec is authoritative.
+    let requested: remuda_protocol::RequestedApiRoute =
+        match spec.get("apiRoute").cloned().map(serde_json::from_value) {
+            Some(Ok(value)) => value,
+            _ => return,
+        };
+    if requested.mode != remuda_protocol::ProviderDeliveryMode::Via {
+        return;
+    }
+    // Any via sub-mode (hub-relay / auto / direct-net) gets a context.
+    let Some(proxy_host) = requested.via_host_id.as_ref() else {
+        return;
+    };
+    let Some(profile_id) = spec
+        .get("providerOverlay")
+        .and_then(|overlay| overlay.get("profileId"))
+        .or_else(|| spec.get("providerProfileId"))
+        .and_then(Value::as_str)
+        .filter(|id| crate::provider_resolve::is_real_profile_id(id))
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Ok(Some(profile)) = state.store.get_provider(profile_id.to_string()).await else {
+        tracing::warn!(%profile_id, "egress install: profile missing");
+        return;
+    };
+    if let Err(error) = state
+        .api_relay
+        .install_egress(
+            state,
+            proxy_host.as_id().as_str(),
+            &instance.instance_id,
+            &profile,
+        )
+        .await
+    {
+        tracing::warn!(%error, instance_id = %instance.instance_id, "api.egress install failed");
+    }
 }
 
 /// Load hosts + running counts, freshen stale resource samples, and select.
@@ -779,6 +835,7 @@ mod tests {
         HostRecord {
             workspaces: Vec::new(),
             workspace_revision: 0,
+            relay_bind: None,
             ssh: None,
             last_error: None,
             host_id: id.into(),

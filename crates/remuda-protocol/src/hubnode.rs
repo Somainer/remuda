@@ -124,6 +124,10 @@ pub const METHOD_API_END: &str = "api.end";
 pub const METHOD_API_CANCEL: &str = "api.cancel";
 /// Consumer→producer: flow control, one credit per chunk the consumer drained.
 pub const METHOD_API_CREDIT: &str = "api.credit";
+/// Hub→proxy Node only (D-048): install or revoke the egress context for an
+/// instance. Carries the gateway credential out of band of `api.open`, so the
+/// secret never rides the stream-open frame.
+pub const METHOD_API_EGRESS: &str = "api.egress";
 
 /// Workspace id selecting the Node scratch area (`<tmp>/remuda-*`) for the
 /// read-only host-file routes. Real workspace ids are `ws_…` ids, so `tmp`
@@ -253,6 +257,8 @@ pub enum HubNodeMethod {
     ApiCancel,
     /// [`METHOD_API_CREDIT`] (D-048).
     ApiCredit,
+    /// [`METHOD_API_EGRESS`] (D-048), Hub→proxy Node only.
+    ApiEgress,
 }
 
 /// An explicitly sequenced phase of a workspace mutation.
@@ -1016,6 +1022,36 @@ pub struct ApiOpenParams {
     pub deadline_ms: u32,
 }
 
+/// `api.egress` params (D-048): Hub→proxy Node egress context for an instance.
+///
+/// This is the **only** frame that carries a gateway credential. It is sent
+/// Hub→H when a `via:<H>` route is decided (at launch, and again whenever H
+/// reconnects) so the proxy Node can rebuild relayed requests against the
+/// pinned origin without the secret ever appearing in an `api.open` frame.
+/// `revoke: true` clears the context when the instance exits or its route goes
+/// down; after a revoke the Node refuses new streams for that instance until a
+/// fresh context arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiEgressParams {
+    /// Instance the context belongs to.
+    pub instance_id: String,
+    /// Gateway profile id; identifies the pinned origin.
+    pub profile_id: String,
+    /// Pinned gateway base URL (origin + base path).
+    pub base_url: String,
+    /// Extra profile headers; auth headers never appear here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ApiHeader>,
+    /// Gateway bearer/API-key credential, memory-only on H; absent revokes
+    /// access to profiles with no stored secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// True clears the installed context (instance exit / route down).
+    #[serde(default)]
+    pub revoke: bool,
+}
+
 /// One header, name and value; D-048.
 ///
 /// A list rather than a map because HTTP permits a header to repeat (`x-stainless-*`
@@ -1357,6 +1393,7 @@ impl HubNodeMethod {
             Self::ApiEnd => METHOD_API_END,
             Self::ApiCancel => METHOD_API_CANCEL,
             Self::ApiCredit => METHOD_API_CREDIT,
+            Self::ApiEgress => METHOD_API_EGRESS,
         }
     }
 
@@ -1397,6 +1434,7 @@ impl HubNodeMethod {
             METHOD_API_END => Self::ApiEnd,
             METHOD_API_CANCEL => Self::ApiCancel,
             METHOD_API_CREDIT => Self::ApiCredit,
+            METHOD_API_EGRESS => Self::ApiEgress,
             _ => return None,
         })
     }
@@ -1449,6 +1487,7 @@ impl HubNodeMethod {
                 | Self::ApiEnd
                 | Self::ApiCancel
                 | Self::ApiCredit
+                | Self::ApiEgress
         )
     }
 }

@@ -372,7 +372,13 @@ async fn create_fleet(
         if let Some(obj) = host_spec.as_object_mut() {
             obj.insert("hostId".into(), json!(host.host_id));
         }
-        crate::providers::resolve_and_attach(&state, host, &mut host_spec).await?;
+        crate::providers::resolve_and_attach(
+            &state,
+            host,
+            &mut host_spec,
+            crate::providers::RouteOverrides::default(),
+        )
+        .await?;
         let (instance, _command) = placement::spawn_on_host(
             &state,
             host,

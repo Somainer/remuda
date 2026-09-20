@@ -37,7 +37,8 @@ def emit(value):
 emit({'jsonrpc': '2.0', 'id': 'hello-1', 'method': 'node.hello', 'params': {
     'hostId': host, 'label': 'fixture', 'nodeVersion': '0.1.0', 'transport': 'ssh-stdio', 'bridge': True, 'daemon': True,
     'instances': [json.loads(instance_file.read_text())] if instance_file.exists() else [],
-    'host': {'hostname': 'fixture-node', 'labels': ['egress=gateway'], 'cli': [{'kind': 'codex', 'version': 'fixture', 'path': '/fixture/codex'}]}
+    'host': {'hostname': 'fixture-node', 'labels': ['egress=gateway'], 'cli': [{'kind': 'codex', 'version': 'fixture', 'path': '/fixture/codex'}]},
+    'capabilities': {'apiRelay': True, 'features': ['api-relay-v1']}
 }})
 for line in sys.stdin:
     frame = json.loads(line)
@@ -55,6 +56,13 @@ for line in sys.stdin:
     method = frame['method']
     if method == 'worktree.list':
         result = {'items': [], 'workspaceRoot': str(data / 'workspace'), 'fixtureHostId': host}
+    elif method == 'instance.create':
+        # Build the full result before emitting: echo the requested route so
+        # the Hub persists the observed route on the instance.
+        result = {'accepted': True, 'fixtureHostId': host}
+        spec = frame['params'].get('spec', {})
+        if 'apiRoute' in spec:
+            result['apiRoute'] = spec['apiRoute']
     else:
         result = {'accepted': True, 'fixtureHostId': host}
     emit({'jsonrpc': '2.0', 'id': frame['id'], 'result': result})
@@ -64,4 +72,14 @@ for line in sys.stdin:
         entry = {'instanceId': instance_id, 'seq': '1', 'event': {'kind': 'lifecycle', 'payload': {'type': 'entity', 'state': 'ready'}}}
         journal_file.write_text(json.dumps(entry) + '\n')
         emit({'jsonrpc': '2.0', 'id': 'start-1', 'method': 'journal.append', 'params': entry})
+        if os.environ.get('REMUDA_FAKE_API_OPEN') == '1':
+            # Test-only: act as a worker Node that opens one relay stream for
+            # the fresh instance. The pause lets the Hub persist the create
+            # echo (observed route) before the open is dispatched.
+            time.sleep(0.5)
+            emit({'jsonrpc': '2.0', 'method': 'api.open', 'params': {
+                'instanceId': instance_id, 'streamId': 'st_ssh_cancel',
+                'method': 'POST', 'path': '/v1/messages', 'query': '',
+                'headers': [], 'bodyChunked': False, 'deadlineMs': 60000,
+            }})
         subprocess.Popen([sys.executable, __file__, 'complete'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)

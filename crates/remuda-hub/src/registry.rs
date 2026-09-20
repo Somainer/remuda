@@ -57,10 +57,15 @@ struct PatchHostBody {
     /// Per-host renderer preference. `null` clears it to fullscreen.
     #[serde(default, deserialize_with = "double_option")]
     default_tui: Option<Option<remuda_protocol::TuiMode>>,
+    /// D-047 Amendment A1: explicit relay bind for direct-network routing.
+    /// Double Option like the launch defaults — absent leaves it, `null`
+    /// clears it back to loopback-only.
+    #[serde(default, deserialize_with = "double_option")]
+    relay_bind: Option<Option<remuda_protocol::HostRelayBind>>,
 }
 
 /// Deserialize a present-but-null field as `Some(None)`.
-fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -94,6 +99,7 @@ pub(crate) fn host_view(host: &HostRecord) -> Value {
         "defaultLaunchArgs": host.default_launch_args,
         "claudeBinaryPath": host.claude_binary_path,
         "defaultTui": host.default_tui,
+        "relayBind": host.relay_bind,
         "workspaces": host.workspaces,
         "workspaceRevision": host.workspace_revision,
     })
@@ -146,6 +152,9 @@ async fn patch_host(
     // filesystem, so anything it validated here would be a guess. It is stored
     // as given and the Node is the authority — a path that host rejects shows
     // up as a launch failure naming the reason.
+    if let Some(Some(bind)) = body.relay_bind.as_ref() {
+        provider_resolve::validate_relay_bind(bind).map_err(HubError::BadRequest)?;
+    }
     let host = state
         .store
         .patch_host(
@@ -159,6 +168,7 @@ async fn patch_host(
                 claude_binary_path: body.claude_binary_path,
                 default_tui: body.default_tui,
             },
+            body.relay_bind,
         )
         .await
         .map_err(crate::http::map_store)?;

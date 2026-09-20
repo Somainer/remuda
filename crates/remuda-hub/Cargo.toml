@@ -27,6 +27,8 @@ remuda-protocol.workspace = true
 remuda-screen.workspace = true
 remuda-ssh.workspace = true
 remuda-push.workspace = true
+# The in-process Hub-host relay egress (D-048) streams gateway responses via
+# Response::chunk(); no extra reqwest feature is needed for that.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite.workspace = true
 rust-embed = { workspace = true, features = ["interpolate-folder-path"] }

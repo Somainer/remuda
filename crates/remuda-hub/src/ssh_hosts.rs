@@ -213,6 +213,8 @@ async fn remove_host(
     // Retire atomically before cancelling; this fences concurrent placement and hello.
     state.store.retire_managed_host(id.clone()).await?;
     supervisor.stop(&id).await;
+    // D-048: revoke/tear down relay streams before removing the live link.
+    state.api_relay.on_link_lost(&state, &id).await;
     state.nodes.remove(&id).await;
     state.store.mark_host_offline(id.clone()).await?;
     state
@@ -419,6 +421,10 @@ async fn supervise(state: AppState, host: ManagedHost) {
         {
             return;
         }
+        // D-048: tear down relay streams this SSH carrier owned, exactly as
+        // the WebSocket session teardown does — otherwise proxy-link losses
+        // never reach W, worker blocks never fire, and stream slots leak.
+        state.api_relay.on_link_lost(&state, &host.id).await;
         let _ = state.store.mark_host_offline(host.id.clone()).await;
         let message = match result {
             Ok(()) => "SSH connection closed".into(),
@@ -532,6 +538,10 @@ async fn connect_once(
             result.unwrap_or(Value::Null),
         ))
         .await?;
+    // D-048 B.2: re-push this host's api.egress contexts only after the hello
+    // reply is on the wire — the frames ride out_rx (the select loop below),
+    // and awaiting many bounded sends inline would block the reply.
+    crate::ws::spawn_egress_reinstall(state, managed.id.clone());
     state
         .store
         .ssh_status(managed.id.clone(), "online", None)

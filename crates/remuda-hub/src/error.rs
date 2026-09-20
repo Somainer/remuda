@@ -56,6 +56,19 @@ pub enum HubError {
         /// `hst_…` that has no connected Node.
         host_id: String,
     },
+    /// A `via` model-API delivery cannot be honoured (D-047 §B.5).
+    ///
+    /// Every variant is a refusal: there is deliberately no fallback error,
+    /// because a proxied session must never silently fall back to direct
+    /// delivery — that would push the request and the gateway credential onto
+    /// a host the operator excluded (D-035).
+    #[error("{message}")]
+    ApiViaRefusal {
+        /// Stable wire code (also the HTTP body `code`).
+        code: remuda_protocol::ApiViaRefusal,
+        /// Human-readable detail.
+        message: String,
+    },
     /// No supply candidate passed admission; the task is explicitly deferred
     /// rather than silently downgraded (coordinator §4.4 step 8). The carried
     /// JSON is the full supply decision (`reasons[]`/`rejected[]`).
@@ -96,6 +109,14 @@ pub enum HubError {
 }
 
 impl HubError {
+    /// Construct a D-047 delivery refusal.
+    pub fn api_via(code: remuda_protocol::ApiViaRefusal, message: impl Into<String>) -> Self {
+        Self::ApiViaRefusal {
+            code,
+            message: message.into(),
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             Self::Unauthenticated => StatusCode::UNAUTHORIZED,
@@ -113,6 +134,7 @@ impl HubError {
             Self::PinRefused { .. } => StatusCode::CONFLICT,
             Self::HostOffline { .. } => StatusCode::CONFLICT,
             Self::NodeBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ApiViaRefusal { code, .. } => StatusCode::from_u16(code.status()).unwrap(),
             Self::Store(_) | Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -133,6 +155,10 @@ impl HubError {
             Self::PinRefused { .. } => "PIN_REFUSED",
             Self::HostOffline { .. } => "HOST_OFFLINE",
             Self::NodeBusy { .. } => "NODE_BUSY",
+            // D-047: the stable lowercase refusal vocabulary is the contract
+            // (`api-via-unknown-host` / `-host-offline` / `-unsupported` /
+            // `-unreachable`), not a SCREAMING_SNAKE hub code.
+            Self::ApiViaRefusal { code, .. } => code.as_str(),
             Self::Store(_) | Self::Internal(_) => "INTERNAL",
         }
     }

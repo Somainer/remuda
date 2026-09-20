@@ -66,6 +66,9 @@ struct CreateBody {
     /// Declared supply envelope (coordinator §4.2); optional.
     #[serde(default)]
     supply: Option<remuda_protocol::SupplyProfile>,
+    /// Model-API delivery (D-047); absent means direct/auto.
+    #[serde(default)]
+    delivery: Option<remuda_protocol::ProviderDelivery>,
 }
 
 fn default_kind() -> String {
@@ -96,6 +99,9 @@ struct PatchBody {
     /// Replace the declared supply envelope (observations merged, not wiped).
     #[serde(default)]
     supply: Option<remuda_protocol::SupplyProfile>,
+    /// Replace the model-API delivery (D-047).
+    #[serde(default)]
+    delivery: Option<remuda_protocol::ProviderDelivery>,
 }
 
 /// `POST /v1/providers/discover` body: probe a gateway before it is saved.
@@ -197,6 +203,7 @@ async fn create_provider(
             .map_err(|err| HubError::Internal(format!("secret store: {err}")))?;
     }
     let supply = body.supply.unwrap_or_default();
+    let delivery = body.delivery.unwrap_or_default();
     let profile = match state
         .store
         .insert_provider(
@@ -213,6 +220,7 @@ async fn create_provider(
             last4,
             fingerprint,
             supply,
+            delivery,
         )
         .await
     {
@@ -308,6 +316,7 @@ async fn patch_provider(
             secret_last4,
             secret_fingerprint,
             body.supply,
+            body.delivery,
         )
         .await
         .map_err(map_store)?;
@@ -455,23 +464,40 @@ fn carry_default_model(saved: Option<&str>, models: &[ProviderModel]) -> Option<
     }
 }
 
-/// D-021 Claude waterfall for a chosen host, then attach overlay metadata (never the token).
+/// Per-dispatch delivery override (D-047): the `apiVia`/`apiRoute` pair from
+/// `POST /v1/instances` and `POST /v1/workers/dispatch`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RouteOverrides {
+    /// Parsed `apiVia` when the request named one.
+    pub(crate) via: Option<remuda_protocol::ApiViaOverride>,
+    /// Parsed `apiRoute` sub-mode when the request named one.
+    pub(crate) route: Option<remuda_protocol::ApiRouteMode>,
+}
+
+/// D-047 Claude waterfall for a chosen host, then attach overlay metadata (never the token).
 pub async fn resolve_and_attach(
     state: &AppState,
     host: &HostRecord,
     spec: &mut Value,
+    overrides: RouteOverrides,
 ) -> Result<(), HubError> {
-    resolve_and_attach_with_project(state, host, spec, None).await
+    resolve_and_attach_with_project(state, host, spec, None, None, overrides).await
 }
 
 /// Waterfall with a project layer (explicit > project > host > global; design
 /// §6). `project` is the stored `Project.provider` reference, which never
 /// contains a secret — only a profile id and a delegation shape.
+///
+/// `project_route_doc` is the D-047 project-layer override
+/// (`{apiVia?, apiRoute?}`), held in its own side table because the typed
+/// project provider ref predates D-047.
 pub async fn resolve_and_attach_with_project(
     state: &AppState,
     host: &HostRecord,
     spec: &mut Value,
     project: Option<&remuda_protocol::ProjectProviderRef>,
+    project_route_doc: Option<&Value>,
+    overrides: RouteOverrides,
 ) -> Result<(), HubError> {
     strip_provider_secrets(spec);
     let kind = spec.get("kind").and_then(Value::as_str).unwrap_or("claude");
@@ -496,7 +522,362 @@ pub async fn resolve_and_attach_with_project(
         project_delegation,
     })?;
     provider_resolve::apply_to_spec(spec, &resolved);
+    // D-047: resolve the delivery waterfall against the *chosen* profile and
+    // write the requested route onto the spec. The refusal checks (unknown
+    // host, offline, old Node, unreachable bind) run here and at dispatch
+    // before any name/worktree allocation — never as a launch-time surprise.
+    let profile = match &resolved {
+        provider_resolve::ResolvedProvider::Profile { profile, .. } => Some(profile.clone()),
+        provider_resolve::ResolvedProvider::Native { .. } => None,
+    };
+    let choice = resolve_route_choice(
+        host.host_id.as_str(),
+        project_route_doc,
+        &overrides,
+        profile.as_deref(),
+    )?;
+    apply_route_to_spec(state, host, spec, profile.as_deref(), choice).await?;
+    // D-048: api.egress installation happens in placement::install_route_egress
+    // once the real instance id exists (both plain create and dispatch), and is
+    // re-sent by api_relay::reinstall_egress_on_connect after H reconnects.
+    // Nothing to install here: at resolve time there is no instance, and the
+    // credential must not ride api.open.
     Ok(())
+}
+
+/// Run the pure waterfall with the launch's layers.
+pub(crate) fn resolve_route_choice(
+    worker_host_id: &str,
+    project_route_doc: Option<&Value>,
+    overrides: &RouteOverrides,
+    profile: Option<&ProviderRecord>,
+) -> Result<Option<provider_resolve::ApiRouteChoice>, HubError> {
+    let delivery = profile
+        .map(|profile| profile.delivery.clone())
+        .unwrap_or_default();
+    let request = overrides
+        .via
+        .clone()
+        .map(|via| provider_resolve::ApiViaLayer {
+            via,
+            route: overrides.route,
+        });
+    let project = parse_project_route_layer(project_route_doc)?;
+    Ok(provider_resolve::resolve_api_route(
+        worker_host_id,
+        request.as_ref(),
+        project.as_ref(),
+        &delivery,
+    ))
+}
+
+/// Parse the project-layer route override doc (`{apiVia, apiRoute}`).
+fn parse_project_route_layer(
+    doc: Option<&Value>,
+) -> Result<Option<provider_resolve::ApiViaLayer>, HubError> {
+    let Some(doc) = doc else { return Ok(None) };
+    let via = match doc.get("apiVia").and_then(Value::as_str) {
+        Some(raw) => remuda_protocol::ApiViaOverride::parse(raw)
+            .map_err(|err| HubError::BadRequest(format!("project provider.apiVia: {err}")))?,
+        None => return Ok(None),
+    };
+    let route = match doc.get("apiRoute").and_then(Value::as_str) {
+        Some(raw) => Some(
+            serde_json::from_value::<remuda_protocol::ApiRouteMode>(Value::String(raw.into()))
+                .map_err(|err| HubError::BadRequest(format!("project provider.apiRoute: {err}")))?,
+        ),
+        None => None,
+    };
+    Ok(Some(provider_resolve::ApiViaLayer { via, route }))
+}
+
+/// Validate a resolved route against live registry state and write the
+/// requested route onto the spec (or remove the key for direct).
+async fn apply_route_to_spec(
+    state: &AppState,
+    worker: &HostRecord,
+    spec: &mut Value,
+    profile: Option<&ProviderRecord>,
+    choice: Option<provider_resolve::ApiRouteChoice>,
+) -> Result<(), HubError> {
+    let Some(obj) = spec.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(choice) = choice else {
+        obj.remove("apiRoute");
+        return Ok(());
+    };
+    // `via` pins a gateway: a native resolution has no base URL and no
+    // credential to place on the proxy host, so there is nothing to relay.
+    let Some(profile) = profile else {
+        return Err(HubError::BadRequest(
+            "apiVia requires a gateway provider profile; the resolved provider is native".into(),
+        ));
+    };
+    let route = validate_via_target(state, worker, &choice, profile).await?;
+    write_requested_route(spec, &provider_resolve::ApiRouteChoice { route, ..choice })?;
+    Ok(())
+}
+
+/// Write the requested-route form of a validated choice onto a launch spec.
+pub(crate) fn write_requested_route(
+    spec: &mut Value,
+    choice: &provider_resolve::ApiRouteChoice,
+) -> Result<(), HubError> {
+    let Some(obj) = spec.as_object_mut() else {
+        return Ok(());
+    };
+    let (via_host_id, mode) = match &choice.target {
+        provider_resolve::ViaTarget::HubHost => (None, remuda_protocol::ProviderDeliveryMode::Via),
+        provider_resolve::ViaTarget::Host(id) => {
+            let parsed: remuda_protocol::HostId =
+                id.parse().map_err(|err: remuda_protocol::WireValueError| {
+                    HubError::api_via(
+                        remuda_protocol::ApiViaRefusal::ApiViaUnknownHost,
+                        err.to_string(),
+                    )
+                })?;
+            (Some(parsed), remuda_protocol::ProviderDeliveryMode::Via)
+        }
+    };
+    let requested = remuda_protocol::RequestedApiRoute {
+        mode,
+        via_host_id,
+        route: choice.route,
+    };
+    obj.insert(
+        "apiRoute".into(),
+        serde_json::to_value(requested).map_err(|err| HubError::Internal(err.to_string()))?,
+    );
+    Ok(())
+}
+
+/// Registry/liveness/capability/bind checks for one resolved `via` choice.
+///
+/// Returns the sub-mode the Node should attempt: `auto` with no configured
+/// relay bind on H is decided as `hub-relay` here (Amendment A1 — the Hub
+/// resolves auto against H's configured bind once, at launch).
+pub(crate) async fn validate_via_target(
+    state: &AppState,
+    worker: &HostRecord,
+    choice: &provider_resolve::ApiRouteChoice,
+    profile: &ProviderRecord,
+) -> Result<remuda_protocol::ApiRouteMode, HubError> {
+    use remuda_protocol::{ApiRouteMode, ApiViaRefusal};
+    // Resolve the named proxy host (and verify it exists) before any worker-
+    // capability check: an old worker naming a bogus host must get 400
+    // api-via-unknown-host, not 409 api-via-unsupported.
+    let proxy_host: Option<HostRecord> = match &choice.target {
+        provider_resolve::ViaTarget::HubHost => None,
+        provider_resolve::ViaTarget::Host(id) => {
+            Some(state.store.get_host(id.clone()).await?.ok_or_else(|| {
+                HubError::api_via(
+                    ApiViaRefusal::ApiViaUnknownHost,
+                    format!("apiVia names unknown host {id}"),
+                )
+            })?)
+        }
+    };
+    // The worker Node speaks the listener half; an old worker cannot launch a
+    // proxied session at all.
+    if !provider_resolve::node_supports_api_relay(worker) {
+        return Err(HubError::api_via(
+            ApiViaRefusal::ApiViaUnsupported,
+            format!(
+                "worker host {} does not advertise the api.* relay capability; \
+                 it runs a Node older than D-048",
+                worker.host_id
+            ),
+        ));
+    }
+    let host_id = match &choice.target {
+        provider_resolve::ViaTarget::HubHost => {
+            // The Hub process is its own always-on egress host. It binds no
+            // relay itself, so direct-net to `self` is unfulfillable; and a
+            // host-scoped secret cannot be released to a Hub that hosts no
+            // such id.
+            if choice.route == ApiRouteMode::DirectNet {
+                return Err(HubError::api_via(
+                    ApiViaRefusal::ApiViaUnreachable,
+                    "route direct-net to the Hub host is impossible: the Hub binds no relay; \
+                     dispatch with route hub-relay"
+                        .to_string(),
+                ));
+            }
+            if !provider_resolve::secret_release_allowed(profile, "") {
+                return Err(HubError::Forbidden);
+            }
+            // Auto is decided once at launch: the Hub host has no relayBind.
+            return Ok(ApiRouteMode::HubRelay);
+        }
+        provider_resolve::ViaTarget::Host(id) => id.clone(),
+    };
+    let host = proxy_host.expect("proxy host resolved above");
+    // Refuse before any name/port/worktree allocation, mirroring the supply
+    // refusals: a proxy host that is down cannot serve the first request.
+    if state.nodes.kind_of(&host_id).await.is_none() {
+        return Err(HubError::api_via(
+            ApiViaRefusal::ApiViaHostOffline,
+            format!("apiVia host {host_id} is offline"),
+        ));
+    }
+    if !provider_resolve::node_supports_api_relay(&host) {
+        return Err(HubError::api_via(
+            ApiViaRefusal::ApiViaUnsupported,
+            format!("host {host_id} runs a Node older than D-048 and cannot speak api.*"),
+        ));
+    }
+    // D-021, strengthened: the gateway secret is released to H, never to W.
+    if !provider_resolve::secret_release_allowed(profile, &host_id) {
+        return Err(HubError::Forbidden);
+    }
+    match choice.route {
+        ApiRouteMode::DirectNet if host.relay_bind.is_none() => Err(HubError::api_via(
+            ApiViaRefusal::ApiViaUnreachable,
+            format!("route direct-net requires a relayBind on host {host_id}; none is configured"),
+        )),
+        // Auto with no bind is decided once, here: hub-relay. With a bind it
+        // stays auto so the Node probes the direct path and falls back.
+        ApiRouteMode::Auto if host.relay_bind.is_none() => Ok(ApiRouteMode::HubRelay),
+        other => Ok(other),
+    }
+}
+
+/// Validate the Node's create-result `apiRoute` echo against what the Hub
+/// requested, attach the registry label, and project it onto the instance.
+///
+/// The echo is the only place the observed route enters the record (D-035).
+/// A `via` request echoed as `direct` is a silent reroute — refuse it.
+/// Returns the validated/projection route (or `None` for direct).
+pub(crate) async fn project_echoed_api_route(
+    state: &AppState,
+    instance_id: &str,
+    echo: Option<remuda_protocol::ApiRoute>,
+) -> Result<Option<remuda_protocol::ApiRoute>, HubError> {
+    let requested: Option<remuda_protocol::RequestedApiRoute> = match state
+        .store
+        .get_instance_spec_json(instance_id.to_string())
+        .await?
+    {
+        Some(spec) => spec
+            .get("apiRoute")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|err| HubError::Internal(format!("stored apiRoute spec: {err}")))?,
+        None => None,
+    };
+    let default_requested = remuda_protocol::RequestedApiRoute {
+        mode: remuda_protocol::ProviderDeliveryMode::Direct,
+        via_host_id: None,
+        route: remuda_protocol::ApiRouteMode::Auto,
+    };
+    match (requested.unwrap_or(default_requested), echo) {
+        // A via launch the Node answered with no route echo is a refused
+        // create, not a silent direct (D-035).
+        (requested, None) if requested.mode == remuda_protocol::ProviderDeliveryMode::Via => {
+            Err(HubError::BadRequest(
+                "node accepted a via launch without an apiRoute echo; refusing to record direct"
+                    .into(),
+            ))
+        }
+        // Direct launch with no echo: nothing to project.
+        (_, None) => Ok(None),
+        (mut requested, Some(mut echo)) => {
+            validate_echo(&mut requested, &echo)?;
+            // The Hub fills the label from its own registry; the Node cannot
+            // know it reliably.
+            if let Some(via_host_id) = echo.via_host_id.as_ref()
+                && let Some(host) = state
+                    .store
+                    .get_host(via_host_id.as_id().to_string())
+                    .await?
+            {
+                echo.via_host_label = Some(host.label);
+            }
+            let projected = if echo.mode == remuda_protocol::ProviderDeliveryMode::Via {
+                Some(echo)
+            } else {
+                None
+            };
+            if let Some(route) = &projected {
+                state
+                    .store
+                    .reconcile_instance_api_route(instance_id.to_string(), route)
+                    .await?;
+            }
+            Ok(projected)
+        }
+    }
+}
+
+/// Cross-check the observed echo against the requested route.
+fn validate_echo(
+    requested: &mut remuda_protocol::RequestedApiRoute,
+    echo: &remuda_protocol::ApiRoute,
+) -> Result<(), HubError> {
+    use remuda_protocol::{ApiRouteKind, ProviderDeliveryMode};
+    match (requested.mode, echo.mode) {
+        (ProviderDeliveryMode::Via, ProviderDeliveryMode::Direct) => {
+            return Err(HubError::BadRequest(
+                "node silently delivered direct on a via launch".into(),
+            ));
+        }
+        (ProviderDeliveryMode::Direct, ProviderDeliveryMode::Via) => {
+            return Err(HubError::BadRequest(
+                "node echoed a via route on a direct launch".into(),
+            ));
+        }
+        _ => {}
+    }
+    // The proxy host must be the one the Hub's waterfall named. `self` (the
+    // Hub as proxy) legitimately carries no host id; the Node cannot invent
+    // one, and a host launch cannot echo none.
+    let wanted_id = requested
+        .via_host_id
+        .as_ref()
+        .map(|id| id.as_id().to_string());
+    match (&wanted_id, &echo.via_host_id) {
+        (Some(wanted), Some(got)) if wanted.as_str() == got.as_id().as_str() => {}
+        (Some(wanted), None) => {
+            return Err(HubError::BadRequest(format!(
+                "via echo omitted the required proxy host {wanted}"
+            )));
+        }
+        (None, Some(got)) => {
+            return Err(HubError::BadRequest(format!(
+                "via echo named {} on a self/Hub-host launch",
+                got.as_id()
+            )));
+        }
+        (Some(wanted), Some(got)) => {
+            return Err(HubError::BadRequest(format!(
+                "via echo names {} but the launch resolved {wanted}",
+                got.as_id()
+            )));
+        }
+        (None, None) => {}
+    }
+    if echo.mode != ProviderDeliveryMode::Via {
+        return Ok(());
+    }
+    // A via echo must name the resolved route.
+    let observed_route = echo.route.ok_or_else(|| {
+        HubError::BadRequest("via echo must name the resolved route (hub-relay/direct-net)".into())
+    })?;
+    // The requested sub-mode constrains what the Node may echo: an explicit
+    // hub-relay cannot come back direct-net and vice versa; auto allows either.
+    match (requested.route, observed_route) {
+        (remuda_protocol::ApiRouteMode::HubRelay, ApiRouteKind::DirectNet) => Err(
+            HubError::BadRequest("node took direct-net on a hub-relay launch".into()),
+        ),
+        (remuda_protocol::ApiRouteMode::DirectNet, ApiRouteKind::HubRelay) => {
+            Err(HubError::BadRequest(
+                "node fell back to hub-relay on a direct-net launch; no silent fallback".into(),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Attach a public overlay snapshot to an instance spec (never the token).
@@ -536,6 +917,16 @@ pub async fn with_launch_secret(
     mut params: Value,
 ) -> Result<Value, HubError> {
     let spec = params.get("spec").unwrap_or(&params);
+    // D-047: a `via` session's credential is loaded on the proxy host (or in
+    // the Hub process) per `api.open`; the worker host receives only the
+    // per-instance relay bearer its own Node mints. Sending
+    // `providerAuthToken` here would hand the gateway secret to the one
+    // machine the operator excluded, so this is a hard stop, not a policy.
+    if spec.pointer("/apiRoute/mode").and_then(Value::as_str)
+        == Some(remuda_protocol::PROVIDER_DELIVERY_VIA)
+    {
+        return Ok(params);
+    }
     let delegation = spec.get("delegation").and_then(Value::as_str).unwrap_or("");
     if delegation == "none" {
         return Ok(params);
@@ -628,6 +1019,16 @@ fn load_secret(store: &FileSecretStore, profile: &ProviderRecord) -> Result<Secr
     store
         .get(name)
         .map_err(|_| HubError::BadRequest("provider profile has no stored auth token".into()))
+}
+
+/// D-048 relay egress: load the gateway secret for one `api.open`, on the
+/// proxy side only. Same vault as [`with_launch_secret`]; callers must have
+/// already passed `secret_release_allowed(profile, H)`.
+pub(crate) fn load_secret_for_relay(
+    store: &std::sync::Arc<FileSecretStore>,
+    profile: &ProviderRecord,
+) -> Result<Secret, HubError> {
+    load_secret(store, profile)
 }
 
 fn vault_name(profile_id: &str) -> String {

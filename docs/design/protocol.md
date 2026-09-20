@@ -1541,17 +1541,18 @@ TransportLimits v1 默认建议：`maxJsonFrameBytes=1048576`、`maxBinaryChunkB
 设计全文见 [api-routing.md](./api-routing.md)。
 
 `delivery = via:<H>` 的会话把模型 API 请求交给 H 出去（D-047）。W 的 Node 在
-每实例 loopback 监听器上收到请求后，把它变成这里的七个帧之一，走**既有**
+每实例 loopback 监听器上收到请求后，把它变成这里的帧之一，走**既有**
 Hub↔Node 链路——与 `object.pull` 同一条路径、同一套授权、同一个 1 MiB 帧上限，
 理由见 §7.4（ssh-stdio 桥只转发整帧 JSON）。
 
-**全部七个帧都是 notification**，没有 `id`，**永不进入** §7.4 那个 32 槽的
+**帧全部是 notification**，没有 `id`，**永不进入** §7.4 那个 32 槽的
 在途 RPC 上限：每条链路维护自己的 stream 注册表，否则几条热流就会卡住
 `instance.create` 和 `tty.write`。carrier 必须按 `HubNodeMethod::is_api()`
 把它们送进 stream 注册表，而不是 JSON-RPC 派发表。
 
 | 帧 | 方向 | params |
 | --- | --- | --- |
+| `api.egress` | Hub→H Node | `{instanceId, profileId, baseUrl, headers:[{name,value}], authToken?, revoke}` |
 | `api.open` | W Node→Hub，Hub→H Node | `{instanceId, streamId, method, path, query, headers:[{name,value}], bodyBase64?, bodyChunked, deadlineMs}` |
 | `api.body` | W Node→Hub→H Node | `{streamId, seq, dataBase64, last}` |
 | `api.head` | H→Hub→W Node | `{streamId, status, headers:[{name,value}]}` |
@@ -1559,6 +1560,16 @@ Hub↔Node 链路——与 `object.pull` 同一条路径、同一套授权、同
 | `api.end` | 双向 | `{streamId, error?:{code,message}, bytesUp, bytesDown, ms}` |
 | `api.cancel` | 双向 | `{streamId, reason}` |
 | `api.credit` | 消费者→生产者 | `{streamId, chunks}` |
+
+**凭据绝不在 `api.open` 里。** 网关凭据（`authToken`）只由 Hub 经
+`api.egress` 单独下发给 H：当一个 `via:<H>` 路由在启动时决议、以及 H 每次
+重连之后，Hub 按 `instanceId` 安装出口上下文（`baseUrl`、profile headers、
+凭据）；实例退出或路由失效时下发 `revoke: true` 清除。**每一次下发（含重连
+重发）都当场过 SecretBroker 的主机作用域校验**：profile 的作用域可在启动后
+收窄，重发时若 H 已不在作用域内，Hub 不发凭据、改为下发 `revoke: true` 清
+掉旧上下文。Node 按 instanceId 安装/清除上下文，`revoke` 后在新的
+`api.egress` 到达前拒绝该实例的新流。这样凭据只存在于 H 内存、不经过 W，也
+不搭在任何数据流帧上。
 
 `headers` 是**列表**而不是 map：HTTP 允许同名重复（`x-stainless-*` 就会），
 折叠成一个值会改变网关看到的请求。`query` 原样转发、从不重新编码；

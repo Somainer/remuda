@@ -373,6 +373,12 @@ pub struct HostRecord {
     /// Monotonic revision of the acknowledged workspace registry.
     #[serde(default)]
     pub workspace_revision: u64,
+    /// Operator-configured relay bind for direct-network API routing
+    /// (D-047 Amendment A1). Absent keeps this host's relay on loopback, so
+    /// every `via` session targeting it takes `hub-relay`. Set through
+    /// `PATCH /v1/hosts/{id}`, never from a Node hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_bind: Option<remuda_protocol::HostRelayBind>,
 }
 
 fn default_provider_binding() -> String {
@@ -485,12 +491,13 @@ pub struct InstanceRecord {
     /// session, so an existing instance's JSON is unchanged.
     ///
     /// Set from the **Node's** create result, never from the request, so the
-    /// Session strip and `remuda watch` report what ran (D-035). Nothing
-    /// populates it yet: the write-back lands with the Hub's route resolution
-    /// (api-routing task 2/4). In particular it is deliberately **not** read
-    /// back off the spec, because the spec carries the *requested* route —
-    /// whose `route` may be `auto`, a value this observation type does not
-    /// have, since a resolved route is never `auto`.
+    /// Session strip and `remuda watch` report what ran (D-035). The Hub
+    /// validates the echo against the requested route before projecting it: a
+    /// `via` request echoed as `direct`, or an echo naming a different proxy
+    /// host, fails the create rather than recording a silent reroute. It is
+    /// deliberately **not** read off the spec, because the spec carries the
+    /// *requested* route — whose `route` may be `auto`, a value this
+    /// observation type does not have, since a resolved route is never `auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_route: Option<remuda_protocol::ApiRoute>,
     /// Current model id from create / `instance.configure`.
@@ -1170,6 +1177,11 @@ pub struct ProviderRecord {
     /// Declared supply + observed window state (coordinator §4.2).
     #[serde(default)]
     pub supply: remuda_protocol::SupplyProfile,
+    /// How sessions using this profile reach the model API (D-047). The D2
+    /// default is `{mode: direct, route: auto}`, exactly what every profile
+    /// stored before D-047 reads back as.
+    #[serde(default)]
+    pub delivery: remuda_protocol::ProviderDelivery,
     /// Create-time.
     pub created_at: String,
     /// Update-time.
@@ -1205,6 +1217,7 @@ impl ProviderRecord {
                 "message": self.last_test_message,
             })),
             "supply": self.supply,
+            "delivery": self.delivery,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         })
@@ -1218,7 +1231,7 @@ impl ProviderRecord {
             .or(self.default_model.as_deref())
             .or_else(|| provider_models::enabled_ids(&self.models).first().copied())
             .unwrap_or("");
-        json!({
+        let mut overlay = json!({
             "profileId": self.id,
             "kind": self.kind,
             "baseUrl": self.base_url,
@@ -1229,7 +1242,17 @@ impl ProviderRecord {
             } else {
                 self.scope.clone()
             },
-        })
+        });
+        // D-047: carry the profile delivery only when non-default, so a
+        // direct/auto profile's overlay is byte-identical to the pre-D-047
+        // shape. The resolved per-launch route rides `InstanceSpec.apiRoute`.
+        if !self.delivery.is_direct_default()
+            && let Some(obj) = overlay.as_object_mut()
+            && let Ok(value) = serde_json::to_value(&self.delivery)
+        {
+            obj.insert("delivery".into(), value);
+        }
+        overlay
     }
 }
 
@@ -2170,6 +2193,56 @@ impl Store {
         .await
     }
 
+    /// Append a Hub-authored journal event with an explicit payload.
+    ///
+    /// Used for the D-047 relay observations (`apiRoute` at launch, the
+    /// per-stream counter record on `api.end`): counters and routing facts
+    /// only, never bodies or headers. Same idempotent seq discipline as
+    /// [`Self::append_hub_diagnostic`]; returns `None` when the instance is
+    /// unknown or an event with this seq already exists.
+    pub async fn append_hub_event(
+        &self,
+        instance_id: String,
+        kind: &'static str,
+        payload: Value,
+    ) -> Result<Option<JournalRecord>, StoreError> {
+        self.run_named("append_hub_event", move |conn| {
+            let Some(instance) = load_instance(conn, &instance_id)? else {
+                return Ok(None);
+            };
+            let seq = instance.durable_seq.parse::<i64>().unwrap_or(0) + 1;
+            if load_journal_row(conn, &instance_id, seq)?.is_some() {
+                return Ok(None);
+            }
+            let event_id = new_id("evt").map_err(|e| StoreError::Id(e.to_string()))?;
+            let now = now_rfc3339();
+            let event = json!({
+                "eventId": event_id,
+                "seq": seq.to_string(),
+                "instanceId": instance_id,
+                "kind": kind,
+                "payload": payload,
+            });
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![instance_id, seq, event_id, event.to_string(), now],
+            )?;
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
+                params![seq, now, instance_id],
+            )?;
+            Ok(Some(JournalRecord {
+                instance_id,
+                seq,
+                event_id,
+                event,
+                observed_at: now,
+            }))
+        })
+        .await
+    }
+
     /// Record the epoch announced in `node.hello`, reporting a Node restart.
     ///
     /// Returns `true` only when a *different* non-empty epoch was already
@@ -2884,6 +2957,72 @@ impl Store {
         .await
     }
 
+    /// Read an instance's raw create spec JSON (D-047 route echo validation).
+    pub async fn get_instance_spec_json(
+        &self,
+        instance_id: String,
+    ) -> Result<Option<Value>, StoreError> {
+        self.run_named("get_instance_spec_json", move |conn| {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT spec_json FROM instances WHERE id = ?1",
+                    params![instance_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.map(|raw| serde_json::from_str(&raw))
+                .transpose()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    /// Project the Node-observed API route onto an instance (D-047).
+    ///
+    /// Callers must validate the echo first — this writes verbatim and is the
+    /// one place the observed route enters the projection. Returns the stored
+    /// route JSON, or `None` when the instance does not exist.
+    pub async fn reconcile_instance_api_route(
+        &self,
+        instance_id: String,
+        route: &remuda_protocol::ApiRoute,
+    ) -> Result<Option<()>, StoreError> {
+        let encoded = serde_json::to_string(route)?;
+        self.run_named("reconcile_instance_api_route", move |conn| {
+            let now = now_rfc3339();
+            let affected = conn.execute(
+                "UPDATE instances SET api_route_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![encoded, now, instance_id],
+            )?;
+            Ok((affected > 0).then_some(()))
+        })
+        .await
+    }
+
+    /// Active (non-terminal) instances whose observed route proxies through
+    /// `via_host_id`. Used when the proxy host's link drops: only instances
+    /// actually egressing on that host go `blocked{api-route-down}`.
+    pub async fn instances_routed_via(
+        &self,
+        via_host_id: String,
+    ) -> Result<Vec<String>, StoreError> {
+        self.run_named("instances_routed_via", move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM instances
+                 WHERE json_extract(api_route_json, '$.mode') = 'via'
+                   AND json_extract(api_route_json, '$.viaHostId') = ?1
+                   AND (lifecycle IN
+                    ('preparing', 'starting', 'ready', 'running', 'closing', 'reconciling')
+                    OR lifecycle = 'requested')",
+            )?;
+            let ids = stmt
+                .query_map(params![via_host_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+        .await
+    }
+
     /// Node RPC success → `accepted`, only from `queued`.
     ///
     /// There is no fourth state to recover: a forwarded send that the Node
@@ -3304,7 +3443,9 @@ impl Store {
         .await
     }
 
-    /// Operator PATCH of labels / maxInstances / display name / provider binding (does not mark online).
+    /// Operator PATCH of labels / maxInstances / display name / provider
+    /// binding / relay bind (does not mark online).
+    #[allow(clippy::too_many_arguments)] // one flat PATCH; grouping hurts callers
     pub async fn patch_host(
         &self,
         host_id: String,
@@ -3313,6 +3454,7 @@ impl Store {
         max_instances: Option<i64>,
         provider_binding: Option<String>,
         launch_defaults: HostLaunchDefaultsPatch,
+        relay_bind: Option<Option<remuda_protocol::HostRelayBind>>,
     ) -> Result<HostRecord, StoreError> {
         let HostLaunchDefaultsPatch {
             default_launch_args,
@@ -3377,6 +3519,18 @@ impl Store {
                     .map_err(|error| StoreError::Id(error.to_string()))?;
                 conn.execute(
                     "UPDATE hosts SET default_tui = ?1 WHERE id = ?2",
+                    params![encoded, host_id],
+                )?;
+            }
+            // D-047 Amendment A1: double Option like the launch defaults —
+            // absent means "PATCH did not mention it", explicit null clears.
+            if let Some(relay_bind) = relay_bind {
+                let encoded = relay_bind
+                    .map(|bind| serde_json::to_string(&bind))
+                    .transpose()
+                    .map_err(|error| StoreError::Id(error.to_string()))?;
+                conn.execute(
+                    "UPDATE hosts SET relay_bind_json = ?1 WHERE id = ?2",
                     params![encoded, host_id],
                 )?;
             }
@@ -3545,7 +3699,7 @@ impl Store {
                     "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                             is_default, revision, secret_name, secret_last4, secret_fingerprint,
                             last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
-                            supply_json
+                            supply_json, delivery_json
                      FROM provider_profiles
                      WHERE scope = 'universal' OR scope = '' OR scope = ?1
                      ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
@@ -3558,7 +3712,7 @@ impl Store {
                     "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                             is_default, revision, secret_name, secret_last4, secret_fingerprint,
                             last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
-                            supply_json
+                            supply_json, delivery_json
                      FROM provider_profiles
                      ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC",
                 )?;
@@ -3616,6 +3770,7 @@ impl Store {
         secret_last4: Option<String>,
         secret_fingerprint: Option<String>,
         supply: remuda_protocol::SupplyProfile,
+        delivery: remuda_protocol::ProviderDelivery,
     ) -> Result<ProviderRecord, StoreError> {
         self.run_named("insert_provider", move |conn| {
             let now = now_rfc3339();
@@ -3629,8 +3784,8 @@ impl Store {
                 "INSERT INTO provider_profiles
                  (id, name, kind, base_url, models_json, default_model, headers_json,
                   is_default, revision, secret_name, secret_last4, secret_fingerprint,
-                  created_at, updated_at, scope, supply_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13, ?14)",
+                  created_at, updated_at, scope, supply_json, delivery_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?12, ?13, ?14, ?15)",
                 params![
                     id,
                     name,
@@ -3646,6 +3801,7 @@ impl Store {
                     now,
                     scope,
                     serde_json::to_string(&supply)?,
+                    serde_json::to_string(&delivery)?,
                 ],
             )?;
             load_provider(conn, &id)?
@@ -3671,6 +3827,7 @@ impl Store {
         secret_last4: Option<Option<String>>,
         secret_fingerprint: Option<Option<String>>,
         supply: Option<remuda_protocol::SupplyProfile>,
+        delivery: Option<remuda_protocol::ProviderDelivery>,
     ) -> Result<ProviderRecord, StoreError> {
         self.run_named("update_provider", move |conn| {
             let existing = load_provider(conn, &id)?
@@ -3753,6 +3910,12 @@ impl Store {
                 conn.execute(
                     "UPDATE provider_profiles SET supply_json = ?1 WHERE id = ?2",
                     params![serde_json::to_string(&supply)?, id],
+                )?;
+            }
+            if let Some(delivery) = delivery {
+                conn.execute(
+                    "UPDATE provider_profiles SET delivery_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&delivery)?, id],
                 )?;
             }
             let now = now_rfc3339();
@@ -3917,7 +4080,7 @@ fn load_provider(conn: &Connection, id: &str) -> Result<Option<ProviderRecord>, 
         "SELECT id, name, kind, base_url, models_json, default_model, headers_json,
                 is_default, revision, secret_name, secret_last4, secret_fingerprint,
                 last_test_ok, last_test_at, last_test_message, created_at, updated_at, scope,
-                supply_json
+                supply_json, delivery_json
          FROM provider_profiles WHERE id = ?1",
         params![id],
         load_provider_row,
@@ -3941,6 +4104,10 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         .get::<_, Option<String>>(18)?
         .unwrap_or_else(|| "{}".into());
     let supply = serde_json::from_str(&supply_json).unwrap_or_default();
+    let delivery: remuda_protocol::ProviderDelivery = row
+        .get::<_, Option<String>>(19)?
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
     Ok(ProviderRecord {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -3962,6 +4129,7 @@ fn load_provider_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord
         updated_at: row.get(16)?,
         scope,
         supply,
+        delivery,
     })
 }
 
@@ -4197,6 +4365,10 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS passkeys_credential_id
             ON passkeys(credential_id);
+        CREATE TABLE IF NOT EXISTS project_route_overrides (
+            project_id TEXT PRIMARY KEY,
+            doc_json TEXT NOT NULL
+        );
         ",
     )?;
     ensure_column(&conn, "devices", "kind", "TEXT NOT NULL DEFAULT 'human'")?;
@@ -4236,6 +4408,18 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
         "supply_json",
         "TEXT NOT NULL DEFAULT '{}'",
     )?;
+    // D-047: per-profile delivery (`{mode, route, viaHostId}`); '{}' parses as
+    // the direct/auto default through the serde defaults.
+    ensure_column(
+        &conn,
+        "provider_profiles",
+        "delivery_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    // D-047 Amendment A1: operator-configured non-loopback relay bind.
+    ensure_column(&conn, "hosts", "relay_bind_json", "TEXT")?;
+    // D-047: the observed API route, written only from the Node create echo.
+    ensure_column(&conn, "instances", "api_route_json", "TEXT")?;
     ensure_column(&conn, "instances", "last_error", "TEXT")?;
     ensure_column(&conn, "instances", "mode", "TEXT")?;
     ensure_column(&conn, "instances", "promoted_at", "TEXT")?;
@@ -6238,6 +6422,29 @@ mod tests {
             wire.get("apiRoute").is_none(),
             "an unproxied instance must not gain an apiRoute key"
         );
+
+        // And once the Node echoes the observed route, the projection column
+        // carries it — still without touching the requested spec route.
+        let echoed = remuda_protocol::ApiRoute::via(
+            "hst_01993ab0-0000-7000-8000-000000000007"
+                .parse()
+                .expect("host id"),
+            Some("proxy-label".into()),
+            remuda_protocol::ApiRouteKind::HubRelay,
+        );
+        store
+            .reconcile_instance_api_route(routed.instance_id.clone(), &echoed)
+            .await
+            .expect("project route");
+        let observed = store
+            .get_instance(routed.instance_id.clone())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(observed.api_route.as_ref(), Some(&echoed));
+        let wire = serde_json::to_value(&observed).expect("serialize");
+        assert_eq!(wire["apiRoute"]["mode"], json!("via"));
+        assert_eq!(wire["apiRoute"]["route"], json!("hub-relay"));
     }
 
     #[tokio::test]
@@ -6409,7 +6616,15 @@ mod tests {
         // The insert guard still fences a burst: fresh `requested` rows count
         // there, so a host at its ceiling refuses another create…
         store
-            .patch_host(host.clone(), None, None, Some(2), None, Default::default())
+            .patch_host(
+                host.clone(),
+                None,
+                None,
+                Some(2),
+                None,
+                Default::default(),
+                None,
+            )
             .await
             .expect("cap 2");
         let pending = seed_instance(&store, &host).await;
@@ -6587,7 +6802,15 @@ mod tests {
             let store = Store::open(dir.path()).expect("store");
             enroll_labeled(&store, host.clone(), "cap-node").await;
             let patched = store
-                .patch_host(host.clone(), None, None, Some(32), None, Default::default())
+                .patch_host(
+                    host.clone(),
+                    None,
+                    None,
+                    Some(32),
+                    None,
+                    Default::default(),
+                    None,
+                )
                 .await
                 .expect("patch");
             assert_eq!(patched.max_instances, 32);
@@ -6928,7 +7151,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             "SELECT id, label, state, last_seen_at, node_version, cli_json, capabilities_json, transport,
                     labels_json, herdr_json, resources_json,
                     COALESCE(max_instances_override, max_instances), hostname, os, provider_binding,
-                    default_launch_args, claude_binary_path, default_tui
+                    default_launch_args, claude_binary_path, default_tui, relay_bind_json
              FROM hosts WHERE id = ?1",
             params![id],
             |row| {
@@ -6953,6 +7176,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
                     row.get::<_, Option<String>>(15)?,
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             },
         )
@@ -6976,6 +7200,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
         default_launch_args,
         claude_binary_path,
         default_tui,
+        relay_bind_json,
     )) = row
     else {
         return Ok(None);
@@ -7041,6 +7266,7 @@ pub(crate) fn load_host(conn: &Connection, id: &str) -> Result<Option<HostRecord
             .and_then(|raw| serde_json::from_str(raw).ok()),
         workspaces,
         workspace_revision: workspace_revision.max(0) as u64,
+        relay_bind: relay_bind_json.and_then(|raw| serde_json::from_str(&raw).ok()),
     }))
 }
 
@@ -7049,7 +7275,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
         "SELECT id, host_id, workspace_id, kind, driver, lifecycle, activity, connectivity,
                 title, journal_id, durable_seq, created_at, updated_at, spec_json, last_error,
                 mode, promoted_at, launched_by,
-                role, scope_json, grants_json, task_id
+                role, scope_json, grants_json, task_id, api_route_json
          FROM instances WHERE id = ?1",
         params![id],
         |row| {
@@ -7084,13 +7310,12 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .get("providerSourceHint")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            // D-047: no `apiRoute` projection yet. The field is populated from
-            // the Node's create result (api-routing task 4), so an instance
-            // reads as "not proxied" until that write-back exists — which is
-            // true, since nothing proxies without it. Reading the spec here
-            // would be wrong twice over: a spec written before D-047 has no
-            // route at all, and one that does carries the *requested* route
-            // (`Route` may be `auto`, which is not an observation).
+            // D-047: the observed route is its own column (`api_route_json`,
+            // read at index 22 above), written only from the Node's create
+            // echo. It is deliberately never derived from the spec here: the
+            // spec carries the *requested* route, whose `route` may be `auto`,
+            // which is not an observation value. A pre-D-047 row has no column
+            // value and reads as `None` — a direct session, truthfully.
             let model = spec
                 .get("model")
                 .and_then(Value::as_str)
@@ -7158,6 +7383,12 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 .and_then(|raw| serde_json::from_str(&raw).ok())
                 .unwrap_or_default();
             let task_id: Option<String> = row.get(21)?;
+            // D-047: the observed route, written only from the Node create
+            // echo. A malformed stored value reads as "no route" the same way
+            // an absent one does; it never fails the instance load.
+            let api_route: Option<remuda_protocol::ApiRoute> = row
+                .get::<_, Option<String>>(22)?
+                .and_then(|raw| serde_json::from_str(&raw).ok());
             // Additive context-usage rollup (context-usage-1), folded from the
             // durable usage_events table so it is never stored redundantly.
             let usage_rollup = crate::usage_store::rollup_instance(
@@ -7186,7 +7417,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 provider_profile_id,
                 provider_source,
                 provider_source_hint,
-                api_route: None,
+                api_route,
                 model,
                 tui: spec
                     .get("tui")
@@ -7541,7 +7772,13 @@ fn normalize_activity(status: &str) -> Option<&'static str> {
 /// `activity=idle` is only set from a Node/herdr idle observation, never as a
 /// create default. Start-failure observations (`native-driver-start-failed`,
 /// entity `failed`) mark `lifecycle=failed`.
-fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
+/// Derive the `(lifecycle, activity)` state an event projects onto its
+/// instance.
+///
+/// `pub(crate)` so the api-relay revocation path can recognise the same
+/// terminal events (exited/failed) the projection applies, rather than
+/// re-deriving the event shape in a second place.
+pub(crate) fn derive_instance_state(event: &Value) -> (Option<&'static str>, Option<&'static str>) {
     let kind = event
         .get("kind")
         .and_then(Value::as_str)

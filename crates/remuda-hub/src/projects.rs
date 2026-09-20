@@ -78,6 +78,12 @@ struct CreateProjectBody {
     hosts: Vec<ProjectHostQuota>,
     #[serde(default)]
     provider: Option<ProjectProviderRef>,
+    /// D-047 project-layer delivery override (`apiVia`/`apiRoute`). Stored in a
+    /// side table because the typed [`ProjectProviderRef`] predates D-047.
+    #[serde(default)]
+    api_via: Option<String>,
+    #[serde(default, rename = "apiRoute")]
+    api_route: Option<String>,
     #[serde(default)]
     default_effort: Option<String>,
     #[serde(default)]
@@ -115,6 +121,15 @@ struct PatchProjectBody {
     branch_pattern: Option<String>,
     #[serde(default)]
     provider: Option<ProjectProviderRef>,
+    /// D-047 project-layer delivery override. `apiVia: null` clears it.
+    #[serde(default, deserialize_with = "crate::registry::double_option")]
+    api_via: Option<Option<String>>,
+    #[serde(
+        default,
+        rename = "apiRoute",
+        deserialize_with = "crate::registry::double_option"
+    )]
+    api_route: Option<Option<String>>,
     #[serde(default)]
     default_effort: Option<Option<String>>,
     #[serde(default)]
@@ -158,6 +173,29 @@ async fn list_projects(
     let mut items = state.store.list_projects().await.map_err(map_store)?;
     items.retain(|project| scope.allows_project(project.meta.id.as_id().as_str()));
     Ok(Json(json!({ "items": items, "nextCursor": null })))
+}
+
+/// Build/validate the D-047 project-layer route override doc.
+///
+/// `Some("")`-filtered spellings only; an unknown `apiVia` is a 400 rather
+/// than a silently ignored layer (ignoring it would deliver direct).
+fn route_override_doc(
+    api_via: Option<&str>,
+    api_route: Option<&str>,
+) -> Result<Option<Value>, HubError> {
+    let via = match api_via.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => remuda_protocol::ApiViaOverride::parse(raw)
+            .map(|via| via.as_wire())
+            .map_err(|err| HubError::BadRequest(format!("apiVia: {err}")))?,
+        None => return Ok(None),
+    };
+    let mut doc = json!({ "apiVia": via });
+    if let Some(raw) = api_route.map(str::trim).filter(|value| !value.is_empty()) {
+        let mode: remuda_protocol::ApiRouteMode = serde_json::from_value(json!(raw))
+            .map_err(|err| HubError::BadRequest(format!("apiRoute: {err}")))?;
+        doc["apiRoute"] = json!(mode.as_str());
+    }
+    Ok(Some(doc))
 }
 
 /// `POST /v1/projects`
@@ -215,6 +253,12 @@ async fn create_project(
         .insert_project(project, device.id.clone())
         .await
         .map_err(map_store)?;
+    let route_doc = route_override_doc(body.api_via.as_deref(), body.api_route.as_deref())?;
+    state
+        .store
+        .set_project_route_override(created.meta.id.as_id().to_string(), route_doc)
+        .await
+        .map_err(map_store)?;
     state
         .store
         .append_audit(
@@ -269,6 +313,47 @@ async fn set_project(
     } else {
         None
     };
+    // D-047 project-layer override. `apiVia: null` clears; a bare `apiRoute`
+    // without a stored or supplied `apiVia` is a 400.
+    if body.api_via.is_some() || body.api_route.is_some() {
+        let existing = state
+            .store
+            .get_project_route_override(id.clone())
+            .await
+            .map_err(map_store)?;
+        let next = match body.api_via {
+            Some(Some(via)) => {
+                let via = remuda_protocol::ApiViaOverride::parse(&via)
+                    .map_err(|err| HubError::BadRequest(format!("apiVia: {err}")))?;
+                let mut doc = json!({ "apiVia": via.as_wire() });
+                let route = body.api_route.flatten().or_else(|| {
+                    existing.as_ref().and_then(|doc| {
+                        doc.get("apiRoute")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                });
+                if let Some(raw) = route {
+                    let mode: remuda_protocol::ApiRouteMode = serde_json::from_value(json!(raw))
+                        .map_err(|err| HubError::BadRequest(format!("apiRoute: {err}")))?;
+                    doc["apiRoute"] = json!(mode.as_str());
+                }
+                Some(doc)
+            }
+            Some(None) => None,
+            None if body.api_route.is_some() => {
+                return Err(HubError::BadRequest(
+                    "apiRoute requires apiVia on the same or a previous update".into(),
+                ));
+            }
+            None => existing,
+        };
+        state
+            .store
+            .set_project_route_override(id.clone(), next)
+            .await
+            .map_err(map_store)?;
+    }
     let updated = state
         .store
         .patch_project(id.clone(), move |project| {
@@ -617,7 +702,60 @@ impl Store {
         self.run_named("delete_project", move |conn| {
             let existing = load_project(conn, &project_id)?;
             conn.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+            conn.execute(
+                "DELETE FROM project_route_overrides WHERE project_id = ?1",
+                params![project_id],
+            )?;
             Ok(existing)
+        })
+        .await
+    }
+
+    /// Store the project-layer API delivery override (D-047 waterfall).
+    ///
+    /// The typed [`ProjectProviderRef`] on the wire predates D-047 and carries
+    /// no routing fields, so the project-level `apiVia`/`apiRoute` live in this
+    /// side table rather than the project document. `None` clears the row.
+    pub async fn set_project_route_override(
+        &self,
+        project_id: String,
+        doc: Option<Value>,
+    ) -> Result<(), StoreError> {
+        self.run_named("set_project_route_override", move |conn| match doc {
+            Some(doc) => {
+                conn.execute(
+                    "INSERT INTO project_route_overrides (project_id, doc_json)
+                     VALUES (?1, ?2)
+                     ON CONFLICT(project_id) DO UPDATE SET doc_json = excluded.doc_json",
+                    params![project_id, doc.to_string()],
+                )?;
+                Ok(())
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM project_route_overrides WHERE project_id = ?1",
+                    params![project_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    /// Read the project-layer API delivery override, if one was stored.
+    pub async fn get_project_route_override(
+        &self,
+        project_id: String,
+    ) -> Result<Option<Value>, StoreError> {
+        self.run_named("get_project_route_override", move |conn| {
+            conn.query_row(
+                "SELECT doc_json FROM project_route_overrides WHERE project_id = ?1",
+                params![project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|raw| serde_json::from_str(&raw).map_err(StoreError::from))
+            .transpose()
         })
         .await
     }

@@ -180,11 +180,14 @@
   margin-left: auto;
 }
 
-/* ui-spec §3.4: the fold's only affordance gets a var(--touch) hit area in
-   compact via an invisible ::after, never a bigger visual glyph. The head
-   gets the same min-height so the 44px pseudo is never clipped by the
-   row's overflow:hidden (clipped pixels do not hit-test). */
-@media (max-width: 767px) {
+/* ui-spec §3.4: both folds render whenever COMPACT_WORKBENCH_QUERY matches
+   (the narrow clause OR the coarse-pointer landscape clause), so the 44px
+   hot zones must key off the SAME query — not max-width alone, which would
+   leave a 32px chip on a coarse landscape phone. The reach is an invisible
+   ::after, never a bigger visual glyph; the D-041 head gets the same
+   min-height so its pseudo is never clipped by overflow:hidden. The D-049
+   toolbar wraps instead of overflowing once the chips fold. */
+@media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
   .foldHead {
     min-height: var(--touch);
   }
@@ -198,13 +201,7 @@
     height: var(--touch);
     transform: translate(-50%, -50%);
   }
-}
 
-/* D-049 compact chrome budget: the transcript action chips fold behind one
-   ⋯ trigger. Its chip look is unchanged; the 44px reach comes from the same
-   invisible ::after mechanism. Expanded, the chips are the same inline
-   buttons (same testids), allowed to wrap instead of overflowing 390px. */
-@media (max-width: 767px) {
   .toolbar {
     flex-wrap: wrap;
   }

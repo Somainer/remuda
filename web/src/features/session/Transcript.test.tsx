@@ -457,7 +457,8 @@ describe("D-049 compact transcript toolbar fold", () => {
     expect(screen.queryByTestId("transcript-search-open")).toBeNull();
     expect(screen.queryByTestId("toggle-injected")).toBeNull();
     expect(trigger.getAttribute("aria-expanded")).toBe("false");
-    expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
+    // Plain disclosure, not a menu: the chips expand inline in its place.
+    expect(trigger.getAttribute("aria-haspopup")).toBeNull();
     expect(trigger.textContent).toContain("⋯");
 
     // Expanding mounts the exact same buttons with the unchanged testids.

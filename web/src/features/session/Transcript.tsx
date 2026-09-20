@@ -692,7 +692,9 @@ function TranscriptInner({
             className={`${ui.chip} ${css.toolsTrigger}`}
             data-testid="transcript-tools-open"
             aria-label="transcript 操作"
-            aria-haspopup="menu"
+            // Plain disclosure: expanding swaps this trigger out for the
+            // inline chips (no menu role, no focus move, no Escape surface),
+            // so there is no haspopup and expanded stays false here.
             aria-expanded={false}
             onClick={() => setToolsOpen(true)}
           >

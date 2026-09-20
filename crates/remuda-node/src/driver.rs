@@ -13,9 +13,8 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
-    time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// Future returned by a driver operation without requiring an async-trait macro.
 pub type DriverFuture<'a> =
@@ -244,10 +243,10 @@ pub trait DriverFactory: Send + Sync {
 pub struct FakeDriver {
     kind: DriverKind,
     panic_prompts: BTreeSet<String>,
-    /// Time `start()` takes before reporting the run handle. Lets the
-    /// fast-accept test prove the RPC ack lands while the driver is still
-    /// materializing.
-    start_delay: Duration,
+    /// Gate parked at by `start()` until released. Lets the fast-accept test
+    /// prove the RPC ack lands while the driver is still materializing,
+    /// without racing a wall-clock delay against scheduler latency.
+    start_gate: Option<Arc<Notify>>,
     instance: Option<Instance>,
 }
 
@@ -257,7 +256,7 @@ impl FakeDriver {
         Self {
             kind,
             panic_prompts: BTreeSet::new(),
-            start_delay: Duration::ZERO,
+            start_gate: None,
             instance: None,
         }
     }
@@ -268,9 +267,11 @@ impl FakeDriver {
         self
     }
 
-    /// Delay `start()` by this long, simulating a slow binary pin / spawn.
-    pub fn with_start_delay(mut self, delay: Duration) -> Self {
-        self.start_delay = delay;
+    /// Park `start()` until `gate` is notified. The gate replaces a timed
+    /// materialization delay: a test can observe the accepted-but-not-started
+    /// state as an actual event ordering instead of comparing elapsed time.
+    pub fn with_start_gate(mut self, gate: Arc<Notify>) -> Self {
+        self.start_gate = Some(gate);
         self
     }
 }
@@ -287,10 +288,10 @@ impl Driver for FakeDriver {
     }
 
     fn start(&self) -> DriverStartFuture<'_> {
-        let delay = self.start_delay;
+        let gate = self.start_gate.clone();
         Box::pin(async move {
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+            if let Some(gate) = gate {
+                gate.notified().await;
             }
             Ok(None)
         })
@@ -588,7 +589,7 @@ impl DriverFactory for FakeDriverFactory {
         Ok(Arc::new(FakeDriver {
             kind: DriverKind::ClaudePrint,
             panic_prompts: BTreeSet::new(),
-            start_delay: Duration::ZERO,
+            start_gate: None,
             instance: Some(launch.instance),
         }))
     }

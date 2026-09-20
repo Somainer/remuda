@@ -3744,25 +3744,28 @@ mod tests {
     }
 
     /// D-028 P2 follow-up: the RPC reply proves only the durable accept. A
-    /// driver whose materialization sleeps (slow `pin_binary`, overlay/shim
+    /// driver whose materialization parks (slow `pin_binary`, overlay/shim
     /// generation, PTY spawn) must not delay the create: the response lands
-    /// immediately with an accepted command and a `preparing` instance, and
-    /// the worker walks the instance to `ready` afterwards.
+    /// with an accepted command and a `preparing` instance while the worker
+    /// is still parked in `start`, and the worker walks the instance to
+    /// `ready` once materialization is released.
     #[tokio::test]
     async fn create_is_accepted_before_a_slow_launch_finishes() {
         let config = crate::DevServerConfig::loopback(0)
             .with_workspace_roots(remuda_testing::test_workspace_roots!());
         let store = Arc::new(MemoryStore::new(8));
         let drivers = DriverRegistry::default();
-        // The shared instance: every built fake starts 400 ms after spawn.
+        // The shared fake parks in `start()` until the test releases the
+        // gate, so the accept-vs-launch ordering is observed as events
+        // rather than raced against an elapsed-time threshold.
+        let start_gate = Arc::new(tokio::sync::Notify::new());
         let slow = Arc::new(
             crate::FakeDriver::new(remuda_protocol::DriverKind::ClaudePrint)
-                .with_start_delay(Duration::from_millis(400)),
+                .with_start_gate(Arc::clone(&start_gate)),
         );
         drivers.register(slow).expect("register slow fake");
         let node = DevNode::with_parts(&config, store, drivers).expect("node");
 
-        let started = std::time::Instant::now();
         let created = node
             .create_instance(
                 serde_json::from_value(serde_json::json!({
@@ -3774,12 +3777,7 @@ mod tests {
             )
             .await
             .expect("create");
-        // The accept does not wait for the 400 ms launch.
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "durable ack took {:?}; it must not wait for materialization",
-            started.elapsed()
-        );
+        // The reply is the durable accept; the launch gate is still held.
         assert_eq!(
             created.command.state,
             CommandState::Accepted,
@@ -3791,7 +3789,24 @@ mod tests {
             "the instance is accepted but not yet materialized"
         );
 
-        // The worker then materializes and journals starting → ready.
+        // While the gate is held the worker can never pass `start()`: this
+        // is the deterministic form of "the ack did not wait for launch" —
+        // a create that awaited materialization could never have returned,
+        // because no one has released the gate yet.
+        let parked = node
+            .get_instance(&created.instance.meta.id)
+            .expect("instance remains visible");
+        assert!(
+            matches!(
+                parked.lifecycle,
+                InstanceLifecycle::Preparing | InstanceLifecycle::Starting
+            ),
+            "instance must not pass start() while the gate is held: {:?}",
+            parked.lifecycle
+        );
+
+        // Release materialization: the worker journals starting → ready.
+        start_gate.notify_one();
         let final_instance = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let instance = node

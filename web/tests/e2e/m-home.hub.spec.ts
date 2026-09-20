@@ -72,6 +72,24 @@ test.describe("390px phone home", () => {
     }
   });
 
+  test("toolbar controls own the 44px touch target (ui-spec §3.4 / D-039)", async ({ page }) => {
+    await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    // The search box and both ordering buttons are primary phone controls:
+    // their painted bounding boxes (not just click-through hot zones) must
+    // reach var(--touch) at the 390px viewport.
+    const targets = [
+      page.getByTestId("home-search"),
+      page.getByTestId("home-order-clock"),
+      page.getByTestId("home-order-list"),
+    ];
+    for (const target of targets) {
+      const box = await target.boundingBox();
+      expect(box, `${await target.getAttribute("data-testid")} rendered`).toBeTruthy();
+      expect(box!.height).toBeGreaterThanOrEqual(44);
+    }
+  });
+
   test("groups project+branch with the blocked count, pins blocked, shows the ring and no wire strings", async ({
     page,
   }) => {

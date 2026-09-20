@@ -79,15 +79,23 @@ export function isFailedCard(
 /**
  * Intermediate ledger states for a column-to-column drag, excluding the
  * current state and ending at the final target state. Null means the drag
- * is illegal as a whole and must be rejected before any PATCH is sent:
- * every returned hop is checked against the state machine, and archived or
- * terminal cards never produce a plan.
+ * is illegal as a whole and must be rejected before any PATCH is sent.
  *
- * Fixed mapping (plan B.4):
- * - to-do → in-progress ends at `running` (pending/deferred take the
- *   `→ placed → running` multi-hop; placed/parked hop straight to running);
- * - in-progress → done ends at `done` (stalled recovers through running);
- * - in-progress → to-do back-drags to `parked`.
+ * Every path is *computed* from {@link canTransition} (BFS over the state
+ * machine), so the two can never drift: terminal states are never used as
+ * intermediates, and when any hop lacks an edge the whole move rejects.
+ *
+ * Allowed column pairs and their target-state set (plan B.4):
+ * - to-do → in-progress lands on `running`/`stalled`. BFS yields
+ *   `pending/deferred → placed → running` (multi-hop) and the direct
+ *   `placed/parked → running`;
+ * - in-progress → done lands on `done`; there is no stalled→done edge, so a
+ *   stalled card takes `stalled → running → done`;
+ * - in-progress → to-do lands on the nearest legal to-do state, `parked`.
+ *
+ * To-do → done is deliberately not a board move (the card must pass through
+ * the in-progress column deliberately); archiving uses the archive route,
+ * not a state transition.
  */
 export function columnMoveHops(
   task: Pick<Task, "state" | "archivedAt" | "placement">,
@@ -98,36 +106,66 @@ export function columnMoveHops(
   if (fromColumn === target || fromColumn === "archived") return null;
   if (isTerminalState(task.state)) return null;
 
-  let hops: TaskState[];
+  let targetStates: readonly TaskState[];
   switch (target) {
     case "in-progress":
       if (fromColumn !== "todo") return null;
-      hops = task.state === "pending" || task.state === "deferred"
-        ? ["placed", "running"]
-        : ["running"];
+      targetStates = ["running", "stalled"];
       break;
     case "done":
       if (fromColumn !== "in-progress") return null;
-      hops = task.state === "stalled" ? ["running", "done"] : ["done"];
+      targetStates = ["done"];
       break;
     case "todo":
       if (fromColumn !== "in-progress") return null;
-      // Nearest legal back-drag for both running and stalled is `parked`.
-      hops = ["parked"];
+      targetStates = ["pending", "placed", "deferred", "parked"];
       break;
     case "archived":
       // Archiving is the dedicated archive route, not a state transition.
       return null;
   }
 
-  // Validate the whole chain before the first PATCH: one illegal hop
-  // rejects the whole move and the caller leaves the card where it was.
-  let current = task.state;
-  for (const hop of hops) {
-    if (!canTransition(current, hop)) return null;
-    current = hop;
+  const path = shortestLegalPath(task.state, new Set(targetStates));
+  // BFS includes the start node; the PATCH sequence is everything after it.
+  return path && path.length > 1 ? path.slice(1) : null;
+}
+
+/**
+ * Shortest legal path from `start` to any state in `targets`, computed
+ * purely from {@link canTransition}. Terminal states (`done`, `failed`)
+ * never serve as intermediate steps: done cannot be traversed and failed
+ * must never be introduced by a drag. Returns the full path including
+ * `start`, or null when no legal path exists.
+ */
+function shortestLegalPath(
+  start: TaskState,
+  targets: ReadonlySet<TaskState>,
+): TaskState[] | null {
+  if (targets.has(start)) return [start];
+  const queue: TaskState[] = [start];
+  const predecessor = new Map<TaskState, TaskState>();
+  const seen = new Set<TaskState>([start]);
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (targets.has(current) && current !== start) {
+      const path: TaskState[] = [];
+      let node: TaskState | undefined = current;
+      while (node !== undefined) {
+        path.unshift(node);
+        node = predecessor.get(node);
+      }
+      return path;
+    }
+    for (const next of LEGAL_TRANSITIONS[current] ?? []) {
+      if (seen.has(next)) continue;
+      // Never traverse a terminal state to reach a column target.
+      if (!targets.has(next) && isTerminalState(next)) continue;
+      seen.add(next);
+      predecessor.set(next, current);
+      queue.push(next);
+    }
   }
-  return hops;
+  return null;
 }
 
 /** Columns the card may legally be dragged to right now (UI disables rest). */

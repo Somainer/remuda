@@ -312,7 +312,10 @@ test.describe("mobile new session (390px)", () => {
     const collected = collectScreenResponses(page, exitedIds);
 
     await page.goto("/sessions");
-    await expect(page.getByTestId("session-list")).toBeVisible();
+    // Compact /sessions redirects to the /m phone home (D-049), which renders
+    // HomeList rather than the desktop SessionList.
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("home-list")).toBeVisible();
     await page.getByTestId("space-chip").filter({ hasText: "remuda-e2e" }).first().click();
     // Mobile auto-opens the space's first tab (an id owned by whichever suite
     // populated this shared hub first — do not assert which one). Navigate to a
@@ -325,24 +328,29 @@ test.describe("mobile new session (390px)", () => {
     await page.waitForTimeout(3_000);
     // D-049: the compact /s/:id route renders no app bottom bar; leaving the
     // session is the header back link, which lands on /sessions and bounces
-    // to the phone home /m (the old bottom-bar helper is gone on purpose).
+    // to the phone home /m (HomeList renders there, not the desktop list).
     await page.getByRole("link", { name: "返回" }).click();
     await expect(page).toHaveURL(/\/m$/);
-    await expect(page.getByTestId("session-list")).toBeVisible();
+    await expect(page.getByTestId("home-list")).toBeVisible();
     // This space also holds other suites' rows; assert at least all 14 of
-    // ours are rendered, scoped by the ids this test created. evaluateAll
-    // serialises args as JSON, so pass an array (no Set across the boundary),
-    // and poll via expect.poll: a cached one-shot promise would not requery.
+    // ours are rendered, scoped by the ids this test created. The phone home
+    // row carries no instance-id attribute, so match the row link's href.
+    // evaluateAll serialises args as JSON, so pass an array (no Set across
+    // the boundary), and poll via expect.poll: a cached one-shot promise
+    // would not requery.
     await expect
       .poll(
         () =>
           page
-            .locator('[data-testid="board-card"][data-lifecycle="exited"]')
+            .locator('[data-testid="home-row"][data-status="exited"]')
             .evaluateAll(
-              (cards, ids) =>
-                cards.filter((card) =>
-                  ids.includes((card as HTMLElement).dataset.instanceId ?? ""),
-                ).length,
+              (rows, ids) =>
+                rows.filter((row) => {
+                  const href =
+                    (row.querySelector("a[href]") as HTMLAnchorElement | null)?.getAttribute("href") ??
+                    "";
+                  return ids.includes(href.replace("/s/", ""));
+                }).length,
               [...exitedIds],
             ),
         { timeout: 10_000 },
@@ -350,7 +358,9 @@ test.describe("mobile new session (390px)", () => {
       .toBeGreaterThanOrEqual(exitedIds.size);
     await shot(page, "mobile-new-session-1-list-390.png");
 
-    // Several 2.5 s list poll cycles: zero /screen reads for the exited rows.
+    // Several 2.5 s home poll cycles: zero /screen reads for the exited rows
+    // (the phone home polls screens for tty-attachable rows only, and the
+    // store skips exited/failed lifecycles).
     await page.waitForTimeout(6_000);
     const screenCalls = [...collected.watched.values()].reduce((sum, n) => sum + n, 0);
     expect(screenCalls, "no bulk screen reads for exited rows").toBe(0);
@@ -362,7 +372,8 @@ test.describe("mobile new session (390px)", () => {
     await shot(page, "mobile-new-session-1-session-390.png");
 
     // The dimmed list stays mounted behind this sheet; it must not fan out.
-    // We're on /s/:firstId here, which has no app bottom bar in compact.
+    // We're on /s/:firstId here, which has no app bottom bar in compact:
+    // back to /m, then the phone shell's 新建 (c-msessionfold D-049).
     await newSessionFromSessionRoute(page);
     const secondId = await createSessionViaSheet(page, "mobile new session repro two");
     created.push(secondId);
@@ -444,7 +455,9 @@ test.describe("mobile new session (390px)", () => {
       .toBeGreaterThanOrEqual(16);
 
     await page.goto("/sessions");
-    await expect(page.getByTestId("session-list")).toBeVisible();
+    // Compact /sessions redirects to the /m phone home (D-049).
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("home-list")).toBeVisible();
     await newFromBottomBar(page);
     await expect(page.getByTestId("new-session-sheet")).toBeVisible();
     await page.getByTestId("new-session-prompt").fill("mobile new session under saturation");

@@ -1,0 +1,249 @@
+/*
+ * /m phone home (D-049, ui-spec §4.7 / §2.1). One column: search + ordering,
+ * project group headers (project · git branch · blocked count), then rows of
+ * dot + title + one next-step/error sentence + remaining-context ring.
+ * Compact-only: this module is never imported by a desktop route.
+ */
+
+.home {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--ink);
+}
+
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  /* 4px each side + the 44px controls keeps this bar at the 52px
+     --top-mobile budget while every control owns var(--touch) (D-039). */
+  padding: var(--space-1) var(--space-3);
+  background: var(--ink-0);
+  border-bottom: 1px solid var(--line);
+}
+
+.search {
+  flex: 1 1 auto;
+  min-width: 0;
+  /* min-height rather than height: a fractional device-pixel border must not
+     paint the box just under the 44px target (ui-spec §3.4). */
+  height: auto;
+  min-height: var(--touch);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-1);
+  color: var(--paper);
+  font-family: var(--font);
+  font-size: var(--text-aux);
+}
+
+.search::placeholder {
+  color: var(--mute);
+}
+
+.order {
+  flex: none;
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.order button {
+  min-height: var(--touch);
+  padding: 0 10px;
+  border: 0;
+  background: var(--ink-1);
+  color: var(--mute);
+  font-family: var(--font);
+  font-size: var(--text-label);
+}
+
+.order button[aria-pressed="true"] {
+  background: var(--ink-2);
+  color: var(--paper);
+}
+
+.groups {
+  flex: 1 1 auto;
+  padding-bottom: var(--space-3);
+}
+
+.group {
+  border-bottom: 1px solid var(--line);
+}
+
+.groupHead {
+  position: sticky;
+  top: 53px;
+  z-index: 4;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-height: 32px;
+  padding: var(--space-1) var(--space-3);
+  background: var(--ink-1);
+  font-size: var(--text-aux);
+}
+
+.groupProject {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--paper);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.groupBranch {
+  flex: none;
+  color: var(--cold);
+  font-family: var(--mono);
+  font-size: var(--text-label);
+  white-space: nowrap;
+}
+
+.groupBlocked {
+  flex: none;
+  color: var(--danger-strong);
+  font-size: var(--text-label);
+  white-space: nowrap;
+}
+
+.groupBlocked[data-zero="1"] {
+  color: var(--mute);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 56px;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.row[data-blocked="1"] {
+  background: color-mix(in srgb, var(--dust) 7%, transparent);
+}
+
+.rowMain {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: inherit;
+  text-decoration: none;
+}
+
+.dot {
+  flex: none;
+}
+
+.rowText {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rowTitle {
+  font-size: var(--text-body);
+  color: var(--paper);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rowBody {
+  font-size: var(--text-aux);
+  color: var(--mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rowBody[data-error="1"] {
+  color: var(--danger-strong);
+}
+
+/* The ring never shrinks the text column: it reserves its own 28px slot. */
+.ring {
+  flex: none;
+  position: relative;
+  width: 28px;
+  height: 28px;
+  display: inline-grid;
+  place-items: center;
+}
+
+.ring svg {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  transform: rotate(-90deg);
+}
+
+.ringTrack {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 2.5;
+}
+
+.ringArc {
+  fill: none;
+  stroke: var(--cold);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke-dasharray 160ms ease;
+}
+
+.ringText {
+  position: relative;
+  font-family: var(--mono);
+  font-size: 8px;
+  line-height: 1;
+  color: var(--paper);
+}
+
+.resume {
+  flex: none;
+  min-height: var(--touch);
+  min-width: var(--touch);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  color: var(--paper);
+  font-family: var(--font);
+  font-size: var(--text-aux);
+}
+
+.resume:disabled {
+  color: var(--mute);
+}
+
+.rowError {
+  flex: 0 0 100%;
+  margin: 0;
+  padding: 0 var(--space-3) var(--space-2);
+  font-size: var(--text-label);
+  color: var(--danger-strong);
+}
+
+.empty {
+  padding: var(--space-5) var(--space-3);
+  text-align: center;
+  color: var(--mute);
+  font-size: var(--text-aux);
+}

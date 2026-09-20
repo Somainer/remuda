@@ -15,6 +15,7 @@ import { BotsPage, BotDetailPage } from "../pages/BotsPage";
 import { SettingsPage } from "../pages/SettingsPage";
 import { SubagentView } from "../features/session/subagent/SubagentView";
 import { Inbox } from "../features/mobile/Inbox";
+import { HomeList } from "../features/mobile/HomeList";
 import { resolveLanding } from "../lib/mobileRoute";
 import { useWorkbenchViewport } from "../lib/viewport";
 
@@ -74,7 +75,7 @@ export function AppRouter() {
         </Route>
         <Route element={<ViewportGate />}>
           <Route path="/m" element={<PhoneShell />}>
-            <Route index element={<SessionsPage />} />
+            <Route index element={<HomeList />} />
             <Route path="inbox" element={<Inbox />} />
             <Route path="*" element={<Navigate to="/m" replace />} />
           </Route>

@@ -641,6 +641,24 @@ async fn fake_node(
                         continue;
                     }
                     if method == "instance.resume" {
+                        // Report the child ready with the inherited native
+                        // session id so its Hub row goes live and the phone
+                        // home can navigate straight to the new instance
+                        // (D-026). The claude-pty branch above handles its own
+                        // provider-overlay-gated launch.
+                        let session_id = spec
+                            .get("resumeSessionId")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+                        append_n = append_instance_state(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "ready",
+                            Some(&session_id),
+                        )
+                        .await?;
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         continue;
                     }
@@ -679,6 +697,36 @@ async fn fake_node(
                         .or_else(|| params.get("prompt"))
                         .and_then(Value::as_str)
                         .unwrap_or("hello");
+                    // c-mhome: an exited row carrying an error. The instance
+                    // reports a native session id first (D-026 resume needs a
+                    // transcript to continue), then exits with `lastError`,
+                    // which is the text the phone home puts in the row body.
+                    if prompt.contains("mhome-exit") {
+                        let session_id = format!("mhome-exit-{}", uuid::Uuid::now_v7());
+                        append_n = append_instance_state(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            "ready",
+                            Some(&session_id),
+                        )
+                        .await?;
+                        append_n = append_instance_exit(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            &session_id,
+                            "API Error: MHOME_EXIT_SENTINEL (429)",
+                        )
+                        .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     let interaction_id = InteractionId::new();
                     // c-nextstep list-row phrase: a create prompt with the
                     // `workflow card <scenario> row-phrase` form raises NO
@@ -769,8 +817,18 @@ async fn fake_node(
                     // complete). c-steer: the "blocked-question" sentinel
                     // instead projects `blocked` directly — a pending question
                     // is never `working`, so the composer must not mistake it
-                    // for a turn.
-                    if prompt.contains("blocked-question") {
+                    // for a turn. c-mhome's "mhome-blocked" row is blocked the
+                    // same way, after one usage observation so its home row has
+                    // a known 50% context ring (100k of the 200k Claude window).
+                    if prompt.contains("mhome-blocked") {
+                        if let Some(usage) = scripted_usage("usage:40000,500,60000,0") {
+                            append_n =
+                                append_event(&mut ws, &instance_id, append_n, "usage", usage)
+                                    .await?;
+                        }
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
+                    } else if prompt.contains("blocked-question") {
                         append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
                             .await?;
                     } else {
@@ -2194,6 +2252,43 @@ async fn append_instance_state(
                     "payload": {
                         "type": "entity", "entityType": "instance", "state": state,
                         "entity": { "nativeRef": { "sessionId": { "value": session_id } } }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
+}
+
+/// c-mhome: an entity `exited` lifecycle carrying the native session id and
+/// the last error text. The Hub folds both onto the instance row; the error
+/// is what the phone home renders in the row body ("errors as body"), while
+/// the session id keeps D-026 resume available.
+async fn append_instance_exit(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    session_id: &str,
+    last_error: &str,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": format!("j{seq}"), "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "lifecycle",
+                    "payload": {
+                        "type": "entity", "entityType": "instance", "state": "exited",
+                        "entity": {
+                            "nativeRef": { "sessionId": { "state": "known", "value": session_id } },
+                            "lastError": last_error
+                        }
                     }
                 }
             }

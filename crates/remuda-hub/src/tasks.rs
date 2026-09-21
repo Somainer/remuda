@@ -573,22 +573,11 @@ async fn bind_task_directory(
     )
     .await
     .map_err(crate::http::lease_refusal)?;
-    // The Node decides mode from the catalog record, not the request: a pool
-    // name that collides with an operator's standalone worktree comes back as
-    // reuse. Never silently change modes — release the row and refuse (D-035).
-    let wire_mode = outcome
-        .result
-        .get("mode")
-        .and_then(Value::as_str)
-        .unwrap_or("pool");
-    if wire_mode
-        != match mode {
-            TaskBindingMode::Reuse => "reuse",
-            TaskBindingMode::Pool => "pool",
-        }
-    {
-        // Undo the lease on both sides: reuse return is a zero-op on disk
-        // (catalog refcount only), so this cannot disturb the directory.
+    // Release the just-acquired lease on both sides after a post-lease
+    // failure: a reuse return is a zero-op on disk (catalog refcount only),
+    // so rollback can never disturb the directory. An offline Node is left
+    // for reconnect reconciliation; the Hub row is always released.
+    let roll_back_lease = |dir_key: String| async move {
         let return_params = json!({
             "hostId": member.host_id.as_id().as_str(),
             "workspaceId": member.workspace_id.as_id().as_str(),
@@ -603,25 +592,53 @@ async fn bind_task_directory(
         )
         .await
         {
-            tracing::warn!(%error, "mode-mismatch rollback: Node worktree.return failed; catalog reconciles on reconnect");
+            tracing::warn!(%error, "binding rollback: Node worktree.return failed; catalog reconciles on reconnect");
         }
-        let _ = state
+        if let Err(error) = state
             .store
             .release_worktree_lease(
                 member.host_id.as_id().to_string(),
                 member.workspace_id.as_id().to_string(),
-                outcome.row.dir_key.clone(),
+                dir_key,
                 task.meta.id.as_id().to_string(),
                 "free".into(),
                 None,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(%error, "binding rollback: Hub lease release failed");
+        }
+    };
+    // The Node decides mode from the catalog record, not the request: a pool
+    // name that collides with an operator's standalone worktree comes back as
+    // reuse. Never silently change modes — release the row and refuse (D-035).
+    let wire_mode = outcome
+        .result
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("pool");
+    if wire_mode
+        != match mode {
+            TaskBindingMode::Reuse => "reuse",
+            TaskBindingMode::Pool => "pool",
+        }
+    {
+        let dir_key = outcome.row.dir_key.clone();
+        roll_back_lease(dir_key).await;
         return Err(HubError::Conflict(format!(
             "requested a {mode:?} worktree but {path_name:?} is an existing directory of mode {wire_mode}; refusing to change modes"
         )));
     }
-    let lease_id = remuda_protocol::Id::try_from(outcome.row.id.clone())
-        .map_err(|error| HubError::Internal(format!("lease id from store: {error}")))?;
+    let lease_id = match remuda_protocol::Id::try_from(outcome.row.id.clone()) {
+        Ok(lease_id) => lease_id,
+        Err(error) => {
+            // The lease row is recorded before the id is needed; release it
+            // too so this failure cannot leak a refcount (the task row is
+            // rolled back by the caller regardless).
+            roll_back_lease(outcome.row.dir_key.clone()).await;
+            return Err(HubError::Internal(format!("lease id from store: {error}")));
+        }
+    };
     let binding = TaskSpaceBinding {
         mode,
         host_id: member.host_id.clone(),

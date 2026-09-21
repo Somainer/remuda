@@ -11,6 +11,7 @@ import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
 import { spaceStore } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
+import { ProjectSwitcher, useProjects } from "../features/tasks/ProjectSwitcher";
 import { SessionsPage } from "../pages/SessionsPage";
 import { InstallBar } from "./InstallBar";
 import css from "./Shell.module.css";
@@ -171,6 +172,9 @@ export function ShellNotify() {
 export function Shell() {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
+  // D-050 §9: the top-bar 全局▸project switcher scopes the task list and the
+  // board (their surfaces read useProjectFilter). Loaded once per shell mount.
+  const projectDirectory = useProjects();
   const location = useLocation();
   const navigate = useNavigate();
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
@@ -305,6 +309,22 @@ export function Shell() {
         </aside>
       ) : null}
       <main className={css.main}>
+        {/* Top-bar project scope: desktop only; compact carries project
+            grouping on /m (ui-spec §2.9/§4.7, D-049). */}
+        {!mobile ? (
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              alignItems: "center",
+              gap: 8,
+              padding: "6px 12px",
+              borderBottom: "1px solid var(--line)",
+            }}
+          >
+            <ProjectSwitcher projects={projectDirectory.projects} />
+          </div>
+        ) : null}
         {onSessions && mobile && !onSessionPage ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} onSelect={workbench.select} /> : null}
         {/* D-049: on compact /s/:id* the SpaceTabs row does not render — the
             header chip's drawer (spaces-drawer-open) and Jump To keep every

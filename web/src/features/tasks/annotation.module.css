@@ -1,0 +1,283 @@
+/*
+ * Annotation panel, badge and selection affordance (plan task-model task 9,
+ * D-050 §7 / ui-spec §2.9). Structured feedback drafts pinned to a task card
+ * or to a ① text anchor; the panel rides above the session composer and the
+ * badge reads 「本次发送带 N 条批注」. The two tabs match the 卡片 / 标记
+ * carriers. All state is device-local (annotations.ts); this module owns no
+ * wire and no queue structure (D-042 untouched).
+ */
+
+/* Zero-height anchor at the top of the session dock; the bar floats above
+   the dock edge (over the transcript) so it consumes no flow height and the
+   session body keeps its measured viewport share. */
+.floatLayer {
+  position: relative;
+  height: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+
+.annotationBar {
+  position: absolute;
+  right: 18px;
+  bottom: calc(100% + 6px);
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  pointer-events: auto;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  color: var(--paper);
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  cursor: pointer;
+}
+
+.badge[data-active="1"] {
+  border-color: var(--dust);
+  color: var(--dust);
+}
+
+.badge[data-disabled="1"] {
+  color: var(--mute);
+  cursor: not-allowed;
+  border-color: var(--line);
+}
+
+.badgeCount {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+.readonlyTag {
+  font-size: var(--text-aux);
+  color: var(--mute);
+}
+
+.panel {
+  border-top: 1px solid var(--line);
+  background: var(--ink-1);
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.tabs {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.tab {
+  border: 1px solid var(--line);
+  background: var(--ink-0);
+  color: var(--mute);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  cursor: pointer;
+}
+
+.tab[data-active="1"] {
+  color: var(--paper);
+  border-color: var(--dust);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 168px;
+  overflow-y: auto;
+}
+
+.empty {
+  margin: 0;
+  font-size: var(--text-aux);
+  color: var(--mute);
+}
+
+.item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  padding: 6px 8px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: var(--text-aux);
+}
+
+.itemMark {
+  font-family: var(--mono);
+  color: var(--dust);
+  flex: 0 0 auto;
+}
+
+.itemBody {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--paper);
+}
+
+.itemQuote {
+  color: var(--mute);
+}
+
+.itemWhere {
+  color: var(--mute);
+  font-size: var(--text-label);
+}
+
+.remove {
+  border: 0;
+  background: transparent;
+  color: var(--mute);
+  cursor: pointer;
+  font-size: var(--text-aux);
+  padding: 0 2px;
+}
+
+.remove:hover {
+  color: var(--danger-strong);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.textarea {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 56px;
+  resize: vertical;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  color: var(--paper);
+  font-family: var(--font);
+  font-size: var(--text-aux);
+}
+
+.textarea::placeholder {
+  color: var(--mute);
+}
+
+.quotePreview {
+  margin: 0;
+  padding: 6px 8px;
+  border-left: 2px solid var(--dust);
+  background: var(--ink-0);
+  color: var(--mute);
+  font-size: var(--text-aux);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+.actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.save {
+  border: 1px solid var(--dust);
+  background: var(--dust);
+  color: var(--on-dust);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  cursor: pointer;
+}
+
+.save[data-disabled="1"] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.cancel {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--mute);
+  border-radius: var(--radius);
+  padding: 4px 12px;
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  cursor: pointer;
+}
+
+/* Floating 批注 affordance near a text selection. */
+.capture {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 280px;
+  padding: 8px;
+  border: 1px solid var(--dust);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+}
+
+.captureTrigger {
+  position: fixed;
+  z-index: 59;
+  border: 1px solid var(--dust);
+  background: var(--ink-2);
+  color: var(--dust);
+  border-radius: var(--radius);
+  padding: 3px 10px;
+  font-family: var(--font);
+  font-size: var(--text-aux);
+  cursor: pointer;
+}
+
+.captureHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--text-label);
+  color: var(--mute);
+}
+
+.captureTitle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.captureReadonly {
+  font-size: var(--text-aux);
+  color: var(--danger-strong);
+}
+
+.savedNote {
+  margin: 0;
+  font-size: var(--text-aux);
+  color: var(--ok);
+}

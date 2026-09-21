@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { rest } from "../../lib/api";
 import type { components } from "../../lib/api.generated";
 import { HubHttpError } from "../../lib/httpError";
@@ -325,7 +325,11 @@ function BoardColumnView({
 export function BoardPage() {
   const hub = useHub();
   const prefs = useSpacesPrefs();
-  const projectId = useProjectFilter();
+  const [params] = useSearchParams();
+  // A deep link ?project= wins (ui-spec route table); otherwise the top-bar
+  // switcher's device-local selection scopes the projection (task 8).
+  const switcherProject = useProjectFilter();
+  const projectId = params.get("project") ?? switcherProject;
   const { view, reload } = useBoardView(projectId);
   const projectNames = useProjectNames();
 

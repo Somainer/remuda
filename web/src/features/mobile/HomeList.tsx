@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import type { Id } from "../../types/wire";
 import { hubStore, useHub } from "../../lib/store";
@@ -8,10 +8,12 @@ import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { fetchChanges } from "../files/filesApi";
 import {
   buildHomeGroups,
+  buildHomeTaskLayer,
   readHomeOrder,
   writeHomeOrder,
   type HomeOrder,
 } from "./homeRows";
+import { TaskGroups, useTaskLedger } from "../tasks/TaskList";
 import { ContextRing } from "./ContextRing";
 import css from "./home.module.css";
 
@@ -30,6 +32,10 @@ type ResumeState = { busy: boolean; error: string | null };
 export function HomeList() {
   const hub = useHub();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  // The desktop board collapses to /m with its ?project= preserved
+  // (resolveLanding keeps the query verbatim); honor it on the task layer.
+  const projectFilter = params.get("project");
   const prefs = useSpacesPrefs();
   const [query, setQuery] = useState("");
   const [order, setOrder] = useState<HomeOrder>(() => readHomeOrder(localStorageAccess()));
@@ -144,6 +150,24 @@ export function HomeList() {
     [spaces, hub.interactions, hub.screens, hub.events, order, query, branches],
   );
 
+  // D-050 task layer stacked above the project+branch session groups:
+  // 需要你 first, tasks nested by parent, SE-nn keys, archive folded. Tapping
+  // a task row opens the shared /s/:id — no second transcript (D-049).
+  const taskLedger = useTaskLedger(projectFilter);
+  const taskLayer = useMemo(
+    () =>
+      buildHomeTaskLayer({
+        tasks: taskLedger.tasks,
+        instances: hub.instances,
+        interactions: hub.interactions,
+        spaces,
+        projectName: taskLedger.projectName,
+        branchOfSpace: (spaceId) => branches[spaceId] || null,
+        query,
+      }),
+    [taskLedger.tasks, taskLedger.projectName, hub.instances, hub.interactions, spaces, branches, query],
+  );
+
   async function onResume(instanceId: string) {
     setResumeStates((current) => ({ ...current, [instanceId]: { busy: true, error: null } }));
     // D-026: resume is a new instance inheriting the native session; on
@@ -191,12 +215,17 @@ export function HomeList() {
           </button>
         </div>
       </div>
-      {groups.length === 0 ? (
+      {groups.length === 0 && taskLayer.length === 0 ? (
         <div className={css.empty} data-testid="home-empty">
           {query.trim() ? "没有匹配的会话" : "暂无会话"}
         </div>
       ) : (
         <div className={css.groups}>
+          {taskLayer.length > 0 ? (
+            <div data-testid="home-tasks">
+              <TaskGroups groups={taskLayer} variant="phone" />
+            </div>
+          ) : null}
           {groups.map((group) => (
             <section key={group.id} className={css.group} data-testid="home-group" data-blocked={group.blockedCount}>
               <header className={css.groupHead}>

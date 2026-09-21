@@ -27,6 +27,12 @@ export type TuiMode = "fullscreen" | "default";
 export type Instance = EntityMeta & {
   hostId: Id;
   workspaceId: Id;
+  /**
+   * Ledger task this session belongs to (`instances.task_id`, D-050). A task
+   * aggregates its sessions for the task list; null for unbound sessions.
+   * Additive wire field — the Hub already serves it on InstanceRecord.
+   */
+  taskId?: Id | null;
   kind: Kind;
   driver: DriverKind;
   lifecycle: Lifecycle;

@@ -284,6 +284,15 @@ export function Shell() {
           ◆
           {pending ? <span className={css.badge}>{pending}</span> : null}
         </Link>
+        {!mobile ? (
+          <Link
+            className={`${css.icon} ${location.pathname.startsWith("/board") ? css.iconActive : ""}`}
+            to="/board"
+            title="任务"
+          >
+            ▦
+          </Link>
+        ) : null}
         <Link className={css.icon} to={onSessions ? workbench.newHref : "/sessions/new"} title="新建">
           <span className={css.plusBox}>＋</span>
         </Link>

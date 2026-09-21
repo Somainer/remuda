@@ -19,10 +19,9 @@
 
 .annotationBar {
   position: absolute;
-  left: 18px;
   right: 18px;
   bottom: calc(100% + 6px);
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-2);

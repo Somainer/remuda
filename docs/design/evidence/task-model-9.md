@@ -20,7 +20,7 @@
 | `web/src/features/tasks/annotations.test.ts` | 新建。19 条 vitest：锚点创建、徽标计数、发送序列化（两载体、空发送、空白忽略、无协议词）、localStorage 持久/隔离/清除/损坏 JSON 容错、订阅通知、DOM 选区（transcript/task-detail、read-only、无归属会话） |
 | `web/src/features/tasks/AnnotationPanel.tsx` | 新建。`AnnotationProvider` + `AnnotationBadge`（「本次发送带 N 条批注」）+ `AnnotationPanel`（**卡片 / 标记 两 tab**）+ `useSessionTask`（`GET /v1/tasks` 只读解析会话→任务，归档判定）。无 Provider 时有 localStorage 降级上下文（SessionPage 单测可独立挂载） |
 | `web/src/features/tasks/AnnotationPanel.test.tsx` | 新建。4 条组件测试：徽标出现/计数、卡片增删、标记 tab 的 ① 编号、归档只读 |
-| `web/src/features/tasks/annotation.module.css` | 新建。徽标、两 tab 面板、选区气泡的样式（复用设计 token，未碰 `session.module.css`） |
+| `web/src/features/tasks/annotation.module.css` | 新建。徽标、两 tab 面板、选区气泡的样式（复用设计 token，未碰 `session.module.css`）。**休止态徽标行用零高度 float layer 锚在 dock 顶部**（绝对定位浮在 composer 上方），不占文档流，故 session body 的视口占比测量（m-chrome ≥0.60）与改动前一致；只有打开的面板进流 |
 | `web/src/features/session/AnnotationCapture.tsx` | 新建。选区→锚点 affordance：在 `data-anchor-surface` 内选中正文弹出「批注」触发钮与输入气泡，存为归属会话（`data-annotation-instance`）的 ① 草稿；read-only 面不弹；在 `/board` 时保存后给「去工作台查看」入口 |
 | `web/src/features/session/Transcript.tsx` | **纯增量标记**：消息 `<section>` 加 `data-anchor-surface="transcript"` + `data-anchor-message={node.id}`，使正文成为 ① 锚点面；未改渲染结构、未碰 ToolCard |
 | `web/src/features/tasks/TaskDetailPanel.tsx` | mandate 正文面补 `data-annotation-instance`（主会话 id）与 `data-annotation-readonly`（归档任务=1） |

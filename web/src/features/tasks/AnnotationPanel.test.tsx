@@ -128,15 +128,21 @@ describe("AnnotationBadge + AnnotationPanel", () => {
     expect(screen.getByTestId("annotation-item")).toHaveTextContent("①");
   });
 
-  it("is a non-interactive read-only preview for archived-task sessions", () => {
-    render(<Harness readonly />);
+  it("is a read-only preview for archived-task sessions: no create forms, drafts still removable", () => {
     seed([{ id: "a1", createdAt: 1, carrier: "card", body: "kept" }]);
-    fireEvent.click(screen.getByTestId("open-card"));
+    render(<Harness readonly />);
     const badge = screen.getByTestId("annotation-badge");
-    expect(badge).toBeDisabled();
-    expect(badge).toHaveAttribute("data-disabled", "1");
+    // Not disabled: a draft made before the archived state resolved stays
+    // openable for review/removal, but creating is blocked.
+    expect(badge).not.toBeDisabled();
+    expect(badge).toHaveAttribute("data-readonly", "1");
+    fireEvent.click(screen.getByTestId("open-card"));
     expect(screen.queryByTestId("annotation-card-input")).toBeNull();
     expect(screen.getByTestId("annotation-readonly-note")).toHaveTextContent("只读预览");
     expect(screen.getByTestId("annotation-panel")).toHaveAttribute("data-readonly", "1");
+    // Existing drafts can still be withdrawn (otherwise they would be trapped
+    // behind a preview forever).
+    fireEvent.click(screen.getByTestId("annotation-item-remove"));
+    expect(readAnnotations(iid)).toHaveLength(0);
   });
 });

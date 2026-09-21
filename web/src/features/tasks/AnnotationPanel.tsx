@@ -166,16 +166,18 @@ export function AnnotationBadge({
   if (count === 0) return null;
 
   const open = panel?.instanceId === instanceId;
+  // Read-only (archived) sessions may still OPEN the panel to review or
+  // remove drafts created before the read-only state resolved; the badge is
+  // only inert when there is nothing to open.
   return (
     <button
       type="button"
       className={css.badge}
       data-testid="annotation-badge"
       data-active={open ? "1" : "0"}
-      data-disabled={readonly ? "1" : "0"}
-      disabled={readonly}
+      data-readonly={readonly ? "1" : "0"}
       aria-expanded={open}
-      title={readonly ? "只读预览：批注不可用" : "查看随下一次发送投递的批注"}
+      title={readonly ? "只读预览：仅可查看或撤回已有批注" : "查看随下一次发送投递的批注"}
       onClick={() => (open ? closePanel() : openPanel(instanceId, "card"))}
     >
       <span aria-hidden="true">批注</span>
@@ -285,7 +287,9 @@ export function AnnotationPanel({
                   className={css.remove}
                   data-testid="annotation-item-remove"
                   aria-label="删除批注"
-                  disabled={readonly}
+                  // Read-only only blocks creating annotations; removing a
+                  // local draft is always allowed (otherwise a draft made
+                  // before the archived state resolved would be trapped).
                   onClick={() => ctx.remove(instanceId, draft.id)}
                 >
                   ✕
@@ -313,7 +317,9 @@ export function AnnotationPanel({
                   className={css.remove}
                   data-testid="annotation-item-remove"
                   aria-label="删除批注"
-                  disabled={readonly}
+                  // Read-only only blocks creating annotations; removing a
+                  // local draft is always allowed (otherwise a draft made
+                  // before the archived state resolved would be trapped).
                   onClick={() => ctx.remove(instanceId, draft.id)}
                 >
                   ✕

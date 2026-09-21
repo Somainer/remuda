@@ -213,6 +213,30 @@ test("an empty task-space projection says 还没有文件 without synthesising e
   await expect(page.getByTestId("files-entry")).toHaveCount(3);
 });
 
+test("the truncation banner reports the rows the active tab actually renders", async ({ page }) => {
+  const host = await resolveHost(page);
+  // wsp_g2_trunc returns two rows and entriesOmitted=12.
+  const instanceId = await createInstance(page, "wsp_g2_trunc", host);
+  created.push(instanceId);
+  // Root-level *.txt covers both fixture rows (big.txt, many.txt).
+  const task = await createTaskWithOwns(page, ["*.txt"]);
+  await placeTaskOnInstance(page, task.id, host, instanceId);
+
+  await mountPanel(page, { host, ws: "wsp_g2_trunc", instance: instanceId });
+
+  // Project space: the server-side cap describes the full returned set.
+  const banner = page.getByTestId("files-trunc-entries");
+  await expect(banner).toBeVisible();
+  await expect(banner).toContainText("前 2 项");
+  await expect(banner).toContainText("12");
+
+  // Task space: the banner names the filtered count and flags that owned
+  // rows may be among the omitted ones — it never quotes the project count.
+  await page.getByTestId("files-space-task").click();
+  await expect(page.getByTestId("files-entry")).toHaveCount(2);
+  await expect(banner).toContainText("匹配的 2 项");
+});
+
 test("non-git and offline availability states pass through into the task space unchanged", async ({
   page,
 }) => {

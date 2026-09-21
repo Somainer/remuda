@@ -10,6 +10,7 @@ import {
   normalizeGlobs,
   taskHasSession,
   taskScopeFrom,
+  taskServesAxis,
   taskSpaceEntries,
   type TaskSpaceScope,
 } from "./taskSpaceFilter";
@@ -193,5 +194,35 @@ describe("taskScopeFrom — session set from the placement ledger", () => {
     const built = taskScopeFrom({ id: "tsk_2" } as never);
     expect(built.owns).toEqual([]);
     expect(built.sessionIds).toEqual([]);
+  });
+});
+
+describe("taskServesAxis — a foreign binding must not label the panel", () => {
+  const axis = { hostId: "hst_a", workspaceId: "wsp_a" };
+
+  it("accepts a binding on the same host+workspace", () => {
+    const task = {
+      workspaceBinding: { mode: "reuse", hostId: "hst_a", workspaceId: "wsp_a" },
+    } as never;
+    expect(taskServesAxis(task, axis)).toBe(true);
+  });
+
+  it("rejects a binding on a different workspace", () => {
+    const task = {
+      workspaceBinding: { mode: "reuse", hostId: "hst_a", workspaceId: "wsp_other" },
+    } as never;
+    expect(taskServesAxis(task, axis)).toBe(false);
+  });
+
+  it("rejects a binding on a different host", () => {
+    const task = {
+      workspaceBinding: { mode: "pool", hostId: "hst_other", workspaceId: "wsp_a" },
+    } as never;
+    expect(taskServesAxis(task, axis)).toBe(false);
+  });
+
+  it("accepts a task with no stored binding (nothing contradicts the axis)", () => {
+    expect(taskServesAxis({ workspaceBinding: undefined } as never, axis)).toBe(true);
+    expect(taskServesAxis({} as never, axis)).toBe(true);
   });
 });

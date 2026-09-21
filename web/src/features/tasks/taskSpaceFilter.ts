@@ -186,3 +186,24 @@ export function taskScopeFrom(
 export function taskHasSession(scope: TaskSpaceScope, instanceId: string): boolean {
   return scope.sessionIds.includes(instanceId);
 }
+
+/**
+ * Whether the task's recorded directory binding targets this panel's
+ * `hostId + workspaceId` axis. The instance match alone is not enough: a
+ * task can hold a placement for the session while its `workspaceBinding`
+ * names another workspace (moved/rebound tasks). Labelling this panel with
+ * that task would apply a foreign owns[] set to unrelated rows, so the
+ * caller must treat such a match as "no owning task here".
+ *
+ * A task without a stored binding cannot contradict the axis (its placement
+ * rows still record the host they ran on); only a binding that positively
+ * names a different host or workspace rejects it.
+ */
+export function taskServesAxis(
+  task: Pick<Task, "workspaceBinding">,
+  axis: { hostId: string; workspaceId: string },
+): boolean {
+  const binding = task.workspaceBinding;
+  if (!binding) return true;
+  return binding.hostId === axis.hostId && binding.workspaceId === axis.workspaceId;
+}

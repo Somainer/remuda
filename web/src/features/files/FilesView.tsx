@@ -348,9 +348,16 @@ function Body({
   return (
     <>
       {status.truncated.entries ? (
-        <p className={css.trunc} data-testid="files-trunc-entries">
-          条目过多：仅显示前 {status.entries.length} 项，另有 {status.truncated.entriesOmitted} 项被省略。
-        </p>
+        taskActive ? (
+          <p className={css.trunc} data-testid="files-trunc-entries">
+            工作区变更已达采集上限，另有 {status.truncated.entriesOmitted} 项未返回；
+            任务空间仅显示其中匹配的 {entries.length} 项，可能不完整。
+          </p>
+        ) : (
+          <p className={css.trunc} data-testid="files-trunc-entries">
+            条目过多：仅显示前 {status.entries.length} 项，另有 {status.truncated.entriesOmitted} 项被省略。
+          </p>
+        )
       ) : null}
       <ul className={css.list} data-testid="files-list">
         {entries.map((entry) => (

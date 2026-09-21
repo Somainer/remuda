@@ -5,6 +5,7 @@ import type { components } from "../../lib/api.generated";
 import { FilesView } from "../files/FilesView";
 import {
   taskScopeFrom,
+  taskServesAxis,
   type TaskPlacementRow,
   type TaskSpaceScope,
 } from "./taskSpaceFilter";
@@ -46,12 +47,19 @@ type PanelState =
   /** `null` task: no ledger task owns this session, so no task tab is shown. */
   | { phase: "ready"; task: TaskDoc | null; scope: TaskSpaceScope | null };
 
-/** Fetch one task plus its placement-ledger session set. */
-async function loadTaskScope(taskId: string): Promise<{ task: TaskDoc; scope: TaskSpaceScope }> {
+type PanelAxis = { hostId: string; workspaceId: string };
+
+/** Fetch one task plus its placement-ledger session set, on-axis only. */
+async function loadTaskScope(
+  taskId: string,
+  axis: PanelAxis,
+): Promise<{ task: TaskDoc; scope: TaskSpaceScope } | null> {
   const [task, placements] = await Promise.all([
     rest<TaskDoc>(`/v1/tasks/${encodeURIComponent(taskId)}`),
     rest<PlacementPage>(`/v1/tasks/${encodeURIComponent(taskId)}/placements`),
   ]);
+  // A task bound to a different host/workspace must not label this panel.
+  if (!taskServesAxis(task, axis)) return null;
   return { task, scope: taskScopeFrom(task, placements.items) };
 }
 
@@ -59,8 +67,16 @@ async function loadTaskScope(taskId: string): Promise<{ task: TaskDoc; scope: Ta
  * Discover the task whose session set contains `instanceId`. The task
  * document's current placement answers the common case with one list call;
  * only when nothing matches do we scan placement ledgers in parallel.
+ *
+ * The instance match alone is not sufficient: a rebound task can still hold
+ * a placement for this session while its binding names another workspace.
+ * Such a match is dropped — the panel renders the plain project-space view
+ * exactly as it does with no owning task.
  */
-async function resolveTaskByInstance(instanceId: string): Promise<{
+async function resolveTaskByInstance(
+  instanceId: string,
+  axis: PanelAxis,
+): Promise<{
   task: TaskDoc;
   scope: TaskSpaceScope;
 } | null> {
@@ -68,7 +84,10 @@ async function resolveTaskByInstance(instanceId: string): Promise<{
   const tasks = page.items ?? [];
 
   const current = tasks.find((item) => item.placement?.instanceId === instanceId);
-  if (current) return loadTaskScope(current.id);
+  if (current && taskServesAxis(current, axis)) {
+    const resolved = await loadTaskScope(current.id, axis);
+    if (resolved) return resolved;
+  }
 
   const ledgers = await Promise.all(
     tasks.map(async (task) => {
@@ -83,7 +102,10 @@ async function resolveTaskByInstance(instanceId: string): Promise<{
       }
     }),
   );
-  const match = ledgers.find(({ rows }) => rows.some((row) => row.instanceId === instanceId));
+  const match = ledgers.find(
+    ({ task, rows }) =>
+      taskServesAxis(task, axis) && rows.some((row) => row.instanceId === instanceId),
+  );
   if (!match) return null;
   return {
     task: match.task,
@@ -94,10 +116,15 @@ async function resolveTaskByInstance(instanceId: string): Promise<{
 async function resolveTask(
   taskId: string | undefined,
   instanceId: string | undefined,
+  axis: PanelAxis,
 ): Promise<{ task: TaskDoc | null; scope: TaskSpaceScope | null }> {
-  if (taskId) return loadTaskScope(taskId);
+  if (taskId) {
+    const found = await loadTaskScope(taskId, axis);
+    if (found) return found;
+    return { task: null, scope: null };
+  }
   if (instanceId) {
-    const found = await resolveTaskByInstance(instanceId);
+    const found = await resolveTaskByInstance(instanceId, axis);
     if (found) return found;
   }
   return { task: null, scope: null };
@@ -116,7 +143,7 @@ export function TaskSpacePanel({
   const load = useCallback(async () => {
     setState({ phase: "loading" });
     try {
-      const resolved = await resolveTask(taskId, instanceId);
+      const resolved = await resolveTask(taskId, instanceId, { hostId, workspaceId });
       setState({ phase: "ready", task: resolved.task, scope: resolved.scope });
     } catch (error) {
       setState({
@@ -124,7 +151,7 @@ export function TaskSpacePanel({
         message: error instanceof Error ? error.message : "load-failed",
       });
     }
-  }, [taskId, instanceId]);
+  }, [taskId, instanceId, hostId, workspaceId]);
 
   useEffect(() => {
     void load();

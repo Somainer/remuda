@@ -1274,6 +1274,8 @@ pub async fn create_instance(
     // directory or missing lease refuses the launch — never substitutes
     // another cwd (D-035).
     let mut binding_lease_key: Option<(String, String, String)> = None;
+    // Pre-spawn classification of the current holder for the atomic claim.
+    let mut binding_lease_holder: Option<Option<String>> = None;
     if let Some(binding) = &binding {
         let host_id = binding.host_id.as_id().to_string();
         let wsp_id = binding.workspace_id.as_id().to_string();
@@ -1304,22 +1306,32 @@ pub async fn create_instance(
                 "task does not hold an active lease on its bound directory".into(),
             ));
         }
-        // Attach lock (D-050 §2.3): a session from another task currently
-        // attached to this directory queues this launch rather than running
-        // concurrently; later sessions of the same task (its tabs) are allowed.
+        // Attach lock classification (D-050 §2.3): same-task sessions/tabs
+        // and stale holders are reclaimable; a live holder of another task
+        // queues this launch. The claim itself is taken atomically before
+        // spawn below.
         let bound_task_id = binding_task.as_ref().unwrap().meta.id.as_id().as_str();
-        if let Some(holder) = lease.holder_instance_id.as_ref()
-            && let Some(holder_instance) = state
-                .store
-                .get_instance(holder.clone())
-                .await
-                .map_err(map_store)?
-            && holder_instance.task_id.as_deref() != Some(bound_task_id)
+        let expect_holder = match state
+            .store
+            .classify_lease_holder(
+                host_id.clone(),
+                wsp_id.clone(),
+                dir_key.clone(),
+                bound_task_id.to_string(),
+            )
+            .await
+            .map_err(map_store)?
+            .expect("the lease row loaded above still exists")
         {
-            return Err(HubError::Conflict(format!(
-                "dir-busy: directory is attached by instance {holder} of another task; queued for serial reuse"
-            )));
-        }
+            crate::store::LeaseHolder::Busy(holder) => {
+                return Err(HubError::Conflict(format!(
+                    "dir-busy: directory is attached by instance {holder} of another task; queued for serial reuse"
+                )));
+            }
+            crate::store::LeaseHolder::Reclaimable(holder) => Some(holder),
+            crate::store::LeaseHolder::Free => None,
+        };
+        binding_lease_holder = Some(expect_holder);
         let cwd = if binding.is_root() {
             // Root: let the Node resolve the registered root through
             // resolve_instance_cwd exactly as an unbound launch would.
@@ -1445,7 +1457,38 @@ pub async fn create_instance(
             crate::inventory::computer_use_preflight(&host).map_err(HubError::BadRequest)?;
         }
     }
-    let (instance, command) = crate::placement::spawn_on_host(
+    // t-bind attach lock, taken atomically before any instance exists. The
+    // conditional UPDATE serializes two concurrent dispatches on one
+    // directory inside the store writer: exactly one claim lands, the other
+    // gets a dir-busy refusal instead of a second launch (D-050 §2.3). The
+    // claim is a pending token carrying the task; it is promoted to the
+    // spawned instance id below and released on a failed spawn.
+    let mut binding_claim: Option<(String, String, String, String)> = None;
+    if let Some((host_id, workspace_id, dir_key)) = binding_lease_key.clone() {
+        let task_for_claim = binding_task
+            .as_ref()
+            .map(|task| task.meta.id.as_id().as_str().to_string())
+            .unwrap_or_default();
+        let claim = format!("pending:{task_for_claim}:{}", uuid::Uuid::now_v7());
+        let claimed = state
+            .store
+            .claim_worktree_lease(
+                host_id.clone(),
+                workspace_id.clone(),
+                dir_key.clone(),
+                claim.clone(),
+                binding_lease_holder.expect("holder classification accompanies the key"),
+            )
+            .await
+            .map_err(map_store)?;
+        if !claimed {
+            return Err(HubError::Conflict(format!(
+                "dir-busy: directory {dir_key} is being attached by another launch; queued for serial reuse"
+            )));
+        }
+        binding_claim = Some((host_id, workspace_id, dir_key, claim));
+    }
+    let spawn_result = crate::placement::spawn_on_host(
         &state,
         &host,
         crate::placement::SpawnRequest {
@@ -1460,23 +1503,40 @@ pub async fn create_instance(
             delegation,
         },
     )
-    .await?;
-    // t-bind attach-lock: the launched session now holds the bound directory
-    // exclusively until it is deleted (delete_instance clears the holder and
-    // returns the lease). Sharing stays serial — a second bound task was
-    // queued/blocked at lease time.
-    if let Some((host_id, workspace_id, dir_key)) = binding_lease_key
-        && let Err(error) = state
+    .await;
+    let (instance, command) = match spawn_result {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            // The directory was claimed but no session exists; free it.
+            if let Some((host_id, workspace_id, dir_key, claim)) = binding_claim {
+                let _ = state
+                    .store
+                    .release_worktree_lease_claim(host_id, workspace_id, dir_key, claim)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+    // Promote the pre-spawn claim to the real holder instance. Only the
+    // dispatch that won the lock promotes; a lost race has no claim to set.
+    if let Some((host_id, workspace_id, dir_key, claim)) = binding_claim {
+        let promoted = state
             .store
-            .attach_worktree_lease_holder(
+            .promote_worktree_lease_holder(
                 host_id,
                 workspace_id,
                 dir_key,
-                Some(instance.instance_id.clone()),
+                claim,
+                instance.instance_id.clone(),
             )
             .await
-    {
-        tracing::warn!(%error, "could not stamp attach-lock holder on worktree lease");
+            .map_err(map_store)?;
+        if !promoted {
+            tracing::warn!(
+                instance_id = %instance.instance_id,
+                "attach-lock claim was superseded before promotion; the directory holder stays with the winning launch"
+            );
+        }
     }
     // §5.6 placement ledger: the same reasons[]/rejected[] JSON that goes to
     // the bot card and the audit trail.

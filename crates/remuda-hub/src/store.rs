@@ -1441,6 +1441,18 @@ impl WorktreeLeaseRow {
     }
 }
 
+/// Dispatch-time classification of the current attach-lock holder.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LeaseHolder {
+    /// No holder (or a reclaimable stale one): claim the empty condition.
+    Free,
+    /// Reclaimable holder to match conditionally (same task's session/tab or
+    /// a stale instance/claim); carries its exact current value.
+    Reclaimable(String),
+    /// Holder belongs to another task and is live: queue this launch.
+    Busy(String),
+}
+
 impl Store {
     /// Open (or create) `hub.sqlite` on a dedicated writer thread, plus a
     /// read-only pool for reads that can be long (hub-store-1).
@@ -2320,26 +2332,171 @@ impl Store {
         .await
     }
 
-    /// Stamp the attach-lock holder on a leased directory (t-bind dispatch
-    /// fold): one attached session at a time; instance delete clears it. A
-    /// missing holder id (unknown instance) or missing row is a no-op.
-    pub async fn attach_worktree_lease_holder(
+    /// Classify the lease row's holder for a dispatch of `task_id` (t-bind,
+    /// D-050 §2.3). Same-task sessions/tabs and a `pending:` claim carrying
+    /// the same task are reclaimable; a missing instance and a `pending:`
+    /// claim older than two minutes (a hub crashed mid-spawn) are stale and
+    /// reclaimable on their exact value; a live holder of another task is
+    /// busy. Returns None when the lease row does not exist.
+    pub(crate) async fn classify_lease_holder(
         &self,
         host_id: String,
         workspace_id: String,
         dir_key: String,
-        holder_instance_id: Option<String>,
-    ) -> Result<(), StoreError> {
-        let Some(holder) = holder_instance_id else {
-            return Ok(());
-        };
-        self.run_named("attach_worktree_lease_holder", move |conn| {
-            if let Some(mut row) = WorktreeLeaseRow::load(conn, &host_id, &workspace_id, &dir_key)?
+        task_id: String,
+    ) -> Result<Option<LeaseHolder>, StoreError> {
+        self.run_named("classify_lease_holder", move |conn| {
+            let Some(row) = WorktreeLeaseRow::load(conn, &host_id, &workspace_id, &dir_key)? else {
+                return Ok(None);
+            };
+            let Some(holder) = row.holder_instance_id else {
+                return Ok(Some(LeaseHolder::Free));
+            };
+            if let Some(claim_task) = holder
+                .strip_prefix("pending:")
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(task, _token)| task)
             {
-                row.holder_instance_id = Some(holder);
-                row.updated_at = now_rfc3339();
-                row.save(conn)?;
+                // Stale pre-spawn claim: reclaimable by anyone; SQL ages it
+                // the same way.
+                let stale: bool = conn.query_row(
+                    "SELECT (julianday('now') - julianday(?1)) * 1440 > 2",
+                    params![row.updated_at],
+                    |stale| stale.get(0),
+                )?;
+                if claim_task == task_id || stale {
+                    return Ok(Some(LeaseHolder::Reclaimable(holder)));
+                }
+                return Ok(Some(LeaseHolder::Busy(holder)));
             }
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM instances WHERE id = ?1)",
+                params![holder],
+                |value| value.get(0),
+            )?;
+            if !exists {
+                return Ok(Some(LeaseHolder::Reclaimable(holder)));
+            }
+            // task_id is carried on the instance spec, not a column.
+            let holder_task: Option<String> = conn.query_row(
+                "SELECT json_extract(spec_json, '$.taskId') FROM instances WHERE id = ?1",
+                params![holder],
+                |value| value.get(0),
+            )?;
+            if holder_task.as_deref() == Some(task_id.as_str()) {
+                Ok(Some(LeaseHolder::Reclaimable(holder)))
+            } else {
+                Ok(Some(LeaseHolder::Busy(holder)))
+            }
+        })
+        .await
+    }
+
+    /// Atomically claim the attach lock on a leased directory before spawn
+    /// (t-bind dispatch fold, D-050 §2.3).
+    ///
+    /// The holder is set with a single conditional UPDATE — it lands only
+    /// where the row is currently `leased` and the holder is null, the exact
+    /// `expect_holder` the caller classified as reclaimable (the same task's
+    /// session/tabs, a stale instance holder), or a `pending:` claim older
+    /// than two minutes (a hub that crashed mid-spawn). Two concurrent
+    /// dispatches on one directory therefore serialize in the writer:
+    /// exactly one claim lands and the other sees zero rows and must refuse
+    /// dir-busy instead of launching. Returns true when claimed.
+    pub async fn claim_worktree_lease(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+        claim: String,
+        expect_holder: Option<String>,
+    ) -> Result<bool, StoreError> {
+        self.run_named("claim_worktree_lease", move |conn| {
+            let now = now_rfc3339();
+            // A stale pre-spawn claim (>2 min) means the claiming hub died
+            // before it could promote or release; reclaim it rather than
+            // stalling the directory forever.
+            let stale_pending =
+                "(holder_instance_id LIKE 'pending:%' AND (julianday('now') - julianday(updated_at)) * 1440 > 2)";
+            let sql = match &expect_holder {
+                // The exact holder the caller classified, or a stale pending
+                // claim.
+                Some(_) => format!(
+                    "UPDATE worktree_leases
+                        SET holder_instance_id = ?1, updated_at = ?2
+                      WHERE host_id = ?3 AND workspace_id = ?4 AND dir_key = ?5
+                        AND state = 'leased'
+                        AND (holder_instance_id = ?6 OR {stale_pending})"
+                ),
+                None => format!(
+                    "UPDATE worktree_leases
+                        SET holder_instance_id = ?1, updated_at = ?2
+                      WHERE host_id = ?3 AND workspace_id = ?4 AND dir_key = ?5
+                        AND state = 'leased'
+                        AND (holder_instance_id IS NULL OR {stale_pending})"
+                ),
+            };
+            let mut stmt = conn.prepare(&sql)?;
+            let affected = match expect_holder {
+                Some(expect) => stmt.execute(params![
+                    claim, now, host_id, workspace_id, dir_key, expect
+                ])?,
+                None => stmt.execute(params![claim, now, host_id, workspace_id, dir_key])?,
+            };
+            Ok(affected > 0)
+        })
+        .await
+    }
+
+    /// Promote a pre-spawn claim token to the spawned instance's id. Only the
+    /// claim that won the lock can promote, so a dispatch that lost the race
+    /// never overwrites the winner's holder. Returns false when the row's
+    /// holder no longer matches the claim.
+    pub async fn promote_worktree_lease_holder(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+        claim: String,
+        instance_id: String,
+    ) -> Result<bool, StoreError> {
+        self.run_named("promote_worktree_lease_holder", move |conn| {
+            let affected = conn.execute(
+                "UPDATE worktree_leases
+                    SET holder_instance_id = ?1, updated_at = ?2
+                  WHERE host_id = ?3 AND workspace_id = ?4 AND dir_key = ?5
+                    AND holder_instance_id = ?6",
+                params![
+                    instance_id,
+                    now_rfc3339(),
+                    host_id,
+                    workspace_id,
+                    dir_key,
+                    claim
+                ],
+            )?;
+            Ok(affected > 0)
+        })
+        .await
+    }
+
+    /// Clear the holder when it is exactly the claim given (abort path: the
+    /// spawn failed and the directory must be free for the queued task).
+    pub async fn release_worktree_lease_claim(
+        &self,
+        host_id: String,
+        workspace_id: String,
+        dir_key: String,
+        claim: String,
+    ) -> Result<(), StoreError> {
+        self.run_named("release_worktree_lease_claim", move |conn| {
+            conn.execute(
+                "UPDATE worktree_leases
+                    SET holder_instance_id = NULL, updated_at = ?1
+                  WHERE host_id = ?2 AND workspace_id = ?3 AND dir_key = ?4
+                    AND holder_instance_id = ?5",
+                params![now_rfc3339(), host_id, workspace_id, dir_key, claim],
+            )?;
             Ok(())
         })
         .await

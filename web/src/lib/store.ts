@@ -88,6 +88,12 @@ export type EffortPending = {
   queued: boolean;
   /** Wall-clock ms the pending state was entered (stale-state safety net). */
   at: number;
+  /**
+   * §9.1 effective-level `observedAt` the push-down started from (null when
+   * nothing had been read back). A read-back newer than this settles the
+   * push-down; an equal/older projection leaves a queued push pending.
+   */
+  baselineObservedAt: string | null;
 };
 
 /** Pending entries older than this without a verdict are dropped. */
@@ -394,6 +400,14 @@ class HubStore {
   private listeners = new Set<Listener>();
   private journals = new Map<Id, JournalClient>();
   private subs = new Map<Id, Id>();
+  /**
+   * §9.1: instanceId → effective `observedAt` of a push-down the durable Hub
+   * projection settled before its live follow frame arrived. The matching live
+   * observation must STILL be treated as our own push-down (leave the slider
+   * where the user put it so a clamp mismatch stays visible), not as a
+   * terminal-side switch that would fold the slider to the clamped level.
+   */
+  private settledEffortPushdown = new Map<Id, string>();
   private bootGen = 0;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /** Screen-read scheduler: queue, single-flight set, in-flight counter. */
@@ -419,20 +433,50 @@ class HubStore {
     for (const listener of this.listeners) listener();
   }
 
-  /** §9.1: fold Hub-record `effortEffective` into the live map, newest wins. */
+  /**
+   * Fold Hub-record `effortEffective` into the live map, newest wins.
+   *
+   * Also settles a push-down whose verdict has projected onto the durable
+   * record. The live follow socket normally clears pending via
+   * {@link noteEffortObservation}, but a frame that is lost to gap-backfill
+   * (the client goes `readonly-stale` under load) or a late page attach only
+   * reaches us through this poll/refresh path — without settling here the chip
+   * would stay on 切换中 forever even though the Hub record already carries
+   * the new level. Only a projection strictly newer than the level the
+   * push-down started from settles, so a queued (working) switch is not
+   * cleared by a poll returning the unchanged baseline.
+   */
   private hydrateEffortEffective(instances: Instance[]) {
-    let updated = false;
     const next = { ...this.state.effortEffective };
+    const pendingNext = { ...this.state.effortPending };
+    let effectiveUpdated = false;
+    let pendingSettled = false;
     for (const instance of instances) {
       const view = effectiveFromRecord(instance.effortEffective);
       if (!view) continue;
       const current = next[instance.id];
       if (!current || view.observedAt >= current.observedAt) {
         next[instance.id] = view;
-        updated = true;
+        effectiveUpdated = true;
+        const pending = this.state.effortPending[instance.id];
+        if (
+          pending
+          && (!pending.baselineObservedAt || view.observedAt > pending.baselineObservedAt)
+        ) {
+          delete pendingNext[instance.id];
+          pendingSettled = true;
+          // Remember the read-back that settled it so the same edge arriving
+          // later on the live socket is not mistaken for a terminal switch.
+          this.settledEffortPushdown.set(instance.id, view.observedAt);
+        }
       }
     }
-    if (updated) this.emit({ effortEffective: next });
+    if (effectiveUpdated || pendingSettled) {
+      this.emit({
+        ...(effectiveUpdated ? { effortEffective: next } : {}),
+        ...(pendingSettled ? { effortPending: pendingNext } : {}),
+      });
+    }
   }
 
   /** context-usage-1: fold Hub-computed usage rollups from polled instances
@@ -605,15 +649,29 @@ class HubStore {
       },
     };
     const pending = this.state.effortPending[instanceId];
-    if (pending) {
+    const hydratedAt = this.settledEffortPushdown.get(instanceId);
+    // "Ours" = a live push-down still pending, OR one the durable projection
+    // already settled whose live frame is only now arriving (same read-back,
+    // observedAt no newer than the one the poll folded).
+    const ours = Boolean(pending) || (hydratedAt != null && parsed.effective.observedAt <= hydratedAt);
+    if (ours) {
       // Our own push-down settled: leave the slider where the user put it (the
       // mismatch line renders if the native side clamped it).
-      patch.effortPending = { ...this.state.effortPending };
-      delete patch.effortPending[instanceId];
+      if (pending) {
+        patch.effortPending = { ...this.state.effortPending };
+        delete patch.effortPending[instanceId];
+      }
+      // Consume the marker once the matching (or an even newer) live edge for
+      // our push-down arrives; a genuinely newer terminal switch (observedAt
+      // past the marker) is handled in the else branch instead.
+      if (hydratedAt != null && parsed.effective.observedAt >= hydratedAt) {
+        this.settledEffortPushdown.delete(instanceId);
+      }
     } else {
-      // Terminal-side switch: the observed level is the truth — move the
-      // slider to it. This is local state only, so it cannot re-trigger a
-      // configure.
+      // Terminal-side switch (or a level newer than any push-down we settled):
+      // the observed level is the truth — move the slider to it. This is local
+      // state only, so it cannot re-trigger a configure.
+      this.settledEffortPushdown.delete(instanceId);
       const instance = this.state.instances.find((row) => row.id === instanceId);
       const kind = (instance?.kind ?? "claude") as EffortKind;
       const selection = effortFromRecord(
@@ -654,12 +712,23 @@ class HubStore {
     if (!parsed) return;
     const pending = { ...this.state.effortPending };
     if (parsed.kind === "queued") {
-      pending[instanceId] = { word: parsed.word, queued: true, at: Date.now() };
+      // Preserve the baseline the push-down started from so the queued entry
+      // is settled only by a strictly newer read-back, not a poll returning
+      // the unchanged level.
+      pending[instanceId] = {
+        word: parsed.word,
+        queued: true,
+        at: pending[instanceId]?.at ?? Date.now(),
+        baselineObservedAt: pending[instanceId]?.baselineObservedAt ?? null,
+      };
       this.emit({ effortPending: pending });
       return;
     }
     if (!pending[instanceId] && parsed.kind === "applied") return;
     delete pending[instanceId];
+    // The push-down ended via a lifecycle, not a projected read-back: no settled
+    // edge owes the later live frame the "our push-down" treatment.
+    this.settledEffortPushdown.delete(instanceId);
     if (parsed.kind === "degraded") {
       // The native side refused: revert the slider to the last observed level
       // (or drop the optimistic request so the record default returns).
@@ -1694,14 +1763,26 @@ class HubStore {
     // Optimistic pending so the chip never shows the old level ambiguously:
     // 切换中 on the idle fast path, 排队中 while the agent works. The driver's
     // `effort-queued` lifecycle and the effective read-back settle it.
+    this.settledEffortPushdown.delete(instanceId);
     this.emit({
       effortPending: {
         ...this.state.effortPending,
-        [instanceId]: { word, queued: busy, at: Date.now() },
+        [instanceId]: {
+          word,
+          queued: busy,
+          at: Date.now(),
+          baselineObservedAt: this.state.effortEffective[instanceId]?.observedAt ?? null,
+        },
       },
     });
     try {
       await this.configure(instanceId, this.permissionModeOf(instanceId), { effort });
+      // Re-request authoritative state once the command is accepted. The
+      // driver projects the read-back before acking, so folding the durable
+      // record settles the chip from the Hub even when this client's live
+      // follow frame was gapped/coalesced; the 2s poll keeps settling it if
+      // this read races. Bounded by one network round trip — no timer.
+      await this.refresh().catch(() => undefined);
     } catch (error) {
       const pending = { ...this.state.effortPending };
       delete pending[instanceId];

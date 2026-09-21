@@ -96,6 +96,14 @@ assembly that rejects an invalid choice before POST.
 
 ### Hub e2e — `task-model-bind.hub.spec.ts`, three consecutive runs
 
+**This spec runs only when the trigger is set.** It self-skips at the
+top of the file (`test.skip(process.env.HUB_E2E_TASK_BIND !== "1", …)`,
+mirroring `api-route.hub.spec.ts`), so the landing gate's default
+full-suite run — without the variable — reports the whole file as
+skipped rather than failing on the missing branded workspace. To
+reproduce it, start the run with `HUB_E2E_TASK_BIND=1` (the same flag
+gates the fake Node in `hub_e2e.rs`).
+
 Command (lock slot `c`, ports from the task brief, bundled chromium via
 `PW_CHANNEL=chromium`, gated fake Node):
 
@@ -163,12 +171,11 @@ POST /v1/instances {taskId: <root-bound>, hostId: "hst_not_a_member"}
 ```
 
 The full hub suite (`pnpm playwright test -c playwright.hub.config.ts`)
-is run once under the same lock in both trigger positions:
+is run under the same lock in both trigger positions:
 
-- **default (unset):** all pre-existing hub-config specs pass (171
-  passed / 20 skipped / 0 failed without the new gated file, which
-  cannot find the gated branded workspace and is therefore the only
-  failing file — proof the gated arms are inert by design);
+- **default (unset, the landing-gate shape):** the binding spec
+  self-skips (`set HUB_E2E_TASK_BIND=1 for the task-model-bind
+  harness`) — 0 failures, and every other hub-config spec runs;
 - **`HUB_E2E_TASK_BIND=1`:** the full suite passes together — 178
   passed / 20 skipped (the 20 are legacy-named specs the hub config does
   not select) / 0 failed, including all eight binding cases. The spec

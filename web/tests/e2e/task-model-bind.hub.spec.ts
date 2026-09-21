@@ -23,6 +23,14 @@ import { login } from "./hub-auth";
  */
 
 test.describe.configure({ mode: "serial" });
+// The in-memory worktree catalog/lease and the branded bind workspace exist
+// on the fake Node only when the harness was started with HUB_E2E_TASK_BIND=1;
+// a default full-suite run (without it) skips this spec so the worker hello
+// and worktree RPCs stay byte-identical (mirrors api-route.hub.spec.ts).
+test.skip(
+  process.env.HUB_E2E_TASK_BIND !== "1",
+  "set HUB_E2E_TASK_BIND=1 for the task-model-bind harness",
+);
 
 type Sharing = {
   dirKey?: string;

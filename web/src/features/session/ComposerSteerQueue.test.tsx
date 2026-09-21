@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { Composer, type HeldItem } from "./Composer";
@@ -118,6 +118,85 @@ describe("Composer 插队发送 per-queued-row control", () => {
     expect(chips[1]).toHaveTextContent("第 2 条");
     expect(chips[1]).toHaveTextContent("queued beta");
     expect(chips[2]).toHaveTextContent("原生");
+  });
+});
+
+describe("Composer 已打断 receipt vs the held-flush edge", () => {
+  it("stays visible when the working→idle held-flush edge commits in the same burst as the steer POST resolving", async () => {
+    // Gate flake under host load: the fake Node journals idle BEFORE answering
+    // the send RPC, so the follow WS can deliver the idle phase in the same
+    // React burst the steer POST resolves in. The held-queue flush effect used
+    // to clear the receipt in that effect, un-rendering the chip before it
+    // ever painted.
+    const user = userEvent.setup();
+    let resolveSend!: (landed: boolean) => void;
+    const onSend = vi.fn(
+      () => new Promise<boolean>((resolve) => void (resolveSend = resolve)),
+    );
+    const onFlushHeld = vi.fn();
+    const heldRow: HeldItem[] = [
+      { id: "local_later", text: "later", reason: "turn", holder: "remuda" },
+    ];
+    const tree = (phase: "working" | "idle") => (
+      <Composer
+        instanceId="ins_badge_race"
+        mobile={false}
+        onSend={onSend}
+        kind="claude"
+        phase={phase}
+        capabilities={caps({ steer: cap(), interrupt: cap() })}
+        held={heldRow}
+        onFlushHeld={onFlushHeld}
+      />
+    );
+    const { rerender } = render(tree("working"));
+
+    const area = screen.getByTestId("composer-input");
+    await user.click(area);
+    await user.type(area, "jump now");
+    await user.click(screen.getByTestId("composer-steer"));
+    await user.click(screen.getByTestId("composer-confirm-ok"));
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+
+    // The steer POST resolves (receipt raised) and the idle status from the
+    // follow socket (held-flush edge) commits in the same render burst.
+    resolveSend(true);
+    await Promise.resolve();
+    rerender(tree("idle"));
+
+    expect(onFlushHeld).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("composer-interrupted-chip")).toBeVisible();
+  });
+
+  it("clears the receipt on its 4 s timer even when no further phase edge fires", () => {
+    // With the flush effect no longer clearing the receipt, the timer is the
+    // bound: pin it with fake timers so a future change cannot silently make
+    // the badge permanent. Mirrors SessionPage's controlled ownership.
+    vi.useFakeTimers();
+    try {
+      const onInterruptedChange = vi.fn();
+      const tree = (interrupted: boolean) => (
+        <Composer
+          instanceId="ins_badge_ttl"
+          mobile={false}
+          onSend={vi.fn()}
+          kind="claude"
+          phase="idle"
+          capabilities={caps()}
+          interrupted={interrupted}
+          onInterruptedChange={onInterruptedChange}
+        />
+      );
+      const { rerender, unmount } = render(tree(true));
+      expect(screen.getByTestId("composer-interrupted-chip")).toBeVisible();
+      vi.advanceTimersByTime(4_001);
+      expect(onInterruptedChange).toHaveBeenCalledWith(false);
+      rerender(tree(false));
+      expect(screen.queryByTestId("composer-interrupted-chip")).toBeNull();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

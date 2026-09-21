@@ -194,6 +194,13 @@ pub trait LocalStore: Send + Sync {
     fn put_pending_interaction(&self, pending: &PendingInteraction) -> Result<(), NodeError>;
     /// Load pending Interactions.
     fn pending_interactions(&self) -> Result<Vec<PendingInteraction>, NodeError>;
+    /// Stop durable journal writer threads during synchronous teardown.
+    ///
+    /// Called from the composed Node's drop so a Node that is dropped without a
+    /// graceful shutdown cannot leave a journal writer alive to race a Node
+    /// reopened on the same data dir. No-op for stores without a durable
+    /// journal.
+    fn shutdown_journal(&self) {}
 }
 
 /// Thread-safe in-memory store used by `remuda dev` and local API tests.
@@ -206,10 +213,16 @@ pub struct MemoryStore {
     journal_bytes_read: std::sync::atomic::AtomicU64,
 }
 
-#[derive(Clone)]
+/// Owns the journal writer job channel and closes it on drop. Not `Clone`: a
+/// copy dropping at the end of a call would tear down a writer another owner
+/// still uses (see the [`Drop`] impl below).
 struct DurableJournal {
     journal: Journal,
     jobs: std_mpsc::SyncSender<JournalJob>,
+    /// Flipped by [`DurableJournal::shutdown`] during Node teardown. The worker
+    /// exits on its next iteration and the underlying single-writer journal
+    /// closes, so a reopen can never race a writer this Node spawned.
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum JournalJob {
@@ -229,23 +242,37 @@ enum JournalJob {
         instance_id: InstanceId,
         reply: std_mpsc::SyncSender<Result<U64, String>>,
     },
+    /// Wake a worker parked in `recv` so it observes the stopping flag.
+    Shutdown,
 }
 
 impl DurableJournal {
     fn open(data_dir: &Path, queue_capacity: usize, fsync: FsyncPolicy) -> Result<Self, NodeError> {
-        let journal = Journal::open_with(data_dir, JournalOptions { fsync })
-            .map_err(|error| NodeError::Driver(format!("journal open failed: {error}")))?;
+        let journal = Journal::open_with(
+            data_dir,
+            JournalOptions {
+                fsync,
+                ..JournalOptions::default()
+            },
+        )
+        .map_err(|error| NodeError::Driver(format!("journal open failed: {error}")))?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| NodeError::Driver(format!("journal runtime failed: {error}")))?;
         let (jobs, receiver) = std_mpsc::sync_channel::<JournalJob>(queue_capacity.max(1));
         let writer = journal.clone();
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_stopping = std::sync::Arc::clone(&stopping);
         thread::Builder::new()
             .name("remuda-node-journal".to_owned())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
+                    if worker_stopping.load(std::sync::atomic::Ordering::Acquire) {
+                        break;
+                    }
                     match job {
+                        JournalJob::Shutdown => break,
                         JournalJob::Append {
                             instance_id,
                             envelope,
@@ -299,7 +326,36 @@ impl DurableJournal {
                 }
             })
             .map_err(|error| NodeError::Driver(format!("journal writer failed: {error}")))?;
-        Ok(Self { journal, jobs })
+        Ok(Self {
+            journal,
+            jobs,
+            stopping,
+        })
+    }
+
+    /// Stop accepting work and release the journal's single-writer lock.
+    ///
+    /// Synchronous on purpose: a Node dropped the hard way (no graceful
+    /// shutdown) calls this from a drop, and a reopened Node in the same process
+    /// must be able to acquire the journal lock immediately afterwards. A
+    /// failed nudge is harmless: a busy worker observes the flag on its next
+    /// iteration. Idempotent, so the [`Drop`] guard and an explicit shutdown
+    /// can both call it.
+    fn shutdown(&self) {
+        if self
+            .stopping
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        // Nudge a worker parked in `recv`; a full queue means it is draining and
+        // it observes the flag at its next iteration anyway.
+        let _ = self.jobs.try_send(JournalJob::Shutdown);
+        self.journal.close();
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn append(
@@ -307,6 +363,9 @@ impl DurableJournal {
         instance_id: &InstanceId,
         envelope: Envelope,
     ) -> Result<Observation, NodeError> {
+        if self.stopped() {
+            return Err(NodeError::Driver("journal is shut down".to_owned()));
+        }
         let (reply, result) = std_mpsc::sync_channel(1);
         self.jobs
             .send(JournalJob::Append {
@@ -358,6 +417,16 @@ impl DurableJournal {
             .recv()
             .map_err(|_| NodeError::Driver("journal writer dropped its result".to_owned()))?
             .map_err(|error| NodeError::Driver(format!("journal watermark failed: {error}")))
+    }
+}
+
+/// RAII guard: the single-writer lock is released on *every* exit path,
+/// including an unwind or an owner that never calls the explicit shutdown.
+/// [`MemoryStore::shutdown_journal`] usually closes first (in order, after the
+/// store-owning tasks have been aborted); this is the backstop.
+impl Drop for DurableJournal {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -443,6 +512,15 @@ impl MemoryStore {
     /// Return the durable journal handle when this store was opened with persistence.
     pub fn journal(&self) -> Option<Journal> {
         self.durable.as_ref().map(|durable| durable.journal.clone())
+    }
+
+    /// Close the durable journal's writer threads now rather than on the last
+    /// drop, so a reopened Node acquires the single-writer lock even while
+    /// aborted tasks still hold store clones.
+    pub fn shutdown_journal(&self) {
+        if let Some(durable) = &self.durable {
+            durable.shutdown();
+        }
     }
 }
 
@@ -880,7 +958,6 @@ impl LocalStore for MemoryStore {
         body: ObservationPayload,
     ) -> Result<Observation, NodeError> {
         let now = timestamp_now()?;
-        let durable = self.durable.clone();
         let (event, sender, persisted) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state
@@ -904,7 +981,7 @@ impl LocalStore for MemoryStore {
                 body,
                 raw: None,
             };
-            let event = match durable.as_ref() {
+            let event = match self.durable.as_ref() {
                 Some(durable) => durable.append(instance_id, envelope)?,
                 None => in_memory_observation(envelope, seq),
             };
@@ -927,7 +1004,6 @@ impl LocalStore for MemoryStore {
         instance_id: &InstanceId,
         mut observation: Observation,
     ) -> Result<Observation, NodeError> {
-        let durable = self.durable.clone();
         let (event, sender, persisted) = {
             let mut state = self.state.write().map_err(|_| NodeError::StorePoisoned)?;
             let record = state
@@ -958,7 +1034,7 @@ impl LocalStore for MemoryStore {
                 interaction.request_key.process_generation =
                     record.instance.process_ref.process_generation;
             }
-            let event = if let Some(durable) = durable.as_ref() {
+            let event = if let Some(durable) = self.durable.as_ref() {
                 durable.append(
                     instance_id,
                     Envelope {
@@ -1181,6 +1257,10 @@ impl LocalStore for MemoryStore {
             out.push(serde_json::from_str(&json)?);
         }
         Ok(out)
+    }
+
+    fn shutdown_journal(&self) {
+        MemoryStore::shutdown_journal(self);
     }
 }
 

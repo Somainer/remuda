@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 futures.workspace = true
+nix = { version = "0.28", features = ["fs"] }
 remuda-protocol.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

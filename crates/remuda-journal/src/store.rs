@@ -7,6 +7,7 @@ use crate::projection::Projections;
 use crate::source::SourceResume;
 use crate::util::u64_i64;
 use futures::Stream;
+use nix::fcntl::{Flock, FlockArg};
 use remuda_protocol::{
     HostId, Id, InstanceId, Observation, ObservationPayload, RawRef, SchemaVersion, U64,
 };
@@ -16,6 +17,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::thread;
 use tokio::sync::{mpsc, oneshot};
@@ -31,17 +34,30 @@ pub enum FsyncPolicy {
     All,
 }
 
+/// How long a second opener waits for a live writer to release the
+/// single-writer lock before [`Error::Locked`] is returned.
+const DEFAULT_WRITER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Poll interval while waiting for the single-writer lock.
+const WRITER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// Options for [`Journal::open_with`].
 #[derive(Debug, Clone)]
 pub struct JournalOptions {
     /// Durability policy for append.
     pub fsync: FsyncPolicy,
+    /// Bounded wait for a live writer to release the single-writer lock. A
+    /// reopen that follows a prompt close acquires within a poll or two; a
+    /// writer that is genuinely still alive (a Node dropped without shutdown,
+    /// a stuck predecessor process) fails the open after this long rather than
+    /// blocking forever.
+    pub writer_lock_wait: std::time::Duration,
 }
 
 impl Default for JournalOptions {
     fn default() -> Self {
         Self {
             fsync: FsyncPolicy::Data,
+            writer_lock_wait: DEFAULT_WRITER_LOCK_WAIT,
         }
     }
 }
@@ -114,6 +130,8 @@ enum OpKind {
     DurableSeq {
         instance: InstanceId,
     },
+    /// Writer-thread shutdown nudge; the response is ignored.
+    Shutdown,
 }
 
 enum OpOut {
@@ -139,6 +157,9 @@ struct Op {
 #[derive(Clone)]
 pub struct Journal {
     tx: mpsc::Sender<Op>,
+    /// Set by [`Journal::close`]; the writer thread checks it between every op
+    /// and exits as soon as it observes it.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl Journal {
@@ -148,25 +169,59 @@ impl Journal {
     }
 
     /// Open with an explicit fsync policy.
+    ///
+    /// Takes an exclusive `flock(2)` on `<data_dir>/journal.lock` for the
+    /// writer's lifetime. The JSONL files, the SQLite index, and the per-record
+    /// sequence table are all single-writer state, so a second opener — another
+    /// thread or a process re-opening the same data dir — cannot race the
+    /// current writer: it waits up to
+    /// [`JournalOptions::writer_lock_wait`](default 5 s) for the lock to be
+    /// released (covering a prompt close finishing its last op) and then fails
+    /// the open with [`Error::Locked`] rather than blocking forever. A process
+    /// killed hard releases the lock in the kernel immediately.
     pub fn open_with(data_dir: impl AsRef<Path>, options: JournalOptions) -> Result<Self, Error> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(data_dir.join("journal"))?;
         let (tx, rx) = mpsc::channel(64);
+        let shutdown = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let writer_shutdown = Arc::clone(&shutdown);
         thread::Builder::new()
             .name("remuda-journal".into())
-            .spawn(move || match Store::open(data_dir, options) {
-                Ok(mut store) => {
-                    let _ = ready_tx.send(Ok(()));
-                    store.run(rx);
-                }
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err));
-                }
-            })
+            .spawn(
+                move || match Store::open(data_dir, options, writer_shutdown) {
+                    Ok(mut store) => {
+                        let _ = ready_tx.send(Ok(()));
+                        store.run(rx);
+                    }
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                    }
+                },
+            )
             .map_err(Error::from)?;
         ready_rx.recv().map_err(|_| Error::Closed)??;
-        Ok(Self { tx })
+        Ok(Self { tx, shutdown })
+    }
+
+    /// Ask the writer thread to stop and release the single-writer lock.
+    ///
+    /// Synchronous and safe to call from a drop: it sets a stop flag and nudges
+    /// a writer parked on an empty queue. Pending and in-flight operations may
+    /// return [`Error::Closed`]; every later operation does. A journal reopened
+    /// against the same data dir then acquires the lock only after this writer
+    /// has fully stopped, so recovery never observes a file a dead writer can
+    /// still touch.
+    pub fn close(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        let (resp, _rx) = oneshot::channel();
+        // Nudge a writer parked in `blocking_recv` on an empty queue. If the
+        // bounded queue is full the writer is actively draining and observes
+        // the flag at its next loop iteration, so a failed nudge is harmless.
+        let _ = self.tx.try_send(Op {
+            kind: OpKind::Shutdown,
+            resp,
+        });
     }
 
     /// Append `envelope` to `instance`; returns the assigned seq (from 1).
@@ -351,6 +406,11 @@ struct Store {
     jsonl: HashMap<String, JsonlFile>,
     projections: HashMap<String, Projections>,
     subscribers: HashMap<String, Vec<mpsc::Sender<Observation>>>,
+    /// Held for the store's whole life so no second writer can open the same
+    /// data dir concurrently; unlocked when the writer thread exits.
+    _writer_lock: Flock<File>,
+    /// Shared with every [`Journal`] handle; [`Journal::close`] flips it.
+    shutdown: Arc<AtomicBool>,
 }
 
 struct JsonlFile {
@@ -359,9 +419,44 @@ struct JsonlFile {
 }
 
 impl Store {
-    fn open(data_dir: PathBuf, options: JournalOptions) -> Result<Self, Error> {
+    fn open(
+        data_dir: PathBuf,
+        options: JournalOptions,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self, Error> {
         let blobs = BlobStore::new(&data_dir)?;
         fs::create_dir_all(data_dir.join("journal"))?;
+        // Single-writer interlock. The wait is bounded: a reopen after a prompt
+        // close acquires within a poll or two (the previous writer is finishing
+        // its last op), while a writer that is genuinely still alive makes the
+        // open fail with `Error::Locked` instead of blocking a process startup
+        // forever. A hard-killed holder releases the lock in the kernel, so the
+        // wait only ever covers a live writer.
+        let lock_path = data_dir.join("journal.lock");
+        let mut lock_file = OpenOptions::new()
+            .create(true)
+            // The file only carries the flock; never truncate a holder's file.
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let deadline = std::time::Instant::now() + options.writer_lock_wait;
+        let writer_lock = loop {
+            match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+                Ok(flock) => break flock,
+                Err((returned, errno)) if errno == nix::errno::Errno::EWOULDBLOCK => {
+                    lock_file = returned;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Locked {
+                            path: lock_path,
+                            waited: options.writer_lock_wait,
+                        });
+                    }
+                    std::thread::sleep(WRITER_LOCK_POLL);
+                }
+                Err((_, errno)) => return Err(Self::lock_error(errno)),
+            }
+        };
         let conn = Connection::open(data_dir.join("journal.sqlite"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         let sync = match options.fsync {
@@ -425,16 +520,28 @@ impl Store {
             jsonl: HashMap::new(),
             projections: HashMap::new(),
             subscribers: HashMap::new(),
+            _writer_lock: writer_lock,
+            shutdown,
         };
         store.recover()?;
         Ok(store)
     }
 
     fn run(&mut self, mut rx: mpsc::Receiver<Op>) {
-        while let Some(op) = rx.blocking_recv() {
+        while !self.shutdown.load(Ordering::Acquire) {
+            let Some(op) = rx.blocking_recv() else {
+                break;
+            };
+            if self.shutdown.load(Ordering::Acquire) || matches!(op.kind, OpKind::Shutdown) {
+                break;
+            }
             let result = self.handle(op.kind);
             let _ = op.resp.send(result);
         }
+    }
+
+    fn lock_error(err: nix::Error) -> Error {
+        Error::Io(std::io::Error::from_raw_os_error(err as i32))
     }
 
     fn handle(&mut self, kind: OpKind) -> Result<OpOut, Error> {
@@ -469,6 +576,7 @@ impl Store {
             OpKind::DurableSeq { instance } => {
                 Ok(OpOut::Watermark(U64(self.watermark(&instance)?)))
             }
+            OpKind::Shutdown => Ok(OpOut::Unit),
         }
     }
 
@@ -611,9 +719,14 @@ impl Store {
             .get_mut(instance_key)
             .ok_or_else(|| Error::Path(path.clone()))?;
         let offset = slot.len;
-        slot.file.write_all(line)?;
-        slot.file.write_all(b"\n")?;
-        let length = (line.len() + 1) as u64;
+        // One write of the whole record including its terminating newline. A
+        // record is only real once the newline is on stable storage, so the
+        // offset/length published into SQLite below always describes a complete
+        // line: recovery treats anything after the last newline as a torn tail.
+        let mut record = line.to_vec();
+        record.push(b'\n');
+        slot.file.write_all(&record)?;
+        let length = record.len() as u64;
         slot.len += length;
         match self.options.fsync {
             FsyncPolicy::Never => {}
@@ -898,6 +1011,15 @@ impl Store {
         Ok(())
     }
 
+    /// Rebuild the SQLite index from the JSONL files, discarding a torn tail.
+    ///
+    /// The JSONL is the authority. A record exists only when its terminating
+    /// newline is on disk, so bytes after the last newline are the remains of a
+    /// write interrupted by an unclean shutdown (or a page the filesystem never
+    /// made durable): they are logged once and physically truncated, never
+    /// parsed. A malformed *complete* line further up is real corruption rather
+    /// than a torn append, so it is an error — discarding complete records to
+    /// paper over that would lose acknowledged observations.
     fn recover(&mut self) -> Result<(), Error> {
         let dir = self.data_dir.join("journal");
         let entries = match fs::read_dir(&dir) {
@@ -914,7 +1036,27 @@ impl Store {
             }
             let instance_s = name.trim_end_matches(".jsonl").to_owned();
             let instance = InstanceId::try_from(instance_s.clone())?;
-            let bytes = fs::read(entry.path())?;
+            let mut bytes = fs::read(entry.path())?;
+            // Cut at the final newline: every byte past it is an unterminated,
+            // therefore never-committed, record.
+            let valid_len = bytes
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |pos| pos + 1) as u64;
+            let torn_bytes = bytes.len() as u64 - valid_len;
+            if torn_bytes > 0 {
+                tracing::warn!(
+                    instance = %instance_s,
+                    torn_bytes,
+                    "truncating torn journal tail left by an unclean shutdown; complete records are kept"
+                );
+                let file = OpenOptions::new().write(true).open(entry.path())?;
+                file.set_len(valid_len)?;
+                if matches!(self.options.fsync, FsyncPolicy::Data | FsyncPolicy::All) {
+                    file.sync_data()?;
+                }
+                bytes.truncate(valid_len as usize);
+            }
             let mut seq = 0u64;
             let mut offset = 0u64;
             let mut proj = Projections::default();
@@ -922,15 +1064,10 @@ impl Store {
                 if chunk.is_empty() {
                     continue;
                 }
-                let obs: Observation = match serde_json::from_slice(chunk) {
-                    Ok(obs) => obs,
-                    Err(_)
-                        if offset + chunk.len() as u64 >= bytes.len().saturating_sub(1) as u64 =>
-                    {
-                        break;
-                    }
-                    Err(err) => return Err(err.into()),
-                };
+                // Every chunk here was newline-terminated on disk, so a parse
+                // failure is corruption inside the committed prefix, not a torn
+                // append, and must not be silently dropped.
+                let obs: Observation = serde_json::from_slice(chunk)?;
                 if obs.instance_id != instance {
                     return Err(Error::Diverged {
                         instance: instance_s.clone(),
@@ -969,17 +1106,27 @@ impl Store {
                     )?;
                 }
                 self.ensure_instance(&instance, &obs.journal_id, &obs.host_id)?;
-                self.conn.execute(
-                    "UPDATE instances SET seq = MAX(seq, ?1) WHERE instance_id = ?2",
-                    params![seq as i64, instance_s],
-                )?;
                 proj.apply(&obs);
                 offset += length;
             }
+            // JSONL is the authority: drop every index row it does not contain
+            // and pin the watermark to exactly what survived, even when the old
+            // SQLite row carried a higher seq from the torn append.
             self.conn.execute(
                 "DELETE FROM events WHERE instance_id = ?1 AND seq > ?2",
                 params![instance_s, seq as i64],
             )?;
+            if seq > 0 {
+                self.conn.execute(
+                    "UPDATE instances SET seq = ?1 WHERE instance_id = ?2",
+                    params![seq as i64, instance_s],
+                )?;
+            } else {
+                self.conn.execute(
+                    "UPDATE instances SET seq = 0 WHERE instance_id = ?1",
+                    params![instance_s],
+                )?;
+            }
             self.projections.insert(instance_s.clone(), proj);
             self.save_checkpoint(&instance)?;
         }

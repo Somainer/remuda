@@ -126,6 +126,7 @@ async fn run_script(kind: ScriptKind, args: &Args) -> Result<Value> {
         &journal_dir,
         JournalOptions {
             fsync: FsyncPolicy::Never,
+            ..JournalOptions::default()
         },
     )?;
     let instance = events

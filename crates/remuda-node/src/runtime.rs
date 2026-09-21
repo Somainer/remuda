@@ -78,7 +78,7 @@ impl AttachmentLoader {
 pub(crate) struct DevNodeInner {
     pub(crate) store: Arc<dyn LocalStore>,
     drivers: DriverRegistry,
-    interactions: Arc<InteractionRuntime>,
+    pub(crate) interactions: Arc<InteractionRuntime>,
     senders: RwLock<BTreeMap<InstanceId, mpsc::Sender<QueuedCommand>>>,
     pub(crate) workers: tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>,
     /// Observation pumps, one per started instance.
@@ -127,6 +127,48 @@ pub(crate) struct DevNodeInner {
 #[derive(Clone)]
 pub struct DevNode {
     pub(crate) inner: Arc<DevNodeInner>,
+}
+
+/// Last-clone teardown.
+///
+/// A Node dropped without [`crate::service::RunningNode::shutdown`] (the
+/// restart tests do exactly this to simulate a hard process death) used to leave
+/// its instance workers, observation pumps, and interaction tasks running: they
+/// held store clones, so the journal writer thread stayed alive with its
+/// SQLite/JSONL handles, and a Node reopened on the same data dir raced a
+/// "dropped" writer allocating the same seq and writing at a stale JSONL offset
+/// — `UNIQUE constraint failed: events.instance_id, events.seq` and
+/// `json: EOF while parsing a string` in the landing gate.
+///
+/// Everything here is synchronous and best-effort: reject new commands, abort
+/// the store-owning tasks, then close the journal explicitly so the
+/// single-writer lock is released even while aborted tasks still drain their
+/// store clones. Writers that run one more instruction after abort can no
+/// longer reach the journal.
+impl Drop for DevNodeInner {
+    fn drop(&mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.interactions.shutdown();
+        abort_task_map(&self.workers);
+        abort_task_map(&self.pumps);
+        self.store.shutdown_journal();
+    }
+}
+
+/// Abort every handle in an instance-keyed task map without awaiting.
+///
+/// Drop-safe `try_lock` only. The maps are held across short inserts and are
+/// drained first by the async shutdown path; contended teardown means a spawn
+/// in flight, whose journal calls now fail because the journal is closed.
+fn abort_task_map(map: &tokio::sync::Mutex<BTreeMap<InstanceId, tokio::task::JoinHandle<()>>>) {
+    if let Ok(mut guard) = map.try_lock() {
+        for (_, handle) in std::mem::take(&mut *guard) {
+            handle.abort();
+        }
+    } else {
+        tracing::warn!("node teardown skipped task abort: task map briefly locked");
+    }
 }
 
 impl DevNode {

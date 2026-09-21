@@ -43,6 +43,12 @@ pub struct InteractionRuntime {
     broker: Arc<InteractionBroker>,
     store: Arc<dyn LocalStore>,
     glue: Arc<Mutex<Glue>>,
+    /// Signals the broker pump and the expiry sweeper to exit on teardown.
+    shutdown: Arc<tokio::sync::Notify>,
+    /// Detached tasks that hold `store` clones (the pump and the sweeper both
+    /// append observations); aborted on shutdown so they cannot outlive the
+    /// Node that owns them.
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 struct Glue {
@@ -139,17 +145,49 @@ impl InteractionRuntime {
                 broker_to_native: HashMap::new(),
                 seen_native,
             })),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tasks: std::sync::Mutex::new(Vec::new()),
         });
         let pump = Arc::clone(&runtime);
-        tokio::spawn(async move {
-            while let Some(observation) = broker_rx.recv().await {
-                if let Err(error) = pump.commit_broker_observation(observation).await {
-                    tracing::debug!(%error, "interaction broker observation commit failed");
+        let pump_shutdown = Arc::clone(&runtime.shutdown);
+        let pump_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = pump_shutdown.notified() => break,
+                    observation = broker_rx.recv() => {
+                        let Some(observation) = observation else { break };
+                        if let Err(error) =
+                            pump.commit_broker_observation(observation).await
+                        {
+                            tracing::debug!(%error, "interaction broker observation commit failed");
+                        }
+                    }
                 }
             }
         });
-        broker.spawn_sweeper(SWEEP_INTERVAL);
+        let sweeper_task = broker.spawn_sweeper(SWEEP_INTERVAL);
+        runtime
+            .tasks
+            .lock()
+            .expect("interaction tasks")
+            .extend([pump_task, sweeper_task]);
         Ok(runtime)
+    }
+
+    /// Stop the broker pump and the expiry sweeper synchronously.
+    ///
+    /// Both append journal observations through the shared store, so a Node
+    /// being torn down aborts them before closing the journal; otherwise a
+    /// dropped Node could keep journaling after its successor reopened the same
+    /// data dir. Safe to call from a drop: notification and abort are
+    /// non-async.
+    pub(crate) fn shutdown(&self) {
+        self.shutdown.notify_waiters();
+        let mut tasks = self.tasks.lock().expect("interaction tasks");
+        for task in tasks.drain(..) {
+            task.abort();
+        }
     }
 
     /// Register the instance driver as the unique Interaction owner.

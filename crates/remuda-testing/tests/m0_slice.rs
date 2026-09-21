@@ -277,6 +277,7 @@ async fn run_kind(
         slice._tmp.path().join("journal"),
         JournalOptions {
             fsync: FsyncPolicy::Never,
+            ..JournalOptions::default()
         },
     )
     .unwrap();

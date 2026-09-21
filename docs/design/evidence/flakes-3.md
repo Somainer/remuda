@@ -24,12 +24,13 @@ host load. Every command — the whole loop and the build — ran inside one
 landing gate, which holds that lock for its entire run. Fixed loopback
 ports were used throughout.
 
-- Before the fix: **1 of 10 runs failed** (run 1). The failure was
-  `hub-live.spec.ts:528` — `expect(getByTestId("composer-interrupted-chip"))
-  .toBeVisible()` found no element — the literal gate signature. Because the
+- Before the fix: **1 of 10 runs failed** (run 1). The failure was in the
+  composer queue / steer / interrupt test —
+  `expect(getByTestId("composer-interrupted-chip")).toBeVisible()` (gate
+  revision line 528) found no element, the literal gate signature. Because the
   file runs in serial mode, the two tests after the failing test (the
-  hook-carried approval test at line 561 and the structured-stream test at
-  line 637) were skipped in that run; the other 7 tests in the file passed.
+  hook-carried approval test and the structured-stream test) were skipped in
+  that run; the other 7 tests in the file passed.
 - After the fix: **10 of 10 runs passed** under the same load protocol.
 - The full web hub e2e suite was also run once to completion: **165 passed,
   20 skipped (pre-existing environment-gated `test.skip` cases such as the
@@ -39,7 +40,9 @@ ports were used throughout.
 
 ## Flake C — interrupted chip missed after a steer on a working native session
 
-**Signature (gate and load loop).** `hub-live.spec.ts:528`,
+**Signature (gate and load loop).** In the composer queue / steer /
+interrupt test, at `hub-live.spec.ts:528` on the gate revision (538 on the
+delivered branch, shifted by the Flake D fix),
 `expect(getByTestId("composer-interrupted-chip")).toBeVisible()` — element
 not found — right after the 插队 (steer) POST was observed on the wire.
 
@@ -99,8 +102,9 @@ link, so the scoped locator matches only the live row of this instance.
   Composer receipt-vs-flush-edge regression test).
 - `pnpm --dir web typecheck` and `pnpm --dir web lint` — clean.
 - `hub-live.spec.ts` × 10 under the load protocol above — 1/10 failing
-  before (Flake C, line 528; lines 561 and 637 serial-skipped), 10/10
-  passing after.
+  before (Flake C in the composer queue / steer / interrupt test; the
+  hook-carried approval and structured-stream tests serial-skipped behind
+  it), 10/10 passing after.
 - Full web hub e2e suite once (185 tests, serial) — 165 passed, 20 skipped
   (pre-existing environment gates), 0 failed; the two tests after Flake C's
   point in the serial file ran (full-suite tests 22/185 and 23/185) and

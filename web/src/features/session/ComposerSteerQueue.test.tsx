@@ -167,6 +167,37 @@ describe("Composer 已打断 receipt vs the held-flush edge", () => {
     expect(onFlushHeld).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("composer-interrupted-chip")).toBeVisible();
   });
+
+  it("clears the receipt on its 4 s timer even when no further phase edge fires", () => {
+    // With the flush effect no longer clearing the receipt, the timer is the
+    // bound: pin it with fake timers so a future change cannot silently make
+    // the badge permanent. Mirrors SessionPage's controlled ownership.
+    vi.useFakeTimers();
+    try {
+      const onInterruptedChange = vi.fn();
+      const tree = (interrupted: boolean) => (
+        <Composer
+          instanceId="ins_badge_ttl"
+          mobile={false}
+          onSend={vi.fn()}
+          kind="claude"
+          phase="idle"
+          capabilities={caps()}
+          interrupted={interrupted}
+          onInterruptedChange={onInterruptedChange}
+        />
+      );
+      const { rerender, unmount } = render(tree(true));
+      expect(screen.getByTestId("composer-interrupted-chip")).toBeVisible();
+      vi.advanceTimersByTime(4_001);
+      expect(onInterruptedChange).toHaveBeenCalledWith(false);
+      rerender(tree(false));
+      expect(screen.queryByTestId("composer-interrupted-chip")).toBeNull();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("Composer mobile (D-042): the three-state controls stay outside the options sheet", () => {

@@ -339,9 +339,13 @@ async fn reopen_after_a_torn_journal_tail_reconciles_and_keeps_complete_records(
 
 /// A hard-dropped Node (no graceful shutdown, the way a real process dies)
 /// must close its journal writer before a second Node reopens the same data
-/// dir, even under CPU contention. Before the fix the dropped Node's spawned
-/// workers kept journaling after the reopen and the two writers raced seq
-/// allocation (`UNIQUE constraint failed: events.instance_id, events.seq`).
+/// dir. Before the fix the dropped Node's spawned workers kept the writer and
+/// its store clones alive, so a successor raced it on seq allocation
+/// (`UNIQUE constraint failed: events.instance_id, events.seq`) and on JSONL
+/// offsets (`json: EOF`). The structural assertion is the successor's
+/// `compose`: it takes the single-writer lock, so a predecessor writer that
+/// survived the drop makes it fail `Error::Locked` after the bounded wait
+/// instead of this test passing on a timing fluke.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hard_dropped_node_cannot_write_after_its_successor_reopens() {
     for _ in 0..5 {
@@ -358,7 +362,18 @@ async fn a_hard_dropped_node_cannot_write_after_its_successor_reopens() {
             // before the next compose can reopen it.
             created.instance.meta.id.clone()
         };
+        // Deterministic, not a sleep: the open polls for the predecessor's
+        // single-writer lock, which is released only when its writer thread
+        // exits. A teardown that leaks the writer makes this return Locked
+        // after the bounded wait; a correct handoff acquires on the first
+        // poll after the close nudge.
+        let reopen_started = std::time::Instant::now();
         let restarted = compose(&config).expect("reopen must not meet a live old writer");
+        assert!(
+            reopen_started.elapsed() < std::time::Duration::from_secs(2),
+            "the dropped Node's writer must release the lock immediately, took {:?}",
+            reopen_started.elapsed()
+        );
         restarted
             .reconcile_herdr()
             .await
@@ -370,9 +385,8 @@ async fn a_hard_dropped_node_cannot_write_after_its_successor_reopens() {
             ),
             "the successor settles the session the dropped Node left behind"
         );
-        // Give a writer that escaped teardown a chance to corrupt the tail;
-        // with the fix it has no journal handle left to write through.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Belt and braces: whatever an aborted task still does, it cannot reach
+        // the closed journal, so the tail stays dense and parseable.
         let instance = restarted.get_instance(&id).expect("instance");
         let page = restarted
             .read_journal(&instance.journal_id, None, 256)

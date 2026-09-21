@@ -98,6 +98,15 @@ writer closing) completes within a poll, while a stale live writer fails the
 open with a named error instead of hanging. The daemon test is the named
 "reopen while a writer lives" case and stays green.
 
+One accepted cost of the bound: `compose` is a synchronous function called
+from async run bodies, so the up-to-5-second lock wait blocks the calling
+runtime worker thread — but only once at Node startup and only when another
+live Node already holds the *same* data directory (a real duplicate start, or
+a test reopening while a predecessor is still shutting down). It never occurs
+on the steady-state journal path; the normal handoff releases within one
+25 ms poll. If `compose` ever becomes hot (e.g. embedded in a request), the
+opener should move to a blocking task rather than shortening the bound.
+
 ## Before / after
 
 The loop was run with the test binary pinned to two cores alongside two CPU
@@ -146,5 +155,8 @@ loop wrapped in
   drives the exact gate path (compose → drop → truncate → compose →
   `reconcile_herdr`) with synthetic data only; and
   `a_hard_dropped_node_cannot_write_after_its_successor_reopens` drops a Node
-  mid-materialization five times in a row and asserts the successor's journal
-  stays dense, indexed, and parseable.
+  mid-materialization five times in a row and asserts the successor's
+  `compose` acquires the single-writer lock immediately (a leaked predecessor
+  writer would make it fail `Error::Locked` after the bounded wait, so the
+  assertion is structural rather than a sleep-and-hope race window), with the
+  journal staying dense, indexed, and parseable.

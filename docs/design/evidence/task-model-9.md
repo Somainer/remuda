@@ -82,8 +82,8 @@
 | web 单测 | `pnpm --dir web test` | **155 files / 1573 passed**（本任务新增 23 条：annotations 19 + AnnotationPanel 4） |
 | typecheck | `pnpm --dir web typecheck` | PASS |
 | lint | `pnpm --dir web lint`（oxlint） | exit 0（新文件无 error；仅 fast-refresh/set-state-in-effect 既有 warning 级） |
-| 本 spec ×3 | `HUB_E2E_LISTEN=127.0.0.1:59350 HUB_E2E_WEB_PORT=59359 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59351 PW_CHANNEL=chromium` + `flock e2e.lock-c`，`playwright -c playwright.hub.config.ts task-model-annotations` | 最终代码 3 轮全绿（2 轮默认 2 passed + 1 skipped（证据用例）；1 轮 `REMUDA_EVIDENCE=1` 3 passed） |
-| 全量 hub e2e | 同一锁槽与端口，全 `*.hub.spec.ts` | 见下节 |
+| 本 spec ×3 | `HUB_E2E_LISTEN=127.0.0.1:59350 HUB_E2E_WEB_PORT=59359 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59351 PW_CHANNEL=chromium` + `flock e2e.lock-c`，`playwright -c playwright.hub.config.ts task-model-annotations` | 默认跑 3 轮全绿（每轮 2 passed + 1 skipped（证据用例））；另 `REMUDA_EVIDENCE=1` 轮 3 passed（截 1440/390） |
+| 全量 hub e2e | 同一锁槽与端口，全 `*.hub.spec.ts` | **178 passed / 38 skipped / 1 failed（flake，见下）/ 27.4m**；唯一失败 `ux-files.hub.spec.ts` row9（FilesView SCM 变更检测等待，未触碰本任务代码，非指针拦截），单独重跑 **8/8 passed**，判定为既有时序 flake。开发中首跑还暴露并已修复两处本任务引入的布局问题：① 入流式 dock 永久压低 session body（m-chrome 0.577 < 0.60）→ 改零高度 float layer；② 全宽浮动条拦截 composer 档位/模型 chip（effort-sync/ux-modelpick/ux-modelsync click timeout）→ 浮动条收缩为靠右内容宽、零高度层 `pointer-events:none`，三 spec 单独重跑 **13/13 passed** |
 | 默认跑脏树检查 | 不带任何标志跑本 spec 后 `git status` | 无新增/修改 PNG（证据仅 `REMUDA_EVIDENCE=1`） |
 | secret-scan | `bash scripts/ci/secret-scan.sh` | 见下节 |
 | no-tunnel-scan | `bash scripts/ci/no-tunnel-scan.sh` | 见下节 |

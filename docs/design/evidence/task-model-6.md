@@ -40,13 +40,13 @@
 
 ## 验证记录
 
-- `pnpm --dir web test`：全量 vitest 绿（含新增 24 个 boardModel 用例，任务套件 123 用例）。
+- `pnpm --dir web test`：154 文件 / **1574 用例全绿**（含新增 24 个 boardModel 用例；任务目录套件 123 用例）。
 - `pnpm --dir web typecheck`：通过。
 - `pnpm --dir web lint`：退出 0（新文件仅 set-state-in-effect 等与 `TaskList.tsx` 同型的提示级 warning）。
 - hub e2e `task-model-boardui.hub.spec.ts`（锁槽 `flock …/locks/e2e.lock-b`，端口 `HUB_E2E_LISTEN=127.0.0.1:59340 HUB_E2E_WEB_PORT=59349 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59341`，`PW_CHANNEL=chromium` 内置 Chromium，`HUB_E2E_TASK_BIND=1`）：连跑 **3 次**均通过（各约 12s）；无 trigger 跑 **1 次整文件 skip**、无 PNG 落库。
-- 回归：`task-model-list.hub.spec.ts`（任务 5，复用 `/board`）1440 + 390 两条在新看板页上全绿。
-- 全量 web hub e2e 套件在同一锁槽/端口下跑 1 次：见文末补记。
-- `bash scripts/ci/secret-scan.sh`、`bash scripts/ci/no-tunnel-scan.sh`：见文末补记。
+- 回归：`task-model-list.hub.spec.ts`（任务 5，复用 `/board`）1440 + 390 两条在新看板页上全绿（最终代码上复跑通过）。
+- 全量 web hub e2e 套件在同一锁槽/端口下跑 1 次（无 trigger，与 gate 一致）：**177 passed / 38 skipped / 0 failed**（26.0m）；本任务 spec 在套件内编号 100，默认运行按预期 skip（38 个 skip 均为门控假 Node/真 Node/证据/mock 用例）。
+- `bash scripts/ci/secret-scan.sh`：pass（退出 0）；`bash scripts/ci/no-tunnel-scan.sh`：passed（退出 0）。
 
 ## 截图
 

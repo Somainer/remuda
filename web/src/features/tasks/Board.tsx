@@ -409,8 +409,11 @@ export function BoardPage() {
         await reload();
       } catch (err) {
         // Grant-verb gating: a caller without Dispatch gets a 403 from the
-        // Hub; the board offered the move and renders the refusal here.
+        // Hub; the board offered the move and renders the refusal here. A
+        // 409 means the state changed under us — refetch so a partial hop is
+        // never shown from a stale column.
         setError(moveErrorMessage(err));
+        await reload();
       } finally {
         setBusyId(null);
       }

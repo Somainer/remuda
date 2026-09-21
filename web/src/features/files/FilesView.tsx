@@ -18,12 +18,28 @@ import {
   type ScmEntry,
 } from "./filesViewModel";
 import css from "./files.module.css";
+import { filterTaskEntries } from "../tasks/taskSpaceFilter";
+
+/**
+ * The optional task-space projection (D-050 §7, t-taskspace). When supplied,
+ * the view gains a 项目空间 / 任务空间 tab pair: both tabs read the same live
+ * status/diff/file payload (no new endpoint), and the task tab narrows the
+ * rows by the task's `owns[]` globs. Availability states are untouched.
+ */
+export interface FilesTaskFilter {
+  /** Label for the task-space tab, e.g. the task title or its SE-nn key. */
+  label: string;
+  /** The task's ownership globs as stored on the task ledger. */
+  owns: readonly string[];
+}
 
 interface FilesViewProps {
   hostId: string;
   workspaceId: string;
   /** Human host label for the subtitle (host name, not attribution). */
   hostLabel?: string;
+  /** When set, the file view offers the task-space filter tab. */
+  taskFilter?: FilesTaskFilter;
   onBack: () => void;
 }
 
@@ -32,7 +48,7 @@ interface FilesViewProps {
  * reads the registered workspace's current git state; the title never implies
  * the changes belong to this session. All loads are manual — no polling.
  */
-export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewProps) {
+export function FilesView({ hostId, workspaceId, hostLabel, taskFilter, onBack }: FilesViewProps) {
   const [view, setView] = useState<FilesViewModel>({
     phase: "loading",
     status: null,
@@ -42,6 +58,10 @@ export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewP
   const [staged, setStaged] = useState(false);
   const [detail, setDetail] = useState<EntryDetailState>({ kind: "idle" });
   const [detailLoading, setDetailLoading] = useState(false);
+  // The project space is the unchanged axis; the task space is its projection.
+  // Default stays on the project space so an open file view is byte-similar.
+  const [space, setSpace] = useState<"project" | "task">("project");
+  const taskActive = taskFilter != null && space === "task";
 
   const load = useCallback(async () => {
     setView((current) => ({ phase: "loading", status: current.status, contentChanged: false }));
@@ -101,6 +121,21 @@ export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewP
     [status, activePath],
   );
 
+  // Task-space projection (D-050 §7): the same rows narrowed by the task's
+  // owns[] globs. It can legitimately be an empty list — that renders the
+  // 「还没有文件」 state, never a synthesised entry.
+  const visibleEntries = useMemo(() => {
+    if (!status) return [];
+    if (!taskActive || !taskFilter) return status.entries;
+    return filterTaskEntries(status.entries, { owns: taskFilter.owns });
+  }, [status, taskActive, taskFilter]);
+
+  const switchSpace = useCallback((next: "project" | "task") => {
+    setSpace(next);
+    setActivePath(null);
+    setDetail({ kind: "idle" });
+  }, []);
+
   return (
     <div className={css.pane} data-testid="files-pane">
       <button type="button" className={css.back} data-testid="files-back" onClick={onBack}>
@@ -119,6 +154,33 @@ export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewP
       <p className={css.note} data-testid="files-attribution">
         这些变更来自该工作区，可能由本会话或同目录的其他会话产生。
       </p>
+
+      {taskFilter ? (
+        <div className={css.toolbar} role="tablist" aria-label="空间切换" data-testid="files-space-tabs">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={space === "project"}
+            className={css.refresh}
+            style={space === "project" ? { borderColor: "var(--paper)" } : undefined}
+            data-testid="files-space-project"
+            onClick={() => switchSpace("project")}
+          >
+            项目空间
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={space === "task"}
+            className={css.refresh}
+            style={space === "task" ? { borderColor: "var(--paper)" } : undefined}
+            data-testid="files-space-task"
+            onClick={() => switchSpace("task")}
+          >
+            任务空间 · {taskFilter.label}
+          </button>
+        </div>
+      ) : null}
 
       <div className={css.toolbar}>
         <button
@@ -152,6 +214,8 @@ export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewP
 
       <Body
         view={view}
+        entries={visibleEntries}
+        taskActive={taskActive}
         activePath={activePath}
         activeEntry={activeEntry}
         staged={staged}
@@ -170,6 +234,10 @@ export function FilesView({ hostId, workspaceId, hostLabel, onBack }: FilesViewP
 
 interface BodyProps {
   view: FilesViewModel;
+  /** Rows to render: all status rows (project space) or the owns-filtered projection (task space). */
+  entries: ScmEntry[];
+  /** Rendering the task-space projection; only changes the empty state wording. */
+  taskActive: boolean;
   activePath: string | null;
   activeEntry: ScmEntry | null;
   staged: boolean;
@@ -182,6 +250,8 @@ interface BodyProps {
 
 function Body({
   view,
+  entries,
+  taskActive,
   activePath,
   activeEntry,
   staged,
@@ -261,6 +331,20 @@ function Body({
     );
   }
 
+  // Task-space empty projection: the worktree has changes, but none of them
+  // lie inside the task's owns[]. The panel says so plainly — it never
+  // synthesises rows (D-050 §7).
+  if (taskActive && entries.length === 0) {
+    return (
+      <div className={css.stateBox} data-testid="files-task-empty">
+        <p className={css.stateTitle}>还没有文件</p>
+        <p className={css.stateReason}>
+          该任务的 owns 范围内还没有出现在工作区当前变更里的文件。
+        </p>
+      </div>
+    );
+  }
+
   return (
     <>
       {status.truncated.entries ? (
@@ -269,7 +353,7 @@ function Body({
         </p>
       ) : null}
       <ul className={css.list} data-testid="files-list">
-        {status.entries.map((entry) => (
+        {entries.map((entry) => (
           <li key={`${entry.xy}:${entry.origPath ?? ""}:${entry.path}`}>
             <button
               type="button"

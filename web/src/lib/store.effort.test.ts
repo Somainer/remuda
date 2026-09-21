@@ -38,7 +38,10 @@ function subscription(instance: Instance) {
   };
 }
 
-async function startFollowing(idSuffix: string) {
+async function startFollowing(
+  idSuffix: string,
+  activity: Instance["activity"] = { state: "known", value: "idle" },
+) {
   const original = mockDb.instances[0];
   const instance: Instance = {
     ...original,
@@ -48,6 +51,7 @@ async function startFollowing(idSuffix: string) {
     effortName: null,
     effortIndex: null,
     effortUltracode: null,
+    activity,
   };
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
   vi.spyOn(api, "eventsRead").mockResolvedValue({
@@ -186,4 +190,123 @@ it("a queued lifecycle shows the pending entry; a degraded one reverts the slide
   expect(toast).toHaveBeenCalled();
   // configure was called once (the user click); the revert did not call it.
   expect(configure).toHaveBeenCalledTimes(1);
+});
+
+it("a poll-projected read-back settles a pending push-down without a live event (c-effortflake)", async () => {
+  // The live follow frame was gapped/coalesced under load, but the driver
+  // still projected the read-back onto the durable Hub record before acking.
+  // The configure-ack refresh folds that projection and must settle pending;
+  // otherwise the chip stays on 切换中 forever even though the Hub knows the
+  // new level.
+  const ctx = await startFollowing("poll-settle");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  const projected: Instance = {
+    ...ctx.instance,
+    effortEffective: {
+      name: "max",
+      ultracode: false,
+      source: "remuda",
+      observedAt: "2026-09-21T00:00:01.000Z",
+    },
+  };
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [projected] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+
+  await hubStore.setEffort(ctx.instance.id, {
+    index: 4,
+    name: "max",
+    kind: "claude",
+    ultracode: false,
+  });
+
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+});
+
+it("a queued push-down survives a poll returning the unchanged level, then settles on the newer one", async () => {
+  const working = { state: "known", value: "working" } as const;
+  const ctx = await startFollowing("poll-queued", working);
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+  // Baseline read-back the session already had before the push-down.
+  ctx.receive(effortEvent(2, "xhigh", false, "remuda"));
+  const baselineAt = "2026-09-16T00:02:00Z";
+
+  const list = vi.spyOn(api, "instanceList");
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        activity: working,
+        effortEffective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: baselineAt },
+      },
+    ],
+  } as never);
+
+  await hubStore.setEffort(ctx.instance.id, {
+    index: 4,
+    name: "max",
+    kind: "claude",
+    ultracode: false,
+  });
+  // The configure-ack poll still shows the OLD level (the turn has not ended):
+  // the queued push-down must remain, not be cleared by an equal observedAt.
+  expect(hubStore.effortPendingOf(ctx.instance.id)?.queued).toBe(true);
+
+  // The turn ends and the new level projects; a later poll settles it.
+  list.mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "xhigh", ultracode: false, source: "remuda", observedAt: "2026-09-16T00:03:00Z" },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+});
+
+it("a poll-settled clamp still leaves the slider on the requested stop when its live frame lands (c-effortflake)", async () => {
+  // The live frame for our max push-down is lost; the configure-ack poll
+  // settles pending from the durable record — which shows the NATIVE CLAMP
+  // (effective xhigh). When that same edge later arrives on the live socket
+  // it must still read as OUR push-down: the slider stays on max so the
+  // 请求 max → 实际 xhigh mismatch survives, instead of folding the slider to
+  // the observed (terminal-switch) level.
+  const ctx = await startFollowing("poll-clamp");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+  const clampedAt = "2026-09-21T00:00:05.000Z";
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: clampedAt },
+      },
+    ],
+  } as never);
+
+  await hubStore.setEffort(ctx.instance.id, {
+    index: 4,
+    name: "max",
+    kind: "claude",
+    ultracode: false,
+  });
+  // The poll settled pending; effective is the clamped level but the slider
+  // the user moved is still on max.
+  expect(hubStore.effortPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("xhigh");
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+
+  // The same clamped edge arrives on the live socket (gapped frame caught up).
+  ctx.receive({
+    ...effortEvent(5, "xhigh", null, "remuda"),
+    observedAt: clampedAt,
+    payload: {
+      effective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: clampedAt },
+      raw: "xhigh",
+    },
+  } as unknown as Observation);
+  // Still our push-down: the slider is NOT folded to the clamped level.
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });

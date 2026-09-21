@@ -1,0 +1,399 @@
+/*
+ * Desktop kanban board (D-050, ui-spec §2.9). The 280px task rail and the
+ * read-only detail panel reuse tasklist.module.css; this sheet owns the
+ * three-column board surface, the cards and the archive fold (a filter
+ * section below the columns — never a fourth column).
+ */
+
+.page {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  background: var(--ink);
+  color: var(--paper);
+  overflow: hidden;
+}
+
+.boardMain {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.boardToolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.boardTitle {
+  margin: 0;
+  font-size: var(--text-aux);
+  font-weight: 600;
+}
+
+.archiveToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: var(--text-label);
+  color: var(--mute);
+  cursor: pointer;
+  user-select: none;
+}
+
+.moveError {
+  margin: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger-strong);
+  font-size: var(--text-label);
+}
+
+.columns {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--line);
+  overflow-y: auto;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  background: var(--ink-0);
+  min-width: 0;
+}
+
+.columnOver {
+  background: var(--ink-2);
+  box-shadow: inset 0 0 0 2px var(--paper);
+}
+
+.columnBlocked {
+  background: color-mix(in srgb, var(--danger) 10%, var(--ink-0));
+  box-shadow: inset 0 0 0 2px var(--danger);
+}
+
+.columnHead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 8px var(--space-3);
+  background: var(--ink-1);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--text-label);
+  color: var(--mute);
+}
+
+.columnTitle {
+  font-weight: 600;
+  color: var(--paper);
+}
+
+.columnCount {
+  margin-left: auto;
+}
+
+.dropReason {
+  margin: 0;
+  padding: 6px var(--space-3);
+  border-bottom: 1px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  color: var(--danger-strong);
+  font-size: var(--text-label);
+}
+
+.columnBody {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2);
+}
+
+.columnEmpty {
+  margin: var(--space-3);
+  color: var(--mute);
+  font-size: var(--text-aux);
+  text-align: center;
+}
+
+/* Cards */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-1);
+}
+
+.card[draggable="true"] {
+  cursor: grab;
+}
+
+.card[draggable="true"]:active {
+  cursor: grabbing;
+}
+
+.card:hover {
+  border-color: color-mix(in srgb, var(--paper) 35%, var(--line));
+}
+
+.cardSelected {
+  border-color: var(--paper);
+  box-shadow: inset 0 0 0 1px var(--paper);
+}
+
+.cardFailed {
+  border-color: var(--danger);
+}
+
+.cardArchived {
+  opacity: 0.75;
+}
+
+.cardHead {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.cardOpen {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.cardKey {
+  flex: none;
+  font-family: var(--font);
+  font-size: var(--text-label);
+  color: var(--mute);
+}
+
+.cardTitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-aux);
+}
+
+.cardArchive {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-size: var(--text-label);
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.cardArchive:hover {
+  color: var(--paper);
+  border-color: var(--paper);
+}
+
+.failBadge {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger-strong);
+  font-size: var(--text-label);
+}
+
+.failMark {
+  flex: none;
+  font-weight: 700;
+}
+
+.failText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cardSessions {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sessionLine {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  color: inherit;
+  text-decoration: none;
+  font-size: var(--text-label);
+}
+
+.sessionLine:hover {
+  text-decoration: underline;
+}
+
+.sessionName {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sessionTime {
+  flex: none;
+  color: var(--mute);
+  font-family: var(--font);
+}
+
+.cardNoSession {
+  margin: 0;
+  color: var(--mute);
+  font-size: var(--text-label);
+}
+
+.cardFoot {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.configChip {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--mute);
+  font-size: var(--text-label);
+}
+
+.shared {
+  flex: 1 1 auto;
+  text-align: right;
+  color: var(--paper);
+  font-size: var(--text-label);
+}
+
+.sharedMute {
+  flex: 1 1 auto;
+  text-align: right;
+  color: var(--mute);
+  font-size: var(--text-label);
+}
+
+/* Archive fold: a filter section, never a board column. */
+
+.archiveFold {
+  flex: none;
+  max-height: 34%;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--line);
+  background: var(--ink-0);
+}
+
+.archiveHead {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 6px var(--space-3);
+  font-size: var(--text-label);
+  color: var(--mute);
+  border-bottom: 1px solid var(--line);
+}
+
+.archiveCount {
+  margin-left: auto;
+}
+
+.archiveEmpty {
+  margin: var(--space-3);
+  color: var(--mute);
+  font-size: var(--text-aux);
+}
+
+.archiveCards {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-2);
+  padding: var(--space-2);
+}
+
+/* Read-only preview */
+
+.preview {
+  flex: 0 0 360px;
+  min-width: 300px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--line);
+  background: var(--ink);
+  overflow: hidden;
+}
+
+.previewBanner {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 8px var(--space-4);
+  border-bottom: 1px solid var(--line);
+  background: var(--ink-1);
+  font-size: var(--text-label);
+}
+
+.previewMode {
+  flex: none;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--mute);
+}
+
+.previewLink {
+  color: var(--paper);
+}
+
+.previewMute {
+  color: var(--mute);
+}

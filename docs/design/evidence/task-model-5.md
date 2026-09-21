@@ -47,7 +47,7 @@
 - `pnpm --dir web typecheck`：通过。
 - `pnpm --dir web lint`：退出 0（新文件仅 3 条 fast-refresh/set-state-in-effect 提示级 warning，与仓库既有同型）。
 - hub e2e `task-model-list.hub.spec.ts`（锁槽 `flock …/locks/e2e.lock-b`，端口 `HUB_E2E_LISTEN=127.0.0.1:59310 HUB_E2E_WEB_PORT=59319 HUB_E2E_UPSTREAM_LISTEN=127.0.0.1:59311`，本地无 Google Chrome 故 `PW_CHANNEL=chromium` 用内置 Chromium）：连跑 **3 次**，每次 1440 + 390 两条均通过。
-- 全量 web hub e2e 套件在同一锁槽/端口下跑 1 次：见文末全量记录。
+- 全量 web hub e2e 套件在同一锁槽/端口下跑 1 次：**172 passed / 28 skipped / 0 failed**（26.0m，skip 均为预期的 gated 假 Node 用例、真实 Node 用例、证据用例与 mock 用例；本任务的 `task-model-list.hub.spec.ts` 两条在套件内编号 100/101 通过）。
 - `bash scripts/ci/secret-scan.sh`：pass；`bash scripts/ci/no-tunnel-scan.sh`：passed。
 
 ## 截图

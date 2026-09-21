@@ -331,6 +331,10 @@ describe("card sessions and the config label", () => {
 
   it("defaults the config label, then names the profile a session applies", () => {
     expect(configLabelOf([])).toBe("default");
+    // The baseline native profile id `none` (D-012) reads as default.
+    expect(
+      configLabelOf([session({ id: "n", taskId: "t", providerProfileId: "none" })]),
+    ).toBe("default");
     expect(
       configLabelOf([session({ id: "a", taskId: "t", providerProfileId: "strict" })]),
     ).toBe("strict");

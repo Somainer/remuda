@@ -100,6 +100,50 @@ const cardIn = (scope: Page | Locator, id: string): Locator =>
 const column = (page: Page, name: string): Locator =>
   page.locator(`[data-testid="board-column"][data-column="${name}"]`);
 
+/**
+ * Drive the exact HTML5 drag event sequence the browser fires on a real
+ * drag: dragstart (source) → dragenter/dragover (column) → drop → dragend,
+ * sharing one DataTransfer. Playwright's CDP mouse cannot drive Chromium's
+ * native drag controller deterministically — the move after dragstart
+ * engages the controller and the next synthetic move stalls — so the events
+ * are dispatched directly. They still run the app's real React drag
+ * handlers, the per-card legality gate, and the real state-hop PATCHes.
+ */
+async function dispatchDrag(
+  page: Page,
+  cardId: string,
+  targetColumn: "todo" | "in-progress" | "done",
+): Promise<void> {
+  await page.evaluate(
+    ({ cardId, targetColumn }) =>
+      new Promise<void>((resolve) => {
+        const dt = new DataTransfer();
+        const source = document.querySelector(
+          `[data-testid="board-card"][data-task-id="${cardId}"]`,
+        )!;
+        const target = document.querySelector(
+          `[data-testid="board-column"][data-column="${targetColumn}"]`,
+        )!;
+        const fire = (el: Element, type: string) =>
+          el.dispatchEvent(
+            new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }),
+          );
+        fire(source, "dragstart");
+        // Let React flush the dragId before the column reads its legality.
+        window.setTimeout(() => {
+          fire(target, "dragenter");
+          fire(target, "dragover");
+          window.setTimeout(() => {
+            fire(target, "drop");
+            if (source.isConnected) fire(source, "dragend");
+            resolve();
+          }, 60);
+        }, 80);
+      }),
+    { cardId, targetColumn },
+  );
+}
+
 async function makeFixture(page: Page): Promise<Fixture> {
   const suffix = Date.now().toString(36);
   const projectName = `tboardui ${suffix}`;
@@ -295,8 +339,8 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     await expect(cardIn(fold, fx.archived.id)).toBeVisible();
 
     // Acceptance 4: to-do → in-progress runs the pending→placed→running
-    // multi-hop through legal PATCHes (a real trusted HTML5 drag).
-    await cardIn(page, fx.todo.id).dragTo(column(page, "in-progress"));
+    // multi-hop through legal PATCHes.
+    await dispatchDrag(page, fx.todo.id, "in-progress");
     await expect
       .poll(
         async () => cardIn(column(page, "in-progress"), fx.todo.id).count(),
@@ -308,7 +352,7 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     await expect(cardIn(column(page, "todo"), fx.todo.id)).toHaveCount(0);
 
     // running → done is the single legal hop.
-    await cardIn(page, fx.todo.id).dragTo(column(page, "done"));
+    await dispatchDrag(page, fx.todo.id, "done");
     await expect
       .poll(async () => cardIn(column(page, "done"), fx.todo.id).count(), { timeout: 15_000 })
       .toBe(1);
@@ -353,7 +397,7 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
         body: JSON.stringify({ error: "dispatch grant required" }),
       });
     });
-    await cardIn(page, fx.running.id).dragTo(column(page, "done"));
+    await dispatchDrag(page, fx.running.id, "done");
     await expect(page.getByTestId("board-move-error")).toContainText(/403|Dispatch|授权/);
     await page.unroute("**/v1/tasks/*");
     // The refusal left the card where it was.

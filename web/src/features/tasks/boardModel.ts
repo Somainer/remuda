@@ -210,10 +210,15 @@ function primarySession(task: BoardItem, sessions: readonly CardSession[]): stri
   return sessions[0]?.id ?? null;
 }
 
-/** The applied config-reuse label (B.8): a session's profile, else default. */
+/**
+ * The applied config-reuse label (B.8): the name of the profile a session
+ * applies. The baseline native profile has wire id `none` (D-012) — it reads
+ * as `default` on the card, so an unconfigured launch and an explicit
+ * baseline both show the default tag rather than a raw id.
+ */
 export function configLabelOf(sessions: readonly CardSession[]): string {
-  return sessions.find((session) => session.providerProfileId?.trim())?.providerProfileId
-    ?? "default";
+  const profileId = sessions.find((session) => session.providerProfileId?.trim())?.providerProfileId;
+  return profileId && profileId !== "none" ? profileId : "default";
 }
 
 // ── Model composition ─────────────────────────────────────────────────────

@@ -109,6 +109,7 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
   let host = "";
   let wsp = "";
   const createdInstances: string[] = [];
+  let previousMaxInstances: number | undefined;
 
   async function makeProject(page: Page): Promise<void> {
     suffix = Date.now().toString(36);
@@ -131,6 +132,28 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
       workspaceId: wsp,
       role: "build",
     });
+    // The shared fake hub keeps live instances from earlier specs; the
+    // default cap is 8 and the serial attach-lock tests launch several.
+    // Raise it (the same PATCH the m-keybar spec uses) so capacity never
+    // masquerades as a dir-busy result; restore the old cap in afterAll.
+    if (previousMaxInstances === undefined) {
+      const hosts = await apiJson<{ items?: { id?: string; maxInstances?: number }[] }>(
+        page,
+        "GET",
+        "/v1/hosts",
+      );
+      previousMaxInstances = hosts.items?.find((item) => item.id === host)?.maxInstances ?? 8;
+    }
+    await apiJson(page, "PATCH", `/v1/hosts/${host}`, { maxInstances: 64 });
+  }
+
+  async function deleteInstance(page: Page, id: string | undefined): Promise<void> {
+    if (!id) return;
+    await page.request
+      .fetch(`/v1/instances/${id}?force=1`, { method: "DELETE" })
+      .catch(() => undefined);
+    const at = createdInstances.indexOf(id);
+    if (at >= 0) createdInstances.splice(at, 1);
   }
 
   async function boundTask(
@@ -163,7 +186,8 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
   }
 
   test.afterAll(async ({ browser }) => {
-    // Best-effort cleanup of the bound sessions so leases detach.
+    // Best-effort cleanup of the bound sessions so leases detach, and restore
+    // the fake node's original capacity for later serial specs.
     const context = await browser.newContext();
     const page = await context.newPage();
     try {
@@ -171,6 +195,13 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
       for (const id of createdInstances) {
         await page.request
           .fetch(`/v1/instances/${id}?force=1`, { method: "DELETE" })
+          .catch(() => undefined);
+      }
+      if (previousMaxInstances !== undefined && host) {
+        await page.request
+          .patch(`/v1/hosts/${host}`, {
+            data: { maxInstances: previousMaxInstances },
+          })
           .catch(() => undefined);
       }
     } finally {
@@ -203,6 +234,7 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
     // Node applies resolve_instance_cwd to the registered root itself.
     const instance = await launchCwd(page, task.id);
     expect(instance.cwd).toBe(wsp);
+    await deleteInstance(page, instance.instanceId ?? instance.id);
   });
 
   test("reuse sibling: cwd folds to the existing remuda-wt directory", async ({ page }) => {
@@ -218,6 +250,7 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
     expect(instance.cwd).toBe(SIBLING_CWD);
     // Reuse never flows through the worktree field.
     expect(instance.worktree ?? null).toBeNull();
+    await deleteInstance(page, instance.instanceId ?? instance.id);
   });
 
   test("reuse sharing: a second task on the same directory bumps refcount and is queued 与 N 个 task 共用", async ({
@@ -265,13 +298,10 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
     expect(blockedLaunch.body).toMatch(/dir-busy/);
 
     // Once the holder detaches, the queued task can launch in the same cwd.
-    await page.request
-      .fetch(`/v1/instances/${firstInstance.instanceId ?? firstInstance.id}?force=1`, {
-        method: "DELETE",
-      })
-      .catch(() => undefined);
+    await deleteInstance(page, firstInstance.instanceId ?? firstInstance.id);
     const secondInstance = await launchCwd(page, second.id);
     expect(secondInstance.cwd).toBe(`${ROOT_CWD}/remuda-wt/${shareDir}`);
+    await deleteInstance(page, secondInstance.instanceId ?? secondInstance.id);
   });
 
   test("pool: the lease allocates a slot with its own wt/<slot>/<task> branch and folds into worktree", async ({
@@ -297,6 +327,7 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
     // field — no new dispatch wire field.
     const instance = await launchCwd(page, task.id);
     expect(instance.cwd).toBe(`${ROOT_CWD}/remuda-wt/${slot}`);
+    await deleteInstance(page, instance.instanceId ?? instance.id);
   });
 
   test("refusals: out-of-tree, dirty directory and a full pool block without creating a task", async ({
@@ -385,5 +416,123 @@ test.describe("task directory binding (HUB_E2E_TASK_BIND=1)", () => {
     });
     expect(conflict.status).toBe(409);
     expect(conflict.body).toMatch(/bound to host/);
+  });
+
+  test("mode mismatch: pool against a standalone reuse directory is refused 409 and refunds the lease row", async ({
+    page,
+  }) => {
+    await makeProject(page);
+    // agent-three is a seeded standalone (operator-owned) worktree. The only
+    // reachable mismatch direction: pool request, reuse catalog record.
+    const mismatchDir = "agent-three";
+    const mismatch = await apiStatus(page, "POST", "/v1/tasks", {
+      projectId: project,
+      title: `mismatch ${suffix}`,
+      intent: "cannot change modes",
+      workspaceBinding: { mode: "pool", hostId: host, workspaceId: wsp, worktreeName: mismatchDir },
+    });
+    expect(mismatch.status).toBe(409);
+    expect(mismatch.body).toMatch(/existing directory of mode reuse|refusing to change modes/);
+
+    // The refused task was rolled back.
+    const list = await apiJson<{ items: CreatedTask[] }>(
+      page,
+      "GET",
+      `/v1/tasks?project=${project}`,
+    );
+    expect(list.items.some((task) => task.title === `mismatch ${suffix}`)).toBe(false);
+
+    // The refund: a fresh reuse binding on the same key starts at refcount 1
+    // — the failed pool request left no task on the lease row.
+    const retry = await boundTask(page, "mismatch-refund", {
+      mode: "reuse",
+      hostId: host,
+      workspaceId: wsp,
+      worktreeName: mismatchDir,
+    });
+    expect(retry.sharing?.dirKey).toBe(mismatchDir);
+    expect(retry.sharing?.refcount).toBe(1);
+    expect(retry.sharing?.queued ?? false).toBe(false);
+  });
+
+  test("attach lock: two concurrent dispatches on one directory yield one launch and one dir-busy refusal", async ({
+    page,
+  }) => {
+    await makeProject(page);
+    // A standalone sibling on its own key: the root "." key is shared with
+    // earlier specs whose sessions may still be attached on this one hub.
+    const raceDir = "agent-race";
+    const first = await boundTask(page, "race-a", {
+      mode: "reuse",
+      hostId: host,
+      workspaceId: wsp,
+      worktreeName: raceDir,
+    });
+    const second = await boundTask(page, "race-b", {
+      mode: "reuse",
+      hostId: host,
+      workspaceId: wsp,
+      worktreeName: raceDir,
+    });
+
+    const launch = (taskId: string, name: string) =>
+      page.request.fetch("/v1/instances", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        data: {
+          hostId: host,
+          workspaceId: wsp,
+          kind: "claude",
+          driver: "claude-pty",
+          taskId,
+          name,
+          prompt: "attach-lock race",
+        },
+      });
+
+    // Fire both before either settles; the conditional claim in the store
+    // writer decides the winner, not client scheduling.
+    const [a, b] = await Promise.all([
+      launch(first.id, `race-a-${suffix}`),
+      launch(second.id, `race-b-${suffix}`),
+    ]);
+    const outcomes = [
+      { name: "a", status: a.status(), body: await a.text() },
+      { name: "b", status: b.status(), body: await b.text() },
+    ];
+    const ok = outcomes.filter((outcome) => outcome.status === 200);
+    const busy = outcomes.filter((outcome) => outcome.status === 409);
+    expect(ok).toHaveLength(1);
+    expect(busy).toHaveLength(1);
+    expect(busy[0].body).toMatch(/dir-busy/);
+
+    // Exactly one instance was spawned: the winner resolves to an instance
+    // row carrying one of the two racing tasks.
+    const winnerBody = JSON.parse(ok[0].body) as { instance: InstanceDoc };
+    const winnerId = winnerBody.instance.instanceId ?? winnerBody.instance.id;
+    expect(winnerId).toBeTruthy();
+    createdInstances.push(winnerId!);
+    const winner = await apiJson<InstanceDoc & { taskId?: string }>(
+      page,
+      "GET",
+      `/v1/instances/${winnerId}`,
+    );
+    expect([first.id, second.id]).toContain(winner.taskId);
+
+    // While the winner is attached, a sequential retry by the loser still
+    // queues; deleting the winner frees the lock.
+    const retry = await apiStatus(page, "POST", "/v1/instances", {
+      hostId: host,
+      workspaceId: wsp,
+      kind: "claude",
+      driver: "claude-pty",
+      taskId: winner.taskId === first.id ? second.id : first.id,
+      name: `race-retry-${suffix}`,
+      prompt: "still queued",
+    });
+    expect(retry.status).toBe(409);
+    expect(retry.body).toMatch(/dir-busy/);
+
+    await deleteInstance(page, winnerId);
   });
 });

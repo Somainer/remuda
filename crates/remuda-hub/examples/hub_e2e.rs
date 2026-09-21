@@ -2530,7 +2530,7 @@ impl BindLeaseState {
         );
         // Separate standalone dirs so serial specs sharing one hub do not
         // count each other's leases on the same key.
-        for name in ["agent-two", "agent-three"] {
+        for name in ["agent-two", "agent-three", "agent-race"] {
             state.catalog.insert(
                 name.into(),
                 BindWorktree {

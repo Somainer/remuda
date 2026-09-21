@@ -132,6 +132,13 @@ async fn main() -> Result<()> {
     {
         route_down_gate = Some(gate);
     }
+    // t-project-switcher: an optional second enrolled fake Node on another
+    // host, each host announcing one branded workspace, so the spec can build
+    // a project whose members span two hosts (D-024 key never merges).
+    let mut project_host_b: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(hub) = &hub {
+        project_host_b = maybe_spawn_project_host_b(addr, hub).await?;
+    }
     println!("HUB_E2E_READY {line}");
     let _ = io::stdout().flush();
     tokio::signal::ctrl_c().await.ok();
@@ -141,6 +148,9 @@ async fn main() -> Result<()> {
     }
     node.abort();
     upstream_task.abort();
+    if let Some(host_b) = project_host_b {
+        host_b.abort();
+    }
     drop(hub);
     Ok(())
 }
@@ -262,6 +272,117 @@ async fn via_proxy_node(
         let _ = ws.close(None).await;
         epoch = epoch.wrapping_add(1);
         // Avoid a tight loop when the socket fails before the gate exists.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// t-project-switcher harness: when `HUB_E2E_PROJECT_SWITCHER=1`, enroll a
+/// second fake Node on its own host (`e2e-project-host-b`) that announces one
+/// branded workspace (root `/tmp/remuda-project-b`). Together with the
+/// primary fake node's `/tmp/remuda-project-a` workspace the spec creates a
+/// project whose `members[]` span two hosts — the D-024 case where the same
+/// logical project must NOT collapse into one Space key. The node answers
+/// every RPC ok; no session is ever launched on it in the spec.
+async fn maybe_spawn_project_host_b(
+    addr: SocketAddr,
+    hub: &remuda_hub::RunningHub,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    if std::env::var("HUB_E2E_PROJECT_SWITCHER").as_deref() != Ok("1") {
+        return Ok(None);
+    }
+    let host_b = HostId::new();
+    let workspace_b = remuda_protocol::WorkspaceId::new();
+    let enroll = hub
+        .mint_enroll_token(remuda_hub::DEFAULT_ENROLL_TOKEN_TTL_MINUTES)
+        .await
+        .context("mint host-b enroll token")?;
+    let handle = tokio::spawn(async move {
+        if let Err(error) = project_host_b_node(addr, enroll, host_b.clone(), workspace_b).await {
+            eprintln!("project host-b node {host_b:?} exited: {error:#}");
+        }
+    });
+    Ok(Some(handle))
+}
+
+/// Connect/reconnect loop for the second enrolled fake Node.
+async fn project_host_b_node(
+    addr: SocketAddr,
+    enroll: String,
+    host_id: HostId,
+    workspace_id: remuda_protocol::WorkspaceId,
+) -> Result<()> {
+    let mut epoch = 1u64;
+    loop {
+        let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+        req.headers_mut()
+            .insert("Authorization", format!("Bearer {enroll}").parse()?);
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
+                "params": {
+                    "hostId": host_id.as_id().as_str(),
+                    "nodeVersion": "0.1.0-e2e",
+                    "label": "e2e-project-host-b",
+                    "nodeEpoch": format!("epoch-e2e-project-b-{epoch}"),
+                    "instanceStoreFound": true,
+                    "instances": [],
+                    "host": {
+                        "hostname": "e2e-project-host-b.local",
+                        "workspaceRevision": 1,
+                        "workspaces": [{
+                            "workspaceId": workspace_id.as_id().as_str(),
+                            "hostId": host_id.as_id().as_str(),
+                            "root": "/tmp/remuda-project-b"
+                        }],
+                        "labels": { "role": "e2e" },
+                        "maxInstances": 8,
+                        "herdr": { "version": "e2e-fake" }
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        // Inventory-only node: the spec only reads its registry (host +
+        // workspace) and never launches here, but GET /v1/hosts/{id}/workspaces
+        // issues a live workspace.list RPC, so answer it with the same
+        // snapshot shape the hello carries; every other RPC gets a generic ok.
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(frame) = serde_json::from_str::<Value>(&text)
+                        && let Some(id) = frame.get("id").cloned()
+                    {
+                        let method = frame
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let result = if method == "workspace.list" {
+                            json!({
+                                "workspaceRevision": 1,
+                                "workspaces": [{
+                                    "workspaceId": workspace_id.as_id().as_str(),
+                                    "hostId": host_id.as_id().as_str(),
+                                    "root": "/tmp/remuda-project-b"
+                                }]
+                            })
+                        } else {
+                            json!({"ok": true})
+                        };
+                        let _ = ws.send(Message::Text(
+                            json!({"jsonrpc":"2.0","id":id,"result":result})
+                                .to_string()
+                                .into(),
+                        )).await;
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        epoch = epoch.wrapping_add(1);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -608,6 +729,17 @@ async fn fake_node(
             "workspaceId": remuda_protocol::WorkspaceId::new().as_id().as_str(),
             "hostId": host,
             "root": "/tmp/remuda-bind"
+        }));
+    }
+    // t-project-switcher: the cross-host project needs one branded workspace
+    // on this, the primary fake host. Distinct root (/tmp/remuda-project-a) so
+    // it never merges with another spec's per-root space chips (D-024 is what
+    // the spec asserts; the fixture keeps the two members visibly apart).
+    if project_switcher_enabled() {
+        workspaces.push(json!({
+            "workspaceId": remuda_protocol::WorkspaceId::new().as_id().as_str(),
+            "hostId": host,
+            "root": "/tmp/remuda-project-a"
         }));
     }
     let workspaces = Value::Array(workspaces);
@@ -2480,6 +2612,18 @@ type NodeWs =
 
 fn task_bind_enabled() -> bool {
     std::env::var("HUB_E2E_TASK_BIND").as_deref() == Ok("1")
+}
+
+// ── t-project-switcher second fake host (HUB_E2E_PROJECT_SWITCHER=1 only) ──
+//
+// Off by default: a default full-suite run enrolls exactly the primary fake
+// node, so every other spec sees an unchanged host directory. With the
+// trigger set, the primary node gains one /tmp/remuda-project-a branded
+// workspace and a second enrolled node (`e2e-project-host-b`) announces
+// /tmp/remuda-project-b, giving the project-switcher spec members on two
+// hosts without merging Space keys (D-024).
+fn project_switcher_enabled() -> bool {
+    std::env::var("HUB_E2E_PROJECT_SWITCHER").as_deref() == Ok("1")
 }
 
 /// One in-memory catalog row the binding fake hands out via worktree.list.

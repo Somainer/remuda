@@ -2,10 +2,12 @@ import { projectStatus } from "../../lib/status";
 import type { Instance, UiStatus } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import type { Observation } from "../../types/observation";
+import type { Task } from "../../types/generated";
 import type { UsageRollup } from "../session/contextUsage";
 import { nextStep, type RowScreen } from "../session/nextStep";
 import { OTHER_SPACE, type Space } from "../spaces/store";
 import { rankQuickFind } from "../search/quickFindSearch";
+import { buildTaskGroups, type TaskListGroup } from "../tasks/taskRows";
 
 /**
  * Pure derivation for the `/m` phone home (ui-spec §4.7 / §2.1, D-038/D-049).
@@ -233,4 +235,35 @@ export function buildHomeGroups(input: HomeRowsInput): HomeGroup[] {
   }
   groups.sort((a, b) => compareGroups(a, b, input.order));
   return groups;
+}
+
+/**
+ * D-050 (task-model task 5): the task grouping layer the `/m` home stacks
+ * above its existing project + git branch session groups. This is only an
+ * additive projection — it delegates wholesale to the task list's pure
+ * `buildTaskGroups()` (需要你 first, project+branch groups with the
+ * buildSpaces() blocked count, parent/child nesting, SE-nn keys, 已归档
+ * folded away) and renders no second transcript: every task row links to the
+ * shared `/s/:id`.
+ */
+export type HomeTaskLayerInput = {
+  tasks: readonly Task[];
+  instances: readonly Instance[];
+  interactions: readonly Pick<Interaction, "instanceId" | "state">[];
+  spaces: readonly Space[];
+  projectName?: (projectId: string) => string | null | undefined;
+  branchOfSpace?: (spaceId: string) => string | null | undefined;
+  query?: string;
+};
+
+export function buildHomeTaskLayer(input: HomeTaskLayerInput): TaskListGroup[] {
+  return buildTaskGroups({
+    tasks: input.tasks,
+    instances: input.instances,
+    interactions: input.interactions,
+    spaces: input.spaces,
+    projectName: input.projectName,
+    branchOfSpace: input.branchOfSpace,
+    query: input.query,
+  });
 }

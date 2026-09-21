@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import type { Id } from "../../types/wire";
 import { hubStore, useHub } from "../../lib/store";
@@ -32,6 +32,10 @@ type ResumeState = { busy: boolean; error: string | null };
 export function HomeList() {
   const hub = useHub();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  // The desktop board collapses to /m with its ?project= preserved
+  // (resolveLanding keeps the query verbatim); honor it on the task layer.
+  const projectFilter = params.get("project");
   const prefs = useSpacesPrefs();
   const [query, setQuery] = useState("");
   const [order, setOrder] = useState<HomeOrder>(() => readHomeOrder(localStorageAccess()));
@@ -149,7 +153,7 @@ export function HomeList() {
   // D-050 task layer stacked above the project+branch session groups:
   // 需要你 first, tasks nested by parent, SE-nn keys, archive folded. Tapping
   // a task row opens the shared /s/:id — no second transcript (D-049).
-  const taskLedger = useTaskLedger();
+  const taskLedger = useTaskLedger(projectFilter);
   const taskLayer = useMemo(
     () =>
       buildHomeTaskLayer({

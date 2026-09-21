@@ -317,6 +317,10 @@ test.describe("task list at 1440 desktop", () => {
     await expect(page.getByTestId("task-list-empty")).toBeVisible();
     await page.getByTestId("task-search").fill("");
 
+    // Evidence: select the owner-blocked task so the detail body (title,
+    // blocked reason, mandate chain) is the right-hand surface.
+    await rowIn(page, fx.blocked.id).first().click();
+    await expect(page.getByTestId("task-detail-blocked")).toBeVisible();
     await shot(page, "task-model-5-board-1440.png");
   });
 });
@@ -349,11 +353,17 @@ test.describe("task layer at 390 phone (/m)", () => {
     const count = await taskGroups.count();
     await expect(taskGroups.nth(count - 1)).toHaveAttribute("data-kind", "archived");
 
+    // Evidence shot pinned to this fixture's project (?project= is carried
+    // verbatim from the collapsed desktop board): one project's task layer.
+    await page.goto(`/m?project=${fx.project}`);
+    const filteredLayer = page.getByTestId("home-tasks");
+    await expect(filteredLayer).toBeVisible();
+    await expect(rowIn(filteredLayer, fx.parent.id).first()).toHaveAttribute("data-depth", "0");
     await shot(page, "task-model-5-home-390.png");
 
     // Acceptance 7: tapping a task row opens the shared /s/:id — no second
     // transcript route exists.
-    await rowIn(layer, fx.parent.id).first().click();
+    await rowIn(filteredLayer, fx.parent.id).first().click();
     await page.waitForURL(new RegExp(`/s/${fx.instanceId}`), { timeout: 15_000 });
   });
 });

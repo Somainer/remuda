@@ -28,16 +28,19 @@ forever** even though the effort actually changed. The fix is in the product
   refresh and the existing 2-second poll, so the settled effort always reaches
   the chip even when its live frame does not.
 
-- **`effort-sync.hub.spec.ts:70` — Codex six-tier round-trip at 390px.** Same
-  cause: the 390px surface renders the same `effortPending` / `effortEffective`
-  store fields as desktop, and the whole serial file ran on a host that was
-  saturated for its duration, so the un-settled pending (`切换中：max`,
-  `source=unknown`) hit the chip assertion there too; it is not a separate
-  layout/picker defect (the six-tier ordering, labels and wire names are
-  untouched and still asserted). The same run's 1440px variant reproduced the
-  identical signature in the load loop below (`title="切换中：max"`,
-  `data-effort-effective="pending"`, fourteen stable resolutions), confirming
-  one shared root cause across both widths.
+- **`effort-sync.hub.spec.ts:70` — Codex six-tier round-trip at 390px.** This
+  was one of the two failures reported by the landing gate. It was **not
+  independently reproduced in the load loop below**: the loop happened to
+  surface the identical defect on the same test's **1440px** variant
+  (`title="切换中：max"`, `data-effort-effective="pending"`, fourteen stable
+  resolutions, `source=unknown`). The 390px attribution is inferred rather
+  than separately reproduced, on the grounds that both widths are one
+  parameterized test reading the exact same `effortPending` / `effortEffective`
+  store fields (the 390px surface has no separate effort projection path), so
+  a pending the store never settles must stick at either width; the six-tier
+  ordering, labels and wire names are untouched and still asserted at 390px,
+  so it is not a layout/picker defect. Both variants pass in the post-fix full
+  suite.
 
 ## Why pending could become terminal (the product bug)
 

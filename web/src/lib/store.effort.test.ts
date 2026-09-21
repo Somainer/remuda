@@ -300,7 +300,7 @@ it("a poll-settled clamp still leaves the slider on the requested stop when its 
 
   // The same clamped edge arrives on the live socket (gapped frame caught up).
   ctx.receive({
-    ...effortEvent(5, "xhigh", null, "remuda"),
+    ...effortEvent(2, "xhigh", null, "remuda"),
     observedAt: clampedAt,
     payload: {
       effective: { name: "xhigh", ultracode: null, source: "remuda", observedAt: clampedAt },
@@ -308,5 +308,47 @@ it("a poll-settled clamp still leaves the slider on the requested stop when its 
     },
   } as unknown as Observation);
   // Still our push-down: the slider is NOT folded to the clamped level.
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+});
+
+it("an older poll projection cannot overwrite a newer live effective or move the slider", async () => {
+  // Monotonic guard: a stale/slower durable record (e.g. a poll answering out
+  // of order after the live socket already advanced) must never roll the
+  // effective level back, and the projection path never writes the slider.
+  const ctx = await startFollowing("monotonic");
+  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+
+  // A terminal-side switch arrives live: effective max, slider folds to max.
+  const newerAt = "2026-09-21T01:00:09.000Z";
+  ctx.receive({
+    ...effortEvent(2, "max", false, "slash"),
+    observedAt: newerAt,
+    payload: {
+      effective: { name: "max", ultracode: false, source: "slash", observedAt: newerAt },
+      raw: "max",
+    },
+  } as unknown as Observation);
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
+
+  // A poll then returns a durable projection carrying an OLDER effective level.
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      {
+        ...ctx.instance,
+        effortEffective: {
+          name: "xhigh",
+          ultracode: null,
+          source: "remuda",
+          observedAt: "2026-09-21T01:00:01.000Z",
+        },
+      },
+    ],
+  } as never);
+  await hubStore.refresh();
+
+  // Neither the effective value nor the slider may regress to the older level.
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.name).toBe("max");
+  expect(hubStore.effortEffectiveOf(ctx.instance.id)?.observedAt).toBe(newerAt);
   expect(hubStore.effortOf(ctx.instance.id, "claude").name).toBe("max");
 });

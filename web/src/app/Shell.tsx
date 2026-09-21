@@ -14,6 +14,8 @@ import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { ProjectSwitcher, useProjects } from "../features/tasks/ProjectSwitcher";
 import { SessionsPage } from "../pages/SessionsPage";
 import { InstallBar } from "./InstallBar";
+import { AnnotationProvider } from "../features/tasks/AnnotationPanel";
+import { AnnotationCapture } from "../features/session/AnnotationCapture";
 import css from "./Shell.module.css";
 import notifyCss from "./shellNotify.module.css";
 
@@ -268,6 +270,7 @@ export function Shell() {
   }, [hub.toast]);
 
   return (
+    <AnnotationProvider>
     <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layoutOf(location.pathname)} data-spaces={showSidebarList ? "1" : "0"} data-panel-collapsed={workbench.prefs.collapsed}>
       <div className={css.install}>
         <InstallBar />
@@ -387,6 +390,8 @@ export function Shell() {
         </div>
       ) : null}
       <ShellNotify />
+      <AnnotationCapture />
     </div>
+    </AnnotationProvider>
   );
 }

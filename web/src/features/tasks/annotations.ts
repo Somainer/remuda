@@ -210,6 +210,19 @@ export function clearAnnotations(instanceId: string): void {
   writeAnnotations(instanceId, []);
 }
 
+/**
+ * Fold this instance's drafts into an outgoing prompt. The caller clears the
+ * drafts only once the send landed (store.send resolves true), mirroring the
+ * composer's 状态待确认 semantics: a failed POST keeps the drafts for retry.
+ */
+export function composeWithAnnotations(
+  instanceId: string,
+  prompt: string,
+): { text: string; count: number } {
+  const drafts = readAnnotations(instanceId).filter((draft) => draft.body.trim() !== "");
+  return { text: withAnnotationPrefix(drafts, prompt), count: drafts.length };
+}
+
 // ── external-store subscription for useSyncExternalStore ─────────────────
 
 type StoreListener = () => void;

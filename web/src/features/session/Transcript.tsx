@@ -1104,6 +1104,11 @@ function renderNode(
         data-status={node.status}
         data-held={node.local?.held ? node.holdReason ?? "turn" : undefined}
         data-command-id={node.local?.commandId ?? undefined}
+        // t-annotations: message prose is an in-message ① anchor surface;
+        // the owning session/readonly state comes from the session-page
+        // ancestor (data-annotation-instance).
+        data-anchor-surface="transcript"
+        data-anchor-message={node.id}
       >
         <div className={session.you}>
           {user ? "You" : node.role}

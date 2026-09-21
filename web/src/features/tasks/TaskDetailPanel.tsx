@@ -35,6 +35,10 @@ export function TaskDetailPanel({
   const failed = task.state === "failed";
   const chain = [...(task.mandate?.chain ?? [])].sort((a, b) => a.depth - b.depth);
   const detailSessionId = primarySessionId ?? sessionIds[0] ?? null;
+  // t-annotations: a ① selected here rides the task's workbench session.
+  // Archived tasks are a read-only preview — the selection affordance must
+  // not raise (readAnnotationSelection honours data-annotation-readonly).
+  const annotationReadonly = task.archivedAt != null;
 
   return (
     <aside className={css.detail} data-testid="task-detail" aria-label="任务详情">
@@ -70,6 +74,8 @@ export function TaskDetailPanel({
         className={css.detailMandate}
         data-testid="task-detail-mandate"
         data-anchor-surface="task-detail"
+        data-annotation-instance={detailSessionId ?? undefined}
+        data-annotation-readonly={annotationReadonly ? "1" : "0"}
       >
         <h3 className={css.detailSectionTitle}>Mandate</h3>
         {chain.length > 0 ? (

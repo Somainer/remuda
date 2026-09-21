@@ -19,6 +19,9 @@ import { projectTurnDecision } from "../features/session/live/turnDecision";
 import { useNow } from "../features/session/live/useElapsed";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
 import { TaskTrack } from "../features/session/TaskTrack";
+import { AnnotationBadge, AnnotationPanel, useAnnotationsContext, useSessionTask } from "../features/tasks/AnnotationPanel";
+import { composeWithAnnotations } from "../features/tasks/annotations";
+import annCss from "../features/tasks/annotation.module.css";
 import { RawEvents } from "../features/session/RawEvents";
 import { assembleTranscript, collectTasks, compactTranscript } from "../features/session/assemble";
 import { readDismissedWorkflows } from "../features/session/workflowDismiss";
@@ -46,6 +49,7 @@ export function SessionPage({
 }) {
   const { instanceId = "" } = useParams();
   const hub = useHub();
+  const annotationPanel = useAnnotationsContext();
   const workbench = useSpaceWorkbench();
   const { active: space, newHref } = workbench;
   const navigate = useNavigate();
@@ -81,6 +85,10 @@ export function SessionPage({
   const [interrupted, setInterrupted] = useState(false);
   useEffect(() => setInterrupted(false), [instanceId]);
   const instance = hub.instances.find((i) => i.id === instanceId) ?? resolveTtyLabInstance(instanceId);
+  // t-annotations: a session of an archived task is a read-only preview — no
+  // badge/entry point and anchor selection raises nothing.
+  const sessionTask = useSessionTask(instanceId, (instance as { taskId?: string | null } | undefined)?.taskId);
+  const annotationReadonly = sessionTask?.archivedAt != null;
   const followed = Boolean(hub.events[instanceId] || hub.journalStatus[instanceId]);
   const showTerminal = instance ? canShowTerminal(instance) : false;
   const showStructured = instance ? hasStructuredSignal(instance) : false;
@@ -164,6 +172,10 @@ export function SessionPage({
   }
   const nodeRestarted = instance?.lastError === "node-epoch-changed";
   const resolvedView = view === "auto" ? baseView : view;
+  // Terminal segments offer no annotations; archived-task sessions are a
+  // read-only preview (plan task-model task 9 acceptance 3).
+  const annotationAllowed =
+    resolvedView !== "tty" && resolvedView !== "events" && !annotationReadonly;
 
   // D-047: the route this session actually got — the Node-echoed clause only,
   // never the requested value (D-035). And the §B.5 block when its proxy host
@@ -425,6 +437,11 @@ export function SessionPage({
       data-mode={instance.mode ?? "native"}
       data-view={resolvedView}
       data-journal={journalStatus}
+      // t-annotations: anchor surfaces inside the transcript inherit the
+      // owning session and the read-only flag (sessions of an archived task
+      // are a read-only preview; terminal segments offer no annotations).
+      data-annotation-instance={resolvedView === "tty" || resolvedView === "events" ? undefined : instance.id}
+      data-annotation-readonly={annotationReadonly ? "1" : "0"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
       <header className={session.header}>
@@ -700,6 +717,29 @@ export function SessionPage({
             ))}
           </div>
         ) : null}
+        <AnnotationPanel
+          instanceId={instance.id}
+          taskId={sessionTask?.id ?? null}
+          taskTitle={sessionTask?.title ?? null}
+          readonly={annotationReadonly}
+        />
+        <div data-testid="annotation-dock" className={annCss.annotationBar}>
+          <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
+          {annotationAllowed ? (
+            <button
+              type="button"
+              className={annCss.badge}
+              data-testid="annotation-add"
+              onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
+            >
+              ＋ 加批注
+            </button>
+          ) : annotationReadonly ? (
+            <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
+              只读预览 · 不可批注
+            </span>
+          ) : null}
+        </div>
         <Composer
           key={instance.id}
           instanceId={instance.id}
@@ -719,6 +759,11 @@ export function SessionPage({
             holder: "remuda" as const,
           }))}
           onHold={(text, reason, refs, staged) => {
+            // Client-held rows bypass onSend: fold the drafts in at hold time
+            // so the prefix rides this queued delivery in order. The hold is
+            // local-only (no POST), so clearing cannot fail.
+            const composed = composeWithAnnotations(instance.id, text);
+            if (composed.count > 0) annotationPanel.clear(instance.id);
             const previews = staged
               .filter((item) => item.objectId)
               .map((item) => ({
@@ -729,7 +774,7 @@ export function SessionPage({
                 mediaType: item.mediaType,
                 size: item.size,
               }));
-            hubStore.hold(instance.id, text, reason, refs, previews);
+            hubStore.hold(instance.id, composed.text, reason, refs, previews);
           }}
           onRetractHeld={(id) => hubStore.retract(id)}
           onSteerHeld={(id) => hubStore.steerHeld(instance.id, id)}
@@ -777,6 +822,11 @@ export function SessionPage({
           onSend={async (text, attachments, staged, mode) => {
             setSending(true);
             try {
+              // D-050 §7: annotation drafts ride this send as a structured
+              // prompt prefix — no wire field, no table. They clear only when
+              // the send landed (a failed POST keeps them as 待确认 drafts).
+              const composed = composeWithAnnotations(instance.id, text);
+              const sentText = composed.text;
               // D-027: the bubble keeps the local blob URLs so the sent
               // message shows thumbnails; the Hub does not echo attachments
               // back onto the journal yet.
@@ -790,7 +840,17 @@ export function SessionPage({
                   mediaType: item.mediaType,
                   size: item.size,
                 }));
-              return await hubStore.send(instance.id, text, attachments ?? [], previews, mode);
+              const landed = await hubStore.send(
+                instance.id,
+                sentText,
+                attachments ?? [],
+                previews,
+                mode,
+              );
+              if (landed !== false && composed.count > 0) {
+                annotationPanel.clear(instance.id);
+              }
+              return landed;
             } finally {
               setSending(false);
             }

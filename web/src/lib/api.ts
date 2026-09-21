@@ -231,6 +231,7 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     cwd?: string | null;
     name?: string | null;
     delegation?: string | null;
+    taskId?: string | null;
     providerProfileId?: string | null;
     providerSource?: string | null;
     providerSourceHint?: string | null;
@@ -317,6 +318,9 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
     launchedBy,
     cwd: extra.cwd ?? rec.workspaceId ?? null,
     name: extra.name ?? rec.title ?? null,
+    // D-050 task membership (instances.task_id); additive, absent on
+    // unbound sessions and older rows.
+    taskId: typeof extra.taskId === "string" && extra.taskId ? extra.taskId : null,
     delegation: typeof rec.delegation === "string" ? rec.delegation : extra.delegation ?? null,
     providerProfileId:
       typeof rec.providerProfileId === "string" ? rec.providerProfileId : extra.providerProfileId ?? null,

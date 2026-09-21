@@ -123,13 +123,17 @@ export function taskAwaitsHuman(
 
 /**
  * Resolve the buildSpaces() Space id a task attaches to: the space of its
- * sessions first (the `instances.task_id` membership), falling back to its
- * recorded directory binding. Returns null for a ledger-only task with no
- * sessions and no binding.
+ * sessions first (the `instances.task_id` membership), then its recorded
+ * directory binding. A child task that has neither inherits its parent's
+ * space — a delegation runs in the parent task's directory, so the family
+ * must stay inside one project+branch group. Returns null for an
+ * unattached ledger task with no placed ancestor.
  */
 export function taskSpaceId(
-  task: Pick<Task, "workspaceBinding">,
+  task: Pick<Task, "workspaceBinding" | "parentTaskId">,
   sessions: readonly Pick<TaskSessionLike, "hostId" | "workspaceId">[],
+  parentById?: ReadonlyMap<string, Pick<Task, "workspaceBinding" | "parentTaskId">>,
+  sessionsByTask?: ReadonlyMap<string, readonly Pick<TaskSessionLike, "hostId" | "workspaceId">[]>,
 ): string | null {
   for (const session of sessions) {
     if (session.hostId && session.workspaceId) {
@@ -139,6 +143,23 @@ export function taskSpaceId(
   const binding = task.workspaceBinding;
   if (binding?.hostId && binding?.workspaceId) {
     return spaceKey(binding.hostId, binding.workspaceId);
+  }
+  // Inherit the nearest placed ancestor's space; guard against cycles.
+  const seen = new Set<string>();
+  let parentId = task.parentTaskId ?? null;
+  while (parentId && !seen.has(parentId)) {
+    seen.add(parentId);
+    const parent = parentById?.get(parentId);
+    if (!parent) break;
+    for (const session of sessionsByTask?.get(parentId) ?? []) {
+      if (session.hostId && session.workspaceId) {
+        return spaceKey(session.hostId, session.workspaceId);
+      }
+    }
+    if (parent.workspaceBinding?.hostId && parent.workspaceBinding?.workspaceId) {
+      return spaceKey(parent.workspaceBinding.hostId, parent.workspaceBinding.workspaceId);
+    }
+    parentId = parent.parentTaskId ?? null;
   }
   return null;
 }
@@ -262,6 +283,7 @@ function matchesNeedle(
 export function buildTaskGroups(input: TaskRowsInput): TaskListGroup[] {
   const tasks = [...input.tasks].sort(byCreatedThenId);
   const keys = displayKeysByTaskId(tasks);
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
 
   const sessionsByTask = new Map<string, TaskSessionLike[]>();
   for (const instance of input.instances ?? []) {
@@ -282,7 +304,7 @@ export function buildTaskGroups(input: TaskRowsInput): TaskListGroup[] {
 
   const prepare = (task: Task): Prepared => {
     const sessions = sessionsByTask.get(task.id) ?? [];
-    const spaceId = taskSpaceId(task, sessions);
+    const spaceId = taskSpaceId(task, sessions, taskById, sessionsByTask);
     const sessionIds = sessions.map((session) => session.id);
     const blockedReason = task.blockedReason?.trim() ? task.blockedReason.trim() : null;
     return {

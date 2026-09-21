@@ -179,7 +179,11 @@ export function TaskGroups({
               {group.project}
               {group.kind === "attention" || group.kind === "archived" ? ` · ${group.count}` : ""}
             </span>
-            {group.branch ? <span className={css.groupBranch}>{group.branch}</span> : null}
+            {group.branch ? (
+              <span className={css.groupBranch}>{group.branch}</span>
+            ) : group.kind === "project" && !group.spaceId ? (
+              <span className={css.groupBranch}>未绑定目录</span>
+            ) : null}
             {group.kind === "project" ? (
               <>
                 <span className={css.groupCount}>{group.count}</span>

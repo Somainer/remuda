@@ -206,8 +206,23 @@ describe("parent / child nesting", () => {
     expect(flattenIds(projectGroup.rows)).toEqual([parent.id, child1.id, child2.id]);
   });
 
-  it("renders a dangling parent reference and an archived child as top-level", () => {
-    const orphan = task("orphan", { parentTaskId: "tsk_missing" });
+  it("keeps a ledger-only child in its parent's Space group", () => {
+    // Parent is launched in wsp-b; the child has no session or binding.
+    const parent = task("placed-parent", { createdAt: "2026-09-21T08:00:00.000Z" });
+    const child = task("unbound-child", {
+      parentTaskId: parent.id,
+      createdAt: "2026-09-21T08:01:00.000Z",
+    });
+    const groups = build(
+      [child, parent],
+      [session("ins_p", parent.id, { hostId: "host-a", workspaceId: "wsp-b" })],
+    );
+    expect(groups.filter((g) => g.kind === "project")).toHaveLength(1);
+    const only = group(groups, "project", `prj:prj_a:${spaceKey("host-a", "wsp-b")}`);
+    expect(flattenIds(only.rows)).toEqual([parent.id, child.id]);
+  });
+
+  it("renders a dangling parent reference and an archived child as top-level", () => {    const orphan = task("orphan", { parentTaskId: "tsk_missing" });
     const parent = task("p");
     const archivedChild = task("ac", { parentTaskId: parent.id, archivedAt: "2026-09-21T10:00:00Z" });
     const groups = build([orphan, archivedChild, parent]);

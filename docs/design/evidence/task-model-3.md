@@ -109,17 +109,20 @@ flock <locks-dir>/e2e.lock-c \
   bash -c 'cd web && pnpm playwright test -c playwright.hub.config.ts task-model-bind'
 ```
 
-Result, three runs in a row:
+Result, three runs in a row (after review round 2 the file holds 8
+cases; the first landing had 6):
 
 ```text
-Running 6 tests using 1 worker
+Running 8 tests using 1 worker
   ✓  reuse root: binding round-trips in doc_json and the session starts at the registered root
   ✓  reuse sibling: cwd folds to the existing remuda-wt directory
   ✓  reuse sharing: a second task on the same directory bumps refcount and is queued 与 N 个 task 共用
   ✓  pool: the lease allocates a slot with its own wt/<slot>/<task> branch and folds into worktree
   ✓  refusals: out-of-tree, dirty directory and a full pool block without creating a task
   ✓  a binding outside project membership is refused and dispatch cannot override the bound host
-  6 passed   # run 1 (47.5s), run 2 (1.2m), run 3 (46.2s)
+  ✓  mode mismatch: pool against a standalone reuse directory is refused 409 and refunds the lease row
+  ✓  attach lock: two concurrent dispatches on one directory yield one launch and one dir-busy refusal
+  8 passed   # run 1 (55.3s), run 2 (55.1s), run 3 (54.2s)
 ```
 
 Representative request/response shapes (ids redacted; `/tmp/remuda-bind`
@@ -166,10 +169,13 @@ is run once under the same lock in both trigger positions:
   passed / 20 skipped / 0 failed without the new gated file, which
   cannot find the gated branded workspace and is therefore the only
   failing file — proof the gated arms are inert by design);
-- **`HUB_E2E_TASK_BIND=1`:** the full suite passes together — 171
+- **`HUB_E2E_TASK_BIND=1`:** the full suite passes together — 178
   passed / 20 skipped (the 20 are legacy-named specs the hub config does
-  not select) / 0 failed, including all six binding cases. The gated
-  branded workspace is announced on a **distinct** root
+  not select) / 0 failed, including all eight binding cases. The spec
+  raises the shared fake node's `maxInstances` for its project and
+  restores it in `afterAll`, and deletes its own sessions as it goes, so
+  it neither hits capacity nor leaks holders into later serial specs.
+  The gated branded workspace is announced on a **distinct** root
   (`/tmp/remuda-bind`, not the legacy `/tmp/remuda-e2e`) so the phone
   home's per-root space chips never shadow the `remuda-e2e` chip the
   shared-hub mobile specs click.
@@ -180,14 +186,22 @@ behaviour.
 
 ## Boundary notes
 
-- **Attach-lock.** Dispatch stamps `holder_instance_id` on the lease
-  row and checks it before launch: a session attached for *another*
-  task makes the launch fail 409 `dir-busy` (the queued task waits);
-  later sessions of the same task (its tabs) are allowed. Instance
-  delete (task 2) clears the holder and returns the lease. Sharing is
-  serial — the second task never starts concurrently; the sharing e2e
-  deletes the holder's session and then launches the queued task in the
-  same cwd.
+- **Attach-lock (atomic after review round 2).** The holder is taken
+  with one conditional UPDATE before spawn
+  (`Store::claim_worktree_lease`): it lands only where the row is
+  `leased` and the holder is null, the exact holder the caller
+  classified as reclaimable (the same task's session/tab, a stale
+  instance holder), or a `pending:` claim older than two minutes (a hub
+  that crashed mid-spawn). Two concurrent dispatches therefore
+  serialize in the store writer — exactly one launch, the other gets
+  409 `dir-busy` (proven by the concurrent e2e). A `pending:<task>:`
+  claim is promoted to the spawned instance id only by the winning
+  dispatch and released on a failed spawn; instance delete (task 2)
+  clears a promoted holder and returns the lease.
+- **Lease refund on every post-lease failure.** Mode mismatch and the
+  (unreachable) lease-id conversion failure both release the Node
+  catalog share and the Hub row before returning; the mode-mismatch e2e
+  asserts the next bind on the key starts at refcount 1.
 - **No path/repo over wire.** Binding reuse still performs no git RPC;
   pool goes through task 2's whitelisted
   `{hostId, workspaceId, name, base, taskId}` lease.

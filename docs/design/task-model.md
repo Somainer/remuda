@@ -52,7 +52,7 @@ CREATE TABLE worktree_leases (
     host_id            TEXT NOT NULL,
     workspace_id      TEXT NOT NULL,
     worktree_name      TEXT,                   -- 可空：reuse-to-root 为 NULL
-    dir_key            TEXT NOT NULL,          -- 相对 workspace 根的规范化路径；注册根本身 = '.'
+    dir_key            TEXT NOT NULL,          -- 裸 worktree/slot 名；注册根本身 = '.'（不是 remuda-wt/ 前缀路径）
     branch             TEXT,
     project_id         TEXT NOT NULL,
     refcount           INTEGER NOT NULL,
@@ -68,7 +68,7 @@ CREATE TABLE worktree_leases (
 三个关键设计：
 
 - **`mode` 列**区分 reuse 与 pool，使 reset/clean/park 语义严格 **pool-only**（§2.2）；reuse lease 归还对目录零操作（§2.1）。
-- **身份键是复合键 `(host_id, workspace_id, dir_key)`**，不是 worktree 名。`dir_key` = 目标目录相对 workspace 根的规范化路径；注册根本身为 `'.'`。`worktree_name` 可空：reuse-to-root 时仓库根不是 worktree、没有 name（`resolve_instance_cwd` 明确允许注册根本身，`crates/remuda-node/src/worktree.rs:355-401`）。「与 N 个 task 共用」= 同一复合键行的 `refcount`，对 reuse-to-root 同样成立。同名目录、跨主机目录因此仍然不合并（D-024）。
+- **身份键是复合键 `(host_id, workspace_id, dir_key)`**，不是 worktree 名。`dir_key` 是**裸 worktree/slot 名**（pool 为 Node 分配的 `<pool>-s<n>`，reuse 兄弟为其 catalog 名），注册根本身为 `'.'`；它不是 `remuda-wt/…` 前缀路径——受管根前缀只存在于 Node 的文件系统布局里。`worktree_name` 可空：reuse-to-root 时仓库根不是 worktree、没有 name（`resolve_instance_cwd` 明确允许注册根本身，`crates/remuda-node/src/worktree.rs:355-401`）。「与 N 个 task 共用」= 同一复合键行的 `refcount`，对 reuse-to-root 同样成立。同名目录、跨主机目录因此仍然不合并（D-024）。
 - **`holder_instance_id` + attach-lock**：一个 lease 在有会话 attach 期间独占（§2.3）；第二个 task 绑同一复合键时 `refcount += 1` 但排队或 `blocked{reason}`，不并发执行。
 
 ### 1.4 目录端 catalog 增量 —— 零迁移 JSON
@@ -142,7 +142,7 @@ task 创建时 `workspaceBinding.mode` 二选一。首次绑定强制显式选�
 result：
 
 ```jsonc
-{ "slot": "s01", "worktreeName": "s01", "dirKey": "remuda-wt/s01",
+{ "slot": "s01", "worktreeName": "s01", "dirKey": "s01",
   "branch": "wt/s01/<derived-slug>", "baseOid": "…",
   "state": "leased", "warm": true }
 ```

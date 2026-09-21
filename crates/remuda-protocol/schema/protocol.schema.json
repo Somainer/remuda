@@ -18682,7 +18682,7 @@
           "description": "Registered workspace the directory belongs to."
         },
         "worktreeName": {
-          "description": "Worktree/slot name. `None` (reuse only) means the registered workspace\nroot itself. For `pool` this is the leased slot name; the directory key\nrelative to the workspace root is then `remuda-wt/<name>`.",
+          "description": "Worktree/slot name, exactly as carried by the lease row's `dir_key`.\n`None` (reuse only) means the registered workspace root itself (dir\nkey `\".\"`). A reuse sibling names the existing worktree; a pool\nbinding carries the Node-assigned bare slot name (`<pool>-s<n>`),\nnever a `remuda-wt/…`-prefixed path — the managed-root prefix lives\nonly in the Node's filesystem layout.",
           "type": [
             "string",
             "null"

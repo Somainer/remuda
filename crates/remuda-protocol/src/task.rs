@@ -175,9 +175,12 @@ pub struct TaskSpaceBinding {
     pub host_id: HostId,
     /// Registered workspace the directory belongs to.
     pub workspace_id: WorkspaceId,
-    /// Worktree/slot name. `None` (reuse only) means the registered workspace
-    /// root itself. For `pool` this is the leased slot name; the directory key
-    /// relative to the workspace root is then `remuda-wt/<name>`.
+    /// Worktree/slot name, exactly as carried by the lease row's `dir_key`.
+    /// `None` (reuse only) means the registered workspace root itself (dir
+    /// key `"."`). A reuse sibling names the existing worktree; a pool
+    /// binding carries the Node-assigned bare slot name (`<pool>-s<n>`),
+    /// never a `remuda-wt/…`-prefixed path — the managed-root prefix lives
+    /// only in the Node's filesystem layout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_name: Option<String>,
     /// Branch checked out while leased. Record only — reuse never switches

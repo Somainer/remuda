@@ -675,7 +675,8 @@ function followUrl(instanceId: Id): string {
   return url.toString();
 }
 
-async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
+/** Authenticated Hub JSON request; shared by the api object and feature code. */
+export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   const session = readSession();
   const headers = {
     "content-type": "application/json",

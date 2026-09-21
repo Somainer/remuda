@@ -4123,8 +4123,12 @@ export type Task = ({
   "state": TaskState;
   "title": (string);
   "updatedAt": Timestamp;
+  "workspaceBinding"?: (TaskSpaceBinding | (null));
   [key: string]: unknown;
 });
+
+/** TaskBindingMode wire values; `protocol.md` §2.2. */
+export type TaskBindingMode = ("reuse" | "pool");
 
 /** Estimated budget envelope; design §4.3. Amounts are estimates (§4.5). */
 export type TaskBudget = ({
@@ -4171,6 +4175,17 @@ export type TaskPlacementRef = ({
   "instanceId"?: (InstanceId | (null));
   "model"?: (string | null);
   "placementId"?: (Id | (null));
+  [key: string]: unknown;
+});
+
+/** The operator's per-task working-directory choice (D-050 §1.1/§2).  Serialised inside the task's existing `doc_json` column, so old task rows need no migration: the field defaults to `None` and is skipped on the wire when absent. The binding routes dispatch two ways without a new dispatch field — `reuse` folds into the existing `cwd` admission, `pool` into the existing `worktree` field backed by a `worktree_leases` row. */
+export type TaskSpaceBinding = ({
+  "branch"?: (string | null);
+  "hostId": HostId;
+  "leaseRefIds"?: ((Id)[]);
+  "mode": TaskBindingMode;
+  "workspaceId": WorkspaceId;
+  "worktreeName"?: (string | null);
   [key: string]: unknown;
 });
 

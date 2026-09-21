@@ -17,8 +17,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use remuda_protocol::{
-    PlacementLedgerRow, PlacementRejection, Task, TaskBudget, TaskClass, TaskDep, TaskId,
-    TaskState, check_paths_within_owns, normalize_globs, parse_diff_paths,
+    HostId, PlacementLedgerRow, PlacementRejection, Task, TaskBindingMode, TaskBudget, TaskClass,
+    TaskDep, TaskId, TaskSpaceBinding, TaskState, WorkspaceId, check_paths_within_owns,
+    normalize_globs, parse_diff_paths,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
@@ -45,6 +46,23 @@ struct BudgetBody {
     max_wall_mins: Option<i64>,
 }
 
+/// Operator's per-task directory choice (D-050 §2); t-bind.
+///
+/// `reuse` binds an existing directory: no `worktreeName` means the registered
+/// workspace root, a name means a `remuda-wt` sibling. `pool` names the pool
+/// to lease a slot from; the Node allocates the concrete `<pool>-s<n>` slot.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BindingBody {
+    mode: String,
+    host_id: String,
+    workspace_id: String,
+    #[serde(default)]
+    worktree_name: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateTaskBody {
@@ -59,6 +77,9 @@ struct CreateTaskBody {
     deps: Option<Vec<DepBody>>,
     #[serde(default)]
     budget: Option<BudgetBody>,
+    /// Optional directory binding chosen at creation (D-050; t-bind).
+    #[serde(default)]
+    workspace_binding: Option<BindingBody>,
 }
 
 #[derive(Deserialize)]
@@ -344,6 +365,7 @@ async fn create_task(
     let deps = resolve_deps(body.deps);
     let budget = budget_from(body.budget);
     let class = class_from(body.class.as_deref())?;
+    let binding_request = body.workspace_binding;
     let task = state
         .store
         .create_task(
@@ -367,6 +389,51 @@ async fn create_task(
         )
         .await
         .map_err(map_store)?;
+    // t-bind: acquire the directory binding before the task becomes usable.
+    // A lease refusal (pool full → 429, dirty tree/branch conflict → 409) never
+    // silently creates the task on another directory: the half-written row is
+    // rolled back and the refusal is returned (D-035).
+    let sharing = if let Some(request) = binding_request.as_ref() {
+        match bind_task_directory(&state, &body.project_id, &task, request).await {
+            Ok((binding, sharing)) => {
+                let updated = state
+                    .store
+                    .mutate_task(task.meta.id.as_id().to_string(), move |task, _conn| {
+                        task.workspace_binding = Some(binding);
+                        Ok(())
+                    })
+                    .await
+                    .map_err(map_store)?
+                    .unwrap_or(task.clone());
+                state
+                    .store
+                    .append_audit(
+                        device.id.clone(),
+                        "task.bind".into(),
+                        Some(updated.meta.id.as_id().to_string()),
+                        json!({
+                            "mode": updated.workspace_binding.as_ref().map(|b| b.mode),
+                            "hostId": updated.workspace_binding.as_ref().map(|b| b.host_id.as_id()),
+                        }),
+                    )
+                    .await
+                    .map_err(map_store)?;
+                Some((updated, sharing))
+            }
+            Err(error) => {
+                let _ = state
+                    .store
+                    .delete_task_cascade(task.meta.id.as_id().to_string())
+                    .await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let (task, sharing) = sharing
+        .map(|(task, sharing)| (task, Some(sharing)))
+        .unwrap_or((task, None));
     state
         .store
         .append_audit(
@@ -377,7 +444,231 @@ async fn create_task(
         )
         .await
         .map_err(map_store)?;
-    Ok(Json(json!(task)))
+    let mut value = json!(task);
+    if let Some(sharing) = sharing {
+        value["sharing"] = sharing;
+    }
+    Ok(Json(value))
+}
+
+/// Lease (or attach to) the directory a new task binds (D-050 §2; t-bind).
+///
+/// `reuse` targets the registered workspace root (`worktreeName` omitted) or
+/// an existing `remuda-wt` sibling the operator created; the sibling must
+/// exist in the Node catalog and must not be a pool-managed slot. `pool`
+/// leases an app-managed slot; the Node returns the concrete slot name and
+/// per-task branch `wt/<slot>/<task-slug>`. Refusals bubble up as 429/409 via
+/// [`crate::http::lease_refusal`] — this function never reroutes.
+async fn bind_task_directory(
+    state: &AppState,
+    project_id: &remuda_protocol::ProjectId,
+    task: &Task,
+    request: &BindingBody,
+) -> Result<(TaskSpaceBinding, Value), HubError> {
+    let mode = match request.mode.as_str() {
+        "reuse" => TaskBindingMode::Reuse,
+        "pool" => TaskBindingMode::Pool,
+        other => {
+            return Err(HubError::BadRequest(format!(
+                "workspaceBinding.mode must be `reuse` or `pool` (got {other:?})"
+            )));
+        }
+    };
+    let host_id = HostId::try_from(request.host_id.clone())
+        .map_err(|error| HubError::BadRequest(format!("workspaceBinding.hostId: {error}")))?;
+    let workspace_id = WorkspaceId::try_from(request.workspace_id.clone())
+        .map_err(|error| HubError::BadRequest(format!("workspaceBinding.workspaceId: {error}")))?;
+    let project = state
+        .store
+        .get_project(project_id.as_id().to_string())
+        .await
+        .map_err(map_store)?
+        .ok_or(HubError::NotFound)?;
+    // The Space key must be a member of the project: a binding can never reach
+    // a host/workspace the project does not include (D-024 key untouched).
+    let member = project
+        .members
+        .iter()
+        .find(|member| member.host_id == host_id && member.workspace_id == workspace_id)
+        .ok_or_else(|| {
+            HubError::BadRequest(
+                "workspaceBinding host/workspace is not a member of this project".into(),
+            )
+        })?;
+    let worktree_name = request
+        .worktree_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty() && *raw != "." && *raw != "-");
+    match mode {
+        TaskBindingMode::Reuse => {
+            if let Some(name) = worktree_name {
+                validate_binding_segment(name)?;
+                // The sibling must already exist and be an operator-owned
+                // worktree, not a pool slot (pool slots bind through `pool`).
+                let catalog = crate::http::call_node(
+                    state,
+                    host_id.as_id().as_str(),
+                    "worktree.list",
+                    json!({ "hostId": host_id.as_id().as_str(), "workspaceId": workspace_id.as_id().as_str() }),
+                )
+                .await
+                .map_err(crate::http::lease_refusal)?;
+                let item = catalog
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find(|item| item.get("name").and_then(Value::as_str) == Some(name))
+                    .ok_or_else(|| {
+                        HubError::BadRequest(format!(
+                            "cannot reuse: no existing worktree named {name:?} on this workspace"
+                        ))
+                    })?;
+                if item.get("pooled").and_then(Value::as_bool) == Some(true) {
+                    return Err(HubError::BadRequest(format!(
+                        "{name:?} is an app-managed pool slot; bind it with mode `pool`"
+                    )));
+                }
+            }
+        }
+        TaskBindingMode::Pool => {
+            let name = worktree_name.ok_or_else(|| {
+                HubError::BadRequest(
+                    "workspaceBinding.worktreeName must name the pool for mode `pool`".into(),
+                )
+            })?;
+            validate_binding_segment(name)?;
+            // The `-s<n>` suffix is reserved by the Node for allocated slots.
+            if let Some((pool, number)) = name.rsplit_once("-s")
+                && !pool.is_empty()
+                && !number.is_empty()
+                && number.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(HubError::BadRequest(
+                    "pool names may not use the reserved `-s<n>` slot suffix".into(),
+                ));
+            }
+        }
+    }
+    let path_name = worktree_name.unwrap_or("-");
+    let base = match mode {
+        TaskBindingMode::Pool => Some(
+            request
+                .base
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .unwrap_or(project.default_base_branch.as_str()),
+        ),
+        TaskBindingMode::Reuse => None,
+    };
+    let outcome = crate::http::lease_on_host(
+        state,
+        member.host_id.as_id().as_str(),
+        member.workspace_id.as_id().as_str(),
+        path_name,
+        base,
+        task.meta.id.as_id().as_str(),
+    )
+    .await
+    .map_err(crate::http::lease_refusal)?;
+    // Release the just-acquired lease on both sides after a post-lease
+    // failure: a reuse return is a zero-op on disk (catalog refcount only),
+    // so rollback can never disturb the directory. An offline Node is left
+    // for reconnect reconciliation; the Hub row is always released.
+    let roll_back_lease = |dir_key: String| async move {
+        let return_params = json!({
+            "hostId": member.host_id.as_id().as_str(),
+            "workspaceId": member.workspace_id.as_id().as_str(),
+            "name": path_name,
+            "taskId": task.meta.id.as_id().as_str(),
+        });
+        if let Err(error) = crate::http::call_node(
+            state,
+            member.host_id.as_id().as_str(),
+            "worktree.return",
+            return_params,
+        )
+        .await
+        {
+            tracing::warn!(%error, "binding rollback: Node worktree.return failed; catalog reconciles on reconnect");
+        }
+        if let Err(error) = state
+            .store
+            .release_worktree_lease(
+                member.host_id.as_id().to_string(),
+                member.workspace_id.as_id().to_string(),
+                dir_key,
+                task.meta.id.as_id().to_string(),
+                "free".into(),
+                None,
+            )
+            .await
+        {
+            tracing::warn!(%error, "binding rollback: Hub lease release failed");
+        }
+    };
+    // The Node decides mode from the catalog record, not the request: a pool
+    // name that collides with an operator's standalone worktree comes back as
+    // reuse. Never silently change modes — release the row and refuse (D-035).
+    let wire_mode = outcome
+        .result
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("pool");
+    if wire_mode
+        != match mode {
+            TaskBindingMode::Reuse => "reuse",
+            TaskBindingMode::Pool => "pool",
+        }
+    {
+        let dir_key = outcome.row.dir_key.clone();
+        roll_back_lease(dir_key).await;
+        return Err(HubError::Conflict(format!(
+            "requested a {mode:?} worktree but {path_name:?} is an existing directory of mode {wire_mode}; refusing to change modes"
+        )));
+    }
+    let lease_id = match remuda_protocol::Id::try_from(outcome.row.id.clone()) {
+        Ok(lease_id) => lease_id,
+        Err(error) => {
+            // The lease row is recorded before the id is needed; release it
+            // too so this failure cannot leak a refcount (the task row is
+            // rolled back by the caller regardless).
+            roll_back_lease(outcome.row.dir_key.clone()).await;
+            return Err(HubError::Internal(format!("lease id from store: {error}")));
+        }
+    };
+    let binding = TaskSpaceBinding {
+        mode,
+        host_id: member.host_id.clone(),
+        workspace_id: member.workspace_id.clone(),
+        // None for reuse-to-root; a pool lease carries the Node-assigned slot
+        // name (`<pool>-s<n>`), not the requested pool name.
+        worktree_name: outcome.row.worktree_name.clone(),
+        branch: outcome.row.branch.clone(),
+        lease_ref_ids: vec![lease_id],
+    };
+    let sharing = json!({
+        "dirKey": outcome.row.dir_key,
+        "refcount": outcome.row.refcount,
+        "queued": outcome.queued,
+        "blocked": outcome
+            .result
+            .get("blocked")
+            .and_then(Value::as_object)
+            .and_then(|blocked| blocked.get("reason"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    });
+    Ok((binding, sharing))
+}
+
+/// Structural admission for a binding worktree name; mirrors
+/// `path_guard::safe_segment` (no `/`, no `..`, no leading dot).
+fn validate_binding_segment(name: &str) -> Result<(), HubError> {
+    remuda_protocol::path_guard::safe_segment(name)
+        .map_err(|error| HubError::BadRequest(format!("workspaceBinding.worktreeName: {error}")))
 }
 
 /// `GET /v1/tasks/{id}` — `remuda task show`.
@@ -1178,6 +1469,21 @@ impl Store {
             )?;
             update_task_row(conn, &task)?;
             Ok(Some((row, task)))
+        })
+        .await
+    }
+
+    /// Roll back a task row plus its seeded ownership claims. Used by task
+    /// creation when the directory binding cannot be acquired: the refused
+    /// task must not linger without a directory (D-035, t-bind).
+    pub async fn delete_task_cascade(&self, task_id: String) -> Result<(), StoreError> {
+        self.run_named("delete_task_cascade", move |conn| {
+            conn.execute(
+                "DELETE FROM task_paths WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            conn.execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
+            Ok(())
         })
         .await
     }

@@ -599,6 +599,17 @@ async fn fake_node(
             "root": "/tmp/remuda-e2e"
         }));
     }
+    // t-bind: project membership needs a branded workspace id, so announce one
+    // extra workspace behind the bind trigger. It uses a distinct root
+    // (/tmp/remuda-bind) so the mobile home's per-root space chips never merge
+    // with or shadow the legacy wsp_e2e "remuda-e2e" chip other specs click.
+    if task_bind_enabled() {
+        workspaces.push(json!({
+            "workspaceId": remuda_protocol::WorkspaceId::new().as_id().as_str(),
+            "hostId": host,
+            "root": "/tmp/remuda-bind"
+        }));
+    }
     let workspaces = Value::Array(workspaces);
     // The enroll hello announces an empty inventory — this process holds no
     // sessions yet — and a later restart re-announces whatever is still live.
@@ -648,6 +659,8 @@ async fn fake_node(
     // §9.1 model-sync: per-instance catalog ids remembered at launch so a
     // configure verdict can attribute the switch path (listed vs typed).
     let mut model_catalogs: HashMap<String, Vec<String>> = HashMap::new();
+    // t-bind gated worktree layer (HUB_E2E_TASK_BIND=1).
+    let mut bind_state = BindLeaseState::seeded();
     // Scripted terminal answers: a spawned timer sends (instance, iid, answers)
     // back into this loop so journal appends stay single-writer.
     let (close_tx, mut close_rx) = tokio::sync::mpsc::channel::<(String, String, Value)>(8);
@@ -762,6 +775,15 @@ async fn fake_node(
                     )
                     .await?;
                 }
+                // t-bind: in-memory worktree catalog/lease, gated on its own
+                // trigger so other specs see no worktree behaviour.
+                "worktree.list" if task_bind_enabled() => {
+                    send_rpc_ok(&mut ws, id, bind_state.list()).await?;
+                }
+                "worktree.lease" if task_bind_enabled() => match bind_state.lease(&params) {
+                    Ok(result) => send_rpc_ok(&mut ws, id, result).await?,
+                    Err(message) => send_rpc_error(&mut ws, id, &message).await?,
+                },
                 "instance.create" | "instance.resume" => {
                     let spec = params.get("spec").unwrap_or(&params);
                     if let Some(kind) = spec.get("kind").and_then(Value::as_str) {
@@ -2446,6 +2468,184 @@ async fn send_rpc_ok(
 
 type NodeWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+// ── t-bind fake worktree layer (HUB_E2E_TASK_BIND=1 only) ──────────────────
+//
+// The default fake Node holds no git repository, so the worktree lease RPCs
+// are modelled in memory behind an explicit trigger; every other spec keeps
+// the previous "unknown method" behaviour. The model mirrors the real Node
+// contract (crates/remuda-node/src/worktree_pool.rs): reuse attaches with a
+// refcount and queues on sharing, pool allocates `<pool>-s<n>` slots with a
+// per-task branch, a dirty tree refuses, and a full pool defers.
+
+fn task_bind_enabled() -> bool {
+    std::env::var("HUB_E2E_TASK_BIND").as_deref() == Ok("1")
+}
+
+/// One in-memory catalog row the binding fake hands out via worktree.list.
+#[derive(Clone)]
+struct BindWorktree {
+    name: String,
+    path: String,
+    branch: String,
+    pooled: bool,
+    leased_by: Vec<String>,
+}
+
+impl BindWorktree {
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "path": self.path,
+            "branch": self.branch,
+            "base": "main",
+            "state": if self.leased_by.is_empty() { "parked" } else { "leased" },
+            "pooled": self.pooled,
+            "leasedBy": self.leased_by,
+        })
+    }
+}
+
+/// Bind lease state held for the fake Node's lifetime.
+#[derive(Default)]
+struct BindLeaseState {
+    /// Catalog keyed by worktree name. Seeded with one standalone reuse dir.
+    catalog: HashMap<String, BindWorktree>,
+    /// Next slot number per pool name.
+    slot_next: HashMap<String, usize>,
+}
+
+impl BindLeaseState {
+    fn seeded() -> Self {
+        let mut state = Self::default();
+        state.catalog.insert(
+            "agent-one".into(),
+            BindWorktree {
+                name: "agent-one".into(),
+                path: "/tmp/remuda-bind/remuda-wt/agent-one".into(),
+                branch: "wt/agent-one/work".into(),
+                pooled: false,
+                leased_by: Vec::new(),
+            },
+        );
+        // Separate standalone dirs so serial specs sharing one hub do not
+        // count each other's leases on the same key.
+        for name in ["agent-two", "agent-three", "agent-race"] {
+            state.catalog.insert(
+                name.into(),
+                BindWorktree {
+                    name: name.into(),
+                    path: format!("/tmp/remuda-bind/remuda-wt/{name}"),
+                    branch: format!("wt/{name}/work"),
+                    pooled: false,
+                    leased_by: Vec::new(),
+                },
+            );
+        }
+        state
+    }
+
+    fn list(&self) -> Value {
+        let mut items: Vec<Value> = self.catalog.values().map(BindWorktree::to_json).collect();
+        items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        json!({ "workspaceRoot": "/tmp/remuda-bind", "items": items, "nextCursor": null })
+    }
+
+    /// Model `worktree.lease`. Returns Ok(result) or Err(message).
+    fn lease(&mut self, params: &Value) -> std::result::Result<Value, String> {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let task = params
+            .get("taskId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        // reuse-to-root.
+        if name == "." {
+            return Ok(json!({
+                "name": ".",
+                "path": "/tmp/remuda-bind",
+                "branch": "main",
+                "base": Value::Null,
+                "mode": "reuse",
+                "state": "leased",
+                "refcount": 1,
+                "warm": true,
+                "queued": false,
+                "dirKey": ".",
+            }));
+        }
+        // Refusal fixtures: never reroute.
+        if name == "dirty" {
+            return Err("worktree dirty-slot is dirty; refusing to lease it".into());
+        }
+        if name == "fullpool" {
+            return Ok(json!({
+                "deferred": true,
+                "code": "SUPPLY_DEFERRED",
+                "reason": "worktree pool 'fullpool' is full and no clean parked slot is available",
+                "poolSize": 4,
+            }));
+        }
+        // Existing catalog row: standalone reuse dir or an already-allocated
+        // slot reached by its slot name.
+        if let Some(row) = self.catalog.get_mut(name) {
+            let already = row.leased_by.contains(&task);
+            let queued = !row.leased_by.is_empty() && !already;
+            if !already {
+                row.leased_by.push(task.clone());
+            }
+            let refcount = row.leased_by.len();
+            let mode = if row.pooled { "pool" } else { "reuse" };
+            let mut payload = json!({
+                "name": row.name,
+                "path": row.path,
+                "branch": row.branch,
+                "base": Value::Null,
+                "mode": mode,
+                "state": "leased",
+                "refcount": refcount,
+                "warm": true,
+                "queued": queued,
+                "dirKey": row.name,
+            });
+            if queued {
+                payload["blocked"] = json!({
+                    "reason": "dir-busy: directory is held by another attached task; queued for serial reuse"
+                });
+            }
+            return Ok(payload);
+        }
+        // Otherwise allocate a pool slot `<name>-s<n>` with a per-task branch.
+        let number = self.slot_next.remove(name).unwrap_or(0) + 1;
+        self.slot_next.insert(name.to_string(), number);
+        let slot = format!("{name}-s{number}");
+        let task_slug = task.replace('_', "-");
+        let branch = format!("wt/{slot}/{task_slug}");
+        let path = format!("/tmp/remuda-bind/remuda-wt/{slot}");
+        self.catalog.insert(
+            slot.clone(),
+            BindWorktree {
+                name: slot.clone(),
+                path: path.clone(),
+                branch: branch.clone(),
+                pooled: true,
+                leased_by: vec![task],
+            },
+        );
+        Ok(json!({
+            "name": slot,
+            "path": path,
+            "branch": branch,
+            "baseOid": "0123456789abcdef0123456789abcdef01234567",
+            "mode": "pool",
+            "state": "leased",
+            "refcount": 1,
+            "warm": false,
+            "queued": false,
+            "dirKey": slot,
+        }))
+    }
+}
 
 async fn send_rpc_error(ws: &mut NodeWs, id: Value, message: &str) -> Result<()> {
     ws.send(Message::Text(

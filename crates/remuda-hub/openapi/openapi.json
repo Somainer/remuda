@@ -3740,6 +3740,9 @@
           "updatedAt": {
             "format": "date-time",
             "type": "string"
+          },
+          "workspaceBinding": {
+            "$ref": "#/components/schemas/TaskSpaceBinding"
           }
         },
         "required": [
@@ -3813,6 +3816,9 @@
           },
           "title": {
             "type": "string"
+          },
+          "workspaceBinding": {
+            "$ref": "#/components/schemas/TaskSpaceBinding"
           }
         },
         "required": [
@@ -3908,6 +3914,91 @@
           }
         },
         "type": "object"
+      },
+      "TaskBindingMode": {
+        "description": "Directory binding mode (D-050): reuse an existing directory or lease an app-managed pool slot.",
+        "type": "string",
+        "enum": [
+          "reuse",
+          "pool"
+        ]
+      },
+      "TaskSpaceBinding": {
+        "description": "Per-task working-directory binding (D-050 §2), serialised inside the task doc_json. Reuse targets the registered root (no worktreeName) or an existing remuda-wt sibling; pool names the pool and records the Node-assigned slot name and wt/<slot>/<task-slug> branch.",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/TaskBindingMode"
+          },
+          "hostId": {
+            "pattern": "^hst_",
+            "type": "string"
+          },
+          "workspaceId": {
+            "pattern": "^wsp_",
+            "type": "string"
+          },
+          "worktreeName": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "leaseRefIds": {
+            "type": "array",
+            "items": {
+              "pattern": "^wtl_",
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "mode",
+          "hostId",
+          "workspaceId"
+        ]
+      },
+      "TaskCreateResult": {
+        "description": "Created task; when a workspaceBinding was supplied the response additionally carries the lease sharing projection (refcount and serial-reuse queue state).",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Task"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "sharing": {
+                "$ref": "#/components/schemas/WorktreeSharing"
+              }
+            }
+          }
+        ]
+      },
+      "WorktreeSharing": {
+        "description": "Read-only sharing projection for a freshly bound directory (D-050 §2.1): refcount is the number of tasks bound to the directory; queued/blockedReason mean another task holds the attach lock and this task waits for serial reuse.",
+        "type": "object",
+        "properties": {
+          "dirKey": {
+            "type": "string"
+          },
+          "refcount": {
+            "type": "integer"
+          },
+          "queued": {
+            "type": "boolean"
+          },
+          "blocked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "dirKey",
+          "refcount",
+          "queued"
+        ]
       },
       "TaskSplit": {
         "description": "remuda task split; parent and mandate chain come from the path id",
@@ -8050,7 +8141,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Task"
+                  "$ref": "#/components/schemas/TaskCreateResult"
                 }
               }
             },

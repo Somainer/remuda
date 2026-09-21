@@ -148,6 +148,75 @@ impl Mandate {
     }
 }
 
+// ─── Directory binding (task-model t-bind, D-050) ──────────────────────────
+
+wire_enum!(TaskBindingMode, "2.2", {
+    // Reuse an existing directory: registered root or a `remuda-wt` sibling;
+    // no git operations, one directory = one branch.
+    Reuse => "reuse",
+    // App-managed worktree pooled by the Node; the lease cuts a per-task
+    // branch `wt/<slot>/<task-slug>` in place.
+    Pool => "pool",
+});
+
+/// The operator's per-task working-directory choice (D-050 §1.1/§2).
+///
+/// Serialised inside the task's existing `doc_json` column, so old task rows
+/// need no migration: the field defaults to `None` and is skipped on the wire
+/// when absent. The binding routes dispatch two ways without a new dispatch
+/// field — `reuse` folds into the existing `cwd` admission, `pool` into the
+/// existing `worktree` field backed by a `worktree_leases` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSpaceBinding {
+    /// Reuse an existing directory, or lease an app-managed pool slot.
+    pub mode: TaskBindingMode,
+    /// Host whose workspace backs the directory.
+    pub host_id: HostId,
+    /// Registered workspace the directory belongs to.
+    pub workspace_id: WorkspaceId,
+    /// Worktree/slot name, exactly as carried by the lease row's `dir_key`.
+    /// `None` (reuse only) means the registered workspace root itself (dir
+    /// key `"."`). A reuse sibling names the existing worktree; a pool
+    /// binding carries the Node-assigned bare slot name (`<pool>-s<n>`),
+    /// never a `remuda-wt/…`-prefixed path — the managed-root prefix lives
+    /// only in the Node's filesystem layout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_name: Option<String>,
+    /// Branch checked out while leased. Record only — reuse never switches
+    /// branches, and the pool derives its branch on the Node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// `worktree_leases` rows backing this binding (one today).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_ref_ids: Vec<Id>,
+}
+
+impl TaskSpaceBinding {
+    /// Directory identity key relative to the workspace root; the registered
+    /// root itself is `"."` (the lease table's composite key, D-050 §1.3).
+    pub fn dir_key(&self) -> &str {
+        self.worktree_name.as_deref().unwrap_or(".")
+    }
+
+    /// True for a binding onto the registered workspace root itself.
+    pub fn is_root(&self) -> bool {
+        self.worktree_name.is_none()
+    }
+
+    /// HTTP path token for the lease routes. A literal `.` collapses in URLs,
+    /// so the root is addressed as `-` (mirrors `http.rs::node_worktree_name`).
+    pub fn lease_path_name(&self) -> &str {
+        if self.is_root() {
+            "-"
+        } else {
+            self.worktree_name
+                .as_deref()
+                .expect("non-root binding has a name")
+        }
+    }
+}
+
 // ─── Task document ─────────────────────────────────────────────────────────
 
 /// One dependency edge. Edges unlock only when the referenced task carries a
@@ -247,6 +316,11 @@ pub struct Task {
     /// skipped on serialise so such rows stay byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<Timestamp>,
+    /// Working-directory binding chosen at creation (D-050). Lives in
+    /// `doc_json` with a serde default, so rows written before t-bind decode
+    /// as `None` and serialise byte-identically (no migration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_binding: Option<TaskSpaceBinding>,
 }
 
 fn default_task_class() -> TaskClass {
@@ -287,6 +361,7 @@ impl Task {
             landed_sha: None,
             blocked_reason: None,
             archived_at: None,
+            workspace_binding: None,
         }
     }
 
@@ -325,6 +400,7 @@ impl Task {
             landed_sha: None,
             blocked_reason: None,
             archived_at: None,
+            workspace_binding: None,
         }
     }
 
@@ -824,6 +900,72 @@ mod tests {
         assert_eq!(decoded.state, TaskState::Running);
         assert!(decoded.archived_at.is_none());
         assert_eq!(decoded.board_column(), BoardColumn::InProgress);
+    }
+
+    #[test]
+    fn workspace_binding_lives_in_doc_json_with_zero_migration() {
+        let now = Timestamp::try_from("2026-09-21T10:00:00.000Z".to_string()).unwrap();
+        let mut task = Task::new_root(
+            now,
+            ProjectId::new(),
+            "bind".into(),
+            "choose a directory".into(),
+            TaskClass::Implement,
+            vec![],
+            vec![],
+            TaskBudget::default(),
+        );
+        // A pre-bind row serialises without the key: old doc_json stays
+        // byte-identical (plan task 3 acceptance 3).
+        assert!(task.workspace_binding.is_none());
+        assert!(
+            !serde_json::to_string(&task)
+                .unwrap()
+                .contains("workspaceBinding")
+        );
+
+        // A reuse-to-root binding decodes and folds to the root dir key.
+        let binding: TaskSpaceBinding = serde_json::from_value(serde_json::json!({
+            "mode": "reuse",
+            "hostId": HostId::new(),
+            "workspaceId": WorkspaceId::new(),
+        }))
+        .unwrap();
+        assert_eq!(binding.mode, TaskBindingMode::Reuse);
+        assert!(binding.is_root());
+        assert_eq!(binding.dir_key(), ".");
+        assert_eq!(binding.lease_path_name(), "-");
+        task.workspace_binding = Some(binding);
+        let wire = serde_json::to_string(&task).unwrap();
+        assert!(wire.contains("workspaceBinding"));
+
+        // An old document without the field still decodes as unbound.
+        let legacy = serde_json::json!({
+            "id": TaskId::new(),
+            "revision": "1",
+            "createdAt": "2026-09-21T10:00:00.000Z",
+            "updatedAt": "2026-09-21T10:00:00.000Z",
+            "projectId": ProjectId::new(),
+            "title": "legacy",
+            "mandate": { "chain": [] },
+            "class": "implement",
+            "state": "pending"
+        });
+        let decoded: Task = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.workspace_binding.is_none());
+
+        // A pool binding names its slot and addresses the lease route by it.
+        let pool: TaskSpaceBinding = serde_json::from_value(serde_json::json!({
+            "mode": "pool",
+            "hostId": HostId::new(),
+            "workspaceId": WorkspaceId::new(),
+            "worktreeName": "alpha-s1",
+            "branch": "wt/alpha-s1/tsk-x"
+        }))
+        .unwrap();
+        assert!(!pool.is_root());
+        assert_eq!(pool.dir_key(), "alpha-s1");
+        assert_eq!(pool.lease_path_name(), "alpha-s1");
     }
 
     #[test]

@@ -16,6 +16,7 @@ import { SettingsPage } from "../pages/SettingsPage";
 import { SubagentView } from "../features/session/subagent/SubagentView";
 import { Inbox } from "../features/mobile/Inbox";
 import { HomeList } from "../features/mobile/HomeList";
+import { TaskListPage } from "../features/tasks/TaskList";
 import { resolveLanding } from "../lib/mobileRoute";
 import { useWorkbenchViewport } from "../lib/viewport";
 
@@ -54,6 +55,7 @@ export function AppRouter() {
           <Route element={<ViewportGate />}>
             <Route path="/sessions" element={<SessionsPage />} />
             <Route path="/approvals" element={<ApprovalsPage />} />
+            <Route path="/board" element={<TaskListPage />} />
           </Route>
           <Route path="/sessions/new" element={<NewSessionPage />} />
           <Route path="/s/:instanceId" element={<SessionPage />} />

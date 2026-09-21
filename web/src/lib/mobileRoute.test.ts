@@ -5,6 +5,9 @@ describe("resolveLanding — compact landing resolution", () => {
   it("bounces the desktop index routes into the /m tree", () => {
     expect(resolveLanding("/sessions", "", true)).toBe("/m");
     expect(resolveLanding("/approvals", "", true)).toBe("/m/inbox");
+    // The desktop task board collapses onto the phone home task layer.
+    expect(resolveLanding("/board", "", true)).toBe("/m");
+    expect(resolveLanding("/board", "?project=prj_1", true)).toBe("/m?project=prj_1");
   });
 
   it("treats a single trailing slash as absent", () => {

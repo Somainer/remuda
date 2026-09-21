@@ -10,7 +10,9 @@
  * Rules:
  * - `/` is the manifest start_url: compact lands on `/m`, desktop on
  *   `/sessions` — one manifest, the viewport decides (D-049).
- * - compact: `/sessions` -> `/m`, `/approvals` -> `/m/inbox`.
+ * - compact: `/sessions` -> `/m`, `/approvals` -> `/m/inbox`, `/board` ->
+ *   `/m` (the desktop task board collapses onto the phone home task layer,
+ *   D-050 / ui-spec §2.9).
  * - desktop: the whole `/m*` tree bounces back to `/sessions`.
  * - `/s/:id*`, `/sessions/new`, `/login`, `/pair`, `/settings` are shared
  *   routes and return null on BOTH sides; `/s/:id` is the same session
@@ -24,7 +26,7 @@ export function resolveLanding(pathname: string, search: string, compact: boolea
   // PWA start_url: no query belongs to the bare root.
   if (path === "/") return compact ? "/m" : "/sessions";
   if (compact) {
-    if (path === "/sessions") return `/m${search}`;
+    if (path === "/sessions" || path === "/board") return `/m${search}`;
     if (path === "/approvals") return `/m/inbox${search}`;
     return null;
   }

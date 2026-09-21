@@ -177,7 +177,11 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
   test("members map to Spaces through the full (hostId, workspaceId) pair — two hosts stay two keys (D-024)", async ({
     page,
   }) => {
+    // A deep link mounts the detail route but must NOT silently rescope the
+    // global filter (scope changes only come from an explicit row click or
+    // switcher action): the stored selection stays absent.
     await page.goto(`/projects/${crossHostProject.id}`);
+    expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
     const memberRows = page.getByTestId("project-member-row");
     await expect(memberRows).toHaveCount(2);
     const keys = await memberRows.evaluateAll((nodes) =>
@@ -196,6 +200,25 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     await expect(rowB).toContainText("/tmp/remuda-project-b");
     await expect(rowA).not.toContainText("工作区尚未注册");
     await expect(rowB).not.toContainText("工作区尚未注册");
+  });
+
+  test("opening a project from the directory is an explicit scope action (filter set; detail shows the project)", async ({
+    page,
+  }) => {
+    await page.goto("/projects");
+    const row = page.getByTestId("project-row").filter({ hasText: crossHostProject.name });
+    await row.click();
+    await expect(page).toHaveURL(new RegExp(`/projects/${crossHostProject.id}$`));
+    // The explicit row click sets the scope, unlike a deep-link mount.
+    expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBe(
+      crossHostProject.id,
+    );
+    // Both the top-bar and the page-header switcher name the open project.
+    const switchers = page.getByTestId("project-switcher");
+    expect(await switchers.count()).toBeGreaterThanOrEqual(1);
+    for (const select of await switchers.all()) {
+      await expect(select).toHaveValue(crossHostProject.id);
+    }
   });
 
   test("the switcher scopes the board and the task list by project id; global shows everything", async ({
@@ -285,7 +308,13 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
         animations: "disabled",
       });
 
-      await page.goto(`/projects/${crossHostProject.id}`);
+      // Enter via the explicit row click (not a deep-link goto) so the scope
+      // is the open project and the switchers name it in the evidence render.
+      await page
+        .getByTestId("project-row")
+        .filter({ hasText: crossHostProject.name })
+        .click();
+      await expect(page).toHaveURL(new RegExp(`/projects/${crossHostProject.id}$`));
       await expect(page.getByTestId("project-member-row")).toHaveCount(2);
       await page.screenshot({
         path: path.join(evidenceDir, `task-model-8-members-${width}.png`),

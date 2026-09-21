@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useHub } from "../lib/store";
 import { rest } from "../lib/api";
 import ui from "../styles/ui.module.css";
@@ -22,11 +22,23 @@ import {
  */
 export function ProjectsPage() {
   const hub = useHub();
+  const navigate = useNavigate();
   const { projects, loading, error, reload } = useProjects();
   const selected = useProjectFilter();
   const visible = selected ? projects.filter((project) => project.id === selected) : projects;
   const hostLabel = (hostId: string) =>
     hub.hosts.find((host) => host.id === hostId)?.label ?? hostId;
+
+  /**
+   * Clicking a project row is an explicit scope choice: it selects the
+   * project and opens its page. Mounting the detail route (deep link /
+   * back-forward) does not touch the global filter — only this action and
+   * the switcher change scope.
+   */
+  function openProject(projectId: string) {
+    projectFilterStore.select(projectId);
+    navigate(`/projects/${encodeURIComponent(projectId)}`);
+  }
 
   return (
     <div style={{ padding: 16 }}>
@@ -57,7 +69,13 @@ export function ProjectsPage() {
       {visible.map((project) => {
         const hosts = projectMemberHostIds(project);
         return (
-          <Link key={project.id} to={`/projects/${project.id}`} className={ui.listItem} data-testid="project-row">
+          <Link
+            key={project.id}
+            to={`/projects/${project.id}`}
+            className={ui.listItem}
+            data-testid="project-row"
+            onClick={() => openProject(project.id)}
+          >
             <span>
               <div>{project.name}</div>
               <div className={ui.listMeta}>
@@ -79,6 +97,12 @@ export function ProjectsPage() {
  * id (the route name predates Project adoption). Members resolve through the
  * exact Space key: a member whose workspace is not registered on that host
  * renders as the bare host/workspace pair instead of being merged away.
+ *
+ * Mounting this route does NOT change the global project filter: a deep link
+ * or back/forward navigation must not silently rescope the task list and
+ * board. The scope changes only through an explicit switcher action (the
+ * list-page switcher both selects and navigates; the detail-page switcher
+ * navigates away on global).
  */
 export function ProjectDetailPage() {
   const { workspaceId: projectId = "" } = useParams();
@@ -87,7 +111,6 @@ export function ProjectDetailPage() {
   const [status, setStatus] = useState<"loading" | "ready" | "missing">("loading");
 
   useEffect(() => {
-    projectFilterStore.select(projectId);
     let cancelled = false;
     setStatus("loading");
     rest<Project>(`/v1/projects/${encodeURIComponent(projectId)}`)

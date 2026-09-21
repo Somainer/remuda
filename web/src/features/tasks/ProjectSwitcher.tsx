@@ -175,6 +175,14 @@ export type ProjectFilterStore = {
   subscribe: (listener: Listener) => () => void;
   select: (projectId: string) => void;
   clear: () => void;
+  /**
+   * Drop the selection when it points at a project the directory no longer
+   * contains (deleted, or out of the caller's scope). Keeps the store and
+   * the control consistent: after reconcile every consumer reads the same
+   * global scope the control shows, instead of filtering the task list and
+   * board to an invisible id. Global is always left untouched.
+   */
+  reconcile: (projectIds: Iterable<string>) => void;
 };
 
 export function createProjectFilterStore(storage = browserStorage()): ProjectFilterStore {
@@ -210,6 +218,13 @@ export function createProjectFilterStore(storage = browserStorage()): ProjectFil
       if (id) update(id);
     },
     clear() {
+      update(GLOBAL_PROJECT);
+    },
+    reconcile(projectIds) {
+      if (selected === GLOBAL_PROJECT) return;
+      for (const id of projectIds) {
+        if (id === selected) return;
+      }
       update(GLOBAL_PROJECT);
     },
   };
@@ -254,6 +269,10 @@ export function useProjects(): ProjectsState {
       .then((items) => {
         setProjects(items);
         setError(null);
+        // Normalize against the freshly loaded directory: a stored selection
+        // for a vanished/out-of-scope project clears here, so the control and
+        // every filter consumer agree on global.
+        projectFilterStore.reconcile(items.map((item) => item.id));
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : "项目加载失败"))
       .finally(() => setLoading(false));
@@ -278,9 +297,10 @@ export type ProjectSwitcherProps = {
 
 /**
  * `全局 ▾ <project>` dropdown. Global (the empty option) clears the filter;
- * a project id filters the task list and the board. An out-of-scope stored
- * selection still renders (empty global select falls back to global) so the
- * control can never trap the operator in a missing scope.
+ * a project id filters the task list and the board. The directory load
+ * reconciles a stale stored id back to global, so the value shown here and
+ * the value consumers read only ever diverge on the first render before the
+ * directory arrives; the empty fallback covers that transient.
  */
 export function ProjectSwitcher({ projects, navigateOnSelect = false }: ProjectSwitcherProps) {
   const selected = useProjectFilter();

@@ -207,6 +207,24 @@ describe("project filter store", () => {
     act(() => projectFilterStore.select("prj_b"));
     expect(result.current).toBe("prj_b");
   });
+
+  it("reconcile keeps a known selection and clears a stale one back to global", () => {
+    const store = createProjectFilterStore({ getItem: () => null, setItem: () => {}, removeItem: () => {} });
+    act(() => store.select("prj_a"));
+    expect(store.getSnapshot()).toBe("prj_a");
+
+    // Still in the directory: untouched, no notification.
+    act(() => store.reconcile(["prj_a", "prj_b"]));
+    expect(store.getSnapshot()).toBe("prj_a");
+
+    // Vanished/out-of-scope: clears and persists the clear.
+    act(() => store.reconcile(["prj_b"]));
+    expect(store.getSnapshot()).toBe(GLOBAL_PROJECT);
+
+    // Global always survives reconcile against any directory, even empty.
+    act(() => store.reconcile([]));
+    expect(store.getSnapshot()).toBe(GLOBAL_PROJECT);
+  });
 });
 
 describe("useProjects", () => {
@@ -230,6 +248,37 @@ describe("useProjects", () => {
   it("listProjects unwraps the envelope and tolerates a missing items array", async () => {
     restMock.mockResolvedValue({ nextCursor: null });
     expect(await listProjects()).toEqual([]);
+  });
+
+  it("clears a stored selection when the project disappears, so consumers and the control agree", async () => {
+    // The operator had prj_a selected (persisted from an earlier session);
+    // the reloaded directory only contains prj_b.
+    act(() => projectFilterStore.select("prj_a"));
+    const consumer = renderHook(() => useProjectFilter());
+    expect(consumer.result.current).toBe("prj_a");
+    restMock.mockResolvedValue({ items: [project("prj_b", "Beta")], nextCursor: null });
+
+    const directory = renderHook(() => useProjects());
+    await waitFor(() => expect(directory.result.current.loading).toBe(false));
+
+    // The directory load reconciles the singleton store: every consumer now
+    // reads global, and the stale persisted key is gone.
+    expect(projectFilterStore.getSnapshot()).toBe(GLOBAL_PROJECT);
+    expect(consumer.result.current).toBe(GLOBAL_PROJECT);
+    expect(localStorage.getItem("remuda.project-filter.v1")).toBeNull();
+
+    // The control renders the same global value rather than a hidden id.
+    const screen2 = render(
+      createElement(
+        MemoryRouter,
+        { initialEntries: ["/projects"] },
+        createElement(ProjectSwitcher, { projects: directory.result.current.projects }),
+      ),
+    );
+    expect((screen2.getByTestId("project-switcher") as HTMLSelectElement).value).toBe("");
+    screen2.unmount();
+    consumer.unmount();
+    directory.unmount();
   });
 });
 

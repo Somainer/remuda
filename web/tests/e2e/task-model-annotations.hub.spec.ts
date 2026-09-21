@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,6 +88,22 @@ test.afterAll(async ({ browser }) => {
 test.afterEach(async ({ page }) => {
   await forceDeleteAllInstances(page).catch(() => undefined);
 });
+
+/**
+ * Select a message's PROSE (the section's second element child; the first is
+ * the You/assistant role header), so the captured ① quote never carries the
+ * role label.
+ */
+async function selectProse(section: Locator) {
+  await section.evaluate((el) => {
+    const prose = el.children[1] ?? el;
+    const range = document.createRange();
+    range.selectNodeContents(prose);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  });
+}
 
 /** Launch on the fake node and answer the create-approval trap. */
 async function createSession(page: Page, prompt: string): Promise<string> {
@@ -184,7 +200,7 @@ test.describe("composer annotation drafts", () => {
     await expect(page.getByTestId("annotation-badge")).toContainText("本次发送带 1 条批注");
 
     // Carrier 2 — an in-message ① anchor created by selecting transcript text.
-    await echo.selectText();
+    await selectProse(echo);
     const capture = page.getByTestId("annotation-capture");
     await expect(capture).toBeVisible({ timeout: 5_000 });
     await capture.click();
@@ -203,8 +219,6 @@ test.describe("composer annotation drafts", () => {
     await expect(page.locator('[data-testid="annotation-item"][data-carrier="anchor"]')).toContainText(
       "ann echo seed",
     );
-
-    await shot(page, "task-model-9-composer-1440.png");
 
     // Send a prompt — the structured prefix rides it, no new wire field.
     const question = `act on the notes please ${suffix}`;
@@ -256,5 +270,40 @@ test.describe("composer annotation drafts", () => {
     await page.goto(`/s/${instanceId}/events`);
     await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "events");
     await expect(page.locator("[data-annotation-instance]")).toHaveCount(0);
+  });
+
+  test("evidence shots: badge + panel at 1440 and 390", async ({ page }) => {
+    test.skip(!evidence, "set REMUDA_EVIDENCE=1 to capture committed screenshots");
+    await login(page);
+    const suffix = Date.now().toString(36);
+    await createSession(page, `ann evidence seed ${suffix}`);
+    const echo = page
+      .getByTestId("message")
+      .filter({ hasText: `echo: ann evidence seed ${suffix}` })
+      .first();
+    await expect(echo).toBeVisible({ timeout: 20_000 });
+
+    // One card draft plus one ① transcript anchor, panel open at 1440.
+    await page.getByTestId("annotation-add").click();
+    await page.getByTestId("annotation-card-input").fill("这条实现需要先补回归测试再合入。");
+    await page.getByTestId("annotation-card-save").click();
+    await selectProse(echo);
+    await page.getByTestId("annotation-capture").click();
+    await expect(page.getByTestId("annotation-capture-popover")).toBeVisible();
+    await page.getByTestId("annotation-capture-input").fill("这行结论和上面的回归断言对不上。");
+    await page.getByTestId("annotation-capture-save").click();
+    await expect(page.getByTestId("annotation-badge-count")).toHaveText("2");
+    // Dismiss the capture popover; the save already opened the panel.
+    await page.getByTestId("annotation-capture-done").click();
+    await expect(page.getByTestId("annotation-capture-popover")).toHaveCount(0);
+    await page.getByTestId("annotation-tab-anchor").click();
+    await expect(page.getByTestId("annotation-panel")).toBeVisible();
+    await shot(page, "task-model-9-composer-1440.png");
+
+    // 390 phone: the same device-local drafts ride along; reopen the panel
+    // from the badge (it was never toggled) — close first, then open.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.getByTestId("annotation-badge-count")).toHaveText("2");
+    await shot(page, "task-model-9-composer-390.png");
   });
 });

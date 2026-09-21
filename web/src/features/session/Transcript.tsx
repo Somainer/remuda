@@ -1104,9 +1104,10 @@ function renderNode(
         data-status={node.status}
         data-held={node.local?.held ? node.holdReason ?? "turn" : undefined}
         data-command-id={node.local?.commandId ?? undefined}
-        // t-annotations: message prose is an in-message ① anchor surface;
-        // the owning session/readonly state comes from the session-page
-        // ancestor (data-annotation-instance).
+        // t-annotations: the message is an in-message ① anchor surface; the
+        // role/status header sits in the same section but the selection
+        // helper in the specs targets the prose element directly. Owning
+        // session/readonly state come from the session-page ancestor.
         data-anchor-surface="transcript"
         data-anchor-message={node.id}
       >

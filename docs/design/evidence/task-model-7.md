@@ -117,6 +117,39 @@ new spec is **not** gated — it runs in every default full-suite run
 (unlike the bind spec, it needs no fake-node trigger), which the full run
 above proves.
 
+## The two default-run guards (same problem class)
+
+A hub spec has to behave in a default gate run; two distinct guards make
+that true here:
+
+1. **Gated-fixture self-skip** (the bind-spec rule): a spec that needs a
+   fake-Node trigger (`HUB_E2E_TASK_BIND`-style) must self-skip when the
+   trigger is absent, or the default full-suite run fails the landing
+   gate. This spec needs **no** trigger — it uses the default fake's g2
+   workspaces — so it deliberately has no such skip and always executes.
+2. **Evidence capture guard** (`REMUDA_EVIDENCE=1`, the m-keybar /
+   cua-media idiom): the three committed PNGs were regenerated on every
+   run, and even a one-pixel font/timing difference dirtied the gate's
+   working tree (this was found at the web gate). The evidence describe
+   block now calls `test.skip(!evidence, …)` and all writes go through a
+   `shot()` helper that is a no-op without the flag. A default run
+   executes the behavioral assertions — including an always-on 390px
+   test that keeps the phone narrowing covered — and touches **no** file
+   under `docs/`; `REMUDA_EVIDENCE=1` runs the two capture tests and
+   rewrites only the three intended PNGs.
+
+### Round 3 verification (evidence-guard fix)
+
+- Default run (no flag): **5 passed, 2 skipped, working tree unchanged**
+  (only the spec source is modified pre-commit; zero files under
+  `docs/design/evidence/` written).
+- `REMUDA_EVIDENCE=1` run: 7 passed; only
+  `task-model-7-{project-1440,task-1440,task-390}.png` are eligible to
+  change, and the committed blobs were verified to match the fresh
+  captures (PNGs restored to/kept at the committed round-1 renders).
+- `pnpm --dir web typecheck` / `lint`: clean.
+
+
 Post-rebase: branch rebased onto `origin/main` `fd37d714` (effortflake
 merge; web store-only delta, no file/task overlap). After rebase:
 vitest **151 files / 1511 tests pass**, typecheck/lint clean, and

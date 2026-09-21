@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { login } from "./hub-auth";
@@ -17,6 +18,13 @@ import { login } from "./hub-auth";
  *  - non-git/offline/etc. fall through to the contract's §3.6 availability
  *    states in both tabs.
  *
+ * Two default-run guards, same class as the gated-fixture rule:
+ *  - this spec is ungated and always runs in a default suite (no fake-node
+ *    trigger);
+ *  - the committed screenshots are regenerated ONLY with REMUDA_EVIDENCE=1.
+ *    A default run executes the behavioral assertions but never writes under
+ *    docs/, so the working tree stays git-clean for the gate.
+ *
  * The TaskSpacePanel is a real Remuda render. Task 5 later mounts it in the
  * app surface; for now it is mounted from inside the already-loaded Remuda
  * shell through the Vite module graph (a same-page dynamic import — no lab
@@ -30,7 +38,17 @@ import { login } from "./hub-auth";
 
 test.describe.configure({ mode: "serial" });
 
-const evidence = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence");
+const here = path.dirname(fileURLToPath(import.meta.url));
+/** Committed evidence only under REMUDA_EVIDENCE=1; default runs stay git-clean. */
+const evidence = process.env.REMUDA_EVIDENCE === "1";
+const evidenceDir = path.join(here, "../../../docs/design/evidence");
+
+async function shot(page: Page, name: string): Promise<void> {
+  if (!evidence) return;
+  await mkdir(evidenceDir, { recursive: true });
+  await page.evaluate(() => document.fonts.ready);
+  await page.screenshot({ path: path.join(evidenceDir, name), animations: "disabled" });
+}
 
 interface PanelParams {
   host: string;
@@ -277,37 +295,10 @@ test("non-git and offline availability states pass through into the task space u
   await expect(page.getByTestId("files-offline")).toBeVisible();
 });
 
-test.describe("evidence renders (Remuda only)", () => {
-  test.use({ viewport: { width: 1440, height: 900 } });
-
-  test("1440: project space and task space panels", async ({ page }) => {
-    const host = await resolveHost(page);
-    const instanceId = await createInstance(page, "wsp_e2e", host);
-    created.push(instanceId);
-    const task = await createTaskWithOwns(page, ["src/**", "notes/**"]);
-    await placeTaskOnInstance(page, task.id, host, instanceId);
-
-    await mountPanel(page, { host, ws: "wsp_e2e", instance: instanceId });
-    await page.waitForTimeout(300);
-    await page.screenshot({
-      path: path.join(evidence, "task-model-7-project-1440.png"),
-      animations: "disabled",
-    });
-
-    await page.getByTestId("files-space-task").click();
-    await expect(page.getByTestId("files-entry")).toHaveCount(2);
-    await page.waitForTimeout(300);
-    await page.screenshot({
-      path: path.join(evidence, "task-model-7-task-1440.png"),
-      animations: "disabled",
-    });
-  });
-});
-
 test.describe("mobile 390px", () => {
   test.use({ viewport: { width: 390, height: 780 } });
 
-  test("390: task space panel stays in the single shared files surface", async ({ page }) => {
+  test("390: task space panel narrows the list in the shared files surface", async ({ page }) => {
     const host = await resolveHost(page);
     const instanceId = await createInstance(page, "wsp_e2e", host);
     created.push(instanceId);
@@ -318,10 +309,47 @@ test.describe("mobile 390px", () => {
     await page.getByTestId("files-space-task").click();
     await expect(page.getByTestId("files-entry")).toHaveCount(1);
     await expect(page.getByTestId("files-entry").filter({ hasText: "src/main.rs" })).toBeVisible();
-    await page.waitForTimeout(300);
-    await page.screenshot({
-      path: path.join(evidence, "task-model-7-task-390.png"),
-      animations: "disabled",
+  });
+});
+
+// Committed renders only; skipped in every default suite run so the gate's
+// working tree stays clean (set REMUDA_EVIDENCE=1 to refresh the PNGs).
+test.describe("evidence renders (Remuda only, REMUDA_EVIDENCE=1)", () => {
+  test.skip(!evidence, "set REMUDA_EVIDENCE=1 to capture the committed screenshots");
+
+  test.describe("1440 desktop", () => {
+    test.use({ viewport: { width: 1440, height: 900 } });
+
+    test("1440: project space and task space panels", async ({ page }) => {
+      const host = await resolveHost(page);
+      const instanceId = await createInstance(page, "wsp_e2e", host);
+      created.push(instanceId);
+      const task = await createTaskWithOwns(page, ["src/**", "notes/**"]);
+      await placeTaskOnInstance(page, task.id, host, instanceId);
+
+      await mountPanel(page, { host, ws: "wsp_e2e", instance: instanceId });
+      await shot(page, "task-model-7-project-1440.png");
+
+      await page.getByTestId("files-space-task").click();
+      await expect(page.getByTestId("files-entry")).toHaveCount(2);
+      await shot(page, "task-model-7-task-1440.png");
+    });
+  });
+
+  test.describe("390 phone", () => {
+    test.use({ viewport: { width: 390, height: 780 } });
+
+    test("390: task space panel", async ({ page }) => {
+      const host = await resolveHost(page);
+      const instanceId = await createInstance(page, "wsp_e2e", host);
+      created.push(instanceId);
+      const task = await createTaskWithOwns(page, ["src/**"]);
+      await placeTaskOnInstance(page, task.id, host, instanceId);
+
+      await mountPanel(page, { host, ws: "wsp_e2e", instance: instanceId });
+      await page.getByTestId("files-space-task").click();
+      await expect(page.getByTestId("files-entry")).toHaveCount(1);
+      await shot(page, "task-model-7-task-390.png");
     });
   });
 });

@@ -39,6 +39,7 @@
 
 - 桌面：`<main>` 顶部右侧一条 scope 条（`项目范围` + 原生 `<select>`，44px 触控命中，复用 `ui.select`/`ui.touchSelect`），在所有 Shell 页面可见；切换只改全局过滤，不强制导航。
 - `/projects` 与 `/projects/:id` 页头另有一个同 store 的切换器（`navigateOnSelect`），在 projects 表面选择会导航到 `/projects/{id}`、全局回列表；从其他表面选择不导航（e2e 覆盖两种行为）。
+- 作用域只由**显式动作**改变：点目录行（行 `onClick` 先 `select` 再导航）或操作切换器；**深链/前进后退直接打开详情不写作用域**（mount 不产生副作用，round-2 决定，见下）。
 - compact：顶栏切换器不渲染（D-049：手机项目分组挂 `/m`，不复制桌面 IA）；projects 页头切换器仍可用。
 - 存储与已注册空间选择器同形（版本化 localStorage、无存储时降级可用、跨标签页 `storage` 事件语义留给既有 store 模式；本批次未加监听，刷新即读新值）。
 
@@ -54,13 +55,19 @@ Hub 的 `resolve_members`（`crates/remuda-hub/src/projects.rs`）要求成员�
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| web 单测 | `pnpm --dir web test` | 151 files / 1501 passed（含新增 18 条） |
+| web 单测 | `pnpm --dir web test` | round 1：1501 passed（含本任务 18 条）；round 2 复核：**151 files / 1507 passed**（本任务 20 条，见下方「round-2 评审闭环」） |
 | typecheck | `pnpm --dir web typecheck` | PASS |
 | lint | `pnpm --dir web lint`（oxlint；新文件仅 fast-refresh 既有 warning 级，无 error） | exit 0 |
 | 夹具编译 | `cargo check -p remuda-hub --example hub_e2e` | PASS |
-| hub e2e（本规格 ×3） | `pnpm playwright test -c playwright.hub.config.ts task-model-project`（锁 `locks/e2e.lock`，端口 59330/59331/59339，`HUB_E2E_PROJECT_SWITCHER=1`，PW_CHANNEL=chromium） | 6 passed × 3（47.0s / 46.1s / 49.2s） |
-| hub e2e（全量 ×1，默认不设触发） | 同一锁槽 `pnpm playwright test -c playwright.hub.config.ts` | **170 passed / 34 skipped / 0 failed**（25.4m；34 skipped 含本规格文件级 self-skip 的 6 个用例，已单独复跑确认 6 skipped） |
+| hub e2e（本规格 round 1 ×3） | `pnpm playwright test -c playwright.hub.config.ts task-model-project`（锁 `locks/e2e.lock`，端口 59330/59331/59339，`HUB_E2E_PROJECT_SWITCHER=1`，PW_CHANNEL=chromium） | 6 passed × 3（47.0s / 46.1s / 49.2s） |
+| hub e2e（本规格 round 2 ×1） | 同一锁槽/触发，加 `REMUDA_EVIDENCE=1` | **7 passed**（新增「显式作用域动作」用例并刷新证据截图） |
+| hub e2e（全量 ×1，默认不设触发） | 同一锁槽 `pnpm playwright test -c playwright.hub.config.ts` | **170 passed / 34 skipped / 0 failed**（25.4m；34 skipped 含本规格文件级 self-skip，已单独复跑确认 skipped） |
 | 密钥/隧道扫描 | `bash scripts/ci/secret-scan.sh` / `bash scripts/ci/no-tunnel-scan.sh` | `secret-scan: pass`（exit 0）/ `no-tunnel-scan: passed`（exit 0） |
+
+### round-2 评审闭环（对 `1d88c352`，PASS 后两项）
+
+1. **陈旧选择自洽（latent bug 已修）**：存储里的 projectId 若不在当前目录（项目被删 / 越 scope），旧实现控件显示「全局」而 store 仍持有该 id，M2 同波次的任务列表/看板会按一个不可见 id 过滤。现在 `projectFilterStore.reconcile(projectIds)` 在每次 `useProjects` 目录加载成功后调用：选中项仍在目录则原样保留，消失则清空为全局（同步删 localStorage 键）；全局永不被改动。控件与所有 `useProjectFilter()` 消费者因此只读同一个值。新增 2 条单测：store 级 `reconcile keeps a known selection and clears a stale one back to global`，以及端到端消费/控件一致性 `clears a stored selection when the project disappears, so consumers and the control agree`（目录重载后 store、`useProjectFilter()`、持久键、控件 value 全部回到全局）。
+2. **详情路由不再在 mount 时改写作用域（澄清项，决定保留显式动作）**：进入 `/projects/:id`（深链 / 前进后退）**不再**产生「静默重设其他表面作用域」的副作用——旧实现 `ProjectDetailPage` mount 时 `projectFilterStore.select(id)` 已删除。作用域只由**显式动作**改变：在 `/projects` 点项目行（行的 `onClick` 调 `select` 再导航）或用任一切换器。e2e 双断言：深链详情后 `localStorage["remuda.project-filter.v1"] === null`；从目录点行进详情后该键为该项目 id 且顶栏/页头两个切换器都显示该项目。证据截图因此改为经「点行」进入详情，画面上两个切换器命名的就是当前打开项目（截图据此刷新）。
 
 ### 本规格三次连跑输出（末尾摘要）
 

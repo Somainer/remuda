@@ -126,43 +126,48 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   const instanceId = new URL(page.url()).pathname.split("/").pop() as string;
   await expect(page.getByTestId("session-page")).toBeVisible();
 
-  await expect
-    .poll(
-      async () =>
-        page.evaluate(async (id) => {
-          const list = await fetch("/v1/interactions", { credentials: "include" });
-          const body = (await list.json()) as {
-            items?: {
-              id: string;
-              instanceId?: string;
-              state?: string;
-              request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
-            }[];
-          };
-          const mine = (body.items ?? []).filter(
-            (item) => item.instanceId === id && item.state === "pending",
-          );
-          for (const item of mine) {
-            const optionId = item.request?.options?.[0]?.id;
-            if (!optionId) continue;
-            await fetch(`/v1/interactions/${item.id}/answer`, {
-              method: "POST",
-              credentials: "include",
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({
-                answer: {
-                  kind: "approval",
-                  optionId,
-                  inputDigest: item.request?.inputDigest ?? "",
-                },
-              }),
-            });
-          }
-          return mine.length;
-        }, instanceId),
-      { timeout: 20_000 },
-    )
-    .toBe(0);
+  // The fake harness can raise a second approval right after the create one;
+  // keep answering until none are pending server-side AND the card unmounts
+  // (mirrors m-chrome.clearApprovals).
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const pendingCount = await page.evaluate(async (id) => {
+      const list = await fetch("/v1/interactions", { credentials: "include" });
+      const body = (await list.json()) as {
+        items?: {
+          id: string;
+          instanceId?: string;
+          state?: string;
+          interactionId?: string;
+          request?: { kind?: string; inputDigest?: string; options?: { id: string }[] };
+        }[];
+      };
+      const mine = (body.items ?? []).filter(
+        (item) => item.instanceId === id && item.state === "pending",
+      );
+      for (const item of mine) {
+        const optionId = item.request?.options?.[0]?.id;
+        if (!optionId) continue;
+        await fetch(`/v1/interactions/${item.interactionId ?? item.id}/answer`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            answer: {
+              kind: "approval",
+              optionId,
+              inputDigest: item.request?.inputDigest ?? "",
+            },
+          }),
+        });
+      }
+      return mine.length;
+    }, instanceId);
+    const cardCount = await page.getByTestId("approval-card").count();
+    if (pendingCount === 0 && cardCount === 0) break;
+    expect(Date.now() < deadline, "approvals clear within 20s").toBe(true);
+    await page.waitForTimeout(300);
+  }
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   return instanceId;
 }

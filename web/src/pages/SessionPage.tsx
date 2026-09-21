@@ -19,7 +19,12 @@ import { projectTurnDecision } from "../features/session/live/turnDecision";
 import { useNow } from "../features/session/live/useElapsed";
 import { SessionNotifications } from "../features/session/notifications/SessionNotifications";
 import { TaskTrack } from "../features/session/TaskTrack";
-import { AnnotationBadge, AnnotationPanel, useAnnotationsContext, useSessionTask } from "../features/tasks/AnnotationPanel";
+import {
+  AnnotationBadge,
+  AnnotationPanel,
+  useAnnotationsContext,
+  useSessionTask,
+} from "../features/tasks/AnnotationPanel";
 import { composeWithAnnotations } from "../features/tasks/annotations";
 import annCss from "../features/tasks/annotation.module.css";
 import { RawEvents } from "../features/session/RawEvents";
@@ -657,6 +662,29 @@ export function SessionPage({
         )}
       </div>
       {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock}>
+        {/* Zero-flow floating chip row anchored at the dock top: it rests
+            just above the composer (over the transcript edge) and never
+            shrinks the session body's measured viewport share — visible
+            whether the in-flow panel is open or not. */}
+        <div className={annCss.floatLayer}>
+          <div data-testid="annotation-dock" className={annCss.annotationBar}>
+            <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
+            {annotationAllowed ? (
+              <button
+                type="button"
+                className={annCss.badge}
+                data-testid="annotation-add"
+                onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
+              >
+                ＋ 加批注
+              </button>
+            ) : annotationReadonly ? (
+              <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
+                只读预览 · 不可批注
+              </span>
+            ) : null}
+          </div>
+        </div>
         <LiveStatusStrip
           events={events}
           nativeRef={instance.nativeRef}
@@ -723,23 +751,6 @@ export function SessionPage({
           taskTitle={sessionTask?.title ?? null}
           readonly={annotationReadonly}
         />
-        <div data-testid="annotation-dock" className={annCss.annotationBar}>
-          <AnnotationBadge instanceId={instance.id} readonly={annotationReadonly} />
-          {annotationAllowed ? (
-            <button
-              type="button"
-              className={annCss.badge}
-              data-testid="annotation-add"
-              onClick={() => annotationPanel.openPanel(instance.id, "card", null)}
-            >
-              ＋ 加批注
-            </button>
-          ) : annotationReadonly ? (
-            <span className={annCss.readonlyTag} data-testid="annotation-readonly-tag">
-              只读预览 · 不可批注
-            </span>
-          ) : null}
-        </div>
         <Composer
           key={instance.id}
           instanceId={instance.id}

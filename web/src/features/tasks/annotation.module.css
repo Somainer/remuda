@@ -7,14 +7,27 @@
  * wire and no queue structure (D-042 untouched).
  */
 
+/* Zero-height anchor at the top of the session dock; the bar floats above
+   the dock edge (over the transcript) so it consumes no flow height and the
+   session body keeps its measured viewport share. */
+.floatLayer {
+  position: relative;
+  height: 0;
+  z-index: 6;
+  pointer-events: none;
+}
+
 .annotationBar {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: calc(100% + 6px);
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: var(--space-2);
-  padding: var(--space-1) var(--space-2);
-  border-top: 1px solid var(--line);
-  background: var(--ink-1);
   flex-wrap: wrap;
+  pointer-events: auto;
 }
 
 .badge {

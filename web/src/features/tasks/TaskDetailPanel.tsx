@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import type { Task } from "../../types/generated";
+import { TASK_STATE_LABEL } from "./taskRows";
 import css from "./tasklist.module.css";
 
 /**
@@ -15,17 +16,6 @@ export type TaskDetailPanelProps = {
   sessionIds?: readonly string[];
   /** First link target for the task's sessions; null when it has none. */
   primarySessionId?: string | null;
-};
-
-const STATE_LABEL: Record<Task["state"], string> = {
-  pending: "待办",
-  placed: "已派发",
-  running: "进行中",
-  stalled: "停滞",
-  done: "已完成",
-  failed: "失败",
-  parked: "停放",
-  deferred: "延后",
 };
 
 export function TaskDetailPanel({
@@ -55,7 +45,7 @@ export function TaskDetailPanel({
           data-state={task.state}
           data-failed={failed ? "1" : "0"}
         >
-          {STATE_LABEL[task.state]}
+          {TASK_STATE_LABEL[task.state]}
         </span>
       </header>
 

@@ -38,6 +38,10 @@ const shotDir = evidence
 const createdInstances: string[] = [];
 
 async function shot(page: Page, name: string) {
+  // Evidence shots are an explicit opt-in: a default gate run must never
+  // write a PNG (the only committed screenshots are Remuda renders captured
+  // with REMUDA_EVIDENCE=1). Mirrors m-keybar.hub.spec.ts.
+  if (!evidence) return;
   await mkdir(shotDir, { recursive: true });
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled" });
 }

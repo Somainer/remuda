@@ -20,7 +20,7 @@
 | `web/src/features/mobile/homeRows.ts`（增量，只读 import） | 新增 `buildHomeTaskLayer()`，整体委托给 `buildTaskGroups()`；既有 `buildHomeGroups()` 一字未动 |
 | `web/src/features/mobile/HomeList.tsx`（增量） | 在既有 project+branch 会话组之上渲染任务层；任务行点击进共享 `/s/:id`；`?project=` 透传（桌面 /board compact 塌缩时查询串原样保留） |
 | `web/src/types/instance.ts`、`web/src/lib/api.ts` | 归一化 `Instance` 增 `taskId?: Id|null`，从 M1 已下发的 `InstanceRecord.taskId`（`instances.task_id`）映射；纯增量、未绑定会话为 null |
-| `web/src/app/router.tsx`、`web/src/app/Shell.tsx`、`web/src/lib/mobileRoute.ts`(+test) | `/board` 路由（挂在 ViewportGate 内，compact 自动塌缩）、桌面轨「任务」入口（手机不显示，手机走 /m）、`/board → /m` 重定向及用例 |
+| `web/src/app/router.tsx`、`web/src/app/Shell.tsx`、`web/src/lib/mobileRoute.ts`(+test) | `/board` 路由（挂在 ViewportGate 内，compact 自动塌缩）、桌面轨「任务」入口（手机不显示，手机走 /m）、`/board → /m` 重定向及用例。主导航入口属本任务：否则新建的 `/board` 任务列表无任何可达路径，验收 1–6 的桌面表面无法进入；只加一枚桌面图标，未改会话主导航结构，看板任务（t-board-ui）复用同一路由 |
 | `web/tests/e2e/task-model-list.hub.spec.ts`（新） | hub e2e：1440 桌面 + 390 手机两条，连跑 3 次全绿 |
 | `docs/design/evidence/task-model-5-board-1440.png`、`task-model-5-home-390.png`（新） | Remuda 自身渲染证据 |
 

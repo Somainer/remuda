@@ -181,11 +181,6 @@ function block(reason: string): DropLegality {
   return { allowed: false, hops: [], reason };
 }
 
-/** Work columns this card may legally be dragged to right now. */
-export function reachableWorkColumns(task: BoardCard["item"]): WorkColumn[] {
-  return BOARD_WORK_COLUMNS.filter((column) => dropLegality(task, column).allowed);
-}
-
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 function cardSessions(

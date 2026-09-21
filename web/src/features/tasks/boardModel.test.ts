@@ -9,7 +9,6 @@ import {
   buildBoardModel,
   configLabelOf,
   dropLegality,
-  reachableWorkColumns,
   sharedCounts,
   type BoardItem,
   type BoardView,
@@ -61,6 +60,13 @@ function session(partial: Partial<CardSession> & Pick<CardSession, "id" | "taskI
     updatedAt: "2026-09-21T11:00:00.000Z",
     ...partial,
   };
+}
+
+/** Columns the card's precomputed drops map would mark legal. */
+function allowedColumns(card: BoardItem): ("todo" | "in-progress" | "done")[] {
+  return (["todo", "in-progress", "done"] as const).filter((column) =>
+    dropLegality(card, column).allowed,
+  );
 }
 
 describe("board column composition", () => {
@@ -181,9 +187,9 @@ describe("precomputed drag legality and multi-hop sequences", () => {
   });
 
   it("precomputes the reachable column set per card", () => {
-    expect(reachableWorkColumns(item("pending"))).toEqual(["in-progress"]);
-    expect(reachableWorkColumns(item("running"))).toEqual(["todo", "done"]);
-    expect(reachableWorkColumns(item("stalled"))).toEqual(["todo", "done"]);
+    expect(allowedColumns(item("pending"))).toEqual(["in-progress"]);
+    expect(allowedColumns(item("running"))).toEqual(["todo", "done"]);
+    expect(allowedColumns(item("stalled"))).toEqual(["todo", "done"]);
   });
 
   it("blocks to-do → done with an explicit reason (pass through in-progress)", () => {
@@ -206,8 +212,8 @@ describe("precomputed drag legality and multi-hop sequences", () => {
       expect(dropLegality(failedMid, target).reason).toBe(TERMINAL_REASON);
       expect(dropLegality(done, target).reason).toBe(TERMINAL_REASON);
     }
-    expect(reachableWorkColumns(failedEarly)).toEqual([]);
-    expect(reachableWorkColumns(done)).toEqual([]);
+    expect(allowedColumns(failedEarly)).toEqual([]);
+    expect(allowedColumns(done)).toEqual([]);
   });
 
   it("blocks the card's own column and every move for an archived card", () => {

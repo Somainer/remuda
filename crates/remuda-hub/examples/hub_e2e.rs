@@ -371,11 +371,13 @@ async fn project_host_b_node(
                         } else {
                             json!({"ok": true})
                         };
-                        let _ = ws.send(Message::Text(
-                            json!({"jsonrpc":"2.0","id":id,"result":result})
-                                .to_string()
-                                .into(),
-                        )).await;
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"jsonrpc":"2.0","id":id,"result":result})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await;
                     }
                 }
                 Some(Ok(_)) => {}

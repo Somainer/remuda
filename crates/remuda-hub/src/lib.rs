@@ -48,6 +48,8 @@ mod registry;
 pub mod ssh_hosts;
 mod store;
 mod store_tickets;
+/// Managed-process supervision (`--managed`): parent-death watch and pid file.
+pub mod supervise;
 mod supply;
 mod tasks;
 mod transport;
@@ -563,20 +565,43 @@ impl RunningHub {
 
     /// Stop HTTP/WS accept and wait for the SQLite writer thread to close.
     pub async fn shutdown(mut self) {
+        self.shutdown_within(Duration::from_secs(5)).await;
+    }
+
+    /// Stop accepting, wait up to `budget` for the HTTP server to drain, then
+    /// flush the journal (WAL checkpoint) within the remaining time.
+    ///
+    /// Managed Hubs (`remuda hub --managed`) call this with a 3-second budget
+    /// so SIGTERM and supervisor-exit shutdowns stay inside the desktop
+    /// shell's teardown window. Connections still in flight when the budget
+    /// expires are aborted; journal durability is given a separate floor.
+    pub async fn shutdown_within(&mut self, budget: Duration) {
+        let started = std::time::Instant::now();
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if let Some(mut task) = self.task.take() {
-            tokio::select! {
-                _ = &mut task => {}
-                () = tokio::time::sleep(Duration::from_secs(5)) => {
-                    task.abort();
-                    let _ = task.await;
-                }
-            }
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(budget, &mut task).await.is_err()
+        {
+            tracing::warn!("hub server did not drain in {budget:?}; aborting");
+            task.abort();
+            let abort_budget = budget
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(250));
+            let _ = tokio::time::timeout(abort_budget, &mut task).await;
         }
         if let Some(store) = self.store.take() {
-            store.close().await;
+            // The writer checkpoints the WAL on Stop (journal flush). Keep a
+            // floor even when the drain spent the whole budget.
+            let remaining = budget
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(500));
+            if tokio::time::timeout(remaining, store.close())
+                .await
+                .is_err()
+            {
+                tracing::error!("hub journal did not flush before shutdown deadline");
+            }
         }
     }
 }
@@ -618,6 +643,7 @@ async fn spawn_inner(
     mut config: HubConfig,
     transport: Option<Arc<dyn remuda_push::Transport>>,
 ) -> anyhow::Result<RunningHub> {
+    supervise::mark_started();
     proxy::configure_public_origin(&mut config)?;
     std::fs::create_dir_all(&config.data_dir)?;
     resolve_bootstrap(&mut config)?;

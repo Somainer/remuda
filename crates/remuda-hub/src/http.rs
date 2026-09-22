@@ -281,8 +281,17 @@ pub(crate) struct ReturnWorktreeBody {
 const WORKTREE_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `GET /healthz`
+///
+/// Liveness probe fields:
+/// - `ok`: always `true` on 200; existing probes depend on this exact key.
+/// - `version`: Hub package version (matches the `remuda` CLI version).
+/// - `uptimeSecs`: whole seconds since this Hub process started.
 pub async fn healthz() -> Json<Value> {
-    Json(json!({ "ok": true }))
+    Json(json!({
+        "ok": true,
+        "version": crate::supervise::HUB_VERSION,
+        "uptimeSecs": crate::supervise::uptime_secs(),
+    }))
 }
 
 /// `POST /v1/login` — bootstrap access code → device token + cookie.

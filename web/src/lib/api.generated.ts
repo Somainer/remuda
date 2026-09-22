@@ -3240,6 +3240,13 @@ export interface operations {
                 content: {
                     "application/json": {
                         ok: boolean;
+                        /**
+                         * Format: uint64
+                         * @description Whole seconds since this Hub process started.
+                         */
+                        uptimeSecs: number;
+                        /** @description Hub package version (matches the remuda CLI version). */
+                        version: string;
                     };
                 };
             };

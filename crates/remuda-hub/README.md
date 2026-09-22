@@ -47,7 +47,7 @@ OpenAPI 3.1: `openapi/openapi.json`. Web client: `pnpm --dir web run gen:api`.
 
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
-| GET | `/healthz` | no | `{ok:true}` |
+| GET | `/healthz` | no | `{ok,version,uptimeSecs}` |
 | POST | `/v1/login` | bootstrap token | Sets `remuda_device` cookie; returns device token |
 | GET | `/v1/hosts` | device | Host registry: `label`, `labels[]`, `online`, `lastSeenAt`, `cli[]`, `herdr`, `resources`, `maxInstances`, `transport` |
 | GET | `/v1/instances` | device | Cross-host index |

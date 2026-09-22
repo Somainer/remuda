@@ -22,6 +22,9 @@ argon2.workspace = true
 axum.workspace = true
 base64 = "0.22"
 futures.workspace = true
+# PR_SET_PDEATHSIG on Linux, kqueue(EVFILT_PROC) on macOS for --managed
+# parent-death supervision; safe wrappers only (workspace forbids unsafe).
+nix = { version = "0.28", default-features = false, features = ["process", "signal", "event"] }
 remuda-driver.workspace = true
 remuda-protocol.workspace = true
 remuda-screen.workspace = true

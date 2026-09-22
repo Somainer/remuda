@@ -22,6 +22,20 @@ fn parse_origin(value: &Value) -> InputOrigin {
     }
 }
 
+/// Read the frame's claimed origin from the Hub envelope.
+///
+/// Only the Hub envelope is authoritative. Native input text cannot promote
+/// itself by including input.origin or a nested spec actor.
+///
+/// SECURITY (spec only — `docs/design/protocol.md` §7.7): this authority runs
+/// in one direction today. Nothing here proves *who the Hub is*: any peer that
+/// completes the Hub↔Node handshake can send `origin: "human"`, because the
+/// handshake authenticates Node→Hub only (bearer `node.auth`) and the
+/// application layer has no Hub identity on the Node side. The Hub ed25519
+/// identity key, the Node-side TOFU pin, and the signed-frame envelope that
+/// close this are specified in §7.7 (mismatch fails loud per D-035). They are
+/// not implemented yet; until they are, this function stays the chokepoint the
+/// future signature check must sit in front of.
 pub(crate) fn wire_origin(params: &Value) -> InputOrigin {
     // Only the Hub envelope is authoritative. Native input text cannot promote
     // itself by including input.origin or a nested spec actor.

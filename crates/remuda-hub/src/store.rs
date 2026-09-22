@@ -1456,6 +1456,15 @@ pub(crate) enum LeaseHolder {
 impl Store {
     /// Open (or create) `hub.sqlite` on a dedicated writer thread, plus a
     /// read-only pool for reads that can be long (hub-store-1).
+    ///
+    /// IDENTITY-KEY SITE (spec only — `docs/design/protocol.md` §7.7): this
+    /// `data_dir` is also the specified home of the future Hub ed25519 identity
+    /// key pair (`hub-identity/identity.ed25519[.pub]`, generated once on first
+    /// start, key `0600`, directory `0700`). The private key belongs in the same
+    /// backup set as `bootstrap-token` and the secret envelopes: a restore that
+    /// loses it mints a new Hub identity and invalidates every Node pin. Nothing
+    /// is created here yet — the spec is docs-only; no schema, code, or wire
+    /// change accompanies this comment.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(data_dir).map_err(|err| StoreError::Id(err.to_string()))?;
         let path = data_dir.join("hub.sqlite");

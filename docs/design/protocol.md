@@ -1425,7 +1425,7 @@ hello result：`{protocol:{major,minor},connectionId:Id,serverEpoch:Id,observati
 
 **空清单的额外要求**：`[]` 是唯一会产生破坏性后果的取值（“我一个都没有”会让 Hub 结算该 host 上每一行），因此只有 `params.instanceStoreFound: true` 与它同行时 Hub 才采信。该字段表示 Node 确实在预期位置找到了 instance store：`--data-dir` 指错、磁盘被清空、或使用内存 store 时都会枚举出零行，而这不代表任何东西，此时 Node 必须**省略** `instances`（而非发送 `[]`）——Hub 对两种沉默一视同仁。`requested` 行不在对账范围内：它是 Hub 单方面、尚未被 Node 确认的意图，重启窗口内的缺席不能证明它已丢失，由 `expire_stale_requested` 按时间单独回收。
 
-身份层：Node 优先使用每 Host 单独的 mTLS client certificate，证书身份绑定 enrollment hostId；简化部署可用 TLS + 每 Node 独立的 256-bit 随机 token，Hub 只保存校验材料，支持轮换/撤销。设备 token 与 Node token 是不同身份，不能互换；Web 登录后使用同源安全 cookie 与 CSRF 保护，WS 首次鉴权使用短时会话凭据/同源校验，不把长期 token 放 URL。SSH 登录只负责隧道，不代替应用内 actor/scope 检查。MCP agent capability 与 Bot token 也是受限身份，不能获取 Hub 管理 credential。
+身份层：Node 优先使用每 Host 单独的 mTLS client certificate，证书身份绑定 enrollment hostId；简化部署可用 TLS + 每 Node 独立的 256-bit 随机 token，Hub 只保存校验材料，支持轮换/撤销。设备 token 与 Node token 是不同身份，不能互换；Web 登录后使用同源安全 cookie 与 CSRF 保护，WS 首次鉴权使用短时会话凭据/同源校验，不把长期 token 放 URL。SSH 登录只负责隧道，不代替应用内 actor/scope 检查。MCP agent capability 与 Bot token 也是受限身份，不能获取 Hub 管理 credential。以上只认证 Node→Hub 方向；Hub→Node 方向的长期应用层身份（Hub ed25519 身份密钥、Node 端 TOFU pin 与签名帧）由 §7.7 规定（截至 2026-09-22 为规格，尚未实现）。
 
 Hub 生成 ownerFence，Node 在本地 durable store 单调保存；旧 fence 的命令返回 `OWNER_FENCED`。一个 Node 的新连接取代旧连接，新连接完成 reconciliation 前不派发变更。Node 必须使用 OS 单实例锁和每 native session 的本地 writer lock；没有锁实现的 host 不能把 lease 宣称为防止重复进程的充分保证。网络分区时旧运行可继续原生执行，但 runtime 不在另一 Host 启动同 Instance，也不在租约失效后接受新的跨主机控制任务。
 
@@ -1609,6 +1609,215 @@ HTTP 错误，让 harness 渲染出真正的模型 API 失败而不是传输故�
 非 loopback 接口开端口（只有操作员显式配置 `Host.relayBind` 才会）、到不了
 任意主机。被转发的是一个单一 origin、白名单、实例作用域的应用请求，字节走
 已经授权、已经审计的链路。
+
+### 7.7 Hub 身份密钥与 Node 端 pin（ed25519；规格，尚未实现）
+
+> **状态（2026-09-22）：本节是规格，不是实现声明。** 本批 docs-only：不实现任何
+> 下述行为，不改 wire 版本（`crates/remuda-protocol/src/lib.rs:62` 仍为 major 1 /
+> minor 0），不改 Hub store schema，不改 Node `enrollment.json` 结构，不引入新依赖。
+> 三个相关代码点只加了指向本节的 doc comment：`crates/remuda-hub/src/store.rs:1468`、
+> `crates/remuda-node/src/transport/hubnode_codec.rs:888`、
+> `crates/remuda-node/src/origin.rs:39`。攻击链复述与现状引用见
+> [evidence/hub-identity-1.md](evidence/hub-identity-1.md)。
+
+#### 7.7.1 缺口与威胁模型
+
+Node 今天对 Hub 的信任是**单向**的：所有指令都以「Hub envelope 是权威的」为前提，
+但握手只认证 Node→Hub 方向（Bearer `node.auth`，`crates/remuda-hub/src/ws.rs:418-427`），
+应用层没有任何东西向 Node 证明对端是它 enroll 的那个 Hub。
+
+- `crates/remuda-node/src/origin.rs:39-43` 的 `wire_origin` 直接读帧参数里的
+  `origin`；其注释（`origin.rs:40-41`）写明「Only the Hub envelope is
+  authoritative」——但「对端是不是 Hub」从不被检验。该函数在 close/create/send 等
+  全部特权入口被调用（`crates/remuda-node/src/transport/hubnode_codec.rs:270`、
+  `hubnode_codec.rs:463`、`hubnode_codec.rs:538`，另见 570/595/671/703）。
+- 握手自报身份：Node 把持久化 `hostId` 放进 hello 参数
+  （`crates/remuda-protocol/src/hubnode.rs:494-497` 的 `NodeHelloParams.host_id`；
+  Node 侧构造在 `hubnode_codec.rs:888` 的 `stdio_hello_params`），Hub 从参数里取
+  `hostId` 入账（`crates/remuda-hub/src/ws.rs:428-441`）。反方向没有对应物。
+- 传输层仅有 TLS：outbound WSS 用 `connect_async` 默认校验
+  （`crates/remuda-node/src/transport/wss.rs:496-507`）——它只证明「对方持有一张
+  对所连名字合法的证书」。配合名字解析劫持，一张合法证书即可让 Node 把对方当 Hub；
+  ssh-stdio carrier 下应用层同样无 Hub 身份。
+- 得手后可伪造的帧包括任意 `instance.create`（可携带下发凭据，见
+  `hubnode_codec.rs:463` 附近的 create 路径）、任何 `origin:"human"` 的特权帧，以及
+  `api.egress`——它是**唯一**携带网关凭据的帧
+  （`crates/remuda-protocol/src/hubnode.rs:127-130`、`hubnode.rs:1025-1040`）。
+
+纯内网拓扑下这条路径被家庭/办公网络边界挡着，但它不依赖任何公网暴露，且是将来任何
+可达性方案的硬前置。本节的目标是让 Node 在应用层认识 Hub 的长期身份。
+
+#### 7.7.2 Hub 身份密钥本身
+
+- **算法**：ed25519。实现批必须优先复用既有 TLS/密码学依赖栈中已存在的 ed25519，
+  **不为此新增 crate**；若复用确实不可能，须在实现批的决策里单独论证。
+- **文件**（全部位于 Hub `data_dir`，与 `hub.sqlite` 同目录层级；
+  `crates/remuda-hub/src/store.rs:1468-1470` 是该目录的现有打开点）：
+  - `hub-identity/identity.ed25519` —— 私钥（32 字节 raw 或 PKCS#8 PEM，实现批二选一并写死）；文件权限 `0600`，目录 `0700`。
+  - `hub-identity/identity.ed25519.pub` —— 公钥；`0644`。
+  - 公钥文件内同时记录 `keyId`（公钥的短指纹，确定性派生，不另起随机身份）。
+- **生成时机**：Hub 首次启动、打开 `data_dir` 之后、接受任何 Node 连接之前。写入用
+  `create_new` + `fsync` + 原子 rename 的收敛形状，与 Node 侧 host-id 的既有写法一致
+  （`crates/remuda-node/src/identity.rs:11-34`），并发启动只有一个赢家。文件已存在时
+  一律读取，**绝不静默重新生成**；解析失败则 Hub 拒绝启动（fail-closed），不自动换钥。
+  私钥文件落盘的保密写法照 `bootstrap-token` 的既有私有文件辅助
+  （`crates/remuda-hub/src/auth.rs:57-67`，同样 `0600` + sync）。
+- **备份归属**：私钥**必须**进入 Hub 备份集，与 `bootstrap-token`、master key 和其他
+  secret envelope 同列——运行手册已要求这些与 SQLite 一致备份
+  （`docs/design/deploy-runbook.md:128-130`），本密钥属于其中「其他 secret
+  envelope」。原因是硬性的：恢复后若该文件缺失，Hub 会生成新身份，**所有 Node 的 pin
+  立即全部失效**，只能逐台重新 enroll。文件 `0600` 是本机纵深，不替代备份集自身的
+  加密与访问控制；备份保留期与其他 secret 相同。
+- **轮转流程**（计划性轮转）：
+  1. 生成新密钥对（新 `keyId`），与旧密钥在目录中**并存**；hello 同时公布两个公钥，
+     旧 key 带 `notAfter`。
+  2. Hub 用**当前在线的旧私钥**签发一份转签声明
+     `{oldKeyId, newKeyId, newPubkey, issuedAt, notAfter, signature}`。Node 只在转签
+     声明通过当前 pin 验签时才接受新指纹（见 7.7.3）。
+  3. 推广窗口结束后，旧私钥从活跃目录移除、离线归档（仍保留在既有备份集内），Hub 只
+     用新密钥签名；Node 在见到首次有效新签名后删除旧指纹。
+  4. **应急轮转**（怀疑私钥泄露）：跳过宽限，旧指纹立即吊销，不发转签声明；所有 Node
+     在下一条连接 fail-loud，由操作员在已认证设备上重新签发一次性 enroll token、逐台
+     重新 enroll（带外通道见 D-018）。
+  5. 任何「线上帧单方面宣布新公钥」、且没有当前 pin 对应私钥签名的，一律拒绝——拒绝
+     形状遵循 [D-035](decisions.md)：不以理由接受、不静默换 pin。
+
+#### 7.7.3 Node 侧 pin 与 TOFU
+
+- **落点与结构（实现批才落，本批不改）**：Node data_dir 的 `enrollment.json`
+  （文件名常量 `crates/remuda-node/src/enroll.rs:11`；现结构只有 `hostId` 与
+  `nodeToken`，`enroll.rs:38-47`）增加一个**可选**字段：
+
+  ~~~text
+  "hubPin": {
+    "alg": "ed25519",
+    "keyId": "<短指纹>",
+    "fingerprint": "sha256:<公钥 DER 的 SHA-256，十六进制>"
+  }
+  ~~~
+
+  文件继续以 `0600`、临时文件 + 原子 rename 写入（既有形状 `enroll.rs:82-107`）。
+  指纹 = 公钥标准编码（DER）的 SHA-256；显示与核对接缝使用完整指纹，不做截断匹配。
+- **TOFU 语义**：pin 只在两个时刻写入——(a) 首次 enroll；(b) 通过当前 pin 验签的转签
+  声明（7.7.2 第 2 步）。普通重连、重放的 hello、任何不带有效转签声明的「换钥通知」
+  都不改 pin。首次 enroll 的信任锚是带外通道本身：一次性 enroll token 由已认证设备在
+  Hub 管理面签发、经操作员注入 Node 环境（`enroll.rs:13-36` 的
+  `REMUDA_ENROLL_TOKEN`），Node 在该通道的 hello result 里首次见到 Hub 公钥并落 pin；
+  pin 与 `nodeToken` 在**同一次原子写**中持久化，任何只持久化其一半的结果视为失败。
+  操作员可在 enroll 时比对完整指纹做带外确认；grace 迁移期这一确认是**强制**的
+  （7.7.5）。
+- **校验时机**：每条 Hub↔Node 连接——outbound WSS 与 ssh-stdio 同等——在 hello
+  result 处、§7.1「hello 成功前不接受其它操作」的同一关卡完成。hello result 必须按
+  7.7.4 签名；签名不过则 hello 不算成功，连接上不接受也不派发任何业务帧。
+- **指纹不匹配 = fail-loud 拒绝（[D-035](decisions.md) 的拒绝形状）**。具体地：
+  - 拒绝整个 hello / 连接，建议错误码 `HUB_IDENTITY_MISMATCH`（实现批在 §9.1 登记）；
+  - 日志记录 expected 与 actual 两个完整指纹与对端传输标识，写一条安全审计事件；
+  - **不**覆盖旧 pin、**不**删除旧 pin、**不**降级为「只信 TLS」、**不**接受无签名
+    帧、**不**自动重新 TOFU——恢复路径只有「有效转签声明」或「操作员重新 enroll」；
+  - 区分「pin 缺失」与「pin 不匹配」两种状态：前者是从未见过（受 7.7.5 迁移规则约束），
+    后者是「认识的 Hub 变了」，任何时候都按更危险者处理。
+
+#### 7.7.4 必须签名的帧与签名内容
+
+**必须由 Hub 签名的 Hub→Node 帧（最小集）**：
+
+1. **hello result**——承载每连接 nonce 与 Hub 公钥，是后续一切的信任根。
+2. **`instance.create`**——可启动任意 agent 并携带下发凭据（派发实现见
+    `hubnode_codec.rs:463` 的 create 路径与 `origin.rs:39-43` 的来源认定）。
+3. **任何 `origin:"human"`（及等价的 Bot 特权来源）的帧**——来源标签直接决定能否通过
+    人类专属审批门（同类双门裁决见 D-045），而该标签今天由 `wire_origin` 直接读帧
+    参数（`hubnode_codec.rs:270`、`463`、`538`、`570`、`595`、`671`、`703`）。因此
+    `instance.close/send/cancel`、`instance.configure`、`instance.respond`/
+    `interaction.respond`、`tty.write`/`instance.keys` 只要携带 Human/Bot 来源就要签；
+    Agent 来源帧本批不强制（签名覆盖集可在将来只增不减地扩大）。
+4. **`api.egress` 安装帧与撤销帧**（`revoke:true` 同等待遇）——唯一携带网关凭据的帧
+   （`hubnode.rs:127-130`、`hubnode.rs:1025-1040`）。安装帧伪造可直接窃走模型 API
+   凭据；撤销帧伪造可做拒绝服务并迫使凭据在混乱中重发，所以两者同权。
+
+**信封（实现批 additive 字段；本批不落 wire、不发这个字段）**：
+
+~~~text
+"sig": {
+  "alg": "ed25519",
+  "keyId": "<签名公钥的短指纹>",
+  "nonce": "<本连接 256-bit 随机挑战，十六进制>",
+  "seq": "1",
+  "frameType": "instance.create",
+  "payloadSha256": "<params 规范化序列化的 SHA-256，十六进制>",
+  "signature": "<ed25519 签名，标准 base64>"
+}
+~~~
+
+**签名内容（canonical signature base）必须覆盖 `(nonce, hostId, seq, frame_type)`**，
+并同时覆盖 `payloadSha256`；五者以定长域分隔拼接后整体签名。逐项理由：
+
+- **nonce —— 防跨会话/跨连接重用。** Node 在每条连接的 hello 中生成新的 256-bit 随机
+  nonce；hello result 与本连接后续帧必须回带同一值。攻击者录制的历史帧携带的是旧连接
+  nonce，在新连接上直接验签失败。nonce 不持久化，重连必换新；它解决的是「同一条合法
+  帧被录下来以后再用」。
+- **hostId —— 防跨主机挪用。** 签名基中的 `hostId` 是**本 Node** 持久化的 `hst_…`
+  身份（`enrollment.json` 的那个，`crates/remuda-node/src/enroll.rs:42-43`）。发给
+  A 主机的合法签名帧挪到 B 主机即验签失败；它同时阻止 Hub 路由层或中间人把另一 host 的
+  指令「转发」给本 Node 充当本地指令。
+- **seq —— 防会话内重放与重排。** 每连接、Hub→Node 方向单调递增的 u64 计数，hello
+  result 为 1，之后每帧 +1；Node 记住本连接已见最大值，回退与重复一律拒绝。它使
+  「把稍后的 `cancel` 签名帧提前到 `send` 之前回放」这类乱序攻击失效。重连后 nonce
+  换新、seq 从 1 重新计数，因此 seq 不需要也**不**复用实例日志的持久水位
+  （`SeqWatermark` 是 journal durableSeq，`hubnode_codec.rs:17-27`，与传输签名计数是
+  两件事，不共用语义、不互相持久化）；跨重连的补页重放由 nonce 单独封死。
+- **frame_type —— 防帧类型掉包。** 签名基绑定方法名字面量（如 `instance.create`）。
+  否则一个为低危方法签出的签名可被贴到高危方法的帧上，四元组不变而语义被换。
+- **payloadSha256 —— 防参数篡改（与前四项同属必签内容）。** 没有它，四元组不变而
+  params 被改（换 prompt、换 `origin`、换凭据、换 instanceId）签名依然有效。哈希输入
+  是 params 的规范化 JSON（对象键按码点排序、无多余空白、数字原样保留），规范化规则与
+  测试向量在实现批固化并进 conformance 测试；`sig` 信封自身不参与自己的哈希输入。
+
+**验签位置**：在进入统一派发表 `dispatch_frame`（入口 `hubnode_codec.rs:214`）**之前**
+完成。验签失败（缺字段、算法不符、nonce/seq 违规、keyId 不在 pin 集合、签名错误）的帧
+被拒绝并计安全审计事件，不得落入 dispatch。无 id 的通知帧不适用「未知通知静默容忍」
+（`hubnode_codec.rs:324` 的 `unhandled` 容忍针对的是*方法未知*，缺签名/坏签名不是
+未知方法）——签名缺失一律是错误，不是可忽略的未来特性。
+
+#### 7.7.5 兼容与迁移
+
+现网所有已 enroll 的 Node 都没有 pin（`enrollment.json` 无 `hubPin`，见
+`enroll.rs:38-47`），现网 Hub 也不签。迁移只有以下路径：
+
+- **路径 A（推荐；零宽限）**：升级 Hub 后逐台重新 enroll。一次性 enroll token 本就是
+  既有带外通道（D-018），重新 enroll 即完成一次带外锚定的 TOFU。完成前该 Node 按
+  pin-missing 规则拒连。不存在「升级即自动信任」。
+- **路径 B（grace 迁移；仅当大批 Node 无法在窗口内重新 enroll）**：设一个有硬性截止
+  时间的迁移窗口（建议不超过 14 天，最终值在实现批定死，不接受运行时无限延长）：
+  - 窗口内，**pin 缺失**的 Node 只在升级后**首次**连接时允许一次 TOFU，且操作员必须
+    在已认证设备上逐台核对并确认完整指纹（完整指纹人工比对，不做「点是即可」的对话框）；
+    每次 TOFU 写安全审计。
+  - 窗口内**已有 pin**的 Node 一律强制验签，grace 不削弱任何已 pin 节点的安全语义。
+  - Hub 对 pin-missing Node 也照常发签名帧；不存在「unsigned mode」，Node 可以先只存证。
+  - 窗口结束后，pin 仍缺失即拒连；不存在第二次延期，延期本身就是一次攻击窗口。
+- **grace 期自身的风险（必须在实现批运维文档中复述）**：TOFU 把安全保证降格为「首次
+  连接安全」。若某 Node 的首次连接恰被名字解析劫持 + 合法证书冒接（7.7.1 的攻击链），
+  攻击者公钥会被 pin，之后真 Hub 反而以 mismatch 被拒——且攻击者可正常运转到窗口结束
+  再被发现。因此 grace 不是风险消除而是风险限时：窗口必须短且硬截止、TOFU 必须人工带外
+  核指纹、期间任何 mismatch 立即 fail-loud 并告警、**绝不允许 grace 内自动重 pin**。
+- **永不升级的老 Node**：窗口结束后 Hub 不得再向其下发 7.7.4 的四类帧；无法在不放弃
+  身份校验的前提下继续服务它们，处置只能是退役或限制到无 Human 帧、无 egress 的隔离
+  用途。此项是策略要求，本规格不实现。
+
+#### 7.7.6 明确不做（本批边界）
+
+- 不实现本节任何行为；这是给实现批的规格与验收依据。
+- 不改 wire 版本（`crates/remuda-protocol/src/lib.rs:62` 不变）；`sig` 是未来的
+  additive 可选字段，老 Node 忽略它的自由由 7.7.5 迁移规则而非「静默接受」给予。
+- 不动 Hub store schema（不新增表/列），不动 Node `enrollment.json` 现有结构。
+- 不引入新依赖；实现批优先复用既有密码学栈。
+- 不做公网前门 / 公网可达性（owner 已裁定另批）；本节只补前置。
+- 不签 Node→Hub 方向：该方向已有 Bearer token / mTLS 身份（§7.1）；双向签名是将来的
+  独立议题。
+
+> 编辑约定：本文件的 `~~~json` / ```` ```json ```` 围栏是
+> `crates/remuda-protocol/tests/wire_golden.rs` 的输入——每块必须是**完整、且对应类型
+> 已存在**的协议帧，片段或未来字段示意（如本节的 `hubPin`、`sig`）必须使用
+> `~~~text` 等其他语言标注，否则 golden 测试按逐行解析并失败。
 
 
 ## 8. 主 agent 的 MCP / CLI 控制面

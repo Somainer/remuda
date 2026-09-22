@@ -3,6 +3,14 @@
 //! [`crate::HubCarrier`] / [`crate::StdioCarrier`] speak SSH-friendly NDJSON
 //! application frames. [`NodeTransport`] is the Hub `/v1/node` JSON-RPC 2.0
 //! carrier used by outbound WSS. A stdio JSON-RPC adapter is not defined here.
+//!
+//! RESILIENCE (spec only — `docs/design/hub-resilience.md`, 2026-09-22
+//! c-hubresil): this module's [`Backoff`] is the entire client-side reconnect
+//! policy today, and the Hub hello handler has no `retry_after` reply. §2.1 of
+//! that doc records the deployed behavior (infinite redial, commands never
+//! replayed, pending appends failed and replayed from the durable journal);
+//! §4 specifies the storm-tuned replacement (2–8 s first window, 60 s cap,
+//! per-host random seed, honored server `hello.retry_after`). Unimplemented.
 
 use crate::NodeError;
 use serde_json::Value;
@@ -34,6 +42,14 @@ pub trait NodeTransport: Send {
 }
 
 /// Exponential backoff used after a Hub disconnect. Commands are never replayed.
+///
+/// SPEC-ONLY (unimplemented, 2026-09-22 c-hubresil): the defaults below are
+/// what ships — 1 s start, 30 s cap, ±25 % jitter — and both real call sites
+/// seed the jitter deterministically (the frame-id counter in the WSS session,
+/// the process id in the daemon supervisor), so simultaneously woken Nodes can
+/// align. `docs/design/hub-resilience.md` §4 specifies a 2–8 s randomized first
+/// window, a 60 s cap, a per-host random seed, and honoring a Hub
+/// `hello.retry_after`; do not widen anything here until that spec lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backoff {
     /// Delay after the first disconnect.

@@ -229,3 +229,22 @@ D-047 把这条例外明确写下，以免日后重新争论。
 8. **在途 RPC 耗尽**：若 `api.*` 走了那个 32 槽 pending map，几条流就会卡住
    `instance.create` 与 `tty.write`。对应：独立 stream 表是硬要求，并有「8 条活流
    不影响 RPC 容量」的测试。
+
+## 11. egress 载荷保护不变量（c-hubresil，2026-09-22）
+
+**不变量**：`api.egress` 携带 provider 上游密钥的载荷
+（`crates/remuda-hub/src/api_relay.rs:130-135` 的 `EgressSnapshot`；明文密钥
+取自密钥库 `crates/remuda-hub/src/api_relay.rs:328` 与
+`crates/remuda-hub/src/api_relay.rs:2011-2014`，作为 `authToken` 于
+`crates/remuda-hub/src/api_relay.rs:351` 发出），**不得以明文经过任何既不是
+Hub、也不是目标 Node 的第三方**。
+
+- 今天该不变量成立的原因纯粹是拓扑：Node 出站直连 Hub，`api.egress` 只走
+  Hub→目标 Node 一跳，重连重装仍是同一跳
+  （`crates/remuda-hub/src/api_relay.rs:426-453`），链路上没有第三方。
+- 在册做法（规格，**尚未实现**）：Node enroll 时登记封装公钥；Hub 发
+  `api.egress` 前把 `authToken` 与含密 header 封成密文，帧携带密钥 id 与
+  封装配版；目标 Node 在内存中解密、按既有流程装载，依旧不落盘；`revoke`
+  帧不携秘密，保持明文。未来若出现任何中转形态，其中转的字节也只能是密文。
+- 本条是**不变量**，不是对当前风险的修复，也不构成对暴露姿态（D-031）的任何
+  论证；完整背景见 [hub-resilience.md](./hub-resilience.md) §6。

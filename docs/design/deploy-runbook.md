@@ -132,3 +132,71 @@ secret envelope；数据库迁移失败时保持 Hub 停止。旧镜像必须兼
 
 公开 VPS CI smoke 只验证包的内部证书容器路径。此次内网部署、DNS-01 和
 真实客户端结果以 [实施证据](./evidence/intranet-hub-1.md) 为准。
+
+## Hub 换机迁移（不重新 enroll、不重新登录）
+
+把 Hub 从一台机器搬到另一台，权威设计见
+[hub-topology.md](./hub-topology.md) §5–§7；本节是操作顺序。全程只动
+`<data_dir>` 与两台机器上的 Hub 进程，不碰 Node 的 enroll、不碰手机登录。
+
+### 不变量（违反任何一条都会退化成重新 enroll/重新登录）
+
+- **RP ID 与 origin 不变**：新机继续使用同一个 `REMUDA_PUBLIC_ORIGIN` 与
+  同一个访问名字；RP ID 是请求 origin 的完整 host，换名字即全部 passkey
+  失效（`crates/remuda-hub/src/passkeys.rs:152-156`、
+  `passkeys.rs:170-184`；D-030 `decisions.md:73`）。
+- **passkey 不变**：passkey 行在主库内，随备份迁移
+  （`crates/remuda-hub/src/store.rs:4957-4970`），origin 不变则浏览器侧
+  凭据原样有效。
+- **host token 不变**：hosts 表随库迁移（`crates/remuda-hub/src/store.rs:4801-4818`）；
+  Node 持久 node token 来自 hello result 回写（`crates/remuda-node/src/daemon.rs:688-690`），
+  与机器无关，Node 不需要重新 enroll。
+- **Hub 身份不变**：`hub-identity/identity.ed25519` 必须随备份恢复；该文件
+  丢失则全体 Node pin 立即失效，只能逐台重新 enroll
+  （`docs/design/protocol.md:1665-1670`）。
+- **二进制版本兼容**：新机使用版本不低于旧机、且兼容当前 schema 的二进制；
+  schema 只前滚（迁移入口 `crates/remuda/src/cmd/hub.rs:111-113`）。
+
+### 必须变化
+
+- **bootstrap-token 必须轮转**：新机首启前执行
+  `remuda hub rotate-bootstrap`（`crates/remuda/src/cmd/hub.rs:52-59`
+  调 `crates/remuda-hub/src/auth.rs:117-121`）。已配对设备的 device token
+  不受影响（D-018 `decisions.md:58`），旧配对码立即失效，杜绝新旧机
+  同时能配对新设备的窗口。
+
+### 顺序
+
+1. **新机准备**：安装版本兼容的二进制；准备空的、权限 `0700` 的
+   `<data_dir>`；确认新机上的 `REMUDA_PUBLIC_ORIGIN` 等配置与旧机逐字一致。
+2. **旧机先 SIGTERM 并确认进程退出**：CLI 同时处理 SIGTERM/SIGINT
+   （`crates/remuda/src/main.rs:56-83`），退出走优雅关闭
+   （`crates/remuda/src/cmd/hub.rs:117-127`），writer 线程在 Stop 时
+   `PRAGMA wal_checkpoint(TRUNCATE)`（`crates/remuda-hub/src/store.rs:1496`）。
+   规格中的 `<data_dir>/hub.lock` 单例锁（hub-topology.md §3）落地后，
+   这一步同时让出锁；锁文件留在磁盘上是正常的，不要手工删除。
+3. **旧机做加密备份**：`scripts/hub-backup.sh --data-dir <旧 data_dir>
+   --recipient <age-recipient> --execute`（另需 `REMUDA_BACKUP_YES_I_KNOW=1`；
+   先不带 `--execute` 跑一次 dry-run 核对成员）。bundle 含 SQLite 与
+   WAL/SHM、`secrets/`、VAPID 私钥、`hub-identity/`、`bootstrap-token`
+   （清单理由 hub-topology.md §4）。脚本只做本地操作，不联网络、不写
+   `deploy/`。
+4. **带外搬运并校验**：由操作员自选带外手段把 `.age` 与旁车 `.sha256`
+   送到新机（脚本本身不提供任何远端传输）；新机 `age -d` 解密，核对旁车
+   摘要与 bundle 内 manifest 的逐文件 SHA-256，解包到空 `<data_dir>`。
+5. **首启前轮转 bootstrap**：见上「必须变化」。
+6. **新机首启**：Node 重连后按 watermark 追平 journal
+   （`crates/remuda-node/src/daemon.rs:576-584`、`daemon.rs:694`）；追平窗内
+   的历史事件不得重放 push/交互唤醒/`api.egress` 重装，判据与结清条件见
+   hub-topology.md §6.3。手机用同一 origin 打开即恢复，不重新登录。
+7. **旧机处置**：确认新机健康、Node 全部追平后，再擦除旧机 `<data_dir>`。
+   任何时候不得让两台机器各持一份数据副本同时充当 Hub；hub.lock 只防
+   同机双进程（hub-topology.md §3），跨机双活靠本顺序与 bootstrap 轮转杜绝。
+
+### 回滚
+
+新机首启失败且尚未擦除旧机时：保持新机停止、在旧机原目录启动同一二进制
+即恢复（不要轮转第二次 bootstrap；旧配对码仍有效）。一旦在新机执行过
+bootstrap 轮转并首启成功，旧机配对码已失效，回滚方向只能是修新机，
+不能简单启旧机继续对外。
+

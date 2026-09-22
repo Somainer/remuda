@@ -20,6 +20,17 @@
 //! direct delivery anywhere in this file: when the proxy leg fails, the stream
 //! ends with an error and (for a dropped proxy link) the instance goes
 //! `blocked{api-route-down}`.
+//!
+//! EGRESS PAYLOAD INVARIANT (spec — `docs/design/api-routing.md` §11 and
+//! `docs/design/hub-resilience.md` §6, 2026-09-22 c-hubresil): the
+//! [`EgressSnapshot`] sent in `api.egress` carries the provider upstream
+//! secret in plaintext. The standing invariant is that this payload may pass
+//! in plaintext only through the Hub and the destination Node. Today that
+//! holds because Nodes dial the Hub directly and there is no intermediary; the
+//! future-proofing — sealing the snapshot to the destination Node's public key
+//! so any later intermediary sees only ciphertext — is specified but
+//! unimplemented. This paragraph is an invariant, not an argument for any
+//! deployment shape.
 
 use crate::AppState;
 use crate::error::HubError;

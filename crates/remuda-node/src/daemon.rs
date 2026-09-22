@@ -1,4 +1,15 @@
 //! Persistent runtime with replaceable local NDJSON controllers.
+//!
+//! RESILIENCE CONTRACT (spec companion — `docs/design/hub-resilience.md`,
+//! 2026-09-22 c-hubresil): the daemon process, its driver processes and the
+//! local durable journal outlive every control transport. This controller
+//! forwards journals from the Node journal and treats a missing durable
+//! acknowledgement as fatal for the *controller* — it exits and reconnects, it
+//! never silently skips a seq. The doc's §2.3/§2.4 pins that behavior with
+//! line anchors and §3 specifies the buffering water levels
+//! (`journal.softfull`, driver back-pressure, follow degradation) that do not
+//! yet exist. The hard failure `journal acknowledgement timed out; reconnect
+//! required` is a contract and must not be weakened. Docs-only for now.
 
 use crate::inventory::{CollectRequest, collect};
 use crate::stdio::rpc_code;

@@ -1,4 +1,13 @@
 //! Node JSON-RPC socket and browser follow multiplexer.
+//!
+//! RESILIENCE (spec only — `docs/design/hub-resilience.md`, 2026-09-22
+//! c-hubresil): two gaps the doc pins here — (1) `/v1/follow` emits only
+//! snapshot/event/gap frames, there is no idle heartbeat frame, so a phone
+//! cannot today distinguish live from stale-on-an-open-socket (§2.6); the
+//! `follow.tick` frame and the live/stale/disconnected/recovering criteria are
+//! specified in §5. (2) the `node.hello` handler has no
+//! `hello.retry_after` reply, so simultaneously woken Nodes cannot be asked to
+//! back off; §4 specifies that frame. Neither is implemented yet.
 
 use crate::AppState;
 use crate::auth::{hash_secret, presented_token, require_device, require_origin, verify_secret};

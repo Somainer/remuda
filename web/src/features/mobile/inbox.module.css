@@ -115,7 +115,7 @@
   background: transparent;
   border: 0;
   color: var(--mute);
-  font-size: 18px;
+  font-size: var(--text-xl);
   line-height: 1;
 }
 

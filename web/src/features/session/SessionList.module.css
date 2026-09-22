@@ -805,7 +805,7 @@
   }
 
   .title {
-    font-size: 18px;
+    font-size: var(--text-xl);
   }
 
   .count,

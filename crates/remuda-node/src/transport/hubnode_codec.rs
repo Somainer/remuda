@@ -873,6 +873,17 @@ pub fn hello_capabilities(host: &Value) -> Option<Value> {
 /// `announceable_inventory` yields a list only for a store it could read:
 /// that pairing is what lets the Hub honour "I really do hold nothing" without
 /// also honouring a wrong `--data-dir`.
+///
+/// SECURITY (spec only — `docs/design/protocol.md` §7.7): the hello this builds
+/// proves the Node to the Hub (its `hostId` plus a bearer/enrollment token); it
+/// does not prove the Hub to the Node. The Node accepts a `hostId`-carrying
+/// hello on any carrier whose TLS terminates, and every dispatch below —
+/// `instance.create`, Human-origin frames, `api.egress` — then trusts that
+/// carrier as "the Hub envelope" (see `crate::origin::wire_origin`). The Hub
+/// ed25519 identity key, the Node-side TOFU pin, and the
+/// `(nonce, hostId, seq, frame_type)` signature envelope that bind these frames
+/// are specified in §7.7 with D-035 fail-loud mismatch handling; not yet
+/// implemented, and no wire/schema change has been made for them.
 #[must_use]
 pub fn stdio_hello_params(
     host_id: &HostId,

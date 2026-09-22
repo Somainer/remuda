@@ -4765,6 +4765,19 @@ fn open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     }
 }
 
+/// Writer-side connection opener: sets WAL, the busy timeout, and runs the
+/// schema batch below.
+///
+/// HUB-LOCK SITE (spec only — `docs/design/hub-topology.md` §3): before a
+/// caller reaches this opener through `Store::open`, the implementation
+/// batch must hold a non-blocking exclusive advisory flock on
+/// `<data_dir>/hub.lock` (acquired after creating `data_dir` and before any
+/// SQLite connection opens). Failure to acquire it must refuse startup
+/// fail-closed instead of letting a second Hub process run its own writer
+/// thread and schema against this directory; the fd is held for the Store's
+/// life and released on drop/exit by the kernel — a stale lock file is
+/// harmless and must never be deleted as a "fix". No lock exists today;
+/// this comment changes no behavior.
 fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(BUSY_WAIT)?;

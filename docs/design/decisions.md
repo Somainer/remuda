@@ -627,6 +627,16 @@ native home 是不是继承来的（[codex-cua.md](./codex-cua.md) §3.1）；`-
   `docs/design/evidence/codex-cua-1.md`。探针失败则只交拒绝路径与物料化，能力
   **默认关闭**。
 
+**附记（2026-09-22，c-nodecosign；追加说明，不改动上方既有条目）**：
+Node 侧 device passkey 联署规格（[passkey-login.md](./passkey-login.md)
+§6）在 D-045 的两道门（来源 Human/Bot、主机心跳回报 installed）之外规划
+第三道门——非空 `capabilities` 的 create 帧在 Node carrier 边界必须带一
+个已配对 human 设备对该帧规范字节的 WebAuthn 联署，且 `computer-use`
+不接受预先签名的无人值守联署券（coupon），设备必须在 create 当时在场。
+这不改变 D-045 的任何现有门与拒绝组合（含 bypassPermissions 与
+computer-use 同帧即拒），只是给「来源声称是 Human/Bot」补上设备级证据；
+该规格本批为 docs-only，wire 与实现均未改。
+
 ## D-046
 
 **2026-09-19 · CUA 交互路由：`elicitation/create` 由 worker 自己答，回答权被 launch 请求约束**

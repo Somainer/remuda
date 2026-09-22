@@ -1000,7 +1000,7 @@
 }
 
 .chipEffortMismatch {
-  color: var(--amber, #ffc107);
+  color: var(--warn);
   font-size: 11px;
   white-space: nowrap;
   padding: 0 2px;
@@ -1013,7 +1013,7 @@
 }
 
 .chipEffortPendingTag {
-  color: var(--info, #57b7ff);
+  color: var(--info);
   font-size: 11px;
   white-space: nowrap;
   padding: 0 2px;
@@ -1609,7 +1609,7 @@
 
 .effortTitle {
   font-family: var(--mono);
-  font-size: 18px;
+  font-size: var(--text-xl);
   font-weight: 600;
   line-height: 1.25;
   letter-spacing: -0.01em;

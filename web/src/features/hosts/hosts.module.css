@@ -415,7 +415,7 @@
   }
 
   .title {
-    font-size: 18px;
+    font-size: var(--text-xl);
   }
 
   .add {
@@ -473,7 +473,7 @@
   }
 
   .detailTitle {
-    font-size: 18px;
+    font-size: var(--text-xl);
     flex: 1;
   }
 

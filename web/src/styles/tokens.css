@@ -20,6 +20,12 @@
   --danger: #8f3d2c;
   /* Brighter danger text for dark surfaces; --danger stays the border/fill. */
   --danger-strong: #d98a70;
+  /* Status hues for dark surfaces: warm mismatch / cold in-flight.
+     Defined equal to the values the chip sites already rendered through
+     their var(--x, fallback) fallbacks, so night is pixel-identical;
+     both clear 4.5:1 against --ink-2. */
+  --warn: #ffc107;
+  --info: #57b7ff;
 }
 
 [data-theme="ledger"] {
@@ -42,6 +48,10 @@
   --danger: #8f3d2c;
   /* Dark enough to read as text/focus on a light ground. */
   --danger-strong: #7a3022;
+  /* Darkened status hues so warm/cold marks stay readable on the light ground;
+     both clear 4.5:1 against --ink-2 (the lightest ledger surface). */
+  --warn: #7a5410;
+  --info: #1f5575;
 }
 
 :root {
@@ -53,7 +63,9 @@
      Important status never relies on sub-12 px text. */
   --text: 14px;
   --text-lg: 16px;
+  --text-xl: 18px;
   --text-body: 14px;
+  --text-13: 13px;
   --text-aux: 12px;
   --text-label: 11px;
 

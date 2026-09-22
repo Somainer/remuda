@@ -1,6 +1,7 @@
 # Evidence: Hub 可被托管运行（c-hubsupervise-1）
 
-Date: 2026-09-23。Design: [hub-supervise.md](../hub-supervise.md)。
+Date: 2026-09-23（同日按审查意见修订一轮，见 §6）。
+Design: [hub-supervise.md](../hub-supervise.md)。
 闸门：Linux devbox（`x86_64-unknown-linux-gnu`，rustc 1.94.1）。
 本文不截图；证据是工作树 file:line 锚点与本地可复跑的命令输出。
 
@@ -8,12 +9,12 @@ Date: 2026-09-23。Design: [hub-supervise.md](../hub-supervise.md)。
 
 | 文件 | 性质 |
 | --- | --- |
-| `crates/remuda-hub/src/supervise.rs` | 新建，独占：父死亡观察器（Linux prctl + starttime 轮询 / macOS kqueue）、`hub.pid` guard、版本与 uptime |
+| `crates/remuda-hub/src/supervise.rs` | 新建，独占：跨 unix 的 `kill(pid,0)` 父死亡轮询、Linux 额外的 prctl 加速、`hub.pid` guard、版本与 uptime |
 | `crates/remuda-hub/src/lib.rs` | 接线：`pub mod supervise`、`spawn_inner` 里 `mark_started()`、`RunningHub::shutdown_within(budget)` |
 | `crates/remuda-hub/src/http.rs` | 只改 `healthz`：保留 `ok`，新增 `version` / `uptimeSecs` |
 | `crates/remuda/src/cmd/hub.rs` | `--managed <parentPid>` 参数、武装/关停/ pid 文件接线 |
 | `crates/remuda/tests/hub_supervise.rs` | 新建，4 个真实二进制集成测试 |
-| `crates/remuda-hub/Cargo.toml`、`crates/remuda/Cargo.toml` | nix 0.28（hub: process/signal/event；remuda dev: signal） |
+| `crates/remuda-hub/Cargo.toml`、`crates/remuda/Cargo.toml` | nix 0.28（hub: process/signal；remuda dev: signal） |
 | `crates/remuda-hub/openapi/openapi.json`、`web/src/lib/api.generated.ts`、`crates/remuda-hub/README.md` | `/healthz` 契约同步 |
 | `docs/design/hub-supervise.md`、本文 | 新建 |
 
@@ -31,10 +32,11 @@ Date: 2026-09-23。Design: [hub-supervise.md](../hub-supervise.md)。
 | SIGTERM 与父死亡汇入同一个 `tokio::select!`，同一关停路径 | `crates/remuda/src/cmd/hub.rs:137-159` |
 | 3 秒关停预算：停接受 → drain → WAL checkpoint | `crates/remuda-hub/src/lib.rs:578-606`（writer checkpoint 见 `crates/remuda-hub/src/store.rs:1493-1498`） |
 | 非托管仍走旧 `drop(running)` 路径（语义不变） | `crates/remuda/src/cmd/hub.rs:160-164` |
-| Linux：直接父才装 `PR_SET_PDEATHSIG(SIGTERM)` | `supervise.rs:231-245` |
-| Linux：250 ms 命名 pid 轮询 + `/proc` starttime 防 pid 复用 | `supervise.rs:44`、`supervise.rs:187-227` |
-| macOS：kqueue `EVFILT_PROC/NOTE_EXIT`，ESRCH 即已退出，失败降级轮询 | `supervise.rs:289-335` |
-| `kill(pid,0)`：EPERM 算存活 | `supervise.rs:174-183` |
+| 跨 unix：250 ms 命名 pid 轮询（Linux/macOS 同一份代码，闸门必编译必测） | `supervise.rs:51`、`supervise.rs:181-190` |
+| Linux 加速：直接父才装 `PR_SET_PDEATHSIG(SIGTERM)` | `supervise.rs:238-251` |
+| Linux：轮询用 `/proc` starttime 防 pid 复用 | `supervise.rs:194-235` |
+| 非 Linux unix：无 OS 专用分支，同一个轮询 `ProcMarker` | `supervise.rs:255-281` |
+| `kill(pid,0)`：EPERM 算存活 | `supervise.rs:181-190` |
 | `/healthz`：`ok` 保留 + `version` + `uptimeSecs`（进程级起点） | `crates/remuda-hub/src/http.rs:289-295`；`supervise.rs:48-63` |
 | OpenAPI 三字段 required（含 `ok`） | `crates/remuda-hub/openapi/openapi.json` `/healthz` 节 |
 
@@ -46,24 +48,25 @@ Date: 2026-09-23。Design: [hub-supervise.md](../hub-supervise.md)。
 cargo test --locked -p remuda --test hub_supervise -- --test-threads=1 --nocapture
 ```
 
-结果（devbox，2026-09-23）：
+结果（devbox，2026-09-23，审查修订后重跑）：
 
 ```text
 test healthz_reports_version_and_monotonic_uptime ... ok
-test managed_hub_exits_when_parent_is_killed ... hub self-exited 77.637363ms after supervisor SIGKILL
-test managed_hub_shuts_down_within_three_seconds_on_sigterm ... managed SIGTERM shutdown completed in 17.852998ms
+test managed_hub_exits_when_parent_is_killed ... hub self-exited 26.229247ms after supervisor SIGKILL
+test managed_hub_shuts_down_within_three_seconds_on_sigterm ... managed SIGTERM shutdown completed in 10.675341ms
 test unmanaged_hub_runs_unsupervised_like_before ... ok
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.23s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.83s
 ```
 
 逐条对应验收：
 
-1. **SIGTERM 3 秒内干净关停**：实测 17.9 ms（预算 3 s，余量两个数量级），
+1. **SIGTERM 3 秒内干净关停**：实测 10.7 ms（预算 3 s，余量两个数量级），
    退出码 0，`hub.pid` 在退出后消失；同一用例还断言 pid 文件内容 == Hub
    pid、权限恰为 0600。
 2. **父进程被杀后 Hub 自退**：父为 `sh -c '… & wait'`，对父发 **SIGKILL**
-   （父无法 trap、无法转发信号），Hub 77.6 ms 内自行消失并删除 pid 文件。
-   这是 Linux prctl + starttime 轮询路径。
+   （父无法 trap、无法转发信号），Hub 自行消失并删除 pid 文件。
+   父 shell 是 Hub 的直接父进程，Linux 上由 prctl 即时投递触发；同一份
+   250 ms 轮询代码在 macOS 上独立成立（由协调员做运行期冒烟）。
 3. **`/healthz` 新字段**：`ok==true`、`version==CARGO_PKG_VERSION`、
    `uptimeSecs` 为非负整数且间隔 1.1 s 后严格增大。既有
    `remuda-hub/tests/hub.rs::healthz_ok` 继续保证 `ok` 键存在。
@@ -106,11 +109,28 @@ cargo test --locked -p remuda-hub -p remuda                             # 全绿
 
 ## 5. 未覆盖与手工验收
 
-- **macOS kqueue 分支**在 Linux 闸门不编译（`#[cfg(target_os="macos")]`），
-  闸门上也没有 apple target 可交叉 `cargo check`；已对照本机 vendored
-  nix 0.28 源码逐形核对（`KEvent::new` 第 4 参为 `FilterFlag` 非 bits、
-  方法名为 `Kqueue::kevent(.., Option<timespec>)`、`EVFILT_PROC` 与
-  `NOTE_EXIT` 在 apple_targets 可用）。运行期行为仍需协调员在 Mac 上手工
-  验，步骤见 `docs/design/hub-supervise.md` §8（SIGKILL 父进程亚秒自退 +
-  pid 文件清理、死 pid 启动拒绝、SIGTERM 3 秒、healthz 三字段）。
+- **不存在 macOS 专用代码**（审查后移除，见 §6）：父死亡检测在所有 unix 上
+  是同一份 `#[cfg(unix)]` 轮询，Linux 闸门必然编译并跑到；`supervise.rs`
+  全文件除 `#[cfg(unix)]` 与 `#[cfg(target_os = "linux")]`（prctl/starttime，
+  Linux 闸门原生覆盖）外没有任何 OS 限定。协调员在 Mac 上的工作只剩真实系统
+  的运行期冒烟，步骤见 `docs/design/hub-supervise.md` §8（构建、SIGKILL 父
+  进程后约一个轮询周期内自退并清理 pid 文件、死 pid 启动拒绝、SIGTERM
+  3 秒、healthz 三字段）。
 - hub.lock 未实现（任务约束）；其规格是本设计 §3.1 引用的依赖。
+
+## 6. 审查修订：删除闸门编译不到的 kqueue 分支
+
+第一版（提交 `977b6d0a`）在 macOS 上另写了 kqueue
+`EVFILT_PROC/NOTE_EXIT` 分支。协调员在 Mac 上构建时发现它**编译不过**：
+
+1. nix 在 macos 目标上 `KEvent::data()` 返回 `isize`，
+   `i64::from(event.data())` 不满足 `From<isize> for i64`；
+2. `watch_kqueue(pid, &tx)` 里对 `&oneshot::Sender` 调会 move 的
+   `tx.send(())`。
+
+根因是该分支被 `#[cfg(target_os = "macos")]` 限定，Linux 合入闸门既不编译
+也不测；在 Linux 上对照 nix 源码逐形核对无法替代真实目标编译。按审查裁定：
+**删除整个 kqueue 分支**，macOS 与其它非 Linux unix 直接使用本来就存在、
+闸门一直编译测试的跨平台 `kill(pid,0)` 轮询（Linux 的 prctl 保留）。
+代价仅为 macOS 父退出后最多约 250 ms 察觉延迟。nix 依赖随之移除只服务于
+kqueue 的 `event` feature。

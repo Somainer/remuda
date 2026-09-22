@@ -65,47 +65,53 @@ shutdown 请求、不等 drain（由进程退出和 tokio runtime 的
 SIGTERM 关停在释放锁之前完成 checkpoint（同节规格第 4 条）。本任务的 PID
 文件**不是**单例锁（见 §5），不承担互斥职责。
 
-## 4. 父进程死亡检测（分平台方案与理由）
+## 4. 父进程死亡检测（方案与理由）
 
-### 4.1 macOS：kqueue `EVFILT_PROC` + `NOTE_EXIT`（精确机制）
+### 4.0 跨平台基线：250 ms `kill(pid, 0)` 轮询
 
-在专门的 `hub-parent-watch` 线程上建 kqueue，注册
-`EV_ADD | EV_CLEAR`、`EVFILT_PROC`、`fflags = NOTE_EXIT`，ident = 托管方
-pid，然后阻塞在一次 `kevent(2)` 里（注册与等待同一调用）：
+**所有 unix 平台（Linux、macOS、其它）都运行同一段轮询代码**：专门的
+`hub-parent-watch` 线程每 250 ms 对 `--managed` 命名的 pid 发一次空信号，
+`EPERM`（进程属于别的用户）也算存活；查不到即判定托管方已退出，通知 run
+loop 开始优雅关停。
 
-- knote 绑定的是内核 **proc 对象**，不是 pid 数字——pid 被回收复用不会产生
-  误判；
-- 父退出时内核立刻投递事件，**无轮询延迟**；
-- 注册时父已死：kevent 返回的事件带 `EV_ERROR`、data 为 `ESRCH`，立即触发
-  关停；
-- kqueue 创建/注册因任何其它原因失败：降级到 250 ms `kill(pid, 0)` 轮询。
+这段代码 `#[cfg(unix)]`、**不绑定任何具体 OS**，因此在 Linux 合入闸门上
+必然被编译、被集成测试实际跑到（§7）。父退出后最迟约 250 ms 被察觉——对
+一个本地托管 Hub 完全可接受。
 
-**Linux 闸门编译不到这个分支**（`#[cfg(target_os = "macos")]`），由协调员
-在 Mac 上手工验收（§8）。
+### 4.1 Linux：额外武装 `prctl(PR_SET_PDEATHSIG)`（加速，非唯一机制）
 
-### 4.2 Linux：`prctl(PR_SET_PDEATHSIG)` + `/proc` starttime 轮询（双保险）
+除轮询外，当命名 pid 恰为 `getppid()`（tray → hub 的正常形态）时，Linux
+另装 `prctl(PR_SET_PDEATHSIG, SIGTERM)`：父死的**瞬间**内核投递 SIGTERM，
+Hub 走与操作员 SIGTERM 完全相同的关停路径，不必等下一个 250 ms 轮询点。
+fork/exec 与 prctl 之间的窗口靠安装后立刻做一次存活检查闭合（prctl(2)
+对该竞态的经典告诫）。
 
-两条机制同时武装，任一触发即开始同一套优雅关停，互不冲突：
+轮询并不因此可有可无，它针对**参数里的命名 pid**（而非 `getppid()`），
+同时覆盖 prctl 兜不住的形态：
 
-1. **`prctl(PR_SET_PDEATHSIG, SIGTERM)`**：仅当 `--managed` 给的 pid 等于
-   `getppid()`（tray → hub 的正常形态）时安装。父死的瞬间内核投递
-   SIGTERM，Hub 走与操作员 SIGTERM 完全相同的关停路径。fork/exec 与
-   prctl 之间的窗口靠安装后立刻做一次存活检查闭合（prctl(2) 对该竞态的
-   经典告诫）。
-2. **250 ms 轮询命名 pid**：`kill(pid, 0)`，`EPERM` 也算存活。轮询针对
-   **参数里的命名 pid**（而非 `getppid()`），所以同时覆盖：
-   - 托管方不是直接父进程（启动器/包装器形态，prctl 语义不适用）；
-   - 裁剪过 prctl 的容器/内核；
-   - subreaper 把孤儿收养成非 1 pid 的情形（单纯判断 `getppid()==1` 会漏）。
-   为防 pid 回收复用误判，轮询在 arm 时快照 `/proc/<pid>/stat` 第 22 字段
-   `starttime`（时钟滴答），之后只有「pid 存在 **且** starttime 不变」才算
-   原托管方存活。
+- 托管方不是直接父进程（启动器/包装器形态，prctl 语义只认 fork 者）；
+- 裁剪过 prctl 的容器/内核；
+- subreaper 把孤儿收养成非 1 pid 的情形（单纯判断 `getppid()==1` 会漏）。
 
-选这套而不是「只轮询 getppid」的理由：prctl 在直接父进程形态下给出内核级
-即时投递（无 250 ms 延迟、无持续唤醒）；命名 pid + starttime 轮询兜住所有
-非典型进程树。复用 `remuda-testing/src/parent_watch.rs` 已在闸门上验证过的
-三机制思路，但本模块不做硬退出（Hub 有自己的 3 秒优雅关停，不需要观察器
-线程 `exit(0)`）。
+为防 pid 回收复用误判，Linux 轮询在 arm 时快照 `/proc/<pid>/stat` 第 22
+字段 `starttime`（时钟滴答），之后只有「pid 存在 **且** starttime 不变」
+才算原托管方存活。
+
+### 4.2 macOS 与其它非 Linux unix：只用轮询（明确不做 kqueue 分支）
+
+macOS 本来可以用 kqueue `EVFILT_PROC`/`NOTE_EXIT` 得到内核即时通知，
+**本任务明确不做**，理由是工程性的而非机制性的：
+
+- 该分支只能 `#[cfg(target_os = "macos")]` 编译，**Linux 合入闸门既编译
+  不到也测不到**；本任务的第一版正是因此带着两处 macOS 编译错误上了
+  Mac（`KEvent::data()` 在 macos 目标是 `isize` 不满足 `From<isize> for
+  i64`；`&oneshot::Sender` 上调用会 move 的 `send`）。
+- 在一条闸门永远走不到的路径上继续修补，只会一轮轮往返。
+- 选择**合入闸门能编译、能测到的代码路径**优先；代价是 macOS 上父退出后
+  最多约 250 ms 才察觉，托管 Hub 可接受。
+
+macOS 路径与 Linux 轮询是**同一份代码**，闸门已经覆盖其编译与逻辑；协调员
+在 Mac 上的验收（§8）只是真实系统上的运行期冒烟。
 
 ### 4.3 非 unix
 
@@ -156,7 +162,7 @@ macOS 与 Linux）。
    且权限 0600 → SIGTERM → 退出码 0、实测耗时 < 3 s、pid 文件删除；
 2. `managed_hub_exits_when_parent_is_killed`：经 `sh -c '... & wait'` 包一层
    托管父，**SIGKILL 父 shell**（父没有任何机会转发信号）→ Hub 在预算内自己
-   退出并删除 pid 文件。这是 Linux prctl + starttime 轮询路径；
+   退出并删除 pid 文件。跑的是跨平台轮询（外加 Linux 的 prctl 加速）；
 3. `healthz_reports_version_and_monotonic_uptime`：`ok` 为 true、
    `version` == `CARGO_PKG_VERSION`、`uptimeSecs` 为非负整数且 1.1 秒后
    严格增大；
@@ -167,14 +173,17 @@ macOS 与 Linux）。
 另有既有 `crates/remuda-hub/tests/hub.rs::healthz_ok` 继续证明 `ok` 字段
 存在。
 
-## 8. macOS 手工验收（协调员，闸门跑不到 kqueue 分支）
+## 8. macOS 运行期验收（协调员，合入前）
 
-在 Mac 上：
+macOS 与 Linux 跑的是**同一份轮询代码**，闸门已覆盖其编译与逻辑；Mac 上的
+验收是真实系统的运行期冒烟，重点看轮询在 macOS 的进程/信号语义下端到端
+成立：
 
-1. `cargo build -p remuda`；
-2. 临时目录里 `sh -c 'remuda --data-dir D hub --managed $$ & h=$!; sleep 2;
-   kill -9 $$'`（或先 `echo $$` 再另开终端 `kill -9 <pid>`），预期 Hub
-   在亚秒内自行退出、`D/hub.pid` 消失；
+1. `cargo build -p remuda --locked` 必须直接编过（本任务不允许有闸门编不到
+   的 macOS 专用代码）；
+2. 临时目录里 `sh -c 'remuda --data-dir D hub --listen 127.0.0.1:0
+   --managed $$ & sleep 2; kill -9 $$'`，预期父 shell 死后 Hub 在约 250 ms
+   轮询周期内自行退出、`D/hub.pid` 消失；
 3. `remuda --data-dir D hub --managed <一个不存在的 pid>` 必须立刻非零退出；
 4. `remuda --data-dir D hub --listen 127.0.0.1:PORT` 后 `kill -TERM`，
    3 秒内退出码 0；
@@ -183,6 +192,8 @@ macOS 与 Linux）。
 ## 9. 明确不做
 
 - 不做 `/shutdown`、`/version` 等任何新 HTTP 路由；关停只有信号一条路；
+- **不做 macOS 专用 kqueue 分支**：只在 macOS 编译的路径闸门测不到，第一版
+  即因此带编译错误；宁要 ~250 ms 检测延迟的同一份轮询代码（§4.2）；
 - 不实现 hub.lock（hub-topology §3 是依赖规格，留给实现批）；
 - 不做 pid 文件验活之外的托管协议（重启策略、日志管道、launchd plist 由
   桌面壳任务负责）；

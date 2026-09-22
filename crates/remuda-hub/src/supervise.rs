@@ -11,23 +11,29 @@
 //!
 //! ## Parent-death mechanisms by platform
 //!
-//! * **macOS**: a kqueue registered with `EVFILT_PROC` / `NOTE_EXIT` on the
-//!   supervisor pid. The knote attaches to the exact `proc` object, so pid
-//!   reuse cannot produce a false negative, and delivery is immediate — no
-//!   polling. A `kill(pid, 0)` poll is kept only as a fallback if the kqueue
-//!   cannot be created or registered.
-//! * **Linux**: `prctl(PR_SET_PDEATHSIG, SIGTERM)` when the named supervisor
-//!   is this process's real parent (the normal tray → hub shape): the kernel
-//!   delivers SIGTERM the instant the parent dies, and the CLI's existing
-//!   signal handler runs the same graceful shutdown as an operator SIGTERM.
-//!   Independently, a 250 ms `kill(pid, 0)` poll watches the *named* pid — it
-//!   covers non-parent pids (a launcher that is not the direct parent),
-//!   kernels/containers without the prctl, and subreaper reparenting. The poll
-//!   compares the supervisor's start time from `/proc/<pid>/stat` so pid reuse
-//!   cannot be mistaken for the supervisor still being alive.
+//! Every unix platform runs the same 250 ms `kill(pid, 0)` poll on the
+//! *named* supervisor pid, so the detection path is always compiled and
+//! tested by the merge gate (it runs on Linux). A parent that exited is at
+//! most one poll interval (~250 ms) of dying undetected — acceptable for a
+//! managed Hub.
 //!
-//! The two mechanisms never conflict: both merely ask the run loop to begin
-//! the same graceful shutdown.
+//! * **Linux additionally arms `prctl(PR_SET_PDEATHSIG, SIGTERM)`** when the
+//!   named supervisor is this process's real parent (the normal tray → hub
+//!   shape): the kernel then delivers SIGTERM the instant the parent dies, and
+//!   the CLI's existing signal handler runs the same graceful shutdown as an
+//!   operator SIGTERM. The poll still runs alongside it and independently
+//!   covers non-parent pids (a launcher that is not the direct parent),
+//!   kernels/containers without the prctl, and subreaper reparenting. The
+//!   Linux poll compares the supervisor's start time from
+//!   `/proc/<pid>/stat` so pid reuse cannot be mistaken for the supervisor
+//!   still being alive.
+//! * **macOS and every other non-Linux unix use the poll alone.** A macOS
+//!   kqueue (`EVFILT_PROC`/`NOTE_EXIT`) would be marginally quicker, but that
+//!   code is `#[cfg]`-invisible to the Linux gate and previously shipped
+//!   uncompiled; one tested mechanism is worth more than a fast untested one.
+//!
+//! The mechanisms never conflict: both merely ask the run loop to begin the
+//! same graceful shutdown.
 //!
 //! Design and rationale: `docs/design/hub-supervise.md`.
 
@@ -40,8 +46,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
-/// How often the fallback parent-pid poll wakes. Matches the 250 ms cadence
-/// already used by the test helper parent watch (`remuda-testing`).
+/// How often the parent-pid poll wakes. Matches the 250 ms cadence already
+/// used by the test helper parent watch (`remuda-testing`).
 const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Hub version reported by `GET /healthz`. Workspace versions move together,
@@ -183,7 +189,7 @@ fn pid_exists(pid: i32) -> bool {
     }
 }
 
-// Linux: prctl + /proc starttime-protected poll ------------------------------
+// Linux: prctl acceleration + /proc starttime-protected poll ---------------
 
 #[cfg(all(unix, target_os = "linux"))]
 struct ProcMarker {
@@ -244,7 +250,12 @@ fn arm_pdeathsig(parent_pid: i32) {
     }
 }
 
-// macOS / non-Linux unix: kqueue NOTE_EXIT + null-signal poll fallback -------
+// Non-Linux unix (macOS, …): the cross-platform null-signal poll only.
+//
+// Deliberately no macOS-only kqueue branch: code behind
+// `#[cfg(target_os = "macos")]` is invisible to the Linux merge gate and
+// cannot be tested here, so it would ship unverified. The poll's ~250 ms
+// detection lag is acceptable for a managed Hub.
 
 #[cfg(all(unix, not(target_os = "linux")))]
 struct ProcMarker;
@@ -259,78 +270,11 @@ impl ProcMarker {
         pid_exists(pid)
     }
 
-    #[cfg(target_os = "macos")]
     fn watch(self, pid: i32, tx: oneshot::Sender<()>) {
-        if watch_kqueue(pid, &tx) {
-            return;
-        }
-        // kqueue unavailable (creation/registration failure that is not
-        // ESRCH): degrade to the 250 ms null-signal poll.
-        self.poll(pid, tx);
-    }
-    #[cfg(not(target_os = "macos"))]
-    fn watch(self, pid: i32, tx: oneshot::Sender<()>) {
-        self.poll(pid, tx);
-    }
-
-    fn poll(&self, pid: i32, tx: oneshot::Sender<()>) {
         while pid_exists(pid) {
             thread::sleep(PARENT_POLL_INTERVAL);
         }
         let _ = tx.send(());
-    }
-}
-
-/// Block on a kqueue `EVFILT_PROC` / `NOTE_EXIT` knote for `pid`.
-///
-/// Returns `true` when the supervisor has exited (or was already gone),
-/// `false` when the kqueue could not be used and the caller should fall back
-/// to polling.
-#[cfg(all(unix, target_os = "macos"))]
-fn watch_kqueue(pid: i32, tx: &oneshot::Sender<()>) -> bool {
-    use nix::sys::event::{EventFilter, EventFlag, FilterFlag, KEvent, Kqueue};
-
-    let Ok(kqueue) = Kqueue::new() else {
-        return false;
-    };
-    let change = KEvent::new(
-        pid as usize,
-        EventFilter::EVFILT_PROC,
-        EventFlag::EV_ADD | EventFlag::EV_CLEAR,
-        FilterFlag::NOTE_EXIT,
-        0,
-        0,
-    );
-    let mut events = [KEvent::new(
-        0,
-        EventFilter::EVFILT_PROC,
-        EventFlag::empty(),
-        FilterFlag::empty(),
-        0,
-        0,
-    )];
-    // Registration and the wait are one kevent(2) call: a dead pid fails the
-    // change with EV_ERROR immediately, a live pid blocks until NOTE_EXIT.
-    // `None` = block indefinitely; the Hub process tears the thread down on
-    // shutdown anyway, and an exited supervisor is exactly what we wait for.
-    match kqueue.kevent(&[change], &mut events, None) {
-        Ok(0) => false,
-        Ok(_) => {
-            let event = events[0];
-            let exited = if event.flags().contains(EventFlag::EV_ERROR) {
-                // data carries the errno for a failed change: ESRCH means the
-                // supervisor was already gone; anything else lets the poller
-                // decide.
-                i64::from(event.data()) == i64::from(nix::errno::Errno::ESRCH as i32)
-            } else {
-                true
-            };
-            if exited {
-                let _ = tx.send(());
-            }
-            exited
-        }
-        Err(_) => false,
     }
 }
 

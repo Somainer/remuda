@@ -4,10 +4,11 @@
 //! pid file, parent watch) rather than the in-process `spawn`, because parent
 //! death and SIGTERM timing are process-contract properties.
 //!
-//! The parent-death tests run the Linux path (`prctl(PR_SET_PDEATHSIG)` plus
-//! the `/proc` start-time poll). The macOS kqueue (`EVFILT_PROC`/`NOTE_EXIT`)
-//! branch is not compiled on this gate; `docs/design/hub-supervise.md` lists
-//! the manual Mac verification steps.
+//! The parent-death tests exercise the cross-platform `kill(pid, 0)` poll
+//! (compiled and covered on every unix, including macOS) plus Linux's
+//! `prctl(PR_SET_PDEATHSIG)` acceleration. There is deliberately no
+//! macOS-only detection code; the coordinator only re-runs this scenario on a
+//! Mac as a runtime smoke test. See `docs/design/hub-supervise.md`.
 
 #![cfg(unix)]
 

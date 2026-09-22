@@ -261,7 +261,7 @@ describe("SessionList scope and conditions", () => {
 /** Space id the real buildSpaces() derives for the fixture host/workspace. */
 const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
 
-describe("SessionList effective-model label (model-pin-1)", () => {
+describe("SessionList effective-model label", () => {
   afterEach(() => {
     for (const key of Object.keys(modelEffective)) delete modelEffective[key];
   });
@@ -271,10 +271,9 @@ describe("SessionList effective-model label (model-pin-1)", () => {
     const label = screen.getAllByTestId("session-model")[0];
     expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "unknown");
-    expect(label).toHaveAttribute("data-model-diverged", "0");
   });
 
-  it("labels the row with the observed id once the session reports one", () => {
+  it("labels the row with the observed id once the session reports the same one", () => {
     for (const id of ["ins_a", "ins_b"]) {
       modelEffective[id] = {
         id: "model_hub/es1_orange_o50[1m]",
@@ -285,14 +284,13 @@ describe("SessionList effective-model label (model-pin-1)", () => {
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
     expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(label).toHaveAttribute("data-model-diverged", "0");
+    expect(label).toHaveAttribute("data-model-effective", "model_hub/es1_orange_o50[1m]");
   });
 
-  // The regression: the pin was requested and a DIFFERENT model in the same
-  // vocabulary answered. The row must show what answered and mark the
-  // divergence, because showing only the request is what made the substituted
-  // model invisible.
-  it("marks a divergence when a different model in the pin's namespace answered", () => {
+  // The pin was requested and a DIFFERENT model answered. The row judges
+  // nothing; it shows both raw strings, so neither the request nor what is
+  // actually running is hidden.
+  it("shows both requested and observed strings verbatim when they differ", () => {
     for (const id of ["ins_a", "ins_b"]) {
       modelEffective[id] = {
         id: "model_hub/es1_orange_o48[1m]",
@@ -303,17 +301,16 @@ describe("SessionList effective-model label (model-pin-1)", () => {
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
     expect(label).toHaveTextContent("model_hub/es1_orange_o48[1m]");
+    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "model_hub/es1_orange_o48[1m]");
-    expect(label).toHaveAttribute("data-model-diverged", "1");
-    // Both ids stay legible, so the pin that was asked for is not lost.
+    // Both ids stay legible in the hover text as well.
     expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o50[1m]");
     expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o48[1m]");
   });
 
-  // The measured false positive (model-pin-1 §3): a gateway resolves a catalog
-  // id to an upstream vendor name. This is a correct launch and must NOT be
-  // flagged as diverged, even though the two strings differ.
-  it("does not flag a gateway resolving the pin to an upstream vendor name", () => {
+  // A gateway resolves a catalog id to an upstream vendor name. The strings
+  // differ, so both are shown — no verdict, just the request and what runs.
+  it("shows both strings for a gateway resolution to an upstream vendor name", () => {
     for (const id of ["ins_a", "ins_b"]) {
       modelEffective[id] = {
         id: "claude-opus-5",
@@ -324,8 +321,8 @@ describe("SessionList effective-model label (model-pin-1)", () => {
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
     expect(label).toHaveTextContent("claude-opus-5");
+    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "claude-opus-5");
-    expect(label).toHaveAttribute("data-model-diverged", "0");
   });
 });
 

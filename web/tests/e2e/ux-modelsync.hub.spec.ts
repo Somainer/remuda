@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url";
  * 2. clicking a model posts instance.configure {model}; the `/model` verdict
  *    read-back marks it the current model (data-model-current);
  * 3. a typed alias that resolves to a different concrete id renders the
- *    resolved selection and 请求 → 实际 mismatch;
+ *    resolved selection and shows both 请求 → 实际 strings verbatim;
  * 4. a terminal-side `/model <id>` (a send) moves the picker with NO configure
  *    posted (single source of truth, no ping-pong);
  * 5. a `not-found` rejection reverts the selection and toasts;
@@ -163,7 +163,7 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "0");
 });
 
-test("a typed alias resolving to a different id renders the mismatch", async ({ page }) => {
+test("a typed alias resolving to a different id shows both model strings", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Model alias resolution");
   // Clicking fast is the optimistic request; rewrite the configure to the
@@ -196,9 +196,9 @@ test("a typed alias resolving to a different id renders the mismatch", async ({ 
   await openModelList(page);
   const panel = page.getByTestId("effort-slider-panel");
   await expect(panel).toHaveAttribute("data-model-current", "plain");
-  await expect(panel).toHaveAttribute("data-model-mismatch", "1");
-  await expect(page.getByTestId("model-option-mismatch")).toContainText("fast");
-  await expect(page.getByTestId("model-option-mismatch")).toContainText("plain");
+  await expect(panel).toHaveAttribute("data-model-different", "1");
+  await expect(page.getByTestId("model-option-different")).toContainText("e2e/fast");
+  await expect(page.getByTestId("model-option-different")).toContainText("e2e/plain");
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "1");
 });
 

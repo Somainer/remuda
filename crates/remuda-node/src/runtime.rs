@@ -2171,10 +2171,14 @@ async fn execute_queued(
         } => interactions
             .dispatch_rpc(
                 "interaction.answer",
+                // A locally drained answer (terminal/local API) has no Hub
+                // frame; stamp human so the committed actor stays the
+                // pre-D-051 Human shape rather than defaulting to Agent.
                 serde_json::json!({
                     "interactionId": interaction_id,
                     "answer": answer,
                     "commandId": command.command_id.as_id().as_str(),
+                    "origin": "human",
                 }),
             )
             .await

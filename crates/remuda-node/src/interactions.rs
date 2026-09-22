@@ -3,7 +3,7 @@
 use crate::{Driver, DriverRequest, LocalStore, NodeError};
 use async_trait::async_trait;
 use remuda_driver::interaction::{
-    BrokerConfig, BrokerError, InstancePolicy, InteractionBroker, InteractionOwner,
+    AnswerCaller, BrokerConfig, BrokerError, InstancePolicy, InteractionBroker, InteractionOwner,
     NativeRequestId, PendingSpec,
 };
 use remuda_protocol::{
@@ -326,7 +326,7 @@ impl InteractionRuntime {
         &self,
         interaction_id: InteractionId,
         answer: InteractionAnswer,
-        by_device: Id,
+        caller: AnswerCaller,
         command_id: CommandId,
     ) -> Result<Value, NodeError> {
         let ticket = {
@@ -378,7 +378,7 @@ impl InteractionRuntime {
         };
         let outcome = self
             .broker
-            .answer(ticket, answer, by_device, command_id.clone())
+            .answer_for(ticket, answer, caller, command_id.clone())
             .await
             .map_err(map_broker)?;
         {
@@ -486,10 +486,37 @@ impl InteractionRuntime {
                     .transpose()
                     .map_err(|err| NodeError::InvalidRequest(err.to_string()))?
                     .unwrap_or(Id::new("dev")?);
+                // D-051 c-deleg2: the committed actor reflects the caller's
+                // device truthfully. Origin comes from the same Hub-stamped
+                // envelope field every other privileged frame uses
+                // (`crates/remuda-node/src/origin.rs:39` wire_origin);
+                // `byInstanceId` is the Agent device's bound instance (the
+                // answering parent), never parsed off the answer body.
+                let origin = crate::origin::wire_origin(&params);
+                let by_instance = params
+                    .get("byInstanceId")
+                    .and_then(Value::as_str)
+                    .map(|raw| InstanceId::try_from(raw.to_owned()))
+                    .transpose()
+                    .map_err(|err| NodeError::InvalidRequest(err.to_string()))?;
+                let caller_origin = match origin {
+                    remuda_protocol::InputOrigin::Human => remuda_driver::LaunchOrigin::Human,
+                    remuda_protocol::InputOrigin::Bot => remuda_driver::LaunchOrigin::Bot,
+                    remuda_protocol::InputOrigin::Agent => remuda_driver::LaunchOrigin::Agent,
+                };
                 let answer: InteractionAnswer =
                     serde_json::from_value(params.get("answer").cloned().unwrap_or(Value::Null))?;
-                self.answer(interaction_id, answer, by_device, command_id)
-                    .await
+                self.answer(
+                    interaction_id,
+                    answer,
+                    AnswerCaller {
+                        device_id: by_device,
+                        origin: caller_origin,
+                        instance_id: by_instance,
+                    },
+                    command_id,
+                )
+                .await
             }
             other => Err(NodeError::InvalidRequest(format!(
                 "unknown interaction method {other}"

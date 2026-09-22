@@ -2,7 +2,7 @@
 
 Date: 2026-09-23（同日按审查意见修订一轮，见 §6）。
 Design: [hub-supervise.md](../hub-supervise.md)。
-闸门：Linux devbox（`x86_64-unknown-linux-gnu`，rustc 1.94.1）。
+闸门：Linux 构建主机（`x86_64-unknown-linux-gnu`，rustc 1.94.1）。
 本文不截图；证据是工作树 file:line 锚点与本地可复跑的命令输出。
 
 ## 1. 交付物与归属
@@ -48,7 +48,7 @@ Design: [hub-supervise.md](../hub-supervise.md)。
 cargo test --locked -p remuda --test hub_supervise -- --test-threads=1 --nocapture
 ```
 
-结果（devbox，2026-09-23，审查修订后重跑）：
+结果（Linux 构建主机，2026-09-23，审查修订后重跑）：
 
 ```text
 test healthz_reports_version_and_monotonic_uptime ... ok

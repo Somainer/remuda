@@ -1006,8 +1006,12 @@ mod tests {
                 ("ins_r", None),
             ]),
         );
-        assert_eq!(hops.iter().map(|h| h.instance_id.as_str()).collect::<Vec<_>>(),
-                   vec!["ins_c", "ins_p", "ins_r"]);
+        assert_eq!(
+            hops.iter()
+                .map(|h| h.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ins_c", "ins_p", "ins_r"]
+        );
         assert_eq!(hops[0].parent_instance_id.as_deref(), Some("ins_p"));
         assert_eq!(hops[2].parent_instance_id, None);
     }
@@ -1021,8 +1025,12 @@ mod tests {
             "ins_c",
             &edges(&[("ins_c", Some("ins_p")), ("ins_p", Some("ins_r"))]),
         );
-        assert_eq!(hops.iter().map(|h| h.instance_id.as_str()).collect::<Vec<_>>(),
-                   vec!["ins_c", "ins_p"]);
+        assert_eq!(
+            hops.iter()
+                .map(|h| h.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ins_c", "ins_p"]
+        );
         assert_eq!(hops[1].parent_instance_id.as_deref(), Some("ins_r"));
         // No NULL-parent hop is fabricated for the unreachable root.
         assert!(hops.iter().all(|h| h.parent_instance_id.is_some()));

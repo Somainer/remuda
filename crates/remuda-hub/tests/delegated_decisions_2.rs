@@ -218,7 +218,11 @@ impl Ctx {
             .await?)
     }
 
-    async fn answer_question(&self, token: &str, interaction_id: &str) -> Result<reqwest::Response> {
+    async fn answer_question(
+        &self,
+        token: &str,
+        interaction_id: &str,
+    ) -> Result<reqwest::Response> {
         self.answer(
             token,
             interaction_id,
@@ -230,15 +234,19 @@ impl Ctx {
     /// `SELECT … FROM audit_log WHERE subject=? ORDER BY id ASC` — the exact
     /// reconstruction query the evidence doc quotes.
     fn audits(&self, subject: &str) -> Result<Vec<(String, Value)>> {
-        let rows = self.db()?.prepare(
-            "SELECT action, detail_json FROM audit_log
+        let rows = self
+            .db()?
+            .prepare(
+                "SELECT action, detail_json FROM audit_log
              WHERE subject = ?1 ORDER BY id ASC",
-        )?.query_map(rusqlite::params![subject], |row| {
-            let action: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            let detail = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
-            Ok((action, detail))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+            )?
+            .query_map(rusqlite::params![subject], |row| {
+                let action: String = row.get(0)?;
+                let raw: String = row.get(1)?;
+                let detail = serde_json::from_str::<Value>(&raw).unwrap_or(Value::Null);
+                Ok((action, detail))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -281,7 +289,10 @@ async fn audit_answered_by_level_zero_when_self() -> Result<()> {
     assert_eq!(detail["answeredByLevel"], 0);
     assert_eq!(detail["byOrigin"], "agent");
     assert_eq!(detail["byInstanceId"], json!(root));
-    assert_eq!(detail["byDevice"], json!(ctx.device_id(&format!("agent-{root}"))?));
+    assert_eq!(
+        detail["byDevice"],
+        json!(ctx.device_id(&format!("agent-{root}"))?)
+    );
     assert_eq!(detail["interactionKind"], "question");
     Ok(())
 }
@@ -327,7 +338,10 @@ async fn audit_answered_by_level_last_when_root_operator() -> Result<()> {
         vec![leaf.clone(), middle.clone(), root.clone()]
     );
     assert_eq!(detail["answeredByLevel"], 2);
-    assert_eq!(detail["answeredByLevel"], detail["chain"].as_array().unwrap().len() as i64 - 1);
+    assert_eq!(
+        detail["answeredByLevel"],
+        detail["chain"].as_array().unwrap().len() as i64 - 1
+    );
     assert_eq!(detail["byOrigin"], "human");
     // An operator device carries no bound instance.
     assert_eq!(detail["byInstanceId"], Value::Null);
@@ -381,9 +395,7 @@ async fn bot_relayed_answer_keeps_bot_answer_row_in_addition_to_answered_row() -
              state, request_version, process_generation, request_json,
              created_at_ms, expires_at_ms)
          VALUES (?1, ?2, ?3, ?4, 'feishu:dd2', 'open', 1, 1, '{}', 0, ?5)",
-        rusqlite::params![
-            "tkt_dd2", bot_device, question, root, expires_ms
-        ],
+        rusqlite::params!["tkt_dd2", bot_device, question, root, expires_ms],
     )?;
 
     let response = ctx
@@ -447,7 +459,10 @@ async fn node_rpc_frame_carries_truthful_origin_and_bound_instance() -> Result<(
     let frame = ctx.node.frame("interaction.answer");
     assert_eq!(frame["origin"], "agent");
     assert_eq!(frame["byInstanceId"], json!(root));
-    assert_eq!(frame["byDevice"], json!(ctx.device_id(&format!("agent-{root}"))?));
+    assert_eq!(
+        frame["byDevice"],
+        json!(ctx.device_id(&format!("agent-{root}"))?)
+    );
 
     // Human operator answering a separate interaction.
     let own_question = ctx.interaction(&root, "question")?;
@@ -459,8 +474,7 @@ async fn node_rpc_frame_carries_truthful_origin_and_bound_instance() -> Result<(
         .iter()
         .rev()
         .find(|(method, params)| {
-            method == "interaction.answer"
-                && params["interactionId"] == json!(own_question)
+            method == "interaction.answer" && params["interactionId"] == json!(own_question)
         })
         .map(|(_, params)| params.clone())
         .expect("human answer frame");
@@ -483,10 +497,7 @@ async fn in_memory_one_shot_approval_answer_leaves_an_answered_audit_row() -> Re
     // approval (no durable `interactions` row): 409 + interactionId.
     let response = ctx
         .http
-        .post(format!(
-            "{}/v1/instances/{sibling}/commands",
-            ctx.base()
-        ))
+        .post(format!("{}/v1/instances/{sibling}/commands", ctx.base()))
         .bearer_auth(&token)
         .json(&json!({
             "operation": "instance.send",
@@ -528,9 +539,11 @@ async fn in_memory_one_shot_approval_answer_leaves_an_answered_audit_row() -> Re
         .and_then(|item| item["interaction"]["request"]["inputDigest"].as_str())
         .or_else(|| {
             // The flat merged entity exposes request directly on some branches.
-            pending["items"].as_array().unwrap().iter().find_map(|item| {
-                item.pointer("/request/inputDigest").and_then(Value::as_str)
-            })
+            pending["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|item| item.pointer("/request/inputDigest").and_then(Value::as_str))
         })
         .expect("pending approval digest")
         .to_string();
@@ -578,8 +591,10 @@ async fn chain_walk_tolerates_a_deleted_middle_ancestor() -> Result<()> {
     let question = ctx.interaction(&leaf, "question")?;
 
     // The middle instance row is gone before the answer lands.
-    ctx.db()?
-        .execute("DELETE FROM instances WHERE id = ?1", rusqlite::params![middle])?;
+    ctx.db()?.execute(
+        "DELETE FROM instances WHERE id = ?1",
+        rusqlite::params![middle],
+    )?;
 
     let response = ctx.answer_question(&ctx.human, &question).await?;
     assert_eq!(response.status(), 200, "{}", response.text().await?);

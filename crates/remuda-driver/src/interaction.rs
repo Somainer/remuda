@@ -919,8 +919,7 @@ mod tests {
 
     /// Register a second instance with its own owner so a ticket can belong to
     /// a different instance than the answering caller.
-    async fn two_instance_harness(
-    ) -> (
+    async fn two_instance_harness() -> (
         Arc<InteractionBroker>,
         mpsc::UnboundedReceiver<Observation>,
         InstanceId,

@@ -121,6 +121,24 @@ pub struct BrokerConfig {
     pub ttl: Duration,
 }
 
+/// Authenticated caller behind an answer, resolved upstream from the device
+/// record (the Node reads it off the Hub-stamped frame). The broker stamps
+/// the committed `ActorRef` from this instead of assuming every answerer is a
+/// Human at the ticket's own instance: a delegated answer comes from the
+/// answering parent's bound instance, not the child that owns the ticket
+/// (D-051 c-deleg2).
+#[derive(Debug, Clone)]
+pub struct AnswerCaller {
+    /// Winning device id; the unique first-answer-wins attribution.
+    pub device_id: Id,
+    /// Caller origin, mapped 1:1 onto the committed `ActorRef.type`.
+    pub origin: LaunchOrigin,
+    /// Bound instance of an Agent-origin device — the answering self/parent.
+    /// `None` for Human/Bot devices; the actor then stays anchored to the
+    /// ticket's owning instance, exactly the pre-D-051 behavior.
+    pub instance_id: Option<InstanceId>,
+}
+
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self { ttl: DEFAULT_TTL }
@@ -308,12 +326,38 @@ impl InteractionBroker {
         }
     }
 
-    /// First valid answer wins. Later commandIds are [`BrokerError::Superseded`].
+    /// Legacy entry point for callers that carry no authenticated device
+    /// origin: the Hub's in-memory one-shot approval broker and the
+    /// insert-time auto-allow policy. The committed actor is a Human device
+    /// anchored to the ticket's own instance — exactly what this broker
+    /// stamped for every answer before D-051 c-deleg2.
     pub async fn answer(
         &self,
         interaction_id: InteractionId,
         answer: InteractionAnswer,
         by_device: Id,
+        command_id: CommandId,
+    ) -> Result<AnswerOutcome, BrokerError> {
+        self.answer_for(
+            interaction_id,
+            answer,
+            AnswerCaller {
+                device_id: by_device,
+                origin: LaunchOrigin::Human,
+                instance_id: None,
+            },
+            command_id,
+        )
+        .await
+    }
+
+    /// First valid answer wins, attributed to `caller` exactly as resolved
+    /// upstream. Later commandIds are [`BrokerError::Superseded`].
+    pub async fn answer_for(
+        &self,
+        interaction_id: InteractionId,
+        answer: InteractionAnswer,
+        caller: AnswerCaller,
         command_id: CommandId,
     ) -> Result<AnswerOutcome, BrokerError> {
         let (owner, ticket, actor) = {
@@ -342,11 +386,23 @@ impl InteractionBroker {
                 .get(&ticket.table.instance_id)
                 .cloned()
                 .ok_or(BrokerError::OwnerMissing)?;
+            let actor_type = match caller.origin {
+                LaunchOrigin::Human => ActorType::Human,
+                LaunchOrigin::Bot => ActorType::Bot,
+                LaunchOrigin::Agent => ActorType::Agent,
+            };
+            // An Agent answers AS its own bound instance (which is the parent
+            // for a delegated answer). Human/Bot devices have no binding; keep
+            // the actor anchored to the ticket owner, as before D-051.
+            let actor_instance = caller
+                .instance_id
+                .clone()
+                .or_else(|| Some(ticket.table.instance_id.clone()));
             let actor = ActorRef {
                 principal_id: Id::new("prn").map_err(|e| BrokerError::Protocol(e.0))?,
-                actor_type: ActorType::Human,
-                device_id: Some(by_device),
-                instance_id: Some(ticket.table.instance_id.clone()),
+                actor_type,
+                device_id: Some(caller.device_id),
+                instance_id: actor_instance,
             };
             let ticket = inner
                 .pending
@@ -859,5 +915,127 @@ mod tests {
             event.body,
             ObservationPayload::InteractionAnswered(_)
         ));
+    }
+
+    /// Register a second instance with its own owner so a ticket can belong to
+    /// a different instance than the answering caller.
+    async fn two_instance_harness() -> (
+        Arc<InteractionBroker>,
+        mpsc::UnboundedReceiver<Observation>,
+        InstanceId,
+        InstanceId,
+        HostId,
+    ) {
+        let (broker, rx) = InteractionBroker::new(BrokerConfig { ttl: DEFAULT_TTL }).unwrap();
+        let owner = Arc::new(RecordingOwner::default());
+        let parent = InstanceId::new();
+        let child = InstanceId::new();
+        let host = HostId::new();
+        broker.register_owner(parent.clone(), owner.clone()).await;
+        broker.register_owner(child.clone(), owner.clone()).await;
+        broker
+            .set_policy(parent.clone(), InstancePolicy::ask(U64(1)))
+            .await;
+        broker
+            .set_policy(child.clone(), InstancePolicy::ask(U64(1)))
+            .await;
+        (broker, rx, parent, child, host)
+    }
+
+    fn answered_actor(event: Observation) -> ActorRef {
+        match event.body {
+            ObservationPayload::InteractionAnswered(payload) => payload.actor,
+            other => panic!("expected answered observation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_caller_actor_names_agent_and_the_callers_bound_instance() {
+        // The ticket belongs to the child; the answering device is the
+        // parent's Agent credential. The committed actor must name the PARENT
+        // instance, not the ticket owner — the lie c-deleg2 removes.
+        let (broker, mut rx, parent, child, host) = two_instance_harness().await;
+        let id = broker.insert(spec(&child, &host, 1)).await.unwrap();
+        let device = Id::new("dev").unwrap();
+        broker
+            .answer_for(
+                id,
+                allow(),
+                AnswerCaller {
+                    device_id: device.clone(),
+                    origin: LaunchOrigin::Agent,
+                    instance_id: Some(parent.clone()),
+                },
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let actor = answered_actor(rx.recv().await.expect("answered observation"));
+        assert_eq!(actor.actor_type, ActorType::Agent);
+        assert_eq!(actor.device_id, Some(device));
+        assert_eq!(actor.instance_id, Some(parent));
+    }
+
+    #[tokio::test]
+    async fn human_and_bot_callers_keep_the_actor_anchored_at_ticket_instance() {
+        let (broker, mut rx, _parent, child, host) = two_instance_harness().await;
+        let human_device = Id::new("dev").unwrap();
+        let id = broker.insert(spec(&child, &host, 1)).await.unwrap();
+        broker
+            .answer_for(
+                id.clone(),
+                allow(),
+                AnswerCaller {
+                    device_id: human_device.clone(),
+                    origin: LaunchOrigin::Human,
+                    instance_id: None,
+                },
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let actor = answered_actor(rx.recv().await.expect("answered observation"));
+        assert_eq!(actor.actor_type, ActorType::Human);
+        assert_eq!(actor.device_id, Some(human_device));
+        // No bound instance on a Human device: stay anchored to the ticket
+        // owner, byte-for-byte the pre-D-051 actor.
+        assert_eq!(actor.instance_id, Some(child.clone()));
+
+        let id = broker.insert(spec(&child, &host, 1)).await.unwrap();
+        let bot_device = Id::new("dev").unwrap();
+        broker
+            .answer_for(
+                id,
+                allow(),
+                AnswerCaller {
+                    device_id: bot_device.clone(),
+                    origin: LaunchOrigin::Bot,
+                    instance_id: None,
+                },
+                CommandId::new(),
+            )
+            .await
+            .unwrap();
+        let actor = answered_actor(rx.recv().await.expect("answered observation"));
+        assert_eq!(actor.actor_type, ActorType::Bot);
+        assert_eq!(actor.device_id, Some(bot_device));
+        assert_eq!(actor.instance_id, Some(child));
+    }
+
+    #[tokio::test]
+    async fn legacy_answer_entry_stamps_human_at_the_ticket_instance() {
+        // The in-memory one-shot approval broker and auto-allow keep using
+        // `answer`; its committed actor must stay the old Human/ticket shape.
+        let (broker, mut rx, _parent, child, host) = two_instance_harness().await;
+        let device = Id::new("dev").unwrap();
+        let id = broker.insert(spec(&child, &host, 1)).await.unwrap();
+        broker
+            .answer(id.clone(), allow(), device.clone(), CommandId::new())
+            .await
+            .unwrap();
+        let actor = answered_actor(rx.recv().await.expect("answered observation"));
+        assert_eq!(actor.actor_type, ActorType::Human);
+        assert_eq!(actor.device_id, Some(device));
+        assert_eq!(actor.instance_id, Some(child));
     }
 }

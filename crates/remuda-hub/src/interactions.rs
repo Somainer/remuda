@@ -488,6 +488,44 @@ pub async fn answer_interaction(
     let device_id = device.id.clone();
     let by_device =
         Id::try_from(device.id.clone()).map_err(|err| HubError::Internal(err.to_string()))?;
+    // Resolve the durable owner row before touching the in-memory broker:
+    // admitted agents carry the preloaded row; humans/bots read it here. The
+    // in-memory one-shot approval broker is only the owner when no durable
+    // row exists, and its pending view (already caller-scoped inside `list`)
+    // is the one source naming the instance the approval gates — the chain
+    // start for its audit row. Peeked before the CAS removes the grant.
+    // Agents never settle an in-memory grant (`authorize_agent_answer`
+    // refuses approval kind upstream).
+    let stored = match preloaded {
+        Some(row) => Some(row),
+        None => {
+            state
+                .store
+                .get_interaction(interaction_id.as_id().as_str().to_string())
+                .await?
+        }
+    };
+    let in_memory_grant_instance = if stored.is_none() {
+        let interaction_id_str = interaction_id.as_id().as_str();
+        state
+            .agent_approvals
+            .list(&device)
+            .await
+            .into_iter()
+            .find(|item| {
+                item.get("interactionId")
+                    .or_else(|| item.get("id"))
+                    .and_then(Value::as_str)
+                    == Some(interaction_id_str)
+            })
+            .and_then(|item| {
+                item.get("instanceId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+    } else {
+        None
+    };
     if let Some(result) = state
         .agent_approvals
         .answer(
@@ -498,6 +536,20 @@ pub async fn answer_interaction(
         )
         .await?
     {
+        // D-051 c-deleg2: every successful answer CAS leaves an
+        // `interaction.answered` row; the bot-relay row below stays additive.
+        if let Some(owner_instance) = &in_memory_grant_instance {
+            append_answered_audit(
+                &state,
+                &device_id,
+                interaction_id.as_id().as_str(),
+                owner_instance,
+                "approval",
+                origin,
+                device.instance_id.as_deref(),
+            )
+            .await;
+        }
         if let Some(relay) = &bot_relay {
             settle_bot_relay(
                 &state,
@@ -510,15 +562,12 @@ pub async fn answer_interaction(
         }
         return Ok(Json(result));
     }
-    let stored = match preloaded {
-        Some(row) => Some(row),
-        None => {
-            state
-                .store
-                .get_interaction(interaction_id.as_id().as_str().to_string())
-                .await?
-        }
-    };
+    // The chain start/kind for the unconditional answer audit, captured
+    // before `stored` moves into the host fan-out below. A live-only
+    // interaction with no durable Hub row has no Hub-known chain start.
+    let audit_target = stored
+        .as_ref()
+        .map(|row| (row.instance_id.clone(), row.kind.clone()));
     // Node owns first-answer-wins. Never commit an answer in the Hub before
     // the owner is reached, and let the Node reconcile same-command retries.
     let mut params = json!({
@@ -526,6 +575,15 @@ pub async fn answer_interaction(
         "commandId": command_id.as_id().as_str(),
         "byDevice": by_device.as_str(),
         "answer": body.answer,
+        // D-051 c-deleg2: truthful actor provenance for the Node-committed
+        // ActorRef. `origin` rides the same Hub-stamped field as every other
+        // Hub→Node frame (`crates/remuda-node/src/origin.rs:39` wire_origin);
+        // `byInstanceId` is the Agent device's bound instance (the answering
+        // parent — distinct from the ticket owner on a delegated answer).
+        // Both are resolved from the authenticated device, never from the
+        // answer body, so a caller cannot self-attest a different actor.
+        "origin": json!(origin),
+        "byInstanceId": json!(device.instance_id),
     });
     if let Some(relay) = &bot_relay {
         // Informational only: the Node still authorizes against `byDevice`.
@@ -555,6 +613,20 @@ pub async fn answer_interaction(
                         .store
                         .record_interaction_answer(interaction_id.as_id().to_string())
                         .await?;
+                    // D-051 c-deleg2: one unconditional `interaction.answered`
+                    // audit row per committed CAS, independent of bot relay.
+                    if let Some((owner_instance, kind)) = &audit_target {
+                        append_answered_audit(
+                            &state,
+                            &device_id,
+                            interaction_id.as_id().as_str(),
+                            owner_instance,
+                            kind,
+                            origin,
+                            device.instance_id.as_deref(),
+                        )
+                        .await;
+                    }
                     if let Some(relay) = &bot_relay {
                         settle_bot_relay(
                             &state,
@@ -621,6 +693,158 @@ async fn settle_bot_relay(
     }
 }
 
+// ---------------------------------------------------------------------------
+// D-051 c-deleg2: unconditional `interaction.answered` audit, with the
+// delegation chain that lets the answer be reconstructed afterwards from
+// `audit_log` alone.
+// ---------------------------------------------------------------------------
+
+/// One hop in an answered interaction's delegation chain. Serialized into the
+/// audit `detail_json` as `{instanceId, parentInstanceId}` so every hop —
+/// including the dangling edge into a since-deleted ancestor — survives
+/// without a join back to the `instances` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainHop {
+    /// Instance id at this hop; index 0 owns the interaction.
+    instance_id: String,
+    /// Immutable Hub-stamped create-time edge (`None` = root row).
+    parent_instance_id: Option<String>,
+}
+
+/// Pure parent-edge walk behind [`delegation_chain`]. `parent_of` resolves one
+/// stored edge:
+/// - `Some(Some(parent))` — row exists and names a parent, keep walking;
+/// - `Some(None)` — root row (`parent_instance_id IS NULL`); included as the
+///   final hop, per the audit shape ("last element is the first NULL-parent
+///   ancestor");
+/// - `None` — no row (a deleted/"dead" ancestor); the walk ends at the last
+///   reachable hop, whose edge still names the missing parent.
+///
+/// A repeated id breaks a defensive cycle (the create-time edge is immutable,
+/// so a live store cannot contain one).
+///
+/// Pure semantics twin of the async [`delegation_chain`] walker (which reads
+/// edges through `Store::get_instance`); kept test-only to pin the edge order
+/// without a database.
+#[cfg(test)]
+fn chain_hops(start: &str, parent_of: &impl Fn(&str) -> Option<Option<String>>) -> Vec<ChainHop> {
+    let mut hops = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = start.to_string();
+    while seen.insert(current.clone()) {
+        match parent_of(&current) {
+            None => break,
+            Some(parent) => {
+                let next = parent.clone();
+                hops.push(ChainHop {
+                    instance_id: current,
+                    parent_instance_id: parent,
+                });
+                match next {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+        }
+    }
+    hops
+}
+
+/// Integer index of the answerer inside the recorded chain:
+/// `0` = the interaction's own instance, `1` = its direct parent,
+/// `chain.len()-1` = the root operator. Human/Bot devices carry no bound
+/// instance and anchor at the chain root; an Agent device anchors at its
+/// bound instance — self (0) or direct parent (1) under the D-051 one-hop
+/// `owns()` gate. An empty chain (the owner row itself is missing) yields 0.
+fn answered_by_level(chain: &[ChainHop], caller_instance_id: Option<&str>) -> usize {
+    match caller_instance_id {
+        Some(id) => chain
+            .iter()
+            .position(|hop| hop.instance_id == id)
+            .unwrap_or(0),
+        None => chain.len().saturating_sub(1),
+    }
+}
+
+/// Production walker: the same edge order as [`chain_hops`], reading the
+/// immutable `parent_instance_id` edge through the existing
+/// `Store::get_instance` accessor (no SQL/schema changes).
+async fn delegation_chain(state: &AppState, start: &str) -> Result<Vec<ChainHop>, HubError> {
+    let mut hops = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = start.to_string();
+    while seen.insert(current.clone()) {
+        match state.store.get_instance(current.clone()).await? {
+            None => break,
+            Some(row) => {
+                hops.push(ChainHop {
+                    instance_id: current,
+                    parent_instance_id: row.parent_instance_id.clone(),
+                });
+                match row.parent_instance_id {
+                    Some(parent) => current = parent,
+                    None => break,
+                }
+            }
+        }
+    }
+    Ok(hops)
+}
+
+/// Write the one unconditional `interaction.answered` audit row after a
+/// committed answer CAS (durable Node CAS or the Hub's in-memory one-shot
+/// approval broker). Best effort like [`settle_bot_relay`]: the answer has
+/// already won, so an audit failure is logged and never turned into a
+/// user-facing failure that could make the client retry a settled answer.
+#[allow(clippy::too_many_arguments)]
+async fn append_answered_audit(
+    state: &AppState,
+    device_id: &str,
+    interaction_id: &str,
+    owner_instance_id: &str,
+    interaction_kind: &str,
+    origin: remuda_protocol::InputOrigin,
+    by_instance_id: Option<&str>,
+) {
+    let chain = match delegation_chain(state, owner_instance_id).await {
+        Ok(chain) => chain,
+        Err(err) => {
+            tracing::error!(error = %err, interaction_id, "failed to walk delegation chain for answer audit");
+            return;
+        }
+    };
+    let level = answered_by_level(&chain, by_instance_id);
+    let chain_json: Vec<Value> = chain
+        .iter()
+        .map(|hop| {
+            json!({
+                "instanceId": hop.instance_id,
+                "parentInstanceId": hop.parent_instance_id,
+            })
+        })
+        .collect();
+    let detail = json!({
+        "chain": chain_json,
+        "answeredByLevel": level,
+        "byDevice": device_id,
+        "byInstanceId": by_instance_id,
+        "byOrigin": json!(origin),
+        "interactionKind": interaction_kind,
+    });
+    if let Err(err) = state
+        .store
+        .append_audit(
+            device_id.to_string(),
+            "interaction.answered".into(),
+            Some(interaction_id.to_string()),
+            detail,
+        )
+        .await
+    {
+        tracing::error!(error = %err, interaction_id, "failed to audit answered interaction");
+    }
+}
+
 fn rpc_result(frame: Value) -> Result<Value, HubError> {
     if let Some(err) = frame.get("error") {
         let code = err.get("code").and_then(Value::as_i64).unwrap_or(-32603);
@@ -676,10 +900,20 @@ pub mod delegated_decisions_test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_delegated_decisions;
+    use super::{answered_by_level, chain_hops, resolve_delegated_decisions};
+    use std::collections::HashMap;
 
     fn ids(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// Build the tri-state parent lookup the pure walker consumes:
+    /// present id → `Some(parent)`, absent id → `None` (dead row).
+    fn edges<'a>(
+        map: &'a [(&'a str, Option<&'a str>)],
+    ) -> impl Fn(&str) -> Option<Option<String>> + 'a {
+        let table: HashMap<&str, Option<&str>> = map.iter().copied().collect();
+        move |id: &str| table.get(id).map(|parent| parent.map(str::to_string))
     }
 
     #[test]
@@ -744,5 +978,116 @@ mod tests {
             &off,
             Some("prj_ambiguous")
         ));
+    }
+
+    // --- D-051 c-deleg2: delegation-chain walk ------------------------------
+
+    #[test]
+    fn chain_with_no_parent_root_is_the_single_root_hop() {
+        // C itself is the first (and only) NULL-parent ancestor.
+        let hops = chain_hops("ins_c", &edges(&[("ins_c", None)]));
+        assert_eq!(
+            hops,
+            vec![super::ChainHop {
+                instance_id: "ins_c".into(),
+                parent_instance_id: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn chain_walks_parent_edges_up_to_the_null_parent_ancestor() {
+        // c → p → r (root, NULL parent).
+        let hops = chain_hops(
+            "ins_c",
+            &edges(&[
+                ("ins_c", Some("ins_p")),
+                ("ins_p", Some("ins_r")),
+                ("ins_r", None),
+            ]),
+        );
+        assert_eq!(
+            hops.iter()
+                .map(|h| h.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ins_c", "ins_p", "ins_r"]
+        );
+        assert_eq!(hops[0].parent_instance_id.as_deref(), Some("ins_p"));
+        assert_eq!(hops[2].parent_instance_id, None);
+    }
+
+    #[test]
+    fn chain_with_dead_middle_parent_ends_at_last_reachable_hop_but_keeps_edge() {
+        // c → p → r(gone) → root. The row for `ins_r` is missing. The walk
+        // ends at p; p's hop still records the dangling edge into the dead
+        // ancestor so the audit row alone shows where the chain broke.
+        let hops = chain_hops(
+            "ins_c",
+            &edges(&[("ins_c", Some("ins_p")), ("ins_p", Some("ins_r"))]),
+        );
+        assert_eq!(
+            hops.iter()
+                .map(|h| h.instance_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ins_c", "ins_p"]
+        );
+        assert_eq!(hops[1].parent_instance_id.as_deref(), Some("ins_r"));
+        // No NULL-parent hop is fabricated for the unreachable root.
+        assert!(hops.iter().all(|h| h.parent_instance_id.is_some()));
+    }
+
+    #[test]
+    fn chain_starting_at_a_missing_row_is_empty() {
+        let lookup = edges(&[]);
+        assert!(chain_hops("ins_gone", &lookup).is_empty());
+    }
+
+    #[test]
+    fn chain_walk_is_cycle_safe() {
+        // Immutable edges make this impossible in production; the walker must
+        // still terminate rather than spin.
+        let hops = chain_hops(
+            "ins_a",
+            &edges(&[("ins_a", Some("ins_b")), ("ins_b", Some("ins_a"))]),
+        );
+        assert_eq!(hops.len(), 2);
+    }
+
+    // --- D-051 c-deleg2: answeredByLevel ------------------------------------
+
+    fn chain_cpr() -> Vec<super::ChainHop> {
+        chain_hops(
+            "ins_c",
+            &edges(&[
+                ("ins_c", Some("ins_p")),
+                ("ins_p", Some("ins_r")),
+                ("ins_r", None),
+            ]),
+        )
+    }
+
+    #[test]
+    fn level_zero_when_the_owner_instance_answers_itself() {
+        assert_eq!(answered_by_level(&chain_cpr(), Some("ins_c")), 0);
+    }
+
+    #[test]
+    fn level_one_when_the_direct_parent_answers() {
+        assert_eq!(answered_by_level(&chain_cpr(), Some("ins_p")), 1);
+    }
+
+    #[test]
+    fn level_last_when_the_root_operator_answers() {
+        // Human/Bot devices have no bound instance: anchor at the root.
+        assert_eq!(answered_by_level(&chain_cpr(), None), 2);
+        // The root instance itself answering is the same index.
+        assert_eq!(answered_by_level(&chain_cpr(), Some("ins_r")), 2);
+    }
+
+    #[test]
+    fn level_root_of_a_single_hop_chain_is_zero() {
+        let hops = chain_hops("ins_c", &edges(&[("ins_c", None)]));
+        assert_eq!(answered_by_level(&hops, None), 0);
+        assert_eq!(answered_by_level(&hops, Some("ins_c")), 0);
     }
 }

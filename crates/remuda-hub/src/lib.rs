@@ -450,6 +450,17 @@ impl RunningHub {
             .await;
     }
 
+    /// Test helper: mount any synthetic Node transport (e.g. one that records
+    /// the frames the Hub sends). Insert the host row first.
+    #[doc(hidden)]
+    pub async fn test_set_node_transport(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+    ) {
+        self.state.nodes.insert(host_id.to_owned(), transport).await;
+    }
+
     /// Test helper: drop the live Node session for `host_id` (host goes offline).
     #[doc(hidden)]
     pub async fn test_disconnect_node(&self, host_id: &str) {

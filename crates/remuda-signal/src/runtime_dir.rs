@@ -53,8 +53,16 @@ pub const SAFE_SOCKET_PATH_BYTES: usize = 100;
 /// macOS/BSD) which the terminating NUL occupies.
 #[cfg(target_os = "linux")]
 pub const SUN_PATH_LIMIT: usize = 107;
+/// Largest usable `sockaddr_un.sun_path` on this platform, in bytes.
+///
+/// The kernel arrays hold one more byte (`sun_path` is 108 on Linux, 104 on
+/// macOS/BSD) which the terminating NUL occupies.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const SUN_PATH_LIMIT: usize = 103;
+/// Largest usable `sockaddr_un.sun_path` on this platform, in bytes.
+///
+/// The kernel arrays hold one more byte (`sun_path` is 108 on Linux, 104 on
+/// macOS/BSD) which the terminating NUL occupies.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
 pub const SUN_PATH_LIMIT: usize = 103;
 
@@ -517,6 +525,74 @@ enum SocketProbe {
     Uncertain,
 }
 
+/// Create the probe socket: non-blocking and close-on-exec.
+///
+/// On platforms whose `socket(2)` accepts the atomic flags — exactly the set
+/// nix itself exposes `SOCK_NONBLOCK`/`SOCK_CLOEXEC` for (linux/android,
+/// freebsd/dragonfly, netbsd/openbsd, solaris/illumos) — both properties are
+/// born on the descriptor.
+#[cfg(all(
+    unix,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+    )
+))]
+fn create_probe_socket() -> nix::Result<std::os::fd::OwnedFd> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+
+    socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+}
+
+/// Create the probe socket on platforms without atomic socket flags
+/// (notably macOS/iOS): the socket is born plain and is immediately made
+/// non-blocking (`F_SETFL` with `O_NONBLOCK`) and close-on-exec (`F_SETFD`
+/// with `FD_CLOEXEC`) before anything can connect or exec with it.
+///
+/// Either `fcntl` failing propagates as an error: a blocking probe connect is
+/// precisely what [`socket_has_live_listener`] must never perform, and a
+/// descriptor without `CLOEXEC` would leak across an exec. On error the owned
+/// descriptor closes on drop.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+    ))
+))]
+fn create_probe_socket() -> nix::Result<std::os::fd::OwnedFd> {
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+    use std::os::fd::AsRawFd;
+
+    let fd = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )?;
+    fcntl(fd.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+    fcntl(fd.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+    Ok(fd)
+}
+
 /// Bounded non-blocking connect probe against `path`.
 ///
 /// A listener that answers (immediately, or once the connect settles) reads
@@ -527,14 +603,9 @@ enum SocketProbe {
 /// Node start behind a peer whose accept backlog is full.
 #[cfg(unix)]
 fn socket_has_live_listener(path: &Path, deadline: std::time::Instant) -> SocketProbe {
-    use nix::sys::socket::{SockFlag, SockType, getsockopt, socket, sockopt};
+    use nix::sys::socket::{getsockopt, sockopt};
 
-    let fd = match socket(
-        nix::sys::socket::AddressFamily::Unix,
-        SockType::Stream,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
-        None,
-    ) {
+    let fd = match create_probe_socket() {
         Ok(fd) => fd,
         Err(_) => return SocketProbe::Uncertain,
     };

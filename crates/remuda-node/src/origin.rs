@@ -1,4 +1,4 @@
-//! Authenticated Hub provenance. Missing/unknown wire values fail closed.
+//! Authenticated Hub provenance. Missing/unknown wire values fail closed. SPEC-ONLY (unimplemented, 2026-09-22 c-nodecosign): the Node trusts the Hub-stamped `origin` on the carrier alone (see `wire_origin` below; attack chain in `docs/design/evidence/node-cosign-1.md` §1) — `docs/design/passkey-login.md` §6 specifies the device-passkey co-signature under which privileged frames (human/bot origin, bypass postures, non-empty capabilities, binary/args overrides; `gate.run`/`gate.then`/`gate.land`) refuse before dispatch when they carry no valid device assertion over the canonical frame.
 
 use std::collections::BTreeMap;
 

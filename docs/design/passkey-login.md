@@ -196,7 +196,8 @@ create/get 信封封装与错误归一化。
    `crates/remuda-node/src/enroll.rs:44-46`），ssh-stdio 桥逐帧透传 JSON。
    这是连接级的对称持有秘密，**不是逐请求签名**。
 2. **请求**：连上之后，帧里的 `origin` 在 Node 侧直接取自 params
-   （`crates/remuda-node/src/origin.rs:25-32`）；Hub 侧所有特权门把它当
+   （`crates/remuda-node/src/origin.rs:39-43`；c-hubidentity 合入后该函数
+   上方 25-38 行新增了同指此缺口的 §7.7 doc comment）；Hub 侧所有特权门把它当
    权威：`crates/remuda-hub/src/agent_scope.rs:284`
    （`restrict_permission` 只约束非 Human）、
    `crates/remuda-driver/src/presets.rs:151-166`（Human/Bot 即追加 yolo

@@ -17,8 +17,10 @@ Node 没有第二道绑定到人与设备的证据，于是全 fleet 远程代�
    **连接级对称秘密**，不是逐请求签名；连上之后的每一帧都不再证明「这一帧
    出自一个在场的人」。
 2. 帧里的 `origin` 字段在 Node 侧**直接取自 params**，没有任何复核：
-   `crates/remuda-node/src/origin.rs:25-32`（`wire_origin` 读
-   `params["origin"]`，`command_origin` 把 `Human` 映射成 `CommandOrigin::Ui`）。
+   `crates/remuda-node/src/origin.rs:39-43`（c-hubidentity 合入前为
+   25-32；其 §7.7 doc comment 在 `:25-38` 描述了同一缺口）——
+   `wire_origin` 读 `params["origin"]`，`command_origin` 把 `Human` 映射成
+   `CommandOrigin::Ui`（现位于 `:45-51`）。
 3. Hub 侧所有特权门都把这个字段当权威。`restrict_permission` 只对
    非 Human 来源补 `manual`、只拒绝 Agent 的非 manual/plan：
    `crates/remuda-hub/src/agent_scope.rs:284`。`stamp` 从已认证设备盖 origin

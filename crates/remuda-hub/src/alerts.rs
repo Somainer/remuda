@@ -184,6 +184,20 @@ async fn fanout(
     }
 }
 
+/// Map a journal event to its outward alert kind.
+///
+/// RESTORE-SUPPRESS SITE (spec only — `docs/design/hub-topology.md` §6.3):
+/// this classification feeds the only two push-bearing effects the spec
+/// names — interaction wakes (`AlertKind::Interaction`) and push fanout
+/// (`dispatch`/`fanout` above, including blocked reminders and badges) — and
+/// it is reached solely through `observe` from the journal append path,
+/// which already skips rows with `appended.replayed`
+/// (`crates/remuda-hub/src/ws.rs:634`). Catch-up rows above a restored
+/// snapshot are fresh inserts, so the implementation batch must gate that
+/// call site on a per-instance restore watermark; the third suppressed
+/// effect is `api.egress` reinstall (`crates/remuda-hub/src/api_relay.rs:415`).
+/// Durable projections keep applying; only outward effects are suppressed.
+/// No behavior changes in this comment.
 fn classify(event: &Value) -> Option<AlertKind> {
     let kind = event
         .get("kind")

@@ -6,9 +6,8 @@ afterEach(() => {
 });
 
 describe("device settings", () => {
-  it("defaults autoRevealTty off and Night Corral only", () => {
+  it("defaults autoRevealTty off and permission to manual", () => {
     expect(DEFAULT_SETTINGS.autoRevealTty).toBe(false);
-    expect(DEFAULT_SETTINGS.theme).toBe("night-corral");
     expect(DEFAULT_SETTINGS.permissionDefault).toBe("manual");
     // The five real Claude levels default to `high`, index 2.
     expect(DEFAULT_SETTINGS.defaultEffortIndex).toBe(2);
@@ -31,7 +30,18 @@ describe("device settings", () => {
     expect(next.deviceName).toBe("phone");
     expect(next.permissionDefault).toBe("acceptEdits");
     expect(next.autoRevealTty).toBe(false);
-    expect(next.theme).toBe("night-corral");
+  });
+
+  it("drops the legacy theme field from old stored blobs on read and rewrite", () => {
+    // The theme used to be a hard-wired device-settings field; it now lives
+    // under runtime.theme.v1 (features/settings/theme.ts) and must not linger.
+    localStorage.setItem(
+      "runtime.device-settings.v1",
+      JSON.stringify({ deviceName: "old", theme: "legacy-value" }),
+    );
+    expect(readDeviceSettings()).not.toHaveProperty("theme");
+    writeDeviceSettings({ deviceName: "old" });
+    expect(JSON.parse(localStorage.getItem("runtime.device-settings.v1")!)).not.toHaveProperty("theme");
   });
 
   it("mentions iOS home screen for push", () => {

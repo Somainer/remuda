@@ -26,6 +26,9 @@ mod hosts;
 mod http;
 mod instances;
 mod interactions;
+/// Test-only seam for the D-051 delegated-decisions feature switch.
+#[doc(hidden)]
+pub use interactions::delegated_decisions_test_support;
 mod inventory;
 mod maintenance;
 mod model_catalog;

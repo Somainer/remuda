@@ -689,6 +689,13 @@ pub async fn restrict_agent_routes(
                     // requires the `dispatch` grant and re-checks scope, and it
                     // now carries the capability block for exactly this caller.
                     || hostcap_read_target(path)
+                    // D-051: delegated-decision routing. Literal predicate for
+                    // `GET /v1/interactions` (list; handler
+                    // `crates/remuda-hub/src/interactions.rs:281`). The handler
+                    // independently re-checks `owns()`, kind, bypass posture,
+                    // and the feature switch; admitting the path loosens
+                    // nothing by itself.
+                    || path == "/v1/interactions"
                     || match read_target(path) {
                         Some(id) => owns(&state, &device, id).await?,
                         None => false,
@@ -699,6 +706,13 @@ pub async fn restrict_agent_routes(
                     || path == "/v1/fleet/instances"
                     || path == "/v1/fleet/broadcast"
                     || (path.starts_with("/v1/instances/") && path.ends_with("/commands"))
+                    // D-051: literal predicate for
+                    // `POST /v1/interactions/{id}/answer` (handler
+                    // `crates/remuda-hub/src/interactions.rs:420`) — there is
+                    // no GET-detail predicate (that endpoint does not exist),
+                    // and no read_target/project/task helper may match this
+                    // implicitly. The handler owns the authorization decision.
+                    || (path.starts_with("/v1/interactions/") && path.ends_with("/answer"))
                     || (path.starts_with("/v1/projects/") && path.ends_with("/members"))
                     // Batch 6 gate-queue enqueue/cancel POSTs.
                     || project_write_target(path)

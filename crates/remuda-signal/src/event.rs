@@ -140,6 +140,22 @@ pub fn is_blocking(event: &str) -> bool {
     BLOCKING_EVENTS.contains(&event)
 }
 
+/// True when this particular hook invocation must wait on a Remuda decision.
+///
+/// [`is_blocking`] names events that block on their own
+/// (`PermissionRequest`, `Elicitation`). One pairing is payload-shaped rather
+/// than name-shaped: in **auto** permission mode an `AskUserQuestion` arrives
+/// as a `PreToolUse` with no following `PermissionRequest` (measured on
+/// `claude` 2.1.277; evidence `askq-pretooluse-1.md`). A `PreToolUse` for any
+/// other tool stays fire-and-forget, so the tool name is what decides.
+#[must_use]
+pub fn hooks_block(name: &str, payload: &serde_json::Value) -> bool {
+    is_blocking(name)
+        || (name == "PreToolUse"
+            && payload.get("tool_name").and_then(serde_json::Value::as_str)
+                == Some(crate::ASK_USER_QUESTION))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,11 +179,30 @@ mod tests {
     }
 
     #[test]
-    fn only_the_two_observe_only_events_block() {
+    fn only_the_two_observe_only_events_block_by_name() {
         assert!(is_blocking("PermissionRequest"));
         assert!(is_blocking("Elicitation"));
         for event in ["SessionStart", "Stop", "MessageDisplay", "Notification"] {
             assert!(!is_blocking(event), "{event} must not block the agent");
         }
+    }
+
+    #[test]
+    fn an_auto_mode_askuserquestion_pretooluse_blocks_by_payload() {
+        // The whole c-askq gap: auto mode raises the question as a PreToolUse
+        // with no PermissionRequest behind it.
+        let question = serde_json::json!({"tool_name": "AskUserQuestion"});
+        assert!(hooks_block("PreToolUse", &question));
+        // A PreToolUse for any other tool keeps the short fire-and-forget wait.
+        assert!(!hooks_block(
+            "PreToolUse",
+            &serde_json::json!({"tool_name": "Bash"})
+        ));
+        assert!(!hooks_block(
+            "PreToolUse",
+            &serde_json::json!({"tool_name": "askuserquestion"})
+        ));
+        // The name-blocking events keep blocking regardless of payload.
+        assert!(hooks_block("PermissionRequest", &serde_json::json!({})));
     }
 }

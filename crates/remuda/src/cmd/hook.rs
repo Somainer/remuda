@@ -24,9 +24,7 @@
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use remuda_signal::{
-    BLOCKING_WAIT, Delivery, HookDecision, HookEnvelope, deliver_event, event::is_blocking,
-};
+use remuda_signal::{BLOCKING_WAIT, Delivery, HookDecision, HookEnvelope, deliver_event};
 use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -127,7 +125,7 @@ fn emit(args: EmitArgs) -> Result<i32> {
     let timeout = args
         .timeout_ms
         .map(Duration::from_millis)
-        .unwrap_or_else(|| wait_for(&args.event));
+        .unwrap_or_else(|| wait_for(&args.event, &payload));
     let event = args.event.clone();
     let envelope = HookEnvelope {
         credential,
@@ -142,7 +140,7 @@ fn emit(args: EmitArgs) -> Result<i32> {
         .enable_all()
         .build()?;
     let delivery = runtime.block_on(deliver_event(&args.socket, &envelope, timeout));
-    println!("{}", decide(&event, delivery));
+    println!("{}", decide(&event, &envelope.payload, delivery));
     // Always 0: a non-zero exit from a hook is a signal to the harness, and
     // "Remuda could not be reached" is not something the agent should act on.
     Ok(0)
@@ -162,17 +160,19 @@ fn emit(args: EmitArgs) -> Result<i32> {
 ///   would break every tool call on a host whose Node merely stopped.
 ///
 /// A non-blocking event never denies: there is nothing to refuse.
-fn decide(event: &str, delivery: Delivery) -> serde_json::Value {
+fn decide(event: &str, payload: &serde_json::Value, delivery: Delivery) -> serde_json::Value {
     match delivery {
         Delivery::Replied(reply) => reply.to_hook_json(),
-        Delivery::TimedOut if is_blocking(event) => HookDecision::timed_out().to_hook_json(event),
+        Delivery::TimedOut if remuda_signal::event::hooks_block(event, payload) => {
+            HookDecision::timed_out().to_hook_json(event)
+        }
         Delivery::TimedOut | Delivery::Unreachable => serde_json::json!({}),
     }
 }
 
 /// Wait budget for one event.
-fn wait_for(event: &str) -> Duration {
-    if is_blocking(event) {
+fn wait_for(event: &str, payload: &serde_json::Value) -> std::time::Duration {
+    if remuda_signal::event::hooks_block(event, payload) {
         BLOCKING_WAIT
     } else {
         NONBLOCKING_WAIT
@@ -216,14 +216,32 @@ mod tests {
     fn a_blocking_event_waits_as_long_as_the_broker_would_hold_the_ticket() {
         // Giving up sooner than the broker retires the ticket would turn a
         // decision the user did make into a silent fallback.
-        assert_eq!(wait_for("PermissionRequest"), BLOCKING_WAIT);
-        assert_eq!(wait_for("Elicitation"), BLOCKING_WAIT);
+        let empty = serde_json::json!({});
+        assert_eq!(wait_for("PermissionRequest", &empty), BLOCKING_WAIT);
+        assert_eq!(wait_for("Elicitation", &empty), BLOCKING_WAIT);
+    }
+
+    #[test]
+    fn an_auto_mode_askuserquestion_pretooluse_gets_the_blocking_budget() {
+        // The whole c-askq gap: this pairing is the owner's main path, and a
+        // 5 s fire-and-forget budget would deny every phone answer.
+        let question = serde_json::json!({"tool_name": "AskUserQuestion"});
+        assert_eq!(
+            wait_for("PreToolUse", &question),
+            BLOCKING_WAIT,
+            "an auto-mode question parks like a PermissionRequest"
+        );
+        assert_eq!(
+            wait_for("PreToolUse", &serde_json::json!({"tool_name": "Bash"})),
+            NONBLOCKING_WAIT
+        );
     }
 
     #[test]
     fn a_fire_and_forget_event_does_not_hold_the_agent_for_minutes() {
+        let empty = serde_json::json!({});
         for event in ["SessionStart", "UserPromptSubmit", "MessageDisplay", "Stop"] {
-            let wait = wait_for(event);
+            let wait = wait_for(event, &empty);
             assert_eq!(wait, NONBLOCKING_WAIT, "{event}");
             assert!(wait < BLOCKING_WAIT);
         }
@@ -232,16 +250,18 @@ mod tests {
     #[test]
     fn a_reply_is_printed_verbatim_including_an_empty_one() {
         // `{}` from the Node is the Node declining to have an opinion.
+        let empty = serde_json::json!({});
         let reply = remuda_signal::HookReply {
             decision: Some(serde_json::json!({"hookSpecificOutput": {"x": 1}})),
         };
         assert_eq!(
-            decide("PermissionRequest", Delivery::Replied(reply)),
+            decide("PermissionRequest", &empty, Delivery::Replied(reply)),
             serde_json::json!({"hookSpecificOutput": {"x": 1}})
         );
         assert_eq!(
             decide(
                 "PermissionRequest",
+                &empty,
                 Delivery::Replied(remuda_signal::HookReply::empty())
             ),
             serde_json::json!({})
@@ -253,7 +273,11 @@ mod tests {
         // §4.4 fail-closed. Printing `{}` here would drop the agent onto its
         // own dialog with no one watching, and an allow would run a tool
         // nobody approved.
-        let json = decide("PermissionRequest", Delivery::TimedOut);
+        let json = decide(
+            "PermissionRequest",
+            &serde_json::json!({}),
+            Delivery::TimedOut,
+        );
         assert_eq!(
             json["hookSpecificOutput"]["decision"]["behavior"], "deny",
             "{json}"
@@ -266,9 +290,30 @@ mod tests {
 
     #[test]
     fn a_timed_out_elicitation_also_denies() {
-        let json = decide("Elicitation", Delivery::TimedOut);
+        let json = decide("Elicitation", &serde_json::json!({}), Delivery::TimedOut);
         assert_eq!(json["hookSpecificOutput"]["hookEventName"], "Elicitation");
         assert_eq!(json["hookSpecificOutput"]["decision"]["behavior"], "deny");
+    }
+
+    #[test]
+    fn a_timed_out_auto_mode_question_denies_in_pretooluse_shape() {
+        // The fail-closed deadline for the auto-mode path must read as a
+        // PreToolUse permissionDecision deny; a PermissionRequest-shaped body
+        // is dropped on this event.
+        let json = decide(
+            "PreToolUse",
+            &serde_json::json!({"tool_name": "AskUserQuestion"}),
+            Delivery::TimedOut,
+        );
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"],
+            serde_json::json!("deny")
+        );
+        assert!(
+            json["hookSpecificOutput"].get("decision").is_none(),
+            "{json}"
+        );
     }
 
     #[test]
@@ -276,7 +321,11 @@ mod tests {
         // Remuda is not in the loop; denying every tool call because the Node
         // stopped would make a dead Node look like a hostile one.
         assert_eq!(
-            decide("PermissionRequest", Delivery::Unreachable),
+            decide(
+                "PermissionRequest",
+                &serde_json::json!({}),
+                Delivery::Unreachable
+            ),
             serde_json::json!({})
         );
     }
@@ -287,8 +336,26 @@ mod tests {
         // be read as a decision about something.
         for event in ["SessionStart", "Stop", "MessageDisplay"] {
             for delivery in [Delivery::TimedOut, Delivery::Unreachable] {
-                assert_eq!(decide(event, delivery), serde_json::json!({}), "{event}");
+                assert_eq!(
+                    decide(event, &serde_json::json!({}), delivery),
+                    serde_json::json!({}),
+                    "{event}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn an_ordinary_pretooluse_timeout_stays_no_opinion() {
+        // Only AskUserQuestion turns PreToolUse into a blocking pairing; a
+        // Bash timing out on the relay keeps the old fire-and-forget behavior.
+        assert_eq!(
+            decide(
+                "PreToolUse",
+                &serde_json::json!({"tool_name": "Bash"}),
+                Delivery::TimedOut
+            ),
+            serde_json::json!({})
+        );
     }
 }

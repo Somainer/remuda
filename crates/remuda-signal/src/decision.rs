@@ -155,10 +155,43 @@ impl HookDecision {
     /// measured error for a mismatch is
     /// `Hook returned incorrect event name: expected 'PreToolUse' but got
     /// 'PermissionRequest'`, and the decision is dropped.
+    ///
+    /// The key vocabulary also differs by event: a `PermissionRequest` reads
+    /// `decision.behavior`, while a `PreToolUse` reads `permissionDecision` /
+    /// `permissionDecisionReason` (its `decision.behavior` arm is deprecated
+    /// and dropped). Measured on `claude` 2.1.277: an auto-mode
+    /// `AskUserQuestion` is a `PreToolUse`, and it accepts the answers through
+    /// `hookSpecificOutput.updatedInput` — "Modified tool input (PreToolUse
+    /// only)" per the harness's own hook docs (evidence `askq-pretooluse-1`).
     #[must_use]
     pub fn to_hook_json(&self, event: &str) -> serde_json::Value {
         let mut specific = serde_json::Map::new();
         specific.insert("hookEventName".into(), serde_json::json!(event));
+        if event == "PreToolUse" {
+            match self {
+                Self::Allow { updated_input, .. } => {
+                    specific.insert("permissionDecision".into(), serde_json::json!("allow"));
+                    if let Some(input) = updated_input {
+                        specific.insert("updatedInput".into(), input.clone());
+                    }
+                    // `updatedPermissions` is a PermissionRequest-only key; the
+                    // PreToolUse specific output does not list it. The one
+                    // allow that reaches this arm (a question answer) never
+                    // carries any anyway.
+                }
+                Self::Deny { message } => {
+                    specific.insert("permissionDecision".into(), serde_json::json!("deny"));
+                    specific.insert(
+                        "permissionDecisionReason".into(),
+                        serde_json::json!(message),
+                    );
+                }
+                // No PreToolUse event ever opens an elicitation; do not invent
+                // a shape for a pairing that cannot occur.
+                Self::Elicitation { .. } => {}
+            }
+            return serde_json::json!({ "hookSpecificOutput": serde_json::Value::Object(specific) });
+        }
         match self {
             Self::Allow {
                 updated_input,
@@ -404,6 +437,112 @@ mod tests {
         }
         .to_hook_json("Elicitation");
         assert_eq!(json["hookSpecificOutput"]["hookEventName"], "Elicitation");
+    }
+
+    #[test]
+    fn a_pretooluse_allow_uses_the_permission_decision_keys_with_updated_input() {
+        // Measured on claude 2.1.277 (evidence askq-pretooluse-1): the auto
+        // mode AskUserQuestion hook is a PreToolUse, and the question answers
+        // land through hookSpecificOutput.updatedInput alongside
+        // permissionDecision. The PermissionRequest `decision.behavior` arm is
+        // deprecated for PreToolUse and its keys are dropped there.
+        let updated = serde_json::json!({
+            "questions": [{"question": "Tea or coffee?"}],
+            "answers": {"Tea or coffee?": "Tea"},
+        });
+        let json = HookDecision::Allow {
+            updated_input: Some(updated),
+            updated_permissions: Vec::new(),
+        }
+        .to_hook_json("PreToolUse");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": {
+                        "questions": [{"question": "Tea or coffee?"}],
+                        "answers": {"Tea or coffee?": "Tea"},
+                    },
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_pretooluse_allow_without_edited_input_sends_no_updated_input() {
+        let json = HookDecision::Allow {
+            updated_input: None,
+            updated_permissions: Vec::new(),
+        }
+        .to_hook_json("PreToolUse");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_pretooluse_deny_carries_its_reason_in_the_pretooluse_key() {
+        let json = HookDecision::Deny {
+            message: "nobody answered".into(),
+        }
+        .to_hook_json("PreToolUse");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "nobody answered",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_pretooluse_decision_never_uses_the_permission_request_shape() {
+        // Same rule as the inverse case in
+        // `a_decision_never_uses_the_key_that_is_silently_ignored`: sending
+        // decision.behavior to a PreToolUse is the deprecated, dropped shape.
+        for decision in [
+            HookDecision::Allow {
+                updated_input: None,
+                updated_permissions: Vec::new(),
+            },
+            HookDecision::Deny {
+                message: "no".into(),
+            },
+        ] {
+            let text = decision.to_hook_json("PreToolUse").to_string();
+            assert!(!text.contains("\"behavior\""), "{text}");
+            assert!(!text.contains("\"decision\""), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_pretooluse_timeout_denies_in_the_pretooluse_shape() {
+        // The relay prints HookDecision::timed_out() keyed by the timed-out
+        // event; an auto-mode question deadline therefore has to read as a
+        // PreToolUse permissionDecision deny, not a PermissionRequest one.
+        let json = HookDecision::timed_out().to_hook_json("PreToolUse");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"],
+            serde_json::json!("deny")
+        );
+        assert!(
+            json["hookSpecificOutput"]
+                .get("permissionDecisionReason")
+                .and_then(|v| v.as_str())
+                .is_some_and(|reason| reason.contains("deadline")),
+            "{json}"
+        );
     }
 
     #[test]

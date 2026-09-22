@@ -24,6 +24,8 @@ CLI:
 With no arguments the unittest suite runs.
 """
 
+from __future__ import annotations
+
 import argparse
 import importlib.util
 import json

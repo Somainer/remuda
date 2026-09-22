@@ -72,6 +72,20 @@ jobs:
       - name: Shared Rust merge gate
         run: ./scripts/ci/gate.sh
 
+  macos-check:
+    # Linux-only gates cannot catch platform cfg mistakes (c-macbuild: the
+    # SOCK_NONBLOCK/SOCK_CLOEXEC breakage that main shipped). Check only; the
+    # test matrix stays Linux.
+    runs-on: macos-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain
+      - name: Check the whole workspace on macOS
+        run: cargo check --workspace --all-targets --locked
+
   m0-stub:
     runs-on: ubuntu-latest
     steps:

@@ -15,7 +15,6 @@ import { useModifierHeld } from "../../lib/useModifierHeld";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { switchSlots } from "../../lib/sessionSlots";
 import { isEmberEffort } from "./effort";
-import { compareModelPin } from "./modelEffective";
 import { nextStep } from "./nextStep";
 import { LaunchedByMark } from "./LaunchedBy";
 import {
@@ -747,38 +746,30 @@ export function SessionList({
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
-                        // model-pin-1: label the row with the model that
-                        // actually answered, not the one that was requested. A
-                        // pin silently replaced by the host's default used to be
-                        // indistinguishable here from an honoured one, because
-                        // the row only ever showed the request.
-                        //
-                        // The observation comes from `modelEffective.ts` through
-                        // the store, and the divergence test is the same alias
-                        // rule the Node and Hub use (`compareModelPin`), so a
-                        // correct gateway launch — a catalog id resolved to an
-                        // upstream vendor name — is not flagged.
+                        // The row says both model strings, verbatim: the one
+                        // requested at dispatch and the one read back from the
+                        // session. When they differ the row shows both; it does
+                        // not judge the difference (owner ruling 2026-09-23:
+                        // the harness records what runs, it does not decide
+                        // whether that is allowed).
                         const requested = hubStore.modelOf(instance.id, instance.kind);
                         const effective = hubStore.modelEffectiveOf(instance.id);
-                        const catalog = hubStore.modelCatalogOf(instance.id)?.models ?? [];
-                        const verdict = effective
-                          ? compareModelPin(requested, effective.id, catalog)
-                          : "honoured";
-                        const diverged = verdict === "mismatch";
+                        const actual = effective?.id;
+                        const differs =
+                          actual !== undefined && actual.trim() !== "" && actual !== requested;
                         return (
                           <>
                             <span className={css.sep}>·</span>
                             <span
                               data-testid="session-model"
-                              data-model-effective={effective ? effective.id : "unknown"}
-                              data-model-diverged={diverged ? "1" : "0"}
+                              data-model-effective={actual ? actual : "unknown"}
                               title={
-                                effective
-                                  ? `请求 ${requested} · 实际 ${effective.id}（${effective.source}）`
+                                actual
+                                  ? `请求 ${requested} · 实际 ${actual}（${effective?.source ?? ""}）`
                                   : `请求 ${requested} · 实际模型尚未从会话回读`
                               }
                             >
-                              {effective ? effective.id : requested}
+                              {differs && actual ? `${actual} ⇐ ${requested}` : (actual ?? requested)}
                             </span>
                           </>
                         );

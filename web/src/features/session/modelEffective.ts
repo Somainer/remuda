@@ -78,54 +78,6 @@ const CATALOG_SOURCES: ReadonlySet<string> = new Set([
   "builtin",
 ]);
 
-/** Outcome of comparing an observed model against the requested pin. */
-export type ModelPinVerdict = "honoured" | "mismatch" | "unresolvable";
-
-/** Drop a trailing context-window variant suffix (`…[1m]`) for comparison. */
-function withoutContextSuffix(id: string): string {
-  const trimmed = id.trim();
-  const open = trimmed.lastIndexOf("[");
-  return open >= 0 && trimmed.endsWith("]") ? trimmed.slice(0, open).trimEnd() : trimmed;
-}
-
-function isNamespaced(id: string): boolean {
-  return id.includes("/");
-}
-
-/**
- * Compare an observed effective model against the requested pin.
- *
- * Mirrors `remuda_protocol::compare_model_pin` (model-pin-1 §3) — keep the two
- * in step. Two unequal ids are not necessarily a disagreement: a gateway
- * resolves a catalog id (`model_hub/es1_orange_o50[1m]`) to an upstream vendor
- * name (`claude-opus-5`), which is a correct launch, not a mismatch.
- *
- * - equal (or equal apart from a `[1m]` suffix) → `honoured`;
- * - both namespaced and different → `mismatch`;
- * - the pin is namespaced and the observation is an upstream name →
- *   `unresolvable` (report the id, never flag divergence);
- * - a catalog hit upgrades an un-namespaced observation to `mismatch`;
- * - two bare aliases that differ → `mismatch`.
- */
-export function compareModelPin(
-  requested: string,
-  observed: string,
-  catalog: readonly string[] = [],
-): ModelPinVerdict {
-  const pin = requested.trim();
-  const seen = observed.trim();
-  if (!pin || !seen) return "honoured";
-  if (seen === pin || withoutContextSuffix(seen) === withoutContextSuffix(pin)) {
-    return "honoured";
-  }
-  const inCatalog = (id: string): boolean =>
-    catalog.some((entry) => entry === id || withoutContextSuffix(entry) === withoutContextSuffix(id));
-  if (isNamespaced(pin) && isNamespaced(seen)) return "mismatch";
-  if (isNamespaced(pin)) return inCatalog(seen) ? "mismatch" : "unresolvable";
-  if (isNamespaced(seen)) return "unresolvable";
-  return "mismatch";
-}
-
 /** Normalize a `modelEffective` object off a Hub InstanceRecord. */
 export function modelFromRecord(value: unknown): ModelEffectiveView | null {
   if (!value || typeof value !== "object") return null;

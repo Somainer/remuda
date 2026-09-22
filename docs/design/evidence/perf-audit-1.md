@@ -83,7 +83,7 @@ HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c web/playwright.perf.config
 
 ### 2.0 测量条件（重要：这是「有负载的相对值」，不是干净基线）
 
-- 硬件/系统：共享 Linux devbox（64 核），`up 292 天`，16 users。
+- 硬件/系统：共享 Linux 构建主机（64 核）。
 - 测量时刻（2026-09-23 04:22 本地）机器**正被合入闸门占满**：
   `load average 52.55 / 57.38 / 54.58`，另有 **5 个并行 cargo
   build/test 闸门进程**（来自其他 worktree 的在跑任务）；本测量进程被
@@ -205,7 +205,7 @@ macOS（尤其 WebKit）列兑现。
 | C | 最长 Long Task ms（归因 file:line） | 2723 · `approvals.deriveRows` · `ApprovalsPage.tsx:48`（其中仅 46.5ms 为派生自耗时，余为卡片渲染提交，见 §2 归因语义） | _（待填）_ | _（待填）_ |
 | C | TBT ms | 9249 | _（待填）_ | _（待填）_ |
 
-¹ 该列在共享 devbox 负载 52.6（1min）/5 个并行闸门构建/本进程 nice 10
+¹ 该列在共享 Linux 构建主机负载 52.6（1min）/5 个并行闸门构建/本进程 nice 10
 下测得，绝对值偏高，见 §2.0；macOS 复测请在所有者常规使用状态（不要
 刻意空载，也不要刻意加压）记录同样的负载信息以便对照。
 
@@ -225,3 +225,38 @@ vendor-friendly 数字，作为 c-shell-decision 的 owner-machine 证据。
 - 不录火焰图截图/不录屏：埋点 JSON 已含归因与 file:line；如后续补截图，
   遵守 `REMUDA_EVIDENCE`，只截 Remuda 渲染，宽度 390 或 1440。
 - perf 场景不进闸门；`tests/perf/results/` 已 gitignore。
+
+## 6 合入闸门失败复核（2026-09-23）：既有负载抖动，非本任务引入
+
+闸门 hub e2e 阶段在高负载下报 `ux-question.hub.spec.ts:246` failed（重试一次
+仍失败）+ 同文件 `:233` flaky。复核结论：**与本任务改动无关**。
+
+- **失败签名不在被测逻辑**：`:246` 两次都死在 `createSession()`
+  （spec:98）——等待 20s 让 fake node 出现在新建会话的主机选择框
+  （`new-session-host` 含 `e2e-fake-node`），终端自答的测试体根本没开始。
+  闸门日志同窗口有 14 个 EPIPE 与多条 `node did not durably accept command`
+  告警（node 实际回了 `{"ok":true}`，是 Hub 转发持久化窗口在饱和下未满足）。
+- **flaky 签名是共享登录助手的冷挂载竞态**：`:233` 首次失败在
+  `tests/e2e/hub-auth.ts:30`——`/login` 5s 内没出现登录表单（页面以已认证
+  shell 挂载）。本任务在自己的 perf 驱动里已用 `ensureLogin()`（容忍该竞态
+  的两侧）绕开，但**没有改动闸门共享的 `hub-auth.ts`**（按复核要求不为过闸
+  改既有测试/助手）。
+- **改动隔离性（静态）**：`hub_e2e.rs` 的 269 行新增全部位于
+  `HUB_E2E_PERF=1` 条件之后（3 个哨兵分支 + 4 个新函数），无既有共享辅助
+  函数被修改；闸门 hub 配置不设置该变量（仓内全量 grep 仅 perf 配置/源码
+  引用）；`ux-question.hub.spec.ts` 与 base `fe392d6a` 逐字节相同；
+  `ApprovalsPage.tsx` 仅 `profileRegion` 纯包装。
+- **对照实验（同一锁槽 `/tmp/remuda-perf-question.lock`、同一端口
+  58884/58893、`PW_CHANNEL=chromium`、`HUB_E2E_PERF` 未设置）**：
+
+  | 版本 | 运行 | 1min 负载区间 | 结果（每文件 3 用例） |
+  |---|---|---|---|
+  | 本分支 `a6f6e7cb` | 3 次 | 12.97–18.94 | 9/9 passed（48.0/49.5/55.1s） |
+  | base `fe392d6a`（独立 target 冷编译） | 3 次 | 11.31–13.85 | 9/9 passed（48.2/49.4/94.0s） |
+
+  合计 18/18，两修订零失败、无差异。闸门当时整机负载约 52（5 个并行
+  cargo 闸门），对照实验负载为 11–19；失败只在饱和窗口出现，记为
+  **既有负载型抖动**（主机选择框 20s 超时 + 登录 5s 冷挂载超时均为
+  setup 阶段的固定超时，不随本任务变化）。后续若要治理，应放宽/重试
+  这两个 setup 等待，属独立任务，不在 c-perfaudit 范围。
+

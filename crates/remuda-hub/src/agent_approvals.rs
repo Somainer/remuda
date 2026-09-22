@@ -235,7 +235,7 @@ impl AgentApprovals {
         &self,
         id: &InteractionId,
         answer: InteractionAnswer,
-        by_device: Id,
+        caller: &crate::store::Device,
         command: CommandId,
     ) -> Result<Option<Value>, HubError> {
         {
@@ -243,6 +243,19 @@ impl AgentApprovals {
             let Some(grant) = grants.get(id) else {
                 return Ok(None);
             };
+            // D-051 (2)/(a): the Hub's in-memory one-shot human approvals never
+            // route. An Agent-origin device other than the grant's own caller
+            // cannot answer it (confused-deputy closure independent of
+            // `owns()`); the interactions handler refuses approval-kind
+            // answers from agents in `authorize_agent_answer`
+            // (`crates/remuda-hub/src/interactions.rs:196`), and this is the
+            // matching gate at the in-memory broker boundary. `list` is
+            // already caller-scoped (`agent_approvals.rs:217-232`).
+            if crate::agent_scope::origin(caller) == remuda_protocol::InputOrigin::Agent
+                && grant.caller.device_id != caller.id
+            {
+                return Err(HubError::Forbidden);
+            }
             if grant.expires <= Instant::now() {
                 return Err(HubError::Expired);
             }
@@ -254,6 +267,8 @@ impl AgentApprovals {
                 ));
             }
         }
+        let by_device =
+            Id::try_from(caller.id.clone()).map_err(|err| HubError::Internal(err.to_string()))?;
         self.broker
             .answer(id.clone(), answer, by_device, command)
             .await
@@ -286,6 +301,15 @@ mod tests {
             name: "instance".into(),
             kind: "agent".into(),
             instance_id: Some(caller.instance_id.as_id().as_str().into()),
+        }
+    }
+
+    fn human_device() -> crate::store::Device {
+        crate::store::Device {
+            id: Id::new("dev").unwrap().to_string(),
+            name: "human".into(),
+            kind: "human".into(),
+            instance_id: None,
         }
     }
 
@@ -327,7 +351,7 @@ mod tests {
                 "inputDigest":pending[0]["request"]["inputDigest"]}))
             .unwrap();
             approvals
-                .answer(&id, answer, Id::new("dev").unwrap(), CommandId::new())
+                .answer(&id, answer, &human_device(), CommandId::new())
                 .await
                 .unwrap();
             let mut headers = HeaderMap::new();
@@ -385,17 +409,12 @@ mod tests {
         }))
         .unwrap();
         approvals
-            .answer(
-                &id,
-                answer.clone(),
-                Id::new("dev").unwrap(),
-                CommandId::new(),
-            )
+            .answer(&id, answer.clone(), &human_device(), CommandId::new())
             .await
             .unwrap();
         assert!(matches!(
             approvals
-                .answer(&id, answer, Id::new("dev").unwrap(), CommandId::new())
+                .answer(&id, answer, &human_device(), CommandId::new())
                 .await,
             Err(HubError::Superseded { .. })
         ));
@@ -425,5 +444,55 @@ mod tests {
         assert!(approvals.require(&headers, &caller, request).await.is_err());
         assert!(approvals.list(&device(&caller)).await.is_empty());
         assert!(approvals.grants.lock().await.is_empty());
+    }
+
+    /// D-051 (2)/(a): an Agent-origin device that is not the grant's own
+    /// caller can never answer the one-shot human approval, regardless of
+    /// whether it holds the id + inputDigest. The grant stays pending for the
+    /// real human answer.
+    #[tokio::test]
+    async fn agent_approvals_answer_refuses_agent_origin_from_non_grant_caller() {
+        let approvals = AgentApprovals::new().unwrap();
+        let caller = ApprovalCaller {
+            device_id: Id::new("dev").unwrap().to_string(),
+            instance_id: InstanceId::new(),
+            host_id: HostId::new(),
+        };
+        let Err(HubError::ApprovalRequired { interaction_id }) = approvals
+            .require(
+                &HeaderMap::new(),
+                &caller,
+                json!({"operation":"instance.send", "target":"sibling"}),
+            )
+            .await
+        else {
+            panic!("unapproved action must open an Interaction");
+        };
+        let id: InteractionId = interaction_id.parse().unwrap();
+        let pending = approvals.list(&device(&caller)).await;
+        let answer: InteractionAnswer = serde_json::from_value(json!({
+            "kind":"approval", "optionId":"allow-once",
+            "inputDigest":pending[0]["request"]["inputDigest"]
+        }))
+        .unwrap();
+        // A different Agent device (same instance, separate credential) is
+        // refused at the broker boundary.
+        let mut other = device(&caller);
+        other.id = Id::new("dev").unwrap().to_string();
+        assert!(matches!(
+            approvals
+                .answer(&id, answer.clone(), &other, CommandId::new())
+                .await,
+            Err(HubError::Forbidden)
+        ));
+        // The grant survives the refused answer.
+        assert_eq!(approvals.list(&device(&caller)).await.len(), 1);
+        // The grant's own caller device passes THIS gate; the interactions
+        // handler still refuses approval-kind answers from Agent origin.
+        approvals
+            .answer(&id, answer, &device(&caller), CommandId::new())
+            .await
+            .unwrap();
+        assert!(approvals.list(&device(&caller)).await.is_empty());
     }
 }

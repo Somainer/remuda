@@ -307,9 +307,10 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 │  │   · agent haiku   running   [打开]                         │  │
 │  │   · agent gpt-6   idle                                     │  │
 │  └────────────────────────────────────────────────────────────┘  │
-│  ┌ 审批  Bash  rm -rf /tmp/coord-media  ──────────────────────┐  │
-│  │  Allow once   Deny   Always in this cwd                    │  │
-│  │  多设备：第一台点的算数                                     │  │
+│  ┌ 审批 · bash · 截止 12:13 ──────────────────────────────────┐  │
+│  │  rm -rf /tmp/coord-media                       preview 原文 │  │
+│  │  [允许一次]  [拒绝]   Always allow (acceptEdits)           │  │
+│  │  按 harness 建议的范围持续允许 · 多设备：第一台点的算数      │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │  最终回答 Markdown…                                              │
 │  usage  in 12.1k / out 800  ·  $0.12                             │
@@ -348,7 +349,7 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 
 - `ended` 显示「回合结束」+ 小芯片 `data-testid=live-decided-by`（值 hook/file/screen/transcript；`file` 来自锁存相位的 `tier=file` 标签，grok 文件层结束的回合显示 `file` 而非 `hook`）；elapsed 始终锚在**回合开始**（submit/spinner 再锚，跨回合从事件列表重取，不依赖会被 turn-ended/clear 覆盖的锁存 `since`），结束时冻结在该回合时长 `endedAt − start`（即终端显示的时长），而不是塌成 0:00 或在稍后打开页面时变成「结束以来」；移除 Esc 打断按钮。迟到的 hook `Stop` 改判 `decidedBy`，但 composer 的 `ended→idle` 边沿幂等，不二次 flush、不移动时长。
 - composer 相位由该 reducer 与 `projectStatus` 合并：`ended→idle` 是工作→空闲边沿，已有 effect 恰好调用一次 `flushHeld`；`unknown` 退回 instance 投影，不塌成 idle/blocked。
-- amber 静默注记可附 Node 侧实际跑过的检查名（`relay-missing` / `socket-refused` / `link-stalled`，来自 instance 上的 `hook.silence` 诊断）。屏幕轮询层只真正探测 relay 与 socket：一个正常结束的会话本来就不再发 hook，relay/socket 都健康时**不报** `link-stalled`（该判定只属于持有 journal flush 游标的 transport 层），新鲜 tier（Stop 刚到）也不写记录；没有检查结果时徽标保持原样，绝不猜原因。
+- amber 静默注记可附 Node 侧实际跑过的检查名（`relay-missing` / `socket-refused` / `link-stalled`，来自 instance 上的 `hook.silence` 诊断）。屏幕轮询层只真正探测 relay 与 socket：一个正常结束的会话本来就不再发 hook，relay/socket 都健康时**不报** `link-stalled`（该判定只属于持有 journal flush 游标的 transport 层），新鲜 tier（Stop 刚到）也不写记录；没有检查结果时徽标保持原样，绝不猜原因。注记色走新 token `--warn`（暖色静默注记）与 `--info`（冷色注记）：两主题在 `tokens.css` 各给一值，作文本/描边对 `--ink-2` 均 ≥ 4.5:1；**不得**再引用全库未定义的 `--amber` 或给 `var(--info, …)` 写字面 fallback（D-052；现状违例点 `session.module.css:1003,1016` 由 token 批次收敛）。
 - `Notification` hook（含 Claude Code 的 `idle_prompt`「等待你输入」）是结束后的咨询，不是阻断请求：不抬相位、不算 waiting；在站内以 toast + 会话页小通知列表呈现（文案、时间、可忽略；`permission_prompt` 类链接到待处理对话卡），既有 push 路径不变。注意 grok 没有单独的阻断权限 hook——它唯一的权限提示就是 `Notification(permission_prompt)`；移除其 waiting 语义后，grok 的 blocked 状态**只**由 screen 层（OSC/屏幕 blocked 锁存与 pending 对话框识别）给出。
 
 **Transcript 节点（journal fold，稳定 `nodeId`）**
@@ -443,9 +444,12 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
   （`server/tool`，`tool_name` 形如 `mcp__codex-computer-use__<verb>`）。
 
 
-**审批卡（内联）**
+**审批卡（内联）**（出处口径见 D-052）
 
-钉在 composer 上，同时出现在审批中心。字段：`interactionId`, `type=approval`, `title`, `preview`（命令或补丁摘要）, `risk`, `actions[]`（allow / deny / allow_once）。提交后按钮 disabled，直到 journal `interaction.answered` 或 `expired`。文案：「多台设备同时点，只记第一次。」
+钉在 composer 上，同时出现在审批中心（两路由同一张卡，见 §2.5 单壳）。字段：`interactionId`, `type=approval`, `title`, `preview`（命令或补丁**原文**，等宽 `<pre>` 呈现，不二次改写；超长以 `title` 给全文，摘要截断由 Node 侧完成）, `carrier`（harness 产出的工具/规则载体）, `expiresAt`（deadline；缺失画 `—`，**不**画「无限期」或 0）, `actions[]`（`id`/`label`/`effect`/`nativeValueRef`）。提交后按钮 disabled，直到 journal `interaction.answered` 或 `expired`。文案：「多台设备同时点，只记第一次。」
+
+- **不显 confidence / risk 分**：协议 `ApprovalRequest` 没有 `risk` 字段（`web/src/types/generated.ts:98-106`），harness 不产校准风险分；编一个分值或「高/中/低风险」标签就是 §3.3 禁止的伪造出处。页面 UI 内不出现「置信度」「风险」字样（反向断言）。
+- **不在 UI 里断言会话边界**：`DecisionOption` 只有 `id`/`label`/`effect`/`nativeValueRef`（`web/src/types/interaction.ts:4-8`），没有 `destination`；而 harness 的 `permission_suggestions` 实测同时包含 `destination: "session"` 与 `destination: "localSettings"`（后者写持久本地设置、跨会话存活），前端无法区分这两者——写「本会话内一直允许」就是伪造出处。按钮**保留并加粗** harness 已产出的原 `opt.label`（如 `Always allow (acceptEdits)` / `Always allow this rule`，`crates/remuda-signal/src/decision.rs:69-74`；`AllowSession` 选项对 `request.suggestions` 逐条生成，`crates/remuda-signal/src/approval.rs:83-90`，一字不改），按钮下方以统一次要文字复述含义：「**按 harness 建议的范围持续允许**」——不加「本会话」「本次会话」「永久」修饰（反向断言）。若要给出真实范围词，需把 `destination` 提到 `DecisionOption`，那是新 wire 字段，与本批零迁移预算冲突。`allow-session` 的 quiet 按钮样式 class 保留，但标签**不得**写「静默通过」。
 
 **AskUserQuestion 表单**
 
@@ -631,11 +635,20 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 | superseded | 别的设备先答；本设备按钮变「已在 Mac 处理」 |
 | paused | Node Agent 断线；禁止点，文案「主机离线，交互暂停」 |
 
-**字段** `interactionId, instanceId, hostId, type, title, preview, createdAt, expiresAt, answeredByDeviceId?`
+**字段** `interactionId, instanceId, hostId, type, title, preview, carrier?, createdAt, expiresAt, answeredByDeviceId?`
+
+`preview` 是命令/补丁**原文**（等宽呈现，不二次改写）；`expiresAt` 缺失画 `—`。审批卡不显 risk、不断言会话边界，完整口径见 §2.2「审批卡（内联）」与 D-052。
 
 多设备：Hub 只接受第一次有效 `commandId`。所有打开此页的客户端靠 journal 更新，不要本地抢锁。Push：`tag=interaction:{id}`，点通知进 `?focus=`。
 
 AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话页表单。Allow/Deny 可在列表一键完成。
+
+**单壳：`/approvals` 与 `/m/inbox` 是同一份壳（InboxShell，D-052）**
+
+- 两个路由渲染同一个 InboxShell（`mode="desktop" | "compact"`；mode 只由父路由 pageshell 决定，**不消费 viewport hook**）+ 同一张 `ApprovalCard`（字段口径见 §2.2，此处不重复）+ 同一个 kind 分段原语（`role=radiogroup` + roving tabindex，每项命中区 ≥ 44px，§3.4）。`?focus=` 高亮滚动、`?kind=` 过滤、`ApprovalCard` DOM 结构在两侧一致；既有 `approval-row` 等 testid 不改名。
+- **两侧档位各自保留，不强制一致**：桌面保留三档（待你处理 / 进行中·最近 / **已离队**——即上面线框的「过期」行与 superseded / paused 行）+ 主机 / Workspace 过滤芯片（query `host` / `workspace`）；compact 保留两档（待你处理 / 进行中·最近，**没有**已离队第三档，`web/src/features/mobile/inboxRows.ts:24-25` 的既有决定）。档位组成由 `mode` prop 决定，**不是**静默删掉任一方行为。D-049「投影只有一份」约束壳与卡控，不强制两面的信息架构相同（两面线框本来就不同，§4.7）。
+- 单壳同时消除今天的两份 a11y 债：桌面旧 kind 分段没有 radiogroup role、compact 旧列表声明了不存在的 `tabpanel`——收敛后全应用只剩一份正确的 radiogroup。
+- compact 重定向口径不变（§1.2 重定向表、§4.7：`/approvals` → `/m/inbox`，query 原样保留）。
 
 ---
 
@@ -752,6 +765,8 @@ AskUserQuestion 不在列表里填完（题太长）；「去回答」进会话�
 
 消费 Hub Task 台账（`GET /v1/board?project=` 与 task 列表），把任务而不是会话作为左栏/看板的卡片单位。机械规则（状态→列投影、lease、refcount、迁移预算）见 [task-model.md](./task-model.md)；本节只定界面。
 
+**实现状态（D-052，2026-09-23 在当前 main 复核）**：`/board` 路由与桌面三列只读投影**已经上线**——`web/src/app/router.tsx` 挂 `<Route path="/board">`，`BoardPage`（`web/src/features/tasks/Board.tsx`）经 `boardModel.ts` 消费 `boardColumns.ts` 的 `boardColumn()` / `WORK_COLUMNS` / `columnMoveHops()`；failed ⚠ 角标（形状 + 文案 + `blockedReason`）、已归档过滤器（非第五列）、footer「与 N 个 task 共用」refcount 与「独占目录」、`default` 配置芯片、拖卡多跳合法性预禁用、只读预览（「预览模式」+「在工作台打开」跳共享 `/s/:id`）均已在面。ui-upgrade 批次因此**不新建页面、不改路由**，只允许在既有文件之上补齐仍缺信号：`reachableColumns()` / `isUnlockedByLandedSha()` / `lockedDepIds()` 三个导出目前在 `web/src` 内（测试外）仍零消费，对应「可达列预计算提示」与依赖锁定角标。**已完成列不暴露 land**（land 只走 gate，I1）是不变规格，任何补齐工作都不得在已完成列加 land 入口；右栏三 tab 与批注锚点不在 ui-upgrade 批次范围。
+
 **桌面线框（看板）**
 
 ```
@@ -837,7 +852,11 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 | `structured` | 正常卡 |
 | `partial` | 虚线边 + 「不完整」；Bash 无 exit 不标成功；diff 无 result 用「结果未知」 |
 | `screen-derived` | 标签「来自屏幕」；只出现在 thought/status 启发式；**不能**生成审批 ID 或 Workflow member |
-| 无法识别 | `opaque` 一行，点开 raw JSON；不参与 Compact 折算成功 |
+| 无法识别 | `opaque` 一行，**行首带 `seq N · <source>`**（等宽，置于 kind 前），点开 raw JSON；不参与 Compact 折算成功 |
+
+**折叠不得吞掉 completeness（D-052）。** partial 卡被 compact 折叠行（§2.2 `FoldedToolRow`）收起后，虚线边 +「不完整」标记必须**原样活在折叠行上**——一张 partial 卡折起来后 operator 仍要能判断结果不完整；折叠态与展开态的 partial 标记同时存在或同时不存在。completeness 仍只有上表三值，**不新增第四种**。D-041 的硬顺序（折叠分支在 family 判定之后；Workflow / error / interaction 豁免）原样保留，由实现批次的回归断言钉死（settled Workflow 卡 compact 下 `data-folded="0"`；running Workflow 卡头 elapsed 每秒递增）。**本批不把 completeness 推到 interaction transcript 节点或审批卡**：那条数据通路不存在（interaction 节点不经 transcript 节点分发；审批卡的数据源是 hub 的 interactions 列表而非 transcript 节点，`Interaction` 类型上既无 completeness 也无回指 observation 的 eventId），要接通需先做 store / assemble 连接键调研，且可能要求新 wire 字段——按批次计划 D11 的默认结论，本批不做，只做 `FoldedToolRow` 这完全可落地的一半。
+
+**无法识别的事件也要可溯源（D-052）。** opaque 节点携带 envelope 上**既有**的 `seq` 与 `source`（零新 wire；现状 `assemble.ts` 构造 opaque 节点时把两者丢掉，由实现批次补上），折叠行 summary 显 `seq N · <source>` 前缀，raw JSON 仍折叠在 details 内。opaque 依旧不参与 Compact 折算成功、依旧禁止当终态。
 
 禁止：把 PTY 里看到的 “✓” 写成 tool ok；把 `logs` ANSI 录像当 transcript（`claude logs` 是 PTY 转储，`claude-control-plane.md` §1.4）。
 
@@ -860,7 +879,14 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 - 12px 下限的出处是 `tokens.css` type scale 的块头注释「Important status never relies on sub-12 px text」，不是 `--text-label` 自己的注释。
 - 用 token 而不是字面量：`.meta` 这类元素此前完全没有引用任何 token（`session.module.css` 里的字号与命中尺寸全是硬编码），这正是这些数字跑偏的原因。改的时候引 token，不要照抄一个 12px 字面量。
 - 这条只管**辅助文本**。正文 14px、输入/强调 16px 不变；`--text-label`（11px）作为标签仍可用于**非状态**的短标签，但状态、诊断、时间戳这类要读的内容走 `--text-aux`。
+- 次级标题/强调面的 18px 走新 token **`--text-xl`**（18px），13px 走新 token **`--text-13`**（13px）：两者与 `--warn` / `--info` 同批在 `tokens.css` 双主题各定义一次（D-052）。新代码不得再写字面 `18px` / `13px` 字号；存量字面量按面分批并入，不做全库一次性转换。
 - compact 判定（布局）与触屏判定（`coarsePointer`）**不要混用**：字号与折叠按「布局是否 compact」决定即可；键盘/直连相关行为一律按 `coarsePointer` 决定——窄桌面窗口会命中 compact 查询但没有触屏，按它砍键盘能力会让人丢鼠标键盘（`web/src/lib/viewport.ts` 注释已警告）。验收要同时覆盖「390 无触控」与「390 有触控」。
+
+**「辅助文本」vs「图形标注」判定口径（D-052，供 CSS 护栏白名单分类）。** sub-12px 下限约束的是「要读的内容」，逐站点按它在界面里的角色二分：
+
+- **辅助文本（受下限约束，不得豁免）**：行与卡片团体里线性排版的文字——状态/诊断句、时间戳、计数（如「N 项运行信息」）、meta 行、tooltip 正文、按钮副文案、列标题与分组头。这些桌面手机同值且 ≥ `var(--text-aux)`。
+- **图形标注（可豁免，逐站点登记）**：与形状绑定、作为图形一部分被读的字符——环内数字、状态点/角标内嵌序号、图标里的字形。豁免不改变其含义必须另有形状编码（不靠颜色/小字传达状态，§6 与 D-039）。
+- 拿不准的一律按辅助文本处理；白名单是**带摘除批次的台账**，不是永久地毯（实现批次的 stylelint opt-in 口径）。
 
 ---
 
@@ -927,8 +953,8 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 | `/m` 子树内容 | 说明 |
 |---|---|
 | `/m` 会话 home | 分组会话首页（项目 + git branch 组头、一句下一步、context 剩余环，行口径同 §2.1 / D-038）；D-050 起在项目/branch 分组上**叠加 task 分组层**（「需要你」首组、父子任务嵌套、`SE-nn` 派生 key、已归档折叠，§2.9） |
-| 看板的 compact 形态 | 不复制桌面三列：单列滚动 + 待办/进行中/已完成/已归档分段过滤（`GET /v1/board` 同一投影，一次一段；D-050）；桌面 `/board` 在 compact 不重定向到一个新页面，分段过滤就是 `/m` 子树内的看板形态 |
-| `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近），沿用 `ApprovalsPage` 的 kind 分段（§2.5） |
+| 看板的 compact 形态 | 不复制桌面三列：单列滚动 + 待办/进行中/已完成/已归档分段过滤（`GET /v1/board` 同一投影，一次一段；D-050）；桌面 `/board` 在 compact 不重定向到一个新页面，分段过滤就是 `/m` 子树内的看板形态。**实现状态（D-052，批次计划 D8）**：`/m` home 的 task 分组层已上线（`HomeList.tsx` 的 `buildHomeTaskLayer`），但单列**分段过滤尚不存在**（`features/mobile/` 无「待办/进行中/已完成」分段）；compact 访问 `/board` 仍由既有重定向落 `/m`（`mobileRoute.ts`）。ui-upgrade 批次**不实现**分段过滤（目标形态以本行为准，实现排后续批次），不得在证据里声称它已由 /m home 承载 |
+| `/m/inbox` 收件箱 | 两档（待你处理 / 进行中·最近，无第三档），与桌面 `/approvals` 渲染同一 InboxShell、同一张 ApprovalCard 与同一 kind 分段（§2.5，D-052） |
 | Jump To sheet | 从 home 顶栏与终端键盘条打开的覆盖层，不独占路由；分组 + 时钟/列表，**不做第二套空间模型**（报告 §10-23 / §11.2） |
 | phone 底栏 | 会话 · 收件箱(n) · 新建 · 更多，只挂在 `/m*` 外壳上（compact 底栏文案以本条为准，§1.1 的「审批」在手机上即「收件箱」） |
 

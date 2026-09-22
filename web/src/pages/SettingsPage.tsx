@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
+  applyTheme,
   iosStandaloneHint,
   readDeviceSettings,
+  readTheme,
   writeDeviceSettings,
+  writeTheme,
   type DeviceSettings,
   type PermissionDefault,
+  type ThemeChoice,
 } from "../features/settings";
 import { effortTable, isEmberTier } from "../features/session/effort";
 import { defaultPermissionTable } from "../features/session/permissions";
@@ -44,38 +48,6 @@ type GroupId = (typeof GROUPS)[number]["id"];
 
 function isGroupId(value: string | null | undefined): value is GroupId {
   return value === "appearance" || value === "notifications" || value === "connection" || value === "host-defaults";
-}
-
-/* ------------------------------------------------------------------ */
-/* Theme. tokens.css already carries the night + ledger palettes; the  */
-/* switch only chooses one, in this browser.                          */
-/* ------------------------------------------------------------------ */
-
-const THEME_KEY = "runtime.theme.v1";
-
-type ThemeChoice = "night" | "ledger";
-
-function readTheme(): ThemeChoice {
-  try {
-    return localStorage.getItem(THEME_KEY) === "ledger" ? "ledger" : "night";
-  } catch {
-    return "night";
-  }
-}
-
-function writeTheme(theme: ThemeChoice): void {
-  try {
-    localStorage.setItem(THEME_KEY, theme);
-  } catch {
-    /* storage denied — throw so the save flow reports failure instead of
-       claiming the choice persisted. */
-    throw new Error("本地存储不可用");
-  }
-  document.documentElement.dataset.theme = theme;
-}
-
-function applyTheme(theme: ThemeChoice): void {
-  document.documentElement.dataset.theme = theme;
 }
 
 /* ------------------------------------------------------------------ */
@@ -491,6 +463,9 @@ export function SettingsPage() {
   const [voiceSupported] = useState(() => speechRecognitionSupported());
   const [voiceEnabled, setVoiceEnabled] = useState(() => readVoiceInputEnabled());
 
+  // Idempotent re-apply: main.tsx already applied the stored theme before
+  // React mounted, so by the time this page mounts the DOM already matches;
+  // this only repairs the attribute if something rewrote it meanwhile.
   useEffect(() => {
     applyTheme(readTheme());
   }, []);

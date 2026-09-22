@@ -4,7 +4,6 @@ export type DeviceSettings = {
   deviceName: string;
   autoRevealTty: boolean;
   permissionDefault: PermissionDefault;
-  theme: "night-corral";
   /** Index into the claude native table; remapped by nearest index when the harness changes. */
   defaultEffortIndex: number;
 };
@@ -23,7 +22,6 @@ export const DEFAULT_SETTINGS: DeviceSettings = {
   deviceName: "this-device",
   autoRevealTty: false,
   permissionDefault: "manual",
-  theme: "night-corral",
   defaultEffortIndex: 2,
 };
 
@@ -44,7 +42,6 @@ export function readDeviceSettings(): DeviceSettings {
       deviceName: parsed.deviceName?.trim() || DEFAULT_SETTINGS.deviceName,
       autoRevealTty: parsed.autoRevealTty === true,
       permissionDefault,
-      theme: "night-corral",
       defaultEffortIndex: Number.isFinite(effortRaw) ? Math.max(0, Math.min(4, Math.round(effortRaw))) : 2,
     };
   } catch {
@@ -53,7 +50,7 @@ export function readDeviceSettings(): DeviceSettings {
 }
 
 export function writeDeviceSettings(patch: Partial<DeviceSettings>): DeviceSettings {
-  const next: DeviceSettings = { ...readDeviceSettings(), ...patch, theme: "night-corral" };
+  const next: DeviceSettings = { ...readDeviceSettings(), ...patch };
   try {
     localStorage.setItem(KEY, JSON.stringify(next));
   } catch {

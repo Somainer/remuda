@@ -1688,7 +1688,7 @@ Node 今天对 Hub 的信任是**单向**的：所有指令都以「Hub envelope
   （文件名常量 `crates/remuda-node/src/enroll.rs:11`；现结构只有 `hostId` 与
   `nodeToken`，`enroll.rs:38-47`）增加一个**可选**字段：
 
-  ~~~json
+  ~~~text
   "hubPin": {
     "alg": "ed25519",
     "keyId": "<短指纹>",
@@ -1736,7 +1736,7 @@ Node 今天对 Hub 的信任是**单向**的：所有指令都以「Hub envelope
 
 **信封（实现批 additive 字段；本批不落 wire、不发这个字段）**：
 
-~~~json
+~~~text
 "sig": {
   "alg": "ed25519",
   "keyId": "<签名公钥的短指纹>",
@@ -1813,6 +1813,11 @@ Node 今天对 Hub 的信任是**单向**的：所有指令都以「Hub envelope
 - 不做公网前门 / 公网可达性（owner 已裁定另批）；本节只补前置。
 - 不签 Node→Hub 方向：该方向已有 Bearer token / mTLS 身份（§7.1）；双向签名是将来的
   独立议题。
+
+> 编辑约定：本文件的 `~~~json` / ```` ```json ```` 围栏是
+> `crates/remuda-protocol/tests/wire_golden.rs` 的输入——每块必须是**完整、且对应类型
+> 已存在**的协议帧，片段或未来字段示意（如本节的 `hubPin`、`sig`）必须使用
+> `~~~text` 等其他语言标注，否则 golden 测试按逐行解析并失败。
 
 
 ## 8. 主 agent 的 MCP / CLI 控制面

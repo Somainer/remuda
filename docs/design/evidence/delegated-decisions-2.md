@@ -105,7 +105,7 @@ driver 库内新增 3 条（`interaction::tests`）：Agent caller 的 actor 落
 Agent 且 instance_id 是**应答父**而非票主子；Human/Bot caller 保持票主
 锚点（含 device_id 逐字）；legacy `answer()` 包装仍是 Human/票主形状。
 
-### 3.3 test log 摘要（devbox，`--locked`）
+### 3.3 test log 摘要（Linux 构建主机，`--locked`）
 
 ```
 remuda-hub 单测 lib: 181 passed; 0 failed（c-deleg1 时 172，+9）

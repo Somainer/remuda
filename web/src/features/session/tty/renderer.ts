@@ -1,4 +1,5 @@
 import type { Terminal } from "@xterm/xterm";
+import { probeWebglContextLoss } from "./rendererProbe";
 
 export type TerminalRenderer = "webgl" | "canvas" | "dom";
 
@@ -8,6 +9,8 @@ export async function attachTerminalRenderer(term: Terminal): Promise<TerminalRe
     const { WebglAddon } = await import("@xterm/addon-webgl");
     const addon = new WebglAddon();
     addon.onContextLoss(() => {
+      // c-perfaudit: make the WebGL→DOM degradation visible in a profile run.
+      probeWebglContextLoss();
       addon.dispose();
     });
     term.loadAddon(addon);

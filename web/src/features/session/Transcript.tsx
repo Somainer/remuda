@@ -25,6 +25,7 @@ import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSea
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
+import { profileRegion } from "../../lib/profileFlags";
 
 /**
  * c-steer 插队发送 from a transcript held row. The page supplies it so the
@@ -248,7 +249,12 @@ function TranscriptInner({
     [instanceId],
   );
   const assembled = useMemo(
-    () => compactTranscript(assembleTranscript(events, bubbles), compact, dismissedWorkflows),
+    () =>
+      // c-perfaudit: when ?profile=1, attributes the long task covering this
+      // rebuild to the transcript assembly region. Zero-opts otherwise.
+      profileRegion("transcript.assemble", () =>
+        compactTranscript(assembleTranscript(events, bubbles), compact, dismissedWorkflows),
+      ),
     [events, bubbles, compact, dismissedWorkflows],
   );
   // Injected records are dropped from the list rather than hidden with CSS so
@@ -358,7 +364,12 @@ function TranscriptInner({
   const settle = journalStatus !== "gap-backfill";
   const defaultFolded = collapseTick > 0;
   const range = useMemo(
-    () => visibleRange(nodes.length, sizes, scrollTop, viewport, OVERSCAN, estimate),
+    () =>
+      // c-perfaudit: covers the per-scrollTop rowOffsets/visibleRange
+      // allocations (virtualWindow.ts) under ?profile=1.
+      profileRegion("transcript.visibleRange", () =>
+        visibleRange(nodes.length, sizes, scrollTop, viewport, OVERSCAN, estimate),
+      ),
     [nodes.length, sizes, scrollTop, viewport, estimate],
   );
 

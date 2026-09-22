@@ -1,0 +1,4 @@
+# c-perfaudit: local measurement output only; numbers are hand-copied into
+# docs/design/evidence/perf-audit-1.md, never committed from here.
+*
+!.gitignore

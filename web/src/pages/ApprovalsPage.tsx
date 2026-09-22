@@ -15,6 +15,7 @@ import {
 } from "../lib/interactionStatus";
 import css from "./ApprovalsPage.module.css";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
+import { profileRegion } from "../lib/profileFlags";
 
 const KIND_FILTERS = ["all", "approval", "question", "plan-review", "elicitation"] as const;
 
@@ -44,25 +45,30 @@ export function ApprovalsPage() {
   const deviceId = thisDeviceId();
 
   const rows = useMemo(() => {
-    return hub.interactions
-      .map((item) => {
-        const instance = hub.instances.find((i) => i.id === item.instanceId);
-        const host = hub.hosts.find((h) => h.id === item.hostId);
-        const uiState = projectInteraction(item, {
-          answering: Boolean(hub.answering[item.id]),
-          host,
-          connectivity: instance?.connectivity,
-          deviceId,
-        });
-        return { item, instance, host, uiState };
-      })
-      .filter((row) => {
-        if (kind !== "all" && row.item.kind !== kind) return false;
-        if (hostFilter && row.item.hostId !== hostFilter) return false;
-        if (workspaceFilter && row.instance?.workspaceId !== workspaceFilter) return false;
-        if (row.uiState === "settled") return false;
-        return true;
-      });
+    // c-perfaudit: per-interaction instance/host joins + filters run on every
+    // store emission (the 2s interaction.list poll included). The region
+    // separates that derivation from the un-instrumented card render commit.
+    return profileRegion("approvals.deriveRows", () =>
+      hub.interactions
+        .map((item) => {
+          const instance = hub.instances.find((i) => i.id === item.instanceId);
+          const host = hub.hosts.find((h) => h.id === item.hostId);
+          const uiState = projectInteraction(item, {
+            answering: Boolean(hub.answering[item.id]),
+            host,
+            connectivity: instance?.connectivity,
+            deviceId,
+          });
+          return { item, instance, host, uiState };
+        })
+        .filter((row) => {
+          if (kind !== "all" && row.item.kind !== kind) return false;
+          if (hostFilter && row.item.hostId !== hostFilter) return false;
+          if (workspaceFilter && row.instance?.workspaceId !== workspaceFilter) return false;
+          if (row.uiState === "settled") return false;
+          return true;
+        }),
+    );
   }, [hub, kind, hostFilter, workspaceFilter, deviceId]);
 
   const queue = rows.filter((r) => r.uiState === "pending" || r.uiState === "answering" || r.uiState === "paused");

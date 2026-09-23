@@ -686,7 +686,11 @@ function TranscriptInner({
   return (
     <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
-      <div className={css.toolbar} data-tools-fold={toolsFolded ? "1" : "0"}>
+      <div
+        className={css.toolbar}
+        data-testid="transcript-toolbar"
+        data-tools-fold={toolsFolded ? "1" : "0"}
+      >
         {toolsFolded ? (
           <button
             type="button"
@@ -751,7 +755,12 @@ function TranscriptInner({
         )}
       </div>
       {searchOpen ? (
-        <div className={css.searchbar} role="search" aria-label="正文搜索">
+        <div
+          className={css.searchbar}
+          data-testid="transcript-searchbar"
+          role="search"
+          aria-label="正文搜索"
+        >
           <input
             ref={inputRef}
             className={css.searchInput}

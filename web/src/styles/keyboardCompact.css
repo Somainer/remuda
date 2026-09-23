@@ -14,11 +14,19 @@
  */
 
 html[data-keyboard="1"] [data-testid="install-bar"],
+html[data-keyboard="1"] [data-testid="update-bar"],
 html[data-keyboard="1"] [data-testid="resume-row"],
 html[data-keyboard="1"] [data-testid="run-details"],
 html[data-keyboard="1"] [data-testid="annotation-dock"],
 html[data-keyboard="1"] [data-testid="task-track"],
-html[data-keyboard="1"] [data-testid="session-notifications"] {
+html[data-keyboard="1"] [data-testid="session-notifications"],
+/* c-mfix round 3: the transcript toolbar (全部折叠 / 搜索正文), an open
+   transcript search and the gap banner sit ABOVE the message scroller and
+   were why the real scrollport kept only ~29% of the band. None is needed
+   while typing; search is reachable again the moment the keyboard closes. */
+html[data-keyboard="1"] [data-testid="transcript-toolbar"],
+html[data-keyboard="1"] [data-testid="transcript-searchbar"],
+html[data-keyboard="1"] [data-testid="journal-banner"] {
   display: none !important;
 }
 
@@ -34,17 +42,33 @@ html[data-keyboard="1"] [data-testid="live-status-strip"] {
   gap: 8px;
 }
 
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-verb"],
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-elapsed"],
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-token-count"],
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-tier"],
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-phrase"],
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-decided-by"],
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-interrupt"] {
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-verb"],
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-elapsed"],
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-token-count"],
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-tier"],
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-phrase"],
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-decided-by"],
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid="live-interrupt"] {
   display: none;
 }
 
-html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid^="live-health-"] {
+html[data-keyboard="1"]
+  [data-testid="live-status-strip"]
+  [data-testid^="live-health-"] {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

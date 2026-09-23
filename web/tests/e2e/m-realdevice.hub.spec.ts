@@ -55,14 +55,23 @@ async function shot(page: Page, name: string, clipToBand = false) {
       height: bandOnly ? window.visualViewport.height : window.innerHeight,
     };
   }, clipToBand);
-  await page.screenshot({ path: path.join(shotDir, name), animations: "disabled", clip });
+  await page.screenshot({
+    path: path.join(shotDir, name),
+    animations: "disabled",
+    clip,
+  });
 }
 
 async function fakeHostId(page: Page): Promise<string | null> {
+  // The fake Node ONLY: a registered real host without the fake harness must
+  // skip the hub-backed cases, not fall through to a host that cannot answer
+  // the sentinels.
   const response = await page.request.get("/v1/hosts");
   if (!response.ok()) return null;
-  const body = (await response.json()) as { items?: { id?: string; label?: string }[] };
-  const host = (body.items ?? []).find((row) => row.label === "e2e-fake-node") ?? body.items?.[0];
+  const body = (await response.json()) as {
+    items?: { id?: string; label?: string }[];
+  };
+  const host = (body.items ?? []).find((row) => row.label === "e2e-fake-node");
   return host?.id ?? null;
 }
 
@@ -70,17 +79,31 @@ async function createTerminal(page: Page): Promise<string> {
   const hostId = await fakeHostId(page);
   expect(hostId, "fake node host").toBeTruthy();
   const response = await page.request.post("/v1/instances", {
-    data: { hostId, workspaceId: "wsp_e2e", kind: "terminal", driver: "shell-pty", prompt: "m realdevice" },
+    data: {
+      hostId,
+      workspaceId: "wsp_e2e",
+      kind: "terminal",
+      driver: "shell-pty",
+      prompt: "m realdevice",
+    },
   });
-  expect(response.ok(), `create terminal: ${response.status()} ${await response.text()}`).toBe(true);
-  const body = (await response.json()) as { instance: { instanceId?: string; id?: string } };
+  expect(
+    response.ok(),
+    `create terminal: ${response.status()} ${await response.text()}`,
+  ).toBe(true);
+  const body = (await response.json()) as {
+    instance: { instanceId?: string; id?: string };
+  };
   const id = body.instance.instanceId ?? body.instance.id;
   expect(id).toBeTruthy();
   created.push(id!);
   return id!;
 }
 
-async function createClaudeSession(page: Page, prompt: string): Promise<string> {
+async function createClaudeSession(
+  page: Page,
+  prompt: string,
+): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -91,7 +114,9 @@ async function createClaudeSession(page: Page, prompt: string): Promise<string> 
   expect(hostId).toBeTruthy();
   await hostPicker.selectOption(hostId!);
   await page.getByTestId("new-session-kind-claude").click();
-  await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0, {
+  await expect(
+    page.getByTestId("new-session-workspace").locator("option"),
+  ).not.toHaveCount(0, {
     timeout: 20_000,
   });
   await page.getByTestId("new-session-prompt").fill(prompt);
@@ -107,7 +132,9 @@ async function clearApprovals(page: Page, instanceId: string) {
   // before the request is durable gets resurrected by its late journal event.
   await page.evaluate(async (id) => {
     const listPending = async () => {
-      const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
+      const body = await (
+        await fetch("/v1/interactions", { credentials: "include" })
+      ).json();
       return (body.items ?? []).filter(
         (item: { instanceId?: string; state?: string }) =>
           item.instanceId === id && item.state === "pending",
@@ -150,37 +177,37 @@ async function clearApprovals(page: Page, instanceId: string) {
  * some engines define the getters on the prototype, so walk up as fallback.
  */
 async function raiseKeyboard(page: Page, keyboardHeight = 308) {
-  await page.evaluate(
-    (keyboardHeight) => {
-      const vv = window.visualViewport;
-      // iOS scroll geometry: the visible band keeps the layout viewport's
-      // width, its bottom edge stays put, and it starts keyboardHeight lower.
-      const height = Math.max(240, window.innerHeight - keyboardHeight);
-      const offsetTop = window.innerHeight - height;
-      const override = (name: string, value: number) => {
-        const desc = { configurable: true, get: () => value } as PropertyDescriptor;
-        try {
-          Object.defineProperty(vv, name, desc);
-        } catch {
-          let proto: object | null = vv;
-          while (proto) {
-            try {
-              Object.defineProperty(proto, name, desc);
-              break;
-            } catch {
-              proto = Object.getPrototypeOf(proto);
-            }
+  await page.evaluate((keyboardHeight) => {
+    const vv = window.visualViewport;
+    // iOS scroll geometry: the visible band keeps the layout viewport's
+    // width, its bottom edge stays put, and it starts keyboardHeight lower.
+    const height = Math.max(240, window.innerHeight - keyboardHeight);
+    const offsetTop = window.innerHeight - height;
+    const override = (name: string, value: number) => {
+      const desc = {
+        configurable: true,
+        get: () => value,
+      } as PropertyDescriptor;
+      try {
+        Object.defineProperty(vv, name, desc);
+      } catch {
+        let proto: object | null = vv;
+        while (proto) {
+          try {
+            Object.defineProperty(proto, name, desc);
+            break;
+          } catch {
+            proto = Object.getPrototypeOf(proto);
           }
         }
-      };
-      override("height", height);
-      override("offsetTop", offsetTop);
-      vv.dispatchEvent(new Event("resize"));
-      vv.dispatchEvent(new Event("scroll"));
-      window.dispatchEvent(new Event("resize"));
-    },
-    keyboardHeight,
-  );
+      }
+    };
+    override("height", height);
+    override("offsetTop", offsetTop);
+    vv.dispatchEvent(new Event("resize"));
+    vv.dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("resize"));
+  }, keyboardHeight);
   await page.waitForTimeout(250);
 }
 
@@ -196,7 +223,10 @@ async function raiseKeyboardIosExact(page: Page, kb: number) {
     const vv = window.visualViewport;
     const h = window.innerHeight - KB;
     Object.defineProperty(vv, "height", { configurable: true, get: () => h });
-    Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => KB });
+    Object.defineProperty(vv, "offsetTop", {
+      configurable: true,
+      get: () => KB,
+    });
     window.scrollTo(0, KB);
     vv.dispatchEvent(new Event("resize"));
     vv.dispatchEvent(new Event("scroll"));
@@ -205,7 +235,8 @@ async function raiseKeyboardIosExact(page: Page, kb: number) {
   await page.waitForTimeout(300);
 }
 
-async function bandRect(page: Page, selector: string) {  return page.evaluate((sel) => {
+async function bandRect(page: Page, selector: string) {
+  return page.evaluate((sel) => {
     const el = document.querySelector(sel);
     if (!el) return null;
     const r = el.getBoundingClientRect();
@@ -246,7 +277,12 @@ async function waitForInBand(page: Page, selector: string, minHeight: number) {
   return last;
 }
 
-async function postCommand(page: Page, id: string, operation: string, payload: unknown) {
+async function postCommand(
+  page: Page,
+  id: string,
+  operation: string,
+  payload: unknown,
+) {
   const result = await page.evaluate(
     async ({ id, operation, payload }) => {
       const res = await fetch(`/v1/instances/${id}/commands`, {
@@ -265,11 +301,19 @@ async function postCommand(page: Page, id: string, operation: string, payload: u
 /** Skip when the fake Node never emits the observation the UI must render. */
 async function expectObservationOrSkip(page: Page, id: string, kind: string) {
   const journal = await page.evaluate(async (id) => {
-    const res = await fetch(`/v1/instances/${id}/journal`, { credentials: "include" });
-    return res.ok() ? await res.text() : "";
+    const res = await fetch(`/v1/instances/${id}/journal`, {
+      credentials: "include",
+    });
+    return res.ok ? await res.text() : "";
   }, id);
-  if (!journal.includes(`"kind":"${kind}"`) && !journal.includes(`"kind": "${kind}"`)) {
-    test.skip(true, `fake Node did not emit a ${kind} observation for the sentinel`);
+  if (
+    !journal.includes(`"kind":"${kind}"`) &&
+    !journal.includes(`"kind": "${kind}"`)
+  ) {
+    test.skip(
+      true,
+      `fake Node did not emit a ${kind} observation for the sentinel`,
+    );
   }
 }
 
@@ -289,10 +333,16 @@ test.beforeEach(async ({ page }) => {
     .poll(
       async () => {
         const url = new URL(page.url()).pathname;
-        if (/\/m(?:[/?]|$)/.test(url) && (await page.getByTestId("home-list").count()) > 0) {
+        if (
+          /\/m(?:[/?]|$)/.test(url) &&
+          (await page.getByTestId("home-list").count()) > 0
+        ) {
           return "m";
         }
-        if (url.startsWith("/sessions") && (await page.getByTestId("session-list").count()) > 0) {
+        if (
+          url.startsWith("/sessions") &&
+          (await page.getByTestId("session-list").count()) > 0
+        ) {
           return "sessions";
         }
         return null;
@@ -304,7 +354,9 @@ test.beforeEach(async ({ page }) => {
 
 test.afterEach(async ({ page }) => {
   for (const id of created.splice(0)) {
-    await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+    await page.request
+      .delete(`/v1/instances/${id}?force=1`)
+      .catch(() => undefined);
   }
 });
 
@@ -315,10 +367,15 @@ test("(a) soft keyboard leaves status bar, transcript and composer inside the vi
   const id = await createClaudeSession(page, "m realdevice keyboard");
   await clearApprovals(page, id);
   await page.goto(`/s/${id}/structured`);
-  await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
+  await expect(page.getByTestId("session-page")).toHaveAttribute(
+    "data-view",
+    "structured",
+  );
   // The fake Node appends an assistant journal line; the transcript must have
   // rendered content before the keyboard opens, otherwise "non-empty" is vacuous.
-  await expect(page.getByTestId("transcript")).not.toBeEmpty({ timeout: 20_000 });
+  await expect(page.getByTestId("transcript")).not.toBeEmpty({
+    timeout: 20_000,
+  });
 
   // click focuses (and on touch engines taps) the composer, which is what
   // raises the real keyboard on the owner's phone.
@@ -350,8 +407,12 @@ test("(a) soft keyboard leaves status bar, transcript and composer inside the vi
     expect(rect, `${label} mounted`).not.toBeNull();
     expect(rect!.height, `${label} height`).toBeGreaterThan(0);
     expect(rect!.width, `${label} width`).toBeGreaterThan(0);
-    expect(rect!.top, `${label} top within band`).toBeGreaterThanOrEqual(rect!.bandTop - 1);
-    expect(rect!.bottom, `${label} bottom above keyboard`).toBeLessThanOrEqual(rect!.bandBottom + 1);
+    expect(rect!.top, `${label} top within band`).toBeGreaterThanOrEqual(
+      rect!.bandTop - 1,
+    );
+    expect(rect!.bottom, `${label} bottom above keyboard`).toBeLessThanOrEqual(
+      rect!.bandBottom + 1,
+    );
     if (selector.includes("transcript")) {
       expect(rect!.text, `${label} non-empty`).toBeGreaterThan(0);
     }
@@ -363,7 +424,8 @@ test("(a) soft keyboard leaves status bar, transcript and composer inside the vi
     x: window.scrollX,
     y: window.scrollY,
     overflow: document.scrollingElement
-      ? document.scrollingElement.scrollHeight - document.scrollingElement.clientHeight
+      ? document.scrollingElement.scrollHeight -
+        document.scrollingElement.clientHeight
       : 0,
   }));
   expect(scroll.y).toBe(0);
@@ -381,7 +443,10 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   const id = await createTerminal(page);
   await page.goto(`/s/${id}/tty`);
   const lab = page.locator("[data-tty-lab]");
-  await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "tty");
+  await expect(page.getByTestId("session-page")).toHaveAttribute(
+    "data-view",
+    "tty",
+  );
   await expect(lab).toHaveAttribute("data-tty-ready", "1", { timeout: 30_000 });
 
   const before = await bandRect(page, '[aria-label="终端画面"]');
@@ -393,10 +458,14 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   expect(["webgl", "canvas", "dom"]).toContain(renderer);
   // Surface the effective engine in the run log: headless WebKit usually
   // reports webgl; the coordinator's device run records what iOS Safari picks.
-  console.log(`[m-realdevice] effective tty renderer on ${testInfo.project.name}: ${renderer}`);
+  console.log(
+    `[m-realdevice] effective tty renderer on ${testInfo.project.name}: ${renderer}`,
+  );
 
   // The grid fitted against the real container, not the default 80x24.
-  await expect.poll(async () => Number(await lab.getAttribute("data-tty-rows"))).toBeGreaterThan(3);
+  await expect
+    .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
+    .toBeGreaterThan(3);
   const cols = Number(await lab.getAttribute("data-tty-cols"));
   expect(cols).toBeGreaterThan(20);
 
@@ -415,7 +484,11 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   });
   expect(painted.ok, `terminal painted something (${painted.kind})`).toBe(true);
   testInfo.attach("webkit-terminal-renderer", {
-    body: JSON.stringify({ renderer, painted, cols, viewport: before }, null, 2),
+    body: JSON.stringify(
+      { renderer, painted, cols, viewport: before },
+      null,
+      2,
+    ),
     contentType: "application/json",
   });
   await shot(page, "m-realdevice-2-terminal-390.png");
@@ -425,8 +498,13 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   await raiseKeyboard(page);
   const after = await waitForInBand(page, '[aria-label="终端画面"]', 120);
   expect(after, "terminal viewport after keyboard").not.toBeNull();
-  expect(after!.height, `terminal height after keyboard: ${JSON.stringify(after)}`).toBeGreaterThan(100);
-  await expect.poll(async () => Number(await lab.getAttribute("data-tty-rows"))).toBeGreaterThan(3);
+  expect(
+    after!.height,
+    `terminal height after keyboard: ${JSON.stringify(after)}`,
+  ).toBeGreaterThan(100);
+  await expect
+    .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
+    .toBeGreaterThan(3);
   await shot(page, "m-realdevice-3-terminal-keyboard-390.png", true);
 });
 
@@ -437,34 +515,55 @@ test("(c) model/effort observations render as change records, never as 未识别
   const id = await createClaudeSession(page, "m realdevice observations");
   await clearApprovals(page, id);
   await page.goto(`/s/${id}/structured`);
-  await expect(page.getByTestId("session-page")).toHaveAttribute("data-view", "structured");
-  await expect(page.getByTestId("transcript")).not.toBeEmpty({ timeout: 20_000 });
+  await expect(page.getByTestId("session-page")).toHaveAttribute(
+    "data-view",
+    "structured",
+  );
+  await expect(page.getByTestId("transcript")).not.toBeEmpty({
+    timeout: 20_000,
+  });
 
   // effort: the same instance.configure path the effort slider uses; the fake
   // Node answers with the effective level as an `effort` observation.
-  await postCommand(page, id, "instance.configure", { effort: { name: "xhigh", index: 3 } });
-  const effortRow = page.getByTestId("observed-change-row").filter({ hasText: "档位" }).first();
+  await postCommand(page, id, "instance.configure", {
+    effort: { name: "xhigh", index: 3 },
+  });
+  const effortRow = page
+    .getByTestId("observed-change-row")
+    .filter({ hasText: "档位" })
+    .first();
   try {
     await expect(effortRow).toBeVisible({ timeout: 20_000 });
   } catch {
     await expectObservationOrSkip(page, id, "effort");
     // Journal carried it but the UI did not render the row: a real failure.
-    throw new Error("effort observation in journal but no change record rendered");
+    throw new Error(
+      "effort observation in journal but no change record rendered",
+    );
   }
   await expect(effortRow).toContainText("xhigh");
 
   // model: wait for the launch turn to settle to idle so the send is not
   // queued, then the /model: sentinel emits a `model` observation.
-  await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
-    timeout: 20_000,
-  });
+  await expect(page.getByTestId("session-page")).toHaveAttribute(
+    "data-status",
+    "idle",
+    {
+      timeout: 20_000,
+    },
+  );
   await postCommand(page, id, "instance.send", { prompt: "/model:e2e/fast" });
-  const modelRow = page.getByTestId("observed-change-row").filter({ hasText: "模型" }).last();
+  const modelRow = page
+    .getByTestId("observed-change-row")
+    .filter({ hasText: "模型" })
+    .last();
   try {
     await expect(modelRow).toBeVisible({ timeout: 20_000 });
   } catch {
     await expectObservationOrSkip(page, id, "model");
-    throw new Error("model observation in journal but no change record rendered");
+    throw new Error(
+      "model observation in journal but no change record rendered",
+    );
   }
   await expect(modelRow).toContainText("e2e/fast");
 
@@ -475,20 +574,241 @@ test("(c) model/effort observations render as change records, never as 未识别
 
   // Provenance honesty: the raw payload is still one disclosure away.
   await modelRow.locator("summary").click();
-  await expect(page.getByTestId("observed-change-json").last()).toContainText("e2e/fast");
+  await expect(page.getByTestId("observed-change-json").last()).toContainText(
+    "e2e/fast",
+  );
 });
 
-test.describe("(d) full chrome combo: keyboard up keeps the composer and a >=40% transcript", () => {
-  // The owner's real session, reproduced by the fake-Node `mfix-chrome-combo`
-  // sentinel: install banner still up, instance exited-but-resumable, run
-  // details present, a running AskUserQuestion tool with a stalled hook tier
-  // and the screen spinner keeping the strip live.
-  for (const [label, width, height, kb] of [
+test.describe("(d) keyboard band: composer fully visible and message scroller >= 40%", () => {
+  const DEVICES = [
     ["iPhone 15", 393, 659, 336],
     ["iPhone SE", 375, 667, 260],
-  ] as const) {
-    test(`${label} ${width}x${height} with a ${kb}px keyboard`, async ({ page }) => {
-      if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+  ] as const;
+
+  /**
+   * Trigger presence is decided from the fake Node's JOURNAL, not from a UI
+   * row the app might legitimately not render: the combo sentinel journals a
+   * hook-tier running tool with toolCallId `obj_mfix_ask`. Missing marker →
+   * skip (no fake Node / old fake Node). Once the marker is present, every
+   * chrome assertion below is a hard failure.
+   */
+  async function expectComboTriggerOrSkip(page: Page, id: string) {
+    const deadline = Date.now() + 15_000;
+    let journal = "";
+    while (Date.now() < deadline) {
+      journal = await page.evaluate(async (instanceId) => {
+        const res = await fetch(`/v1/instances/${instanceId}/journal`, {
+          credentials: "include",
+        });
+        return res.ok ? await res.text() : "";
+      }, id);
+      if (
+        journal.includes("obj_mfix_ask") &&
+        journal.includes('"state":"exited"')
+      )
+        return;
+      await page.waitForTimeout(300);
+    }
+    test.skip(
+      true,
+      "fake Node never emitted the mfix-chrome-combo journal trigger",
+    );
+  }
+
+  type Band = { top: number; bottom: number; height: number };
+
+  async function currentBand(
+    page: Page,
+    fullHeight: number,
+    kb: number,
+  ): Promise<Band> {
+    const band = await page.evaluate(() => ({
+      top: Math.round(window.visualViewport.offsetTop),
+      bottom: Math.round(
+        window.visualViewport.offsetTop + window.visualViewport.height,
+      ),
+      height: Math.round(window.visualViewport.height),
+    }));
+    expect(band.height).toBe(fullHeight - kb);
+    await expect(page.locator("html")).toHaveAttribute("data-keyboard", "1");
+    return band;
+  }
+
+  /** Non-essential chrome mounted before the keyboard must be display:none after. */
+  async function assertChromeCollapsed(
+    page: Page,
+    strip: ReturnType<Page["locator"]>,
+  ) {
+    for (const testid of [
+      "install-bar",
+      "update-bar",
+      "resume-row",
+      "run-details",
+      "annotation-dock",
+      "task-track",
+      "session-notifications",
+      "transcript-toolbar",
+    ]) {
+      const locator = page.getByTestId(testid);
+      if ((await locator.count()) > 0) await expect(locator).toBeHidden();
+    }
+    await expect(strip).toBeVisible();
+    const stripBox = await strip.boundingBox();
+    expect(stripBox).toBeTruthy();
+    expect(stripBox!.height).toBeLessThanOrEqual(34);
+  }
+
+  /**
+   * Acceptance (1): composer form, textarea and send control entirely in the
+   * visual band. One in-page pass — boundingBox() can transiently answer null
+   * mid React re-render even while the element is laid out.
+   */
+  async function assertComposerInBand(page: Page, band: Band) {
+    const boxes = await page.evaluate(() => {
+      const rect = (el: Element | null) => {
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return {
+          top: Math.round(r.top),
+          bottom: Math.round(r.bottom),
+          height: Math.round(r.height),
+        };
+      };
+      const form = document.querySelector("[data-testid='composer']");
+      const send = [...(form?.querySelectorAll("button") ?? [])].find((b) =>
+        (b.textContent ?? "").includes("发送"),
+      );
+      return {
+        composer: rect(form),
+        input: rect(document.querySelector("[data-testid='composer-input']")),
+        send: rect(send ?? null),
+      };
+    });
+    for (const [name, box] of Object.entries(boxes) as [
+      string,
+      typeof boxes.composer,
+    ][]) {
+      expect(box, `${name} mounted`).not.toBeNull();
+      expect(box!.top, `${name} top`).toBeGreaterThanOrEqual(band.top - 1);
+      expect(box!.bottom, `${name} bottom`).toBeLessThanOrEqual(
+        band.bottom + 1,
+      );
+      expect(box!.height, `${name} height`).toBeGreaterThan(0);
+    }
+  }
+
+  /**
+   * Acceptance (2), measured on the actual message SCROLLPORT, not the
+   * transcript root (which also owns the toolbar): the scroller keeps >=40%
+   * of the band, is bottom-pinned, and — when content overflows — paints the
+   * latest transcript row just above its bottom edge.
+   */
+  async function assertScrollerInBand(page: Page, band: Band) {
+    const box = await bandRect(page, "[data-testid='transcript-scroller']");
+    expect(box, "scroller mounted").not.toBeNull();
+    expect(box!.top, "scroller top within band").toBeGreaterThanOrEqual(
+      band.top - 1,
+    );
+    expect(box!.bottom, "scroller bottom within band").toBeLessThanOrEqual(
+      band.bottom + 1,
+    );
+    expect(
+      box!.height,
+      `scroller ${box!.height}px must keep >=40% of the ${band.height}px band`,
+    ).toBeGreaterThanOrEqual(band.height * 0.4 - 1);
+
+    const latest = await page.evaluate((within) => {
+      const scroller = document.querySelector<HTMLElement>(
+        "[data-testid='transcript-scroller']",
+      );
+      if (!scroller)
+        return {
+          overflows: false,
+          pinned: false,
+          rowVisible: false,
+          paintsLatest: false,
+        };
+      const pinned =
+        scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
+      // Every assembled node (message, tool card, usage footer, change
+      // record…) renders in a uniform `transcript-row` wrapper.
+      const rows = [
+        ...scroller.querySelectorAll("[data-testid='transcript-row']"),
+      ];
+      const last = rows[rows.length - 1] ?? null;
+      const tail = rows.slice(-2);
+      const sr = scroller.getBoundingClientRect();
+      const lr = last?.getBoundingClientRect();
+      const rowVisible =
+        !!lr &&
+        lr.bottom > sr.top + 2 &&
+        lr.top < sr.bottom - 2 &&
+        lr.height > 0 &&
+        scroller.contains(last);
+      // When content overflows, pinning must keep the tail painted right at
+      // the scroller's bottom edge. When the whole conversation fits, blank
+      // space below the latest row is correct — row visibility above is the
+      // contract, so do not demand paint where there is nothing to paint.
+      const overflows = scroller.scrollHeight > scroller.clientHeight + 4;
+      const x = Math.round(sr.left + sr.width / 2);
+      let paintsLatest = !overflows;
+      if (overflows) {
+        for (const dy of [4, 12, 24, 36]) {
+          const hit = document.elementFromPoint(x, Math.round(sr.bottom - dy));
+          const rowHit = hit?.closest("[data-testid='transcript-row']");
+          if (hit && rowHit && tail.includes(rowHit)) {
+            paintsLatest = true;
+            break;
+          }
+        }
+      }
+      return { overflows, pinned, rowVisible, paintsLatest };
+    });
+    expect(latest.pinned, "scroller pinned to the latest content").toBe(true);
+    expect(
+      latest.rowVisible,
+      "latest row intersects the visible scroller rect",
+    ).toBe(true);
+    expect(
+      latest.paintsLatest,
+      "the paint just above the scroller bottom is the latest row",
+    ).toBe(true);
+  }
+
+  async function assertChromeReturns(page: Page, installRequired: boolean) {
+    await expect(page.getByTestId("run-details")).toBeVisible();
+    await expect(page.getByTestId("resume-row")).toBeVisible();
+    if (installRequired)
+      await expect(page.getByTestId("install-bar")).toBeVisible();
+  }
+
+  async function lowerKeyboard(page: Page) {
+    await page.evaluate(() => {
+      const vv = window.visualViewport;
+      Object.defineProperty(vv, "height", {
+        configurable: true,
+        get: () => window.innerHeight,
+      });
+      Object.defineProperty(vv, "offsetTop", {
+        configurable: true,
+        get: () => 0,
+      });
+      vv.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    });
+    await expect(page.locator("html")).not.toHaveAttribute("data-keyboard");
+  }
+
+  for (const [label, width, height, kb] of DEVICES) {
+    test(`geometry — exited full-chrome session, ${label} ${width}x${height} / ${kb}px keyboard`, async ({
+      page,
+    }, testInfo) => {
+      // Geometry-only case by design: the owner's session was EXITED, so its
+      // composer is disabled and force-click only exercises the tap, not
+      // focus. Focus is covered by the enabled-composer case below.
+      if (!(await fakeHostId(page)))
+        test.skip(true, "fake Node not registered");
+      const webkit = testInfo.project.name.toLowerCase().includes("webkit");
       await page.setViewportSize({ width, height });
       const id = await createClaudeSession(page, "mfix-chrome-combo");
       await clearApprovals(page, id);
@@ -496,143 +816,102 @@ test.describe("(d) full chrome combo: keyboard up keeps the composer and a >=40%
       const sessionPage = page.getByTestId("session-page");
       await expect(sessionPage).toHaveAttribute("data-view", "structured");
 
-      // Trigger absence → the Node answered like an ordinary echo session.
-      const comboReady = await page
-        .getByTestId("resume-row")
-        .waitFor({ state: "visible", timeout: 12_000 })
-        .then(() => true)
-        .catch(() => false);
-      if (!comboReady) test.skip(true, "fake Node lacks the mfix-chrome-combo sentinel");
+      // Trigger verified from the journal BEFORE any UI dependency.
+      await expectComboTriggerOrSkip(page, id);
 
-      // The chrome combination the owner saw.
+      // Trigger exists → missing chrome here is a real failure.
       await expect(sessionPage).toHaveAttribute("data-status", "exited");
       await expect(page.getByTestId("resume-row")).toBeVisible();
       await expect(page.getByTestId("run-details")).toBeVisible();
       const strip = page.getByTestId("live-status-strip");
       await expect(strip).toBeVisible();
       await expect(strip).toHaveAttribute("data-phase", "tool-started");
-      // The backdated hook record is past the 3x-cadence stall budget.
-      await expect(page.getByTestId("live-health-hook")).toHaveAttribute("data-reason", "stalled");
-      // The iOS install offer is the banner the owner had not dismissed. WebKit
-      // iPhone surfaces beforeinstallprompt-style criteria; headless Chromium
-      // does not offer, so treat it as a precondition, not a requirement.
-      const installBar = page.getByTestId("install-bar");
-      const installVisible = await installBar.isVisible().catch(() => false);
-      // The running tool content is the latest transcript content.
-      await expect(page.getByTestId("transcript")).toContainText("AskUserQuestion");
-
-      // Focus first, then raise the keyboard exactly the way iOS (and the
-      // coordinator's verifier) does — layout viewport unchanged. The
-      // composer is disabled in the exited state (as in the owner's session)
-      // but still visible and tappable on the phone; force the focus.
-      await page.getByTestId("composer-input").click({ force: true });
-      if (evidence) {
-        // Evidence on the owner's iPhone 15 only; the SE case shares
-        // the same layout path at 375px.
-        if (width === 393) await shot(page, "m-realdevice-5-chrome-keyboard-down-390.png");
-      }
-      await raiseKeyboardIosExact(page, kb);
-
-      const band = await page.evaluate(() => ({
-        top: Math.round(window.visualViewport.offsetTop),
-        bottom: Math.round(window.visualViewport.offsetTop + window.visualViewport.height),
-        height: Math.round(window.visualViewport.height),
-      }));
-      expect(band.height).toBe(height - kb);
-      await expect(page.locator("html")).toHaveAttribute("data-keyboard", "1");
-
-      // Non-essential chrome is collapsed.
-      for (const gone of [
-        "install-bar",
-        "resume-row",
-        "run-details",
-        "annotation-dock",
-        "task-track",
-        "session-notifications",
-      ]) {
-        const box = await page.getByTestId(gone).count();
-        if (box > 0) {
-          // Mounted but display:none is the contract.
-          await expect(page.getByTestId(gone)).toBeHidden();
-        }
-      }
-      // The strip is a single line.
-      await expect(strip).toBeVisible();
-      const stripBox = await strip.boundingBox();
-      expect(stripBox).toBeTruthy();
-      expect(stripBox!.height).toBeLessThanOrEqual(34);
-
-      // (1) Composer — textarea AND its send control — entirely in band.
-      // One in-page measurement pass: boundingBox() can transiently answer
-      // null mid React re-render even while the element is laid out.
-      const boxes = await page.evaluate(() => {
-        const rect = (el: Element | null) => {
-          if (!el) return null;
-          const r = el.getBoundingClientRect();
-          return { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) };
-        };
-        const form = document.querySelector("[data-testid='composer']");
-        const send = [...(form?.querySelectorAll("button") ?? [])].find((b) =>
-          (b.textContent ?? "").includes("发送"),
+      await expect(page.getByTestId("live-health-hook")).toHaveAttribute(
+        "data-reason",
+        "stalled",
+      );
+      // The undismissed install offer the acceptance runs on iOS/WebKit must
+      // show; on engines that never surface an offer the whole case skips
+      // explicitly rather than passing without it.
+      if (
+        !webkit &&
+        !(await page
+          .getByTestId("install-bar")
+          .isVisible()
+          .catch(() => false))
+      ) {
+        test.skip(
+          true,
+          "engine surfaces no install offer; banner coverage is WebKit-only here",
         );
-        return {
-          composer: rect(form),
-          input: rect(document.querySelector("[data-testid='composer-input']")),
-          send: rect(send ?? null),
-        };
-      });
-      for (const [name, box] of Object.entries(boxes) as [string, typeof boxes.composer][]) {
-        expect(box, `${name} mounted`).not.toBeNull();
-        expect(box!.top, `${name} top`).toBeGreaterThanOrEqual(band.top - 1);
-        expect(box!.bottom, `${name} bottom`).toBeLessThanOrEqual(band.bottom + 1);
       }
-
-      // (2) Transcript keeps >= 40% of the band and shows the latest content.
-      const tBox = await bandRect(page, "[data-testid='transcript']");
-      expect(tBox, "transcript mounted").not.toBeNull();
-      expect(tBox!.top).toBeGreaterThanOrEqual(band.top - 1);
-      expect(tBox!.bottom).toBeLessThanOrEqual(band.bottom + 1);
-      expect(tBox!.height, `transcript ${tBox!.height} vs band ${band.height}`).toBeGreaterThanOrEqual(
-        band.height * 0.4 - 1,
+      await expect(page.getByTestId("install-bar")).toBeVisible();
+      await expect(page.getByTestId("transcript")).toContainText(
+        "AskUserQuestion",
       );
 
-      // Pinned to the bottom and painting content there = latest message
-      // visible, not a blank flex remainder.
-      const painted = await page.evaluate(() => {
-        const root = document.querySelector<HTMLElement>("[data-testid='transcript']");
-        if (!root) return { pinned: false, contentAtBottom: false };
-        const pinned = root.scrollTop + root.clientHeight >= root.scrollHeight - 4;
-        const x = Math.round(root.getBoundingClientRect().left + root.clientWidth / 2);
-        const y = Math.round(root.getBoundingClientRect().bottom - 12);
-        const hit = document.elementFromPoint(x, y)?.closest("[data-testid='transcript']");
-        return { pinned, contentAtBottom: hit === root || root.contains(hit) };
-      });
-      expect(painted.pinned, "transcript pinned to latest content").toBe(true);
-      expect(painted.contentAtBottom, "transcript paints content at its bottom edge").toBe(true);
+      await page.getByTestId("composer-input").click({ force: true });
+      if (evidence && width === 393)
+        await shot(page, "m-realdevice-5-chrome-keyboard-down-390.png");
+      await raiseKeyboardIosExact(page, kb);
+      const band = await currentBand(page, height, kb);
 
-      if (evidence) {
-        if (width === 393) await shot(page, "m-realdevice-6-chrome-keyboard-up-390.png", true);
-        // Mechanical BEFORE: the collapse is driven entirely by the attribute;
-        // remove it (geometry unchanged) to capture the pre-fix layout.
-        await page.evaluate(() => document.documentElement.removeAttribute("data-keyboard"));
+      await assertChromeCollapsed(page, strip);
+      await assertComposerInBand(page, band);
+      await assertScrollerInBand(page, band);
+
+      if (evidence && width === 393) {
+        await shot(page, "m-realdevice-6-chrome-keyboard-up-390.png", true);
+        // Mechanical BEFORE: same geometry with the collapse attribute off.
+        await page.evaluate(() =>
+          document.documentElement.removeAttribute("data-keyboard"),
+        );
         await page.waitForTimeout(200);
-        if (width === 393) await shot(page, "m-realdevice-7-chrome-keyboard-up-nocollapse-390.png", true);
+        await shot(
+          page,
+          "m-realdevice-7-chrome-keyboard-up-nocollapse-390.png",
+          true,
+        );
         await page.evaluate(() => {
           document.documentElement.dataset.keyboard = "1";
         });
       }
 
       // Keyboard closes: every piece of chrome comes back.
-      await page.evaluate(() => {
-        const vv = window.visualViewport;
-        Object.defineProperty(vv, "height", { configurable: true, get: () => window.innerHeight });
-        Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => 0 });
-        vv.dispatchEvent(new Event("resize"));
-        window.dispatchEvent(new Event("resize"));
+      await lowerKeyboard(page);
+      await assertChromeReturns(page, true);
+    });
+
+    test(`focus — enabled composer receives focus, ${label} ${width}x${height} / ${kb}px keyboard`, async ({
+      page,
+    }) => {
+      if (!(await fakeHostId(page)))
+        test.skip(true, "fake Node not registered");
+      await page.setViewportSize({ width, height });
+      // A normal echo session settles to idle: the composer is ENABLED, so a
+      // real (non-forced) click exercises focus the way the owner's tap does.
+      const id = await createClaudeSession(page, `mfix focus ${label}`);
+      await clearApprovals(page, id);
+      await page.goto(`/s/${id}/structured`);
+      const sessionPage = page.getByTestId("session-page");
+      await expect(sessionPage).toHaveAttribute("data-view", "structured");
+      await expect(sessionPage).toHaveAttribute("data-status", "idle", {
+        timeout: 20_000,
       });
-      await expect(page.getByTestId("run-details")).toBeVisible();
-      if (installVisible) await expect(page.getByTestId("install-bar")).toBeVisible();
-      await expect(page.getByTestId("resume-row")).toBeVisible();
+      const input = page.getByTestId("composer-input");
+      await expect(input).toBeEnabled();
+      await input.click();
+      await expect(input).toBeFocused();
+
+      await raiseKeyboardIosExact(page, kb);
+      const band = await currentBand(page, height, kb);
+      await assertComposerInBand(page, band);
+      await assertScrollerInBand(page, band);
+      // Focus survives the geometry change (the band must not steal it).
+      await expect(input).toBeFocused();
+
+      await lowerKeyboard(page);
+      await expect(input).toBeEnabled();
     });
   }
 });

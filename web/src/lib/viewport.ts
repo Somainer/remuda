@@ -22,26 +22,38 @@ const KEYBOARD_MIN_HEIGHT_PX = 120;
 
 export function useWorkbenchViewport() {
   const [mobile, setMobile] = useState(() =>
-    typeof window === "undefined" ? false : window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
+    typeof window === "undefined"
+      ? false
+      : window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
   );
   const [coarsePointer, setCoarsePointer] = useState(() =>
-    typeof window === "undefined" ? false : window.matchMedia(COARSE_POINTER_QUERY).matches,
+    typeof window === "undefined"
+      ? false
+      : window.matchMedia(COARSE_POINTER_QUERY).matches,
   );
-  const [height, setHeight] = useState(() => (typeof window === "undefined" ? 800 : window.innerHeight));
+  const [height, setHeight] = useState(() =>
+    typeof window === "undefined" ? 800 : window.innerHeight,
+  );
   const [offsetTop, setOffsetTop] = useState(0);
 
   useEffect(() => {
     const media = window.matchMedia(COMPACT_WORKBENCH_QUERY);
     const coarse = window.matchMedia(COARSE_POINTER_QUERY);
     const apply = (nextHeight: number, nextOffset: number) => {
-      document.documentElement.style.setProperty("--workbench-height", `${nextHeight}px`);
+      document.documentElement.style.setProperty(
+        "--workbench-height",
+        `${nextHeight}px`,
+      );
       // c-mfix: on iOS the keyboard leaves the layout viewport full-height and
       // exposes the visual viewport as a sub-rect (offsetTop..offsetTop+height).
       // Shrinking the shell to `height` while anchoring it at layout y=0 made
       // the header/transcript sit ABOVE that band — "keyboard opens and the
       // page disappears". The shell now pins itself to the whole band via
       // --workbench-top, so offsetTop is a layout input, not just React state.
-      document.documentElement.style.setProperty("--workbench-top", `${nextOffset}px`);
+      document.documentElement.style.setProperty(
+        "--workbench-top",
+        `${nextOffset}px`,
+      );
       setHeight(nextHeight);
       setOffsetTop(nextOffset);
     };
@@ -101,6 +113,13 @@ export function useWorkbenchViewport() {
   return { mobile, coarsePointer, height, offsetTop };
 }
 
-export function composing(event: { nativeEvent: { isComposing?: boolean; keyCode?: number }; key: string }): boolean {
-  return Boolean(event.nativeEvent.isComposing) || event.key === "Process" || event.nativeEvent.keyCode === 229;
+export function composing(event: {
+  nativeEvent: { isComposing?: boolean; keyCode?: number };
+  key: string;
+}): boolean {
+  return (
+    Boolean(event.nativeEvent.isComposing) ||
+    event.key === "Process" ||
+    event.nativeEvent.keyCode === 229
+  );
 }

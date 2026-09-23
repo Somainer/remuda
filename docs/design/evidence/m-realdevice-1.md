@@ -150,8 +150,14 @@ small browser-chrome moves and rubber-banding do not). While stamped,
 `src/styles/keyboardCompact.css` (imported once in `main.tsx`, all selectors
 scoped to the attribute, stable testids only):
 
-- hides the install banner, the exited-session resume row, the 运行详情
-  disclosure, the annotation dock, task track and session notifications;
+- hides the install banner (`install-bar`) AND the waiting-worker update bar
+  (`update-bar` — InstallBar renders that instead when a new service worker
+  is waiting), the exited-session resume row, the 运行详情 disclosure, the
+  annotation dock, task track and session notifications;
+- **round 3:** also hides the transcript toolbar (全部折叠 / 搜索正文), an open
+  transcript search and the gap-backfill journal banner — these sat ABOVE the
+  message scroller and were why the real SCROLLPORT kept only ~29 % of the
+  band while the transcript ROOT passed the 40 % assertion;
 - compresses the live status strip to one clipped line — phase dot + tool
   name + the hook health note; timer/token/tier/spinner phrase/Esc fold away
   until the keyboard closes;
@@ -186,16 +192,36 @@ window.scrollTo(0, KB); vv.dispatchEvent(new Event("resize"));
 vv.dispatchEvent(new Event("scroll")); window.dispatchEvent(new Event("resize"));
 ```
 
-Cases: iPhone 15 393×659 / KB 336 AND iPhone SE 375×667 / KB 260. Assertions
-against the exact band `[offsetTop, offsetTop + height]`:
+Cases: iPhone 15 393×659 / KB 336 AND iPhone SE 375×667 / KB 260. Each device
+has TWO cases:
 
-1. composer form, textarea, and the 发送 control are entirely inside the band;
-2. the transcript is ≥ 40 % of the band (measured 45.5 %, 147/323 px, on the
-   iPhone 15 fixture), is bottom-pinned and paints content at its bottom edge
-   (latest AskUserQuestion row visible).
+- **geometry** — the exited full-chrome session (force-tap only; its composer
+  is disabled by design). Assertions against the exact band
+  `[offsetTop, offsetTop + height]`:
+  1. composer form, textarea, and the 发送 control are entirely inside the band;
+  2. the message SCROLLPORT `[data-testid="transcript-scroller"]` — not the
+     transcript root — keeps ≥ 40 % of the band: measured **147/323 ≈ 45.5 %**
+     on iPhone 15 (the toolbar collapse returned ~50 px to the scrollport);
+     the scroller is bottom-pinned (`scrollTop + clientHeight >=
+     scrollHeight - 4`) and the painted elements just above its bottom edge
+     belong to the tail `transcript-row` wrappers (the AskUserQuestion tool
+     card + usage row of the fixture). Short conversations that fit the band
+     are exempt from the bottom-edge paint check — blank space below the last
+     row is correct there.
+- **focus** — an enabled, idle composer: a real (non-forced) click asserts
+  `toBeFocused()` BEFORE the keyboard geometry is applied; the composer stays
+  fully in the band, focus survives the geometry change, and the enabled
+  composer returns when the keyboard closes. The scroller measured
+  **173/323 ≈ 53.5 %** in this case.
 
-Keyboard close restores every collapsed piece. With the keyboard down the
-layout is byte-identical to before the change.
+Honesty guards: trigger presence is read from the fake Node's JOURNAL
+(`obj_mfix_ask` tool call + the exited entity) and missing trigger SKIPS; once
+the trigger exists, missing chrome is a hard failure. The install banner is
+required in the WebKit acceptance cases (iPhone surfaces the offer; if an
+engine never does, the case skips explicitly). `fakeHostId` returns only the
+`e2e-fake-node` host — a registered real host skips the hub-backed cases
+rather than erroring. Keyboard close restores every collapsed piece; with the
+keyboard down the layout is unchanged.
 
 ### Round-2 evidence (WebKit iPhone 15, 390 CSS px)
 
@@ -209,8 +235,10 @@ layout is byte-identical to before the change.
   the full transcript block with the AskUserQuestion row and 858-token usage,
   and the entire composer (textarea + effort chip + 发送) inside the band.
 
-Result: **5/5 passed on webkit-iphone** (a–c plus both d devices); the d
-cases also pass on host Chromium. Full `m-*.hub.spec.ts` sweep (m-chrome,
-m-home, m-inbox, m-jumpto, m-keybar, m-push, m-shell, m-realdevice) green on
-Chromium against a fresh fake Node.
+Result (round 3): **7/7 passed on webkit-iphone** (a–c plus geometry/focus
+on both devices); the geometry/focus cases also pass on host Chromium. Full
+`m-*.hub.spec.ts` sweep (m-chrome, m-home, m-inbox, m-jumpto, m-keybar,
+m-push, m-shell, m-realdevice) green on Chromium against a fresh fake Node.
+All e2e runs were wrapped in
+`flock ~/Projects/remuda-agents/locks/gate-e2e.lock` with per-worker ports.
 

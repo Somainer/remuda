@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { Interaction, InteractionAnswer, QuestionField } from "../../types/interaction";
 import { composing } from "../../lib/viewport";
-import css from "../session/session.module.css";
+import css from "./decision.module.css";
 
 type FieldAnswer = { optionIds: string[]; text: string | null };
 

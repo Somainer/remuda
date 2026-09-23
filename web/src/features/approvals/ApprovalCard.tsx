@@ -1,6 +1,6 @@
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
 import { optionAnswerFor } from "./answers";
-import css from "../session/session.module.css";
+import css from "./decision.module.css";
 
 export function ApprovalCard({
   interaction,

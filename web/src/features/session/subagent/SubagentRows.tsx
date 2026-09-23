@@ -11,7 +11,7 @@ import { Link, useParams } from "react-router-dom";
 import type { SubagentRef } from "../assemble";
 import { ToolCard } from "../ToolCard";
 import { isToolFailure } from "../assemble";
-import sessionCss from "../session.module.css";
+import sessionCss from "../toolCard.module.css";
 import css from "./subagent.module.css";
 
 /** Route for a subagent's full drill-in transcript. */

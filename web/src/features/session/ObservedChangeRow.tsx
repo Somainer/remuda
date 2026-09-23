@@ -1,5 +1,5 @@
 import { jsonPreview } from "../../lib/format";
-import css from "./session.module.css";
+import css from "./toolCard.module.css";
 
 /**
  * c-mfix: `effort` and `model` are known observation kinds (protocol §5.1,

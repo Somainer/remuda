@@ -45,7 +45,7 @@ import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { readSessionView, writeSessionView, type SessionView } from "../lib/viewPref";
 import { FilesView } from "../features/files/FilesView";
-import session from "../features/session/session.module.css";
+import session from "../chrome/sessionPage.module.css";
 
 export function SessionPage({
   view = "auto",

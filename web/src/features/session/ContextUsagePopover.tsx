@@ -8,7 +8,7 @@ import {
   type UsageCell,
   type UsageRollup,
 } from "./contextUsage";
-import css from "./session.module.css";
+import css from "./contextUsage.module.css";
 
 /**
  * The context chip's hover/tap popover (context-usage-1): context-window

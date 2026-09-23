@@ -1,5 +1,5 @@
 import { jsonPreview } from "../../lib/format";
-import css from "./session.module.css";
+import css from "./toolCard.module.css";
 
 export function OpaqueRow({ kind, summary, raw }: { kind: string; summary: string | null; raw: unknown }) {
   return (

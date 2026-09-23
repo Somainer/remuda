@@ -1,7 +1,7 @@
 /* c-composer / D-042 (ui-spec.md §2.2 compact composer 边界): mobile-only
    styles for the collapsed options trigger, the options bottom sheet and the
    Sheet-based confirm dialog. Desktop composer markup/styles are owned by
-   session.module.css and stay byte-identical; nothing here adds a media
+   composer.module.css (UO-4 split) and stay byte-identical; nothing here adds a media
    query — the mobile layout is a TSX conditional, not a CSS breakpoint. */
 
 /* The collapsed options trigger: the permission word · effort tier fused
@@ -71,7 +71,7 @@
 }
 
 /* The ultracode stop's ember treatment on the collapsed trigger. Declared in
-   this module (not composed with session.module.css `.ember`) so the
+   this module (not composed with effort.module.css `.ember` (UO-4 split)) so the
    cross-module cascade cannot drop the border colour on equal specificity.
    The trigger keeps its light ember glow while collapsed. */
 .triggerEmber {
@@ -193,7 +193,7 @@
 }
 
 /* Touch sizing by hit area: standalone chip geometry (no `.chip`
-   composition from session.module.css) — 44px via --touch, never a
+   composition from composer.module.css (UO-4 split)) — 44px via --touch, never a
    hard-coded pixel size. */
 .attachBtn {
   height: auto;

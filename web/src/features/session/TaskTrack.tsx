@@ -4,7 +4,7 @@ import type { ToolNode } from "./assemble";
 import { knowledgeValue } from "../../types/command";
 import { asRecord, asString } from "../../lib/format";
 import { subagentHref } from "./subagent/SubagentRows";
-import css from "./session.module.css";
+import css from "./taskTrack.module.css";
 import uiCss from "./transcript.module.css";
 
 /** Prompt text beyond this many characters collapses behind an expand toggle. */

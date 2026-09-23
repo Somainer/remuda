@@ -50,7 +50,7 @@ import { ContextUsagePopover } from "./ContextUsagePopover";
 import { ComposerConfirmDialog, ComposerOptionsSheet } from "./ComposerOptions";
 import type { UsageRollup } from "./contextUsage";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
-import css from "./session.module.css";
+import css from "./composer.module.css";
 import opt from "./composerOptions.module.css";
 
 type MenuId = "effort" | "permission" | "usage" | null;

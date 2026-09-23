@@ -474,15 +474,32 @@ function TranscriptInner({
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    // c-mfix round 4: a height change (the soft keyboard shrinks the band)
+    // does not change nodes/sizes, so the pin effect above never reruns and a
+    // long transcript pinned to the tail is left scrolled above its newest
+    // row. Re-pin in the same frame the scroller shrinks, but ONLY while the
+    // user was already pinned to the bottom — someone who scrolled up keeps
+    // their reading position when the keyboard opens.
+    let wasPinned = false;
     const measure = () => {
       const next = el.clientHeight;
       const viewport = next < 32 ? 720 : next;
       viewportRef.current = viewport;
       setViewport(viewport);
+      if (wasPinned) {
+        el.scrollTop = el.scrollHeight;
+        scrollTopRef.current = el.scrollTop;
+      }
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
+    // ResizeObserver fires with the box AFTER the shrink; pin state must be
+    // sampled from the geometry just before it, so refresh it on every scroll
+    // frame and in the observer callback before `measure`.
+    const ro = new ResizeObserver(() => {
+      wasPinned = pinRef.current;
+      measure();
+    });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
@@ -697,7 +714,11 @@ function TranscriptInner({
   return (
     <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
-      <div className={css.toolbar} data-tools-fold={toolsFolded ? "1" : "0"}>
+      <div
+        className={css.toolbar}
+        data-testid="transcript-toolbar"
+        data-tools-fold={toolsFolded ? "1" : "0"}
+      >
         {toolsFolded ? (
           <button
             type="button"
@@ -762,7 +783,12 @@ function TranscriptInner({
         )}
       </div>
       {searchOpen ? (
-        <div className={css.searchbar} role="search" aria-label="正文搜索">
+        <div
+          className={css.searchbar}
+          data-testid="transcript-searchbar"
+          role="search"
+          aria-label="正文搜索"
+        >
           <input
             ref={inputRef}
             className={css.searchInput}

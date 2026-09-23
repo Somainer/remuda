@@ -37,6 +37,7 @@ const baseHub = {
 beforeEach(() => {
   localStorage.clear();
   document.documentElement.removeAttribute("data-theme");
+  document.documentElement.removeAttribute("data-appearance");
   vi.spyOn(store, "useHub").mockReturnValue(baseHub);
   vi.spyOn(store.hubStore, "passkeysSupported").mockReturnValue(true);
   vi.spyOn(store.hubStore, "setCompact").mockImplementation(() => {});
@@ -94,7 +95,7 @@ describe("grouping and anchors", () => {
 });
 
 describe("no new default permissions", () => {
-  it("ships the same defaults: manual permission, autoReveal off, high effort, night", () => {
+  it("ships the same defaults: manual permission, autoReveal off, high effort, system appearance", () => {
     renderSettings(["/settings"]);
     expect(screen.getByTestId("settings-perm-manual")).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByTestId("settings-perm-acceptEdits")).toHaveAttribute("aria-pressed", "false");
@@ -108,7 +109,8 @@ describe("no new default permissions", () => {
     expect(screen.queryByTestId("settings-perm-dontAsk")).toBeNull();
     expect(screen.getByTestId("settings-auto-reveal-tty")).not.toBeChecked();
     expect(screen.getByTestId("settings-effort-high")).toHaveAttribute("data-selected", "1");
-    expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("settings-appearance-system")).toHaveAttribute("aria-checked", "true");
+    expect(document.documentElement.hasAttribute("data-appearance")).toBe(false);
     expect(screen.getByTestId("settings-device-name")).toHaveValue("this-device");
   });
 });
@@ -116,10 +118,10 @@ describe("no new default permissions", () => {
 const originalSetItem = Storage.prototype.setItem;
 
 describe("save states and rollback", () => {
-  it("shows 保存中 then 已保存 for a theme change and persists it immediately", async () => {
+  it("shows 保存中 then 已保存 for an appearance change and persists it immediately", async () => {
     renderSettings(["/settings"]);
     // Local appearance prefs commit on selection — no draft save button.
-    fireEvent.click(screen.getByTestId("settings-theme-ledger"));
+    fireEvent.click(screen.getByTestId("settings-appearance-light"));
 
     // The saving state is rendered before the persist settles.
     expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saving");
@@ -130,11 +132,24 @@ describe("save states and rollback", () => {
     );
     const saved = screen.getByTestId("settings-appearance-status");
     expect(saved).toHaveTextContent("已保存");
-    expect(localStorage.getItem("runtime.theme.v1")).toBe("ledger");
-    expect(document.documentElement.dataset.theme).toBe("ledger");
+    expect(localStorage.getItem("runtime.theme.v1")).toBe("light");
+    expect(document.documentElement.dataset.appearance).toBe("light");
+    expect(screen.getByTestId("settings-appearance-light")).toHaveAttribute("aria-checked", "true");
   });
 
-  it("marks a failed theme save, rolls that field back, and keeps the error visible", async () => {
+  it("is a radiogroup with one tab stop that arrow keys move through", async () => {
+    renderSettings(["/settings"]);
+    const group = screen.getByRole("radiogroup", { name: "外观" });
+    const radios = screen.getAllByRole("radio").filter((r) => group.contains(r));
+    expect(radios.map((r) => r.textContent)).toEqual(["跟随系统", "深色", "浅色"]);
+    expect(radios.map((r) => r.tabIndex)).toEqual([0, -1, -1]);
+    fireEvent.keyDown(radios[0]!, { key: "ArrowRight" });
+    await waitFor(() => expect(radios[1]).toHaveAttribute("aria-checked", "true"));
+    expect(document.activeElement).toBe(radios[1]);
+    await waitFor(() => expect(document.documentElement.dataset.appearance).toBe("dark"));
+  });
+
+  it("marks a failed appearance save, rolls that field back, and keeps the error visible", async () => {
     const setItem = vi
       .spyOn(Storage.prototype, "setItem")
       .mockImplementation(function (this: Storage, key: string, value: string) {
@@ -142,22 +157,60 @@ describe("save states and rollback", () => {
         originalSetItem.call(this, key, value);
       });
     renderSettings(["/settings"]);
-    fireEvent.click(screen.getByTestId("settings-theme-ledger"));
+    fireEvent.click(screen.getByTestId("settings-appearance-light"));
     await waitFor(() =>
       expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
     );
     const failed = screen.getByTestId("settings-appearance-status");
     expect(failed).toHaveTextContent("失败");
     // The rejected field is back at its last committed value…
-    await waitFor(() => expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true"));
-    expect(screen.getByTestId("settings-theme-ledger")).toHaveAttribute("aria-pressed", "false");
-    expect(document.documentElement.dataset.theme).toBe("night");
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-system")).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(screen.getByTestId("settings-appearance-light")).toHaveAttribute("aria-checked", "false");
+    expect(document.documentElement.hasAttribute("data-appearance")).toBe(false);
     // …and the failure is not covered by a later "saved".
     expect(failed).toHaveTextContent("失败");
     setItem.mockRestore();
   });
 
-  it("keeps a committed permission choice even when a later theme change rejects", async () => {
+  it("returns focus to the committed radio when an arrow-key choice is rejected", async () => {
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === "runtime.theme.v1") throw new Error("quota");
+        originalSetItem.call(this, key, value);
+      });
+    renderSettings(["/settings"]);
+    const system = screen.getByTestId("settings-appearance-system");
+    system.focus();
+    fireEvent.keyDown(system, { key: "ArrowRight" });
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
+    );
+    expect(system).toHaveAttribute("aria-checked", "true");
+    expect(system.tabIndex).toBe(0);
+    expect(document.activeElement).toBe(system);
+    setItem.mockRestore();
+  });
+
+  it("steps through two rapid arrow keys before the first save settles", async () => {
+    renderSettings(["/settings"]);
+    const system = screen.getByTestId("settings-appearance-system");
+    const light = screen.getByTestId("settings-appearance-light");
+    system.focus();
+    fireEvent.keyDown(system, { key: "ArrowRight" });
+    // The first commit is still in its saving frames; focus stays on 深色.
+    expect(document.activeElement).toBe(screen.getByTestId("settings-appearance-dark"));
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved"),
+    );
+    expect(light).toHaveAttribute("aria-checked", "true");
+    expect(document.activeElement).toBe(light);
+  });
+
+  it("keeps a committed permission choice even when a later appearance change rejects", async () => {
     const setItem = vi
       .spyOn(Storage.prototype, "setItem")
       .mockImplementation(function (this: Storage, key: string, value: string) {
@@ -171,13 +224,13 @@ describe("save states and rollback", () => {
       expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved"),
     );
     expect(readDeviceSettings().permissionDefault).toBe("acceptEdits");
-    // The later theme change fails and rolls only the theme back.
-    fireEvent.click(screen.getByTestId("settings-theme-ledger"));
+    // The later appearance change fails and rolls only the appearance back.
+    fireEvent.click(screen.getByTestId("settings-appearance-light"));
     await waitFor(() =>
       expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
     );
     expect(screen.getByTestId("settings-perm-acceptEdits")).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("settings-appearance-system")).toHaveAttribute("aria-checked", "true");
     expect(readDeviceSettings().permissionDefault).toBe("acceptEdits");
     setItem.mockRestore();
   });

@@ -39,6 +39,8 @@ export type InteractionRequest =
       planDigest: Digest;
       options: DecisionOption[];
       allowFeedback: boolean;
+      /** Inline plan text under review; null/absent when only a planRef exists. */
+      plan?: string | null;
     }
   | {
       kind: "elicitation";

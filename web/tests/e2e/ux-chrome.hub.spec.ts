@@ -285,14 +285,18 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
       expect(overflow).toBeLessThanOrEqual(390);
 
       // Geometry: each reachable control owns its 44px corners and the zones
-      // never overlap (corner ownership proves the D-039 borders).
-      await assertHotTarget(page, page.getByRole("link", { name: "返回" }), "back", 390, 844);
-      await assertHotTarget(page, page.getByTestId("spaces-drawer-open"), "space-chip", 390, 844);
-      await assertHotTarget(page, page.getByTestId("view-switch-tty"), "seg-tty", 390, 844);
-      await assertHotTarget(page, page.getByTestId("view-switch-structured"), "seg-struct", 390, 844);
-      await assertHotTarget(page, page.getByRole("button", { name: "Stop" }), "stop", 390, 844);
-      await assertHotTarget(page, page.getByTestId("session-more-open"), "more", 390, 844);
-      await assertHotTarget(page, page.getByTestId("run-details-summary"), "details", 390, 844);
+      // never overlap (corner ownership proves the D-039 borders). Hit areas
+      // follow pointer: coarse (visual-system.md §6.2), so only the touch
+      // round measures them; the fine-pointer round checks layout and fold.
+      if (touch) {
+        await assertHotTarget(page, page.getByRole("link", { name: "返回" }), "back", 390, 844);
+        await assertHotTarget(page, page.getByTestId("spaces-drawer-open"), "space-chip", 390, 844);
+        await assertHotTarget(page, page.getByTestId("view-switch-tty"), "seg-tty", 390, 844);
+        await assertHotTarget(page, page.getByTestId("view-switch-structured"), "seg-struct", 390, 844);
+        await assertHotTarget(page, page.getByRole("button", { name: "Stop" }), "stop", 390, 844);
+        await assertHotTarget(page, page.getByTestId("session-more-open"), "more", 390, 844);
+        await assertHotTarget(page, page.getByTestId("run-details-summary"), "details", 390, 844);
+      }
 
       // The fold gave the transcript at least 56px of vertical space.
       const bodyBox = await page.getByTestId("session-body").boundingBox();

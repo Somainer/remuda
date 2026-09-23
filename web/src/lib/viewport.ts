@@ -12,41 +12,93 @@ export const COMPACT_WORKBENCH_QUERY =
  */
 export const COARSE_POINTER_QUERY = "(pointer: coarse) and (hover: none)";
 
+/**
+ * c-mfix round 2: only treat the band as keyboard-compact once it lost at
+ * least this many px of height. Both acceptance keyboards clear it (iPhone 15
+ * 336 / iPhone SE 260); transient scroll rubber-banding and small browser-chrome
+ * moves do not.
+ */
+const KEYBOARD_MIN_HEIGHT_PX = 120;
+
 export function useWorkbenchViewport() {
   const [mobile, setMobile] = useState(() =>
-    typeof window === "undefined" ? false : window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
+    typeof window === "undefined"
+      ? false
+      : window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
   );
   const [coarsePointer, setCoarsePointer] = useState(() =>
-    typeof window === "undefined" ? false : window.matchMedia(COARSE_POINTER_QUERY).matches,
+    typeof window === "undefined"
+      ? false
+      : window.matchMedia(COARSE_POINTER_QUERY).matches,
   );
-  const [height, setHeight] = useState(() => (typeof window === "undefined" ? 800 : window.innerHeight));
+  const [height, setHeight] = useState(() =>
+    typeof window === "undefined" ? 800 : window.innerHeight,
+  );
   const [offsetTop, setOffsetTop] = useState(0);
 
   useEffect(() => {
     const media = window.matchMedia(COMPACT_WORKBENCH_QUERY);
     const coarse = window.matchMedia(COARSE_POINTER_QUERY);
     const apply = (nextHeight: number, nextOffset: number) => {
-      document.documentElement.style.setProperty("--workbench-height", `${nextHeight}px`);
+      document.documentElement.style.setProperty(
+        "--workbench-height",
+        `${nextHeight}px`,
+      );
       // c-mfix: on iOS the keyboard leaves the layout viewport full-height and
       // exposes the visual viewport as a sub-rect (offsetTop..offsetTop+height).
       // Shrinking the shell to `height` while anchoring it at layout y=0 made
       // the header/transcript sit ABOVE that band — "keyboard opens and the
       // page disappears". The shell now pins itself to the whole band via
       // --workbench-top, so offsetTop is a layout input, not just React state.
-      document.documentElement.style.setProperty("--workbench-top", `${nextOffset}px`);
+      document.documentElement.style.setProperty(
+        "--workbench-top",
+        `${nextOffset}px`,
+      );
       setHeight(nextHeight);
       setOffsetTop(nextOffset);
     };
+    // Collapse non-essential chrome while the soft keyboard owns the lower
+    // part of the band: install banner, the exited-session resume row, the
+    // run-details disclosure, the annotation dock, task/notifications strips
+    // hide; the live status strip compresses to one line (keyboardCompact.css).
+    // The composer and transcript are never collapsed.
+    const setKeyboard = (active: boolean) => {
+      if (active) document.documentElement.dataset.keyboard = "1";
+      else delete document.documentElement.dataset.keyboard;
+    };
+    // c-mfix round 4: which surface owns the focus while the keyboard is up.
+    // The transcript search box lives in the very toolbar keyboardCompact
+    // collapses; typing a search would hide the search input itself. While
+    // the search has focus the toolbar/searchbar stay mounted (CSS keys off
+    // this attribute). Everything else collapses as before.
+    const updateKeyboardFocus = () => {
+      const activeEl = document.activeElement;
+      const root = document.documentElement;
+      if (!(activeEl instanceof Element)) {
+        delete root.dataset.keyboardFocus;
+        return;
+      }
+      if (activeEl.closest("[data-testid='transcript-searchbar']")) {
+        root.dataset.keyboardFocus = "search";
+      } else if (activeEl.closest("[data-testid='composer']")) {
+        root.dataset.keyboardFocus = "composer";
+      } else {
+        delete root.dataset.keyboardFocus;
+      }
+    };
     const update = () => {
-      setMobile(media.matches);
+      const isCompact = media.matches;
+      setMobile(isCompact);
       setCoarsePointer(coarse.matches);
       const viewport = window.visualViewport;
       if (!viewport) {
         apply(window.innerHeight, 0);
+        setKeyboard(false);
         return;
       }
       if (viewport.scale !== 1) {
         apply(window.innerHeight, 0);
+        setKeyboard(false);
         return;
       }
       // c-mfix: do NOT window.scrollTo(0, 0) here. While the keyboard opens,
@@ -55,6 +107,10 @@ export function useWorkbenchViewport() {
       // under the keyboard. The shell is position:fixed to the visual band
       // now, so it never depends on document scroll anyway.
       apply(viewport.height, viewport.offsetTop || 0);
+      // iOS raises offsetTop with the keyboard; Android-style resize leaves
+      // it 0 but still loses the height — either geometry is enough here.
+      const lost = window.innerHeight - viewport.height;
+      setKeyboard(Boolean(isCompact && lost >= KEYBOARD_MIN_HEIGHT_PX));
     };
     update();
     media.addEventListener("change", update);
@@ -62,20 +118,33 @@ export function useWorkbenchViewport() {
     window.addEventListener("resize", update);
     window.visualViewport?.addEventListener("resize", update);
     window.visualViewport?.addEventListener("scroll", update);
+    document.addEventListener("focusin", updateKeyboardFocus, true);
+    document.addEventListener("focusout", updateKeyboardFocus, true);
     return () => {
       media.removeEventListener("change", update);
       coarse.removeEventListener("change", update);
       window.removeEventListener("resize", update);
       window.visualViewport?.removeEventListener("resize", update);
       window.visualViewport?.removeEventListener("scroll", update);
+      document.removeEventListener("focusin", updateKeyboardFocus, true);
+      document.removeEventListener("focusout", updateKeyboardFocus, true);
       document.documentElement.style.removeProperty("--workbench-height");
       document.documentElement.style.removeProperty("--workbench-top");
+      document.documentElement.removeAttribute("data-keyboard");
+      document.documentElement.removeAttribute("data-keyboard-focus");
     };
   }, []);
 
   return { mobile, coarsePointer, height, offsetTop };
 }
 
-export function composing(event: { nativeEvent: { isComposing?: boolean; keyCode?: number }; key: string }): boolean {
-  return Boolean(event.nativeEvent.isComposing) || event.key === "Process" || event.nativeEvent.keyCode === 229;
+export function composing(event: {
+  nativeEvent: { isComposing?: boolean; keyCode?: number };
+  key: string;
+}): boolean {
+  return (
+    Boolean(event.nativeEvent.isComposing) ||
+    event.key === "Process" ||
+    event.nativeEvent.keyCode === 229
+  );
 }

@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -19,9 +20,7 @@ async function shot(page: Page, name: string) {
 }
 
 async function setTheme(page: Page, theme: "night" | "ledger") {
-  await page.evaluate((value) => {
-    document.documentElement.dataset.theme = value;
-  }, theme);
+  await setMode(page, theme);
 }
 
 /**

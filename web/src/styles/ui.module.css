@@ -1,99 +1,467 @@
+/* @tokens strict */
+/* Base controls (visual-system.md §8). Role tokens only; hit areas follow
+   pointer: coarse, never viewport width. */
+
+/* ---------------------------------------------------------------- */
+/* Buttons (§8.1). One primary per view region.                      */
+/* ---------------------------------------------------------------- */
+
 .btn {
-  border: 1px solid var(--line);
-  background: var(--ink-2);
-  color: var(--paper);
-  border-radius: var(--radius);
-  min-height: 36px;
-  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: var(--lh-ui);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.btn:hover:not(:disabled) {
+  border-color: var(--border-control);
 }
 
 .btnPrimary {
   composes: btn;
-  background: var(--dust);
-  border-color: var(--dust);
-  color: var(--ink);
+  background: var(--primary-fill);
+  border-color: var(--primary-fill);
+  color: var(--on-primary);
 }
 
-.btnDanger {
-  composes: btn;
-  border-color: var(--danger);
-  color: var(--paper);
+.btnPrimary:hover:not(:disabled) {
+  border-color: var(--primary-fill);
 }
 
 .btnGhost {
   composes: btn;
   background: transparent;
+  border-color: transparent;
+  color: var(--fg-muted);
+}
+
+.btnGhost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: transparent;
+  color: var(--fg-body);
+}
+
+/* No red fills: destructive actions are an outline in the danger role. */
+.btnDanger {
+  composes: btn;
+  background: transparent;
+  border-color: var(--danger-border);
+  color: var(--danger-fg);
+}
+
+.btnDanger:hover:not(:disabled) {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
 }
 
 .btn:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
-/* Status shapes differ without colour and never use an ×, which is reserved
-   for closing a tab: ● working, ○ idle, ■ exited, ⚠ blocked. */
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  display: inline-block;
-  flex: 0 0 auto;
-}
-
-.dotBlocked {
-  width: auto;
-  height: auto;
-  min-width: 8px;
+/* Visible 32×32, 16px glyph; coarse pointers get a 44×44 ::after hit area.
+   Keep ≥ 12px between neighbours so the hit areas never overlap. */
+.iconBtn {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 0;
+  flex: none;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--dust);
-  font-size: 11px;
+  color: var(--fg-muted);
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.iconBtn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}
+
+.iconBtn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.iconBtn :global(svg) {
+  width: 16px;
+  height: 16px;
+}
+
+/* Explicit shared target for callers whose glyph is smaller than the
+   required hit area; additive, nothing adopts it without opting in. */
+.touchTarget {
+  min-width: var(--touch);
+  min-height: var(--touch);
+}
+
+/* ---------------------------------------------------------------- */
+/* Segmented control (§8.2): radiogroup for filters, tablist for     */
+/* view switches.                                                    */
+/* ---------------------------------------------------------------- */
+
+.seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+}
+
+.segItem {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--seg-item);
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
+}
+
+.segItem:hover {
+  color: var(--fg-body);
+}
+
+.segItem[aria-checked="true"],
+.segItem[aria-selected="true"],
+.segItem[aria-pressed="true"] {
+  background: var(--bg-raised);
+  color: var(--fg-strong);
+  box-shadow: inset 0 0 0 1px var(--border-control);
+}
+
+/* ---------------------------------------------------------------- */
+/* Inputs (§8.3).                                                    */
+/* ---------------------------------------------------------------- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.label {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.input,
+.select,
+.textarea {
+  width: 100%;
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-size: var(--text-input);
+}
+
+.textarea {
+  min-height: 88px;
+  padding: var(--space-2) 10px;
+  resize: vertical;
+}
+
+.input[aria-invalid="true"],
+.select[aria-invalid="true"],
+.textarea[aria-invalid="true"] {
+  border-color: var(--danger-fg);
+}
+
+.fieldError {
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+/* Native selects that must stay finger-sized even at fine pointers. */
+.touchSelect {
+  min-height: var(--touch);
+  font-size: var(--text-input);
+}
+
+.search {
+  margin: var(--space-2) var(--space-3);
+}
+
+/* ---------------------------------------------------------------- */
+/* Menus and sheets (§8.4). Overlays are the only shadowed layer.    */
+/* ---------------------------------------------------------------- */
+
+.menu {
+  min-width: 200px;
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-2);
+}
+
+.menuItem {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--control-h);
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-body);
+  text-align: left;
+}
+
+.menuItem:hover,
+.menuItem[aria-selected="true"] {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}
+
+.menuCheck {
+  color: var(--fg-strong);
+}
+
+.sheet {
+  position: relative;
+  padding: var(--space-5) var(--space-4) calc(var(--space-4) + var(--safe-bottom));
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-3);
+}
+
+.sheet::before {
+  content: "";
+  position: absolute;
+  top: var(--space-2);
+  left: 50%;
+  width: 36px;
+  height: 4px;
+  margin-left: -18px;
+  border-radius: var(--radius-pill);
+  background: var(--border-control);
+}
+
+/* ---------------------------------------------------------------- */
+/* Chips and badges (§8.5).                                          */
+/* ---------------------------------------------------------------- */
+
+.chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 24px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.chip:hover {
+  color: var(--fg-body);
+}
+
+.chipOn {
+  background: var(--bg-selected);
+  border-color: var(--border-control);
+  color: var(--fg-strong);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: 20px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-xs);
+  background: var(--bg-selected);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.badgeAttention {
+  composes: badge;
+  background: var(--attention-bg);
+  color: var(--attention-fg);
+}
+
+.badgeDanger {
+  composes: badge;
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+.badgeSuccess {
+  composes: badge;
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.badgeNeutral {
+  composes: badge;
+}
+
+/* Unknown is never a colour: dashed, neutral, and always carries text. */
+.badgeUnknown {
+  composes: badge;
+  background: transparent;
+  border: 1px dashed var(--unknown-border);
+  color: var(--unknown-fg);
+}
+
+.pill {
+  composes: badge;
+}
+
+/* Count badges: the only place a sub-12px glyph size is allowed. */
+.count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-pill);
+  background: var(--attention-fg);
+  color: var(--on-attention);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
   line-height: 1;
 }
-.dotWorking {
-  background: var(--cold);
+
+.num {
+  font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------- */
+/* StateDot (§8.6). Shapes differ without colour and never use an ×, */
+/* which is reserved for closing a tab: ● working, ○ idle, ■ exited, */
+/* ⚠ blocked, dashed ring unknown.                                   */
+/* ---------------------------------------------------------------- */
+
+.dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.dotBlocked {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: auto;
+  height: auto;
+  min-width: 8px;
+  border-radius: 0;
+  background: transparent;
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  line-height: 1;
+}
+
+.dotWorking {
+  background: var(--link);
+}
+
 .dotStarting {
-  background: var(--mute);
+  background: var(--fg-faint);
   animation: dim 1.6s ease-in-out infinite;
 }
+
 .dotIdle {
   background: transparent;
-  box-shadow: inset 0 0 0 2px var(--ok);
+  box-shadow: inset 0 0 0 1.5px var(--fg-muted);
 }
+
 .dotExited {
+  width: 7px;
+  height: 7px;
   border-radius: 1px;
-  background: var(--mute);
+  background: var(--fg-faint);
 }
+
 .dotUnknown {
   background: transparent;
-  box-shadow: inset 0 0 0 1px var(--mute);
-  border-style: dashed;
+  border: 1px dashed var(--unknown-border);
 }
+
+/* ---------------------------------------------------------------- */
+/* Connection indicator. Live is calm (muted), not a success colour. */
+/* ---------------------------------------------------------------- */
 
 .conn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  color: var(--mute);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .connLive {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--ok);
+  background: var(--fg-muted);
 }
 
 .connOff {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--mute);
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--fg-faint);
 }
 
 .connDots {
@@ -105,311 +473,428 @@
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: var(--cold);
+  background: var(--link);
   animation: blink 0.9s infinite;
 }
 
 .connDot:nth-child(2) {
   animation-delay: 0.15s;
 }
+
 .connDot:nth-child(3) {
   animation-delay: 0.3s;
 }
 
-.md :global(p) {
-  margin: 0 0 0.6em;
+/* ---------------------------------------------------------------- */
+/* Reading text (§8.7).                                              */
+/* ---------------------------------------------------------------- */
+
+.md,
+.prose {
+  color: var(--fg-body);
+  font-family: var(--font-read);
+  font-size: var(--text-read);
+  line-height: var(--lh-read);
+  overflow-wrap: anywhere;
 }
-.md :global(p:last-child) {
+
+.md :global(p),
+.prose :global(p) {
+  margin: 0 0 var(--space-3);
+}
+
+.md :global(p:last-child),
+.prose :global(p:last-child) {
   margin-bottom: 0;
 }
-.md :global(pre) {
-  background: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 8px;
+
+.md :global(:is(h1, h2, h3, h4, h5, h6)),
+.prose :global(:is(h1, h2, h3, h4, h5, h6)) {
+  margin: var(--space-4) 0 var(--space-2);
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
+}
+
+/* Reading headings (§5.2): fixed at every width, not the page/title roles. */
+.md :global(h1),
+.prose :global(h1) {
+  margin: 24px 0 12px;
+  font-size: 20px;
+  line-height: 28px;
+}
+
+.md :global(h2),
+.prose :global(h2) {
+  margin: 20px 0 8px;
+  font-size: 18px;
+  line-height: 26px;
+}
+
+.md :global(h3),
+.prose :global(h3) {
+  margin: 16px 0 4px;
+  font-size: 16px;
+  line-height: 24px;
+}
+
+.md :global(:is(ul, ol)),
+.prose :global(:is(ul, ol)) {
+  margin: 0 0 var(--space-3);
+  padding-left: 1.4em;
+}
+
+.md :global(blockquote),
+.prose :global(blockquote) {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--border-control);
+  color: var(--fg-muted);
+}
+
+.md :global(pre),
+.prose :global(pre) {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
   overflow: auto;
-  font-size: 12px;
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  font-size: var(--text-code);
+  line-height: var(--lh-code);
 }
-.md :global(code) {
-  font-family: var(--mono);
-  font-size: 12px;
+
+.md :global(code),
+.prose :global(code) {
+  font-family: var(--font-mono);
 }
-.md :global(a) {
-  color: var(--cold);
+
+.md :global(:not(pre) > code),
+.prose :global(:not(pre) > code) {
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-inset);
+  font-size: 0.875em;
+}
+
+.md :global(pre code),
+.prose :global(pre code) {
+  font-size: inherit;
+}
+
+.md :global(a),
+.prose :global(a) {
+  color: var(--link);
+}
+
+.md :global(table),
+.prose :global(table) {
+  display: block;
+  max-width: 100%;
+  margin: 0 0 var(--space-3);
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.md :global(:is(th, td)),
+.prose :global(:is(th, td)) {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--divider);
+  text-align: left;
+  vertical-align: top;
+}
+
+.md :global(th),
+.prose :global(th) {
+  color: var(--fg-strong);
+  font-weight: 600;
+  border-bottom-color: var(--border);
+}
+
+.md :global(hr),
+.prose :global(hr) {
+  margin: var(--space-4) 0;
+  border: 0;
+  border-top: 1px solid var(--divider);
 }
 
 .codeHead {
   display: flex;
   justify-content: flex-end;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
 }
 
+/* ---------------------------------------------------------------- */
+/* Diff.                                                             */
+/* ---------------------------------------------------------------- */
+
 .diff {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   overflow: hidden;
-  font-family: var(--mono);
-  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .diffUnknown {
-  border-style: dashed;
+  border: 1px dashed var(--unknown-border);
 }
 
 .diffHead {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
-  padding: 6px 8px;
-  background: var(--ink);
-  color: var(--mute);
+  gap: var(--space-2);
+  padding: 6px var(--space-2);
+  border-bottom: 1px solid var(--divider);
+  color: var(--fg-muted);
 }
 
 .diffLine {
-  padding: 0 8px;
+  padding: 0 var(--space-2);
   white-space: pre-wrap;
 }
 
 .diffAdd {
-  background: color-mix(in srgb, var(--ok) 18%, transparent);
+  background: var(--diff-add-bg);
 }
 
 .diffDel {
-  background: color-mix(in srgb, var(--danger) 22%, transparent);
+  background: var(--diff-del-bg);
 }
+
+/* ---------------------------------------------------------------- */
+/* Legacy modal (components/Modal uses overlay.module.css now).      */
+/* ---------------------------------------------------------------- */
 
 .modal {
   position: fixed;
   inset: 0;
-  background: color-mix(in srgb, var(--ink) 72%, transparent);
+  z-index: 40;
   display: flex;
   align-items: flex-end;
   justify-content: center;
-  z-index: 40;
+  padding-bottom: var(--safe-bottom);
+  background: var(--scrim);
 }
 
 .modalPanel {
-  background: var(--ink-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   width: min(520px, calc(100% - 24px));
-  margin-bottom: calc(24px + var(--safe-bottom));
-  padding: 16px;
+  margin-bottom: var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-3);
 }
 
+/* ---------------------------------------------------------------- */
+/* Cards: level 1 (surface + border, no shadow).                     */
+/* ---------------------------------------------------------------- */
+
 .card {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  padding: 10px 12px;
+  padding: 10px var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .cardPartial {
-  border-style: dashed;
+  border: 1px dashed var(--unknown-border);
 }
 
 .cardHead {
   display: flex;
   align-items: center;
-  gap: 8px;
-  color: var(--mute);
-  font-size: 12px;
+  gap: var(--space-2);
   margin-bottom: 6px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
-.pill {
-  border: 1px solid var(--line);
-  border-radius: 99px;
-  padding: 0 8px;
-  font-size: 11px;
-  color: var(--mute);
+/* Pending approval: amber means "needs you". */
+.approval {
+  padding: 10px var(--space-3);
+  border: 1px solid var(--attention-border);
+  border-radius: var(--radius-md);
+  background: var(--attention-bg);
 }
+
+/* ---------------------------------------------------------------- */
+/* Monospace is for code, paths, terminal and IDs only.              */
+/* ---------------------------------------------------------------- */
 
 .path {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--paper);
+  color: var(--fg-body);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .pre {
-  margin: 0;
-  font-family: var(--mono);
-  font-size: 12px;
-  white-space: pre-wrap;
-  overflow: auto;
   max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  white-space: pre-wrap;
 }
 
 .row {
   display: flex;
-  gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+  gap: var(--space-2);
 }
 
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--mute);
-}
-
-.input,
-.select,
-.textarea {
-  background: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 8px 10px;
-  color: var(--paper);
-  width: 100%;
-}
-
-.touchSelect {
-  min-height: 44px;
-  font-size: 16px;
-}
-
-.textarea {
-  min-height: 88px;
-  resize: vertical;
-}
+/* ---------------------------------------------------------------- */
+/* Lists.                                                            */
+/* ---------------------------------------------------------------- */
 
 .listItem {
   display: flex;
   gap: 10px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--line);
+  width: 100%;
+  min-height: var(--touch);
+  padding: 10px var(--space-3);
+  border: 0;
+  border-bottom: 1px solid var(--divider);
+  border-radius: 0;
+  background: transparent;
   color: inherit;
   text-align: left;
-  background: transparent;
-  width: 100%;
-  border-left: 0;
-  border-right: 0;
-  border-top: 0;
-  border-radius: 0;
-  min-height: 44px;
+}
+
+.listItem:hover {
+  background: var(--bg-hover);
+}
+
+.listItem:focus-visible {
+  outline-offset: -2px;
 }
 
 .listItemActive {
-  background: color-mix(in srgb, var(--cold) 12%, transparent);
+  background: var(--bg-selected);
 }
 
 .listMeta {
-  color: var(--mute);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .groupTitle {
-  padding: 8px 12px 4px;
-  color: var(--mute);
-  font-size: 12px;
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
 }
 
-.search {
-  margin: 8px 12px;
-}
-
-.chip {
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--mute);
-  border-radius: 99px;
-  padding: 4px 10px;
-  min-height: 32px;
-}
-
-.chipOn {
-  border-color: var(--dust);
-  color: var(--paper);
-}
+/* ---------------------------------------------------------------- */
+/* PWA install bar.                                                  */
+/* ---------------------------------------------------------------- */
 
 .install {
   position: sticky;
   top: 0;
   z-index: 20;
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
-  padding: 8px 12px;
-  background: var(--ink-2);
-  border-bottom: 1px solid var(--line);
-  font-size: 13px;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--divider);
+  background: var(--bg-surface);
+  font-size: var(--text-ui);
 }
 
 .installActions {
   display: flex;
-  gap: 8px;
   flex: none;
+  gap: var(--space-2);
 }
 
 .installBtn {
-  min-height: 44px;
-  height: 44px;
-  padding: 0 14px;
-  border-radius: var(--radius);
-  font-size: 13px;
-}
-
-@media (max-width: 767px) {
-  /* Every action, not just the primary/danger pair, meets the 44 px touch
-     target on phones (P1-3). Desktop density is unchanged. */
-  .btn,
-  .btnPrimary,
-  .btnDanger,
-  .btnGhost {
-    min-height: var(--touch);
-  }
-
-  /* Toolbar chips (RawEvents kinds, transcript actions) are finger-operated
-     on the phone layout even though they sit at desktop density on desktop. */
-  .chip {
-    min-height: var(--touch);
-    display: inline-flex;
-    align-items: center;
-  }
-
-  .modal {
-    padding-bottom: var(--safe-bottom);
-  }
-}
-
-/* Explicit shared target for callers whose icon glyph is smaller than the
-   required hit area; additive, nothing adopts it without opting in. */
-.touchTarget {
-  min-width: var(--touch);
+  height: var(--touch);
   min-height: var(--touch);
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--text-ui);
 }
 
-.approval {
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  padding: 10px 12px;
-  background: color-mix(in srgb, var(--dust) 10%, var(--ink-2));
-}
+/* ---------------------------------------------------------------- */
+/* Transcript auxiliaries.                                           */
+/* ---------------------------------------------------------------- */
 
 .usage {
-  color: var(--mute);
-  font-size: 12px;
-  padding: 4px 0;
+  padding: var(--space-1) 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .thought {
-  color: var(--mute);
-  font-size: 13px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
 }
 
 .you {
-  color: var(--mute);
-  font-size: 12px;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
-@keyframes pulse {
-  50% {
-    opacity: 0.35;
+/* ---------------------------------------------------------------- */
+/* Coarse pointers: grow hit areas, not visible density (§6.2).      */
+/* ---------------------------------------------------------------- */
+
+@media (pointer: coarse) {
+  .btn {
+    padding: 0 var(--space-4);
+  }
+
+  .iconBtn::after,
+  .segItem::after,
+  .chip::after {
+    content: "";
+    position: absolute;
+  }
+
+  .iconBtn::after {
+    inset: calc((var(--icon-btn) - var(--touch)) / 2);
+  }
+
+  /* Vertical only, so neighbouring items never overlap; the reach past the
+     32px track is reserved as block margin for wrapped rows. */
+  .seg {
+    margin-block: calc((var(--touch) - 32px) / 2);
+  }
+
+  .segItem {
+    min-width: var(--touch);
+  }
+
+  .segItem::after {
+    inset: calc((var(--seg-item) - var(--touch)) / 2) 0;
+  }
+
+  /* The 44px reach is reserved in layout (block margins), so wrapped rows
+     of chips never share hit area whatever gap the container uses. */
+  .chip {
+    min-width: var(--touch);
+    justify-content: center;
+    margin-block: calc((var(--touch) - 24px) / 2);
+  }
+
+  /* Offsets are from the padding box: step out over the 1px border so the
+     zone is the full 44px tall and as wide as the visible chip. */
+  .chip::after {
+    top: calc(50% - var(--touch) / 2);
+    right: -1px;
+    left: -1px;
+    height: var(--touch);
   }
 }
 

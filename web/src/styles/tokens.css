@@ -1,100 +1,305 @@
-:root,
-:root[data-theme="night"],
-[data-theme="night"] {
-  --canvas: #0c0f14;
-  --ink: #12161c;
-  --ink-0: #0f1319;
-  --ink-1: #151b23;
-  --ink-2: #1a212b;
-  --line: #2a3340;
-  --paper: #e7dcc8;
-  --mute: #8b7f6a;
-  --dust: #c9842a;
-  --cold: #6a8b9a;
-  --ok: #7a8f62;
-  --on-dust: #12161c;
-  --scrim: rgba(12, 15, 20, 0.72);
-  --diff-add: rgba(122, 143, 98, 0.13);
-  --diff-del: rgba(231, 220, 200, 0.05);
-  --diff-ctx: rgba(231, 220, 200, 0.03);
-  --danger: #8f3d2c;
-  /* Brighter danger text for dark surfaces; --danger stays the border/fill. */
-  --danger-strong: #d98a70;
-  /* Status hues for dark surfaces: warm mismatch / cold in-flight.
-     Defined equal to the values the chip sites already rendered through
-     their var(--x, fallback) fallbacks, so night is pixel-identical;
-     both clear 4.5:1 against --ink-2. */
-  --warn: #ffc107;
-  --info: #57b7ff;
-}
-
-[data-theme="ledger"] {
-  --canvas: #e4e0d6;
-  --ink: #f3f0ea;
-  --ink-0: #eae5da;
-  --ink-1: #efe8d8;
-  --ink-2: #faf8f3;
-  --line: #c5c1b7;
-  --paper: #1e2a32;
-  --mute: #5e6b72;
-  --dust: #8c6a16;
-  --cold: #3d5a68;
-  --ok: #556a3c;
-  --on-dust: #f8f6f1;
-  --scrim: rgba(30, 42, 50, 0.55);
-  --diff-add: rgba(85, 106, 60, 0.16);
-  --diff-del: rgba(143, 61, 44, 0.1);
-  --diff-ctx: rgba(30, 42, 50, 0.03);
-  --danger: #8f3d2c;
-  /* Dark enough to read as text/focus on a light ground. */
-  --danger-strong: #7a3022;
-  /* Darkened status hues so warm/cold marks stay readable on the light ground;
-     both clear 4.5:1 against --ink-2 (the lightest ledger surface). */
-  --warn: #7a5410;
-  --info: #1f5575;
-}
+/* ------------------------------------------------------------------ */
+/* 「墨」 token contract — docs/design/visual-system.md (D-053).       */
+/* Mode branches live in this file only: dark on :root, light via the */
+/* system media block and the explicit attribute block. The two light */
+/* blocks must stay verbatim-equal (tokens.contrast.test.ts).         */
+/* ------------------------------------------------------------------ */
 
 :root {
-  --font: "IBM Plex Sans", system-ui, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  --radius: 4px;
+  color-scheme: dark;
+  --bg-nav: #1c1b19;
+  --bg-canvas: #232220;
+  --bg-surface: #2a2926;
+  --bg-raised: #312f2c;
+  --bg-input: #2a2926;
+  --bg-inset: #1d1c1a;
+  --bg-hover: rgb(255 246 230 / 0.05);
+  --bg-selected: rgb(255 246 230 / 0.075);
+  --border: #3a3834;
+  --divider: #2e2d2a;
+  --border-control: #8e8980;
+  --fg-strong: #f1ede6;
+  --fg-body: #dcd7ce;
+  --fg-muted: #b3ada2;
+  --fg-faint: #b0a99d;
+  --link: #9ec0dc;
+  --focus: #a9c9e6;
+  --attention-fg: #e0b872;
+  --attention-bg: rgb(224 184 114 / 0.13);
+  --attention-border: rgb(224 184 114 / 0.45);
+  --danger-fg: #ec9a94;
+  --danger-bg: rgb(236 154 148 / 0.13);
+  --danger-border: rgb(236 154 148 / 0.45);
+  --success-fg: #a3c29a;
+  --success-bg: rgb(163 194 154 / 0.13);
+  --primary-fill: #ece7de;
+  --on-primary: #23221f;
+  --on-attention: #1f1e1b;
+  --scrim: rgb(10 9 8 / 0.62);
+  --diff-add-bg: rgb(163 194 154 / 0.14);
+  --diff-del-bg: rgb(236 154 148 / 0.14);
+  --diff-ctx-bg: rgb(255 246 230 / 0.03);
+  --shadow-2: 0 8px 24px rgb(0 0 0 / 0.4), 0 1px 2px rgb(0 0 0 / 0.3);
+  --shadow-3: 0 24px 64px rgb(0 0 0 / 0.55);
+  /* Syntax colours carried over from codeBlock.module.css (night); comment
+     and del lightened just enough to clear 4.5:1 on --bg-inset. */
+  --tok-comment: #8c8478;
+  --tok-keyword: #d08770;
+  --tok-type: #7fa8b8;
+  --tok-string: #a3b87a;
+  --tok-number: #d2a65a;
+  --tok-function: #e0c9a0;
+  --tok-meta: #b08d57;
+  --tok-attr: #8fb3c2;
+  --tok-del: #bc7361;
+  --tok-add: #7a8f62;
+  /* Effort top-notch ember, carried over verbatim from session.module.css (night). */
+  --ember-ultra: #f2b95e;
+  --ember-knob-face: #e7dcc8;
+  --ember-knob-edge: rgba(12, 15, 20, 0.3);
+  --ember-ring-top: rgba(201, 132, 42, 0.45);
+  --ember-ring-ultra: rgba(255, 196, 104, 0.85);
+  --ember-knob-ultra-bg: color-mix(in srgb, var(--ember-knob-face) 88%, #ffce85);
+}
 
-  /* Type scale (P1-3): body 14, inputs/emphasis 16, aux 12-13, labels 11.
-     Important status never relies on sub-12 px text. */
-  --text: 14px;
-  --text-lg: 16px;
-  --text-xl: 18px;
-  --text-body: 14px;
-  --text-13: 13px;
-  --text-aux: 12px;
-  --text-label: 11px;
+@media (prefers-color-scheme: light) {
+  :root:not([data-appearance="dark"]) {
+    color-scheme: light;
+    --bg-nav: #f1efea;
+    --bg-canvas: #f9f8f5;
+    --bg-surface: #ffffff;
+    --bg-raised: #ffffff;
+    --bg-input: #ffffff;
+    --bg-inset: #f2f0eb;
+    --bg-hover: rgb(60 45 20 / 0.05);
+    --bg-selected: rgb(60 45 20 / 0.07);
+    --border: #e2ded6;
+    --divider: #ebe8e2;
+    --border-control: #847e74;
+    --fg-strong: #1f1e1b;
+    --fg-body: #393731;
+    --fg-muted: #57524a;
+    --fg-faint: #69635a;
+    --link: #2f5f86;
+    --focus: #2f6aa0;
+    --attention-fg: #835610;
+    --attention-bg: rgb(131 86 16 / 0.1);
+    --attention-border: rgb(131 86 16 / 0.35);
+    --danger-fg: #a3383e;
+    --danger-bg: rgb(163 56 62 / 0.1);
+    --danger-border: rgb(163 56 62 / 0.35);
+    --success-fg: #3a6843;
+    --success-bg: rgb(58 104 67 / 0.1);
+    --primary-fill: #2a2926;
+    --on-primary: #faf9f6;
+    --on-attention: #ffffff;
+    --scrim: rgb(31 30 27 / 0.28);
+    --diff-add-bg: rgb(58 104 67 / 0.1);
+    --diff-del-bg: rgb(163 56 62 / 0.09);
+    --diff-ctx-bg: rgb(60 45 20 / 0.03);
+    --shadow-2: 0 8px 24px rgb(31 30 27 / 0.1), 0 1px 3px rgb(31 30 27 / 0.08);
+    --shadow-3: 0 24px 64px rgb(31 30 27 / 0.18);
+    --tok-comment: #706a61;
+    --tok-keyword: #9a4a33;
+    --tok-type: #3d5a68;
+    --tok-string: #556a3c;
+    --tok-number: #886715;
+    --tok-function: #6d5a2e;
+    --tok-meta: #7a5a30;
+    --tok-attr: #3d5a68;
+    --tok-del: #8f3d2c;
+    --tok-add: #556a3c;
+    --ember-ultra: #9a5d08;
+    --ember-knob-face: #ffffff;
+    --ember-knob-edge: rgba(30, 42, 50, 0.2);
+    --ember-ring-top: rgba(140, 106, 22, 0.4);
+    --ember-ring-ultra: rgba(154, 93, 8, 0.75);
+    --ember-knob-ultra-bg: color-mix(in srgb, var(--ember-knob-face) 90%, #e8b866);
+  }
+}
 
-  /* Spacing scale. */
+:root[data-appearance="light"] {
+  color-scheme: light;
+  --bg-nav: #f1efea;
+  --bg-canvas: #f9f8f5;
+  --bg-surface: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-input: #ffffff;
+  --bg-inset: #f2f0eb;
+  --bg-hover: rgb(60 45 20 / 0.05);
+  --bg-selected: rgb(60 45 20 / 0.07);
+  --border: #e2ded6;
+  --divider: #ebe8e2;
+  --border-control: #847e74;
+  --fg-strong: #1f1e1b;
+  --fg-body: #393731;
+  --fg-muted: #57524a;
+  --fg-faint: #69635a;
+  --link: #2f5f86;
+  --focus: #2f6aa0;
+  --attention-fg: #835610;
+  --attention-bg: rgb(131 86 16 / 0.1);
+  --attention-border: rgb(131 86 16 / 0.35);
+  --danger-fg: #a3383e;
+  --danger-bg: rgb(163 56 62 / 0.1);
+  --danger-border: rgb(163 56 62 / 0.35);
+  --success-fg: #3a6843;
+  --success-bg: rgb(58 104 67 / 0.1);
+  --primary-fill: #2a2926;
+  --on-primary: #faf9f6;
+  --on-attention: #ffffff;
+  --scrim: rgb(31 30 27 / 0.28);
+  --diff-add-bg: rgb(58 104 67 / 0.1);
+  --diff-del-bg: rgb(163 56 62 / 0.09);
+  --diff-ctx-bg: rgb(60 45 20 / 0.03);
+  --shadow-2: 0 8px 24px rgb(31 30 27 / 0.1), 0 1px 3px rgb(31 30 27 / 0.08);
+  --shadow-3: 0 24px 64px rgb(31 30 27 / 0.18);
+  --tok-comment: #706a61;
+  --tok-keyword: #9a4a33;
+  --tok-type: #3d5a68;
+  --tok-string: #556a3c;
+  --tok-number: #886715;
+  --tok-function: #6d5a2e;
+  --tok-meta: #7a5a30;
+  --tok-attr: #3d5a68;
+  --tok-del: #8f3d2c;
+  --tok-add: #556a3c;
+  --ember-ultra: #9a5d08;
+  --ember-knob-face: #ffffff;
+  --ember-knob-edge: rgba(30, 42, 50, 0.2);
+  --ember-ring-top: rgba(140, 106, 22, 0.4);
+  --ember-ring-ultra: rgba(154, 93, 8, 0.75);
+  --ember-knob-ultra-bg: color-mix(in srgb, var(--ember-knob-face) 90%, #e8b866);
+}
+
+/* ------------------------------------------------------------------ */
+/* Mode-independent roles and scales.                                 */
+/* ------------------------------------------------------------------ */
+
+:root {
+  --unknown-fg: var(--fg-muted);
+  --unknown-border: var(--border-control);
+  /* The terminal is an always-dark instrument: same in both modes. */
+  --term-bg: #1a1917;
+  --term-fg: #e4dfd6;
+
+  --font-ui:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui,
+    sans-serif;
+  --font-read: var(--font-ui);
+  --font-mono:
+    "IBM Plex Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "PingFang SC",
+    "Microsoft YaHei", monospace;
+
+  /* Type scale. Each size has a paired --lh-* line height; only ui/title/page
+     (and their line heights) change below 768, and only in this file. */
+  --text-ui: 13px;
+  --lh-ui: 19px;
+  /* The same pair as a ratio, for body only: --text-ui text still gets
+     exactly --lh-ui, while an element that sets just a smaller font-size
+     (a chip, a mark) gets a proportional line box, not a 19px one. */
+  --lh-ui-ratio: calc(19 / 13);
+  --text-meta: 12px;
+  --lh-meta: 16px;
+  --text-title: 14px;
+  --lh-title: 20px;
+  --text-page: 18px;
+  --lh-page: 26px;
+  --text-read: 16px;
+  --lh-read: 28px;
+  --text-input: 14px;
+  --text-code: 13px;
+  --lh-code: 1.6;
+  /* Shape-bound glyphs only (badge counts, kbd) — D-052 §9 exemption. */
+  --text-2xs: 11px;
+
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
   --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --gutter: 24px;
 
-  /* Unified touch target; icons inside may be smaller, the hit box is not. */
+  /* Hit areas follow pointer: coarse, never width. */
+  --control-h: 32px;
+  --control-h-sm: 28px;
+  --control-h-lg: 36px;
   --touch: 44px;
+  --seg-item: 26px;
+  --icon-btn: 32px;
 
-  /* Visible focus ring, shared by every surface. */
-  --focus-ring: 1px solid var(--cold);
-  --focus-offset: 2px;
-
-  --rail: 48px;
-  --list: 280px;
-  --aside: 300px;
-  --bar: 64px;
-  --top: 56px;
+  --sidebar: 248px;
+  --sidebar-narrow: 216px;
+  --sidebar-collapsed: 48px;
+  --header-h: 48px;
+  --tabs-h: 36px;
   --top-mobile: 52px;
+  --phone-nav-h: 56px;
+  --composer-row: 56px;
+  --index: 272px;
+  --aside: 300px;
+  --read-measure: 720px;
+  --read-gutter: 32px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --workbench-height: 100dvh;
   /* c-mfix: visualViewport.offsetTop — 0 except while the iOS keyboard opens,
      when the visible band starts this far down the layout viewport. */
   --workbench-top: 0px;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-pill: 999px;
+
+  --focus-ring: 2px solid var(--focus);
+  --focus-offset: 2px;
+
+  --dur-1: 100ms;
+  --dur-2: 160ms;
+  --dur-3: 240ms;
+  --ease-out: cubic-bezier(0.2, 0, 0, 1);
+  --ease-in: cubic-bezier(0.3, 0, 1, 1);
 }
+
+@media (max-width: 1199px) {
+  :root {
+    --gutter: 20px;
+    --index: 240px;
+    --read-gutter: 24px;
+  }
+}
+
+@media (max-width: 767px) {
+  :root {
+    --text-ui: 15px;
+    --lh-ui: 22px;
+    --lh-ui-ratio: calc(22 / 15);
+    --text-title: 16px;
+    --lh-title: 22px;
+    --text-page: 20px;
+    --lh-page: 28px;
+    --gutter: 16px;
+    --read-gutter: 16px;
+  }
+}
+
+@media (pointer: coarse) {
+  :root {
+    --control-h: 44px;
+    --control-h-sm: 36px;
+    --control-h-lg: 48px;
+    --text-input: 16px;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Base elements.                                                     */
+/* ------------------------------------------------------------------ */
 
 *,
 *::before,
@@ -110,25 +315,18 @@ body,
 }
 
 html {
-  background: var(--canvas);
-  color-scheme: dark;
-}
-
-/* Ledger is a light surface: native controls (scrollbars, form widgets) and
-   the UA colour-scheme follow it instead of staying dark. */
-:root[data-theme="ledger"],
-[data-theme="ledger"] {
-  color-scheme: light;
+  background: var(--bg-canvas);
 }
 
 body {
-  font-family: var(--font);
-  font-size: var(--text);
-  line-height: 1.45;
-  background: var(--ink);
-  color: var(--paper);
-  text-rendering: optimizeLegibility;
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui-ratio);
+  background: var(--bg-canvas);
+  color: var(--fg-body);
   -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 button,
@@ -142,10 +340,43 @@ select {
 input,
 textarea,
 select {
-  background: var(--ink-0);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: 8px 10px;
+  font-size: var(--text-input);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--fg-faint);
+}
+
+/* Text inputs show focus through the edge, not an outline (§7.3).
+   Checkboxes, radios, ranges and the like keep the global ring. */
+input:not(
+    [type="checkbox"],
+    [type="radio"],
+    [type="range"],
+    [type="file"],
+    [type="color"],
+    [type="button"],
+    [type="submit"],
+    [type="reset"],
+    [type="image"]
+  ):focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
+}
+
+input:disabled,
+textarea:disabled,
+select:disabled {
+  background: var(--bg-inset);
 }
 
 button {
@@ -153,18 +384,18 @@ button {
 }
 
 a {
-  color: var(--cold);
+  color: var(--link);
   text-decoration: none;
 }
 
 a:hover {
-  color: var(--paper);
+  text-decoration: underline;
 }
 
 code,
 pre,
 kbd {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
 }
 
 :focus-visible {
@@ -188,9 +419,61 @@ kbd {
   }
 }
 
+/* A mode switch is instant (§7.4): appearance.ts holds this for two frames. */
+:root[data-mode-switch] *,
+:root[data-mode-switch] *::before,
+:root[data-mode-switch] *::after {
+  transition: none !important;
+}
+
+/* Only elements that opt in with data-motion="essential" keep moving. */
 @media (prefers-reduced-motion: reduce) {
-  *:not(.spin):not(.conn-dot) {
+  *:not([data-motion="essential"]),
+  *:not([data-motion="essential"])::before,
+  *:not([data-motion="essential"])::after {
     animation: none !important;
     transition: none !important;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Transition aliases (old → new). Removed by UO-1b once every        */
+/* surface has migrated; new code must not reference these names.    */
+/* ------------------------------------------------------------------ */
+
+:root {
+  --canvas: var(--bg-nav);
+  --ink: var(--bg-canvas);
+  --ink-0: var(--bg-inset);
+  --ink-1: var(--bg-surface);
+  --ink-2: var(--bg-surface);
+  --line: var(--border);
+  --paper: var(--fg-body);
+  --mute: var(--fg-muted);
+  --dust: var(--attention-fg);
+  --on-dust: var(--on-attention);
+  --cold: var(--link);
+  --ok: var(--success-fg);
+  --danger: var(--danger-border);
+  --danger-strong: var(--danger-fg);
+  --warn: var(--attention-fg);
+  --info: var(--link);
+  --diff-add: var(--diff-add-bg);
+  --diff-del: var(--diff-del-bg);
+  --diff-ctx: var(--diff-ctx-bg);
+  --font: var(--font-ui);
+  --mono: var(--font-mono);
+  --radius: var(--radius-sm);
+  --rail: var(--sidebar-collapsed);
+  --list: var(--index);
+  --top: 56px;
+  --bar: 64px;
+  /* Old size tokens keep their values for the transition. */
+  --text: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-body: 14px;
+  --text-13: 13px;
+  --text-aux: 12px;
+  --text-label: 11px;
 }

@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -317,9 +318,7 @@ test.describe("new session sheet (mock-backed)", () => {
       ] as const) {
         await page.setViewportSize({ width, height });
         await page.goto("/sessions/new");
-        await page.evaluate((next) => {
-          document.documentElement.setAttribute("data-theme", next);
-        }, theme);
+        await setMode(page, theme);
         const slider = page.getByTestId("new-session-effort-slider");
         await expect(slider).toBeVisible();
         // plain = ordinary `high`, top = the restrained `max` accent,
@@ -445,7 +444,7 @@ test.describe("batch B: origin, draft, vocabulary, keyboard", () => {
       ] as const) {
         await page.setViewportSize({ width, height });
         await page.goto("/sessions/new");
-        await page.evaluate((next) => document.documentElement.setAttribute("data-theme", next), theme);
+        await setMode(page, theme);
         await page.getByTestId("new-session-prompt").fill("示例：整理 worktree 创建失败的重试路径");
         await shot(page, `workbench-b-newsession-layer1-${theme}-${tag}.png`);
         await page.getByTestId("new-session-advanced").click();

@@ -109,7 +109,7 @@ test.describe("providers bots settings", () => {
     await expect(page.getByTestId("settings-page")).toBeVisible();
     await expect(page.getByTestId("settings-device-name")).toHaveValue("this-device");
     await expect(page.getByTestId("settings-ios-hint")).toContainText("主屏幕");
-    await expect(page.getByTestId("settings-theme")).toContainText("Night Corral");
+    await expect(page.getByTestId("settings-theme")).toContainText("终端始终为深色底");
     await expect(page.getByTestId("settings-auto-reveal-tty")).not.toBeChecked();
     await expect(page.getByTestId("settings-perm-manual")).toBeVisible();
     await page.getByTestId("settings-push").click();

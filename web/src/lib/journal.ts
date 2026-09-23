@@ -306,11 +306,23 @@ export class JournalClient {
   }
 
   async resumeAfterReconnect(): Promise<U64 | null> {
-    const page = await this.read({
-      journalId: this.journalId,
-      afterSeq: this.appliedSeq,
-      limit: 128,
-    });
+    let page;
+    try {
+      page = await this.read({
+        journalId: this.journalId,
+        afterSeq: this.appliedSeq,
+        limit: 128,
+      });
+    } catch (err) {
+      // A rejected resync read must never leave the client latched at
+      // "reconnecting": settle at the same truthful retryable state a gap
+      // budget exhaustion uses. onStatus mirrors it to the UI (只读 banner
+      // with its 重试 action), and a later contiguous socket batch or a
+      // successful retry restores "live". Re-throw so the caller can report
+      // why the resync did not happen.
+      this.setStatus("readonly-stale");
+      throw err;
+    }
     if (page.events.length === 0) {
       this.setStatus("live");
       return this.appliedSeq;

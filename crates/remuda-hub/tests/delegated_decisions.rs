@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use remuda_hub::store_test_support::Store;
-use remuda_hub::{HubConfig, spawn};
+use remuda_hub::{HubConfig, HubError, NodeTransport, TransportKind, spawn};
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 use tempfile::TempDir;
@@ -567,5 +567,343 @@ async fn operators_still_see_and_pin_every_pending_with_switch_on() -> Result<()
     ] {
         assert!(ids.contains(id), "operator page missing {id}");
     }
+    Ok(())
+}
+
+// --- D-051 (6d): plan-review self-exclusion and the real Node CAS ---------
+//
+// A plan-review gates the target instance's OWN plan, so it does NOT accept
+// the self edge in `owns()`: the child cannot list/answer it; its direct
+// parent (or a human) does. The answer rides the Node first-answer-wins CAS.
+//
+// These tests do NOT script the Node result: the test transport is backed by
+// the real remuda-driver InteractionBroker with a counting owner, so the
+// Hub->Node interaction.answer path actually wins/loses the CAS exactly once.
+
+use remuda_driver::interaction::{
+    AnswerCaller, BrokerConfig, BrokerError, InteractionBroker, InteractionOwner, NativeRequestId,
+    PendingSpec,
+};
+use remuda_protocol::{
+    CommandId, DecisionEffect, DecisionOption, Digest, Id as PId, InteractionAnswer,
+    InteractionRequest, PlanReviewRequest, U64,
+};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const PLAN_DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Owner that counts how many times the winning answer was actually applied,
+/// so tests can assert exactly one driver delivery under a race.
+struct CountingOwner {
+    delivered: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl InteractionOwner for CountingOwner {
+    async fn apply_answer(
+        &self,
+        _id: remuda_protocol::InteractionId,
+        _answer: InteractionAnswer,
+    ) -> Result<(), BrokerError> {
+        self.delivered.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn deny_or_cancel(&self, _id: remuda_protocol::InteractionId) -> Result<(), BrokerError> {
+        Ok(())
+    }
+}
+
+/// A Node transport backed by the real driver interaction broker.
+struct BrokerTransport {
+    broker: Arc<InteractionBroker>,
+}
+
+fn rpc_frame(result: Result<remuda_driver::interaction::AnswerOutcome, BrokerError>) -> Value {
+    match result {
+        Ok(_) => json!({
+            "jsonrpc": "2.0", "id": "1",
+            "result": { "outcome": "accepted", "state": "answer-committed" }
+        }),
+        Err(BrokerError::Superseded { .. }) => json!({
+            "jsonrpc": "2.0", "id": "1",
+            "error": { "code": -32004, "message": "interaction already answered" }
+        }),
+        Err(BrokerError::Expired) => json!({
+            "jsonrpc": "2.0", "id": "1",
+            "error": { "code": -32005, "message": "interaction expired" }
+        }),
+        Err(other) => json!({
+            "jsonrpc": "2.0", "id": "1",
+            "error": { "code": -32602, "message": other.to_string() }
+        }),
+    }
+}
+
+impl NodeTransport for BrokerTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+    fn call(
+        &self,
+        method: &str,
+        params: Value,
+        _timeout: std::time::Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>> {
+        // The merged inbox also polls the Node live list; these tests rely on
+        // the durable Hub row only, so the live side is empty.
+        if method == "interaction.list" {
+            return Box::pin(std::future::ready(Ok(Some(json!({ "items": [] })))));
+        }
+        assert_eq!(
+            method, "interaction.answer",
+            "unexpected Node method {method}"
+        );
+        let broker = self.broker.clone();
+        Box::pin(async move {
+            let interaction_id = params["interactionId"]
+                .as_str()
+                .and_then(|s| remuda_protocol::InteractionId::try_from(s.to_string()).ok())
+                .expect("interactionId");
+            let answer: InteractionAnswer =
+                serde_json::from_value(params["answer"].clone()).expect("answer");
+            let command_id: CommandId =
+                serde_json::from_value(params["commandId"].clone()).expect("commandId");
+            let device_id: PId =
+                serde_json::from_value(params["byDevice"].clone()).expect("byDevice");
+            let origin = match params["origin"].as_str() {
+                Some("human") => remuda_driver::LaunchOrigin::Human,
+                Some("agent") => remuda_driver::LaunchOrigin::Agent,
+                other => panic!("unexpected origin {other:?}"),
+            };
+            let instance_id = params
+                .get("byInstanceId")
+                .and_then(Value::as_str)
+                .and_then(|s| remuda_protocol::InstanceId::try_from(s.to_string()).ok());
+            let caller = AnswerCaller {
+                device_id,
+                origin,
+                instance_id,
+            };
+            let result = broker
+                .answer_for(interaction_id, answer, caller, command_id)
+                .await;
+            Ok(Some(rpc_frame(result)))
+        })
+    }
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+}
+
+impl Ctx {
+    /// Insert a pending interaction row with a caller-chosen id (matches the
+    /// broker ticket id).
+    fn interaction_with_id(&self, instance_id: &str, kind: &str, id: &str) -> Result<()> {
+        let db = rusqlite::Connection::open(self._dir.path().join("data").join("hub.sqlite"))?;
+        db.execute(
+            "INSERT INTO interactions
+                (id, instance_id, host_id, kind, state, blocking, payload_json,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 1, '{}', ?5, ?5)",
+            rusqlite::params![id, instance_id, self.host, kind, NOW],
+        )?;
+        Ok(())
+    }
+
+    /// POST a well-formed plan-review answer.
+    async fn plan_answer(&self, token: &str, interaction_id: &str) -> Result<reqwest::Response> {
+        Ok(self
+            .http
+            .post(format!(
+                "{}/v1/interactions/{interaction_id}/answer",
+                self.base()
+            ))
+            .bearer_auth(token)
+            .json(&json!({
+                "answer": {
+                    "kind": "plan-review",
+                    "optionId": "approve",
+                    "planRevision": "1",
+                    "planDigest": PLAN_DIGEST,
+                    "feedback": null
+                }
+            }))
+            .send()
+            .await?)
+    }
+
+    /// Back the owning host's transport with a real driver broker holding one
+    /// pending plan-review for `child`, and create the matching Hub row.
+    /// Returns the interaction id and the delivery counter.
+    async fn seed_plan_review_node(&self, child: &str) -> Result<(String, Arc<AtomicUsize>)> {
+        let (broker, mut observations) =
+            InteractionBroker::new(BrokerConfig::default()).expect("broker");
+        // Drain answered observations so the broker channel never blocks.
+        tokio::spawn(async move { while observations.recv().await.is_some() {} });
+        let delivered = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_owner(
+                child.parse::<remuda_protocol::InstanceId>()?,
+                Arc::new(CountingOwner {
+                    delivered: delivered.clone(),
+                }),
+            )
+            .await;
+        let review = PlanReviewRequest {
+            title: "Plan review".into(),
+            plan_ref: PId::new("obj")?,
+            plan_revision: U64(1),
+            plan_digest: Digest::try_from(PLAN_DIGEST.to_string())?,
+            options: vec![
+                DecisionOption {
+                    id: "approve".into(),
+                    label: "Approve".into(),
+                    effect: DecisionEffect::AllowOnce,
+                    native_value_ref: PId::new("obj")?,
+                },
+                DecisionOption {
+                    id: "deny".into(),
+                    label: "Deny".into(),
+                    effect: DecisionEffect::Deny,
+                    native_value_ref: PId::new("obj")?,
+                },
+            ],
+            allow_feedback: true,
+            plan: Some("# the plan".into()),
+        };
+        let id = broker
+            .insert(PendingSpec {
+                instance_id: child.parse()?,
+                host_id: remuda_protocol::HostId::new(),
+                native_request_id: NativeRequestId {
+                    request_id: "perm-plan".into(),
+                    tool_use_id: None,
+                },
+                payload: InteractionRequest::PlanReview(Box::new(review)),
+                run_generation: U64(1),
+                tool_name: Some("ExitPlanMode".into()),
+            })
+            .await
+            .expect("insert ticket");
+        let id = id.as_id().as_str().to_string();
+        self.interaction_with_id(child, "plan-review", &id)?;
+        self.hub
+            .test_set_node_transport(
+                &self.host,
+                Arc::new(BrokerTransport { broker }) as Arc<dyn NodeTransport>,
+            )
+            .await;
+        Ok((id, delivered))
+    }
+}
+
+#[tokio::test]
+async fn a_parents_plan_review_answer_wins_the_real_node_cas_once() -> Result<()> {
+    let _flag = flag(Some(true)).await;
+    let ctx = Ctx::boot().await?;
+    let parent = ctx.instance("manual", None).await?;
+    let child = ctx.instance("manual", Some(&parent)).await?;
+    let (review, delivered) = ctx.seed_plan_review_node(&child).await?;
+    let token = ctx.agent_token(&parent).await?;
+
+    let response = ctx.plan_answer(&token, &review).await?;
+    assert_eq!(response.status(), 200, "{}", response.text().await?);
+    assert_eq!(ctx.interaction_state(&review)?, "answer-committed");
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        1,
+        "the winning answer must be applied to the driver exactly once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_child_cannot_answer_or_even_see_its_own_plan_review() -> Result<()> {
+    let _flag = flag(Some(true)).await;
+    let ctx = Ctx::boot().await?;
+    let parent = ctx.instance("manual", None).await?;
+    let child = ctx.instance("manual", Some(&parent)).await?;
+    let (review, delivered) = ctx.seed_plan_review_node(&child).await?;
+    let child_token = ctx.agent_token(&child).await?;
+    let parent_token = ctx.agent_token(&parent).await?;
+
+    // The child is refused before the Node is ever contacted.
+    let response = ctx.plan_answer(&child_token, &review).await?;
+    assert_eq!(response.status(), 403);
+    assert_eq!(ctx.interaction_state(&review)?, "pending");
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        0,
+        "a 403 must not reach the CAS"
+    );
+
+    // And it does not appear in the child's own merged inbox.
+    let body = ctx.list(&child_token, &[]).await?.json::<Value>().await?;
+    assert!(
+        !item_ids(&body).contains(&review),
+        "the child must not see its own plan review"
+    );
+    // The direct parent does see it.
+    let body = ctx.list(&parent_token, &[]).await?.json::<Value>().await?;
+    assert!(
+        item_ids(&body).contains(&review),
+        "the parent must see the child's plan review"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn when_human_and_parent_answer_concurrently_one_wins_and_one_is_superseded() -> Result<()> {
+    let _flag = flag(Some(true)).await;
+    let ctx = std::sync::Arc::new(Ctx::boot().await?);
+    let parent = ctx.instance("manual", None).await?;
+    let child = ctx.instance("manual", Some(&parent)).await?;
+    let (review, delivered) = ctx.seed_plan_review_node(&child).await?;
+    let parent_token = ctx.agent_token(&parent).await?;
+    let human_token = ctx.human.clone();
+
+    // Fire both answers concurrently; the broker mutex decides the winner.
+    let review_for_parent = review.clone();
+    let review_for_human = review.clone();
+    let parent_answer = {
+        let ctx = std::sync::Arc::clone(&ctx);
+        async move {
+            ctx.plan_answer(&parent_token, &review_for_parent)
+                .await
+                .expect("parent request")
+                .status()
+                .as_u16()
+        }
+    };
+    let human_answer = {
+        let ctx = std::sync::Arc::clone(&ctx);
+        async move {
+            ctx.plan_answer(&human_token, &review_for_human)
+                .await
+                .expect("human request")
+                .status()
+                .as_u16()
+        }
+    };
+    let (parent_status, human_status) = tokio::join!(parent_answer, human_answer);
+
+    let statuses = [parent_status, human_status];
+    assert!(
+        statuses.contains(&200) && statuses.contains(&409),
+        "expected one accepted (200) and one Superseded (409), got {statuses:?}"
+    );
+    assert_eq!(
+        delivered.load(Ordering::SeqCst),
+        1,
+        "exactly one answer must reach the driver under a concurrent race"
+    );
+    assert_eq!(ctx.interaction_state(&review)?, "answer-committed");
     Ok(())
 }

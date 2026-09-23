@@ -105,6 +105,8 @@ fn probe_fixtures_decode_without_unknown() {
         "claude-permission-host-allow.jsonl",
         "claude-permission-host-deny.jsonl",
         "claude-askuser.jsonl",
+        "claude-exit-plan-mode-allow.jsonl",
+        "claude-exit-plan-mode-deny.jsonl",
         "claude-hook-permission.jsonl",
         "claude-hook-permission-allow.jsonl",
         "claude-hook-permission-deny.jsonl",

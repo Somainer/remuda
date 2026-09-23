@@ -131,3 +131,144 @@ set), plus a `原始事件` disclosure keeping the raw payload one click away
 
 Keyboard-up shots are clipped to the visualViewport band (the off-band strip
 of the layout viewport is not part of what the phone displays).
+
+## Round 2: keyboard up still hid the conversation and most of the composer
+
+The band pinning fixed "everything disappears", but on the owner's real
+session (re-verified in WebKit iPhone 15) the band is only 323 px tall
+(393×659 viewport, 336 px keyboard) and fixed chrome ate all of it: install
+banner ~60 + session header ~42 + the exited-session resume row ~45 + the
+运行详情/加批注 row ~40 + a multi-line live status strip ~90, leaving the
+transcript at 0 px and only ~20 px of the composer visible above the
+keyboard. The round-1 fixture session had none of that chrome.
+
+### Fix: keyboard-compact chrome collapse
+
+`lib/viewport.ts` now stamps `<html data-keyboard="1">` whenever a compact
+viewport loses ≥120 px of visual height (both acceptance keyboards clear it;
+small browser-chrome moves and rubber-banding do not). While stamped,
+`src/styles/keyboardCompact.css` (imported once in `main.tsx`, all selectors
+scoped to the attribute, stable testids only):
+
+- hides the install banner (`install-bar`) AND the waiting-worker update bar
+  (`update-bar` — InstallBar renders that instead when a new service worker
+  is waiting), the exited-session resume row, the 运行详情 disclosure, the
+  annotation dock, task track and session notifications;
+- **round 3:** also hides the transcript toolbar (全部折叠 / 搜索正文), an open
+  transcript search and the gap-backfill journal banner — these sat ABOVE the
+  message scroller and were why the real SCROLLPORT kept only ~29 % of the
+  band while the transcript ROOT passed the 40 % assertion;
+- compresses the live status strip to one clipped line — phase dot + tool
+  name + the hook health note; timer/token/tier/spinner phrase/Esc fold away
+  until the keyboard closes;
+- tightens the dock wrapper padding/gaps (the composer's own 44 px touch rows
+  are untouched).
+
+The composer and the transcript are never hidden; with the keyboard down the
+attribute is removed and nothing in the stylesheet applies.
+
+### Fixture and assertions
+
+The fake Node gained the `mfix-chrome-combo` sentinel
+(`crates/remuda-hub/examples/hub_e2e.rs`, reached from both
+`instance.create` initial input and `instance.send`): a ready→exited
+resumable instance (`signalTier: hook`, native session id) with a user
+message, a still-**running** AskUserQuestion tool_call + a hook
+`tool-started` phase whose last hook record is backdated 30 s (past the
+3× cadence stall budget → the `hook · 通道静默，计时可能不准` note), an
+858-output-token usage snapshot, and a fresh screen `live.status` spinner
+(keeps the turn decision `working`, so Esc 打断 and the running verbs
+render). The spec self-skips when the sentinel is absent (the gate runs
+without a fake Node; headless Chromium also does not surface the install
+banner, which the spec treats as a precondition rather than a requirement).
+
+The keyboard is emulated exactly as iOS and the coordinator's verifier do —
+the layout viewport is NOT resized:
+
+```js
+Object.defineProperty(vv, "height", { configurable: true, get: () => innerHeight - KB });
+Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => KB });
+window.scrollTo(0, KB); vv.dispatchEvent(new Event("resize"));
+vv.dispatchEvent(new Event("scroll")); window.dispatchEvent(new Event("resize"));
+```
+
+Cases: iPhone 15 393×659 / KB 336 AND iPhone SE 375×667 / KB 260. Each device
+has TWO cases:
+
+- **geometry** — the exited full-chrome session (force-tap only; its composer
+  is disabled by design). Assertions against the exact band
+  `[offsetTop, offsetTop + height]`:
+  1. composer form, textarea, and the 发送 control are entirely inside the band;
+  2. the message SCROLLPORT `[data-testid="transcript-scroller"]` — not the
+     transcript root — keeps ≥ 40 % of the band: measured **147/323 ≈ 45.5 %**
+     on iPhone 15 (the toolbar collapse returned ~50 px to the scrollport);
+     the scroller is bottom-pinned (`scrollTop + clientHeight >=
+     scrollHeight - 4`) and the painted elements just above its bottom edge
+     belong to the tail `transcript-row` wrappers (the AskUserQuestion tool
+     card + usage row of the fixture). Short conversations that fit the band
+     are exempt from the bottom-edge paint check — blank space below the last
+     row is correct there.
+- **focus** — an enabled, idle composer: a real (non-forced) click asserts
+  `toBeFocused()` BEFORE the keyboard geometry is applied; the composer stays
+  fully in the band, focus survives the geometry change, and the enabled
+  composer returns when the keyboard closes. The scroller measured
+  **173/323 ≈ 53.5 %** in this case.
+
+Honesty guards: trigger presence is read from the fake Node's JOURNAL
+(`obj_mfix_ask` tool call + the exited entity) and missing trigger SKIPS; once
+the trigger exists, missing chrome is a hard failure. The install banner is
+required in the WebKit acceptance cases (iPhone surfaces the offer; if an
+engine never does, the case skips explicitly). `fakeHostId` returns only the
+`e2e-fake-node` host — a registered real host skips the hub-backed cases
+rather than erroring. Keyboard close restores every collapsed piece; with the
+keyboard down the layout is unchanged.
+
+### Round-2 evidence (WebKit iPhone 15, 390 CSS px)
+
+- `m-realdevice-5-chrome-keyboard-down-390.png` — keyboard DOWN: unchanged,
+  all chrome present.
+- `m-realdevice-7-chrome-keyboard-up-nocollapse-390.png` — mechanical
+  BEFORE: same geometry with the collapse attribute removed; banner, resume
+  row, run details and the wrapped multi-line strip fill the band, the
+  composer is clipped at the band edge (owner's report).
+- `m-realdevice-6-chrome-keyboard-up-390.png` — AFTER: one-line status strip,
+  the full transcript block with the AskUserQuestion row and 858-token usage,
+  and the entire composer (textarea + effort chip + 发送) inside the band.
+
+Result (round 3): **7/7 passed on webkit-iphone** (a–c plus geometry/focus
+on both devices); the geometry/focus cases also pass on host Chromium. Full
+`m-*.hub.spec.ts` sweep (m-chrome, m-home, m-inbox, m-jumpto, m-keybar,
+m-push, m-shell, m-realdevice) green on Chromium against a fresh fake Node.
+All e2e runs were wrapped in
+the gate e2e lock (`flock` on the shared gate lock) with per-worker ports.
+
+
+## Round 4: pin-on-shrink, and search focus under the keyboard
+
+Two more acceptance findings, both verified as real:
+
+1. **Pin held only on node/size changes, not on scroller resize.** When the
+   keyboard opened, the scroller's `clientHeight` shrank but the pin effect
+   (`el.scrollTop = el.scrollHeight`, keyed on `nodes.length`/`sizes`) never
+   reran and the scroller's ResizeObserver only stored the new height — so an
+   overflowing, pinned transcript stayed scrolled above its tail and the
+   newest message vanished while typing. Fix (`Transcript.tsx`): the scroller
+   ResizeObserver samples `pinRef` BEFORE the shrink and re-applies the
+   bottom pin in the same frame only while the user was already pinned; a
+   reader who scrolled up keeps their position. Covered by a jsdom unit test
+   (pinned → re-pinned from 720 to 323; scrolled-up → offset preserved at 100
+   when the viewport shrinks to 240). The `mfix-chrome-combo` fake-Node
+   fixture now journals twelve tall history turns so the transcript
+   OVERFLOWS the band, and the e2e assertion requires overflow and hits the
+   exact LAST `transcript-row` (the running AskUserQuestion card) just above
+   the scroller's bottom edge — no "last two", no skip when content fits the
+   overflow case.
+2. **Opening transcript search hid the search box.** The collapsed toolbar
+   hosts the search input, so focusing search raised the keyboard and hid the
+   box. `lib/viewport.ts` now tracks the focused surface on focusin/focusout
+   (`data-keyboard-focus="search"|"composer"` on `<html>`);
+   `keyboardCompact.css` keeps the toolbar/searchbar mounted while search
+   owns focus and collapses them only when the composer is focused. New e2e
+   case per device: open search, focus the input, apply the keyboard
+   geometry, assert `data-keyboard-focus="search"`, the toolbar + searchbar +
+   input stay visible inside the band and keep focus.

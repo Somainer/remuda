@@ -175,16 +175,23 @@ pub struct QuestionRequest {
 pub struct PlanReviewRequest {
     /// `title`; protocol §5.4.
     pub title: String,
-    /// `plan_ref`; protocol §5.4.
+    /// `plan_ref`; protocol §5.4. An unparsed placeholder id on print/sdk
+    /// carriers; the authoritative text is [`Self::plan`], not an object.
     pub plan_ref: Id,
     /// `plan_revision`; protocol §5.4.
     pub plan_revision: U64,
-    /// `plan_digest`; protocol §5.4.
+    /// `plan_digest`; protocol §5.4 — sha256 of exactly the `plan` UTF-8 bytes.
     pub plan_digest: Digest,
     /// `options`; protocol §5.4.
     pub options: Vec<DecisionOption>,
     /// `allow_feedback`; protocol §5.4.
     pub allow_feedback: bool,
+    /// `plan`; protocol §5.4. The plan text the reviewer approves, inline.
+    /// `plan_digest` is sha256 of exactly these UTF-8 bytes. Absent (`null`)
+    /// on producers that only have a `plan_ref`. Additive optional field:
+    /// older readers ignore it, newer readers default it to absent.
+    #[serde(default, deserialize_with = "crate::scalar::required_option")]
+    pub plan: Option<String>,
 }
 
 /// ElicitationRequest; `protocol.md` §5.4.

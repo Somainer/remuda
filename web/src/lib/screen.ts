@@ -61,14 +61,25 @@ export function screenTextOf(obs: Observation): string {
   );
 }
 
-/** Latest screen-derived snapshot from a followed journal. */
-export function latestScreenFromObservations(events: Observation[]): ScreenRead {
+/**
+ * Latest screen-derived snapshot from a followed journal, with the seq of the
+ * observation it came from. The seq orders journal-derived screens against
+ * in-flight `tty.screen` RPC reads so a read that started before a newer
+ * journal frame cannot overwrite it on its stale resolution.
+ */
+export function latestScreenSnapshot(events: Observation[]): { lines: string[]; seq: string | null } {
   for (let i = events.length - 1; i >= 0; i--) {
     const obs = events[i];
     if (!isScreenObservation(obs)) continue;
     const text = screenTextOf(obs);
     if (!text) continue;
-    return { lines: text.split(/\r?\n/) };
+    return { lines: text.split(/\r?\n/), seq: obs.seq };
   }
-  return { lines: [] };
+  return { lines: [], seq: null };
+}
+
+/** Latest screen-derived snapshot from a followed journal. */
+export function latestScreenFromObservations(events: Observation[]): ScreenRead {
+  const { lines } = latestScreenSnapshot(events);
+  return { lines };
 }

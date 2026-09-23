@@ -20,13 +20,18 @@ html[data-keyboard="1"] [data-testid="run-details"],
 html[data-keyboard="1"] [data-testid="annotation-dock"],
 html[data-keyboard="1"] [data-testid="task-track"],
 html[data-keyboard="1"] [data-testid="session-notifications"],
-/* c-mfix round 3: the transcript toolbar (全部折叠 / 搜索正文), an open
-   transcript search and the gap banner sit ABOVE the message scroller and
-   were why the real scrollport kept only ~29% of the band. None is needed
-   while typing; search is reachable again the moment the keyboard closes. */
-html[data-keyboard="1"] [data-testid="transcript-toolbar"],
-html[data-keyboard="1"] [data-testid="transcript-searchbar"],
-html[data-keyboard="1"] [data-testid="journal-banner"] {
+/* c-mfix round 3: an open transcript search and the gap banner sit ABOVE the
+   message scroller and were why the real scrollport kept only ~29% of the
+   band. Neither is needed while typing in the composer; search is reachable
+   again the moment the keyboard closes. Round 4: the TOOLBAR/searchbar stay
+   visible while the search input itself owns the focus — otherwise opening
+   search (which raises the keyboard) would hide the box being typed into. */
+html[data-keyboard="1"]:not([data-keyboard-focus="search"])
+  [data-testid="journal-banner"],
+html[data-keyboard="1"]:not([data-keyboard-focus="search"])
+  [data-testid="transcript-toolbar"],
+html[data-keyboard="1"]:not([data-keyboard-focus="search"])
+  [data-testid="transcript-searchbar"] {
   display: none !important;
 }
 

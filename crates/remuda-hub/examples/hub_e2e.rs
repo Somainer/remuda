@@ -3033,6 +3033,58 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
         }),
     )
     .await?;
+    // c-mfix round 4: a long backlog so the transcript OVERFLOWS the keyboard
+    // band — pinning must keep the tail on screen when the scroller shrinks.
+    // Twelve completed assistant turns, each a few lines tall.
+    for i in 1..=12 {
+        n = append_full_event(
+            ws,
+            instance_id,
+            n,
+            json!({
+                "kind": "message",
+                "completeness": "structured",
+                "observedAt": stale_at,
+                "payload": {
+                    "role": "assistant",
+                    "text": format!("历史回合 {i}：这是一段足够高的多行输出，\n用来把 transcript 撑出键盘 band，\n确保滚动口发生溢出。"),
+                    "origin": "assistant"
+                }
+            }),
+        )
+        .await?;
+    }
+    // Prior-turn usage lands BEFORE the currently running tool, so the
+    // running AskUserQuestion card is the transcript's final (latest) row.
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "usage",
+            "completeness": "structured",
+            "observedAt": stale_at,
+            "source": { "channel": "hook" },
+            "payload": {
+                "usageId": "obj_mfix_usage",
+                "scope": "turn",
+                "scopeId": "obj_mfix_run",
+                "mode": "snapshot",
+                "metricRevision": "1",
+                "inputTokens": wf_known(json!("12000")),
+                "inputAccounting": "uncached",
+                "outputTokens": wf_known(json!("858")),
+                "reasoningTokens": wf_unknown(),
+                "cacheReadTokens": wf_known(json!("0")),
+                "cacheWriteTokens": wf_known(json!("0")),
+                "totalTokens": wf_known(json!("12858")),
+                "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
+                "accounting": "estimated",
+                "nativeFieldsRef": null
+            }
+        }),
+    )
+    .await?;
     n = append_full_event(
         ws,
         instance_id,
@@ -3083,35 +3135,7 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
         }),
     )
     .await?;
-    n = append_full_event(
-        ws,
-        instance_id,
-        n,
-        json!({
-            "kind": "usage",
-            "completeness": "structured",
-            "observedAt": stale_at,
-            "source": { "channel": "hook" },
-            "payload": {
-                "usageId": "obj_mfix_usage",
-                "scope": "turn",
-                "scopeId": "obj_mfix_run",
-                "mode": "snapshot",
-                "metricRevision": "1",
-                "inputTokens": wf_known(json!("12000")),
-                "inputAccounting": "uncached",
-                "outputTokens": wf_known(json!("858")),
-                "reasoningTokens": wf_unknown(),
-                "cacheReadTokens": wf_known(json!("0")),
-                "cacheWriteTokens": wf_known(json!("0")),
-                "totalTokens": wf_known(json!("12858")),
-                "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
-                "accounting": "estimated",
-                "nativeFieldsRef": null
-            }
-        }),
-    )
-    .await?;
+
     // The fresh screen spinner keeps the decision `working` even though the
     // hook tier is stalled (Esc 打断 must render).
     n = append_full_event(

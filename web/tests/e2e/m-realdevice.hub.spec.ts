@@ -700,10 +700,16 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
   /**
    * Acceptance (2), measured on the actual message SCROLLPORT, not the
    * transcript root (which also owns the toolbar): the scroller keeps >=40%
-   * of the band, is bottom-pinned, and — when content overflows — paints the
-   * latest transcript row just above its bottom edge.
+   * of the band and is bottom-pinned. When `requireOverflow` is set the
+   * fixture content must overflow the band, and the paint just above the
+   * scroller's bottom edge must be THE LATEST row (exact row, not a tail
+   * sibling) — the round-4 pin-on-shrink contract.
    */
-  async function assertScrollerInBand(page: Page, band: Band) {
+  async function assertScrollerInBand(
+    page: Page,
+    band: Band,
+    requireOverflow = false,
+  ) {
     const box = await bandRect(page, "[data-testid='transcript-scroller']");
     expect(box, "scroller mounted").not.toBeNull();
     expect(box!.top, "scroller top within band").toBeGreaterThanOrEqual(
@@ -717,7 +723,7 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       `scroller ${box!.height}px must keep >=40% of the ${band.height}px band`,
     ).toBeGreaterThanOrEqual(band.height * 0.4 - 1);
 
-    const latest = await page.evaluate((within) => {
+    const latest = await page.evaluate(() => {
       const scroller = document.querySelector<HTMLElement>(
         "[data-testid='transcript-scroller']",
       );
@@ -730,13 +736,11 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
         };
       const pinned =
         scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
-      // Every assembled node (message, tool card, usage footer, change
-      // record…) renders in a uniform `transcript-row` wrapper.
+      // Every assembled node renders in a uniform `transcript-row` wrapper.
       const rows = [
         ...scroller.querySelectorAll("[data-testid='transcript-row']"),
       ];
       const last = rows[rows.length - 1] ?? null;
-      const tail = rows.slice(-2);
       const sr = scroller.getBoundingClientRect();
       const lr = last?.getBoundingClientRect();
       const rowVisible =
@@ -745,18 +749,16 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
         lr.top < sr.bottom - 2 &&
         lr.height > 0 &&
         scroller.contains(last);
-      // When content overflows, pinning must keep the tail painted right at
-      // the scroller's bottom edge. When the whole conversation fits, blank
-      // space below the latest row is correct — row visibility above is the
-      // contract, so do not demand paint where there is nothing to paint.
       const overflows = scroller.scrollHeight > scroller.clientHeight + 4;
+      // When content overflows, pinning must keep the tail painted right at
+      // the scroller's bottom edge; the hit must be the LAST row itself.
       const x = Math.round(sr.left + sr.width / 2);
-      let paintsLatest = !overflows;
+      let paintsLatest = false;
       if (overflows) {
         for (const dy of [4, 12, 24, 36]) {
           const hit = document.elementFromPoint(x, Math.round(sr.bottom - dy));
           const rowHit = hit?.closest("[data-testid='transcript-row']");
-          if (hit && rowHit && tail.includes(rowHit)) {
+          if (hit && rowHit && rowHit === last) {
             paintsLatest = true;
             break;
           }
@@ -764,14 +766,20 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       }
       return { overflows, pinned, rowVisible, paintsLatest };
     });
+    if (requireOverflow) {
+      expect(
+        latest.overflows,
+        "fixture must overflow the keyboard band (scrollHeight > clientHeight)",
+      ).toBe(true);
+      expect(
+        latest.paintsLatest,
+        "the paint just above the scroller bottom is THE latest row",
+      ).toBe(true);
+    }
     expect(latest.pinned, "scroller pinned to the latest content").toBe(true);
     expect(
       latest.rowVisible,
       "latest row intersects the visible scroller rect",
-    ).toBe(true);
-    expect(
-      latest.paintsLatest,
-      "the paint just above the scroller bottom is the latest row",
     ).toBe(true);
   }
 
@@ -808,8 +816,12 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       // focus. Focus is covered by the enabled-composer case below.
       if (!(await fakeHostId(page)))
         test.skip(true, "fake Node not registered");
-      const webkit = testInfo.project.name.toLowerCase().includes("webkit");
+      // Set the exact device viewport BEFORE login/navigation (the shared
+      // mobile beforeEach logs in on the descriptor's default size), keeping
+      // the full phone emulation so the compact media queries and the folded
+      // transcript toolbar engage.
       await page.setViewportSize({ width, height });
+      const webkit = testInfo.project.name.toLowerCase().includes("webkit");
       const id = await createClaudeSession(page, "mfix-chrome-combo");
       await clearApprovals(page, id);
       await page.goto(`/s/${id}/structured`);
@@ -858,7 +870,9 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
 
       await assertChromeCollapsed(page, strip);
       await assertComposerInBand(page, band);
-      await assertScrollerInBand(page, band);
+      // The combo fixture deliberately overflows the band: the pin must hold
+      // the exact latest (running AskUserQuestion) row at the bottom edge.
+      await assertScrollerInBand(page, band, true);
 
       if (evidence && width === 393) {
         await shot(page, "m-realdevice-6-chrome-keyboard-up-390.png", true);
@@ -887,6 +901,10 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
     }) => {
       if (!(await fakeHostId(page)))
         test.skip(true, "fake Node not registered");
+      // Set the exact device viewport BEFORE login/navigation (the shared
+      // mobile beforeEach logs in on the descriptor's default size), keeping
+      // the full phone emulation so the compact media queries and the folded
+      // transcript toolbar engage.
       await page.setViewportSize({ width, height });
       // A normal echo session settles to idle: the composer is ENABLED, so a
       // real (non-forced) click exercises focus the way the owner's tap does.
@@ -912,6 +930,72 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
 
       await lowerKeyboard(page);
       await expect(input).toBeEnabled();
+    });
+
+    test(`search — transcript search input stays visible under the keyboard, ${label} ${width}x${height} / ${kb}px keyboard`, async ({
+      page,
+    }) => {
+      // Round 4: opening transcript search raises the keyboard, and the
+      // keyboard collapse must not hide the very input being typed into.
+      if (!(await fakeHostId(page)))
+        test.skip(true, "fake Node not registered");
+      // Set the exact device viewport BEFORE login/navigation (the shared
+      // mobile beforeEach logs in on the descriptor's default size), keeping
+      // the full phone emulation so the compact media queries and the folded
+      // transcript toolbar engage.
+      await page.setViewportSize({ width, height });
+      const id = await createClaudeSession(page, `mfix search ${label}`);
+      await clearApprovals(page, id);
+      await page.goto(`/s/${id}/structured`);
+      const sessionPage = page.getByTestId("session-page");
+      await expect(sessionPage).toHaveAttribute("data-view", "structured");
+      await expect(sessionPage).toHaveAttribute("data-status", "idle", {
+        timeout: 20_000,
+      });
+
+      // The transcript (with its toolbar) mounts a beat after navigation
+      // while the virtual window settles; wait for it instead of racing with
+      // a synchronous isVisible check.
+      const toolbar = page.getByTestId("transcript-toolbar");
+      await expect(toolbar).toBeVisible();
+      if ((await toolbar.getAttribute("data-tools-fold")) === "1") {
+        // Compact: expand the ⋯ fold first.
+        await page.getByTestId("transcript-tools-open").click();
+      }
+      await page.getByTestId("transcript-search-open").click({ timeout: 5000 });
+      const searchInput = page.getByTestId("transcript-search-input");
+      await searchInput.click();
+      await expect(searchInput).toBeFocused();
+
+      await raiseKeyboardIosExact(page, kb);
+      const band = await currentBand(page, height, kb);
+      await expect(page.locator("html")).toHaveAttribute(
+        "data-keyboard-focus",
+        "search",
+      );
+
+      // The search box AND its toolbar host stay mounted while it is focused.
+      const searchBox = await bandRect(
+        page,
+        "[data-testid='transcript-searchbar']",
+      );
+      expect(searchBox, "searchbar mounted under the keyboard").not.toBeNull();
+      expect(searchBox!.height).toBeGreaterThan(0);
+      const inputBox = await bandRect(
+        page,
+        "[data-testid='transcript-search-input']",
+      );
+      expect(inputBox, "search input mounted").not.toBeNull();
+      expect(inputBox!.height).toBeGreaterThan(0);
+      expect(inputBox!.top).toBeGreaterThanOrEqual(band.top - 1);
+      // The input can sit partially behind the keyboard on real iOS if it
+      // was scrolled into view, but its top and clickable area must remain in
+      // the band — assert its top half is visible there.
+      expect(inputBox!.top + inputBox!.height / 2).toBeLessThanOrEqual(
+        band.bottom + 1,
+      );
+      await expect(page.getByTestId("transcript-toolbar")).toBeVisible();
+      await expect(searchInput).toBeFocused();
     });
   }
 });

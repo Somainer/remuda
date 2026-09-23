@@ -474,15 +474,32 @@ function TranscriptInner({
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    // c-mfix round 4: a height change (the soft keyboard shrinks the band)
+    // does not change nodes/sizes, so the pin effect above never reruns and a
+    // long transcript pinned to the tail is left scrolled above its newest
+    // row. Re-pin in the same frame the scroller shrinks, but ONLY while the
+    // user was already pinned to the bottom — someone who scrolled up keeps
+    // their reading position when the keyboard opens.
+    let wasPinned = false;
     const measure = () => {
       const next = el.clientHeight;
       const viewport = next < 32 ? 720 : next;
       viewportRef.current = viewport;
       setViewport(viewport);
+      if (wasPinned) {
+        el.scrollTop = el.scrollHeight;
+        scrollTopRef.current = el.scrollTop;
+      }
     };
     measure();
     if (typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver(measure);
+    // ResizeObserver fires with the box AFTER the shrink; pin state must be
+    // sampled from the geometry just before it, so refresh it on every scroll
+    // frame and in the observer callback before `measure`.
+    const ro = new ResizeObserver(() => {
+      wasPinned = pinRef.current;
+      measure();
+    });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);

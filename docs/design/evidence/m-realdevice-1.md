@@ -240,5 +240,35 @@ on both devices); the geometry/focus cases also pass on host Chromium. Full
 `m-*.hub.spec.ts` sweep (m-chrome, m-home, m-inbox, m-jumpto, m-keybar,
 m-push, m-shell, m-realdevice) green on Chromium against a fresh fake Node.
 All e2e runs were wrapped in
-`flock ~/Projects/remuda-agents/locks/gate-e2e.lock` with per-worker ports.
+the gate e2e lock (`flock` on the shared gate lock) with per-worker ports.
 
+
+## Round 4: pin-on-shrink, and search focus under the keyboard
+
+Two more acceptance findings, both verified as real:
+
+1. **Pin held only on node/size changes, not on scroller resize.** When the
+   keyboard opened, the scroller's `clientHeight` shrank but the pin effect
+   (`el.scrollTop = el.scrollHeight`, keyed on `nodes.length`/`sizes`) never
+   reran and the scroller's ResizeObserver only stored the new height — so an
+   overflowing, pinned transcript stayed scrolled above its tail and the
+   newest message vanished while typing. Fix (`Transcript.tsx`): the scroller
+   ResizeObserver samples `pinRef` BEFORE the shrink and re-applies the
+   bottom pin in the same frame only while the user was already pinned; a
+   reader who scrolled up keeps their position. Covered by a jsdom unit test
+   (pinned → re-pinned from 720 to 323; scrolled-up → offset preserved at 100
+   when the viewport shrinks to 240). The `mfix-chrome-combo` fake-Node
+   fixture now journals twelve tall history turns so the transcript
+   OVERFLOWS the band, and the e2e assertion requires overflow and hits the
+   exact LAST `transcript-row` (the running AskUserQuestion card) just above
+   the scroller's bottom edge — no "last two", no skip when content fits the
+   overflow case.
+2. **Opening transcript search hid the search box.** The collapsed toolbar
+   hosts the search input, so focusing search raised the keyboard and hid the
+   box. `lib/viewport.ts` now tracks the focused surface on focusin/focusout
+   (`data-keyboard-focus="search"|"composer"` on `<html>`);
+   `keyboardCompact.css` keeps the toolbar/searchbar mounted while search
+   owns focus and collapses them only when the composer is focused. New e2e
+   case per device: open search, focus the input, apply the keyboard
+   geometry, assert `data-keyboard-focus="search"`, the toolbar + searchbar +
+   input stay visible inside the band and keep focus.

@@ -66,6 +66,26 @@ export function useWorkbenchViewport() {
       if (active) document.documentElement.dataset.keyboard = "1";
       else delete document.documentElement.dataset.keyboard;
     };
+    // c-mfix round 4: which surface owns the focus while the keyboard is up.
+    // The transcript search box lives in the very toolbar keyboardCompact
+    // collapses; typing a search would hide the search input itself. While
+    // the search has focus the toolbar/searchbar stay mounted (CSS keys off
+    // this attribute). Everything else collapses as before.
+    const updateKeyboardFocus = () => {
+      const activeEl = document.activeElement;
+      const root = document.documentElement;
+      if (!(activeEl instanceof Element)) {
+        delete root.dataset.keyboardFocus;
+        return;
+      }
+      if (activeEl.closest("[data-testid='transcript-searchbar']")) {
+        root.dataset.keyboardFocus = "search";
+      } else if (activeEl.closest("[data-testid='composer']")) {
+        root.dataset.keyboardFocus = "composer";
+      } else {
+        delete root.dataset.keyboardFocus;
+      }
+    };
     const update = () => {
       const isCompact = media.matches;
       setMobile(isCompact);
@@ -98,15 +118,20 @@ export function useWorkbenchViewport() {
     window.addEventListener("resize", update);
     window.visualViewport?.addEventListener("resize", update);
     window.visualViewport?.addEventListener("scroll", update);
+    document.addEventListener("focusin", updateKeyboardFocus, true);
+    document.addEventListener("focusout", updateKeyboardFocus, true);
     return () => {
       media.removeEventListener("change", update);
       coarse.removeEventListener("change", update);
       window.removeEventListener("resize", update);
       window.visualViewport?.removeEventListener("resize", update);
       window.visualViewport?.removeEventListener("scroll", update);
+      document.removeEventListener("focusin", updateKeyboardFocus, true);
+      document.removeEventListener("focusout", updateKeyboardFocus, true);
       document.documentElement.style.removeProperty("--workbench-height");
       document.documentElement.style.removeProperty("--workbench-top");
       document.documentElement.removeAttribute("data-keyboard");
+      document.documentElement.removeAttribute("data-keyboard-focus");
     };
   }, []);
 

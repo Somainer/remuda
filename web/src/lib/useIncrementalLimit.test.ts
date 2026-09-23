@@ -71,18 +71,28 @@ describe("useIncrementalLimit", () => {
     expect(result.current).toBeGreaterThanOrEqual(19);
   });
 
-  it("keeps the fully-revealed limit when total grows back after a shrink", () => {
-    const { rerender, result } = renderHook(({ total }) => useIncrementalLimit(total, { step: 10 }), {
-      initialProps: { total: 25 },
+  it("re-slices from the lowered mark when total grows after a shrink (no tail jump)", () => {
+    // Regression for the high-water-mark bug: clamping only the RETURNED
+    // value left the stored limit at the pre-shrink count, so growth mounted
+    // the whole tail in one commit. The clamp must be persisted.
+    const { rerender, result } = renderHook(({ total }) => useIncrementalLimit(total, { step: 12 }), {
+      initialProps: { total: 20 },
     });
-    pumpFrames(2);
-    expect(result.current).toBe(25);
-    rerender({ total: 3 });
-    expect(result.current).toBe(3);
-    // resetKey did not change, so this is ordinary growth: the user already
-    // revealed 25 rows — no restart, no single big commit of hidden rows.
-    rerender({ total: 25 });
-    expect(result.current).toBe(25);
+    pumpFrames(1);
+    expect(result.current).toBe(20);
+    // Shrink hard: 20 -> 5, stored limit lowers to exactly what is mounted.
+    rerender({ total: 5 });
+    expect(result.current).toBe(5);
+    // Grow back to 40 with the SAME filter: no single 35-card commit. The
+    // first render reveals only the 5 already mounted, then step slices.
+    rerender({ total: 40 });
+    expect(result.current).toBe(5);
+    pumpFrames(1);
+    expect(result.current).toBe(17);
+    pumpFrames(1);
+    expect(result.current).toBe(29);
+    pumpFrames(1);
+    expect(result.current).toBe(40);
     expect(pending.size).toBe(0);
   });
 
@@ -93,10 +103,14 @@ describe("useIncrementalLimit", () => {
     );
     pumpFrames(2);
     expect(result.current).toBe(25);
-    // Same filter, different total -> stays revealed.
+    // Same filter, shrink clamps the stored mark to what is mounted.
     rerender({ total: 15, resetKey: "all" });
     expect(result.current).toBe(15);
+    // Same filter, grow back: re-slice from the lowered mark, no single
+    // 10-row tail commit.
     rerender({ total: 25, resetKey: "all" });
+    expect(result.current).toBe(15);
+    pumpFrames(1);
     expect(result.current).toBe(25);
     // Filter actually changed -> restart from the first slice.
     rerender({ total: 25, resetKey: "approval" });

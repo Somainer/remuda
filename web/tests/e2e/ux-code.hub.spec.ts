@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 /**
@@ -248,8 +249,8 @@ test("fenced code: hover toolbar, copy, highlighting and wrap", async ({ page })
   if (await jump.isVisible().catch(() => false)) await jump.click();
   await first.hover();
   await mkdir(evidence, { recursive: true });
-  for (const theme of ["night", "ledger"]) {
-    await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
+  for (const theme of ["night", "ledger"] as const) {
+    await setMode(page, theme);
     await settleAndShootCodeBlock(page, path.join(evidence, `workbench-code-1-${theme}-1440.png`));
   }
 });
@@ -315,8 +316,8 @@ test.describe("390px", () => {
     await page.waitForTimeout(200);
 
     await mkdir(evidence, { recursive: true });
-    for (const theme of ["night", "ledger"]) {
-      await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
+    for (const theme of ["night", "ledger"] as const) {
+      await setMode(page, theme);
       await settleAndShootCodeBlock(page, path.join(evidence, `workbench-code-1-${theme}-390.png`));
     }
   });

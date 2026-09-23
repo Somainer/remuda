@@ -1,5 +1,6 @@
 import type { UiStatus } from "../types/instance";
 import ui from "../styles/ui.module.css";
+import { CommitProbe } from "./CommitProbe";
 
 const CLASS: Record<UiStatus, string> = {
   blocked: ui.dotBlocked,
@@ -11,9 +12,9 @@ const CLASS: Record<UiStatus, string> = {
 };
 
 /**
- * Status shapes read without colour: ⚠ blocked, ● working, ○ idle, ■ exited.
- * None of them is an ×, which in this UI only ever means "close tab" (D-024
- * addendum).
+ * Status shapes read without colour: ⚠ blocked, ● working, ○ idle, ■ exited,
+ * dashed ring unknown. None of them is an ×, which in this UI only ever means
+ * "close tab" (D-024 addendum).
  */
 const LABEL: Record<UiStatus, string> = {
   blocked: "待处理",
@@ -26,14 +27,16 @@ const LABEL: Record<UiStatus, string> = {
 
 export function StateDot({ status, title }: { status: UiStatus; title?: string }) {
   return (
-    <span
-      className={`${ui.dot} ${CLASS[status]}`}
-      data-status={status}
-      title={title ?? LABEL[status]}
-      aria-label={LABEL[status]}
-      role="img"
-    >
-      {status === "blocked" ? "⚠" : null}
-    </span>
+    <CommitProbe name="StateDot">
+      <span
+        className={`${ui.dot} ${CLASS[status]}`}
+        data-status={status}
+        title={title ?? LABEL[status]}
+        aria-label={LABEL[status]}
+        role="img"
+      >
+        {status === "blocked" ? "⚠" : null}
+      </span>
+    </CommitProbe>
   );
 }

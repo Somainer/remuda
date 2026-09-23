@@ -166,7 +166,7 @@ for (const theme of ["night", "ledger"] as const) {
         localStorage.setItem("runtime.theme.v1", choice);
       }, theme);
       await page.goto(`/s/${instanceId}`);
-      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      await expect(page.locator("html")).toHaveAttribute("data-appearance", theme === "ledger" ? "light" : "dark");
       await expect(page.getByTestId("composer-bar")).toBeVisible();
 
       await forceMismatch(page);

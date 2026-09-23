@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 /**
@@ -180,7 +181,7 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
       .first()
       .getByTestId("question-form");
     await expect(frameCard.getByText("接下来这个会话主要想做什么？")).toBeVisible();
-    await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
+    await setMode(page, theme);
     await shot(page, `ask-user-question-1-card-${suffix}.png`);
   }
 
@@ -208,7 +209,7 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
     await expect(page).toHaveURL(new RegExp(`/s/${terminal}$`));
     const frameCard = page.getByTestId("question-form");
     await expect(frameCard.getByText("接下来这个会话主要想做什么？")).toBeVisible();
-    await page.evaluate((value) => document.documentElement.setAttribute("data-theme", value), theme);
+    await setMode(page, theme);
     await shot(page, `ask-user-question-1-card-${suffix}.png`);
   }
 

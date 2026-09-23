@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 // Committed evidence is refreshed only on request (REMUDA_EVIDENCE=1); every other run —
@@ -155,7 +156,7 @@ async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
     await expect(page.locator("[data-tty-ready]")).toHaveAttribute("data-tty-ready", "1");
     await expect(page.getByTestId("tty-ansi-preview")).toContainText("SPACE_CWD=", { timeout: 20_000 });
   }
-  await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+  await setMode(page, theme);
   await page.evaluate(() => document.fonts.ready);
   await mkdir(evidence, { recursive: true });
   const image = await page.screenshot({ path: path.join(evidence, `${realNode ? "" : "fake-"}${name}`), animations: "disabled", scale: "css" });

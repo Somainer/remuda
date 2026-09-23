@@ -16,6 +16,7 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 /**
@@ -396,9 +397,7 @@ test("live status strip: phase/elapsed/health over a real PTY turn", async ({ pa
 
     // 5 — both themes at 390 and 1440 px, no horizontal page scroll.
     const setTheme = async (theme: "night" | "ledger") => {
-      await page.evaluate((value) => {
-        document.documentElement.dataset.theme = value;
-      }, theme);
+      await setMode(page, theme);
     };
     for (const [width, height, theme, suffix] of [
       [1440, 900, "night", "1440-night"],

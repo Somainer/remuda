@@ -1,10 +1,12 @@
 export {
-  applyTheme,
-  readTheme,
-  writeTheme,
-  THEME_KEY,
-  type ThemeChoice,
-} from "./theme";
+  applyAppearance,
+  readAppearance,
+  resolveAppearance,
+  writeAppearance,
+  APPEARANCE_KEY,
+  type Appearance,
+  type ResolvedAppearance,
+} from "./appearance";
 export {
   DEFAULT_SETTINGS,
   iosStandaloneHint,

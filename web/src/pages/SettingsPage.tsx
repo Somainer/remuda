@@ -1,15 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
-  applyTheme,
+  applyAppearance,
   iosStandaloneHint,
+  readAppearance,
   readDeviceSettings,
-  readTheme,
+  writeAppearance,
   writeDeviceSettings,
-  writeTheme,
+  type Appearance,
   type DeviceSettings,
   type PermissionDefault,
-  type ThemeChoice,
 } from "../features/settings";
 import { effortTable, isEmberTier } from "../features/session/effort";
 import { defaultPermissionTable } from "../features/session/permissions";
@@ -28,6 +28,7 @@ import { hubStore, useHub } from "../lib/store";
 import { LoginPage } from "./LoginPage";
 import { api } from "../lib/api";
 import { TUI_OPTIONS } from "../lib/sessionOptions";
+import ui from "../styles/ui.module.css";
 import type { Host, TuiMode } from "../types/instance";
 import { hostRegistry } from "../features/hosts/registry";
 
@@ -437,6 +438,55 @@ const PERMS: { id: PermissionDefault; label: string; native: string; description
       description: option.description,
     }));
 
+const APPEARANCES: { id: Appearance; label: string }[] = [
+  { id: "system", label: "跟随系统" },
+  { id: "dark", label: "深色" },
+  { id: "light", label: "浅色" },
+];
+
+/** Segmented radiogroup: one tab stop; arrow keys move and choose. */
+function AppearanceSeg({ value, onChoose }: { value: Appearance; onChoose: (choice: Appearance) => void }) {
+  const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  // A rejected choice rolls `value` back; focus follows the checked radio so
+  // the one tab stop and the selection never disagree.
+  useEffect(() => {
+    const focused = refs.current.findIndex((el) => el !== null && el === document.activeElement);
+    const checked = APPEARANCES.findIndex((option) => option.id === value);
+    if (focused >= 0 && focused !== checked) refs.current[checked]?.focus();
+  });
+  const onKeyDown = (event: KeyboardEvent, index: number) => {
+    const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
+    const back = event.key === "ArrowLeft" || event.key === "ArrowUp";
+    if (!forward && !back) return;
+    event.preventDefault();
+    const next = (index + (forward ? 1 : -1) + APPEARANCES.length) % APPEARANCES.length;
+    refs.current[next]?.focus();
+    onChoose(APPEARANCES[next]!.id);
+  };
+  return (
+    <div className={ui.seg} role="radiogroup" aria-labelledby="settings-appearance-label" data-testid="settings-appearance">
+      {APPEARANCES.map((option, index) => (
+        <button
+          key={option.id}
+          ref={(el) => {
+            refs.current[index] = el;
+          }}
+          type="button"
+          role="radio"
+          className={ui.segItem}
+          data-testid={`settings-appearance-${option.id}`}
+          aria-checked={value === option.id}
+          tabIndex={value === option.id ? 0 : -1}
+          onClick={() => onChoose(option.id)}
+          onKeyDown={(event) => onKeyDown(event, index)}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Page                                                                */
 /* ------------------------------------------------------------------ */
@@ -447,7 +497,7 @@ export function SettingsPage() {
   const location = useLocation();
   const [access, setAccess] = useState(() => readAccessCode());
   const [settings, setSettings] = useState(() => readDeviceSettings());
-  const [theme, setTheme] = useState<ThemeChoice>(() => readTheme());
+  const [appearanceChoice, setAppearanceChoice] = useState<Appearance>(() => readAppearance());
   const [push, setPush] = useState<PushStatus>(() => ({
     permission: typeof Notification === "undefined" ? "unsupported" : Notification.permission,
     subscribed: false,
@@ -463,11 +513,11 @@ export function SettingsPage() {
   const [voiceSupported] = useState(() => speechRecognitionSupported());
   const [voiceEnabled, setVoiceEnabled] = useState(() => readVoiceInputEnabled());
 
-  // Idempotent re-apply: main.tsx already applied the stored theme before
-  // React mounted, so by the time this page mounts the DOM already matches;
-  // this only repairs the attribute if something rewrote it meanwhile.
+  // Idempotent re-apply: main.tsx already applied the stored appearance
+  // before React mounted, so by the time this page mounts the DOM already
+  // matches; this only repairs the attribute if something rewrote it.
   useEffect(() => {
-    applyTheme(readTheme());
+    applyAppearance(readAppearance());
   }, []);
 
   useEffect(() => {
@@ -507,20 +557,23 @@ export function SettingsPage() {
     else navigate("/sessions");
   };
 
-  const chooseTheme = (choice: ThemeChoice) =>
-    appearance.run(() => {
-      // Optimistic so the selection reads instantly; a denied write restores
-      // the last committed theme and surfaces 失败.
-      setTheme(choice);
-      applyTheme(choice);
+  const chooseAppearance = (choice: Appearance) => {
+    // Optimistic so the selection reads instantly; a denied write restores
+    // the last committed appearance and surfaces 失败. Set before the runner's
+    // saving render, so AppearanceSeg's focus repair never sees a stale value
+    // and a second arrow key steps on from this choice.
+    setAppearanceChoice(choice);
+    return appearance.run(() => {
+      applyAppearance(choice);
       try {
-        writeTheme(choice);
+        writeAppearance(choice);
       } catch (err) {
-        setTheme(readTheme());
-        applyTheme(readTheme());
+        setAppearanceChoice(readAppearance());
+        applyAppearance(readAppearance());
         throw err;
       }
     });
+  };
 
   const commitDevicePrefs = (patch: Partial<DeviceSettings>) =>
     appearance.run(() => {
@@ -610,24 +663,13 @@ export function SettingsPage() {
             <GroupHeading id="appearance" label="外观与输入" hint="本分组偏好只保存在此浏览器，不会同步；选择即时生效。" />
 
             <div className={css.section}>
-              <div className={css.label}>主题</div>
-              <p className={css.hint} data-testid="settings-theme">
-                双主题：Night Corral（深色）与 Ledger（浅色）。字体与 IBM Plex 不变。
-              </p>
-              <div className={css.row}>
-                {(["night", "ledger"] as const).map((choice) => (
-                  <button
-                    key={choice}
-                    type="button"
-                    className={`${css.chip} ${theme === choice ? css.chipOn : ""}`}
-                    data-testid={`settings-theme-${choice}`}
-                    aria-pressed={theme === choice}
-                    onClick={() => void chooseTheme(choice)}
-                  >
-                    {choice === "night" ? "Night Corral" : "Ledger（浅色）"}
-                  </button>
-                ))}
+              <div className={css.label} id="settings-appearance-label">
+                外观
               </div>
+              <AppearanceSeg value={appearanceChoice} onChoose={(choice) => void chooseAppearance(choice)} />
+              <p className={css.hint} data-testid="settings-theme">
+                仅保存在此浏览器。终端始终为深色底。
+              </p>
             </div>
 
             <div className={css.section}>

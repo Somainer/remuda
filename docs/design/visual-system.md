@@ -23,7 +23,7 @@
 
 tokenGuard 断言两条：
 
-- `[data-appearance` 只以 `:root[data-appearance="…"]` 的形式出现在 `tokens.css` 里，不得出现在任何组件模块；
+- 模式属性只允许出现在 `tokens.css` 中、且只允许以下两种**作用于 `:root`** 的选择器形式：`:root[data-appearance="dark|light"]`（显式选择）与 `:root:not([data-appearance="dark"])`（系统浅色块）；组件模块里不得出现任何 `[data-appearance` 选择器；
 - 两个浅色块（媒体查询块与显式选择器块）的声明集合**逐字相等**。
 
 ### 1.2 偏好键
@@ -54,7 +54,11 @@ tokenGuard 断言两条：
 - 加两个 theme-color：`<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#232220">` 与 `<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f9f8f5">`；
 - `<title>` 与 `apple-mobile-web-app-title` 改为 `Remuda`。
 
-外观由纯 CSS 媒体查询解析，**不加任何阻塞首帧的脚本**：Hub 对 `index.html` 与 `sw.js` 两个壳文件返回 `no-cache`（`crates/remuda-hub/src/web.rs:103-111`；`/assets/` 哈希资源 immutable 长缓存，manifest、图标、favicon 等其余非资产路径无显式缓存指令），service worker 不预缓存壳与外观相关文件，也不新增任何未缓存资源；`sw.src.js` 不改。
+外观由纯 CSS 媒体查询解析，**不加任何阻塞首帧的脚本**。缓存层按现状描述、本次不改：
+
+- HTTP 头（`crates/remuda-hub/src/web.rs:103-112`）：`index.html` 与 `sw.js` 返回 `no-cache`，哈希 `/assets/*` 为 immutable 长缓存；manifest、图标、favicon 等其余非资产路径无显式缓存指令。
+- Service worker（`web/sw.src.js`，本次不改、不新增资源）：install 时 `cache.addAll` 预缓存 SHELL 清单（`/`、`/index.html`、`/manifest.webmanifest`、`/favicon.svg`、两个图标）；导航请求 network-first——优先取网络文档并在成功时刷新缓存壳，网络失败才回退缓存的 `/index.html`；`/v1/`、`/node/`、`/push/` 不经过缓存，其他同源 GET 走 cache-first。
+- 首帧颜色因此由 `no-cache` 的 `index.html` + network-first 导航保证：系统浅色设备首帧即为浅色，不依赖任何同步脚本。
 
 `manifest.webmanifest`：`name` / `short_name` 改为 `Remuda`，`theme_color` 与 `background_color` 都用 `#232220`。
 
@@ -290,7 +294,7 @@ tokenGuard 断言两条：
 | 2 级 | raised + 1px `--border` + `--shadow-2` | 深：`0 8px 24px rgb(0 0 0/.40), 0 1px 2px rgb(0 0 0/.30)`；浅：`0 8px 24px rgb(31 30 27/.10), 0 1px 3px rgb(31 30 27/.08)` |
 | 3 级 | 对话框、sheet，放在 `--scrim` 之上 | `--shadow-3`。深：`0 24px 64px rgb(0 0 0/.55)`；浅：`0 24px 64px rgb(31 30 27/.18)` |
 
-只有浮层（菜单、弹出层、对话框、sheet）带阴影，共两级 `--shadow-2` / `--shadow-3`（取代 D-052 第 8 条中「不新增 elevation/阴影 token」一句）。所有层级都不使用 backdrop-filter。
+只有浮层（菜单、弹出层、对话框、sheet）带阴影，共两级 `--shadow-2` / `--shadow-3`。D-052 第 8 条原文为「不新增 z-index / elevation / 阴影 / disabled token」，本系统只放开其中的**阴影**部分（D-053 第 8 条），z-index 与 disabled token 的口径不变。所有层级都不使用 backdrop-filter。
 
 ### 7.3 焦点
 

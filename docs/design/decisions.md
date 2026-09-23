@@ -31,7 +31,7 @@
 
 | D-050 | 2026-09-20 | **Task 优先模型：Task 是 instance 之上的聚合（非第二状态机）；目录绑定 `workspaceBinding{reuse\|pool}` + 唯一新表 `worktree_leases`（`mode`、复合键 `(host_id,workspace_id,dir_key)`、可空 `worktree_name`、`holder_instance_id` attach-lock）；reuse=顺序轮用、归还对目录零操作，pool=detached-HEAD 停放、租借切 `wt/<slot>/<task-slug>`、return-don't-delete（reset/clean/park 仅 pool）；既有回收路径（`remove_record`/`worker.remove_worker`/`delete_instance`/`retire_worker`）必须 lease-aware；看板 8 态→4 列只读投影，failed 按 `placement.is_some()` 归位 + 角标（不存 pre-fail 列），拖卡列→列多跳；门控用 grant 动词（create/set-state=`GrantVerb::Dispatch`、land=`GrantVerb::Land`，持 grant 的协调员 agent 授权，非「agent 一律 403」）；迁移预算=一个增量列 `archived_at`（落 `tasks.rs` migrate）+ 一张新表；批注=composer 草稿（零 wire）；任务空间=文件视图客户端过滤投影（零端点）；参考产品合规护栏（只泛称、开源项目可具名、不引述内部文档、截图只提交 Remuda 渲染） | coordinator（task-model 计划任务 1 t-spec，docs-only） | [task-model.md](./task-model.md) 全文；[ui-spec.md §1.5/§2.9](./ui-spec.md)；[evidence/task-model-1.md](./evidence/task-model-1.md)；D-024/D-033/D-035/D-047/D-049 |
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
-| D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端恒深色**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 elevation/阴影 token」一句；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围（详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
+| D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端恒深色**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -990,7 +990,7 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 - 对比度不足。次级文字 `--mute` 在 `--ink-2` 上只有 4.12:1；终端 brightBlack 在终端底上只有 1.42:1（`web/src/features/session/tty/theme.ts:61`）。
 - 字体混排。正文 webfont 只打了拉丁子集（`web/src/main.tsx:7-9`），中文逐字回落到系统字体，同一行里出现两套字形。
 - 字号与焦点。`font-size` 字面量中 11px 有 99 处，另有 11.5px 12 处、10px 19 处、10.5px 11 处、9px 2 处、8px 1 处，内联样式里还有 10px（`web/src/features/session/LaunchedBy.tsx:47`）；全局焦点环只有 1px（`web/src/styles/tokens.css:83`）。
-- 触控尺寸判定错误。触控 44px 按宽度（`@media (max-width: 767px)`）而不是按指针判定（`web/src/styles/ui.module.css:356-372`），违背 D-039「compact 判定与 coarsePointer 判定不得混用」。
+- 触控尺寸判定错误。触控 44px 按宽度（`@media (max-width: 767px)`）而不是按指针判定（`web/src/styles/ui.module.css:356-372`），违背 D-039 关于 compact（布局）判定与 coarsePointer（触屏）判定不得混用的要求。
 - iOS 放大。fine 指针下文本输入 14px、手机本地输入 15px，均低于 iOS 不放大的 16px 阈值，聚焦时会放大页面。
 - 渲染开销。会话页每秒整页重渲染（`web/src/pages/SessionPage.tsx:154` 的 `useNow(true)`）；另有 `optimizeLegibility`（`web/src/styles/tokens.css:130`）、`backdrop-filter` 与 `transition: all` 等开销。
 - 导航层数。桌面会话路由叠了四层导航（48px 图标轨、会话列表第二列、SpaceTabs 行、页头）。
@@ -1027,7 +1027,7 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
    - 等宽只用 IBM Plex Mono（OFL-1.1，许可证文件入库），只用于代码、路径、终端、ID 和需要对齐的数字。
    - 阅读感靠度量：正文 16px/28px，行宽上限 720px。
 6. **字号下限。**
-   - 承载信息的文字 ≥ 12px。辅助文字 `--text-meta` 在所有宽度下都是 12px，落实 D-039「.meta 桌面与手机同字号」。
+   - 承载信息的文字 ≥ 12px。辅助文字 `--text-meta` 在所有宽度下都是 12px，落实 D-039 对 `.meta` 一类辅助文本桌面与手机统一 12px 的要求。
    - 11px 只用于与形状绑定的徽标数字和 kbd 字形，属于 D-052 第 9 条的图形标注豁免，逐站点登记。
    - 文本输入在 `pointer: coarse` 下为 16px。
 7. **命中区按 `pointer: coarse` 判定，不按宽度。**
@@ -1043,6 +1043,7 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 10. **桌面导航骨架**（≥768 且非 coarse 矮屏）。
     - 一条带文字的侧栏，`<nav aria-label="主导航">`：会话、收件箱、任务看板，外加项目区和管理菜单。每页一条 48px 页头。取消 48px 图标轨和会话路由上的第二列。
     - tab 条只在 `/s/*` 上出现；列表路由不再有 tab 条。**本条修订 D-024**：D-024 原口径为「当前 space 的 agent 会话显示为内容上方 tabs」「桌面支持可折叠 Spaces/Sessions 左栏及首字母窄轨」（详见原 ui-spec §1.4）——现改为 tab 条只属于会话路由，Space 面板（重命名、排序、已退出分组）移到 `/sessions` 的索引列；侧栏只有一个折叠概念。
+    - **选中态（显式修订 D-024 addendum 的「侧栏强当前态」）**：addendum 原条文要求「当前 space 与当前会话都用品牌左条 + 底色 + 加粗标题」；现取消品牌左条与首字母窄轨，当前 Space、当前会话与主导航选中项统一为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，深浅两态都不靠品牌色条做唯一指示（仍保留底色 + 字重，不单靠颜色）。addendum 的关闭 / dismissal /「已退出 (n)」分组 / 恢复与删除语义全部不变。
     - 项目范围由侧栏项目区设定，写入同一个项目过滤偏好；`/projects` 页头的切换器保留。
     - 快捷键：
       - ⌘/Ctrl+B 在所有桌面路由上折叠侧栏；

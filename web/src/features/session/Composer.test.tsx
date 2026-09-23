@@ -46,6 +46,7 @@ describe("Composer shortcuts", () => {
         onSend={vi.fn()}
         kind="claude"
         model="opus"
+        launchModel="opus"
         effort={effortAt("claude", 2)}
         effortEffective={{ name: "high", ultracode: null, source: "launch", observedAt: "2026-09-14T00:00:00Z" }}
         contextLabel="74%"

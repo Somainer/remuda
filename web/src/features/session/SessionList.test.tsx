@@ -45,8 +45,11 @@ vi.mock("../../lib/store", () => ({
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: () => null,
     modelOf: () => "model_hub/es1_orange_o50[1m]",
-    modelRequestedOf: (id: string) =>
-      requestedModel[id] === null ? null : requestedModel[id] ?? "model_hub/es1_orange_o50[1m]",
+    // Running model for the chip: a read-back effective id wins; otherwise an
+    // explicit fixture entry (pin or null); otherwise the fixture launch pin.
+    runningModelOf: (id: string) =>
+      modelEffective[id]?.id ??
+      (id in runningModel ? runningModel[id] : "model_hub/es1_orange_o50[1m]"),
     modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
     modelCatalogOf: () => null,
     refreshScreens: vi.fn(),
@@ -69,10 +72,9 @@ const modelEffective: Record<
   string,
   { id: string; source: string; observedAt: string }
 > = {};
-/// Per-instance durable requested model for the requested-vs-running pair.
-/// Absent entries fall back to the dispatch pin; `null` means nothing was
-/// requested (a journal-discovered row).
-const requestedModel: Record<string, string | null> = {};
+/// Per-instance running model the chip shows when no read-back exists yet
+/// (the durable launch spec). null means no launch model: chip is empty.
+const runningModel: Record<string, string | null> = {};
 
 function host(id: string, label: string) {
   return { id, label, state: "online" };
@@ -122,7 +124,7 @@ beforeEach(() => {
   titles.ins_a = "spill 抖动";
   titles.ins_b = "等待批准";
   for (const key of Object.keys(summaries)) delete summaries[key];
-  for (const key of Object.keys(requestedModel)) delete requestedModel[key];
+  for (const key of Object.keys(runningModel)) delete runningModel[key];
 });
 
 describe("SessionList empty states", () => {
@@ -268,36 +270,20 @@ describe("SessionList scope and conditions", () => {
 /** Space id the real buildSpaces() derives for the fixture host/workspace. */
 const derivedSpace = { id: '["host-a","wsp-a"]', name: "sfe-root", hostId: "host-a", workspaceId: "wsp-a" };
 
-describe("SessionList effective-model label", () => {
+describe("SessionList model label", () => {
   afterEach(() => {
     for (const key of Object.keys(modelEffective)) delete modelEffective[key];
+    for (const key of Object.keys(runningModel)) delete runningModel[key];
   });
 
-  it("labels the row with the requested id until one is read back", () => {
+  it("shows the durable launch spec verbatim before any read-back", () => {
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
+    expect(label.textContent).toBe("model_hub/es1_orange_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "unknown");
   });
 
-  it("labels the row with the observed id once the session reports the same one", () => {
-    for (const id of ["ins_a", "ins_b"]) {
-      modelEffective[id] = {
-        id: "model_hub/es1_orange_o50[1m]",
-        source: "launch",
-        observedAt: "2026-09-18T00:00:00Z",
-      };
-    }
-    renderList();
-    const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(label).toHaveAttribute("data-model-effective", "model_hub/es1_orange_o50[1m]");
-  });
-
-  // The pin was requested and a DIFFERENT model answered. The row judges
-  // nothing; it shows both raw strings, so neither the request nor what is
-  // actually running is hidden.
-  it("shows both requested and observed strings verbatim when they differ", () => {
+  it("shows the running id verbatim once read back, equal or not to the launch", () => {
     for (const id of ["ins_a", "ins_b"]) {
       modelEffective[id] = {
         id: "model_hub/es1_orange_o48[1m]",
@@ -307,21 +293,18 @@ describe("SessionList effective-model label", () => {
     }
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("model_hub/es1_orange_o48[1m]");
-    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
+    // Only the running id — even when the launch pin differed, the chip
+    // never reconstructs a requested-vs-running pair.
+    expect(label.textContent).toBe("model_hub/es1_orange_o48[1m]");
+    expect(label).not.toHaveTextContent("⇐");
     expect(label).toHaveAttribute("data-model-effective", "model_hub/es1_orange_o48[1m]");
-    // Both ids stay legible in the hover text as well.
-    expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o50[1m]");
-    expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o48[1m]");
   });
 
-  // The 2026-09-23 incident pair: the gateway routing prefix is stripped on
-  // forwarding, so the two RAW ids end in the same last segment. Showing
-  // shortened ids would render `seed-evolving ⇐ seed-evolving`; the row must
-  // carry both full strings.
-  it("shows the incident routing-prefix pair verbatim, not shortened", () => {
+  it("renders the running id raw even when its last segment matches the launch", () => {
+    // The incident pair: shortening ids would collapse them to
+    // "seed-evolving"; the chip shows the full running string verbatim.
     for (const id of ["ins_a", "ins_b"]) {
-      requestedModel[id] = "passthrough/ark/seed-evolving";
+      runningModel[id] = "passthrough/ark/seed-evolving";
       modelEffective[id] = {
         id: "ark/seed-evolving",
         source: "launch",
@@ -330,53 +313,22 @@ describe("SessionList effective-model label", () => {
     }
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("passthrough/ark/seed-evolving");
-    expect(label).toHaveTextContent("ark/seed-evolving");
-    // The full text is the textContent, not merely a tooltip.
-    expect(label.textContent).toBe("ark/seed-evolving ⇐ passthrough/ark/seed-evolving");
-    expect(label.getAttribute("title")).toContain("passthrough/ark/seed-evolving");
-    expect(label.getAttribute("title")).toContain("ark/seed-evolving");
+    expect(label.textContent).toBe("ark/seed-evolving");
+    expect(label).not.toHaveTextContent("⇐");
   });
 
-  // Whitespace-bearing durable requests are recorded verbatim; the display
-  // compares raw strings, so a padded request differs from its trimmed running
-  // id (the materializer trims the launch token, the roster does not).
-  it("keeps whitespace-bearing requested ids verbatim", () => {
-    for (const id of ["ins_a", "ins_b"]) {
-      requestedModel[id] = " sonnet ";
-      modelEffective[id] = {
-        id: "sonnet",
-        source: "launch",
-        observedAt: "2026-09-24T00:00:00Z",
-      };
-    }
+  // A journal-discovered instance with no launch model and no read-back yet:
+  // the chip is empty, never an invented "opus".
+  it("shows nothing when there is no launch model and no read-back", () => {
+    for (const id of ["ins_a", "ins_b"]) runningModel[id] = null;
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label.textContent).toBe("sonnet ⇐  sonnet ");
+    expect(label.textContent).toBe("");
   });
 
-  // A gateway resolves a catalog id to an upstream vendor name. The strings
-  // differ, so both are shown — no verdict, just the request and what runs.
-  it("shows both strings for a gateway resolution to an upstream vendor name", () => {
+  it("shows only the running id for a journal-discovered row with no launch model", () => {
     for (const id of ["ins_a", "ins_b"]) {
-      modelEffective[id] = {
-        id: "claude-opus-5",
-        source: "launch",
-        observedAt: "2026-09-18T00:00:00Z",
-      };
-    }
-    renderList();
-    const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("claude-opus-5");
-    expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(label).toHaveAttribute("data-model-effective", "claude-opus-5");
-  });
-
-  // A journal-discovered instance with no durable request and no switch:
-  // show only what runs, never an invented "opus" request.
-  it("shows only the running id when nothing was requested", () => {
-    for (const id of ["ins_a", "ins_b"]) {
-      requestedModel[id] = null;
+      runningModel[id] = null;
       modelEffective[id] = {
         id: "sonnet",
         source: "unknown",
@@ -385,9 +337,9 @@ describe("SessionList effective-model label", () => {
     }
     renderList();
     const label = screen.getAllByTestId("session-model")[0];
-    expect(label).toHaveTextContent("sonnet");
-    expect(label).not.toHaveTextContent("⇐");
+    expect(label.textContent).toBe("sonnet");
     expect(label).not.toHaveTextContent("opus");
+    expect(label).not.toHaveTextContent("⇐");
   });
 });
 

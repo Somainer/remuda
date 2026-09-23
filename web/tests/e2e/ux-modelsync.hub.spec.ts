@@ -163,22 +163,11 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "0");
 });
 
-test("a typed alias resolving to a different id shows both model strings", async ({ page }) => {
+test("a typed alias resolving to a different id shows only the running model", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Model alias resolution");
-  // Snapshot the durable launch model BEFORE configure (the fake node's
-  // post_command patches spec.model to the posted sentinel, so the steady
-  // request cannot be read off the row afterwards).
-  const launch = await page
-    .request
-    .get(`/v1/instances/${instanceId}`)
-    .then((r) => r.json());
-  const launchModel: string = launch.instance?.model ?? launch.model ?? "";
-  expect(launchModel).toBeTruthy();
   // Clicking fast is the optimistic request; rewrite the configure to the
-  // resolve sentinel so the fake verdict reports a different concrete id. The
-  // verdict edge carries requested=e2e/fast (the real configured alias) and
-  // effective=e2e/plain.
+  // resolve sentinel so the fake verdict reports a different concrete id.
   await page.route("**/v1/instances/*/commands", async (route) => {
     const body = route.request().postDataJSON();
     if (body?.operation === "instance.configure" && body.payload?.model) {
@@ -191,7 +180,7 @@ test("a typed alias resolving to a different id shows both model strings", async
   await clearApprovals(page, instanceId);
   await openModelList(page);
   await page.getByTestId("model-option-fast").click();
-  // Wait for the read-back (queued/pending clears), then reopen the list.
+  // Wait for the read-back (queued/pending clears).
   await expect
     .poll(
       async () =>
@@ -204,26 +193,33 @@ test("a typed alias resolving to a different id shows both model strings", async
       { timeout: 10_000 },
     )
     .toBe(true);
+  // The chip shows ONLY the running model, verbatim — the client never
+  // reconstructs a requested-vs-running pair. The resolved id is a deliberate
+  // switch here, so there is no model_pin_mismatch diagnostic either.
   await openModelList(page);
-  const panel = page.getByTestId("effort-slider-panel");
-  await expect(panel).toHaveAttribute("data-model-current", "plain");
-  await expect(panel).toHaveAttribute("data-model-different", "1");
-  // Settled: a deliberate configure IS a request, so the requested half is the
-  // configured alias (the edge's `requested`, which survived resolving) — not
-  // the launch spec, not the sentinel, not the patched spec.model. The running
-  // half is the resolved id. Assert again after a full reload (durable
-  // projection replays the edge), not just against in-memory optimism.
-  const expectSettledNote = async () => {
-    const note = page.getByTestId("model-option-different");
-    await expect(note).toHaveText("请求 e2e/fast → 实际 e2e/plain", { timeout: 10_000 });
-  };
-  await expectSettledNote();
+  await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
+    "data-model-current",
+    "plain",
+  );
+  await expect(page.getByTestId("model-option-different")).toHaveCount(0);
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "1");
 
+  // Collapsed chip carries the full running id, not a pair.
+  await page.getByTestId("effort-list-back").click();
+  await expect(page.getByTestId("effort-model")).toHaveText("e2e/plain");
+  await expect(page.getByTestId("effort-model")).not.toHaveText("⇐");
+
+  // Persists across a full reload (journal replays the edge).
   await page.reload();
   await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
   await openModelList(page);
-  await expectSettledNote();
+  await expect(page.getByTestId("effort-slider-panel")).toHaveAttribute(
+    "data-model-current",
+    "plain",
+  );
+  await page.getByTestId("effort-list-back").click();
+  await expect(page.getByTestId("effort-model")).toHaveText("e2e/plain");
+  await expect(page.getByTestId("effort-model")).not.toHaveText("⇐");
 });
 
 test("a terminal-side /model moves the picker without posting configure", async ({ page }) => {

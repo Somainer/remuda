@@ -77,6 +77,48 @@ it("desktop keeps host, cost, switch, Stop and the toggles on the main row, with
   expect(screen.getByTestId("session-meta")).not.toBeVisible();
 });
 
+it("renders a recorded model_pin_mismatch in run details with both ids verbatim", () => {
+  // model-pin-1 §5.4: the launch divergence is the Node's authoritative
+  // diagnostic, shown in run details — never recomputed into a chip pair.
+  const events = [
+    {
+      eventId: "evt_pin_1",
+      instanceId: grokInstance.id,
+      journalId: "obj",
+      seq: "1",
+      kind: "lifecycle",
+      observedAt: "2026-09-24T00:00:00Z",
+      source: { channel: "runtime" },
+      payload: {
+        type: "native",
+        topic: "diagnostic",
+        nativeName: "model_pin_mismatch",
+        nativeId: { state: "not-applicable" },
+        status: { state: "known", value: "diverged" },
+        severity: "warning",
+        affectsCompletion: false,
+        dataRef: null,
+        relatedIds: {
+          reason: "model-mismatch",
+          requested: "passthrough/ark/seed-evolving",
+          observed: "ark/seed-evolving",
+        },
+      },
+    },
+  ];
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [grokInstance],
+    events: { [grokInstance.id]: events as never[] },
+  });
+  renderPage();
+  const pin = screen.getByTestId("run-details-model-pin");
+  expect(pin).toHaveTextContent("请求模型 passthrough/ark/seed-evolving，实际运行 ark/seed-evolving");
+  expect(pin).toHaveAttribute("data-requested", "passthrough/ark/seed-evolving");
+  expect(pin).toHaveAttribute("data-observed", "ark/seed-evolving");
+});
+
 it("mobile folds the chips strip into one header chip and moves the toggles into the ⋯ sheet", () => {
   mockViewportState.mobile = true;
   stubMatchMedia((query) => query.includes("640"));

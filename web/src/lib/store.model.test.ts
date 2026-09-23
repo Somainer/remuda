@@ -14,6 +14,7 @@ import type { Observation } from "../types/observation";
 import { api } from "./api";
 import { mockDb } from "./mock";
 import { hubStore } from "./store";
+import { modelPinMismatches } from "../features/session/modelEffective";
 
 type History = Awaited<ReturnType<typeof api.eventsRead>>;
 
@@ -157,6 +158,29 @@ function configureLifecycle(seq: number, status: string, instanceId: string): Ob
   } as unknown as Observation;
 }
 
+function modelPinMismatchEvent(seq: number, requested: string, observed: string): Observation {
+  return {
+    eventId: `evt_pin_${seq}`,
+    instanceId: "x",
+    journalId: "x",
+    seq: String(seq),
+    kind: "lifecycle",
+    observedAt: `2026-09-16T00:0${seq}:00Z`,
+    source: { channel: "runtime" },
+    payload: {
+      type: "native",
+      topic: "diagnostic",
+      nativeName: "model_pin_mismatch",
+      nativeId: { state: "not-applicable" },
+      status: { state: "known", value: "diverged" },
+      severity: "warning",
+      affectsCompletion: false,
+      dataRef: null,
+      relatedIds: { reason: "model-mismatch", requested, observed },
+    },
+  } as unknown as Observation;
+}
+
 afterEach(() => {
   hubStore.logout();
   vi.restoreAllMocks();
@@ -189,66 +213,74 @@ it("a terminal-side /model moves the picker without posting configure", async ()
   expect(configure).not.toHaveBeenCalled();
 });
 
-it("the requested half tracks the launch spec, then a deliberate /model switch", async () => {
-  // Regression (2026-09-23 acceptance rounds 4/5):
-  //  - a live read-back folded into the picker used to be the "requested"
-  //    half, so requested == running and the pair vanished;
-  //  - then the half was pinned to the launch spec forever, so a user's own
-  //    `/model` switch showed as a divergence. A deliberate switch IS a
-  //    request: the observed slash id becomes the requested half.
-  const launchModel = "passthrough/ark/seed-evolving";
-  const ctx = await startFollowing("requested", launchModel);
-  // Launch read-back: the gateway strips its routing prefix.
-  ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("ark/seed-evolving");
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("ark/seed-evolving");
-  // The pair's requested half keeps the durable launch spec.
-  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe(launchModel);
-
-  // A later terminal /model is a deliberate request to the new id: requested
-  // moves to C and equals running, so the pair collapses to one id.
-  ctx.receive(modelEvent(3, "model_hub/es1_orange_o50", "slash"));
-  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/es1_orange_o50");
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/es1_orange_o50");
-  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("model_hub/es1_orange_o50");
+it("the chip shows the launch spec, then the running model, raw — launch A / read-back A", async () => {
+  // Case (a): launch and read-back agree.
+  const ctx = await startFollowing("chip-a", "model_hub/A");
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/A");
+  ctx.receive(modelEvent(2, "model_hub/A", "launch"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/A");
 });
 
-it("a journal-discovered instance with no durable model invents no request", async () => {
-  // Node-discovered instance: the Hub row has no model; only an effective id
-  // exists. No fabricated "opus" — requested is null, displays show one id.
-  const ctx = await startFollowing("discovered", undefined);
+it("the chip shows the running read-back when it differs from the launch — launch A / read-back B", async () => {
+  // Case (b): the client does NOT reconstruct a pair — the chip says B only.
+  const ctx = await startFollowing("chip-b", "model_hub/A");
+  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/B");
+});
+
+it("a later /model C simply moves the running chip to C — launch A / B / C", async () => {
+  // Case (c): a terminal switch changes only the running model; no pair.
+  const ctx = await startFollowing("chip-c", "model_hub/A");
+  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
+  ctx.receive(modelEvent(3, "model_hub/C", "slash"));
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/C");
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/C");
+  // The picker moved with the terminal switch without a configure round-trip.
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/C");
+});
+
+it("the launch divergence diagnostic is recorded verbatim and survives a later /model", async () => {
+  // Cases (b)+(c) for run details: the chip shows the running id, and the
+  // AUTHORITATIVE Node diagnostic carries requested/observed verbatim. A
+  // later switch changes the chip but the diagnostic stays as history.
+  const ctx = await startFollowing("pin-diag", "model_hub/A");
+  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
+  ctx.receive(modelPinMismatchEvent(3, "model_hub/A", "model_hub/B"));
+  // Chip says B only...
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/B");
+  // ...run details holds the record verbatim.
+  let mismatches = modelPinMismatches((hubStore as unknown as { state: { events: Record<string, Observation[]> } }).state.events[ctx.instance.id] ?? []);
+  expect(mismatches).toEqual([{ requested: "model_hub/A", observed: "model_hub/B", eventId: "evt_pin_3" }]);
+
+  // Operator then switches to C: chip moves, the diagnostic remains.
+  ctx.receive(modelEvent(4, "model_hub/C", "slash"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/C");
+  mismatches = modelPinMismatches((hubStore as unknown as { state: { events: Record<string, Observation[]> } }).state.events[ctx.instance.id] ?? []);
+  expect(mismatches).toHaveLength(1);
+  expect(mismatches[0]).toMatchObject({ requested: "model_hub/A", observed: "model_hub/B" });
+});
+
+it("no launch model and a read-back shows the running id and invents nothing", async () => {
+  // Case (d): journal-discovered row, no durable spec.
+  const ctx = await startFollowing("chip-d", undefined);
   expect(ctx.instance.model).toBeUndefined();
-  ctx.receive(modelEvent(2, "sonnet", "unknown"));
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("sonnet");
-  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBeNull();
+  ctx.receive(modelEvent(2, "model_hub/X", "unknown"));
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/X");
 });
 
-it("a settled remuda configure requests the configured id even when it resolved", async () => {
+it("a settled configure still folds the picker and clears pending", async () => {
   const ctx = await startFollowing("configure", "ark/seed-evolving");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  // The launch read-back lands first (the live journal always carries it
-  // before any switch edge; delivering the switch edge alone would gap the
-  // client's watermark).
   ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
   await hubStore.setModel(ctx.instance.id, "e2e/fast");
-  // The verdict edge stamps requested=e2e/fast, effective=e2e/plain (alias
-  // resolved to a different concrete id); requested stays the configured id.
+  // The configure edge stamps requested=e2e/fast, effective=e2e/plain.
   ctx.receive(modelEvent(3, "e2e/plain", "remuda", undefined, "e2e/fast"));
   expect(hubStore.modelPendingOf(ctx.instance.id)).toBeNull();
-  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("e2e/fast");
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("e2e/plain");
-});
-
-it("an unknown read-back does not change the requested half", async () => {
-  const ctx = await startFollowing("unknown-edge", "model_hub/A");
-  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
-  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("model_hub/A");
-  // Unattributed assistant-model change: running moves, the request is still
-  // the launch spec (the Hub roster clears its own stale pair; the web just
-  // keeps the durable request until a deliberate switch supersedes it).
-  ctx.receive(modelEvent(3, "model_hub/C", "unknown"));
-  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/C");
-  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("model_hub/A");
+  // The chip shows the running id verbatim, not a pair.
+  expect(hubStore.runningModelOf(ctx.instance.id)).toBe("e2e/plain");
+  // The picker sits on the resolved id.
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("e2e/plain");
 });
 
 it("our pending push-down clears on read-back and reports the resolved id", async () => {

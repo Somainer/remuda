@@ -144,7 +144,7 @@ export function catalogNote(catalog: ModelCatalogView | null | undefined): Model
 export function EffortSlider({
   kind,
   model,
-  modelRequested,
+  launchModel = null,
   models,
   modelEffective,
   modelPending,
@@ -165,11 +165,10 @@ export function EffortSlider({
   kind: EffortKind | string;
   /** Undefined when the harness has no model axis (agy), or when the page owns its own model field. */
   model?: string;
-  /** The durable/deliberate requested model for the requested-vs-running
-   *  pair (launch spec, a terminal `/model`, or a Remuda configure), or null
-   *  when nothing was requested. Distinct from `model`, the picker's folded
-   *  selection. Both strings render verbatim. */
-  modelRequested?: string | null;
+  /** Durable launch spec verbatim (`instance.model`), shown in the chip
+   *  before the first read-back; null/absent when the launch named no model.
+   *  Never the picker default alias. */
+  launchModel?: string | null;
   models?: string[];
   /** Resolved effective model id from read-back (may differ from the alias picked). */
   modelEffective?: string | null;
@@ -222,7 +221,6 @@ export function EffortSlider({
   const ultraStop = stop?.ultracode === true;
   const ratio = effortRatio(shown, Math.max(1, stops.length));
   const fallback = effortStopIndex(kind, defaultEffortIndex(kind), false);
-  const modelLabel = model ? shortModel(model) : "";
   // The current model is the read-back effective id (an alias resolves to a
   // concrete id); fall back to the requested/instance id until read-back.
   const currentModel = modelEffective || model || "";
@@ -238,23 +236,11 @@ export function EffortSlider({
     [currentModel, models, kind],
   );
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
-  // The requested half is the durable launch spec / a deliberate switch
-  // (modelRequested), never the picker fold (`model`); it is null when nothing
-  // was requested, in which case no pair is shown — only the running id. While
-  // a requested switch is in flight the effective id is stale, so no pair.
-  // The comparison and the rendered text use the RAW strings — no trimming
-  // and no verdict (owner ruling 2026-09-23).
-  const requestedModel = modelRequested ?? null;
-  const effectiveModel = modelEffective ?? null;
-  const modelDifferent =
-    !modelPending &&
-    Boolean(
-      requestedModel &&
-        effectiveModel &&
-        requestedModel.length > 0 &&
-        effectiveModel.length > 0 &&
-        requestedModel !== effectiveModel,
-    );
+  // The model chip shows the RUNNING model verbatim: the read-back effective
+  // id, else the durable launch spec, else nothing. No shortening (CSS
+  // ellipsis only) and no requested-vs-running pair — the launch divergence
+  // lives in run details (model-pin-1 §5.4).
+  const runningModel = modelEffective ?? launchModel ?? "";
   const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
 
   // ── List-view roving keyboard navigation ──────────────────────────────
@@ -546,7 +532,6 @@ export function EffortSlider({
       <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}
         data-model-current={currentModel ? shortModel(currentModel) : ""}
         data-model-pending={modelPending ? (modelPending.queued ? "queued" : "switching") : "0"}
-        data-model-different={modelDifferent ? "1" : "0"}
         data-model-path={modelSelectionPath ?? ""}
         data-catalog-source={modelCatalog?.source ?? ""}
       >
@@ -662,11 +647,6 @@ export function EffortSlider({
                   </button>
                 );
               })}
-              {modelDifferent && requestedModel && effectiveModel ? (
-                <div className={css.effortDesc} data-testid="model-option-different">
-                  请求 {requestedModel} → 实际 {effectiveModel}
-                </div>
-              ) : null}
               {onModel ? (
                 <div className={css.effortTypeRow}>
                   <input
@@ -810,18 +790,12 @@ export function EffortSlider({
         className={css.effortModel}
         data-testid={tid("model")}
         title={
-          // Both full ids verbatim on hover; the chip itself carries the same
-          // raw text (CSS ellipsis trims for width, it does not rewrite ids).
-          modelDifferent && requestedModel && effectiveModel
-            ? `请求 ${requestedModel} · 实际 ${effectiveModel}`
-            : stop?.description
+          // The running model verbatim on hover; codex chips keep their
+          // stock description. A claude launch with no model at all is empty.
+          runningModel ? `实际 ${runningModel}` : kind === "codex" ? (stop?.description ?? "") : ""
         }
       >
-        {kind === "codex"
-          ? stop?.description
-          : modelDifferent && requestedModel && effectiveModel
-            ? `${effectiveModel} ⇐ ${requestedModel}`
-            : modelLabel || stop?.description || ""}
+        {kind === "codex" ? (stop?.description ?? "") : runningModel}
       </div>
       {track}
       {ticks}

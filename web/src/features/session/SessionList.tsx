@@ -746,36 +746,26 @@ export function SessionList({
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
-                        // The row says both model strings verbatim: what was
-                        // requested (durable launch spec or a deliberate
-                        // switch) and what is running. When no model was ever
-                        // requested, only the running id is shown — never an
-                        // invented default. The pair is raw inequality, with
-                        // no trimming or verdict (owner ruling 2026-09-23).
-                        const requested = hubStore.modelRequestedOf(instance.id);
-                        const effective = hubStore.modelEffectiveOf(instance.id);
-                        const actual = effective?.id;
-                        const differs =
-                          Boolean(actual && requested) && actual !== requested;
+                        // The chip says only the model that is running,
+                        // verbatim: the transcript read-back, or before any
+                        // read-back the durable launch spec, or nothing. The
+                        // launch divergence is NOT recomputed here — it is
+                        // the Node's model_pin_mismatch diagnostic, shown in
+                        // run details (model-pin-1 §5.4).
+                        const running = hubStore.runningModelOf(instance.id);
                         return (
                           <>
                             <span className={css.sep}>·</span>
                             <span
                               data-testid="session-model"
-                              data-model-effective={actual ? actual : "unknown"}
+                              data-model-effective={hubStore.modelEffectiveOf(instance.id)?.id ?? "unknown"}
                               title={
-                                actual
-                                  ? requested
-                                    ? `请求 ${requested} · 实际 ${actual}（${effective?.source ?? ""}）`
-                                    : `实际 ${actual}（${effective?.source ?? ""}）`
-                                  : requested
-                                    ? `请求 ${requested} · 实际模型尚未从会话回读`
-                                    : "实际模型尚未从会话回读"
+                                running
+                                  ? `实际 ${running}（${hubStore.modelEffectiveOf(instance.id)?.source ?? ""}）`
+                                  : "实际模型尚未从会话回读"
                               }
                             >
-                              {differs && actual && requested
-                                ? `${actual} ⇐ ${requested}`
-                                : (actual ?? requested ?? "")}
+                              {running ?? ""}
                             </span>
                           </>
                         );

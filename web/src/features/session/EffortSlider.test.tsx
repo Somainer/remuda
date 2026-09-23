@@ -187,142 +187,60 @@ describe("EffortSlider visual ladder", () => {
   });
 });
 
-describe("EffortSlider model read-back display", () => {
-  // The attribute lives on the expanded tier/model panel.
-  async function openPanel(overrides: Partial<SliderProps> & Pick<SliderProps, "kind">) {
-    mount(overrides);
-    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
-    return screen.getByTestId("effort-slider-panel");
-  }
+describe("EffortSlider running-model chip", () => {
+  // The collapsed chip is `effort-model`; the expanded panel is reached by
+  // clicking effort-open-list after mount().
 
-  it("shows both strings when a gateway resolves the catalog pin to an upstream name", async () => {
-    // Measured: es1_orange_o50 answers as claude-opus-5 on a real gateway.
-    // The strings differ, so both are shown verbatim — no verdict.
-    const panel = await openPanel({
+  it("shows the launch spec verbatim before any read-back", () => {
+    mount({ kind: "claude", launchModel: "model_hub/es1_orange_o50[1m]" });
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("model_hub/es1_orange_o50[1m]");
+    // No pair machinery exists anywhere.
+    expect(screen.queryByTestId("model-option-different")).toBeNull();
+  });
+
+  it("shows only the running id verbatim once read back, even if it differs from launch", async () => {
+    mount({
       kind: "claude",
-      model: "model_hub/es1_orange_o50[1m]",
-      modelRequested: "model_hub/es1_orange_o50[1m]",
+      launchModel: "model_hub/es1_orange_o50[1m]",
       modelEffective: "claude-opus-5",
     });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-    const note = screen.getByTestId("model-option-different");
-    expect(note).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(note).toHaveTextContent("claude-opus-5");
-  });
-
-  it("shows both strings for a different id in the pin's own namespace", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "model_hub/es1_orange_o50[1m]",
-      modelRequested: "model_hub/es1_orange_o50[1m]",
-      modelEffective: "model_hub/es1_orange_o48[1m]",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-    const note = screen.getByTestId("model-option-different");
-    expect(note).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(note).toHaveTextContent("model_hub/es1_orange_o48[1m]");
-  });
-
-  it("shows both strings for a [1m] context-suffix spelling difference", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "ark/seed-evolving[1m]",
-      modelRequested: "ark/seed-evolving[1m]",
-      modelEffective: "ark/seed-evolving",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-  });
-
-  it("does not show a difference while a switch is pending even if the id differs", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "model_hub/es1_orange_o50[1m]",
-      modelEffective: "model_hub/es1_orange_o48[1m]",
-      modelPending: { id: "model_hub/es1_orange_o48[1m]", queued: false },
-    });
-    expect(panel).toHaveAttribute("data-model-different", "0");
-  });
-
-  it("shows no difference for identical strings", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "ark/seed-evolving",
-      modelRequested: "ark/seed-evolving",
-      modelEffective: "ark/seed-evolving",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "0");
+    expect(screen.getByTestId("effort-model").textContent).toBe("claude-opus-5");
+    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
+    const panel = screen.getByTestId("effort-slider-panel");
+    expect(panel).not.toHaveAttribute("data-model-different");
     expect(screen.queryByTestId("model-option-different")).toBeNull();
   });
 
-  it("shows only the running id when no model was requested", async () => {
-    // A journal-discovered instance with no durable spec and no switch:
-    // modelRequested null must not invent "opus" or show a pair.
-    const panel = await openPanel({
+  it("renders the full running id raw even when its last segment matches the launch", () => {
+    // The incident pair: no shortening, no pair; the running id alone is full.
+    mount({
       kind: "claude",
-      model: "sonnet",
-      modelRequested: null,
-      modelEffective: "sonnet",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "0");
-    expect(screen.queryByTestId("model-option-different")).toBeNull();
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId("effort-list-back"));
-    const chip = screen.getByTestId("effort-model");
-    expect(chip.textContent).toBe("sonnet");
-    expect(chip.textContent).not.toContain("⇐");
-  });
-
-  it("keeps whitespace-bearing requested ids verbatim", async () => {
-    // The roster records the padded request; the materializer trims the
-    // launch token. Comparing raw strings shows the difference, and the text
-    // carries the original characters (no trim/rewrite).
-    const panel = await openPanel({
-      kind: "claude",
-      model: " sonnet ",
-      modelRequested: " sonnet ",
-      modelEffective: "sonnet",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-    const note = screen.getByTestId("model-option-different");
-    expect(note.textContent).toBe("请求  sonnet  → 实际 sonnet");
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId("effort-list-back"));
-    expect(screen.getByTestId("effort-model").textContent).toBe("sonnet ⇐  sonnet ");
-  });
-
-  it("renders the incident pair verbatim even though their last segments match", async () => {
-    // The picker folded to the running id (`model`), but the requested half is
-    // the launch spec with its routing prefix. Nothing may shorten the ids.
-    const user = userEvent.setup();
-    const panel = await openPanel({
-      kind: "claude",
-      model: "ark/seed-evolving",
-      modelRequested: "passthrough/ark/seed-evolving",
+      launchModel: "passthrough/ark/seed-evolving",
       modelEffective: "ark/seed-evolving",
     });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-    const note = screen.getByTestId("model-option-different");
-    expect(note).toHaveTextContent("passthrough/ark/seed-evolving");
-    expect(note).toHaveTextContent("ark/seed-evolving");
-    // The collapsed chip carries both full strings in its text, raw.
-    await user.click(screen.getByTestId("effort-list-back"));
-    const chip = screen.getByTestId("effort-model");
-    expect(chip.textContent).toBe("ark/seed-evolving ⇐ passthrough/ark/seed-evolving");
-    expect(chip.getAttribute("title")).toContain("passthrough/ark/seed-evolving");
-    expect(chip.getAttribute("title")).toContain("ark/seed-evolving");
+    expect(screen.getByTestId("effort-model").textContent).toBe("ark/seed-evolving");
   });
 
-  it("uses modelRequested, not the folded picker selection, for the pair", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      // Picker followed a terminal /model fold onto the same id as running...
-      model: "ark/seed-evolving",
-      // ...but the launch spec differed. Without modelRequested the pair would
-      // wrongly collapse to "no difference".
-      modelRequested: "passthrough/ark/seed-evolving",
-      modelEffective: "ark/seed-evolving",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "1");
+  it("shows nothing when there is no launch model and no read-back", () => {
+    mount({ kind: "claude", launchModel: null });
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("");
+    expect(chip).not.toHaveTextContent("opus");
+  });
+
+  it("shows the running id for a row with no launch model", () => {
+    mount({ kind: "claude", launchModel: null, modelEffective: "sonnet" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("sonnet");
+    expect(screen.getByTestId("effort-model")).not.toHaveTextContent("opus");
+  });
+
+  it("moves straight to a later /model id with no divergence note", async () => {
+    mount({ kind: "claude", launchModel: "model_hub/A", modelEffective: "model_hub/C" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("model_hub/C");
+    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
+    const panel = screen.getByTestId("effort-slider-panel");
+    expect(panel).not.toHaveAttribute("data-model-different");
   });
 });
 

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
+import { setMode } from "./appearanceHelper";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -634,9 +635,7 @@ test.describe("composer control bar and effort", () => {
     await row(page, "空闲会话").click();
     await expect(page.getByTestId("composer-bar")).toBeVisible();
     for (const theme of ["night", "ledger"] as const) {
-      await page.evaluate((next) => {
-        document.documentElement.setAttribute("data-theme", next);
-      }, theme);
+      await setMode(page, theme);
       for (const [width, height, tag] of [
         [1440, 900, "1440"],
         [768, 900, "768"],

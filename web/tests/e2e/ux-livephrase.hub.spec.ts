@@ -16,6 +16,7 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
 
 /**
@@ -347,9 +348,7 @@ test("screen spinner status: verb/tokens/phrase reach the strip and Esc interrup
     // 6 — both themes at 390 and 1440 px: the richer strip never causes a
     //     horizontal page scroll.
     const setTheme = async (theme: "night" | "ledger") => {
-      await page.evaluate((value) => {
-        document.documentElement.dataset.theme = value;
-      }, theme);
+      await setMode(page, theme);
     };
     // Restart one short turn just to repaint the populated strip for the
     // matrix captures.

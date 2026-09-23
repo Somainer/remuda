@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { setMode } from "./appearanceHelper";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,7 +31,7 @@ async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
     await hubStore.refresh();
     return labels;
   });
-  await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
+  await setMode(page, theme);
   await page.evaluate(() => document.fonts.ready);
   const rendered = await page.locator("body").innerText();
   expect(rendered).not.toMatch(/\/Users\//);

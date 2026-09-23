@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setMode } from "./appearanceHelper";
 
 /**
  * P1-3 acceptance for the settings page (exploration §5, §7.2):
@@ -37,9 +38,7 @@ async function shot(page: Page, name: string) {
 }
 
 async function setTheme(page: Page, theme: "night" | "ledger") {
-  await page.evaluate((value) => {
-    document.documentElement.dataset.theme = value;
-  }, theme);
+  await setMode(page, theme);
 }
 
 test("evidence: settings groups, both themes, three widths", async ({ browser, browserName }) => {
@@ -57,7 +56,7 @@ test("evidence: settings groups, both themes, three widths", async ({ browser, b
   await shot(page, "workbench-f-settings-1-groups-1440-night");
 
   // 1440, ledger: the light theme with the completed immediate-save status.
-  await page.getByTestId("settings-theme-ledger").click();
+  await page.getByTestId("settings-appearance-light").click();
   await expect(page.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved");
   await shot(page, "workbench-f-settings-1-saved-1440-ledger");
 
@@ -77,7 +76,7 @@ test("evidence: settings groups, both themes, three widths", async ({ browser, b
     };
   });
   await broken.goto("/settings");
-  await broken.getByTestId("settings-theme-ledger").click();
+  await broken.getByTestId("settings-appearance-light").click();
   await expect(broken.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error");
   await shot(broken, "workbench-f-settings-1-failed-1440-night");
   await broken.close();
@@ -123,6 +122,25 @@ async function expectMinTarget(locator: ReturnType<Page["locator"]>, name: strin
   expect(box!.width, `${name} width`).toBeGreaterThanOrEqual(44);
 }
 
+/**
+ * The hit area reaches 44px even where the visible box is smaller: points
+ * 21px above and below the centre still land on the control.
+ */
+async function expectHitArea(page: Page, locator: ReturnType<Page["locator"]>, name: string) {
+  await expect(locator, name).toBeVisible();
+  const box = await locator.boundingBox();
+  expect(box, name).toBeTruthy();
+  expect(box!.width, `${name} width`).toBeGreaterThanOrEqual(44);
+  const cx = box!.x + box!.width / 2;
+  const cy = box!.y + box!.height / 2;
+  const handle = await locator.elementHandle();
+  const hits = await page.evaluate(
+    ([el, x, ys]) => ys.map((y) => (el as Element).contains(document.elementFromPoint(x, y))),
+    [handle, cx, [cy - 21, cy + 21]] as const,
+  );
+  expect(hits, `${name} hit area spans 44px`).toEqual([true, true]);
+}
+
 test.describe("settings groups and deep links", () => {
   test("deep link opens the right group and browser back returns to it", async ({ page }) => {
     await page.goto("/sessions");
@@ -160,10 +178,10 @@ test.describe("settings groups and deep links", () => {
 });
 
 test.describe("save states", () => {
-  test("theme change runs through 保存中 and 已保存 and persists", async ({ page }) => {
+  test("appearance change runs through 保存中 and 已保存 and persists", async ({ page }) => {
     await page.goto("/settings");
     // Appearance prefs commit immediately on selection.
-    await page.getByTestId("settings-theme-ledger").click();
+    await page.getByTestId("settings-appearance-light").click();
 
     const status = page.getByTestId("settings-appearance-status");
     // The intermediate state has to be painted, not just visited in state.
@@ -172,30 +190,30 @@ test.describe("save states", () => {
     await expect(status).toHaveAttribute("data-phase", "saved");
     await expect(status).toContainText("已保存");
 
-    expect(await page.evaluate(() => localStorage.getItem("runtime.theme.v1"))).toBe("ledger");
-    expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe("ledger");
+    expect(await page.evaluate(() => localStorage.getItem("runtime.theme.v1"))).toBe("light");
+    expect(await page.evaluate(() => document.documentElement.dataset.appearance)).toBe("light");
     // Reload keeps the choice and applies it before interaction.
     await page.reload();
     await expect(page.getByTestId("settings-page")).toBeVisible();
-    expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe("ledger");
-    await expect(page.getByTestId("settings-theme-ledger")).toHaveAttribute("aria-pressed", "true");
+    expect(await page.evaluate(() => document.documentElement.dataset.appearance)).toBe("light");
+    await expect(page.getByTestId("settings-appearance-light")).toHaveAttribute("aria-checked", "true");
   });
 
   test("a failed save shows 失败 and rolls the field back to the last valid value", async ({ page }) => {
     await denyStorageKey(page, "runtime.theme.v1");
     await page.goto("/settings");
-    // Fresh context starts at the night default — that is the committed
-    // "last valid value" the rejected edit must return to.
-    await expect(page.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");
+    // Fresh context starts at the follow-system default — that is the
+    // committed "last valid value" the rejected edit must return to.
+    await expect(page.getByTestId("settings-appearance-system")).toHaveAttribute("aria-checked", "true");
 
-    await page.getByTestId("settings-theme-ledger").click();
+    await page.getByTestId("settings-appearance-light").click();
     const status = page.getByTestId("settings-appearance-status");
     await expect(status).toHaveAttribute("data-phase", "error");
     await expect(status).toContainText("失败");
-    // The rejected choice is back to night and nothing was persisted.
-    await expect(page.getByTestId("settings-theme-night")).toHaveAttribute("aria-pressed", "true");
-    await expect(page.getByTestId("settings-theme-ledger")).toHaveAttribute("aria-pressed", "false");
-    expect(await page.evaluate(() => document.documentElement.dataset.theme)).toBe("night");
+    // The rejected choice is back to system and nothing was persisted.
+    await expect(page.getByTestId("settings-appearance-system")).toHaveAttribute("aria-checked", "true");
+    await expect(page.getByTestId("settings-appearance-light")).toHaveAttribute("aria-checked", "false");
+    expect(await page.evaluate(() => document.documentElement.getAttribute("data-appearance"))).toBeNull();
     // The error is persistent — it does not time out behind a later toast.
     await expect(status).toContainText("失败");
   });
@@ -251,7 +269,7 @@ test.describe("responsive settings", () => {
     await expect(page.getByTestId("settings-nav-notifications")).toBeVisible();
 
     // A full immediate-save cycle has to complete while zoomed.
-    await page.getByTestId("settings-theme-ledger").click();
+    await page.getByTestId("settings-appearance-light").click();
     await expect(page.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved");
     const dims = await page.evaluate(() => ({
       scroll: document.documentElement.scrollWidth,
@@ -264,9 +282,7 @@ test.describe("responsive settings", () => {
   for (const theme of ["night", "ledger"] as const) {
     test(`the ${theme} theme renders every group`, async ({ page }) => {
       await page.goto("/settings");
-      await page.evaluate((value) => {
-        document.documentElement.dataset.theme = value;
-      }, theme);
+      await setMode(page, theme);
       for (const id of ["appearance", "notifications", "connection", "host-defaults"] as const) {
         await expect(page.getByTestId(`settings-group-${id}`)).toBeVisible();
       }
@@ -280,7 +296,14 @@ test.describe("responsive settings", () => {
   }
 });
 
+/**
+ * Hit areas follow pointer: coarse, not width (visual-system.md §6.2), so
+ * these run with touch emulation. Fine pointers keep desktop density at any
+ * width; the responsive block above covers their layout.
+ */
 test.describe("44px touch targets", () => {
+  test.use({ hasTouch: true });
+
   test("settings controls measure at least 44px at phone width", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/settings");
@@ -290,7 +313,8 @@ test.describe("44px touch targets", () => {
     }
     await expectMinTarget(page.getByTestId("settings-perm-manual"), "perm chip");
     await expectMinTarget(page.getByTestId("settings-effort-high"), "effort chip");
-    await expectMinTarget(page.getByTestId("settings-theme-night"), "theme chip");
+    // Segment items stay 26px visible; ::after carries the 44px hit area.
+    await expectHitArea(page, page.getByTestId("settings-appearance-dark"), "appearance segment");
     await expectMinTarget(page.getByTestId("settings-identity-save"), "save");
   });
 

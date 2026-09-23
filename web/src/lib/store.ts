@@ -61,7 +61,7 @@ import {
 import {
   normalizePermissionMode as normalizeKindPermissionMode,
 } from "../features/session/permissions";
-import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
+import { doneFromLines, lastLines, latestScreenSnapshot } from "./screen";
 import { liveSummary } from "../features/session/liveSummary";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -265,6 +265,14 @@ export type BubbleAttachment = {
 
 const COMPACT_KEY = "runtime.compact";
 
+/**
+ * A rendered screen. `journalSeq` is the seq of the journal observation this
+ * screen was derived from (null for screens only seen via a `tty.screen`
+ * RPC). It orders concurrent updates so a live RPC read that was in flight
+ * before a newer journal frame cannot overwrite that frame when it resolves.
+ */
+export type ScreenEntry = { lines: string[]; done: boolean; journalSeq: string | null };
+
 export type HubState = {
   ready: boolean;
   authed: boolean;
@@ -309,7 +317,7 @@ export type HubState = {
   modelPending: Record<string, ModelPending>;
   compact: boolean;
   answering: Record<string, true>;
-  screens: Record<string, { lines: string[]; done: boolean }>;
+  screens: Record<string, ScreenEntry>;
   /** List-row live phrases projected from each instance's journal tail. */
   summaries: Record<string, string>;
 };
@@ -386,13 +394,44 @@ function applyInstanceActivity(instances: Instance[], events: Observation[]): In
   });
 }
 
-/** An HTTP poll started before a followed turn boundary cannot undo it. */
-function mergeInstanceSnapshots(incoming: Instance[], current: Instance[]): Instance[] {
+/**
+ * An HTTP poll started before a followed turn boundary cannot undo it, and
+ * an optimistically-inserted (just-created) instance cannot be dropped by a
+ * list response whose request began before the create completed. `pins`
+ * records created ids keyed by the list-request sequence they were created
+ * against; `reqSeq` is THIS response's request sequence, and `outstanding`
+ * the sequences still in flight (this request included). A pinned id missing
+ * from the incoming list is retained while any request at/before its pin is
+ * unresolved — including a newer response that lands while an older one is
+ * still pending.
+ */
+function mergeInstanceSnapshots(
+  incoming: Instance[],
+  current: Instance[],
+  pins?: ReadonlyMap<Id, { seq: number; confirmedByNewer: boolean }>,
+  reqSeq = Number.POSITIVE_INFINITY,
+  outstanding?: ReadonlySet<number>,
+): Instance[] {
   const previous = new Map(current.map((instance) => [instance.id, instance]));
-  return incoming.map((instance) => {
+  const merged = incoming.map((instance) => {
     const newer = previous.get(instance.id);
     return newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq) ? newer : instance;
   });
+  if (!pins?.size) return merged;
+  const seen = new Set(merged.map((instance) => instance.id));
+  for (const [id, pin] of pins) {
+    if (seen.has(id)) continue;
+    const optimistic = previous.get(id);
+    if (!optimistic) continue;
+    // This response (in `outstanding`), or an even older request still
+    // pending, may predate the create: keep the optimistic row. A response
+    // that started strictly after the create AND has no older in-flight
+    // sibling is authoritative.
+    if (Array.from(outstanding ?? [reqSeq]).some((seq) => seq <= pin.seq)) {
+      merged.unshift(optimistic);
+    }
+  }
+  return merged;
 }
 
 class HubStore {
@@ -409,7 +448,23 @@ class HubStore {
    */
   private settledEffortPushdown = new Map<Id, string>();
   private bootGen = 0;
+  /**
+   * List-fetch sequencing: every refresh() takes a monotonically increasing
+   * seq at fetch START. Optimistically created instances are pinned against
+   * the seq at create time, and a list response only drops a pinned id once
+   * every request at/before that seq has resolved and a newer response
+   * confirmed the list — a poll that began before the create can never erase
+   * the row when it lands late (the 会话不存在 race after navigation).
+   */
+  private listReqSeq = 0;
+  private listOutstanding = new Set<number>();
+  private pinnedCreates = new Map<Id, { seq: number; confirmedByNewer: boolean }>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Per-instance monotonic token for `tty.screen` reads: a stale response
+   * (a newer read already started) never commits.
+   */
+  private screenReadGen = new Map<Id, number>();
   /** Screen-read scheduler: queue, single-flight set, in-flight counter. */
   private screenQueue: Id[] = [];
   private screenPending = new Set<Id>();
@@ -1017,6 +1072,11 @@ class HubStore {
     api.disconnect();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
+    // Drop cross-session list sequencing: a fetch from the old device must
+    // not carry pins into the next login.
+    this.listReqSeq = 0;
+    this.listOutstanding.clear();
+    this.pinnedCreates.clear();
     this.emit({
       authed: false,
       session: null,
@@ -1082,19 +1142,51 @@ class HubStore {
   }
 
   async refresh() {
-    const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
-    this.emit({
-      instances: mergeInstanceSnapshots(instances.items, this.state.instances),
-      interactions,
-    });
-    this.hydrateEffortEffective(instances.items);
-    this.hydrateUsageRollups(instances.items);
-    this.hydrateModels(instances.items);
-    this.hydratePermissionEffective(instances.items);
-    // NOTE: list-row live phrases are NOT derived here. refresh() fans into
-    // every authenticated path (close/cancel/create/resume re-enter it) and
-    // must not add journal polling; the mounted SessionList hydrates phrases
-    // for the rows it renders via hydrateRowSummaries().
+    // Sequence this fetch from its START, not its resolution: a create that
+    // lands while the request is in flight must survive this response and be
+    // released only by a response newer than the create once this one is in.
+    const reqSeq = ++this.listReqSeq;
+    this.listOutstanding.add(reqSeq);
+    try {
+      const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
+      this.emit({
+        instances: mergeInstanceSnapshots(
+          instances.items,
+          this.state.instances,
+          this.pinnedCreates,
+          reqSeq,
+          this.listOutstanding,
+        ),
+        interactions,
+      });
+      // A response newer than a pin proves the server has spoken after the
+      // create. Combined with the in-flight sweep below (every older request
+      // answered), that is when dropping the pin on a missing id is safe.
+      for (const pin of this.pinnedCreates.values()) {
+        if (reqSeq > pin.seq) pin.confirmedByNewer = true;
+      }
+      this.hydrateEffortEffective(instances.items);
+      this.hydrateUsageRollups(instances.items);
+      this.hydrateModels(instances.items);
+      this.hydratePermissionEffective(instances.items);
+      // NOTE: list-row live phrases are NOT derived here. refresh() fans into
+      // every authenticated path (close/cancel/create/resume re-enter it) and
+      // must not add journal polling; the mounted SessionList hydrates phrases
+      // for the rows it renders via hydrateRowSummaries().
+    } finally {
+      this.listOutstanding.delete(reqSeq);
+      for (const [id, pin] of this.pinnedCreates) {
+        if (!pin.confirmedByNewer) continue;
+        let olderInFlight = false;
+        for (const seq of this.listOutstanding) {
+          if (seq <= pin.seq) {
+            olderInFlight = true;
+            break;
+          }
+        }
+        if (!olderInFlight) this.pinnedCreates.delete(id);
+      }
+    }
   }
 
   /** durableSeq already projected for a row phrase; unchanged seq = skip. */
@@ -1237,7 +1329,7 @@ class HubStore {
           this.notePermissionLifecycle(instanceId, event);
         }
         const next = current.concat(fresh);
-        const screen = latestScreenFromObservations(next);
+        const screen = latestScreenSnapshot(next);
         const phrase = liveSummary(next);
         // Clear a finished run's phrase so the row falls back to its
         // constant sentence instead of keeping a stale (invented) status.
@@ -1248,10 +1340,16 @@ class HubStore {
           instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
           bubbles: settleBubbles(this.state.bubbles, instanceId, next),
+          // The journal seq tags the screen so an in-flight tty.screen read
+          // that started before this frame cannot overwrite it on resolve.
           screens: screen.lines.length
             ? {
                 ...this.state.screens,
-                [instanceId]: { lines: lastLines(screen.lines, 80), done: doneFromLines(screen.lines) },
+                [instanceId]: {
+                  lines: lastLines(screen.lines, 80),
+                  done: doneFromLines(screen.lines),
+                  journalSeq: screen.seq,
+                },
               }
             : this.state.screens,
           summaries,
@@ -1346,19 +1444,49 @@ class HubStore {
     return client.loadEarlier();
   }
 
+  /**
+   * Surface a background reconciliation failure on the existing toast mouth
+   * instead of swallowing it. These reads never gate the user action (POST
+   * landings resolve without them), so this is advisory; the 2 s poll and the
+   * follow socket self-heal the same state.
+   */
+  private reconcileToast(err: unknown, what: string) {
+    const message = err instanceof Error && err.message ? err.message : String(err);
+    this.toast(`${what}失败：${message}（将在下次轮询重试）`);
+  }
+
   async catchup(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return;
     const client = this.journals.get(instance.journalId);
     if (!client) {
-      await this.follow(instanceId);
+      // follow() seeds its own connection state; only surface its failure.
+      try {
+        await this.follow(instanceId);
+      } catch (err) {
+        this.reconcileToast(err, "会话同步");
+      }
       return;
     }
     client.markReconnecting();
     this.emit({ connection: "reconnecting" });
-    await client.resumeAfterReconnect();
+    try {
+      await client.resumeAfterReconnect();
+    } catch (err) {
+      // resumeAfterReconnect normally settles the client at readonly-stale
+      // itself; a rejection must not leave the global latch behind.
+      this.reconcileToast(err, "会话同步");
+    }
+    // The follow socket remains the live channel and resume settles the client
+    // at live or readonly-stale; clear the global reconnecting latch on EVERY
+    // path (the old awaited code left it stuck if a read after the latch
+    // rejected).
     this.emit({ connection: "live" });
-    await this.refresh();
+    try {
+      await this.refresh();
+    } catch (err) {
+      this.reconcileToast(err, "会话列表刷新");
+    }
   }
 
   async create(spec: InstanceCreateSpec) {
@@ -1376,12 +1504,19 @@ class HubStore {
       effort: { ...this.state.effort, [createdId]: effort },
       models: { ...this.state.models, [createdId]: spec.model },
     });
+    // Pin the created row against every list request still in flight (a poll
+    // started before the create resolves late and otherwise drops the row,
+    // which made /s/:id render 会话不存在 immediately after navigation). The
+    // pin releases on the first post-create response once all older requests
+    // settle — see refresh()/mergeInstanceSnapshots.
+    this.pinnedCreates.set(createdId, { seq: this.listReqSeq, confirmedByNewer: false });
     // Do not gate navigation on the list refresh: the create response already
     // carries the instance the new /s/:id route mounts, and the follow socket
     // delivers the rest. Under gate load awaiting the two refresh GETs here
     // kept NewSessionPage on /sessions/new past the test's 20 s window even
-    // though the create had landed (a retry then passed).
-    void this.refresh().catch(() => undefined);
+    // though the create had landed (a retry then passed). A failure is
+    // surfaced (not swallowed): the 2 s poll self-heals the list.
+    void this.refresh().catch((err) => this.reconcileToast(err, "会话列表刷新"));
     return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
 
@@ -1436,8 +1571,14 @@ class HubStore {
       // same state.
       const events = this.state.events[instanceId] ?? [];
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
-      void this.catchup(instanceId).catch(() => undefined);
-      void this.refreshScreen(instanceId).catch(() => undefined);
+      // catchup owns its own failures (toast + the connection latch always
+      // clears), so it never rejects and the POST resolution stays first.
+      void this.catchup(instanceId);
+      void this.refreshScreen(instanceId).catch((err) => {
+        // NODE_BUSY is the bulk-read back-pressure the scheduler backs off
+        // on, not a reconciliation failure; anything else is surfaced.
+        if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
+      });
       return true;
     } catch {
       // Keep `commandId: null`. The bubble is 「状态待确认」: no command id
@@ -1615,7 +1756,16 @@ class HubStore {
   }
 
   async refreshScreen(instanceId: Id) {
-    let read;
+    // Generation guard: a newer read (or the periodic scheduler) superseding
+    // this one makes its late resolution a no-op.
+    const gen = (this.screenReadGen.get(instanceId) ?? 0) + 1;
+    this.screenReadGen.set(instanceId, gen);
+    // Journal screen seq known BEFORE the RPC went out. The live buffer the
+    // RPC returns is at least that new; a journal frame that lands while the
+    // read is in flight is newer than the request, and the read must not win.
+    const journalSeqAtStart = this.state.screens[instanceId]?.journalSeq ?? null;
+    let read: { lines: string[] };
+    let fromJournal = false;
     try {
       read = await api.screenRead(instanceId, 80);
     } catch (err) {
@@ -1624,13 +1774,41 @@ class HubStore {
       read = { lines: [] };
     }
     if (!read.lines.length) {
-      read = latestScreenFromObservations(this.state.events[instanceId] ?? []);
+      const snapshot = latestScreenSnapshot(this.state.events[instanceId] ?? []);
+      read = { lines: snapshot.lines };
+      fromJournal = true;
+    }
+    const current = this.state.screens[instanceId];
+    if (this.screenReadGen.get(instanceId) !== gen) return;
+    if (fromJournal) {
+      // Re-derived journal content at resolve time: skip if the committed
+      // journal screen is already at/beyond it (same content, newer frame).
+      const derivedSeq = latestScreenSnapshot(this.state.events[instanceId] ?? []).seq;
+      if (
+        current?.journalSeq != null &&
+        derivedSeq != null &&
+        BigInt(current.journalSeq) >= BigInt(derivedSeq)
+      ) {
+        return;
+      }
+    } else if (
+      // Live RPC read: a journal frame landed while it was in flight — that
+      // durable frame is newer than the request. Drop the read; the next
+      // scheduled poll re-reads a buffer that already contains it.
+      current?.journalSeq != null &&
+      journalSeqAtStart !== current.journalSeq
+    ) {
+      return;
     }
     const lines = lastLines(read.lines, 80);
     this.emit({
       screens: {
         ...this.state.screens,
-        [instanceId]: { lines: lastLines(lines, 3), done: doneFromLines(read.lines) },
+        [instanceId]: {
+          lines: lastLines(lines, 3),
+          done: doneFromLines(read.lines),
+          journalSeq: current?.journalSeq ?? null,
+        },
       },
     });
   }

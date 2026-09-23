@@ -101,6 +101,40 @@ Two unit tests in `web/src/lib/store.localBubble.test.ts` pin both
 resolutions with every reconciliation read hanging forever; they fail on the
 old awaited code (2 s timeouts) and pass on the new code.
 
+### Round 2 — making the fire-and-forget reconciliation race-safe
+
+The codex+grok acceptance review rejected round 1: detaching the
+reconciliation exposed three real races. All fixed in `web/src/lib/store.ts`
+(`screen.ts` exposes a screen snapshot's source seq), each with a unit test
+in `web/src/lib/store.reconcile-race.test.ts` (five tests, each verified red
+on round-1 code):
+
+1. **Stale list poll dropping the just-created instance.** A `refresh()`
+   started before the create could resolve after it; `incoming.map(…)`
+   replaced the whole list, so `/s/:id` rendered 会话不存在 on mount. List
+   fetches now take a monotonic seq at fetch START (`listReqSeq` /
+   `listOutstanding`); `create` pins its optimistic id against the seq in
+   flight. `mergeInstanceSnapshots` keeps a pinned id missing from a
+   response while any request at/before the pin is outstanding, and the pin
+   releases only after a response newer than the create AND every older
+   request have settled — the newer-response-witness + in-flight sweep is
+   needed: either condition alone either releases too early on the stale
+   response itself or retains the pin forever.
+2. **Swallowed background errors / latched 重连中.** The detached
+   `.catch(() => undefined)` calls hid failures and a rejection between
+   `markReconnecting()` and the `live` emit latched the global connection
+   indicator. `catchup()` now never leaves the latch: the live emit runs on
+   every path, and failures (resume / list refresh / screen read) go through
+   a `reconcileToast` advisory on the existing toast mouth — the POST action
+   still resolved on its landing, and the 2 s poll self-heals.
+3. **Stale `tty.screen` overwriting a newer journal screen.** Each read now
+   takes a per-instance generation (a newer read supersedes a late one) and
+   the journal-derived screen carries its source seq in the screen state
+   (`journalSeq`); a live RPC read that began before a newer journal frame
+   commits nothing when the frame landed while it was in flight (the next
+   scheduled poll re-reads the buffer). Journal-derived empty fallbacks are
+   deduped the same way.
+
 ## Verification
 
 - 10x loops, `--repeat-each 10 --workers 1`, each test filtered alone, under
@@ -113,3 +147,8 @@ old awaited code (2 s timeouts) and pass on the new code.
   - after: pty **10/10**; steer **10/10**.
 - `pnpm -C web test` — all unit tests pass including the two new pins
   (1640); `pnpm -C web typecheck` and oxlint on the changed files — clean.
+- Round 2: `pnpm -C web test` — 1645 pass (five additional race pins,
+  `store.reconcile-race.test.ts`, each failing on round-1 code);
+  10x loops after the race fixes — pty **10/10**, steer **10/10**; whole
+  hub-live file **10 passed, 1 skipped** (external-Node). Same lock/ports
+  protocol (58830/58831/58839).

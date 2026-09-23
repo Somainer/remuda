@@ -40,13 +40,26 @@ function subscription(instance: Instance) {
 
 async function startFollowing(idSuffix: string, launchModel?: string) {
   const original = mockDb.instances[0];
-  const instance: Instance = {
+  const base: Instance = {
     ...original,
     id: `ins_model_store_${idSuffix}`,
     journalId: `obj_model_store_${idSuffix}`,
     kind: "claude",
-    ...(launchModel ? { model: launchModel } : {}),
   };
+  // `undefined` launchModel means a journal-discovered row with no durable
+  // model; an explicit value sets it; null explicitly removes the field.
+  const instance: Instance =
+    launchModel === undefined
+      ? (() => {
+            const { model: _omit, ...rest } = base;
+            return rest as Instance;
+          })()
+      : launchModel === null
+        ? (() => {
+            const { model: _omit, ...rest } = base;
+            return { ...rest, model: null } as Instance;
+          })()
+        : { ...base, model: launchModel };
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
   vi.spyOn(api, "eventsRead").mockResolvedValue({
     events: [],
@@ -79,6 +92,7 @@ function modelEvent(
   id: string,
   source: string,
   catalog?: { models: string[]; source: "gateway-discovery" | "settings" | "builtin" },
+  requestedOverride?: string,
 ): Observation {
   return {
     eventId: `evt_mdl_${seq}_${id}`.replace(/[^a-zA-Z0-9_]/g, "_"),
@@ -90,8 +104,9 @@ function modelEvent(
     source: { channel: "transcript" },
     payload: {
       // Launch and Remuda-switch edges name the requested id; a hand-typed
-      // terminal /model (source "slash") does not.
-      requested: source === "slash" ? undefined : id,
+      // terminal /model (source "slash") does not. A Remuda configure that
+      // resolved to a different concrete id stamps the configured alias.
+      requested: requestedOverride ?? (source === "slash" ? undefined : id),
       effective: { id, source, observedAt: `2026-09-16T00:0${seq}:00Z` },
       raw: id,
       ...(catalog
@@ -174,39 +189,66 @@ it("a terminal-side /model moves the picker without posting configure", async ()
   expect(configure).not.toHaveBeenCalled();
 });
 
-it("the requested half keeps the durable launch spec when a live read-back folds the picker", async () => {
-  // Regression for the 2026-09-23 acceptance: noteModelObservation folds the
-  // running id into the picker selection (`state.models`), which used to be
-  // the "requested" half too — so requested == running and the divergence
-  // never displayed. The pair's requested side must read the launch spec.
+it("the requested half tracks the launch spec, then a deliberate /model switch", async () => {
+  // Regression (2026-09-23 acceptance rounds 4/5):
+  //  - a live read-back folded into the picker used to be the "requested"
+  //    half, so requested == running and the pair vanished;
+  //  - then the half was pinned to the launch spec forever, so a user's own
+  //    `/model` switch showed as a divergence. A deliberate switch IS a
+  //    request: the observed slash id becomes the requested half.
   const launchModel = "passthrough/ark/seed-evolving";
   const ctx = await startFollowing("requested", launchModel);
-  // The gateway strips its routing prefix: the launch read-back id differs.
+  // Launch read-back: the gateway strips its routing prefix.
   ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
-  // The picker follows the fold (it sits on what actually runs)...
   expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("ark/seed-evolving");
   expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("ark/seed-evolving");
-  // ...but the requested value for the pair stays the durable spec, verbatim.
-  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe(launchModel);
+  // The pair's requested half keeps the durable launch spec.
+  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe(launchModel);
 
-  // A later terminal /model moves the picker again; requested is still the
-  // launch spec until the operator's own configure goes pending.
+  // A later terminal /model is a deliberate request to the new id: requested
+  // moves to C and equals running, so the pair collapses to one id.
   ctx.receive(modelEvent(3, "model_hub/es1_orange_o50", "slash"));
   expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/es1_orange_o50");
-  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe(launchModel);
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/es1_orange_o50");
+  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("model_hub/es1_orange_o50");
 });
 
-it("an in-flight switch is the requested value until its read-back settles", async () => {
-  const ctx = await startFollowing("switch", "ark/seed-evolving");
+it("a journal-discovered instance with no durable model invents no request", async () => {
+  // Node-discovered instance: the Hub row has no model; only an effective id
+  // exists. No fabricated "opus" — requested is null, displays show one id.
+  const ctx = await startFollowing("discovered", undefined);
+  expect(ctx.instance.model).toBeUndefined();
+  ctx.receive(modelEvent(2, "sonnet", "unknown"));
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("sonnet");
+  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBeNull();
+});
+
+it("a settled remuda configure requests the configured id even when it resolved", async () => {
+  const ctx = await startFollowing("configure", "ark/seed-evolving");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  // The launch read-back lands first (the live journal always carries it
+  // before any switch edge; delivering the switch edge alone would gap the
+  // client's watermark).
   ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
-  await hubStore.setModel(ctx.instance.id, "model_hub/es1_orange_o50[1m]");
-  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe(
-    "model_hub/es1_orange_o50[1m]",
-  );
-  ctx.receive(modelEvent(3, "model_hub/es1_orange_o50[1m]", "remuda"));
-  // Settled: requested returns to the launch spec (no newer switch requested).
-  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe("ark/seed-evolving");
+  await hubStore.setModel(ctx.instance.id, "e2e/fast");
+  // The verdict edge stamps requested=e2e/fast, effective=e2e/plain (alias
+  // resolved to a different concrete id); requested stays the configured id.
+  ctx.receive(modelEvent(3, "e2e/plain", "remuda", undefined, "e2e/fast"));
+  expect(hubStore.modelPendingOf(ctx.instance.id)).toBeNull();
+  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("e2e/fast");
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("e2e/plain");
+});
+
+it("an unknown read-back does not change the requested half", async () => {
+  const ctx = await startFollowing("unknown-edge", "model_hub/A");
+  ctx.receive(modelEvent(2, "model_hub/B", "launch"));
+  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("model_hub/A");
+  // Unattributed assistant-model change: running moves, the request is still
+  // the launch spec (the Hub roster clears its own stale pair; the web just
+  // keeps the durable request until a deliberate switch supersedes it).
+  ctx.receive(modelEvent(3, "model_hub/C", "unknown"));
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/C");
+  expect(hubStore.modelRequestedOf(ctx.instance.id)).toBe("model_hub/A");
 });
 
 it("our pending push-down clears on read-back and reports the resolved id", async () => {

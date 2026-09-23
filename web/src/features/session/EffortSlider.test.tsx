@@ -201,6 +201,7 @@ describe("EffortSlider model read-back display", () => {
     const panel = await openPanel({
       kind: "claude",
       model: "model_hub/es1_orange_o50[1m]",
+      modelRequested: "model_hub/es1_orange_o50[1m]",
       modelEffective: "claude-opus-5",
     });
     expect(panel).toHaveAttribute("data-model-different", "1");
@@ -213,6 +214,7 @@ describe("EffortSlider model read-back display", () => {
     const panel = await openPanel({
       kind: "claude",
       model: "model_hub/es1_orange_o50[1m]",
+      modelRequested: "model_hub/es1_orange_o50[1m]",
       modelEffective: "model_hub/es1_orange_o48[1m]",
     });
     expect(panel).toHaveAttribute("data-model-different", "1");
@@ -225,6 +227,7 @@ describe("EffortSlider model read-back display", () => {
     const panel = await openPanel({
       kind: "claude",
       model: "ark/seed-evolving[1m]",
+      modelRequested: "ark/seed-evolving[1m]",
       modelEffective: "ark/seed-evolving",
     });
     expect(panel).toHaveAttribute("data-model-different", "1");
@@ -244,10 +247,47 @@ describe("EffortSlider model read-back display", () => {
     const panel = await openPanel({
       kind: "claude",
       model: "ark/seed-evolving",
+      modelRequested: "ark/seed-evolving",
       modelEffective: "ark/seed-evolving",
     });
     expect(panel).toHaveAttribute("data-model-different", "0");
     expect(screen.queryByTestId("model-option-different")).toBeNull();
+  });
+
+  it("shows only the running id when no model was requested", async () => {
+    // A journal-discovered instance with no durable spec and no switch:
+    // modelRequested null must not invent "opus" or show a pair.
+    const panel = await openPanel({
+      kind: "claude",
+      model: "sonnet",
+      modelRequested: null,
+      modelEffective: "sonnet",
+    });
+    expect(panel).toHaveAttribute("data-model-different", "0");
+    expect(screen.queryByTestId("model-option-different")).toBeNull();
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("effort-list-back"));
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("sonnet");
+    expect(chip.textContent).not.toContain("⇐");
+  });
+
+  it("keeps whitespace-bearing requested ids verbatim", async () => {
+    // The roster records the padded request; the materializer trims the
+    // launch token. Comparing raw strings shows the difference, and the text
+    // carries the original characters (no trim/rewrite).
+    const panel = await openPanel({
+      kind: "claude",
+      model: " sonnet ",
+      modelRequested: " sonnet ",
+      modelEffective: "sonnet",
+    });
+    expect(panel).toHaveAttribute("data-model-different", "1");
+    const note = screen.getByTestId("model-option-different");
+    expect(note.textContent).toBe("请求  sonnet  → 实际 sonnet");
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("effort-list-back"));
+    expect(screen.getByTestId("effort-model").textContent).toBe("sonnet ⇐  sonnet ");
   });
 
   it("renders the incident pair verbatim even though their last segments match", async () => {

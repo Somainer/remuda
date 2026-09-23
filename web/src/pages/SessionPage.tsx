@@ -801,7 +801,7 @@ export function SessionPage({
           permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
-          modelRequested={hubStore.modelRequestedOf(instance.id, instance.kind)}
+          modelRequested={hubStore.modelRequestedOf(instance.id)}
           models={hubStore.modelListOf(instance.id) ?? undefined}
           modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
           modelPending={hubStore.modelPendingOf(instance.id)}

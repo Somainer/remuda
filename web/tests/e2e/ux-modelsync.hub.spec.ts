@@ -166,8 +166,19 @@ test("the picker lists the gateway-discovered models and selection read-backs", 
 test("a typed alias resolving to a different id shows both model strings", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const instanceId = await createSession(page, "Model alias resolution");
+  // Snapshot the durable launch model BEFORE configure (the fake node's
+  // post_command patches spec.model to the posted sentinel, so the steady
+  // request cannot be read off the row afterwards).
+  const launch = await page
+    .request
+    .get(`/v1/instances/${instanceId}`)
+    .then((r) => r.json());
+  const launchModel: string = launch.instance?.model ?? launch.model ?? "";
+  expect(launchModel).toBeTruthy();
   // Clicking fast is the optimistic request; rewrite the configure to the
-  // resolve sentinel so the fake verdict reports a different concrete id.
+  // resolve sentinel so the fake verdict reports a different concrete id. The
+  // verdict edge carries requested=e2e/fast (the real configured alias) and
+  // effective=e2e/plain.
   await page.route("**/v1/instances/*/commands", async (route) => {
     const body = route.request().postDataJSON();
     if (body?.operation === "instance.configure" && body.payload?.model) {
@@ -197,14 +208,22 @@ test("a typed alias resolving to a different id shows both model strings", async
   const panel = page.getByTestId("effort-slider-panel");
   await expect(panel).toHaveAttribute("data-model-current", "plain");
   await expect(panel).toHaveAttribute("data-model-different", "1");
-  // Once the switch settles, the "requested" half is the durable launch spec
-  // the instance was created with — the e2e fake node's default
-  // `passthrough/auto` (its short label is "auto", which is why the first test
-  // reads data-model-current "auto") — never the configure sentinel or the
-  // picker fold. The running half is the resolved id.
-  const note = page.getByTestId("model-option-different");
-  await expect(note).toHaveText("请求 passthrough/auto → 实际 e2e/plain", { timeout: 10_000 });
+  // Settled: a deliberate configure IS a request, so the requested half is the
+  // configured alias (the edge's `requested`, which survived resolving) — not
+  // the launch spec, not the sentinel, not the patched spec.model. The running
+  // half is the resolved id. Assert again after a full reload (durable
+  // projection replays the edge), not just against in-memory optimism.
+  const expectSettledNote = async () => {
+    const note = page.getByTestId("model-option-different");
+    await expect(note).toHaveText("请求 e2e/fast → 实际 e2e/plain", { timeout: 10_000 });
+  };
+  await expectSettledNote();
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "1");
+
+  await page.reload();
+  await page.getByTestId("model-effort-chip").waitFor({ timeout: 20_000 });
+  await openModelList(page);
+  await expectSettledNote();
 });
 
 test("a terminal-side /model moves the picker without posting configure", async ({ page }) => {

@@ -746,17 +746,17 @@ export function SessionList({
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
-                        // The row says both model strings, verbatim: the one
-                        // requested at dispatch and the one read back from the
-                        // session. When they differ the row shows both; it does
-                        // not judge the difference (owner ruling 2026-09-23:
-                        // the harness records what runs, it does not decide
-                        // whether that is allowed).
-                        const requested = hubStore.modelRequestedOf(instance.id, instance.kind);
+                        // The row says both model strings verbatim: what was
+                        // requested (durable launch spec or a deliberate
+                        // switch) and what is running. When no model was ever
+                        // requested, only the running id is shown — never an
+                        // invented default. The pair is raw inequality, with
+                        // no trimming or verdict (owner ruling 2026-09-23).
+                        const requested = hubStore.modelRequestedOf(instance.id);
                         const effective = hubStore.modelEffectiveOf(instance.id);
                         const actual = effective?.id;
                         const differs =
-                          actual !== undefined && actual.trim() !== "" && actual !== requested;
+                          Boolean(actual && requested) && actual !== requested;
                         return (
                           <>
                             <span className={css.sep}>·</span>
@@ -765,11 +765,17 @@ export function SessionList({
                               data-model-effective={actual ? actual : "unknown"}
                               title={
                                 actual
-                                  ? `请求 ${requested} · 实际 ${actual}（${effective?.source ?? ""}）`
-                                  : `请求 ${requested} · 实际模型尚未从会话回读`
+                                  ? requested
+                                    ? `请求 ${requested} · 实际 ${actual}（${effective?.source ?? ""}）`
+                                    : `实际 ${actual}（${effective?.source ?? ""}）`
+                                  : requested
+                                    ? `请求 ${requested} · 实际模型尚未从会话回读`
+                                    : "实际模型尚未从会话回读"
                               }
                             >
-                              {differs && actual ? `${actual} ⇐ ${requested}` : (actual ?? requested)}
+                              {differs && actual && requested
+                                ? `${actual} ⇐ ${requested}`
+                                : (actual ?? requested ?? "")}
                             </span>
                           </>
                         );

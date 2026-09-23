@@ -45,7 +45,8 @@ vi.mock("../../lib/store", () => ({
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: () => null,
     modelOf: () => "model_hub/es1_orange_o50[1m]",
-    modelRequestedOf: (id: string) => requestedModel[id] ?? "model_hub/es1_orange_o50[1m]",
+    modelRequestedOf: (id: string) =>
+      requestedModel[id] === null ? null : requestedModel[id] ?? "model_hub/es1_orange_o50[1m]",
     modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
     modelCatalogOf: () => null,
     refreshScreens: vi.fn(),
@@ -69,8 +70,9 @@ const modelEffective: Record<
   { id: string; source: string; observedAt: string }
 > = {};
 /// Per-instance durable requested model for the requested-vs-running pair.
-/// Absent entries fall back to the dispatch pin the fixture instances carry.
-const requestedModel: Record<string, string> = {};
+/// Absent entries fall back to the dispatch pin; `null` means nothing was
+/// requested (a journal-discovered row).
+const requestedModel: Record<string, string | null> = {};
 
 function host(id: string, label: string) {
   return { id, label, state: "online" };
@@ -331,9 +333,26 @@ describe("SessionList effective-model label", () => {
     expect(label).toHaveTextContent("passthrough/ark/seed-evolving");
     expect(label).toHaveTextContent("ark/seed-evolving");
     // The full text is the textContent, not merely a tooltip.
-    expect(label.textContent).toContain("ark/seed-evolving ⇐ passthrough/ark/seed-evolving");
+    expect(label.textContent).toBe("ark/seed-evolving ⇐ passthrough/ark/seed-evolving");
     expect(label.getAttribute("title")).toContain("passthrough/ark/seed-evolving");
     expect(label.getAttribute("title")).toContain("ark/seed-evolving");
+  });
+
+  // Whitespace-bearing durable requests are recorded verbatim; the display
+  // compares raw strings, so a padded request differs from its trimmed running
+  // id (the materializer trims the launch token, the roster does not).
+  it("keeps whitespace-bearing requested ids verbatim", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+      requestedModel[id] = " sonnet ";
+      modelEffective[id] = {
+        id: "sonnet",
+        source: "launch",
+        observedAt: "2026-09-24T00:00:00Z",
+      };
+    }
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label.textContent).toBe("sonnet ⇐  sonnet ");
   });
 
   // A gateway resolves a catalog id to an upstream vendor name. The strings
@@ -351,6 +370,24 @@ describe("SessionList effective-model label", () => {
     expect(label).toHaveTextContent("claude-opus-5");
     expect(label).toHaveTextContent("model_hub/es1_orange_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "claude-opus-5");
+  });
+
+  // A journal-discovered instance with no durable request and no switch:
+  // show only what runs, never an invented "opus" request.
+  it("shows only the running id when nothing was requested", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+      requestedModel[id] = null;
+      modelEffective[id] = {
+        id: "sonnet",
+        source: "unknown",
+        observedAt: "2026-09-24T00:00:00Z",
+      };
+    }
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label).toHaveTextContent("sonnet");
+    expect(label).not.toHaveTextContent("⇐");
+    expect(label).not.toHaveTextContent("opus");
   });
 });
 

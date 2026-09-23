@@ -165,10 +165,10 @@ export function EffortSlider({
   kind: EffortKind | string;
   /** Undefined when the harness has no model axis (agy), or when the page owns its own model field. */
   model?: string;
-  /** The durable requested model for the requested-vs-running pair (the
-   *  launch spec, or an in-flight switch). Distinct from `model`, which is the
-   *  picker's folded selection and follows a terminal `/model`. Both strings
-   *  render verbatim. */
+  /** The durable/deliberate requested model for the requested-vs-running
+   *  pair (launch spec, a terminal `/model`, or a Remuda configure), or null
+   *  when nothing was requested. Distinct from `model`, the picker's folded
+   *  selection. Both strings render verbatim. */
   modelRequested?: string | null;
   models?: string[];
   /** Resolved effective model id from read-back (may differ from the alias picked). */
@@ -238,17 +238,23 @@ export function EffortSlider({
     [currentModel, models, kind],
   );
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
-  // The requested half of the pair is the durable launch spec (or an in-flight
-  // switch), never the picker fold; when the prop is absent (new-session form,
-  // bare test mounts) fall back to the picker value. While a requested switch
-  // is in flight the effective id is simply stale, so don't show the pair yet.
-  // Raw inequality only: both ids render verbatim, no verdict or id rewriting
-  // (owner ruling 2026-09-23).
-  const requestedModel = (modelRequested ?? model ?? "").trim();
-  const effectiveModel = (modelEffective ?? "").trim();
+  // The requested half is the durable launch spec / a deliberate switch
+  // (modelRequested), never the picker fold (`model`); it is null when nothing
+  // was requested, in which case no pair is shown — only the running id. While
+  // a requested switch is in flight the effective id is stale, so no pair.
+  // The comparison and the rendered text use the RAW strings — no trimming
+  // and no verdict (owner ruling 2026-09-23).
+  const requestedModel = modelRequested ?? null;
+  const effectiveModel = modelEffective ?? null;
   const modelDifferent =
     !modelPending &&
-    Boolean(requestedModel && effectiveModel && requestedModel !== effectiveModel);
+    Boolean(
+      requestedModel &&
+        effectiveModel &&
+        requestedModel.length > 0 &&
+        effectiveModel.length > 0 &&
+        requestedModel !== effectiveModel,
+    );
   const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
 
   // ── List-view roving keyboard navigation ──────────────────────────────
@@ -656,7 +662,7 @@ export function EffortSlider({
                   </button>
                 );
               })}
-              {modelDifferent ? (
+              {modelDifferent && requestedModel && effectiveModel ? (
                 <div className={css.effortDesc} data-testid="model-option-different">
                   请求 {requestedModel} → 实际 {effectiveModel}
                 </div>
@@ -806,14 +812,14 @@ export function EffortSlider({
         title={
           // Both full ids verbatim on hover; the chip itself carries the same
           // raw text (CSS ellipsis trims for width, it does not rewrite ids).
-          modelDifferent
+          modelDifferent && requestedModel && effectiveModel
             ? `请求 ${requestedModel} · 实际 ${effectiveModel}`
             : stop?.description
         }
       >
         {kind === "codex"
           ? stop?.description
-          : modelDifferent
+          : modelDifferent && requestedModel && effectiveModel
             ? `${effectiveModel} ⇐ ${requestedModel}`
             : modelLabel || stop?.description || ""}
       </div>

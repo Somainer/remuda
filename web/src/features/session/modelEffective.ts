@@ -136,9 +136,10 @@ export function modelFromObservation(
 ): {
   effective: ModelEffectiveView;
   catalog: ModelCatalogView | null;
-  /** True when the payload explicitly carried a `requested` id (a launch
-   *  snapshot or a switch verdict). A catalog refresh carries none. */
-  hasRequested: boolean;
+  /** The explicit requested id the payload carried (a launch snapshot or a
+   *  switch verdict), or null. For a remuda configure this is the id actually
+   *  sent, which may resolve to a different concrete effective id. */
+  requestedId: string | null;
 } | null {
   const event = observation as { body?: ModelObservationPayload } | null;
   const body = event?.body;
@@ -151,9 +152,13 @@ export function modelFromObservation(
   // `effective`); honour it when the inner object did not carry one.
   const selectionPath =
     effective.selectionPath ?? selectionPathOf(payload.payload.selectionPath);
+  const requestedId =
+    typeof payload.payload.requested === "string" && payload.payload.requested.length > 0
+      ? payload.payload.requested
+      : null;
   return {
     effective: selectionPath ? { ...effective, selectionPath } : effective,
     catalog: catalogFromRecord(payload.payload.catalog),
-    hasRequested: typeof payload.payload.requested === "string" && payload.payload.requested.length > 0,
+    requestedId,
   };
 }

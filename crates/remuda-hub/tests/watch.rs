@@ -832,6 +832,49 @@ async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids
     }
 }
 
+/// An unattributed (`unknown`) read-back — e.g. an assistant message.model
+/// change with no `/model` verdict or configure — also supersedes a recorded
+/// launch divergence: the roster row must not keep showing the obsolete pair.
+#[tokio::test]
+async fn an_unknown_source_readback_clears_a_stale_launch_divergence() {
+    let ctx = Ctx::spawn().await.unwrap();
+    let project = project_with_enrolled_workspace(&ctx, "watch-modelunk", "59020-59049").await;
+    ctx.dispatch(&project, "c-modelx", "59020-59049").await;
+
+    ctx.node.set_screen(&["$ ready"], "ready");
+    let observed = ctx.observe().await;
+    let instance_id = observed["items"][0]["instanceId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Launch divergence is recorded first.
+    ctx.node.append_journal(
+        &instance_id,
+        &[model_edge_event("model_hub/es1_orange_o48[1m]", "launch")],
+    );
+    let observed = ctx.observe().await;
+    assert_eq!(
+        observed["items"][0]["modelEffective"],
+        "model_hub/es1_orange_o48[1m]"
+    );
+
+    // A later assistant record reports a third id with no attributable command.
+    ctx.node.append_journal(
+        &instance_id,
+        &[model_edge_event("model_hub/es1_orange_o47", "unknown")],
+    );
+    for _ in 0..2 {
+        let observed = ctx.observe().await;
+        let row = &observed["items"][0];
+        assert!(
+            row.get("modelEffective").is_none(),
+            "an unknown read-back clears the stale launch modelEffective: {row}"
+        );
+        assert_eq!(row["state"]["state"], "working", "{row}");
+    }
+}
+
 /// A launch honours the pin, and only THEN does the operator reconfigure the
 /// session to another model. The later observation is `slash`/`remuda`-sourced,
 /// so it must not be read back as a dispatch substitution: the worker stays

@@ -291,10 +291,9 @@ async fn observe_one(
     // The raw (requested, observed) pair of a launch read-back divergence, for
     // the status detail. Informational only: it does not change worker state.
     let mut model_divergence: Option<(String, String)> = None;
-    // A later human `/model` (`slash`) or Remuda `instance.configure`
-    // (`remuda`) supersedes the launch read-back: the roster row must drop the
-    // launch divergence it persisted, or `remuda watch` would keep showing the
-    // old pair forever.
+    // A non-launch read-back (deliberate slash/remuda switch, or an
+    // unattributed `unknown` assistant-model change) supersedes the launch
+    // read-back: the roster row must drop the launch divergence it persisted.
     let mut clear_model_effective = false;
     if let Some(instance_id) = worker.instance_id.as_ref()
         && let Some(record) = state
@@ -382,10 +381,16 @@ async fn observe_one(
                 model_effective = Some(observed.to_owned());
                 model_divergence = Some((requested.to_owned(), observed.to_owned()));
             }
-        } else if matches!(source, "slash" | "remuda") && observed.is_some() {
-            // The operator intentionally changed the model after launch. The
-            // stale launch divergence (if any was recorded) is no longer the
-            // state of this worker: clear it on the next roster mutation.
+        } else if observed.is_some() {
+            // Any NON-launch read-back supersedes the launch pair: a deliberate
+            // slash/remuda switch the operator owns, and also an unattributed
+            // `unknown` edge (an assistant message.model that changed with no
+            // /model verdict or configure — the tracker legitimately emits it
+            // once the launch edge has reset its pending source). Keeping the
+            // old launch id would leave `remuda watch` showing an obsolete
+            // pair against a newer authoritative observation, so clear it.
+            // Empty source with a read-back is treated the same way: only the
+            // exact "launch" string keeps this arm closed.
             clear_model_effective = true;
         }
     }

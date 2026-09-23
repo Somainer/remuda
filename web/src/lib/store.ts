@@ -301,6 +301,12 @@ export type HubState = {
    *  effective read-back lands or the switch is rejected. */
   effortPending: Record<string, EffortPending>;
   models: Record<string, string>;
+  /** Deliberate post-launch model requests the live session evidenced
+   *  (a terminal `/model`, source slash; or a settled Remuda configure,
+   *  source remuda). Overlays the durable launch spec for the
+   *  requested-vs-running pair. The picker fold (`models`) is a separate,
+   *  display-only value and is not a request. */
+  modelRequested: Record<string, string>;
   /** §9.1 transcript-read-back effective model per instance. */
   modelEffective: Record<string, ModelEffectiveView>;
   /** §9.1 discovered switchable model list per instance. */
@@ -339,6 +345,7 @@ const initial: HubState = {
   permissionEffective: {},
   permissionPending: {},
   models: {},
+  modelRequested: {},
   modelEffective: {},
   modelCatalogs: {},
   modelPending: {},
@@ -527,9 +534,22 @@ class HubStore {
     }
   }
 
-  /** Apply one transcript-read-back model observation: settles a pending
-   *  push-down, records the discovered catalog, and — for a terminal-side
-   *  switch — moves the picker selection locally without a configure. */
+  /** A deliberate post-launch switch evidenced by this edge becomes the
+   *  requested half of the pair: a terminal `/model` (slash) requests the id
+   *  that came back; a Remuda configure (remuda) requested the configured id,
+   *  which the payload stamps as `requested` (it may have resolved to a
+   *  different concrete effective id). Launch and unknown edges are not
+   *  requests — the launch spec or the previous request stays in force. */
+  private static explicitRequested(
+    source: string,
+    effectiveId: string,
+    requestedId: string | null,
+  ): string | null {
+    if (source === "slash") return effectiveId;
+    if (source === "remuda") return requestedId ?? effectiveId;
+    return null;
+  }
+
   /** Apply one transcript-read-back model observation. `live` events settle a
    *  pending push-down and fold terminal-side switches; history replay only
    *  hydrates effective/catalog state (it must never consume a pending set
@@ -551,24 +571,41 @@ class HubStore {
         [instanceId]: parsed.catalog,
       };
     }
+    const explicit = HubStore.explicitRequested(
+      parsed.effective.source,
+      parsed.effective.id,
+      parsed.requestedId,
+    );
+    if (explicit) {
+      patch.modelRequested = {
+        ...this.state.modelRequested,
+        [instanceId]: explicit,
+      };
+    }
     // A catalog-only refresh edge (the scoped gateway cache landed after
     // promotion; no `requested`, so it is not a switch verdict) hydrates the
     // list but must never settle an in-flight pending or move the optimistic
     // selection.
-    const catalogOnly = Boolean(parsed.catalog) && !parsed.hasRequested;
+    const catalogOnly = Boolean(parsed.catalog) && parsed.requestedId === null;
     if (live && this.state.modelPending[instanceId] && !catalogOnly) {
-      // Our own push-down settled: keep the optimistic selection; the mismatch
-      // line renders if the resolved id differs.
+      // Our own push-down settled: clear pending. The requested half is the id
+      // we configured (carried on the remuda edge as `requested`); the edge
+      // handler above records it. The mismatch line renders if the resolved
+      // effective id differs from that request.
       patch.modelPending = { ...this.state.modelPending };
       delete patch.modelPending[instanceId];
+      // The settled effective id is also where the picker sits now.
+      patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     } else if (live && !catalogOnly) {
-      // Live, terminal-side switch: fold the observed id into the local
-      // selection so a hand-typed `/model` moves the picker, never calling
-      // configure back.
+      // Any other live model edge (launch read-back or a terminal-side
+      // switch) folds the effective id into the picker selection, so the
+      // picker tracks what actually runs; a hand-typed `/model` moves it
+      // without posting configure back. This is display-only — the requested
+      // half comes from `modelRequested` above, not this fold.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     } else if (!live && this.state.models[instanceId] == null) {
-      // History replay on a fresh mount: seed the selection from the observed
-      // id so the picker reflects the resolved model after reload.
+      // History replay on a fresh mount: seed the picker from the observed id
+      // so it reflects the resolved model after reload.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     }
     this.emit(patch);
@@ -601,17 +638,21 @@ class HubStore {
     delete pending[instanceId];
     if (parsed.kind === "degraded") {
       // Refused: revert the picker to the last observed id (or drop the
-      // optimistic request so the instance default returns).
+      // optimistic request so the instance default returns). The refused
+      // switch never became a request, so drop the explicit requested id too
+      // — the pair falls back to the launch spec (or shows one id).
       const effective = this.state.modelEffective[instanceId];
       const models = { ...this.state.models };
       if (effective) models[instanceId] = effective.id;
       else delete models[instanceId];
+      const modelRequested = { ...this.state.modelRequested };
+      delete modelRequested[instanceId];
       const reason =
         { "not-found": "模型不存在", "dialog-kept": "已取消切换", "no-readback-within-window": "未收到回读" }[
           parsed.reason
         ] ?? parsed.reason;
       this.toast(`模型切换被拒绝：${reason}`);
-      this.emit({ modelPending: pending, models });
+      this.emit({ modelPending: pending, models, modelRequested });
     } else {
       this.emit({ modelPending: pending });
     }
@@ -1739,7 +1780,12 @@ class HubStore {
     this.emit({
       permissionMode: { ...this.state.permissionMode, [instanceId]: permissionMode },
       ...(extras?.effort ? { effort: { ...this.state.effort, [instanceId]: extras.effort } } : {}),
-      ...(extras?.model ? { models: { ...this.state.models, [instanceId]: extras.model } } : {}),
+      ...(extras?.model
+        ? {
+            models: { ...this.state.models, [instanceId]: extras.model },
+            modelRequested: { ...this.state.modelRequested, [instanceId]: extras.model },
+          }
+        : {}),
     });
   }
 
@@ -1814,9 +1860,12 @@ class HubStore {
       const models = { ...this.state.models };
       if (effective) models[instanceId] = effective.id;
       else delete models[instanceId];
+      // The failed switch never became a request.
+      const modelRequested = { ...this.state.modelRequested };
+      delete modelRequested[instanceId];
       const reason = error instanceof Error ? error.message : String(error);
       this.toast(`模型切换失败：${reason}`);
-      this.emit({ modelPending: pending, models });
+      this.emit({ modelPending: pending, models, modelRequested });
       // Swallow after reporting: SessionPage hands this promise straight to
       // the Composer (no void), and the toast is the failure mouth. Re-
       // throwing would only create an unhandled rejection.
@@ -1995,14 +2044,19 @@ class HubStore {
    *  read-back it would equal the running id and hide the very difference the
    *  pair exists to show. The Hub never overwrites `instance.model` on a
    *  model projection, so it stays the dispatch value. */
-  modelRequestedOf(instanceId: Id, kind?: string): string {
+  /** The requested model for the requested-vs-running pair, or null when
+   *  nothing was requested. Precedence: an in-flight switch's optimistic id,
+   *  a settled deliberate switch (a terminal `/model` or a Remuda configure),
+   *  then the durable launch spec (`instance.model`). It never invents a
+   *  default: a journal-discovered session with no durable `model` and no
+   *  switch shows only its running model, not a fabricated "opus". */
+  modelRequestedOf(instanceId: Id): string | null {
     const pending = this.modelPendingOf(instanceId);
     if (pending) return pending.id;
+    const explicit = this.state.modelRequested[instanceId];
+    if (explicit) return explicit;
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    return (
-      instance?.model ??
-      (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus")
-    );
+    return instance?.model ? instance.model : null;
   }
 
   /** The real model list for the picker: discovered catalog ids plus the

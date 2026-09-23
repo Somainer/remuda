@@ -21,7 +21,7 @@ the alias-aware comparison, the Hub launch-source scope, and the explicit-
 `model_pin` arming landed on `main` in merge `e417a513`
 (`wt/c-modelpin/b-modelpin-md`) — protocol comparison `5e7082fa`, Node refusal
 `c2641cbd`, web/CLI divergence row `72871ceb` + `6ff569c4`. The refusal half was
-rescinded by owner ruling on 2026-09-23 (§5): merge `5a982a8`
+rescinded by owner ruling on 2026-09-23 (§5): merge `80db05b8`
 (`wt/c-modelpin/b-modelpin2-md`), commit `5b54dd80` — record, never stop. This
 evidence doc landed in the docs commits immediately after the implementation.
 
@@ -320,20 +320,30 @@ is not to decide whether the agent is allowed to run on it.
   observed id) and, when the screen itself gave no detail line, writes
   `requested <pin>, observed <actual>` into the watch **detail**. The worker
   state/status are untouched: a divergence never overrides the screen
-  classification, so a genuinely blocked worker still shows its own reason. A
-  later `slash`/`remuda` model edge **clears** the recorded launch
-  `modelEffective` — the operator intentionally changed the model, so the stale
-  launch pair must not linger on the row;
+  classification, so a genuinely blocked worker still shows its own reason.
+  **Any non-launch read-back clears** the recorded launch `modelEffective`, so
+  the stale pair never lingers — a deliberate `slash`/`remuda` switch the
+  operator owns, and equally an unattributed `unknown` edge (an assistant
+  `message.model` change with no `/model` verdict or configure; the tracker
+  legitimately emits it once the launch edge resets its pending source). The
+  old value is kept only on a pass that could not read the instance row;
 - the UI shows the two raw strings. The session-list model chip and the
-  session-page model control render `observed ⇐ requested` whenever the
-  read-back string differs from the request, verbatim and with no verdict,
-  flag, or styling between them. The **requested half is the durable launch
-  spec (`instance.model`) or an in-flight optimistic switch only** — never the
-  picker fold: the store folds a live read-back (and history replay) into the
-  picker selection so a terminal `/model` moves the picker, and feeding that
-  back as "requested" made the two strings identical and hid the divergence.
-  Both strings render raw (CSS ellipsis only); shortening ids would turn the
-  incident pair `passthrough/ark/seed-evolving` vs `ark/seed-evolving` into
+  session-page model control render `observed ⇐ requested` only when both
+  halves exist and the raw strings differ. The **requested half is the latest
+  explicit request**: an in-flight optimistic switch, a settled deliberate
+  switch (a terminal `/model` → the observed id; a Remuda configure → the
+  configured id, carried as the edge's `requested` even when it resolved to a
+  different concrete id), else the durable launch spec (`instance.model`). It
+  is **never invented**: a journal-discovered instance with no durable model
+  and no switch shows only its running model, not a fabricated `opus`. It is
+  also never the picker fold (`state.models`): the picker follows live
+  read-backs so a terminal `/model` moves it, but the fold is display-only.
+  After a deliberate switch the request equals the new id, so the launch pair
+  collapses to one string rather than showing the user's own switch forever.
+  Both strings compare and render raw — no trimming (a padded recorded
+  request stays padded) and no verdict, flag or styling between them;
+  shortening ids would turn the incident pair
+  `passthrough/ark/seed-evolving` vs `ark/seed-evolving` into
   `seed-evolving ⇐ seed-evolving`. The web no longer carries the TS port of
   `compare_model_pin`; the judgment lives only where the recording decision
   needs it (the Node diagnostic and the Hub detail), in Rust;
@@ -357,11 +367,11 @@ all, and a later human/Remuda switch is out of scope by source attribution.
 |---|---|
 | `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate *reports* (never refuses): a same-namespace substitution returns a divergence naming both ids exactly once; gateway resolution/pin/snapshot/later-switch/no-readback/no-pin paths report nothing; the catalog-upgraded case reports |
 | `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY: the mismatch case journals `model_pin_mismatch` with both ids verbatim while the instance stays non-Failed with no `last_error`; **the same instance then accepts a second prompt, answers it (`SPIKE_COMPLETE …`), and returns Ready — continuation proof, not just "not failed"**; the honoured case is unchanged |
-| `remuda-hub/tests/watch.rs::a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids` | a launch mismatch leaves the worker Working across passes; the watch detail names both ids verbatim and contains no refusal wording; `modelEffective` carries the observed id; **a later `slash` edge clears the stale launch `modelEffective` on the roster row and persists** |
-| `web .../store.model.test.ts` | the real observation→store→display path: a live launch read-back folds the picker (`modelOf`) yet `modelRequestedOf` keeps the durable launch spec; a terminal `/model` fold and a settled configure behave the same; an in-flight switch is the requested value until its read-back |
-| `web .../SessionList.test.tsx` | the chip shows the request before read-back, the single id when equal, and **both raw strings verbatim whenever they differ** — including the incident `passthrough/ark/seed-evolving` vs `ark/seed-evolving` pair (never `seed-evolving ⇐ seed-evolving`) |
-| `web .../EffortSlider.test.tsx` | the session-page model control shows both full ids on any raw difference (gateway resolution, same-namespace difference, `[1m]` spelling, the incident routing-prefix pair), nothing while a switch is pending, nothing when equal; the requested half is `modelRequested`, not the folded picker selection |
-| `web .../ux-modelsync.hub.spec.ts` | after a configure settles, the pair is the durable launch spec (`passthrough/auto`, the fake node's launch model) vs the resolved running id (`e2e/plain`), both verbatim — the configure sentinel never becomes the requested half |
+| `remuda-hub/tests/watch.rs::a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids` + `an_unknown_source_readback_clears_a_stale_launch_divergence` | a launch mismatch leaves the worker Working across passes; the watch detail names both ids verbatim and contains no refusal wording; `modelEffective` carries the observed id; **a later `slash`/`remuda` edge and an unattributed `unknown` assistant-model edge both clear the stale launch `modelEffective` and persist; the value survives only when the instance row could not be read** |
+| `web .../store.model.test.ts` | the real observation→store→display path: a live launch read-back folds the picker (`modelOf`) yet `modelRequestedOf` keeps the durable launch spec; a terminal `/model` then becomes the requested id so the pair collapses; a settled configure requests the configured alias even when it resolved to another effective id; an unattributed `unknown` edge moves running but not the request; **a journal-discovered row with no `model` yields a null request — no invented `opus`, one id shown** |
+| `web .../SessionList.test.tsx` | the chip shows the request before read-back, the single id when equal, and **both raw strings verbatim whenever they differ** — the incident `passthrough/ark/seed-evolving` vs `ark/seed-evolving` pair (never `seed-evolving ⇐ seed-evolving`), a padded `" sonnet "` request kept verbatim, and only the running id when nothing was requested |
+| `web .../EffortSlider.test.tsx` | the session-page model control shows both full ids on any raw difference (gateway resolution, same-namespace difference, `[1m]` spelling, the incident routing-prefix pair, a padded request), nothing while a switch is pending, nothing when equal, and one id when the request is null; comparison and text use the raw strings |
+| `web .../ux-modelsync.hub.spec.ts` | snapshots the launch model before configure (the fake node patches `spec.model` to the posted sentinel); after settle, the pair is the **configured alias** (`e2e/fast`, the edge `requested`) vs the resolved running id (`e2e/plain`), asserted again after a full reload; the launch spec, sentinel and picker fold never appear on the settled request half |
 
 ---
 

@@ -221,10 +221,35 @@ fn relay_command(options: &OverlayOptions, event: &str) -> String {
     )
 }
 
+/// Margin past the relay's own bounded wait Claude is told to hold the hook.
+///
+/// Claude cancels a command hook at its registered `timeout` (default 600 s)
+/// and then continues without the hook's output; the relay parks blocking
+/// events for `remuda_signal::BLOCKING_WAIT` (15 min). With no explicit
+/// timeout Claude gives up five minutes before Remuda does, leaving a phone
+/// card whose answer arrives too late to do anything. Pin Claude's deadline
+/// past Remuda's so Remuda's legible fail-closed deny always lands first.
+const BLOCKING_HOOK_TIMEOUT_MARGIN_SECS: u64 = 60;
+
+/// The `timeout` (seconds) Claude must give an installed relay hook.
+///
+/// `None` for fire-and-forget events, where Claude's default is already far
+/// longer than the relay's own short wait. `Some` for every event whose hook
+/// can park: the two name-blocking events (`PermissionRequest`,
+/// `Elicitation`) plus `PreToolUse`, which blocks payload-shapedly for an
+/// auto-mode AskUserQuestion.
+#[must_use]
+fn hook_timeout_seconds(event: &str) -> Option<u64> {
+    let blocks = event == "PreToolUse" || remuda_signal::event::is_blocking(event);
+    blocks.then(|| remuda_signal::BLOCKING_WAIT.as_secs() + BLOCKING_HOOK_TIMEOUT_MARGIN_SECS)
+}
+
 /// Append one hook command under `event` without disturbing what is there.
 ///
 /// Idempotent: re-materializing the same overlay does not stack duplicate
-/// registrations, which would run the relay twice per event.
+/// registrations, which would run the relay twice per event. A re-materialize
+/// also refreshes the `timeout` on Remuda's own entry, so overlays written by
+/// an older build pick the deadline up without being duplicated.
 fn merge_hook(settings: &mut Value, event: &str, command: &str) -> DriverResult<()> {
     let object = settings.as_object_mut().ok_or_else(|| {
         DriverError::SettingsIsolationUnavailable("settings overlay is not an object".into())
@@ -242,20 +267,27 @@ fn merge_hook(settings: &mut Value, event: &str, command: &str) -> DriverResult<
                 "{event} hooks overlay is not an array"
             ))
         })?;
-    let already = matchers.iter().any(|matcher| {
-        matcher
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_some_and(|hooks| {
-                hooks
-                    .iter()
-                    .any(|hook| hook.get("command").and_then(Value::as_str) == Some(command))
-            })
-    });
-    if !already {
-        matchers.push(json!({
-            "hooks": [{ "type": "command", "command": command }]
-        }));
+    let mut found = false;
+    for matcher in matchers.iter_mut() {
+        if let Some(hooks) = matcher.get_mut("hooks").and_then(Value::as_array_mut) {
+            for hook in hooks.iter_mut() {
+                if hook.get("command").and_then(Value::as_str) == Some(command) {
+                    found = true;
+                    // The entry is Remuda's own; make sure its deadline keeps
+                    // pace with BLOCKING_WAIT (no-op when already current).
+                    if let Some(seconds) = hook_timeout_seconds(event) {
+                        hook["timeout"] = json!(seconds);
+                    }
+                }
+            }
+        }
+    }
+    if !found {
+        let mut entry = json!({ "type": "command", "command": command });
+        if let Some(seconds) = hook_timeout_seconds(event) {
+            entry["timeout"] = json!(seconds);
+        }
+        matchers.push(json!({ "hooks": [entry] }));
     }
     Ok(())
 }
@@ -588,6 +620,101 @@ mod tests {
             settings["hooks"]["SessionStart"].as_array().unwrap().len(),
             1
         );
+        // The blocking entries survive re-materialization as one entry each
+        // with the timeout still in place.
+        for event in ["PreToolUse", "PermissionRequest", "Elicitation"] {
+            let matchers = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(matchers.len(), 1, "{event} must not duplicate");
+            assert_eq!(
+                settings["hooks"][event][0]["hooks"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1,
+                "{event} relay must not duplicate"
+            );
+            assert!(
+                settings["hooks"][event][0]["hooks"][0]
+                    .get("timeout")
+                    .is_some(),
+                "{event} must keep its timeout on re-materialize"
+            );
+        }
+    }
+
+    #[test]
+    fn every_blocking_events_hook_timeout_outlasts_the_relay_wait() {
+        // Claude's default hook timeout is 600 s; the relay parks blocking
+        // events for BLOCKING_WAIT (15 min). Every installed entry whose hook
+        // can park must tell Claude to wait strictly longer, or the card can
+        // be open on the phone after Claude has already discarded the answer.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = read(&materialize_overlay(&options(dir.path())).unwrap());
+        let relay_wait = remuda_signal::BLOCKING_WAIT.as_secs();
+        for event in ["PreToolUse", "PermissionRequest", "Elicitation"] {
+            let timeout = settings["hooks"][event][0]["hooks"][0]["timeout"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{event} installed hook has no timeout"));
+            assert!(
+                timeout > relay_wait,
+                "{event} timeout {timeout} must outlast the relay wait {relay_wait}"
+            );
+        }
+        // Fire-and-forget events are left on Claude's default: no `timeout`
+        // key is written for them.
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "Stop",
+            "Notification",
+            "PostToolUse",
+            "PostToolBatch",
+            "MessageDisplay",
+        ] {
+            assert!(
+                settings["hooks"][event][0]["hooks"][0]
+                    .get("timeout")
+                    .is_none(),
+                "{event} must not pin a timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn the_timeout_relation_derives_from_blocking_wait_in_one_place() {
+        // The relation lives in one function; pin it so a BLOCKING_WAIT change
+        // can never silently move Claude's deadline back under it.
+        let expected = remuda_signal::BLOCKING_WAIT.as_secs() + 60;
+        for event in ["PreToolUse", "PermissionRequest", "Elicitation"] {
+            assert_eq!(hook_timeout_seconds(event), Some(expected));
+        }
+        assert_eq!(hook_timeout_seconds("SessionStart"), None);
+        assert_eq!(hook_timeout_seconds("PostToolUse"), None);
+    }
+
+    #[test]
+    fn a_legacy_entry_without_a_timeout_is_upgraded_in_place() {
+        // An overlay an older build wrote (relay command present, no timeout)
+        // must gain the deadline without a second entry being stacked.
+        let mut settings = json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "hooks": [{
+                        "type": "command",
+                        "command": "exec /opt/remuda/bin/remuda hook emit --socket /s --event 'PreToolUse'"
+                    }]
+                }]
+            }
+        });
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        merge_hook(&mut settings, "PreToolUse", &command).unwrap();
+        let matchers = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(matchers.len(), 1);
+        assert_eq!(matchers[0]["hooks"].as_array().unwrap().len(), 1);
+        assert!(matchers[0]["hooks"][0].get("timeout").is_some());
     }
 
     #[test]

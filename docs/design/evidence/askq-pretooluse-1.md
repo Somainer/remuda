@@ -144,6 +144,24 @@ PreToolUse 钩子输出：
 | deny | `decision: {behavior:"deny",message}` | `permissionDecision:"deny"` + `permissionDecisionReason` |
 | questions/answers 语义 | 问题原文做键、label/id 同形 | 完全一致，直接复用 |
 
+### 4.1 钩子 `timeout`：必须盖过 Remuda 的 15 分钟等待
+
+Claude 对每个 command hook 在注册项的 `timeout`（秒）处**直接取消**并丢弃该钩输出；
+文档默认值对 PreToolUse / PermissionRequest 是 **600 s**，超时的 PreToolUse 不阻断，
+调用继续走正常权限流程（code.claude.com/docs/en/hooks，Common fields / Timeouts）。
+而 Remuda 继电器对阻塞事件要等到 `BLOCKING_WAIT` = **900 s**（与 broker TTL 对齐）。
+旧版 overlay 注册项不写 `timeout`：第 10 分钟 Claude 已放弃、回到自己的表单，
+第 10–15 分钟之间手机卡片还开着，此时答复什么也改变不了。
+
+修复（`launch::overlay::hook_timeout_seconds`）：对三个可能 park 的事件
+（`PreToolUse`、`PermissionRequest`、`Elicitation`）写入
+`timeout = BLOCKING_WAIT + 60 s = 960 s`，让 Remuda 自己可读的 fail-closed deny
+总是先于 Claude 的静默取消到达；fire-and-forget 事件不写 `timeout`（继电器只等
+5 s，Claude 默认值已远大于它）。值从 `remuda_signal::BLOCKING_WAIT` 派生，不在
+第二处写死秒数；`merge_hook` 保持幂等，并会给旧版本写出的无 `timeout` 注册项就地
+补上而不重复堆叠。codex shadow 路径（`CODEX_HOOK_TIMEOUT_SECS = 600`，trust hash
+覆盖 timeout）与本次无关，未改动。
+
 ---
 
 ## 5 落到实现的对应关系
@@ -158,9 +176,11 @@ PreToolUse 钩子输出：
 | 继电器阻塞预算 | `cmd::hook::wait_for`（问题型 PreToolUse 给 BLOCKING_WAIT） | `…an_auto_mode_askuserquestion_pretooluse_gets_the_blocking_budget` |
 | §5 TUI 自答收卡（新路径） | 复用 `bus::close_terminal_answered`，同时撤配对钩 | `bus::a_terminal_answer_closes_the_auto_mode_card_and_both_hooks`、`…on_a_lone_pretooluse_card…` |
 | 真实录制形状 | `fixtures/askuser/pretooluse-auto.json`、`posttooluse-auto.json`、`fixtures/claude/claude-askuser-auto.jsonl` | include_str! 直读 |
+| §4.1 hook timeout 盖过 900 s 等待 | `overlay::hook_timeout_seconds`、`merge_hook` | `overlay::every_blocking_events_hook_timeout_outlasts_the_relay_wait`、`…the_timeout_relation_derives_from_blocking_wait_in_one_place`、`…a_legacy_entry_without_a_timeout_is_upgraded_in_place` |
 
-超时策略沿用既有 question 语义（blocking wait 与 broker TTL 对齐；harness 自身
-每钩 600 s 的上限照旧），本任务不改。
+超时语义：Remuda 侧不变（blocking wait 与 broker TTL 对齐，见
+`BLOCKING_WAIT`）；harness 侧由 overlay 显式把阻塞事件的 hook `timeout` 钉到
+960 s（§4.1），保证两者先后关系。
 
 ## 6 复现
 

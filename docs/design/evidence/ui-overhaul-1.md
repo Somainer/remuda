@@ -51,10 +51,11 @@ pnpm --dir web exec playwright test -c playwright.perf.config.ts
 | 焦点环 | `tokens.css` 的「文本输入以边框表示焦点」只作用于文本类 `input`/`textarea`/`select`，checkbox、radio、range 等回到全局 `--focus` 焦点环。本轮拥有文件中其余 `outline: none` 仅 `settings.module.css` 的分组容器（`tabIndex=-1` 的程序化焦点目标，不可 Tab 到） | 通过 |
 | 被拒后焦点 | `SettingsPage.test.tsx`「returns focus to the committed radio…」：写入抛错时方向键选中被回滚，焦点回到已提交项（`tabIndex=0` 且为 `activeElement`）；「steps through two rapid arrow keys…」：首次保存未完成时连按两次右键，依次落到深色、浅色，焦点不回跳 | 通过 |
 | 阅读标题 | `ui.module.css` `.md`/`.prose`：h1 20/28、上 24 下 12；h2 18/26、20/8；h3 16/24、16/4；均 600 | 通过 |
+| 紧凑行高度 | body 行高用 `--lh-ui-ratio`（19/13，<768 为 22/15）而非固定 `--lh-ui`：`--text-ui` 文字仍恰为 19/22px，只改字号的小字（芯片、标记）行盒按比例缩小，与 main 的 `1.45` 行为一致。固定 19px 曾让 Provider 模型行的 10px 芯片撑到 23px（行高 36，`providers-discovery.spec.ts:179` 要求 < 34），并让 390 下会话行 headline 里 10px 的启动来源标记撑到 24px（行高 22，`ux-nextstep.hub.spec.ts` 单行断言）；两条现均通过 | 通过 |
 | 粗指针热区互不重叠 | chip 与分段控件的 44px 只在纵向延伸，并以 `margin-block` 在布局中预留，换行后相邻行不共享热区；chip 的 `::after` 从 padding 盒外扩 1px 边框，热区为完整 44px。`uo1-hitarea.hub.spec.ts`（`hasTouch`）：390 下原始事件筛选 chip 实际换成多行，每个 chip 44px 热区四角 `elementFromPoint` 都落在自身；设置页外观分段同样。`ux-touchhit` / `ux-chrome` 的既有热区断言通过 | 通过 |
 | 无未映射颜色 / 无 `--dust` 填充 | `tokenGuard.test.ts` 扫描本轮拥有的 CSS/TSX | 通过 |
 | 对比度 token | `tokens.contrast.test.ts`：深浅两套正文/次要/状态色对各自表面 | 通过 |
-| 字体晚到 | `font-swap.hub.spec.ts`：woff2 延迟 800ms，每条先做一次无换字体对照（字体已缓存）再做换字体恢复。两组输入相同：首次离开后快照 `runtime.reading.v1.<id>` 整条记录，每组进入前写回，init 脚本记录会话页文档启动时读到的记录并断言两组都与快照逐字节相同（对照组本身会改写该记录，实测两条用例都改写了锚点或偏移）。断言：换字体恢复距保存位置不超过对照的误差 + 4px（换字体不引入额外偏移）、字体换入前后位移 ≤ 4px、行不重叠。短会话：`saved=249.375 control=344.375 beforeSwap=344.375 settled=344.375`（对照误差 95，换字体 95，额外偏移 0）。长会话（2400 行突发 + 代码回复 + 24 行，超过 Hub 2000 行尾窗，断言 `fromSeq>1` 且 `reachedAfterSeq=false`，即只重放有界窗口）：`saved=249.25 control=227.66 beforeSwap=227.66 settled=227.66`（对照误差 21.6，换字体 21.6，额外偏移 0）。两条连续各跑 2 遍数值一致；390 置底会话换字后仍置底 | 通过 |
+| 字体晚到 | `font-swap.hub.spec.ts`：woff2 延迟 800ms，每条先做一次无换字体对照（字体已缓存）再做换字体恢复。两组输入相同：首次离开后快照 `runtime.reading.v1.<id>` 整条记录，每组进入前写回，init 脚本记录会话页文档启动时读到的记录并断言两组都与快照逐字节相同（对照组本身会改写该记录，实测两条用例都改写了锚点或偏移）。断言：换字体恢复距保存位置不超过对照的误差 + 4px（换字体不引入额外偏移）、字体换入前后位移 ≤ 4px、行不重叠。短会话：`saved=249.09 control=339.09 beforeSwap=339.09 settled=339.09`（对照误差 90，换字体 90，额外偏移 0）。长会话（2400 行突发 + 代码回复 + 24 行，超过 Hub 2000 行尾窗，断言 `fromSeq>1` 且 `reachedAfterSeq=false`，即只重放有界窗口）：`saved=249.39 control=224.81 beforeSwap=224.81 settled=224.81`（对照误差 24.6，换字体 24.6，额外偏移 0；紧凑行高修正后重测）。修正前两条连续各跑 2 遍数值一致；390 置底会话换字后仍置底 | 通过 |
 | 截图 1440/768/390 | 仓库内 20 张见 §2（390 与 1440）；768 深/浅另行交付评审目录，不入库 | 通过 |
 | 44px 断言迁移 | `ux-chrome.hub.spec.ts` 按 `touch` 分 `hasTouch` 上下文、只在触控下断言热区；`ux-settings.spec.ts` 的「44px touch targets」在 `hasTouch` describe 内；`ux-filters.spec.ts` 手机筛选面板一条移入 `hasTouch` describe。后者仍失败，原因见 §4 | 已迁移 |
 | 冒烟集 | m-chrome、m-home、m-inbox、turn-end、session-virtual.hub、journal-window、ux-touchhit、font-swap、theme-boot：28 过 / 2 跳过 / 1 失败 / 1 未跑 | 见 §4 |
@@ -69,7 +70,9 @@ pnpm --dir web exec playwright test -c playwright.perf.config.ts
   已不可达，需要产品决定该用例改到哪个表面。同因：`ux-filters-evidence.spec.ts:103`（390 一帧）、
   mobile-webkit 下 `ux-settings.spec.ts:145`（深链后期望 `session-list`）。mobile-webkit 下
   `ux-filters.spec.ts:145`「Tab stays inside the open panel」为 WebKit 的 Tab 默认不聚焦按钮。
-- `EffortSlider` 单测一条：合并前即失败。
+- `EffortSlider` 单测一条：合并前即失败（紧凑行高修正后的一次全量单测中通过，时有时无）。
+- `ux-code.hub.spec.ts:194`（fenced code 工具栏）：`jump-latest` 一直不稳定，点击超时；在 main 的 `web/src` 上同样失败。
+- 分批跑时偶发、单独重跑通过或去掉本轮改动后同样偶发：`ux-files.hub.spec.ts:175`（去掉紧凑行高修正 3 次失败 1 次，保留时 2 次失败 1 次）、`ux-livephrase.hub.spec.ts:116`（单独重跑通过）、`ux-keys.hub.spec.ts:360`（期望恰好 9 行会话，依赖同文件前一条及其他 spec 留下的会话；整文件单跑 5/5 通过）。
 - Transcript 位置恢复精度：`saved` 与 `control` 相差约 95px（上方行高不一的场景可达 1318px），
   来自 `Transcript.tsx` 以估算行高补未测量行，与字体无关；font-swap 因此以无换字对照为基准。
 - Transcript 长窗口滚动跳行（新发现，基线问题）：2000 行尾窗里从底部向上按像素滚动（`scrollTop`

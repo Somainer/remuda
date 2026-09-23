@@ -196,6 +196,10 @@
      (and their line heights) change below 768, and only in this file. */
   --text-ui: 13px;
   --lh-ui: 19px;
+  /* The same pair as a ratio, for body only: --text-ui text still gets
+     exactly --lh-ui, while an element that sets just a smaller font-size
+     (a chip, a mark) gets a proportional line box, not a 19px one. */
+  --lh-ui-ratio: calc(19 / 13);
   --text-meta: 12px;
   --lh-meta: 16px;
   --text-title: 14px;
@@ -274,6 +278,7 @@
   :root {
     --text-ui: 15px;
     --lh-ui: 22px;
+    --lh-ui-ratio: calc(22 / 15);
     --text-title: 16px;
     --lh-title: 22px;
     --text-page: 20px;
@@ -316,7 +321,7 @@ html {
 body {
   font-family: var(--font-ui);
   font-size: var(--text-ui);
-  line-height: var(--lh-ui);
+  line-height: var(--lh-ui-ratio);
   background: var(--bg-canvas);
   color: var(--fg-body);
   -webkit-font-smoothing: antialiased;

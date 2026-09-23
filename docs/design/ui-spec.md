@@ -1,7 +1,7 @@
 # Web / PWA 富交互界面规格
 
 状态：可开工规格 v0.2（2026-09-12）  
-产品定位：unified remote agent runtime 的遥控面（方案草案称 Remuda；未拍板前 UI 文案用 **runtime**）。  
+产品定位：unified remote agent runtime 的遥控面（产品名已定 **Remuda**：UI 文案、窗口标题与 manifest 均用 Remuda，D-001/D-053）。
 **不是** harness，**不造** agent loop。界面只观察 + 下发控制；resume 权威是原生会话。
 
 **v0.2.3 changelog（2026-09-20，task 优先模型，见 D-050）**：新增 §1.5「Task 层」（Task 是 instance 之上的聚合而非第二状态机；看板列只读投影；目录绑定 reuse\|pool 与 attach-lock；任务空间=文件视图过滤投影；批注=composer 草稿；工作台多 session 用 tab 不分屏；/m 任务分组）与 §2.9「任务列表与看板 `/board`」（三列+已归档过滤、failed 角标按 placement 归位、拖卡多跳、`SE-nn` 派生 key、父子嵌套、「需要你」首组、只读预览、任务/项目空间面板、批注徽标、项目切换器）；§1.1 projects 行与「项目」段改为采纳 Hub `Project` 实体（Space 键不放松，D-024）；§1.2 路由表新增 `/board`；§1.3 映射表补看板 compact 落点；§4.7 `/m` 子树补任务分组与看板单列过滤。机械细节（表结构、RPC/路由形状、迁移预算、grant 门控）以 [task-model.md](./task-model.md) 为准。
@@ -85,7 +85,7 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 | `/s/:instanceId/tty` | 会话页终端视图 | 无 tty 时回 structured 并 toast；不重定向 |
 | `/s/:instanceId/structured` | 会话页结构化视图 | pty-backed 的第二视图；不重定向 |
 | `/s/:instanceId/files` | 会话页文件/diff（桌面右栏；手机全屏） | 不重定向 |
-| `/approvals` | 审批中心 | `?focus=:interactionId` 高亮一条；桌面保留一等入口。compact 下 `<Navigate replace>` 到 `/m/inbox`，`?focus=` 等 query **原样保留**（D-049） |
+| `/approvals` | 收件箱 | `?focus=:interactionId` 高亮一条；桌面保留一等入口。compact 下 `<Navigate replace>` 到 `/m/inbox`，`?focus=` 等 query **原样保留**（D-049） |
 | `/m/inbox` | 手机收件箱（D-049） | 两档 + 沿用 `?kind=` / `?focus=`（§2.5、§4.7）；桌面访问 `<Navigate replace>` 回 `/sessions` |
 | `/hosts` | 主机列表 | |
 | `/hosts/:hostId` | 主机详情 | |
@@ -1129,7 +1129,7 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 **自写**
 
-- 会话列表跨主机、审批中心、Provider、Bot、新建会话 sheet、tool registry 的 Claude 族（Bash/Edit/Read/Write/Workflow/Task/MCP）、journal 客户端（snapshot+seq+gap）。
+- 会话列表跨主机、收件箱、Provider、Bot、新建会话 sheet、tool registry 的 Claude 族（Bash/Edit/Read/Write/Workflow/Task/MCP）、journal 客户端（snapshot+seq+gap）。
 
 ### 5.2 栈
 

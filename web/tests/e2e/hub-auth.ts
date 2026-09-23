@@ -27,7 +27,9 @@ export async function useAccessCode(page: Page) {
 
 export async function login(page: Page, name = "e2e-browser") {
   await page.goto("/login");
-  await expect(page.getByTestId("login-page")).toBeVisible();
+  // The first SPA render after goto can miss the 5 s expect default under gate
+  // load; match the generous post-submit waits below.
+  await expect(page.getByTestId("login-page")).toBeVisible({ timeout: 20_000 });
   await useAccessCode(page);
   await page.getByTestId("login-tab-bootstrap").click();
   await page.getByTestId("login-device-name").fill(name);
@@ -35,13 +37,15 @@ export async function login(page: Page, name = "e2e-browser") {
   await page.getByTestId("login-submit").click();
   // D-049: a compact viewport lands on the phone home /m (HomeList,
   // m-home); desktop lands on /sessions (SessionList). The shared SessionsPage
-  // list renders only under the desktop shell.
+  // list renders only under the desktop shell. At 390 px the SPA first lands on
+  // /sessions and resolveLanding (web/src/lib/mobileRoute.ts) redirects to /m
+  // when the compact media query settles, so wait for either landing list first
+  // — waiting on session-list while it is being unmounted is the 20 s timeout —
+  // and only after that assert which of the two final routes we landed on.
+  await expect(page.getByTestId("home-list").or(page.getByTestId("session-list"))).toBeVisible({
+    timeout: 20_000,
+  });
   await expect(page).toHaveURL(/\/(sessions|m)(?:[/?]|$)/, { timeout: 20_000 });
-  if (/\/m(?:[/?]|$)/.test(new URL(page.url()).pathname)) {
-    await expect(page.getByTestId("home-list")).toBeVisible();
-  } else {
-    await expect(page.getByTestId("session-list")).toBeVisible();
-  }
   await expectCookieSession(page);
 }
 
@@ -52,6 +56,6 @@ export async function logout(page: Page) {
     response.request().method() === "DELETE" && new URL(response.url()).pathname.startsWith("/v1/devices/"));
   await page.getByTestId("settings-logout").click();
   expect((await revoked).ok()).toBe(true);
-  await expect(page.getByTestId("login-page")).toBeVisible();
+  await expect(page.getByTestId("login-page")).toBeVisible({ timeout: 20_000 });
   expect((await page.context().cookies()).some((item) => item.name === "remuda_device")).toBe(false);
 }

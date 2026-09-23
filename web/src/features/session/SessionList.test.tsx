@@ -318,12 +318,12 @@ describe("SessionList model label", () => {
   });
 
   // A journal-discovered instance with no launch model and no read-back yet:
-  // the chip is empty, never an invented "opus".
-  it("shows nothing when there is no launch model and no read-back", () => {
+  // the whole model slot (separator + span) is omitted — never an empty span
+  // or an invented "opus".
+  it("omits the model slot when there is no launch model and no read-back", () => {
     for (const id of ["ins_a", "ins_b"]) runningModel[id] = null;
     renderList();
-    const label = screen.getAllByTestId("session-model")[0];
-    expect(label.textContent).toBe("");
+    expect(screen.queryAllByTestId("session-model")).toHaveLength(0);
   });
 
   it("shows only the running id for a journal-discovered row with no launch model", () => {

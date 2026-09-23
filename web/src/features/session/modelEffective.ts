@@ -164,6 +164,9 @@ export function modelFromObservation(
 export type ModelPinMismatch = {
   requested: string;
   observed: string;
+  /** When the diagnostic was recorded (Hub projection); absent for a record
+   *  seen only in the live journal window. */
+  observedAt?: string;
   /** Stable event id, used as the React key when more than one is recorded. */
   eventId?: string;
 };
@@ -200,5 +203,40 @@ export function modelPinMismatches(events: readonly unknown[]): ModelPinMismatch
       }
     }
   }
+  return out;
+}
+
+/** Merge the Hub-projected launch divergences (durable, window-independent)
+ *  with any diagnostics present in the currently loaded journal window
+ *  (the live edge before projection lands), de-duplicated on
+ *  requested/observed/observedAt. Projected records come first in stored
+ *  order, then window-only records. */
+export function allModelPinMismatches(
+  projected:
+    | readonly { requested?: unknown; observed?: unknown; observedAt?: unknown }[]
+    | null
+    | undefined,
+  events: readonly unknown[],
+): ModelPinMismatch[] {
+  const out: ModelPinMismatch[] = [];
+  const seen = new Set<string>();
+  const keyOf = (r: { requested: string; observed: string; observedAt?: string }) =>
+    `${r.requested}\u0000${r.observed}\u0000${r.observedAt ?? ""}`;
+  const push = (r: ModelPinMismatch & { observedAt?: string }) => {
+    const key = keyOf(r);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(r);
+  };
+  for (const row of projected ?? []) {
+    if (typeof row.requested === "string" && typeof row.observed === "string") {
+      push({
+        requested: row.requested,
+        observed: row.observed,
+        ...(typeof row.observedAt === "string" ? { observedAt: row.observedAt } : {}),
+      });
+    }
+  }
+  for (const mismatch of modelPinMismatches(events)) push(mismatch);
   return out;
 }

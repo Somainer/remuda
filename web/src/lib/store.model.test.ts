@@ -14,7 +14,7 @@ import type { Observation } from "../types/observation";
 import { api } from "./api";
 import { mockDb } from "./mock";
 import { hubStore } from "./store";
-import { modelPinMismatches } from "../features/session/modelEffective";
+import { allModelPinMismatches, modelPinMismatches } from "../features/session/modelEffective";
 
 type History = Awaited<ReturnType<typeof api.eventsRead>>;
 
@@ -213,30 +213,47 @@ it("a terminal-side /model moves the picker without posting configure", async ()
   expect(configure).not.toHaveBeenCalled();
 });
 
-it("the chip shows the launch spec, then the running model, raw — launch A / read-back A", async () => {
-  // Case (a): launch and read-back agree.
+it("case (a) launch A / read-back A: chip A, no diagnostic", async () => {
   const ctx = await startFollowing("chip-a", "model_hub/A");
   expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/A");
   ctx.receive(modelEvent(2, "model_hub/A", "launch"));
   expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/A");
+  // Agreeing read-back records no divergence.
+  expect(
+    allModelPinMismatches(
+      ctx.instance.modelPinMismatches ?? null,
+      (hubStore as unknown as { state: { events: Record<string, Observation[]> } }).state.events[
+        ctx.instance.id
+      ] ?? [],
+    ),
+  ).toHaveLength(0);
 });
 
-it("the chip shows the running read-back when it differs from the launch — launch A / read-back B", async () => {
-  // Case (b): the client does NOT reconstruct a pair — the chip says B only.
+it("case (b) launch A / read-back B: chip B, diagnostic recorded verbatim", async () => {
   const ctx = await startFollowing("chip-b", "model_hub/A");
   ctx.receive(modelEvent(2, "model_hub/B", "launch"));
   expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/B");
+  ctx.receive(modelPinMismatchEvent(3, "model_hub/A", "model_hub/B"));
+  const events = (hubStore as unknown as { state: { events: Record<string, Observation[]> } })
+    .state.events[ctx.instance.id];
+  expect(modelPinMismatches(events)).toEqual([
+    { requested: "model_hub/A", observed: "model_hub/B", eventId: "evt_pin_3" },
+  ]);
 });
 
-it("a later /model C simply moves the running chip to C — launch A / B / C", async () => {
-  // Case (c): a terminal switch changes only the running model; no pair.
+it("case (c) then /model C: chip C, the launch diagnostic stays as history", async () => {
   const ctx = await startFollowing("chip-c", "model_hub/A");
   ctx.receive(modelEvent(2, "model_hub/B", "launch"));
-  ctx.receive(modelEvent(3, "model_hub/C", "slash"));
+  ctx.receive(modelPinMismatchEvent(3, "model_hub/A", "model_hub/B"));
+  ctx.receive(modelEvent(4, "model_hub/C", "slash"));
   expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/C");
   expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/C");
   // The picker moved with the terminal switch without a configure round-trip.
   expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/C");
+  // The launch diagnostic remains in the window as history.
+  const events = (hubStore as unknown as { state: { events: Record<string, Observation[]> } })
+    .state.events[ctx.instance.id];
+  expect(modelPinMismatches(events)).toHaveLength(1);
 });
 
 it("the launch divergence diagnostic is recorded verbatim and survives a later /model", async () => {

@@ -5182,6 +5182,41 @@ fn apply_effective_model_projection(
     Ok(())
 }
 
+/// model-pin-1 §5.4: persist a recorded launch model-pin divergence onto the
+/// instance spec, verbatim, so run details keeps the authoritative record
+/// independently of the bounded journal tail window. Records accumulate
+/// (a session can be re-launched); de-duped on the full record.
+fn apply_model_pin_mismatch_projection(
+    conn: &Connection,
+    instance_id: &str,
+    record: &Value,
+) -> Result<(), StoreError> {
+    let spec_raw: String = conn.query_row(
+        "SELECT spec_json FROM instances WHERE id = ?1",
+        params![instance_id],
+        |row| row.get(0),
+    )?;
+    let mut spec: Value = serde_json::from_str(&spec_raw).unwrap_or(json!({}));
+    if let Some(object) = spec.as_object_mut() {
+        let existing = object
+            .get("modelPinMismatches")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if existing.iter().any(|row| row == record) {
+            return Ok(());
+        }
+        let mut next = existing;
+        next.push(record.clone());
+        object.insert("modelPinMismatches".into(), Value::Array(next));
+        conn.execute(
+            "UPDATE instances SET spec_json = ?1 WHERE id = ?2",
+            params![Value::Object(object.clone()).to_string(), instance_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// §9.1: persist the transcript-observed effective effort onto the spec.
 fn apply_effective_effort_projection(
     conn: &Connection,
@@ -5291,6 +5326,27 @@ fn apply_instance_projection(
         )?;
     }
     if kind == "lifecycle" && payload_type == "native" {
+        // model-pin-1 §5.4: project the launch divergence onto the instance
+        // record so it survives beyond the bounded journal window. Verbatim
+        // requested/observed + the event time; the client never recomputes.
+        if payload.get("topic").and_then(Value::as_str) == Some("diagnostic")
+            && payload.get("nativeName").and_then(Value::as_str) == Some("model_pin_mismatch")
+            && let Some(related) = payload.get("relatedIds")
+            && let (Some(requested), Some(observed)) = (
+                related.get("requested").and_then(Value::as_str),
+                related.get("observed").and_then(Value::as_str),
+            )
+        {
+            let record = json!({
+                "requested": requested,
+                "observed": observed,
+                "observedAt": event
+                    .get("observedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or(now),
+            });
+            apply_model_pin_mismatch_projection(conn, instance_id, &record)?;
+        }
         // D-025: a promoted terminal changes kind/mode on the Hub row too, so
         // the session list and header follow the agent the human started.
         let name = payload
@@ -7554,6 +7610,89 @@ mod tests {
         assert_eq!(
             effective.get("id").and_then(Value::as_str),
             Some("model_hub/es1_orange_o48[1m]")
+        );
+    }
+
+    /// A `model_pin_mismatch` diagnostic projects verbatim onto the instance
+    /// spec as `modelPinMismatches`, independent of the journal tail window,
+    /// and accumulates/de-dupes across re-launches (model-pin-1 §5.4).
+    #[tokio::test]
+    async fn model_pin_mismatch_projects_onto_instance_record() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "cap-node").await;
+        let instance = seed_instance(&store, &host).await;
+        let event = json!({"kind":"lifecycle","observedAt":"2026-09-24T00:00:00.000Z","payload":{
+            "type":"native","topic":"diagnostic","nativeName":"model_pin_mismatch",
+            "nativeId":{"state":"not-applicable"},
+            "status":{"state":"known","value":"diverged"},
+            "severity":"warning","affectsCompletion":false,"dataRef":null,
+            "relatedIds":{"reason":"model-mismatch",
+                "requested":"passthrough/ark/seed-evolving",
+                "observed":"ark/seed-evolving"}}});
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                Some(1),
+                event.clone(),
+            )
+            .await
+            .expect("diagnostic");
+        // A replay of the same event must not duplicate the projection.
+        store
+            .append_journal(host.clone(), instance.instance_id.clone(), Some(1), event)
+            .await
+            .expect("replay");
+        let spec = store
+            .get_instance_spec_json(instance.instance_id.clone())
+            .await
+            .expect("get spec")
+            .expect("spec row");
+        let mismatches = spec
+            .get("modelPinMismatches")
+            .and_then(Value::as_array)
+            .expect("projected mismatches");
+        assert_eq!(mismatches.len(), 1, "replay must not duplicate");
+        assert_eq!(
+            mismatches[0].get("requested").and_then(Value::as_str),
+            Some("passthrough/ark/seed-evolving")
+        );
+        assert_eq!(
+            mismatches[0].get("observed").and_then(Value::as_str),
+            Some("ark/seed-evolving")
+        );
+        assert_eq!(
+            mismatches[0].get("observedAt").and_then(Value::as_str),
+            Some("2026-09-24T00:00:00.000Z")
+        );
+
+        // A second, distinct divergence accumulates.
+        store
+            .append_journal(
+                host,
+                instance.instance_id.clone(),
+                Some(2),
+                json!({"kind":"lifecycle","observedAt":"2026-09-24T01:00:00.000Z","payload":{
+                    "type":"native","topic":"diagnostic","nativeName":"model_pin_mismatch",
+                    "nativeId":{"state":"not-applicable"},
+                    "status":{"state":"known","value":"diverged"},
+                    "severity":"warning","affectsCompletion":false,"dataRef":null,
+                    "relatedIds":{"reason":"model-mismatch","requested":"A2","observed":"B2"}}}),
+            )
+            .await
+            .expect("second diagnostic");
+        let spec = store
+            .get_instance_spec_json(instance.instance_id.clone())
+            .await
+            .expect("get spec 2")
+            .expect("spec row 2");
+        assert_eq!(
+            spec.get("modelPinMismatches")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
         );
     }
 

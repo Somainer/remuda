@@ -10,7 +10,7 @@ import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
-import { modelPinMismatches } from "../features/session/modelEffective";
+import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
@@ -431,10 +431,12 @@ export function SessionPage({
   // `model_pin_mismatch` diagnostic (never recomputed here). Render each
   // recorded one verbatim in run details; a later /model changes the running
   // chip but leaves the historical diagnostic in place.
-  for (const mismatch of modelPinMismatches(events)) {
+  // Projected records are durable and window-independent; the event window
+  // adds a diagnostic that arrived before the projection landed.
+  for (const mismatch of allModelPinMismatches(instance.modelPinMismatches, events)) {
     diagnostics.push(
       <span
-        key={`model-pin-${mismatch.eventId ?? diagnostics.length}`}
+        key={`model-pin-${mismatch.eventId ?? mismatch.observedAt ?? diagnostics.length}`}
         data-testid="run-details-model-pin"
         data-requested={mismatch.requested}
         data-observed={mismatch.observed}

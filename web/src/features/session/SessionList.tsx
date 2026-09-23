@@ -748,24 +748,24 @@ export function SessionList({
                       {(() => {
                         // The chip says only the model that is running,
                         // verbatim: the transcript read-back, or before any
-                        // read-back the durable launch spec, or nothing. The
-                        // launch divergence is NOT recomputed here — it is
-                        // the Node's model_pin_mismatch diagnostic, shown in
-                        // run details (model-pin-1 §5.4).
+                        // read-back the durable launch spec. When neither
+                        // exists the slot is omitted entirely (no separator,
+                        // no empty span, no "not read back" hint for a model
+                        // nothing ever requested). The launch divergence is
+                        // not recomputed here — it is the Node's
+                        // model_pin_mismatch diagnostic in run details
+                        // (model-pin-1 §5.4).
                         const running = hubStore.runningModelOf(instance.id);
+                        if (!running) return null;
                         return (
                           <>
                             <span className={css.sep}>·</span>
                             <span
                               data-testid="session-model"
                               data-model-effective={hubStore.modelEffectiveOf(instance.id)?.id ?? "unknown"}
-                              title={
-                                running
-                                  ? `实际 ${running}（${hubStore.modelEffectiveOf(instance.id)?.source ?? ""}）`
-                                  : "实际模型尚未从会话回读"
-                              }
+                              title={`实际 ${running}（${hubStore.modelEffectiveOf(instance.id)?.source ?? ""}）`}
                             >
-                              {running ?? ""}
+                              {running}
                             </span>
                           </>
                         );

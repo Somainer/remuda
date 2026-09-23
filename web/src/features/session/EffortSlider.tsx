@@ -237,10 +237,17 @@ export function EffortSlider({
   );
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
   // The model chip shows the RUNNING model verbatim: the read-back effective
-  // id, else the durable launch spec, else nothing. No shortening (CSS
-  // ellipsis only) and no requested-vs-running pair — the launch divergence
-  // lives in run details (model-pin-1 §5.4).
+  // id, else the durable launch spec. No shortening (CSS ellipsis only) and
+  // no requested-vs-running pair — the launch divergence lives in run
+  // details (model-pin-1 §5.4).
   const runningModel = modelEffective ?? launchModel ?? "";
+  // `model` is undefined ONLY for an effort-only slider (agy sessions, and
+  // the New Session form before it owns a model field): that surface keeps
+  // the tier stop description. When the model axis exists the chip shows the
+  // running model for EVERY kind (including Codex), even when it is the empty
+  // string (a launched session with neither spec nor read-back yet).
+  const hasModelAxis = model !== undefined;
+  const chipText = hasModelAxis ? runningModel : (stop?.description ?? "");
   const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
 
   // ── List-view roving keyboard navigation ──────────────────────────────
@@ -790,12 +797,14 @@ export function EffortSlider({
         className={css.effortModel}
         data-testid={tid("model")}
         title={
-          // The running model verbatim on hover; codex chips keep their
-          // stock description. A claude launch with no model at all is empty.
-          runningModel ? `实际 ${runningModel}` : kind === "codex" ? (stop?.description ?? "") : ""
+          hasModelAxis
+            ? runningModel
+              ? `实际 ${runningModel}`
+              : ""
+            : (stop?.description ?? "")
         }
       >
-        {kind === "codex" ? (stop?.description ?? "") : runningModel}
+        {chipText}
       </div>
       {track}
       {ticks}

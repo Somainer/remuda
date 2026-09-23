@@ -192,7 +192,7 @@ describe("EffortSlider running-model chip", () => {
   // clicking effort-open-list after mount().
 
   it("shows the launch spec verbatim before any read-back", () => {
-    mount({ kind: "claude", launchModel: "model_hub/es1_orange_o50[1m]" });
+    mount({ kind: "claude", model: "", launchModel: "model_hub/es1_orange_o50[1m]" });
     const chip = screen.getByTestId("effort-model");
     expect(chip.textContent).toBe("model_hub/es1_orange_o50[1m]");
     // No pair machinery exists anywhere.
@@ -202,6 +202,7 @@ describe("EffortSlider running-model chip", () => {
   it("shows only the running id verbatim once read back, even if it differs from launch", async () => {
     mount({
       kind: "claude",
+      model: "",
       launchModel: "model_hub/es1_orange_o50[1m]",
       modelEffective: "claude-opus-5",
     });
@@ -216,6 +217,7 @@ describe("EffortSlider running-model chip", () => {
     // The incident pair: no shortening, no pair; the running id alone is full.
     mount({
       kind: "claude",
+      model: "",
       launchModel: "passthrough/ark/seed-evolving",
       modelEffective: "ark/seed-evolving",
     });
@@ -223,24 +225,60 @@ describe("EffortSlider running-model chip", () => {
   });
 
   it("shows nothing when there is no launch model and no read-back", () => {
-    mount({ kind: "claude", launchModel: null });
+    mount({ kind: "claude", model: "", launchModel: null });
     const chip = screen.getByTestId("effort-model");
     expect(chip.textContent).toBe("");
     expect(chip).not.toHaveTextContent("opus");
   });
 
   it("shows the running id for a row with no launch model", () => {
-    mount({ kind: "claude", launchModel: null, modelEffective: "sonnet" });
+    mount({ kind: "claude", model: "", launchModel: null, modelEffective: "sonnet" });
     expect(screen.getByTestId("effort-model").textContent).toBe("sonnet");
     expect(screen.getByTestId("effort-model")).not.toHaveTextContent("opus");
   });
 
   it("moves straight to a later /model id with no divergence note", async () => {
-    mount({ kind: "claude", launchModel: "model_hub/A", modelEffective: "model_hub/C" });
+    mount({ kind: "claude", model: "", launchModel: "model_hub/A", modelEffective: "model_hub/C" });
     expect(screen.getByTestId("effort-model").textContent).toBe("model_hub/C");
     await userEvent.setup().click(screen.getByTestId("effort-open-list"));
     const panel = screen.getByTestId("effort-slider-panel");
     expect(panel).not.toHaveAttribute("data-model-different");
+  });
+
+  it("codex shows the model, not the effort stop description (effective / launch / absent)", () => {
+    // Codex supports the model axis: the chip must never substitute the
+    // tier sentence for the running id.
+    const { unmount } = mount({ kind: "codex", index: 4, model: "gpt-5", launchModel: "gpt-5" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("gpt-5");
+    unmount();
+
+    // Read-back of a different id.
+    mount({
+      kind: "codex",
+      index: 4,
+      model: "gpt-5",
+      launchModel: "gpt-5",
+      modelEffective: "gpt-5.4",
+    });
+    expect(screen.getByTestId("effort-model").textContent).toBe("gpt-5.4");
+  });
+
+  it("an effort-only slider (no model prop) keeps the tier stop description", () => {
+    // The New Session form mounts EffortSlider with kind+index only (model
+    // undefined); the explanatory stop sentence must remain under the slider.
+    {
+      const { unmount } = mount({ kind: "claude", index: 2 });
+      const chip = screen.getByTestId("effort-model");
+      expect(chip.textContent).not.toBe("");
+      expect(chip.textContent).toMatch(/档|default/i);
+      unmount();
+    }
+    // agy sessions are effort-only too.
+    {
+      const { unmount } = mount({ kind: "agy", index: 0 });
+      expect(screen.getByTestId("effort-model").textContent).not.toBe("");
+      unmount();
+    }
   });
 });
 

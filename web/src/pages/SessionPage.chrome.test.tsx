@@ -119,6 +119,36 @@ it("renders a recorded model_pin_mismatch in run details with both ids verbatim"
   expect(pin).toHaveAttribute("data-observed", "ark/seed-evolving");
 });
 
+it("renders a projected model_pin_mismatch even when it is older than the loaded window", () => {
+  // model-pin-1 §5.4 regression: the divergence survives beyond the bounded
+  // newest-event window because the Hub projects it onto the instance
+  // record. No diagnostic event is present in `events` here; run details must
+  // still show the recorded pair verbatim.
+  const instanceWithProjection = {
+    ...grokInstance,
+    modelPinMismatches: [
+      {
+        requested: "model_hub/es1_orange_o50[1m]",
+        observed: "model_hub/es1_orange_o48[1m]",
+        observedAt: "2026-09-24T00:00:00Z",
+      },
+    ],
+  };
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [instanceWithProjection],
+    // Deliberately empty window: the diagnostic is older than 2000 events.
+    events: { [grokInstance.id]: [] },
+  });
+  renderPage();
+  const pins = screen.getAllByTestId("run-details-model-pin");
+  expect(pins).toHaveLength(1);
+  expect(pins[0]).toHaveTextContent(
+    "请求模型 model_hub/es1_orange_o50[1m]，实际运行 model_hub/es1_orange_o48[1m]",
+  );
+});
+
 it("mobile folds the chips strip into one header chip and moves the toggles into the ⋯ sheet", () => {
   mockViewportState.mobile = true;
   stubMatchMedia((query) => query.includes("640"));

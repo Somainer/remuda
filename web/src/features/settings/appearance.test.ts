@@ -52,6 +52,7 @@ afterEach(() => {
   localStorage.removeItem(APPEARANCE_KEY);
   root.removeAttribute("data-appearance");
   root.removeAttribute("data-theme");
+  root.removeAttribute("data-mode-switch");
   root.style.removeProperty("--bg-canvas");
   for (const meta of document.querySelectorAll('meta[name="theme-color"]')) meta.remove();
   vi.restoreAllMocks();
@@ -123,6 +124,30 @@ describe("applyAppearance", () => {
   it("falls back to dark when matchMedia is unavailable", () => {
     applyAppearance("system");
     expect(root.dataset.theme).toBe("night");
+  });
+
+  it("holds transitions off for two frames around a switch, including an OS flip", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (fn: FrameRequestCallback) => frames.push(fn));
+    vi.stubGlobal("cancelAnimationFrame", () => undefined);
+    const tick = () => frames.splice(0).forEach((fn) => fn(0));
+
+    applyAppearance("light");
+    expect(root.hasAttribute("data-mode-switch")).toBe(true);
+    tick();
+    expect(root.hasAttribute("data-mode-switch")).toBe(true);
+    tick();
+    expect(root.hasAttribute("data-mode-switch")).toBe(false);
+
+    const system = fakeSystem(false);
+    applyAppearance("system");
+    tick();
+    tick();
+    system.flip(true);
+    expect(root.hasAttribute("data-mode-switch")).toBe(true);
+    tick();
+    tick();
+    expect(root.hasAttribute("data-mode-switch")).toBe(false);
   });
 });
 

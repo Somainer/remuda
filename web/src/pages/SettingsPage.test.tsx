@@ -174,6 +174,26 @@ describe("save states and rollback", () => {
     setItem.mockRestore();
   });
 
+  it("returns focus to the committed radio when an arrow-key choice is rejected", async () => {
+    const setItem = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === "runtime.theme.v1") throw new Error("quota");
+        originalSetItem.call(this, key, value);
+      });
+    renderSettings(["/settings"]);
+    const system = screen.getByTestId("settings-appearance-system");
+    system.focus();
+    fireEvent.keyDown(system, { key: "ArrowRight" });
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "error"),
+    );
+    expect(system).toHaveAttribute("aria-checked", "true");
+    expect(system.tabIndex).toBe(0);
+    expect(document.activeElement).toBe(system);
+    setItem.mockRestore();
+  });
+
   it("keeps a committed permission choice even when a later appearance change rejects", async () => {
     const setItem = vi
       .spyOn(Storage.prototype, "setItem")

@@ -517,10 +517,26 @@
   line-height: var(--lh-title);
 }
 
+/* Reading headings (§5.2): fixed at every width, not the page/title roles. */
 .md :global(h1),
 .prose :global(h1) {
-  font-size: var(--text-page);
-  line-height: var(--lh-page);
+  margin: 24px 0 12px;
+  font-size: 20px;
+  line-height: 28px;
+}
+
+.md :global(h2),
+.prose :global(h2) {
+  margin: 20px 0 8px;
+  font-size: 18px;
+  line-height: 26px;
+}
+
+.md :global(h3),
+.prose :global(h3) {
+  margin: 16px 0 4px;
+  font-size: 16px;
+  line-height: 24px;
 }
 
 .md :global(:is(ul, ol)),
@@ -850,22 +866,35 @@
     inset: calc((var(--icon-btn) - var(--touch)) / 2);
   }
 
-  /* Vertical only, so neighbouring items never overlap. */
+  /* Vertical only, so neighbouring items never overlap; the reach past the
+     32px track is reserved as block margin for wrapped rows. */
+  .seg {
+    margin-block: calc((var(--touch) - 32px) / 2);
+  }
+
   .segItem {
     min-width: var(--touch);
   }
 
   .segItem::after {
-    inset: -9px 0;
+    inset: calc((var(--seg-item) - var(--touch)) / 2) 0;
   }
 
+  /* The 44px reach is reserved in layout (block margins), so wrapped rows
+     of chips never share hit area whatever gap the container uses. */
   .chip {
     min-width: var(--touch);
     justify-content: center;
+    margin-block: calc((var(--touch) - 24px) / 2);
   }
 
+  /* Offsets are from the padding box: step out over the 1px border so the
+     zone is the full 44px tall and as wide as the visible chip. */
   .chip::after {
-    inset: -10px 0;
+    top: calc(50% - var(--touch) / 2);
+    right: -1px;
+    left: -1px;
+    height: var(--touch);
   }
 }
 

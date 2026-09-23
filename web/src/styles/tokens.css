@@ -348,8 +348,19 @@ textarea::placeholder {
   color: var(--fg-faint);
 }
 
-/* Text inputs show focus through the edge, not an outline. */
-input:focus-visible,
+/* Text inputs show focus through the edge, not an outline (§7.3).
+   Checkboxes, radios, ranges and the like keep the global ring. */
+input:not(
+    [type="checkbox"],
+    [type="radio"],
+    [type="range"],
+    [type="file"],
+    [type="color"],
+    [type="button"],
+    [type="submit"],
+    [type="reset"],
+    [type="image"]
+  ):focus-visible,
 textarea:focus-visible,
 select:focus-visible {
   outline: none;
@@ -401,6 +412,13 @@ kbd {
   to {
     transform: rotate(360deg);
   }
+}
+
+/* A mode switch is instant (§7.4): appearance.ts holds this for two frames. */
+:root[data-mode-switch] *,
+:root[data-mode-switch] *::before,
+:root[data-mode-switch] *::after {
+  transition: none !important;
 }
 
 /* Only elements that opt in with data-motion="essential" keep moving. */

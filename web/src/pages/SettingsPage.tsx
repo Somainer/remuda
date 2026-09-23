@@ -447,6 +447,13 @@ const APPEARANCES: { id: Appearance; label: string }[] = [
 /** Segmented radiogroup: one tab stop; arrow keys move and choose. */
 function AppearanceSeg({ value, onChoose }: { value: Appearance; onChoose: (choice: Appearance) => void }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
+  // A rejected choice rolls `value` back; focus follows the checked radio so
+  // the one tab stop and the selection never disagree.
+  useEffect(() => {
+    const focused = refs.current.findIndex((el) => el !== null && el === document.activeElement);
+    const checked = APPEARANCES.findIndex((option) => option.id === value);
+    if (focused >= 0 && focused !== checked) refs.current[checked]?.focus();
+  });
   const onKeyDown = (event: KeyboardEvent, index: number) => {
     const forward = event.key === "ArrowRight" || event.key === "ArrowDown";
     const back = event.key === "ArrowLeft" || event.key === "ArrowUp";

@@ -60,7 +60,24 @@ function mirror(resolved: ResolvedAppearance): void {
 }
 
 function onSystemChange(event: MediaQueryListEvent): void {
+  holdTransitions();
   mirror(event.matches ? "light" : "dark");
+}
+
+// A mode switch is instant (visual-system.md §7.4): controls that transition
+// colour on hover must not fade into the new palette. tokens.css turns every
+// transition off while <html data-mode-switch> is set; it is cleared two
+// frames later, after the frame that painted the new mode.
+let holdFrame = 0;
+
+function holdTransitions(): void {
+  if (typeof requestAnimationFrame !== "function") return;
+  const root = document.documentElement;
+  root.setAttribute("data-mode-switch", "");
+  cancelAnimationFrame(holdFrame);
+  holdFrame = requestAnimationFrame(() => {
+    holdFrame = requestAnimationFrame(() => root.removeAttribute("data-mode-switch"));
+  });
 }
 
 function followSystem(on: boolean): void {
@@ -77,6 +94,7 @@ function followSystem(on: boolean): void {
 export function applyAppearance(choice: Appearance): void {
   const root = document.documentElement;
   const metas = themeColorMetas();
+  holdTransitions();
   if (choice === "system") {
     root.removeAttribute("data-appearance");
     for (const meta of metas) meta.content = metaDefaults.get(meta) ?? meta.content;

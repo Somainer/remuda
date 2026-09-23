@@ -8,6 +8,7 @@ import "@fontsource/ibm-plex-sans/latin-400.css";
 import "@fontsource/ibm-plex-sans/latin-500.css";
 import "@fontsource/ibm-plex-sans/latin-600.css";
 import "./styles/tokens.css";
+import "./styles/keyboardCompact.css";
 
 // Apply the stored theme once, before React mounts: the choice then holds on
 // the first frame of every route, without having to visit the settings page.

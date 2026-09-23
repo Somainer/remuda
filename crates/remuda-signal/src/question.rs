@@ -21,6 +21,7 @@
 //! order, matching that same path.
 
 use crate::decision::{HookDecision, PermissionRequestEvent};
+use crate::event::HookEvent;
 use remuda_protocol::{
     ActorRef, ActorType, CommandId, CommittedAnswer, EntityMeta, Id, InstanceId, Interaction,
     InteractionAnswer, InteractionCarrier, InteractionKind, InteractionRequest,
@@ -38,6 +39,42 @@ pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
 #[must_use]
 pub fn is_ask_user_question(request: &PermissionRequestEvent) -> bool {
     request.tool_name == ASK_USER_QUESTION
+}
+
+/// Read the question request carried by either hook event that carries one.
+///
+/// - `PermissionRequest` is the shape default/manual modes raise (evidence
+///   `ask-user-question-1.md`).
+/// - In **auto** permission mode the harness raises the question as a
+///   `PreToolUse` instead and sends no `PermissionRequest` at all when that
+///   hook answers (measured on `claude` 2.1.277, evidence
+///   `askq-pretooluse-1.md`). Its payload is field-compatible: same
+///   `tool_input.questions[]`; `tool_use_id` is present here (it is absent on
+///   `PermissionRequest`), and there are no permission suggestions.
+///
+/// Returns `None` for anything else, so a `PreToolUse` for an ordinary tool
+/// can never be turned into a question card.
+#[must_use]
+pub fn question_request_from_event(event: &HookEvent) -> Option<PermissionRequestEvent> {
+    match event.name.as_str() {
+        "PermissionRequest" => {
+            PermissionRequestEvent::from_event(event).filter(is_ask_user_question)
+        }
+        "PreToolUse" if event.text("tool_name") == Some(ASK_USER_QUESTION) => {
+            Some(PermissionRequestEvent {
+                tool_name: ASK_USER_QUESTION.to_owned(),
+                tool_input: event
+                    .payload
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                suggestions: Vec::new(),
+                tool_use_id: event.text("tool_use_id").map(ToOwned::to_owned),
+                permission_mode: event.text("permission_mode").map(ToOwned::to_owned),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Build the question card for an `AskUserQuestion` permission request.
@@ -369,6 +406,17 @@ mod tests {
         PermissionRequestEvent::from_event(&event).expect("a recorded permission request")
     }
 
+    /// The recorded auto-mode PreToolUse (claude 2.1.277,
+    /// evidence askq-pretooluse-1).
+    fn recorded_pretooluse() -> crate::event::HookEvent {
+        let raw = include_str!("../fixtures/askuser/pretooluse-auto.json");
+        crate::event::HookEvent {
+            name: "PreToolUse".into(),
+            ppid: 4242,
+            payload: serde_json::from_str(raw).unwrap(),
+        }
+    }
+
     fn context() -> ApprovalContext {
         ApprovalContext {
             instance_id: InstanceId::new(),
@@ -516,5 +564,97 @@ mod tests {
         let mapped = answer_from_harness(&questions, &answers).expect("answers");
         assert!(mapped["q0"].option_ids.is_empty());
         assert_eq!(mapped["q0"].text.as_deref(), Some("月球"));
+    }
+
+    #[test]
+    fn the_recorded_auto_mode_pretooluse_is_read_as_a_question() {
+        // The c-askq shape: auto mode sends no PermissionRequest; the
+        // PreToolUse carries the same questions payload plus the tool_use_id
+        // that PermissionRequest lacks.
+        let request = question_request_from_event(&recorded_pretooluse())
+            .expect("the auto-mode PreToolUse is a question request");
+        assert_eq!(request.tool_name, ASK_USER_QUESTION);
+        assert_eq!(
+            request.tool_use_id.as_deref(),
+            Some("call_00000000000000000000000001")
+        );
+        assert_eq!(request.permission_mode.as_deref(), Some("auto"));
+        assert!(request.suggestions.is_empty());
+        assert_eq!(request.tool_input["questions"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_recorded_auto_mode_pretooluse_builds_the_same_card_shape() {
+        let request = question_request_from_event(&recorded_pretooluse()).expect("request");
+        let card = question_request(&request);
+        assert_eq!(card.fields.len(), 1);
+        assert_eq!(card.fields[0].title, "Tea or coffee?");
+        assert_eq!(card.fields[0].description.as_deref(), Some("Beverage"));
+        assert_eq!(card.fields[0].input, QuestionInput::SingleSelect);
+        assert_eq!(card.fields[0].options.len(), 2);
+        assert_eq!(card.fields[0].options[0].id, "Tea");
+    }
+
+    #[test]
+    fn an_auto_mode_card_answer_round_trips_through_the_pretooluse_input() {
+        let request = question_request_from_event(&recorded_pretooluse()).expect("request");
+        let decision = question_decision(
+            &request,
+            &QuestionAnswer {
+                answers: BTreeMap::from([(
+                    "q0".into(),
+                    QuestionFieldAnswer {
+                        option_ids: vec!["Coffee".into()],
+                        text: None,
+                    },
+                )]),
+            },
+        )
+        .expect("a decision");
+        let HookDecision::Allow { updated_input, .. } = decision else {
+            panic!("expected allow");
+        };
+        assert_eq!(
+            updated_input.expect("input")["answers"]["Tea or coffee?"],
+            serde_json::json!("Coffee")
+        );
+    }
+
+    #[test]
+    fn only_askuserquestion_pretooluse_events_become_question_requests() {
+        for (name, tool) in [
+            ("PreToolUse", "Bash"),
+            ("PreToolUse", "Write"),
+            ("PostToolUse", ASK_USER_QUESTION),
+            ("Notification", ASK_USER_QUESTION),
+        ] {
+            let event = HookEvent {
+                name: name.into(),
+                ppid: 1,
+                payload: serde_json::json!({"tool_name": tool, "tool_input": {}}),
+            };
+            assert!(
+                question_request_from_event(&event).is_none(),
+                "{name}/{tool} must not become a question"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_request_and_pretooluse_for_one_call_have_equal_questions() {
+        // The dedup key relies on the paired events carrying byte-identical
+        // question arrays (measured 2.1.277); assert it on the recorded pair.
+        let pre = question_request_from_event(&recorded_pretooluse()).expect("pre");
+        let raw = include_str!("../fixtures/askuser/posttooluse-auto.json");
+        let post = HookEvent {
+            name: "PostToolUse".into(),
+            ppid: 1,
+            payload: serde_json::from_str(raw).unwrap(),
+        };
+        // The PostToolUse echoes the same questions the card was built from.
+        assert_eq!(
+            pre.tool_input["questions"],
+            post.payload["tool_input"]["questions"]
+        );
     }
 }

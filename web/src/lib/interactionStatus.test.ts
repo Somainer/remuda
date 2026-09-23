@@ -8,6 +8,7 @@ import {
   hostOnline,
   nativeCleared,
   projectInteraction,
+  settledOnThisDevice,
 } from "./interactionStatus";
 
 function host(state: Host["state"]): Host {
@@ -175,5 +176,32 @@ describe("canSubmitAnswer — every other unsubmittable case", () => {
       deadline: known("2000-01-01T00:00:00.000Z"),
     };
     expect(canSubmitAnswer(stale, { host: host("online") })).toBe(false);
+  });
+});
+
+describe("settledOnThisDevice (pre-join projection filter)", () => {
+  it("is false for pending / invalidated / expired states", () => {
+    expect(settledOnThisDevice(interaction("pending"), "dev")).toBe(false);
+    expect(settledOnThisDevice(interaction("invalidated"), "dev")).toBe(false);
+    expect(settledOnThisDevice(interaction("expired"), "dev")).toBe(false);
+  });
+
+  it("is true when this device committed the answer (or no actor recorded)", () => {
+    expect(settledOnThisDevice(interaction("resolved", "dev"), "dev")).toBe(true);
+    expect(settledOnThisDevice(interaction("answer-committed", "dev"), "dev")).toBe(true);
+    expect(settledOnThisDevice(interaction("resolved"), "dev")).toBe(true);
+  });
+
+  it("is false when another device committed the answer", () => {
+    expect(settledOnThisDevice(interaction("resolved", "other"), "dev")).toBe(false);
+  });
+
+  it("is false for a committed answer whose deadline has passed (expiry wins)", () => {
+    const stale: Interaction = {
+      ...interaction("resolved", "dev"),
+      deadline: known("2000-01-01T00:00:00.000Z"),
+    };
+    expect(settledOnThisDevice(stale, "dev")).toBe(false);
+    expect(projectInteraction(stale, { deviceId: "dev" })).toBe("expired");
   });
 });

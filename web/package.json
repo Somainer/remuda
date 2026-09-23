@@ -10,6 +10,7 @@
     "test": "vitest run",
     "test:e2e": "playwright test",
     "test:e2e:hub": "playwright test -c playwright.hub.config.ts",
+    "test:perf": "playwright test -c playwright.perf.config.ts",
     "test:e2e:terminal": "playwright test -c playwright.terminal.config.ts",
     "lint": "oxlint src --ignore-pattern src/lib/api.generated.ts",
     "preview": "vite preview",

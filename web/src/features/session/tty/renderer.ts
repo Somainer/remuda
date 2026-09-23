@@ -1,4 +1,5 @@
 import type { Terminal } from "@xterm/xterm";
+import { probeWebglContextLoss } from "./rendererProbe";
 
 export type TerminalRenderer = "webgl" | "canvas" | "dom";
 
@@ -32,6 +33,8 @@ export async function attachTerminalRenderer(
     const { WebglAddon } = await import("@xterm/addon-webgl");
     addon = new WebglAddon();
     addon.onContextLoss(() => {
+      // Make the WebGL→canvas fallback visible in a profile run.
+      probeWebglContextLoss();
       // dispose() first: it re-installs xterm's own DOM renderer, so even if
       // the canvas import fails (offline, chunk error) rows still paint.
       addon?.dispose();

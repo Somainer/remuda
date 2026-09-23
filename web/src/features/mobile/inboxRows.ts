@@ -149,6 +149,13 @@ export type InboxInteractionRow = {
   goAnswer: boolean;
   focused: boolean;
   createdAt: string;
+  /**
+   * Deep-equality signature of every field the card renders. The 2 s
+   * interaction poll and the 2.5 s summary tick re-parse state into fresh
+   * objects; an equal sig lets the memoized card skip re-rendering
+   * (c-inboxperf, evidence inbox-perf-1.md).
+   */
+  sig: string;
 };
 
 export type InboxInstanceRow = {
@@ -165,6 +172,8 @@ export type InboxInstanceRow = {
   contextPct: number | null;
   status: UiStatus;
   updatedAt: string;
+  /** Deep-equality signature for the memoized recent-row card. */
+  sig: string;
 };
 
 export type InboxRows = {
@@ -192,6 +201,17 @@ export type InboxSource = {
 };
 
 const RECENT_STATUSES: ReadonlySet<UiStatus> = new Set(["working", "idle", "exited"]);
+const ACTIVE_INTERACTION_STATES: ReadonlySet<InteractionUiState> = new Set([
+  "pending",
+  "answering",
+  "paused",
+]);
+
+function isActiveUiState(
+  state: InteractionUiState,
+): state is Extract<InteractionUiState, "pending" | "answering" | "paused"> {
+  return ACTIVE_INTERACTION_STATES.has(state);
+}
 
 function byRecency(a: { createdAt: string; rowId: string }, b: { createdAt: string; rowId: string }): number {
   const ta = Date.parse(a.createdAt);
@@ -205,6 +225,10 @@ function byRecency(a: { createdAt: string; rowId: string }, b: { createdAt: stri
  * accessors, and `opts.kind` / `opts.focus` mirror the /approvals URL query.
  * The kind segment filters the interaction tier exactly as /approvals does;
  * the recent tier is instance projection and stays untouched by it.
+ *
+ * Each interaction is projected exactly once (the blocked-instance set is
+ * built in the same pass; it deliberately ignores the kind filter, since a
+ * blocked instance stays blocked even while its row is filtered out).
  */
 export function deriveInboxRows(
   source: InboxSource,
@@ -217,8 +241,12 @@ export function deriveInboxRows(
   const hostById = new Map(source.hosts.map((host) => [host.id, host]));
 
   const pending: InboxInteractionRow[] = [];
+  // A blocked instance already has a row in the interaction tier (kind
+  // filtering can hide it; it is still blocked — never advertise it as
+  // working or idle).
+  const blockedInstanceIds = new Set<Id>();
+
   for (const item of source.interactions) {
-    if (kind !== "all" && item.kind !== kind) continue;
     const instance = instanceById.get(item.instanceId);
     const host = hostById.get(item.hostId);
     const uiState = projectInteraction(item, {
@@ -227,12 +255,23 @@ export function deriveInboxRows(
       connectivity: instance?.connectivity,
       deviceId: source.deviceId,
     });
-    if (uiState !== "pending" && uiState !== "answering" && uiState !== "paused") continue;
+    if (!isActiveUiState(uiState)) continue;
+    // A blocked instance already has a row in the interaction tier (kind
+    // filtering can hide the row; the instance is still blocked — never
+    // advertise it as working or idle).
+    blockedInstanceIds.add(item.instanceId);
+    if (kind !== "all" && item.kind !== kind) continue;
 
     const options =
       item.request.kind === "approval" || item.request.kind === "plan-review"
         ? item.request.options
         : [];
+    const hostLabel = source.hostName(item.hostId);
+    const workspaceLabel = source.workspaceLabel(instance?.workspaceId ?? "");
+    const timeLabel = formatListTime(item.updatedAt || item.createdAt, nowMs);
+    const subtitle = latestEventText(instance, source.phrases[item.instanceId], item);
+    const contextPct = contextPctOf(instance, source.rollups);
+    const focused = focus === item.id;
     pending.push({
       rowType: "interaction",
       rowId: item.id,
@@ -242,60 +281,88 @@ export function deriveInboxRows(
       interactionKind: item.kind,
       carrier: item.carrier,
       headline: interactionHeadline(item),
-      subtitle: latestEventText(instance, source.phrases[item.instanceId], item),
-      hostLabel: source.hostName(item.hostId),
-      workspaceLabel: source.workspaceLabel(instance?.workspaceId ?? ""),
+      subtitle,
+      hostLabel,
+      workspaceLabel,
       harness: instance?.kind ?? "—",
-      timeLabel: formatListTime(item.updatedAt || item.createdAt, nowMs),
-      contextPct: contextPctOf(instance, source.rollups),
+      timeLabel,
+      contextPct,
       uiState,
       answerable: item.answerable,
       options,
       goAnswer: item.kind === "question",
-      focused: focus === item.id,
+      focused,
       createdAt: item.createdAt,
+      sig: JSON.stringify({
+        t: "i",
+        // Every interaction field the card/actions read; `request` is a
+        // fresh parse on every poll so compare by content, not identity.
+        i: [
+          item.state,
+          item.kind,
+          item.carrier,
+          item.answerable,
+          item.createdAt,
+          item.updatedAt,
+          item.deadline,
+          item.request,
+        ],
+        n: instance
+          ? [
+              instance.connectivity,
+              instance.lifecycle,
+              instance.activity,
+              instance.kind,
+              instance.lastError,
+              instance.usageRollup,
+            ]
+          : null,
+        // contextPct also reads source.rollups (a separate store slice).
+        v: [hostLabel, workspaceLabel, subtitle, timeLabel, contextPct, focused ? 1 : 0, uiState],
+      }),
     });
   }
   pending.sort(byRecency);
-
-  // A blocked instance already has a row in the interaction tier (kind
-  // filtering can hide it; it is still blocked — never advertise it as
-  // working or idle).
-  const blockedInstanceIds = new Set(
-    source.interactions
-      .filter((item) => {
-        const instance = instanceById.get(item.instanceId);
-        const host = hostById.get(item.hostId);
-        const state = projectInteraction(item, {
-          answering: Boolean(source.answering[item.id]),
-          host,
-          connectivity: instance?.connectivity,
-          deviceId: source.deviceId,
-        });
-        return state === "pending" || state === "answering" || state === "paused";
-      })
-      .map((item) => item.instanceId),
-  );
 
   const recent: InboxInstanceRow[] = [];
   for (const instance of source.instances) {
     if (blockedInstanceIds.has(instance.id)) continue;
     const status = projectStatus(instance);
     if (!RECENT_STATUSES.has(status)) continue;
+    const hostLabel = source.hostName(instance.hostId);
+    const workspaceLabel = source.workspaceLabel(instance.workspaceId);
+    const title = source.titleOf(instance.id) || "会话";
+    const subtitle = latestEventText(instance, source.phrases[instance.id]);
+    const timeLabel = formatListTime(instance.updatedAt, nowMs);
+    const contextPct = contextPctOf(instance, source.rollups);
     recent.push({
       rowType: "instance",
       rowId: instance.id,
       instanceId: instance.id,
       hostId: instance.hostId,
-      title: source.titleOf(instance.id) || "会话",
-      subtitle: latestEventText(instance, source.phrases[instance.id]),
-      hostLabel: source.hostName(instance.hostId),
-      workspaceLabel: source.workspaceLabel(instance.workspaceId),
+      title,
+      subtitle,
+      hostLabel,
+      workspaceLabel,
       harness: instance.kind,
-      timeLabel: formatListTime(instance.updatedAt, nowMs),
-      contextPct: contextPctOf(instance, source.rollups),
+      timeLabel,
+      contextPct,
       status,
       updatedAt: instance.updatedAt,
+      sig: JSON.stringify({
+        t: "n",
+        n: [
+          instance.connectivity,
+          instance.lifecycle,
+          instance.activity,
+          instance.kind,
+          instance.lastError,
+          instance.usageRollup,
+          instance.updatedAt,
+        ],
+        // contextPct also reads source.rollups (a separate store slice).
+        v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
+      }),
     });
   }
   recent.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));

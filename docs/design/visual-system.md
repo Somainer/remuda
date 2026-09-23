@@ -225,7 +225,7 @@ tokenGuard 断言两条：
 
 规则：
 
-- 承载信息的文字 ≥ 12px；`--text-meta` 在所有宽度下都是 12px，落实 D-039「.meta 桌面与手机同字号」；
+- 承载信息的文字 ≥ 12px；`--text-meta` 在所有宽度下都是 12px，落实 D-039 对 `.meta` 一类辅助/诊断文本桌面与手机统一为 12px 的要求（D-039 决策原文为「`.meta` 一类辅助/诊断文本**桌面与手机统一** `var(--text-aux)`（12px）」）；
 - 11px 只用于与形状绑定的徽标数字和 kbd 字形，属于 D-052 第 9 条的图形标注豁免，逐站点登记；
 - 文本输入在 `pointer: coarse` 下为 16px，iOS 聚焦不再放大页面；
 - 按宽度变化的值只在 `tokens.css` 的 `@media (max-width: 767px)` 里重设 `--text-ui`、`--text-title`、`--text-page` 三个；组件内不写宽度分支；

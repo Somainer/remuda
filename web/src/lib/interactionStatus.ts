@@ -29,6 +29,33 @@ export function hostOnline(host: Host | undefined, connectivity?: string): boole
   return host.state === "online" || host.state === "enrolled";
 }
 
+/**
+ * Whether the interaction is settled on THIS device by the state branches
+ * projectInteraction resolves BEFORE looking at host connectivity, in the
+ * same evaluation order:
+ *  - expired state or a passed deadline wins (it projects "expired", a
+ *    visible 已离队 row, so this is never "settled");
+ *  - answer-committed/resolved by another device projects "superseded";
+ *  - answer-committed/resolved with no actor or by this device projects
+ *    "settled" and renders nowhere.
+ *
+ * Lets list derivation drop no-render rows before joining instances/hosts
+ * (c-inboxperf) without reimplementing the order-sensitive rule.
+ */
+export function settledOnThisDevice(
+  interaction: Interaction,
+  deviceId: string = thisDeviceId(),
+): boolean {
+  if (interaction.state === "expired" || deadlinePassed(interaction)) return false;
+  if (interaction.state === "answer-committed" || interaction.state === "resolved") {
+    const actorDevice =
+      interaction.answer.state === "known" ? interaction.answer.value.actor.deviceId : null;
+    if (actorDevice && actorDevice !== deviceId) return false;
+    return true;
+  }
+  return false;
+}
+
 /** UI interaction state (ui-spec §2.5). answering is local until journal interaction.answered. */
 export function projectInteraction(
   interaction: Interaction,

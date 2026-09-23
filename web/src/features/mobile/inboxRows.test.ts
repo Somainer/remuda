@@ -443,6 +443,26 @@ describe("context ring pct", () => {
     expect(contextRingLabel(0)).toBe("上下文剩余 0%");
     expect(contextRingLabel(142)).toBe("上下文剩余 100%");
   });
+
+  it("bakes contextPct into the memo sig in both tiers (stale-ring guard)", () => {
+    const base = source({
+      interactions: [interaction({ id: "int_1", instanceId: "ins_blocked" })],
+      instances: [
+        inst({ id: "ins_blocked" }),
+        inst({ id: "ins_recent" }),
+      ],
+      rollups: {},
+    });
+    const before = deriveInboxRows(base);
+    const after = deriveInboxRows({
+      ...base,
+      rollups: { ins_blocked: { contextPct: 40 }, ins_recent: { contextPct: 61 } } as never,
+    });
+    expect(after.pending[0]!.sig).not.toBe(before.pending[0]!.sig);
+    expect(after.recent.find((r) => r.instanceId === "ins_recent")!.sig).not.toBe(
+      before.recent.find((r) => r.instanceId === "ins_recent")!.sig,
+    );
+  });
 });
 
 describe("derivePushBanner", () => {

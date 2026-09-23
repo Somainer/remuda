@@ -18,6 +18,11 @@ const NODE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Interaction kind that must never route to an agent (D-051 (2), D-017).
 const APPROVAL_KIND: &str = "approval";
+/// D-051 (6d) plan-review kind. A plan review gates a CHILD's own plan, so
+/// the child instance must never review itself; only its direct parent (or a
+/// human) answers. The generic one-hop `owns()` edge admits self, which is
+/// correct for other kinds but not this one.
+const PLAN_REVIEW_KIND: &str = "plan-review";
 /// Session posture that disables every downstream gate (D-011).
 const BYPASS_PERMISSIONS: &str = "bypassPermissions";
 
@@ -165,6 +170,14 @@ async fn delegated_visible_items(
         if item.get("kind").and_then(Value::as_str) == Some(APPROVAL_KIND) {
             continue;
         }
+        // D-051 (6d): a plan review is the target instance's OWN plan. The
+        // self edge in `owns()` must not admit it to the child — only a
+        // direct parent or a human reviews a plan.
+        if item.get("kind").and_then(Value::as_str) == Some(PLAN_REVIEW_KIND)
+            && target == caller_instance
+        {
+            continue;
+        }
         if !resolved.contains_key(target) {
             resolved.insert(target.to_string(), RouteTarget::load(state, target).await?);
         }
@@ -208,6 +221,14 @@ async fn authorize_agent_answer(
     // one-shot approvals additionally carry their own origin gate in
     // `crates/remuda-hub/src/agent_approvals.rs:234` `answer`.
     if row.kind == APPROVAL_KIND {
+        return Err(HubError::Forbidden);
+    }
+    // D-051 (6d): no self-answer for plan reviews. The child instance can
+    // approve its own ordinary interactions via the self edge, but it cannot
+    // be the reviewer of its own plan; only a direct parent or a human.
+    if row.kind == PLAN_REVIEW_KIND
+        && device.instance_id.as_deref() == Some(row.instance_id.as_str())
+    {
         return Err(HubError::Forbidden);
     }
     // The handler re-checks the same one-hop edge the middleware relies on:

@@ -1,4 +1,4 @@
-import { memo, useCallback, useMemo } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { StateDot } from "../components/StateDot";
 import { PtyQuestionAnswers } from "../components/PtyQuestionAnswers";
@@ -32,7 +32,10 @@ function kindLabel(item: Interaction): string {
   return item.request.title;
 }
 
-type RespondFn = (item: Interaction, answer: InteractionAnswer) => void;
+type RespondFn = (
+  item: Interaction,
+  answer: InteractionAnswer,
+) => void | Promise<void>;
 
 /**
  * Memoized on row.sig (see approvalRows.ts): a 2 s interaction.list poll
@@ -46,6 +49,28 @@ const QueueCard = memo(
     const paused = uiState === "paused";
     const answering = uiState === "answering";
     const workspace = hubStore.workspaceOf(instance?.workspaceId ?? "");
+    // Per-card deny feedback (cleared when the card unmounts on settle).
+    const [feedbackText, setFeedbackText] = useState("");
+    const [submitError, setSubmitError] = useState<string | null>(null);
+    const review =
+      item.kind === "plan-review" && item.request.kind === "plan-review"
+        ? item.request
+        : null;
+    // UTF-8 byte length must match the server's 4 KiB feedback cap (Chinese is
+    // 3 bytes/char, so a character count is wrong).
+    const feedbackBytes = new TextEncoder().encode(feedbackText).length;
+    const MAX_FEEDBACK_BYTES = 4 * 1024;
+    const feedbackOverLimit = feedbackBytes > MAX_FEEDBACK_BYTES;
+    const submit = async (answer: InteractionAnswer) => {
+      setSubmitError(null);
+      try {
+        await onRespond(item, answer);
+      } catch (error) {
+        // The store clears the local "answering" flag on a rejected POST, so
+        // the card is answerable again; surface the error and keep the draft.
+        setSubmitError(error instanceof Error ? error.message : String(error));
+      }
+    };
     return (
       <article
 
@@ -80,6 +105,26 @@ const QueueCard = memo(
           {item.kind === "elicitation" && !answering ? (
             <ElicitationCard key={item.id} interaction={item} busy={paused || !item.answerable} onRespond={(answer) => onRespond(item, answer)} />
           ) : null}
+          {review && typeof review.plan === "string" && review.plan.length > 0 ? (
+            <details className={css.planDetails}>
+              <summary className={css.planSummary}>
+                查看计划（{review.plan.length} 字）
+              </summary>
+              <pre className={css.planBody}>{review.plan}</pre>
+            </details>
+          ) : null}
+          {review && !(typeof review.plan === "string" && review.plan.length > 0) ? (
+            // Legacy/empty-inline plan review: the body lives only in the
+            // session; tell the reviewer instead of showing a blank card.
+            <p className={css.terminalNote}>
+              计划正文未随请求内联提供，请
+              <Link to={`/s/${item.instanceId}`} className={css.planSessionLink}>
+                打开会话查看
+              </Link>
+              完整计划后再决定
+            </p>
+          ) : null}
+          {submitError ? <p className={css.planError} role="alert">{submitError}</p> : null}
         </div>
         <div className={css.actions}>
           {answering ? (
@@ -110,27 +155,59 @@ const QueueCard = memo(
           {!answering && item.kind === "question" && item.carrier === "native-tty" ?
             <PtyQuestionAnswers item={item} disabled={paused || !item.answerable}
               onAnswer={(answer) => onRespond(item, answer)} /> : null}
-          {!answering && item.kind === "plan-review" && item.request.kind === "plan-review"
-            ? item.request.options.map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  className={`${css.btn} ${opt.effect === "deny" ? "" : css.btnDust}`}
-                  disabled={paused || answering}
-                  onClick={() =>
-                    onRespond(item, {
-                      kind: "plan-review",
-                      optionId: opt.id,
-                      planRevision: item.request.kind === "plan-review" ? item.request.planRevision : "1",
-                      planDigest: item.request.kind === "plan-review" ? item.request.planDigest : "",
-                      feedback: null,
-                    })
-                  }
-                >
-                  {opt.label}
-                </button>
-              ))
+          {review && !answering
+            ? review.options.map((opt) => {
+                const isDeny = opt.effect === "deny" || opt.id === "deny";
+                // Deny is blocked client-side when the feedback exceeds the
+                // server's UTF-8 byte cap, so the card never gets stuck.
+                const disabled =
+                  paused || !item.answerable || (isDeny && feedbackOverLimit);
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    className={`${css.btn} ${isDeny ? "" : css.btnDust} ${paused ? css.btnDash : ""}`}
+                    disabled={disabled}
+                    onClick={() =>
+                      void submit({
+                        kind: "plan-review",
+                        optionId: opt.id,
+                        planRevision: review.planRevision,
+                        planDigest: review.planDigest,
+                        // Null only when the field is LITERALLY empty; a
+                        // supplied whitespace note is forwarded verbatim (the
+                        // backend substitutes its default only for null).
+                        feedback: isDeny && feedbackText.length > 0 ? feedbackText : null,
+                      })
+                    }
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })
             : null}
+          {review && !answering && review.allowFeedback ? (
+            <>
+              <textarea
+                className={`${css.planFeedback} ${feedbackOverLimit ? css.planFeedbackInvalid : ""}`}
+                aria-label="计划审批拒绝反馈（可选）"
+                aria-invalid={feedbackOverLimit}
+                rows={2}
+                placeholder="拒绝时回给子代理的反馈（可选）"
+                value={feedbackText}
+                disabled={paused || !item.answerable}
+                onChange={(event) => {
+                  setFeedbackText(event.target.value);
+                  setSubmitError(null);
+                }}
+              />
+              {feedbackOverLimit ? (
+                <p className={css.planError} role="alert">
+                  反馈超过 {MAX_FEEDBACK_BYTES} 字节（当前 {feedbackBytes}），请缩短后再拒绝
+                </p>
+              ) : null}
+            </>
+          ) : null}
           <Link to={`/s/${item.instanceId}`} className={`${css.btn} ${css.btnMute}`}>
             打开会话
           </Link>
@@ -221,9 +298,10 @@ export function ApprovalsPage() {
   const queueLimit = useIncrementalLimit(queue.length, { resetKey: filterKey });
   const departedLimit = useIncrementalLimit(departed.length, { resetKey: filterKey });
 
-  const respond = useCallback<RespondFn>((item, answer) => {
-    void hubStore.respond(item.id, answer);
-  }, []);
+  const respond = useCallback<RespondFn>(
+    (item, answer) => hubStore.respond(item.id, answer),
+    [],
+  );
 
   const setKind = (id: (typeof KIND_FILTERS)[number]) => {
     const next = new URLSearchParams(params);

@@ -630,6 +630,31 @@ interactions.push({
       { id: "deny", label: "拒绝", effect: "deny", nativeValueRef: id("obj_") },
     ],
     allowFeedback: true,
+    plan: "# 实施计划\n\n1. 先读取 README\n2. 运行测试\n3. 汇报结果",
+  },
+});
+
+// Legacy/compatible plan review whose body was not inlined: the card must
+// point the reviewer to the session instead of rendering an empty body.
+const legacyPlanId = id("int_");
+interactions.push({
+  ...pendingInteraction,
+  ...meta(legacyPlanId),
+  id: legacyPlanId,
+  instanceId: insWorking,
+  kind: "plan-review",
+  request: {
+    kind: "plan-review",
+    title: "无正文计划",
+    planRef: id("obj_"),
+    planRevision: "1",
+    planDigest: digestPlaceholder(),
+    options: [
+      { id: "approve", label: "同意", effect: "allow-once", nativeValueRef: id("obj_") },
+      { id: "deny", label: "拒绝", effect: "deny", nativeValueRef: id("obj_") },
+    ],
+    allowFeedback: false,
+    plan: null,
   },
 });
 titles.set(insPaused, "离线主机上的审批");
@@ -1059,6 +1084,12 @@ export function mockRespond(interactionIdArg: Id, answer: InteractionAnswer): Co
     dispatch: "intent-durable",
     resolution: "clear",
   };
+  // Test-only hook (mock mode): expose the last submitted answer so e2e can
+  // assert the exact wire payload (e.g. whitespace feedback is not nulled).
+  if (typeof window !== "undefined") {
+    (window as unknown as { __lastInteractionAnswer?: InteractionAnswer }).__lastInteractionAnswer =
+      answer;
+  }
   return { command, relatedCommandIds: [] };
 }
 

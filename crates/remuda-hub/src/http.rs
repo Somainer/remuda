@@ -1917,6 +1917,17 @@ pub async fn post_command(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
+    // The Node accepts only `cmd_` + a canonical lowercase UUIDv7
+    // (`remuda_protocol::CommandId`). Reject a malformed client id at the HTTP
+    // boundary so the bad id is a 400 the caller can fix, never a row that
+    // reaches a Node and comes back rejected.
+    if let Some(command_id) = body.command_id.as_deref()
+        && remuda_protocol::CommandId::try_from(command_id.to_owned()).is_err()
+    {
+        return Err(HubError::BadRequest(format!(
+            "commandId must be `cmd_` plus a canonical lowercase UUIDv7, got {command_id}"
+        )));
+    }
     let instance = state
         .store
         .get_instance(instance_id.clone())
@@ -1943,6 +1954,23 @@ pub async fn post_command(
         &mut payload,
     )
     .await?;
+    // Same-id client retry (protocol §2.5: a retry keeps its id). The lookup
+    // runs BEFORE attachment resolution (G3): a message re-sent after its
+    // attachment expired must come back as the original row, not a 400. A
+    // still-queued, never-forwarded row is forwarded now that the retry proves
+    // the caller is back (G1).
+    if let Some(command_id) = body.command_id.as_deref()
+        && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
+    {
+        let command = if retry_matches_row(&existing, &body.operation, &instance_id, &payload) {
+            forward_unforwarded_retry(&state, existing).await?
+        } else {
+            return Err(HubError::Conflict(
+                "commandId reused with a different payload".into(),
+            ));
+        };
+        return Ok(Json(json!({ "command": command, "replayed": true })));
+    }
     if body.operation == "instance.send" {
         crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload).await?;
     }
@@ -1966,6 +1994,9 @@ pub async fn post_command(
             .map_err(map_store)?;
     }
     if !created {
+        // Lost the lookup/insert race against a concurrent first POST: apply
+        // the same G1 rule instead of returning the queued row unforwarded.
+        let command = forward_unforwarded_retry(&state, command).await?;
         return Ok(Json(json!({ "command": command, "replayed": true })));
     }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();
@@ -2009,6 +2040,74 @@ fn send_message_text(payload: &Value) -> Option<String> {
         None
     } else {
         Some(parts.join("\n"))
+    }
+}
+
+/// Ordered `objectId` list from an `instance.send` payload's attachments.
+///
+/// The stored row carries resolved attachment manifests and a retried request
+/// carries the client's raw `{objectId}` references; both spell the id under
+/// the same key, so this is the field G3 compares.
+fn attachment_object_ids(payload: &Value) -> Vec<&str> {
+    payload
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("objectId").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether a same-id retry denotes the same command as the stored row.
+///
+/// Exact payload equality always counts (a client replaying the row it was
+/// given). For `instance.send` a retry can legitimately differ in wire shape:
+/// the stored row carries Hub-resolved attachment manifests and stamps, while
+/// the retry carries raw attachment references, so after the exact comparison
+/// fails the retry is compared on its semantic fields — message text, `mode`,
+/// and the ordered attachment objectId list (G3). Anything else, including a
+/// retry addressed at another instance or a non-send operation whose payload
+/// changed, is a 409.
+fn retry_matches_row(
+    row: &CommandRecord,
+    operation: &str,
+    instance_id: &str,
+    payload: &Value,
+) -> bool {
+    if row.operation != operation || row.instance_id.as_deref() != Some(instance_id) {
+        return false;
+    }
+    if row.payload == *payload {
+        return true;
+    }
+    operation == "instance.send"
+        && send_message_text(&row.payload) == send_message_text(payload)
+        && explicit_mode(&row.payload) == explicit_mode(payload)
+        && attachment_object_ids(&row.payload) == attachment_object_ids(payload)
+}
+
+/// The send's `mode`, treating an explicit null the same as an absent field.
+fn explicit_mode(payload: &Value) -> Option<&Value> {
+    payload.get("mode").filter(|mode| !mode.is_null())
+}
+
+/// G1: forward a queued row that never had a forward intent when a same-id
+/// retry arrives and the host is now online. Already-forwarded rows return
+/// unchanged — a retry must never cause a second dispatch. Concurrent retries
+/// are serialized by `mark_forward_intent`; Node-side commandId+digest dedup is
+/// the second floor.
+async fn forward_unforwarded_retry(
+    state: &AppState,
+    command: CommandRecord,
+) -> Result<CommandRecord, HubError> {
+    if !command.forwarded && command.state == "queued" {
+        let live = state.nodes.kind_of(&command.host_id).await.is_some();
+        forward_if_online(state, command, live).await
+    } else {
+        Ok(command)
     }
 }
 
@@ -2609,6 +2708,39 @@ pub async fn list_instance_commands(
         "instanceId": instance_id,
         "commands": commands,
     })))
+}
+
+/// `GET /v1/instances/{id}/commands/{commandId}`: one command ledger row, so a
+/// reconnecting client can read a send's `state`/`resolution` without
+/// re-POSTing it (G2). Read authorization matches the commands list: Human/Bot
+/// seats reach any instance, while Agent callers are refused at the route
+/// middleware (a commands detail path is not an agent read target) and again
+/// here. The row must belong to the instance named in the path — command ids
+/// are a global ledger, so a mismatch answers 404 rather than leaking another
+/// instance's row.
+pub async fn get_instance_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((instance_id, command_id)): Path<(String, String)>,
+) -> Result<Json<CommandRecord>, HubError> {
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
+    if state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .is_none()
+    {
+        return Err(HubError::NotFound);
+    }
+    let command = state
+        .store
+        .get_command(command_id)
+        .await?
+        .ok_or(HubError::NotFound)?;
+    if command.instance_id.as_deref() != Some(instance_id.as_str()) {
+        return Err(HubError::NotFound);
+    }
+    Ok(Json(command))
 }
 
 pub(crate) async fn forward_if_online(

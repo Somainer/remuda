@@ -6664,6 +6664,9 @@
           "401": {
             "$ref": "#/components/responses/Error"
           },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
           "403": {
             "$ref": "#/components/responses/Error"
           },
@@ -6672,6 +6675,48 @@
           },
           "409": {
             "$ref": "#/components/responses/AgentActionConflict"
+          }
+        },
+        "tags": [
+          "instances"
+        ]
+      }
+    },
+    "/v1/instances/{id}/commands/{commandId}": {
+      "get": {
+        "operationId": "instanceCommandStatus",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdPath"
+          },
+          {
+            "in": "path",
+            "name": "commandId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandRecord"
+                }
+              }
+            },
+            "description": "Command ledger row"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
           }
         },
         "tags": [

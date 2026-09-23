@@ -1,12 +1,12 @@
 {
-  "name": "runtime",
-  "short_name": "runtime",
+  "name": "Remuda",
+  "short_name": "Remuda",
   "description": "Remote agent runtime control surface",
   "display": "standalone",
   "start_url": "/",
   "scope": "/",
-  "theme_color": "#12161c",
-  "background_color": "#0c0f14",
+  "theme_color": "#232220",
+  "background_color": "#232220",
   "lang": "zh-CN",
   "icons": [
     {

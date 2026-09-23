@@ -85,6 +85,19 @@ herdrx
   JSON shape rewritten in Rust. Not a Go copy.
 
 -------------------------------------------------------------------------------
+SIL Open Font License 1.1 (bundled font)
+
+IBM Plex Mono
+  Copyright 2017 IBM Corp.
+  License: OFL-1.1 (full text: web/LICENSES/IBM-Plex-Mono-OFL.txt)
+  Source: https://github.com/IBM/plex, packaged as @fontsource/ibm-plex-mono
+  5.3.0
+  Bundled: latin subset, weights 400 and 500 (woff2/woff), emitted by the
+  web build under hashed /assets/ names. Imported from web/src/main.tsx.
+  Modifications: none. Used for code, paths, IDs and the terminal only; UI
+  text uses the platform system font, so no other webfont is shipped.
+
+-------------------------------------------------------------------------------
 Not copied (referenced by absolute path at runtime only)
 
 OpenAI Codex / ChatGPT Computer Use

@@ -54,7 +54,7 @@ tokenGuard 断言两条：
 - 加两个 theme-color：`<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#232220">` 与 `<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f9f8f5">`；
 - `<title>` 与 `apple-mobile-web-app-title` 改为 `Remuda`。
 
-外观由纯 CSS 媒体查询解析，**不加任何阻塞首帧的脚本**：Hub 对 `/assets/` 之外的文件一律 `no-cache`，service worker 不预缓存这些文件，也不新增任何未缓存资源；`sw.src.js` 不改。
+外观由纯 CSS 媒体查询解析，**不加任何阻塞首帧的脚本**：Hub 对 `index.html` 与 `sw.js` 两个壳文件返回 `no-cache`（`crates/remuda-hub/src/web.rs:103-111`；`/assets/` 哈希资源 immutable 长缓存，manifest、图标、favicon 等其余非资产路径无显式缓存指令），service worker 不预缓存壳与外观相关文件，也不新增任何未缓存资源；`sw.src.js` 不改。
 
 `manifest.webmanifest`：`name` / `short_name` 改为 `Remuda`，`theme_color` 与 `background_color` 都用 `#232220`。
 

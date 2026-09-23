@@ -59,7 +59,7 @@
 | `projects` | 项目 | Hub `Project` 实体（任务看板、任务列表、项目切换器；`members[]` 引用 Space 键，D-024/D-050） | 侧栏「项目」区（每行就是范围控件：点项目行 → `/board?project={id}`，点「全局」→ `/board`）；另有 `/projects` 与其页头的 `ProjectSwitcher` | 新建会话步骤里选；compact 看板塌缩进 `/m` |
 | `providers` | Provider | profile、健康、与 astergate 关系 | 「管理」菜单 → `/providers` | 更多 → Provider |
 | `bots` | Bot | 飞书 / Telegram 绑定、白名单、会话键 | 「管理」菜单 → `/bots` | 更多 → Bot |
-| `settings` | 设置 | 设备、推送、权限、外观默认 | 「管理」菜单 → `/settings`；外观分段为 `[跟随系统 | 深色 | 浅色]`（D-053，默认跟随系统） | 更多 → 设置 |
+| `settings` | 设置 | 设备、推送、权限、外观默认 | 「管理」菜单 → `/settings`；外观分段为 `[跟随系统 \| 深色 \| 浅色]`（D-053，默认跟随系统） | 更多 → 设置 |
 
 「项目」对应 Hub **`Project` 实体**（D-050 起 Web 采纳；`members[]` 是 `(hostId, workspaceId)` 列表，直接引用 Space 键，不合并同名/跨主机目录，D-024 不变）。任务列表与看板按 projectId 过滤；桌面只有两个项目范围入口：侧栏「项目」区的行与 `/projects` 页头的 `ProjectSwitcher`，二者写同一个偏好。已注册目录的协议实体仍是 **Workspace**（主机上的 cwd 通讯录，id=`workspaceId`），为新建会话、文件视图与过滤器提供稳定 `workspaceId`（host + path + 可选 worktree）；Project 引用 Workspace，不替代它。task 聚合层与看板投影见 §1.5 / §2.9。
 
@@ -141,7 +141,7 @@ Hash 路由不要。用 **React Router**（History API）。认证 cookie 必须
 - `/sessions` 和 `/board` 在内容区左边多一条索引列（宽 `--index`）：`/sessions` 挂 SpacesPanel，`/board` 是任务清单；宽度 <1024 时索引列收成页头上的按钮，点开是覆盖层，里面是同一个组件、同样的 testid。会话路由 `/s/*` **没有**第二列。
 - tab 条只在 `/s/*` 上渲染（36px），列表路由不再有 tab 条；集合语义见 §1.4。
 - 右栏文件视图在 ≥1280 时并排（300px）；<1280 时从页头「文件」按钮或 ⋯ 菜单以覆盖 sheet 打开。
-- 会话页页头：面包屑/标题、host、cost、状态点（§2.1 投影）、`终端|结构` 分段、Stop、文件开关、⋯。这排元素在 compact 下允许重排与减铬，但 **`终端|结构` 分段与 Stop 必须始终留在页头，永不进 ⋯ 溢出菜单**（D-040 (2) 不变）：另一个视图是一等入口，不是「更多」里的设置。host 与 cost 留在桌面主行；诊断字段（driver / delegation / provider / lifecycle / seq / connectivity / native / promoted）进 ⋯ 菜单里的「运行详情」（§2.2；D-053 取代 D-040 (3) 的第二行触发版式，面板内容、按设备持久化与 `session-meta` 不变）。
+- 会话页页头：面包屑/标题、host、cost、状态点（§2.1 投影）、`终端|结构` 分段、Stop、文件开关、⋯。这排元素在 compact 下允许重排与减铬，但 **`终端|结构` 分段与 Stop 必须始终留在页头，永不进 ⋯ 溢出菜单**（D-040 (2) 不变）：另一个视图是一等入口，不是「更多」里的设置。host 与 cost 留在桌面主行；诊断字段（driver / delegation / provider / lifecycle / seq / connectivity / native / promoted）进 ⋯ 菜单里的「运行详情」（§2.2；D-053 取代旧 ui-spec §2.2 第二行「只有这一个触发器」的版式（基线 `80db05b8:docs/design/ui-spec.md:335`），D-040 (3) 钉住的面板内容、按设备持久化与 `session-meta` 不变）。
 
 **手机**
 
@@ -213,7 +213,7 @@ Paseo compact 是左列表 / 中 agent / 右文件三态互斥（`paseo/docs/mob
 本节是 task 优先模型的界面口径；实体字段、表结构、RPC/路由形状、迁移预算与门控动词以 [task-model.md](./task-model.md) 为机械权威，ADR 为 [D-050](./decisions.md)。
 
 - **Task 是 instance（会话）之上的聚合层，不是第二套状态机。** Hub 的 Task 台账 8 态（pending/placed/running/stalled/done/failed/parked/deferred）是唯一权威；看板列、任务分组、人读 key、共用计数全是只读派生投影，UI 不把投影写回为状态。
-- **一个 task 聚合多个 session**：实例经既有 `instances.task_id` 归属 task。一个 task 的多个 session 用 **tab/卡片**呈现（复用 §1.4 的 `visibleTabs`/`spaceSessions` 语义，`spaces/store.ts:93-108`），点开进共享 `/s/:id`。**不做并排多 pane 工作台**：§1.3 映射表「v1 不做多 pane 分屏（一实例一终端）」对 task 面同样成立；某参考看板产品的并排多面板不抄。
+- **一个 task 聚合多个 session**：实例经既有 `instances.task_id` 归属 task。一个 task 的多个 session 用 **tab/卡片**呈现，tab 集合按 §1.4 的 D-053 规则：会话 `instance.taskId` 非空时是该 Task 的会话，为空才回落到所在 Space 的 `visibleTabs`（`spaces/store.ts:93-108`），点开进共享 `/s/:id`。**不做并排多 pane 工作台**：§1.3 映射表「不做多 pane 分屏（一个实例一个终端）」对 task 面同样成立；某参考看板产品的并排多面板不抄。
 - **看板列是只读投影**：待办 / 进行中 / 已完成 三列 + 已归档过滤（不是第五列）。投影表、failed 按 placement 归位 + 角标、拖卡列→列多跳映射、done≠解锁见 §2.9 与 [task-model.md](./task-model.md) §5。
 - **目录绑定二选一**（task 创建时显式选择，按项目记忆，无静默默认）：`reuse` = 复用注册根或既有 `remuda-wt` 兄弟目录，一目录一分支、attach 期间独占、多 task 顺序轮用，归还对目录零操作；`pool` = app 管理的 worktree 池，detached-HEAD 停放、租借时切 `wt/<slot>/<task-slug>`、归还时 reset/clean/park 但不删除。池满、目录忙、分支冲突一律显式 `blocked`（卡片/行显示理由），**绝不静默换目录或回退主 checkout**（D-035）。「与 N 个 task 共用」= 同目录 lease 的引用计数，是顺序轮用不是并发；Space 键 `(hostId, workspaceId)` 不放松（D-024）。
 - **项目空间 vs 任务空间**：项目空间 = 既有文件视图（轴 `hostId+workspaceId`，[files-view-contract.md](./files-view-contract.md)），即 worktree 全树；任务空间 = 同一视图按 task 的 session 集合 + `owns[]` glob 的**客户端过滤投影**，空态「还没有文件」，不新增端点。两空间在会话右栏/`/s/:id/files` 内以 tab 切换。
@@ -247,16 +247,16 @@ compact（手机）不渲染这个页面：`<Navigate replace>` 到 `/m`（D-049
 
 上面线框里每行的第二句（「等你批准 Bash」「AskUserQuestion · 3 题」「Workflow wf_ab12 · phase compile」）是**派生出来的一句话**，不是 wire 字段的转写。据此把行内容钉死：
 
-- **默认视口里只出现**：状态点（§2.1 上表的三维投影）、标题、kind 芯片、unread/pending 徽标、以及一句「下一步」。行内**不出现** `lifecycle`/`activity`/`connectivity` 的原文三元组（`ready · waiting-interaction · connected`），也不出现 `ins_…` 短码、`driver`、`model`。
+- **默认视口里只出现**：状态点（§2.1 上表的三维投影）、标题、kind 芯片、unread/pending 徽标、以及一句「下一步」；容器 ≥960 时宽行 grid 另有「主机/工作区·分支」与相对时间两列（D-053 对本条的显式增补，见下「行栅格」）。行内**不出现** `lifecycle`/`activity`/`connectivity` 的原文三元组（`ready · waiting-interaction · connected`），也不出现 `ins_…` 短码、`driver`、`model`。
 - 那句「下一步」由**已有字段投影**得出（`projectStatus` / `Interaction.request.kind|description` / `exitLabel` / screen 终态），**不新造状态机、不猜成功**。`connectivity ≠ connected` 与 `lifecycle ∈ {unknown,reconciling}` 必须产出「状态待确认」，**不得**回落成 idle/空闲一类正向文案；`exited` 用「已退出」而不是「完成」。
 - 三维 wire、`ins_`、driver、model 退到每行的 `<details data-testid="session-wire">` 展开内容或 `title`：**默认视口不可见**，可读性不丢。
-- 行内遥控（`send…` 输入框、enter / esc / ctrl+c 按键）收进长按/溢出 `Sheet`（**保留全部既有 testid 与命令路径**，只是不再常驻行内）；「待处理」组在行上保留**一个**主操作（「去处理」，`board-go-hand`，用 `.btnPrimary .btnSm`，直达 `/approvals?focus=` 或该会话）。
+- 行内遥控（`send…` 输入框、enter / esc / ctrl+c 按键）收进长按/溢出 `Sheet`（**保留全部既有 testid 与命令路径**，只是不再常驻行内）；「待处理」组在行上保留**一个**主操作（「去处理」，`board-go-handle`，用 `.btnPrimary .btnSm`，直达 `/approvals?focus=` 或该会话）。
 - 状态点仍是三维投影（下表），本条只改**文本**的呈现位置，不改状态语义。
 
-**行栅格（D-053）**：列表容器设 `container-type: inline-size`。
+**行栅格（D-053；宽行修订 D-038 的默认视口清单）**：列表容器设 `container-type: inline-size`。
 
-- 容器宽 ≥960px：单行 48px，grid 列为 `[28 | 标题 minmax(220px,2fr) | 下一步 minmax(200px,3fr) | 主机/工作区·分支 200 | 时间 56 | 动作]`；
-- 容器宽 <960px：两行，共 56px；
+- 容器宽 ≥960px：单行 48px，grid 列为 `[28 | 标题 minmax(220px,2fr) | 下一步 minmax(200px,3fr) | 主机/工作区·分支 200 | 时间 56 | 动作]`；后两列（主机/工作区·分支、相对时间）是 D-053 对 D-038 默认视口五要素的**显式增补**——三维 wire 原文、`ins_`、driver、model 仍只进 `session-wire` / `title`；
+- 容器宽 <960px：两行，共 56px（不额外加列，仍是五要素口径）；
 - 多选框（`board-select`）只在悬停、行内 `focus-within`、已有选中项或 coarse 指针时显示；
 - 行高与热区按 §3.4 与 [visual-system.md](./visual-system.md)：coarse 指针下行可见高度可直接取 44px。
 
@@ -319,12 +319,12 @@ wire 用 `lifecycle` × `activity` × `connectivity`（`protocol.md` §2.3）。
 │            ┌ composer（与阅读列同宽，圆角 12）────┐ 或 EndedBar                 │
 ```
 
-**页头（D-053；D-040 的桌面主行规则不变，第二行触发版式被取代）**
+**页头（D-053；D-040 的桌面主行规则不变，旧 §2.2 的第二行触发版式被取代）**
 
-- **桌面（≥1024）**：一行 48px，左右 20px。左侧：面包屑「{Space} / {Task 标题}」（13px `--fg-muted`，未绑定 task 的会话没有 Task 段）+ `<h1>` 标题（`--text-title`，单行省略）+ 12px 元信息行，用 `·` 分隔：StateDot + 状态词（`session-status-label`；blocked 或 unknown 用 `--attention-fg`，节点丢失用 `--danger-fg`）、host（`session-host`，最宽 160px）、cost（`session-cost`，未知显示「—」）。右簇：`ViewSwitch`（`.seg`）、「文件」（`files-toggle`，仅 ≥1024 出现）、Stop（32px `.iconBtn`，aria-label `Stop`，hover 变 danger 色）、⋯（`session-more-open`）。
+- **桌面（≥1024）**：一行 48px，左右 20px。左侧：面包屑「{Space} / {Task 标题}」（13px `--fg-muted`，未绑定 task 的会话没有 Task 段）+ `<h1>` 标题（`--text-title`，单行省略）+ 12px 元信息行，用 `·` 分隔：StateDot + 状态词（`session-status-label`；blocked 用 `--attention-fg`，unknown / 「状态待确认」用 `--unknown-fg`（中性 `--fg-muted`，配虚线形状，不使用琥珀，D-053/§3.3），节点丢失用 `--danger-fg`）、host（`session-host`，最宽 160px）、cost（`session-cost`，未知显示「—」）。右簇：`ViewSwitch`（`.seg`）、「文件」（`files-toggle`，仅 ≥1024 出现）、Stop（32px `.iconBtn`，aria-label `Stop`，hover 变 danger 色）、⋯（`session-more-open`）。
 - **768–1023**：面包屑只留最近一段，host 最宽 120px，「文件」进 ⋯。
-- **手机（<768）**：一行 52px，左右各 4px。从左到右：返回 `‹`（aria-label「返回」，字形 20px，padding 热区 44×44）、标题块（`<button data-testid="spaces-drawer-open">`，flex 1，高 44px，打开 Space 抽屉）、`终端|结构` `.seg`（每项可见 26px、热区 44）、Stop（32px 方块，`::after` 热区 44，与 ⋯ 间距 12px）、⋯（32px，`::after` 热区 44）。标题块两行：第一行 7px StateDot + 标题（16px/600）；第二行 12px——`<span data-testid="spaces-chips">{Space 名}</span>` + ` · {状态词}`（「等待操作 / 状态待确认 / 已断开」用 `--attention-fg`）。`/s/` 上不使用 `space-chip`。截断按 D-049 三步（§4.7），状态点始终在第一行。
-- **「运行详情」从第二行移进 ⋯ 菜单（D-053 取代 D-040 (3)）**：页头不再有第二行触发器。`RunDetails` 新增受控 prop `open` / `onClose`，由菜单项 `run-details-summary`（「运行详情 · N 项」）控制；不传 props 时保持自带触发行为。面板仍在页头下方的文档流里展开（不是浮层），12px 文字、值用等宽字体，内容为 driver / delegation / provider / providerSourceHint / lifecycle / seq / connectivity / native / promoted / LaunchedBy；默认收起，展开态按设备持久化到 `runtime.run-details.open`；`run-details`、`session-meta` testid 不变。
+- **手机（<768）**：一行 52px，左右各 4px。从左到右：返回 `‹`（aria-label「返回」，字形 20px，padding 热区 44×44）、标题块（`<button data-testid="spaces-drawer-open">`，flex 1，高 44px，打开 Space 抽屉）、`终端|结构` `.seg`（每项可见 26px、热区 44）、Stop（32px 方块，`::after` 热区 44，与 ⋯ 间距 12px）、⋯（32px，`::after` 热区 44）。标题块两行：第一行 7px StateDot + 标题（16px/600）；第二行 12px——`<span data-testid="spaces-chips">{Space 名}</span>` + ` · {状态词}`（「等待操作」用 `--attention-fg`；「状态待确认」用 `--unknown-fg` 中性色；「已断开」用 `--danger-fg`；unknown 绝不使用琥珀，D-053/§3.3）。`/s/` 上不使用 `space-chip`。截断按 D-049 三步（§4.7），状态点始终在第一行。
+- **「运行详情」从第二行移进 ⋯ 菜单（D-053）**：页头不再有第二行触发器。**取代的是旧 ui-spec §2.2（基线 `80db05b8:docs/design/ui-spec.md:335`）「第二行只有这一个触发器」的版式**，不是 D-040 (3) 的条文；D-040 (3) 钉住的内容（哪些诊断进 disclosure、默认收起、按设备持久化、`session-meta` testid）全部不变。`RunDetails` 新增受控 prop `open` / `onClose`，由菜单项 `run-details-summary`（「运行详情 · N 项」）控制；不传 props 时保持自带触发行为。面板仍在页头下方的文档流里展开（不是浮层），12px 文字、值用等宽字体，内容为 driver / delegation / provider / providerSourceHint / lifecycle / seq / connectivity / native / promoted / LaunchedBy；默认收起，展开态按设备持久化到 `runtime.run-details.open`；`run-details`、`session-meta` testid 不变。
 - **⋯ 菜单**（`SessionMoreMenu`；桌面 `.menu`，手机 `.sheet`，每项 48px），顺序固定：
 
   | 顺序 | 菜单项 | testid | 说明 |
@@ -489,7 +489,7 @@ mediaType, name}`，`protocol.md` §5.2），字节在对象库、不在 journal
 
 - 外壳：`--bg-input` 底，12px 圆角，1px `--border`，宽度与阅读列对齐（720px，停靠区内居中）；`:focus-within` 时边框变 `--focus` 并加 `0 0 0 1px var(--focus)`。
 - 文本框：无边框，16px/24px，`--fg-body`，placeholder「输入提示词…」。行数：桌面 1–10 行，手机 1–5 行，键盘态 1–3 行。自增高用 CSS grid 镜像（`::after{content: attr(data-value)}`）实现，不读 `scrollHeight`。
-- 桌面是两行：文本行 + 32px 工具行。控件 28px 高，12px `--fg-muted`，无边框；hover `--bg-hover`，打开时 `--bg-selected`。左：`attach-file` 与「粘贴附件」；中：`harness-chip`（静态文字）、`model-effort-chip`（显示「opus · high ▾」：切换中或排队中带 `--link`，与生效值不一致时带 `--attention-fg`，未知时显示「?」）、`context-chip`（圆环 + 「42%」）、`permission-chip`（danger 模式下 `--danger-fg`、前缀 ⚠，是 composer 里唯一带边框的控件）；右：状态文字（`composer-queue-status`、`composer-interrupted-chip`、`composer-cap-note`）、忙碌时出现 `composer-steer` 和 `composer-interrupt`、发送按钮（32px 圆形，`--primary-fill` 底，里面是 ↑；`data-mode`、`data-holder` 不变）。composer 自身宽度 <600px 时先隐藏 harness 名，再把 context 收成只剩圆环。
+- 桌面是两行：文本行 + 32px 工具行。控件 28px 高，12px `--fg-muted`，无边框；hover `--bg-hover`，打开时 `--bg-selected`。左：`attach-file` 与「粘贴附件」；中：`harness-chip`（静态文字）、`model-effort-chip`（显示「opus · high ▾」：切换中或排队中带 `--link`，与生效值不一致时带 `--attention-fg`，未知时显示「?」）、`context-chip`（圆环 + 「42%」）、`permission-chip`（danger 模式下仅 `--danger-fg` 字 + ⚠ 前缀，不加边框——带边框的 danger 触发器只属于 compact 单行的选项触发器，见下）；右：状态文字（`composer-queue-status`、`composer-interrupted-chip`、`composer-cap-note`）、忙碌时出现 `composer-steer` 和 `composer-interrupt`、发送按钮（32px 圆形，`--primary-fill` 底，里面是 ↑；`data-mode`、`data-holder` 不变）。composer 自身宽度 <600px 时先隐藏 harness 名，再把 context 收成只剩圆环。
 - 顶部区只在有内容时出现：最大高度 112px（键盘态 36px），自身可滚动。排队行（`composer-queued-row`、`composer-queued-chip`，28px，带「插队发送」和 ✕）、附件块（40px，`--bg-inset`；上传失败边框用 `--danger-border`）、代码引用芯片；手机额外显示「尚未验证」（`composer-cap-note`，`--attention-fg`）。
 - 桌面 ≥1024 时文本行下方显示说明（`composer-caption`），12px `--fg-faint`：「Enter 发送（工作中排队）· ⌘/Ctrl+Enter 插队 · Esc 打断 · 组字中 Enter 不发送」。
 - 发送语义：桌面 Enter 发送（IME composing / keyCode 229 / key=Process 时忽略，抄 herdrx `Composer.tsx` `composing()`），Shift+Enter 换行；⌘/Ctrl+Enter 插队；手机 Enter 换行、主发送是按钮。不要抢中文候选。
@@ -926,7 +926,7 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 | 控件 | 可见尺寸（两态相同） | coarse 指针下的命中区 |
 |---|---|---|
 | 返回箭头 `‹` | 20px 字形 | 44×44（padding） |
-| `终端\|结构` 分段 `.segItem` | 26px 高（在 D-039 的 25–30 区间内），项最小宽 44px | 每项 44，`::after { inset: -9px 0 }` 只向上下扩，相邻项不重叠 |
+| `终端\|结构` 分段 `.segItem` | 26px 高（在 D-039 的 25–30 区间内），fine 指针下无最小宽约束 | 每项 44 高、`min-width: 44px`；`::after { inset: -9px 0 }` 只向上下扩，相邻项不重叠 |
 | 手机 Stop 方块 | 32px | `::after` 44×44 |
 | 图标按钮 `.iconBtn` | 32×32，字形 16px | `::after` 44×44 |
 | 芯片 `.chip` | 24px 高 | 竖向热区补到 44，`min-width: 44px` |
@@ -941,7 +941,7 @@ envelope `completeness`（`deepseek-harness.md` §8.3）：`structured` / `parti
 - 承载信息的文字 ≥ 12px；用令牌而不是字面量。
 - 正文 16px（`--text-read`，三档相同）、输入在 coarse 指针下 16px（`--text-input`，iOS 不放大页面）、fine 指针下输入 14px。
 - 11px（`--text-2xs`）**只**用于与形状绑定的徽标数字和 kbd 字形——它是图形的一部分，不是线性排版里要读的文字。
-- compact 判定（布局）与触屏判定（`pointer: coarse`）**不要混用**：字号分段、折叠按「布局是否 compact」决定；键盘/直连/命中区相关行为一律按指针决定。
+- 布局断点、指针、字号与折叠的分工（不要混用）：**工具卡默认折叠与宽度无关**——已 settled 且成功的调用在所有宽度都折一行（§2.2，D-053 修订 D-041），只有 Workflow/error/running/interaction 等豁免集合不折；**字号随宽度的变化只有** [visual-system.md](./visual-system.md) §5.2 在 `@media (max-width: 767px)` 里重设 `--text-ui`、`--text-title`、`--text-page` 三个令牌，组件内不写宽度分支；命中区、输入字号（coarse 16px）、键盘/直连相关行为一律按 `pointer: coarse` 决定——窄桌面窗口会命中 compact 布局查询但没有触屏，按宽度加 44px 热区会误伤鼠标用户。
 
 **「辅助文本」vs「图形标注」判定口径（D-052 第 9 条，供 CSS 护栏白名单分类）。** sub-12px 下限约束的是「要读的内容」，逐站点按它在界面里的角色二分：
 
@@ -998,7 +998,11 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 - `manifest.webmanifest`：`display: standalone`（herdrx；DSH 用 fullscreen，手机不要 fullscreen 以免挡状态栏）。
 - 图标 any + maskable 192/512。
 - `start_url: /`（D-049，2026-09-19 从 `/sessions` 改）：落点由 §1.2 的重定向层按视口判定——手机安装的 PWA 落 `/m`，桌面安装的落 `/sessions`。只有一份 manifest、一份 SW（SW 预缓存壳清单已含 `/`，`sw.src.js:9`）。
-- `theme_color` / `background_color` 都用深色 canvas `#232220`（两态下的状态栏外观由两个带 `media` 的 theme-color meta 处理，D-053）：`index.html` 同时声明 `<meta name("theme-color" media="(prefers-color-scheme: dark)" content="#232220">` 与 `…light… content="#f9f8f5">`；manifest 的 `name` / `short_name` 为 `Remuda`。
+- `theme_color` / `background_color` 都用深色 canvas `#232220`（两态下的浏览器栏外观由两个带 `media` 的 theme-color meta 处理，D-053）：`index.html` 同时声明
+  `<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#232220">`
+  与
+  `<meta name="theme-color" media="(prefers-color-scheme: light)" content="#f9f8f5">`；
+  manifest 的 `name` / `short_name` 为 `Remuda`。
 - SW：预缓存壳；**不**缓存 journal API。更新策略抄 herdrx `pwa.ts`（waiting + `ACTIVATE_UPDATE`）。
 - `beforeinstallprompt` 横条「添加到主屏幕」。
 - 安装要求：**Hub 公网或内网 HTTPS**。明文 HTTP 无 Push、无 clipboard、无 SW。loopback 开发除外。
@@ -1057,7 +1061,7 @@ iOS：必须加到主屏幕才有 Notification（herdrx `needsHomeScreenForNotif
 
 三步牺牲之后 compact 页头仍恒为：**返回 `‹` / 标题块（内含 Space 名与状态点）/ `终端|结构` 分段 / Stop / ⋯**——状态点始终留在第一行，与三步牺牲无关。390px 宽时标题块约 150px；360px 宽时触发第 2 步。
 
-**主机与 cost 的 compact 例外（D-049，仅 compact；D-040 的桌面规则一字不动）**：D-040 钉的是**桌面**主行必须可见 host 与 cost；compact 下二者移入 ⋯ 菜单的「运行详情」面板（§2.2；D-053 取代 D-040 (3) 的第二行触发版式），不删除、不猜值——标题块里的 Space 名已经同时点名主机与项目（§1.4 的 `(hostId, workspaceId)` 归属），「这场要花多少钱、在哪个主机上」打开运行详情即可读到。桌面主行的 host 与 cost 保持原位，本条不改它。
+**主机与 cost 的 compact 例外（D-049，仅 compact；D-040 的桌面规则一字不动）**：D-040 钉的是**桌面**主行必须可见 host 与 cost；compact 下二者移入 ⋯ 菜单的「运行详情」面板（§2.2；D-053 取代的是旧 ui-spec §2.2 第二行「只有这一个触发器」的版式（基线 `80db05b8:docs/design/ui-spec.md:335`），D-040 (3) 的面板内容/持久化/`session-meta` 不变），不删除、不猜值——标题块里的 Space 名已经同时点名主机与项目（§1.4 的 `(hostId, workspaceId)` 归属），「这场要花多少钱、在哪个主机上」打开运行详情即可读到。桌面主行的 host 与 cost 保持原位，本条不改它。
 
 **`终端|结构` 分段与 Stop 在任何宽度下都不截断、不折行、不进 ⋯ 溢出菜单**（D-040 (2)）：另一个视图是一等主控件（报告 §10-19 要求做成主分段），不是可收纳的设置项；「一键回终端且不 fork」必须在最窄宽度下仍然一键可达。热区与字形尺寸见 §3.4。
 

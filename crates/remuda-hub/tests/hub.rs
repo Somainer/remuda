@@ -4252,61 +4252,147 @@ async fn same_command_id_changed_top_level_anchor_index_conflicts() -> Result<()
     Ok(())
 }
 
-/// A same-id retry of `instance.configure` must reproduce the command's
-/// original outcome: a spec merge that failed with 500 fails again on replay
-/// instead of returning a do-nothing `replayed:true`, and a successful
-/// configure's replay keeps the merged spec.
+/// An out-of-i64-range anchor index is cast negative by the first-POST
+/// validator and stored as the position fallback; the identical retry must
+/// apply the same fallback and replay, not 409.
 #[tokio::test]
-async fn configure_replay_reruns_the_spec_merge() -> Result<()> {
+async fn same_command_id_replay_with_out_of_range_anchor_index_matches() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
     let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let sends = Arc::new(AtomicUsize::new(0));
     let (_token, _link) =
-        accepting_node(hub.addr, &enroll, &host_id, "r3-configure", sends.clone()).await?;
+        accepting_node(hub.addr, &enroll, &host_id, "r4-index-range", sends.clone()).await?;
     let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
     let path = format!("/v1/instances/{instance_id}/commands");
 
-    // Wrong-typed effort: the row commits, the spec merge fails to deserialize
-    // EffortSelection and surfaces 500 — both on the first POST and on replay.
+    let (status, _, uploaded) = http(
+        hub.addr,
+        "POST",
+        &format!("/v1/objects?instanceId={instance_id}"),
+        &[("Cookie", &cookie)],
+        Some("range file"),
+    )
+    .await?;
+    assert_eq!(status, 200, "{uploaded}");
+    let object_id = serde_json::from_str::<Value>(uploaded.trim())?["objectId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
     let command_id = remuda_protocol::CommandId::new();
-    let bad = json!({
+    let body = json!({
         "commandId": command_id.as_id().as_str(),
-        "operation": "instance.configure",
-        "payload": { "effort": { "name": 123 } }
+        "operation": "instance.send",
+        "payload": {
+            "text": "huge index",
+            "attachments": [{
+                "objectId": object_id,
+                "index": (i64::MAX as u64) + 1
+            }]
+        }
     })
     .to_string();
     let (status, _, first) =
-        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&bad)).await?;
-    assert_eq!(status, 500, "the merge error must surface: {first}");
-    let (status, _, replay) =
-        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&bad)).await?;
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 200, "{first}");
+    let first: Value = serde_json::from_str(first.trim())?;
     assert_eq!(
-        status, 500,
-        "a configure replay must re-run the merge, not report replayed success: {replay}"
+        first["command"]["payload"]["attachments"][0]["index"],
+        json!(1),
+        "the validator fell back to position 1"
     );
+    let (status, _, replay) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(
+        status, 200,
+        "identical out-of-range retry must replay: {replay}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(replay.trim())?["replayed"],
+        json!(true)
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(sends.load(Ordering::Relaxed), 1);
+    Ok(())
+}
 
-    // A valid configure: first POST merges, replay reports the same outcome
-    // and the spec stays merged exactly once.
-    let ok_id = remuda_protocol::CommandId::new();
-    let good = json!({
-        "commandId": ok_id.as_id().as_str(),
+/// A same-id `instance.configure` replay is read-only: it returns the stored
+/// command without re-running the spec merge, so it can never clobber a
+/// configuration applied by a later command. A first POST whose merge failed
+/// leaves an unmerged stored row; its replay returns that row rather than a
+/// false fresh success.
+#[tokio::test]
+async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (_token, _link) =
+        accepting_node(hub.addr, &enroll, &host_id, "r4-configure", sends.clone()).await?;
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    let path = format!("/v1/instances/{instance_id}/commands");
+
+    // Configure A (id X): model opus.
+    let id_x = remuda_protocol::CommandId::new();
+    let cmd_a = json!({
+        "commandId": id_x.as_id().as_str(),
         "operation": "instance.configure",
         "payload": { "model": "opus" }
     })
     .to_string();
-    let (status, _, body) =
-        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&good)).await?;
+    let (status, _, original) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&cmd_a),
+    )
+    .await?;
+    assert_eq!(status, 200, "{original}");
+    let original: Value = serde_json::from_str(original.trim())?;
+    assert_eq!(original["replayed"], json!(false));
+
+    // Configure B (id Y): model haiku — the newer current configuration.
+    let id_y = remuda_protocol::CommandId::new();
+    let cmd_b = json!({
+        "commandId": id_y.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "model": "haiku" }
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&cmd_b),
+    )
+    .await?;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(
-        serde_json::from_str::<Value>(body.trim())?["replayed"],
-        json!(false)
-    );
-    let (status, _, body) =
-        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&good)).await?;
-    assert_eq!(status, 200, "{body}");
-    let replay: Value = serde_json::from_str(body.trim())?;
+
+    // Replay A: read-only. The stored row X comes back, B's spec survives.
+    let (status, _, replay) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&cmd_a),
+    )
+    .await?;
+    assert_eq!(status, 200, "{replay}");
+    let replay: Value = serde_json::from_str(replay.trim())?;
     assert_eq!(replay["replayed"], json!(true));
+    assert_eq!(
+        replay["command"]["commandId"],
+        json!(id_x.as_id().as_str()),
+        "the replay returns X's stored row, not Y's"
+    );
+    assert_eq!(
+        replay["command"]["payload"]["model"],
+        json!("opus"),
+        "the response carries X's original content"
+    );
     let (status, _, instance) = http(
         hub.addr,
         "GET",
@@ -4318,15 +4404,78 @@ async fn configure_replay_reruns_the_spec_merge() -> Result<()> {
     assert_eq!(status, 200, "{instance}");
     assert_eq!(
         serde_json::from_str::<Value>(instance.trim())?["model"],
-        json!("opus"),
-        "the replay kept the original merge result"
+        json!("haiku"),
+        "replaying A must not clobber B's newer configuration"
+    );
+
+    // Identifier precedence applies to configure too: replaying X with a key
+    // the keyless original never carried is 409, not a read-only success.
+    let cmd_a_other_key = json!({
+        "commandId": id_x.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "model": "opus" },
+        "idempotencyKey": "reconnb-r4-configure-foreign-key"
+    })
+    .to_string();
+    let (status, _, conflict) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&cmd_a_other_key),
+    )
+    .await?;
+    assert_eq!(status, 409, "{conflict}");
+    assert_eq!(
+        serde_json::from_str::<Value>(conflict.trim())?["code"],
+        json!("COMMAND_ID_CONFLICT")
+    );
+
+    // A configure whose first-POST merge failed: the replay is read-only too
+    // — it returns the stored row and applies nothing (no 500 re-run, no
+    // successful merge of the bad payload).
+    let bad_id = remuda_protocol::CommandId::new();
+    let bad = json!({
+        "commandId": bad_id.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "effort": { "name": 123 } }
+    })
+    .to_string();
+    let (status, _, first) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&bad)).await?;
+    assert_eq!(status, 500, "the first merge error must surface: {first}");
+    let (status, _, replay) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&bad)).await?;
+    assert_eq!(
+        status, 200,
+        "a replay returns the stored row, it does not re-run the merge: {replay}"
+    );
+    let replay: Value = serde_json::from_str(replay.trim())?;
+    assert_eq!(replay["replayed"], json!(true));
+    assert_eq!(replay["command"]["state"], json!("queued"), "{replay}");
+    assert_eq!(replay["command"]["forwarded"], json!(false), "{replay}");
+    let (status, _, instance) = http(
+        hub.addr,
+        "GET",
+        &format!("/v1/instances/{instance_id}"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{instance}");
+    let instance: Value = serde_json::from_str(instance.trim())?;
+    assert_eq!(
+        instance["model"],
+        json!("haiku"),
+        "the failed configure's replay applies nothing"
     );
     Ok(())
 }
 
-/// Idempotency-key precedence on the same-id send shortcut: a key bound to a
-/// DIFFERENT row makes the retry 409 even though the commandId and payload
-/// match; the row's own key and an unbound key replay.
+/// Idempotency-key precedence on the same-id send shortcut: the key is part
+/// of the command's identity. A replay may omit the key, but ANY key that
+/// differs from the one stored with the commandId — bound elsewhere or merely
+/// unused — is 409.
 #[tokio::test]
 async fn command_id_replay_enforces_idempotency_key_precedence() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
@@ -4450,16 +4599,16 @@ async fn command_id_replay_enforces_idempotency_key_precedence() -> Result<()> {
         json!(true)
     );
 
-    // A replay with a brand-new, unbound key is allowed (the key names no
-    // other command), matching queue_command's insert-time precedence.
+    // A replay with a different, otherwise-unused key is still a different
+    // request identity -> 409 (even though K2 binds no other command yet).
     let body_c_fresh_key = json!({
         "commandId": id_c.as_id().as_str(),
         "operation": "instance.send",
         "payload": { "text": "payload r" },
-        "idempotencyKey": "reconnb-r3-key-unbound"
+        "idempotencyKey": "reconnb-r4-key-unused"
     })
     .to_string();
-    let (status, _, replay) = http(
+    let (status, _, conflict) = http(
         hub.addr,
         "POST",
         &path,
@@ -4467,10 +4616,56 @@ async fn command_id_replay_enforces_idempotency_key_precedence() -> Result<()> {
         Some(&body_c_fresh_key),
     )
     .await?;
+    assert_eq!(
+        status, 409,
+        "a different unused key on a keyed command's replay must conflict: {conflict}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(conflict.trim())?["code"],
+        json!("COMMAND_ID_CONFLICT")
+    );
+
+    // Replaying the keyed command WITHOUT a key is fine.
+    let body_c_no_key = json!({
+        "commandId": id_c.as_id().as_str(),
+        "operation": "instance.send",
+        "payload": { "text": "payload r" }
+    })
+    .to_string();
+    let (status, _, replay) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&body_c_no_key),
+    )
+    .await?;
     assert_eq!(status, 200, "{replay}");
     assert_eq!(
         serde_json::from_str::<Value>(replay.trim())?["replayed"],
         json!(true)
+    );
+
+    // And supplying a key on a command originally stored WITHOUT one also
+    // conflicts — the original had no such identity component.
+    let body_a_with_key = json!({
+        "commandId": id_a.as_id().as_str(),
+        "operation": "instance.send",
+        "payload": payload_a,
+        "idempotencyKey": "reconnb-r4-key-on-keyless"
+    })
+    .to_string();
+    let (status, _, conflict) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&body_a_with_key),
+    )
+    .await?;
+    assert_eq!(
+        status, 409,
+        "adding a key to a keyless command must conflict: {conflict}"
     );
     Ok(())
 }

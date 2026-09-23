@@ -12,6 +12,14 @@ export const COMPACT_WORKBENCH_QUERY =
  */
 export const COARSE_POINTER_QUERY = "(pointer: coarse) and (hover: none)";
 
+/**
+ * c-mfix round 2: only treat the band as keyboard-compact once it lost at
+ * least this many px of height. Both acceptance keyboards clear it (iPhone 15
+ * 336 / iPhone SE 260); transient scroll rubber-banding and small browser-chrome
+ * moves do not.
+ */
+const KEYBOARD_MIN_HEIGHT_PX = 120;
+
 export function useWorkbenchViewport() {
   const [mobile, setMobile] = useState(() =>
     typeof window === "undefined" ? false : window.matchMedia(COMPACT_WORKBENCH_QUERY).matches,
@@ -37,16 +45,28 @@ export function useWorkbenchViewport() {
       setHeight(nextHeight);
       setOffsetTop(nextOffset);
     };
+    // Collapse non-essential chrome while the soft keyboard owns the lower
+    // part of the band: install banner, the exited-session resume row, the
+    // run-details disclosure, the annotation dock, task/notifications strips
+    // hide; the live status strip compresses to one line (keyboardCompact.css).
+    // The composer and transcript are never collapsed.
+    const setKeyboard = (active: boolean) => {
+      if (active) document.documentElement.dataset.keyboard = "1";
+      else delete document.documentElement.dataset.keyboard;
+    };
     const update = () => {
-      setMobile(media.matches);
+      const isCompact = media.matches;
+      setMobile(isCompact);
       setCoarsePointer(coarse.matches);
       const viewport = window.visualViewport;
       if (!viewport) {
         apply(window.innerHeight, 0);
+        setKeyboard(false);
         return;
       }
       if (viewport.scale !== 1) {
         apply(window.innerHeight, 0);
+        setKeyboard(false);
         return;
       }
       // c-mfix: do NOT window.scrollTo(0, 0) here. While the keyboard opens,
@@ -55,6 +75,10 @@ export function useWorkbenchViewport() {
       // under the keyboard. The shell is position:fixed to the visual band
       // now, so it never depends on document scroll anyway.
       apply(viewport.height, viewport.offsetTop || 0);
+      // iOS raises offsetTop with the keyboard; Android-style resize leaves
+      // it 0 but still loses the height — either geometry is enough here.
+      const lost = window.innerHeight - viewport.height;
+      setKeyboard(Boolean(isCompact && lost >= KEYBOARD_MIN_HEIGHT_PX));
     };
     update();
     media.addEventListener("change", update);
@@ -70,6 +94,7 @@ export function useWorkbenchViewport() {
       window.visualViewport?.removeEventListener("scroll", update);
       document.documentElement.style.removeProperty("--workbench-height");
       document.documentElement.style.removeProperty("--workbench-top");
+      document.documentElement.removeAttribute("data-keyboard");
     };
   }, []);
 

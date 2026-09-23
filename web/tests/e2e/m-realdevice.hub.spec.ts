@@ -42,17 +42,19 @@ const shotDir = evidence
 async function shot(page: Page, name: string, clipToBand = false) {
   if (!evidence) return;
   await mkdir(shotDir, { recursive: true });
-  // A full-page capture still shows the layout viewport's off-band strip
-  // above the keyboard; clip to the visualViewport band so the evidence is
-  // the picture the phone screen actually displays.
-  const clip = clipToBand
-    ? await page.evaluate(() => ({
-        x: 0,
-        y: window.visualViewport.offsetTop,
-        width: 390,
-        height: window.visualViewport.height,
-      }))
-    : undefined;
+  // Evidence stays at the 390px phone width: clip from the centre on the
+  // 393px device, and use the whole width on narrower devices. Band shots clip
+  // vertically to the visualViewport band; the off-band layout strip is not
+  // part of what the phone displays.
+  const clip = await page.evaluate((bandOnly) => {
+    const x = Math.max(0, Math.round((window.innerWidth - 390) / 2));
+    return {
+      x,
+      y: bandOnly ? window.visualViewport.offsetTop : 0,
+      width: Math.min(390, window.innerWidth),
+      height: bandOnly ? window.visualViewport.height : window.innerHeight,
+    };
+  }, clipToBand);
   await page.screenshot({ path: path.join(shotDir, name), animations: "disabled", clip });
 }
 
@@ -182,8 +184,28 @@ async function raiseKeyboard(page: Page, keyboardHeight = 308) {
   await page.waitForTimeout(250);
 }
 
-async function bandRect(page: Page, selector: string) {
-  return page.evaluate((sel) => {
+/**
+ * The exact soft-keyboard sequence the coordinator's verifier uses on a real
+ * iPhone: the LAYOUT viewport keeps its size (innerHeight unchanged), the
+ * visual viewport keeps its width with bottom pinned (height shrinks,
+ * offsetTop = keyboard height), iOS scrolls the layout viewport to reveal the
+ * focused input, then the three listeners fire in this order.
+ */
+async function raiseKeyboardIosExact(page: Page, kb: number) {
+  await page.evaluate((KB) => {
+    const vv = window.visualViewport;
+    const h = window.innerHeight - KB;
+    Object.defineProperty(vv, "height", { configurable: true, get: () => h });
+    Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => KB });
+    window.scrollTo(0, KB);
+    vv.dispatchEvent(new Event("resize"));
+    vv.dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("resize"));
+  }, kb);
+  await page.waitForTimeout(300);
+}
+
+async function bandRect(page: Page, selector: string) {  return page.evaluate((sel) => {
     const el = document.querySelector(sel);
     if (!el) return null;
     const r = el.getBoundingClientRect();
@@ -454,4 +476,163 @@ test("(c) model/effort observations render as change records, never as 未识别
   // Provenance honesty: the raw payload is still one disclosure away.
   await modelRow.locator("summary").click();
   await expect(page.getByTestId("observed-change-json").last()).toContainText("e2e/fast");
+});
+
+test.describe("(d) full chrome combo: keyboard up keeps the composer and a >=40% transcript", () => {
+  // The owner's real session, reproduced by the fake-Node `mfix-chrome-combo`
+  // sentinel: install banner still up, instance exited-but-resumable, run
+  // details present, a running AskUserQuestion tool with a stalled hook tier
+  // and the screen spinner keeping the strip live.
+  for (const [label, width, height, kb] of [
+    ["iPhone 15", 393, 659, 336],
+    ["iPhone SE", 375, 667, 260],
+  ] as const) {
+    test(`${label} ${width}x${height} with a ${kb}px keyboard`, async ({ page }) => {
+      if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+      await page.setViewportSize({ width, height });
+      const id = await createClaudeSession(page, "mfix-chrome-combo");
+      await clearApprovals(page, id);
+      await page.goto(`/s/${id}/structured`);
+      const sessionPage = page.getByTestId("session-page");
+      await expect(sessionPage).toHaveAttribute("data-view", "structured");
+
+      // Trigger absence → the Node answered like an ordinary echo session.
+      const comboReady = await page
+        .getByTestId("resume-row")
+        .waitFor({ state: "visible", timeout: 12_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!comboReady) test.skip(true, "fake Node lacks the mfix-chrome-combo sentinel");
+
+      // The chrome combination the owner saw.
+      await expect(sessionPage).toHaveAttribute("data-status", "exited");
+      await expect(page.getByTestId("resume-row")).toBeVisible();
+      await expect(page.getByTestId("run-details")).toBeVisible();
+      const strip = page.getByTestId("live-status-strip");
+      await expect(strip).toBeVisible();
+      await expect(strip).toHaveAttribute("data-phase", "tool-started");
+      // The backdated hook record is past the 3x-cadence stall budget.
+      await expect(page.getByTestId("live-health-hook")).toHaveAttribute("data-reason", "stalled");
+      // The iOS install offer is the banner the owner had not dismissed. WebKit
+      // iPhone surfaces beforeinstallprompt-style criteria; headless Chromium
+      // does not offer, so treat it as a precondition, not a requirement.
+      const installBar = page.getByTestId("install-bar");
+      const installVisible = await installBar.isVisible().catch(() => false);
+      // The running tool content is the latest transcript content.
+      await expect(page.getByTestId("transcript")).toContainText("AskUserQuestion");
+
+      // Focus first, then raise the keyboard exactly the way iOS (and the
+      // coordinator's verifier) does — layout viewport unchanged. The
+      // composer is disabled in the exited state (as in the owner's session)
+      // but still visible and tappable on the phone; force the focus.
+      await page.getByTestId("composer-input").click({ force: true });
+      if (evidence) {
+        // Evidence on the owner's iPhone 15 only; the SE case shares
+        // the same layout path at 375px.
+        if (width === 393) await shot(page, "m-realdevice-5-chrome-keyboard-down-390.png");
+      }
+      await raiseKeyboardIosExact(page, kb);
+
+      const band = await page.evaluate(() => ({
+        top: Math.round(window.visualViewport.offsetTop),
+        bottom: Math.round(window.visualViewport.offsetTop + window.visualViewport.height),
+        height: Math.round(window.visualViewport.height),
+      }));
+      expect(band.height).toBe(height - kb);
+      await expect(page.locator("html")).toHaveAttribute("data-keyboard", "1");
+
+      // Non-essential chrome is collapsed.
+      for (const gone of [
+        "install-bar",
+        "resume-row",
+        "run-details",
+        "annotation-dock",
+        "task-track",
+        "session-notifications",
+      ]) {
+        const box = await page.getByTestId(gone).count();
+        if (box > 0) {
+          // Mounted but display:none is the contract.
+          await expect(page.getByTestId(gone)).toBeHidden();
+        }
+      }
+      // The strip is a single line.
+      await expect(strip).toBeVisible();
+      const stripBox = await strip.boundingBox();
+      expect(stripBox).toBeTruthy();
+      expect(stripBox!.height).toBeLessThanOrEqual(34);
+
+      // (1) Composer — textarea AND its send control — entirely in band.
+      // One in-page measurement pass: boundingBox() can transiently answer
+      // null mid React re-render even while the element is laid out.
+      const boxes = await page.evaluate(() => {
+        const rect = (el: Element | null) => {
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) };
+        };
+        const form = document.querySelector("[data-testid='composer']");
+        const send = [...(form?.querySelectorAll("button") ?? [])].find((b) =>
+          (b.textContent ?? "").includes("发送"),
+        );
+        return {
+          composer: rect(form),
+          input: rect(document.querySelector("[data-testid='composer-input']")),
+          send: rect(send ?? null),
+        };
+      });
+      for (const [name, box] of Object.entries(boxes) as [string, typeof boxes.composer][]) {
+        expect(box, `${name} mounted`).not.toBeNull();
+        expect(box!.top, `${name} top`).toBeGreaterThanOrEqual(band.top - 1);
+        expect(box!.bottom, `${name} bottom`).toBeLessThanOrEqual(band.bottom + 1);
+      }
+
+      // (2) Transcript keeps >= 40% of the band and shows the latest content.
+      const tBox = await bandRect(page, "[data-testid='transcript']");
+      expect(tBox, "transcript mounted").not.toBeNull();
+      expect(tBox!.top).toBeGreaterThanOrEqual(band.top - 1);
+      expect(tBox!.bottom).toBeLessThanOrEqual(band.bottom + 1);
+      expect(tBox!.height, `transcript ${tBox!.height} vs band ${band.height}`).toBeGreaterThanOrEqual(
+        band.height * 0.4 - 1,
+      );
+
+      // Pinned to the bottom and painting content there = latest message
+      // visible, not a blank flex remainder.
+      const painted = await page.evaluate(() => {
+        const root = document.querySelector<HTMLElement>("[data-testid='transcript']");
+        if (!root) return { pinned: false, contentAtBottom: false };
+        const pinned = root.scrollTop + root.clientHeight >= root.scrollHeight - 4;
+        const x = Math.round(root.getBoundingClientRect().left + root.clientWidth / 2);
+        const y = Math.round(root.getBoundingClientRect().bottom - 12);
+        const hit = document.elementFromPoint(x, y)?.closest("[data-testid='transcript']");
+        return { pinned, contentAtBottom: hit === root || root.contains(hit) };
+      });
+      expect(painted.pinned, "transcript pinned to latest content").toBe(true);
+      expect(painted.contentAtBottom, "transcript paints content at its bottom edge").toBe(true);
+
+      if (evidence) {
+        if (width === 393) await shot(page, "m-realdevice-6-chrome-keyboard-up-390.png", true);
+        // Mechanical BEFORE: the collapse is driven entirely by the attribute;
+        // remove it (geometry unchanged) to capture the pre-fix layout.
+        await page.evaluate(() => document.documentElement.removeAttribute("data-keyboard"));
+        await page.waitForTimeout(200);
+        if (width === 393) await shot(page, "m-realdevice-7-chrome-keyboard-up-nocollapse-390.png", true);
+        await page.evaluate(() => {
+          document.documentElement.dataset.keyboard = "1";
+        });
+      }
+
+      // Keyboard closes: every piece of chrome comes back.
+      await page.evaluate(() => {
+        const vv = window.visualViewport;
+        Object.defineProperty(vv, "height", { configurable: true, get: () => window.innerHeight });
+        Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => 0 });
+        vv.dispatchEvent(new Event("resize"));
+        window.dispatchEvent(new Event("resize"));
+      });
+      await expect(page.getByTestId("run-details")).toBeVisible();
+      if (installVisible) await expect(page.getByTestId("install-bar")).toBeVisible();
+      await expect(page.getByTestId("resume-row")).toBeVisible();
+    });
+  }
 });

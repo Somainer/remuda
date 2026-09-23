@@ -1,0 +1,60 @@
+/*
+ * c-mfix round 2: soft-keyboard chrome collapse.
+ *
+ * While a compact viewport has the soft keyboard up (lib/viewport.ts stamps
+ * <html data-keyboard="1"> from the visualViewport shrink), the visible band
+ * on a phone can be ~320 px tall. Non-essential chrome is collapsed so the
+ * two things the operator needs keep the band: the conversation (the
+ * transcript flex area stays >= 40%) and the whole composer. The composer and
+ * transcript are never targeted here; with the keyboard down nothing in this
+ * file applies.
+ *
+ * Selectors use stable testids (the components' CSS-module hashes are not
+ * reachable from a global stylesheet), all scoped to the html attribute.
+ */
+
+html[data-keyboard="1"] [data-testid="install-bar"],
+html[data-keyboard="1"] [data-testid="resume-row"],
+html[data-keyboard="1"] [data-testid="run-details"],
+html[data-keyboard="1"] [data-testid="annotation-dock"],
+html[data-keyboard="1"] [data-testid="task-track"],
+html[data-keyboard="1"] [data-testid="session-notifications"] {
+  display: none !important;
+}
+
+/* Status strip: one clipped line — phase dot + tool, the hook health note.
+   Timer/token/tier/spinner phrase/Esc fold away until the keyboard closes;
+   Esc stays available from the composer affordances, and the transcript row
+   keeps every status detail. */
+html[data-keyboard="1"] [data-testid="live-status-strip"] {
+  flex-wrap: nowrap;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  gap: 8px;
+}
+
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-verb"],
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-elapsed"],
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-token-count"],
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-tier"],
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-phrase"],
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-decided-by"],
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid="live-interrupt"] {
+  display: none;
+}
+
+html[data-keyboard="1"] [data-testid="live-status-strip"] [data-testid^="live-health-"] {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The dock's 12px padding + 12px gaps were sized for the full-height layout;
+   in the keyboard band the same strip-to-composer rhythm costs ~40px the
+   transcript needs. Tighten both — the composer's own rows keep their 44px
+   hit heights, only the wrapper spacing shrinks. */
+html[data-keyboard="1"] [data-testid="session-dock"] {
+  padding: 4px 12px;
+  gap: 4px;
+}

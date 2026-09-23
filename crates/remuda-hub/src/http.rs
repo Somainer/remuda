@@ -12,6 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 #[derive(Deserialize)]
@@ -1954,21 +1956,41 @@ pub async fn post_command(
         &mut payload,
     )
     .await?;
-    // Same-id client retry (protocol §2.5: a retry keeps its id). The lookup
-    // runs BEFORE attachment resolution (G3): a message re-sent after its
-    // attachment expired must come back as the original row, not a 400. A
-    // still-queued, never-forwarded row is forwarded now that the retry proves
-    // the caller is back (G1).
-    if let Some(command_id) = body.command_id.as_deref()
+    // Same-id client retry of a send (protocol §2.5: a retry keeps its id).
+    // The shortcut is `instance.send`-only: other operations (notably
+    // `instance.configure`) must re-run their post-queue side effects through
+    // the normal path below, so a replay reports the original outcome instead
+    // of a fresh success that did nothing.
+    if body.operation == "instance.send"
+        && let Some(command_id) = body.command_id.as_deref()
         && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
     {
-        let command = if retry_matches_row(&existing, &body.operation, &instance_id, &payload) {
-            forward_unforwarded_retry(&state, existing).await?
-        } else {
+        // Identifier identity first: the executable payload must match, and a
+        // supplied idempotency key must be unbound or bound to this same row.
+        if !retry_matches_row(&existing, &body.operation, &instance_id, &payload) {
             return Err(HubError::Conflict(
                 "commandId reused with a different payload".into(),
             ));
-        };
+        }
+        if let Some(key) = body.idempotency_key.as_deref()
+            && let Some(bound) = command_for_idempotency_key(&state, key).await?
+            && (bound.command_id != existing.command_id
+                || !retry_matches_row(&bound, &body.operation, &instance_id, &payload))
+        {
+            return Err(HubError::Conflict(
+                "idempotency key reused with a different command".into(),
+            ));
+        }
+        // A row that never went out is not "already delivered": its objects
+        // must still be live exactly as a fresh send requires (the host can
+        // spend longer offline than OBJECT_TTL). Expired references get the
+        // same 400 here; the client resends with fresh uploads under a new
+        // commandId. Already-forwarded rows skip this and replay regardless.
+        if !existing.forwarded && existing.state == "queued" {
+            crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload)
+                .await?;
+        }
+        let command = forward_unforwarded_retry(&state, existing).await?;
         return Ok(Json(json!({ "command": command, "replayed": true })));
     }
     if body.operation == "instance.send" {
@@ -2043,39 +2065,60 @@ fn send_message_text(payload: &Value) -> Option<String> {
     }
 }
 
-/// Project one `attachments` field in place for replay comparison. Null and
-/// empty arrays are dropped (the first-POST validator strips them, so a stored
-/// row lacks the key); arrays become arrays of trimmed objectIds; any other
-/// shape is left untouched because it cannot be a shape the Hub stored, so it
-/// must mismatch.
-fn normalize_attachments_field(object: &mut serde_json::Map<String, Value>, key: &str) {
-    let projected = match object.get(key) {
+/// Canonical form of one top-level attachments array entry for replay
+/// comparison: the trimmed `objectId` plus the EFFECTIVE anchor index.
+///
+/// The first-POST validator rewrites top-level entries to resolved manifests
+/// and, for both sides, the effective index is the client's `index` when it is
+/// a positive integer, else the 1-based array position
+/// (`objects::validate_send_attachments`). Those are the only two client
+/// fields that survive validation — kind/mediaType/name/size/digest in the
+/// stored manifest derive from the object itself, and unknown client fields
+/// are discarded — so they are the only two compared. A missing/blank
+/// `objectId` projects to null and can never match a stored manifest.
+fn canonical_top_level_attachment(position: usize, entry: &Value) -> Value {
+    let object_id = entry
+        .get("objectId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let index = entry
+        .get("index")
+        .and_then(Value::as_u64)
+        .filter(|index| *index >= 1)
+        .unwrap_or(position as u64 + 1);
+    json!({ "objectId": object_id, "index": index })
+}
+
+/// Project the top-level `attachments` field in place for replay comparison.
+/// Null and empty arrays are dropped (the first-POST validator strips them, so
+/// a stored row lacks the key); arrays become the canonical id+index entries.
+/// Any other shape is left untouched because it cannot be a shape the Hub
+/// stored, so it must mismatch.
+///
+/// `input.attachments` is deliberately NOT projected: the validator never
+/// rewrites that location, so the nested metadata the Node consumes directly
+/// (`kind`, `mediaType`, `name`, `digest`, `index`, …) stays verbatim and any
+/// change to it is a conflict.
+fn normalize_top_level_attachments(object: &mut serde_json::Map<String, Value>) {
+    let projected = match object.get("attachments") {
         None => return,
         Some(Value::Null) => None,
         Some(Value::Array(entries)) => Some(
             entries
                 .iter()
-                .map(|entry| {
-                    match entry
-                        .get("objectId")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|id| !id.is_empty())
-                    {
-                        Some(id) => Value::String(id.to_owned()),
-                        None => Value::Null,
-                    }
-                })
+                .enumerate()
+                .map(|(position, entry)| canonical_top_level_attachment(position, entry))
                 .collect::<Vec<_>>(),
         ),
         Some(_) => return,
     };
     match projected {
-        Some(ids) if !ids.is_empty() => {
-            object.insert(key.to_owned(), Value::Array(ids));
+        Some(entries) if !entries.is_empty() => {
+            object.insert("attachments".to_owned(), Value::Array(entries));
         }
         _ => {
-            object.remove(key);
+            object.remove("attachments");
         }
     }
 }
@@ -2089,24 +2132,21 @@ fn normalize_attachments_field(object: &mut serde_json::Map<String, Value>, key:
 ///   must not be replayed by an Agent-stamped retry);
 /// - the prompt in every shape the Node's `InstanceSendParams::prompt_text`
 ///   reads (`input.text`, a string `input`, `input.blocks`, flattened
-///   `text`/`prompt`) — carried as the full `input` object, so block structure
-///   stays significant;
-/// - delivery mode in both locations (`mode` and `input.mode`);
-/// - `runId` and any other future executable field;
-/// - attachments under either `attachments` or `input.attachments`, projected
-///   to their normalized objectId lists.
+///   `text`/`prompt`) — `input` is carried whole, so block structure and the
+///   nested `mode` / `attachments` metadata stay significant;
+/// - the flattened `mode`, `runId` and any other future executable field;
+/// - nested `input.attachments` verbatim — the Node reads every field there
+///   (kind decides image vs. file delivery);
+/// - top-level `attachments` projected to trimmed id + effective index, the
+///   only fields the first-POST validator leaves client-controlled.
 ///
-/// Only the two rewrites the Hub itself performs on a first POST are
-/// normalized away: the path-inserted `instanceId` and the resolved
-/// attachment manifests (a replay carries raw `{objectId}` references).
+/// The sole rewrites normalized away are the Hub's own: the path-inserted
+/// top-level `instanceId` and the resolved top-level attachment manifests.
 fn normalized_send_payload(payload: &Value) -> Value {
     let mut out = payload.clone();
     if let Some(object) = out.as_object_mut() {
         object.remove("instanceId");
-        normalize_attachments_field(object, "attachments");
-        if let Some(input) = object.get_mut("input").and_then(Value::as_object_mut) {
-            normalize_attachments_field(input, "attachments");
-        }
+        normalize_top_level_attachments(object);
     }
     out
 }
@@ -2181,6 +2221,86 @@ async fn release_forward_intent(
         .get_command(command_id.to_owned())
         .await?
         .ok_or(HubError::NotFound)
+}
+
+/// Load the command row an idempotency key is bound to, if any. Mirrors the
+/// key lookup inside `Store::queue_command` so the same-id send shortcut can
+/// enforce the same precedence without re-entering the insert path.
+async fn command_for_idempotency_key(
+    state: &AppState,
+    key: &str,
+) -> Result<Option<CommandRecord>, HubError> {
+    let command_id: Option<String> = state
+        .store
+        .run_named("command_for_idempotency_key", {
+            let key = key.to_owned();
+            move |conn| match conn.query_row(
+                "SELECT id FROM commands WHERE idempotency_key = ?1",
+                rusqlite::params![key],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(id) => Ok(Some(id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(error) => Err(crate::store::StoreError::from(error)),
+            }
+        })
+        .await?;
+    match command_id {
+        Some(id) => Ok(state.store.get_command(id).await?),
+        None => Ok(None),
+    }
+}
+
+/// In-flight forward attempts keyed by command id. A same-id retry that loses
+/// `mark_forward_intent` waits for the winner's attempt to settle before
+/// reloading the row, so it cannot report a transient `forwarded=1` the
+/// winner's `Ok(None)` release is about to clear. Hub-local state is enough:
+/// the Hub is a single process and the durable guard stays in SQLite.
+static FORWARD_ATTEMPTS: LazyLock<Mutex<HashMap<String, tokio::sync::watch::Sender<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Role acquired at the per-command forward slot.
+enum ForwardSlot {
+    /// This request owns the attempt: it may mark the forward intent and make
+    /// the RPC; the guard settles followers on drop.
+    Leader(ForwardAttempt),
+    /// Another request owns the attempt: wait for its channel to close before
+    /// reading the row.
+    Follower(tokio::sync::watch::Receiver<()>),
+}
+
+/// RAII registration of one forward attempt: dropped when the attempt settles
+/// (including via `Ok(None)` release), which closes every follower's channel.
+struct ForwardAttempt {
+    command_id: String,
+}
+
+/// Acquire the per-command slot BEFORE the SQLite forward-intent mark, so a
+/// concurrent loser is guaranteed to be registered as a follower before the
+/// winner can mark and release the intent.
+fn acquire_forward_slot(command_id: String) -> ForwardSlot {
+    let mut attempts = FORWARD_ATTEMPTS.lock().expect("forward attempts lock");
+    if let Some(tx) = attempts.get(&command_id) {
+        return ForwardSlot::Follower(tx.subscribe());
+    }
+    let (tx, _rx) = tokio::sync::watch::channel(());
+    attempts.insert(command_id.clone(), tx);
+    ForwardSlot::Leader(ForwardAttempt { command_id })
+}
+
+impl Drop for ForwardAttempt {
+    fn drop(&mut self) {
+        let mut attempts = FORWARD_ATTEMPTS.lock().expect("forward attempts lock");
+        attempts.remove(&self.command_id);
+        // The watch sender drops here; followers' `changed()` resolves closed.
+    }
+}
+
+/// Wait (bounded by the RPC accept deadline plus slack) for an in-flight
+/// forward attempt on this command to settle, so the subsequent row read sees
+/// the terminal `forwarded`/`resolution`, not a transient intent.
+async fn await_forward_attempt(mut rx: tokio::sync::watch::Receiver<()>, timeout: Duration) {
+    let _ = tokio::time::timeout(timeout, rx.changed()).await;
 }
 
 fn journal_text(text: &str) -> String {
@@ -2826,17 +2946,45 @@ pub(crate) async fn forward_if_online(
     if !host_online {
         return Ok(command);
     }
-    let first = state
-        .store
-        .mark_forward_intent(command.command_id.clone())
-        .await?;
-    if !first {
-        return state
-            .store
-            .get_command(command.command_id.clone())
-            .await?
-            .ok_or(HubError::NotFound);
-    }
+    // Serialize in-process forward attempts per command: a loser waits for the
+    // winner's attempt to fully settle (including an `Ok(None)` intent release)
+    // before reading the row, so it never reports a transient `forwarded=1`
+    // that is about to be cleared. The durable guard remains the SQLite mark.
+    let deadline = Duration::from_millis(
+        state
+            .config
+            .command_accept_timeout_ms
+            .max(1)
+            .saturating_add(500),
+    );
+    let _forward_attempt = match acquire_forward_slot(command.command_id.clone()) {
+        ForwardSlot::Follower(rx) => {
+            await_forward_attempt(rx, deadline).await;
+            return state
+                .store
+                .get_command(command.command_id.clone())
+                .await?
+                .ok_or(HubError::NotFound);
+        }
+        ForwardSlot::Leader(attempt) => {
+            let first = state
+                .store
+                .mark_forward_intent(command.command_id.clone())
+                .await?;
+            if !first {
+                // Durably forwarded before this process slot existed (an
+                // already-terminal row): no follower could have joined the new
+                // slot, and dropping the guard releases any that did.
+                drop(attempt);
+                return state
+                    .store
+                    .get_command(command.command_id.clone())
+                    .await?
+                    .ok_or(HubError::NotFound);
+            }
+            attempt
+        }
+    };
     // A forwarded non-create command now has resolution `unknown`. There is
     // deliberately no Hub-side ack deadline that settles it: a forward intent
     // exists, so §2.5 forbids expiring or rejecting the command without asking
@@ -3219,5 +3367,62 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
 impl crate::store::StoreError {
     fn clone_as_internal(&self) -> Self {
         crate::store::StoreError::Id(self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod forward_slot_tests {
+    use super::*;
+
+    /// A follower must block while the leader's attempt is open and be
+    /// released exactly when the leader's guard drops — so a losing retry
+    /// reads the row only after an `Ok(None)` release has landed.
+    #[tokio::test]
+    async fn follower_waits_until_the_leader_attempt_settles() {
+        let command_id = "cmd_slot_unit_fixture".to_string();
+
+        let leader = acquire_forward_slot(command_id.clone());
+        assert!(
+            matches!(leader, ForwardSlot::Leader(_)),
+            "first acquirer leads"
+        );
+        let follower_rx = match acquire_forward_slot(command_id.clone()) {
+            ForwardSlot::Follower(rx) => rx,
+            ForwardSlot::Leader(_) => panic!("second acquirer must follow"),
+        };
+
+        // Still open: the follower does not settle.
+        let pending = tokio::time::timeout(Duration::from_millis(50), async {
+            let mut rx = follower_rx.clone();
+            rx.changed().await
+        })
+        .await;
+        assert!(
+            pending.is_err(),
+            "follower must wait while the attempt is open"
+        );
+
+        // Leader settles (guard drop, as happens after intent release): the
+        // follower is released promptly.
+        drop(leader);
+        let settled = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut rx = follower_rx;
+            rx.changed().await
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "follower must be released when the leader settles"
+        );
+
+        // The slot is leader-vacant again for a later retry's new attempt.
+        assert!(matches!(
+            acquire_forward_slot(command_id),
+            ForwardSlot::Leader(_)
+        ));
+        // Drop this last guard so the shared map stays clean.
+        if let ForwardSlot::Leader(guard) = acquire_forward_slot("cmd_slot_other".to_owned()) {
+            drop(guard);
+        }
     }
 }

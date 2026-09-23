@@ -1376,7 +1376,12 @@ class HubStore {
       effort: { ...this.state.effort, [createdId]: effort },
       models: { ...this.state.models, [createdId]: spec.model },
     });
-    await this.refresh();
+    // Do not gate navigation on the list refresh: the create response already
+    // carries the instance the new /s/:id route mounts, and the follow socket
+    // delivers the rest. Under gate load awaiting the two refresh GETs here
+    // kept NewSessionPage on /sessions/new past the test's 20 s window even
+    // though the create had landed (a retry then passed).
+    void this.refresh().catch(() => undefined);
     return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
 
@@ -1420,10 +1425,19 @@ class HubStore {
             : b,
         ),
       });
-      await this.catchup(instanceId);
+      // Settle the bubble from events the live follow socket has already
+      // delivered, then return — the POST landing is what callers await (the
+      // 插队 receipt is raised on this resolution and the gate's steer test
+      // polls the wire then waits 5 s for that chip). The bounded
+      // reconciliation below must not be part of that latency: under gate
+      // load its HTTP chain (journal backfill + refresh + screen read) can
+      // take longer than the 5 s wait, even though the interrupt actually
+      // landed. The live socket and this background catch-up converge the
+      // same state.
       const events = this.state.events[instanceId] ?? [];
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
-      await this.refreshScreen(instanceId).catch(() => undefined);
+      void this.catchup(instanceId).catch(() => undefined);
+      void this.refreshScreen(instanceId).catch(() => undefined);
       return true;
     } catch {
       // Keep `commandId: null`. The bubble is 「状态待确认」: no command id

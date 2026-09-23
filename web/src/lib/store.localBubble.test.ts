@@ -214,3 +214,68 @@ it("settles by the journal observation carrying the same commandId, even with id
   expect(hubStore.getSnapshot().bubbles).toHaveLength(count);
   expect(hubStore.getSnapshot().bubbles.every((b) => b.state === "settled")).toBe(true);
 });
+
+it("send returns as soon as the POST lands, without awaiting catchup's HTTP chain", async () => {
+  // Gate flake (hub-live "composer queue / steer"): the 插队 receipt is raised
+  // when send() resolves; awaiting the journal backfill + list refresh + screen
+  // read inside that promise made the receipt wait on a reconciliation chain
+  // that under gate load took longer than the UI's 5 s, even though the POST
+  // (the interrupt landing) had already returned. Reconciliation now runs in
+  // the background, so callers resolve on the POST alone.
+  const { api, hubStore } = await fresh();
+  stubPostSend(api);
+  await hubStore.follow(INSTANCE);
+
+  vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_fast", "accepted"));
+  // Every reconciliation read now hangs: the old awaited chain could never
+  // resolve this test; the background chain in the new code simply stays open.
+  vi.spyOn(api, "eventsRead").mockReturnValue(new Promise(() => {}));
+  vi.spyOn(api, "instanceList").mockReturnValue(new Promise(() => {}));
+  vi.spyOn(api, "interactionList").mockReturnValue(new Promise(() => {}));
+
+  let landed: boolean | undefined;
+  void hubStore.send(INSTANCE, "steer prompt").then((value) => {
+    landed = value;
+  });
+  await vi.waitFor(() => expect(landed).toBe(true), { timeout: 2_000 });
+  // The commandId emit rides the POST response, not the reconciliation.
+  expect(hubStore.getSnapshot().bubbles[0]?.commandId).toBe("cmd_fast");
+});
+
+it("create returns the instance without awaiting the post-create list refresh", async () => {
+  // Gate flake (hub-live "native PTY default"): NewSessionPage navigates only
+  // after create() resolves; the awaited two-GET list refresh after the POST
+  // kept the sheet on /sessions/new under gate load even though the create had
+  // landed. The create response already carries the instance the /s/:id route
+  // mounts, so the refresh is fire-and-forget.
+  const { api, hubStore } = await fresh();
+  const instance = {
+    id: INSTANCE,
+    journalId: JOURNAL,
+    hostId: "hst_1",
+    kind: "claude",
+    driver: "claude-pty",
+    lifecycle: "running",
+  } as Awaited<ReturnType<Api["instanceCreate"]>>["instance"];
+  vi.spyOn(api, "instanceCreate").mockResolvedValue({
+    instance,
+    command: commandResult("cmd_create", "accepted").command,
+  });
+  vi.spyOn(api, "instanceList").mockReturnValue(new Promise(() => {}));
+  vi.spyOn(api, "interactionList").mockReturnValue(new Promise(() => {}));
+
+  let created: typeof instance | undefined;
+  void hubStore
+    .create({
+      hostId: "hst_1",
+      kind: "claude",
+      driver: "claude-pty",
+      model: "e2e/auto",
+      permissionMode: "default",
+      prompt: "p",
+    })
+    .then((value) => {
+      created = value;
+    });
+  await vi.waitFor(() => expect(created?.id).toBe(INSTANCE), { timeout: 2_000 });
+});

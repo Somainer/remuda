@@ -71,9 +71,7 @@ fn profile() -> ProviderProfile {
     }
 }
 
-fn replay_driver(
-    fixture_name: &str,
-) -> (TempDir, ClaudePrintDriver, InstanceSpec, std::path::PathBuf) {
+fn replay_driver(fixture_name: &str) -> (TempDir, ClaudePrintDriver, InstanceSpec) {
     let path = remuda_testing::ensure_workspace_bin("fake-claude-replay");
     assert!(path.is_file(), "missing {}", path.display());
     let pin = BinaryPin {
@@ -86,20 +84,14 @@ fn replay_driver(
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&launch).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    // Unique per driver so concurrent replays never share a status file.
-    let result_file = tmp.path().join(format!("replay-{fixture_name}.status"));
     let mut extra = BTreeMap::new();
     extra.insert(
         "FAKE_CLAUDE_FIXTURE".into(),
         fixture(fixture_name).to_string_lossy().into_owned(),
     );
-    // Strict: the driver-driven replay deep-verifies the whole permission
-    // payload and normalizes only the generated initialize request id.
+    // Strict: the driver-driven replay verifies the whole permission frame and
+    // normalizes only the generated initialize request id.
     extra.insert("FAKE_CLAUDE_STRICT".into(), "1".into());
-    extra.insert(
-        "FAKE_CLAUDE_RESULT_FILE".into(),
-        result_file.to_string_lossy().into_owned(),
-    );
     let mut options = ClaudePrintOptions::new(profile(), launch, home, BinarySource::Pinned(pin));
     options.origin = InputOrigin::Human;
     options.extra_env = extra;
@@ -116,30 +108,22 @@ fn replay_driver(
         mode: ClaudePermissionMode::Plan,
         interaction: ClaudeInteractionMode::Host,
     }));
-    (tmp, ClaudePrintDriver::new(options), spec, result_file)
+    // `tmp` is returned so its lifetime covers the whole driver run.
+    (tmp, ClaudePrintDriver::new(options), spec)
 }
 
-/// Wait for the replay peer's own exit disposition side channel and assert it
-/// exited cleanly (0). A verdict/payload mismatch makes the peer write "1".
-async fn assert_replay_clean_exit(result_file: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(status) = std::fs::read_to_string(result_file) {
-            assert_eq!(
-                status.trim(),
-                "0",
-                "fake-claude-replay exited non-zero (verdict or payload mismatch)"
-            );
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "replay never wrote its exit status at {}",
-                result_file.display()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+/// Assert the child process the driver spawned actually exited with status 0 —
+/// the real OS wait status the driver reaps in close(), not a file the peer
+/// self-reported.
+async fn assert_child_exited_cleanly(driver: &ClaudePrintDriver) {
+    let status = driver
+        .child_exit_status()
+        .await
+        .expect("driver reaped the replay child");
+    assert!(
+        status.success(),
+        "fake-claude-replay exited non-zero (verdict/frame mismatch): {status}"
+    );
 }
 
 fn prompt() -> DriverInput {
@@ -307,7 +291,7 @@ fn plan_answer(
 
 #[tokio::test]
 async fn approving_the_plan_review_runs_the_planned_command() {
-    let (_tmp, driver, spec, result_file) = replay_driver("claude-exit-plan-mode-allow.jsonl");
+    let (_tmp, driver, spec) = replay_driver("claude-exit-plan-mode-allow.jsonl");
     let (mut handle, _, request) = start_and_expect_plan_review(&driver, spec, ALLOW_PLAN).await;
 
     driver
@@ -338,15 +322,15 @@ async fn approving_the_plan_review_runs_the_planned_command() {
             .any(|t| t.contains("plan-approved")),
         "the planned Bash output must appear in its tool_result"
     );
-    // The replay deep-compared the allow payload (exact input, no
-    // updatedPermissions) and exited cleanly.
-    assert_replay_clean_exit(&result_file).await;
     driver.close().await.expect("close");
+    // The replay verified the whole allow frame (exact input, no
+    // updatedPermissions) and its child exited cleanly (real OS status).
+    assert_child_exited_cleanly(&driver).await;
 }
 
 #[tokio::test]
 async fn denying_the_plan_review_feeds_feedback_to_the_model_and_blocks_execution() {
-    let (_tmp, driver, spec, result_file) = replay_driver("claude-exit-plan-mode-deny.jsonl");
+    let (_tmp, driver, spec) = replay_driver("claude-exit-plan-mode-deny.jsonl");
     let (mut handle, _, request) = start_and_expect_plan_review(&driver, spec, DENY_PLAN).await;
 
     driver
@@ -380,8 +364,8 @@ async fn denying_the_plan_review_feeds_feedback_to_the_model_and_blocks_executio
             .any(|t| t.contains("plan-denied")),
         "the planned command output must not appear"
     );
-    assert_replay_clean_exit(&result_file).await;
     driver.close().await.expect("close");
+    assert_child_exited_cleanly(&driver).await;
 }
 
 /// A wrong verdict must be caught by the VCR: deny against the ALLOW fixture
@@ -433,6 +417,8 @@ enum Tamper {
     AddedPermissions,
     /// Correct inner payload, but claim the envelope subtype is an error.
     WrongSubtype,
+    /// Correct type/response, but add an unexpected ROOT field.
+    ExtraRootField,
 }
 
 /// The whole-envelope verification must reject each corruption.
@@ -443,6 +429,7 @@ fn the_replay_rejects_a_corrupted_allow_permission_envelope() {
         Tamper::ChangedInput,
         Tamper::AddedPermissions,
         Tamper::WrongSubtype,
+        Tamper::ExtraRootField,
     ] {
         let status = drive_vcr_tampered(
             &binary,
@@ -517,6 +504,14 @@ fn drive_vcr_tampered(
                         .and_then(Value::as_object_mut)
                         .expect("response object")
                         .insert("subtype".into(), json!("error"));
+                }
+                Tamper::ExtraRootField => {
+                    // type/response stay byte-identical; only an extra root
+                    // key is added, which the complete-frame compare forbids.
+                    frame
+                        .as_object_mut()
+                        .expect("permission frame is an object")
+                        .insert("unexpected".into(), json!(true));
                 }
             }
         }

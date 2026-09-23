@@ -30,6 +30,7 @@
 | D-049 | 2026-09-19 | **手机优先 UI：受限 `/m` 路由树 + 会话本体不分叉 + 视口重定向层 + `start_url: /` + badge/权限横幅口径 + 平台听写真名。** (1) **受限路由树**：同一 Vite PWA 内新增手机优先路由树，`/m` **只拥有导航与首页级信息架构**——`/m`（会话 home）、`/m/inbox`（收件箱）、Jump To sheet、phone 底栏（会话·收件箱(n)·新建·更多）；桌面路由零改动，不做独立客户端、不做原生 app。(2) **会话本体不分叉**：手机打开会话仍是共享的 `/s/:instanceId`（及 `/tty` `/structured` `/files` `/events`），`/sessions/new` `/login` `/pair` `/settings` 同样共享；改善靠该路由的 compact 形态（D-040/D-041/D-042 + ui-spec §4.7 铬预算：一条顶栏 `--top-mobile` 52px + 一条底栏 `--bar` 64px、正文 ≥ 60% 视口、截断优先级=标题→space 芯片→状态文字、状态点恒在主行、`终端\|结构` 分段与 Stop 永不截断/进 ⋯；§1.4 chips 折单芯片 + tabs 行收起；**host 芯片与 cost 仅 compact 折入「运行详情」，D-040 桌面主行规则不变**），不复制 transcript。(3) **重定向与深链**（`<Navigate replace>`）：compact 下 `/sessions`→`/m`、`/approvals?focus=`→`/m/inbox?focus=`（**query 原样保留**）；桌面下 `/m*`→`/sessions`；**`/s/:id` 永不重定向**（两套壳下同一条路由）；`/sessions/new` `/login` `/pair` `/settings` 两侧不重定向。(4) **`start_url` 从 `/sessions` 改为 `/`**，由重定向层按视口判定落点（手机装的 PWA 落 `/m`，桌面落 `/sessions`），一份 manifest、一份 SW。(5) **badge**：推送 payload 增加一个**可选**整数 `badge` 字段（该设备 pending interaction 数），SW 调 `setAppBadge`/`clearAppBadge`，无 Badging API 则什么都不做、不用通知条数冒充，字段缺失行为逐字节不变；**不新增推送事件类型**。(6) **权限申请不在启动时弹**，只在 `/m/inbox` 顶部横幅（用户手势触发）与设置→通知两处；iOS 未加主屏时横幅文案改「先加到主屏幕」。(7) **语音**：平台键盘听写优先、先成文再发送（`composing()` 守卫对听写同样生效）、Web Speech API 仅作可用时增强且默认关、不做云转写/录音上传/协议字段、iOS Safari 无 `SpeechRecognition`（写进设置文案）、终端段不提供语音。(8) **里程碑**：M1 = home、会话、收件箱、新建、登录、语音；键盘条、分组 Jump To、badge 与推送真机验证排 M2。取舍：会话路由 compact 去掉 app 底栏后「回家」靠 44px 返回键 + Jump To（ui-spec §4.7 / 计划风险 E9），若实测反感只回滚该条、不回滚整棵 `/m` 树。 | coordinator（mobile-ui 计划 section (B)/(D) D1–D8 默认值，所有者未拍板即按默认执行；任务 c-mspec 落规格） | [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5（P0 能读能批能说 + 明确不做）、§6（落地顺序）、§7.1（home）、§9（SOTA 一句话「投影不是第二个 agent、终端一键可回不 fork」+「不要抄」清单）、§10-19（主分段）、§10-23（Jump To 不做第二套空间模型）、§11.2（分组/时钟/只搜标题）、§11.3（Inbox 两档、错误当正文、权限横幅）、§11.4（git 扫视串可学、硬裁 diff 不抄）、§11.5（端口/Kill 面板与隧道整体不抄，D-031）；[ui-spec.md §1.2/§1.3/§4.5/§4.6/§4.7/§4.8](./ui-spec.md)；D-026/D-028a/D-031/D-038/D-039/D-040/D-041/D-042；[evidence/mobile-ui-1.md](./evidence/mobile-ui-1.md) |
 
 | D-050 | 2026-09-20 | **Task 优先模型：Task 是 instance 之上的聚合（非第二状态机）；目录绑定 `workspaceBinding{reuse\|pool}` + 唯一新表 `worktree_leases`（`mode`、复合键 `(host_id,workspace_id,dir_key)`、可空 `worktree_name`、`holder_instance_id` attach-lock）；reuse=顺序轮用、归还对目录零操作，pool=detached-HEAD 停放、租借切 `wt/<slot>/<task-slug>`、return-don't-delete（reset/clean/park 仅 pool）；既有回收路径（`remove_record`/`worker.remove_worker`/`delete_instance`/`retire_worker`）必须 lease-aware；看板 8 态→4 列只读投影，failed 按 `placement.is_some()` 归位 + 角标（不存 pre-fail 列），拖卡列→列多跳；门控用 grant 动词（create/set-state=`GrantVerb::Dispatch`、land=`GrantVerb::Land`，持 grant 的协调员 agent 授权，非「agent 一律 403」）；迁移预算=一个增量列 `archived_at`（落 `tasks.rs` migrate）+ 一张新表；批注=composer 草稿（零 wire）；任务空间=文件视图客户端过滤投影（零端点）；参考产品合规护栏（只泛称、开源项目可具名、不引述内部文档、截图只提交 Remuda 渲染） | coordinator（task-model 计划任务 1 t-spec，docs-only） | [task-model.md](./task-model.md) 全文；[ui-spec.md §1.5/§2.9](./ui-spec.md)；[evidence/task-model-1.md](./evidence/task-model-1.md)；D-024/D-033/D-035/D-047/D-049 |
+| D-051 | 2026-09-24 | **委托决策（delegated decisions）：agent 可代人审批，但 plan-review 由 Node 侧 driver 直接铸造。** (1)-(5) Agent 设备经一跳家庭边（self 或直接子实例，`owns()`）可列出/回答非 approval 的交互；approval 永不下放，bypass 双侧排除；开关为 per-project 环境变量（`REMUDA_DELEGATED_DECISIONS`），无 wire/schema 字段；actor 真实化（`AnswerCaller` → committed `ActorRef.instance_id`，c-deleg2 审计链）。**(6) 2026-09-24 修正（取代早先 Hub-fold 设计）**：print/sdk 上 driver 把子代理的 `ExitPlanMode` 原生 `can_use_tool` 暂停铸为 `InteractionRequest::PlanReview`（内联 `plan` 正文 ≤ 32 KiB、sha256 digest、approve/deny、allowFeedback），走既有 Node first-answer-wins CAS；仅顶层（非 sub-agent）、有可回复原生暂停时铸，其余回人类 Approval；正文 inline（加性可选 `PlanReviewRequest.plan`，`planRef` 仅占位，**不写对象表/不新增 `AttachmentKind`/零新 wire enum**）；approve 只 allow 原 input 绝不附 `updatedPermissions`/setMode，deny 用 feedback 回喂模型；plan-review 不吃 `owns()` self 边（child 不能列/答自己的 plan）；Node 不论 carrier 先 `validate_answer`（offered option/请求 revision/digest/feedback 规则）再进 CAS。刮屏 carrier（claude-pty、无 hooks 的 shell-pty）不产生 plan-review；shell-pty+hooks 待真录验证（T2）。真实父子 gateway 轮次待协调员验证。 | 用户 + coordinator（D-051 (6) 修正 2026-09-24；c-deleg1/2/3 实跑证据） | [evidence/delegated-decisions-1.md](./evidence/delegated-decisions-1.md)、[-2](./evidence/delegated-decisions-2.md)、[-3](./evidence/delegated-decisions-3.md)；D-017/D-011；`protocol.md §5.4` |
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
 | D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端恒深色**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 
@@ -944,6 +945,54 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 **由谁**：coordinator（task-model 计划 §(B) 设计与 §(D) D1–D12 推荐默认值，所有者未另行拍板即按默认执行；任务 1 t-spec 落规格，零代码）。
 
 **依据**：[task-model.md](./task-model.md)（由派工计划 §(B)/§(D) 派生的入库设计文档，含全部 file:line 复核）、[ui-spec.md §1.5/§2.9](./ui-spec.md)、[coordinator-hierarchy.md](./coordinator-hierarchy.md)（Project schema §3.2、台账分层）、[files-view-contract.md](./files-view-contract.md)、[coordinator-guide.md](./coordinator-guide.md)（证据/密钥/gate 规则）；代码锚点见 [evidence/task-model-1.md](./evidence/task-model-1.md) §4（全部在 `1468a2ba` 上复核，含两处相对派工计划漂移的记录：`runtime_link.rs` 兜底臂与 `runtime.rs` 的 `NotApplicable` 行）。
+
+## D-051
+
+**日期**：2026-09-22（(1)-(5)）；**(6) 修正 2026-09-24**。
+
+### 委托决策：agent 可代人审批（一跳）；plan-review 由 Node 侧 driver 直接铸造
+
+D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（self 或直接子实例）上代人类回答非 approval 的交互；同时收紧 plan-review：父可以评审子代理的计划，但子不能评审自己的计划。
+
+**(1) Agent 一跳审批（c-deleg1/2）**
+
+- 中间件白名单：Agent 的非 approval pending 交互在 `GET /v1/interactions` 中对 caller instance 为 self 或直接子实例时可见；approval 与 bypass-posture 调用者在中间件与 answer handler 两侧都被拒绝。
+- 答案走**既有** Node first-answer-wins CAS（`interaction.answer` → broker），Hub 不裁决、不翻译。
+- 人仍可从 inbox 回答任何 pending 交互；先到者赢，后到者拿 Superseded。
+- Actor 真实化（c-deleg2）：Node 不再把所有答案的 actor 当 Human，而是用 Hub 盖章的 `origin`/`byInstanceId`/`byDevice` 解析 `AnswerCaller`，committed `ActorRef.instance_id` 记录真实回答者；审计链 answer→command→journal 可重建。
+
+**(2) 开关（无 wire 字段）**
+
+- per-project 环境变量 `REMUDA_DELEGATED_DECISIONS`（truthy 开），经 driver→Node→Hub create spec 传递；不存在 driver 独立设置。
+- 旧行为字节不变（关）；Agent 不可见时产物（journal event、list 投影）与开关无关，只是路由不放行。
+
+**(3) 排除**
+
+- approval 类永不下放给 Agent（D-017 confused deputy）。
+- 任一调用方/目标子任一侧为 bypass 姿态时，Agent 答案在 list 和 answer 两处都被拒。
+- 非一跳（祖父/兄弟）不路由。
+
+**(6) plan-review v2（2026-09-24 修正，取代早先 Hub-fold 设计）**
+
+> 早先（c-deleg3 初版）让 Hub fold-stage 把观察到的 ExitPlanMode 重新铸 plan-review、经 Hub-native broker 与伪造的 plan 对象通道审批。该设计有三个问题：Hub-fold 与 Node 拥有的审批卡两行重复需要 settlement 关联、Hub 需要翻译层与伪造 device、以及引入 plan 对象表/`AttachmentKind`。v2 改为 **driver 在 Node 侧直接铸 PlanReview，走同一条 Node CAS**，全部撤回。
+
+事实基础：Node 的 `InteractionOwner` 按 instance 注册、与 kind 无关；Claude 的 `ExitPlanMode` 在 stream-json 上是一个真正可回复的原生暂停（`can_use_tool`）。真录 fixture（Claude 2.1.277）证明：`allow` 且不带 `updatedPermissions` 时 CLI 自行从 plan 退到 default；`deny.message` 原样作为 `is_error` tool_result 喂给模型。
+
+- **(6a) driver 铸票**：print/sdk 上，仅当①拿到原生 `can_use_tool` 暂停、②该 tool_use 被 mapper 以**顶层**（`parent_tool_use_id == null`）见过（非 sub-agent）、③`input.plan` 是 ≤ 32 KiB 的字符串（空字符串也铸）时，铸 `InteractionRequest::PlanReview{plan, planDigest=sha256(plan), planRevision=1, options=[approve,deny], allowFeedback=true}`。其余（nested/oversized/absent/非 ExitPlanMode）fail-closed 回人类 Approval。
+- **(6b) 正文 inline**：加性可选 `PlanReviewRequest.plan: Option<String>`（serde default），旧读者忽略、新读者缺失为 None；`planRef` 是不解析的占位 id。**不写对象表、不新增 `AttachmentKind`、零新 wire enum**。
+- **(6c) consumer**：approve 只回 allow + 原 input，**绝不附带 `updatedPermissions`/setMode**（CLI 自行 plan→default）；deny 以 reviewer `feedback` 逐字作为 deny message 回喂模型，feedback 为 null（字段缺失）时才用默认 `"plan review denied"`。
+- **(6d) self-exclusion**：plan-review 不吃 `owns()` 的 self 边——child 不能列出或回答自己的 plan review；直接父或人可答。
+- **(6e) 先校验后 CAS**：Node 对 plan-review 答复**不论 carrier**（含 ClaudeControl）一律先跑 `validate_answer`：选项必须是请求 offer 的、revision 必须等于请求的 revision、digest 必须一致、`allow_feedback=false` 时 deny 不得带 feedback、approve 永不带 feedback、feedback ≤ 4096 UTF-8 字节；坏答复不消费 ticket，child 可再答。
+
+**覆盖边界**：仅 print/sdk（唯一有真录证据的可回复原生暂停）。刮屏 carrier（`claude-pty`、无 hooks 的 `shell-pty`）不产生 plan-review；shell-pty+hooks 路径（T2）以真录 hook payload 为门槛，未做。
+
+**撤回（取代早先 Hub-fold 设计）**：Hub fold-stage 生产者、Hub-native plan-review broker、plan 对象表与 GC、PlanReview→Approval 翻译层与伪造 device、Hub relay；该 Hub-fold 原型分支不合并。
+
+**待协调员验证**：真实父子 gateway 轮次（brief §8 验收 2/3：child plan 模式、父 list 看到 plan 正文、approve 后 child 退到 default 执行、deny+feedback 进 transcript、`interaction.answered` 审计 `answeredByLevel=1`、人从 /approvals 作答）需要交互式 gateway 与两个 agent，留待 landing 后在 demo 环境跑；本批用真录 2.1.277 VCR + 真实 broker CAS 单测证明等价链路。
+
+**由谁**：用户 + coordinator（(1)-(5) 用户拍板，c-deleg1/2 实跑；(6) 修正由 coordinator 批准的 plan-review v2 设计，c-deleg3 落地）。
+
+**依据**：[evidence/delegated-decisions-1.md](./evidence/delegated-decisions-1.md)、[-2](./evidence/delegated-decisions-2.md)、[-3](./evidence/delegated-decisions-3.md)；[`protocol.md §5.4`](./protocol.md)（`PlanReviewRequest.plan`）；D-017/D-011。
 
 ## D-052
 

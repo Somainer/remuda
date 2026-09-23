@@ -2165,19 +2165,41 @@ class HubStore {
       const interaction = this.state.interactions.find((i) => i.id === interactionId);
       if (interaction) await this.catchup(interaction.instanceId);
     } catch {
-      // Post-commit sync failure: the broker already accepted the answer.
-      // Leave the card in its submitted/committed state; do not re-enable the
-      // buttons or make the reviewer think the decision was rejected.
-    } finally {
-      const interaction = this.state.interactions.find((i) => i.id === interactionId);
-      const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];
-      const answered = events.some(
-        (ev) => ev.kind === "interaction.answered" && (ev.payload as { interactionId?: Id }).interactionId === interactionId,
-      );
-      if (!interaction || interaction.state !== "pending" || answered) {
-        const { [interactionId]: _removed, ...rest } = this.state.answering;
-        this.emit({ answering: rest });
-      }
+      // Post-commit sync failure: the receipt below settles the card
+      // optimistically; the next authoritative list confirms it.
+    }
+    // Settle the local projection even if the authoritative refresh failed:
+    // if the answer receipt is already in the journal (or the list now shows
+    // a non-pending state), optimistically mark the row answer-committed so
+    // the card leaves the queue instead of re-enabling approve/deny on a
+    // already committed decision. The next successful list refresh confirms it.
+    const interaction = this.state.interactions.find((i) => i.id === interactionId);
+    const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];
+    const receipt = events.find(
+      (ev) =>
+        ev.kind === "interaction.answered" &&
+        (ev.payload as { interactionId?: Id }).interactionId === interactionId,
+    );
+    const authoritativeSettled = interaction && interaction.state !== "pending";
+    // If the row is still pending despite a receipt in the journal (the list
+    // refresh failed or simply has not caught up), optimistically settle it so
+    // the card leaves the queue; the next authoritative list confirms it.
+    if (interaction && interaction.state === "pending" && receipt) {
+      this.emit({
+        interactions: this.state.interactions.map((row) =>
+          row.id === interactionId
+            ? { ...row, state: "answer-committed" as const }
+            : row,
+        ),
+      });
+    }
+    // Clear the answering marker when the card has settled (authoritative
+    // list, receipt-driven optimistic update, or the row is gone). If neither
+    // happened (refresh failed before the receipt landed), leave the marker on
+    // so the card stays submitted rather than re-enabling a committed review.
+    if (!interaction || authoritativeSettled || receipt) {
+      const { [interactionId]: _removed, ...rest } = this.state.answering;
+      this.emit({ answering: rest });
     }
   }
 

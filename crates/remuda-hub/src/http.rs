@@ -2043,34 +2043,81 @@ fn send_message_text(payload: &Value) -> Option<String> {
     }
 }
 
-/// Ordered `objectId` list from an `instance.send` payload's attachments.
-///
-/// The stored row carries resolved attachment manifests and a retried request
-/// carries the client's raw `{objectId}` references; both spell the id under
-/// the same key, so this is the field G3 compares.
-fn attachment_object_ids(payload: &Value) -> Vec<&str> {
-    payload
-        .get("attachments")
-        .and_then(Value::as_array)
-        .map(|entries| {
+/// Project one `attachments` field in place for replay comparison. Null and
+/// empty arrays are dropped (the first-POST validator strips them, so a stored
+/// row lacks the key); arrays become arrays of trimmed objectIds; any other
+/// shape is left untouched because it cannot be a shape the Hub stored, so it
+/// must mismatch.
+fn normalize_attachments_field(object: &mut serde_json::Map<String, Value>, key: &str) {
+    let projected = match object.get(key) {
+        None => return,
+        Some(Value::Null) => None,
+        Some(Value::Array(entries)) => Some(
             entries
                 .iter()
-                .filter_map(|entry| entry.get("objectId").and_then(Value::as_str))
-                .collect()
-        })
-        .unwrap_or_default()
+                .map(|entry| {
+                    match entry
+                        .get("objectId")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    {
+                        Some(id) => Value::String(id.to_owned()),
+                        None => Value::Null,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => return,
+    };
+    match projected {
+        Some(ids) if !ids.is_empty() => {
+            object.insert(key.to_owned(), Value::Array(ids));
+        }
+        _ => {
+            object.remove(key);
+        }
+    }
+}
+
+/// Canonical form of the executable `instance.send` payload used to decide
+/// whether a same-id retry denotes the same command (G3).
+///
+/// Everything the Node interprets survives the projection, so a difference in
+/// ANY of it is a 409 rather than a silently dropped command:
+/// - provenance: the stamped `origin` and `input.origin` (a Human-stored row
+///   must not be replayed by an Agent-stamped retry);
+/// - the prompt in every shape the Node's `InstanceSendParams::prompt_text`
+///   reads (`input.text`, a string `input`, `input.blocks`, flattened
+///   `text`/`prompt`) — carried as the full `input` object, so block structure
+///   stays significant;
+/// - delivery mode in both locations (`mode` and `input.mode`);
+/// - `runId` and any other future executable field;
+/// - attachments under either `attachments` or `input.attachments`, projected
+///   to their normalized objectId lists.
+///
+/// Only the two rewrites the Hub itself performs on a first POST are
+/// normalized away: the path-inserted `instanceId` and the resolved
+/// attachment manifests (a replay carries raw `{objectId}` references).
+fn normalized_send_payload(payload: &Value) -> Value {
+    let mut out = payload.clone();
+    if let Some(object) = out.as_object_mut() {
+        object.remove("instanceId");
+        normalize_attachments_field(object, "attachments");
+        if let Some(input) = object.get_mut("input").and_then(Value::as_object_mut) {
+            normalize_attachments_field(input, "attachments");
+        }
+    }
+    out
 }
 
 /// Whether a same-id retry denotes the same command as the stored row.
 ///
-/// Exact payload equality always counts (a client replaying the row it was
-/// given). For `instance.send` a retry can legitimately differ in wire shape:
-/// the stored row carries Hub-resolved attachment manifests and stamps, while
-/// the retry carries raw attachment references, so after the exact comparison
-/// fails the retry is compared on its semantic fields — message text, `mode`,
-/// and the ordered attachment objectId list (G3). Anything else, including a
-/// retry addressed at another instance or a non-send operation whose payload
-/// changed, is a 409.
+/// `instance.send` rows compare by full normalized executable payload
+/// (prompt in every shape, both mode locations, both attachment locations,
+/// provenance and any other Node-run field). Other operations carry no
+/// Hub-rewritten fields, so they compare exactly. A mismatched operation or
+/// instance path is always a conflict.
 fn retry_matches_row(
     row: &CommandRecord,
     operation: &str,
@@ -2080,18 +2127,10 @@ fn retry_matches_row(
     if row.operation != operation || row.instance_id.as_deref() != Some(instance_id) {
         return false;
     }
-    if row.payload == *payload {
-        return true;
+    if operation == "instance.send" {
+        return normalized_send_payload(&row.payload) == normalized_send_payload(payload);
     }
-    operation == "instance.send"
-        && send_message_text(&row.payload) == send_message_text(payload)
-        && explicit_mode(&row.payload) == explicit_mode(payload)
-        && attachment_object_ids(&row.payload) == attachment_object_ids(payload)
-}
-
-/// The send's `mode`, treating an explicit null the same as an absent field.
-fn explicit_mode(payload: &Value) -> Option<&Value> {
-    payload.get("mode").filter(|mode| !mode.is_null())
+    row.payload == *payload
 }
 
 /// G1: forward a queued row that never had a forward intent when a same-id
@@ -2109,6 +2148,39 @@ async fn forward_unforwarded_retry(
     } else {
         Ok(command)
     }
+}
+
+/// Roll a just-marked forward intent back when the forward proved the Node
+/// never received the frame (`nodes.call` returned `Ok(None)`). The row
+/// returns to `forwarded=0` / `resolution='clear'` while still `queued`, so a
+/// later same-id retry after the host reconnects can forward it exactly once.
+/// Rows that already left `queued` (accepted/settled by a mirrored journal)
+/// are never rewritten.
+async fn release_forward_intent(
+    state: &AppState,
+    command_id: &str,
+) -> Result<CommandRecord, HubError> {
+    state
+        .store
+        .run_named("release_forward_intent", {
+            let command_id = command_id.to_owned();
+            move |conn| {
+                let now = crate::config::now_rfc3339();
+                conn.execute(
+                    "UPDATE commands
+                        SET forwarded = 0, resolution = 'clear', updated_at = ?1
+                      WHERE id = ?2 AND state = 'queued' AND forwarded = 1",
+                    rusqlite::params![now, command_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await?;
+    state
+        .store
+        .get_command(command_id.to_owned())
+        .await?
+        .ok_or(HubError::NotFound)
 }
 
 fn journal_text(text: &str) -> String {
@@ -2712,12 +2784,15 @@ pub async fn list_instance_commands(
 
 /// `GET /v1/instances/{id}/commands/{commandId}`: one command ledger row, so a
 /// reconnecting client can read a send's `state`/`resolution` without
-/// re-POSTing it (G2). Read authorization matches the commands list: Human/Bot
-/// seats reach any instance, while Agent callers are refused at the route
-/// middleware (a commands detail path is not an agent read target) and again
-/// here. The row must belong to the instance named in the path — command ids
-/// are a global ledger, so a mismatch answers 404 rather than leaking another
-/// instance's row.
+/// re-POSTing it (G2). Read authorization matches the journal and commands
+/// list: a Human/Bot device that can read the instance may read its commands,
+/// so separately authenticated same-owner Human devices intentionally share
+/// visibility (there is no per-device command binding, matching journal
+/// reads), while Agent callers are refused at the route middleware (a commands
+/// detail path is not an agent read target) and again here. The row must
+/// belong to the instance named in the path — command ids are a global
+/// ledger, so a mismatch answers 404 rather than leaking another instance's
+/// row.
 pub async fn get_instance_command(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2907,12 +2982,17 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound)
         }
         Ok(None) => {
-            tracing::debug!(command_id = %command.command_id, "node offline at forward; not resent");
-            state
-                .store
-                .get_command(command.command_id.clone())
-                .await?
-                .ok_or(HubError::NotFound)
+            // No live link / pre-send failure: `WssTransport::call` proves the
+            // frame was never queued on the Node. The forward intent this call
+            // marked must therefore be rolled back while the row is still
+            // `queued`, so a later same-id re-POST after the host returns can
+            // forward it. Timeouts and dropped waiters take the Err arm below
+            // and keep the intent, because those frames may already be running.
+            tracing::debug!(
+                command_id = %command.command_id,
+                "node link gone after forward intent; frame never queued; releasing intent"
+            );
+            release_forward_intent(state, &command.command_id).await
         }
 
         Err(err) => {

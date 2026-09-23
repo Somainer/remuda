@@ -291,6 +291,11 @@ async fn observe_one(
     // The raw (requested, observed) pair of a launch read-back divergence, for
     // the status detail. Informational only: it does not change worker state.
     let mut model_divergence: Option<(String, String)> = None;
+    // A later human `/model` (`slash`) or Remuda `instance.configure`
+    // (`remuda`) supersedes the launch read-back: the roster row must drop the
+    // launch divergence it persisted, or `remuda watch` would keep showing the
+    // old pair forever.
+    let mut clear_model_effective = false;
     if let Some(instance_id) = worker.instance_id.as_ref()
         && let Some(record) = state
             .store
@@ -377,6 +382,11 @@ async fn observe_one(
                 model_effective = Some(observed.to_owned());
                 model_divergence = Some((requested.to_owned(), observed.to_owned()));
             }
+        } else if matches!(source, "slash" | "remuda") && observed.is_some() {
+            // The operator intentionally changed the model after launch. The
+            // stale launch divergence (if any was recorded) is no longer the
+            // state of this worker: clear it on the next roster mutation.
+            clear_model_effective = true;
         }
     }
     // The Hub row is authoritative once the instance is terminal: a stale or
@@ -567,10 +577,14 @@ async fn observe_one(
                 row.state = next;
             }
             row.watch = Some(watch);
-            // Report the observed id when it diverged; never clear a divergence
-            // already recorded because this pass could not read the row.
+            // A launch divergence writes the observed id; a later
+            // slash/remuda switch clears it. Both arms run only once the
+            // instance row was read this pass, so a row that could not be read
+            // leaves the recorded value untouched.
             if model_effective.is_some() {
                 row.model_effective = model_effective;
+            } else if clear_model_effective {
+                row.model_effective = None;
             }
             Ok(())
         })

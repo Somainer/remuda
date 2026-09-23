@@ -752,7 +752,7 @@ export function SessionList({
                         // not judge the difference (owner ruling 2026-09-23:
                         // the harness records what runs, it does not decide
                         // whether that is allowed).
-                        const requested = hubStore.modelOf(instance.id, instance.kind);
+                        const requested = hubStore.modelRequestedOf(instance.id, instance.kind);
                         const effective = hubStore.modelEffectiveOf(instance.id);
                         const actual = effective?.id;
                         const differs =

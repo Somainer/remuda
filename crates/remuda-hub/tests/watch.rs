@@ -812,6 +812,24 @@ async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids
     let row = &observed["items"][0];
     assert_eq!(row["state"]["state"], "working", "{row}");
     assert_ne!(row["watch"]["status"], "blocked", "{row}");
+
+    // A later human `/model` switch supersedes the launch read-back: the stale
+    // launch pair must leave the roster row, or `remuda watch` would show it
+    // forever even though the operator intentionally changed the model.
+    ctx.node.append_journal(
+        &instance_id,
+        &[model_edge_event("ark/seed-evolving", "slash")],
+    );
+    // Two asserting passes: the clear, like the divergence, must persist.
+    for _ in 0..2 {
+        let observed = ctx.observe().await;
+        let row = &observed["items"][0];
+        assert!(
+            row.get("modelEffective").is_none(),
+            "a slash switch clears the stale launch modelEffective: {row}"
+        );
+        assert_eq!(row["state"]["state"], "working", "{row}");
+    }
 }
 
 /// A launch honours the pin, and only THEN does the operator reconfigure the

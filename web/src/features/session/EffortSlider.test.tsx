@@ -249,6 +249,41 @@ describe("EffortSlider model read-back display", () => {
     expect(panel).toHaveAttribute("data-model-different", "0");
     expect(screen.queryByTestId("model-option-different")).toBeNull();
   });
+
+  it("renders the incident pair verbatim even though their last segments match", async () => {
+    // The picker folded to the running id (`model`), but the requested half is
+    // the launch spec with its routing prefix. Nothing may shorten the ids.
+    const user = userEvent.setup();
+    const panel = await openPanel({
+      kind: "claude",
+      model: "ark/seed-evolving",
+      modelRequested: "passthrough/ark/seed-evolving",
+      modelEffective: "ark/seed-evolving",
+    });
+    expect(panel).toHaveAttribute("data-model-different", "1");
+    const note = screen.getByTestId("model-option-different");
+    expect(note).toHaveTextContent("passthrough/ark/seed-evolving");
+    expect(note).toHaveTextContent("ark/seed-evolving");
+    // The collapsed chip carries both full strings in its text, raw.
+    await user.click(screen.getByTestId("effort-list-back"));
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("ark/seed-evolving ⇐ passthrough/ark/seed-evolving");
+    expect(chip.getAttribute("title")).toContain("passthrough/ark/seed-evolving");
+    expect(chip.getAttribute("title")).toContain("ark/seed-evolving");
+  });
+
+  it("uses modelRequested, not the folded picker selection, for the pair", async () => {
+    const panel = await openPanel({
+      kind: "claude",
+      // Picker followed a terminal /model fold onto the same id as running...
+      model: "ark/seed-evolving",
+      // ...but the launch spec differed. Without modelRequested the pair would
+      // wrongly collapse to "no difference".
+      modelRequested: "passthrough/ark/seed-evolving",
+      modelEffective: "ark/seed-evolving",
+    });
+    expect(panel).toHaveAttribute("data-model-different", "1");
+  });
 });
 
 describe("EffortSlider tall catalog", () => {

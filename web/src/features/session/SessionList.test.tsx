@@ -45,6 +45,7 @@ vi.mock("../../lib/store", () => ({
     effortOf: () => ({ name: "medium", index: 2, ultracode: false }),
     effortEffectiveOf: () => null,
     modelOf: () => "model_hub/es1_orange_o50[1m]",
+    modelRequestedOf: (id: string) => requestedModel[id] ?? "model_hub/es1_orange_o50[1m]",
     modelEffectiveOf: (id: string) => modelEffective[id] ?? null,
     modelCatalogOf: () => null,
     refreshScreens: vi.fn(),
@@ -67,6 +68,9 @@ const modelEffective: Record<
   string,
   { id: string; source: string; observedAt: string }
 > = {};
+/// Per-instance durable requested model for the requested-vs-running pair.
+/// Absent entries fall back to the dispatch pin the fixture instances carry.
+const requestedModel: Record<string, string> = {};
 
 function host(id: string, label: string) {
   return { id, label, state: "online" };
@@ -116,6 +120,7 @@ beforeEach(() => {
   titles.ins_a = "spill 抖动";
   titles.ins_b = "等待批准";
   for (const key of Object.keys(summaries)) delete summaries[key];
+  for (const key of Object.keys(requestedModel)) delete requestedModel[key];
 });
 
 describe("SessionList empty states", () => {
@@ -306,6 +311,29 @@ describe("SessionList effective-model label", () => {
     // Both ids stay legible in the hover text as well.
     expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o50[1m]");
     expect(label.getAttribute("title")).toContain("model_hub/es1_orange_o48[1m]");
+  });
+
+  // The 2026-09-23 incident pair: the gateway routing prefix is stripped on
+  // forwarding, so the two RAW ids end in the same last segment. Showing
+  // shortened ids would render `seed-evolving ⇐ seed-evolving`; the row must
+  // carry both full strings.
+  it("shows the incident routing-prefix pair verbatim, not shortened", () => {
+    for (const id of ["ins_a", "ins_b"]) {
+      requestedModel[id] = "passthrough/ark/seed-evolving";
+      modelEffective[id] = {
+        id: "ark/seed-evolving",
+        source: "launch",
+        observedAt: "2026-09-23T00:00:00Z",
+      };
+    }
+    renderList();
+    const label = screen.getAllByTestId("session-model")[0];
+    expect(label).toHaveTextContent("passthrough/ark/seed-evolving");
+    expect(label).toHaveTextContent("ark/seed-evolving");
+    // The full text is the textContent, not merely a tooltip.
+    expect(label.textContent).toContain("ark/seed-evolving ⇐ passthrough/ark/seed-evolving");
+    expect(label.getAttribute("title")).toContain("passthrough/ark/seed-evolving");
+    expect(label.getAttribute("title")).toContain("ark/seed-evolving");
   });
 
   // A gateway resolves a catalog id to an upstream vendor name. The strings

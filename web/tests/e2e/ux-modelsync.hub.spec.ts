@@ -197,8 +197,13 @@ test("a typed alias resolving to a different id shows both model strings", async
   const panel = page.getByTestId("effort-slider-panel");
   await expect(panel).toHaveAttribute("data-model-current", "plain");
   await expect(panel).toHaveAttribute("data-model-different", "1");
-  await expect(page.getByTestId("model-option-different")).toContainText("e2e/fast");
-  await expect(page.getByTestId("model-option-different")).toContainText("e2e/plain");
+  // Once the switch settles, the "requested" half is the durable launch spec
+  // the instance was created with — the e2e fake node's default
+  // `passthrough/auto` (its short label is "auto", which is why the first test
+  // reads data-model-current "auto") — never the configure sentinel or the
+  // picker fold. The running half is the resolved id.
+  const note = page.getByTestId("model-option-different");
+  await expect(note).toHaveText("请求 passthrough/auto → 实际 e2e/plain", { timeout: 10_000 });
   await expect(page.getByTestId("model-option-plain")).toHaveAttribute("data-selected", "1");
 });
 

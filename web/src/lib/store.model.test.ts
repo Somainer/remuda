@@ -38,13 +38,14 @@ function subscription(instance: Instance) {
   };
 }
 
-async function startFollowing(idSuffix: string) {
+async function startFollowing(idSuffix: string, launchModel?: string) {
   const original = mockDb.instances[0];
   const instance: Instance = {
     ...original,
     id: `ins_model_store_${idSuffix}`,
     journalId: `obj_model_store_${idSuffix}`,
     kind: "claude",
+    ...(launchModel ? { model: launchModel } : {}),
   };
   vi.spyOn(api, "instanceGet").mockResolvedValue(instance);
   vi.spyOn(api, "eventsRead").mockResolvedValue({
@@ -171,6 +172,41 @@ it("a terminal-side /model moves the picker without posting configure", async ()
   expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("model_hub/es1_orange_o50");
   expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/es1_orange_o50");
   expect(configure).not.toHaveBeenCalled();
+});
+
+it("the requested half keeps the durable launch spec when a live read-back folds the picker", async () => {
+  // Regression for the 2026-09-23 acceptance: noteModelObservation folds the
+  // running id into the picker selection (`state.models`), which used to be
+  // the "requested" half too — so requested == running and the divergence
+  // never displayed. The pair's requested side must read the launch spec.
+  const launchModel = "passthrough/ark/seed-evolving";
+  const ctx = await startFollowing("requested", launchModel);
+  // The gateway strips its routing prefix: the launch read-back id differs.
+  ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
+  // The picker follows the fold (it sits on what actually runs)...
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("ark/seed-evolving");
+  expect(hubStore.modelEffectiveOf(ctx.instance.id)?.id).toBe("ark/seed-evolving");
+  // ...but the requested value for the pair stays the durable spec, verbatim.
+  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe(launchModel);
+
+  // A later terminal /model moves the picker again; requested is still the
+  // launch spec until the operator's own configure goes pending.
+  ctx.receive(modelEvent(3, "model_hub/es1_orange_o50", "slash"));
+  expect(hubStore.modelOf(ctx.instance.id, "claude")).toBe("model_hub/es1_orange_o50");
+  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe(launchModel);
+});
+
+it("an in-flight switch is the requested value until its read-back settles", async () => {
+  const ctx = await startFollowing("switch", "ark/seed-evolving");
+  vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
+  ctx.receive(modelEvent(2, "ark/seed-evolving", "launch"));
+  await hubStore.setModel(ctx.instance.id, "model_hub/es1_orange_o50[1m]");
+  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe(
+    "model_hub/es1_orange_o50[1m]",
+  );
+  ctx.receive(modelEvent(3, "model_hub/es1_orange_o50[1m]", "remuda"));
+  // Settled: requested returns to the launch spec (no newer switch requested).
+  expect(hubStore.modelRequestedOf(ctx.instance.id, "claude")).toBe("ark/seed-evolving");
 });
 
 it("our pending push-down clears on read-back and reports the resolved id", async () => {

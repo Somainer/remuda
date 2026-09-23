@@ -1977,11 +1977,29 @@ class HubStore {
 
   modelOf(instanceId: Id, kind?: string): string {
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    // The *requested* selection: optimistic, then the launch/instance record.
-    // The read-back id is `modelEffectiveOf`; when the two raw strings differ
-    // the UI shows both, without judging the difference.
+    // The *picker* selection: optimistic launch, a configure push-down, or a
+    // terminal `/model` folded in by `noteModelObservation`. It tracks what
+    // the picker is sitting on, NOT what was requested of the launch — use
+    // `modelRequestedOf` for the requested-vs-running display.
     return (
       this.state.models[instanceId] ??
+      instance?.model ??
+      (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus")
+    );
+  }
+
+  /** The requested model for the requested-vs-running pair (model-pin-1 §5):
+   *  an in-flight switch's optimistic id, otherwise the durable launch spec.
+   *  It deliberately never reads `state.models` — the picker fold follows a
+   *  terminal-side `/model` (and history replay), so after the launch
+   *  read-back it would equal the running id and hide the very difference the
+   *  pair exists to show. The Hub never overwrites `instance.model` on a
+   *  model projection, so it stays the dispatch value. */
+  modelRequestedOf(instanceId: Id, kind?: string): string {
+    const pending = this.modelPendingOf(instanceId);
+    if (pending) return pending.id;
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return (
       instance?.model ??
       (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus")
     );

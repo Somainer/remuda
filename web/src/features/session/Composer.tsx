@@ -95,6 +95,7 @@ export function Composer({
   permissionPending = null,
   kind = "claude",
   model = "opus",
+  modelRequested = null,
   models,
   modelEffective,
   modelPending,
@@ -154,6 +155,9 @@ export function Composer({
   permissionPending?: { mode: string; queued: boolean } | null;
   kind?: EffortKind | string;
   model?: string;
+  /** Durable requested model for the requested-vs-running pair (launch spec /
+   *  in-flight switch); the picker fold stays on `model`. */
+  modelRequested?: string | null;
   models?: string[];
   /** §9.1 transcript-read-back effective model id; null/undefined = unobserved. */
   modelEffective?: string | null;
@@ -896,6 +900,7 @@ export function Composer({
     <EffortSlider
       kind={harness}
       model={caps.model ? model : undefined}
+      modelRequested={caps.model ? modelRequested : null}
       models={caps.model ? models : undefined}
       modelEffective={caps.model ? modelEffective : null}
       modelPending={caps.model ? modelPending : null}
@@ -921,6 +926,7 @@ export function Composer({
     <EffortSlider
       kind={harness}
       model={caps.model ? model : undefined}
+      modelRequested={caps.model ? modelRequested : null}
       models={caps.model ? models : undefined}
       modelEffective={caps.model ? modelEffective : null}
       modelPending={caps.model ? modelPending : null}

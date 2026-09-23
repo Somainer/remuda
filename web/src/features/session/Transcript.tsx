@@ -14,6 +14,7 @@ import { ToolCard } from "./ToolCard";
 import { WorkflowTree } from "./WorkflowTree";
 import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
+import { ObservedChangeRow } from "./ObservedChangeRow";
 import { SubagentFolds } from "./subagent/SubagentRows";
 import css from "./transcript.module.css";
 import session from "./session.module.css";
@@ -1299,6 +1300,12 @@ function renderNode(
     );
   }
   if (node.type === "opaque") {
+    // c-mfix: effort/model are KNOWN observation kinds (protocol §5.1); only
+    // this dispatch site changed — assembly/windowing logic is untouched. The
+    // opaque fallback node carries kind="effort"|"model" plus the raw payload.
+    if (node.kind === "model" || node.kind === "effort") {
+      return <ObservedChangeRow kind={node.kind} raw={node.raw} />;
+    }
     return <OpaqueRow kind={node.kind} summary={node.summary} raw={node.raw} />;
   }
   return null;

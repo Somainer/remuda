@@ -3,9 +3,10 @@
  * (webgl / canvas / dom) onto the shared profiler channel.
  *
  * `attachTerminalRenderer` picks the first addon that loads, but a WebGL
- * context can be lost later (GPU reset, driver fallback); the addon disposes
- * itself on context loss and xterm keeps painting with whatever is left, which
- * can silently degrade a session from GPU to DOM rendering. TerminalView
+ * context can be lost later (GPU reset, memory pressure, backgrounding);
+ * the addon chains a canvas renderer in on context loss (xterm's own DOM
+ * renderer only takes over if that canvas addon fails to load), which can
+ * silently degrade a session from GPU to 2D-canvas rendering. TerminalView
  * calls `probeRendererSelection` once when the addon settles and
  * `probeWebglContextLoss` from the addon's loss callback, so the perf report
  * shows both the initial renderer and every subsequent degradation.

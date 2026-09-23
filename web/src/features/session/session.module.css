@@ -2562,6 +2562,19 @@
   color: var(--mute);
 }
 
+/* c-mfix: known effort/model observations rendered as a light change record
+   (ObservedChangeRow), not 未识别事件. Same weight as .opaque; the disclosure
+   keeps the raw payload one click away. */
+.changeRow {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mute);
+}
+
+.changeRow details summary {
+  cursor: pointer;
+}
+
 .track {
   border: 1px solid var(--line);
   border-radius: var(--radius);

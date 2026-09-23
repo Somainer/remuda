@@ -1,4 +1,14 @@
 .shell {
+  /* c-mfix: pin the workbench to the visualViewport band (height + its
+     offsetTop while the iOS keyboard is open). A static top-anchored box
+     shrank to keyboard height but stayed at layout y=0, so its upper half
+     scrolled out of the visible band the moment the keyboard appeared.
+     Fixed positioning also means the document has no scroll position for
+     iOS to fight while revealing the focused input. */
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--workbench-top, 0px);
   height: var(--workbench-height, 100dvh);
   display: grid;
   grid-template-columns: var(--rail) minmax(0, 1fr);

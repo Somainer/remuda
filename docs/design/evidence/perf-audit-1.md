@@ -181,8 +181,8 @@ React 提交。这不是本轮修复范围（本任务只测量），但应作�
 候选，优先级凭 §4 复测再定。
 
 跨场景补充：Linux headless/软件 GL 下 WebGL 保持生效、零降级，没有
-观测到「WebGL 上下文丢失后掉到 DOM」的隐藏卡顿；该探针的价值要在
-macOS（尤其 WebKit）列兑现。
+观测到「WebGL 上下文丢失后掉到 canvas（canvas 加载失败才退 DOM）」的
+隐藏卡顿；该探针的价值要在 macOS（尤其 WebKit）列兑现。
 
 ## 4 引擎对比表（协调员在所有者 Mac 上填写）
 

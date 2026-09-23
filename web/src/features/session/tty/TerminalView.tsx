@@ -335,12 +335,19 @@ export function TerminalView({
     settleFitRef.current = settleFit;
     void whenFontsReady().then(() => applyFitRef.current());
     applyFit();
-    void attachTerminalRenderer(term).then((name) => {
-      // May resolve after a session switch already disposed this terminal.
+    // c-mfix: a later WebGL context loss (iOS keyboard/memory pressure is a
+    // common trigger) downgrades to canvas; keep the pill and the grid fit in
+    // sync with the renderer actually painting.
+    const onEffectiveRenderer = (name: TerminalRenderer) => {
       if (disposed) return;
       probeRendererSelection(name);
       setRenderer(name);
       applyFitRef.current();
+    };
+    void attachTerminalRenderer(term, onEffectiveRenderer).then((name) => {
+      // May resolve after a session switch already disposed this terminal.
+      if (disposed) return;
+      onEffectiveRenderer(name);
     });
 
     const session = openTtySession(instanceRef.current, {

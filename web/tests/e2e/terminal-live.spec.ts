@@ -7,7 +7,8 @@ const access = process.env.VITE_ACCESS_CODE ?? "";
 
 async function login(page: Page) {
   await page.goto("/login");
-  await expect(page.getByTestId("login-page")).toBeVisible();
+  // Same generous first-render wait as hub-auth's login() under gate load.
+  await expect(page.getByTestId("login-page")).toBeVisible({ timeout: 20_000 });
   const toggle = page.getByTestId("login-use-code");
   if (await toggle.isVisible().catch(() => false)) await toggle.click();
   await page.getByTestId("login-tab-bootstrap").click();

@@ -281,6 +281,8 @@ describe("SessionList model label", () => {
     const label = screen.getAllByTestId("session-model")[0];
     expect(label.textContent).toBe("model_hub/es1_orange_o50[1m]");
     expect(label).toHaveAttribute("data-model-effective", "unknown");
+    // The launch spec is not mislabeled as observed.
+    expect(label.getAttribute("title")).toContain("尚未从会话回读");
   });
 
   it("shows the running id verbatim once read back, equal or not to the launch", () => {

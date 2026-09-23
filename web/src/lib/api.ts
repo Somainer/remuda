@@ -222,7 +222,7 @@ function mapHost(h: components["schemas"]["HostView"]): Host {
   };
 }
 
-function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
+export function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
   const id = rec.instanceId as Id;
   const hostId = rec.hostId as Id;
   const kind = mapKind(rec.kind);
@@ -252,6 +252,13 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
       | null;
     modelCatalog?:
       | { models?: unknown; source?: string; observedAt?: string }
+      | null;
+    modelPinMismatches?:
+      | readonly {
+          requested?: unknown;
+          observed?: unknown;
+          observedAt?: unknown;
+        }[]
       | null;
     mode?: string | null;
     promotedAt?: string | null;
@@ -376,6 +383,15 @@ function mapInstance(rec: components["schemas"]["InstanceRecord"]): Instance {
             observedAt: extra.modelCatalog.observedAt ?? "",
           }
         : null,
+    modelPinMismatches: Array.isArray(extra.modelPinMismatches)
+      ? extra.modelPinMismatches.flatMap((row) =>
+          typeof row?.requested === "string" &&
+          typeof row.observed === "string" &&
+          typeof row.observedAt === "string"
+            ? [{ requested: row.requested, observed: row.observed, observedAt: row.observedAt }]
+            : [],
+        )
+      : null,
     mode: extra.mode === "promoted" || extra.mode === "native" ? extra.mode : null,
     promotedAt: typeof extra.promotedAt === "string" ? extra.promotedAt : null,
     usageRollup: coerceUsageRollup(rec.usageRollup ?? extra.usageRollup),

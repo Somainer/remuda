@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import * as store from "../lib/store";
+import { mapInstance } from "../lib/api";
 import { mockDb } from "../lib/mock";
 import { SessionPage } from "./SessionPage";
 
@@ -119,25 +120,34 @@ it("renders a recorded model_pin_mismatch in run details with both ids verbatim"
   expect(pin).toHaveAttribute("data-observed", "ark/seed-evolving");
 });
 
-it("renders a projected model_pin_mismatch even when it is older than the loaded window", () => {
-  // model-pin-1 §5.4 regression: the divergence survives beyond the bounded
-  // newest-event window because the Hub projects it onto the instance
-  // record. No diagnostic event is present in `events` here; run details must
-  // still show the recorded pair verbatim.
-  const instanceWithProjection = {
-    ...grokInstance,
+it("renders a projected model_pin_mismatch through the real API mapper even with an empty window", () => {
+  // model-pin-1 §5.4 regression: the durable divergence reaches the browser
+  // through the public instance JSON -> mapInstance (the actual wire
+  // boundary), and run details renders it with an EMPTY event window (the
+  // diagnostic has aged out of the bounded tail). Nothing is hand-injected.
+  const projected = mapInstance({
+    instanceId: grokInstance.id,
+    hostId: grokInstance.hostId,
+    workspaceId: grokInstance.workspaceId,
+    kind: "generic-pty",
+    driver: grokInstance.driver,
+    lifecycle: "ready",
+    activity: "idle",
+    connectivity: "connected",
+    journalId: grokInstance.journalId,
+    durableSeq: "1",
     modelPinMismatches: [
       {
         requested: "model_hub/es1_orange_o50[1m]",
         observed: "model_hub/es1_orange_o48[1m]",
-        observedAt: "2026-09-24T00:00:00Z",
+        observedAt: "2026-09-24T00:00:00.000Z",
       },
     ],
-  };
+  } as never);
   vi.spyOn(store, "useHub").mockReturnValue({
     ...store.hubStore.getSnapshot(),
     ready: true,
-    instances: [instanceWithProjection],
+    instances: [projected],
     // Deliberately empty window: the diagnostic is older than 2000 events.
     events: { [grokInstance.id]: [] },
   });
@@ -147,6 +157,64 @@ it("renders a projected model_pin_mismatch even when it is older than the loaded
   expect(pins[0]).toHaveTextContent(
     "请求模型 model_hub/es1_orange_o50[1m]，实际运行 model_hub/es1_orange_o48[1m]",
   );
+});
+
+it("deduplicates a projected diagnostic and the same launch event still in the window", () => {
+  // The steady state: projected record + the in-tail event for the same
+  // divergence must render ONCE (identity is requested+observed).
+  const projected = mapInstance({
+    instanceId: grokInstance.id,
+    hostId: grokInstance.hostId,
+    workspaceId: grokInstance.workspaceId,
+    kind: "generic-pty",
+    driver: grokInstance.driver,
+    lifecycle: "ready",
+    activity: "idle",
+    connectivity: "connected",
+    journalId: grokInstance.journalId,
+    durableSeq: "2",
+    modelPinMismatches: [
+      {
+        requested: "passthrough/ark/seed-evolving",
+        observed: "ark/seed-evolving",
+        observedAt: "2026-09-24T00:00:00.000Z",
+      },
+    ],
+  } as never);
+  const events = [
+    {
+      eventId: "evt_pin_live",
+      instanceId: grokInstance.id,
+      journalId: "obj",
+      seq: "1",
+      kind: "lifecycle",
+      observedAt: "2026-09-24T00:00:00.000Z",
+      source: { channel: "runtime" },
+      payload: {
+        type: "native",
+        topic: "diagnostic",
+        nativeName: "model_pin_mismatch",
+        nativeId: { state: "not-applicable" },
+        status: { state: "known", value: "diverged" },
+        severity: "warning",
+        affectsCompletion: false,
+        dataRef: null,
+        relatedIds: {
+          reason: "model-mismatch",
+          requested: "passthrough/ark/seed-evolving",
+          observed: "ark/seed-evolving",
+        },
+      },
+    },
+  ];
+  vi.spyOn(store, "useHub").mockReturnValue({
+    ...store.hubStore.getSnapshot(),
+    ready: true,
+    instances: [projected],
+    events: { [grokInstance.id]: events as never[] },
+  });
+  renderPage();
+  expect(screen.getAllByTestId("run-details-model-pin")).toHaveLength(1);
 });
 
 it("mobile folds the chips strip into one header chip and moves the toggles into the ⋯ sheet", () => {

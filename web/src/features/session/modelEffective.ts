@@ -172,14 +172,17 @@ export type ModelPinMismatch = {
 };
 
 /** Extract every recorded `model_pin_mismatch` diagnostic from a journal
- *  event window, in journal order. A later `/model` does not erase history —
- *  the diagnostic stays in run details even though the chip moves on. */
+ *  event window, in journal order. The window event does not carry the
+ *  projected observedAt; identity is requested+observed (see the merge). A
+ *  later `/model` does not erase history — the diagnostic stays in run
+ *  details even though the chip moves on. */
 export function modelPinMismatches(events: readonly unknown[]): ModelPinMismatch[] {
   const out: ModelPinMismatch[] = [];
   for (const event of events) {
     const e = event as
       | {
           eventId?: string;
+          observedAt?: string;
           kind?: string;
           payload?: {
             type?: string;
@@ -199,7 +202,15 @@ export function modelPinMismatches(events: readonly unknown[]): ModelPinMismatch
       const requested = p.relatedIds?.requested;
       const observed = p.relatedIds?.observed;
       if (typeof requested === "string" && typeof observed === "string") {
-        out.push({ requested, observed, ...(e.eventId ? { eventId: e.eventId } : {}) });
+        out.push({
+          requested,
+          observed,
+          // Carry the event envelope time when present; the merge treats
+          // requested+observed as identity, so a missing observedAt still
+          // matches the projected record.
+          ...(e.observedAt ? { observedAt: e.observedAt } : {}),
+          ...(e.eventId ? { eventId: e.eventId } : {}),
+        });
       }
     }
   }
@@ -208,9 +219,11 @@ export function modelPinMismatches(events: readonly unknown[]): ModelPinMismatch
 
 /** Merge the Hub-projected launch divergences (durable, window-independent)
  *  with any diagnostics present in the currently loaded journal window
- *  (the live edge before projection lands), de-duplicated on
- *  requested/observed/observedAt. Projected records come first in stored
- *  order, then window-only records. */
+ *  (the live edge before projection lands). Identity is requested+observed,
+ *  so a projected record and the still-loaded window event for the same
+ *  launch divergence render ONCE even though only the projected copy
+ *  carries observedAt. Projected records come first in stored order, then
+ *  window-only records. */
 export function allModelPinMismatches(
   projected:
     | readonly { requested?: unknown; observed?: unknown; observedAt?: unknown }[]
@@ -220,8 +233,8 @@ export function allModelPinMismatches(
 ): ModelPinMismatch[] {
   const out: ModelPinMismatch[] = [];
   const seen = new Set<string>();
-  const keyOf = (r: { requested: string; observed: string; observedAt?: string }) =>
-    `${r.requested}\u0000${r.observed}\u0000${r.observedAt ?? ""}`;
+  const keyOf = (r: { requested: string; observed: string }) =>
+    `${r.requested}\u0000${r.observed}`;
   const push = (r: ModelPinMismatch & { observedAt?: string }) => {
     const key = keyOf(r);
     if (seen.has(key)) return;

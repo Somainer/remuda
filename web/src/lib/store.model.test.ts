@@ -237,7 +237,7 @@ it("case (b) launch A / read-back B: chip B, diagnostic recorded verbatim", asyn
   const events = (hubStore as unknown as { state: { events: Record<string, Observation[]> } })
     .state.events[ctx.instance.id];
   expect(modelPinMismatches(events)).toEqual([
-    { requested: "model_hub/A", observed: "model_hub/B", eventId: "evt_pin_3" },
+    { requested: "model_hub/A", observed: "model_hub/B", observedAt: "2026-09-16T00:03:00Z", eventId: "evt_pin_3" },
   ]);
 });
 
@@ -267,7 +267,7 @@ it("the launch divergence diagnostic is recorded verbatim and survives a later /
   expect(hubStore.runningModelOf(ctx.instance.id)).toBe("model_hub/B");
   // ...run details holds the record verbatim.
   let mismatches = modelPinMismatches((hubStore as unknown as { state: { events: Record<string, Observation[]> } }).state.events[ctx.instance.id] ?? []);
-  expect(mismatches).toEqual([{ requested: "model_hub/A", observed: "model_hub/B", eventId: "evt_pin_3" }]);
+  expect(mismatches).toEqual([{ requested: "model_hub/A", observed: "model_hub/B", observedAt: "2026-09-16T00:03:00Z", eventId: "evt_pin_3" }]);
 
   // Operator then switches to C: chip moves, the diagnostic remains.
   ctx.receive(modelEvent(4, "model_hub/C", "slash"));

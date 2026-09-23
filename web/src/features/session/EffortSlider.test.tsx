@@ -195,6 +195,9 @@ describe("EffortSlider running-model chip", () => {
     mount({ kind: "claude", model: "", launchModel: "model_hub/es1_orange_o50[1m]" });
     const chip = screen.getByTestId("effort-model");
     expect(chip.textContent).toBe("model_hub/es1_orange_o50[1m]");
+    // The launch spec is not mislabeled as a read-back.
+    expect(chip.getAttribute("title")).toContain("尚未从会话回读");
+    expect(chip.getAttribute("title")).not.toContain("实际 ");
     // No pair machinery exists anywhere.
     expect(screen.queryByTestId("model-option-different")).toBeNull();
   });
@@ -206,7 +209,9 @@ describe("EffortSlider running-model chip", () => {
       launchModel: "model_hub/es1_orange_o50[1m]",
       modelEffective: "claude-opus-5",
     });
-    expect(screen.getByTestId("effort-model").textContent).toBe("claude-opus-5");
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("claude-opus-5");
+    expect(chip.getAttribute("title")).toBe("实际 claude-opus-5");
     await userEvent.setup().click(screen.getByTestId("effort-open-list"));
     const panel = screen.getByTestId("effort-slider-panel");
     expect(panel).not.toHaveAttribute("data-model-different");

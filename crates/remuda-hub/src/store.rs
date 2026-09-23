@@ -558,6 +558,15 @@ pub struct InstanceRecord {
         rename = "modelCatalog"
     )]
     pub model_catalog: Option<Value>,
+    /// model-pin-1 §5.4: launch model-pin divergences projected from the
+    /// Node's `model_pin_mismatch` diagnostics, verbatim. Durable across the
+    /// bounded journal tail; the browser renders these in run details.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "modelPinMismatches"
+    )]
+    pub model_pin_mismatches: Option<Value>,
     /// Native session id reported by the driver, resumable with `--resume` (D-026).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
@@ -7645,26 +7654,27 @@ mod tests {
             .append_journal(host.clone(), instance.instance_id.clone(), Some(1), event)
             .await
             .expect("replay");
-        let spec = store
-            .get_instance_spec_json(instance.instance_id.clone())
+        // Assert through the PUBLIC instance record (the shape the API
+        // serializes), not private spec_json. Replay must not duplicate.
+        let mismatches = store
+            .get_instance(instance.instance_id.clone())
             .await
-            .expect("get spec")
-            .expect("spec row");
-        let mismatches = spec
-            .get("modelPinMismatches")
-            .and_then(Value::as_array)
-            .expect("projected mismatches");
-        assert_eq!(mismatches.len(), 1, "replay must not duplicate");
+            .expect("get")
+            .expect("row")
+            .model_pin_mismatches
+            .expect("projected mismatches on the public record");
+        let rows = mismatches.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "replay must not duplicate");
         assert_eq!(
-            mismatches[0].get("requested").and_then(Value::as_str),
+            rows[0].get("requested").and_then(Value::as_str),
             Some("passthrough/ark/seed-evolving")
         );
         assert_eq!(
-            mismatches[0].get("observed").and_then(Value::as_str),
+            rows[0].get("observed").and_then(Value::as_str),
             Some("ark/seed-evolving")
         );
         assert_eq!(
-            mismatches[0].get("observedAt").and_then(Value::as_str),
+            rows[0].get("observedAt").and_then(Value::as_str),
             Some("2026-09-24T00:00:00.000Z")
         );
 
@@ -7683,17 +7693,14 @@ mod tests {
             )
             .await
             .expect("second diagnostic");
-        let spec = store
-            .get_instance_spec_json(instance.instance_id.clone())
+        let count = store
+            .get_instance(instance.instance_id)
             .await
-            .expect("get spec 2")
-            .expect("spec row 2");
-        assert_eq!(
-            spec.get("modelPinMismatches")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(2)
-        );
+            .expect("get2")
+            .expect("row2")
+            .model_pin_mismatches
+            .and_then(|value| value.as_array().map(|rows| rows.len()));
+        assert_eq!(count, Some(2));
     }
 
     /// A `permission` journal event persists the transcript-read-back mode as
@@ -8123,6 +8130,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
             let effort_effective = spec.get("effortEffective").cloned();
             let model_effective = spec.get("modelEffective").cloned();
             let model_catalog = spec.get("modelCatalog").cloned();
+            let model_pin_mismatches = spec.get("modelPinMismatches").cloned();
             let mode: Option<String> = row.get(15)?;
             let promoted_at: Option<String> = row.get(16)?;
             let stored: Option<String> = row.get(17)?;
@@ -8194,6 +8202,7 @@ fn load_instance(conn: &Connection, id: &str) -> Result<Option<InstanceRecord>, 
                 effort_effective,
                 model_effective,
                 model_catalog,
+                model_pin_mismatches,
                 native_session_id: spec
                     .get("nativeSessionId")
                     .and_then(Value::as_str)

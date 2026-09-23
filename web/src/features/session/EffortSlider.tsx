@@ -248,6 +248,16 @@ export function EffortSlider({
   // string (a launched session with neither spec nor read-back yet).
   const hasModelAxis = model !== undefined;
   const chipText = hasModelAxis ? runningModel : (stop?.description ?? "");
+  // A read-back is present (vs only the launch spec) — drives the tooltip
+  // wording so the launch value is not mislabeled as observed.
+  const hasReadback = modelEffective != null && modelEffective !== "";
+  const chipTitle = !hasModelAxis
+    ? (stop?.description ?? "")
+    : runningModel
+      ? hasReadback
+        ? `实际 ${runningModel}`
+        : `${runningModel}（尚未从会话回读）`
+      : "";
   const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
 
   // ── List-view roving keyboard navigation ──────────────────────────────
@@ -796,13 +806,7 @@ export function EffortSlider({
       <div
         className={css.effortModel}
         data-testid={tid("model")}
-        title={
-          hasModelAxis
-            ? runningModel
-              ? `实际 ${runningModel}`
-              : ""
-            : (stop?.description ?? "")
-        }
+        title={chipTitle}
       >
         {chipText}
       </div>

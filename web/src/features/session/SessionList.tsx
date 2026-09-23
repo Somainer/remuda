@@ -757,13 +757,18 @@ export function SessionList({
                         // (model-pin-1 §5.4).
                         const running = hubStore.runningModelOf(instance.id);
                         if (!running) return null;
+                        const effective = hubStore.modelEffectiveOf(instance.id);
                         return (
                           <>
                             <span className={css.sep}>·</span>
                             <span
                               data-testid="session-model"
-                              data-model-effective={hubStore.modelEffectiveOf(instance.id)?.id ?? "unknown"}
-                              title={`实际 ${running}（${hubStore.modelEffectiveOf(instance.id)?.source ?? ""}）`}
+                              data-model-effective={effective?.id ?? "unknown"}
+                              title={
+                                effective
+                                  ? `实际 ${running}（${effective.source}）`
+                                  : `${running}（尚未从会话回读）`
+                              }
                             >
                               {running}
                             </span>

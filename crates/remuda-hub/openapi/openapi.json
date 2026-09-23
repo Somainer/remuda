@@ -1474,6 +1474,33 @@
             ],
             "additionalProperties": true
           },
+          "modelPinMismatches": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "description": "model-pin-1 §5.4: recorded launch model-pin divergences projected from the Node's model_pin_mismatch diagnostics, verbatim ({requested, observed, observedAt}). Durable across the bounded journal tail; rendered in run details. Only sessions whose launch diagnostic is folded after the projection shipped are populated.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "requested": {
+                  "type": "string"
+                },
+                "observed": {
+                  "type": "string"
+                },
+                "observedAt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "requested",
+                "observed",
+                "observedAt"
+              ],
+              "additionalProperties": true
+            }
+          },
           "hostId": {
             "type": "string"
           },

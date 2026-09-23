@@ -8,6 +8,7 @@ Copied from `docs/research/cli-help/` (research traces, 2026-09-12). Originals s
 | `claude/claude-permission-host-allow.jsonl` | host allow Bash (`claude-interaction-probe.md` §1.2) |
 | `claude/claude-permission-host-deny.jsonl` | host deny Bash |
 | `claude/claude-askuser.jsonl` | AskUserQuestion round-trip |
+| `claude/claude-askuser-auto.jsonl` | auto-mode AskUserQuestion answered by a PreToolUse hook (`docs/design/evidence/askq-pretooluse-1.md`, claude 2.1.277) |
 | `claude/claude-*-no-prompt-tool.jsonl` | same probes without `--permission-prompt-tool stdio` |
 | `claude/claude-hook-permission*.jsonl` | PermissionRequest hook allow/deny |
 | `claude/claude-workflow-canary-*.jsonl` | Workflow cross-model canary |

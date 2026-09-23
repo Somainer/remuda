@@ -1,32 +1,54 @@
 import { useEffect, useState } from "react";
 
+export type IncrementalLimitOptions = {
+  /** Rows revealed per animation frame. */
+  step?: number;
+  /**
+   * Identity of the filter/view the list is currently showing. When this key
+   * changes (kind segment, host/workspace filter), progressive mount restarts
+   * from the first slice — the list now shows a different set. Key it on the
+   * filter itself.
+   */
+  resetKey?: unknown;
+};
+
 /**
  * Progressive-mount limit for long lists.
  *
- * Returns `step` on first render and grows by `step` on each animation frame
- * until it reaches `total`. A flood (100 pending approvals / inbox rows)
- * therefore commits a few cards per frame instead of hundreds in one task —
- * the scenario-C measurement (docs/design/evidence/inbox-perf-1.md) traced a
- * 2.7 s Long Task to that single commit. Every row still mounts within a
- * handful of frames, so counts, filters and deep links keep seeing the whole
- * list; small lists (< `step`) render in one commit exactly as before.
+ * Starts at `step` and grows by `step` on each animation frame until it
+ * reaches `total`, so a flood (100 pending approvals / inbox rows) commits a
+ * few cards per frame instead of hundreds in one task — the scenario-C
+ * measurement (docs/design/evidence/inbox-perf-1.md) traced a 2.7 s Long Task
+ * to that single commit. Small lists (< `step`) render in one commit exactly
+ * as before.
  *
- * When `total` shrinks (e.g. a kind filter narrows the list) the limit
- * restarts, so when it later grows back (filter cleared) the list again
- * mounts in slices rather than as one big commit. Plain growth overshoot
- * (20 + 12 past 25) is just clamped, never treated as a shrink.
+ * Two distinct ways the count changes, handled differently:
+ *  - SHRINK with the same filter (a card is answered locally or on another
+ *    device): persist `limit = min(limit, total)`. The revealed tail that
+ *    remains stays mounted (an open free-text / elicitation draft is never
+ *    lost), AND the stored high-water mark is lowered — so when the list later
+ *    grows again (new interactions arrive with no filter change) the new tail
+ *    mounts in `step` slices, not as one jump back to the old high-water mark.
+ *  - FILTER change (`resetKey`): a genuinely different set, so restart from
+ *    the first slice.
  */
-export function useIncrementalLimit(total: number, step = 12): number {
+export function useIncrementalLimit(
+  total: number,
+  options: IncrementalLimitOptions = {},
+): number {
+  const step = options.step ?? 12;
+  const resetKey = options.resetKey;
   const [limit, setLimit] = useState(step);
-  const [prevTotal, setPrevTotal] = useState(total);
+  const [prevResetKey, setPrevResetKey] = useState(resetKey);
 
-  // Adjust state during render (React's derived-state pattern), only on a
-  // real shrink — growth keeps walking the limit up via the rAF effect.
-  if (total < prevTotal) {
-    setPrevTotal(total);
+  // React's derived-state-during-render pattern. A filter identity change
+  // restarts slicing; otherwise a shrink lowers the stored limit to exactly
+  // what is mounted (never reset to step, never left at a stale high mark).
+  if (!Object.is(resetKey, prevResetKey)) {
+    setPrevResetKey(resetKey);
     setLimit(Math.min(step, total));
-  } else if (total > prevTotal) {
-    setPrevTotal(total);
+  } else if (limit > total) {
+    setLimit(total);
   }
 
   useEffect(() => {

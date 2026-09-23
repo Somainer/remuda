@@ -53,8 +53,9 @@
 pnpm --dir web exec playwright install chromium webkit
 
 # Linux / macOS 通用，引擎由 --project 决定，引擎名取自 Playwright browserName
-HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c web/playwright.perf.config.ts --project=chromium
-HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c web/playwright.perf.config.ts --project=webkit
+# （pnpm --dir web 已把工作目录切到 web/，配置路径也相对该目录）
+HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c playwright.perf.config.ts --project=chromium
+HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c playwright.perf.config.ts --project=webkit
 # 或直接：HUB_E2E_PERF=1 pnpm --dir web test:perf（默认跑配置内全部 project）
 ```
 
@@ -189,28 +190,40 @@ React 提交。这不是本轮修复范围（本任务只测量），但应作�
 用 §1.2 同一份驱动、同一份场景（事件/行/卡片数与速率都在 fake Node
 里写死），在 macOS 上分别跑 `--project=chromium` 与
 `--project=webkit`，把各自
-`web/tests/perf/results/perf-<engine>-*.json` 的数字抄入：
+`web/tests/perf/results/perf-<engine>-*.json` 的数字抄入。**截至本修订，
+macOS 两列都还没有在所有者机器上运行**：可在任意引擎测得的行明确标
+**未测**；WebKit 在任何平台都不提供的遥测（Long Tasks、heap）标
+**不支持**（perf JSON 输出 `null`，见注²），不留待填占位。
 
 | 场景 | 指标 | Linux Chromium（本任务，有负载¹） | macOS Chromium | macOS WebKit（Safari 引擎） |
 |---|---|---|---|---|
-| A | Long Task 数/分钟 | 257（52 个 / 12.1s） | _（待填）_ | _（待填）_ |
-| A | 最长 Long Task ms（归因 file:line） | 96 · `transcript.assemble` · `Transcript.tsx:211` | _（待填）_ | _（待填）_ |
-| A | TBT ms | 711 | _（待填）_ | _（待填）_ |
-| A | 峰值 heap | 128.7 MB | _（待填）_ | _（待填，WebKit 可能为 null）_ |
-| B | Long Task 数/分钟 | 0（0 个 / 13.5s） | _（待填）_ | _（待填）_ |
-| B | 最长 Long Task ms（归因 file:line） | 无 | _（待填）_ | _（待填）_ |
-| B | TBT ms | 0 | _（待填）_ | _（待填）_ |
-| B | renderer / context-loss | webgl / 0 | _（待填）_ | _（待填）_ |
-| C | Long Task 数/分钟 | 55（13 个 / 14.1s） | _（待填）_ | _（待填）_ |
-| C | 最长 Long Task ms（归因 file:line） | 2723 · `approvals.deriveRows` · `ApprovalsPage.tsx:48`（其中仅 46.5ms 为派生自耗时，余为卡片渲染提交，见 §2 归因语义） | _（待填）_ | _（待填）_ |
-| C | TBT ms | 9249 | _（待填）_ | _（待填）_ |
+| A | Long Task 数/分钟 | 257（52 个 / 12.1s） | 未测 | 不支持² |
+| A | 最长 Long Task ms（归因 file:line） | 96 · `transcript.assemble` · `Transcript.tsx:211` | 未测 | 不支持² |
+| A | TBT ms | 711 | 未测 | 不支持² |
+| A | 峰值 heap | 128.7 MB | 未测 | 不支持²（无 `performance.memory`） |
+| B | Long Task 数/分钟 | 0（0 个 / 13.5s，实测零） | 未测 | 不支持² |
+| B | 最长 Long Task ms（归因 file:line） | 无（实测零） | 未测 | 不支持² |
+| B | TBT ms | 0（实测零） | 未测 | 不支持² |
+| B | renderer / context-loss | webgl / 0 | 未测 | 未测（探针各引擎可用，待跑） |
+| C | Long Task 数/分钟 | 55（13 个 / 14.1s） | 未测 | 不支持² |
+| C | 最长 Long Task ms（归因 file:line） | 2723 · `approvals.deriveRows` · `ApprovalsPage.tsx:48`（其中仅 46.5ms 为派生自耗时，其余约 2.68s 推断为卡片渲染提交、未直接测，见 §2 归因语义） | 未测 | 不支持² |
+| C | TBT ms | 9249 | 未测 | 不支持² |
 
 ¹ 该列在共享 Linux 构建主机负载 52.6（1min）/5 个并行闸门构建/本进程 nice 10
 下测得，绝对值偏高，见 §2.0；macOS 复测请在所有者常规使用状态（不要
 刻意空载，也不要刻意加压）记录同样的负载信息以便对照。
 
-填写时请一并记录：Chrome/Safari 版本、Mac 机型与年份、是否外接显示器
-（WebGL 硬件加速路径相关），以及测量时刻的 `uptime` 负载（本机这组数字
+² **WebKit 列标「不支持」的行（Long Task 数/分钟、最长 Long Task、TBT、
+峰值 heap）在 perf JSON 里就是 `null`，与平台无关、不是占位**：WebKit 既
+没有 Long Tasks API
+（`PerformanceObserver.supportedEntryTypes` 不含 `longtask`），也没有
+`performance.memory`；这些是引擎无法提供的遥测，不是测出来的零。
+`regionTimings`、墙上时长、renderer/context-loss 基于 `performance.now()`
+与自有探针，各引擎都测，WebKit 行跑完后照实填（当前未测）。`0` 只
+表示「确实测到零」（如 Linux Chromium 场景 B 的 TBT=0）。
+
+macOS 复测记录要求：Chrome/Safari 版本、Mac 机型与年份、是否外接显示器
+（WebGL 硬件加速路径相关）、测量时刻的 `uptime` 负载（本机这组数字
 对应的引擎是 HeadlessChromium 151.0.0.0，负载条件见 §2.0）。这张表替代桌面 brief §B 里引用的第三方
 vendor-friendly 数字，作为 c-shell-decision 的 owner-machine 证据。
 

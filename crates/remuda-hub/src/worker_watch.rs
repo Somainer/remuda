@@ -291,6 +291,10 @@ async fn observe_one(
     // The raw (requested, observed) pair of a launch read-back divergence, for
     // the status detail. Informational only: it does not change worker state.
     let mut model_divergence: Option<(String, String)> = None;
+    // A non-launch read-back (deliberate slash/remuda switch, or an
+    // unattributed `unknown` assistant-model change) supersedes the launch
+    // read-back: the roster row must drop the launch divergence it persisted.
+    let mut clear_model_effective = false;
     if let Some(instance_id) = worker.instance_id.as_ref()
         && let Some(record) = state
             .store
@@ -377,6 +381,17 @@ async fn observe_one(
                 model_effective = Some(observed.to_owned());
                 model_divergence = Some((requested.to_owned(), observed.to_owned()));
             }
+        } else if observed.is_some() {
+            // Any NON-launch read-back supersedes the launch pair: a deliberate
+            // slash/remuda switch the operator owns, and also an unattributed
+            // `unknown` edge (an assistant message.model that changed with no
+            // /model verdict or configure — the tracker legitimately emits it
+            // once the launch edge has reset its pending source). Keeping the
+            // old launch id would leave `remuda watch` showing an obsolete
+            // pair against a newer authoritative observation, so clear it.
+            // Empty source with a read-back is treated the same way: only the
+            // exact "launch" string keeps this arm closed.
+            clear_model_effective = true;
         }
     }
     // The Hub row is authoritative once the instance is terminal: a stale or
@@ -567,10 +582,14 @@ async fn observe_one(
                 row.state = next;
             }
             row.watch = Some(watch);
-            // Report the observed id when it diverged; never clear a divergence
-            // already recorded because this pass could not read the row.
+            // A launch divergence writes the observed id; a later
+            // slash/remuda switch clears it. Both arms run only once the
+            // instance row was read this pass, so a row that could not be read
+            // leaves the recorded value untouched.
             if model_effective.is_some() {
                 row.model_effective = model_effective;
+            } else if clear_model_effective {
+                row.model_effective = None;
             }
             Ok(())
         })

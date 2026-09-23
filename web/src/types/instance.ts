@@ -94,6 +94,14 @@ export type Instance = EntityMeta & {
     /** Whether a Remuda switch used the session's own list or typed the id. */
     selectionPath?: "listed" | "typed" | null;
   } | null;
+  /** model-pin-1 §5.4: launch model-pin divergences the Hub projected from the
+   *  Node's `model_pin_mismatch` diagnostics. Durable — survives the bounded
+   *  journal tail — and verbatim; the client renders, never recomputes. */
+  modelPinMismatches?: {
+    requested: string;
+    observed: string;
+    observedAt: string;
+  }[] | null;
   /** §9.1 discovered switchable model list (gateway cache / settings / builtin). */
   modelCatalog?: {
     models: string[];

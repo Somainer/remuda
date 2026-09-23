@@ -144,6 +144,7 @@ export function catalogNote(catalog: ModelCatalogView | null | undefined): Model
 export function EffortSlider({
   kind,
   model,
+  launchModel = null,
   models,
   modelEffective,
   modelPending,
@@ -164,6 +165,10 @@ export function EffortSlider({
   kind: EffortKind | string;
   /** Undefined when the harness has no model axis (agy), or when the page owns its own model field. */
   model?: string;
+  /** Durable launch spec verbatim (`instance.model`), shown in the chip
+   *  before the first read-back; null/absent when the launch named no model.
+   *  Never the picker default alias. */
+  launchModel?: string | null;
   models?: string[];
   /** Resolved effective model id from read-back (may differ from the alias picked). */
   modelEffective?: string | null;
@@ -216,7 +221,6 @@ export function EffortSlider({
   const ultraStop = stop?.ultracode === true;
   const ratio = effortRatio(shown, Math.max(1, stops.length));
   const fallback = effortStopIndex(kind, defaultEffortIndex(kind), false);
-  const modelLabel = model ? shortModel(model) : "";
   // The current model is the read-back effective id (an alias resolves to a
   // concrete id); fall back to the requested/instance id until read-back.
   const currentModel = modelEffective || model || "";
@@ -232,13 +236,28 @@ export function EffortSlider({
     [currentModel, models, kind],
   );
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
-  // While a requested switch is in flight (pending) the effective id is simply
-  // stale, so don't show the two strings as different yet. Otherwise any raw
-  // inequality is shown as-is — requested and actual, verbatim, with no
-  // verdict between them (owner ruling 2026-09-23).
-  const modelDifferent =
-    !modelPending &&
-    Boolean(model && modelEffective && model !== modelEffective);
+  // The model chip shows the RUNNING model verbatim: the read-back effective
+  // id, else the durable launch spec. No shortening (CSS ellipsis only) and
+  // no requested-vs-running pair — the launch divergence lives in run
+  // details (model-pin-1 §5.4).
+  const runningModel = modelEffective ?? launchModel ?? "";
+  // `model` is undefined ONLY for an effort-only slider (agy sessions, and
+  // the New Session form before it owns a model field): that surface keeps
+  // the tier stop description. When the model axis exists the chip shows the
+  // running model for EVERY kind (including Codex), even when it is the empty
+  // string (a launched session with neither spec nor read-back yet).
+  const hasModelAxis = model !== undefined;
+  const chipText = hasModelAxis ? runningModel : (stop?.description ?? "");
+  // A read-back is present (vs only the launch spec) — drives the tooltip
+  // wording so the launch value is not mislabeled as observed.
+  const hasReadback = modelEffective != null && modelEffective !== "";
+  const chipTitle = !hasModelAxis
+    ? (stop?.description ?? "")
+    : runningModel
+      ? hasReadback
+        ? `实际 ${runningModel}`
+        : `${runningModel}（尚未从会话回读）`
+      : "";
   const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
 
   // ── List-view roving keyboard navigation ──────────────────────────────
@@ -530,7 +549,6 @@ export function EffortSlider({
       <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}
         data-model-current={currentModel ? shortModel(currentModel) : ""}
         data-model-pending={modelPending ? (modelPending.queued ? "queued" : "switching") : "0"}
-        data-model-different={modelDifferent ? "1" : "0"}
         data-model-path={modelSelectionPath ?? ""}
         data-catalog-source={modelCatalog?.source ?? ""}
       >
@@ -646,11 +664,6 @@ export function EffortSlider({
                   </button>
                 );
               })}
-              {modelDifferent && model && modelEffective ? (
-                <div className={css.effortDesc} data-testid="model-option-different">
-                  请求 {model} → 实际 {modelEffective}
-                </div>
-              ) : null}
               {onModel ? (
                 <div className={css.effortTypeRow}>
                   <input
@@ -793,19 +806,9 @@ export function EffortSlider({
       <div
         className={css.effortModel}
         data-testid={tid("model")}
-        title={
-          // When the read-back differs from the request, both full ids are
-          // shown verbatim on hover; the chip itself carries the short labels.
-          modelDifferent && model && modelEffective
-            ? `请求 ${model} · 实际 ${modelEffective}`
-            : stop?.description
-        }
+        title={chipTitle}
       >
-        {kind === "codex"
-          ? stop?.description
-          : modelDifferent && modelEffective
-            ? `${shortModel(modelEffective)} ⇐ ${modelLabel || shortModel(model)}`
-            : modelLabel || stop?.description || ""}
+        {chipText}
       </div>
       {track}
       {ticks}

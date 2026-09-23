@@ -10,6 +10,7 @@ import { QuestionForm } from "../features/approvals/QuestionForm";
 import { Composer } from "../features/session/Composer";
 import { steerHeldControl } from "../features/composer/state";
 import { LaunchedByMark } from "../features/session/LaunchedBy";
+import { allModelPinMismatches } from "../features/session/modelEffective";
 import { RunDetails } from "../features/session/RunDetails";
 import { contextPercent } from "../features/session/effort";
 import { ptyYoloChipLabel } from "../lib/sessionOptions";
@@ -426,6 +427,24 @@ export function SessionPage({
   if (journalStatus === "gap-backfill") diagnostics.push(<span key="note-gap">正在补事件</span>);
   if (journalStatus === "readonly-stale") diagnostics.push(<span key="note-readonly">只读</span>);
   if (status === "idle") diagnostics.push(<span key="note-idle">回合结束、进程仍在</span>);
+  // model-pin-1 §5.4: the launch divergence is the Node's authoritative
+  // `model_pin_mismatch` diagnostic (never recomputed here). Render each
+  // recorded one verbatim in run details; a later /model changes the running
+  // chip but leaves the historical diagnostic in place.
+  // Projected records are durable and window-independent; the event window
+  // adds a diagnostic that arrived before the projection landed.
+  for (const mismatch of allModelPinMismatches(instance.modelPinMismatches, events)) {
+    diagnostics.push(
+      <span
+        key={`model-pin-${mismatch.eventId ?? mismatch.observedAt ?? diagnostics.length}`}
+        data-testid="run-details-model-pin"
+        data-requested={mismatch.requested}
+        data-observed={mismatch.observed}
+      >
+        请求模型 {mismatch.requested}，实际运行 {mismatch.observed}
+      </span>,
+    );
+  }
   const diagnosticRows = diagnostics.flatMap((node, index) =>
     index === 0 ? [node] : [<span key={`sep-${index}`} className={session.dotSep}>·</span>, node],
   );
@@ -801,6 +820,7 @@ export function SessionPage({
           permissionPending={genericPty ? null : hubStore.permissionPendingOf(instance.id)}
           kind={instance.kind}
           model={hubStore.modelOf(instance.id, instance.kind)}
+          launchModel={instance.model ?? null}
           models={hubStore.modelListOf(instance.id) ?? undefined}
           modelEffective={hubStore.modelEffectiveOf(instance.id)?.id ?? null}
           modelPending={hubStore.modelPendingOf(instance.id)}

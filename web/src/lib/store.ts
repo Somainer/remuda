@@ -587,13 +587,12 @@ class HubStore {
     }
   }
 
-  /** Apply one transcript-read-back model observation: settles a pending
-   *  push-down, records the discovered catalog, and — for a terminal-side
-   *  switch — moves the picker selection locally without a configure. */
   /** Apply one transcript-read-back model observation. `live` events settle a
-   *  pending push-down and fold terminal-side switches; history replay only
-   *  hydrates effective/catalog state (it must never consume a pending set
-   *  after the replay window started, nor move the optimistic selection). */
+   *  pending push-down and fold the effective id into the PICKER selection
+   *  (a terminal `/model` moves the picker without a configure round-trip);
+   *  history replay only hydrates effective/catalog state. The chip shows the
+   *  effective id itself; the client does not reconstruct a "requested" model
+   *  (model-pin-1 §5.4). */
   private noteModelObservation(instanceId: Id, observation: Observation, live: boolean): boolean {
     const parsed = modelFromObservation(observation);
     if (!parsed) return false;
@@ -617,18 +616,18 @@ class HubStore {
     // selection.
     const catalogOnly = Boolean(parsed.catalog) && !parsed.hasRequested;
     if (live && this.state.modelPending[instanceId] && !catalogOnly) {
-      // Our own push-down settled: keep the optimistic selection; the mismatch
-      // line renders if the resolved id differs.
+      // Our own push-down settled: clear pending, park the picker on the
+      // resolved id.
       patch.modelPending = { ...this.state.modelPending };
       delete patch.modelPending[instanceId];
+      patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     } else if (live && !catalogOnly) {
-      // Live, terminal-side switch: fold the observed id into the local
-      // selection so a hand-typed `/model` moves the picker, never calling
-      // configure back.
+      // Live model edge (launch read-back or a terminal-side switch): fold
+      // the effective id into the picker selection.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     } else if (!live && this.state.models[instanceId] == null) {
-      // History replay on a fresh mount: seed the selection from the observed
-      // id so the picker reflects the resolved model after reload.
+      // History replay on a fresh mount: seed the picker from the observed id
+      // so it reflects the resolved model after reload.
       patch.models = { ...this.state.models, [instanceId]: parsed.effective.id };
     }
     this.emit(patch);
@@ -2248,14 +2247,25 @@ class HubStore {
 
   modelOf(instanceId: Id, kind?: string): string {
     const instance = this.state.instances.find((row) => row.id === instanceId);
-    // The *requested* selection: optimistic, then the launch/instance record.
-    // The read-back id is `modelEffectiveOf`; when the two raw strings differ
-    // the UI shows both, without judging the difference.
+    // The *picker* selection: optimistic launch/configure, a terminal
+    // `/model` folded in by `noteModelObservation`, the launch spec, or the
+    // picker's built-in alias. The session model chip does not read this —
+    // it shows the recorded running/launch value verbatim (`runningModelOf`).
     return (
       this.state.models[instanceId] ??
       instance?.model ??
       (kind === "codex" ? "gpt-5" : kind === "grok" ? "grok-4" : "opus")
     );
+  }
+
+  /** The model the chip shows, verbatim: the transcript-read-back RUNNING
+   *  model; before any read-back the durable launch spec; null when neither
+   *  exists. Nothing is invented (no opus/gpt-5/grok-4), no aliasing. */
+  runningModelOf(instanceId: Id): string | null {
+    const effective = this.state.modelEffective[instanceId]?.id;
+    if (effective) return effective;
+    const instance = this.state.instances.find((row) => row.id === instanceId);
+    return instance?.model ? instance.model : null;
   }
 
   /** The real model list for the picker: discovered catalog ids plus the

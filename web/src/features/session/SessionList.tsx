@@ -746,30 +746,31 @@ export function SessionList({
                       {branch ? <span className={css.branch}>{branch}</span> : null}
                       <span>· {instance.driver}</span>
                       {(() => {
-                        // The row says both model strings, verbatim: the one
-                        // requested at dispatch and the one read back from the
-                        // session. When they differ the row shows both; it does
-                        // not judge the difference (owner ruling 2026-09-23:
-                        // the harness records what runs, it does not decide
-                        // whether that is allowed).
-                        const requested = hubStore.modelOf(instance.id, instance.kind);
+                        // The chip says only the model that is running,
+                        // verbatim: the transcript read-back, or before any
+                        // read-back the durable launch spec. When neither
+                        // exists the slot is omitted entirely (no separator,
+                        // no empty span, no "not read back" hint for a model
+                        // nothing ever requested). The launch divergence is
+                        // not recomputed here — it is the Node's
+                        // model_pin_mismatch diagnostic in run details
+                        // (model-pin-1 §5.4).
+                        const running = hubStore.runningModelOf(instance.id);
+                        if (!running) return null;
                         const effective = hubStore.modelEffectiveOf(instance.id);
-                        const actual = effective?.id;
-                        const differs =
-                          actual !== undefined && actual.trim() !== "" && actual !== requested;
                         return (
                           <>
                             <span className={css.sep}>·</span>
                             <span
                               data-testid="session-model"
-                              data-model-effective={actual ? actual : "unknown"}
+                              data-model-effective={effective?.id ?? "unknown"}
                               title={
-                                actual
-                                  ? `请求 ${requested} · 实际 ${actual}（${effective?.source ?? ""}）`
-                                  : `请求 ${requested} · 实际模型尚未从会话回读`
+                                effective
+                                  ? `实际 ${running}（${effective.source}）`
+                                  : `${running}（尚未从会话回读）`
                               }
                             >
-                              {differs && actual ? `${actual} ⇐ ${requested}` : (actual ?? requested)}
+                              {running}
                             </span>
                           </>
                         );

@@ -95,6 +95,7 @@ export function Composer({
   permissionPending = null,
   kind = "claude",
   model = "opus",
+  launchModel = null,
   models,
   modelEffective,
   modelPending,
@@ -154,6 +155,8 @@ export function Composer({
   permissionPending?: { mode: string; queued: boolean } | null;
   kind?: EffortKind | string;
   model?: string;
+  /** Durable launch spec verbatim for the model chip (before read-back). */
+  launchModel?: string | null;
   models?: string[];
   /** §9.1 transcript-read-back effective model id; null/undefined = unobserved. */
   modelEffective?: string | null;
@@ -896,6 +899,7 @@ export function Composer({
     <EffortSlider
       kind={harness}
       model={caps.model ? model : undefined}
+      launchModel={caps.model ? launchModel : null}
       models={caps.model ? models : undefined}
       modelEffective={caps.model ? modelEffective : null}
       modelPending={caps.model ? modelPending : null}
@@ -921,6 +925,7 @@ export function Composer({
     <EffortSlider
       kind={harness}
       model={caps.model ? model : undefined}
+      launchModel={caps.model ? launchModel : null}
       models={caps.model ? models : undefined}
       modelEffective={caps.model ? modelEffective : null}
       modelPending={caps.model ? modelPending : null}

@@ -2235,6 +2235,14 @@ export interface components {
             } & {
                 [key: string]: unknown;
             }) | null;
+            /** @description model-pin-1 §5.4: recorded launch model-pin divergences projected from the Node's model_pin_mismatch diagnostics, verbatim ({requested, observed, observedAt}). Durable across the bounded journal tail; rendered in run details. Only sessions whose launch diagnostic is folded after the projection shipped are populated. */
+            modelPinMismatches?: ({
+                observed: string;
+                observedAt: string;
+                requested: string;
+            } & {
+                [key: string]: unknown;
+            })[] | null;
             name?: string | null;
             /** @description Native session id the driver reported; what POST /v1/instances/{id}/resume passes to `claude --resume` (D-026). */
             readonly nativeSessionId?: string | null;

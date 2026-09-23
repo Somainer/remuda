@@ -157,3 +157,99 @@ export function modelFromObservation(
     hasRequested: typeof payload.payload.requested === "string" && payload.payload.requested.length > 0,
   };
 }
+
+/** A recorded launch model-pin divergence (model-pin-1 §5): the Node's
+ *  `model_pin_mismatch` warning diagnostic, verbatim. The client never
+ *  recomputes the divergence — it reads this authoritative record. */
+export type ModelPinMismatch = {
+  requested: string;
+  observed: string;
+  /** When the diagnostic was recorded (Hub projection); absent for a record
+   *  seen only in the live journal window. */
+  observedAt?: string;
+  /** Stable event id, used as the React key when more than one is recorded. */
+  eventId?: string;
+};
+
+/** Extract every recorded `model_pin_mismatch` diagnostic from a journal
+ *  event window, in journal order. The window event does not carry the
+ *  projected observedAt; identity is requested+observed (see the merge). A
+ *  later `/model` does not erase history — the diagnostic stays in run
+ *  details even though the chip moves on. */
+export function modelPinMismatches(events: readonly unknown[]): ModelPinMismatch[] {
+  const out: ModelPinMismatch[] = [];
+  for (const event of events) {
+    const e = event as
+      | {
+          eventId?: string;
+          observedAt?: string;
+          kind?: string;
+          payload?: {
+            type?: string;
+            topic?: string;
+            nativeName?: string;
+            relatedIds?: Record<string, unknown>;
+          };
+        }
+      | null;
+    const p = e?.payload;
+    if (
+      e?.kind === "lifecycle" &&
+      p?.type === "native" &&
+      p.topic === "diagnostic" &&
+      p.nativeName === "model_pin_mismatch"
+    ) {
+      const requested = p.relatedIds?.requested;
+      const observed = p.relatedIds?.observed;
+      if (typeof requested === "string" && typeof observed === "string") {
+        out.push({
+          requested,
+          observed,
+          // Carry the event envelope time when present; the merge treats
+          // requested+observed as identity, so a missing observedAt still
+          // matches the projected record.
+          ...(e.observedAt ? { observedAt: e.observedAt } : {}),
+          ...(e.eventId ? { eventId: e.eventId } : {}),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** Merge the Hub-projected launch divergences (durable, window-independent)
+ *  with any diagnostics present in the currently loaded journal window
+ *  (the live edge before projection lands). Identity is requested+observed,
+ *  so a projected record and the still-loaded window event for the same
+ *  launch divergence render ONCE even though only the projected copy
+ *  carries observedAt. Projected records come first in stored order, then
+ *  window-only records. */
+export function allModelPinMismatches(
+  projected:
+    | readonly { requested?: unknown; observed?: unknown; observedAt?: unknown }[]
+    | null
+    | undefined,
+  events: readonly unknown[],
+): ModelPinMismatch[] {
+  const out: ModelPinMismatch[] = [];
+  const seen = new Set<string>();
+  const keyOf = (r: { requested: string; observed: string }) =>
+    `${r.requested}\u0000${r.observed}`;
+  const push = (r: ModelPinMismatch & { observedAt?: string }) => {
+    const key = keyOf(r);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(r);
+  };
+  for (const row of projected ?? []) {
+    if (typeof row.requested === "string" && typeof row.observed === "string") {
+      push({
+        requested: row.requested,
+        observed: row.observed,
+        ...(typeof row.observedAt === "string" ? { observedAt: row.observedAt } : {}),
+      });
+    }
+  }
+  for (const mismatch of modelPinMismatches(events)) push(mismatch);
+  return out;
+}

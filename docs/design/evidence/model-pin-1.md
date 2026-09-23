@@ -16,13 +16,14 @@ with the fake harness from `crates/remuda-testing`, on an isolated temp root. No
 host, user or path names appear below; every model id is either a synthetic
 stand-in or a host-generic gateway id.
 
-Implementation: branch `wt/c-modelpin/b-modelpin-md`; the full implementation
-through the round-3 source-scoping and explicit-pin fixes is at
-`46e92c6fa99c16c8f9b489f2607f7d112ba18b4a` (this evidence doc lands in the
-commits immediately after). The argv/overlay channel work and reporting are in
-the earlier commits; the post-launch read-back gate, the alias-aware comparison,
-the Hub launch-source scope, and the explicit-`model_pin` arming follow on the
-same branch.
+Implementation: the argv/overlay channel work, the post-launch read-back gate,
+the alias-aware comparison, the Hub launch-source scope, and the explicit-
+`model_pin` arming landed on `main` in merge `e417a513`
+(`wt/c-modelpin/b-modelpin-md`) — protocol comparison `5e7082fa`, Node refusal
+`c2641cbd`, web/CLI divergence row `72871ceb` + `6ff569c4`. The refusal half was
+rescinded by owner ruling on 2026-09-23 (§5): merge `80db05b8`
+(`wt/c-modelpin/b-modelpin2-md`), commit `5b54dd80` — record, never stop. This
+evidence doc landed in the docs commits immediately after the implementation.
 
 ---
 
@@ -319,13 +320,37 @@ is not to decide whether the agent is allowed to run on it.
   observed id) and, when the screen itself gave no detail line, writes
   `requested <pin>, observed <actual>` into the watch **detail**. The worker
   state/status are untouched: a divergence never overrides the screen
-  classification, so a genuinely blocked worker still shows its own reason;
-- the UI shows the two raw strings. The session-list model chip and the
-  session-page model control render `observed ⇐ requested` whenever the
-  read-back string differs from the request, verbatim and with no verdict,
-  flag, or styling between them. The web no longer carries the TS port of
-  `compare_model_pin`; the judgment lives only where the recording decision
-  needs it (the Node diagnostic and the Hub detail), in Rust.
+  classification, so a genuinely blocked worker still shows its own reason.
+  **Any non-launch read-back clears** the recorded launch `modelEffective`, so
+  the stale pair never lingers — a deliberate `slash`/`remuda` switch the
+  operator owns, and equally an unattributed `unknown` edge (an assistant
+  `message.model` change with no `/model` verdict or configure; the tracker
+  legitimately emits it once the launch edge resets its pending source). The
+  old value is kept only on a pass that could not read the instance row;
+- the UI shows ONE recorded value, verbatim. The session-list model chip and
+  the session-page model control render the **running** model: the
+  transcript read-back `modelEffective.id`; before any read-back the durable
+  launch spec `instance.model`; and **nothing** when neither exists (no
+  invented `opus`/`gpt-5`/`grok-4`, no picker-alias fallback, no shortening
+  or trimming). The client does **not** reconstruct a "requested vs running"
+  pair: that required rebuilding the request from several ingestion paths
+  and lost/overwrote it on list refresh, replay, a refused switch, or a
+  catalog-only refresh. A later terminal `/model` or Remuda configure simply
+  changes the running model the chip shows. The web carries no
+  `compare_model_pin` port and no per-switch request tracking;
+- the launch divergence is shown from the AUTHORITATIVE record the Node
+  writes, not recomputed: the `model_pin_mismatch` native warning diagnostic
+  (`requested` + `observed` verbatim). When that diagnostic is folded, the Hub
+  projects it onto the instance record as `modelPinMismatches`
+  (requested/observed/observedAt; de-duped on replay, accumulated across
+  re-launches), exposed on the public InstanceRecord JSON and mapped through
+  to the browser, so run details (`run-details-model-pin`) renders it
+  **independently of the bounded ~2000-event journal tail**. The web merges
+  the durable projection with any diagnostic still in the live window,
+  de-duplicating on requested+observed so the same divergence renders once.
+  **No backfill**: only sessions whose launch diagnostic is folded after
+  this change are projected; pre-existing sessions still see the record while
+  it remains in the loaded window (or after manually loading older history).
 
 ### 5.2 What no longer happens
 
@@ -334,8 +359,9 @@ is not to decide whether the agent is allowed to run on it.
   `model-mismatch` `last_error`;
 - the Hub never sets a worker `Blocked` for a model difference
   (`WorkerState` is decided by the screen classification alone);
-- no divergence marker / `data-model-diverged` / `data-model-mismatch`
-  attribute in the web — those were judgments; only the two strings remain.
+- the chip never shows a reconstructed `observed ⇐ requested` pair, a
+  divergence attribute, or an invented default — the only divergence surface
+  is the Node's recorded diagnostic in run details.
 
 Fail-open is unchanged: with no genuine launch read-back there is no record at
 all, and a later human/Remuda switch is out of scope by source attribution.
@@ -345,10 +371,14 @@ all, and a later human/Remuda switch is out of scope by source attribution.
 | Test | Covers |
 |---|---|
 | `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate *reports* (never refuses): a same-namespace substitution returns a divergence naming both ids exactly once; gateway resolution/pin/snapshot/later-switch/no-readback/no-pin paths report nothing; the catalog-upgraded case reports |
-| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY: the mismatch case journals `model_pin_mismatch` with both ids verbatim while the instance stays non-Failed with no `last_error`; the honoured case is unchanged |
-| `remuda-hub/tests/watch.rs::a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids` | a launch mismatch leaves the worker Working across passes; the watch detail names both ids verbatim and contains no refusal wording; `modelEffective` carries the observed id |
-| `web .../SessionList.test.tsx` | the chip shows the request before read-back, the single id when equal, and **both raw strings verbatim whenever they differ** — including a gateway→upstream resolution |
-| `web .../EffortSlider.test.tsx` | the session-page model control shows both full ids on any raw difference (gateway resolution, same-namespace difference, `[1m]` spelling), nothing while a switch is pending, nothing when equal |
+| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY: the mismatch case journals `model_pin_mismatch` with both ids verbatim while the instance stays non-Failed with no `last_error`; **the same instance then accepts a second prompt, answers it (`SPIKE_COMPLETE …`), and returns Ready — continuation proof, not just "not failed"**; the honoured case is unchanged |
+| `remuda-hub/tests/watch.rs::a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids` + `an_unknown_source_readback_clears_a_stale_launch_divergence` | a launch mismatch leaves the worker Working across passes; the watch detail names both ids verbatim and contains no refusal wording; `modelEffective` carries the observed id; **a later `slash` edge and an unattributed `unknown` assistant-model edge both clear the stale launch `modelEffective` and persist across passes** (the unreadable-row preservation is by code structure — the mutation runs only inside the successfully-read-row block — and is not separately asserted) |
+| `remuda-hub/src/store.rs::tests::model_pin_mismatch_projects_onto_instance_record` | the diagnostic projects verbatim into the **public InstanceRecord** field (`get_instance().model_pin_mismatches`, the serialized API shape — not private spec json), is de-duped on replay and accumulates across re-launches |
+| `web .../api.modelPin.test.ts` | the public InstanceRecord JSON maps through `mapInstance` to `instance.modelPinMismatches`; null/absent → null, malformed rows dropped — the wire boundary the browser actually receives |
+| `web .../store.model.test.ts` (real observation→store path) + rendered components | the four cases, asserted at the accessor and rendered: **(a)** launch A / read-back A → chip A, zero diagnostics; **(b)** launch A / read-back B → chip B + the `model_pin_mismatch` record ("requested A, observed B") selected verbatim; **(c)** then `/model` C → chip C while the diagnostic remains; **(d)** no launch model / read-back X → chip X, nothing invented. Rendered: `EffortSlider.test.tsx` (claude + codex effective/launch/absent incl. read-back-vs-launch tooltip wording, effort-only stop description), `SessionList.test.tsx` (chip text + tooltip + the empty slot is omitted), `SessionPage.chrome.test.tsx` (run-details from the real mapper with an EMPTY window, and projection+in-window dedupe to one line) |
+| `web .../SessionList.test.tsx` | the row chip shows the launch spec before read-back (tooltip says "尚未从会话回读", not "实际"), then only the running id verbatim — including the incident running id `ark/seed-evolving` in full (no shortening, no `⇐` pair) — and omits the separator/span entirely when neither a launch model nor a read-back exists |
+| `web .../EffortSlider.test.tsx` | the session-page chip for claude AND codex shows the launch spec verbatim pre-readback (marked not-yet-read-back) and the running id verbatim post-readback (even when it differs or ends in the same segment, tooltip `实际 …`), nothing for a model-axis launch with neither value, and moves straight to a later `/model` id; an effort-only slider (no `model` prop: New Session, agy) keeps the tier stop description; no `data-model-different` / `model-option-different` surface exists |
+| `web .../ux-modelsync.hub.spec.ts` | after a configure resolves to a different id, the chip shows only the running `e2e/plain` verbatim (collapsed text is not a pair), with no divergence note, and the same after a full reload |
 
 ---
 

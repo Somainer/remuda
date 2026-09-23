@@ -198,6 +198,70 @@ async fn assert_pin_reaches_the_harness(mismatch: bool) {
             "a divergence must not be recorded as an instance failure: {:?}",
             instance.last_error
         );
+
+        // Continuation proof: recording the divergence must not have stopped the
+        // process. The launch turn is the harness's default approval-gated tool
+        // turn (agent_status blocked), so a follow-up send queues behind the
+        // permission gate instead of delivering. Enqueue it, approve turn 1,
+        // then require the SAME instance to answer the second prompt (the fake
+        // harness echoes `SPIKE_COMPLETE <prompt>` once the gated catch-all
+        // scenario is consumed). A session that had been closed or failed
+        // accepts no command and never produces a second-turn transcript.
+        let second_prompt = "MODEL_PIN_SECOND_TURN continuation probe";
+        let command = node
+            .submit_command(
+                &created.instance.meta.id,
+                serde_json::from_value(serde_json::json!({
+                    "operation": "send",
+                    "prompt": second_prompt,
+                }))
+                .expect("send request"),
+            )
+            .await
+            .expect("the instance must still accept work after a divergence");
+
+        // Approve turn 1's pending tool call (the harness accepts "1"). Turn 1
+        // completes; the queue then drains the follow-up.
+        node.submit_command(
+            &created.instance.meta.id,
+            serde_json::from_value(serde_json::json!({
+                "operation": "tty.write",
+                "keys": ["1"],
+            }))
+            .expect("key request"),
+        )
+        .await
+        .expect("answering the approval must work");
+
+        wait_for_command_settled(
+            &node,
+            &created.instance,
+            &command.command.command_id,
+            Duration::from_secs(60),
+        )
+        .await;
+        wait_for_transcript_text(&transcript, second_prompt, Duration::from_secs(60)).await;
+        wait_for_transcript_text(
+            &transcript,
+            &format!("SPIKE_COMPLETE {second_prompt}"),
+            Duration::from_secs(60),
+        )
+        .await;
+        // Live, not merely non-failed: after answering, the same instance is
+        // Ready and idle (the second turn ended), and never went through
+        // Failed/Exited.
+        let live = wait_for_activity(
+            &node,
+            &created.instance.meta.id,
+            remuda_protocol::Activity::Idle,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(
+            live.lifecycle,
+            remuda_protocol::InstanceLifecycle::Ready,
+            "{live:?}"
+        );
     } else {
         // The pin answered, so the gate stays silent and nothing is failed.
         assert!(
@@ -291,6 +355,81 @@ fn transcript_models(path: &Path) -> Vec<String> {
         }
     }
     seen
+}
+
+/// Wait until a submitted command settles (its response reached the harness).
+async fn wait_for_command_settled(
+    node: &DevNode,
+    instance: &remuda_protocol::Instance,
+    command_id: &remuda_protocol::CommandId,
+    budget: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let command = node.get_command(command_id).expect("command row");
+        if command.state == remuda_protocol::CommandState::Settled {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let inst = node.get_instance(&instance.meta.id).map(|i| {
+                format!(
+                    "lifecycle={:?} activity={:?} last_error={:?}",
+                    i.lifecycle, i.activity, i.last_error
+                )
+            });
+            eprintln!("SETTLE TIMEOUT: {inst:?}");
+            if let Ok(page) = node.read_journal(&instance.journal_id, None, 64) {
+                for event in &page.events {
+                    if let remuda_protocol::JournalEvent::Instance(o) = event {
+                        eprintln!("  event {:?}", o.body);
+                    }
+                }
+            }
+            panic!("second-prompt command never settled: {:?}", command.state);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until the session transcript contains `needle` (a prompt or a reply).
+async fn wait_for_transcript_text(path: &Path, needle: &str, budget: Duration) {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "transcript never contained {needle:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until the instance's activity projects `wanted`, returning its row.
+/// Used after the queued second turn drains and ends (idle).
+async fn wait_for_activity(
+    node: &DevNode,
+    instance_id: &remuda_protocol::InstanceId,
+    wanted: remuda_protocol::Activity,
+    budget: Duration,
+) -> remuda_protocol::Instance {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let instance = node.get_instance(instance_id).expect("instance row");
+        if instance.activity == (remuda_protocol::Knowledge::Known { value: wanted }) {
+            return instance;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "instance activity never reached {wanted:?}: {:?}",
+            instance.activity
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Wait for the harness to write its session transcript under `<home>/projects`.

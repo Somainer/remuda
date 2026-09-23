@@ -187,67 +187,103 @@ describe("EffortSlider visual ladder", () => {
   });
 });
 
-describe("EffortSlider model read-back display", () => {
-  // The attribute lives on the expanded tier/model panel.
-  async function openPanel(overrides: Partial<SliderProps> & Pick<SliderProps, "kind">) {
-    mount(overrides);
-    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
-    return screen.getByTestId("effort-slider-panel");
-  }
+describe("EffortSlider running-model chip", () => {
+  // The collapsed chip is `effort-model`; the expanded panel is reached by
+  // clicking effort-open-list after mount().
 
-  it("shows both strings when a gateway resolves the catalog pin to an upstream name", async () => {
-    // Measured: es1_orange_o50 answers as claude-opus-5 on a real gateway.
-    // The strings differ, so both are shown verbatim — no verdict.
-    const panel = await openPanel({
+  it("shows the launch spec verbatim before any read-back", () => {
+    mount({ kind: "claude", model: "", launchModel: "model_hub/es1_orange_o50[1m]" });
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("model_hub/es1_orange_o50[1m]");
+    // The launch spec is not mislabeled as a read-back.
+    expect(chip.getAttribute("title")).toContain("尚未从会话回读");
+    expect(chip.getAttribute("title")).not.toContain("实际 ");
+    // No pair machinery exists anywhere.
+    expect(screen.queryByTestId("model-option-different")).toBeNull();
+  });
+
+  it("shows only the running id verbatim once read back, even if it differs from launch", async () => {
+    mount({
       kind: "claude",
-      model: "model_hub/es1_orange_o50[1m]",
+      model: "",
+      launchModel: "model_hub/es1_orange_o50[1m]",
       modelEffective: "claude-opus-5",
     });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-    const note = screen.getByTestId("model-option-different");
-    expect(note).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(note).toHaveTextContent("claude-opus-5");
-  });
-
-  it("shows both strings for a different id in the pin's own namespace", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "model_hub/es1_orange_o50[1m]",
-      modelEffective: "model_hub/es1_orange_o48[1m]",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-    const note = screen.getByTestId("model-option-different");
-    expect(note).toHaveTextContent("model_hub/es1_orange_o50[1m]");
-    expect(note).toHaveTextContent("model_hub/es1_orange_o48[1m]");
-  });
-
-  it("shows both strings for a [1m] context-suffix spelling difference", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "ark/seed-evolving[1m]",
-      modelEffective: "ark/seed-evolving",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "1");
-  });
-
-  it("does not show a difference while a switch is pending even if the id differs", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "model_hub/es1_orange_o50[1m]",
-      modelEffective: "model_hub/es1_orange_o48[1m]",
-      modelPending: { id: "model_hub/es1_orange_o48[1m]", queued: false },
-    });
-    expect(panel).toHaveAttribute("data-model-different", "0");
-  });
-
-  it("shows no difference for identical strings", async () => {
-    const panel = await openPanel({
-      kind: "claude",
-      model: "ark/seed-evolving",
-      modelEffective: "ark/seed-evolving",
-    });
-    expect(panel).toHaveAttribute("data-model-different", "0");
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("claude-opus-5");
+    expect(chip.getAttribute("title")).toBe("实际 claude-opus-5");
+    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
+    const panel = screen.getByTestId("effort-slider-panel");
+    expect(panel).not.toHaveAttribute("data-model-different");
     expect(screen.queryByTestId("model-option-different")).toBeNull();
+  });
+
+  it("renders the full running id raw even when its last segment matches the launch", () => {
+    // The incident pair: no shortening, no pair; the running id alone is full.
+    mount({
+      kind: "claude",
+      model: "",
+      launchModel: "passthrough/ark/seed-evolving",
+      modelEffective: "ark/seed-evolving",
+    });
+    expect(screen.getByTestId("effort-model").textContent).toBe("ark/seed-evolving");
+  });
+
+  it("shows nothing when there is no launch model and no read-back", () => {
+    mount({ kind: "claude", model: "", launchModel: null });
+    const chip = screen.getByTestId("effort-model");
+    expect(chip.textContent).toBe("");
+    expect(chip).not.toHaveTextContent("opus");
+  });
+
+  it("shows the running id for a row with no launch model", () => {
+    mount({ kind: "claude", model: "", launchModel: null, modelEffective: "sonnet" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("sonnet");
+    expect(screen.getByTestId("effort-model")).not.toHaveTextContent("opus");
+  });
+
+  it("moves straight to a later /model id with no divergence note", async () => {
+    mount({ kind: "claude", model: "", launchModel: "model_hub/A", modelEffective: "model_hub/C" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("model_hub/C");
+    await userEvent.setup().click(screen.getByTestId("effort-open-list"));
+    const panel = screen.getByTestId("effort-slider-panel");
+    expect(panel).not.toHaveAttribute("data-model-different");
+  });
+
+  it("codex shows the model, not the effort stop description (effective / launch / absent)", () => {
+    // Codex supports the model axis: the chip must never substitute the
+    // tier sentence for the running id.
+    const { unmount } = mount({ kind: "codex", index: 4, model: "gpt-5", launchModel: "gpt-5" });
+    expect(screen.getByTestId("effort-model").textContent).toBe("gpt-5");
+    unmount();
+
+    // Read-back of a different id.
+    mount({
+      kind: "codex",
+      index: 4,
+      model: "gpt-5",
+      launchModel: "gpt-5",
+      modelEffective: "gpt-5.4",
+    });
+    expect(screen.getByTestId("effort-model").textContent).toBe("gpt-5.4");
+  });
+
+  it("an effort-only slider (no model prop) keeps the tier stop description", () => {
+    // The New Session form mounts EffortSlider with kind+index only (model
+    // undefined); the explanatory stop sentence must remain under the slider.
+    {
+      const { unmount } = mount({ kind: "claude", index: 2 });
+      const chip = screen.getByTestId("effort-model");
+      expect(chip.textContent).not.toBe("");
+      expect(chip.textContent).toMatch(/档|default/i);
+      unmount();
+    }
+    // agy sessions are effort-only too.
+    {
+      const { unmount } = mount({ kind: "agy", index: 0 });
+      expect(screen.getByTestId("effort-model").textContent).not.toBe("");
+      unmount();
+    }
   });
 });
 

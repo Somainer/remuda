@@ -20,7 +20,6 @@ import {
 } from "./effort";
 import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
 import css from "./session.module.css";
-import { compareModelPin } from "./modelEffective";
 
 /**
  * Half the knob, in px — keep in step with `--knob-size` in session.module.css,
@@ -233,16 +232,13 @@ export function EffortSlider({
     [currentModel, models, kind],
   );
   const modelPendingShort = modelPending?.id ? shortModel(modelPending.id) : null;
-  // A mismatch is settled state; while the requested switch is still in flight
-  // (pending) the effective id is simply stale, so don't cry mismatch yet.
-  // Use the alias-aware comparison, not shortModel inequality: a correct
-  // gateway launch resolves a catalog id to an upstream vendor name
-  // (`es1_orange_o50` → `claude-opus-5`), which is not a mismatch
-  // (model-pin-1 §3).
-  const modelMismatch =
-    !modelPending && model && modelEffective
-      ? compareModelPin(model, modelEffective, models ?? []) === "mismatch"
-      : false;
+  // While a requested switch is in flight (pending) the effective id is simply
+  // stale, so don't show the two strings as different yet. Otherwise any raw
+  // inequality is shown as-is — requested and actual, verbatim, with no
+  // verdict between them (owner ruling 2026-09-23).
+  const modelDifferent =
+    !modelPending &&
+    Boolean(model && modelEffective && model !== modelEffective);
   const catalogDiagnostic = modelList.length ? catalogNote(modelCatalog) : null;
 
   // ── List-view roving keyboard navigation ──────────────────────────────
@@ -534,7 +530,7 @@ export function EffortSlider({
       <div className={frame} data-testid={tid("slider-panel")} data-view="list" data-harness={kind}
         data-model-current={currentModel ? shortModel(currentModel) : ""}
         data-model-pending={modelPending ? (modelPending.queued ? "queued" : "switching") : "0"}
-        data-model-mismatch={modelMismatch ? "1" : "0"}
+        data-model-different={modelDifferent ? "1" : "0"}
         data-model-path={modelSelectionPath ?? ""}
         data-catalog-source={modelCatalog?.source ?? ""}
       >
@@ -650,9 +646,9 @@ export function EffortSlider({
                   </button>
                 );
               })}
-              {modelMismatch ? (
-                <div className={css.effortDesc} data-testid="model-option-mismatch">
-                  请求 {shortModel(model)} → 实际 {shortModel(modelEffective ?? undefined)}
+              {modelDifferent && model && modelEffective ? (
+                <div className={css.effortDesc} data-testid="model-option-different">
+                  请求 {model} → 实际 {modelEffective}
                 </div>
               ) : null}
               {onModel ? (
@@ -794,8 +790,22 @@ export function EffortSlider({
           <ResetIcon />
         </button>
       </div>
-      <div className={css.effortModel} data-testid={tid("model")} title={stop?.description}>
-        {kind === "codex" ? stop?.description : modelLabel || stop?.description || ""}
+      <div
+        className={css.effortModel}
+        data-testid={tid("model")}
+        title={
+          // When the read-back differs from the request, both full ids are
+          // shown verbatim on hover; the chip itself carries the short labels.
+          modelDifferent && model && modelEffective
+            ? `请求 ${model} · 实际 ${modelEffective}`
+            : stop?.description
+        }
+      >
+        {kind === "codex"
+          ? stop?.description
+          : modelDifferent && modelEffective
+            ? `${shortModel(modelEffective)} ⇐ ${modelLabel || shortModel(model)}`
+            : modelLabel || stop?.description || ""}
       </div>
       {track}
       {ticks}

@@ -1,5 +1,12 @@
 # A `--model` pin must reach the process, or the launch must refuse
 
+> **2026-09-23 owner ruling — the refusal described below is removed; see [§5](#5-owner-ruling-2026-09-23-record-never-stop).**
+> A model that differs from the pin is now recorded honestly (a Node warning
+> diagnostic, a Hub watch detail, and both raw strings in the UI) but the
+> process is not closed, the instance is not failed, and the worker is not
+> Blocked. §1–§4 are kept as the history of the argv/overlay channel and the
+> comparison; the kill/block behaviour they describe no longer ships.
+
 A dispatch that names a model must put that model in front of the process, on
 every claude launch path. If it cannot, the launch must fail loudly rather than
 run on something else while every record claims the pin was honoured.
@@ -148,7 +155,8 @@ Brief step 4 asked for the first observed effective model to be compared against
 the pin, with a mismatch stopping the launch and ending the worker Blocked. That
 is now implemented — but the comparison is **not** string equality, and the gate
 judges a real read-back rather than the driver's own launch assertion. This
-section records why.
+section records why. (The stopping/Blocking half was rescinded 2026-09-23; see
+§5.)
 
 ### 3.1 Why equality on `message.model` is unsound
 
@@ -221,23 +229,26 @@ ever changed. `pin_from_recipe` is the single arming path.
 
 ### 3.3.1 The Hub half is source-scoped too
 
-The watch pass derives the `Blocked` worker from the projected `modelEffective`,
-and must apply the **same** source gate: it only treats a record with
+The watch pass derives a divergence record from the projected `modelEffective`,
+and applies the **same** source gate: it only treats a record with
 `effective.source == "launch"` as a possible substitution. The instance
 projection is source-agnostic, so an operator switching the session after launch
 (a human `/model`, or a Hub `instance.configure`) overwrites `modelEffective`
 while `WorkerRoster.model` keeps the dispatch pin. Without the source filter the
-next watch pass would end an intentionally reconfigured worker `Blocked` naming
-two ids nobody substituted, and keep it Blocked. `slash`/`remuda` observations
-change neither worker state nor the effective-model column.
+next watch pass would record two ids nobody substituted against an intentional
+reconfiguration, and keep recording them. `slash`/`remuda` observations change
+neither worker state nor the effective-model column. (Post-§5 this derivation
+feeds the watch detail and `modelEffective` only — never a `Blocked` state.)
 
 
-On a `Mismatch` the pump journals the contradicting observation, sends
-`DriverRequest::Close` to stop the process, and records
-`model-mismatch: requested <pin> but <observed> answered`. The Hub watch pass
-then ends the worker **Blocked** with that reason naming both ids
-(`WorkerState` has no `Failed` arm). The instance itself is marked failed by the
-Node; the worker is Blocked by the Hub.
+On a `Mismatch` the pump used to journal the contradicting observation, send
+`DriverRequest::Close` to stop the process, and record
+`model-mismatch: requested <pin> but <observed> answered`; the Hub watch pass
+then ended the worker **Blocked** with that reason naming both ids
+(`WorkerState` has no `Failed` arm). The instance was marked failed by the Node;
+the worker was Blocked by the Hub. **Superseded 2026-09-23: see §5 — the pump
+now journals a warning diagnostic and keeps running; the Hub records the pair
+in its watch detail and leaves the worker Working.**
 
 ### 3.4 The read-back end to end
 
@@ -249,13 +260,95 @@ parsed and reaches argv, but the session *reports* a different id — separating
 
 - **honoured** — pinned `…o50[1m]`, harness reports `…o50[1m]`: instance Ready,
   no `model-mismatch`;
+- **honoured** — pinned `…o50[1m]`, harness reports `…o50[1m]`: instance Ready,
+  no divergence record;
 - **mismatch** — pinned `…o50[1m]`, harness reports `…o48[1m]` (the host
-  default, same namespace): the launch is stopped, the instance is Failed with a
-  `model-mismatch` error naming both ids, and the worker ends Blocked.
+  default, same namespace): **as first shipped**, the launch was stopped, the
+  instance Failed with a `model-mismatch` error naming both ids, and the worker
+  ended Blocked. **Since 2026-09-23 (§5):** the session keeps running; the Node
+  journals a `model_pin_mismatch` warning diagnostic carrying `requested` and
+  `observed` verbatim, the instance stays Ready with no `last_error`, and the
+  Hub worker stays Working with the pair in the watch detail.
 
 A correct gateway launch (`…o50[1m]` answered by `claude-opus-5`) is not
-reported as diverged in the watch table or the web strip — only a real mismatch
-is.
+reported as diverged in the watch table or the web strip — only a same-
+vocabulary difference is.
+
+---
+
+## 5. Owner ruling 2026-09-23: record, never stop
+
+The 2026-09-23 incident that triggered this review was a *false* kill: the pin
+`passthrough/ark/seed-evolving` was answered as `ark/seed-evolving` (the
+gateway's routing prefix is stripped on forwarding), and the §3 namespaced
+pair rule judged the one-turn-old session failed. Reviewing the *true-positive*
+half of the rule, the owner ruled that the whole enforcement was the harness
+overreaching:
+
+> 「不要为 Agent 决定要干什么。Harness 只是提供 capability，实际上决定怎么做的永远是 Agent。」
+>
+> 「模型替换就停 Session 是为何？为啥要多此一举。」
+
+So the enforcement was removed. The harness's job on a model difference is the
+same one D-035 gives it for every other axis: **say what actually happened**. It
+is not to decide whether the agent is allowed to run on it.
+
+### 5.1 What still happens
+
+- the launch read-back is still judged once, with the same source scope
+  (launch-sourced, raw-backed — §3.3) and the same alias-aware comparison
+  (§3.2). A prefix-normalisation special case (`passthrough/…` → `…`) was
+  prototyped during this incident and then withdrawn by the owner: **no prefix
+  special-casing, no normalisation beyond the existing context-suffix rule**;
+- on a decidable `Mismatch` the Node pump journals a **warning diagnostic**
+  using the existing native-lifecycle diagnostic shape (no new wire type or
+  field):
+
+  ```
+  topic       = diagnostic
+  native_name = model_pin_mismatch
+  related_ids = { reason: "model-mismatch",
+                  requested: "<pin verbatim>",
+                  observed: "<actual id verbatim>" }
+  severity    = warning        affects_completion = false
+  ```
+
+  The model edge itself is journaled first, so the actual id is in the journal
+  independently of the diagnostic;
+- the Hub watch pass records the pair on the roster row (`modelEffective` = the
+  observed id) and, when the screen itself gave no detail line, writes
+  `requested <pin>, observed <actual>` into the watch **detail**. The worker
+  state/status are untouched: a divergence never overrides the screen
+  classification, so a genuinely blocked worker still shows its own reason;
+- the UI shows the two raw strings. The session-list model chip and the
+  session-page model control render `observed ⇐ requested` whenever the
+  read-back string differs from the request, verbatim and with no verdict,
+  flag, or styling between them. The web no longer carries the TS port of
+  `compare_model_pin`; the judgment lives only where the recording decision
+  needs it (the Node diagnostic and the Hub detail), in Rust.
+
+### 5.2 What no longer happens
+
+- no `DriverRequest::Close` over a model difference; no
+  `record_task_exit`; the instance is never `Failed` and gets no
+  `model-mismatch` `last_error`;
+- the Hub never sets a worker `Blocked` for a model difference
+  (`WorkerState` is decided by the screen classification alone);
+- no divergence marker / `data-model-diverged` / `data-model-mismatch`
+  attribute in the web — those were judgments; only the two strings remain.
+
+Fail-open is unchanged: with no genuine launch read-back there is no record at
+all, and a later human/Remuda switch is out of scope by source attribution.
+
+### 5.3 Tests after the ruling
+
+| Test | Covers |
+|---|---|
+| `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate *reports* (never refuses): a same-namespace substitution returns a divergence naming both ids exactly once; gateway resolution/pin/snapshot/later-switch/no-readback/no-pin paths report nothing; the catalog-upgraded case reports |
+| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY: the mismatch case journals `model_pin_mismatch` with both ids verbatim while the instance stays non-Failed with no `last_error`; the honoured case is unchanged |
+| `remuda-hub/tests/watch.rs::a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids` | a launch mismatch leaves the worker Working across passes; the watch detail names both ids verbatim and contains no refusal wording; `modelEffective` carries the observed id |
+| `web .../SessionList.test.tsx` | the chip shows the request before read-back, the single id when equal, and **both raw strings verbatim whenever they differ** — including a gateway→upstream resolution |
+| `web .../EffortSlider.test.tsx` | the session-page model control shows both full ids on any raw difference (gateway resolution, same-namespace difference, `[1m]` spelling), nothing while a switch is pending, nothing when equal |
 
 ---
 
@@ -266,13 +359,13 @@ is.
 | `remuda-driver/tests/materializer.rs::shell_pty_agent` | the pin on argv verbatim for claude-print / claude-pty / shell-pty; no pin ⇒ no token; no `--model` grafted onto codex/grok/agy |
 | `remuda-driver/tests/model_pin_overlay.rs` | host `model` + `ANTHROPIC_MODEL` evicted under delegation `none`; endpoint/credential kept; blank pin is not a pin; case-insensitive env match |
 | `remuda-protocol/src/model.rs::tests` | `compare_model_pin`: suffix-equal Honoured, same-namespace Mismatch, upstream resolution Unresolvable, catalog hit, bare alias, absent pin |
-| `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate: synthetic snapshot never judged, launch read-back mismatch refuses naming both ids, gateway resolution passes, later switches out of scope, no read-back fails open, no pin never refuses, **an unpinned/blank pin arms no gate despite a populated `model_requested`** |
-| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY, **honoured** and **mismatch** cases: the pinned id is received; a substituted launch is stopped Failed, both ids named |
-| `remuda-hub/tests/watch.rs` | a launch-sourced mismatch ends the worker Blocked naming both ids and sets `modelEffective`; a gateway→upstream resolution is neither blocked nor recorded; **a `slash`/`remuda` switch after an honoured launch keeps the worker Working across repeated passes** |
+| `remuda-node/src/runtime.rs::tests::model_pin_gate` | the read-back gate **reports** (post-§5, never refuses): synthetic snapshot never judged, launch read-back divergence names both ids exactly once, gateway resolution passes, later switches out of scope, no read-back fails open, no pin never reports, **an unpinned/blank pin arms no gate despite a populated `model_requested`** |
+| `remuda-node/tests/model_pin_launch.rs` | end to end through a real PTY, **honoured** and **diverged** cases: the pinned id is received; a substituted launch keeps running with a warning diagnostic naming both ids verbatim and no instance failure (post-§5) |
+| `remuda-hub/tests/watch.rs` | a launch-sourced divergence keeps the worker **Working** with both ids in the watch detail and sets `modelEffective` (post-§5); a gateway→upstream resolution is neither detailed nor recorded; **a `slash`/`remuda` switch after an honoured launch keeps the worker Working across repeated passes** |
 | `remuda-hub/src/store.rs::tests` | a `model` journal event projects the observed id to `modelEffective` |
 | `remuda-driver/tests/materializer.rs` | `spec.model_id` becomes `RecipeProvider.model_pin` verbatim; an unpinned launch has `model_pin = None` even when `model_requested` is populated |
-| `web/.../EffortSlider.test.tsx` | the slider's requested-vs-actual note uses the alias rule: gateway resolution and suffix variants not flagged, real same-namespace mismatch flagged, pending not flagged |
+| `web/.../EffortSlider.test.tsx` | post-§5: the control shows both full ids whenever the raw strings differ (gateway resolution, same-namespace difference, `[1m]` spelling); nothing while a switch is pending or when the strings are equal — no verdict |
 | `remuda/src/cmd/watch.rs::tests` | the MODEL cell: observed-first `observed ⇐ requested` on divergence, `-` when unknown, truncation keeps the observed id |
-| `web/src/features/session/SessionList.test.tsx` | the row label: requested until read back; real substitution marked diverged; gateway resolution not marked |
+| `web/src/features/session/SessionList.test.tsx` | post-§5: the row label shows the request until read back, the one id when equal, and both raw strings verbatim whenever they differ |
 | `remuda-node/tests/model_pin_evidence.rs` | `#[ignore]` capture tool that produced §1.2–1.3 |
 

@@ -1978,8 +1978,8 @@ class HubStore {
   modelOf(instanceId: Id, kind?: string): string {
     const instance = this.state.instances.find((row) => row.id === instanceId);
     // The *requested* selection: optimistic, then the launch/instance record.
-    // The resolved id is `modelEffectiveOf` (an alias resolves to a concrete
-    // id); the picker shows a mismatch when they differ.
+    // The read-back id is `modelEffectiveOf`; when the two raw strings differ
+    // the UI shows both, without judging the difference.
     return (
       this.state.models[instanceId] ??
       instance?.model ??

@@ -163,30 +163,40 @@ async fn assert_pin_reaches_the_harness(mismatch: bool) {
 
     if mismatch {
         // The substitution: the process answered on the host's default. The
-        // read-back gate must have stopped the launch, naming both ids.
+        // read-back gate records it honestly — a diagnostic naming both ids —
+        // and lets the session run (owner ruling 2026-09-23, model-pin-1 §5:
+        // the harness records what answered; it does not stop the agent).
         assert!(
             models.iter().any(|model| model == HOST_DEFAULT),
             "the mismatch case must report the host default: {models:?}"
         );
-        let failure =
-            wait_for_model_mismatch(&node, &created.instance.meta.id, Duration::from_secs(60))
-                .await;
+        let diagnostic =
+            wait_for_model_divergence(&node, &created.instance, Duration::from_secs(60)).await;
         assert!(
-            failure.contains(PIN),
-            "must name the requested id: {failure}"
+            diagnostic.contains(PIN),
+            "the record must name the requested id verbatim: {diagnostic}"
         );
         assert!(
-            failure.contains(HOST_DEFAULT),
-            "must name the observed id: {failure}"
+            diagnostic.contains(HOST_DEFAULT),
+            "the record must name the observed id verbatim: {diagnostic}"
         );
-        // And the instance must not be left running on the wrong model.
+        // The instance must still be running — not failed, no error recorded.
         let instance = node
             .get_instance(&created.instance.meta.id)
             .expect("instance row");
-        assert_eq!(
+        assert_ne!(
             instance.lifecycle,
             remuda_protocol::InstanceLifecycle::Failed,
-            "a refused launch must not stay working"
+            "a model divergence is recorded, never fatal"
+        );
+        assert!(
+            !instance
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("model-mismatch"),
+            "a divergence must not be recorded as an instance failure: {:?}",
+            instance.last_error
         );
     } else {
         // The pin answered, so the gate stays silent and nothing is failed.
@@ -215,23 +225,49 @@ async fn assert_pin_reaches_the_harness(mismatch: bool) {
     let _ = node;
 }
 
-/// Wait for the Node to record the model-mismatch refusal, returning its reason.
-async fn wait_for_model_mismatch(
+/// Wait for the Node to journal the model-pin divergence diagnostic, returning
+/// the joined related-id values (`reason`, `requested`, `observed`).
+async fn wait_for_model_divergence(
     node: &DevNode,
-    instance_id: &remuda_protocol::InstanceId,
+    instance: &remuda_protocol::Instance,
     budget: Duration,
 ) -> String {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if let Ok(instance) = node.get_instance(instance_id)
-            && let Some(error) = instance.last_error.as_deref()
-            && error.contains("model-mismatch")
-        {
-            return error.to_owned();
+        let page = node
+            .read_journal(&instance.journal_id, None, 4096)
+            .expect("read journal");
+        let found = page.events.iter().find_map(|event| match event {
+            remuda_protocol::JournalEvent::Instance(observation) => match &observation.body {
+                remuda_protocol::ObservationPayload::Lifecycle(payload) => match payload.as_ref() {
+                    remuda_protocol::LifecyclePayload::Native(native)
+                        if native.native_name == "model_pin_mismatch"
+                            && matches!(
+                                native.topic,
+                                remuda_protocol::LifecycleTopic::Diagnostic
+                            ) =>
+                    {
+                        Some(
+                            native
+                                .related_ids
+                                .values()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        )
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        });
+        if let Some(text) = found {
+            return text;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the node never recorded a model-mismatch refusal"
+            "the node never journaled the model divergence diagnostic"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

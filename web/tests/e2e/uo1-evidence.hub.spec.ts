@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { seedMode } from "./appearanceHelper";
@@ -7,9 +7,11 @@ import { login } from "./hub-auth";
 
 /**
  * UO-1 evidence: the foundation layer (tokens, base controls, appearance,
- * terminal palette) on the five reference surfaces, in both modes at 390 and
- * 1440. A default run skips everything and writes nothing; REMUDA_EVIDENCE=1
- * refreshes docs/design/evidence/ui-overhaul/UO-1-<surface>-<mode>-<width>.png.
+ * terminal palette) on the five reference surfaces, in both modes at 390,
+ * 768 and 1440. A default run skips everything and writes nothing;
+ * REMUDA_EVIDENCE=1 refreshes the committed 390/1440 frames in
+ * docs/design/evidence/ui-overhaul/UO-1-<surface>-<mode>-<width>.png, and
+ * UO1_SHOT_COPY_DIR (optional) also receives every width for review.
  *
  * Fake Node content:
  *  - a claude-print session left on its create approval (the amber pending
@@ -24,7 +26,11 @@ const evidence = process.env.REMUDA_EVIDENCE === "1";
 const shotDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/ui-overhaul");
 
 const MODES = ["dark", "light"] as const;
-const WIDTHS = [390, 1440] as const;
+/** 390 and 1440 are committed; 768 is only written to UO1_SHOT_COPY_DIR. */
+const WIDTHS = [390, 768, 1440] as const;
+const COMMITTED_WIDTHS: readonly number[] = [390, 1440];
+/** Optional review directory that receives every shot as `<surface>-<width>-<mode>.png`. */
+const copyDir = process.env.UO1_SHOT_COPY_DIR ?? "";
 type Mode = (typeof MODES)[number];
 
 let structuredId = "";
@@ -73,10 +79,14 @@ async function shoot(page: Page, surface: string, mode: Mode, width: number): Pr
   // Web fonts in, then one settled frame.
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   await page.waitForTimeout(300);
-  await page.screenshot({
-    path: path.join(shotDir, `UO-1-${surface}-${mode}-${width}.png`),
-    animations: "disabled",
-  });
+  const shot = await page.screenshot({ animations: "disabled" });
+  if (COMMITTED_WIDTHS.includes(width)) {
+    await writeFile(path.join(shotDir, `UO-1-${surface}-${mode}-${width}.png`), shot);
+  }
+  if (copyDir) {
+    await mkdir(copyDir, { recursive: true });
+    await writeFile(path.join(copyDir, `${surface}-${width}-${mode}.png`), shot);
+  }
 }
 
 test.beforeAll(async ({ browser }) => {
@@ -132,9 +142,14 @@ for (const mode of MODES) {
       const transcript = page.getByTestId("transcript");
       const code = transcript.locator("pre").filter({ hasText: "export function add" });
       await expect(code).toBeVisible({ timeout: 30_000 });
-      await expect(transcript.locator("table").first()).toBeAttached({ timeout: 30_000 });
-      // Park the code reply at the top so code, table and tool card share the frame.
-      await code.evaluate((el) => el.scrollIntoView({ block: "start" }));
+      const table = transcript.locator("table").first();
+      await expect(table).toBeAttached({ timeout: 30_000 });
+      const tool = transcript.getByTestId("tool-card").last();
+      await expect(tool).toBeAttached({ timeout: 30_000 });
+      // Frame the rendered table with the settled tool card under it.
+      await table.evaluate((el) => el.scrollIntoView({ block: "start" }));
+      await expect(table).toBeInViewport();
+      await expect(tool).toBeInViewport();
       await shoot(page, "structured", mode, width);
 
       await page.goto(width <= 767 ? "/m/inbox" : "/approvals");

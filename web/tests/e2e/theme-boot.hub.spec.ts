@@ -187,6 +187,46 @@ test.describe("appearance applied at boot", () => {
 });
 
 /**
+ * A mode switch is instant (visual-system.md §7.4) even with motion allowed:
+ * buttons and segments transition colour on hover, but must not fade into the
+ * new palette. Read the running transitions one painted frame after the
+ * switch, while a hovered control's colours are changing with the mode.
+ */
+test.describe("mode switch", () => {
+  for (const [from, to] of [
+    ["dark", "light"],
+    ["light", "dark"],
+  ] as const) {
+    test(`switching ${from} → ${to} starts no transition`, async ({ page }) => {
+      await page.emulateMedia({ colorScheme: from, reducedMotion: "no-preference" });
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await seedMode(page, from);
+      await login(page);
+      await page.goto("/settings");
+      const target = page.getByTestId(`settings-appearance-${to}`);
+      await expect(target).toBeVisible();
+      await page.getByTestId("settings-appearance-system").hover();
+
+      const running = await target.evaluate(async (el) => {
+        (el as HTMLElement).click();
+        // One rendering step after the click, the next callback sees what it started.
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        return document
+          .getAnimations()
+          .filter((animation) => animation instanceof CSSTransition && animation.playState === "running")
+          .map((animation) => {
+            const t = (animation as CSSTransition).effect as KeyframeEffect | null;
+            const node = t?.target;
+            return `${node?.tagName.toLowerCase()}.${String(node?.className).slice(0, 40)} ${(animation as CSSTransition).transitionProperty}`;
+          });
+      });
+      await expect(page.locator("html")).toHaveAttribute("data-appearance", to);
+      expect(running, `transitions running right after ${from} → ${to}`).toEqual([]);
+    });
+  }
+});
+
+/**
  * Reduced motion (visual-system.md §7): tokens.css stops every animation and
  * transition except on elements that opt in with data-motion="essential".
  * Read the live animation list rather than the stylesheet, after hovering and

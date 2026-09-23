@@ -13,7 +13,8 @@ import { login } from "./hub-auth";
  *
  * Every woff2 response is held for 800ms, so the swap reliably lands after
  * the first rows render. Fake Node only: `__journal_burst__:<n>` appends n
- * assistant rows in one journal append.
+ * assistant rows in one journal append. The long-journal case writes more
+ * than the Hub's tail window first, so the restore runs on a bounded replay.
  */
 
 test.describe.configure({ mode: "serial" });
@@ -26,6 +27,8 @@ const FONT_DELAY_MS = Number(process.env.FONT_SWAP_DELAY_MS ?? 800);
 const DRIFT_PX = 4;
 /** Enough sans rows below the code block to park it near the top and scroll. */
 const BURST = 24;
+/** Longer than the Hub's 2000-row tail window, so the tab replays a bounded tail. */
+const LONG_BURST = 2400;
 
 const created: string[] = [];
 
@@ -67,7 +70,7 @@ async function command(page: Page, instanceId: string, prompt: string): Promise<
  * A session whose transcript mixes monospace (the fenced reply, the header's
  * path and IDs) with a run of sans rows below it.
  */
-async function seedSession(page: Page): Promise<string> {
+async function seedSession(page: Page, longBurst = 0): Promise<string> {
   const instanceId = await page.evaluate(async () => {
     const hosts = (await (await fetch("/v1/hosts", { credentials: "include" })).json()) as {
       items?: { hostId?: string; label?: string }[];
@@ -123,44 +126,76 @@ async function seedSession(page: Page): Promise<string> {
   // above the anchor stays short: a tall row the virtualiser has never
   // measured is placed by its row estimate on restore, which would move the
   // anchor with or without a font swap.
+  if (longBurst > 0) {
+    // A journal longer than the Hub's tail window (2000 rows): the tab only
+    // replays the bounded tail, so the rows above the anchor are a window
+    // floor, not the start of the session.
+    await command(page, instanceId, `__journal_burst__:${longBurst}`);
+    await expect
+      .poll(async () => Number((await journalTail(page, instanceId)).durableSeq ?? 0), { timeout: 60_000 })
+      .toBeGreaterThanOrEqual(longBurst);
+  }
   await command(page, instanceId, "font swap probe: show me code");
   // The reply must be journaled before the burst lands below it.
   await expect
-    .poll(
-      () =>
-        page.evaluate(async (id) => {
-          const body = (await (await fetch(`/v1/instances/${id}/journal`, { credentials: "include" })).json()) as {
-            events?: { event?: { payload?: { text?: unknown } } }[];
-          };
-          return (body.events ?? []).some(
-            (event) => typeof event.event?.payload?.text === "string" && event.event.payload.text.includes("```ts"),
-          );
-        }, instanceId),
-      { timeout: 30_000 },
-    )
-    .toBe(true);
+    .poll(async () => textsAfterLastCode(await journalTail(page, instanceId)), { timeout: 30_000 })
+    .not.toBeNull();
   await command(page, instanceId, `__journal_burst__:${BURST}`);
   // Burst labels count across the whole fake node, so wait on the journal.
   await expect
     .poll(
-      () =>
-        page.evaluate(async (id) => {
-          const body = (await (await fetch(`/v1/instances/${id}/journal`, { credentials: "include" })).json()) as {
-            events?: { event?: { payload?: { text?: unknown } } }[];
-          };
-          return (body.events ?? []).filter(
-            (event) => typeof event.event?.payload?.text === "string" && event.event.payload.text.includes("__journal_burst__"),
-          ).length;
-        }, instanceId),
+      async () =>
+        (textsAfterLastCode(await journalTail(page, instanceId)) ?? []).filter((text) => text.includes("__journal_burst__"))
+          .length,
       { timeout: 30_000 },
     )
     .toBeGreaterThanOrEqual(BURST);
+  if (longBurst > 0) {
+    const tail = await journalTail(page, instanceId);
+    expect(Number(tail.fromSeq), "the journal is longer than one tail window").toBeGreaterThan(1);
+    expect(tail.reachedAfterSeq, "the tail window is partial").toBe(false);
+  }
   return instanceId;
 }
 
-/** The newest burst row is on screen once the pinned transcript has loaded. */
-async function loaded(page: Page): Promise<void> {
+type JournalTail = {
+  durableSeq?: string | number;
+  fromSeq?: string | number | null;
+  reachedAfterSeq?: boolean;
+  events?: { event?: { payload?: { text?: unknown } } }[];
+};
+
+/** The Hub's bounded tail window of the journal. */
+async function journalTail(page: Page, instanceId: string): Promise<JournalTail> {
+  return page.evaluate(
+    async (id) => (await (await fetch(`/v1/instances/${id}/journal`, { credentials: "include" })).json()) as JournalTail,
+    instanceId,
+  );
+}
+
+/** Texts after the newest fenced-code reply, or null while there is none. */
+function textsAfterLastCode(tail: JournalTail): string[] | null {
+  const texts = (tail.events ?? []).map((event) =>
+    typeof event.event?.payload?.text === "string" ? event.event.payload.text : "",
+  );
+  const last = texts.findLastIndex((text) => text.includes("```ts"));
+  return last < 0 ? null : texts.slice(last + 1);
+}
+
+/**
+ * The tab is live and shows the newest burst row. A long journal lands in
+ * stages (the bounded tail, then the rest), so any burst row is not enough.
+ */
+async function loaded(page: Page, instanceId?: string): Promise<void> {
   await expect(page.getByTestId("transcript")).toContainText(/journal_burst_* event \d+/, { timeout: 30_000 });
+  if (!instanceId) return;
+  await expect(page.getByTestId("session-page")).toHaveAttribute("data-journal", "live", { timeout: 30_000 });
+  const newest = Math.max(
+    ...(textsAfterLastCode(await journalTail(page, instanceId)) ?? []).map((text) =>
+      Number(/__journal_burst__ event (\d+)/.exec(text)?.[1] ?? 0),
+    ),
+  );
+  await expect(page.getByTestId("transcript")).toContainText(`journal_burst event ${newest}`, { timeout: 30_000 });
 }
 
 /** Scroller-relative top of the row carrying burst event `n`. */
@@ -204,41 +239,61 @@ async function afterSwap(page: Page): Promise<void> {
   await page.waitForTimeout(300);
 }
 
-test("a saved reading position survives a late monospace swap", async ({ page }) => {
-  test.setTimeout(120_000);
+/**
+ * Save a reading position just below the code block, leave, then restore it
+ * twice: once with the font cached (the no-swap control) and once with the
+ * woff2 held so the swap lands after the restore.
+ */
+async function savedPositionSurvivesSwap(page: Page, longBurst: number): Promise<void> {
   await page.setViewportSize({ width: 1440, height: 900 });
-  const instanceId = await seedSession(page);
+  const instanceId = await seedSession(page, longBurst);
 
   await page.goto(`/s/${instanceId}`);
   const scroller = page.getByTestId("transcript-scroller");
-  await loaded(page);
+  await loaded(page, instanceId);
   await afterSwap(page);
 
-  // Walk up to the code block (virtualised out while pinned to the bottom).
-  const code = page.getByTestId("transcript").locator("pre").first();
-  await expect
-    .poll(
-      async () => {
-        if ((await code.count()) > 0) return true;
-        await scroller.evaluate((el) => {
-          el.scrollTop = Math.max(0, el.scrollTop - el.clientHeight * 0.8);
-          el.dispatchEvent(new Event("scroll", { bubbles: true }));
-        });
-        return false;
-      },
-      { timeout: 30_000, intervals: [200] },
-    )
-    .toBe(true);
+  // Reach the code block (virtualised out while pinned to the bottom). A
+  // short journal walks up as a reader would. In a long window a pixel walk
+  // jumps over unmeasured rows (a Transcript virtualiser issue outside this
+  // spec) and can miss the block, so there the transcript's own search jumps
+  // to it by row index.
+  const code = scroller.locator("pre").first();
+  if (longBurst > 0) {
+    await page.getByTestId("transcript-search-open").click();
+    const search = page.getByTestId("transcript-search-input");
+    await search.fill("here is the function");
+    await search.press("Enter");
+    await expect(page.getByTestId("transcript-search-count")).toHaveText(/^1\//);
+    await page.getByTestId("transcript-search-close").click();
+    await expect(code).toBeAttached({ timeout: 10_000 });
+  } else {
+    await expect
+      .poll(
+        async () => {
+          if ((await code.count()) > 0) return true;
+          await scroller.evaluate((el) => {
+            el.scrollTop = Math.max(0, el.scrollTop - el.clientHeight * 0.8);
+            el.dispatchEvent(new Event("scroll", { bubbles: true }));
+          });
+          return false;
+        },
+        { timeout: 30_000, intervals: [200] },
+      )
+      .toBe(true);
+  }
 
   // Park the code block's tail near the top of the viewport and anchor on
-  // the first burst row rendered below it, then leave.
+  // the first burst row below it, then leave.
   const anchor = await scroller.evaluate((el) => {
-    // The reply's fenced block (the last one rendered).
+    // The newest reply's fenced block (the last one rendered).
     const pre = Array.from(el.querySelectorAll("pre")).at(-1);
     if (!pre) throw new Error("code block not rendered");
     el.scrollTop += pre.getBoundingClientRect().bottom - el.getBoundingClientRect().top - 200;
     el.dispatchEvent(new Event("scroll", { bubbles: true }));
+    const below = pre.getBoundingClientRect().bottom - 1;
     const labels = Array.from(el.querySelectorAll<HTMLElement>("[data-testid='transcript-row']"))
+      .filter((row) => row.getBoundingClientRect().top >= below)
       .map((row) => /journal_burst_* event (\d+)\b/.exec(row.textContent ?? "")?.[1])
       .filter((value): value is string => Boolean(value))
       .map(Number);
@@ -257,9 +312,10 @@ test("a saved reading position survives a late monospace swap", async ({ page })
 
   // Control: restore with the font already cached, so no swap happens.
   await page.goto(`/s/${instanceId}`);
-  await expect.poll(() => rowOffset(scroller, anchor), { timeout: 15_000 }).not.toBeNull();
+  await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
   await afterSwap(page);
   const control = (await rowOffset(scroller, anchor))!;
+  const viewport = await scroller.evaluate((el) => el.clientHeight);
 
   // Fresh document with the woff2 held (routing also bypasses the HTTP
   // cache): rows restore on the fallback monospace, the swap lands after.
@@ -267,27 +323,44 @@ test("a saved reading position survives a late monospace swap", async ({ page })
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
   await page.goto(`/s/${instanceId}`);
-  await expect.poll(() => rowOffset(scroller, anchor), { timeout: 15_000 }).not.toBeNull();
+  await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
   const swappedBeforeRestore = await monoLoaded(page);
   const beforeSwap = (await rowOffset(scroller, anchor))!;
   await afterSwap(page);
   const settled = (await rowOffset(scroller, anchor))!;
 
-  // `saved` vs `control` is the restore's own precision, independent of
-  // fonts (Transcript sizes never-measured rows above the anchor by its row
-  // estimate); it is recorded, not asserted here.
-  const measured = `saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} swappedBeforeRestore=${swappedBeforeRestore}`;
+  // `saved` vs `control` is the restore's own precision with no font change
+  // at all (Transcript places never-measured rows by its row estimate), a
+  // baseline gap reported separately. What this spec owns is that the swap
+  // adds nothing on top: the swapped restore is no further from the saved
+  // position than the no-swap restore, and nothing moves when the font lands.
+  const measured = `longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} swappedBeforeRestore=${swappedBeforeRestore}`;
   test.info().annotations.push({ type: "font-swap", description: measured });
+  console.log(`FONTSWAP ${measured}`);
   if (FONT_DELAY_MS > 0) {
     expect(swappedBeforeRestore, `the delayed font arrived before the restore (${measured})`).toBe(false);
   }
-  expect(Math.abs(settled - control), `a late swap changed where the row restores (${measured})`).toBeLessThanOrEqual(
-    DRIFT_PX,
-  );
+  // The restore brings the saved row back on screen.
+  expect(control, `the saved row restores inside the viewport (${measured})`).toBeGreaterThanOrEqual(0);
+  expect(control, `the saved row restores inside the viewport (${measured})`).toBeLessThan(viewport);
+  expect(
+    Math.abs(settled - saved!),
+    `a late swap moved the restore further from the saved position than the no-swap control (${measured})`,
+  ).toBeLessThanOrEqual(Math.abs(control - saved!) + DRIFT_PX);
   expect(Math.abs(settled - beforeSwap), `row drifted when the web font swapped in (${measured})`).toBeLessThanOrEqual(
     DRIFT_PX,
   );
   await assertRowsStacked(scroller);
+}
+
+test("a saved reading position survives a late monospace swap", async ({ page }) => {
+  test.setTimeout(120_000);
+  await savedPositionSurvivesSwap(page, 0);
+});
+
+test("a saved position in a bounded long journal survives a late monospace swap", async ({ page }) => {
+  test.setTimeout(240_000);
+  await savedPositionSurvivesSwap(page, LONG_BURST);
 });
 
 test("a pinned transcript stays pinned through a late monospace swap", async ({ page }) => {

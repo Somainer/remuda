@@ -277,27 +277,36 @@ test.describe("P0-1 filters, scope and zero results", () => {
     await expect(page.getByTestId("session-search")).toHaveValue("");
   });
 
-  test("the phone layout uses the bottom sheet and keeps the filter controls reachable", async ({ page }) => {
-    // The sheet animates in with a transform, which leaves the painted box on a
-    // fractional pixel mid-flight. Reduced motion is a real user setting the
-    // stylesheet already honours, and it makes the measurement deterministic.
-    await page.emulateMedia({ reducedMotion: "reduce" });
-    await page.setViewportSize({ width: 390, height: 844 });
-    const trigger = page.getByTestId("session-filter-open");
-    await trigger.click();
-    const panel = page.getByTestId("session-filter-panel");
-    await expect(panel).toHaveAttribute("data-variant", "sheet");
-    await expect(panel).toHaveAttribute("aria-modal", "true");
+  /**
+   * Hit areas follow pointer: coarse, not width (visual-system.md §6.2), so
+   * the 44px check runs with touch emulation; a fine pointer at 390 keeps
+   * desktop density.
+   */
+  test.describe("touch", () => {
+    test.use({ hasTouch: true });
 
-    // Every control in the sheet meets the project's 44px touch target.
-    const targets = await panel.getByRole("button").all();
-    for (const target of targets) {
-      const box = await target.boundingBox();
-      expect(box, "a sheet control must be laid out").not.toBeNull();
-      expect(box!.height).toBeGreaterThanOrEqual(44);
-    }
-    await page.keyboard.press("Escape");
-    await expect(panel).toHaveCount(0);
-    await expect(trigger).toBeFocused();
+    test("the phone layout uses the bottom sheet and keeps the filter controls reachable", async ({ page }) => {
+      // The sheet animates in with a transform, which leaves the painted box on a
+      // fractional pixel mid-flight. Reduced motion is a real user setting the
+      // stylesheet already honours, and it makes the measurement deterministic.
+      await page.emulateMedia({ reducedMotion: "reduce" });
+      await page.setViewportSize({ width: 390, height: 844 });
+      const trigger = page.getByTestId("session-filter-open");
+      await trigger.click();
+      const panel = page.getByTestId("session-filter-panel");
+      await expect(panel).toHaveAttribute("data-variant", "sheet");
+      await expect(panel).toHaveAttribute("aria-modal", "true");
+
+      // Every control in the sheet meets the project's 44px touch target.
+      const targets = await panel.getByRole("button").all();
+      for (const target of targets) {
+        const box = await target.boundingBox();
+        expect(box, "a sheet control must be laid out").not.toBeNull();
+        expect(box!.height).toBeGreaterThanOrEqual(44);
+      }
+      await page.keyboard.press("Escape");
+      await expect(panel).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+    });
   });
 });

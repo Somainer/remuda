@@ -3121,6 +3121,7 @@ export type PlanReviewAnswer = ({
 export type PlanReviewRequest = ({
   "allowFeedback": (boolean);
   "options": ((DecisionOption)[]);
+  "plan": (string | null);
   "planDigest": Digest;
   "planRef": Id;
   "planRevision": U64;

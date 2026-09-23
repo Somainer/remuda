@@ -332,14 +332,18 @@ impl InteractionRuntime {
         let ticket = {
             let glue = self.glue.lock().await;
             if let Some(row) = glue.pending.get(&interaction_id)
-                && matches!(
+                && (matches!(
                     row.interaction.carrier,
                     InteractionCarrier::NativeTty | InteractionCarrier::HarnessHook
-                )
+                ) || row.interaction.kind == InteractionKind::PlanReview)
             {
-                // Both carriers answer a card that named its options and
+                // TTY/hook carriers answer a card that named its options and
                 // carried an input digest, so the answer has to match them —
                 // otherwise a stale or forged answer reaches the agent.
+                // PlanReview is validated for EVERY carrier (D-051 (6e)):
+                // print/sdk ClaudeControl is otherwise unchecked, and the
+                // broker consumes the ticket before it reaches the driver, so
+                // a bad plan answer would leave the child parked forever.
                 remuda_driver::interaction::validate_answer(&row.interaction.request, &answer)
                     .map_err(map_broker)?;
             }
@@ -625,5 +629,221 @@ fn map_broker(err: BrokerError) -> NodeError {
             winner: winner.as_id().to_string(),
         },
         other => NodeError::Driver(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod plan_review_node_cas_tests {
+    use super::*;
+    use crate::MemoryStore;
+    use crate::driver::FakeDriver;
+    use remuda_protocol::{
+        DriverKind, HostId, InstanceLifecycle, Knowledge, PlanReviewRequest, U64 as P64,
+        WorkspaceId,
+    };
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn seeded_runtime() -> (
+        TempDir,
+        Arc<dyn LocalStore>,
+        InstanceId,
+        Arc<InteractionRuntime>,
+    ) {
+        let dir = tempfile::tempdir().expect("tmp");
+        // open_journaled opens the dir itself.
+        let store = Arc::new(MemoryStore::open_journaled(dir.path(), 128).unwrap());
+        let runtime = InteractionRuntime::spawn(store.clone()).expect("runtime");
+        let instance_id = InstanceId::new();
+        let mut instance = crate::runtime::fixture_instance(
+            instance_id.clone(),
+            HostId::new(),
+            WorkspaceId::new(),
+            DriverKind::ClaudePrint,
+        )
+        .expect("fixture instance");
+        instance.lifecycle = InstanceLifecycle::Ready;
+        store.insert_instance(instance).expect("instance");
+        runtime
+            .register_driver(
+                instance_id.clone(),
+                Arc::new(FakeDriver::new(DriverKind::ClaudePrint)),
+            )
+            .await;
+        (dir, store, instance_id, runtime)
+    }
+
+    fn plan_review_interaction(
+        instance_id: &InstanceId,
+        host_id: HostId,
+        digest: &str,
+    ) -> Interaction {
+        let now =
+            remuda_protocol::Timestamp::try_from("2026-09-23T00:00:00.000Z".to_string()).unwrap();
+        Interaction {
+            meta: EntityMeta {
+                id: InteractionId::new(),
+                revision: P64(1),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+            instance_id: instance_id.clone(),
+            run_id: None,
+            host_id,
+            kind: InteractionKind::PlanReview,
+            request_key: InteractionRequestKey {
+                native: NativeRequestKey::Rpc {
+                    value_type: NativeRequestValueType::String,
+                    value: "perm-plan".into(),
+                },
+                process_generation: P64(1),
+                run_generation: Some(P64(1)),
+                connection_epoch: Id::new("epoch").unwrap(),
+            },
+            request_version: P64(1),
+            state: InteractionState::Pending,
+            blocking: true,
+            answerable: true,
+            // print/sdk carrier — validated only because kind == PlanReview.
+            carrier: InteractionCarrier::ClaudeControl,
+            request: InteractionRequest::PlanReview(Box::new(PlanReviewRequest {
+                title: "Plan review".into(),
+                plan_ref: Id::new("obj").unwrap(),
+                plan_revision: P64(1),
+                plan_digest: Digest::try_from(digest.to_string()).unwrap(),
+                options: vec![
+                    DecisionOption {
+                        id: "approve".into(),
+                        label: "Approve".into(),
+                        effect: DecisionEffect::AllowOnce,
+                        native_value_ref: Id::new("obj").unwrap(),
+                    },
+                    DecisionOption {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        effect: DecisionEffect::Deny,
+                        native_value_ref: Id::new("obj").unwrap(),
+                    },
+                ],
+                allow_feedback: true,
+                plan: Some("# the plan".into()),
+            })),
+            deadline: Knowledge::Unknown {
+                reason: "none".into(),
+                evidence_event_ids: vec![],
+            },
+            deadline_source: remuda_protocol::DeadlineSource::None,
+            answer: Knowledge::Unknown {
+                reason: "pending".into(),
+                evidence_event_ids: vec![],
+            },
+            delivery: remuda_protocol::DeliveryState::NotSent,
+            resolution: Knowledge::Unknown {
+                reason: "pending".into(),
+                evidence_event_ids: vec![],
+            },
+        }
+    }
+
+    fn answer_json(
+        interaction_id: &str,
+        option: &str,
+        digest: &str,
+        feedback: Option<&str>,
+    ) -> Value {
+        json!({
+            "interactionId": interaction_id,
+            "commandId": CommandId::new().as_id().as_str(),
+            "origin": "human",
+            "answer": {
+                "kind": "plan-review",
+                "optionId": option,
+                "planRevision": "1",
+                "planDigest": digest,
+                "feedback": feedback
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_bad_plan_review_answer_on_claude_control_is_rejected_and_the_ticket_stays_pending() {
+        let (_dir, store, instance_id, runtime) = seeded_runtime().await;
+        let good = format!("sha256:{}", "a".repeat(64));
+        let bad = format!("sha256:{}", "b".repeat(64));
+        let interaction = plan_review_interaction(
+            &instance_id,
+            store.get_instance(&instance_id).unwrap().host_id.clone(),
+            &good,
+        );
+        let obs = store
+            .append_observation(
+                &instance_id,
+                None,
+                Completeness::Structured,
+                ObservationPayload::InteractionRequested(Box::new(
+                    remuda_protocol::InteractionRequestedPayload { interaction },
+                )),
+            )
+            .expect("append");
+        runtime.ingest(&obs).await.expect("ingest");
+        let plan_id = runtime.list(Some(&instance_id), None).await[0]
+            .interaction_id
+            .clone();
+
+        // Wrong digest is rejected before the broker consumes the ticket.
+        let err = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_json(plan_id.as_id().as_str(), "approve", &bad, None),
+            )
+            .await
+            .expect_err("bad digest must be rejected");
+        assert!(matches!(err, NodeError::InvalidRequest(_)), "{err:?}");
+
+        // The ticket survived: it is still listed and a correct answer wins.
+        assert_eq!(runtime.list(Some(&instance_id), None).await.len(), 1);
+        let accepted = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_json(plan_id.as_id().as_str(), "approve", &good, None),
+            )
+            .await
+            .expect("a correct answer must still win");
+        assert_eq!(accepted["outcome"], json!("accepted"));
+        assert!(runtime.list(Some(&instance_id), None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn approve_with_feedback_is_rejected_for_a_plan_review() {
+        let (_dir, store, instance_id, runtime) = seeded_runtime().await;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let interaction = plan_review_interaction(
+            &instance_id,
+            store.get_instance(&instance_id).unwrap().host_id.clone(),
+            &digest,
+        );
+        let obs = store
+            .append_observation(
+                &instance_id,
+                None,
+                Completeness::Structured,
+                ObservationPayload::InteractionRequested(Box::new(
+                    remuda_protocol::InteractionRequestedPayload { interaction },
+                )),
+            )
+            .expect("append");
+        runtime.ingest(&obs).await.expect("ingest");
+        let plan_id = runtime.list(Some(&instance_id), None).await[0]
+            .interaction_id
+            .clone();
+        let err = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_json(plan_id.as_id().as_str(), "approve", &digest, Some("note")),
+            )
+            .await
+            .expect_err("approve cannot carry feedback");
+        assert!(matches!(err, NodeError::InvalidRequest(_)), "{err:?}");
+        assert_eq!(runtime.list(Some(&instance_id), None).await.len(), 1);
     }
 }

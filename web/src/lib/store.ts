@@ -2148,10 +2148,26 @@ class HubStore {
   async respond(interactionId: Id, answer: InteractionAnswer) {
     this.emit({ answering: { ...this.state.answering, [interactionId]: true } });
     try {
+      // The decision is committed the moment the POST succeeds. Any failure
+      // AFTER that (a list/catchup refresh) is a UI-sync problem, not a
+      // rejected decision: keep the success path so the card does not flip
+      // back to answerable (a second answer would only be Superseded).
       await api.interactionRespond(interactionId, answer);
+    } catch (error) {
+      // Only a rejected POST returns the card to answerable state and surfaces
+      // the error; the draft is preserved for correction.
+      const { [interactionId]: _removed, ...rest } = this.state.answering;
+      this.emit({ answering: rest });
+      throw error;
+    }
+    try {
       await this.refresh();
       const interaction = this.state.interactions.find((i) => i.id === interactionId);
       if (interaction) await this.catchup(interaction.instanceId);
+    } catch {
+      // Post-commit sync failure: the broker already accepted the answer.
+      // Leave the card in its submitted/committed state; do not re-enable the
+      // buttons or make the reviewer think the decision was rejected.
     } finally {
       const interaction = this.state.interactions.find((i) => i.id === interactionId);
       const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];

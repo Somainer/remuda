@@ -14,6 +14,12 @@ pub(super) struct StreamState {
     active: HashMap<Option<String>, String>,
     blocks: HashMap<(Option<String>, String), BTreeMap<u32, Block>>,
     snapshots: HashSet<String>,
+    /// Mapped ids of TOP-LEVEL (`parent_tool_use_id == null`) ExitPlanMode
+    /// tool_use blocks seen on assistant messages. D-051 (6a): only such a
+    /// call is minted as a PlanReview; sub-agent (nested) ExitPlanMode calls
+    /// stay approvals. `CanUseToolRequest` carries no parent field, so this
+    /// mapper-recorded set is the only trustworthy top-level signal.
+    pub(super) top_level_exit_plan: HashSet<Id>,
 }
 
 struct Block {
@@ -289,6 +295,15 @@ pub(super) fn map_assistant(
         || blocks.values().any(|b| b.kind() == "tool_use");
     for value in content {
         let kind = value["type"].as_str().unwrap_or("");
+        // Capture (owned) before `value` moves into the block below.
+        let tool_name = if kind == "tool_use" {
+            value
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        };
         if !matches!(kind, "text" | "thinking" | "redacted_thinking" | "tool_use") {
             out.extend(mapper.opaque(kind, OpaqueReason::UnmappedFields, &value)?);
             continue;
@@ -335,6 +350,12 @@ pub(super) fn map_assistant(
             MutationOperation::Close,
             None,
         )?);
+        // Record top-level ExitPlanMode calls (D-051 (6a)). The block id was
+        // already mapped through NativeIds in `new_block`, the same mapping
+        // `build_interaction` applies to the can_use_tool tool_use_id.
+        if msg.parent_tool_use_id.is_none() && tool_name.as_deref() == Some("ExitPlanMode") {
+            mapper.stream.top_level_exit_plan.insert(block.id.clone());
+        }
     }
     mapper.stream.blocks.insert(key, blocks);
     if let Some(id) = &msg.uuid {

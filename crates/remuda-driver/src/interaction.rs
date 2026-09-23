@@ -556,11 +556,55 @@ pub fn validate_answer(
                 }
             }
         }
-        (InteractionRequest::PlanReview(_), InteractionAnswer::PlanReview(_))
-        | (InteractionRequest::Elicitation(_), InteractionAnswer::Elicitation(_)) => {}
+        (InteractionRequest::PlanReview(request), InteractionAnswer::PlanReview(answer)) => {
+            // D-051 (6e): the answer must echo the displayed plan exactly,
+            // revision 1 only, and name an offered option.
+            if plan_answer_is_invalid(request, answer) {
+                return Err(invalid());
+            }
+        }
+        (InteractionRequest::Elicitation(_), InteractionAnswer::Elicitation(_)) => {}
         _ => return Err(invalid()),
     }
     Ok(())
+}
+
+/// Plan-review answers reject malformed input BEFORE the first-answer CAS
+/// consumes the ticket, so a bad answer cannot burn the child's one
+/// ExitPlanMode pause (D-051 (6e)).
+fn plan_answer_is_invalid(
+    request: &remuda_protocol::PlanReviewRequest,
+    answer: &remuda_protocol::PlanReviewAnswer,
+) -> bool {
+    /// Max reviewer feedback echoed into the deny tool result.
+    const MAX_PLAN_FEEDBACK_BYTES: usize = 4 * 1024;
+    // The chosen option must be one the request actually offered — never
+    // trust the answer's own option spelling.
+    let offered = request
+        .options
+        .iter()
+        .any(|option| option.id == answer.option_id);
+    if !offered
+        || answer.plan_revision != request.plan_revision
+        || answer.plan_digest != request.plan_digest
+    {
+        return true;
+    }
+    // Feedback is allowed only when the request offered it. Approve never
+    // takes reviewer text (it would be silently dropped); deny accepts it
+    // verbatim up to the byte cap. An absent (null) deny note is fine — the
+    // driver substitutes its default message.
+    // Exhaust over (feedback present?, request allows it): approve-with-text
+    // is rejected regardless; deny-with-text is rejected when disallowed or
+    // over the byte cap; an absent note is always fine.
+    if answer.option_id == "approve" && answer.feedback.is_some() {
+        return true;
+    }
+    match (answer.feedback.as_ref(), request.allow_feedback) {
+        (Some(text), true) => text.len() > MAX_PLAN_FEEDBACK_BYTES,
+        (Some(_), false) => true,
+        (None, _) => false,
+    }
 }
 
 fn kind_of(payload: &InteractionRequest) -> InteractionKind {

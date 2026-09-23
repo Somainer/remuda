@@ -1013,7 +1013,8 @@ type InteractionRequest =
       requestedPermissionsRef: Id|null; inputDigest: Digest}
   | {kind: "question"; title: string; fields: QuestionField[]}
   | {kind: "plan-review"; title: string; planRef: Id; planRevision: U64;
-      planDigest: Digest; options: DecisionOption[]; allowFeedback: boolean}
+      planDigest: Digest; options: DecisionOption[]; allowFeedback: boolean;
+      plan: string|null}
   | {kind: "elicitation"; title: string; mode: "form"|"url"|"native-extension";
       schemaRef: Id|null; schemaDialect: string|null; url: string|null;
       nativeExtension: string|null; allowedActions: ("accept"|"decline"|"cancel")[]};
@@ -1025,7 +1026,7 @@ type InteractionAnswer =
   | {kind: "elicitation"; action: "accept"|"decline"|"cancel"; content: Json|null};
 ~~~
 
-`approval` 默认只公开该请求实际允许的选项，不能全局添加“总是同意”；scope 与原生权限范围必须一致。v1 不支持通过 approval answer 编辑命令输入或添加自定义权限规则；有需求须新的 requestVersion/明确 encoder，不把 answer.text 注入 shell。question 字段 ID、optionId、必填性、单/多选限制逐项校验。plan-review 必须有 **真正可回复的原生暂停请求**；仅看到 `plan` 文本或 `ExitPlanMode` 工具调用时不能创建可批准的执行授权。
+`approval` 默认只公开该请求实际允许的选项，不能全局添加“总是同意”；scope 与原生权限范围必须一致。v1 不支持通过 approval answer 编辑命令输入或添加自定义权限规则；有需求须新的 requestVersion/明确 encoder，不把 answer.text 注入 shell。question 字段 ID、optionId、必填性、单/多选限制逐项校验。plan-review 必须有 **真正可回复的原生暂停请求**；仅看到 `plan` 文本或 `ExitPlanMode` 工具调用时不能创建可批准的执行授权。plan-review 的 `plan` 是请求自带的待批正文，`planDigest = sha256(plan 的 UTF-8 字节)`；driver 只在拿到原生暂停请求、调用来自顶层（非 sub-agent）且正文 ≤ 32 KiB 时铸 plan-review，否则退回 approval；`planRef` 是不解析的占位 id，不指向对象。
 
 | kind | payload |
 | --- | --- |
@@ -1958,7 +1959,7 @@ reconciliation 是有输入输出的只读对账动作：输入 instance generat
 | 项目名与后端语言 | wire 使用 runtime，语言无关的 JSON/字段表；沿 proposal 的 Go Hub/Node 倾向 | 命名不进入 native session ID；选 Go/TS 不改变协议 |
 | Herdr vs 自有 PTY | 已安装 Herdr 的 Node 优先用 terminal observe/control；其流标 rendered-ansi，carrier 可替换 | bridge 源码已确认，仍须针对目标版本验收 input、UTF-8/ANSI、尺寸、detach、server 重启、full redraw 和 history gap；不要承诺源 PTY 原字节 |
 | Claude 持续 stdin 的整体任务结束 | 只默认支持 native-turn；task scope unknown | 原生明确 run-boundary 或足够强的官方 protocol；必须覆盖“任务先完成、首 result 后到、随后还有 continuation”的 fixture，空 ledger 不能过关 |
-| Claude control 协议与完整交互 | host+stdio prompt tool+initialize 固定；allow/deny/单选已有 CLI 2.1.268 证据 | 将已有 fixture 转成 adapter 验收，再补两次并发审批、多选/自由输入、ExitPlanMode、elicitation/dialog、control_cancel_request、不中断 Workflow 的持续 stdin；探针空 sources 不证明全配置下无竞争 |
+| Claude control 协议与完整交互 | host+stdio prompt tool+initialize 固定；allow/deny/单选已有 CLI 2.1.268 证据；ExitPlanMode 已有 print 2.1.277 证据（host stdio，plan 模式 allow/deny 双录） | 将已有 fixture 转成 adapter 验收，再补两次并发审批、多选/自由输入、elicitation/dialog、control_cancel_request、不中断 Workflow 的持续 stdin；ExitPlanMode 的 hook（PTY）路径仍须真录；探针空 sources 不证明全配置下无竞争 |
 | Claude gateway + Artifact | full-native 人机通道保留 claude-pty；print 当前不能满足 artifact 要求 | 在实际 gateway profile 与 native-login profile 分别验证 Artifact，记录工具资格和事件；失败不可拿普通 HTML viewer 冒充 |
 | Claude settings/home 继承 | 固定 sources + 持久 native store，独立 overlay | 两个不同 endpoint 同时运行，hooks/MCP/skills/Workflow 保留，cache 不串路由；不自动迁移/复制 OAuth |
 | Claude native hooks 的远程批准 | 只在唯一 responder 和真实输出 schema 验收后启用 | 同时存在 Flux/Orca/herdr 时，证明无重复批准；hook 超时、Node 断线、无 tool_use_id 的并发调用都不能错答 |

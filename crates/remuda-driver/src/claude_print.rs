@@ -27,9 +27,9 @@ use remuda_protocol::{
     Knowledge, LifecyclePayload, LifecycleTopic, MessagePayload, MessagePhase, MessageRole,
     ModelPayload, MutationOperation, NativeLifecycle, NativeRef, NativeRequestKey,
     NativeRequestValueType, NodeMutation, Observation, ObservationPayload, ObservationSource,
-    OpaqueImpact, OpaquePayload, OpaqueReason, PermissionMode, QuestionField, QuestionInput,
-    QuestionOption, QuestionRequest, RawRef, Redaction, ResultStage, RunId, RuntimeCursor,
-    SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, TextBlock,
+    OpaqueImpact, OpaquePayload, OpaqueReason, PermissionMode, PlanReviewRequest, QuestionField,
+    QuestionInput, QuestionOption, QuestionRequest, RawRef, Redaction, ResultStage, RunId,
+    RuntimeCursor, SchemaVersion, Severity, SourceChannel, SourceCursor, SourceDelivery, TextBlock,
     ThoughtPayload, ThoughtRepresentation, Timestamp, ToolCallPayload, ToolCallState, ToolCategory,
     ToolOutcome, ToolResultPayload, U64, UsageMode, UsagePayload, UsageScope, WorkflowEngine,
     WorkflowPhasePayload, WorkflowRunPayload, WorkflowState,
@@ -1851,6 +1851,13 @@ impl Mapper {
     }
 }
 
+/// D-051 (6a) max inline plan text a reviewer sees. Larger plans fail closed
+/// to an Approval (human-only, full text in the transcript) rather than being
+/// truncated or shipped through a second channel. One host's inbox
+/// aggregates every pending interaction into one list RPC, so the cap keeps a
+/// burst of plans well under the 1 MiB frame limit.
+const MAX_PLAN_REVIEW_BYTES: usize = 32 * 1024;
+
 fn build_interaction(
     mapper: &mut Mapper,
     env: &ControlRequestEnvelope,
@@ -1864,8 +1871,26 @@ fn build_interaction(
         None => None,
     };
     let ask = req.tool_name == "AskUserQuestion";
+    // D-051 (6a): a TOP-LEVEL ExitPlanMode with an inline plan under the cap
+    // is a PlanReview routed to the parent. Every other shape (nested call,
+    // missing/too-large plan, a tool_use the mapper never saw at top level)
+    // stays a human-only Approval — fail closed.
+    let plan_review = if !ask {
+        exit_plan_review_request(mapper, req, tool_call_id.as_ref())?
+    } else {
+        None
+    };
+    let kind = if ask {
+        InteractionKind::Question
+    } else if plan_review.is_some() {
+        InteractionKind::PlanReview
+    } else {
+        InteractionKind::Approval
+    };
     let request = if ask {
         InteractionRequest::Question(Box::new(question_request(req)))
+    } else if let Some(review) = plan_review {
+        InteractionRequest::PlanReview(Box::new(review))
     } else {
         InteractionRequest::Approval(Box::new(ApprovalRequest {
             title: req
@@ -1903,11 +1928,7 @@ fn build_interaction(
         instance_id: mapper.instance_id.clone(),
         run_id: Some(mapper.run_id.clone()),
         host_id: mapper.host_id.clone(),
-        kind: if ask {
-            InteractionKind::Question
-        } else {
-            InteractionKind::Approval
-        },
+        kind,
         request_key: InteractionRequestKey {
             native: NativeRequestKey::Rpc {
                 value_type: NativeRequestValueType::String,
@@ -1929,6 +1950,64 @@ fn build_interaction(
         delivery: remuda_protocol::DeliveryState::NotSent,
         resolution: unknown("pending"),
     })
+}
+
+/// Build the PlanReview request when the ExitPlanMode pause satisfies
+/// D-051 (6a); otherwise `None` so the caller falls back to an Approval.
+fn exit_plan_review_request(
+    mapper: &Mapper,
+    req: &CanUseToolRequest,
+    mapped_tool_call_id: Option<&Id>,
+) -> DriverResult<Option<PlanReviewRequest>> {
+    if req.tool_name != "ExitPlanMode" {
+        return Ok(None);
+    }
+    // The pause must correspond to a top-level tool_use the mapper saw. A
+    // nested (sub-agent) call or an id the assistant stream never produced
+    // fails closed.
+    let Some(tool_call_id) = mapped_tool_call_id else {
+        return Ok(None);
+    };
+    if !mapper.stream.top_level_exit_plan.contains(tool_call_id) {
+        return Ok(None);
+    }
+    // Inline plan text, within the byte cap. The predicate is "a string no
+    // larger than the cap" (D-051 (6a)): an empty string still mints — the
+    // reviewer then approves/denies on the tool call itself, and the UI shows
+    // the open-session hint. Absent/non-string or oversized → Approval.
+    let Some(plan) = req.input.get("plan").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if plan.len() > MAX_PLAN_REVIEW_BYTES {
+        return Ok(None);
+    }
+    let plan_digest = crate::binary::hash_bytes(plan.as_bytes())?;
+    Ok(Some(PlanReviewRequest {
+        title: req
+            .display_name
+            .clone()
+            .unwrap_or_else(|| "Plan review".to_string()),
+        // Unparsed placeholder; the inline `plan` is authoritative.
+        plan_ref: Id::new("obj")?,
+        plan_revision: U64(1),
+        plan_digest,
+        options: vec![
+            DecisionOption {
+                id: "approve".into(),
+                label: "Approve".into(),
+                effect: DecisionEffect::AllowOnce,
+                native_value_ref: Id::new("obj")?,
+            },
+            DecisionOption {
+                id: "deny".into(),
+                label: "Deny".into(),
+                effect: DecisionEffect::Deny,
+                native_value_ref: Id::new("obj")?,
+            },
+        ],
+        allow_feedback: true,
+        plan: Some(plan.to_string()),
+    }))
 }
 
 fn question_request(req: &CanUseToolRequest) -> QuestionRequest {
@@ -2015,6 +2094,33 @@ fn permission_from_answer(
                 Ok(ControlSuccessPayload::Permission(PermissionResult::Deny {
                     message: "host denied".into(),
                     interrupt: Some(false),
+                }))
+            }
+        }
+        // D-051 (6c): a plan-review resolution is the ExitPlanMode permission
+        // response. Approve lets the call proceed with its original input and
+        // NO permission escalation — the CLI itself moves plan → default,
+        // never acceptEdits/bypass. Deny feeds the reviewer's feedback
+        // verbatim; only an ABSENT (null) note falls back to the default
+        // message. Whitespace is forwarded as-is (the reviewer chose it;
+        // validity is enforced upstream in validate_answer).
+        InteractionAnswer::PlanReview(plan) => {
+            if plan.option_id == "approve" {
+                Ok(ControlSuccessPayload::Permission(PermissionResult::Allow {
+                    updated_input: input.clone(),
+                    updated_permissions: None,
+                }))
+            } else {
+                Ok(ControlSuccessPayload::Permission(PermissionResult::Deny {
+                    message: plan
+                        .feedback
+                        .clone()
+                        .unwrap_or_else(|| "plan review denied".into()),
+                    // The recorded 2.1.277 deny frame omits `interrupt` (the
+                    // CLI defaults to non-interrupting); match it exactly so
+                    // the VCR deep-equal of the payload passes and no
+                    // undocumented field rides along.
+                    interrupt: None,
                 }))
             }
         }
@@ -3451,5 +3557,454 @@ mod attachment_tests {
     fn a_missing_attachment_file_fails_the_send() {
         let blocks = image_blocks(std::path::Path::new("/nonexistent/shot.png"), "hi");
         assert!(prompt_content(&blocks).is_err());
+    }
+}
+
+#[cfg(test)]
+mod plan_review_mint_tests {
+    use super::*;
+    use remuda_protocol::{
+        ApprovalAnswer, Digest, InteractionAnswer as Answer, InteractionRequest, PlanReviewAnswer,
+        U64,
+    };
+    use serde_json::json;
+
+    const PLAN: &str = "# Plan\n\n1. Run the shell command `echo plan-approved`.\n";
+
+    fn can_use_tool_request(tool_use_id: &str, plan: &str, tool_name: &str) -> CanUseToolRequest {
+        CanUseToolRequest {
+            tool_name: tool_name.into(),
+            input: json!({ "plan": plan, "planFilePath": "/work/plan.md" }),
+            permission_suggestions: None,
+            blocked_path: None,
+            blocked_paths: None,
+            tool_use_id: Some(tool_use_id.into()),
+            title: None,
+            display_name: Some("ExitPlanMode".into()),
+            description: None,
+            requires_user_interaction: Some(true),
+            decision_reason_type: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn envelope() -> ControlRequestEnvelope {
+        ControlRequestEnvelope {
+            request_id: "perm-exit-plan".into(),
+            request: ControlRequest::Unknown(serde_json::json!({
+                "subtype": "can_use_tool"
+            })),
+        }
+    }
+
+    /// Feed the recorded real-Claude assistant frame through the mapper so the
+    /// top-level ExitPlanMode set is populated, then return the native
+    /// tool_use id from that frame.
+    fn feed_real_assistant_frame(mapper: &mut StdoutMapper) -> String {
+        let raw =
+            include_str!("../../remuda-testing/fixtures/claude/claude-exit-plan-mode-allow.jsonl");
+        let frame: Value = raw
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .filter_map(Result::ok)
+            .find(|frame| {
+                frame.get("type").and_then(Value::as_str) == Some("assistant")
+                    && frame
+                        .pointer("/message/content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| {
+                            blocks.iter().any(|block| {
+                                block.get("type").and_then(Value::as_str) == Some("tool_use")
+                                    && block.get("name").and_then(Value::as_str)
+                                        == Some("ExitPlanMode")
+                            })
+                        })
+            })
+            .expect("recorded ExitPlanMode assistant frame");
+        let native_id = frame
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .find(|b| b.get("name").and_then(Value::as_str) == Some("ExitPlanMode"))
+            })
+            .and_then(|b| b.get("id"))
+            .and_then(Value::as_str)
+            .expect("native tool id")
+            .to_string();
+        let obs = mapper.map(frame).expect("map assistant");
+        assert!(
+            obs.iter().any(|o| matches!(
+                o.body,
+                ObservationPayload::ToolCall(ref c)
+                    if matches!(&c.tool_name, Knowledge::Known { value } if value == "ExitPlanMode")
+            )),
+            "the frame maps an ExitPlanMode tool_call"
+        );
+        native_id
+    }
+
+    #[test]
+    fn a_top_level_exit_plan_mode_with_inline_plan_mints_a_plan_review() {
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+        let native_id = feed_real_assistant_frame(&mut mapper);
+        let req = can_use_tool_request(&native_id, PLAN, "ExitPlanMode");
+        let interaction =
+            build_interaction(&mut mapper.mapper, &envelope(), &req, InteractionId::new())
+                .expect("build");
+        assert_eq!(interaction.kind, InteractionKind::PlanReview);
+        let InteractionRequest::PlanReview(review) = &interaction.request else {
+            panic!("expected plan review, got {:?}", interaction.request);
+        };
+        assert_eq!(review.plan.as_deref(), Some(PLAN));
+        assert_eq!(review.plan_revision, U64(1));
+        assert!(review.allow_feedback);
+        let ids: Vec<_> = review.options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, vec!["approve", "deny"]);
+        // Digest is sha256 of the exact plan bytes.
+        let expected = crate::binary::hash_bytes(PLAN.as_bytes()).expect("digest");
+        assert_eq!(review.plan_digest, expected);
+    }
+
+    #[test]
+    fn a_nested_sub_agent_exit_plan_mode_falls_back_to_approval() {
+        // A tool_use nested under another tool call is not in the top-level
+        // set even though the tool name matches.
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+        let nested_frame = json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg_nested",
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_nested",
+                    "name": "ExitPlanMode",
+                    "input": {"plan": PLAN}
+                }]
+            },
+            "parent_tool_use_id": "toolu_parent"
+        });
+        mapper.map(nested_frame).expect("map");
+        let req = can_use_tool_request("toolu_nested", PLAN, "ExitPlanMode");
+        let interaction =
+            build_interaction(&mut mapper.mapper, &envelope(), &req, InteractionId::new())
+                .expect("build");
+        assert_eq!(
+            interaction.kind,
+            InteractionKind::Approval,
+            "nested ExitPlanMode stays human-only"
+        );
+    }
+
+    #[test]
+    fn a_plan_over_32kib_falls_back_to_approval() {
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+        let native_id = feed_real_assistant_frame(&mut mapper);
+        let big = format!("# {}\n", "z".repeat(32 * 1024));
+        let req = can_use_tool_request(&native_id, &big, "ExitPlanMode");
+        let interaction =
+            build_interaction(&mut mapper.mapper, &envelope(), &req, InteractionId::new())
+                .expect("build");
+        assert_eq!(interaction.kind, InteractionKind::Approval);
+    }
+
+    #[test]
+    fn an_unknown_tool_never_mints_a_plan_review() {
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+        feed_real_assistant_frame(&mut mapper);
+        let req = can_use_tool_request("toolu_bash", "echo hi", "Bash");
+        let interaction =
+            build_interaction(&mut mapper.mapper, &envelope(), &req, InteractionId::new())
+                .expect("build");
+        assert_eq!(interaction.kind, InteractionKind::Approval);
+    }
+
+    #[test]
+    fn approve_carries_no_permission_escalation() {
+        let input = json!({"plan": PLAN});
+        let digest = Digest::try_from(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let answer = Answer::PlanReview(Box::new(PlanReviewAnswer {
+            option_id: "approve".into(),
+            plan_revision: U64(1),
+            plan_digest: digest,
+            feedback: None,
+        }));
+        match permission_from_answer(&input, &answer).expect("payload") {
+            ControlSuccessPayload::Permission(PermissionResult::Allow {
+                updated_input,
+                updated_permissions,
+            }) => {
+                assert_eq!(updated_input, input);
+                assert!(updated_permissions.is_none(), "approve never escalates");
+            }
+            other => panic!("expected allow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deny_uses_the_reviewer_feedback_or_a_default_message() {
+        let input = json!({"plan": PLAN});
+        let digest = Digest::try_from(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let mk = |feedback: Option<String>| {
+            Answer::PlanReview(Box::new(PlanReviewAnswer {
+                option_id: "deny".into(),
+                plan_revision: U64(1),
+                plan_digest: digest.clone(),
+                feedback,
+            }))
+        };
+        let with_feedback =
+            permission_from_answer(&input, &mk(Some("do less".into()))).expect("payload");
+        assert!(matches!(
+            with_feedback,
+            ControlSuccessPayload::Permission(PermissionResult::Deny { ref message, .. })
+                if message == "do less"
+        ));
+        let default = permission_from_answer(&input, &mk(None)).expect("payload");
+        assert!(matches!(
+            default,
+            ControlSuccessPayload::Permission(PermissionResult::Deny { ref message, .. })
+                if message == "plan review denied"
+        ));
+    }
+
+    fn plan_review_options() -> Vec<DecisionOption> {
+        vec![
+            DecisionOption {
+                id: "approve".into(),
+                label: "Approve".into(),
+                effect: DecisionEffect::AllowOnce,
+                native_value_ref: Id::new("obj").unwrap(),
+            },
+            DecisionOption {
+                id: "deny".into(),
+                label: "Deny".into(),
+                effect: DecisionEffect::Deny,
+                native_value_ref: Id::new("obj").unwrap(),
+            },
+        ]
+    }
+
+    #[test]
+    fn validate_rejects_bad_plan_answers() {
+        let mk_review = |revision: u64, allow_feedback: bool| PlanReviewRequest {
+            title: "Plan review".into(),
+            plan_ref: Id::new("obj").unwrap(),
+            plan_revision: U64(revision),
+            plan_digest: crate::binary::hash_bytes(PLAN.as_bytes()).unwrap(),
+            options: plan_review_options(),
+            allow_feedback,
+            plan: Some(PLAN.into()),
+        };
+        let request = InteractionRequest::PlanReview(Box::new(mk_review(1, true)));
+        let digest = crate::binary::hash_bytes(PLAN.as_bytes()).unwrap();
+        let mk = |option: &str, revision: u64, digest: Digest, feedback: Option<String>| {
+            Answer::PlanReview(Box::new(PlanReviewAnswer {
+                option_id: option.into(),
+                plan_revision: U64(revision),
+                plan_digest: digest,
+                feedback,
+            }))
+        };
+        // Option the request never offered.
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk(
+                    "allow-once",
+                    1,
+                    crate::binary::hash_bytes(PLAN.as_bytes()).unwrap(),
+                    None
+                )
+            )
+            .is_err()
+        );
+        // Revision must echo the REQUEST's revision (2 here), not a hardcoded 1.
+        let rev2 = InteractionRequest::PlanReview(Box::new(mk_review(2, true)));
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &rev2,
+                &mk("approve", 1, digest.clone(), None)
+            )
+            .is_err(),
+            "revision 1 answer cannot satisfy a revision-2 request"
+        );
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &rev2,
+                &mk("approve", 2, digest.clone(), None)
+            )
+            .is_ok(),
+            "the matching request revision is accepted"
+        );
+        // Wrong digest.
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk(
+                    "approve",
+                    1,
+                    Digest::try_from(format!("sha256:{}", "b".repeat(64))).unwrap(),
+                    None
+                )
+            )
+            .is_err()
+        );
+        // Approve must not carry feedback (it would be silently dropped).
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk("approve", 1, digest.clone(), Some("note".into()))
+            )
+            .is_err()
+        );
+        // Oversized feedback on deny.
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk("deny", 1, digest.clone(), Some("x".repeat(4097)))
+            )
+            .is_err()
+        );
+        // When the request disallows feedback, even deny feedback is refused.
+        let no_feedback = InteractionRequest::PlanReview(Box::new(mk_review(1, false)));
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &no_feedback,
+                &mk("deny", 1, digest.clone(), Some("note".into()))
+            )
+            .is_err()
+        );
+        // But a bare deny with no feedback is still accepted there.
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &no_feedback,
+                &mk("deny", 1, digest.clone(), None)
+            )
+            .is_ok()
+        );
+        // Valid approve and deny (the offered options) with/without feedback.
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk("approve", 1, digest.clone(), None)
+            )
+            .is_ok()
+        );
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk("deny", 1, digest, Some("do less".into()))
+            )
+            .is_ok()
+        );
+        // Whitespace-only feedback is not rejected here (length-based): it is
+        // forwarded verbatim by permission_from_answer; the reviewer typed it.
+        assert!(
+            remuda_driver::interaction::validate_answer(
+                &request,
+                &mk(
+                    "deny",
+                    1,
+                    crate::binary::hash_bytes(PLAN.as_bytes()).unwrap(),
+                    Some("   ".into())
+                )
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn deny_feedback_is_forwarded_verbatim_including_whitespace() {
+        let input = json!({"plan": PLAN});
+        let digest = Digest::try_from(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let mk = |feedback: Option<String>| {
+            Answer::PlanReview(Box::new(PlanReviewAnswer {
+                option_id: "deny".into(),
+                plan_revision: U64(1),
+                plan_digest: digest.clone(),
+                feedback,
+            }))
+        };
+        // Absent (null) note -> default message.
+        assert!(matches!(
+            permission_from_answer(&input, &mk(None)).expect("payload"),
+            ControlSuccessPayload::Permission(PermissionResult::Deny { ref message, .. })
+                if message == "plan review denied"
+        ));
+        // Present but whitespace-only -> forwarded verbatim (NOT default).
+        assert!(matches!(
+            permission_from_answer(&input, &mk(Some("  ".into()))).expect("payload"),
+            ControlSuccessPayload::Permission(PermissionResult::Deny { ref message, .. })
+                if message == "  "
+        ));
+        // Ordinary text verbatim.
+        assert!(matches!(
+            permission_from_answer(&input, &mk(Some("do less".into()))).expect("payload"),
+            ControlSuccessPayload::Permission(PermissionResult::Deny { ref message, .. })
+                if message == "do less"
+        ));
+    }
+
+    #[test]
+    fn an_empty_string_plan_still_mints_a_plan_review() {
+        // The approved predicate is "plan is a string <= 32 KiB"; an empty
+        // string qualifies — the reviewer gates the tool call itself and the
+        // UI falls back to the open-session hint.
+        let mut mapper = StdoutMapper::new(DriverKind::ClaudePrint, "sess");
+        let native_id = feed_real_assistant_frame(&mut mapper);
+        let mut req = can_use_tool_request(&native_id, PLAN, "ExitPlanMode");
+        req.input = json!({ "plan": "" });
+        let interaction =
+            build_interaction(&mut mapper.mapper, &envelope(), &req, InteractionId::new())
+                .expect("build");
+        assert_eq!(interaction.kind, InteractionKind::PlanReview);
+        let InteractionRequest::PlanReview(review) = &interaction.request else {
+            panic!("expected plan review");
+        };
+        assert_eq!(review.plan.as_deref(), Some(""));
+        // Digest of the empty string is still well-defined.
+        assert_eq!(review.plan_digest, crate::binary::hash_bytes(b"").unwrap());
+    }
+
+    #[test]
+    fn a_plan_review_answer_does_not_match_an_approval_request() {
+        // Cross-kind answers must fail, so a plan answer cannot settle an
+        // approval or vice versa.
+        let approval = InteractionRequest::Approval(Box::new(ApprovalRequest {
+            title: "Bash".into(),
+            description: String::new(),
+            tool_call_id: None,
+            action_ref: Id::new("obj").unwrap(),
+            options: Vec::new(),
+            requested_permissions_ref: None,
+            input_digest: Digest::try_from(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        }));
+        let plan = Answer::PlanReview(Box::new(PlanReviewAnswer {
+            option_id: "approve".into(),
+            plan_revision: U64(1),
+            plan_digest: crate::binary::hash_bytes(PLAN.as_bytes()).unwrap(),
+            feedback: None,
+        }));
+        assert!(
+            remuda_driver::interaction::validate_answer(&approval, &plan).is_err(),
+            "a plan answer cannot satisfy an approval"
+        );
+        let approval_answer = Answer::Approval(Box::new(ApprovalAnswer {
+            option_id: "allow".into(),
+            input_digest: Digest::try_from(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        }));
+        let review = InteractionRequest::PlanReview(Box::new(PlanReviewRequest {
+            title: "Plan review".into(),
+            plan_ref: Id::new("obj").unwrap(),
+            plan_revision: U64(1),
+            plan_digest: crate::binary::hash_bytes(PLAN.as_bytes()).unwrap(),
+            options: Vec::new(),
+            allow_feedback: true,
+            plan: Some(PLAN.into()),
+        }));
+        assert!(remuda_driver::interaction::validate_answer(&review, &approval_answer).is_err());
     }
 }

@@ -27,6 +27,10 @@ path = "src/bin/fake-harness.rs"
 name = "fake-gateway"
 path = "src/bin/fake-gateway.rs"
 
+[[bin]]
+name = "fake-claude-replay"
+path = "src/bin/fake-claude-replay.rs"
+
 [lints]
 workspace = true
 

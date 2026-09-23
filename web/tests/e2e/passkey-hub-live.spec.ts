@@ -32,7 +32,8 @@ async function virtualAuthenticator(page: Page): Promise<{ client: CDPSession; i
 
 async function loginWithCode(page: Page, name: string) {
   await page.goto(`${origin}/login`);
-  await expect(page.getByTestId("login-page")).toBeVisible();
+  // Same generous first-render wait as hub-auth's login() under gate load.
+  await expect(page.getByTestId("login-page")).toBeVisible({ timeout: 20_000 });
   await useAccessCode(page);
   await page.getByTestId("login-tab-bootstrap").click();
   await page.getByTestId("login-device-name").fill(name);

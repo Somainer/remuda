@@ -1268,7 +1268,44 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         continue;
                     }
-                    // §9.1: a terminal-side `/effort <level>` typed in the PTY is
+                    // c-perfaudit: `__perf_transcript__:<events>:<batchesPerSec>`
+                    // streams a paced tool/message journal flood (HUB_E2E_PERF=1
+                    // only; the perf Playwright project sets it).
+                    if perf_flood_enabled()
+                        && let Some([events, bps]) = prompt
+                            .strip_prefix("__perf_transcript__:")
+                            .and_then(perf_parse_parts)
+                    {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n = append_perf_transcript(
+                            &mut ws,
+                            &instance_id,
+                            append_n,
+                            events.max(2000),
+                            bps.max(1),
+                            &mut frame_queue,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    // c-perfaudit: `__perf_interactions__:<n>` parks n pending
+                    // approval cards for the inbox-flood scenario.
+                    if perf_flood_enabled()
+                        && let Some(count) = prompt
+                            .strip_prefix("__perf_interactions__:")
+                            .and_then(|tail| tail.parse::<u64>().ok())
+                    {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        let mut guard = pending.lock().await;
+                        for i in 0..count.max(100) {
+                            let iid = InteractionId::new();
+                            let mut card = fake_approval(&instance_id, host, iid.as_id().as_str());
+                            card["request"]["description"] = json!(format!("perf approval {i}"));
+                            guard.insert(iid.as_id().as_str().to_string(), card);
+                        }
+                        drop(guard);
+                        continue;
+                    }
                     // observed as a hand-typed slash command — the fake node emits
                     // the matching effort observation attributed to `slash`, and
                     // nothing calls instance.configure back (no ping-pong).
@@ -2079,6 +2116,31 @@ async fn fake_node(
                         }
                         tty.submit(&bytes)
                     };
+                    // c-perfaudit: `__perf_tty__:<lines>:<perFrame>:<fps>`
+                    // floods the raw TTY stream (HUB_E2E_PERF=1 only; the perf
+                    // Playwright project sets it and the spec skips without it).
+                    let perf_tty = if perf_flood_enabled() {
+                        submitted
+                            .as_deref()
+                            .and_then(|line| line.strip_prefix("__perf_tty__:"))
+                            .and_then(perf_parse_parts::<3>)
+                    } else {
+                        None
+                    };
+                    if let Some([lines, per_frame, fps]) = perf_tty {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_perf_tty_flood(
+                            &mut ws,
+                            &instance_id,
+                            tty,
+                            lines.max(5000),
+                            per_frame.max(1),
+                            fps.max(1),
+                            &mut frame_queue,
+                        )
+                        .await?;
+                        continue;
+                    }
                     // `TTYNODE_RESTART` typed into a session makes the fake
                     // Node restart: ack the write, drop the socket, reconnect
                     // under a new epoch, and re-announce an inventory that no
@@ -2635,6 +2697,31 @@ type NodeWs =
 
 fn task_bind_enabled() -> bool {
     std::env::var("HUB_E2E_TASK_BIND").as_deref() == Ok("1")
+}
+
+// ── c-perfaudit high-rate flood triggers (HUB_E2E_PERF=1 only) ────────────
+//
+// The performance scenarios (web/tests/perf/scenarios.perf.ts via
+// playwright.perf.config.ts) need event streams a normal scripted turn cannot
+// produce: thousands of journal events at a fixed batch rate, a terminal
+// frame flood, and a hundred pending interactions. The sentinels are inert on
+// every other run (they fall through to the normal echo paths), and the Playwright
+// spec test.skips when this trigger is absent.
+fn perf_flood_enabled() -> bool {
+    std::env::var("HUB_E2E_PERF").as_deref() == Ok("1")
+}
+
+/// Parse a `a:b[:c]` sentinel tail into its numeric parts.
+fn perf_parse_parts<const K: usize>(tail: &str) -> Option<[u64; K]> {
+    let parts: Vec<&str> = tail.split(':').collect();
+    if parts.len() != K {
+        return None;
+    }
+    let mut out = [0u64; K];
+    for (slot, part) in out.iter_mut().zip(parts) {
+        *slot = part.parse().ok()?;
+    }
+    Some(out)
 }
 
 // ── t-project-switcher second fake host (HUB_E2E_PROJECT_SWITCHER=1 only) ──
@@ -3257,6 +3344,186 @@ async fn append_burst(
     ))
     .await?;
     Ok(last_seq)
+}
+
+/// c-perfaudit: pump Hub->Node frames already buffered on the socket into the
+/// stashed-frame queue so a long paced flood cannot let the TCP buffer (or a
+/// pending RPC) grow unbounded. The parked frames are reprocessed by the main
+/// loop the moment the flood returns.
+async fn perf_pump_frames(ws: &mut NodeWs, queue: &mut std::collections::VecDeque<String>) {
+    while let Ok(Some(Ok(Message::Text(text)))) =
+        tokio::time::timeout(Duration::from_millis(2), ws.next()).await
+    {
+        queue.push_back(text.to_string());
+    }
+}
+
+/// c-perfaudit scenario A: stream `events_target` journal events (rounded up
+/// to the batch size) at `batches_per_sec` frames/sec. Each 10-event batch is
+/// 3 tool call/result pairs plus 4 assistant messages, so 2000 events carry
+/// 600 tools — above the 500-tool scenario floor. The caller acks the command
+/// RPC first; this only streams (and ends the turn idle).
+///
+/// Pacing is anchored to wall clock and does NOT wait on the Hub's per-batch
+/// ack — ack round-trip latency would cap the send rate below the target.
+/// Inbound frames are pumped into the stashed queue while streaming; a final
+/// ack barrier (plus the trailing idle append, also acked) guarantees the Hub
+/// durably processed every batch before this returns.
+async fn append_perf_transcript(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    mut n: u64,
+    events_target: u64,
+    batches_per_sec: u64,
+    queue: &mut std::collections::VecDeque<String>,
+) -> Result<u64> {
+    const BATCH: u64 = 10;
+    n = append_native_status(ws, instance_id, n, "working").await?;
+    wait_frame_ack(ws, queue, &format!("j{n}")).await?;
+    let batches = events_target.max(BATCH).div_ceil(BATCH);
+    let period = Duration::from_nanos(1_000_000_000 / batches_per_sec.clamp(1, 1000));
+    let flood_started = tokio::time::Instant::now();
+    for b in 0..batches {
+        let mut events: Vec<Value> = Vec::with_capacity(BATCH as usize);
+        for k in 0..BATCH {
+            let global = b * BATCH + k;
+            if k % 4 < 2 {
+                // k pairs (0,1),(4,5),(8,9): three tools per batch.
+                let tool_no = b * 3 + k / 4;
+                let tool_id = format!("perf-tcall-{tool_no}");
+                if k % 2 == 0 {
+                    events.push(json!({
+                        "kind": "tool_call",
+                        "payload": {
+                            "nodeId": tool_id,
+                            "revision": "1",
+                            "operation": "open",
+                            "baseRevision": null,
+                            "toolCallId": tool_id,
+                            "parentToolCallId": null,
+                            "toolName": wf_known(json!("Bash")),
+                            "displayTitle": wf_known(json!("Bash")),
+                            "category": "shell",
+                            "input": wf_known(json!({ "command": format!("echo perf {tool_no}") })),
+                            "inputTextDelta": null,
+                            "state": "running",
+                            "executor": wf_unknown(),
+                        }
+                    }));
+                } else {
+                    events.push(json!({
+                        "kind": "tool_result",
+                        "payload": {
+                            "nodeId": tool_id,
+                            "revision": "2",
+                            "operation": "close",
+                            "baseRevision": "1",
+                            "toolCallId": tool_id,
+                            "stage": "final",
+                            "outcome": "succeeded",
+                            "blocks": [{ "type": "text", "text": format!("perf ok {tool_no}\n") }],
+                            "structuredResult": wf_known(json!({ "stdout": format!("perf ok {tool_no}\n") })),
+                            "exitCode": wf_known(json!(0)),
+                            "changes": [],
+                        }
+                    }));
+                }
+            } else {
+                events.push(json!({
+                    "kind": "message",
+                    "completeness": "structured",
+                    "payload": { "role": "assistant", "text": format!("perf transcript event {global}") }
+                }));
+            }
+        }
+        n += BATCH;
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("j{n}"),
+                "method": "journal.append",
+                "params": { "instanceId": instance_id, "events": events }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        // Drain any acks/RPCs the Hub sent back without blocking the cadence…
+        perf_pump_frames(ws, queue).await;
+        // …then sleep only until this batch's scheduled tick.
+        let target = flood_started + period * (b + 1) as u32;
+        let now = tokio::time::Instant::now();
+        if now < target {
+            tokio::time::sleep(target - now).await;
+        }
+    }
+    // Barrier: the last batch's ack proves every earlier append was received
+    // and durably processed before the turn ends idle.
+    wait_frame_ack(ws, queue, &format!("j{n}")).await?;
+    n = append_native_status(ws, instance_id, n, "idle").await?;
+    wait_frame_ack(ws, queue, &format!("j{n}")).await?;
+    Ok(n)
+}
+
+/// c-perfaudit scenario B: push `lines_target` terminal output lines as
+/// `tty.frame` notifications, `per_frame` lines per frame at `frames_per_sec`,
+/// while continuing to pump inbound frames. The cooked screen is retained as a
+/// bounded ring like a real PTY.
+async fn append_perf_tty_flood(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    tty: &mut TtyFake,
+    lines_target: u64,
+    per_frame: u64,
+    frames_per_sec: u64,
+    queue: &mut std::collections::VecDeque<String>,
+) -> Result<()> {
+    let per_frame = per_frame.clamp(1, 500);
+    let period = Duration::from_nanos(1_000_000_000 / frames_per_sec.clamp(1, 1000));
+    let mut sent = 0u64;
+    let mut tick = 0u64;
+    while sent < lines_target {
+        let started = tokio::time::Instant::now();
+        let mut chunk = String::new();
+        for _ in 0..per_frame {
+            if sent >= lines_target {
+                break;
+            }
+            sent += 1;
+            chunk.push_str(&format!("perf flood line {sent:05}\r\n"));
+        }
+        tty.screen.extend_from_slice(chunk.as_bytes());
+        if tty.screen.len() > 65_536 {
+            let cutoff = tty.screen.len() - 65_536;
+            tty.screen.drain(..cutoff);
+        }
+        ws.send(Message::Text(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "tty.frame",
+                "params": {
+                    "instanceId": instance_id,
+                    "streamId": tty.stream_id,
+                    "dataBase64": base64::engine::general_purpose::STANDARD.encode(chunk.as_bytes()),
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        tick += 1;
+        // A non-blocking pump most ticks; an occasional 2 ms wait lets an
+        // in-flight tty.resize (or any Hub RPC) land and get parked.
+        if tick.is_multiple_of(25) {
+            perf_pump_frames(ws, queue).await;
+        }
+        let elapsed = started.elapsed();
+        if elapsed < period {
+            tokio::time::sleep(period - elapsed).await;
+        }
+    }
+    perf_pump_frames(ws, queue).await;
+    Ok(())
 }
 
 async fn append_journal(

@@ -31,6 +31,7 @@
 
 | D-050 | 2026-09-20 | **Task 优先模型：Task 是 instance 之上的聚合（非第二状态机）；目录绑定 `workspaceBinding{reuse\|pool}` + 唯一新表 `worktree_leases`（`mode`、复合键 `(host_id,workspace_id,dir_key)`、可空 `worktree_name`、`holder_instance_id` attach-lock）；reuse=顺序轮用、归还对目录零操作，pool=detached-HEAD 停放、租借切 `wt/<slot>/<task-slug>`、return-don't-delete（reset/clean/park 仅 pool）；既有回收路径（`remove_record`/`worker.remove_worker`/`delete_instance`/`retire_worker`）必须 lease-aware；看板 8 态→4 列只读投影，failed 按 `placement.is_some()` 归位 + 角标（不存 pre-fail 列），拖卡列→列多跳；门控用 grant 动词（create/set-state=`GrantVerb::Dispatch`、land=`GrantVerb::Land`，持 grant 的协调员 agent 授权，非「agent 一律 403」）；迁移预算=一个增量列 `archived_at`（落 `tasks.rs` migrate）+ 一张新表；批注=composer 草稿（零 wire）；任务空间=文件视图客户端过滤投影（零端点）；参考产品合规护栏（只泛称、开源项目可具名、不引述内部文档、截图只提交 Remuda 渲染） | coordinator（task-model 计划任务 1 t-spec，docs-only） | [task-model.md](./task-model.md) 全文；[ui-spec.md §1.5/§2.9](./ui-spec.md)；[evidence/task-model-1.md](./evidence/task-model-1.md)；D-024/D-033/D-035/D-047/D-049 |
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
+| D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端恒深色**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -973,3 +974,135 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 **由谁**：coordinator（ui-upgrade 批次派工计划 §(B)/§(D) 设计与推荐默认值，所有者未另行拍板即按默认执行；任务 1 c-uispec2 落规格，零代码）。
 
 **依据**：[ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；代码锚点（均在 2026-09-23 当前 main 复核）：`web/src/types/generated.ts:98-106,2658,2667,2863`、`web/src/types/interaction.ts:4-8`、`crates/remuda-signal/src/decision.rs:69-74`、`crates/remuda-signal/src/approval.rs:83-90`、`web/src/features/session/ToolCard.tsx:386-401,500-522`、`web/src/features/session/assemble.ts:133,626-646`、`web/src/features/session/OpaqueRow.tsx:4-16`、`web/src/features/session/session.module.css:1003,1016`、`web/src/pages/NewSessionPage.tsx:298-302`、`web/src/pages/ApprovalsPage.tsx:42-66,232`、`web/src/features/mobile/inboxRows.ts:24-25`、`web/src/features/tasks/{Board.tsx,boardModel.ts,boardColumns.ts}`；Claude fixtures `crates/remuda-testing/fixtures/claude/claude-permission-host-allow.jsonl` 与 `crates/remuda-claude-wire/tests/fixtures/claude-permission-host-deny.jsonl`（各含 `session` 与 `localSettings` 两种 destination）；逐条旧→新对照、冲突核对表与三条陈旧判断复核见 [evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)。
+
+## D-053
+
+**2026-09-23 · UI 整体重做：角色令牌、深浅双态、同源字体、阅读列与单侧栏**
+
+| 日期 | 2026-09-23 |
+|---|---|
+| 状态 | adopted（规格层；实施按 UO-1…UO-13 跟进，本决策先合） |
+| 相关 | [visual-system.md](./visual-system.md)、[ui-spec.md §1.1/§1.3/§1.4/§2.1/§2.2/§2.3/§2.5/§2.9/§3.4/§4.6/§4.7/§6/§7](./ui-spec.md)、D-024、D-038、D-039、D-040、D-041、D-042、D-049、D-050、D-052 |
+
+**背景**：所有者判断现有界面缺乏质感，授权完全重新设计。所有者同时反馈三件事：webview 操作发涩；手机上键盘遮住内容；终端不显示、问题到不了手机。在 main（`42ccd7ee`）上复核现状，结论如下：
+
+- 颜色按色相命名。同一个 `--dust` 同时承担主按钮、选中态和「需要你」三种含义（`web/src/styles/ui.module.css:10-15` 的 `.btnPrimary` 填充、`:323-324` 的 `.chipOn` 选中描边、`:52` 的 blocked 点与 `:386-391` 的待审批卡）。
+- 对比度不足。次级文字 `--mute` 在 `--ink-2` 上只有 4.12:1；终端 brightBlack 在终端底上只有 1.42:1（`web/src/features/session/tty/theme.ts:61`）。
+- 字体混排。正文 webfont 只打了拉丁子集（`web/src/main.tsx:7-9`），中文逐字回落到系统字体，同一行里出现两套字形。
+- 字号与焦点。`font-size` 字面量中 11px 有 99 处，另有 11.5px 12 处、10px 19 处、10.5px 11 处、9px 2 处、8px 1 处，内联样式里还有 10px（`web/src/features/session/LaunchedBy.tsx:47`）；全局焦点环只有 1px（`web/src/styles/tokens.css:83`）。
+- 触控尺寸判定错误。触控 44px 按宽度（`@media (max-width: 767px)`）而不是按指针判定（`web/src/styles/ui.module.css:356-372`），违背 D-039 关于 compact（布局）判定与 coarsePointer（触屏）判定不得混用的要求。
+- iOS 放大。fine 指针下文本输入 14px、手机本地输入 15px，均低于 iOS 不放大的 16px 阈值，聚焦时会放大页面。
+- 渲染开销。会话页每秒整页重渲染（`web/src/pages/SessionPage.tsx:154` 的 `useNow(true)`）；另有 `optimizeLegibility`（`web/src/styles/tokens.css:130`）、`backdrop-filter` 与 `transition: all` 等开销。
+- 导航层数。桌面会话路由叠了四层导航（48px 图标轨、会话列表第二列、SpaceTabs 行、页头）。
+- 主题。ui-spec §6 仍写着「v1 只做 A（深色）」。
+
+**决策**：机械细节（令牌值、对比度矩阵、控件尺寸）以 [visual-system.md](./visual-system.md) 为准，这里只钉边界。
+
+1. **颜色只按角色引用。** 角色族如下：
+   - 背景：`--bg-nav/--bg-canvas/--bg-surface/--bg-raised/--bg-input/--bg-inset/--bg-hover/--bg-selected`
+   - 文字：`--fg-strong/--fg-body/--fg-muted/--fg-faint`
+   - 线条：`--border/--divider/--border-control`
+   - 链接与焦点：`--link/--focus`
+   - 状态：`--attention-*/--danger-*/--success-*/--unknown-*`
+   - 主按钮：`--primary-fill/--on-primary`
+   - 专用域：`--diff-*-bg`、`--tok-*`、`--term-*`
+
+   十六进制字面量只允许出现在 `tokens.css`、`tty/theme.ts`、`web/index.html`（theme-color）、`manifest.webmanifest` 四处。尺寸令牌保留 `--text-*` 前缀，颜色角色不得占用 `--text`。
+2. **状态色纪律。**
+   - 琥珀只表示「需要你 / 注意」。
+   - 红只表示失败和破坏性动作。
+   - 绿只表示权威确认的成功（merged、passed、回执已确认）。idle、已连接、在线都不用绿。
+   - 未知 = 中性色 + 虚线形状 + 文字「未知 / 待确认」（ui-spec §3.3、D-038 的「状态待确认」口径）。
+   - 按钮不用状态色填充；主按钮是中性的反色填充。
+3. **深浅两态各自调校，不做反相；由 CSS 解析，不加任何阻塞脚本。**
+   - 深色值写在 `:root` 上。浅色值写两处，内容逐字相同：`@media (prefers-color-scheme: light) { :root:not([data-appearance="dark"]) }` 和 `:root[data-appearance="light"]`。
+   - 偏好键 `runtime.theme.v1` 取值 `system | dark | light`，默认 `system`。旧值 `night`、`ledger` 分别读作 `dark`、`light`；键缺失视为 `system`。
+   - 显式选择时，由 `main.tsx` 在挂载前写入 `:root[data-appearance]`；跟随系统时不写这个属性。
+   - `data-appearance` 只允许出现在 `:root` 上。组件模块里不得出现任何模式分支；凡是随模式变化的值，一律做成令牌。
+   - theme-color 用两个带 `media` 的 meta 标签。
+   - 只发布一套调色板「墨」（微暖、低彩）。**本条落实 D-052 第 11 条预留的浅色主题正式化。**
+4. **终端是恒深色的仪器。** 深浅两态下终端相同。xterm 标准 256 色立方不再染色；每个非黑 ANSI 色在终端底上都 ≥ 4.5:1；终端输出的颜色不被改写。
+5. **字体。**
+   - UI 与长文同用平台系统字体栈（含 PingFang SC、微软雅黑、Noto Sans CJK），不打包任何正文 webfont。
+   - 等宽只用 IBM Plex Mono（OFL-1.1，许可证文件入库），只用于代码、路径、终端、ID 和需要对齐的数字。
+   - 阅读感靠度量：正文 16px/28px，行宽上限 720px。
+6. **字号下限。**
+   - 承载信息的文字 ≥ 12px。辅助文字 `--text-meta` 在所有宽度下都是 12px，落实 D-039 对 `.meta` 一类辅助文本桌面与手机统一 12px 的要求。
+   - 11px 只用于与形状绑定的徽标数字和 kbd 字形，属于 D-052 第 9 条的图形标注豁免，逐站点登记。
+   - 文本输入在 `pointer: coarse` 下为 16px。
+7. **命中区按 `pointer: coarse` 判定，不按宽度。**
+   - 字形与图形控件的可见尺寸不变，44px 只靠 `::after` 或 padding 形成的热区，热区互不重叠（ui-spec §3.4）：返回箭头 20px、`终端|结构` 分段项 26px、手机 Stop 方块 32px、图标按钮 32px、芯片 24px。
+   - 本条澄清：文字按钮和输入框不是字形，coarse 下可见高度可以直接取 44px。
+8. **层级靠色阶与留白。**
+   - 只有浮层（菜单、弹出层、对话框、sheet）带阴影，共两级：`--shadow-2` 和 `--shadow-3`。**本条取代 D-052 第 8 条中「不新增 z-index / elevation / 阴影 / disabled token」一句里的阴影部分**——该条其余口径（不新增 z-index / disabled token）不变。
+   - 全站不使用 backdrop-filter。
+9. **动效。**
+   - 只动 opacity、transform 和颜色，时长 100–240ms。
+   - 流式内容没有入场动画；模式切换即时生效。
+   - reduced-motion 下只保留标记了 `data-motion="essential"` 的元素。
+10. **桌面导航骨架**（≥768 且非 coarse 矮屏）。
+    - 一条带文字的侧栏，`<nav aria-label="主导航">`：会话、收件箱、任务看板，外加项目区和管理菜单。每页一条 48px 页头。取消 48px 图标轨和会话路由上的第二列。
+    - tab 条只在 `/s/*` 上出现；列表路由不再有 tab 条。**本条修订 D-024**：D-024 原口径为「当前 space 的 agent 会话显示为内容上方 tabs」「桌面支持可折叠 Spaces/Sessions 左栏及首字母窄轨」（详见原 ui-spec §1.4）——现改为 tab 条只属于会话路由，Space 面板（重命名、排序、已退出分组）移到 `/sessions` 的索引列；侧栏只有一个折叠概念。
+    - **选中态（显式修订 D-024 addendum 的「侧栏强当前态」）**：addendum 原条文要求「当前 space 与当前会话都用品牌左条 + 底色 + 加粗标题」；现取消品牌左条与首字母窄轨，当前 Space、当前会话与主导航选中项统一为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，深浅两态都不靠品牌色条做唯一指示（仍保留底色 + 字重，不单靠颜色）。addendum 的关闭 / dismissal /「已退出 (n)」分组 / 恢复与删除语义全部不变。
+    - **活动 tab 下划线（显式修订 D-024 addendum 的「活动 tab」条）**：addendum 原条文为「**活动 tab** 使用品牌下划线 + 底色 + 加粗，深浅主题均有足够对比」；「墨」角色里没有非状态的品牌色，现改为 **2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗**（下划线颜色即强文字色，对比度随 `--fg-strong` 全集值；不单靠颜色，底色与字重同时在），深浅两态一致。addendum 同句的「键盘焦点环沿用全局 `:focus-visible`」不变，tab 的关闭 / dismissal 语义不变。
+    - 项目范围由侧栏项目区设定，写入同一个项目过滤偏好；`/projects` 页头的切换器保留。
+    - 快捷键：
+      - ⌘/Ctrl+B 在所有桌面路由上折叠侧栏；
+      - ⌘/Ctrl+1..9 永远对应「眼前的第 n 个编号」：`/s/*` 上是 tab 条，`/sessions` 上是列表徽标，列表徽标仍来自 `switchSlots()`；
+      - ⌘/Ctrl+[ 和 ] 切换 Space。
+    - tab 集合采用所有者 2026-09-23 拍板的方案：会话的 `instance.taskId` 非空时（D-050：实例经既有 `instances.task_id` 归属 task），tab 是该 Task 的会话；否则是所在 Space 的 `visibleTabs`。零新增请求，不依赖轮询。关闭语义按 D-024 addendum 不变，关闭记在会话所属的 Space 上。
+    - compact 路由树、重定向与共享会话页按 D-049 不变。
+    - **会话列表宽行（修订 D-038 的默认视口清单）**：`/sessions` 容器宽 ≥960 时行高 48px、单行 grid，在 D-038 的五要素（状态点、标题、kind 芯片、徽标、一句下一步）之外**允许额外**出现「主机/工作区·分支」与相对时间两列；<960 时两行共 56px，不额外加列。三维 wire 原文、`ins_`、driver、model 仍只进 `<details data-testid="session-wire">` 或 `title`，D-038 其余口径不变。
+11. **会话页。**
+    - 桌面页头只有一行；host 与 cost 仍在主行（D-040 的桌面规则不变）。
+    - 「运行详情」的触发从第二行移进 ⋯ 菜单。**取代的是旧 ui-spec §2.2（基线 `80db05b8:docs/design/ui-spec.md:335`）中「第二行只有这一个触发器（`▸ 运行详情`，无其他 token）」的版式**——该约束是规格旧文，不是 D-040 (3) 的条文。D-040 (3) 钉住的内容（哪些诊断进 disclosure、默认收起、展开态按设备持久化、`session-meta` testid）全部不变；面板仍在页头下方的文档流里展开。
+    - compact 页头仍是一行 52px。原来的单枚 space 芯片并入标题块：标题块兼任 Space 抽屉的触发（`spaces-drawer-open`），Space 名包在 `<span data-testid="spaces-chips">` 里；`/s/` 上不使用 `space-chip`。**本条取代 D-040 (1) 的单枚芯片形状**，抽屉行为与 testid 不变。
+    - D-049 的截断三步逐字不变：标题先省略；其次 Space 名退成首字母；最后状态文字收起。状态点始终在行上。
+    - `终端|结构` 分段与 Stop 永不进 ⋯（D-040 (2) 不变）。
+    - 已结束的会话由停靠区的结束条承载续接；页头和重启横幅里的续接入口删除，只保留拇指区这一个入口。
+12. **工具调用折叠。**
+    - 已 settled且成功的工具调用，在所有宽度下都默认折成一行。**本条修订 D-041 的「桌面默认态不变」**——该条原允许折叠只在 compact 默认生效。
+    - D-041 的豁免集合（Workflow、error、interaction、running / 未 settled）与「折叠分支必须在 family 判定之后」不变，D-052 第 4 条的回归断言不变；读者显式「全部折叠」的既有行为不变。
+13. **手机。**
+    - compact 顶栏是一条 52px。
+    - 首页级屏的底栏改为 56px（原 64px，即 ui-spec §4.7 的 `--bar`），**本条修订 ui-spec §4.7 的这个数值**。
+    - 会话路由不渲染 app 底栏，也不渲染 tab 行（D-049）。
+    - composer 收起态是单行 56px（D-042 不变）。
+    - 软键盘状态沿用 `html[data-keyboard="1"]` 与 `--workbench-height`。键盘弹起时正文保底占可见带的 40%，待处理卡、路由故障和 composer 永不隐藏。
+14. **兼容层与护栏。**
+    - 旧 token 名在 `tokens.css` 末尾保留为别名，过渡期内由 JS 维护 `data-theme` 镜像。二者都在最后一个界面任务合入后删除。
+    - 重做过的模块首行标 `/* @tokens strict */`。单测在这些模块里禁止以下写法：十六进制、旧 token 名、`[data-theme`、`[data-appearance`、`prefers-color-scheme`、小于 12px 的字号字面量（登记过的图形站点除外）、`transition: all`、`backdrop-filter`。
+    - `tokens.contrast.test.ts` 在以下全集上断言：文本 ≥ 4.5:1，控件描边与焦点 ≥ 3:1。
+      - 背景：五种不透明底；hover、selected 分别叠在这五种底上。
+      - strong、body 另外叠在三种状态色底 × 五种底上。
+      - 各状态文字叠在自己的状态底 × 五种底上。
+
+**后果**：
+
+- 从未选过主题、且系统为浅色的设备，第一次会看到浅色，并且首帧就是正确的颜色。
+- 显式选了与系统相反模式的设备，首帧行为与今天相同：在模块脚本执行前可能短暂出现系统色。
+- 移除正文 webfont 后，截断点和虚拟行的估算高度会一次性变化；行高由 ResizeObserver 重新测量。
+- 切换模式只改属性，不触发 React 重渲染，终端不受影响。
+- 多处可见文案会变。每个任务在同一个 PR 里更新对应的 e2e。
+- ui-spec 相关章节在本决策的同一个 PR 内改写。
+
+**不做什么**：
+
+- 不打包衬线或 CJK webfont；不做阅读字体偏好。
+- 不做调色板选择器、URL 参数外观、顶栏主题开关、阅读模式、检查器。
+- 不做数学排版、交互可视化、成果预览。
+- 不做新建 Task 的界面；不做 compact 看板分段。
+- 不改路由、wire、端点；不新增轮询；不做第二份 transcript；不做手机专用会话路由。
+- 审批卡不显示 risk、置信度，也不断言会话边界。
+- 不改写终端输出的颜色。
+- 不加阻塞首帧的脚本。
+- 入库文字不点名任何闭源参考产品。证据截图只提交 Remuda 自身在 390 与 1440 宽度下的渲染，且只在设置了 `REMUDA_EVIDENCE` 时生成。
+
+**由谁**：所有者（重做授权）+ coordinator。所有者 2026-09-23 的四项拍板：
+
+1. 默认外观跟随系统（计划 §7 选项 1A）；
+2. UI 与正文同用系统无衬线字体，不打包衬线或 CJK webfont（2A）；
+3. 只发布「墨」一套调色板，深色、浅色两态（3A）；
+4. 会话有 `instance.taskId` 时 tab 集合是该 Task 的会话，否则是所在 Space 的会话；⌘1..9 跟随眼前的可见编号（4A）。
+
+**依据**：[visual-system.md](./visual-system.md)（令牌契约与对比度全集）。代码锚点在 `42ccd7ee` 上复核：`web/src/styles/tokens.css:1-196`、`web/src/styles/ui.module.css:10-15,52,323-324,356-372,386-391`、`web/src/features/session/tty/theme.ts:15-68`、`web/src/pages/SessionPage.tsx:95,154,452-596,669`、`web/src/app/Shell.tsx:207-237,337`、`web/index.html:2,9`、`crates/remuda-hub/src/web.rs:1-9,100-107`。

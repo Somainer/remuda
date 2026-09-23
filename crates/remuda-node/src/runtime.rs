@@ -1472,20 +1472,25 @@ fn normalize_explicit_pin(pin: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Post-launch model-pin read-back (`evidence/model-pin-1.md` §3).
+/// Post-launch model-pin read-back (`evidence/model-pin-1.md` §3, §5).
 ///
 /// model-pin-1: a `--model` pin is sent, but a host layer can still make the
 /// session answer on something else. This gate reads back what actually
-/// answered and refuses a substitution, using the alias-aware comparison in
+/// answered using the alias-aware comparison in
 /// [`remuda_protocol::compare_model_pin`] so a correct gateway launch
 /// (`model_hub/es1_orange_o50[1m]` answered by `claude-opus-5`) is not flagged.
 ///
 /// It is deliberately event-driven and fail-open: it judges only the
 /// **launch-attributed** read-back, once. If no genuine read-back ever arrives
-/// (no assistant message, no verdict), there is no evidence of a substitution,
-/// so the launch is allowed to continue rather than killed on a guess. A later
-/// in-session switch — a human `/model` or a Remuda `configure` — is out of
-/// scope by source attribution and never refused here.
+/// (no assistant message, no verdict), there is no evidence of a divergence, so
+/// nothing is recorded. A later in-session switch — a human `/model` or a
+/// Remuda `configure` — is out of scope by source attribution.
+///
+/// Owner ruling 2026-09-23 (`model-pin-1.md` §5): a divergence is **recorded,
+/// never acted on**. The harness provides the capability; the agent decides
+/// what it runs. The gate must not close the process or fail the instance — it
+/// returns one [`ModelDivergence`] the pump journals as a warning diagnostic
+/// naming both ids verbatim, and the session keeps running.
 struct ModelPinGate {
     /// The requested id. `None` disables the gate entirely: a pin that was
     /// never requested cannot mismatch.
@@ -1497,6 +1502,16 @@ struct ModelPinGate {
     settled: bool,
 }
 
+/// A launch read-back that named a model other than the pin, in the pin's own
+/// vocabulary. Recorded honestly and then ignored: the session is not stopped.
+#[derive(Debug, PartialEq, Eq)]
+struct ModelDivergence {
+    /// The requested pin, verbatim.
+    pin: String,
+    /// The id that actually answered, verbatim.
+    observed: String,
+}
+
 impl ModelPinGate {
     fn new(pin: Option<String>) -> Self {
         Self {
@@ -1506,8 +1521,9 @@ impl ModelPinGate {
         }
     }
 
-    /// Fold one observation. `Some(reason)` means stop this launch.
-    fn observe(&mut self, observation: &remuda_protocol::Observation) -> Option<String> {
+    /// Fold one observation. `Some` means the launch read-back proved a
+    /// divergence: the caller records it and keeps the session running.
+    fn observe(&mut self, observation: &remuda_protocol::Observation) -> Option<ModelDivergence> {
         let pin = self.pin.as_deref()?;
         let ObservationPayload::Model(payload) = &observation.body else {
             return None;
@@ -1542,9 +1558,10 @@ impl ModelPinGate {
         self.settled = true;
         let observed = payload.effective.id.trim();
         match remuda_protocol::compare_model_pin(pin, observed, &self.catalog) {
-            remuda_protocol::ModelPinVerdict::Mismatch => Some(format!(
-                "{MODEL_MISMATCH}: requested {pin} but {observed} answered"
-            )),
+            remuda_protocol::ModelPinVerdict::Mismatch => Some(ModelDivergence {
+                pin: pin.to_owned(),
+                observed: observed.to_owned(),
+            }),
             // Honoured (the pin, or its context-suffix spelling) and
             // Unresolvable (a gateway resolved it to an upstream vendor name —
             // indistinguishable from a correct launch on this channel) both
@@ -1555,8 +1572,40 @@ impl ModelPinGate {
     }
 }
 
-/// Lifecycle error name for a launch whose model pin was not honoured.
-pub const MODEL_MISMATCH: &str = "model-mismatch";
+/// Stable machine reason on the diagnostic that records a launch model pin
+/// that was not honoured (`model-pin-1.md` §5). Recorded, never fatal: the
+/// session keeps running and the instance is not failed.
+const MODEL_MISMATCH: &str = "model-mismatch";
+
+/// The journal record for a launch read-back that named a different model in
+/// the pin's own vocabulary.
+///
+/// Reuses the native diagnostic shape — no new wire type or field — and carries
+/// both ids verbatim in `related_ids`. It is a warning that does not affect
+/// completion, because the owner's 2026-09-23 ruling is that the harness
+/// records what answered; it does not stop the agent from running on it.
+fn model_pin_diagnostic(pin: &str, observed: &str) -> ObservationPayload {
+    ObservationPayload::Lifecycle(Box::new(LifecyclePayload::Native(Box::new(
+        remuda_protocol::NativeLifecycle {
+            topic: remuda_protocol::LifecycleTopic::Diagnostic,
+            native_name: "model_pin_mismatch".to_owned(),
+            native_id: Knowledge::NotApplicable,
+            status: Knowledge::Known {
+                value: "diverged".to_owned(),
+            },
+            related_ids: [
+                ("reason".to_owned(), MODEL_MISMATCH.to_owned()),
+                ("requested".to_owned(), pin.to_owned()),
+                ("observed".to_owned(), observed.to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            data_ref: None,
+            severity: remuda_protocol::Severity::Warning,
+            affects_completion: false,
+        },
+    ))))
+}
 
 fn spawn_observation_pump(
     store: Arc<dyn LocalStore>,
@@ -1578,28 +1627,21 @@ fn spawn_observation_pump(
         let mut workflow = crate::workflow_producer::WorkflowProducer::new(instance_id.clone());
         let mut workflow_tick = tokio::time::interval(crate::workflow_producer::WORKFLOW_POLL);
         workflow_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // model-pin-1: refuse a launch the explicit pin did not reach. The gate
-        // arms from `model_pin` — `spec.model_id` only, never the
-        // profile-derived default that also populates `model_requested` on an
-        // unpinned launch — so a launch with no pin can never start refusing.
+        // model-pin-1 §5: record what the launch actually read back, then keep
+        // running. The gate arms from `model_pin` — `spec.model_id` only,
+        // never the profile-derived default that also populates
+        // `model_requested` on an unpinned launch — so a launch with no pin
+        // records nothing. Owner ruling 2026-09-23: a divergence is not the
+        // harness's decision to act on; it is a fact to journal.
         let mut model_pin = ModelPinGate::new(pin_from_recipe(&driver.launch_recipe()));
         loop {
             tokio::select! {
                 maybe_observation = observations.recv() => {
                     let Some(observation) = maybe_observation else { break };
-                    // Before the fold, so the refusal does not race the
-                    // observation that proves it into the journal.
-                    if let Some(reason) = model_pin.observe(&observation) {
-                        tracing::error!(%reason, "model pin not honoured; stopping the launch");
-                        // Journal the contradicting observation first: the
-                        // refusal must be explainable from the journal.
-                        let _ = store.append_driver_observation(&instance_id, observation);
-                        if let Err(error) = driver.execute(DriverRequest::Close).await {
-                            tracing::error!(%error, "model-mismatch teardown failed");
-                        }
-                        record_task_exit(store.as_ref(), &instance_id, &reason);
-                        break;
-                    }
+                    // Fold the observation first, so the model edge that proves
+                    // the divergence is in the journal before the diagnostic
+                    // that explains it.
+                    let divergence = model_pin.observe(&observation);
                     pump_one_observation(
                         &store,
                         &interactions,
@@ -1611,6 +1653,23 @@ fn spawn_observation_pump(
                         &mut workflow,
                         observation,
                     ).await;
+                    // Record requested vs observed verbatim and let the session
+                    // run: no Close, no task exit, no failed instance.
+                    if let Some(divergence) = divergence {
+                        tracing::warn!(
+                            pin = %divergence.pin,
+                            observed = %divergence.observed,
+                            "launch model pin not honoured; recording and continuing"
+                        );
+                        if let Err(error) = store.append_observation(
+                            &instance_id,
+                            None,
+                            Completeness::Structured,
+                            model_pin_diagnostic(&divergence.pin, &divergence.observed),
+                        ) {
+                            tracing::error!(%error, "model pin diagnostic commit failed");
+                        }
+                    }
                 }
                 _ = workflow_tick.tick() => {
                     for derived in workflow.poll() {
@@ -4221,25 +4280,30 @@ mod tests {
         }
 
         /// The substitution, on the launch read-back: a different id in the
-        /// pin's own vocabulary answered. Refuses, naming both ids.
+        /// pin's own vocabulary answered. The gate reports it once, naming both
+        /// ids verbatim; the pump (not asserted here) records and keeps running.
         #[test]
-        fn a_substituted_model_on_the_launch_readback_refuses_naming_both_ids() {
+        fn a_substituted_model_on_the_launch_readback_reports_a_divergence_naming_both_ids() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
             // The snapshot asserts the pin first; it must not settle anything.
             assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
             assert!(!gate.settled);
-            let reason = gate
+            let divergence = gate
                 .observe(&launch_readback("model_hub/es1_orange_o48[1m]"))
-                .expect("a namespaced substitution must refuse");
-            assert!(reason.contains(MODEL_MISMATCH), "{reason}");
-            assert!(reason.contains(PIN), "{reason}");
-            assert!(reason.contains("model_hub/es1_orange_o48[1m]"), "{reason}");
+                .expect("a namespaced substitution is a reported divergence");
+            assert_eq!(divergence.pin, PIN);
+            assert_eq!(divergence.observed, "model_hub/es1_orange_o48[1m]");
+            // One launch, one verdict: a later edge reports nothing more.
+            assert_eq!(
+                gate.observe(&launch_readback("model_hub/es1_orange_o48[1m]")),
+                None
+            );
         }
 
         /// The measured false positive a byte-equality gate would have made: a
         /// correct gateway launch resolves the pin to an upstream vendor name.
         #[test]
-        fn a_gateway_resolution_on_the_launch_readback_does_not_refuse() {
+        fn a_gateway_resolution_on_the_launch_readback_is_not_reported() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
             assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
             assert_eq!(gate.observe(&launch_readback("claude-opus-5")), None);
@@ -4257,7 +4321,7 @@ mod tests {
             assert!(gate.settled);
         }
 
-        /// The snapshot alone must never refuse, even though it names a model.
+        /// The snapshot alone is never judged, even though it names a model.
         /// Judging it was the unfalsifiable hole in the first implementation.
         #[test]
         fn the_synthetic_snapshot_is_never_judged() {
@@ -4271,9 +4335,9 @@ mod tests {
         }
 
         /// After the launch read-back, a later switch is out of scope and cannot
-        /// refuse — even to a different model.
+        /// be reported — even to a different model.
         #[test]
-        fn a_later_human_or_remuda_switch_never_refuses() {
+        fn a_later_human_or_remuda_switch_is_never_reported() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
             assert_eq!(gate.observe(&launch_readback(PIN)), None);
             assert_eq!(
@@ -4293,9 +4357,9 @@ mod tests {
         }
 
         /// Fail-open: no genuine read-back (no assistant message, no verdict)
-        /// means no evidence, so the launch is never refused.
+        /// means no evidence, so nothing is recorded.
         #[test]
-        fn with_no_read_back_there_is_no_refusal() {
+        fn with_no_read_back_there_is_no_report() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
             assert_eq!(gate.observe(&launch_snapshot(PIN, None)), None);
             assert_eq!(
@@ -4310,7 +4374,7 @@ mod tests {
 
         /// A pin that was never requested cannot mismatch.
         #[test]
-        fn no_pin_never_refuses() {
+        fn no_pin_never_reports() {
             let mut gate = ModelPinGate::new(None);
             assert_eq!(
                 gate.observe(&launch_readback("model_hub/es1_orange_o48[1m]")),
@@ -4334,16 +4398,17 @@ mod tests {
             assert_eq!(pin_from_recipe(&None), None);
         }
         /// The catalog from the snapshot makes an un-namespaced launch read-back
-        /// comparable, upgrading it to a decidable mismatch.
+        /// comparable, upgrading it to a reported divergence.
         #[test]
         fn a_catalog_makes_an_unnamespaced_substitution_decidable() {
             let mut gate = ModelPinGate::new(Some(PIN.to_owned()));
             let catalog = vec!["es1_orange_o48".to_owned(), "es1_orange_o50".to_owned()];
             gate.observe(&launch_snapshot(PIN, Some(catalog)));
-            assert!(
-                gate.observe(&launch_readback("es1_orange_o48"))
-                    .is_some_and(|reason| reason.contains(MODEL_MISMATCH))
-            );
+            let divergence = gate
+                .observe(&launch_readback("es1_orange_o48"))
+                .expect("a catalog-listed substitution is decidable");
+            assert_eq!(divergence.pin, PIN);
+            assert_eq!(divergence.observed, "es1_orange_o48");
         }
 
         /// Non-model observations never decide anything.

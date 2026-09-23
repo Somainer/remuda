@@ -758,8 +758,12 @@ fn model_edge_event(effective: &str, source: &str) -> Value {
     })
 }
 
+// model-pin-1 §5 (owner ruling 2026-09-23): a launch read-back that names a
+// different model in the pin's vocabulary is recorded, never acted on. The
+// worker keeps Working; the detail names both ids verbatim and the roster row
+// carries the observed id so the UI can show both strings.
 #[tokio::test]
-async fn a_model_mismatch_readback_ends_the_worker_blocked_naming_both_ids() {
+async fn a_model_divergence_readback_keeps_the_worker_working_and_names_both_ids() {
     let ctx = Ctx::spawn().await.unwrap();
     let project = project_with_enrolled_workspace(&ctx, "watch-modelx", "59020-59049").await;
     ctx.dispatch(&project, "c-modelx", "59020-59049").await;
@@ -781,15 +785,33 @@ async fn a_model_mismatch_readback_ends_the_worker_blocked_naming_both_ids() {
     // node's queued journal frames before the screen read.
     let observed = ctx.observe().await;
     let row = &observed["items"][0];
-    assert_eq!(row["watch"]["status"], "blocked", "{row}");
-    let reason = row["watch"]["reason"].as_str().unwrap_or("");
-    assert!(reason.contains("model-mismatch"), "{reason}");
-    assert!(reason.contains("model_hub/es1_orange_o50[1m]"), "{reason}");
-    assert!(reason.contains("model_hub/es1_orange_o48[1m]"), "{reason}");
-    // WorkerState has no Failed arm; a model refusal is a Blocked worker.
-    assert_eq!(row["state"]["state"], "blocked");
-    // The effective id is carried on the roster row.
+    assert_eq!(
+        row["watch"]["status"], "working",
+        "a divergence is not a block: {row}"
+    );
+    assert_eq!(row["state"]["state"], "working", "{row}");
+    // The status detail honestly records both ids, verbatim.
+    let detail = row["watch"]["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("model_hub/es1_orange_o50[1m]"),
+        "detail must name the requested id: {detail}"
+    );
+    assert!(
+        detail.contains("model_hub/es1_orange_o48[1m]"),
+        "detail must name the observed id: {detail}"
+    );
+    assert!(
+        !detail.contains("model-mismatch"),
+        "the detail is a fact, not a refusal: {detail}"
+    );
+    // The effective id is carried on the roster row for display.
     assert_eq!(row["modelEffective"], "model_hub/es1_orange_o48[1m]");
+
+    // And it stays working on later passes — the recording is not sticky state.
+    let observed = ctx.observe().await;
+    let row = &observed["items"][0];
+    assert_eq!(row["state"]["state"], "working", "{row}");
+    assert_ne!(row["watch"]["status"], "blocked", "{row}");
 }
 
 /// A launch honours the pin, and only THEN does the operator reconfigure the

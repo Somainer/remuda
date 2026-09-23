@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
 import {
@@ -13,6 +13,7 @@ import {
   type PushBannerState,
 } from "./inboxRows";
 import { hubStore, useHub } from "../../lib/store";
+import { useIncrementalLimit } from "../../lib/useIncrementalLimit";
 import { readPushStatus, subscribePush, type PushStatus } from "../../lib/push";
 import { thisDeviceId } from "../../lib/interactionStatus";
 import { optionAnswerFor } from "../approvals/answers";
@@ -152,67 +153,76 @@ function InteractionActions({
   );
 }
 
-function InteractionRowCard({
-  row,
-  item,
-  onRespond,
-}: {
-  row: InboxInteractionRow;
-  item: Interaction | undefined;
-  onRespond: (item: Interaction, answer: InteractionAnswer) => void;
-}) {
-  return (
-    <article
-      ref={(el) => {
-        // Focus scroll looks the element up by interaction id; React 19 ref
-        // cleanup keeps the map from keeping detached rows.
-        rowRefs.set(row.interactionId, el);
-        return () => {
-          rowRefs.delete(row.interactionId);
-        };
-      }}
-      className={`${css.row} ${row.focused ? css.rowFocus : ""}`}
-      data-testid="m-inbox-row"
-      data-interaction-id={row.interactionId}
-      data-kind={row.interactionKind}
-      data-state={row.uiState}
-      data-focus={row.focused ? "true" : "false"}
-    >
-      <div className={css.rowHead}>
-        <StateDot
-          status={row.uiState === "paused" ? "unknown" : "blocked"}
-          title={row.uiState === "paused" ? "主机离线，交互暂停" : "待处理"}
-        />
-        <span className={css.headline} title={row.headline}>
-          {row.headline}
-        </span>
-        <span className={css.rowSpacer} />
-        <ContextRing pct={row.contextPct} />
-      </div>
-      {row.subtitle ? (
-        <p
-          className={`${css.subtitle} ${row.uiState === "paused" ? css.subtitleMute : ""} ${
-            row.subtitle && item?.carrier === "native-tty" ? css.subtitlePre : ""
-          }`}
-          title={row.subtitle}
-        >
-          {row.subtitle}
-        </p>
-      ) : null}
-      {item && item.carrier === "harness-hook" ? (
-        <p className={css.note}>来自工具钩子 · 回答直接决定工具是否执行</p>
-      ) : null}
-      {item && !item.answerable ? <p className={css.note}>请打开会话查看完整终端提示</p> : null}
-      {row.uiState === "paused" ? (
-        <p className={css.pausedNote} data-testid="m-inbox-paused">
-          主机离线，交互暂停
-        </p>
-      ) : null}
-      <MetaLine host={row.hostLabel} workspace={row.workspaceLabel} harness={row.harness} time={row.timeLabel} />
-      <InteractionActions row={row} item={item} onRespond={onRespond} />
-    </article>
-  );
-}
+/**
+ * Memoized on row.sig (see inboxRows.deriveInboxRows): the 2.5 s summary tick
+ * and the 2 s interaction poll both re-render Inbox with fresh row objects;
+ * equal sig means the card's rendered content is unchanged, so the card bails
+ * out. Same flood fix as the desktop approvals center (inbox-perf-1).
+ */
+const InteractionRowCard = memo(
+  function InteractionRowCard({
+    row,
+    item,
+    onRespond,
+  }: {
+    row: InboxInteractionRow;
+    item: Interaction | undefined;
+    onRespond: (item: Interaction, answer: InteractionAnswer) => void;
+  }) {
+    return (
+      <article
+        ref={(el) => {
+          // Focus scroll looks the element up by interaction id; React 19 ref
+          // cleanup keeps the map from keeping detached rows.
+          rowRefs.set(row.interactionId, el);
+          return () => {
+            rowRefs.delete(row.interactionId);
+          };
+        }}
+        className={`${css.row} ${row.focused ? css.rowFocus : ""}`}
+        data-testid="m-inbox-row"
+        data-interaction-id={row.interactionId}
+        data-kind={row.interactionKind}
+        data-state={row.uiState}
+        data-focus={row.focused ? "true" : "false"}
+      >
+        <div className={css.rowHead}>
+          <StateDot
+            status={row.uiState === "paused" ? "unknown" : "blocked"}
+            title={row.uiState === "paused" ? "主机离线，交互暂停" : "待处理"}
+          />
+          <span className={css.headline} title={row.headline}>
+            {row.headline}
+          </span>
+          <span className={css.rowSpacer} />
+          <ContextRing pct={row.contextPct} />
+        </div>
+        {row.subtitle ? (
+          <p
+            className={`${css.subtitle} ${row.uiState === "paused" ? css.subtitleMute : ""} ${
+              row.subtitle && item?.carrier === "native-tty" ? css.subtitlePre : ""
+            }`}
+            title={row.subtitle}
+          >
+            {row.subtitle}
+          </p>
+        ) : null}
+        {item && item.carrier === "harness-hook" ? (
+          <p className={css.note}>来自工具钩子 · 回答直接决定工具是否执行</p>
+        ) : null}
+        {item && !item.answerable ? <p className={css.note}>请打开会话查看完整终端提示</p> : null}
+        {row.uiState === "paused" ? (
+          <p className={css.pausedNote} data-testid="m-inbox-paused">
+            主机离线，交互暂停
+          </p>
+        ) : null}
+        <MetaLine host={row.hostLabel} workspace={row.workspaceLabel} harness={row.harness} time={row.timeLabel} />
+        <InteractionActions row={row} item={item} onRespond={onRespond} />
+      </article>
+    );
+  },
+  (prev, next) => prev.row.sig === next.row.sig && prev.onRespond === next.onRespond,
+);
 
 // Module-level: the focus effect below needs the mounted row element without
 // threading a ref callback through every row. Entries are overwritten on
@@ -220,34 +230,37 @@ function InteractionRowCard({
 // tier.
 const rowRefs = new Map<string, HTMLElement | null>();
 
-function RecentRowCard({ row }: { row: InboxInstanceRow }) {
-  return (
-    <article
-      className={css.row}
-      data-testid="m-inbox-recent-row"
-      data-instance-id={row.instanceId}
-      data-status={row.status}
-    >
-      <div className={css.rowHead}>
-        <StateDot status={row.status} />
-        <Link to={`/s/${row.instanceId}`} className={css.headlineLink} title={row.title}>
-          {row.title}
-        </Link>
-        <span className={css.rowSpacer} />
-        <ContextRing pct={row.contextPct} />
-      </div>
-      {row.subtitle ? (
-        <p
-          className={`${css.subtitle} ${row.status === "exited" ? css.subtitleError : ""}`}
-          title={row.subtitle}
-        >
-          {row.subtitle}
-        </p>
-      ) : null}
-      <MetaLine host={row.hostLabel} workspace={row.workspaceLabel} harness={row.harness} time={row.timeLabel} />
-    </article>
-  );
-}
+const RecentRowCard = memo(
+  function RecentRowCard({ row }: { row: InboxInstanceRow }) {
+    return (
+      <article
+        className={css.row}
+        data-testid="m-inbox-recent-row"
+        data-instance-id={row.instanceId}
+        data-status={row.status}
+      >
+        <div className={css.rowHead}>
+          <StateDot status={row.status} />
+          <Link to={`/s/${row.instanceId}`} className={css.headlineLink} title={row.title}>
+            {row.title}
+          </Link>
+          <span className={css.rowSpacer} />
+          <ContextRing pct={row.contextPct} />
+        </div>
+        {row.subtitle ? (
+          <p
+            className={`${css.subtitle} ${row.status === "exited" ? css.subtitleError : ""}`}
+            title={row.subtitle}
+          >
+            {row.subtitle}
+          </p>
+        ) : null}
+        <MetaLine host={row.hostLabel} workspace={row.workspaceLabel} harness={row.harness} time={row.timeLabel} />
+      </article>
+    );
+  },
+  (prev, next) => prev.row.sig === next.row.sig,
+);
 
 export function Inbox() {
   const hub = useHub();
@@ -272,6 +285,14 @@ export function Inbox() {
     };
   }, []);
 
+  // Explicit workspace lookup: the derive memo depends on this stable map
+  // (not on the whole hub), and a workspace-catalog refresh must re-derive
+  // because row labels read through it.
+  const workspaceById = useMemo(
+    () => new Map(hub.workspaces.map((workspace) => [workspace.id, workspace])),
+    [hub.workspaces],
+  );
+
   const rows = useMemo(
     () =>
       deriveInboxRows(
@@ -285,11 +306,24 @@ export function Inbox() {
           deviceId,
           titleOf: (id) => hubStore.titleOf(id),
           hostName: (id) => hubStore.hostName(id),
-          workspaceLabel: (id) => hubStore.workspaceOf(id)?.label ?? "",
+          workspaceLabel: (id) => workspaceById.get(id)?.label ?? "",
         },
         { kind, focus },
       ),
-    [hub, kind, focus, deviceId],
+    // Concrete slices rather than the whole hub: an unrelated store emission
+    // (host catalog refresh, effort frames) does not re-derive the inbox.
+    [
+      hub.interactions,
+      hub.instances,
+      hub.hosts,
+      hub.answering,
+      hub.summaries,
+      hub.usageRollup,
+      workspaceById,
+      deviceId,
+      kind,
+      focus,
+    ],
   );
   const interactionsById = useMemo(
     () => new Map(hub.interactions.map((item) => [item.id, item])),
@@ -313,6 +347,15 @@ export function Inbox() {
     return () => window.clearInterval(timer);
   }, [phraseIds.join(",")]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // A flood must not commit every card in one task (the desktop approvals
+  // center measured 2.7 s at 100 pending). Mount each tier in rAF slices; all
+  // rows still appear within a few frames, so counts/deep links see the list.
+  // resetKey is the kind filter: a shrink from answering a card only clamps
+  // (revealed rows — and any open draft — stay mounted); only a kind switch
+  // restarts slicing.
+  const pendingLimit = useIncrementalLimit(rows.pending.length, { resetKey: kind });
+  const recentLimit = useIncrementalLimit(rows.recent.length, { resetKey: kind });
+
   // Deep link (?focus=<interactionId>, ui-spec §1.2): highlight the row and
   // scroll it into view the moment it renders. The redirect layer carries
   // the query from /approvals verbatim.
@@ -321,7 +364,8 @@ export function Inbox() {
     if (!focus) return;
     const el = rowRefs.get(focus);
     el?.scrollIntoView({ block: "center", behavior: "auto" });
-  }, [focus, focusedKey]);
+    // pendingLimit: the focused row may mount in a later rAF slice.
+  }, [focus, focusedKey, pendingLimit]);
 
   useEffect(() => {
     return () => {
@@ -329,9 +373,9 @@ export function Inbox() {
     };
   }, []);
 
-  const respond = (item: Interaction, answer: InteractionAnswer) => {
+  const respond = useCallback((item: Interaction, answer: InteractionAnswer) => {
     void hubStore.respond(item.id, answer);
-  };
+  }, []);
 
   const setKind = (next: (typeof INBOX_KINDS)[number]) => {
     const search = new URLSearchParams(params);
@@ -432,7 +476,7 @@ export function Inbox() {
         <h2 className={css.tierTitle} data-testid="m-inbox-tier-pending">
           待你处理 ({rows.pending.length})
         </h2>
-        {rows.pending.map((row) => (
+        {rows.pending.slice(0, pendingLimit).map((row) => (
           <InteractionRowCard
             key={row.interactionId}
             row={row}
@@ -447,7 +491,7 @@ export function Inbox() {
         <h2 className={css.tierTitle} data-testid="m-inbox-tier-recent">
           进行中 · 最近 ({rows.recent.length})
         </h2>
-        {rows.recent.map((row) => (
+        {rows.recent.slice(0, recentLimit).map((row) => (
           <RecentRowCard key={row.instanceId} row={row} />
         ))}
       </section>

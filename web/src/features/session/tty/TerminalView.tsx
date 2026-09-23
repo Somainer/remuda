@@ -18,6 +18,8 @@ import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type 
 import { binaryStringToBytes } from "./ids";
 import { LocalInput } from "./LocalInput";
 import { attachTerminalRenderer, type TerminalRenderer } from "./renderer";
+import { probeRendererSelection } from "./rendererProbe";
+import { profileRegion } from "../../../lib/profileFlags";
 import { createFontMeasure, fittedTerminalFont, responsiveTerminalSize, whenFontsReady } from "./terminalFit";
 import { attachTerminalTouch } from "./terminalTouch";
 import {
@@ -203,12 +205,16 @@ export function TerminalView({
       // snapshot bytes and live bytes together, and the guard decision differs.
       for (const run of groupByOrigin(outQueue.splice(0))) {
         if (run.replay) replayGuard.enter();
-        term.write(run.bytes, () => {
-          // xterm runs this right after *this* chunk is parsed, in FIFO order,
-          // so the guard drops exactly when the replayed bytes are done.
-          if (run.replay) replayGuard.leave();
-          setReady(true);
-          setMouseMode(term.modes.mouseTrackingMode);
+        // c-perfaudit: xterm parse/dispatch cost per flushed run (region is a
+        // no-op without ?profile=1).
+        profileRegion("tty.termWrite", () => {
+          term.write(run.bytes, () => {
+            // xterm runs this right after *this* chunk is parsed, in FIFO order,
+            // so the guard drops exactly when the replayed bytes are done.
+            if (run.replay) replayGuard.leave();
+            setReady(true);
+            setMouseMode(term.modes.mouseTrackingMode);
+          });
         });
       }
     };
@@ -334,6 +340,7 @@ export function TerminalView({
     // sync with the renderer actually painting.
     const onEffectiveRenderer = (name: TerminalRenderer) => {
       if (disposed) return;
+      probeRendererSelection(name);
       setRenderer(name);
       applyFitRef.current();
     };
@@ -349,19 +356,21 @@ export function TerminalView({
         term.reset();
       },
       onFrame: (payload, _offset, _streamId, reset, replay) => {
-        const shouldReset = reset || resetStreamRef.current;
-        if (shouldReset) {
-          term.reset();
-          resetStreamRef.current = false;
-        }
-        const bytes = payloadForStreamWrite(payload, false);
-        const text = stripAnsi(payload);
-        const latin1 = Array.from(payload, (b) => String.fromCharCode(b)).join("");
-        // B5: bound the preview like rawTail — an unbounded <pre> wedges long sessions.
-        setPreview((current) => (shouldReset ? text : (current + text).slice(-4000)));
-        setRawTail((current) => (shouldReset ? latin1 : (current + latin1).slice(-4000)));
-        outQueue.push({ bytes, replay });
-        if (!outRaf) outRaf = requestAnimationFrame(flushOut);
+        profileRegion("tty.onFrame", () => {
+          const shouldReset = reset || resetStreamRef.current;
+          if (shouldReset) {
+            term.reset();
+            resetStreamRef.current = false;
+          }
+          const bytes = payloadForStreamWrite(payload, false);
+          const text = stripAnsi(payload);
+          const latin1 = Array.from(payload, (b) => String.fromCharCode(b)).join("");
+          // B5: bound the preview like rawTail — an unbounded <pre> wedges long sessions.
+          setPreview((current) => (shouldReset ? text : (current + text).slice(-4000)));
+          setRawTail((current) => (shouldReset ? latin1 : (current + latin1).slice(-4000)));
+          outQueue.push({ bytes, replay });
+          if (!outRaf) outRaf = requestAnimationFrame(flushOut);
+        });
       },
       onStatus: (next, message, nextStale) => {
         setStatus(next);

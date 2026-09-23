@@ -185,3 +185,53 @@ test.describe("appearance applied at boot", () => {
     });
   });
 });
+
+/**
+ * Reduced motion (visual-system.md §7): tokens.css stops every animation and
+ * transition except on elements that opt in with data-motion="essential".
+ * Read the live animation list rather than the stylesheet, after hovering and
+ * focusing controls that normally transition.
+ */
+test.describe("reduced motion", () => {
+  async function movingOutsideEssential(page: Page): Promise<string[]> {
+    return page.evaluate(() =>
+      document
+        .getAnimations()
+        .filter((animation) => animation.playState === "running")
+        .map((animation) => {
+          const target = (animation.effect as KeyframeEffect | null)?.target ?? null;
+          if (!target || target.closest("[data-motion='essential']")) return null;
+          const name =
+            animation instanceof CSSAnimation
+              ? animation.animationName
+              : animation instanceof CSSTransition
+                ? `transition:${animation.transitionProperty}`
+                : "script";
+          return `${target.tagName.toLowerCase()}.${String(target.className).slice(0, 40)} ${name}`;
+        })
+        .filter((entry): entry is string => entry !== null),
+    );
+  }
+
+  for (const mode of ["dark", "light"] as const) {
+    test(`only data-motion=essential moves under reduced motion (${mode})`, async ({ page }) => {
+      await page.emulateMedia({ colorScheme: mode, reducedMotion: "reduce" });
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await seedMode(page, mode);
+      await login(page);
+
+      for (const route of ["/sessions", "/approvals", "/settings"]) {
+        await page.goto(route);
+        await page.waitForLoadState("networkidle").catch(() => undefined);
+        const buttons = page.locator("button:visible");
+        const count = Math.min(await buttons.count(), 6);
+        for (let index = 0; index < count; index += 1) {
+          await buttons.nth(index).hover().catch(() => undefined);
+          await buttons.nth(index).focus().catch(() => undefined);
+          expect(await movingOutsideEssential(page), `${route} after hovering control ${index}`).toEqual([]);
+        }
+        expect(await movingOutsideEssential(page), `${route} at rest`).toEqual([]);
+      }
+    });
+  }
+});

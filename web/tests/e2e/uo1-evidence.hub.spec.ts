@@ -130,8 +130,11 @@ for (const mode of MODES) {
 
       await page.goto(`/s/${structuredId}/structured`);
       const transcript = page.getByTestId("transcript");
-      await expect(transcript.locator("pre").first()).toBeVisible({ timeout: 30_000 });
+      const code = transcript.locator("pre").filter({ hasText: "export function add" });
+      await expect(code).toBeVisible({ timeout: 30_000 });
       await expect(transcript.locator("table").first()).toBeAttached({ timeout: 30_000 });
+      // Park the code reply at the top so code, table and tool card share the frame.
+      await code.evaluate((el) => el.scrollIntoView({ block: "start" }));
       await shoot(page, "structured", mode, width);
 
       await page.goto(width <= 767 ? "/m/inbox" : "/approvals");

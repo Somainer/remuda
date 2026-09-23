@@ -1,4 +1,5 @@
-import { act, renderHook } from "@testing-library/react";
+import { act } from "react";
+import { renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useIncrementalLimit } from "./useIncrementalLimit";
 
@@ -43,7 +44,7 @@ describe("useIncrementalLimit", () => {
   });
 
   it("grows toward a large total in slices and never exceeds it", () => {
-    const { result } = renderHook(() => useIncrementalLimit(30, 10));
+    const { result } = renderHook(() => useIncrementalLimit(30, { step: 10 }));
     expect(result.current).toBe(10);
     pumpFrames(1);
     expect(result.current).toBe(20);
@@ -55,33 +56,52 @@ describe("useIncrementalLimit", () => {
     expect(result.current).toBe(30);
   });
 
-  it("shrinks back immediately when the total becomes smaller", () => {
-    const { rerender, result } = renderHook(({ total }) => useIncrementalLimit(total, 10), {
-      initialProps: { total: 25 },
+  it("only clamps (never resets) when a card leaves: rows 13+ stay mounted", () => {
+    // Regression for the draft-loss bug: answering one card shrank total by 1
+    // and reset the limit to the step, unmounting every revealed later row.
+    const { rerender, result } = renderHook(({ total }) => useIncrementalLimit(total, { step: 12 }), {
+      initialProps: { total: 20 },
     });
-    pumpFrames(2);
-    expect(result.current).toBe(25);
-    rerender({ total: 8 });
-    expect(result.current).toBe(8);
+    pumpFrames(1);
+    expect(result.current).toBe(20);
+    // One card answered elsewhere: total 20 -> 19.
+    rerender({ total: 19 });
+    expect(result.current).toBe(19);
+    // Rows 13-19 are still inside the limit; nothing below 19 is mounted.
+    expect(result.current).toBeGreaterThanOrEqual(19);
   });
 
-  it("restarts slice growth after shrinking and growing again", () => {
-    const { rerender, result } = renderHook(({ total }) => useIncrementalLimit(total, 10), {
+  it("keeps the fully-revealed limit when total grows back after a shrink", () => {
+    const { rerender, result } = renderHook(({ total }) => useIncrementalLimit(total, { step: 10 }), {
       initialProps: { total: 25 },
     });
     pumpFrames(2);
     expect(result.current).toBe(25);
     rerender({ total: 3 });
     expect(result.current).toBe(3);
-    // Filter cleared: must not re-mount all 25 in one commit — growth
-    // restarts from the clamped slice and walks back up.
+    // resetKey did not change, so this is ordinary growth: the user already
+    // revealed 25 rows — no restart, no single big commit of hidden rows.
     rerender({ total: 25 });
-    expect(result.current).toBe(3);
-    pumpFrames(1);
-    expect(result.current).toBe(13);
-    pumpFrames(1);
-    expect(result.current).toBe(23);
-    pumpFrames(1);
     expect(result.current).toBe(25);
+    expect(pending.size).toBe(0);
+  });
+
+  it("restarts slicing only when the resetKey (filter) changes", () => {
+    const { rerender, result } = renderHook(
+      ({ total, resetKey }) => useIncrementalLimit(total, { step: 10, resetKey }),
+      { initialProps: { total: 25, resetKey: "all" } },
+    );
+    pumpFrames(2);
+    expect(result.current).toBe(25);
+    // Same filter, different total -> stays revealed.
+    rerender({ total: 15, resetKey: "all" });
+    expect(result.current).toBe(15);
+    rerender({ total: 25, resetKey: "all" });
+    expect(result.current).toBe(25);
+    // Filter actually changed -> restart from the first slice.
+    rerender({ total: 25, resetKey: "approval" });
+    expect(result.current).toBe(10);
+    pumpFrames(1);
+    expect(result.current).toBe(20);
   });
 });

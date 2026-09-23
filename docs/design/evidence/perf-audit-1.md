@@ -53,8 +53,9 @@
 pnpm --dir web exec playwright install chromium webkit
 
 # Linux / macOS 通用，引擎由 --project 决定，引擎名取自 Playwright browserName
-HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c web/playwright.perf.config.ts --project=chromium
-HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c web/playwright.perf.config.ts --project=webkit
+# （pnpm --dir web 已把工作目录切到 web/，配置路径也相对该目录）
+HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c playwright.perf.config.ts --project=chromium
+HUB_E2E_PERF=1 pnpm --dir web exec playwright test -c playwright.perf.config.ts --project=webkit
 # 或直接：HUB_E2E_PERF=1 pnpm --dir web test:perf（默认跑配置内全部 project）
 ```
 
@@ -208,6 +209,14 @@ React 提交。这不是本轮修复范围（本任务只测量），但应作�
 ¹ 该列在共享 Linux 构建主机负载 52.6（1min）/5 个并行闸门构建/本进程 nice 10
 下测得，绝对值偏高，见 §2.0；macOS 复测请在所有者常规使用状态（不要
 刻意空载，也不要刻意加压）记录同样的负载信息以便对照。
+
+² **WebKit 列的 Long Task 数/分钟、最长 Long Task、TBT、峰值 heap 一律填
+`null（unsupported）`，不要填 0**：WebKit 既没有 Long Tasks API
+（`PerformanceObserver.supportedEntryTypes` 不含 `longtask`），也没有
+`performance.memory`；这些是浏览器无法提供的遥测，不是测出来的零。JSON
+里对应字段在不支持时输出 `null`（`regionTimings`、墙上时长、renderer/
+context-loss 用的是 `performance.now()` / 自有探针，各引擎都测，照常填）。
+`0` 只保留给「确实测到零」（如 Linux Chromium 场景 B 的 TBT=0）。
 
 填写时请一并记录：Chrome/Safari 版本、Mac 机型与年份、是否外接显示器
 （WebGL 硬件加速路径相关），以及测量时刻的 `uptime` 负载（本机这组数字

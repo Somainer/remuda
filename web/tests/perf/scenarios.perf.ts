@@ -45,6 +45,7 @@ const RESULTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "results");
 type RemudaPerfReport = {
   startedAt: number;
   userAgent: string;
+  capabilities: { longTasks: boolean; jsHeap: boolean };
   scenario: string | null;
   scenarios: { name: string; start: number; end: number | null }[];
   longTasks: {
@@ -64,9 +65,13 @@ type ScenarioResult = {
   scenario: string;
   wallMs: number;
   target: Record<string, number>;
-  longTaskCount: number;
-  longTasksPerMinute: number;
-  totalBlockingTimeMs: number;
+  /**
+   * Long-task metrics. null means the engine cannot measure this (e.g. WebKit
+   * has no Long Tasks API) — never a measured zero.
+   */
+  longTaskCount: number | null;
+  longTasksPerMinute: number | null;
+  totalBlockingTimeMs: number | null;
   worstLongTask: {
     durationMs: number;
     regionLabel: string | null;
@@ -74,16 +79,18 @@ type ScenarioResult = {
     container: string | null;
   } | null;
   /** Long tasks with no instrumented region on the stack — reported, not guessed. */
-  unattributedLongTasks: number;
+  unattributedLongTasks: number | null;
   /** Tasks per instrumented region label (attribution histogram). */
-  regionHistogram: Record<string, number>;
+  regionHistogram: Record<string, number> | null;
   /**
    * Instrumented cost within the scenario window, whether or not it crossed
    * the 50ms long-task threshold: call count, total synchronous ms and worst
    * ms per label. This is what separates "expensive but never blocking" from
-   * "main-thread blocker".
+   * "main-thread blocker". Region timing uses performance.now() and works on
+   * every engine, so it is never null.
    */
   regionTimings: Record<string, { calls: number; totalMs: number; maxMs: number }>;
+  /** null when the engine exposes no JS heap API (non-Chromium), not zero. */
   peakJsHeapBytes: number | null;
   terminalRenderer: string | null;
   terminalContextLosses: number;
@@ -312,8 +319,8 @@ async function markScenario(page: Page, name: string | null) {
 }
 
 /**
- * Poll window.performance.memory (Chromium only); WebKit leaves the peak null
- * and the JSON says so instead of inventing a number.
+ * Poll window.performance.memory (Chromium only). readPeakHeap returns null
+ * on engines without the API so the JSON says "unsupported" rather than 0.
  */
 async function installHeapSampler(page: Page) {
   await page.addInitScript(() => {
@@ -328,7 +335,13 @@ async function installHeapSampler(page: Page) {
 }
 
 async function readPeakHeap(page: Page): Promise<number | null> {
-  return page.evaluate(() => (window as unknown as { __perfHeapMax?: number }).__perfHeapMax ?? null);
+  return page.evaluate(() => {
+    const hasMemory =
+      "memory" in performance &&
+      (performance as unknown as { memory?: object }).memory != null;
+    if (!hasMemory) return null;
+    return (window as unknown as { __perfHeapMax?: number }).__perfHeapMax ?? 0;
+  });
 }
 
 function summarise(
@@ -371,18 +384,25 @@ function summarise(
     entry.maxMs = Math.max(entry.maxMs, ms);
   }
   const rendererProbes = report.probes.filter((probe) => probe.kind === "terminal-renderer");
+  // No Long Tasks API on this engine (e.g. WebKit): emit null, not 0, so an
+  // unsupported metric is never mistaken for a measured zero.
+  const longTasksSupported = report.capabilities?.longTasks ?? true;
   return {
     engine,
     engineUserAgent: report.userAgent,
     scenario,
     wallMs,
     target,
-    longTaskCount: tasks.length,
-    longTasksPerMinute: wallMs > 0 ? (tasks.length / wallMs) * 60_000 : 0,
-    totalBlockingTimeMs,
-    worstLongTask: worst,
-    unattributedLongTasks: histogram["(unattributed)"] ?? 0,
-    regionHistogram: histogram,
+    longTaskCount: longTasksSupported ? tasks.length : null,
+    longTasksPerMinute: longTasksSupported
+      ? wallMs > 0
+        ? (tasks.length / wallMs) * 60_000
+        : 0
+      : null,
+    totalBlockingTimeMs: longTasksSupported ? totalBlockingTimeMs : null,
+    worstLongTask: longTasksSupported ? worst : null,
+    unattributedLongTasks: longTasksSupported ? (histogram["(unattributed)"] ?? 0) : null,
+    regionHistogram: longTasksSupported ? histogram : null,
     regionTimings: timings,
     peakJsHeapBytes: peakHeap,
     terminalRenderer: rendererProbes.length
@@ -460,7 +480,8 @@ test("A: long transcript streaming at 20 batches/s while scrolling", async ({ pa
     // REPORTED, not asserted against performance thresholds — this task
     // measures, it does not fix.
     expect(result.wallMs).toBeGreaterThan(0);
-    expect(result.longTaskCount).toBeGreaterThanOrEqual(0);
+    // Long tasks are null (unsupported), not zero, on engines without the API.
+    if (result.longTaskCount != null) expect(result.longTaskCount).toBeGreaterThanOrEqual(0);
   } finally {
     await driver.close();
     await cleanupPage(browser);

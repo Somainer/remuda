@@ -1,39 +1,58 @@
 import { useEffect, useState } from "react";
 
+export type IncrementalLimitOptions = {
+  /** Rows revealed per animation frame. */
+  step?: number;
+  /**
+   * Identity of the filter/view the list is currently showing. When this key
+   * changes (kind segment, host/workspace filter), progressive mount restarts
+   * from the first slice — the list now shows a different set. Key it on the
+   * filter itself.
+   */
+  resetKey?: unknown;
+};
+
 /**
  * Progressive-mount limit for long lists.
  *
- * Returns `step` on first render and grows by `step` on each animation frame
- * until it reaches `total`. A flood (100 pending approvals / inbox rows)
- * therefore commits a few cards per frame instead of hundreds in one task —
- * the scenario-C measurement (docs/design/evidence/inbox-perf-1.md) traced a
- * 2.7 s Long Task to that single commit. Every row still mounts within a
- * handful of frames, so counts, filters and deep links keep seeing the whole
- * list; small lists (< `step`) render in one commit exactly as before.
+ * Returns `step` on first mount and grows by `step` on each animation frame
+ * until it reaches `total`, so a flood (100 pending approvals / inbox rows)
+ * commits a few cards per frame instead of hundreds in one task — the
+ * scenario-C measurement (docs/design/evidence/inbox-perf-1.md) traced a
+ * 2.7 s Long Task to that single commit. Small lists (< `step`) render in one
+ * commit exactly as before.
  *
- * When `total` shrinks (e.g. a kind filter narrows the list) the limit
- * restarts, so when it later grows back (filter cleared) the list again
- * mounts in slices rather than as one big commit. Plain growth overshoot
- * (20 + 12 past 25) is just clamped, never treated as a shrink.
+ * Crucially, a plain SHRINK of `total` only clamps the limit: a card leaving
+ * the queue (the user answers it, or another device does) must not unmount the
+ * rows already revealed, or an in-progress free-text / elicitation draft in a
+ * later card would be lost. Slicing restarts only when `resetKey` changes
+ * (i.e. the filter itself changed).
  */
-export function useIncrementalLimit(total: number, step = 12): number {
+export function useIncrementalLimit(
+  total: number,
+  options: IncrementalLimitOptions = {},
+): number {
+  const step = options.step ?? 12;
+  const resetKey = options.resetKey;
   const [limit, setLimit] = useState(step);
-  const [prevTotal, setPrevTotal] = useState(total);
+  const [prevResetKey, setPrevResetKey] = useState(resetKey);
 
-  // Adjust state during render (React's derived-state pattern), only on a
-  // real shrink — growth keeps walking the limit up via the rAF effect.
-  if (total < prevTotal) {
-    setPrevTotal(total);
+  // React's derived-state pattern: only a filter identity change restarts
+  // slicing. A grow/shrink of total alone never resets below what is mounted.
+  if (!Object.is(resetKey, prevResetKey)) {
+    setPrevResetKey(resetKey);
     setLimit(Math.min(step, total));
-  } else if (total > prevTotal) {
-    setPrevTotal(total);
   }
 
+  // Clamp (never reset) on shrink: answered card drops total by 1, the rest
+  // of the revealed rows stay mounted.
+  const clamped = Math.min(limit, total);
+
   useEffect(() => {
-    if (limit >= total) return;
+    if (clamped >= total) return;
     const frame = requestAnimationFrame(() => setLimit((value) => value + step));
     return () => cancelAnimationFrame(frame);
-  }, [limit, total, step]);
+  }, [clamped, total, step]);
 
-  return Math.min(limit, total);
+  return clamped;
 }

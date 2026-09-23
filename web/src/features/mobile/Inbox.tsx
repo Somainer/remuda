@@ -350,8 +350,11 @@ export function Inbox() {
   // A flood must not commit every card in one task (the desktop approvals
   // center measured 2.7 s at 100 pending). Mount each tier in rAF slices; all
   // rows still appear within a few frames, so counts/deep links see the list.
-  const pendingLimit = useIncrementalLimit(rows.pending.length);
-  const recentLimit = useIncrementalLimit(rows.recent.length);
+  // resetKey is the kind filter: a shrink from answering a card only clamps
+  // (revealed rows — and any open draft — stay mounted); only a kind switch
+  // restarts slicing.
+  const pendingLimit = useIncrementalLimit(rows.pending.length, { resetKey: kind });
+  const recentLimit = useIncrementalLimit(rows.recent.length, { resetKey: kind });
 
   // Deep link (?focus=<interactionId>, ui-spec §1.2): highlight the row and
   // scroll it into view the moment it renders. The redirect layer carries

@@ -88,9 +88,11 @@ export default defineConfig({
     },
     {
       // Run on macOS for the Safari-engine column (Playwright WebKit == the
-      // WKWebView engine family the shell decision is about).
+      // WKWebView engine family the shell decision is about). browserName
+      // must be set explicitly: the project `name` is only a label, so an
+      // empty `use` would still launch the default (chromium) browser.
       name: "webkit",
-      use: {},
+      use: { browserName: "webkit" },
     },
   ],
 });

@@ -72,6 +72,9 @@ describe("profileFlags (?profile=1)", () => {
         disconnect: vi.fn(),
       };
     });
+    // Model a long-task-capable engine (Chromium): the real feature gate is
+    // PerformanceObserver.supportedEntryTypes, not the constructor alone.
+    Object.assign(ctor, { supportedEntryTypes: ["longtask"] });
     vi.stubGlobal("PerformanceObserver", ctor);
   });
 
@@ -104,6 +107,7 @@ describe("profileFlags (?profile=1)", () => {
 
     const report = window.__remudaPerf!.getReport();
     expect(report.enabled).toBe(true);
+    expect(report.capabilities.longTasks).toBe(true);
     expect(report.scenario).toBeNull();
     expect(report.scenarios).toHaveLength(1);
     expect(report.scenarios[0]!.name).toBe("scenario-A");
@@ -156,5 +160,29 @@ describe("profileFlags (?profile=1)", () => {
     const after = window.__remudaPerf!.getReport();
     expect(after.longTasks).toHaveLength(0);
     expect(after.regions).toHaveLength(0);
+  });
+});
+
+describe("profileFlags capabilities on an engine without Long Tasks (WebKit-like)", () => {
+  afterEach(() => {
+    vi.resetModules();
+    vi.unstubAllGlobals();
+    delete (window as unknown as { __remudaPerf?: unknown }).__remudaPerf;
+    setSearch("");
+  });
+
+  it("reports longTasks:false and never builds an observer without the entry type", async () => {
+    setSearch("?profile=1");
+    const ctor = vi.fn();
+    // supportedEntryTypes exists but does not include "longtask" — exactly
+    // what WebKit exposes. The summary must emit null, not a measured zero.
+    Object.assign(ctor, { supportedEntryTypes: ["measure", "navigation"] });
+    vi.stubGlobal("PerformanceObserver", ctor);
+
+    const mod = await importProfileFlags();
+    expect(mod.profilingEnabled).toBe(true);
+    expect(ctor).not.toHaveBeenCalled();
+    const report = window.__remudaPerf!.getReport();
+    expect(report.capabilities.longTasks).toBe(false);
   });
 });

@@ -161,21 +161,203 @@ it("a list poll that began before create completes never drops the created insta
   expect(hubStore.getSnapshot().instances.some((i) => i.id === INSTANCE)).toBe(false);
 });
 
-it("a failed background catch-up restores the connection latch and surfaces the error", async () => {
+it("a failed catch-up settles the per-session journal status (not a latched 重连) and a retry restores live", async () => {
   const { api, hubStore } = await fresh();
   const onBatch = await mountFollow(api, hubStore);
   expect(onBatch).toBeTypeOf("function");
   expect(hubStore.getSnapshot().connection).toBe("live");
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
 
-  // Every journal read now fails: resumeAfterReconnect cannot complete.
+  // The bounded journal read fails (HTTP 502 / network drop): no events.
   vi.mocked(api.eventsRead).mockRejectedValue(new Error("HTTP 502"));
   const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => undefined);
 
   await hubStore.catchup(INSTANCE);
 
-  // The old awaited code latched the UI at 「重连中」; it must recover.
-  expect(hubStore.getSnapshot().connection).toBe("live");
+  // The per-session status SessionPage actually renders must not stay at
+  // reconnecting: the client settles at the truthful readonly-stale state
+  // (JournalBanner shows 只读 + 重试), and the global indicator follows.
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("readonly-stale");
+  expect(hubStore.getSnapshot().connection).toBe("reconnecting");
   expect(toast).toHaveBeenCalled();
+
+  // The existing retry action (the banner 重试 button calls catchup) with a
+  // healthy read restores live on both layers.
+  vi.mocked(api.eventsRead).mockResolvedValue({
+    events: [],
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  await hubStore.catchup(INSTANCE);
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
+  expect(hubStore.getSnapshot().connection).toBe("live");
+});
+
+it("a failed catch-up is cleared automatically when the follow socket delivers a contiguous batch", async () => {
+  const { api, hubStore } = await fresh();
+  const onBatch = await mountFollow(api, hubStore);
+  onBatch(screenBatch("1", "JOURNAL-1"));
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
+
+  vi.mocked(api.eventsRead).mockRejectedValue(new Error("HTTP 502"));
+  vi.spyOn(hubStore, "toast").mockImplementation(() => undefined);
+  await hubStore.catchup(INSTANCE);
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("readonly-stale");
+  expect(hubStore.getSnapshot().connection).toBe("reconnecting");
+
+  // No manual retry: the still-open follow socket delivers the next turn's
+  // contiguous frame. applyBatch flushes it and the client returns to live,
+  // clearing both the per-session banner and the global indicator.
+  onBatch(screenBatch("2", "JOURNAL-2"));
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
+  expect(hubStore.getSnapshot().connection).toBe("live");
+});
+
+it("an RPC screen committed first is not rolled back by catch-up re-deriving the same journal screen", async () => {
+  // Reviewer trigger: journal has the DONE screen at seq 1; the parallel
+  // tty.screen read resolves first with the new working buffer; catch-up then
+  // delivers a NON-screen event at seq 2. The re-derived seq-1 screen must not
+  // overwrite the newer RPC buffer (which would restore the DONE badge).
+  const { api, hubStore } = await fresh();
+  const onBatch = await mountFollow(api, hubStore);
+
+  onBatch(screenBatch("1", "DONE old task"));
+  expect(hubStore.getSnapshot().screens[INSTANCE]?.done).toBe(true);
+
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: ["working on new task"] });
+  await hubStore.refreshScreen(INSTANCE);
+  const afterRpc = hubStore.getSnapshot().screens[INSTANCE];
+  expect(afterRpc?.lines).toEqual(["working on new task"]);
+  expect(afterRpc?.done).toBe(false);
+  expect(afterRpc?.journalSeq).toBe("1");
+
+  // Catch-up delivers a regular assistant message at seq 2 — the latest
+  // SCREEN observation is still seq 1, and that equal basis must not commit.
+  onBatch({
+    subscriptionId: "sub_reconcile_race",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_msg_2",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        completeness: "structured",
+        payload: { role: "assistant", text: "still working" },
+      } as unknown as Observation,
+    ],
+  });
+
+  const screen = hubStore.getSnapshot().screens[INSTANCE];
+  expect(screen?.lines).toEqual(["working on new task"]);
+  expect(screen?.done).toBe(false);
+
+  // A genuinely newer journal screen (seq 3) wins again.
+  onBatch(screenBatch("3", "DONE new task"));
+  const later = hubStore.getSnapshot().screens[INSTANCE];
+  expect(later?.lines.join(" ")).toContain("DONE new task");
+  expect(later?.journalSeq).toBe("3");
+});
+
+it("an unexpected 500 screen read is reported by both layers, never replaced with a fallback", async () => {
+  const { HubHttpError } = await import("./httpError");
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  onBatchScreen(api, hubStore, "1", "JOURNAL-BEFORE");
+  const error = new HubHttpError(500, "INTERNAL", "boom", []);
+  vi.spyOn(api, "screenRead").mockRejectedValue(error);
+
+  // Direct call: the error propagates; the committed screen is untouched and
+  // no fallback silently masquerades as current content.
+  await expect(hubStore.refreshScreen(INSTANCE)).rejects.toBe(error);
+  expect(hubStore.getSnapshot().screens[INSTANCE]?.lines.join(" ")).toContain("JOURNAL-BEFORE");
+
+  // Scheduler layer (the 2.5 s list poll fan-out): unexpected failures are
+  // reported as an advisory, unlike NODE_BUSY which only backs off.
+  const toast = vi.spyOn(hubStore, "toast").mockImplementation(() => undefined);
+  hubStore.refreshScreens([INSTANCE]);
+  await vi.waitFor(() => expect(toast).toHaveBeenCalled());
+
+  // A 4xx (offline host / no PTY for this carrier) is converted by the api
+  // layer into an expected empty read, so refreshScreen falls back to the
+  // journal screen without any error.
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  await expect(hubStore.refreshScreen(INSTANCE)).resolves.toBeUndefined();
+});
+
+function onBatchScreen(api: Api, hubStore: Store, seq: string, text: string) {
+  const subscribe = vi.mocked(api.eventsSubscribe);
+  const onBatch = subscribe.mock.calls[0]?.[2] as (batch: Record<string, unknown>) => void;
+  onBatch(screenBatch(seq, text));
+  return hubStore.getSnapshot().screens[INSTANCE];
+}
+
+it("a list response in flight across logout is dropped; the request seq stays monotonic", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+  vi.spyOn(api, "deviceRevoke").mockResolvedValue(undefined as never);
+  type ListPage = Awaited<ReturnType<Api["instanceList"]>>;
+  let releaseFirst: (items: ListPage["items"]) => void = () => {};
+  const firstPoll = new Promise<ListPage>((resolve) => {
+    releaseFirst = (items) => resolve({ items, nextCursor: null });
+  });
+  let releaseSecond: (items: ListPage["items"]) => void = () => {};
+  const secondPoll = new Promise<ListPage>((resolve) => {
+    releaseSecond = (items) => resolve({ items, nextCursor: null });
+  });
+  const oldRow = { id: "ins_OLD_SESSION", journalId: "j_old", revision: "1", durableSeq: "0" } as ListPage["items"][number];
+  vi.spyOn(api, "instanceList")
+    .mockReturnValueOnce(firstPoll) // pre-logout poll
+    .mockReturnValueOnce(secondPoll) // post-logout poll, begun pre-create
+    .mockResolvedValue({ items: [], nextCursor: null });
+  const instance = {
+    id: INSTANCE,
+    journalId: JOURNAL,
+    hostId: "hst_1",
+    kind: "claude",
+    driver: "claude-pty",
+    lifecycle: "running",
+  } as Awaited<ReturnType<Api["instanceCreate"]>>["instance"];
+  vi.spyOn(api, "instanceCreate").mockResolvedValue({
+    instance,
+    command: commandResult("cmd_create2", "accepted").command,
+  });
+
+  // 1. Poll starts before logout and is still awaiting when the session ends.
+  const staleRefresh = hubStore.refresh();
+  hubStore.logout();
+  expect(hubStore.getSnapshot().instances).toEqual([]);
+  // 2. Its old-session body resolves: the epoch guard drops it wholesale.
+  releaseFirst([oldRow]);
+  await staleRefresh;
+  expect(hubStore.getSnapshot().instances).toEqual([]);
+
+  // 3. A poll started in the new (post-logout) epoch is still in flight when
+  //    a session is created — pinning must work with the monotonic (un-reset)
+  //    request seq.
+  const pendingRefresh = hubStore.refresh();
+  const created = await hubStore.create({
+    hostId: "hst_1",
+    kind: "claude",
+    driver: "claude-pty",
+    model: "e2e/auto",
+    permissionMode: "default",
+    prompt: "p",
+  });
+  expect(created.id).toBe(INSTANCE);
+  releaseSecond([]);
+  await pendingRefresh;
+  // The response that began before the create cannot drop the optimistic row.
+  expect(hubStore.getSnapshot().instances.some((i) => i.id === INSTANCE)).toBe(true);
+  expect(hubStore.getSnapshot().instances.some((i) => i.id === "ins_OLD_SESSION")).toBe(false);
+  // 4. A settled post-create response is authoritative again.
+  await hubStore.refresh();
+  expect(hubStore.getSnapshot().instances.some((i) => i.id === INSTANCE)).toBe(false);
 });
 
 it("a tty.screen read in flight before a newer journal frame cannot overwrite it", async () => {

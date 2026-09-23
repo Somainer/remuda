@@ -152,3 +152,53 @@ on round-1 code):
   10x loops after the race fixes — pty **10/10**, steer **10/10**; whole
   hub-live file **10 passed, 1 skipped** (external-Node). Same lock/ports
   protocol (58830/58831/58839).
+
+### Round 3 — three narrow leftovers of the detached reconciliation
+
+A second codex+grok review rejected round 2 for four narrow leftovers. All
+fixed; six new unit pins (five failing on round-2 code), evidence below:
+
+1. **Per-session journal status latched at 重连.** Round 2 reset only the
+   global `connection`; `JournalClient.resumeAfterReconnect` rejected from
+   its read with the client still `reconnecting`, and SessionPage prefers
+   the per-session `journalStatus[id]`, so the banner latched (the 2 s poll
+   refreshes lists, not journals). `journal.ts` now settles the client at
+   `readonly-stale` — the same truthful retryable state gap-budget
+   exhaustion uses — when the resync read rejects, and re-throws for the
+   toast. `catchup` derives the global indicator from the SETTLED client
+   status, and `follow`'s `onStatus` clears the global indicator whenever a
+   client returns to `live` — so recovery is automatic when the follow
+   socket delivers a contiguous frame again, with the existing 重试 action
+   the explicit path. Pins: failed catch-up yields `readonly-stale` +
+   banner-visible state and a healthy retry (or a contiguous socket batch)
+   restores `live` on both layers.
+2. **One screen order for both sources.** Catch-up re-derives the latest
+   journal screen on EVERY batch (including non-screen events), so an RPC
+   buffer that committed first (`working on new task`) was rolled back to
+   the older DONE journal screen when catch-up delivered a later non-screen
+   event. Both sources now commit through one helper with a total order on
+   `journalSeq`: journal updates are skipped when the committed basis is at
+   or beyond theirs; RPC updates carry the seq the buffer was known fresh
+   through at read start and lose to a journal frame that advanced during
+   the flight. Pin: RPC first, non-screen catch-up event second keeps the
+   newer RPC buffer (DONE badge cannot return); a genuinely newer journal
+   screen still wins.
+3. **Screen errors no longer swallowed.** `api.screenRead` now converts
+   only expected absence (4xx — offline host 422, no PTY 404) into an
+   empty read; 5xx/network propagate. `refreshScreen` propagates them
+   (generation-guarded) and the periodic scheduler reports them via the
+   same advisory toast rather than returning silently; NODE_BUSY remains
+   the only back-off path. API-layer test (`api.screenRead.test.ts`)
+   exercises the real fetch → error conversion for 200/4xx/503/500.
+4. **Logout epoch invalidating in-flight list responses.** `logout` no
+   longer resets the request seq (which made a pre-logout response look
+   newer than a post-login create) or yanks `listOutstanding`; it bumps the
+   existing `bootGen`, and `refresh` captures the epoch at fetch START and
+   drops body merge and pin bookkeeping when the epoch changed — the stale
+   request still releases its own outstanding slot in `finally`. Pin:
+   pre-logout poll → logout → late old-session body → list stays empty;
+   post-logout poll in flight across a create still keeps the pin.
+
+Verification: `pnpm -C web test` 1653 pass; typecheck and oxlint clean;
+10x loops pty **10/10**, steer **10/10** (58850/58851/58859, same lock
+protocol).

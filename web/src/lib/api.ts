@@ -1401,8 +1401,7 @@ function createLiveApi(): HubApi {
         // The Hub refused this read to protect the control-RPC reservation
         // (NODE_BUSY/503): nothing failed on the Node and the next poll cycle
         // is expected to succeed. Surface it so the store backs off instead
-        // of hammering; every other failure (offline host, unsupported
-        // carrier, 404) stays an empty screen, same as before.
+        // of hammering.
         if (
           err instanceof HubHttpError &&
           (err.code === "NODE_BUSY" || err.status === 503)
@@ -1410,7 +1409,16 @@ function createLiveApi(): HubApi {
           // Honour the Hub's back-off hint; fall back to one poll cycle.
           throw new ScreenNodeBusyError(err.retryAfterMs ?? 2500);
         }
-        return { lines: [] };
+        // A 4xx means "no screen for this instance right now": host offline
+        // (422 Unsatisfiable), unsupported carrier/404, etc. That is an
+        // expected empty screen and the caller derives a journal fallback.
+        // A 5xx or a network failure is an UNEXPECTED read failure: propagate
+        // it so the store reports instead of silently showing fallback
+        // content as a current screen.
+        if (err instanceof HubHttpError && err.status < 500) {
+          return { lines: [] };
+        }
+        throw err;
       }
     },
     async instanceClose(instanceId) {

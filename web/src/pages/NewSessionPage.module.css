@@ -424,11 +424,16 @@
 
 @media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
   /* Rise from the bottom edge, sized to the visual viewport so the soft
-     keyboard pushes the footer — and the primary action — up with it. */
+     keyboard pushes the footer — and the primary action — up with it.
+     c-mfix: the band starts at --workbench-top while the keyboard is open, so
+     anchor from the BAND bottom (layout bottom minus top minus band height),
+     not the old shell-height model that parked the sheet mid-screen. */
   .sheet {
     inset: auto 0 auto 0;
     margin: 0;
-    bottom: calc(100dvh - var(--workbench-height, 100dvh));
+    bottom: calc(
+      100dvh - var(--workbench-top, 0px) - var(--workbench-height, 100dvh)
+    );
     width: 100%;
     max-width: 100%;
     height: auto;

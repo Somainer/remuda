@@ -1,0 +1,2881 @@
+{
+  "artifact_kind": "synthetic-offline-negative-control-not-model-output",
+  "designed_to_fail": [
+    "threshold-1-regression-precision: confident wrong answers on 14 flake records sit above every regression probability, so no operating point reaches 0.95",
+    "threshold-2-coverage-gain: undefined once no precision-compliant operating point exists",
+    "threshold-3-p95-latency: roughly one response in ten is injected above 900ms"
+  ],
+  "model": "jev-1.13.0",
+  "profile": "fail",
+  "question": {
+    "flake_option_meaning": "failure is transient: timing, environment, or contention.",
+    "key": "triage",
+    "options": [
+      "flake",
+      "regression"
+    ],
+    "primitive": "choice",
+    "regression_option_meaning": "failure recurs: a real regression. Conservatively safe use: drop the scheduled automatic retry.",
+    "wording": "Given this failed gate step's log tail, if the gate is rerun unchanged on a healthy runner, does the same failure recur because of the code under test?"
+  },
+  "responses": [
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.234,
+          "probabilities": {
+            "flake": 0.3829,
+            "regression": 0.6171
+          }
+        }
+      },
+      "id": "c0001",
+      "latency_ms": 334
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.74,
+          "probabilities": {
+            "flake": 0.1299,
+            "regression": 0.8701
+          }
+        }
+      },
+      "id": "c0002",
+      "latency_ms": 385
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.542,
+          "probabilities": {
+            "flake": 0.2289,
+            "regression": 0.7711
+          }
+        }
+      },
+      "id": "c0003",
+      "latency_ms": 460
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.379,
+          "probabilities": {
+            "flake": 0.3106,
+            "regression": 0.6894
+          }
+        }
+      },
+      "id": "c0004",
+      "latency_ms": 280
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.537,
+          "probabilities": {
+            "flake": 0.2316,
+            "regression": 0.7684
+          }
+        }
+      },
+      "id": "c0005",
+      "latency_ms": 431
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.391,
+          "probabilities": {
+            "flake": 0.3044,
+            "regression": 0.6956
+          }
+        }
+      },
+      "id": "c0006",
+      "latency_ms": 1014
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.56,
+          "probabilities": {
+            "flake": 0.2198,
+            "regression": 0.7802
+          }
+        }
+      },
+      "id": "c0007",
+      "latency_ms": 655
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.356,
+          "probabilities": {
+            "flake": 0.3222,
+            "regression": 0.6778
+          }
+        }
+      },
+      "id": "c0008",
+      "latency_ms": 150
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.511,
+          "probabilities": {
+            "flake": 0.2443,
+            "regression": 0.7557
+          }
+        }
+      },
+      "id": "c0009",
+      "latency_ms": 181
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.25,
+          "probabilities": {
+            "flake": 0.3752,
+            "regression": 0.6248
+          }
+        }
+      },
+      "id": "c0010",
+      "latency_ms": 177
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.405,
+          "probabilities": {
+            "flake": 0.2973,
+            "regression": 0.7027
+          }
+        }
+      },
+      "id": "c0011",
+      "latency_ms": 398
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.743,
+          "probabilities": {
+            "flake": 0.1287,
+            "regression": 0.8713
+          }
+        }
+      },
+      "id": "c0012",
+      "latency_ms": 279
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.611,
+          "probabilities": {
+            "flake": 0.1945,
+            "regression": 0.8055
+          }
+        }
+      },
+      "id": "c0013",
+      "latency_ms": 972
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.217,
+          "probabilities": {
+            "flake": 0.3915,
+            "regression": 0.6085
+          }
+        }
+      },
+      "id": "c0014",
+      "latency_ms": 300
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.671,
+          "probabilities": {
+            "flake": 0.1643,
+            "regression": 0.8357
+          }
+        }
+      },
+      "id": "c0015",
+      "latency_ms": 308
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.795,
+          "probabilities": {
+            "flake": 0.1023,
+            "regression": 0.8977
+          }
+        }
+      },
+      "id": "c0016",
+      "latency_ms": 181
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.235,
+          "probabilities": {
+            "flake": 0.3826,
+            "regression": 0.6174
+          }
+        }
+      },
+      "id": "c0017",
+      "latency_ms": 1322
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.25,
+          "probabilities": {
+            "flake": 0.3748,
+            "regression": 0.6252
+          }
+        }
+      },
+      "id": "c0018",
+      "latency_ms": 380
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.858,
+          "probabilities": {
+            "flake": 0.929,
+            "regression": 0.071
+          }
+        }
+      },
+      "id": "c0019",
+      "latency_ms": 307
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.72,
+          "probabilities": {
+            "flake": 0.8598,
+            "regression": 0.1402
+          }
+        }
+      },
+      "id": "c0020",
+      "latency_ms": 310
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.667,
+          "probabilities": {
+            "flake": 0.1664,
+            "regression": 0.8336
+          }
+        }
+      },
+      "id": "c0021",
+      "latency_ms": 450
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.591,
+          "probabilities": {
+            "flake": 0.2047,
+            "regression": 0.7953
+          }
+        }
+      },
+      "id": "c0022",
+      "latency_ms": 583
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.33,
+          "probabilities": {
+            "flake": 0.3349,
+            "regression": 0.6651
+          }
+        }
+      },
+      "id": "c0023",
+      "latency_ms": 547
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.415,
+          "probabilities": {
+            "flake": 0.2923,
+            "regression": 0.7077
+          }
+        }
+      },
+      "id": "c0024",
+      "latency_ms": 518
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.782,
+          "probabilities": {
+            "flake": 0.1088,
+            "regression": 0.8912
+          }
+        }
+      },
+      "id": "c0025",
+      "latency_ms": 379
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.291,
+          "probabilities": {
+            "flake": 0.3545,
+            "regression": 0.6455
+          }
+        }
+      },
+      "id": "c0026",
+      "latency_ms": 706
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.663,
+          "probabilities": {
+            "flake": 0.1686,
+            "regression": 0.8314
+          }
+        }
+      },
+      "id": "c0027",
+      "latency_ms": 314
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.69,
+          "probabilities": {
+            "flake": 0.1552,
+            "regression": 0.8448
+          }
+        }
+      },
+      "id": "c0028",
+      "latency_ms": 546
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.544,
+          "probabilities": {
+            "flake": 0.2282,
+            "regression": 0.7718
+          }
+        }
+      },
+      "id": "c0029",
+      "latency_ms": 222
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.292,
+          "probabilities": {
+            "flake": 0.3539,
+            "regression": 0.6461
+          }
+        }
+      },
+      "id": "c0030",
+      "latency_ms": 237
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.363,
+          "probabilities": {
+            "flake": 0.3183,
+            "regression": 0.6817
+          }
+        }
+      },
+      "id": "c0031",
+      "latency_ms": 561
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.253,
+          "probabilities": {
+            "flake": 0.3736,
+            "regression": 0.6264
+          }
+        }
+      },
+      "id": "c0032",
+      "latency_ms": 388
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.712,
+          "probabilities": {
+            "flake": 0.1441,
+            "regression": 0.8559
+          }
+        }
+      },
+      "id": "c0033",
+      "latency_ms": 1275
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.508,
+          "probabilities": {
+            "flake": 0.2459,
+            "regression": 0.7541
+          }
+        }
+      },
+      "id": "c0034",
+      "latency_ms": 1318
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.513,
+          "probabilities": {
+            "flake": 0.2435,
+            "regression": 0.7565
+          }
+        }
+      },
+      "id": "c0035",
+      "latency_ms": 203
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.478,
+          "probabilities": {
+            "flake": 0.2608,
+            "regression": 0.7392
+          }
+        }
+      },
+      "id": "c0036",
+      "latency_ms": 332
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.409,
+          "probabilities": {
+            "flake": 0.2957,
+            "regression": 0.7043
+          }
+        }
+      },
+      "id": "c0037",
+      "latency_ms": 363
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.601,
+          "probabilities": {
+            "flake": 0.1996,
+            "regression": 0.8004
+          }
+        }
+      },
+      "id": "c0038",
+      "latency_ms": 225
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.43,
+          "probabilities": {
+            "flake": 0.2852,
+            "regression": 0.7148
+          }
+        }
+      },
+      "id": "c0039",
+      "latency_ms": 430
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.771,
+          "probabilities": {
+            "flake": 0.1144,
+            "regression": 0.8856
+          }
+        }
+      },
+      "id": "c0040",
+      "latency_ms": 1137
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.202,
+          "probabilities": {
+            "flake": 0.3992,
+            "regression": 0.6008
+          }
+        }
+      },
+      "id": "c0041",
+      "latency_ms": 414
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.282,
+          "probabilities": {
+            "flake": 0.359,
+            "regression": 0.641
+          }
+        }
+      },
+      "id": "c0042",
+      "latency_ms": 259
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.728,
+          "probabilities": {
+            "flake": 0.1359,
+            "regression": 0.8641
+          }
+        }
+      },
+      "id": "c0043",
+      "latency_ms": 511
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.416,
+          "probabilities": {
+            "flake": 0.2921,
+            "regression": 0.7079
+          }
+        }
+      },
+      "id": "c0044",
+      "latency_ms": 351
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.634,
+          "probabilities": {
+            "flake": 0.817,
+            "regression": 0.183
+          }
+        }
+      },
+      "id": "c0045",
+      "latency_ms": 980
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.453,
+          "probabilities": {
+            "flake": 0.7263,
+            "regression": 0.2737
+          }
+        }
+      },
+      "id": "c0046",
+      "latency_ms": 636
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.643,
+          "probabilities": {
+            "flake": 0.8214,
+            "regression": 0.1786
+          }
+        }
+      },
+      "id": "c0047",
+      "latency_ms": 336
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.549,
+          "probabilities": {
+            "flake": 0.7746,
+            "regression": 0.2254
+          }
+        }
+      },
+      "id": "c0048",
+      "latency_ms": 468
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.356,
+          "probabilities": {
+            "flake": 0.3219,
+            "regression": 0.6781
+          }
+        }
+      },
+      "id": "c0049",
+      "latency_ms": 1369
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.694,
+          "probabilities": {
+            "flake": 0.1528,
+            "regression": 0.8472
+          }
+        }
+      },
+      "id": "c0050",
+      "latency_ms": 291
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.82,
+          "probabilities": {
+            "flake": 0.0901,
+            "regression": 0.9099
+          }
+        }
+      },
+      "id": "c0051",
+      "latency_ms": 1131
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.208,
+          "probabilities": {
+            "flake": 0.3961,
+            "regression": 0.6039
+          }
+        }
+      },
+      "id": "c0052",
+      "latency_ms": 380
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.477,
+          "probabilities": {
+            "flake": 0.2615,
+            "regression": 0.7385
+          }
+        }
+      },
+      "id": "c0053",
+      "latency_ms": 743
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.699,
+          "probabilities": {
+            "flake": 0.1505,
+            "regression": 0.8495
+          }
+        }
+      },
+      "id": "c0054",
+      "latency_ms": 625
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.388,
+          "probabilities": {
+            "flake": 0.306,
+            "regression": 0.694
+          }
+        }
+      },
+      "id": "c0055",
+      "latency_ms": 1071
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.387,
+          "probabilities": {
+            "flake": 0.3065,
+            "regression": 0.6935
+          }
+        }
+      },
+      "id": "c0056",
+      "latency_ms": 361
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.381,
+          "probabilities": {
+            "flake": 0.3094,
+            "regression": 0.6906
+          }
+        }
+      },
+      "id": "c0057",
+      "latency_ms": 1096
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.316,
+          "probabilities": {
+            "flake": 0.3419,
+            "regression": 0.6581
+          }
+        }
+      },
+      "id": "c0058",
+      "latency_ms": 288
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.783,
+          "probabilities": {
+            "flake": 0.1084,
+            "regression": 0.8916
+          }
+        }
+      },
+      "id": "c0059",
+      "latency_ms": 313
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.574,
+          "probabilities": {
+            "flake": 0.2128,
+            "regression": 0.7872
+          }
+        }
+      },
+      "id": "c0060",
+      "latency_ms": 450
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.256,
+          "probabilities": {
+            "flake": 0.3718,
+            "regression": 0.6282
+          }
+        }
+      },
+      "id": "c0061",
+      "latency_ms": 1218
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.7,
+          "probabilities": {
+            "flake": 0.1501,
+            "regression": 0.8499
+          }
+        }
+      },
+      "id": "c0062",
+      "latency_ms": 703
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.334,
+          "probabilities": {
+            "flake": 0.333,
+            "regression": 0.667
+          }
+        }
+      },
+      "id": "c0063",
+      "latency_ms": 623
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.581,
+          "probabilities": {
+            "flake": 0.2093,
+            "regression": 0.7907
+          }
+        }
+      },
+      "id": "c0064",
+      "latency_ms": 218
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.382,
+          "probabilities": {
+            "flake": 0.3091,
+            "regression": 0.6909
+          }
+        }
+      },
+      "id": "c0065",
+      "latency_ms": 232
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.68,
+          "probabilities": {
+            "flake": 0.1602,
+            "regression": 0.8398
+          }
+        }
+      },
+      "id": "c0066",
+      "latency_ms": 310
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.681,
+          "probabilities": {
+            "flake": 0.1596,
+            "regression": 0.8404
+          }
+        }
+      },
+      "id": "c0067",
+      "latency_ms": 238
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.439,
+          "probabilities": {
+            "flake": 0.2806,
+            "regression": 0.7194
+          }
+        }
+      },
+      "id": "c0068",
+      "latency_ms": 380
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.374,
+          "probabilities": {
+            "flake": 0.3132,
+            "regression": 0.6868
+          }
+        }
+      },
+      "id": "c0069",
+      "latency_ms": 150
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.649,
+          "probabilities": {
+            "flake": 0.1757,
+            "regression": 0.8243
+          }
+        }
+      },
+      "id": "c0070",
+      "latency_ms": 1216
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.438,
+          "probabilities": {
+            "flake": 0.2812,
+            "regression": 0.7188
+          }
+        }
+      },
+      "id": "c0071",
+      "latency_ms": 419
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.324,
+          "probabilities": {
+            "flake": 0.338,
+            "regression": 0.662
+          }
+        }
+      },
+      "id": "c0072",
+      "latency_ms": 1187
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.431,
+          "probabilities": {
+            "flake": 0.2844,
+            "regression": 0.7156
+          }
+        }
+      },
+      "id": "c0073",
+      "latency_ms": 323
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.67,
+          "probabilities": {
+            "flake": 0.1652,
+            "regression": 0.8348
+          }
+        }
+      },
+      "id": "c0074",
+      "latency_ms": 258
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.628,
+          "probabilities": {
+            "flake": 0.1859,
+            "regression": 0.8141
+          }
+        }
+      },
+      "id": "c0075",
+      "latency_ms": 735
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.921,
+          "probabilities": {
+            "flake": 0.9605,
+            "regression": 0.0395
+          }
+        }
+      },
+      "id": "c0076",
+      "latency_ms": 327
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.989,
+          "probabilities": {
+            "flake": 0.0054,
+            "regression": 0.9946
+          }
+        }
+      },
+      "id": "c0077",
+      "latency_ms": 688
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.928,
+          "probabilities": {
+            "flake": 0.9638,
+            "regression": 0.0362
+          }
+        }
+      },
+      "id": "c0078",
+      "latency_ms": 226
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.664,
+          "probabilities": {
+            "flake": 0.8321,
+            "regression": 0.1679
+          }
+        }
+      },
+      "id": "c0079",
+      "latency_ms": 262
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.732,
+          "probabilities": {
+            "flake": 0.866,
+            "regression": 0.134
+          }
+        }
+      },
+      "id": "c0080",
+      "latency_ms": 647
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.555,
+          "probabilities": {
+            "flake": 0.7773,
+            "regression": 0.2227
+          }
+        }
+      },
+      "id": "c0081",
+      "latency_ms": 355
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.797,
+          "probabilities": {
+            "flake": 0.8987,
+            "regression": 0.1013
+          }
+        }
+      },
+      "id": "c0082",
+      "latency_ms": 658
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.538,
+          "probabilities": {
+            "flake": 0.7692,
+            "regression": 0.2308
+          }
+        }
+      },
+      "id": "c0083",
+      "latency_ms": 302
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.499,
+          "probabilities": {
+            "flake": 0.7494,
+            "regression": 0.2506
+          }
+        }
+      },
+      "id": "c0084",
+      "latency_ms": 492
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.843,
+          "probabilities": {
+            "flake": 0.9214,
+            "regression": 0.0786
+          }
+        }
+      },
+      "id": "c0085",
+      "latency_ms": 217
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.543,
+          "probabilities": {
+            "flake": 0.7717,
+            "regression": 0.2283
+          }
+        }
+      },
+      "id": "c0086",
+      "latency_ms": 242
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.558,
+          "probabilities": {
+            "flake": 0.7792,
+            "regression": 0.2208
+          }
+        }
+      },
+      "id": "c0087",
+      "latency_ms": 550
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.99,
+          "probabilities": {
+            "flake": 0.0052,
+            "regression": 0.9948
+          }
+        }
+      },
+      "id": "c0088",
+      "latency_ms": 150
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.537,
+          "probabilities": {
+            "flake": 0.7684,
+            "regression": 0.2316
+          }
+        }
+      },
+      "id": "c0089",
+      "latency_ms": 271
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.499,
+          "probabilities": {
+            "flake": 0.7493,
+            "regression": 0.2507
+          }
+        }
+      },
+      "id": "c0090",
+      "latency_ms": 261
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.887,
+          "probabilities": {
+            "flake": 0.9433,
+            "regression": 0.0567
+          }
+        }
+      },
+      "id": "c0091",
+      "latency_ms": 533
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.978,
+          "probabilities": {
+            "flake": 0.0108,
+            "regression": 0.9892
+          }
+        }
+      },
+      "id": "c0092",
+      "latency_ms": 186
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.806,
+          "probabilities": {
+            "flake": 0.9031,
+            "regression": 0.0969
+          }
+        }
+      },
+      "id": "c0093",
+      "latency_ms": 400
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.503,
+          "probabilities": {
+            "flake": 0.7513,
+            "regression": 0.2487
+          }
+        }
+      },
+      "id": "c0094",
+      "latency_ms": 452
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.575,
+          "probabilities": {
+            "flake": 0.7875,
+            "regression": 0.2125
+          }
+        }
+      },
+      "id": "c0095",
+      "latency_ms": 219
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.865,
+          "probabilities": {
+            "flake": 0.9326,
+            "regression": 0.0674
+          }
+        }
+      },
+      "id": "c0096",
+      "latency_ms": 226
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.634,
+          "probabilities": {
+            "flake": 0.1829,
+            "regression": 0.8171
+          }
+        }
+      },
+      "id": "c0097",
+      "latency_ms": 310
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.666,
+          "probabilities": {
+            "flake": 0.167,
+            "regression": 0.833
+          }
+        }
+      },
+      "id": "c0098",
+      "latency_ms": 260
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.819,
+          "probabilities": {
+            "flake": 0.0905,
+            "regression": 0.9095
+          }
+        }
+      },
+      "id": "c0099",
+      "latency_ms": 311
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.561,
+          "probabilities": {
+            "flake": 0.2197,
+            "regression": 0.7803
+          }
+        }
+      },
+      "id": "c0100",
+      "latency_ms": 1040
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.541,
+          "probabilities": {
+            "flake": 0.2297,
+            "regression": 0.7703
+          }
+        }
+      },
+      "id": "c0101",
+      "latency_ms": 294
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.719,
+          "probabilities": {
+            "flake": 0.1403,
+            "regression": 0.8597
+          }
+        }
+      },
+      "id": "c0102",
+      "latency_ms": 215
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.259,
+          "probabilities": {
+            "flake": 0.3703,
+            "regression": 0.6297
+          }
+        }
+      },
+      "id": "c0103",
+      "latency_ms": 701
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.787,
+          "probabilities": {
+            "flake": 0.1067,
+            "regression": 0.8933
+          }
+        }
+      },
+      "id": "c0104",
+      "latency_ms": 1339
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.327,
+          "probabilities": {
+            "flake": 0.3365,
+            "regression": 0.6635
+          }
+        }
+      },
+      "id": "c0105",
+      "latency_ms": 496
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.579,
+          "probabilities": {
+            "flake": 0.2103,
+            "regression": 0.7897
+          }
+        }
+      },
+      "id": "c0106",
+      "latency_ms": 230
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.785,
+          "probabilities": {
+            "flake": 0.1076,
+            "regression": 0.8924
+          }
+        }
+      },
+      "id": "c0107",
+      "latency_ms": 708
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.371,
+          "probabilities": {
+            "flake": 0.3146,
+            "regression": 0.6854
+          }
+        }
+      },
+      "id": "c0108",
+      "latency_ms": 228
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.784,
+          "probabilities": {
+            "flake": 0.1081,
+            "regression": 0.8919
+          }
+        }
+      },
+      "id": "c0109",
+      "latency_ms": 235
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.548,
+          "probabilities": {
+            "flake": 0.2262,
+            "regression": 0.7738
+          }
+        }
+      },
+      "id": "c0110",
+      "latency_ms": 642
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.347,
+          "probabilities": {
+            "flake": 0.3263,
+            "regression": 0.6737
+          }
+        }
+      },
+      "id": "c0111",
+      "latency_ms": 542
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.486,
+          "probabilities": {
+            "flake": 0.2572,
+            "regression": 0.7428
+          }
+        }
+      },
+      "id": "c0112",
+      "latency_ms": 198
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.345,
+          "probabilities": {
+            "flake": 0.3275,
+            "regression": 0.6725
+          }
+        }
+      },
+      "id": "c0113",
+      "latency_ms": 294
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.439,
+          "probabilities": {
+            "flake": 0.2807,
+            "regression": 0.7193
+          }
+        }
+      },
+      "id": "c0114",
+      "latency_ms": 491
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.509,
+          "probabilities": {
+            "flake": 0.2456,
+            "regression": 0.7544
+          }
+        }
+      },
+      "id": "c0115",
+      "latency_ms": 780
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.489,
+          "probabilities": {
+            "flake": 0.2557,
+            "regression": 0.7443
+          }
+        }
+      },
+      "id": "c0116",
+      "latency_ms": 255
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.578,
+          "probabilities": {
+            "flake": 0.2108,
+            "regression": 0.7892
+          }
+        }
+      },
+      "id": "c0117",
+      "latency_ms": 1270
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.976,
+          "probabilities": {
+            "flake": 0.0119,
+            "regression": 0.9881
+          }
+        }
+      },
+      "id": "c0118",
+      "latency_ms": 483
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.846,
+          "probabilities": {
+            "flake": 0.9228,
+            "regression": 0.0772
+          }
+        }
+      },
+      "id": "c0119",
+      "latency_ms": 709
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.974,
+          "probabilities": {
+            "flake": 0.0128,
+            "regression": 0.9872
+          }
+        }
+      },
+      "id": "c0120",
+      "latency_ms": 693
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.881,
+          "probabilities": {
+            "flake": 0.9405,
+            "regression": 0.0595
+          }
+        }
+      },
+      "id": "c0121",
+      "latency_ms": 429
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.721,
+          "probabilities": {
+            "flake": 0.8606,
+            "regression": 0.1394
+          }
+        }
+      },
+      "id": "c0122",
+      "latency_ms": 661
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.899,
+          "probabilities": {
+            "flake": 0.9496,
+            "regression": 0.0504
+          }
+        }
+      },
+      "id": "c0123",
+      "latency_ms": 150
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.591,
+          "probabilities": {
+            "flake": 0.7957,
+            "regression": 0.2043
+          }
+        }
+      },
+      "id": "c0124",
+      "latency_ms": 323
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.562,
+          "probabilities": {
+            "flake": 0.7812,
+            "regression": 0.2188
+          }
+        }
+      },
+      "id": "c0125",
+      "latency_ms": 541
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.827,
+          "probabilities": {
+            "flake": 0.9134,
+            "regression": 0.0866
+          }
+        }
+      },
+      "id": "c0126",
+      "latency_ms": 150
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.981,
+          "probabilities": {
+            "flake": 0.0097,
+            "regression": 0.9903
+          }
+        }
+      },
+      "id": "c0127",
+      "latency_ms": 398
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.698,
+          "probabilities": {
+            "flake": 0.8489,
+            "regression": 0.1511
+          }
+        }
+      },
+      "id": "c0128",
+      "latency_ms": 306
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.638,
+          "probabilities": {
+            "flake": 0.819,
+            "regression": 0.181
+          }
+        }
+      },
+      "id": "c0129",
+      "latency_ms": 1029
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.826,
+          "probabilities": {
+            "flake": 0.9132,
+            "regression": 0.0868
+          }
+        }
+      },
+      "id": "c0130",
+      "latency_ms": 359
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.752,
+          "probabilities": {
+            "flake": 0.8759,
+            "regression": 0.1241
+          }
+        }
+      },
+      "id": "c0131",
+      "latency_ms": 442
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.572,
+          "probabilities": {
+            "flake": 0.7858,
+            "regression": 0.2142
+          }
+        }
+      },
+      "id": "c0132",
+      "latency_ms": 170
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.334,
+          "probabilities": {
+            "flake": 0.3332,
+            "regression": 0.6668
+          }
+        }
+      },
+      "id": "c0133",
+      "latency_ms": 285
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.602,
+          "probabilities": {
+            "flake": 0.1989,
+            "regression": 0.8011
+          }
+        }
+      },
+      "id": "c0134",
+      "latency_ms": 273
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.276,
+          "probabilities": {
+            "flake": 0.362,
+            "regression": 0.638
+          }
+        }
+      },
+      "id": "c0135",
+      "latency_ms": 609
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.437,
+          "probabilities": {
+            "flake": 0.2815,
+            "regression": 0.7185
+          }
+        }
+      },
+      "id": "c0136",
+      "latency_ms": 360
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.516,
+          "probabilities": {
+            "flake": 0.2422,
+            "regression": 0.7578
+          }
+        }
+      },
+      "id": "c0137",
+      "latency_ms": 649
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.646,
+          "probabilities": {
+            "flake": 0.1771,
+            "regression": 0.8229
+          }
+        }
+      },
+      "id": "c0138",
+      "latency_ms": 667
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.371,
+          "probabilities": {
+            "flake": 0.3144,
+            "regression": 0.6856
+          }
+        }
+      },
+      "id": "c0139",
+      "latency_ms": 499
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.663,
+          "probabilities": {
+            "flake": 0.1683,
+            "regression": 0.8317
+          }
+        }
+      },
+      "id": "c0140",
+      "latency_ms": 396
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.591,
+          "probabilities": {
+            "flake": 0.2046,
+            "regression": 0.7954
+          }
+        }
+      },
+      "id": "c0141",
+      "latency_ms": 264
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.382,
+          "probabilities": {
+            "flake": 0.309,
+            "regression": 0.691
+          }
+        }
+      },
+      "id": "c0142",
+      "latency_ms": 586
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.24,
+          "probabilities": {
+            "flake": 0.3799,
+            "regression": 0.6201
+          }
+        }
+      },
+      "id": "c0143",
+      "latency_ms": 640
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.467,
+          "probabilities": {
+            "flake": 0.2666,
+            "regression": 0.7334
+          }
+        }
+      },
+      "id": "c0144",
+      "latency_ms": 218
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.698,
+          "probabilities": {
+            "flake": 0.1509,
+            "regression": 0.8491
+          }
+        }
+      },
+      "id": "c0145",
+      "latency_ms": 281
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.683,
+          "probabilities": {
+            "flake": 0.1586,
+            "regression": 0.8414
+          }
+        }
+      },
+      "id": "c0146",
+      "latency_ms": 513
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.288,
+          "probabilities": {
+            "flake": 0.3562,
+            "regression": 0.6438
+          }
+        }
+      },
+      "id": "c0147",
+      "latency_ms": 208
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.213,
+          "probabilities": {
+            "flake": 0.3933,
+            "regression": 0.6067
+          }
+        }
+      },
+      "id": "c0148",
+      "latency_ms": 335
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.34,
+          "probabilities": {
+            "flake": 0.3299,
+            "regression": 0.6701
+          }
+        }
+      },
+      "id": "c0149",
+      "latency_ms": 760
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.413,
+          "probabilities": {
+            "flake": 0.2937,
+            "regression": 0.7063
+          }
+        }
+      },
+      "id": "c0150",
+      "latency_ms": 761
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.263,
+          "probabilities": {
+            "flake": 0.3687,
+            "regression": 0.6313
+          }
+        }
+      },
+      "id": "c0151",
+      "latency_ms": 630
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.828,
+          "probabilities": {
+            "flake": 0.0858,
+            "regression": 0.9142
+          }
+        }
+      },
+      "id": "c0152",
+      "latency_ms": 375
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.298,
+          "probabilities": {
+            "flake": 0.3512,
+            "regression": 0.6488
+          }
+        }
+      },
+      "id": "c0153",
+      "latency_ms": 268
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.822,
+          "probabilities": {
+            "flake": 0.9108,
+            "regression": 0.0892
+          }
+        }
+      },
+      "id": "c0154",
+      "latency_ms": 705
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.541,
+          "probabilities": {
+            "flake": 0.7704,
+            "regression": 0.2296
+          }
+        }
+      },
+      "id": "c0155",
+      "latency_ms": 410
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.669,
+          "probabilities": {
+            "flake": 0.8346,
+            "regression": 0.1654
+          }
+        }
+      },
+      "id": "c0156",
+      "latency_ms": 1281
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.686,
+          "probabilities": {
+            "flake": 0.8429,
+            "regression": 0.1571
+          }
+        }
+      },
+      "id": "c0157",
+      "latency_ms": 244
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.883,
+          "probabilities": {
+            "flake": 0.9415,
+            "regression": 0.0585
+          }
+        }
+      },
+      "id": "c0158",
+      "latency_ms": 205
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.711,
+          "probabilities": {
+            "flake": 0.8553,
+            "regression": 0.1447
+          }
+        }
+      },
+      "id": "c0159",
+      "latency_ms": 316
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.65,
+          "probabilities": {
+            "flake": 0.825,
+            "regression": 0.175
+          }
+        }
+      },
+      "id": "c0160",
+      "latency_ms": 591
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.858,
+          "probabilities": {
+            "flake": 0.9289,
+            "regression": 0.0711
+          }
+        }
+      },
+      "id": "c0161",
+      "latency_ms": 341
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.628,
+          "probabilities": {
+            "flake": 0.8141,
+            "regression": 0.1859
+          }
+        }
+      },
+      "id": "c0162",
+      "latency_ms": 363
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.976,
+          "probabilities": {
+            "flake": 0.012,
+            "regression": 0.988
+          }
+        }
+      },
+      "id": "c0163",
+      "latency_ms": 619
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.977,
+          "probabilities": {
+            "flake": 0.0117,
+            "regression": 0.9883
+          }
+        }
+      },
+      "id": "c0164",
+      "latency_ms": 632
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.453,
+          "probabilities": {
+            "flake": 0.7267,
+            "regression": 0.2733
+          }
+        }
+      },
+      "id": "c0165",
+      "latency_ms": 185
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.973,
+          "probabilities": {
+            "flake": 0.0137,
+            "regression": 0.9863
+          }
+        }
+      },
+      "id": "c0166",
+      "latency_ms": 991
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.927,
+          "probabilities": {
+            "flake": 0.9635,
+            "regression": 0.0365
+          }
+        }
+      },
+      "id": "c0167",
+      "latency_ms": 1014
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.668,
+          "probabilities": {
+            "flake": 0.8338,
+            "regression": 0.1662
+          }
+        }
+      },
+      "id": "c0168",
+      "latency_ms": 762
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.727,
+          "probabilities": {
+            "flake": 0.8634,
+            "regression": 0.1366
+          }
+        }
+      },
+      "id": "c0169",
+      "latency_ms": 498
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.823,
+          "probabilities": {
+            "flake": 0.9114,
+            "regression": 0.0886
+          }
+        }
+      },
+      "id": "c0170",
+      "latency_ms": 232
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.833,
+          "probabilities": {
+            "flake": 0.9163,
+            "regression": 0.0837
+          }
+        }
+      },
+      "id": "c0171",
+      "latency_ms": 634
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.485,
+          "probabilities": {
+            "flake": 0.7423,
+            "regression": 0.2577
+          }
+        }
+      },
+      "id": "c0172",
+      "latency_ms": 729
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.6,
+          "probabilities": {
+            "flake": 0.8002,
+            "regression": 0.1998
+          }
+        }
+      },
+      "id": "c0173",
+      "latency_ms": 256
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.985,
+          "probabilities": {
+            "flake": 0.0073,
+            "regression": 0.9927
+          }
+        }
+      },
+      "id": "c0174",
+      "latency_ms": 1092
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.574,
+          "probabilities": {
+            "flake": 0.7872,
+            "regression": 0.2128
+          }
+        }
+      },
+      "id": "c0175",
+      "latency_ms": 427
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.6,
+          "probabilities": {
+            "flake": 0.7999,
+            "regression": 0.2001
+          }
+        }
+      },
+      "id": "c0176",
+      "latency_ms": 308
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.718,
+          "probabilities": {
+            "flake": 0.1412,
+            "regression": 0.8588
+          }
+        }
+      },
+      "id": "c0177",
+      "latency_ms": 476
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.519,
+          "probabilities": {
+            "flake": 0.2407,
+            "regression": 0.7593
+          }
+        }
+      },
+      "id": "c0178",
+      "latency_ms": 235
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.519,
+          "probabilities": {
+            "flake": 0.2406,
+            "regression": 0.7594
+          }
+        }
+      },
+      "id": "c0179",
+      "latency_ms": 251
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.686,
+          "probabilities": {
+            "flake": 0.1568,
+            "regression": 0.8432
+          }
+        }
+      },
+      "id": "c0180",
+      "latency_ms": 339
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.5,
+          "probabilities": {
+            "flake": 0.2498,
+            "regression": 0.7502
+          }
+        }
+      },
+      "id": "c0181",
+      "latency_ms": 223
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.38,
+          "probabilities": {
+            "flake": 0.3102,
+            "regression": 0.6898
+          }
+        }
+      },
+      "id": "c0182",
+      "latency_ms": 285
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.4,
+          "probabilities": {
+            "flake": 0.2999,
+            "regression": 0.7001
+          }
+        }
+      },
+      "id": "c0183",
+      "latency_ms": 322
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.304,
+          "probabilities": {
+            "flake": 0.3478,
+            "regression": 0.6522
+          }
+        }
+      },
+      "id": "c0184",
+      "latency_ms": 1166
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.497,
+          "probabilities": {
+            "flake": 0.2516,
+            "regression": 0.7484
+          }
+        }
+      },
+      "id": "c0185",
+      "latency_ms": 332
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.325,
+          "probabilities": {
+            "flake": 0.3377,
+            "regression": 0.6623
+          }
+        }
+      },
+      "id": "c0186",
+      "latency_ms": 569
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.422,
+          "probabilities": {
+            "flake": 0.2892,
+            "regression": 0.7108
+          }
+        }
+      },
+      "id": "c0187",
+      "latency_ms": 253
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.839,
+          "probabilities": {
+            "flake": 0.0806,
+            "regression": 0.9194
+          }
+        }
+      },
+      "id": "c0188",
+      "latency_ms": 179
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.47,
+          "probabilities": {
+            "flake": 0.2648,
+            "regression": 0.7352
+          }
+        }
+      },
+      "id": "c0189",
+      "latency_ms": 264
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.581,
+          "probabilities": {
+            "flake": 0.2093,
+            "regression": 0.7907
+          }
+        }
+      },
+      "id": "c0190",
+      "latency_ms": 589
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.814,
+          "probabilities": {
+            "flake": 0.0932,
+            "regression": 0.9068
+          }
+        }
+      },
+      "id": "c0191",
+      "latency_ms": 326
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.981,
+          "probabilities": {
+            "flake": 0.0094,
+            "regression": 0.9906
+          }
+        }
+      },
+      "id": "c0192",
+      "latency_ms": 349
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.984,
+          "probabilities": {
+            "flake": 0.0082,
+            "regression": 0.9918
+          }
+        }
+      },
+      "id": "c0193",
+      "latency_ms": 346
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.473,
+          "probabilities": {
+            "flake": 0.7365,
+            "regression": 0.2635
+          }
+        }
+      },
+      "id": "c0194",
+      "latency_ms": 243
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.589,
+          "probabilities": {
+            "flake": 0.7943,
+            "regression": 0.2057
+          }
+        }
+      },
+      "id": "c0195",
+      "latency_ms": 1350
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.743,
+          "probabilities": {
+            "flake": 0.8713,
+            "regression": 0.1287
+          }
+        }
+      },
+      "id": "c0196",
+      "latency_ms": 523
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.836,
+          "probabilities": {
+            "flake": 0.9178,
+            "regression": 0.0822
+          }
+        }
+      },
+      "id": "c0197",
+      "latency_ms": 248
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.912,
+          "probabilities": {
+            "flake": 0.9561,
+            "regression": 0.0439
+          }
+        }
+      },
+      "id": "c0198",
+      "latency_ms": 694
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.896,
+          "probabilities": {
+            "flake": 0.9479,
+            "regression": 0.0521
+          }
+        }
+      },
+      "id": "c0199",
+      "latency_ms": 249
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.685,
+          "probabilities": {
+            "flake": 0.8426,
+            "regression": 0.1574
+          }
+        }
+      },
+      "id": "c0200",
+      "latency_ms": 288
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.616,
+          "probabilities": {
+            "flake": 0.808,
+            "regression": 0.192
+          }
+        }
+      },
+      "id": "c0201",
+      "latency_ms": 265
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.984,
+          "probabilities": {
+            "flake": 0.008,
+            "regression": 0.992
+          }
+        }
+      },
+      "id": "c0202",
+      "latency_ms": 412
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "regression",
+          "confidence": 0.98,
+          "probabilities": {
+            "flake": 0.0099,
+            "regression": 0.9901
+          }
+        }
+      },
+      "id": "c0203",
+      "latency_ms": 588
+    },
+    {
+      "answers": {
+        "triage": {
+          "choice": "flake",
+          "confidence": 0.609,
+          "probabilities": {
+            "flake": 0.8046,
+            "regression": 0.1954
+          }
+        }
+      },
+      "id": "c0204",
+      "latency_ms": 269
+    }
+  ],
+  "seed": 23840044,
+  "warning": "Responses are deliberately degraded synthetic data, generated by generate_corpus.py. They must make the offline judge print no-go. Nothing here is model output and no network was ever used."
+}

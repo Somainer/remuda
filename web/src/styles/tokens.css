@@ -91,6 +91,9 @@
   --top-mobile: 52px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --workbench-height: 100dvh;
+  /* c-mfix: visualViewport.offsetTop — 0 except while the iOS keyboard opens,
+     when the visible band starts this far down the layout viewport. */
+  --workbench-top: 0px;
 }
 
 *,

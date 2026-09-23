@@ -6,6 +6,15 @@
  * var(--touch) (44px) of hit area.
  */
 .shell {
+  /* c-mfix: live inside the visualViewport band. iOS keeps the layout viewport
+     full-size while the keyboard is open and reveals only the band starting
+     at offsetTop; anchoring a keyboard-shrunk box at layout y=0 hid every
+     row above the composer the moment an input was focused. Fixed also removes
+     document scroll, which iOS otherwise hijacks during focus. */
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--workbench-top, 0px);
   height: var(--workbench-height, 100dvh);
   display: flex;
   flex-direction: column;

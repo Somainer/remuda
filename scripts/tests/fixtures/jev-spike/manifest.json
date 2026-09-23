@@ -1,0 +1,502 @@
+{
+  "artifact": "c-jevspike synthetic gate-failure triage corpus (offline)",
+  "categories": [
+    "cargo-test",
+    "clippy",
+    "fmt",
+    "vitest",
+    "playwright",
+    "infra"
+  ],
+  "corpus_sha256": "5e3cd9f77e7d9e7dc4bdcd0a156547d67c98a137370cc547351e0e7d3663068d",
+  "counts_by_category": {
+    "cargo-test": {
+      "flake": 21,
+      "regression": 27,
+      "total": 48
+    },
+    "clippy": {
+      "flake": 4,
+      "regression": 24,
+      "total": 28
+    },
+    "fmt": {
+      "flake": 2,
+      "regression": 18,
+      "total": 20
+    },
+    "infra": {
+      "flake": 13,
+      "regression": 15,
+      "total": 28
+    },
+    "playwright": {
+      "flake": 23,
+      "regression": 21,
+      "total": 44
+    },
+    "vitest": {
+      "flake": 15,
+      "regression": 21,
+      "total": 36
+    }
+  },
+  "families": [
+    {
+      "category": "fmt",
+      "count": 18,
+      "gold": "regression",
+      "modeled_on": "cargo fmt --check 'Diff in ... at line 919:' (deterministic)",
+      "signature": "fmt-diff",
+      "step": "cargo-fmt"
+    },
+    {
+      "category": "fmt",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "rustfmt version drift between runners (environment)",
+      "signature": "fmt-toolchain-drift",
+      "step": "cargo-fmt"
+    },
+    {
+      "category": "clippy",
+      "count": 22,
+      "gold": "regression",
+      "modeled_on": "clippy -D warnings lint/error output (deterministic)",
+      "signature": "clippy-lint",
+      "step": "cargo-clippy"
+    },
+    {
+      "category": "clippy",
+      "count": 2,
+      "gold": "regression",
+      "modeled_on": "target-gated code triggers -D warnings on the gate target",
+      "signature": "clippy-cfg-target",
+      "step": "cargo-clippy"
+    },
+    {
+      "category": "clippy",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "rustc incremental-cache ICE, clean rerun passes",
+      "signature": "clippy-ice",
+      "step": "cargo-clippy"
+    },
+    {
+      "category": "clippy",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "registry mirror spurious network error",
+      "signature": "clippy-registry",
+      "step": "cargo-clippy"
+    },
+    {
+      "category": "cargo-test",
+      "count": 6,
+      "gold": "regression",
+      "modeled_on": "libtest left/right assertion failures",
+      "signature": "ct-assert-eq",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "libtest assert!/invariant failures",
+      "signature": "ct-assert-custom",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 2,
+      "gold": "regression",
+      "modeled_on": "wire_golden Error(\"trailing characters\") panic (this week, real)",
+      "signature": "ct-wire-golden",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "deterministic hub request sequence mismatch (variant is wrong)",
+      "signature": "ct-sequence-wrong",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 6,
+      "gold": "regression",
+      "modeled_on": "error[E....] compile failures surfaced by cargo test",
+      "signature": "ct-compile",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 3,
+      "gold": "regression",
+      "modeled_on": "deterministic Err from a fresh in-memory journal",
+      "signature": "ct-result-business",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 2,
+      "gold": "regression",
+      "modeled_on": "timing assertion failing because new blocking code was added (trap case)",
+      "signature": "ct-perf-regression",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 5,
+      "gold": "flake",
+      "modeled_on": "create_is_accepted_before_a_slow_launch_finishes / credit_starved timing flakes (real)",
+      "signature": "ct-known-timing",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 4,
+      "gold": "flake",
+      "modeled_on": "never_reaches_the_hub: duplicate post only while fixture shared (real)",
+      "signature": "ct-attachments-order",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 3,
+      "gold": "flake",
+      "modeled_on": "a_reopened_store... json EOF / UNIQUE seq dual-writer race (real)",
+      "signature": "ct-journal-race",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "AddrInUse racing port release between test binaries",
+      "signature": "ct-port-bind",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "bounded journal lock wait / database is locked",
+      "signature": "ct-lock-wait",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 3,
+      "gold": "flake",
+      "modeled_on": "TZ/locale/umask sensitive assertions (machine-dependent)",
+      "signature": "ct-env-tzumask",
+      "step": "cargo-test"
+    },
+    {
+      "category": "cargo-test",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "SIGKILL at cgroup memory ceiling under concurrent binaries",
+      "signature": "ct-oom",
+      "step": "cargo-test"
+    },
+    {
+      "category": "vitest",
+      "count": 7,
+      "gold": "regression",
+      "modeled_on": "vitest AssertionError on rendered value",
+      "signature": "vt-expect",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "TestingLibrary unable to find role/name",
+      "signature": "vt-role",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "esbuild/TS transform/parse failure (deterministic)",
+      "signature": "vt-transform",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 3,
+      "gold": "regression",
+      "modeled_on": "inline snapshot drift (deterministic)",
+      "signature": "vt-snapshot",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 3,
+      "gold": "regression",
+      "modeled_on": "unhandled rejection carrying a real invariant mismatch",
+      "signature": "vt-throw-business",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 4,
+      "gold": "flake",
+      "modeled_on": "EffortSlider verbatim fallback: red on one machine, green on another (real)",
+      "signature": "vt-effort-roster",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 5,
+      "gold": "flake",
+      "modeled_on": "fake timers interleaved with worker steal (load timing)",
+      "signature": "vt-fake-timer",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "locale/date formatting differs across runners",
+      "signature": "vt-tz",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "pending timer in teardown, promise never settles",
+      "signature": "vt-teardown-leak",
+      "step": "web-test"
+    },
+    {
+      "category": "vitest",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "vitest worker forced teardown dropped last message",
+      "signature": "vt-worker-stall",
+      "step": "web-test"
+    },
+    {
+      "category": "playwright",
+      "count": 7,
+      "gold": "regression",
+      "modeled_on": "toHaveText Expected/Received mismatch (product changed)",
+      "signature": "pw-text",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "node absent from DOM tree (not merely slow)",
+      "signature": "pw-missing-node",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "toHaveCount wrong count after predicate change",
+      "signature": "pw-count",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 3,
+      "gold": "regression",
+      "modeled_on": "playwright webServer fails on tsc/vite build error",
+      "signature": "pw-webserver-build",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 3,
+      "gold": "regression",
+      "modeled_on": "storage state/fixture invariant edited incorrectly",
+      "signature": "pw-storage-state",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 6,
+      "gold": "flake",
+      "modeled_on": "page load 30s timeout under concurrent build load",
+      "signature": "pw-load-timeout",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 5,
+      "gold": "flake",
+      "modeled_on": "effort-sync.hub.spec.ts pending chip, frame lost in follow gap (real)",
+      "signature": "pw-effort-pending",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 4,
+      "gold": "flake",
+      "modeled_on": "hub e2e port occupied / AddrInUse in globalSetup",
+      "signature": "pw-port",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 3,
+      "gold": "flake",
+      "modeled_on": "renderer closed at startup or browser binary cache reclaimed",
+      "signature": "pw-browser-crash",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 3,
+      "gold": "flake",
+      "modeled_on": "single read-back frame lost in follow socket gap (hard case)",
+      "signature": "pw-socket-gap",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "playwright",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "EBUSY trace.zip still held by previous worker",
+      "signature": "pw-trace-lock",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "infra",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "pnpm ERR_PNPM_OUT_OF_LOCKFILE frozen install",
+      "signature": "infra-lockfile",
+      "step": "web-install"
+    },
+    {
+      "category": "infra",
+      "count": 4,
+      "gold": "regression",
+      "modeled_on": "web build tsc error TS....",
+      "signature": "infra-tsc",
+      "step": "web-build"
+    },
+    {
+      "category": "infra",
+      "count": 2,
+      "gold": "regression",
+      "modeled_on": "secret-scan matched a literal that must not ship",
+      "signature": "infra-secret-scan",
+      "step": "secret-scan"
+    },
+    {
+      "category": "infra",
+      "count": 1,
+      "gold": "regression",
+      "modeled_on": "no-tunnel-scan found a forwarding listener",
+      "signature": "infra-no-tunnel",
+      "step": "no-tunnel-scan"
+    },
+    {
+      "category": "infra",
+      "count": 2,
+      "gold": "regression",
+      "modeled_on": "Rollup failed to resolve a missing import",
+      "signature": "infra-vite-resolve",
+      "step": "web-build"
+    },
+    {
+      "category": "infra",
+      "count": 2,
+      "gold": "regression",
+      "modeled_on": "fresh-database migration fails deterministically",
+      "signature": "infra-migration",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "infra",
+      "count": 3,
+      "gold": "flake",
+      "modeled_on": "ENOSPC scratch volume under concurrent build",
+      "signature": "infra-disk",
+      "step": "web-install"
+    },
+    {
+      "category": "infra",
+      "count": 3,
+      "gold": "flake",
+      "modeled_on": "registry mirror ECONNRESET / spurious network error",
+      "signature": "infra-mirror",
+      "step": "web-install"
+    },
+    {
+      "category": "infra",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "gate-e2e.lock contention between gate workers (real)",
+      "signature": "infra-flock",
+      "step": "web-hub-e2e"
+    },
+    {
+      "category": "infra",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "rustc SIGKILL linking under cpu pin",
+      "signature": "infra-oom-build",
+      "step": "cargo-check"
+    },
+    {
+      "category": "infra",
+      "count": 2,
+      "gold": "flake",
+      "modeled_on": "corrupted registry cache archive",
+      "signature": "infra-cache",
+      "step": "web-install"
+    },
+    {
+      "category": "infra",
+      "count": 1,
+      "gold": "flake",
+      "modeled_on": "leftover store temp file owned by another runner",
+      "signature": "infra-eacces",
+      "step": "web-install"
+    }
+  ],
+  "generator": "scripts/tests/fixtures/jev-spike/generate_corpus.py",
+  "known_flaky_roster": [
+    "cmd::mcp::attachment::tests::an_agent_naming_another_session_never_reaches_the_hub",
+    "runtime::tests::create_is_accepted_before_a_slow_launch_finishes",
+    "api_relay::relay_tests::credit_starved_egress_ends_at_the_hard_cap_after_four_chunks",
+    "a_reopened_store_vouches_for_an_empty_inventory",
+    "lets a free-typed id through as the verbatim fallback",
+    "effort-sync.hub.spec.ts",
+    "timing_tests::debounce_coalesces_rapid_signals",
+    "timing_tests::watch_notify_arrives_before_deadline"
+  ],
+  "record_schema": {
+    "category": "one of the six reporting categories",
+    "gold": "regression (fails again unchanged) or flake (transient)",
+    "id": "c#### sequential, stable across regenerations",
+    "log": "synthetic multi-line log tail, repo-relative paths only",
+    "signature": "hand-authored template family; gold is fixed per family",
+    "step": "gate.sh step name where the failure surfaced"
+  },
+  "responses_fail_fixture_sha256": "98b424839c8e7d5af8dd612f045e8b730f12e7baec7eea0d0655ceda2031b421",
+  "responses_fixture_sha256": "071483edcd2d4a5d5bed485fb22cae37baefe17bed985ab7c166d7c0f50d4afd",
+  "sanitization_rules": [
+    "no /home/ or /Users/ home paths",
+    "no C:\\\\Users or $HOME or ~/ home forms",
+    "no IPv4 dotted addresses",
+    "no @ email forms (scoped package names such as @playwright/test contain @ but are not emails)",
+    "no hostnames or domains",
+    "no tokens; secret-like output is always a described rule name"
+  ],
+  "schema_version": 1,
+  "seed": 20260923,
+  "total": 204
+}

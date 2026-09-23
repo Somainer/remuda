@@ -15,17 +15,28 @@ HeadlessChromium）在闸门满负荷（测量时 `uptime` 负载 52.6，5 个�
   `approvals.deriveRows`（`ApprovalsPage.tsx:48`）；
 - 但该区域 **18 次调用累计仅 48.3 ms、单次峰值 46.5 ms**。
 
-即：2.7 秒里约 2.68 s 不是行派生，而是**每次 2 秒 `interaction.list`
-轮询后 React 对约 100 张卡片的整表重新渲染/提交**。轮询把 interactions
-解析成全新对象（数组与元素身份全部变化），`rows` 的 `useMemo` 依赖整个
-`hub` store 对象必然失效，随后每张卡片无 memo，全部重新提交。
+**未直接测到的（推断，不是测量值）**：约 2.68 s 花在哪。Long Task
+归因只证明 `deriveRows` 在该任务时间窗内执行过（perf-audit-1 §场景 C
+「归因语义」：标签＝窗内自耗时最长的被埋点区域，**不等于**整块任务都
+花在该函数），而埋点没有覆盖 React 内部，所以「剩余约 2.68 s 是每次
+2 秒 `interaction.list` 轮询后 React 对约 100 张卡片的整表渲染/提交」
+是一条**基于实测边界的推断**，不是逐毫秒测出来的：
 
-同一场景 C 在本任务的常规负载（`uptime` 5.4/9.7/12.4，见 §4）下复测
-修前代码，结果更清楚地暴露结构：7 个 Long Task、最长 113 ms、TBT
-360 ms，而 `approvals.deriveRows` **14 次调用累计 0.8 ms、峰值 0.2 ms**
-——派生几乎免费，账单全部在卡片提交；满闸门负载把同一个同步提交从
-113 ms 放大到 2723 ms，正是所有者偶发「卡死」的来源（共享构建主机被
-闸门占满时打开/停留在收件箱）。
+1. 被埋点的行派生在窗内自耗时上界 46.5 ms（区域计时实测）；
+2. 轮询把 interactions 解析成全新对象（数组与元素身份全变），而 `rows`
+   的 `useMemo` 依赖整个 `hub` store、行组件又没有 memo，因此每次轮询
+   必然触发全部卡片重新渲染/提交（代码路径可证）；
+3. 该窗口内除派生与这次提交外没有别的被埋点同步工作；渲染/提交段未被
+   埋点，无法从这份数据再细分 React 各阶段（reconcile / commit / 布局）。
+
+同一场景 C 在本任务常规负载（`uptime` 5.4/9.7/12.4，见 §4）下复测
+修前代码，实测 7 个 Long Task、最长 113 ms、TBT 360 ms，而
+`approvals.deriveRows` **14 次调用累计 0.8 ms、峰值 0.2 ms**。
+「派生几乎免费、账单主要在卡片提交」同样是基于上述边界的推断，而非
+直接测量；推断机理与负载放大一致：同一类同步提交在满闸门负载下从
+113 ms 被放大到 2723 ms，与所有者偶发「卡死」（共享构建主机被闸门
+占满时打开/停留在收件箱）的现象吻合，但 2.68 s 的逐段构成本次没有
+直接测量。
 
 协调员给的三个线索在 profile 下全部成立，但都不是主账单：
 
@@ -60,9 +71,13 @@ HeadlessChromium）在闸门满负荷（测量时 `uptime` 负载 52.6，5 个�
      把首屏列表按每动画帧 12 张切片提交，100 张卡不再出现在同一个
      任务里；全部行仍在数帧（≈150 ms）内挂载，计数/过滤/深链看到的仍是
      完整列表。深链行若落在后续切片，focus 滚动效果在切片挂载后补跑。
+     **`total` 单纯变小（某张卡被本设备/其它设备回答）只把 limit 夹到
+     total，绝不回退到第一片**——否则第 13 张以后的卡会卸载重建，
+     其中正在输入的自由文本/表单草稿会丢；只有过滤身份（`resetKey`，
+     桌面＝kind/host/workspace，手机＝kind）变化才重新切片。
    - 手机侧 `/m/inbox`（所有者最常用的收件箱入口）同样处理：两档分别
      渐进挂载 + 卡片 memo（sig 同时覆盖 2.5 s summary tick 会变化的
-     phrase/timeLabel）。
+     phrase/timeLabel），shrink 同样只 clamp、按 kind 才重切。
 
 行为不变性：tier 划分、过滤、focus、已离队、回答提交流程与原来一致；
 既有 approvals 与 m-inbox 单测/e2e 保持通过（见 §5）。
@@ -110,6 +125,15 @@ perf-audit-1 的实测——修后提交被切成每帧 12 张卡片（单帧派
 0.8 ms 升到 4.8 ms 是行签名 `sig`（每行一次 JSON.stringify）的成本，
 峰值仍仅 0.6 ms，换来整表提交消失。
 
+本表三列均为 Linux HeadlessChromium（支持 Long Tasks API 与
+`performance.memory`），所以修后的 Long Task 数/TBT/最长任务 **0** 是
+**实测到的零**。在 WebKit（`--project=webkit`）上这些字段不适用：
+WebKit 没有 Long Tasks API 也没有 heap 接口，perf JSON 对
+`longTaskCount/longTasksPerMinute/totalBlockingTimeMs/worstLongTask/
+unattributedLongTasks/regionHistogram/peakJsHeapBytes` 输出 **`null`
+（unsupported）**，不是 0；`wallMs` 与 `regionTimings`（基于
+`performance.now()`）仍正常测量。
+
 ## 5 验证清单
 
 - `pnpm --dir web test`：✅ 161 文件 / 1639 用例全过（新增
@@ -126,6 +150,19 @@ perf-audit-1 的实测——修后提交被切成每帧 12 张卡片（单帧派
     `grok-structural.hub.spec.ts` approvals 队列用例 ✅；
     `m-shell`（?focus 深链/390 重定向）、`m-push`、`ux-question`
     （/approvals 提问卡与 390 回答跳转）、`ux-nextstep`：✅。
+
+### 5.1 验收复审跟进（b-inboxperf2）
+
+- 修复渐进挂载在 `total` 单纯减 1（回答一张卡）时把 limit 重置回 12、
+  导致第 13+ 张卡卸载丢草稿的缺陷：改为 shrink 只 clamp，仅过滤身份
+  `resetKey` 变化才重切；新增 hook 单测（grow→20、shrink→19，
+  limit ≥ 19）与组件测试（第 15 张卡的草稿在别卡被回答后仍在）。
+- perf 配置 `webkit` project 显式 `browserName: "webkit"`（原来空 `use`
+  仍起 Chromium）；WebKit 不支持的 Long Task/heap 字段在 JSON 输出
+  `null（unsupported）` 而非 0（见 §4 注 ²）。
+- 复审后本地：`pnpm --dir web test` ✅ **162 文件 / 1643 用例**，
+  typecheck ✅、lint ✅；e2e：`approvals.spec.ts` 2/2、
+  `m-inbox.hub.spec.ts` 4 过 + 1 evidence 跳过。
 
 ## 6 刻意不做
 

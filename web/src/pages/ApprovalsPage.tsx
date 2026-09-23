@@ -214,8 +214,12 @@ export function ApprovalsPage() {
   // Progressive mount: committing 100 cards in one task was the scenario-C
   // long task; reveal another slice per animation frame. All rows still mount
   // (counts/deep links/tests see the full list) just never in one task.
-  const queueLimit = useIncrementalLimit(queue.length);
-  const departedLimit = useIncrementalLimit(departed.length);
+  // resetKey is the filter identity: answering a card (total shrinks) keeps
+  // revealed rows mounted, but switching filters shows a different set and so
+  // restarts slicing.
+  const filterKey = `${kind}\u0000${hostFilter}\u0000${workspaceFilter}`;
+  const queueLimit = useIncrementalLimit(queue.length, { resetKey: filterKey });
+  const departedLimit = useIncrementalLimit(departed.length, { resetKey: filterKey });
 
   const respond = useCallback<RespondFn>((item, answer) => {
     void hubStore.respond(item.id, answer);

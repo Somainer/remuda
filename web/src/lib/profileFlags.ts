@@ -52,10 +52,24 @@ export type ProfileProbe = {
   at: number;
 };
 
+/**
+ * Browser capabilities the metrics depend on. WebKit, for example, has neither
+ * the Long Tasks API nor `performance.memory`; an empty list there means
+ * "could not measure", never "measured zero". The scenario summary turns
+ * unsupported metrics into null rather than 0.
+ */
+export type ProfileCapabilities = {
+  /** PerformanceObserver supports entryType "longtask". */
+  longTasks: boolean;
+  /** Chromium-only non-standard performance.memory heap sampling. */
+  jsHeap: boolean;
+};
+
 export type ProfileReport = {
   enabled: boolean;
   startedAt: number;
   userAgent: string;
+  capabilities: ProfileCapabilities;
   scenario: string | null;
   scenarios: ProfileScenarioInterval[];
   longTasks: ProfileLongTask[];
@@ -152,8 +166,18 @@ class ActiveProfiler {
   private stackTops = new Map<string, string | null>();
   private observer: PerformanceObserver | null = null;
 
+  private readonly capabilities: ProfileCapabilities;
+
   constructor() {
-    if (typeof PerformanceObserver === "function") {
+    // Detect support up front so an empty long-task/heap result on WebKit is
+    // reported as null (unsupported), never as a measured zero.
+    const supported =
+      typeof PerformanceObserver === "function" &&
+      Array.isArray(PerformanceObserver.supportedEntryTypes)
+        ? PerformanceObserver.supportedEntryTypes
+        : [];
+    let longTasks = supported.includes("longtask");
+    if (longTasks) {
       try {
         this.observer = new PerformanceObserver((list) => {
           for (const entry of list.getEntries()) {
@@ -164,11 +188,19 @@ class ActiveProfiler {
         });
         this.observer.observe({ entryTypes: ["longtask"] });
       } catch {
-        // Some engines reject "longtask" (or stub PerformanceObserver); the
-        // report simply comes back with an empty long-task list.
+        // Supported per supportedEntryTypes but observe() threw: treat it as
+        // unavailable so the summary reports null rather than a false zero.
         this.observer = null;
+        longTasks = false;
       }
     }
+    this.capabilities = {
+      longTasks,
+      jsHeap:
+        typeof performance !== "undefined" &&
+        "memory" in performance &&
+        (performance as unknown as { memory?: object }).memory != null,
+    };
   }
 
   runRegion<T>(label: string, fn: () => T): T {
@@ -216,6 +248,7 @@ class ActiveProfiler {
       enabled: true,
       startedAt: this.startedAt,
       userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "",
+      capabilities: { ...this.capabilities },
       scenario: current?.name ?? null,
       scenarios: this.scenarios.map((interval) => ({ ...interval })),
       longTasks: this.longTasks.map((task) => ({ ...task, region: task.region ? { ...task.region } : null })),

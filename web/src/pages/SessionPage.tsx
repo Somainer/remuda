@@ -678,7 +678,7 @@ export function SessionPage({
           />
         )}
       </div>
-      {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock}>
+      {resolvedView === "tty" || resolvedView === "events" ? null : <div className={session.dock} data-testid="session-dock">
         {/* Zero-flow floating chip row anchored at the dock top: it rests
             just above the composer (over the transcript edge) and never
             shrinks the session body's measured viewport share — visible

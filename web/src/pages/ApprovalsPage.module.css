@@ -389,3 +389,60 @@
   background: transparent;
   margin-left: auto;
 }
+
+.planDetails {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0 10px;
+}
+
+.planSummary {
+  cursor: pointer;
+  padding: 7px 0;
+  font-size: 13px;
+  color: var(--mute);
+  user-select: none;
+}
+
+.planBody {
+  margin: 0;
+  padding: 8px 0 10px;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid var(--line);
+  max-height: 16em;
+  overflow: auto;
+}
+
+.planFeedback {
+  width: 100%;
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: inherit;
+  background: transparent;
+  resize: vertical;
+}
+
+.planError {
+  margin: 6px 0 0;
+  color: var(--danger, #c0392b);
+  font-size: 12px;
+}
+
+.planFeedbackInvalid {
+  border-color: var(--danger, #c0392b);
+}
+
+.planSessionLink {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  margin: 0 0.25em;
+}

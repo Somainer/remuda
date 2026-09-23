@@ -7,7 +7,12 @@ import type { Observation } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { Transcript } from "./Transcript";
 
-function obs(seq: number, kind: Observation["kind"], payload: unknown, instanceId = "ins_t"): Observation {
+function obs(
+  seq: number,
+  kind: Observation["kind"],
+  payload: unknown,
+  instanceId = "ins_t",
+): Observation {
   return {
     schemaVersion: 1,
     eventId: `evt_${seq}` as Id,
@@ -44,36 +49,71 @@ function obs(seq: number, kind: Observation["kind"], payload: unknown, instanceI
 
 function userMessage(seq: number, text: string): Observation {
   return obs(seq, "message", {
-    nodeId: `n-${seq}` as Id, messageId: `m-${seq}` as Id, role: "user", phase: "input",
-    revision: "1", baseRevision: null, operation: "open",
-    blocks: [{ type: "text", text }], targetBlock: null, parentToolCallId: null,
-    nativeOrigin: known("ui"), status: "complete",
+    nodeId: `n-${seq}` as Id,
+    messageId: `m-${seq}` as Id,
+    role: "user",
+    phase: "input",
+    revision: "1",
+    baseRevision: null,
+    operation: "open",
+    blocks: [{ type: "text", text }],
+    targetBlock: null,
+    parentToolCallId: null,
+    nativeOrigin: known("ui"),
+    status: "complete",
   });
 }
 
 function assistantMessage(seq: number, text: string): Observation {
   return obs(seq, "message", {
-    nodeId: `n-${seq}` as Id, messageId: `m-${seq}` as Id, role: "assistant", phase: "final",
-    revision: "1", baseRevision: null, operation: "open",
-    blocks: [{ type: "text", text }], targetBlock: null, parentToolCallId: null,
-    nativeOrigin: known("assistant"), status: "complete",
+    nodeId: `n-${seq}` as Id,
+    messageId: `m-${seq}` as Id,
+    role: "assistant",
+    phase: "final",
+    revision: "1",
+    baseRevision: null,
+    operation: "open",
+    blocks: [{ type: "text", text }],
+    targetBlock: null,
+    parentToolCallId: null,
+    nativeOrigin: known("assistant"),
+    status: "complete",
   });
 }
 
 function failedTool(seqCall: number, seqResult: number): Observation[] {
   return [
     obs(seqCall, "tool_call", {
-      nodeId: `nc-${seqCall}` as Id, revision: "1", operation: "open", baseRevision: null,
-      toolCallId: `tc-fail` as Id, parentToolCallId: null,
-      toolName: known("Bash"), displayTitle: known("Bash"), category: "shell",
-      input: known({ command: "make test" }), inputTextDelta: null, state: "running",
-      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+      nodeId: `nc-${seqCall}` as Id,
+      revision: "1",
+      operation: "open",
+      baseRevision: null,
+      toolCallId: `tc-fail` as Id,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "make test" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({
+        hostId: "hst" as Id,
+        workspaceId: null,
+        nativeAgentId: null,
+      }),
     }),
     obs(seqResult, "tool_result", {
-      nodeId: `nr-${seqResult}` as Id, revision: "1", operation: "close", baseRevision: null,
-      toolCallId: "tc-fail" as Id, stage: "final", outcome: "failed",
-      blocks: [{ type: "text", text: "tests failed" }], structuredResult: unknownKnowledge("text"),
-      exitCode: known(1), changes: [],
+      nodeId: `nr-${seqResult}` as Id,
+      revision: "1",
+      operation: "close",
+      baseRevision: null,
+      toolCallId: "tc-fail" as Id,
+      stage: "final",
+      outcome: "failed",
+      blocks: [{ type: "text", text: "tests failed" }],
+      structuredResult: unknownKnowledge("text"),
+      exitCode: known(1),
+      changes: [],
     }),
   ];
 }
@@ -81,18 +121,36 @@ function failedTool(seqCall: number, seqResult: number): Observation[] {
 function settledBash(seqCall: number, seqResult: number): Observation[] {
   return [
     obs(seqCall, "tool_call", {
-      nodeId: `nc-${seqCall}` as Id, revision: "1", operation: "open", baseRevision: null,
-      toolCallId: "tc-bash" as Id, parentToolCallId: null,
-      toolName: known("Bash"), displayTitle: known("Bash"), category: "shell",
-      input: known({ command: "echo silent-command" }), inputTextDelta: null, state: "running",
-      executor: known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null }),
+      nodeId: `nc-${seqCall}` as Id,
+      revision: "1",
+      operation: "open",
+      baseRevision: null,
+      toolCallId: "tc-bash" as Id,
+      parentToolCallId: null,
+      toolName: known("Bash"),
+      displayTitle: known("Bash"),
+      category: "shell",
+      input: known({ command: "echo silent-command" }),
+      inputTextDelta: null,
+      state: "running",
+      executor: known({
+        hostId: "hst" as Id,
+        workspaceId: null,
+        nativeAgentId: null,
+      }),
     }),
     obs(seqResult, "tool_result", {
-      nodeId: `nr-${seqResult}` as Id, revision: "1", operation: "close", baseRevision: null,
-      toolCallId: "tc-bash" as Id, stage: "final", outcome: "succeeded",
+      nodeId: `nr-${seqResult}` as Id,
+      revision: "1",
+      operation: "close",
+      baseRevision: null,
+      toolCallId: "tc-bash" as Id,
+      stage: "final",
+      outcome: "succeeded",
       blocks: [{ type: "text", text: "zorpto-searchfind-4711" }],
       structuredResult: unknownKnowledge("text"),
-      exitCode: known(0), changes: [],
+      exitCode: known(0),
+      changes: [],
     }),
   ];
 }
@@ -111,11 +169,18 @@ function stubCompactLayout() {
   }));
 }
 
-function renderRouted(events: Observation[], path = "/s/ins_t", compact = true) {
+function renderRouted(
+  events: Observation[],
+  path = "/s/ins_t",
+  compact = true,
+) {
   return render(
     <MemoryRouter initialEntries={[path]}>
       <Routes>
-        <Route path="/s/:instanceId" element={<Transcript events={events} compact={compact} />} />
+        <Route
+          path="/s/:instanceId"
+          element={<Transcript events={events} compact={compact} />}
+        />
       </Routes>
     </MemoryRouter>,
   );
@@ -123,14 +188,37 @@ function renderRouted(events: Observation[], path = "/s/ins_t", compact = true) 
 
 describe("Transcript", () => {
   it("fills an empty completed message from delayed history without remounting its bubble", () => {
-    const base = buildLongObservations({ instanceId: "ins_stream", journalId: "obj_stream", hostId: "hst_1", count: 1 })[0];
+    const base = buildLongObservations({
+      instanceId: "ins_stream",
+      journalId: "obj_stream",
+      hostId: "hst_1",
+      count: 1,
+    })[0];
     if (base.kind !== "message") throw new Error("expected a message fixture");
-    const open = { ...base, payload: { ...base.payload, status: "streaming" as const, blocks: [{ type: "text" as const, text: "hello from web hub" }] } };
-    const close = {
-      ...base, eventId: "evt_close", seq: "2",
-      payload: { ...base.payload, messageId: "renamed", operation: "close" as const, revision: "2", baseRevision: "1", blocks: [] },
+    const open = {
+      ...base,
+      payload: {
+        ...base.payload,
+        status: "streaming" as const,
+        blocks: [{ type: "text" as const, text: "hello from web hub" }],
+      },
     };
-    const { rerender } = render(<Transcript events={[close]} compact={false} />);
+    const close = {
+      ...base,
+      eventId: "evt_close",
+      seq: "2",
+      payload: {
+        ...base.payload,
+        messageId: "renamed",
+        operation: "close" as const,
+        revision: "2",
+        baseRevision: "1",
+        blocks: [],
+      },
+    };
+    const { rerender } = render(
+      <Transcript events={[close]} compact={false} />,
+    );
     const bubble = screen.getByTestId("message");
     expect(bubble).toHaveTextContent("You");
     rerender(<Transcript events={[close, open]} compact={false} />);
@@ -140,16 +228,47 @@ describe("Transcript", () => {
   });
 
   it("updates the same assistant bubble while stream revisions arrive", () => {
-    const base = buildLongObservations({ instanceId: "ins_stream", journalId: "obj_stream", hostId: "hst_1", count: 1 })[0];
+    const base = buildLongObservations({
+      instanceId: "ins_stream",
+      journalId: "obj_stream",
+      hostId: "hst_1",
+      count: 1,
+    })[0];
     if (base.kind !== "message") throw new Error("expected a message fixture");
-    const open = { ...base, payload: { ...base.payload, role: "assistant" as const, status: "streaming" as const, blocks: [{ type: "text" as const, text: "我" }] } };
+    const open = {
+      ...base,
+      payload: {
+        ...base.payload,
+        role: "assistant" as const,
+        status: "streaming" as const,
+        blocks: [{ type: "text" as const, text: "我" }],
+      },
+    };
     const append = {
-      ...open, eventId: "evt_append", seq: "2",
-      payload: { ...open.payload, operation: "append" as const, revision: "2", baseRevision: "1", targetBlock: 0, blocks: [{ type: "text" as const, text: "先看看" }] },
+      ...open,
+      eventId: "evt_append",
+      seq: "2",
+      payload: {
+        ...open.payload,
+        operation: "append" as const,
+        revision: "2",
+        baseRevision: "1",
+        targetBlock: 0,
+        blocks: [{ type: "text" as const, text: "先看看" }],
+      },
     };
     const close = {
-      ...open, eventId: "evt_close", seq: "3",
-      payload: { ...open.payload, operation: "close" as const, revision: "3", baseRevision: "2", status: "complete" as const, blocks: [{ type: "text" as const, text: "我先看看" }] },
+      ...open,
+      eventId: "evt_close",
+      seq: "3",
+      payload: {
+        ...open.payload,
+        operation: "close" as const,
+        revision: "3",
+        baseRevision: "2",
+        status: "complete" as const,
+        blocks: [{ type: "text" as const, text: "我先看看" }],
+      },
     };
     const { rerender } = render(<Transcript events={[open]} compact={false} />);
     const bubble = screen.getByTestId("message");
@@ -186,11 +305,113 @@ describe("Transcript", () => {
       hostId: "hst_1" as Id,
       count: 8,
     });
-    const { container } = render(<Transcript events={events} compact={false} />);
+    const { container } = render(
+      <Transcript events={events} compact={false} />,
+    );
     await user.keyboard("j");
     expect(container.querySelector('[data-turn-active="1"]')).toBeTruthy();
     await user.keyboard("k");
     expect(container.querySelector("[data-anchor]")).toBeTruthy();
+  });
+
+  it("re-pins a pinned transcript to its tail when the scroller shrinks, and leaves a scrolled-up position alone", () => {
+    // c-mfix round 4: the soft keyboard shrinks the scroller without changing
+    // nodes/sizes. The ResizeObserver path must re-pin a following
+    // transcript to the bottom and must NOT move a user who scrolled up.
+    const ROW = 96;
+    const COUNT = 60;
+    const isScroller = (el: unknown) =>
+      el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
+    let clientHeight = 720;
+    const scrollHeight = COUNT * ROW;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? clientHeight : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? scrollHeight : 0;
+      },
+    );
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
+      height: ROW - 12,
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      width: 0,
+      x: 0,
+      y: 0,
+      toJSON() {},
+    } as DOMRect);
+
+    // One observer for the scroller; capture its callback so the test can
+    // deliver the keyboard shrink the way the browser does.
+    let fireScrollerResize: () => void = () => {};
+    class ControllableResizeObserver {
+      private cb: () => void;
+      constructor(cb: () => void) {
+        this.cb = cb;
+      }
+      observe(el: Element) {
+        if (
+          el instanceof HTMLElement &&
+          el.dataset?.testid === "transcript-scroller"
+        ) {
+          fireScrollerResize = this.cb;
+        }
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", ControllableResizeObserver);
+
+    const events = buildLongObservations({
+      instanceId: "ins_shrink" as Id,
+      journalId: "obj_shrink" as Id,
+      hostId: "hst_1" as Id,
+      count: COUNT,
+    });
+    render(<Transcript events={events} compact={false} />);
+    const scroller = screen.getByTestId("transcript-scroller") as HTMLElement;
+
+    // jsdom never clamps scrollTop to scrollHeight - clientHeight; a real
+    // browser does, so emulate it on this element, starting at the pinned
+    // mount position the layout effect already chose.
+    let top = scrollHeight - clientHeight;
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => {
+        top = Math.max(0, Math.min(v, scrollHeight - clientHeight));
+      },
+    });
+
+    // Mount pins a follow session to the tail.
+    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(
+      scrollHeight - 720,
+    );
+
+    // Keyboard shrinks the viewport from 720 to 323: pinned stays pinned.
+    clientHeight = 323;
+    fireScrollerResize();
+    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(
+      scrollHeight - 323,
+    );
+
+    // User scrolls up (past the 64px pin threshold); a second shrink keeps
+    // the reading position instead of yanking back to the tail.
+    (scroller as HTMLElement & { scrollTop: number }).scrollTop = 100;
+    fireEvent.scroll(scroller);
+    clientHeight = 240;
+    fireScrollerResize();
+    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(
+      100,
+    );
+
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("does not rebuild row ResizeObservers on parent scroll re-renders", () => {
@@ -198,14 +419,26 @@ describe("Transcript", () => {
     const VIEW = 720;
     const isScroller = (el: unknown) =>
       el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
-    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return isScroller(this) ? VIEW : 0;
-    });
-    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return isScroller(this) ? 200 * ROW : 0;
-    });
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? VIEW : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? 200 * ROW : 0;
+      },
+    );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12, top: 0, left: 0, right: 0, bottom: 0, width: 0, x: 0, y: 0, toJSON() {},
+      height: ROW - 12,
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      width: 0,
+      x: 0,
+      y: 0,
+      toJSON() {},
     } as DOMRect);
 
     let observersCreated = 0;
@@ -267,14 +500,26 @@ describe("Transcript search (batch E)", () => {
     const VIEW = 720;
     const isScroller = (el: unknown) =>
       el instanceof HTMLElement && el.dataset?.testid === "transcript-scroller";
-    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return isScroller(this) ? VIEW : 0;
-    });
-    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
-      return isScroller(this) ? rowCount * ROW : 0;
-    });
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? VIEW : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return isScroller(this) ? rowCount * ROW : 0;
+      },
+    );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12, top: 0, left: 0, right: 0, bottom: 0, width: 0, x: 0, y: 0, toJSON() {},
+      height: ROW - 12,
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      width: 0,
+      x: 0,
+      y: 0,
+      toJSON() {},
     } as DOMRect);
   }
 
@@ -293,13 +538,17 @@ describe("Transcript search (batch E)", () => {
     await user.click(screen.getByTestId("transcript-search-open"));
     const input = screen.getByTestId("transcript-search-input");
     await user.type(input, "prompt 1357");
-    expect(screen.getByTestId("transcript-search-count").textContent).toMatch(/1\/1/);
+    expect(screen.getByTestId("transcript-search-count").textContent).toMatch(
+      /1\/1/,
+    );
 
     await user.keyboard("[Enter]");
     // The hit is node index 1356, far below the ~24 rendered rows; the
     // scroller must have been positioned there from assembled geometry, never
     // by querying a DOM node the virtual window did not mount.
-    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(1356 * 96);
+    expect((scroller as HTMLElement & { scrollTop: number }).scrollTop).toBe(
+      1356 * 96,
+    );
     // jsdom does not fire `scroll` on programmatic scrollTop writes; do what
     // the browser does so the windowing state catches up.
     fireEvent.scroll(scroller);
@@ -323,11 +572,15 @@ describe("Transcript search (batch E)", () => {
     (scroller as HTMLElement & { scrollTop: number }).scrollTop = 2400;
     fireEvent.scroll(scroller);
     first.unmount();
-    expect(localStorage.getItem("runtime.reading.v1.ins_restore")).toContain("\"follow\":false");
+    expect(localStorage.getItem("runtime.reading.v1.ins_restore")).toContain(
+      '"follow":false',
+    );
 
     renderRouted(events, "/s/ins_restore", false);
     const scroller2 = screen.getByTestId("transcript-scroller") as HTMLElement;
-    expect((scroller2 as HTMLElement & { scrollTop: number }).scrollTop).toBe(2400);
+    expect((scroller2 as HTMLElement & { scrollTop: number }).scrollTop).toBe(
+      2400,
+    );
     localStorage.clear();
   });
 
@@ -342,12 +595,16 @@ describe("Transcript search (batch E)", () => {
     stubLayout(60);
     const first = renderRouted(events, "/s/ins_follow", false);
     first.unmount();
-    const saved = JSON.parse(localStorage.getItem("runtime.reading.v1.ins_follow") ?? "{}");
+    const saved = JSON.parse(
+      localStorage.getItem("runtime.reading.v1.ins_follow") ?? "{}",
+    );
     expect(saved.follow).toBe(true);
     const second = renderRouted(events, "/s/ins_follow", false);
     // A following transcript never restores an old offset and re-pins to end.
     const scroller2 = screen.getByTestId("transcript-scroller") as HTMLElement;
-    expect((scroller2 as HTMLElement & { scrollTop: number }).scrollTop).toBe(60 * 96);
+    expect((scroller2 as HTMLElement & { scrollTop: number }).scrollTop).toBe(
+      60 * 96,
+    );
     second.unmount();
     localStorage.clear();
   });
@@ -362,24 +619,33 @@ describe("Transcript search (batch E)", () => {
       assistantMessage(4, "有测试挂了"),
     ];
     renderRouted(events, "/s/ins_fail");
-    expect(screen.getByTestId("tool-failure-tag").textContent).toContain("失败");
+    expect(screen.getByTestId("tool-failure-tag").textContent).toContain(
+      "失败",
+    );
     const card = screen.getByTestId("tool-card");
     expect(card.getAttribute("data-folded")).toBe("0");
     // Collapse-all folds routine cards; a failure must not disappear.
     await user.click(screen.getByTestId("collapse-all"));
     expect(screen.getByTestId("tool-failure-tag")).toBeTruthy();
-    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe(
+      "0",
+    );
   });
 
   it("keeps aria-live off on the transcript root while search is open", async () => {
     const user = userEvent.setup();
-    renderRouted([userMessage(1, "alpha"), assistantMessage(2, "beta")], "/s/ins_live");
+    renderRouted(
+      [userMessage(1, "alpha"), assistantMessage(2, "beta")],
+      "/s/ins_live",
+    );
     const root = screen.getByTestId("transcript");
     expect(root.getAttribute("aria-live")).toBe("off");
     await user.click(screen.getByTestId("transcript-search-open"));
     await user.type(screen.getByTestId("transcript-search-input"), "beta");
     expect(root.getAttribute("aria-live")).toBe("off");
-    expect(screen.getByTestId("transcript-search-count").getAttribute("aria-live")).toBe("off");
+    expect(
+      screen.getByTestId("transcript-search-count").getAttribute("aria-live"),
+    ).toBe("off");
   });
 });
 
@@ -408,7 +674,10 @@ describe("D-041 fold vs in-transcript search hit", () => {
     // fold hides the chip behind the ⋯ trigger on this layout; open it first.
     await user.click(screen.getByTestId("transcript-tools-open"));
     await user.click(screen.getByTestId("transcript-search-open"));
-    await user.type(screen.getByTestId("transcript-search-input"), "zorpto-searchfind-4711");
+    await user.type(
+      screen.getByTestId("transcript-search-input"),
+      "zorpto-searchfind-4711",
+    );
 
     // The hit auto-expands the D-041 fold so the match is visible and the
     // full card body (stdout) is mounted.
@@ -431,7 +700,10 @@ function injectedMessage(seq: number, text: string): Observation {
   const event = userMessage(seq, text);
   return {
     ...event,
-    payload: { ...(event.payload as Record<string, unknown>), origin: "hook-context" },
+    payload: {
+      ...(event.payload as Record<string, unknown>),
+      origin: "hook-context",
+    },
   } as Observation;
 }
 
@@ -472,7 +744,10 @@ describe("D-049 compact transcript toolbar fold", () => {
   it("re-folds the row after an action is chosen", async () => {
     stubCompactLayout();
     const user = userEvent.setup();
-    renderRouted([userMessage(1, "跑一下"), assistantMessage(2, "done")], "/s/ins_refold");
+    renderRouted(
+      [userMessage(1, "跑一下"), assistantMessage(2, "done")],
+      "/s/ins_refold",
+    );
 
     await user.click(screen.getByTestId("transcript-tools-open"));
     // 搜索正文 opens the dedicated search strip and folds the chips again.
@@ -491,7 +766,11 @@ describe("D-049 compact transcript toolbar fold", () => {
   it("keeps the chips inline with no trigger on a desktop-width layout", () => {
     // No matchMedia stub: jsdom has no matchMedia, which reads as the desktop
     // default (same guard ToolCard's layout hook uses).
-    renderRouted([userMessage(1, "跑一下"), assistantMessage(2, "done")], "/s/ins_wide", false);
+    renderRouted(
+      [userMessage(1, "跑一下"), assistantMessage(2, "done")],
+      "/s/ins_wide",
+      false,
+    );
     expect(screen.getByTestId("collapse-all")).toBeTruthy();
     expect(screen.getByTestId("transcript-search-open")).toBeTruthy();
     expect(screen.queryByTestId("transcript-tools-open")).toBeNull();

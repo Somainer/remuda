@@ -1078,6 +1078,19 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-mfix round 2: the full phone-chrome combo fixture
+                    // (exited resumable instance + live hook/tool/status strip).
+                    if prompt == "mfix-chrome-combo" {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        append_n =
+                            append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
+                        continue;
+                    }
                     let interaction_id = InteractionId::new();
                     // c-nextstep list-row phrase: a create prompt with the
                     // `workflow card <scenario> row-phrase` form raises NO
@@ -1391,6 +1404,14 @@ async fn fake_node(
                             }),
                         )
                         .await?;
+                        continue;
+                    }
+                    // c-mfix round 2: the full phone-chrome combo fixture
+                    // (exited resumable instance + live hook/tool/status strip).
+                    if prompt == "mfix-chrome-combo" {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n =
+                            append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
                         continue;
                     }
                     // r-ux-comment: reply with a fenced code block so the browser
@@ -2956,6 +2977,190 @@ async fn append_instance_exit(
     .await?;
     let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
     Ok(seq)
+}
+
+/// c-mfix round 2: the exact phone chrome combination the owner hit while the
+/// soft keyboard was up: an exited (but resumable) instance whose last turn
+/// still paints a full live status strip — a running AskUserQuestion tool on
+/// the hook tier (its last hook record is 30 s old, so the strip computes a
+/// stalled-hook 「通道静默」 note), a fresh screen spinner keeping the turn
+/// decision in `working` (so Esc 打断 renders), and an 858-output-token usage
+/// snapshot. The web spec asserts the compact keyboard band still shows the
+/// composer and a >=40% transcript.
+async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64) -> Result<u64> {
+    let session_id = format!("mfix-chrome-{}", uuid::Uuid::now_v7());
+    let rfc3339 = |t: time::OffsetDateTime| {
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            t.year(),
+            t.month() as u8,
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.millisecond(),
+        )
+    };
+    // Backdated 30 s: older than the hook tier's 3x cadence stall budget.
+    let stale_at = rfc3339(time::OffsetDateTime::now_utc() - time::Duration::seconds(30));
+    let now_at = rfc3339(time::OffsetDateTime::now_utc());
+
+    let entity = |state: &str, at: &str| {
+        json!({
+            "kind": "lifecycle",
+            "observedAt": at,
+            "payload": {
+                "type": "entity", "entityType": "instance", "state": state,
+                "entity": {
+                    "nativeRef": {
+                        "sessionId": { "state": "known", "value": session_id },
+                        "signalTier": "hook"
+                    }
+                }
+            }
+        })
+    };
+    n = append_full_event(ws, instance_id, n, entity("ready", &now_at)).await?;
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "message",
+            "completeness": "structured",
+            "observedAt": now_at,
+            "payload": { "role": "user", "text": "mfix chrome combo 最新消息", "origin": "human" }
+        }),
+    )
+    .await?;
+    // c-mfix round 4: a long backlog so the transcript OVERFLOWS the keyboard
+    // band — pinning must keep the tail on screen when the scroller shrinks.
+    // Twelve completed assistant turns, each a few lines tall.
+    for i in 1..=12 {
+        n = append_full_event(
+            ws,
+            instance_id,
+            n,
+            json!({
+                "kind": "message",
+                "completeness": "structured",
+                "observedAt": stale_at,
+                "payload": {
+                    "role": "assistant",
+                    "text": format!("历史回合 {i}：这是一段足够高的多行输出，\n用来把 transcript 撑出键盘 band，\n确保滚动口发生溢出。"),
+                    "origin": "assistant"
+                }
+            }),
+        )
+        .await?;
+    }
+    // Prior-turn usage lands BEFORE the currently running tool, so the
+    // running AskUserQuestion card is the transcript's final (latest) row.
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "usage",
+            "completeness": "structured",
+            "observedAt": stale_at,
+            "source": { "channel": "hook" },
+            "payload": {
+                "usageId": "obj_mfix_usage",
+                "scope": "turn",
+                "scopeId": "obj_mfix_run",
+                "mode": "snapshot",
+                "metricRevision": "1",
+                "inputTokens": wf_known(json!("12000")),
+                "inputAccounting": "uncached",
+                "outputTokens": wf_known(json!("858")),
+                "reasoningTokens": wf_unknown(),
+                "cacheReadTokens": wf_known(json!("0")),
+                "cacheWriteTokens": wf_known(json!("0")),
+                "totalTokens": wf_known(json!("12858")),
+                "cost": { "state": "unknown", "reason": "unpriced", "evidenceEventIds": [] },
+                "accounting": "estimated",
+                "nativeFieldsRef": null
+            }
+        }),
+    )
+    .await?;
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "tool_call",
+            "completeness": "structured",
+            "observedAt": stale_at,
+            "source": { "channel": "hook" },
+            "payload": {
+                "nodeId": "obj_mfix_ask",
+                "revision": "1",
+                "operation": "open",
+                "baseRevision": null,
+                "toolCallId": "obj_mfix_ask",
+                "parentToolCallId": null,
+                "toolName": wf_known(json!("AskUserQuestion")),
+                "displayTitle": wf_known(json!("AskUserQuestion")),
+                "category": "other",
+                "input": wf_known(json!({ "questions": [] })),
+                "inputTextDelta": null,
+                "state": "running",
+                "executor": wf_unknown()
+            }
+        }),
+    )
+    .await?;
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "lifecycle",
+            "completeness": "structured",
+            "observedAt": stale_at,
+            "source": { "channel": "hook" },
+            "payload": {
+                "type": "native",
+                "nativeName": "turn.phase",
+                "relatedIds": {
+                    "phase": "tool-started",
+                    "tier": "hook",
+                    "toolCallId": "obj_mfix_ask",
+                    "toolName": "AskUserQuestion",
+                    "since": stale_at
+                }
+            }
+        }),
+    )
+    .await?;
+
+    // The fresh screen spinner keeps the decision `working` even though the
+    // hook tier is stalled (Esc 打断 must render).
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "lifecycle",
+            "completeness": "structured",
+            "observedAt": now_at,
+            "source": { "channel": "screen" },
+            "payload": {
+                "type": "native",
+                "nativeName": "live.status",
+                "relatedIds": {
+                    "liveStatus": "1",
+                    "verb": "running PreToolUse hooks",
+                    "interruptible": "1",
+                    "since": now_at
+                }
+            }
+        }),
+    )
+    .await?;
+    append_full_event(ws, instance_id, n, entity("exited", &now_at)).await
 }
 
 /// One full-shape user message observation. A composer/command send carries

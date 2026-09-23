@@ -85,6 +85,58 @@ async function answerPendingApprovals(page: Page, instanceId: string) {
 
 test.describe.configure({ mode: "serial" });
 
+/**
+ * Gate hygiene: this file creates instances and only two of its eight tests
+ * delete theirs, so by the second half the shared in-process fake Node is
+ * carrying this file's leftovers, and earlier gate files leave more. The fake
+ * host advertises a fixed `maxInstances: 8` (a product ceiling other specs
+ * deliberately exercise), and a POST refused with 422 PLACEMENT_UNSATISFIABLE
+ * leaves NewSessionPage on /sessions/new — the gate flake attributed to lines
+ * 447/481 (it accumulates: in a 10-repeat loop against one live server the
+ * 9th and 10th runs failed deterministically). Sweep the shared host before
+ * the first test and after every test so each run starts with real headroom. The external-Node flow
+ * owns its own host and must never be swept.
+ */
+async function sweepFakeNodeInstances(page: Page) {
+  const hostId = await page.evaluate(async () => {
+    const res = await fetch("/v1/hosts", { credentials: "include" });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      items?: { id?: string; label?: string }[];
+    };
+    return body.items?.find((host) => host.label === "e2e-fake-node")?.id ?? null;
+  });
+  if (!hostId) return;
+  const items = await page.evaluate(async (id) => {
+    const res = await fetch("/v1/instances", { credentials: "include" });
+    if (!res.ok) return [];
+    const body = (await res.json()) as {
+      items?: { instanceId?: string; hostId?: string }[];
+    };
+    return (body.items ?? []).filter((item) => item.hostId === id && item.instanceId);
+  }, hostId);
+  for (const item of items) {
+    await page.request.delete(`/v1/instances/${item.instanceId}?force=1`).catch(() => undefined);
+  }
+}
+
+test.beforeAll(async ({ browser }) => {
+  if (process.env.HUB_E2E_EXTERNAL === "1") return;
+  const page = await browser.newPage();
+  try {
+    await login(page);
+    await sweepFakeNodeInstances(page);
+  } finally {
+    await page.close();
+  }
+});
+
+test.afterEach(async ({ page }) => {
+  if (process.env.HUB_E2E_EXTERNAL === "1") return;
+  // An unauthenticated page (a failure before login) simply sweeps nothing.
+  await sweepFakeNodeInstances(page).catch(() => undefined);
+});
+
 test("device login, hosts, create/send/close, follow, approvals", async ({ page }) => {
   test.skip(process.env.HUB_E2E_EXTERNAL === "1", "External Node is covered by the real shell workspace flow");
   const followUrls: string[] = [];

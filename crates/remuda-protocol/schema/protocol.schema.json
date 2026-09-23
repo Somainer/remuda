@@ -14050,13 +14050,21 @@
           },
           "type": "array"
         },
+        "plan": {
+          "default": null,
+          "description": "`plan`; protocol §5.4. The plan text the reviewer approves, inline.\n`plan_digest` is sha256 of exactly these UTF-8 bytes. Absent (`null`)\non producers that only have a `plan_ref`. Additive optional field:\nolder readers ignore it, newer readers default it to absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "planDigest": {
           "$ref": "#/$defs/Digest",
-          "description": "`plan_digest`; protocol §5.4."
+          "description": "`plan_digest`; protocol §5.4 — sha256 of exactly the `plan` UTF-8 bytes."
         },
         "planRef": {
           "$ref": "#/$defs/Id",
-          "description": "`plan_ref`; protocol §5.4."
+          "description": "`plan_ref`; protocol §5.4. An unparsed placeholder id on print/sdk\ncarriers; the authoritative text is [`Self::plan`], not an object."
         },
         "planRevision": {
           "$ref": "#/$defs/U64",
@@ -14073,7 +14081,8 @@
         "planRevision",
         "planDigest",
         "options",
-        "allowFeedback"
+        "allowFeedback",
+        "plan"
       ],
       "type": "object"
     },

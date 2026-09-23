@@ -61,7 +61,7 @@ import {
 import {
   normalizePermissionMode as normalizeKindPermissionMode,
 } from "../features/session/permissions";
-import { doneFromLines, lastLines, latestScreenFromObservations } from "./screen";
+import { doneFromLines, lastLines, latestScreenSnapshot } from "./screen";
 import { liveSummary } from "../features/session/liveSummary";
 import { isUnauthorized } from "./httpError";
 import { JournalClient, type JournalRead } from "./journal";
@@ -265,6 +265,19 @@ export type BubbleAttachment = {
 
 const COMPACT_KEY = "runtime.compact";
 
+/**
+ * A rendered screen. `journalSeq` is the ordering basis: for a
+ * journal-derived screen it is the seq of the source observation; for a live
+ * `tty.screen` RPC result it is the journal seq that buffer was known fresh
+ * THROUGH when the read started (null before any journal screen). One total
+ * order then holds in both directions: a journal screen whose seq is at or
+ * behind the committed basis cannot roll an RPC buffer back (catch-up
+ * re-derives the same screen on every later non-screen event), and an RPC
+ * read whose basis is behind a journal frame committed during its flight
+ * cannot overwrite that frame.
+ */
+export type ScreenEntry = { lines: string[]; done: boolean; journalSeq: string | null };
+
 export type HubState = {
   ready: boolean;
   authed: boolean;
@@ -309,7 +322,7 @@ export type HubState = {
   modelPending: Record<string, ModelPending>;
   compact: boolean;
   answering: Record<string, true>;
-  screens: Record<string, { lines: string[]; done: boolean }>;
+  screens: Record<string, ScreenEntry>;
   /** List-row live phrases projected from each instance's journal tail. */
   summaries: Record<string, string>;
 };
@@ -386,13 +399,44 @@ function applyInstanceActivity(instances: Instance[], events: Observation[]): In
   });
 }
 
-/** An HTTP poll started before a followed turn boundary cannot undo it. */
-function mergeInstanceSnapshots(incoming: Instance[], current: Instance[]): Instance[] {
+/**
+ * An HTTP poll started before a followed turn boundary cannot undo it, and
+ * an optimistically-inserted (just-created) instance cannot be dropped by a
+ * list response whose request began before the create completed. `pins`
+ * records created ids keyed by the list-request sequence they were created
+ * against; `reqSeq` is THIS response's request sequence, and `outstanding`
+ * the sequences still in flight (this request included). A pinned id missing
+ * from the incoming list is retained while any request at/before its pin is
+ * unresolved — including a newer response that lands while an older one is
+ * still pending.
+ */
+function mergeInstanceSnapshots(
+  incoming: Instance[],
+  current: Instance[],
+  pins?: ReadonlyMap<Id, { seq: number; confirmedByNewer: boolean }>,
+  reqSeq = Number.POSITIVE_INFINITY,
+  outstanding?: ReadonlySet<number>,
+): Instance[] {
   const previous = new Map(current.map((instance) => [instance.id, instance]));
-  return incoming.map((instance) => {
+  const merged = incoming.map((instance) => {
     const newer = previous.get(instance.id);
     return newer && BigInt(newer.durableSeq) > BigInt(instance.durableSeq) ? newer : instance;
   });
+  if (!pins?.size) return merged;
+  const seen = new Set(merged.map((instance) => instance.id));
+  for (const [id, pin] of pins) {
+    if (seen.has(id)) continue;
+    const optimistic = previous.get(id);
+    if (!optimistic) continue;
+    // This response (in `outstanding`), or an even older request still
+    // pending, may predate the create: keep the optimistic row. A response
+    // that started strictly after the create AND has no older in-flight
+    // sibling is authoritative.
+    if (Array.from(outstanding ?? [reqSeq]).some((seq) => seq <= pin.seq)) {
+      merged.unshift(optimistic);
+    }
+  }
+  return merged;
 }
 
 class HubStore {
@@ -409,7 +453,23 @@ class HubStore {
    */
   private settledEffortPushdown = new Map<Id, string>();
   private bootGen = 0;
+  /**
+   * List-fetch sequencing: every refresh() takes a monotonically increasing
+   * seq at fetch START. Optimistically created instances are pinned against
+   * the seq at create time, and a list response only drops a pinned id once
+   * every request at/before that seq has resolved and a newer response
+   * confirmed the list — a poll that began before the create can never erase
+   * the row when it lands late (the 会话不存在 race after navigation).
+   */
+  private listReqSeq = 0;
+  private listOutstanding = new Set<number>();
+  private pinnedCreates = new Map<Id, { seq: number; confirmedByNewer: boolean }>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  /**
+   * Per-instance monotonic token for `tty.screen` reads: a stale response
+   * (a newer read already started) never commits.
+   */
+  private screenReadGen = new Map<Id, number>();
   /** Screen-read scheduler: queue, single-flight set, in-flight counter. */
   private screenQueue: Id[] = [];
   private screenPending = new Set<Id>();
@@ -1016,6 +1076,17 @@ class HubStore {
     api.disconnect();
     this.stopWorkspaceFollow?.();
     this.stopWorkspaceFollow = null;
+    // Invalidate this auth epoch: a list fetch already in flight (the 2 s
+    // poll may be awaiting when the user logs out) must be dropped wholesale
+    // when it resolves — neither replace the wiped instance list with the old
+    // session's rows nor release pins a re-login creates. The request seq
+    // stays monotonic ACROSS logouts on purpose: it is captured at fetch
+    // start and compared against create pins, so resetting it would let a
+    // pre-logout response look newer than a post-login create. Do not clear
+    // listOutstanding: the stale request still owns its own entry and removes
+    // it in its finally.
+    ++this.bootGen;
+    this.pinnedCreates.clear();
     this.emit({
       authed: false,
       session: null,
@@ -1081,19 +1152,61 @@ class HubStore {
   }
 
   async refresh() {
-    const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
-    this.emit({
-      instances: mergeInstanceSnapshots(instances.items, this.state.instances),
-      interactions,
-    });
-    this.hydrateEffortEffective(instances.items);
-    this.hydrateUsageRollups(instances.items);
-    this.hydrateModels(instances.items);
-    this.hydratePermissionEffective(instances.items);
-    // NOTE: list-row live phrases are NOT derived here. refresh() fans into
-    // every authenticated path (close/cancel/create/resume re-enter it) and
-    // must not add journal polling; the mounted SessionList hydrates phrases
-    // for the rows it renders via hydrateRowSummaries().
+    // Sequence this fetch from its START, not its resolution: a create that
+    // lands while the request is in flight must survive this response and be
+    // released only by a response newer than the create once this one is in.
+    const reqSeq = ++this.listReqSeq;
+    // Bind the response to the auth epoch captured at fetch START. A logout
+    // (or a new bootstrap) while the request is in flight invalidates it: its
+    // body belongs to the old session and must not merge or touch pins.
+    const epoch = this.bootGen;
+    this.listOutstanding.add(reqSeq);
+    try {
+      const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
+      if (epoch !== this.bootGen) return;
+      this.emit({
+        instances: mergeInstanceSnapshots(
+          instances.items,
+          this.state.instances,
+          this.pinnedCreates,
+          reqSeq,
+          this.listOutstanding,
+        ),
+        interactions,
+      });
+      // A response newer than a pin proves the server has spoken after the
+      // create. Combined with the in-flight sweep below (every older request
+      // answered), that is when dropping the pin on a missing id is safe.
+      for (const pin of this.pinnedCreates.values()) {
+        if (reqSeq > pin.seq) pin.confirmedByNewer = true;
+      }
+      this.hydrateEffortEffective(instances.items);
+      this.hydrateUsageRollups(instances.items);
+      this.hydrateModels(instances.items);
+      this.hydratePermissionEffective(instances.items);
+      // NOTE: list-row live phrases are NOT derived here. refresh() fans into
+      // every authenticated path (close/cancel/create/resume re-enter it) and
+      // must not add journal polling; the mounted SessionList hydrates phrases
+      // for the rows it renders via hydrateRowSummaries().
+    } finally {
+      // The stale request always releases its own outstanding slot; it is the
+      // epoch guard around the reap below that keeps it from moving pins — no
+      // control flow in this finally.
+      this.listOutstanding.delete(reqSeq);
+      if (epoch === this.bootGen) {
+        for (const [id, pin] of this.pinnedCreates) {
+          if (!pin.confirmedByNewer) continue;
+          let olderInFlight = false;
+          for (const seq of this.listOutstanding) {
+            if (seq <= pin.seq) {
+              olderInFlight = true;
+              break;
+            }
+          }
+          if (!olderInFlight) this.pinnedCreates.delete(id);
+        }
+      }
+    }
   }
 
   /** durableSeq already projected for a row phrase; unchanged seq = skip. */
@@ -1236,23 +1349,30 @@ class HubStore {
           this.notePermissionLifecycle(instanceId, event);
         }
         const next = current.concat(fresh);
-        const screen = latestScreenFromObservations(next);
+        const screen = latestScreenSnapshot(next);
         const phrase = liveSummary(next);
         // Clear a finished run's phrase so the row falls back to its
         // constant sentence instead of keeping a stale (invented) status.
         const summaries = { ...this.state.summaries };
         if (phrase) summaries[instanceId] = phrase;
         else delete summaries[instanceId];
+        // Commit through the one screen ordering: catch-up re-derives the
+        // latest journal screen on EVERY batch (including non-screen events),
+        // and a live RPC buffer already fresh through that seq is newer — a
+        // re-derived equal-or-older seq must not roll it (DONE badge flapping
+        // while the new turn works).
+        const screenPatch =
+          screen.lines.length && screen.seq !== null
+            ? this.screenCommitPatch(instanceId, lastLines(screen.lines, 80), doneFromLines(screen.lines), {
+                kind: "journal",
+                seq: screen.seq,
+              })
+            : null;
         this.emit({
           instances: applyInstanceActivity(this.state.instances, events),
           events: { ...this.state.events, [instanceId]: next },
           bubbles: settleBubbles(this.state.bubbles, instanceId, next),
-          screens: screen.lines.length
-            ? {
-                ...this.state.screens,
-                [instanceId]: { lines: lastLines(screen.lines, 80), done: doneFromLines(screen.lines) },
-              }
-            : this.state.screens,
+          screens: screenPatch ?? this.state.screens,
           summaries,
         });
       },
@@ -1278,7 +1398,17 @@ class HubStore {
         });
       },
       onStatus: (status) => {
-        this.emit({ journalStatus: { ...this.state.journalStatus, [instanceId]: status } });
+        // A client returning to live means the follow socket caught up again:
+        // clear the coarse global indicator too, so recovery needs no manual
+        // retry (non-live states stay per-session — SessionPage prefers them).
+        this.emit(
+          status === "live"
+            ? {
+                journalStatus: { ...this.state.journalStatus, [instanceId]: status },
+                connection: "live" as const,
+              }
+            : { journalStatus: { ...this.state.journalStatus, [instanceId]: status } },
+        );
       },
       onGap: (from, to) => {
         void client.fillGap(from, to).then((acked) => {
@@ -1345,19 +1475,51 @@ class HubStore {
     return client.loadEarlier();
   }
 
+  /**
+   * Surface a background reconciliation failure on the existing toast mouth
+   * instead of swallowing it. These reads never gate the user action (POST
+   * landings resolve without them), so this is advisory; the 2 s poll and the
+   * follow socket self-heal the same state.
+   */
+  private reconcileToast(err: unknown, what: string) {
+    const message = err instanceof Error && err.message ? err.message : String(err);
+    this.toast(`${what}失败：${message}（将在下次轮询重试）`);
+  }
+
   async catchup(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId);
     if (!instance) return;
     const client = this.journals.get(instance.journalId);
     if (!client) {
-      await this.follow(instanceId);
+      // follow() seeds its own connection state; only surface its failure.
+      try {
+        await this.follow(instanceId);
+      } catch (err) {
+        this.reconcileToast(err, "会话同步");
+      }
       return;
     }
     client.markReconnecting();
     this.emit({ connection: "reconnecting" });
-    await client.resumeAfterReconnect();
-    this.emit({ connection: "live" });
-    await this.refresh();
+    try {
+      await client.resumeAfterReconnect();
+    } catch (err) {
+      // resumeAfterReconnect settles the client at readonly-stale itself (and
+      // onStatus mirrors that into journalStatus), so the per-session banner
+      // is truthful 只读 + 重试 instead of a latched 重连. Report the cause.
+      this.reconcileToast(err, "会话同步");
+    }
+    // Derive the global indicator from the SETTLED client status, never an
+    // unconditional "live": a failed resync stays reconnecting globally until
+    // a later catch-up (the banner 重试 action, send, visibility regain,
+    // steerHeld) succeeds; the client can only be "live" or "readonly-stale"
+    // here, both of which onStatus has already projected per session.
+    this.emit({ connection: client.status === "live" ? "live" : "reconnecting" });
+    try {
+      await this.refresh();
+    } catch (err) {
+      this.reconcileToast(err, "会话列表刷新");
+    }
   }
 
   async create(spec: InstanceCreateSpec) {
@@ -1375,7 +1537,19 @@ class HubStore {
       effort: { ...this.state.effort, [createdId]: effort },
       models: { ...this.state.models, [createdId]: spec.model },
     });
-    await this.refresh();
+    // Pin the created row against every list request still in flight (a poll
+    // started before the create resolves late and otherwise drops the row,
+    // which made /s/:id render 会话不存在 immediately after navigation). The
+    // pin releases on the first post-create response once all older requests
+    // settle — see refresh()/mergeInstanceSnapshots.
+    this.pinnedCreates.set(createdId, { seq: this.listReqSeq, confirmedByNewer: false });
+    // Do not gate navigation on the list refresh: the create response already
+    // carries the instance the new /s/:id route mounts, and the follow socket
+    // delivers the rest. Under gate load awaiting the two refresh GETs here
+    // kept NewSessionPage on /sessions/new past the test's 20 s window even
+    // though the create had landed (a retry then passed). A failure is
+    // surfaced (not swallowed): the 2 s poll self-heals the list.
+    void this.refresh().catch((err) => this.reconcileToast(err, "会话列表刷新"));
     return this.state.instances.find((i) => i.id === result.instance.id) ?? result.instance;
   }
 
@@ -1419,10 +1593,25 @@ class HubStore {
             : b,
         ),
       });
-      await this.catchup(instanceId);
+      // Settle the bubble from events the live follow socket has already
+      // delivered, then return — the POST landing is what callers await (the
+      // 插队 receipt is raised on this resolution and the gate's steer test
+      // polls the wire then waits 5 s for that chip). The bounded
+      // reconciliation below must not be part of that latency: under gate
+      // load its HTTP chain (journal backfill + refresh + screen read) can
+      // take longer than the 5 s wait, even though the interrupt actually
+      // landed. The live socket and this background catch-up converge the
+      // same state.
       const events = this.state.events[instanceId] ?? [];
       this.emit({ bubbles: settleBubbles(this.state.bubbles, instanceId, events) });
-      await this.refreshScreen(instanceId).catch(() => undefined);
+      // catchup owns its own failures (toast + the connection latch always
+      // clears), so it never rejects and the POST resolution stays first.
+      void this.catchup(instanceId);
+      void this.refreshScreen(instanceId).catch((err) => {
+        // NODE_BUSY is the bulk-read back-pressure the scheduler backs off
+        // on, not a reconciliation failure; anything else is surfaced.
+        if (!isScreenNodeBusy(err)) this.reconcileToast(err, "屏幕同步");
+      });
       return true;
     } catch {
       // Keep `commandId: null`. The bubble is 「状态待确认」: no command id
@@ -1599,25 +1788,84 @@ class HubStore {
     this.toast(`已群发 ${instanceIds.length} 个实例`);
   }
 
+  /**
+   * Build the `screens` state patch for one screen update under the single
+   * ordering described on {@link ScreenEntry}, or null when the candidate is
+   * stale and the committed screen must stand. `lastLines(…, 3)` previews are
+   * the caller's responsibility (the journal path keeps its wider tail).
+   */
+  private screenCommitPatch(
+    instanceId: Id,
+    lines: string[],
+    done: boolean,
+    source: { kind: "journal"; seq: string } | { kind: "rpc"; basis: string | null },
+  ): Record<string, ScreenEntry> | null {
+    const current = this.state.screens[instanceId] ?? null;
+    if (source.kind === "journal") {
+      // Catch-up re-derives the latest journal screen on every batch; an RPC
+      // buffer already fresh through this seq (equal basis) is newer, and a
+      // frame with a higher committed basis is newer still.
+      if (current?.journalSeq != null && BigInt(current.journalSeq) >= BigInt(source.seq)) return null;
+    } else if (
+      // RPC: a journal screen whose seq exceeds the basis this read was fresh
+      // through committed while the read was in flight (or was already there
+      // in a re-attempt); that durable frame wins.
+      current?.journalSeq != null &&
+      source.basis != null &&
+      BigInt(current.journalSeq) > BigInt(source.basis)
+    ) {
+      return null;
+    }
+    const journalSeq = source.kind === "journal" ? source.seq : source.basis;
+    return { ...this.state.screens, [instanceId]: { lines, done, journalSeq } };
+  }
+
   async refreshScreen(instanceId: Id) {
-    let read;
+    // Generation guard: a newer read (or the periodic scheduler) superseding
+    // this one makes its late resolution a no-op — including its error.
+    const gen = (this.screenReadGen.get(instanceId) ?? 0) + 1;
+    this.screenReadGen.set(instanceId, gen);
+    // Journal screen seq known BEFORE the RPC went out. The live buffer the
+    // RPC returns is at least that new; a journal frame that lands while the
+    // read is in flight is newer than the request, and the read must not win.
+    const journalSeqAtStart = this.state.screens[instanceId]?.journalSeq ?? null;
+    let read: { lines: string[] };
     try {
       read = await api.screenRead(instanceId, 80);
     } catch (err) {
-      // NODE_BUSY is a refusal, not a screen: let the scheduler back off.
-      if (isScreenNodeBusy(err)) throw err;
-      read = { lines: [] };
+      if (this.screenReadGen.get(instanceId) !== gen) return;
+      // NODE_BUSY is bulk-read back-pressure (the scheduler backs off);
+      // anything else is an unexpected failure that api.screenRead no longer
+      // converts into an empty screen — propagate so the caller reports it
+      // instead of silently keeping or re-deriving content.
+      throw err;
     }
+    if (this.screenReadGen.get(instanceId) !== gen) return;
+    let patch: Record<string, ScreenEntry> | null;
     if (!read.lines.length) {
-      read = latestScreenFromObservations(this.state.events[instanceId] ?? []);
+      // Legitimately no live buffer (unsupported carrier / offline host
+      // answers 4xx at the API layer): fall back to the latest journal screen.
+      const snapshot = latestScreenSnapshot(this.state.events[instanceId] ?? []);
+      if (!snapshot.lines.length || snapshot.seq === null) return;
+      patch = this.screenCommitPatch(
+        instanceId,
+        lastLines(snapshot.lines, 3),
+        doneFromLines(snapshot.lines),
+        { kind: "journal", seq: snapshot.seq },
+      );
+    } else {
+      // Mid-flight journal frame: screenCommitPatch's basis check needs the
+      // start basis; an RPC whose basis is null while a journal screen now
+      // exists is covered by the explicit change check.
+      const current = this.state.screens[instanceId];
+      if ((current?.journalSeq ?? null) !== journalSeqAtStart) return;
+      const lines = lastLines(read.lines, 80);
+      patch = this.screenCommitPatch(instanceId, lastLines(lines, 3), doneFromLines(read.lines), {
+        kind: "rpc",
+        basis: journalSeqAtStart,
+      });
     }
-    const lines = lastLines(read.lines, 80);
-    this.emit({
-      screens: {
-        ...this.state.screens,
-        [instanceId]: { lines: lastLines(lines, 3), done: doneFromLines(read.lines) },
-      },
-    });
+    if (patch) this.emit({ screens: patch });
   }
 
   /**
@@ -1677,7 +1925,14 @@ class HubStore {
     try {
       await this.refreshScreen(instanceId);
     } catch (err) {
-      if (!isScreenNodeBusy(err)) return;
+      if (!isScreenNodeBusy(err)) {
+        // An unexpected screen-read failure (5xx/network) must not be
+        // swallowed: the periodic list poll retries the row on its own, and
+        // this advisory surfaces the gap instead of presenting stale content
+        // as current.
+        this.reconcileToast(err, "屏幕同步");
+        return;
+      }
       // Back off exactly this row for one poll cycle; intervening interval
       // ticks skip it via screenBackoffUntil, and no error reaches the console.
       const retryAfterMs = err.retryAfterMs;
@@ -1892,10 +2147,26 @@ class HubStore {
   async respond(interactionId: Id, answer: InteractionAnswer) {
     this.emit({ answering: { ...this.state.answering, [interactionId]: true } });
     try {
+      // The decision is committed the moment the POST succeeds. Any failure
+      // AFTER that (a list/catchup refresh) is a UI-sync problem, not a
+      // rejected decision: keep the success path so the card does not flip
+      // back to answerable (a second answer would only be Superseded).
       await api.interactionRespond(interactionId, answer);
+    } catch (error) {
+      // Only a rejected POST returns the card to answerable state and surfaces
+      // the error; the draft is preserved for correction.
+      const { [interactionId]: _removed, ...rest } = this.state.answering;
+      this.emit({ answering: rest });
+      throw error;
+    }
+    try {
       await this.refresh();
       const interaction = this.state.interactions.find((i) => i.id === interactionId);
       if (interaction) await this.catchup(interaction.instanceId);
+    } catch {
+      // Post-commit sync failure: the broker already accepted the answer.
+      // Leave the card in its submitted/committed state; do not re-enable the
+      // buttons or make the reviewer think the decision was rejected.
     } finally {
       const interaction = this.state.interactions.find((i) => i.id === interactionId);
       const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];

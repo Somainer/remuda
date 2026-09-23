@@ -557,11 +557,13 @@ export function SettingsPage() {
     else navigate("/sessions");
   };
 
-  const chooseAppearance = (choice: Appearance) =>
-    appearance.run(() => {
-      // Optimistic so the selection reads instantly; a denied write restores
-      // the last committed appearance and surfaces 失败.
-      setAppearanceChoice(choice);
+  const chooseAppearance = (choice: Appearance) => {
+    // Optimistic so the selection reads instantly; a denied write restores
+    // the last committed appearance and surfaces 失败. Set before the runner's
+    // saving render, so AppearanceSeg's focus repair never sees a stale value
+    // and a second arrow key steps on from this choice.
+    setAppearanceChoice(choice);
+    return appearance.run(() => {
       applyAppearance(choice);
       try {
         writeAppearance(choice);
@@ -571,6 +573,7 @@ export function SettingsPage() {
         throw err;
       }
     });
+  };
 
   const commitDevicePrefs = (patch: Partial<DeviceSettings>) =>
     appearance.run(() => {

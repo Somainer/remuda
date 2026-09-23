@@ -146,7 +146,7 @@ describe("save states and rollback", () => {
     fireEvent.keyDown(radios[0]!, { key: "ArrowRight" });
     await waitFor(() => expect(radios[1]).toHaveAttribute("aria-checked", "true"));
     expect(document.activeElement).toBe(radios[1]);
-    expect(document.documentElement.dataset.appearance).toBe("dark");
+    await waitFor(() => expect(document.documentElement.dataset.appearance).toBe("dark"));
   });
 
   it("marks a failed appearance save, rolls that field back, and keeps the error visible", async () => {
@@ -192,6 +192,22 @@ describe("save states and rollback", () => {
     expect(system.tabIndex).toBe(0);
     expect(document.activeElement).toBe(system);
     setItem.mockRestore();
+  });
+
+  it("steps through two rapid arrow keys before the first save settles", async () => {
+    renderSettings(["/settings"]);
+    const system = screen.getByTestId("settings-appearance-system");
+    const light = screen.getByTestId("settings-appearance-light");
+    system.focus();
+    fireEvent.keyDown(system, { key: "ArrowRight" });
+    // The first commit is still in its saving frames; focus stays on 深色.
+    expect(document.activeElement).toBe(screen.getByTestId("settings-appearance-dark"));
+    fireEvent.keyDown(document.activeElement!, { key: "ArrowRight" });
+    await waitFor(() =>
+      expect(screen.getByTestId("settings-appearance-status")).toHaveAttribute("data-phase", "saved"),
+    );
+    expect(light).toHaveAttribute("aria-checked", "true");
+    expect(document.activeElement).toBe(light);
   });
 
   it("keeps a committed permission choice even when a later appearance change rejects", async () => {

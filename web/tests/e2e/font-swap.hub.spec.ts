@@ -310,11 +310,30 @@ async function savedPositionSurvivesSwap(page: Page, longBurst: number): Promise
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
 
+  // The saved reading position is the restore's whole input. A visit
+  // re-saves it (scroll persistence, unmount), so snapshot the record the
+  // first visit left behind and reinstate it before each arm; an init script
+  // records what the session document found at start, before the app read it.
+  const readingKey = `runtime.reading.v1.${instanceId}`;
+  const original = await page.evaluate((key) => localStorage.getItem(key), readingKey);
+  expect(original, "the first visit saved a reading position").not.toBeNull();
+  expect(JSON.parse(original!).follow, "the saved position is not pinned").toBe(false);
+  await page.addInitScript((key) => {
+    (window as unknown as { __readingInput?: string | null }).__readingInput = localStorage.getItem(key);
+  }, readingKey);
+  const reinstate = async () => {
+    await page.evaluate(([key, value]) => localStorage.setItem(key, value), [readingKey, original!] as const);
+  };
+  const consumed = () =>
+    page.evaluate(() => (window as unknown as { __readingInput?: string | null }).__readingInput ?? null);
+
   // Control: restore with the font already cached, so no swap happens.
+  await reinstate();
   await page.goto(`/s/${instanceId}`);
   await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
   await afterSwap(page);
   const control = (await rowOffset(scroller, anchor))!;
+  const controlInput = await consumed();
   const viewport = await scroller.evaluate((el) => el.clientHeight);
 
   // Fresh document with the woff2 held (routing also bypasses the HTTP
@@ -322,19 +341,26 @@ async function savedPositionSurvivesSwap(page: Page, longBurst: number): Promise
   await delayFonts(page);
   await page.goto("/sessions");
   await expect(page.getByTestId("session-list")).toBeVisible();
+  const leftByControl = await page.evaluate((key) => localStorage.getItem(key), readingKey);
+  await reinstate();
   await page.goto(`/s/${instanceId}`);
   await expect.poll(() => rowOffset(scroller, anchor), { timeout: 30_000 }).not.toBeNull();
   const swappedBeforeRestore = await monoLoaded(page);
   const beforeSwap = (await rowOffset(scroller, anchor))!;
   await afterSwap(page);
   const settled = (await rowOffset(scroller, anchor))!;
+  const swapInput = await consumed();
+
+  // Both arms restore from the byte-identical record the first visit saved.
+  expect(controlInput, "the control arm restored from the original saved record").toBe(original);
+  expect(swapInput, "the swap arm restored from the original saved record").toBe(original);
 
   // `saved` vs `control` is the restore's own precision with no font change
   // at all (Transcript places never-measured rows by its row estimate), a
   // baseline gap reported separately. What this spec owns is that the swap
   // adds nothing on top: the swapped restore is no further from the saved
   // position than the no-swap restore, and nothing moves when the font lands.
-  const measured = `longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} swappedBeforeRestore=${swappedBeforeRestore}`;
+  const measured = `longBurst=${longBurst} saved=${saved} control=${control} beforeSwap=${beforeSwap} settled=${settled} swappedBeforeRestore=${swappedBeforeRestore} input=${original} leftByControl=${leftByControl}`;
   test.info().annotations.push({ type: "font-swap", description: measured });
   console.log(`FONTSWAP ${measured}`);
   if (FONT_DELAY_MS > 0) {

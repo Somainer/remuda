@@ -5,7 +5,7 @@
 
 use crate::{Shutdown, config::Config, dispatcher};
 use clap::{Args as ClapArgs, Subcommand};
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 #[derive(ClapArgs)]
 #[command(about = "Run the Hub, authentication store, and embedded Web application.")]
@@ -19,6 +19,10 @@ pub(crate) struct Args {
     /// Run the configured Feishu dispatcher against this Hub in the same process.
     #[arg(long)]
     with_dispatcher: bool,
+    /// Run supervised by the given parent process pid: exit when it dies and
+    /// manage `<data_dir>/hub.pid`. Used by the tray helper / desktop shell.
+    #[arg(long, value_name = "parentPid", conflicts_with_all = ["healthcheck", "migrate"])]
+    managed: Option<u32>,
     /// Probe the configured local Hub health endpoint and exit (container healthcheck).
     #[arg(long, conflicts_with_all = ["migrate", "with_dispatcher"])]
     healthcheck: bool,
@@ -103,6 +107,7 @@ pub(crate) async fn run(
     let with_dispatcher = args.with_dispatcher;
     let healthcheck = args.healthcheck;
     let migrate = args.migrate;
+    let managed = args.managed;
     args.apply(&mut config);
     config.validate()?;
     if healthcheck {
@@ -114,16 +119,50 @@ pub(crate) async fn run(
     if with_dispatcher && config.dispatcher.is_none() {
         anyhow::bail!("--with-dispatcher requires a [dispatcher] configuration section");
     }
-    let running = start(&config).await?;
-    tracing::info!(address = %running.addr, "remuda hub listening");
-    let result = if with_dispatcher {
-        dispatcher::run_configured(&config, Some(&running), shutdown.wait()).await
-    } else {
-        shutdown.wait().await
+    // Arm the parent watch before binding: a supervisor that dies while the
+    // Hub is still starting must not leave an orphaned listener. Fails fast if
+    // the named parent is already gone.
+    let mut parent_watch = match managed {
+        Some(parent_pid) => Some(remuda_hub::supervise::watch_parent(parent_pid)?),
+        None => None,
     };
-    // RunningHub::drop requests Axum graceful shutdown. TODO(remuda-hub): expose
-    // an awaited shutdown handle so the CLI can also verify completion of its drain.
-    drop(running);
+    let mut running = start(&config).await?;
+    tracing::info!(address = %running.addr, "remuda hub listening");
+    // Publish the pid only once the listener is bound, so a stale hub.pid can
+    // never point at a Hub that failed to start. Removed on every return path.
+    let pid_file = match managed {
+        Some(_) => Some(remuda_hub::supervise::PidFile::write(&config.data_dir)?),
+        None => None,
+    };
+    let result = tokio::select! {
+        result = async {
+            if with_dispatcher {
+                dispatcher::run_configured(&config, Some(&running), shutdown.wait()).await
+            } else {
+                shutdown.wait().await
+            }
+        } => result,
+        () = async {
+            match parent_watch.as_mut() {
+                Some(watch) => watch.exited().await,
+                // Never resolves in unmanaged mode.
+                None => std::future::pending().await,
+            }
+        } => {
+            tracing::info!(parent_pid = managed.expect("managed"), "managed parent exited; shutting down");
+            Ok(())
+        }
+    };
+    if managed.is_some() {
+        // Managed mode guarantees a bounded teardown: stop accepting, drain,
+        // flush the journal, all within a 3-second budget.
+        running.shutdown_within(Duration::from_secs(3)).await;
+    } else {
+        // Unmanaged: identical to the pre-supervision behavior — Drop requests
+        // Axum graceful shutdown without awaiting the drain.
+        drop(running);
+    }
+    drop(pid_file);
     result
 }
 

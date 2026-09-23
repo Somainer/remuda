@@ -1,0 +1,46 @@
+{
+  "session_id": "00000000-0000-4000-a000-0000000000a2",
+  "transcript_path": "/tmp/remuda-askq/w/session.jsonl",
+  "cwd": "/tmp/remuda-askq/w",
+  "prompt_id": "00000000-0000-4000-b000-0000000000b2",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "xhigh"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "AskUserQuestion",
+  "tool_input": {
+    "questions": [
+      {
+        "question": "Tea or coffee?",
+        "header": "Beverage",
+        "multiSelect": false,
+        "options": [
+          {"label": "Tea", "description": "A brewed leaf-based drink, served hot or iced."},
+          {"label": "Coffee", "description": "A brewed bean-based drink containing caffeine."}
+        ]
+      }
+    ],
+    "answers": {
+      "Tea or coffee?": "Tea"
+    }
+  },
+  "tool_response": {
+    "questions": [
+      {
+        "question": "Tea or coffee?",
+        "header": "Beverage",
+        "multiSelect": false,
+        "options": [
+          {"label": "Tea", "description": "A brewed leaf-based drink, served hot or iced."},
+          {"label": "Coffee", "description": "A brewed bean-based drink containing caffeine."}
+        ]
+      }
+    ],
+    "answers": {
+      "Tea or coffee?": "Tea"
+    }
+  },
+  "tool_use_id": "call_00000000000000000000000001",
+  "duration_ms": 1
+}

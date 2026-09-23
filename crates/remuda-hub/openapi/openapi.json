@@ -4922,10 +4922,22 @@
                   "properties": {
                     "ok": {
                       "type": "boolean"
+                    },
+                    "version": {
+                      "type": "string",
+                      "description": "Hub package version (matches the remuda CLI version)."
+                    },
+                    "uptimeSecs": {
+                      "type": "integer",
+                      "format": "uint64",
+                      "description": "Whole seconds since this Hub process started.",
+                      "minimum": 0
                     }
                   },
                   "required": [
-                    "ok"
+                    "ok",
+                    "version",
+                    "uptimeSecs"
                   ],
                   "type": "object"
                 }

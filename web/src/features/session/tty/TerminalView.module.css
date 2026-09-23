@@ -8,11 +8,15 @@
 }
 
 .lab[data-tty-fullscreen="1"] {
+  /* c-mfix: fill the visualViewport band (keyboard aware), never the layout
+     viewport — inset:0 + 100dvh let the keyboard cover the lower rows. */
   position: fixed;
-  inset: 0;
+  left: 0;
+  right: 0;
+  top: var(--workbench-top, 0px);
   z-index: 80;
   width: 100vw;
-  height: 100dvh;
+  height: var(--workbench-height, 100dvh);
   padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
     env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
   box-sizing: border-box;

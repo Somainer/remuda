@@ -73,6 +73,12 @@ pub struct SignalBus {
     /// device answered through Remuda.
     open_questions:
         std::sync::Mutex<std::collections::HashMap<crate::pending::DecisionKey, OpenQuestion>>,
+    /// In-flight AskUserQuestion calls, keyed by a content fingerprint of
+    /// their `tool_input`. Auto mode raises the question as a `PreToolUse` and
+    /// — when that hook returns no opinion — the same call again as a
+    /// `PermissionRequest`; both hooks park, but only the first opens a card
+    /// and one answer must resolve both (evidence `askq-pretooluse-1.md`).
+    question_calls: std::sync::Mutex<std::collections::HashMap<String, QuestionCall>>,
     blocking_wait: std::time::Duration,
     /// P5 (c-hookgap): turns observed on the hook channel, most recent last,
     /// plus the pid a `Stop`/`Esc` interrupt is aimed at.
@@ -108,6 +114,41 @@ struct OpenQuestion {
     interaction: remuda_protocol::Interaction,
     /// The original request, used to validate the observed answers.
     request: crate::PermissionRequestEvent,
+}
+
+/// One in-flight AskUserQuestion call and the two hooks it may park.
+///
+/// The harness can raise the same call twice — a `PreToolUse` and, when that
+/// hook does not decide it, a `PermissionRequest` ~tens of ms later (measured
+/// on claude 2.1.277; the pair carries byte-identical `tool_input`). Only the
+/// first hook opens a card; the second parks beside it and one device answer
+/// resolves both.
+#[derive(Clone)]
+struct QuestionCall {
+    /// Decision key of the hook that opened the card (the interaction id).
+    primary: crate::pending::DecisionKey,
+    /// Decision key of the paired hook, once it has arrived.
+    secondary: Option<crate::pending::DecisionKey>,
+}
+
+/// Fingerprint one AskUserQuestion call across its two hook events.
+///
+/// The paired `PreToolUse` / `PermissionRequest` carry identical
+/// `tool_input` (measured), but only the `PreToolUse` has a `tool_use_id`.
+/// Content is therefore the correlation the two hooks can actually share.
+/// The `agent_id` scopes it: a parked question blocks its agent's turn, so one
+/// agent never has two of these in flight, but the main session and a
+/// sub-agent (or two sub-agents) may ask the same question text concurrently
+/// and must not be folded onto one card.
+fn question_fingerprint(agent_id: Option<&str>, tool_input: &serde_json::Value) -> String {
+    let body = tool_input
+        .get("questions")
+        .and_then(|q| serde_json::to_string(q).ok())
+        .unwrap_or_else(|| serde_json::to_string(tool_input).unwrap_or_default());
+    match agent_id {
+        Some(agent) => format!("agent:{agent}\0{body}"),
+        None => format!("main\0{body}"),
+    }
 }
 /// A blocking hook whose card is open and whose process may await a decision.
 ///
@@ -153,6 +194,7 @@ impl SignalBus {
             pending: crate::pending::PendingDecisions::new(),
             parked: std::sync::Mutex::new(std::collections::HashMap::new()),
             open_questions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            question_calls: std::sync::Mutex::new(std::collections::HashMap::new()),
             blocking_wait: crate::BLOCKING_WAIT,
             turn_active: std::sync::Mutex::new(VecDeque::new()),
             live: std::sync::Mutex::new(LiveState::new(live_scope)),
@@ -197,14 +239,34 @@ impl SignalBus {
         answer: &remuda_protocol::InteractionAnswer,
     ) -> crate::Outcome {
         let key = crate::pending::DecisionKey::new(id.as_id().as_str());
+        // A question call may have two parked hooks (a paired PreToolUse and
+        // PermissionRequest). Peek the association up front so the answer fans
+        // out to both and the primary ending first does not strand it; the
+        // association itself is reaped by note_hook_ended as the hooks finish.
+        let call = matches!(answer, remuda_protocol::InteractionAnswer::Question(_))
+            .then(|| self.peek_question_call(&key))
+            .flatten();
         // The parked record carries what the answer needs: suggestions for an
-        // approval echo, the original request for a question rebuild.
-        let parked_record = self
-            .parked
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .map(|parked| (parked.suggestions.clone(), parked.question.clone()));
+        // approval echo, the original request for a question rebuild. If the
+        // card-owning hook already ended, a still-parked paired hook for the
+        // same call answers in its place.
+        let mut resolve_key = key.clone();
+        let parked_record = self.parked_record(&key);
+        let parked_record = match parked_record {
+            Some(record) => Some(record),
+            None => {
+                if let Some(open) = &call
+                    && let Some(secondary) = &open.secondary
+                    && secondary != &key
+                    && let Some(record) = self.parked_record(secondary)
+                {
+                    resolve_key = secondary.clone();
+                    Some(record)
+                } else {
+                    None
+                }
+            }
+        };
         let Some((suggestions, question_event)) = parked_record else {
             // No parked context: the hook already ended. Still report
             // honestly rather than claiming a delivery we cannot prove.
@@ -229,7 +291,28 @@ impl SignalBus {
                 },
             );
         };
-        let outcome = self.pending.resolve(&key, decision);
+        let outcome = self.pending.resolve(&resolve_key, decision.clone());
+        // One call has two parked hooks: the same decision reaches the paired
+        // one, serialized in whichever event vocabulary that hook carries.
+        if let Some(open) = &call {
+            for peer in [Some(&open.primary), open.secondary.as_ref()]
+                .into_iter()
+                .flatten()
+                .filter(|peer| **peer != resolve_key)
+            {
+                if self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(peer)
+                {
+                    // The reported outcome is the card-owning hook's; a
+                    // secondary that ended on its own deadline is simply not
+                    // there to receive the fan-out.
+                    let _ = self.pending.resolve(peer, decision.clone());
+                }
+            }
+        }
         // A device answer wins the question outright: the terminal cannot
         // answer the same card a moment later and emit a second resolution.
         if matches!(answer, remuda_protocol::InteractionAnswer::Question(_)) {
@@ -239,6 +322,82 @@ impl SignalBus {
                 .remove(&key);
         }
         outcome
+    }
+
+    /// Clone the parked context a decision needs, if a hook is parked there.
+    fn parked_record(
+        &self,
+        key: &crate::pending::DecisionKey,
+    ) -> Option<(
+        Vec<crate::PermissionSuggestion>,
+        Option<crate::PermissionRequestEvent>,
+    )> {
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|parked| (parked.suggestions.clone(), parked.question.clone()))
+    }
+
+    /// Return the question-call association for whichever of its two hooks
+    /// matches `hook`, if any. The association is left in place; reaping is
+    /// done by [`note_hook_ended`](Self::note_hook_ended) as hooks finish.
+    fn peek_question_call(&self, hook: &crate::pending::DecisionKey) -> Option<QuestionCall> {
+        self.question_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|call| &call.primary == hook || call.secondary.as_ref() == Some(hook))
+            .cloned()
+    }
+
+    /// Drop a finished hook from its question-call association.
+    ///
+    /// The association lives while at least one of the two hooks is parked:
+    /// the first of the pair to finish leaves it in place for the other; once
+    /// neither has a parked record the entry is gone so a later, genuinely new
+    /// question with identical text opens its own card.
+    fn note_hook_ended(&self, hook: &crate::pending::DecisionKey) {
+        // Find under the calls lock only; touch the parked table separately
+        // so the lock order never inverts.
+        let found = {
+            let mut calls = self
+                .question_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some((fingerprint, call)) = calls
+                .iter_mut()
+                .find(|(_, call)| &call.primary == hook || call.secondary.as_ref() == Some(hook))
+                .map(|(fingerprint, call)| (fingerprint.clone(), call))
+            else {
+                return;
+            };
+            if &call.primary == hook {
+                if call.secondary.is_none() {
+                    calls.remove(&fingerprint);
+                    return;
+                }
+                // The paired hook may still be parked; leave the association
+                // anchored on the card id, and let the pair's own finish (or a
+                // terminal close / device answer) remove it.
+                return;
+            }
+            call.secondary = None;
+            let primary = call.primary.clone();
+            (fingerprint, primary)
+        };
+        let (fingerprint, primary) = found;
+        let primary_live = self
+            .parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&primary);
+        if !primary_live {
+            self.question_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&fingerprint);
+        }
     }
 
     /// Retire every parked hook, denying them; called when the instance stops.
@@ -258,6 +417,10 @@ impl SignalBus {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.open_questions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.question_calls
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
@@ -539,8 +702,11 @@ impl SignalBus {
         self.close_terminal_answered(&event).await;
         // A blocking event opens its interaction card and parks the hook in
         // the same pass. The fold does not await the decision — it hands the
-        // handle back so the socket delivery task can.
-        if crate::event::is_blocking(&event.name) {
+        // handle back so the socket delivery task can. In auto permission
+        // mode an AskUserQuestion arrives as a PreToolUse (no
+        // PermissionRequest follows while that hook is pending), so
+        // "blocks" is payload-shaped there.
+        if crate::event::hooks_block(&event.name, &event.payload) {
             return self.open_and_park(&event, register_waiter).await;
         }
         None
@@ -557,6 +723,179 @@ impl SignalBus {
         event: &HookEvent,
         register_waiter: bool,
     ) -> Option<PendingDecision> {
+        let Some(question) = crate::question::question_request_from_event(event) else {
+            return self.open_plain_blocker(event, register_waiter).await;
+        };
+        let mut fingerprint = question_fingerprint(event.text("agent_id"), &question.tool_input);
+        // The same call may already have parked its first hook (a PreToolUse
+        // followed ~tens of ms later by a PermissionRequest, or the reverse).
+        // It must not mint a second card; park behind the existing one.
+        let pair_with = {
+            let calls = self
+                .question_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            calls
+                .get(&fingerprint)
+                .filter(|call| call.secondary.is_none())
+                .map(|call| call.primary.clone())
+        };
+        if let Some(primary) = pair_with {
+            return self.park_paired_hook(event, question, primary, fingerprint, register_waiter);
+        }
+        // A fully occupied entry (two hooks already parked) is a third
+        // concurrent question with identical text in the same agent — not a
+        // shape the harness can produce (a parked question blocks the turn),
+        // but never clobber the live association: stand this card alone.
+        let occupied = self
+            .question_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&fingerprint);
+        if occupied {
+            fingerprint.push_str("\0standalone");
+        }
+        self.open_question_card(event, question, fingerprint, register_waiter)
+            .await
+    }
+
+    /// Park the second hook of an AskUserQuestion call behind the open card.
+    ///
+    /// No interaction is emitted (one call, one card) and no
+    /// `open_questions` row is added (the primary's already closes it). The
+    /// waiter and parked record are still registered before this function
+    /// returns, so the one device answer resolves both hooks.
+    fn park_paired_hook(
+        &self,
+        event: &HookEvent,
+        question: crate::PermissionRequestEvent,
+        primary: crate::pending::DecisionKey,
+        fingerprint: String,
+        register_waiter: bool,
+    ) -> Option<PendingDecision> {
+        let key = Self::paired_key(&primary, &event.name);
+        let decision_rx = register_waiter.then(|| self.pending.park(key.clone()));
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.clone(),
+                ParkedHook {
+                    suggestions: Vec::new(),
+                    question: Some(question),
+                    decision_rx,
+                },
+            );
+        if let Some(open) = self
+            .question_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&fingerprint)
+        {
+            open.secondary = Some(key.clone());
+        }
+        Some(PendingDecision {
+            key,
+            event: event.name.clone(),
+        })
+    }
+
+    /// The decision key the paired hook for an interaction parks under.
+    fn paired_key(
+        primary: &crate::pending::DecisionKey,
+        event: &str,
+    ) -> crate::pending::DecisionKey {
+        crate::pending::DecisionKey::new(format!("{}::paired::{}", primary.as_str(), event))
+    }
+
+    /// Open the card for the first hook of an AskUserQuestion call.
+    async fn open_question_card(
+        &self,
+        event: &HookEvent,
+        question: crate::PermissionRequestEvent,
+        fingerprint: String,
+        register_waiter: bool,
+    ) -> Option<PendingDecision> {
+        let Some((interaction, key)) = self.open_interaction(event) else {
+            tracing::debug!(
+                event = %event.name,
+                "no interaction could be opened; the agent keeps its own prompt"
+            );
+            return None;
+        };
+        // Register waiter, parked record, and the call association BEFORE the
+        // card becomes visible (same window as the approval path): a paired
+        // hook or a device answer arriving the instant the card appears must
+        // find them.
+        let decision_rx = register_waiter.then(|| self.pending.park(key.clone()));
+        self.parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.clone(),
+                ParkedHook {
+                    suggestions: Vec::new(),
+                    question: Some(question.clone()),
+                    decision_rx,
+                },
+            );
+        self.question_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                fingerprint,
+                QuestionCall {
+                    primary: key.clone(),
+                    secondary: None,
+                },
+            );
+        // The TUI can answer this card itself; remember it so the closing
+        // PostToolUse resolves the banner even with no device answer.
+        self.open_questions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                key.clone(),
+                OpenQuestion {
+                    interaction: interaction.clone(),
+                    request: question,
+                },
+            );
+        if !self.emit_interaction(interaction).await {
+            // Nobody can see a card that never reached the journal. Retire
+            // everything just registered; dropping the sender reads as
+            // fail-closed TimedOut, never an answered deny.
+            tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
+            self.parked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            self.open_questions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            self.question_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|_, call| call.primary != key);
+            if register_waiter {
+                self.pending.retire(&key, crate::RetireReason::Deadline);
+            }
+            return None;
+        }
+        Some(PendingDecision {
+            key,
+            event: event.name.clone(),
+        })
+    }
+
+    /// Open a card and park the hook for a non-question blocking event
+    /// (`PermissionRequest` for an ordinary tool, `Elicitation`).
+    async fn open_plain_blocker(
+        &self,
+        event: &HookEvent,
+        register_waiter: bool,
+    ) -> Option<PendingDecision> {
         let Some((interaction, key)) = self.open_interaction(event) else {
             tracing::debug!(
                 event = %event.name,
@@ -565,9 +904,6 @@ impl SignalBus {
             return None;
         };
         let permission_request = crate::decision::PermissionRequestEvent::from_event(event);
-        let is_question = permission_request
-            .as_ref()
-            .is_some_and(crate::question::is_ask_user_question);
         let suggestions = permission_request
             .as_ref()
             .map(|request| request.suggestions.clone())
@@ -588,28 +924,10 @@ impl SignalBus {
                 key.clone(),
                 ParkedHook {
                     suggestions,
-                    question: if is_question {
-                        permission_request.clone()
-                    } else {
-                        None
-                    },
+                    question: None,
                     decision_rx,
                 },
             );
-        if is_question && let Some(request) = permission_request {
-            // The TUI can answer this card itself; remember it so the closing
-            // PostToolUse resolves the banner even with no device answer.
-            self.open_questions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(
-                    key.clone(),
-                    OpenQuestion {
-                        interaction: interaction.clone(),
-                        request,
-                    },
-                );
-        }
         if !self.emit_interaction(interaction).await {
             // Nobody can see a card that never reached the journal. Answering
             // it is impossible, so the relay must not park for the full TTL.
@@ -618,10 +936,6 @@ impl SignalBus {
             // deny, and avoids leaving a dead entry for the instance lifetime.
             tracing::debug!(event = %event.name, "interaction not journaled; not parking a hook");
             self.parked
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&key);
-            self.open_questions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&key);
@@ -668,6 +982,10 @@ impl SignalBus {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&pending.key);
+        // Release this hook's slot in its question-call association; the
+        // reply below is serialized in THIS hook's event vocabulary
+        // (PermissionRequest vs PreToolUse differ).
+        self.note_hook_ended(&pending.key);
         tracing::debug!(event = %pending.event, ?outcome, "blocking hook resolved");
         HookReply {
             decision: Some(decision.to_hook_json(&pending.event)),
@@ -699,6 +1017,14 @@ impl SignalBus {
                 } else {
                     crate::approval::approval_interaction(&request, &context).ok()?
                 }
+            }
+            // Auto permission mode raises AskUserQuestion as a PreToolUse
+            // without a PermissionRequest (evidence askq-pretooluse-1). Only
+            // the question form reaches this arm; every other PreToolUse is a
+            // fire-and-forget event and never calls open_interaction.
+            "PreToolUse" => {
+                let request = crate::question::question_request_from_event(event)?;
+                crate::question::question_interaction(&request, &context).ok()?
             }
             "Elicitation" => crate::approval::elicitation_interaction(event, &context).ok()?,
             _ => return None,
@@ -775,6 +1101,28 @@ impl SignalBus {
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&key);
         self.pending.retire(&key, crate::RetireReason::Deadline);
+        // The call may have a second parked hook (the paired
+        // PreToolUse/PermissionRequest): it can never be answered now either.
+        let secondary = {
+            let mut calls = self
+                .question_calls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let secondary = calls
+                .values()
+                .find(|call| call.primary == key)
+                .and_then(|call| call.secondary.clone());
+            calls.retain(|_, call| call.primary != key);
+            secondary
+        };
+        if let Some(secondary) = secondary {
+            self.parked
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&secondary);
+            self.pending
+                .retire(&secondary, crate::RetireReason::Deadline);
+        }
         let Some(now) = now_ts() else {
             return;
         };
@@ -1915,5 +2263,361 @@ mod tests {
         .await;
         assert!(bus.is_parked(&card.meta.id), "the question stays open");
         handle.abort();
+    }
+
+    // ----- auto mode: AskUserQuestion arrives as a PreToolUse (c-askq) -----
+
+    /// The recorded auto-mode PreToolUse payload (claude 2.1.277,
+    /// evidence askq-pretooluse-1), verbatim.
+    fn auto_pretooluse() -> serde_json::Value {
+        serde_json::from_str(include_str!("../fixtures/askuser/pretooluse-auto.json")).unwrap()
+    }
+
+    fn auto_posttooluse() -> serde_json::Value {
+        serde_json::from_str(include_str!("../fixtures/askuser/posttooluse-auto.json")).unwrap()
+    }
+
+    /// Same call as [`ask_user_question_request`] but on the PreToolUse event,
+    /// carrying the `tool_use_id` only that event has.
+    fn ask_user_question_pretooluse() -> serde_json::Value {
+        let mut payload = ask_user_question_request();
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert(
+                "tool_use_id".into(),
+                serde_json::json!("call_00000000000000000000000001"),
+            );
+            map.insert("permission_mode".into(), serde_json::json!("auto"));
+        }
+        payload
+    }
+
+    fn tea_answer() -> remuda_protocol::InteractionAnswer {
+        remuda_protocol::InteractionAnswer::Question(Box::new(remuda_protocol::QuestionAnswer {
+            answers: std::collections::BTreeMap::from([(
+                "q0".into(),
+                remuda_protocol::QuestionFieldAnswer {
+                    option_ids: vec!["Tea".into()],
+                    text: None,
+                },
+            )]),
+        }))
+    }
+
+    #[tokio::test]
+    async fn an_auto_mode_pretooluse_opens_a_question_card() {
+        // The owner's main path: auto permission mode, only a PreToolUse
+        // arrives for AskUserQuestion — before this fix it was journaled as a
+        // plain tool call and no card ever reached the phone.
+        let (bus, mut rx) = bus();
+        let handle =
+            tokio::spawn(
+                async move { bus.handle(envelope("PreToolUse", auto_pretooluse())).await },
+            );
+        let card = next_interaction(&mut rx).await;
+        assert_eq!(card.kind, remuda_protocol::InteractionKind::Question);
+        let remuda_protocol::InteractionRequest::Question(request) = &card.request else {
+            panic!("expected a question");
+        };
+        assert_eq!(request.fields.len(), 1);
+        assert_eq!(request.fields[0].title, "Tea or coffee?");
+        assert_eq!(request.fields[0].description.as_deref(), Some("Beverage"));
+        assert_eq!(request.fields[0].options.len(), 2);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_pretooluse_opens_nothing() {
+        // Only AskUserQuestion turns a PreToolUse into a blocker.
+        let (bus, mut rx) = bus();
+        bus.handle(envelope(
+            "PreToolUse",
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+        ))
+        .await;
+        for observation in std::iter::from_fn(|| rx.try_recv().ok()) {
+            assert!(
+                !matches!(
+                    observation.body,
+                    ObservationPayload::InteractionRequested(_)
+                ),
+                "an ordinary PreToolUse must not open a card"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_auto_mode_question_answer_reaches_the_hook_in_pretooluse_shape() {
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let delivery = Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            delivery
+                .deliver(envelope("PreToolUse", auto_pretooluse()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        assert_eq!(
+            bus.resolve_answer(&card.meta.id, &tea_answer()),
+            crate::Outcome::Answered
+        );
+        let reply = handle.await.expect("handler");
+        let json = reply.to_hook_json();
+        // PreToolUse vocabulary: permissionDecision + updatedInput at the
+        // hookSpecificOutput level — the PermissionRequest decision.behavior
+        // shape is deprecated and dropped on this event.
+        assert_eq!(json["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"],
+            serde_json::json!("allow")
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["updatedInput"]["answers"]["Tea or coffee?"],
+            serde_json::json!("Tea")
+        );
+        assert!(
+            json["hookSpecificOutput"].get("decision").is_none(),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_pretooluse_and_permission_request_open_one_card() {
+        // Measured on 2.1.277: a call whose first hook gives no opinion is
+        // raised again on the other event ~tens of ms later. Same call: one
+        // card, both hooks parked.
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let pre = Arc::clone(&bus);
+        let perm = Arc::clone(&bus);
+        let pre_handle = tokio::spawn(async move {
+            pre.deliver(envelope("PreToolUse", ask_user_question_pretooluse()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        let perm_handle = tokio::spawn(async move {
+            perm.deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        // Let the paired hook park.
+        while bus.pending().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        // Exactly one interaction card for the two hook events.
+        let mut cards = 0;
+        while let Ok(observation) = rx.try_recv() {
+            if matches!(
+                observation.body,
+                ObservationPayload::InteractionRequested(_)
+            ) {
+                cards += 1;
+            }
+        }
+        assert_eq!(cards, 0, "the second event must not emit another card");
+        assert_eq!(
+            bus.resolve_answer(
+                &card.meta.id,
+                &remuda_protocol::InteractionAnswer::Question(Box::new(
+                    remuda_protocol::QuestionAnswer {
+                        answers: std::collections::BTreeMap::from([
+                            (
+                                "q0".into(),
+                                remuda_protocol::QuestionFieldAnswer {
+                                    option_ids: vec!["回到 GravityDB".into()],
+                                    text: None,
+                                },
+                            ),
+                            (
+                                "q1".into(),
+                                remuda_protocol::QuestionFieldAnswer {
+                                    option_ids: vec!["保存端口".into(), "保存环境变量".into()],
+                                    text: None,
+                                },
+                            ),
+                        ]),
+                    },
+                )),
+            ),
+            crate::Outcome::Answered
+        );
+        let pre_reply = pre_handle.await.expect("handler").to_hook_json();
+        let perm_reply = perm_handle.await.expect("handler").to_hook_json();
+        // One decision, each serialized in its own event's vocabulary.
+        assert_eq!(
+            pre_reply["hookSpecificOutput"]["hookEventName"],
+            "PreToolUse"
+        );
+        assert_eq!(
+            pre_reply["hookSpecificOutput"]["permissionDecision"],
+            serde_json::json!("allow")
+        );
+        assert_eq!(
+            pre_reply["hookSpecificOutput"]["updatedInput"]["answers"]["下一步做什么？"],
+            serde_json::json!("回到 GravityDB")
+        );
+        assert_eq!(
+            perm_reply["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(
+            perm_reply["hookSpecificOutput"]["decision"]["behavior"],
+            serde_json::json!("allow")
+        );
+        assert_eq!(
+            perm_reply["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["下一步做什么？"],
+            serde_json::json!("回到 GravityDB")
+        );
+        // Both hooks done: the association is reaped.
+        assert_eq!(bus.pending().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn paired_events_in_the_other_order_also_open_one_card() {
+        // Do not rely on the measured ordering: a PermissionRequest could be
+        // the first hook observed.
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let perm = Arc::clone(&bus);
+        let pre = Arc::clone(&bus);
+        let perm_handle = tokio::spawn(async move {
+            perm.deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        let pre_handle = tokio::spawn(async move {
+            pre.deliver(envelope("PreToolUse", ask_user_question_pretooluse()))
+                .await
+        });
+        while bus.pending().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            bus.resolve_answer(&card.meta.id, &tea_answer_alt()),
+            crate::Outcome::Answered
+        );
+        assert_eq!(
+            perm_handle.await.expect("handler").to_hook_json()["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(
+            pre_handle.await.expect("handler").to_hook_json()["hookSpecificOutput"]["hookEventName"],
+            "PreToolUse"
+        );
+    }
+
+    fn tea_answer_alt() -> remuda_protocol::InteractionAnswer {
+        remuda_protocol::InteractionAnswer::Question(Box::new(remuda_protocol::QuestionAnswer {
+            answers: std::collections::BTreeMap::from([(
+                "q0".into(),
+                remuda_protocol::QuestionFieldAnswer {
+                    option_ids: vec!["继续排查".into()],
+                    text: None,
+                },
+            )]),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_terminal_answer_closes_the_auto_mode_card_and_both_hooks() {
+        // The human answers in the TUI while BOTH hooks are parked: the
+        // PostToolUse resolves the card terminal-sourced and retires both
+        // waits, so neither relay sits out its full deadline.
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let pre = Arc::clone(&bus);
+        let perm = Arc::clone(&bus);
+        let pre_handle = tokio::spawn(async move {
+            pre.deliver(envelope("PreToolUse", ask_user_question_pretooluse()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        let perm_handle = tokio::spawn(async move {
+            perm.deliver(envelope("PermissionRequest", ask_user_question_request()))
+                .await
+        });
+        while bus.pending().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        bus.handle(envelope("PostToolUse", post_tool_use_answers()))
+            .await;
+        for handle in [pre_handle, perm_handle] {
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+                .await
+                .expect("delivery unblocked")
+                .expect("task");
+            // Nobody answered through the hooks: fail closed on both.
+            assert!(
+                reply.to_hook_json().to_string().contains("deny"),
+                "{}",
+                reply.to_hook_json()
+            );
+        }
+        assert!(!bus.is_parked(&card.meta.id));
+    }
+
+    #[tokio::test]
+    async fn identical_questions_from_different_agents_open_two_cards() {
+        // The main session and a sub-agent may ask the same text concurrently;
+        // the fingerprint is scoped by agent_id so they never share one card.
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let main = Arc::clone(&bus);
+        let sub = Arc::clone(&bus);
+        let main_handle = tokio::spawn(async move {
+            main.deliver(envelope("PreToolUse", auto_pretooluse()))
+                .await
+        });
+        let first = next_interaction(&mut rx).await;
+        let mut sub_payload = auto_pretooluse();
+        sub_payload["agent_id"] = serde_json::json!("subagent-7");
+        let sub_handle =
+            tokio::spawn(async move { sub.deliver(envelope("PreToolUse", sub_payload)).await });
+        let second = next_interaction(&mut rx).await;
+        assert_ne!(first.meta.id, second.meta.id, "two agents, two cards");
+        assert_eq!(bus.pending().len(), 2);
+        for handle in [main_handle, sub_handle] {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_answer_on_a_lone_pretooluse_card_resolves_it() {
+        // The pure auto-mode sequence from the recorded fixture: PreToolUse
+        // only, then the human answers in the TUI.
+        let (bus, mut rx) = bus();
+        let bus = Arc::new(bus);
+        let delivery = Arc::clone(&bus);
+        let handle = tokio::spawn(async move {
+            delivery
+                .deliver(envelope("PreToolUse", auto_pretooluse()))
+                .await
+        });
+        let card = next_interaction(&mut rx).await;
+        bus.handle(envelope("PostToolUse", auto_posttooluse()))
+            .await;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("delivery unblocked")
+            .expect("task");
+        assert_eq!(
+            reply.to_hook_json()["hookSpecificOutput"]["permissionDecision"],
+            serde_json::json!("deny")
+        );
+        // The terminal resolution is journaled against the same card.
+        let mut resolved = false;
+        while let Ok(observation) = rx.try_recv() {
+            if let ObservationPayload::Lifecycle(payload) = &observation.body
+                && let remuda_protocol::LifecyclePayload::Entity(entity) = payload.as_ref()
+                && let remuda_protocol::LifecycleEntity::Interaction(interaction) =
+                    &entity.entity_value
+                && interaction.meta.id == card.meta.id
+            {
+                assert_eq!(
+                    entity.reason_code, "terminal-answered",
+                    "the phone card must show who answered"
+                );
+                resolved = true;
+            }
+        }
+        assert!(resolved, "a terminal resolution was journaled");
     }
 }

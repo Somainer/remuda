@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode, type RefObject } from "react";
 import { useFocusTrap } from "./useFocusTrap";
-import ui from "../styles/ui.module.css";
+import css from "./overlay.module.css";
 
 /**
  * The centered dialog, now on the shared overlay contract (UX plan §2).
@@ -52,12 +52,12 @@ export function Modal({
 
   if (!open) return null;
   return (
-    <div className={ui.modal} style={{ top: box.top, height: box.height }} onClick={onClose} role="presentation">
+    <div className={css.modalScrim} style={{ top: box.top, height: box.height }} onClick={onClose} role="presentation">
       <div
         {...aria}
         ref={containerRef}
         onKeyDown={onKeyDown}
-        className={ui.modalPanel}
+        className={css.modalPanel}
         onClick={(e) => e.stopPropagation()}
       >
         {children}

@@ -1,20 +1,22 @@
-/* Shared overlay surface (UX plan §2). Batches B/D/F style their contents, not
-   the scrim — the scrim and panel geometry live here so every overlay in the
-   workbench sits at the same depth and reads the same in both themes. */
+/* @tokens strict */
+/* Shared overlay surface (UX plan §2; visual-system.md §7.2). Callers style
+   their contents, not the scrim — scrim and panel geometry live here so every
+   overlay sits at the same depth. Overlays are the only shadowed layer:
+   popovers at level 2, sheets and dialogs at level 3. No backdrop-filter. */
 
 .scrim {
   position: fixed;
   inset: 0;
   z-index: 40;
-  background: var(--scrim);
   display: flex;
+  background: var(--scrim);
 }
 
 /* Desktop: anchored under the toolbar, near the trigger that opened it. */
 .scrim[data-variant="popover"] {
   align-items: flex-start;
   justify-content: flex-end;
-  padding: calc(var(--top) + 8px) 20px 20px;
+  padding: calc(var(--header-h) + var(--space-2)) 20px 20px;
 }
 
 /* Phone: rises from the bottom edge, clear of the home indicator. */
@@ -25,52 +27,72 @@
 }
 
 .panel {
-  background: var(--ink-2);
-  border: 1px solid var(--line);
-  color: var(--paper);
   display: flex;
   flex-direction: column;
   max-height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  color: var(--fg-body);
 }
 
 .panelPopover {
-  border-radius: var(--radius);
   width: min(420px, 100%);
-  padding: 14px 16px 16px;
-  gap: 12px;
+  gap: var(--space-3);
+  padding: 14px var(--space-4) var(--space-4);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-2);
 }
 
 .panelSheet {
-  border-radius: var(--radius) var(--radius) 0 0;
-  border-bottom: none;
+  position: relative;
   width: 100%;
   max-height: 80vh;
-  padding: 16px 16px calc(16px + var(--safe-bottom));
   gap: 14px;
+  padding: var(--space-5) var(--space-4) calc(var(--space-4) + var(--safe-bottom));
+  border-bottom: none;
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  box-shadow: var(--shadow-3);
 }
 
-/* The centered dialog keeps its own geometry; Modal.tsx still uses
-   ui.module.css for it, which batch F owns. These are here only so a caller
-   can reach the same tokens without editing that shared file. */
+/* 36×4 grab handle. */
+.panelSheet::before {
+  content: "";
+  position: absolute;
+  top: var(--space-2);
+  left: 50%;
+  width: 36px;
+  height: 4px;
+  margin-left: -18px;
+  border-radius: var(--radius-pill);
+  background: var(--border-control);
+}
+
+/* The centered dialog (components/Modal.tsx). */
 .modalScrim {
   position: fixed;
   inset: 0;
   z-index: 40;
-  background: var(--scrim);
   display: flex;
   align-items: flex-end;
   justify-content: center;
+  padding-bottom: var(--safe-bottom);
+  background: var(--scrim);
 }
 
 .modalPanel {
-  background: var(--ink-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   width: min(520px, calc(100% - 24px));
-  margin-bottom: calc(24px + var(--safe-bottom));
-  padding: 16px;
+  max-height: calc(100% - 48px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  margin-bottom: var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  color: var(--fg-body);
+  box-shadow: var(--shadow-3);
 }
 
 /* A header row most overlays want: title on the left, close on the right. */
@@ -81,41 +103,44 @@
 }
 
 .title {
-  font-size: 14px;
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
   font-weight: 600;
+  line-height: var(--lh-title);
 }
 
 .close {
+  position: relative;
+  min-height: var(--control-h-sm);
+  min-width: var(--control-h-sm);
   margin-left: auto;
-  height: 32px;
-  min-width: 32px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--mute);
-  font-size: 13px;
   padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
 }
 
 .close:hover {
-  color: var(--paper);
+  border-color: var(--border-control);
+  color: var(--fg-strong);
 }
 
-/* Phones get the project's 44px touch target (exploration §P1-3). `min-height`
-   rather than `height`: under border-box a fractional device-pixel border
-   rounds the painted box just under the target. */
-@media (max-width: 767px) {
+/* Coarse pointers get the 44px target. `min-height` rather than `height`:
+   under border-box a fractional device-pixel border rounds the painted box
+   just under the target. */
+@media (pointer: coarse) {
   .close {
-    height: auto;
-    min-height: 44px;
-    min-width: 44px;
+    min-height: var(--touch);
+    min-width: var(--touch);
   }
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .panelSheet {
-    animation: rise 140ms ease-out;
-  }
+.panelSheet,
+.modalPanel {
+  animation: rise var(--dur-2) var(--ease-out);
 }
 
 @keyframes rise {

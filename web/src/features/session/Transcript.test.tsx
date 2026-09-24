@@ -714,6 +714,69 @@ describe("D-041 fold vs in-transcript search hit", () => {
       .poll(() => screen.getByTestId("tool-card").getAttribute("data-folded"))
       .toBe("1");
   });
+
+  it("opens a nested settled subagent result that holds the only hit", async () => {
+    const user = userEvent.setup();
+    const executor = known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null });
+    const call = (seq: number, id: string, name: string, input: unknown, parent: string | null) =>
+      obs(seq, "tool_call", {
+        nodeId: `nc-${seq}` as Id,
+        revision: "1",
+        operation: "open",
+        baseRevision: null,
+        toolCallId: id as Id,
+        parentToolCallId: parent as Id | null,
+        toolName: known(name),
+        displayTitle: known(name),
+        category: name === "Bash" ? "shell" : "agent",
+        input: known(input),
+        inputTextDelta: null,
+        state: "running",
+        executor,
+      });
+    const result = (seq: number, id: string, text: string) =>
+      obs(seq, "tool_result", {
+        nodeId: `nr-${seq}` as Id,
+        revision: "1",
+        operation: "close",
+        baseRevision: null,
+        toolCallId: id as Id,
+        stage: "final",
+        outcome: "succeeded",
+        blocks: [{ type: "text", text }],
+        structuredResult: unknownKnowledge("text"),
+        exitCode: known(0),
+        changes: [],
+      });
+    const child = call(3, "tc-child", "Bash", { command: "ls" }, "tc-task");
+    const childResult = result(4, "tc-child", "quillon-nested-9921");
+    for (const event of [child, childResult]) {
+      (event.source as { nativeAgentId: unknown }).nativeAgentId = known("agent-sub");
+    }
+    renderRouted(
+      [
+        userMessage(1, "派个子任务"),
+        call(2, "tc-task", "Task", { description: "look around" }, null),
+        child,
+        childResult,
+        result(5, "tc-task", "sub done"),
+        assistantMessage(6, "好了"),
+      ],
+      "/s/ins_nested_hit",
+    );
+    expect(screen.getByTestId("subagent-fold-toggle").getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("quillon-nested-9921")).toBeNull();
+
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "quillon-nested-9921");
+
+    // The hit opens the subagent fold AND the settled card inside it.
+    await expect.poll(() => screen.queryByText("quillon-nested-9921")).not.toBeNull();
+    const nested = screen
+      .getByTestId("subagent-fold")
+      .querySelector("[data-testid='tool-card']") as HTMLElement;
+    expect(nested.getAttribute("data-folded")).toBe("0");
+  });
 });
 
 /** A user-role message the agent did not write: hook context injection. */

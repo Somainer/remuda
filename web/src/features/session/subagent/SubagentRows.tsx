@@ -99,6 +99,9 @@ export function SubagentFold({
                 completeness={node.completeness}
                 diffState={node.diffState}
                 foldSettled
+                // The searched row opens past its settled fold; the others keep
+                // whatever the reader chose (undefined = the card's own state).
+                expanded={openChildId === node.id ? true : undefined}
               />
             ),
           )}

@@ -6,7 +6,16 @@ export function AuthGate() {
   const location = useLocation();
   if (!hub.ready) {
     return (
-      <p style={{ padding: 24, color: "var(--mute)", background: "var(--ink)", minHeight: "100dvh" }} data-testid="auth-loading">
+      <p
+        style={{
+          margin: 0,
+          minHeight: "100dvh",
+          padding: "var(--space-5)",
+          background: "var(--bg-canvas)",
+          color: "var(--fg-muted)",
+        }}
+        data-testid="auth-loading"
+      >
         加载中…
       </p>
     );

@@ -52,11 +52,15 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
   }
 
   return (
-    <section className={ui.card} style={{ marginBottom: 16 }} data-testid="fleet-broadcast">
-      <strong>群发</strong>
-      <p className={ui.listMeta}>POST /v1/fleet/broadcast · 对筛选到的运行中 Instance 发送 prompt 或按键</p>
+    <section className={css.section} data-testid="fleet-broadcast">
+      <div className={css.sectionHead}>
+        <h2 className={css.sectionTitle}>群发</h2>
+        <p className={css.sectionSub}>
+          POST /v1/fleet/broadcast · 对筛选到的运行中 Instance 发送 prompt 或按键
+        </p>
+      </div>
 
-      <div className={ui.row} style={{ gap: 8, marginTop: 8 }}>
+      <div className={css.formRow}>
         <label className={ui.field}>
           主机
           <select
@@ -104,7 +108,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
       </div>
 
       {form.mode === "prompt" ? (
-        <label className={ui.field} style={{ marginTop: 8 }}>
+        <label className={ui.field}>
           <span className={ui.listMeta}>群发内容</span>
           <textarea
             className={ui.textarea}
@@ -116,7 +120,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
           />
         </label>
       ) : (
-        <label className={ui.field} style={{ marginTop: 8 }}>
+        <label className={ui.field}>
           <span className={ui.listMeta}>按键</span>
           <select
             className={ui.select}
@@ -134,20 +138,20 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
       )}
 
       {error ? (
-        <p data-testid="broadcast-error" style={{ color: "var(--dust)" }}>
+        <p data-testid="broadcast-error" className={css.error}>
           {error}
         </p>
       ) : null}
 
-      <div className={ui.row} style={{ marginTop: 8, justifyContent: "flex-end" }}>
+      <div className={css.actions}>
         <Button variant="primary" data-testid="broadcast-send" disabled={busy} onClick={submit}>
           {busy ? "发送中…" : "确认群发"}
         </Button>
       </div>
 
       {result ? (
-        <div style={{ marginTop: 8 }}>
-          <p className={ui.listMeta} data-testid="broadcast-summary">
+        <div className={css.resultBlock}>
+          <p className={css.sectionSub} data-testid="broadcast-summary">
             {summarize(result)}
           </p>
           <ul className={css.members} data-testid="broadcast-results">
@@ -158,10 +162,12 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
                 data-testid="broadcast-result"
                 data-ok={String(entry.ok ?? false)}
               >
-                <span className={ui.listMeta}>{entry.ok ? "✓" : "×"}</span>
-                <span>
+                <span className={`${css.mark} ${entry.ok ? css.markOk : css.markFail}`}>
+                  {entry.ok ? "成功" : "失败"}
+                </span>
+                <span className={css.memberBody}>
                   {entry.instanceId}
-                  <div className={ui.listMeta}>
+                  <div className={css.memberMeta}>
                     {entry.kind} · {entry.hostId}
                     {entry.replayed ? " · 重放" : ""}
                     {entry.error ? ` · ${entry.error}` : entry.state ? ` · ${entry.state}` : ""}

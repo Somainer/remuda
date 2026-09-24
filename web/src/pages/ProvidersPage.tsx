@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { Button } from "../components/Button";
 import { Modal } from "../components/Modal";
+import { PageHeader } from "../components/PageHeader";
 import {
   DELEGATION_COPY,
   NATIVE_PROFILE,
@@ -21,6 +22,7 @@ import {
   type ProviderTestResult,
 } from "../features/providers";
 import { ProviderForm } from "../features/providers/ProviderForm";
+import ui from "../styles/ui.module.css";
 import css from "../features/providers/providers.module.css";
 import { api } from "../lib/api";
 import type { Host } from "../types/instance";
@@ -79,81 +81,85 @@ export function ProvidersPage() {
 
   return (
     <div className={css.page} data-testid="providers-page">
-      <header className={css.head}>
-        <h1 className={css.title}>Provider</h1>
-        <div className={css.sub}>自己的 Anthropic-Messages 网关，不再手写 overlay</div>
-        <div style={{ flex: 1 }} />
-        <Button variant="primary" data-testid="provider-add" onClick={() => setCreating(true)}>
-          添加网关
-        </Button>
-      </header>
+      <PageHeader
+        title="Provider"
+        actions={
+          <Button variant="primary" data-testid="provider-add" onClick={() => setCreating(true)}>
+            添加网关
+          </Button>
+        }
+      />
       <div className={css.body}>
-        {error ? <p className={css.error}>{error}</p> : null}
-        {live.map((p) => (
-          <Link
-            key={p.profileId}
-            to={`/providers/${p.profileId}`}
-            className={css.card}
-            data-testid="provider-row"
-            data-delegation={p.delegation}
-            data-available={p.available ? "1" : "0"}
-            data-default={p.defaultGateway ? "1" : "0"}
-          >
-            <div className={css.cardHead}>
-              {healthDot(p.health?.ok ?? true)}
-              <span className={css.id}>{p.name || p.profileId}</span>
-              {p.defaultGateway ? <span className={css.badge}>默认网关</span> : null}
-              {p.scope?.startsWith("host:") ? <span className={css.badge}>host</span> : null}
-              <span className={css.proto}>{p.protocol}</span>
-            </div>
-            <div className={css.grid}>
-              <div className={css.label}>baseUrl</div>
-              <div className={css.value}>{p.baseUrl ?? "—"}</div>
-              <div className={css.label}>健康</div>
-              <div className={css.value}>{healthLine(p.health)}</div>
-              <div className={css.label}>secret</div>
-              <div className={css.value}>{formatSecret(p.secret)} · last4</div>
-              {p.kind === "gateway" ? (
-                <>
-                  <div className={css.label}>交付方式</div>
-                  <div
-                    className={css.value}
-                    data-testid="provider-delivery"
-                    data-via={p.delivery?.mode === "via" ? "1" : "0"}
-                    data-offline={
-                      p.delivery?.mode === "via" && deliveryHostOffline(p.delivery, hosts)
-                        ? "1"
-                        : "0"
-                    }
-                  >
-                    {deliveryClause(p.delivery, hosts)}
-                  </div>
-                </>
-              ) : null}
-            </div>
-            <div className={css.blurb}>{DELEGATION_COPY[p.delegation].hint}</div>
-          </Link>
-        ))}
-        {direct ? (
-          <Link
-            to={`/providers/${direct.profileId}`}
-            className={direct.available ? css.card : css.dashed}
-            data-testid="provider-row"
-            data-delegation="direct"
-            data-available={direct.available ? "1" : "0"}
-          >
-            <div className={css.dashTitle}>Direct {direct.available ? direct.name : "多 key / 权重 / 冷却"}</div>
-            <div className={css.dashBody}>
-              {direct.available ? formatSecret(direct.secret) : "标记 v2，本规格不实现 —— 位置留着，避免以后另起一页"}
-            </div>
-          </Link>
-        ) : (
-          <div className={css.dashed} data-testid="provider-row" data-delegation="direct" data-available="0">
-            <div className={css.dashTitle}>Direct 多 key / 权重 / 冷却</div>
-            <div className={css.dashBody}>标记 v2，本规格不实现 —— 位置留着，避免以后另起一页</div>
+        <div className={css.inner}>
+          <p className={css.sub}>自己的 Anthropic-Messages 网关，不再手写 overlay</p>
+          {error ? <p className={css.error}>{error}</p> : null}
+          <div className={css.list}>
+            {live.map((p) => (
+              <Link
+                key={p.profileId}
+                to={`/providers/${p.profileId}`}
+                className={css.card}
+                data-testid="provider-row"
+                data-delegation={p.delegation}
+                data-available={p.available ? "1" : "0"}
+                data-default={p.defaultGateway ? "1" : "0"}
+              >
+                <div className={css.cardHead}>
+                  {healthDot(p.health?.ok ?? true)}
+                  <span className={css.id}>{p.name || p.profileId}</span>
+                  {p.defaultGateway ? <span className={ui.chip}>默认网关</span> : null}
+                  {p.scope?.startsWith("host:") ? <span className={ui.chip}>host</span> : null}
+                  <span className={css.proto}>{p.protocol}</span>
+                </div>
+                <dl className={css.grid}>
+                  <dt className={css.label}>baseUrl</dt>
+                  <dd>{p.baseUrl ?? "—"}</dd>
+                  <dt className={css.label}>健康</dt>
+                  <dd>{healthLine(p.health)}</dd>
+                  <dt className={css.label}>secret</dt>
+                  <dd>{formatSecret(p.secret)} · last4</dd>
+                  {p.kind === "gateway" ? (
+                    <>
+                      <dt className={css.label}>交付方式</dt>
+                      <dd
+                        data-testid="provider-delivery"
+                        data-via={p.delivery?.mode === "via" ? "1" : "0"}
+                        data-offline={
+                          p.delivery?.mode === "via" && deliveryHostOffline(p.delivery, hosts)
+                            ? "1"
+                            : "0"
+                        }
+                      >
+                        {deliveryClause(p.delivery, hosts)}
+                      </dd>
+                    </>
+                  ) : null}
+                </dl>
+                <div className={css.blurb}>{DELEGATION_COPY[p.delegation].hint}</div>
+              </Link>
+            ))}
+            {direct ? (
+              <Link
+                to={`/providers/${direct.profileId}`}
+                className={direct.available ? css.card : css.dashed}
+                data-testid="provider-row"
+                data-delegation="direct"
+                data-available={direct.available ? "1" : "0"}
+              >
+                <div className={css.dashTitle}>Direct {direct.available ? direct.name : "多 key / 权重 / 冷却"}</div>
+                <div className={css.dashBody}>
+                  {direct.available ? formatSecret(direct.secret) : "标记 v2，本规格不实现 —— 位置留着，避免以后另起一页"}
+                </div>
+              </Link>
+            ) : (
+              <div className={css.dashed} data-testid="provider-row" data-delegation="direct" data-available="0">
+                <div className={css.dashTitle}>Direct 多 key / 权重 / 冷却</div>
+                <div className={css.dashBody}>标记 v2，本规格不实现 —— 位置留着，避免以后另起一页</div>
+              </div>
+            )}
           </div>
-        )}
-        <div className={css.foot}>健康红点不自动切换会话中的 key；只提示「新会话将避开不健康 profile」。</div>
+          <p className={css.foot}>健康红点不自动切换会话中的 key；只提示「新会话将避开不健康 profile」。</p>
+        </div>
       </div>
       <Modal
         open={creating}
@@ -161,7 +167,7 @@ export function ProvidersPage() {
           if (!busy) setCreating(false);
         }}
       >
-        <h2 style={{ marginTop: 0, fontSize: 16 }}>添加网关</h2>
+        <h2 className={css.modalTitle}>添加网关</h2>
         <ProviderForm
           busy={busy}
           error={formError}
@@ -225,7 +231,13 @@ export function ProviderDetailPage() {
     };
   }, [profileId]);
 
-  if (!p) return <p style={{ padding: 16 }}>未知 profile</p>;
+  if (!p) {
+    return (
+      <div className={css.page} data-testid="provider-detail">
+        <PageHeader crumbs={[{ label: "Provider", to: "/providers" }]} title="未知 profile" />
+      </div>
+    );
+  }
   const copy = DELEGATION_COPY[p.delegation];
   const editable = p.kind !== "native";
 
@@ -260,180 +272,173 @@ export function ProviderDetailPage() {
 
   return (
     <div className={css.page} data-testid="provider-detail" data-delegation={p.delegation}>
-      <header className={css.head}>
-        <Link to="/providers" className={css.back}>
-          ←
-        </Link>
-        <h1 className={css.title}>{p.name || p.profileId}</h1>
-        <div className={css.sub}>{copy.title}</div>
-      </header>
+      <PageHeader crumbs={[{ label: "Provider", to: "/providers" }]} title={p.name || p.profileId} />
       <div className={css.body}>
-        <div className={p.available ? css.card : css.dashed}>
-          <div className={css.cardHead}>
-            {healthDot(p.health?.ok ?? p.available)}
-            <span className={css.id}>{p.profileId}</span>
-            {p.defaultGateway ? <span className={css.badge}>默认网关</span> : null}
-            <span className={css.proto}>{p.protocol}</span>
-          </div>
-          <div className={css.grid}>
-            <div className={css.label}>baseUrl</div>
-            <div className={css.value}>{p.baseUrl ?? "—"}</div>
-            <div className={css.label}>scope</div>
-            <div className={css.value}>{p.scope || "universal"}</div>
-            <div className={css.label}>健康</div>
-            <div className={css.value} data-testid="provider-health">
-              {healthLine(p.health)}
-              {p.health?.checkedAt ? ` · ${p.health.checkedAt}` : ""}
+        <div className={css.inner}>
+          <p className={css.sub}>{copy.title}</p>
+          <div className={css.cardPanel}>
+            <div className={css.cardHead}>
+              {healthDot(p.health?.ok ?? p.available)}
+              <span className={css.id}>{p.profileId}</span>
+              {p.defaultGateway ? <span className={ui.chip}>默认网关</span> : null}
+              <span className={css.proto}>{p.protocol}</span>
             </div>
-            <div className={css.label}>secret</div>
-            <div className={css.value} data-testid="provider-secret">
-              {formatSecret(p.secret)} last4
-            </div>
-            <div className={css.label}>models</div>
-            <div className={css.value} data-testid="provider-model-summary">
-              {p.models.length
-                ? `${enabledModels(p.models).length}/${p.models.length} 已启用`
-                : "由 CLI 原生目录决定"}
-            </div>
-            <div className={css.label}>默认模型</div>
-            <div className={css.value} data-testid="provider-default-model">
-              {p.defaultModel ?? "—"}
-            </div>
-            {p.kind === "gateway" ? (
-              <>
-                <div className={css.label}>交付方式</div>
-                <div
-                  className={css.value}
-                  data-testid="provider-delivery"
-                  data-via={p.delivery?.mode === "via" ? "1" : "0"}
-                  data-offline={
-                    p.delivery?.mode === "via" && deliveryHostOffline(p.delivery, hosts)
-                      ? "1"
-                      : "0"
-                  }
-                >
-                  {deliveryClause(p.delivery, hosts)}
-                </div>
-              </>
-            ) : null}
-            <div className={css.label}>lastError</div>
-            <div className={css.value}>{p.lastError ?? "—"}</div>
-          </div>
-          <div className={css.blurb}>{copy.hint}</div>
-        </div>
-        {p.models.length ? (
-          <div>
-            <div className={css.sectionLabel}>模型名原样透传</div>
-            <div className={css.models}>
-              {p.models.map((m) => {
-                const context = contextChip(m.contextWindow);
-                return (
-                  <span
-                    key={m.id}
-                    className={css.chip}
-                    data-testid="provider-model-chip"
-                    data-enabled={m.enabled ? "1" : "0"}
-                    style={m.enabled ? undefined : { opacity: 0.5 }}
+            <dl className={css.grid}>
+              <dt className={css.label}>baseUrl</dt>
+              <dd>{p.baseUrl ?? "—"}</dd>
+              <dt className={css.label}>scope</dt>
+              <dd>{p.scope || "universal"}</dd>
+              <dt className={css.label}>健康</dt>
+              <dd data-testid="provider-health">
+                {healthLine(p.health)}
+                {p.health?.checkedAt ? ` · ${p.health.checkedAt}` : ""}
+              </dd>
+              <dt className={css.label}>secret</dt>
+              <dd data-testid="provider-secret">
+                {formatSecret(p.secret)} last4
+              </dd>
+              <dt className={css.label}>models</dt>
+              <dd data-testid="provider-model-summary">
+                {p.models.length
+                  ? `${enabledModels(p.models).length}/${p.models.length} 已启用`
+                  : "由 CLI 原生目录决定"}
+              </dd>
+              <dt className={css.label}>默认模型</dt>
+              <dd data-testid="provider-default-model">
+                {p.defaultModel ?? "—"}
+              </dd>
+              {p.kind === "gateway" ? (
+                <>
+                  <dt className={css.label}>交付方式</dt>
+                  <dd
+                    data-testid="provider-delivery"
+                    data-via={p.delivery?.mode === "via" ? "1" : "0"}
+                    data-offline={
+                      p.delivery?.mode === "via" && deliveryHostOffline(p.delivery, hosts) ? "1" : "0"
+                    }
                   >
-                    {m.id}
-                    {context ? ` · ${context}` : ""}
-                    {m.id === p.defaultModel ? " · 默认" : ""}
-                  </span>
-                );
-              })}
+                    {deliveryClause(p.delivery, hosts)}
+                  </dd>
+                </>
+              ) : null}
+              <dt className={css.label}>lastError</dt>
+              <dd>{p.lastError ?? "—"}</dd>
+            </dl>
+            <div className={css.blurb}>{copy.hint}</div>
+          </div>
+          {p.models.length ? (
+            <section>
+              <h2 className={css.sectionLabel}>模型名原样透传</h2>
+              <div className={css.models}>
+                {p.models.map((m) => {
+                  const context = contextChip(m.contextWindow);
+                  return (
+                    <span
+                      key={m.id}
+                      className={css.chip}
+                      data-testid="provider-model-chip"
+                      data-enabled={m.enabled ? "1" : "0"}
+                    >
+                      {m.id}
+                      {context ? ` · ${context}` : ""}
+                      {m.id === p.defaultModel ? " · 默认" : ""}
+                    </span>
+                  );
+                })}
+              </div>
+            </section>
+          ) : null}
+          {editable ? (
+            <div className={css.actions}>
+              <Button
+                data-testid="provider-test"
+                disabled={busy}
+                onClick={() => {
+                  setBusy(true);
+                  setTest(null);
+                  void api
+                    .providerTest(p.id)
+                    .then((result) => {
+                      setTest(result);
+                      setP((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              health: {
+                                ok: result.ok,
+                                status: result.status,
+                                latencyMs: result.latencyMs,
+                                message: result.message,
+                              },
+                              lastError: result.ok ? null : result.message,
+                            }
+                          : prev,
+                      );
+                    })
+                    .catch((err: unknown) =>
+                      setTest({
+                        ok: false,
+                        reachable: false,
+                        message: err instanceof Error ? err.message : "test failed",
+                      }),
+                    )
+                    .finally(() => setBusy(false));
+                }}
+              >
+                测试连通
+              </Button>
+              <Button data-testid="provider-edit" onClick={() => setEditing(true)}>
+                编辑
+              </Button>
+              <Button data-testid="provider-rotate" onClick={() => setRotating(true)}>
+                轮换 token
+              </Button>
+              <Button
+                data-testid="provider-set-default"
+                disabled={busy || p.kind !== "gateway" || p.defaultGateway}
+                onClick={() => {
+                  setBusy(true);
+                  void api
+                    .providerPatch(p.id, { defaultGateway: true })
+                    .then((row) => setP(fromHub(row)))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                设为默认网关
+              </Button>
+              <Button
+                variant="danger"
+                data-testid="provider-delete"
+                disabled={busy}
+                onClick={() => {
+                  if (!window.confirm(`删除 ${p.name}？`)) return;
+                  setBusy(true);
+                  void api
+                    .providerDelete(p.id)
+                    .then(() => navigate("/providers"))
+                    .finally(() => setBusy(false));
+                }}
+              >
+                删除
+              </Button>
             </div>
-          </div>
-        ) : null}
-        {editable ? (
-          <div className={css.actions}>
-            <Button
-              data-testid="provider-test"
-              disabled={busy}
-              onClick={() => {
-                setBusy(true);
-                setTest(null);
-                void api
-                  .providerTest(p.id)
-                  .then((result) => {
-                    setTest(result);
-                    setP((prev) =>
-                      prev
-                        ? {
-                            ...prev,
-                            health: {
-                              ok: result.ok,
-                              status: result.status,
-                              latencyMs: result.latencyMs,
-                              message: result.message,
-                            },
-                            lastError: result.ok ? null : result.message,
-                          }
-                        : prev,
-                    );
-                  })
-                  .catch((err: unknown) =>
-                    setTest({
-                      ok: false,
-                      reachable: false,
-                      message: err instanceof Error ? err.message : "test failed",
-                    }),
-                  )
-                  .finally(() => setBusy(false));
-              }}
-            >
-              测试连通
-            </Button>
-            <Button data-testid="provider-edit" onClick={() => setEditing(true)}>
-              编辑
-            </Button>
-            <Button data-testid="provider-rotate" onClick={() => setRotating(true)}>
-              轮换 token
-            </Button>
-            <Button
-              data-testid="provider-set-default"
-              disabled={busy || p.kind !== "gateway" || p.defaultGateway}
-              onClick={() => {
-                setBusy(true);
-                void api
-                  .providerPatch(p.id, { defaultGateway: true })
-                  .then((row) => setP(fromHub(row)))
-                  .finally(() => setBusy(false));
-              }}
-            >
-              设为默认网关
-            </Button>
-            <Button
-              variant="danger"
-              data-testid="provider-delete"
-              disabled={busy}
-              onClick={() => {
-                if (!window.confirm(`删除 ${p.name}？`)) return;
-                setBusy(true);
-                void api
-                  .providerDelete(p.id)
-                  .then(() => navigate("/providers"))
-                  .finally(() => setBusy(false));
-              }}
-            >
-              删除
-            </Button>
-          </div>
-        ) : null}
-        {test ? (
-          <p className={css.foot} data-testid="provider-test-result" data-ok={test.ok ? "1" : "0"}>
-            {test.message}
-          </p>
-        ) : null}
-        {shouldAvoidUnhealthy(p) ? (
-          <p className={css.foot} style={{ color: "var(--dust)" }} data-testid="provider-unhealthy-hint">
-            新会话将避开不健康 profile
-          </p>
-        ) : (
-          <div className={css.foot}>健康红点不自动切换会话中的 key；只提示「新会话将避开不健康 profile」。</div>
-        )}
+          ) : null}
+          {test ? (
+            <p className={css.foot} data-testid="provider-test-result" data-ok={test.ok ? "1" : "0"}>
+              {test.message}
+            </p>
+          ) : null}
+          {shouldAvoidUnhealthy(p) ? (
+            <p className={`${css.foot} ${css.footWarn}`} data-testid="provider-unhealthy-hint">
+              新会话将避开不健康 profile
+            </p>
+          ) : (
+            <p className={css.foot}>健康红点不自动切换会话中的 key；只提示「新会话将避开不健康 profile」。</p>
+          )}
+        </div>
       </div>
       <Modal open={editing} onClose={() => !busy && setEditing(false)}>
-        <h2 style={{ marginTop: 0, fontSize: 16 }}>编辑 {p.name}</h2>
+        <h2 className={css.modalTitle}>编辑 {p.name}</h2>
         <ProviderForm
           initial={p}
           busy={busy}
@@ -445,7 +450,7 @@ export function ProviderDetailPage() {
         />
       </Modal>
       <Modal open={rotating} onClose={() => !busy && setRotating(false)}>
-        <h2 style={{ marginTop: 0, fontSize: 16 }}>轮换 token</h2>
+        <h2 className={css.modalTitle}>轮换 token</h2>
         <ProviderForm
           initial={p}
           rotateOnly

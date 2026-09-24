@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { useHub } from "../lib/store";
 import { rest } from "../lib/api";
+import { PageHeader } from "../components/PageHeader";
 import ui from "../styles/ui.module.css";
 import {
   ProjectSwitcher,
@@ -20,6 +21,33 @@ import {
  * and the file view). The top switcher scopes the task list and the board by
  * projectId, with 全局 showing every project in scope.
  */
+
+/**
+ * The §4.10 surface list. Projects has no module stylesheet in this batch, so
+ * the one-list wrapper is an inline layout value speaking in role tokens —
+ * never a font size or a raw colour.
+ */
+const SURFACE_LIST: CSSProperties = {
+  overflow: "hidden",
+  border: "1px solid var(--border)",
+  borderRadius: "var(--radius-md)",
+  background: "var(--bg-surface)",
+};
+
+const BODY: CSSProperties = {
+  flex: "1 1 auto",
+  minHeight: 0,
+  overflow: "auto",
+  padding: "var(--space-5) var(--gutter) 40px",
+};
+
+const INNER: CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: "var(--space-5)",
+  maxWidth: 880,
+};
+
 export function ProjectsPage() {
   const hub = useHub();
   const navigate = useNavigate();
@@ -41,53 +69,51 @@ export function ProjectsPage() {
   }
 
   return (
-    <div style={{ padding: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "flex-end",
-          justifyContent: "space-between",
-          gap: 12,
-          flexWrap: "wrap",
-        }}
-      >
-        <h1 style={{ fontSize: 18 }}>项目</h1>
-        <ProjectSwitcher projects={projects} navigateOnSelect />
+    <div style={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }} data-testid="projects-page">
+      <PageHeader
+        title="项目"
+        actions={<ProjectSwitcher projects={projects} navigateOnSelect />}
+      />
+      <div style={BODY}>
+        <div style={INNER}>
+          <p className={ui.listMeta}>
+            Hub Project 实体 · 成员经 (host, workspace) 映射到 Space，不合并同名或跨主机目录
+          </p>
+          {loading ? <p className={ui.listMeta}>加载中…</p> : null}
+          {error ? (
+            <p className={ui.listMeta}>
+              项目加载失败：{error} <button type="button" onClick={reload}>重试</button>
+            </p>
+          ) : null}
+          {!loading && !error && visible.length === 0 ? (
+            <p className={ui.listMeta}>{selected ? "所选项目不在当前范围内。" : "范围内还没有项目。"}</p>
+          ) : null}
+          <div style={SURFACE_LIST}>
+            {visible.map((project) => {
+              const hosts = projectMemberHostIds(project);
+              return (
+                <Link
+                  key={project.id}
+                  to={`/projects/${project.id}`}
+                  className={ui.listItem}
+                  data-testid="project-row"
+                  onClick={() => openProject(project.id)}
+                >
+                  <span>
+                    <div>{project.name}</div>
+                    <div className={ui.listMeta}>
+                      {project.members?.length ?? 0} 个成员 · {hosts.length} 台主机 · 基线 {project.defaultBaseBranch ?? "main"}
+                    </div>
+                    <div className={ui.listMeta}>
+                      {hosts.map((hostId) => hostLabel(hostId)).join(" · ") || "尚无成员工作区"}
+                    </div>
+                  </span>
+                </Link>
+              );
+            })}
+          </div>
+        </div>
       </div>
-      <p className={ui.listMeta}>
-        Hub Project 实体 · 成员经 (host, workspace) 映射到 Space，不合并同名/跨主机目录（D-024）
-      </p>
-      {loading ? <p className={ui.listMeta}>加载中…</p> : null}
-      {error ? (
-        <p className={ui.listMeta}>
-          项目加载失败：{error} <button type="button" onClick={reload}>重试</button>
-        </p>
-      ) : null}
-      {!loading && !error && visible.length === 0 ? (
-        <p className={ui.listMeta}>{selected ? "所选项目不在当前范围内。" : "范围内还没有项目。"}</p>
-      ) : null}
-      {visible.map((project) => {
-        const hosts = projectMemberHostIds(project);
-        return (
-          <Link
-            key={project.id}
-            to={`/projects/${project.id}`}
-            className={ui.listItem}
-            data-testid="project-row"
-            onClick={() => openProject(project.id)}
-          >
-            <span>
-              <div>{project.name}</div>
-              <div className={ui.listMeta}>
-                {project.members?.length ?? 0} 个成员 · {hosts.length} 台主机 · 基线 {project.defaultBaseBranch ?? "main"}
-              </div>
-              <div className={ui.listMeta}>
-                {hosts.map((hostId) => hostLabel(hostId)).join(" · ") || "尚无成员工作区"}
-              </div>
-            </span>
-          </Link>
-        );
-      })}
     </div>
   );
 }
@@ -132,18 +158,23 @@ export function ProjectDetailPage() {
 
   if (status === "loading") {
     return (
-      <div style={{ padding: 16 }}>
-        <p className={ui.listMeta}>加载中…</p>
+      <div style={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}>
+        <PageHeader crumbs={[{ label: "项目", to: "/projects" }]} title="项目" />
+        <div style={BODY}>
+          <p className={ui.listMeta}>加载中…</p>
+        </div>
       </div>
     );
   }
   if (status === "missing" || !project) {
     return (
-      <div style={{ padding: 16 }}>
-        <h1 style={{ fontSize: 18 }}>项目不存在</h1>
-        <p className={ui.listMeta}>
-          <Link to="/projects">返回项目列表</Link>
-        </p>
+      <div style={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}>
+        <PageHeader crumbs={[{ label: "项目", to: "/projects" }]} title="项目不存在" />
+        <div style={BODY}>
+          <p className={ui.listMeta}>
+            <Link to="/projects">返回项目列表</Link>
+          </p>
+        </div>
       </div>
     );
   }
@@ -153,43 +184,42 @@ export function ProjectDetailPage() {
     hub.hosts.find((host) => host.id === hostId)?.label ?? hostId;
 
   return (
-    <div style={{ padding: 16 }}>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "flex-end",
-          justifyContent: "space-between",
-          gap: 12,
-          flexWrap: "wrap",
-        }}
-      >
-        <div>
-          <h1 style={{ fontSize: 18 }}>{project.name}</h1>
-          <p className={ui.listMeta}>
-            <Link to="/projects">项目</Link> · {project.id}
+    <div style={{ flex: "1 1 auto", minHeight: 0, display: "flex", flexDirection: "column" }}>
+      <PageHeader
+        crumbs={[{ label: "项目", to: "/projects" }]}
+        title={project.name}
+        actions={<ProjectSwitcher projects={[project]} navigateOnSelect />}
+      />
+      <div style={BODY}>
+        <div style={INNER}>
+          <p className={ui.path}>
+            基线 {project.defaultBaseBranch ?? "main"} · 分支 {project.branchPattern ?? "wt/{worker}/{topic}"}
+            {project.repoRemote ? ` · ${project.repoRemote}` : ""}
+            {project.gate?.command ? ` · gate ${project.gate.command}` : ""}
           </p>
+          <section>
+            <h2 className={ui.groupTitle} style={{ padding: 0, margin: "0 0 var(--space-3)" }}>
+              成员工作区（Space 键不合并）
+            </h2>
+            {rows.length === 0 ? <p className={ui.listMeta}>尚无成员工作区。</p> : (
+              <div style={SURFACE_LIST}>
+                {rows.map((row) => (
+                  <div key={row.key} className={ui.listItem} data-testid="project-member-row" data-space-key={row.key}>
+                    <span>
+                      <div>
+                        {hostLabel(row.member.hostId)} · {row.workspace?.label ?? row.member.workspaceId}
+                      </div>
+                      <div className={ui.listMeta}>
+                        {row.workspace ? row.workspace.rootPath : "工作区尚未注册"} · {row.member.role ?? "member"}
+                      </div>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </div>
-        <ProjectSwitcher projects={[project]} navigateOnSelect />
       </div>
-      <p className={ui.path}>
-        基线 {project.defaultBaseBranch ?? "main"} · 分支 {project.branchPattern ?? "wt/{worker}/{topic}"}
-        {project.repoRemote ? ` · ${project.repoRemote}` : ""}
-        {project.gate?.command ? ` · gate ${project.gate.command}` : ""}
-      </p>
-      <h2 style={{ fontSize: 14, marginTop: 12 }}>成员工作区（Space 键不合并，D-024）</h2>
-      {rows.length === 0 ? <p className={ui.listMeta}>尚无成员工作区。</p> : null}
-      {rows.map((row) => (
-        <div key={row.key} className={ui.listItem} data-testid="project-member-row" data-space-key={row.key}>
-          <span>
-            <div>
-              {hostLabel(row.member.hostId)} · {row.workspace?.label ?? row.member.workspaceId}
-            </div>
-            <div className={ui.listMeta}>
-              {row.workspace ? row.workspace.rootPath : "工作区尚未注册"} · {row.member.role ?? "member"}
-            </div>
-          </span>
-        </div>
-      ))}
     </div>
   );
 }

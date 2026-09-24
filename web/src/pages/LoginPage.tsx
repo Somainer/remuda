@@ -113,7 +113,7 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
         }}
       >
         <header className={css.head}>
-          <h1 className={css.title}>runtime</h1>
+          <h1 className={css.title}>Remuda</h1>
           <p className={css.hint}>
             {tab === "pair" ? "手机用配对码加入已登录的设备。" : "用 Passkey 直接登录，或首次用访问码进入。"}
           </p>
@@ -166,10 +166,12 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
             </button>
           ) : (
             <section className={css.codes} data-testid="login-codes">
-              <div className={css.tabs}>
+              <div className={css.tabs} role="tablist" aria-label="登录方式">
                 <button
                   type="button"
-                  className={`${css.tab} ${tab === "bootstrap" ? css.tabOn : ""}`}
+                  role="tab"
+                  className={css.tab}
+                  aria-selected={tab === "bootstrap"}
                   data-testid="login-tab-bootstrap"
                   onClick={() => setTab("bootstrap")}
                 >
@@ -177,7 +179,9 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
                 </button>
                 <button
                   type="button"
-                  className={`${css.tab} ${tab === "pair" ? css.tabOn : ""}`}
+                  role="tab"
+                  className={css.tab}
+                  aria-selected={tab === "pair"}
                   data-testid="login-tab-pair"
                   onClick={() => setTab("pair")}
                 >

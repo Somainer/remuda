@@ -1,14 +1,163 @@
+/* @tokens strict */
+/* /fleet (UO-13, ui-overhaul §4.10): surfaces and list rows. Broadcast and
+   fleet creation are each one surface card; fleet members and broadcast
+   results are plain divider rows. Role tokens only. */
+
+.page {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-canvas);
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-5) var(--gutter) 40px;
+}
+
+.inner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  max-width: 880px;
+}
+
+.intro {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.sectionHead {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sectionTitle {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
+}
+
+.sectionSub {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.formRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.formRow > * {
+  flex: 1 1 160px;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.error {
+  margin: 0;
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.resultBlock {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+/* Fleet groups and broadcast results share the row language. */
+.groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.groupHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.groupTitle {
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
+}
+
 .members {
-  list-style: none;
-  margin: 8px 0 0;
+  margin: 0;
   padding: 0;
+  list-style: none;
 }
 
 .member {
   display: flex;
-  gap: 8px;
   align-items: flex-start;
-  padding: 8px 0;
-  border-top: 1px solid var(--line);
+  gap: var(--space-2);
   min-height: 44px;
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--divider);
+}
+
+.member:first-child {
+  border-top: 0;
+}
+
+.memberBody {
+  flex: 1;
+  min-width: 0;
+}
+
+.memberMeta {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+/* Result word marks: the × glyph is reserved for closing tabs, so outcomes
+   read as text with a role colour (visual-system.md §2/§8.6). */
+.mark {
+  flex: none;
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.markOk {
+  color: var(--success-fg);
+}
+
+.markFail {
+  color: var(--danger-fg);
 }

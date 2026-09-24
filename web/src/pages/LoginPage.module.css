@@ -1,115 +1,123 @@
+/* @tokens strict */
+/* /login and /pair (UO-13, visual-system.md §5.2): a centered 400px surface
+   card on the canvas. The title uses --text-page. Inputs follow pointer:
+   coarse for hit height and 16px type, fine for 32/14. Role tokens only. */
+
 .page {
   min-height: 100dvh;
   display: grid;
   place-items: center;
-  padding: 24px 16px;
-  background: var(--canvas, var(--ink));
-  color: var(--paper);
+  padding: var(--space-5) var(--space-4);
+  background: var(--bg-canvas);
+  color: var(--fg-body);
 }
 
 .card {
-  width: min(420px, 100%);
-  background: var(--ink);
-  border: 1px solid var(--line);
-  border-radius: 4px;
   display: flex;
   flex-direction: column;
+  width: min(400px, 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
 }
 
 .head {
-  padding: 16px 18px;
-  border-bottom: 1px solid var(--line);
+  padding: var(--space-4) var(--space-4) var(--space-3);
 }
 
 .title {
   margin: 0;
-  font-size: var(--text-xl);
+  color: var(--fg-strong);
+  font-size: var(--text-page);
   font-weight: 600;
+  line-height: var(--lh-page);
 }
 
 .hint {
-  margin: 6px 0 0;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-  line-height: 1.5;
+  margin: var(--space-2) 0 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: 0 var(--space-4) var(--space-4);
 }
 
 .tabs {
   display: flex;
-  border-bottom: 1px solid var(--line);
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
 }
 
 .tab {
   flex: 1;
-  height: 44px;
+  min-height: var(--control-h);
   border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--mute);
-  font-size: 13px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
 }
 
-.tabOn {
-  color: var(--paper);
-  box-shadow: inset 0 -2px 0 var(--paper);
+.tab:hover {
+  color: var(--fg-body);
 }
 
-.body {
-  padding: 16px 18px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
+.tab[aria-selected="true"] {
+  background: var(--bg-raised);
+  color: var(--fg-strong);
+  box-shadow: inset 0 0 0 1px var(--border-control);
 }
 
 .label {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--space-1);
 }
 
 .input {
-  min-height: 44px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--ink-0, #0f1319);
-  color: var(--paper);
-  padding: 0 12px;
-  font-size: 16px;
   width: 100%;
-}
-
-.input:focus {
-  border-color: var(--paper);
-  outline: none;
+  min-height: var(--control-h);
+  padding: 0 10px;
+  font-size: var(--text-input);
 }
 
 .mono {
-  font-family: var(--mono);
-  letter-spacing: 0.12em;
+  font-family: var(--font-mono);
   text-transform: uppercase;
+  letter-spacing: 0.12em;
 }
 
 .error {
   margin: 0;
-  color: var(--dust);
-  font-size: 13px;
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .submit {
-  min-height: 44px;
-  height: 44px;
-  border: 1px solid var(--paper);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--paper);
-  font-size: 14px;
+  min-height: var(--control-h-lg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
   font-weight: 500;
 }
 
@@ -118,55 +126,43 @@
   cursor: not-allowed;
 }
 
-@media (max-width: 767px) {
-  .title {
-    font-size: 20px;
-  }
-
-  .submit {
-    height: 48px;
-    min-height: 48px;
-    font-size: 15px;
-  }
-}
-
 .passkey {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 .passButton {
-  min-height: 48px;
-  border: 1px solid var(--paper);
-  border-radius: 4px;
-  background: var(--paper);
-  color: var(--ink);
-  font-size: 15px;
-  font-weight: 600;
+  min-height: var(--control-h-lg);
+  border: 1px solid var(--primary-fill);
+  border-radius: var(--radius-sm);
+  background: var(--primary-fill);
+  color: var(--on-primary);
+  font-size: var(--text-ui);
+  font-weight: 500;
 }
 
 .passButton:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: wait;
 }
 
 .toggle {
-  min-height: 40px;
+  align-self: center;
+  min-height: var(--control-h-sm);
   border: 0;
   background: transparent;
-  color: var(--mute);
-  font-size: 13px;
-  text-decoration: underline;
-  text-underline-offset: 3px;
+  color: var(--link);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .codes {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  border-top: 1px solid var(--line);
-  padding-top: 14px;
+  gap: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--divider);
 }
 
 .autofillHidden {
@@ -182,11 +178,18 @@
 }
 
 .autofill {
-  min-height: 38px;
-  border: 1px dashed var(--line);
-  border-radius: 4px;
+  width: 100%;
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: 1px dashed var(--border-control);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--mute);
-  padding: 0 12px;
-  font-size: 14px;
+  color: var(--fg-muted);
+  font-size: var(--text-input);
+}
+
+.autofill:focus-visible {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
 }

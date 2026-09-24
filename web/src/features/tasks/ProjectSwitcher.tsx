@@ -317,7 +317,10 @@ export function ProjectSwitcher({ projects, navigateOnSelect = false }: ProjectS
   }
 
   return (
-    <label className={ui.field} style={{ margin: 0 }}>
+    <label
+      className={ui.field}
+      style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: "var(--space-2)", margin: 0 }}
+    >
       <span className={ui.listMeta}>项目范围</span>
       <select
         className={`${ui.select} ${ui.touchSelect}`}

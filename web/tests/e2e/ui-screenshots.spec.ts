@@ -16,17 +16,54 @@ test.describe("ui screenshots 1440 / 390", () => {
     test.skip(info.project.name !== "chromium", "golden screenshots from chromium only");
     await page.emulateMedia({ reducedMotion: "reduce" });
 
+    // The mock client has no /v1/projects endpoint; give the gallery a small
+    // directory so /projects renders its list instead of the load-error state.
+    await page.route("**/v1/projects", async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              id: "prj_sfe",
+              name: "sfe-root",
+              defaultBaseBranch: "main",
+              branchPattern: "wt/{worker}/{topic}",
+              members: [{ hostId: "hst_devbox", workspaceId: "wsp_sfe", role: "member" }],
+            },
+            {
+              id: "prj_remuda",
+              name: "remuda",
+              defaultBaseBranch: "main",
+              members: [
+                { hostId: "hst_devbox", workspaceId: "wsp_app", role: "member" },
+                { hostId: "hst_sg", workspaceId: "wsp_sg", role: "member" },
+              ],
+            },
+          ],
+        }),
+      });
+    });
+
     for (const [w, h, tag] of [
       [1440, 900, "1440"],
       [390, 844, "390"],
     ] as const) {
       await page.setViewportSize({ width: w, height: h });
 
-      await page.goto("/sessions");
-      await expect(page.getByTestId("session-list").first()).toBeVisible();
-      await shot(page, `sessions-${tag}.png`);
-
-      await page.getByTestId("session-row").filter({ hasText: "看 TaskManager spill" }).first().click();
+      // c-minbox: at 390 /sessions redirects to the phone home /m
+      // (D-049); the session index column is desktop-only.
+      if (w < 768) {
+        await page.goto("/m");
+        await expect(page.getByTestId("home-list")).toBeVisible();
+        await shot(page, `sessions-${tag}.png`);
+        await page.getByTestId("home-row-link").filter({ hasText: "看 TaskManager spill" }).first().click();
+      } else {
+        await page.goto("/sessions");
+        await expect(page.getByTestId("session-list").first()).toBeVisible();
+        await shot(page, `sessions-${tag}.png`);
+        await page.getByTestId("session-row").filter({ hasText: "看 TaskManager spill" }).first().click();
+      }
       await expect(page.getByTestId("session-page")).toBeVisible();
       await expect(page.getByTestId("composer")).toBeVisible();
       await shot(page, `session-${tag}.png`);
@@ -55,6 +92,14 @@ test.describe("ui screenshots 1440 / 390", () => {
       await expect(page.getByTestId("hosts-page")).toBeVisible();
       await shot(page, `hosts-${tag}.png`);
 
+      await page.goto("/fleet");
+      await expect(page.getByTestId("fleet-page")).toBeVisible();
+      await shot(page, `fleet-${tag}.png`);
+
+      await page.goto("/projects");
+      await expect(page.getByTestId("projects-page")).toBeVisible();
+      await shot(page, `projects-${tag}.png`);
+
       await page.goto("/providers");
       await expect(page.getByTestId("providers-page")).toBeVisible();
       await shot(page, `providers-${tag}.png`);
@@ -62,6 +107,27 @@ test.describe("ui screenshots 1440 / 390", () => {
       await page.goto("/bots");
       await expect(page.getByTestId("bots-page")).toBeVisible();
       await shot(page, `bots-${tag}.png`);
+
+      // The login card only renders unauthenticated. The mock otherwise
+      // bootstraps every page into an authed session, so use a separate
+      // browser context whose pre-boot storage is cleared and flagged
+      // logged-out (the flag alone is not enough — a stored session auto
+      // re-logs back in). A separate context keeps the main page's session.
+      const loginBrowser = await page.context().browser();
+      if (!loginBrowser) throw new Error("no browser for the login shot");
+      const loginContext = await loginBrowser.newContext({
+        viewport: { width: w, height: h },
+        reducedMotion: "reduce",
+      });
+      const loginPage = await loginContext.newPage();
+      await loginPage.addInitScript(() => {
+        localStorage.clear();
+        localStorage.setItem("runtime.logged-out", "1");
+      });
+      await loginPage.goto("/login");
+      await expect(loginPage.getByTestId("login-page")).toBeVisible();
+      await shot(loginPage, `login-${tag}.png`);
+      await loginContext.close();
 
       await page.goto("/settings");
       await expect(page.getByTestId("settings-page")).toBeVisible();

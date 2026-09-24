@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { fetchHostDoctor, type HostDoctorReport } from "../../lib/api";
 import type { Id } from "../../types/wire";
+import ui from "../../styles/ui.module.css";
 import { COMPUTER_USE_KIND, computerUseState, type HostCli } from "./model";
 import css from "./hosts.module.css";
 
@@ -50,15 +51,15 @@ function HostDiagnosticsRequest({ hostId, online, cli }: { hostId: Id; online: b
   }, [hostId, online, refresh]);
 
   const findings = report?.checks.filter((check) => check.status !== "ok") ?? [];
-  return <section data-testid="host-diagnostics" aria-label="主机诊断">
+  return <section className={css.diagnostics} data-testid="host-diagnostics" aria-label="主机诊断">
     <div className={css.sectionLabel}>主机诊断 · 工作目录访问权限</div>
     <ComputerUseRow cli={cli} />
-    <button type="button" className={css.add} disabled={!online || checking} onClick={() => setRefresh((value) => value + 1)}>
+    <button type="button" className={ui.btn} disabled={!online || checking} onClick={() => setRefresh((value) => value + 1)}>
       {checking ? "检查中…" : "重新检查"}
     </button>
-    {!online ? <p role="status">主机离线，无法检查当前权限</p> : null}
+    {!online ? <p role="status" className={css.meta}>主机离线，无法检查当前权限</p> : null}
     {error ? <p role="alert" className={css.sshError}>{error}</p> : null}
-    {report && findings.length === 0 ? <p role="status">主机检查通过</p> : null}
+    {report && findings.length === 0 ? <p role="status" className={css.meta}>主机检查通过</p> : null}
     {findings.map((check) => <p key={check.name} role={check.status === "blocker" ? "alert" : "status"} className={css.sshError}>
       {check.message}
     </p>)}

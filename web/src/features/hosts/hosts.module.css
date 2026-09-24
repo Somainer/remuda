@@ -1,274 +1,269 @@
-.page {
-  padding: 16px;
-}
+/* @tokens strict */
+/* /hosts and /hosts/:id (UO-13, ui-overhaul §4.10/§2.6): PageHeader over
+   surface lists. Online is a solid --link dot, offline a hollow muted ring,
+   stale a dashed ring — never green. Role tokens only. */
 
-.board {
+.page {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  min-height: 100%;
-  background: var(--ink);
+  background: var(--bg-canvas);
 }
 
-.head {
-  height: 56px;
-  flex: none;
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-5) var(--gutter) 40px;
+}
+
+.inner {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 20px;
-  border-bottom: 1px solid var(--line);
-  flex-wrap: nowrap;
+  flex-direction: column;
+  gap: var(--space-5);
+  max-width: 880px;
 }
 
-.headMeta {
-  flex: 1;
-  min-width: 0;
+/* The meta line directly under the header: count + fleet link. */
+.metaRow {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
-  overflow: hidden;
-}
-
-.title {
-  font-size: 16px;
-  font-weight: 600;
-  margin: 0;
-  color: var(--paper);
-  flex: none;
-  flex-shrink: 0;
-  white-space: nowrap;
-  word-break: keep-all;
+  gap: var(--space-2) var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .count {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
+  color: inherit;
+  font-variant-numeric: tabular-nums;
 }
 
-.add {
-  height: 30px;
-  min-height: 30px;
-  border: 1px solid var(--paper);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--paper);
-  font-size: 13px;
-  padding: 0 13px;
-  flex: none;
-  white-space: nowrap;
+a.count {
+  color: var(--link);
 }
 
-.toggle {
-  height: 30px;
-  min-height: 30px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--mute);
-  font-size: 12px;
-  padding: 0 10px;
-}
+/* ----------------------------------------------------------------- */
+/* Host list                                                          */
+/* ----------------------------------------------------------------- */
 
-.toggleOn {
-  border-color: var(--paper);
-  color: var(--paper);
+.list {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .row {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 13px 20px;
-  border-bottom: 1px solid var(--line);
-  color: inherit;
-  text-decoration: none;
-  background: transparent;
-  min-height: 0;
-  border-left: 0;
-  border-right: 0;
-  border-top: 0;
-  border-radius: 0;
+  gap: var(--space-3);
   width: 100%;
+  min-height: 52px;
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--divider);
+  background: transparent;
+  color: inherit;
   text-align: left;
+  text-decoration: none;
+}
+
+.list > *:last-child {
+  border-bottom: 0;
+}
+
+.row:hover {
+  background: var(--bg-hover);
+}
+
+.row:focus-visible {
+  outline-offset: -2px;
+}
+
+.dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+}
+
+/* Online reads as the working/link colour; it is never a success green. */
+.dotOn {
+  background: var(--link);
+}
+
+.dotOff {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--fg-muted);
+}
+
+/* Stale = "state pending confirmation": neutral dashed ring + text. */
+.dotStale {
+  background: transparent;
+  border: 1px dashed var(--unknown-border);
 }
 
 .identity {
-  width: 150px;
-  flex: none;
-  min-width: 0;
   display: flex;
+  flex: 1 1 200px;
   flex-direction: column;
   justify-content: center;
+  gap: 2px;
+  min-width: 0;
 }
 
 .name {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--paper);
   overflow: hidden;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 500;
+  line-height: var(--lh-title);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .nameOff {
+  color: var(--fg-muted);
   font-weight: 400;
-  color: var(--mute);
+}
+
+.mobileMeta {
+  display: none;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .cell {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
+  flex: none;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .cellRtt {
-  width: 96px;
-  flex: none;
+  width: 104px;
+  font-variant-numeric: tabular-nums;
 }
 
 .cellCli {
-  flex: 1;
-  min-width: 160px;
+  flex: 1 1 180px;
+  min-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .cellTransport {
-  width: 120px;
-  flex: none;
+  width: 132px;
 }
 
 .cellSessions {
+  width: 64px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chevron {
   flex: none;
+  color: var(--fg-faint);
+  font-size: var(--text-title);
 }
 
-.dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  flex: 0 0 auto;
-}
+/* ----------------------------------------------------------------- */
+/* Host detail                                                        */
+/* ----------------------------------------------------------------- */
 
-.dotOn {
-  background: var(--ok);
-}
-
-.dotOff {
-  background: transparent;
-  border: 1px solid var(--mute);
-  box-sizing: border-box;
-}
-
-.dotAuth {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex: none;
-  background: var(--ok);
-}
-
-.dotUnknown {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex: none;
-  border: 1px dashed var(--mute);
-  box-sizing: border-box;
-  background: transparent;
-}
-
-.detail {
-  padding: 18px 20px;
+.detailMetaRow {
   display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.detailHead {
-  display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-2) var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
-.back {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-  flex: none;
+.detailMetaRow .pathId {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
 }
 
-.detailTitle {
-  font-size: 15px;
-  font-weight: 600;
+.sshPanel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.sshPanel p {
+  flex-basis: 100%;
   margin: 0;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.detailMeta {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 14px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
 }
 
 .metric {
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 11px 13px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .metricLabel {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .metricValue {
-  font-family: var(--mono);
-  font-size: 13px;
-  color: var(--paper);
+  color: var(--fg-strong);
+  font-family: var(--font-mono);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+  font-variant-numeric: tabular-nums;
 }
 
 .sectionLabel {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-  letter-spacing: 0.06em;
-  margin-bottom: 9px;
+  margin-bottom: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  font-weight: 600;
+  line-height: var(--lh-ui);
 }
 
 .cliTable {
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .cliRow {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 10px 13px;
-  border-bottom: 1px solid var(--line);
-  font-family: var(--mono);
-  font-size: 12.5px;
+  gap: var(--space-3);
+  padding: 10px var(--space-3);
+  border-bottom: 1px solid var(--divider);
+  color: var(--fg-body);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .cliRow:last-child {
@@ -276,168 +271,176 @@
 }
 
 .cliKind {
-  width: 80px;
-  color: var(--paper);
   flex: none;
+  width: 96px;
+  color: var(--fg-strong);
 }
 
 .cliVerInline {
   display: none;
+  color: var(--fg-muted);
 }
 
 .cliPath {
   flex: 1;
-  color: var(--mute);
   min-width: 0;
   overflow: hidden;
+  color: var(--fg-muted);
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .cliVer {
-  width: 90px;
-  color: var(--mute);
   flex: none;
+  width: 96px;
+  color: var(--fg-muted);
 }
 
 .cliAuth {
   display: flex;
+  flex: none;
   align-items: center;
   gap: 6px;
-  width: 110px;
+  width: 124px;
+  color: var(--fg-muted);
+}
+
+/* Auth dots are not a success state: known = calm muted, unknown dashed. */
+.dotAuth {
   flex: none;
-  color: var(--mute);
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--fg-muted);
 }
 
-.chips {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.chip {
-  height: 28px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  padding: 0 10px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--paper);
-}
-
-.chipPath {
-  color: var(--mute);
-  margin-left: 7px;
+.dotUnknown {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  border: 1px dashed var(--unknown-border);
 }
 
 .foot {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-  border-top: 1px solid var(--line);
-  padding-top: 12px;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--divider);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .meta {
-  color: var(--mute);
-  font-size: 12px;
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
-.cli {
-  font-family: var(--mono);
-  font-size: 12px;
-  margin: 4px 0;
-}
-
-.progress {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-top: 12px;
-}
-
-.step {
-  color: var(--mute);
-  font-size: 12px;
-}
-
-.stepOn {
-  color: var(--paper);
-}
-
-.labels {
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-top: 8px;
+.sshError {
+  display: block;
+  margin: 0;
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .fields {
   display: grid;
-  gap: 8px;
+  gap: var(--space-2);
   max-width: 480px;
 }
 
-.newSession {
-  height: 30px;
-  min-height: 30px;
-  border: 1px solid var(--paper);
-  border-radius: 4px;
-  display: flex;
-  align-items: center;
-  padding: 0 13px;
-  font-size: 13px;
-  color: var(--paper);
+/* Detail page card around the registered-workspace list. */
+.workspaces {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.workspaces [data-testid="host-workspaces"] {
+  padding: var(--space-3);
+  border-bottom: 0;
   background: transparent;
-  flex: none;
-  white-space: nowrap;
 }
 
-.newSession:disabled {
-  opacity: 0.45;
+.diagnostics {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
 }
 
-.mobileMeta,
-.chevron {
-  display: none;
+.diagnostics .cliRow {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.hint {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.hint code {
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-inset);
+  color: var(--fg-body);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
+.formActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.modalTitle {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
+}
+
+/* PlacementPicker (also used by New Session): layout classes the shared
+   control does not provide. */
+.pickerFieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.pickerStack {
+  margin-top: var(--space-2);
+}
+
+.pickerWarn {
+  color: var(--attention-fg);
+}
+
+@media (max-width: 1023px) {
+  .cellTransport,
+  .cellRtt {
+    display: none;
+  }
 }
 
 @media (max-width: 767px) {
-  .head {
-    height: 52px;
-    padding: 0 16px;
-    flex-wrap: nowrap;
-  }
-
-  .headMeta {
-    min-width: 0;
-  }
-
-  .title {
-    font-size: var(--text-xl);
-  }
-
-  .add {
-    height: 32px;
-    min-height: 32px;
-    padding: 0 12px;
-  }
-
   .row {
-    padding: 14px 16px;
-    gap: 12px;
-  }
-
-  .identity {
-    width: auto;
-    flex: 1;
-    gap: 4px;
-  }
-
-  .name,
-  .nameOff {
-    font-size: 15px;
+    gap: var(--space-2);
+    padding: 0 var(--space-3);
   }
 
   .cell {
@@ -446,63 +449,26 @@
 
   .mobileMeta {
     display: block;
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--mute);
-  }
-
-  .chevron {
-    display: block;
-    font-family: var(--mono);
-    font-size: 13px;
-    color: var(--mute);
-    flex: none;
   }
 
   .metrics {
     grid-template-columns: 1fr 1fr;
   }
 
-  .detail {
-    padding: 16px;
-  }
-
-  .detailHead {
-    flex-wrap: wrap;
-    row-gap: 6px;
-  }
-
-  .detailTitle {
-    font-size: var(--text-xl);
-    flex: 1;
-  }
-
-  .detailMeta {
-    flex: 1 1 100%;
-    order: 4;
-  }
-
-  .newSession {
-    height: 32px;
-    min-height: 32px;
-  }
-
   .cliRow {
     flex-wrap: wrap;
-    gap: 4px 8px;
-    padding: 11px 12px;
+    gap: 4px var(--space-2);
   }
 
   .cliKind {
-    width: auto;
     flex: 1;
-    font-size: 13px;
+    width: auto;
     order: 1;
   }
 
   .cliVerInline {
     display: inline;
-    color: var(--mute);
+    color: var(--fg-muted);
   }
 
   .cliVer {
@@ -510,22 +476,13 @@
   }
 
   .cliAuth {
-    width: auto;
     flex: none;
+    width: auto;
     order: 2;
   }
 
   .cliPath {
     flex: 1 1 100%;
-    font-size: 11px;
     order: 3;
   }
-}
-
-.sshError { color: var(--dust); font-size: 12px; overflow-wrap: anywhere; white-space: normal; display: block; }
-.sshPanel { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
-.sshPanel p { flex-basis: 100%; margin: 0; }
-@media (max-width: 640px) {
-  .fields input, .fields select { min-height: 44px; font-size: 16px; }
-  .sshPanel button { min-height: 44px; }
 }

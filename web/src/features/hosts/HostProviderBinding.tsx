@@ -1,5 +1,4 @@
 import ui from "../../styles/ui.module.css";
-import css from "./hosts.module.css";
 
 export type HostBindingKind = "auto" | "native" | "profile";
 
@@ -30,7 +29,7 @@ export function HostProviderBinding({ binding, profiles, disabled, onChange }: P
   return (
     <div className={ui.field} data-testid="host-provider-binding">
       <span>Provider</span>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+      <div className={ui.seg} role="group" aria-label="Provider 绑定">
         {(
           [
             ["auto", "自动"],
@@ -41,8 +40,9 @@ export function HostProviderBinding({ binding, profiles, disabled, onChange }: P
           <button
             key={id}
             type="button"
-            className={parsed.kind === id ? css.add : css.toggle}
+            className={ui.segItem}
             data-testid={`host-binding-${id}`}
+            aria-pressed={parsed.kind === id}
             disabled={disabled}
             onClick={() => {
               if (id === "profile") {

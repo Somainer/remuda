@@ -159,12 +159,13 @@ export function ProviderForm({
             名称
             <input className={ui.input} data-testid="provider-name" value={name} onChange={(e) => setName(e.target.value)} />
           </label>
-          <fieldset className={ui.field} style={{ border: 0, padding: 0, margin: 0 }}>
+          <fieldset className={css.plainFieldset}>
             <legend>类型</legend>
             <div className={css.seg}>
               <button
                 type="button"
-                className={`${css.choice} ${kind === "gateway" ? css.choiceOn : ""}`}
+                className={css.choice}
+                aria-pressed={kind === "gateway"}
                 data-testid="provider-kind-gateway"
                 onClick={() => setKind("gateway")}
               >
@@ -172,7 +173,8 @@ export function ProviderForm({
               </button>
               <button
                 type="button"
-                className={`${css.choice} ${kind === "direct" ? css.choiceOn : ""}`}
+                className={css.choice}
+                aria-pressed={kind === "direct"}
                 data-testid="provider-kind-direct"
                 onClick={() => setKind("direct")}
               >
@@ -213,12 +215,13 @@ export function ProviderForm({
             onChange={setModels}
             onDefaultChange={setDefaultModel}
           />
-          <fieldset className={ui.field} style={{ border: 0, padding: 0, margin: 0 }}>
+          <fieldset className={css.plainFieldset}>
             <legend>范围</legend>
             <div className={css.seg}>
               <button
                 type="button"
-                className={`${css.choice} ${scopeKind === "universal" ? css.choiceOn : ""}`}
+                className={css.choice}
+                aria-pressed={scopeKind === "universal"}
                 data-testid="provider-scope-universal"
                 onClick={() => setScopeKind("universal")}
               >
@@ -226,7 +229,8 @@ export function ProviderForm({
               </button>
               <button
                 type="button"
-                className={`${css.choice} ${scopeKind === "host" ? css.choiceOn : ""}`}
+                className={css.choice}
+                aria-pressed={scopeKind === "host"}
                 data-testid="provider-scope-host"
                 onClick={() => {
                   setScopeKind("host");
@@ -267,8 +271,7 @@ export function ProviderForm({
           ) : null}
           {kind === "gateway" ? (
             <fieldset
-              className={ui.field}
-              style={{ border: 0, padding: 0, margin: 0 }}
+              className={css.plainFieldset}
               data-testid="provider-delivery"
               data-mode={delivery.mode}
             >
@@ -276,7 +279,8 @@ export function ProviderForm({
               <div className={css.seg}>
                 <button
                   type="button"
-                  className={`${css.choice} ${delivery.mode === "direct" ? css.choiceOn : ""}`}
+                  className={css.choice}
+                  aria-pressed={delivery.mode === "direct"}
                   data-testid="provider-delivery-direct"
                   onClick={() => setDelivery(DEFAULT_DELIVERY)}
                 >
@@ -284,7 +288,8 @@ export function ProviderForm({
                 </button>
                 <button
                   type="button"
-                  className={`${css.choice} ${delivery.mode === "via" ? css.choiceOn : ""}`}
+                  className={css.choice}
+                  aria-pressed={delivery.mode === "via"}
                   data-testid="provider-delivery-via"
                   onClick={() => {
                     const hostId = delivery.viaHostId || hosts[0]?.id || "";
@@ -355,7 +360,7 @@ export function ProviderForm({
           {error}
         </p>
       ) : null}
-      <div className={ui.row} style={{ marginTop: 8 }}>
+      <div className={css.formActions}>
         <Button type="button" onClick={onCancel}>
           取消
         </Button>

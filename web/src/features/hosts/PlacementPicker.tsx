@@ -1,6 +1,7 @@
 import type { Id } from "../../types/wire";
 import ui from "../../styles/ui.module.css";
 import { hostsMatching, sortHostsOnlineFirst, type HostView, type Placement } from "./model";
+import css from "./hosts.module.css";
 
 /** New-session placement control. Import this instead of editing NewSessionPage. */
 export function PlacementPicker({
@@ -18,7 +19,7 @@ export function PlacementPicker({
   const selectedLabels = value.kind === "labels" ? value.labels : [];
 
   return (
-    <fieldset data-testid="placement-picker" style={{ border: 0, padding: 0 }}>
+    <fieldset data-testid="placement-picker" className={css.pickerFieldset}>
       <legend className={ui.listMeta}>Placement</legend>
       <div className={ui.row}>
         {(
@@ -44,7 +45,7 @@ export function PlacementPicker({
         ))}
       </div>
       {value.kind === "host" ? (
-        <label className={ui.field} style={{ marginTop: 8 }}>
+        <label className={`${ui.field} ${css.pickerStack}`}>
           主机
           <select
             className={`${ui.select} ${ui.touchSelect}`}
@@ -61,7 +62,7 @@ export function PlacementPicker({
         </label>
       ) : null}
       {value.kind === "labels" ? (
-        <div className={ui.row} style={{ marginTop: 8 }}>
+        <div className={`${ui.row} ${css.pickerStack}`}>
           {labels.map((label) => {
             const on = selectedLabels.includes(label);
             return (
@@ -83,7 +84,7 @@ export function PlacementPicker({
       ) : null}
       {value.kind === "any" ? <p className={ui.listMeta}>Hub 按能力与负载选择，不可满足时返回明确错误。</p> : null}
       {matched.length === 0 ? (
-        <p className={ui.listMeta} data-testid="placement-unsatisfied" style={{ color: "var(--dust)" }}>
+        <p className={`${ui.listMeta} ${css.pickerWarn}`} data-testid="placement-unsatisfied">
           没有满足 placement 的在线主机，不会静默降级。
         </p>
       ) : (

@@ -334,6 +334,8 @@ stateDiagram-v2
 
 相同 `(principalId, commandId)`、相同 digest 返回原记录；不同 digest 返回 `COMMAND_ID_CONFLICT`。RPC id 只配对本次连接上的 response，不能替代 commandId。观察到最终原生结果而先前 ACK 丢失时，可以在一次持久事务中记录 accepted、settled 两个有序变更，不能声称收到从未收到的 ACK。
 
+> **2026-09-25 注（D-055）：重放按操作分叉——send 可重放，configure 不可重放。** 同 commandId 重放 `instance.send` 用于恢复丢失响应：返回存储的原始结局，仍排队的行恰好转发一次。`instance.configure` 的 spec merge 只在首次 POST 发生一次：重放命中终态行时原样返回存储记录（包括首次 merge 失败时持久化的原始 500/body，绝不把它重放成 200）；原始结局尚未持久化（转发在飞，`queued`+`forwarded=1`）时 Hub 返回 409 指明 “still in flight”，客户端应轮询 `GET /v1/instances/{id}/commands/{commandId}`；离线排队（`queued`+`forwarded=0`）的 configure 重放同样被 409 拒绝，客户端必须换用新 commandId 发新命令，重放不代为转发。并发同 id 首次 POST 在 Hub 串行 writer 上分出唯一创建行，merge 严格一次。GET 单行命令在转发尝试进行中返回该尝试的终态行（尝试未开始时如实返回 pending），任何读都不先报 `forwardIntent` 再报其回滚。
+
 派发顺序固定为：Hub durable inbox → Node durable command receipt → Node 写 `intent-durable` 并 fsync → 唯一 driver owner 发一次原生操作 → 记录 transport-written → 原生证据推进 accepted → 业务证据推进 settled。进程恰好在发出与落账之间崩溃时，intent 已存在即视为“可能发送”；恢复先查原生历史/请求状态，没有原生幂等保证则保持 unknown，**绝不因为找不到 ACK 而重发**。无法证明没执行时也不能标 rejected；超时查询返回 unknown 的现状。
 
 ### Origin

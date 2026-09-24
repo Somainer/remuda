@@ -2076,13 +2076,18 @@ fn configure_merge_failed(command: &CommandRecord) -> bool {
         && !command.forwarded
 }
 
-/// Operation-specific handling for a replay of an already-stored command. The
-/// incoming row is first settled against any in-flight forward attempt, so the
-/// result is never a stale early snapshot:
-/// - `instance.configure` is read-only and reproduces its ORIGINAL outcome —
-///   the stored row on success, the persisted merge error (500) on failure;
+/// Operation-specific handling for a replay of an already-stored command.
+/// - `instance.configure` is NON-replayable (D-055, 2026-09-25). Its spec
+///   merge runs exactly once, on the first POST; a re-POST only reads the
+///   stored outcome. A live forward attempt is detected WITHOUT awaiting it,
+///   so a replay answers a clear 409 immediately instead of merging or
+///   returning a premature terminal 200. A terminal row is returned verbatim —
+///   including the persisted pre-dispatch merge failure, reproduced with its
+///   original 500; a `queued` row (forward in flight, RPC-unknown, or an
+///   offline queue) is a 409 telling the caller to poll the row or issue a new
+///   command;
 /// - `instance.send` re-checks attachment liveness while still unsent and
-///   takes the G1 forward;
+///   settles against the in-flight attempt before taking the G1 forward;
 /// - other queued ops take the G1 forward; terminal rows pass through.
 async fn replay_existing_command(
     state: &AppState,
@@ -2092,9 +2097,19 @@ async fn replay_existing_command(
     existing: CommandRecord,
     payload: &mut Value,
 ) -> Result<CommandRecord, HubError> {
-    let command = settled_command_row(state, existing).await;
     match operation {
         "instance.configure" => {
+            // Peek, never await: a live attempt must answer 409 at once, not be
+            // hidden behind the attempt's eventual terminal row.
+            if subscribe_forward_attempt(&existing.command_id).is_some() {
+                return Err(configure_in_flight());
+            }
+            // Fresh durable read: the HTTP-level lookup can predate this point.
+            let command = state
+                .store
+                .get_command(existing.command_id.clone())
+                .await?
+                .unwrap_or(existing);
             if configure_merge_failed(&command) {
                 let reason = command
                     .settlement_reason
@@ -2102,18 +2117,52 @@ async fn replay_existing_command(
                     .unwrap_or_else(|| "configure spec merge failed".to_string());
                 return Err(HubError::Internal(reason));
             }
+            if command.state == "queued" {
+                // Re-peek after the read closes the subscribe→intent-mark race
+                // (still non-blocking): a slot acquired in the gap is in flight.
+                if command.forwarded || subscribe_forward_attempt(&command.command_id).is_some() {
+                    return Err(configure_in_flight());
+                }
+                // The original outcome is not terminal and applying anything
+                // again is forbidden; answering 200 could contradict the
+                // attempt still running (it may yet fail the merge). The web
+                // outbox replays instance.send only, so no client needs a
+                // queued configure forwarded on replay.
+                return Err(HubError::Conflict(
+                    "a queued instance.configure cannot be replayed; \
+                     issue a new command with a new commandId"
+                        .to_string(),
+                ));
+            }
             Ok(command)
         }
-        "instance.send" => {
-            // A row that never went out is not "already delivered": its
-            // objects must still be live exactly as a fresh send requires.
-            if !command.forwarded && command.state == "queued" {
-                crate::objects::validate_send_attachments(state, device, instance, payload).await?;
+        other => {
+            let command = settled_command_row(state, existing).await;
+            match other {
+                "instance.send" => {
+                    // A row that never went out is not "already delivered": its
+                    // objects must still be live exactly as a fresh send requires.
+                    if !command.forwarded && command.state == "queued" {
+                        crate::objects::validate_send_attachments(state, device, instance, payload)
+                            .await?;
+                    }
+                    forward_unforwarded_retry(state, command).await
+                }
+                _ => forward_unforwarded_retry(state, command).await,
             }
-            forward_unforwarded_retry(state, command).await
         }
-        _ => forward_unforwarded_retry(state, command).await,
     }
+}
+
+/// Clear 409 for a configure whose first attempt's outcome is not persisted
+/// yet (the forward RPC is running or rests unknown): the caller polls the
+/// command row rather than replaying.
+fn configure_in_flight() -> HubError {
+    HubError::Conflict(
+        "instance.configure is still in flight; poll GET \
+         /v1/instances/{id}/commands/{commandId} for its outcome"
+            .to_string(),
+    )
 }
 
 /// Maximum message text copied into a journal record (the full text still
@@ -2409,19 +2458,34 @@ async fn await_attempt_result(
 ///   `forwarded=1`, nor a released intent as forwarded);
 /// - otherwise the durable row is re-read now, so an early-path snapshot that
 ///   observed a transient flag cannot outlive the attempt that set it.
+///
+/// The first subscription is taken before the durable re-read, but an attempt
+/// can still acquire its slot (and mark the intent) in that gap: a re-read
+/// that comes back `queued` therefore subscribes once more and binds to that
+/// attempt too. Without this a status reader could observe `forwarded=1` and,
+/// on its next read, the released intent — the rolled-back shape a poller must
+/// never see.
 async fn settled_command_row(state: &AppState, command: CommandRecord) -> CommandRecord {
-    if let Some(rx) = subscribe_forward_attempt(&command.command_id)
-        && let Some(row) = await_attempt_result(rx).await
-    {
+    async fn await_active(command_id: &str) -> Option<CommandRecord> {
+        let rx = subscribe_forward_attempt(command_id)?;
+        await_attempt_result(rx).await
+    }
+    if let Some(row) = await_active(&command.command_id).await {
         return row;
     }
-    state
+    let reloaded = state
         .store
         .get_command(command.command_id.clone())
         .await
         .ok()
         .flatten()
-        .unwrap_or(command)
+        .unwrap_or(command);
+    if reloaded.state == "queued"
+        && let Some(row) = await_active(&reloaded.command_id).await
+    {
+        return row;
+    }
+    reloaded
 }
 
 fn journal_text(text: &str) -> String {
@@ -3033,7 +3097,9 @@ pub async fn list_instance_commands(
 /// detail path is not an agent read target) and again here. The row must
 /// belong to the instance named in the path — command ids are a global
 /// ledger, so a mismatch answers 404 rather than leaking another instance's
-/// row.
+/// row. A read while a forward attempt is active binds to THAT attempt's
+/// settled row, so it never returns a transient forward intent a concurrent
+/// release (the frame proved never queued) would walk back.
 pub async fn get_instance_command(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3056,6 +3122,7 @@ pub async fn get_instance_command(
     if command.instance_id.as_deref() != Some(instance_id.as_str()) {
         return Err(HubError::NotFound);
     }
+    let command = settled_command_row(&state, command).await;
     Ok(Json(command))
 }
 

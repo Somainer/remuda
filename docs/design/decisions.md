@@ -33,6 +33,7 @@
 | D-051 | 2026-09-24 | **委托决策（delegated decisions）：agent 可代人审批，但 plan-review 由 Node 侧 driver 直接铸造。** (1)-(5) Agent 设备经一跳家庭边（self 或直接子实例，`owns()`）可列出/回答非 approval 的交互；approval 永不下放，bypass 双侧排除；开关为 **Hub 进程环境变量**（全局开关 + per-project 覆盖名单，非 driver→Node→Hub 传播、无 wire/schema/create-spec 字段）；actor 真实化（`AnswerCaller` → committed `ActorRef.instance_id`，c-deleg2 审计链）。**(6) 2026-09-24 修正（取代早先 Hub-fold 设计）**：print/sdk 上 driver 把子代理的 `ExitPlanMode` 原生 `can_use_tool` 暂停铸为 `InteractionRequest::PlanReview`（内联 `plan` 正文 ≤ 32 KiB、sha256 digest、approve/deny、allowFeedback），走既有 Node first-answer-wins CAS；仅顶层（非 sub-agent）、有可回复原生暂停时铸，其余回人类 Approval；正文 inline（加性可选 `PlanReviewRequest.plan`，`planRef` 仅占位，**不写对象表/不新增 `AttachmentKind`/零新 wire enum**）；approve 只 allow 原 input 绝不附 `updatedPermissions`/setMode，deny 用 feedback 回喂模型；plan-review 不吃 `owns()` self 边（child 不能列/答自己的 plan）；Node 不论 carrier 先 `validate_answer`（offered option/请求 revision/digest/feedback 规则）再进 CAS。刮屏 carrier（claude-pty、无 hooks 的 shell-pty）不产生 plan-review；shell-pty+hooks 待真录验证（T2）。真实父子 gateway 轮次待协调员验证。 | 用户 + coordinator（D-051 (6) 修正 2026-09-24；c-deleg1/2/3 实跑证据） | [evidence/delegated-decisions-1.md](./evidence/delegated-decisions-1.md)、[-2](./evidence/delegated-decisions-2.md)、[-3](./evidence/delegated-decisions-3.md)；D-017/D-011；`protocol.md §5.4` |
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
 | D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端恒深色**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
+| D-055 | 2026-09-25 | **命令重放按操作分叉：`instance.send` 可重放，`instance.configure` 不可重放。** 同一 commandId 重放 `instance.send` 继续用于恢复丢失响应：返回存储原记录，对仍排队的行恰好转发一次（G1/G2 不变）。`instance.configure` 的 spec merge 只在首次 POST 发生且只发生一次，重放永不再次 merge：终态行（accepted/settled）原样返回存储记录（含首次 merge 失败时持久化的原始 500 与原始 body）；原始结果尚未持久化（转发仍在飞）时返回明确的 409「still in flight」并指引轮询 `GET …/commands/{commandId}`；离线排队（`forwarded=0`）的 configure 重放返回明确 409，要求客户端换用新 commandId 发新命令，绝不代为转发。理由：web 离线 outbox 只重放 send，configure 重放无法闭合「重复 merge / 首次 500 重放成 200 / 并发同 id 双 merge / 排队行重放被转发」四类边角。配套：`GET /v1/instances/{id}/commands/{commandId}` 在转发尝试进行中绑定到**本次尝试**发布的终态行（尝试尚未开始时如实返回 pending 的 `queued`/`forwarded=false`），永不先报 `forwarded=true` 再报回滚后的 `forwarded=false`。 | coordinator（c-configfix） | `protocol.md §2.5`；D-055 任务 B（send 重放） |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -1160,3 +1161,28 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 4. 会话有 `instance.taskId` 时 tab 集合是该 Task 的会话，否则是所在 Space 的会话；⌘1..9 跟随眼前的可见编号（4A）。
 
 **依据**：[visual-system.md](./visual-system.md)（令牌契约与对比度全集）。代码锚点在 `42ccd7ee` 上复核：`web/src/styles/tokens.css:1-196`、`web/src/styles/ui.module.css:10-15,52,323-324,356-372,386-391`、`web/src/features/session/tty/theme.ts:15-68`、`web/src/pages/SessionPage.tsx:95,154,452-596,669`、`web/src/app/Shell.tsx:207-237,337`、`web/index.html:2,9`、`crates/remuda-hub/src/web.rs:1-9,100-107`。
+
+## D-055
+
+**2026-09-25 · 命令重放按操作分叉：send 可重放，configure 不可重放**
+
+| 日期 | 2026-09-25 |
+|---|---|
+| 状态 | adopted |
+| 相关 | protocol.md §2.5（命令幂等段，同日加注）；D-055 任务 B（send 同 id 重放恢复丢失响应，已落地） |
+
+**背景**：D-055 任务 B 让客户端用同一 commandId 重新 POST 以恢复丢失的响应；这对 `instance.send` 正确。`instance.configure` 沿用同一重放路径留下验收无法闭合的边角：(a) configure 重放可能再次 merge spec；(b) 首次 merge 失败（500）的行被重放成 200；(c) 并发同 id 重试不是原子的，可能 merge 两次；(d) 离线排队的 configure 从不转发，但重放路径语义不清。web 离线 outbox 只重放 `instance.send`，configure 根本不需要重放。
+
+**决策**：
+
+1. **`instance.send` 保持可重放。** 同 id 重放返回存储的原始记录/结局；仍排队的行走 G1，恰好转发一次；在飞尝试的跟随者绑定该尝试发布的终态行。
+2. **`instance.configure` 不可重放，spec merge 严格一次。** merge 只在首次 POST 执行：
+   - 终态行（`accepted`/`settled`）的重放：返回存储的原始记录，绝不再次 merge；首次 POST 在派发前 merge 失败的，持久化原始失败，重放原样复现该 500 与原始 body。
+   - 原始结局尚未持久化（转发仍在飞，`queued` + `forwarded=1`）：返回明确 409（`COMMAND_ID_CONFLICT`，body 指明 “still in flight”），指引客户端轮询 `GET /v1/instances/{id}/commands/{commandId}`；绝不 merge、绝不提前 200。
+   - 离线排队（`queued` + `forwarded=0`）：返回明确 409（body 指明排队 configure 不可重放），客户端必须以新 commandId 发新命令；重放绝不代为转发（重连本身也不自动转发，沿用既有 G1 规则）。
+   - 并发同 id 的首次 POST 竞争在 store 的串行 writer 上分出唯一 created 行，merge 只可能发生一次；负方走上述重放规则。
+3. **GET 单行命令诚实报在飞状态。** `GET /v1/instances/{id}/commands/{commandId}` 与重放走同一个「在飞尝试结算」：读到行后若有活动尝试，等待并返回**本次尝试**发布的终态行；订阅与意图标记之间的竞态由重读后二次订阅闭合。尝试尚未开始时如实返回 pending（`queued`/`forwarded=false`）。任何读都绝不先报 `forwarded=true` 再报被回滚的 `forwarded=false`（Ok(None) 释放）。
+
+**不做什么**：不新增错误码或状态机取值（409 复用 `COMMAND_ID_CONFLICT`，消息区分在飞/排队）；不引入 configure 转发队列；不改 Node 侧 commandId+digest 去重；web 无代码改动（outbox 本来只重放 send）。
+
+**依据**：`crates/remuda-hub/src/http.rs`（`post_command`、`replay_existing_command`、`settled_command_row`、`get_instance_command`）；`crates/remuda-hub/src/store.rs`（`queue_command` 串行 writer、`reject_command`、`patch_instance_configure`）。

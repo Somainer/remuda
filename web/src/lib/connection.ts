@@ -123,16 +123,6 @@ export class ConnectionMachine {
   }
 
   /**
-   * Begin in recovering WITHOUT firing a resume action (bootstrap uses this
-   * when no REST hello succeeded yet — a genuinely offline reload drives
-   * setStateOffline instead).
-   */
-  markRecovering() {
-    this.attempt = 0;
-    this.setState("recovering");
-  }
-
-  /**
    * Bootstrap over REST SUCCEEDED (hello + list), but no follow socket exists
    * yet (the caller is on the session list / new-session page), so there is no
    * frame stream to watchdog: report live without arming the frame timer. The

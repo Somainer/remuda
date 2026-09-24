@@ -4384,14 +4384,8 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
     let replay: Value = serde_json::from_str(replay.trim())?;
     assert_eq!(replay["replayed"], json!(true));
     assert_eq!(
-        replay["command"]["commandId"],
-        json!(id_x.as_id().as_str()),
-        "the replay returns X's stored row, not Y's"
-    );
-    assert_eq!(
-        replay["command"]["payload"]["model"],
-        json!("opus"),
-        "the response carries X's original content"
+        replay["command"], original["command"],
+        "the replay's complete command outcome equals X's original response"
     );
     let (status, _, instance) = http(
         hub.addr,
@@ -4431,9 +4425,9 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
         json!("COMMAND_ID_CONFLICT")
     );
 
-    // A configure whose first-POST merge failed: the replay is read-only too
-    // — it returns the stored row and applies nothing (no 500 re-run, no
-    // successful merge of the bad payload).
+    // A configure whose first-POST merge failed persists that outcome: the
+    // replay reproduces the SAME 500 with the same body (it does not re-run
+    // the merge and does not become a do-nothing replayed success).
     let bad_id = remuda_protocol::CommandId::new();
     let bad = json!({
         "commandId": bad_id.as_id().as_str(),
@@ -4444,16 +4438,16 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
     let (status, _, first) =
         http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&bad)).await?;
     assert_eq!(status, 500, "the first merge error must surface: {first}");
+    let first: Value = serde_json::from_str(first.trim())?;
+    assert_eq!(first["code"], json!("INTERNAL"), "{first}");
     let (status, _, replay) =
         http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&bad)).await?;
     assert_eq!(
-        status, 200,
-        "a replay returns the stored row, it does not re-run the merge: {replay}"
+        status, 500,
+        "a replay must reproduce the original merge failure: {replay}"
     );
     let replay: Value = serde_json::from_str(replay.trim())?;
-    assert_eq!(replay["replayed"], json!(true));
-    assert_eq!(replay["command"]["state"], json!("queued"), "{replay}");
-    assert_eq!(replay["command"]["forwarded"], json!(false), "{replay}");
+    assert_eq!(replay, first, "the replay body equals the original failure");
     let (status, _, instance) = http(
         hub.addr,
         "GET",
@@ -4469,6 +4463,21 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
         json!("haiku"),
         "the failed configure's replay applies nothing"
     );
+
+    // And the failed row reads back as a rejected, unforwarded settlement.
+    let (status, _, row) = http(
+        hub.addr,
+        "GET",
+        &format!("{path}/{}", bad_id.as_id().as_str()),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{row}");
+    let row: Value = serde_json::from_str(row.trim())?;
+    assert_eq!(row["state"], json!("settled"), "{row}");
+    assert_eq!(row["forwarded"], json!(false), "{row}");
+    assert_eq!(row["settlement"]["outcome"], json!("rejected"), "{row}");
     Ok(())
 }
 
@@ -4764,5 +4773,231 @@ async fn queued_unforwarded_send_with_expired_attachment_is_rejected() -> Result
     let row: Value = serde_json::from_str(row.trim())?;
     assert_eq!(row["forwarded"], json!(false), "{row}");
     assert_eq!(row["state"], json!("queued"), "{row}");
+    Ok(())
+}
+
+/// Two concurrent FIRST POSTs of one commandId with the same payload but
+/// different idempotency keys must serialize to one command plus one 409 —
+/// the store's writer job enforces (commandId, key) identity atomically, so
+/// the divergent key cannot ride the same-id replay branch.
+#[tokio::test]
+async fn concurrent_same_id_first_posts_with_different_keys_one_conflicts() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (_token, _link) =
+        accepting_node(hub.addr, &enroll, &host_id, "r5-key-race", sends.clone()).await?;
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    let path = format!("/v1/instances/{instance_id}/commands");
+
+    // Repeat to cover both interleavings (handler-prefilter and the
+    // writer-job atomic check); the outcome is required in every round.
+    for round in 0..6 {
+        let command_id = remuda_protocol::CommandId::new();
+        let make = |key: &str| {
+            json!({
+                "commandId": command_id.as_id().as_str(),
+                "operation": "instance.send",
+                "payload": { "text": format!("key race {round}") },
+                "idempotencyKey": key
+            })
+            .to_string()
+        };
+        let body1 = make(&format!("reconnb-r5-k1-{round}"));
+        let body2 = make(&format!("reconnb-r5-k2-{round}"));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let post = |body: String| {
+            let addr = hub.addr;
+            let cookie = cookie.clone();
+            let path = path.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                http(addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await
+            })
+        };
+        let one = post(body1);
+        let two = post(body2);
+        let (a, b) = tokio::join!(one, two);
+        let results = [a??, b??];
+        let statuses: Vec<u16> = results.iter().map(|(status, _, _)| *status).collect();
+        assert!(
+            statuses.contains(&200) && statuses.contains(&409),
+            "round {round}: exactly one POST succeeds, one conflicts, got {statuses:?}"
+        );
+        for (status, _, body) in &results {
+            if *status == 409 {
+                let body: Value = serde_json::from_str(body.trim())?;
+                assert_eq!(body["code"], json!("COMMAND_ID_CONFLICT"), "{body}");
+            }
+        }
+    }
+    // Let any dispatched frame land; exactly one command per round.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, _, listed) = http(
+        hub.addr,
+        "GET",
+        &format!("{path}?limit=50"),
+        &[("Cookie", &cookie)],
+        None,
+    )
+    .await?;
+    assert_eq!(status, 200, "{listed}");
+    let listed: Value = serde_json::from_str(listed.trim())?;
+    let race_rows = listed["commands"]
+        .as_array()
+        .context("commands")?
+        .iter()
+        .filter(|row| {
+            row["payload"]["text"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("key race "))
+        })
+        .count();
+    assert_eq!(
+        race_rows, 6,
+        "one committed command per round, no duplicate rows"
+    );
+    assert_eq!(sends.load(Ordering::Relaxed), 6, "one dispatch per round");
+
+    // Deterministic identity check: commit a command under one key, reject the
+    // same commandId under a second key, then show the rejected key was never
+    // bound and starts a legitimately fresh command on its own POST.
+    let bound_id = remuda_protocol::CommandId::new();
+    let bound = json!({
+        "commandId": bound_id.as_id().as_str(),
+        "operation": "instance.send",
+        "payload": { "text": "bound key" },
+        "idempotencyKey": "reconnb-r5-bound"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&bound),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let foreign = json!({
+        "commandId": bound_id.as_id().as_str(),
+        "operation": "instance.send",
+        "payload": { "text": "bound key" },
+        "idempotencyKey": "reconnb-r5-unbound-foreign"
+    })
+    .to_string();
+    let (status, _, conflict) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&foreign),
+    )
+    .await?;
+    assert_eq!(status, 409, "{conflict}");
+    let foreign_only = json!({
+        "operation": "instance.send",
+        "payload": { "text": "bound key" },
+        "idempotencyKey": "reconnb-r5-unbound-foreign"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&foreign_only),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(body.trim())?["replayed"],
+        json!(false),
+        "a rejected key was never committed, so its key-only POST is fresh"
+    );
+    Ok(())
+}
+
+/// Concurrent same-id retries against a transport whose forward NEVER queues
+/// a frame (`Ok(None)`): every response — followers included, across the
+/// attempt-1→attempt-2 handoffs — must report the released queued row
+/// (forwarded=false), never a transient forwarded=true.
+#[tokio::test]
+async fn concurrent_retries_against_dead_forward_all_report_unforwarded() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let (node_token, link) =
+        accepting_node(hub.addr, &enroll, &host_id, "r5-dead", sends.clone()).await?;
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    link.abort();
+    wait_host_online(hub.addr, &cookie, host_id.as_id().as_str(), false).await?;
+    let path = format!("/v1/instances/{instance_id}/commands");
+
+    let command_id = remuda_protocol::CommandId::new();
+    let body = json!({
+        "commandId": command_id.as_id().as_str(),
+        "operation": "instance.send",
+        "payload": { "text": "everyone rolls back" }
+    })
+    .to_string();
+    let (status, _, queued) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 200, "{queued}");
+    assert_eq!(
+        serde_json::from_str::<Value>(queued.trim())?["command"]["forwarded"],
+        json!(false)
+    );
+
+    // Host row live, transport refuses every frame before it queues.
+    hub.test_set_node_reply(host_id.as_id().as_str(), None)
+        .await;
+
+    // Burst concurrent replays through the leader/follower handoffs.
+    let barrier = Arc::new(tokio::sync::Barrier::new(6));
+    let mut tasks = Vec::new();
+    for _ in 0..6 {
+        let body = body.clone();
+        let addr = hub.addr;
+        let cookie = cookie.clone();
+        let path = path.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            http(addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await
+        }));
+    }
+    for task in tasks {
+        let (status, _, resp) = task.await??;
+        assert_eq!(status, 200, "{resp}");
+        let resp: Value = serde_json::from_str(resp.trim())?;
+        assert_eq!(resp["replayed"], json!(true));
+        assert_eq!(resp["command"]["state"], json!("queued"), "{resp}");
+        assert_eq!(
+            resp["command"]["forwarded"],
+            json!(false),
+            "no response may report a forward that never queued: {resp}"
+        );
+        assert_eq!(resp["command"]["resolution"], json!("clear"), "{resp}");
+    }
+
+    // After the real Node returns, one same-id replay delivers it once.
+    let (node, _) = open_fake_node(hub.addr, &node_token, &host_id, "r5-dead-back").await?;
+    let sends_back = Arc::new(AtomicUsize::new(0));
+    let _link = drive_accepting_node(node, sends_back.clone());
+    wait_host_online(hub.addr, &cookie, host_id.as_id().as_str(), true).await?;
+    let (status, _, delivered) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 200, "{delivered}");
+    assert_eq!(
+        serde_json::from_str::<Value>(delivered.trim())?["command"]["forwarded"],
+        json!(true)
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(sends_back.load(Ordering::Relaxed), 1);
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
     Ok(())
 }

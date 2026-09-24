@@ -777,7 +777,88 @@ describe("D-041 fold vs in-transcript search hit", () => {
       .querySelector("[data-testid='tool-card']") as HTMLElement;
     expect(nested.getAttribute("data-folded")).toBe("0");
   });
+
+  it("steps through two nested settled hits under one parent, opening each in turn", async () => {
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "派个子任务"),
+        nestedCall(2, "tc-task", "Task", { description: "look around" }, null),
+        nestedCall(3, "tc-a", "Bash", { command: "ls a" }, "tc-task", "agent-sub"),
+        nestedResult(4, "tc-a", "twinhit-3301 first", "agent-sub"),
+        nestedCall(5, "tc-b", "Bash", { command: "ls b" }, "tc-task", "agent-sub"),
+        nestedResult(6, "tc-b", "twinhit-3301 second", "agent-sub"),
+        nestedResult(7, "tc-task", "sub done"),
+        assistantMessage(8, "好了"),
+      ],
+      "/s/ins_twin_hit",
+    );
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "twinhit-3301");
+    const count = () => screen.getByTestId("transcript-search-count").textContent;
+    const folded = () =>
+      [...screen.getByTestId("subagent-fold").querySelectorAll("[data-testid='tool-card']")].map((card) =>
+        card.getAttribute("data-folded"),
+      );
+
+    await expect.poll(count).toBe("1/2");
+    await expect.poll(folded).toEqual(["0", "1"]);
+    await user.click(screen.getByTestId("transcript-search-next"));
+    expect(count()).toBe("2/2");
+    await expect.poll(folded).toEqual(["1", "0"]);
+    await user.click(screen.getByTestId("transcript-search-prev"));
+    expect(count()).toBe("1/2");
+    await expect.poll(folded).toEqual(["0", "1"]);
+  });
 });
+
+const nestedExecutor = known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null });
+
+/** A tool call, optionally stamped as a subagent's own (source agent id). */
+function nestedCall(
+  seq: number,
+  id: string,
+  name: string,
+  input: unknown,
+  parent: string | null,
+  agent?: string,
+): Observation {
+  const event = obs(seq, "tool_call", {
+    nodeId: `nc-${seq}` as Id,
+    revision: "1",
+    operation: "open",
+    baseRevision: null,
+    toolCallId: id as Id,
+    parentToolCallId: parent as Id | null,
+    toolName: known(name),
+    displayTitle: known(name),
+    category: name === "Bash" ? "shell" : name === "Workflow" ? "workflow" : "agent",
+    input: known(input),
+    inputTextDelta: null,
+    state: "running",
+    executor: nestedExecutor,
+  });
+  if (agent) (event.source as { nativeAgentId: unknown }).nativeAgentId = known(agent);
+  return event;
+}
+
+function nestedResult(seq: number, id: string, text: string, agent?: string): Observation {
+  const event = obs(seq, "tool_result", {
+    nodeId: `nr-${seq}` as Id,
+    revision: "1",
+    operation: "close",
+    baseRevision: null,
+    toolCallId: id as Id,
+    stage: "final",
+    outcome: "succeeded",
+    blocks: [{ type: "text", text }],
+    structuredResult: unknownKnowledge("text"),
+    exitCode: known(0),
+    changes: [],
+  });
+  if (agent) (event.source as { nativeAgentId: unknown }).nativeAgentId = known(agent);
+  return event;
+}
 
 /** A user-role message the agent did not write: hook context injection. */
 function injectedMessage(seq: number, text: string): Observation {

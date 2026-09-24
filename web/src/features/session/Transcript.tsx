@@ -364,9 +364,13 @@ function TranscriptInner({
       if (!located) return;
       const topId = nodes[located.index].id;
       const prev = map.get(topId);
+      // The nested child to open is the SELECTED hit when it sits under this
+      // parent; otherwise the first nested hit. A later match must not steal
+      // it, or 上一项/下一项 would never open the one the counter points at.
+      const nested = located.compactId ? match.nodeId : null;
       map.set(topId, {
         current: i === selectedIdx || Boolean(prev?.current),
-        childId: located.compactId ? match.nodeId : prev?.childId ?? null,
+        childId: nested && (i === selectedIdx || !prev?.childId) ? nested : prev?.childId ?? null,
       });
     });
     return map;

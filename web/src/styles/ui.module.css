@@ -655,6 +655,9 @@
   border-bottom: 1px solid var(--divider);
   text-align: left;
   vertical-align: top;
+  /* Figures line up down a column; an authored `:---:` alignment still wins
+     (it arrives as an inline style). */
+  font-variant-numeric: tabular-nums;
 }
 
 .md :global(th),

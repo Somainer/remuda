@@ -15,7 +15,7 @@ import type {
   WorkflowRunPayload,
 } from "../../types/generated";
 import type { DiffState } from "./assemble";
-import css from "./session.module.css";
+import css from "./toolCard.module.css";
 import foldCss from "./transcript.module.css";
 
 function asTextBlocks(result: ToolResultPayload | null): string {

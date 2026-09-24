@@ -1,0 +1,309 @@
+.fold {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  min-height: 24px;
+}
+
+.tool {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  overflow: hidden;
+}
+
+.toolPartial {
+  border-style: dashed;
+}
+
+.toolHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.toolTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--paper);
+}
+
+.toolStatus {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.runDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--cold);
+  flex: none;
+  animation: dim 1.4s ease-in-out infinite;
+}
+
+.okDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  flex: none;
+}
+
+.cmd {
+  margin: 0;
+  padding: 9px 12px 7px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--paper);
+  white-space: pre-wrap;
+}
+
+.stdoutHead {
+  padding: 0 12px 6px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mute);
+  cursor: pointer;
+}
+
+.stdout {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mute);
+  line-height: 1.6;
+  border-left: 1px solid var(--line);
+  margin: 0 12px 10px;
+  padding-left: 10px;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow: auto;
+}
+
+/* D-045 §6.2 / ui-spec §2.2: screenshot blocks a tool result staged. The
+   bound is a fixed max-height (never the card's), and opening one is a plain
+   link to /v1/objects/{id} — no lightbox, no auto-expand. */
+.toolMedia {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 12px 10px;
+}
+
+.toolMediaLink {
+  line-height: 0;
+  border-radius: 6px;
+}
+
+.toolThumb {
+  display: block;
+  max-height: 180px;
+  max-width: 100%;
+  width: auto;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+
+/* The text shown when a staged object has expired or fails to load. */
+.toolMediaMissing {
+  display: block;
+  min-height: 48px;
+  max-width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px dashed var(--line);
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.path {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stat {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.applied {
+  height: 20px;
+  border: 1px solid var(--ok);
+  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ok);
+  background: transparent;
+  flex: none;
+}
+
+.unknown {
+  height: 20px;
+  border: 1px dashed var(--mute);
+  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  background: transparent;
+  flex: none;
+}
+
+.proposed {
+  height: 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  background: transparent;
+  flex: none;
+}
+
+.usage {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mute);
+  padding-top: 2px;
+}
+
+.wfPhase {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--paper);
+  padding: 0 12px;
+}
+
+.wfMembers {
+  padding: 9px 12px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  list-style: none;
+}
+
+.member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 18px;
+}
+
+.memberName {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--paper);
+  min-width: 120px;
+}
+
+.memberMeta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  flex: 1;
+}
+
+.openBtn {
+  height: 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 9px;
+  font-size: 12px;
+  color: var(--paper);
+  background: transparent;
+  flex: none;
+}
+
+@keyframes dim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+
+   class carries the original declarations. */
+
+.spacer {
+  composes: spacer from "../../chrome/sessionHeader.module.css";
+}
+
+.assistant {
+  composes: assistant from "./transcript.module.css";
+}
+
+.bubble {
+  composes: bubble from "./transcript.module.css";
+}
+
+.cursor {
+  composes: cursor from "./transcript.module.css";
+}
+
+.thought {
+  composes: thought from "./transcript.module.css";
+}
+
+.user {
+  composes: user from "./transcript.module.css";
+}
+
+.you {
+  composes: you from "./transcript.module.css";
+}
+
+.opaque {
+  composes: opaque from "./transcript.module.css";
+}
+
+.changeRow {
+  composes: changeRow from "./transcript.module.css";
+}
+
+.heldRowActions {
+  composes: heldRowActions from "./composer.module.css";
+}

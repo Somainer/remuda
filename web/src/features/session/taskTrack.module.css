@@ -1,0 +1,36 @@
+.track {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 8px 12px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.track ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+
+   class carries the original declarations. */
+
+.openBtn {
+  composes: openBtn from "./toolCard.module.css";
+}
+
+.stat {
+  composes: stat from "./toolCard.module.css";
+}
+
+.toolHead {
+  composes: toolHead from "./toolCard.module.css";
+}
+
+.toolTitle {
+  composes: toolTitle from "./toolCard.module.css";
+}

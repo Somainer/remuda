@@ -2,7 +2,7 @@ import type { Instance } from "../../types/instance";
 import type { Observation } from "../../types/observation";
 import { latestScreenFromObservations } from "../../lib/screen";
 import { knowledgeValue } from "../../types/command";
-import css from "./session.module.css";
+import css from "./screen.module.css";
 
 export function ScreenView({
   instance,

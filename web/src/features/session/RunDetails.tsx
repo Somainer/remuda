@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import session from "./session.module.css";
+import session from "./runDetails.module.css";
 import css from "./runDetails.module.css";
 
 /**

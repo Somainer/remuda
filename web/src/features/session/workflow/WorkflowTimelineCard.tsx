@@ -22,7 +22,7 @@ import type {
 import type { SubagentRef } from "../assemble";
 import { ToolCard } from "../ToolCard";
 import { isToolFailure } from "../assemble";
-import sessionCss from "../session.module.css";
+import sessionCss from "../toolCard.module.css";
 import { subagentHref } from "../subagent/SubagentRows";
 import {
   agentClocks,

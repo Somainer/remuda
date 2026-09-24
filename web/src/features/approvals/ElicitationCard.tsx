@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Interaction, InteractionAnswer } from "../../types/interaction";
-import css from "../session/session.module.css";
+import css from "./decision.module.css";
 
 type ElicitationAction = "accept" | "decline" | "cancel";
 

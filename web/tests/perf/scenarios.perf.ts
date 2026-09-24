@@ -111,6 +111,8 @@ type ScenarioResult = {
     changedTickCommits: number;
     /** Update commits attributed to the one PATCHed card (must be exactly 1). */
     changedCardCommits: number;
+    /** Wall-clock ms of the closed E-board interval (must be positive). */
+    changeWallMs: number;
   };
 };
 
@@ -879,13 +881,26 @@ test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit 
       "no card commits except the changed one and time-label crossings",
     ).toBe(0);
 
+    // Close the measurement interval BEFORE reading the report, otherwise
+    // summarise finds no closed E-board interval and reports wallMs 0 (which
+    // zeroes the long-task rate too).
+    await markScenario(page, null);
+    const closedReport = await getReport(page);
+    const closedInterval = closedReport.scenarios
+      .filter((s) => s.name === "E-board")
+      .at(-1);
+    expect(closedInterval?.end, "the E-board scenario interval is closed").toBeTruthy();
+    const changeWallMs = (closedInterval?.end ?? 0) - (closedInterval?.start ?? 0);
+    expect(changeWallMs, "scenario wallMs is positive").toBeGreaterThan(0);
+
     const result = summarise(
-      changeReport,
+      closedReport,
       browser.browserType().name(),
       "E-board",
       { tasks: E_TASKS, pendingInteractions: E_PENDING },
       await readPeakHeap(page),
     );
+    expect(result.wallMs, "summarised wallMs is positive").toBeGreaterThan(0);
     result.boardCard = {
       tasks: E_TASKS,
       pendingInteractions: E_PENDING,
@@ -897,6 +912,7 @@ test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit 
       quietUnexplainedCommits: quietUnexplained.length,
       changedTickCommits: changedCommits.length,
       changedCardCommits: targetCommits.length,
+      changeWallMs,
     };
     summaries.push(result);
     console.log(JSON.stringify(result, null, 2));

@@ -601,7 +601,10 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
         const el = document.activeElement as HTMLElement | null;
         return {
           testid: el?.getAttribute("data-testid") ?? null,
-          task: el?.closest('[data-testid="board-card"]')?.getAttribute("data-task-id") ?? null,
+          // A board card or a rail task row carries the id.
+          task:
+            (el?.closest('[data-task-id]') as HTMLElement | null)?.getAttribute("data-task-id") ??
+            null,
           column: el?.closest('[data-testid="board-card"]')?.getAttribute("data-column") ?? null,
           inInert: !!el?.closest("[inert]"),
         };
@@ -696,6 +699,21 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
         }),
       );
 
+    // ── #2 (rail-origin) Esc from a rail-opened preview returns to the RAIL ──
+    // Open via a rail row click, not a card button; the restore target must
+    // be that rail row even though a card for the task exists on the board.
+    const railRowFor = (id: string) =>
+      page.locator(`[data-testid="task-row"][data-task-id="${id}"]`);
+    await railRowFor(fx.running.id).click();
+    await expect(drawer).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect
+      .poll(focusInfo, { timeout: 2_000 })
+      .toEqual(
+        expect.objectContaining({ testid: "task-row", task: fx.running.id }),
+      );
+
     // ── #4 Esc in the drawer must not close the sidebar 管理 menu ──────────
     await page.getByTestId("sidebar-admin").click();
     const adminMenu = page.getByRole("menu", { name: "管理" });
@@ -714,5 +732,83 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     await expect(adminMenu).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(adminMenu).toHaveCount(0);
+  });
+
+  test("preview at 900px covers the folded rail overlay: inert rows and scrim click", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 900, height: 900 });
+    await login(page);
+    const fx = await makeFixture(page);
+    await page.goto(`/board?project=${fx.project}`);
+    await expect(page.getByTestId("board-page")).toBeVisible();
+
+    // Below 1024 the rail is folded behind a 清单 button.
+    const rail = page.getByTestId("task-list");
+    await expect(rail).not.toBeVisible();
+    await page.getByTestId("board-index-open").click();
+    await expect(rail).toBeVisible();
+    expect(await rail.getAttribute("inert")).toBeNull();
+
+    // Open a preview from the rail. The overlay rail is now UNDER the scrim
+    // (z-31 < scrim z-40) and must be inert.
+    const firstRailRow = page.locator('[data-testid="task-list"] [data-testid="task-row"]').first();
+    const railTaskId = (await firstRailRow.getAttribute("data-task-id")) ?? "";
+    await firstRailRow.click();
+    const drawer = page.getByRole("dialog", { name: "任务预览" });
+    await expect(drawer).toBeVisible();
+    await expect(rail).toHaveAttribute("inert", "");
+
+    const inRail = async () =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        return !!el?.closest('[data-testid="task-list"]');
+      });
+
+    // Forward and reverse Tab from the drawer never reach the covered rail.
+    await drawer.focus();
+    for (let i = 0; i < 12; i += 1) {
+      await page.keyboard.press("Tab");
+      expect(await inRail()).toBe(false);
+    }
+    for (let i = 0; i < 12; i += 1) {
+      await page.keyboard.press("Shift+Tab");
+      expect(await inRail()).toBe(false);
+    }
+    // Even an explicit .focus() cannot enter the inert rail.
+    expect(
+      await page.evaluate((id) => {
+        const el = document.querySelector<HTMLElement>(
+          `[data-testid="task-row"][data-task-id="${id}"]`,
+        );
+        el?.focus();
+        return {
+          focusedInRail: !!document.activeElement?.closest('[data-testid="task-list"]'),
+          inert: !!el?.closest("[inert]"),
+        };
+      }, railTaskId),
+    ).toEqual({ focusedInRail: false, inert: true });
+
+    // A pointer click on the covered rail position hits the scrim and
+    // dismisses the preview (it never opens a different task).
+    const rowBox = await firstRailRow.boundingBox();
+    expect(rowBox).toBeTruthy();
+    await page.mouse.click(rowBox!.x + rowBox!.width / 2, rowBox!.y + rowBox!.height / 2);
+    await expect(drawer).toHaveCount(0);
+    // Focus restored to the rail row that opened the preview (rail origin).
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => ({
+            testid: (document.activeElement as HTMLElement | null)?.getAttribute("data-testid"),
+            task:
+              (document.activeElement as HTMLElement | null)
+                ?.closest('[data-testid="task-row"]')
+                ?.getAttribute("data-task-id") ?? null,
+          })),
+        { timeout: 2_000 },
+      )
+      .toEqual(expect.objectContaining({ testid: "task-row", task: railTaskId }));
   });
 });

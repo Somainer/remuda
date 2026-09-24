@@ -378,6 +378,22 @@ const noop = () => undefined;
 const cssEscape = (value: string): string =>
   typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, "\\$&");
 
+/**
+ * Whether focus can actually land on `el`: attached to the document, not
+ * inside an inert subtree, and rendered (offsetParent is null for
+ * display:none/zero-size-subtree; none of these controls is position:fixed).
+ */
+function isConnectedVisible(el: HTMLElement | null | undefined): el is HTMLElement {
+  return (
+    !!el &&
+    el.isConnected &&
+    !el.hasAttribute("inert") &&
+    !el.closest("[inert]") &&
+    !el.hidden &&
+    el.offsetParent !== null
+  );
+}
+
 // ── Page ──────────────────────────────────────────────────────────────────
 
 export function BoardPage() {
@@ -495,30 +511,28 @@ export function BoardPage() {
     const trigger = previewTrigger.current;
     setSelectedId(null);
     if (!trigger) return;
-    // Resolve AFTER the drawer unmounts. The card may have changed columns
-    // during the preview, so re-query the current card button by task id;
-    // the captured node is used only if that lookup misses but the node is
-    // still connected. Fallbacks: the rail row (rail-opened previews), then
-    // the rail search, so focus never lands on the covered board.
+    // Resolve AFTER the drawer (and any narrow-width inert) unmounts. The
+    // trigger KIND wins: a rail-opened preview returns to its rail row, a
+    // card-opened one to the current card button (re-queried, because the
+    // card may have changed columns). Only when that preferred target is
+    // gone or hidden do we walk to another connected, visible control for
+    // the task; focus never lands on a covered/hidden element.
     window.requestAnimationFrame(() => {
       const selector = `[data-task-id="${cssEscape(trigger.taskId)}"]`;
+      const railRow = document.querySelector<HTMLElement>(
+        `[data-testid="task-row"]${selector}`,
+      );
       const cardButton = document.querySelector<HTMLElement>(
         `[data-testid="board-card"]${selector} [data-testid="board-card-open"]`,
       );
-      if (cardButton?.isConnected) {
-        cardButton.focus();
+      const preferred = trigger.from === "rail" ? railRow : cardButton;
+      if (isConnectedVisible(preferred)) {
+        preferred.focus();
         return;
       }
-      if (trigger.node?.isConnected) {
-        trigger.node.focus();
-        return;
-      }
-      if (trigger.from === "rail") {
-        const railRow = document.querySelector<HTMLElement>(
-          `[data-testid="task-row"]${selector}`,
-        );
-        if (railRow?.isConnected) {
-          railRow.focus();
+      for (const candidate of [trigger.node, cardButton, railRow]) {
+        if (isConnectedVisible(candidate)) {
+          candidate.focus();
           return;
         }
       }
@@ -659,10 +673,19 @@ export function BoardPage() {
           onClick={() => setIndexOpen(false)}
         />
       ) : null}
+      {/*
+        Below 1024px the rail is an absolute overlay that paints UNDER the
+        preview scrim (rail z-31 < scrim z-40); while a preview is open it is
+        also inert, so its covered rows leave the tab order and clicks pass
+        through to the scrim. At ≥1024 the rail is a static index column
+        (indexOpen can't be set, the 清单 button is hidden there) and stays
+        interactive, by design.
+      */}
       <aside
         className={`${listCss.rail} ${css.rail}`}
         data-testid="task-list"
         data-open={indexOpen ? "1" : undefined}
+        inert={selectedItem && indexOpen ? true : undefined}
         aria-label="任务清单"
       >
         <div className={listCss.toolbar}>

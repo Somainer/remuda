@@ -196,7 +196,7 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
     await page.goto("/approvals");
     await expect(page).toHaveURL(/\/m\/inbox(?:\?|$)/);
     const phoneRow = page
-      .getByTestId("m-inbox-row")
+      .getByTestId("approval-row")
       .filter({ hasText: "AskUserQuestion" })
       .first();
     await expect(phoneRow).toBeVisible({ timeout: 20_000 });

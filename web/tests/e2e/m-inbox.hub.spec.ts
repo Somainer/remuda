@@ -168,7 +168,7 @@ test.describe("390px phone inbox", () => {
     const target = pairs[0].interaction;
 
     await page.goto(`/m/inbox?focus=${target}`);
-    await expect(page.getByTestId("m-inbox-row")).toHaveCount(4, { timeout: 20_000 });
+    await expect(page.getByTestId("approval-row")).toHaveCount(4, { timeout: 20_000 });
     const focused = page.locator('[data-interaction-id="' + target + '"]');
     await expect(focused).toHaveAttribute("data-focus", "true");
 
@@ -207,7 +207,7 @@ test.describe("390px phone inbox", () => {
 
     await page.goto("/m/inbox?kind=question");
     await expect(page.getByTestId("m-inbox")).toBeVisible();
-    await expect(page.getByTestId("m-inbox-row")).toHaveCount(1, { timeout: 20_000 });
+    await expect(page.getByTestId("approval-row")).toHaveCount(1, { timeout: 20_000 });
     const qrow = inboxRow(page, questionId);
     await expect(qrow).toHaveAttribute("data-kind", "question");
     const answer = qrow.getByRole("link", { name: "去回答" });
@@ -215,17 +215,17 @@ test.describe("390px phone inbox", () => {
     await expect(qrow.getByRole("button", { name: "允许一次" })).toHaveCount(0);
 
     await page.goto("/m/inbox?kind=approval");
-    await expect(page.getByTestId("m-inbox-row").filter({ hasText: "echo e2e" })).toBeVisible({
+    await expect(page.getByTestId("approval-row").filter({ hasText: "echo e2e" })).toBeVisible({
       timeout: 10_000,
     });
     await expect(page.locator(`[data-interaction-id="${questionId}"]`)).toHaveCount(0);
 
     // Segment buttons drive the same query; 全部 removes it.
-    await page.getByTestId("m-inbox-kind-question").click();
+    await page.getByTestId("inbox-kind-question").click();
     await expect(page).toHaveURL(/kind=question$/);
-    await page.getByTestId("m-inbox-kind-all").click();
+    await page.getByTestId("inbox-kind-all").click();
     await expect(page).toHaveURL(/\/m\/inbox$/);
-    await expect(page.getByTestId("m-inbox-row")).toHaveCount(2);
+    await expect(page.getByTestId("approval-row")).toHaveCount(2);
   });
 
   test("evidence: inbox banner and both tiers at 390px", async ({ page }) => {
@@ -242,7 +242,7 @@ test.describe("390px phone inbox", () => {
 
     await page.goto("/m/inbox");
     await expect(page.getByTestId("m-inbox-push-banner")).toBeVisible({ timeout: 10_000 });
-    await expect(page.getByTestId("m-inbox-row")).toHaveCount(1, { timeout: 15_000 });
+    await expect(page.getByTestId("approval-row")).toHaveCount(1, { timeout: 15_000 });
     await expect(page.getByTestId("m-inbox-recent-row")).toHaveCount(1, { timeout: 15_000 });
     await shot(page, "mobile-ui-4-inbox-390.png");
   });

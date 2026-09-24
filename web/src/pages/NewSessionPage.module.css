@@ -1,25 +1,30 @@
+/* @tokens strict */
 /*
- * Batch B: the form consumes the shared Sheet (components/Sheet.tsx) for the
- * scrim, dialog semantics and focus trap. This module only lays out the panel
- * contents. The shared scrim anchors popovers to the toolbar, but the New
- * Session dialog is centered (desktop) / bottom-sheet (phone): the panel
- * positions itself fixed inside the scrim so the shared scrim styles do not
- * have to change.
+ * UO-11 新建会话. The form owns only the panel contents: the shared Sheet
+ * (components/Sheet.tsx + overlay.module.css) provides the scrim, focus trap
+ * and the bottom-sheet grab handle. Desktop is a centered 720 (--read-measure)
+ * dialog; compact widths and short coarse-landscape viewports (the same
+ * layout query as useWorkbenchViewport().mobile) rise from the bottom of the
+ * visible band so the footer — and 开始 — stay above the soft keyboard.
+ * Hit sizes follow pointer: coarse, never width (ui-spec §3.4).
  */
 
 .sheet {
-  /* Center within the scrim regardless of its flex alignment. */
+  /* Centre within the scrim regardless of its flex alignment. */
   position: fixed;
   inset: 0;
   margin: auto;
-  width: 716px;
-  max-width: calc(100% - 24px);
-  height: calc(var(--workbench-height, 100dvh) - 48px);
-  max-height: calc(var(--workbench-height, 100dvh) - 48px);
+  width: var(--read-measure);
+  max-width: calc(100% - var(--space-5) * 2);
+  height: calc(var(--workbench-height, 100dvh) - var(--space-5) * 2);
+  max-height: calc(var(--workbench-height, 100dvh) - var(--space-5) * 2);
   padding: 0;
   gap: 0;
   overflow: hidden;
-  background: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-3);
 }
 
 .sheetForm {
@@ -30,58 +35,77 @@
 }
 
 .head {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--line);
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex: none;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--divider);
 }
 
 .headTitle {
-  font-size: 16px;
-  font-weight: 600;
   margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
 }
 
 .close {
-  width: 32px;
-  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: var(--icon-btn);
+  height: var(--icon-btn);
   margin-left: auto;
+  padding: 0;
   border: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--mute);
-  font-family: var(--mono);
-  font-size: 14px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+}
+
+.close:hover {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
 }
 
 .body {
-  padding: 16px 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 15px;
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
   overflow: auto;
 }
 
 .field {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--space-2);
   min-width: 0;
 }
 
+/* Fieldset reset for the labelled button groups (权限 / 执行 agent / 模型来源). */
+.bareFieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
 .label {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
 }
 
 .pair {
   display: flex;
-  gap: 14px;
+  gap: var(--space-4);
 }
 
 .pair > * {
@@ -90,263 +114,415 @@
 }
 
 .prompt {
-  min-height: 88px;
-  border: 1px solid var(--paper);
-  border-radius: var(--radius);
-  background: var(--ink-0);
-  padding: 11px 12px;
-  font-size: 14px;
-  line-height: 1.55;
-  color: var(--paper);
-  resize: vertical;
   width: 100%;
+  min-height: 88px;
+  padding: var(--space-3);
+  resize: vertical;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-size: var(--text-input);
+  line-height: 1.5;
 }
 
 .selectWrap {
-  height: 40px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
   display: flex;
   align-items: center;
-  padding: 0 12px;
-  gap: 9px;
-  background: var(--ink);
+  gap: var(--space-2);
+  /* Definite height so the native control fills it (height:100% needs a
+     definite parent); control-h is 32 with a fine pointer, 44 with coarse. */
+  height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+}
+
+.selectWrap:focus-within {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 1px var(--focus);
 }
 
 .select {
   flex: 1;
   min-width: 0;
-  border: 0;
-  background: transparent;
+  width: 100%;
+  height: 100%;
   padding: 0;
+  border: 0;
+  outline: none;
   appearance: none;
-  font-size: 14px;
+  background: transparent;
+  color: var(--fg-strong);
+  font-size: var(--text-input);
+}
+
+/* The wrapper owns the focus ring (composer-style :focus-within). */
+.select:focus-visible {
+  border: 0;
+  box-shadow: none;
 }
 
 .hostDot {
+  flex: none;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--ok);
-  flex: none;
+  /* Online is a calm idle fact, never a success green (state discipline). */
+  background: var(--fg-muted);
 }
 
 .hostDotOff {
-  background: var(--mute);
+  background: var(--fg-faint);
 }
 
 .hint {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.offlineHint {
+  color: var(--attention-fg);
 }
 
 .seg {
   display: flex;
-  gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+  gap: var(--space-2);
 }
 
 .choice {
-  height: 36px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  position: relative;
   display: inline-flex;
   align-items: center;
-  padding: 0 13px;
-  font-size: 13px;
-  color: var(--mute);
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  gap: 8px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: var(--lh-ui);
   white-space: nowrap;
+  transition:
+    background-color var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out),
+    color var(--dur-1) var(--ease-out);
 }
 
-.choiceOn {
-  border-color: var(--paper);
-  color: var(--paper);
+.choice:hover:not(:disabled) {
+  border-color: var(--border-control);
+  background: var(--bg-hover);
+  color: var(--fg-body);
 }
 
-.choiceDust {
-  border-color: var(--dust);
-  color: var(--dust);
+.choiceOn,
+.choiceOn:disabled {
+  border-color: var(--border-control);
+  background: var(--bg-selected);
+  color: var(--fg-strong);
 }
 
-.choiceDisabled {
+/* A destructive permission reads as danger whether or not it is selected. */
+.choiceDanger {
+  border-color: var(--danger-border);
+  color: var(--danger-fg);
+}
+
+.choiceDanger.choiceOn,
+.choiceDanger.choiceOn:disabled {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+.choiceDanger:hover:not(:disabled) {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+/* Unsupported harness (the dashed, explicit class). A plain disabled state
+   (submit in flight) only changes the cursor so the selected choice keeps its
+   selection look instead of going faint. */
+.choiceDisabled,
+.choiceDisabled:disabled {
   border-style: dashed;
-  color: var(--line);
+  border-color: var(--border);
+  background: transparent;
+  color: var(--fg-faint);
   cursor: not-allowed;
 }
 
-.yolo {
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  padding: 11px 13px;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
+.choice:disabled {
+  cursor: not-allowed;
 }
 
 .permRow {
   display: flex;
-  gap: 8px;
-  align-items: center;
   flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
 }
 
 .permChoice {
   flex: none;
   white-space: nowrap;
-  min-width: max-content;
+}
+
+.permNative {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  font-variant-numeric: tabular-nums;
+}
+
+.yolo {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+  background: var(--danger-bg);
 }
 
 .yoloHead {
   display: flex;
-  align-items: center;
-  gap: 9px;
   flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.yoloDot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger-fg);
+}
+
+.yoloTitle {
+  flex: 1;
+  color: var(--danger-fg);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 .yoloAck {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  gap: var(--space-2);
+  margin-left: var(--space-4);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
   white-space: nowrap;
 }
 
 .yoloAck input {
+  flex: none;
   width: 16px;
   height: 16px;
-  flex: none;
-}
-
-.yoloDot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--dust);
-  flex: none;
-}
-
-.yoloTitle {
-  font-size: 13px;
-  color: var(--dust);
-  flex: 1;
+  accent-color: var(--primary-fill);
 }
 
 .yoloBody {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
-  line-height: 1.6;
-  padding-left: 16px;
+  padding-left: var(--space-4);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .advanced {
-  border-top: 1px solid var(--line);
-  padding-top: 13px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--divider);
 }
 
 .advancedToggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 9px;
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
-  background: transparent;
-  border: 0;
+  gap: var(--space-2);
+  min-height: var(--control-h);
   padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
   text-align: left;
 }
 
-.m3 {
-  color: var(--dust);
+.advancedToggle:hover {
+  color: var(--fg-strong);
 }
 
 .driverList {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding-left: 18px;
+  gap: var(--space-2);
+  padding-left: var(--space-4);
+}
+
+.driverChoices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.driverChoice {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-h);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+
+.driverChoice:hover:not(:disabled) {
+  border-color: var(--border-control);
+}
+
+.driverChoiceOn {
+  border-color: var(--border-control);
+  background: var(--bg-selected);
+}
+
+.driverChoice:disabled {
+  border-style: dashed;
+  color: var(--fg-faint);
+  cursor: not-allowed;
 }
 
 .radio {
+  flex: none;
+  box-sizing: border-box;
   width: 13px;
   height: 13px;
+  border: 1px solid var(--border-control);
   border-radius: 50%;
-  border: 1px solid var(--line);
-  box-sizing: border-box;
-  flex: none;
 }
 
 .radioOn {
-  border: 4px solid var(--paper);
+  border: 4px solid var(--fg-strong);
+}
+
+.driverName {
+  white-space: nowrap;
+}
+
+.driverDefault {
+  padding: 1px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.launchPreview {
+  margin: var(--space-2) 0 var(--space-1);
+  padding: var(--space-3);
+  overflow-x: auto;
+  border: 1px solid var(--divider);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  color: var(--fg-body);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: var(--lh-code);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.argChip {
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-xs);
+  background: var(--bg-inset);
+  color: var(--fg-body);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .foot {
-  padding: 13px 18px;
-  border-top: 1px solid var(--line);
+  flex: none;
   display: flex;
   align-items: center;
-  gap: 12px;
-  flex: none;
-  background: var(--ink);
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--divider);
+  background: var(--bg-raised);
 }
 
 .footNote {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
   flex: 1;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .discard {
-  height: 36px;
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  display: flex;
-  align-items: center;
-  padding: 0 14px;
-  font-size: 13px;
-  color: var(--dust);
-  background: transparent;
+  min-height: var(--control-h);
   margin-right: auto;
+  padding: 0 var(--space-4);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--danger-fg);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: var(--lh-ui);
+}
+
+.discard:hover:not(:disabled) {
+  background: var(--danger-bg);
 }
 
 .cancel {
-  height: 36px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  display: flex;
-  align-items: center;
-  padding: 0 16px;
-  font-size: 13px;
-  color: var(--mute);
-  background: transparent;
+  min-height: var(--control-h);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: var(--lh-ui);
+}
+
+.cancel:hover:not(:disabled) {
+  border-color: var(--border-control);
 }
 
 .start {
-  height: 36px;
-  border: 1px solid var(--paper);
-  border-radius: var(--radius);
-  display: flex;
-  align-items: center;
-  padding: 0 22px;
-  font-size: 13px;
+  min-height: var(--control-h);
+  padding: 0 var(--space-5);
+  border: 1px solid var(--primary-fill);
+  border-radius: var(--radius-sm);
+  background: var(--primary-fill);
+  color: var(--on-primary);
+  font-size: var(--text-ui);
   font-weight: 500;
-  color: var(--paper);
-  background: transparent;
+  line-height: var(--lh-ui);
 }
 
 .start:disabled {
@@ -355,79 +531,77 @@
 }
 
 .error {
-  color: var(--dust);
-  font-size: 13px;
-  line-height: 1.45;
   margin: 0;
+  color: var(--danger-fg);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
   /* A code plus host-derived reason can be long; never overflow the 390px
      sheet or hide the text behind an ellipsis. */
   overflow-wrap: anywhere;
 }
 
-/* P0-2.5: the create may have landed but the result is unknown. The block is
-   persistent (no toast), names the phase and offers read-only actions. */
+/* P0-2.5: the create may have landed but the result is unknown. Unknown is a
+   neutral dashed shape that always carries text — never an amber/red fill. */
 .uncertain {
-  border: 1px solid var(--line);
-  border-left: 3px solid var(--dust);
-  border-radius: var(--radius);
-  padding: 12px 14px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  background: var(--ink-0);
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px dashed var(--unknown-border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .uncertainTitle {
-  margin: 0;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--paper);
   display: flex;
-  align-items: center;
-  gap: 10px;
   flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
 }
 
 .uncertainId {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
   font-weight: 400;
+  line-height: var(--lh-meta);
 }
 
 .uncertainBody {
   margin: 0;
-  font-size: 13px;
-  color: var(--paper);
-  line-height: 1.6;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 .uncertainActions {
   display: flex;
-  gap: 10px;
   flex-wrap: wrap;
+  gap: var(--space-2);
 }
 
 .checkButton {
-  height: 36px;
-  border: 1px solid var(--paper);
-  border-radius: var(--radius);
-  padding: 0 16px;
-  font-size: 13px;
-  color: var(--paper);
-  background: transparent;
+  min-height: var(--control-h);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--primary-fill);
+  border-radius: var(--radius-sm);
+  background: var(--primary-fill);
+  color: var(--on-primary);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: var(--lh-ui);
 }
 
-.handle {
-  display: none;
-}
-
+/* Compact layout: a bottom sheet pinned to the visible band. This is the same
+   layout query as useWorkbenchViewport().mobile (a width question, which also
+   matches short coarse-landscape viewports); touch hit sizes stay in the
+   pointer: coarse block below so a narrow mouse window keeps its density. */
 @media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
-  /* Rise from the bottom edge, sized to the visual viewport so the soft
-     keyboard pushes the footer — and the primary action — up with it.
-     c-mfix: the band starts at --workbench-top while the keyboard is open, so
-     anchor from the BAND bottom (layout bottom minus top minus band height),
-     not the old shell-height model that parked the sheet mid-screen. */
   .sheet {
     inset: auto 0 auto 0;
     margin: 0;
@@ -438,86 +612,29 @@
     max-width: 100%;
     height: auto;
     max-height: var(--workbench-height, 100dvh);
-    border-radius: 4px 4px 0 0;
-    border-left: 0;
-    border-right: 0;
-    border-bottom: 0;
+    border: 0;
+    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
   }
 
-  .foot {
-    padding-bottom: calc(13px + var(--safe-bottom));
-  }
-
-  .handle {
-    display: flex;
-    justify-content: center;
-    padding: 9px 0 4px;
-    flex: none;
-  }
-
-  .handleBar {
-    width: 38px;
-    height: 4px;
-    border-radius: 2px;
-    background: var(--line);
-  }
-
+  /* The shared Sheet draws the 36×4 grab handle (panelSheet::before) at the
+     band top; keep the title clear of it. */
   .head {
-    padding: 6px 16px 12px;
-  }
-
-  .headTitle {
-    font-size: 17px;
+    padding: 20px var(--space-4) var(--space-3);
   }
 
   .body {
-    padding: 14px 16px;
-    gap: 14px;
+    gap: var(--space-4);
+    padding: var(--space-4);
   }
 
   .pair {
     flex-direction: column;
-    gap: 9px;
+    gap: var(--space-3);
   }
 
-  .prompt {
-    min-height: 96px;
-    font-size: 15px;
-    padding: 12px;
-  }
-
-  .selectWrap {
-    height: 52px;
-  }
-
-  .select {
-    font-size: 16px;
-  }
-
-  .choice {
-    flex: 1;
-    height: 44px;
-    justify-content: center;
-    padding: 0 8px;
-  }
-
-  .permChoice {
-    flex: none;
-    white-space: nowrap;
-    min-width: max-content;
-    padding: 0 13px;
-  }
-
-  .yoloHead {
-    flex-wrap: wrap;
-  }
-
-  .yoloTitle {
-    white-space: nowrap;
-  }
-
-  .yoloAck {
-    margin-left: 16px;
+  .foot {
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4) calc(var(--space-3) + var(--safe-bottom));
   }
 
   .footNote {
@@ -526,85 +643,20 @@
 
   .discard,
   .cancel {
-    height: 48px;
-    padding: 0 18px;
-    font-size: 14px;
+    flex: 0 1 auto;
+    padding: 0 var(--space-3);
   }
 
   .start {
     flex: 1;
-    height: 48px;
-    justify-content: center;
-    font-size: 15px;
-    padding: 0 18px;
+    padding: 0 var(--space-4);
   }
 }
 
-/* D-028 §5.1 native-PTY-first driver picker (advanced section) */
-.driverChoices {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.driverChoice {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--paper);
-  font-size: 13px;
-  padding: 7px 11px;
-  min-height: 36px;
-}
-
-.driverChoiceOn {
-  border-color: var(--paper);
-}
-
-.driverName {
-  white-space: nowrap;
-}
-
-.driverDefault {
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--mute);
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  padding: 1px 7px;
-}
-
-.launchPreview {
-  margin: 8px 0 4px;
-  padding: 9px 11px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-0);
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--paper);
-  white-space: pre-wrap;
-  word-break: break-all;
-  overflow-x: auto;
-}
-
-.permChoice {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.permNative {
-  color: var(--mute);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  opacity: 0.85;
-}
-
-.choiceOn .permNative,
-.choiceDust .permNative {
-  opacity: 1;
+/* Coarse pointers: text buttons and inputs may visibly grow to 44px (they are
+   not glyph controls). This never keys off width (ui-spec §3.4). */
+@media (pointer: coarse) {
+  .choice {
+    padding: 0 var(--space-4);
+  }
 }

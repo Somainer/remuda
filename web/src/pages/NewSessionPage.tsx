@@ -569,9 +569,6 @@ export function NewSessionPage() {
           })();
         }}
       >
-        <div className={css.handle}>
-          <div className={css.handleBar} />
-        </div>
         <header className={css.head}>
           <h1 className={css.headTitle} id="new-session-title">
             新建会话
@@ -629,6 +626,7 @@ export function NewSessionPage() {
                   type="button"
                   className={`${css.choice} ${cwdMode === "existing" ? css.choiceOn : ""}`}
                   data-testid="cwd-mode-existing"
+                  aria-pressed={cwdMode === "existing"}
                   onClick={() => setCwdMode("existing")}
                 >
                   已有目录
@@ -637,6 +635,7 @@ export function NewSessionPage() {
                   type="button"
                   className={`${css.choice} ${cwdMode === "worktree" ? css.choiceOn : ""}`}
                   data-testid="cwd-mode-worktree"
+                  aria-pressed={cwdMode === "worktree"}
                   onClick={() => setCwdMode("worktree")}
                 >
                   新建 worktree
@@ -698,7 +697,7 @@ export function NewSessionPage() {
             </div>
           </div>
           <div className={css.pair}>
-            <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
+            <fieldset className={`${css.field} ${css.bareFieldset}`}>
               <legend className={css.label}>执行 agent</legend>
               <div className={css.seg}>
                 {KINDS.map((k) => (
@@ -707,6 +706,7 @@ export function NewSessionPage() {
                     type="button"
                     className={`${css.choice} ${activeKind === k.id ? css.choiceOn : ""} ${kindEnabled(k.id) ? "" : css.choiceDisabled}`}
                     data-testid={`new-session-kind-${k.id}`}
+                    aria-pressed={activeKind === k.id}
                     disabled={!kindEnabled(k.id) || phase !== "idle"}
                     onClick={() => {
                       if (!kindEnabled(k.id)) return;
@@ -771,7 +771,7 @@ export function NewSessionPage() {
               </label>
             )}
           </div>
-          <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
+          <fieldset className={`${css.field} ${css.bareFieldset}`}>
             <legend className={css.label}>权限</legend>
             {activeKind !== "terminal" ? (
               <div className={`${css.seg} ${css.permRow}`} data-testid="new-session-perm-row" data-harness={activeKind}>
@@ -779,9 +779,10 @@ export function NewSessionPage() {
                   <button
                     key={opt.id}
                     type="button"
-                    className={`${css.choice} ${css.permChoice} ${permissionMode === opt.id ? (opt.danger ? css.choiceDust : css.choiceOn) : ""}`}
+                    className={`${css.choice} ${css.permChoice} ${permissionMode === opt.id ? css.choiceOn : ""} ${opt.danger ? css.choiceDanger : ""}`}
                     data-testid={`new-session-perm-${opt.id}`}
                     data-danger={opt.danger ? "1" : undefined}
+                    aria-pressed={permissionMode === opt.id}
                     title={opt.description}
                     onClick={() => setPermissionMode(opt.id)}
                   >
@@ -797,9 +798,10 @@ export function NewSessionPage() {
                   <button
                     key={opt.id}
                     type="button"
-                    className={`${css.choice} ${css.permChoice} ${codexSandbox === opt.native ? (opt.danger ? css.choiceDust : css.choiceOn) : ""}`}
+                    className={`${css.choice} ${css.permChoice} ${codexSandbox === opt.native ? css.choiceOn : ""} ${opt.danger ? css.choiceDanger : ""}`}
                     data-testid={`new-session-sandbox-${opt.native}`}
                     data-danger={opt.danger ? "1" : undefined}
+                    aria-pressed={codexSandbox === opt.native}
                     title={opt.description}
                     onClick={() => setCodexSandbox(opt.native)}
                   >
@@ -830,8 +832,7 @@ export function NewSessionPage() {
           </fieldset>
           {effortCaps(activeKind).effort ? (
             <fieldset
-              className={css.field}
-              style={{ border: 0, padding: 0, margin: 0 }}
+              className={`${css.field} ${css.bareFieldset}`}
               data-testid="new-session-effort"
               data-harness={activeKind}
               data-effort={effortWireName(sessionEffort)}
@@ -857,7 +858,7 @@ export function NewSessionPage() {
               />
             </fieldset>
           ) : null}
-          <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }}>
+          <fieldset className={`${css.field} ${css.bareFieldset}`}>
             <legend className={css.label}>模型来源</legend>
             <div className={css.seg}>
               {DELEGATION_OPTIONS.map((opt) => (
@@ -866,6 +867,7 @@ export function NewSessionPage() {
                   type="button"
                   className={`${css.choice} ${delegation === opt.id ? css.choiceOn : ""}`}
                   data-testid={`new-session-delegation-${opt.id}`}
+                  aria-pressed={delegation === opt.id}
                   onClick={() => setDelegation(opt.id)}
                 >
                   {DELEGATION_LABELS[opt.id]}
@@ -921,7 +923,7 @@ export function NewSessionPage() {
                 {apiVia && hosts.find((host) => host.id === apiVia)?.state !== "online"
                   && hosts.find((host) => host.id === apiVia)?.state !== "enrolled"
                   && apiVia !== "none" && apiVia !== "self" ? (
-                  <span data-testid="new-session-api-via-offline" style={{ color: "var(--dust)" }}>
+                  <span data-testid="new-session-api-via-offline" className={css.offlineHint}>
                     该主机当前离线，派发将被 Hub 拒绝（api-via-host-offline），不会改道
                   </span>
                 ) : null}
@@ -956,7 +958,7 @@ export function NewSessionPage() {
                   </p>
                 )}
                 {!plainTerminal ? (
-                  <fieldset className={css.field} style={{ border: 0, padding: 0, margin: 0 }} data-testid="new-session-driver-row">
+                  <fieldset className={`${css.field} ${css.bareFieldset}`} data-testid="new-session-driver-row">
                     <legend className={css.label}>承载方式 · launch prefill</legend>
                     <div className={css.driverChoices}>
                       {driverChoices.map((choice) => (
@@ -966,6 +968,7 @@ export function NewSessionPage() {
                           className={`${css.driverChoice} ${driver === choice.id ? css.driverChoiceOn : ""} ${choice.allowed ? "" : css.choiceDisabled}`}
                           data-testid={`new-session-driver-${choice.id}`}
                           data-default={choice.id === nativeDefault ? "1" : "0"}
+                          aria-pressed={driver === choice.id}
                           disabled={!choice.allowed}
                           onClick={() => setDriverOverride(choice.id === nativeDefault ? null : choice.id)}
                         >
@@ -1060,7 +1063,7 @@ export function NewSessionPage() {
                 {launchArgTokens.length ? (
                   <p className={css.hint} data-testid="new-session-args-chips">
                     {launchArgTokens.map((token, index) => (
-                      <code key={`${token}-${index}`} className={css.m3}>
+                      <code key={`${token}-${index}`} className={css.argChip}>
                         {token}
                       </code>
                     ))}

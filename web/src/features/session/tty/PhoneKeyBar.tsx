@@ -52,12 +52,32 @@ const ACTION_KEYS: ActionKey[] = [
   { id: "ctrl", label: "Ctrl", ariaLabel: "Ctrl 粘滞修饰键", writes: true },
   { id: "esc", label: "Esc", ariaLabel: "Esc", writes: true },
   { id: "tab", label: "Tab", ariaLabel: "Tab", writes: true },
-  { id: "git", label: "git", ariaLabel: "打开 git 面板（工作区变更）", writes: false },
-  { id: "jump", label: "跳转", ariaLabel: "Jump To：跳转到其他会话", writes: false },
+  {
+    id: "git",
+    label: "git",
+    ariaLabel: "打开 git 面板（工作区变更）",
+    writes: false,
+  },
+  {
+    id: "jump",
+    label: "跳转",
+    ariaLabel: "Jump To：跳转到其他会话",
+    writes: false,
+  },
   { id: "clip", label: "贴", ariaLabel: "粘贴剪贴板到终端", writes: true },
-  { id: "history", label: "史", ariaLabel: "历史 prompt：填入本地输入条", writes: false },
+  {
+    id: "history",
+    label: "史",
+    ariaLabel: "历史 prompt：填入本地输入条",
+    writes: false,
+  },
   { id: "view", label: "", ariaLabel: "", writes: false },
-  { id: "keyboard", label: "键", ariaLabel: "唤起或收起软键盘与辅助键行", writes: false },
+  {
+    id: "keyboard",
+    label: "键",
+    ariaLabel: "唤起或收起软键盘与辅助键行",
+    writes: false,
+  },
 ];
 
 export function PhoneKeyBar({
@@ -80,7 +100,9 @@ export function PhoneKeyBar({
   const [ctrl, setCtrl] = useState(false);
   const [auxOpen, setAuxOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [clipboard, setClipboard] = useState<ClipboardReadStatus>(clipboardReadStatusSync);
+  const [clipboard, setClipboard] = useState<ClipboardReadStatus>(
+    clipboardReadStatusSync,
+  );
 
   useEffect(() => {
     let alive = true;
@@ -136,7 +158,9 @@ export function PhoneKeyBar({
         // The shared QuickFind overlay only mounts inside the spaces drawer on
         // this route, so open that drawer and call the exported opener in
         // grouped mode — no copy of its state or UI (m-jumpto acceptance 4).
-        document.querySelector<HTMLElement>("[data-testid='spaces-drawer-open']")?.click();
+        document
+          .querySelector<HTMLElement>("[data-testid='spaces-drawer-open']")
+          ?.click();
         openQuickFind({ grouped: true });
         return;
       case "clip": {
@@ -154,7 +178,10 @@ export function PhoneKeyBar({
             // the mouth is the toast plus the next probe flipping the button
             // disabled-with-reason — never a silent no-op.
             hubStore.toast("读取剪贴板失败：浏览器未授权");
-            setClipboard({ state: "blocked", reason: "浏览器拒绝了剪贴板读取权限" });
+            setClipboard({
+              state: "blocked",
+              reason: "浏览器拒绝了剪贴板读取权限",
+            });
           });
         return;
       }
@@ -182,21 +209,36 @@ export function PhoneKeyBar({
   };
 
   return (
-    <div className={css.phoneBar} data-testid="phone-keybar" data-aux={auxOpen ? "1" : "0"}>
+    <div
+      className={css.phoneBar}
+      data-testid="phone-keybar"
+      data-aux={auxOpen ? "1" : "0"}
+    >
       <div
         className={css.phoneRow}
         role="toolbar"
         aria-label="九键键盘条"
         onPointerDown={(event) => {
-          if ((event.target as HTMLElement).closest("button")) event.preventDefault();
+          if ((event.target as HTMLElement).closest("button"))
+            event.preventDefault();
         }}
       >
         {ACTION_KEYS.map((key) => {
           const id = key.id === "view" ? otherView : key.id;
           const label = key.id === "view" ? otherLabel : key.label;
-          const ariaLabel = key.id === "view" ? `切换到${otherLabel}视图（与顶栏分段同步）` : key.ariaLabel;
-          const pressed = key.id === "ctrl" ? ctrl : key.id === "keyboard" ? auxOpen : undefined;
-          const keyDisabled = key.writes && (disabled || (key.id === "clip" && clipboard.state !== "ready"));
+          const ariaLabel =
+            key.id === "view"
+              ? `切换到${otherLabel}视图（与顶栏分段同步）`
+              : key.ariaLabel;
+          const pressed =
+            key.id === "ctrl"
+              ? ctrl
+              : key.id === "keyboard"
+                ? auxOpen
+                : undefined;
+          const keyDisabled =
+            key.writes &&
+            (disabled || (key.id === "clip" && clipboard.state !== "ready"));
           return (
             <button
               key={key.id}
@@ -207,7 +249,11 @@ export function PhoneKeyBar({
               disabled={keyDisabled}
               aria-pressed={pressed}
               aria-label={ariaLabel}
-              title={key.id === "clip" && clipboard.state === "blocked" ? clipboard.reason : undefined}
+              title={
+                key.id === "clip" && clipboard.state === "blocked"
+                  ? clipboard.reason
+                  : undefined
+              }
               onClick={() => onAction(key.id)}
             >
               {label}
@@ -235,6 +281,9 @@ export function PhoneKeyBar({
         onClose={() => setHistoryOpen(false)}
         variant="sheet"
         testId="phone-history-sheet"
+        // UO-10: the history panel belongs to the always-dark terminal
+        // instrument, even though Sheet renders in a page-level portal.
+        className={css.historySheet}
       >
         <div className={css.historyHead}>
           <h2>历史 prompt</h2>
@@ -247,7 +296,9 @@ export function PhoneKeyBar({
             关闭
           </button>
         </div>
-        <p className={css.historyHint}>选中只填入本地输入条，不会自动发送（D-028a）。</p>
+        <p className={css.historyHint}>
+          选中只填入本地输入条，不会自动发送（D-028a）。
+        </p>
         {prompts.length ? (
           <div className={css.historyList} role="list">
             {prompts.map((prompt, index) => (

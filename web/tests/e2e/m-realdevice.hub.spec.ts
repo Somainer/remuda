@@ -212,6 +212,54 @@ async function raiseKeyboard(page: Page, keyboardHeight = 308) {
 }
 
 /**
+ * UO-10 round-2: drive a REAL keyboard open ANIMATION — intermediate frames
+ * at sub-threshold heights (loss < 120px) BEFORE the frozen final frame. The
+ * round-1 gate emitted a PTY resize from a timer scheduled during one of
+ * these approach frames; the freeze must now cancel/skip them. Fires each
+ * frame as a separate resize event so listeners observe the transition.
+ */
+async function raiseKeyboardAnimated(
+  page: Page,
+  keyboardHeight: number,
+): Promise<void> {
+  await page.evaluate(async (kb) => {
+    const vv = window.visualViewport;
+    const emit = (height: number) => {
+      const top = window.innerHeight - height;
+      const set = (name: string, value: number) => {
+        const desc: PropertyDescriptor = {
+          configurable: true,
+          get: () => value,
+        };
+        try {
+          Object.defineProperty(vv, name, desc);
+        } catch {
+          let proto: object | null = vv;
+          while (proto) {
+            try {
+              Object.defineProperty(proto, name, desc);
+              break;
+            } catch {
+              proto = Object.getPrototypeOf(proto);
+            }
+          }
+        }
+      };
+      set("height", height);
+      set("offsetTop", top);
+      vv.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    };
+    // Full → small loss (sub-threshold, must defer) → full keyboard.
+    emit(window.innerHeight - 40);
+    await new Promise((r) => setTimeout(r, 16));
+    emit(window.innerHeight - kb);
+    await new Promise((r) => setTimeout(r, 16));
+  }, keyboardHeight);
+  await page.waitForTimeout(300);
+}
+
+/**
  * The exact soft-keyboard sequence the coordinator's verifier uses on a real
  * iPhone: the LAYOUT viewport keeps its size (innerHeight unchanged), the
  * visual viewport keeps its width with bottom pinned (height shrinks,
@@ -532,9 +580,10 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
       }),
   );
 
-  // Keyboard up: the terminal keeps the band; the xterm viewport stays
-  // visible (clipped to the band) rather than collapsing behind the keyboard.
-  await raiseKeyboard(page);
+  // Keyboard up through a REAL animation (sub-threshold frame first, then
+  // the full keyboard): intermediate frames must neither commit a grid nor
+  // schedule a resize that later fires while frozen.
+  await raiseKeyboardAnimated(page, 308);
   await page.waitForTimeout(300);
   const after = await waitForInBand(page, '[aria-label="终端画面"]', 120);
   expect(after, "terminal viewport after keyboard").not.toBeNull();

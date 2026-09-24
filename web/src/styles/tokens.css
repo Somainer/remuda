@@ -179,27 +179,9 @@
 :root {
   --unknown-fg: var(--fg-muted);
   --unknown-border: var(--border-control);
-  /* The terminal is an always-dark instrument: same in both modes. These
-     mirror tty/theme.ts TERMINAL_THEME (visual-system.md §3.4/§4) so the
-     terminal frame chrome and the xterm canvas can share one palette without
-     CSS colour literals in TerminalView.module.css. */
+  /* The terminal is an always-dark instrument: same in both modes. */
   --term-bg: #1a1917;
   --term-fg: #e4dfd6;
-  --term-cursor: #e0b872;
-  --term-selection: #3d3a35;
-  --term-black: #2c2a27;
-  --term-red: #e8837c;
-  --term-green: #9dbf87;
-  --term-yellow: #dcb46a;
-  --term-blue: #86aee0;
-  --term-magenta: #c79ad8;
-  --term-cyan: #7fbfbb;
-  --term-white: #cfc9be;
-  /* Chrome derived from the same pair: frame surfaces, hairline borders and
-     muted text that stay readable on --term-bg in BOTH appearances. */
-  --term-raised: color-mix(in srgb, var(--term-fg) 7%, var(--term-bg));
-  --term-border: color-mix(in srgb, var(--term-fg) 18%, var(--term-bg));
-  --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
 
   --font-ui:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",

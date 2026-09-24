@@ -6,75 +6,92 @@ ui-spec §2.3/§4.7.
 
 ## What changed
 
-- **Always-dark instrument.** `tokens.css` now carries the full
-  `--term-*` chrome palette (`--term-bg` `#1a1917`, `--term-fg`
-  `#e4dfd6`, cursor/selection, raised surface, hairline, muted text) in the
-  mode-independent token block. `TerminalView.module.css` references only
-  `--term-*` tokens — no ink/paper/dust role tokens and no colour literals —
-  so the pane, toolbar, dock, key bar and badges resolve identically in
-  light and dark. The xterm canvas keeps `TERMINAL_THEME`
-  (`TerminalView.tsx` imports that name instead of the transition alias;
-  ANSI output and the standard 256-colour cube are never recoloured).
+- **Always-dark instrument.** The only new token on `:root` is the UO-1
+  pair `--term-bg` `#1a1917` / `--term-fg` `#e4dfd6` (tokens.css is UO-1's
+  file; round-2 review asked that no further tokens be added there). The
+  chrome shades (`--tty-raised`, `--tty-border`, `--tty-muted`) are derived
+  locally with `color-mix` and scoped to `.lab`, so they never leak and
+  never swap with the page appearance. `TerminalView.module.css` references
+  only those and type/radius tokens — no ink/paper/dust role tokens and no
+  component colour literals. The pane, toolbar, dock, key bar, badges,
+  search field and history panel resolve identically in light and dark.
+  xterm keeps `TERMINAL_THEME`; ANSI output and the standard 256-colour
+  cube are never recoloured.
 - **No pane/canvas seam.** Pane `.lab`, `.viewport` and the xterm host all
-  resolve `rgb(26, 25, 23)`; the host itself is transparent over the same
-  pane background, so there is no boundary between frame and canvas.
-- **Keyboard freeze (zero PTY resize).** While
-  `<html data-keyboard="1">` is stamped, `applyFit()` returns immediately —
-  no xterm fit and no `sessionRef.resize`. The existing
-  `data-keyboard` CSS freezes the grid: the viewport becomes a
-  bottom-aligning clipping flex box and the pre-keyboard xterm host sits at
-  the bottom of the band, upper rows clipped. A single `sendPtyResize`
-  dedupes by the last grid (`{cols,rows}`), so keyboard close that restores
-  the same grid also sends nothing. `window.__ttyLab.resizeCount()` /
-  `resetResizeCount()` expose the counter for tests. Keyboard close
-  re-enables fit normally.
-- **Type and spacing tokens.** Local input is `--text-input` (14px fine /
-  **16px coarse pointer**), field height 36px fine / 44px coarse, send
-  control matched. All chrome text uses `--text-meta` (12px) or larger; the
-  old 10.5px / 11px literal sizes are gone. Toolbar is a 32px desktop strip;
-  AuxKeys keys 28px with 12px mono; progress bar 2px; mode pill is a
-  radius-pill capsule. Stale badge shapes follow the two evidence kinds
-  (dashed neutral 「画面可能过期」 for `node-link-unavailable`, regular
-  frame text 「会话已结束」 for `instance-gone`).
+  resolve `rgb(26, 25, 23)`; the host is transparent over the pane.
+- **Keyboard freeze with a three-state fit gate.** `applyFit` classifies
+  each visual-viewport event:
+  - `freeze` — keyboard open, height-only change: clear any pending 40ms
+    resize timer, skip the fit, and if an earlier sub-threshold frame
+    already changed the xterm grid, roll it back to the frozen snapshot
+    (no PTY resize);
+  - `defer` — compact viewport in the first <120px of the keyboard opening:
+    commit no grid (the gesture may still reach the freeze threshold), so
+    a real open ANIMATION cannot schedule a resize that fires while frozen;
+  - `fit` — normal layout, including a WIDTH change with the keyboard open
+    (rotation): keeps the frozen ROWS, refits COLS to the new width, and
+    sends exactly one resize via an `allowResizeWhileKeyboard` flag that
+    lets the deferred timer past the still-stamped keyboard attribute.
+  A grid-deduping `sendPtyResize` means an open/close that settles to the
+  same grid sends nothing. `__ttyLab.resizeCount()` /
+  `resetResizeCount()` expose the counter.
+- **Cursor-anchored crop.** The frozen host is positioned with one
+  `translateY` computed from the active cursor row
+  (`clamp(cursorY - visibleRows + 1, 0, gridRows - visibleRows) ×
+  cellHeight`): a fresh shell prompt in the first rows stays at the top of
+  the band; a tall scrollback keeps its newest bottom rows. No xterm/PTY
+  resize; recomputed as frames arrive.
+- **Search field + history panel.** The desktop terminal search input gets
+  terminal roles (`--tty-raised` bg, `--term-fg` ink, hairline border,
+  terminal focus ring) instead of the page input theme. The history Sheet
+  renders in a page portal outside `.lab`, so a `historySheet` class gives
+  it the terminal background/border/foreground — prompts, heading and
+  close never render pale-on-white in light appearance.
+- **Type and spacing tokens.** Local input `--text-input` (14px fine /
+  **16px coarse**), height 36/44; all chrome text `--text-meta` (12px) or
+  larger (old 10.5/11px literals removed); toolbar 32px; AuxKeys 28px;
+  progress 2px; mode pill a radius capsule. Stale badge: dashed neutral
+  「画面可能过期」 for `node-link-unavailable`, regular 「会话已结束」 for
+  `instance-gone`.
 
 ## Verification
 
 The dev-only `pnpm test:e2e:terminal` gate needs `remuda dev` panes on a
-herdr server (which carries every worker session and the owner's own panes);
-per the task coordinator that command is NOT run here. Terminal coverage
-uses the hub-e2e fake Node plus `m-realdevice`, under the gate e2e lock
-with per-worker ports, servers in their own process groups with trap
-cleanup.
+herdr server; per the task coordinator it is never run here. Coverage uses
+the hub-e2e fake Node plus `m-realdevice`, under the gate e2e lock with
+per-worker ports, servers in setsid process groups with trap cleanup.
 
-- `tests/e2e/uo10-evidence.hub.spec.ts` (new):
-  - same dark instrument in explicit **dark** and **light** appearance on a
-    1440 desktop: `--term-bg` resolves `#1a1917`, pane and viewport both
-    `rgb(26, 25, 23)` (no seam), chrome ink stays light;
-  - 393px keyboard (323px visible band): local input and phone key bar fully
-    inside the band, xterm viewport/canvas height > 0; zero
-    `__ttyLab.resizeCount()` calls and identical rows/cols across the full
-    open/close cycle; the minimum font size on the terminal frame is ≥12px.
-- `tests/e2e/m-realdevice.hub.spec.ts` (b) drives the terminal at a 393px
-  phone width on every engine and asserts zero PTY resize calls with the
-  same fitted rows/cols through keyboard open and close.
+- `tests/e2e/uo10-evidence.hub.spec.ts`:
+  - same dark instrument in **dark** and **light** appearance (1440):
+    `--term-bg #1a1917`, pane/viewport `rgb(26,25,23)`, chrome ink resolves
+    from the `--tty-muted` shade (canvas-resolved sRGB), distinct from and
+    darker than `--term-fg` but still ≥4.5:1;
+  - 393px keyboard (323px band): local input + phone key bar inside the
+    band, xterm visible; **zero** resize calls and identical rows/cols
+    across the animated open/close; minimum frame font ≥12px; a fresh
+    shell's early rows remain inside the band (cursor-anchored crop);
+  - **rotation with keyboard open**: width 393→700, exactly one resize,
+    cols increase, rows stay at the frozen value;
+  - history sheet dark in both appearances (`rgb(26,25,23)` panel, light
+    heading) with light/dark screenshots.
+- `tests/e2e/m-realdevice.hub.spec.ts` (b) drives a real animated keyboard
+  open (sub-threshold frame then full height) at 393px on every engine and
+  asserts zero resize calls with unchanged rows/cols through open+close.
 
 Screenshots (390/1440, Remuda only):
 
-- `uo10-terminal-dark-1440.png` / `uo10-terminal-light-1440.png` — the dark
-  terminal is pixel-identical in both appearances;
-- `uo10-terminal-keyboard-390.png` — keyboard up, input + key bar in band,
-  xterm bottom-aligned.
+- `uo10-terminal-dark-1440.png` / `uo10-terminal-light-1440.png`;
+- `uo10-terminal-keyboard-390.png` — keyboard up, input + key bar in band;
+- `uo10-history-sheet-dark-390.png` / `uo10-history-sheet-light-390.png`.
 
 ## Results
 
-- WebKit iPhone 13 (mrealdevice config): `m-realdevice` + `uo10-evidence`
-  9 passed.
-- Chromium hub config: `uo10-evidence`, `m-realdevice`,
-  `session-terminal-lab`, `terminal-live`, `ux-ttymode` — passed with the
+- WebKit iPhone 13: `m-realdevice` 9 passed.
+- Chromium hub config (`uo10-evidence`, `m-realdevice`,
+  `session-terminal-lab`, `terminal-live`, `ux-ttymode`): 13 passed, 3
   pre-existing skips.
-- Unit: StaleScreenBadge wording tests updated; full `pnpm test` green.
-- Perf scenario B (5000-line terminal flood + scrollback paging, chromium,
-  same host, two runs each):
+- Unit 1738/1738 (StaleScreenBadge wording tests updated).
+- Perf scenario B (two runs each vs origin/main):
 
   | run | this branch wallMs | origin/main wallMs |
   |---|---|---|
@@ -82,5 +99,5 @@ Screenshots (390/1440, Remuda only):
   | 2 | 13 009 | 13 171 |
   | median | 13 262 | 13 059 |
 
-  Both: 0 long tasks, renderer `webgl`, 0 context losses. Median delta
-  ~+1.5 %, inside run-to-run noise; **no regression**.
+  0 long tasks, `webgl`, 0 context losses both — ~+1.5% median, within
+  noise; **no regression**.

@@ -204,44 +204,55 @@ for (const appearance of ["dark", "light"] as const) {
     expect(["rgba(0, 0, 0, 0)", "rgb(26, 25, 23)", null]).toContain(
       colors.host,
     );
-    // The geo pill renders in LIGHT ink on the dark instrument. Newer
-    // browsers serialize colour-mix results in lab/oklab (no "rgb(" text), so
-    // resolve sRGB channels through a canvas fill+getImageData instead of
-    // string-matching computed style. Also prove the pill is wired to the
-    // mode-independent --term-muted token rather than an appearance token.
+    // The geo pill renders in LIGHT muted ink on the dark instrument
+    // (--tty-muted ≈ rgb(151,148,141)), distinct from the plain --term-fg
+    // (≈ rgb(228,223,214)) but still well above the 4.5:1 floor. Serialized
+    // colour-mix is not stable across engines, so resolve sRGB via canvas.
     const geo = page.getByTestId("tty-io-mode");
     await expect(geo).toBeVisible();
     const ink = await page.evaluate(() => {
-      const pill = document.querySelector<HTMLElement>(
-        "[data-testid='tty-io-mode']",
-      )!;
-      const pillColor = getComputedStyle(pill).color;
-      // The same token, probed independently.
-      const probe = document.createElement("span");
-      probe.style.color = "var(--term-muted)";
-      probe.style.position = "absolute";
-      document.body.appendChild(probe);
-      const tokenColor = getComputedStyle(probe).color;
-      probe.remove();
       const read = (cssColor: string) => {
         const canvas = document.createElement("canvas");
         canvas.width = 1;
         canvas.height = 1;
         const ctx = canvas.getContext("2d")!;
-        ctx.fillStyle = "#000";
         ctx.fillStyle = cssColor;
         ctx.fillRect(0, 0, 1, 1);
         const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
-        return { r, g, b };
+        return [r, g, b] as const;
       };
-      return { pillColor, tokenColor, rgb: read(pillColor) };
+      const pill = document.querySelector<HTMLElement>(
+        "[data-testid='tty-io-mode']",
+      )!;
+      const lab = document.querySelector<HTMLElement>("[data-tty-lab='1']")!;
+      // The chrome shades are scoped to .lab (not :root), so the probes must
+      // resolve INSIDE the lab element — a body-level probe would inherit
+      // --term-fg instead.
+      const readVar = (name: string) => {
+        const probe = document.createElement("span");
+        probe.style.color = name;
+        probe.style.position = "absolute";
+        lab.appendChild(probe);
+        const rgb = read(getComputedStyle(probe).color);
+        probe.remove();
+        return rgb;
+      };
+      return {
+        pillRgb: read(getComputedStyle(pill).color),
+        mutedRgb: readVar("var(--tty-muted)"),
+        fgRgb: readVar("var(--term-fg)"),
+      };
     });
-    expect(ink.pillColor, "pill must resolve from the --term-muted token").toBe(
-      ink.tokenColor,
+    // The pill is the muted chrome shade (not plain foreground).
+    expect(ink.pillRgb, "pill uses the terminal muted shade").toEqual(
+      ink.mutedRgb,
     );
+    // …which is visibly darker than the plain foreground.
+    expect(ink.pillRgb[0]).toBeLessThan(ink.fgRgb[0]);
+    // …but still light ink on the dark instrument (>130 floor, ≈4.5:1).
     expect(
-      Math.min(ink.rgb.r, ink.rgb.g, ink.rgb.b),
-      `chrome ink ${JSON.stringify(ink.rgb)} stays light on the dark terminal`,
+      Math.min(...ink.pillRgb),
+      `chrome ink ${JSON.stringify(ink.pillRgb)} stays light`,
     ).toBeGreaterThan(130);
 
     if (appearance === "dark") await shot(page, "uo10-terminal-dark-1440.png");
@@ -352,6 +363,60 @@ test.describe("390px keyboard band", () => {
     expect(Number(await lab.getAttribute("data-tty-rows"))).toBe(beforeRows);
     expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(beforeCols);
 
+    // UO-10 round-2 item 4: this is a FRESH shell whose banner/prompt occupy
+    // the first few rows. The cursor-anchored crop must keep a painted early
+    // row visible INSIDE the band (the old bottom-only clip left a short
+    // buffer blank). WebGL canvas pixels are not readable
+    // (preserveDrawingBuffer=false), so assert via renderer-agnostic geometry:
+    // the ROW containing the active cursor has a painted element intersecting
+    // the visible band near its top, and the screen's top edge sits inside
+    // the band (offsetRows=0 for a short buffer).
+    const promptVisible = await page.evaluate(() => {
+      const viewport = document.querySelector<HTMLElement>(
+        '[aria-label="终端画面"]',
+      );
+      const screen = document.querySelector<HTMLElement>(".xterm-screen");
+      if (!viewport || !screen)
+        return { ok: false, reason: "no terminal screen" };
+      const vr = viewport.getBoundingClientRect();
+      const sr = screen.getBoundingClientRect();
+      // Cursor-anchored crop: for a short buffer the transform offset must be
+      // 0, so the frozen screen's TOP edge aligns with (or is just below) the
+      // viewport band's top — the prompt painted in the first rows is in the
+      // band, not scrolled above it.
+      const topGap = sr.top - vr.top;
+      const topAligned = topGap >= -2 && topGap < vr.height * 0.35;
+      // A painted row element (xterm-rows > div, or the webgl canvas) exists
+      // within the top third of the band.
+      const domRows = screen.querySelectorAll(".xterm-rows > div");
+      let earlyRowInBand = false;
+      domRows.forEach((row, i) => {
+        if (i > 5) return;
+        const r = row.getBoundingClientRect();
+        if (r.height > 0 && r.top >= vr.top - 2 && r.bottom <= vr.bottom + 2)
+          earlyRowInBand = true;
+      });
+      // For canvas/webgl renderers the screen element itself overlapping the
+      // top of the band is the evidence.
+      const canvasInBand =
+        sr.top < vr.top + vr.height * 0.35 && sr.bottom > vr.top;
+      const rowsMounted = domRows.length > 0;
+      return {
+        ok: topAligned && canvasInBand,
+        topAligned,
+        canvasInBand,
+        earlyRowInBand,
+        rowsMounted,
+        topGap,
+        srTop: sr.top,
+        vrTop: vr.top,
+      };
+    });
+    expect(
+      promptVisible.ok,
+      `fresh shell prompt visible after keyboard crop: ${JSON.stringify(promptVisible)}`,
+    ).toBe(true);
+
     if (evidence) await shot(page, "uo10-terminal-keyboard-390.png", 390);
 
     // Keyboard closes: fit resumes — still ZERO resize commands when the grid
@@ -403,4 +468,139 @@ test.describe("390px keyboard band", () => {
     ).toEqual([]);
     expect(smallest.min).toBeGreaterThanOrEqual(12);
   });
+
+  test("width change with the keyboard open (rotation) refits and sends exactly one resize", async ({
+    page,
+  }) => {
+    if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+    const id = await createTerminal(page, "uo10 rotate");
+    const lab = page.locator("[data-tty-lab]");
+    await page.goto(`/s/${id}/tty`);
+    await expect(lab).toHaveAttribute("data-tty-ready", "1", {
+      timeout: 30_000,
+    });
+    await expect
+      .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
+      .toBeGreaterThan(3);
+
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              window.__ttyLab?.resetResizeCount();
+              resolve();
+            }),
+          );
+        }),
+    );
+    const colsBefore = Number(await lab.getAttribute("data-tty-cols"));
+    const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
+
+    // Open the keyboard (height-only → frozen, zero resize).
+    await raiseKeyboardIosExact(page, 336);
+    await page.waitForTimeout(300);
+    expect(
+      await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+    ).toBe(0);
+    expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
+
+    // Rotate: width changes while the keyboard stays open. This is a genuine
+    // layout change — exactly one resize must go out with the new cols.
+    const landscapeWidth = 700;
+    await page.setViewportSize({
+      width: landscapeWidth,
+      height: 659,
+    });
+    // The keyboard stays at the same height in both orientations.
+    await page.evaluate((kb) => {
+      const vv = window.visualViewport;
+      const h = window.innerHeight - kb;
+      Object.defineProperty(vv, "height", {
+        configurable: true,
+        get: () => h,
+      });
+      Object.defineProperty(vv, "offsetTop", {
+        configurable: true,
+        get: () => kb,
+      });
+      vv.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    }, 336);
+    await page.waitForTimeout(500);
+
+    // Exactly one resize for the rotation.
+    await expect
+      .poll(async () =>
+        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      )
+      .toBe(1);
+    // The new width produces a different (wider) col grid.
+    const colsRotated = Number(await lab.getAttribute("data-tty-cols"));
+    expect(colsRotated).toBeGreaterThan(colsBefore);
+    // Rotation did not restore the pre-keyboard rows (still frozen height);
+    // only cols changed.
+    expect(Number(await lab.getAttribute("data-tty-rows"))).toBe(rowsBefore);
+  });
+
+  for (const appearance of ["light", "dark"] as const) {
+    test(`history sheet stays a dark panel in ${appearance} appearance`, async ({
+      page,
+    }) => {
+      if (!(await fakeHostId(page)))
+        test.skip(true, "fake Node not registered");
+      await page.setViewportSize({ width: 393, height: 659 });
+      await page.addInitScript((mode) => {
+        window.localStorage.setItem("runtime.theme.v1", mode);
+      }, appearance);
+      await page.reload();
+      const id = await createTerminal(page, `uo10 history ${appearance}`);
+      // Seed a prompt so the history list has content.
+      await openTerminal(page, id);
+      await page
+        .locator("input[aria-label='本地输入']")
+        .first()
+        .fill("uo10 history seed");
+      await page.keyboard.press("Enter");
+      await page.waitForTimeout(500);
+      // Open the 史 history panel from the phone key bar.
+      await page.getByTestId("phone-key-history").click();
+      const sheet = page.getByTestId("phone-history-sheet");
+      await expect(sheet).toBeVisible();
+      const heading = page.getByText("历史 prompt").first();
+      await expect(heading).toBeVisible();
+
+      // The panel is the dark terminal surface in BOTH appearances: its
+      // background is --term-bg, and text stays light (pale text on white was
+      // the round-2 light-mode bug).
+      const panel = await page.evaluate(() => {
+        const el = document.querySelector<HTMLElement>(
+          "[data-testid='phone-history-sheet']",
+        )!;
+        const h = el.querySelector<HTMLElement>("h2")!;
+        const read = (cssColor: string) => {
+          const c = document.createElement("canvas");
+          c.width = 1;
+          c.height = 1;
+          const ctx = c.getContext("2d")!;
+          ctx.fillStyle = cssColor;
+          ctx.fillRect(0, 0, 1, 1);
+          return Array.from(ctx.getImageData(0, 0, 1, 1).data.slice(0, 3));
+        };
+        return {
+          bg: read(getComputedStyle(el).backgroundColor),
+          heading: read(getComputedStyle(h).color),
+        };
+      });
+      // Background rgb(26,25,23).
+      expect(panel.bg).toEqual([26, 25, 23]);
+      // Heading light ink in both appearances.
+      expect(Math.min(...panel.heading)).toBeGreaterThan(150);
+
+      if (appearance === "light")
+        await shot(page, "uo10-history-sheet-light-390.png", 390);
+      if (appearance === "dark")
+        await shot(page, "uo10-history-sheet-dark-390.png", 390);
+    });
+  }
 });

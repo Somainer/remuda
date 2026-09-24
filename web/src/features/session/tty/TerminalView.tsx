@@ -5,7 +5,10 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { useWorkbenchViewport } from "../../../lib/viewport";
+import {
+  COMPACT_WORKBENCH_QUERY,
+  useWorkbenchViewport,
+} from "../../../lib/viewport";
 import { hubStore } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
@@ -242,6 +245,93 @@ export function TerminalView({
       sentCount += 1;
       void sessionRef.current?.resize(cols, rows);
     };
+    /**
+     * UO-10 round-2 resize gate.
+     *
+     * A keyboard open is a HEIGHT-only shrink: the visual viewport loses
+     * height while the layout width (and therefore the fitted cols) stays
+     * constant. Such transitions must never refit or resize the PTY — the
+     * grid is frozen at its pre-keyboard value.
+     *
+     * A WIDTH change (rotation, split view) is a genuine layout change even
+     * while the keyboard is open: cols really do change, so it must refit and
+     * send exactly one resize.
+     *
+     * Returns:
+     *  - "freeze"  → keyboard height-only transition: skip fit, and restore
+     *               the frozen grid if an intermediate sub-threshold frame
+     *               already resized xterm before data-keyboard was stamped;
+     *  - "defer"   → compact, keyboard in the first <120px of opening: the
+     *               gesture may still reach the freeze threshold, so wait;
+     *  - "fit"     → normal layout change, fit and resize.
+     */
+    let frozenGrid: { cols: number; rows: number } | null = null;
+    let lastClientWidth = host.clientWidth;
+    // UO-10 round-2 item 2: the client width recorded the moment the freeze
+    // began. A width change relative to this is a real rotation/layout change
+    // that must refit even while the keyboard stays open.
+    let frozenClientWidth = host.clientWidth;
+    // Kept fresh by the ResizeObserver (which fires before applyFit reads
+    // clientWidth on rotation, so the comparison is not a self-equal).
+    let observedClientWidth = host.clientWidth;
+    // True while the CURRENT applyFit is a rotation-driven fit made while the
+    // keyboard is open; the scheduled resize must not be re-cancelled by the
+    // still-stamped data-keyboard attribute.
+    let allowResizeWhileKeyboard = false;
+    /**
+     * UO-10 round-2 item 4: while frozen, position the pre-keyboard-sized host
+     * inside the clipped viewport so the ACTIVE CURSOR ROW (and the newest
+     * output) stays visible.
+     *
+     * offsetRows = clamp(cursorY - visibleRows + 1, 0, gridRows - visibleRows)
+     *   - fresh shell, cursor near the top → 0 (prompt visible at the top);
+     *   - tall buffer, cursor at the bottom → gridRows - visibleRows
+     *     (bottom rows visible, equivalent to the old bottom-align).
+     * Pure CSS, no xterm/PTY resize. Recomputed on writes (cursor moves).
+     */
+    const updateFreezeCrop = () => {
+      if (document.documentElement.dataset.keyboard !== "1") {
+        host.style.transform = "";
+        return;
+      }
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      const screenH = screen?.getBoundingClientRect().height ?? 0;
+      const cellH = term.rows > 0 ? screenH / term.rows : 0;
+      const viewportH = viewport.clientHeight;
+      if (cellH <= 0 || viewportH <= 0) return;
+      const visibleRows = viewportH / cellH;
+      const cursorY = term.buffer.active.cursorY;
+      const maxOffset = Math.max(0, term.rows - visibleRows);
+      const offsetRows = Math.min(
+        maxOffset,
+        Math.max(0, cursorY - visibleRows + 1),
+      );
+      host.style.transform = `translateY(${-Math.round(offsetRows * cellH)}px)`;
+    };
+    const keyboardState = (): "freeze" | "defer" | "fit" => {
+      const vv = window.visualViewport;
+      if (!vv) return "fit";
+      const isCompact = window.matchMedia(COMPACT_WORKBENCH_QUERY).matches;
+      const heightLoss = window.innerHeight - vv.height;
+      // Compare against the OBSERVED width (updated by ResizeObserver) and
+      // the width captured at freeze entry — either changing means rotation.
+      const widthChanged =
+        observedClientWidth !== lastClientWidth ||
+        (document.documentElement.dataset.keyboard === "1" &&
+          frozenGrid !== null &&
+          observedClientWidth !== frozenClientWidth);
+      if (vv.scale !== 1) return "fit";
+      if (document.documentElement.dataset.keyboard === "1") {
+        // Keyboard fully open. A width change still refits (rotation); the
+        // height shrink alone freezes.
+        return widthChanged ? "fit" : "freeze";
+      }
+      // Intermediate keyboard frames on a compact viewport: loss between 0
+      // and the freeze threshold. Don't commit a grid yet — the gesture may
+      // cross into frozen state on the next frame.
+      if (isCompact && heightLoss > 0 && heightLoss < 120) return "defer";
+      return "fit";
+    };
 
     const flushOut = () => {
       outRaf = 0;
@@ -259,6 +349,10 @@ export function TerminalView({
             if (run.replay) replayGuard.leave();
             setReady(true);
             setMouseMode(term.modes.mouseTrackingMode);
+            // UO-10: keep the frozen crop anchored to the cursor as output
+            // arrives while the keyboard is open.
+            if (document.documentElement.dataset.keyboard === "1")
+              updateFreezeCrop();
           });
         });
       }
@@ -266,11 +360,55 @@ export function TerminalView({
 
     const applyFit = () => {
       if (!termRef.current || !viewportRef.current) return;
-      // UO-10 keyboard freeze (ui-spec §2.3/§4.7): while the soft keyboard
-      // owns the band there is no fit and no PTY resize. CSS keeps xterm at
-      // its pre-keyboard grid bottom-aligned in the clipped viewport; the
-      // close-triggered fit restores the layout with the same rows/cols.
-      if (document.documentElement.dataset.keyboard === "1") return;
+      const gate = keyboardState();
+      // A rotation fit arms this for the scheduled resize; reset on entry.
+      const rotationFit =
+        gate === "fit" && document.documentElement.dataset.keyboard === "1";
+      // UO-10 round-2:
+      //  - freeze: keyboard-only height transition. Cancel any resize a
+      //    sub-threshold frame scheduled; if that frame already changed the
+      //    xterm grid, restore the frozen snapshot. Never fit/resize.
+      //  - defer: compact viewport in the first <120px of keyboard opening.
+      //    Skip entirely so the approach frames cannot commit a grid.
+      if (gate === "freeze" || gate === "defer") {
+        window.clearTimeout(resizeTimer);
+        // A freeze/defer is a keyboard transition; a rotation flag left armed
+        // by a previous fit is consumed or cancelled here.
+        allowResizeWhileKeyboard = false;
+        if (gate === "freeze") {
+          if (!frozenGrid) {
+            // First frozen frame: snapshot the grid AND the width the PTY
+            // currently has.
+            frozenGrid = { cols: term.cols, rows: term.rows };
+            frozenClientWidth = observedClientWidth;
+          } else if (
+            term.cols !== frozenGrid.cols ||
+            term.rows !== frozenGrid.rows
+          ) {
+            // An intermediate frame resized xterm before data-keyboard was
+            // stamped — roll the client grid back. No PTY resize.
+            term.resize(frozenGrid.cols, frozenGrid.rows);
+            setCols(frozenGrid.cols);
+            setRows(frozenGrid.rows);
+          }
+          updateFreezeCrop();
+        }
+        lastClientWidth = observedClientWidth;
+        return;
+      }
+      // Normal layout change (incl. rotation while keyboard open).
+      // UO-10 round-2 item 2: rotation while the keyboard stays open keeps
+      // the FROZEN ROWS (the keyboard still occludes that height) and only
+      // refits COLS to the new width. The frozen snapshot supplies rows;
+      // don't clear it until keyboard close. A normal (non-keyboard) layout
+      // change clears the snapshot and measures the full box.
+      const pinnedRows = rotationFit ? (frozenGrid?.rows ?? null) : null;
+      if (!rotationFit) {
+        frozenGrid = null;
+        host.style.transform = "";
+      }
+      allowResizeWhileKeyboard = rotationFit;
+      lastClientWidth = observedClientWidth;
       // A4: xterm is mounted in `.host`, which carries 16px/20px padding inside
       // `.viewport`. Measuring `.viewport` overshot by that padding, so the
       // bottom row was clipped and `.viewport` grew its own scrollbar.
@@ -282,19 +420,30 @@ export function TerminalView({
       const padY =
         (parseFloat(pad.paddingTop) || 0) +
         (parseFloat(pad.paddingBottom) || 0);
+      // Rotation with keyboard: height is unconstrained for the fit math —
+      // rows are pinned to the frozen value, so use a large height so the
+      // responsive solver never clips rows; cols derive from real width.
       const bounds = {
         width: Math.max(0, host.clientWidth - padX),
-        height: Math.max(0, host.clientHeight - padY),
+        height:
+          pinnedRows !== null
+            ? Number.POSITIVE_INFINITY
+            : Math.max(0, host.clientHeight - padY),
         dpr: window.devicePixelRatio || 1,
         lineHeight: term.options.lineHeight || 1,
         letterSpacing: term.options.letterSpacing || 0,
       };
       if (modeRef.current === "responsive") {
-        const size = responsiveTerminalSize(
+        const computed = responsiveTerminalSize(
           bounds,
           font.measure,
           BASE_FONT_SIZE,
         );
+        // Rotation keeps the frozen rows; only cols change.
+        const size =
+          pinnedRows !== null && computed
+            ? { cols: computed.cols, rows: pinnedRows }
+            : computed;
         if (size && (term.cols !== size.cols || term.rows !== size.rows))
           term.resize(size.cols, size.rows);
         if (size) {
@@ -302,7 +451,14 @@ export function TerminalView({
           setRows(size.rows);
           window.clearTimeout(resizeTimer);
           resizeTimer = window.setTimeout(() => {
+            // Re-check: a keyboard may have OPENED between scheduling and
+            // firing (UO-10 round-2 item 1). A rotation fit that itself ran
+            // while the keyboard was open is allowed through.
+            const keyboardNow =
+              document.documentElement.dataset.keyboard === "1";
+            if (keyboardNow && !allowResizeWhileKeyboard) return;
             sendPtyResize(size.cols, size.rows);
+            allowResizeWhileKeyboard = false;
           }, 40);
         }
         return;
@@ -347,7 +503,10 @@ export function TerminalView({
       setRows(term.rows);
       window.clearTimeout(resizeTimer);
       resizeTimer = window.setTimeout(() => {
+        const keyboardNow = document.documentElement.dataset.keyboard === "1";
+        if (keyboardNow && !allowResizeWhileKeyboard) return;
         sendPtyResize(term.cols, term.rows);
+        allowResizeWhileKeyboard = false;
       }, 40);
     };
 
@@ -464,7 +623,11 @@ export function TerminalView({
     sessionRef.current = session;
     generationRef.current += 1;
 
-    const observer = new ResizeObserver(() => applyFit());
+    const observer = new ResizeObserver(() => {
+      observedClientWidth = host.clientWidth;
+      applyFit();
+    });
+    observedClientWidth = host.clientWidth;
     observer.observe(viewport);
     const onViewport = () => {
       if (window.visualViewport && window.visualViewport.scale !== 1) return;
@@ -534,6 +697,7 @@ export function TerminalView({
       window.visualViewport?.removeEventListener("resize", onViewport);
       window.removeEventListener("resize", onViewport);
       window.clearTimeout(resizeTimer);
+      host.style.transform = "";
       if (outRaf) cancelAnimationFrame(outRaf);
       inputDisposable.dispose();
       binaryDisposable.dispose();
@@ -751,6 +915,7 @@ export function TerminalView({
             }}
           >
             <input
+              className={css.searchInput}
               aria-label="搜索终端"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}

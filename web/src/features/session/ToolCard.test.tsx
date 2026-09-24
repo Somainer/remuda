@@ -127,7 +127,39 @@ describe("ToolCard · reading-column fold (D-053)", () => {
     expect(screen.getByTestId("tool-thumb")).toBeTruthy();
   });
 
-  it("keeps 不完整 visible on a folded partial record", () => {
+  it("keeps a partial record open at desktop and compact widths", () => {
+    const original = window.matchMedia;
+    try {
+      for (const compact of [false, true]) {
+        window.matchMedia = ((query: string) => ({
+          matches: compact,
+          media: query,
+          onchange: null,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          addListener: () => {},
+          removeListener: () => {},
+          dispatchEvent: () => false,
+        })) as typeof window.matchMedia;
+        const { unmount } = render(
+          <ToolCard
+            driverKind="claude-pty"
+            call={mcpCall()}
+            result={imageResult()}
+            completeness="partial"
+            diffState="unknown"
+            foldSettled={!compact}
+          />,
+        );
+        expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+        unmount();
+      }
+    } finally {
+      window.matchMedia = original;
+    }
+  });
+
+  it("folds a partial record only on an explicit collapse-all and keeps 不完整 visible", () => {
     render(
       <ToolCard
         driverKind="claude-pty"
@@ -136,6 +168,7 @@ describe("ToolCard · reading-column fold (D-053)", () => {
         completeness="partial"
         diffState="unknown"
         foldSettled
+        defaultFolded
       />,
     );
     expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");

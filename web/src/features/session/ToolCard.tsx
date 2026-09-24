@@ -526,13 +526,14 @@ export function ToolCard({
   // the instant its final result lands. D-053 extends the D-041 automatic fold
   // to every width inside the reading column (`foldSettled`); a bare card keeps
   // the D-041 compact-layout rule. The Workflow/error/interaction exemptions
-  // live inside shouldFoldToolCard.
+  // live inside shouldFoldToolCard. A partial record never auto-folds (it is
+  // missing data the reader should see); only an explicit 全部折叠 folds it.
   const compactLayout = useCompactLayout();
   const folded =
     !userExpanded &&
     shouldFoldToolCard({
       family,
-      settled,
+      settled: settled && completeness !== "partial",
       compact: foldSettled || compactLayout,
       failed,
       interaction: isInteractionTool(nativeName),

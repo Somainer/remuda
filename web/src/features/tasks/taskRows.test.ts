@@ -10,6 +10,7 @@ import {
   ATTENTION_GROUP_ID,
   buildTaskGroups,
   taskAwaitsHuman,
+  taskCardSignal,
   taskNextStep,
   taskSpaceId,
   type TaskListGroup,
@@ -384,5 +385,51 @@ describe("search", () => {
     // key search matches the first sequence only.
     expect(flattenIds(group(byKey, "project").rows)).toEqual([spill.id]);
     expect(build([spill, other], [], [], { query: "不存在的关键词" }).some((g) => g.rows.length)).toBe(false);
+  });
+});
+
+describe("board card signal line (ui-spec §2.9)", () => {
+  it("shows the failure signal first, carrying the reason", () => {
+    const failed = task("f1", { state: "failed", blockedReason: "worker exited 42" });
+    expect(
+      taskCardSignal({ task: failed, needsHuman: true, sessionCount: 1 }),
+    ).toEqual({ kind: "failed", reason: "worker exited 42" });
+    const noReason = task("f2", { state: "failed" });
+    expect(taskCardSignal({ task: noReason, needsHuman: true, sessionCount: 0 })).toEqual({
+      kind: "failed",
+      reason: null,
+    });
+  });
+
+  it("shows 需要你处理 before any state phrase", () => {
+    const blocked = task("h1", { state: "running", blockedReason: "waiting on keys" });
+    expect(
+      taskCardSignal({ task: blocked, needsHuman: true, sessionCount: 1 }),
+    ).toEqual({ kind: "needs-human" });
+  });
+
+  it("renders the authoritative sha7 for a landed card", () => {
+    const landed = task("l1", { state: "done", landedSha: "abcdef0123456789" });
+    expect(
+      taskCardSignal({ task: landed, needsHuman: false, sessionCount: 1 }),
+    ).toEqual({ kind: "landed", sha7: "abcdef0" });
+  });
+
+  it("renders 尚未合入 for a done card without a land record — never a land entry", () => {
+    const unlanded = task("u1", { state: "done" });
+    expect(
+      taskCardSignal({ task: unlanded, needsHuman: false, sessionCount: 1 }),
+    ).toEqual({ kind: "unlanded" });
+  });
+
+  it("falls back to the shared next-step phrase for live states", () => {
+    const running = task("s1", { state: "running" });
+    expect(
+      taskCardSignal({ task: running, needsHuman: false, sessionCount: 1 }),
+    ).toEqual({ kind: "next-step", text: "进行中" });
+    const pending = task("s2", { state: "pending" });
+    expect(
+      taskCardSignal({ task: pending, needsHuman: false, sessionCount: 0 }),
+    ).toEqual({ kind: "next-step", text: "待派发" });
   });
 });

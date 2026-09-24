@@ -1,14 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "react-router-dom";
 import { rest } from "../../lib/api";
 import type { components } from "../../lib/api.generated";
-import { useHub } from "../../lib/store";
-import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { fetchChanges } from "../files/filesApi";
 import type { Task } from "../../types/generated";
-import { TaskDetailPanel } from "./TaskDetailPanel";
 import {
-  buildTaskGroups,
   taskNextStep,
   type TaskListGroup,
   type TaskRow,
@@ -16,13 +12,13 @@ import {
 import css from "./tasklist.module.css";
 
 /**
- * Task list mounted at `/board` (D-050, ui-spec §2.9; plan task-model 5).
- * The rail is the operator's work list — 需要你 first, project + git branch
- * groups (header blocked count is buildSpaces() blockedCount), children
- * nested under parents, SE-nn derived keys, 已归档 folded away — and the
- * detail panel renders mandate/title/blockedReason as the body a later task
- * anchors annotations to. Ledger data comes from GET /v1/tasks; sessions and
- * interactions from the same hub store every other surface polls.
+ * The operator task list (D-050, ui-spec §2.9; plan task-model 5) — the
+ * 需要你-first rail mounted beside the desktop board (Board.tsx) and, in its
+ * phone variant, inside the /m home task layer (HomeList.tsx). Project + git
+ * branch groups (header blocked count is buildSpaces() blockedCount),
+ * children nested under parents, SE-nn derived keys, 已归档 folded away.
+ * Ledger data comes from GET /v1/tasks; sessions and interactions from the
+ * same hub store every other surface polls.
  */
 
 type TaskPage = components["schemas"]["TaskPage"];
@@ -320,80 +316,4 @@ function TaskRowView({
       ))}
     </>
   );
-}
-
-export function TaskListPage() {
-  const hub = useHub();
-  const prefs = useSpacesPrefs();
-  const [params] = useSearchParams();
-  const projectId = params.get("project");
-  const ledger = useTaskLedger(projectId);
-  const [query, setQuery] = useState("");
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  const spaces = useMemo(
-    () => buildSpaces(hub.workspaces, hub.instances, prefs),
-    [hub.workspaces, hub.instances, prefs],
-  );
-  const { branchOf } = useLiveBranches(spaces);
-
-  const groups = useMemo(
-    () =>
-      buildTaskGroups({
-        tasks: ledger.tasks,
-        instances: hub.instances,
-        interactions: hub.interactions,
-        spaces,
-        projectName: ledger.projectName,
-        branchOfSpace: branchOf,
-        query,
-      }),
-    [ledger.tasks, ledger.projectName, hub.instances, hub.interactions, spaces, branchOf, query],
-  );
-
-  // Keep a selection: the chosen task, the first live row on arrival, or null.
-  const flatRows = useMemo(
-    () => groups.flatMap((group) => flattenRows(group.rows)),
-    [groups],
-  );
-  useEffect(() => {
-    if (flatRows.length === 0) {
-      setSelectedId(null);
-      return;
-    }
-    if (!selectedId || !flatRows.some((row) => row.id === selectedId)) {
-      setSelectedId(flatRows[0].id);
-    }
-  }, [flatRows, selectedId]);
-
-  const selectedRow = flatRows.find((row) => row.id === selectedId) ?? null;
-
-  return (
-    <div className={css.board} data-testid="task-list">
-      <div className={css.rail}>
-        <div className={css.toolbar}>
-          <input
-            className={css.search}
-            type="search"
-            data-testid="task-search"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-            placeholder="搜索 Task"
-            aria-label="搜索任务"
-          />
-        </div>
-        <TaskGroups groups={groups} selectedId={selectedId} onSelect={(task) => setSelectedId(task.id)} />
-      </div>
-      <TaskDetailPanel
-        task={selectedRow?.task ?? null}
-        displayKey={selectedRow?.displayKey}
-        sessionIds={selectedRow?.sessionIds}
-        primarySessionId={selectedRow?.primarySessionId}
-      />
-    </div>
-  );
-}
-
-function flattenRows(rows: TaskRow[]): TaskRow[] {
-  return rows.flatMap((row) => [row, ...flattenRows(row.children)]);
 }

@@ -85,6 +85,8 @@ type Fixture = {
   running: TaskDoc;
   done: TaskDoc;
   failed: TaskDoc;
+  blocked: TaskDoc;
+  landed: TaskDoc;
   archived: TaskDoc;
   sharedA: TaskDoc;
   sharedB: TaskDoc;
@@ -209,6 +211,50 @@ async function makeFixture(page: Page): Promise<Fixture> {
   });
   await setState(failed, "failed", "worker exited 42");
 
+  // A live session parked on a pending approval: the card's 需要你 signal.
+  const blocked = await create("needs-you");
+  const blockedLaunch = await apiJson<{ instance?: { instanceId?: string; id?: string } }>(
+    page,
+    "POST",
+    "/v1/instances",
+    {
+      hostId: host,
+      workspaceId: "wsp_e2e",
+      kind: "claude",
+      driver: "claude-print",
+      taskId: blocked.id,
+      prompt: `BUI mhome-blocked approval gate ${suffix}`,
+    },
+  );
+  const blockedInstanceId = blockedLaunch.instance?.instanceId ?? blockedLaunch.instance?.id;
+  expect(blockedInstanceId).toBeTruthy();
+  createdInstances.push(blockedInstanceId!);
+  await expect
+    .poll(
+      async () => {
+        const list = await apiJson<{ items?: { instanceId?: string; state?: string }[] }>(
+          page,
+          "GET",
+          `/v1/interactions?instanceId=${blockedInstanceId}`,
+        );
+        return (list.items ?? []).some(
+          (item) => item.instanceId === blockedInstanceId && item.state === "pending",
+        );
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+
+  // A genuinely landed card: done through the state machine, then the
+  // gate/land record writes the sha (the only path to 已合入).
+  const landed = await create("landed");
+  await setState(landed, "placed");
+  await setState(landed, "running");
+  await setState(landed, "done");
+  await apiJson(page, "POST", `/v1/tasks/${landed.id}/land`, {
+    sha: "abcdef0123456789abcdef",
+  });
+
   // One archived card (state untouched).
   const archived = await create("archived");
   await apiJson<TaskDoc>(page, "POST", `/v1/tasks/${archived.id}/archive`, {});
@@ -246,6 +292,8 @@ async function makeFixture(page: Page): Promise<Fixture> {
     running,
     done,
     failed,
+    blocked,
+    landed,
     archived,
     sharedA,
     sharedB,
@@ -274,11 +322,14 @@ test.afterAll(async ({ browser }) => {
 test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
 
-  test("three columns, sessions, sharing, failed badge, legal drags and the read-only preview", async ({
-    page,
-  }) => {
+  // Shared across the serial tests in this describe (the project poll test
+  // only needs a project id to deep-link).
+  let fixture: Fixture | null = null;
+
+  test("three columns, card states, legal drags and the overlay preview", async ({ page }) => {
     await login(page);
     const fx = await makeFixture(page);
+    fixture = fx;
 
     // The sidebar project rows are the board's project filter (UO-2a, formerly
     // the top-bar switcher); global would show every project on the shared
@@ -338,6 +389,55 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     const fold = page.getByTestId("board-archive-fold");
     await expect(fold).toBeVisible();
     await expect(cardIn(fold, fx.archived.id)).toBeVisible();
+
+    // UO-8: the six card states. Failed keeps its badge; the rest render the
+    // one signal line (needs-you / landed / unlanded / derived next step).
+    const blockedCard = cardIn(column(page, "todo"), fx.blocked.id);
+    await expect(blockedCard.getByTestId("board-signal")).toHaveAttribute(
+      "data-kind",
+      "needs-human",
+    );
+    await expect(blockedCard.getByTestId("board-signal")).toContainText("需要你处理");
+
+    const landedCard = cardIn(column(page, "done"), fx.landed.id);
+    await expect(landedCard.getByTestId("board-signal")).toHaveAttribute("data-kind", "landed");
+    await expect(landedCard.getByTestId("board-signal")).toContainText("abcdef0");
+    await expect(landedCard.getByTestId("board-signal")).toContainText("已合入");
+
+    const doneCard = cardIn(column(page, "done"), fx.done.id);
+    await expect(doneCard.getByTestId("board-signal")).toHaveAttribute("data-kind", "unlanded");
+    await expect(doneCard.getByTestId("board-signal")).toContainText("尚未合入");
+
+    await expect(
+      cardIn(column(page, "in-progress"), fx.running.id).getByTestId("board-signal"),
+    ).toHaveAttribute("data-kind", "next-step");
+    await expect(
+      cardIn(column(page, "todo"), fx.sharedA.id).getByTestId("board-signal"),
+    ).toContainText("待派发");
+
+    // UO-8: the board exposes no land entry — 已合入/尚未合入 are status
+    // lines, never a button or link. (Scope to the board surface and match
+    // the action word, not task titles, which may contain "landed".)
+    const boardSurface = page.getByTestId("board-page");
+    expect(await boardSurface.locator('[data-testid*="land" i]').count()).toBe(0);
+    for (const role of ["button", "link"] as const) {
+      expect(
+        await boardSurface.getByRole(role, { name: /合入|land\b/i }).count(),
+        `no ${role} offers a land action`,
+      ).toBe(0);
+    }
+
+    // UO-8: three tracks at 1440. Sidebar 248 + rail 272 + 32px gutters leave
+    // ~269px per column (the exact pixel depends on the scroller width).
+    const widths = await page
+      .getByTestId("board-column")
+      .evaluateAll((nodes) => nodes.map((node) => (node as HTMLElement).getBoundingClientRect().width));
+    expect(widths).toHaveLength(3);
+    for (const width of widths) {
+      expect(Math.round(width), `column width ${width} ≈ 269`).toBeGreaterThanOrEqual(255);
+      expect(Math.round(width)).toBeLessThanOrEqual(285);
+    }
+    console.log(`UO-8 column widths at 1440: ${widths.map((w) => Math.round(w)).join(", ")}px`);
 
     // Acceptance 4: to-do → in-progress runs the pending→placed→running
     // multi-hop through legal PATCHes.
@@ -404,18 +504,311 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     // The refusal left the card where it was.
     await expect(cardIn(column(page, "in-progress"), fx.running.id)).toBeVisible();
 
-    // Acceptance 6: the card detail is an explicit read-only preview with a
-    // link into the shared workbench. There is no composer on /board.
-    await cardIn(page, fx.todo.id).getByTestId("board-card-open").click();
+    // Acceptance 6 + UO-8: the detail is an overlay drawer, not a fixed
+    // right rail — width min(400px, 100% - 48px), raised surface over a
+    // scrim, 预览模式 banner, link into the shared workbench.
+    const todoOpen = cardIn(page, fx.todo.id).getByTestId("board-card-open");
+    await todoOpen.click();
+    const scrim = page.getByTestId("board-preview-scrim");
+    const drawer = page.getByRole("dialog", { name: "任务预览" });
+    await expect(scrim).toBeVisible();
+    await expect(drawer).toBeVisible();
+    const drawerBox = await drawer.boundingBox();
+    expect(drawerBox).toBeTruthy();
+    expect(Math.round(drawerBox!.width)).toBe(400);
+    expect(Math.round(drawerBox!.height)).toBeGreaterThan(600);
+    // The drawer overlays the board rather than participating in its grid.
+    expect(drawerBox!.x).toBeGreaterThan(1440 - 400 - 24);
+
     await expect(page.getByTestId("board-preview-banner")).toContainText("预览模式");
     await expect(page.getByTestId("board-preview-open")).toHaveAttribute(
       "href",
       `/s/${fx.instanceId}`,
     );
     await expect(page.getByTestId("task-detail-title")).toContainText("bui todo");
+    // Focus moved into the drawer while open.
+    await expect(drawer).toBeFocused();
+
+    // Esc closes the overlay and returns focus to the originating card.
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect(scrim).toHaveCount(0);
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const el = document.activeElement;
+            return {
+              testid: el?.getAttribute("data-testid"),
+              task: el?.closest('[data-testid="board-card"]')?.getAttribute("data-task-id"),
+            };
+          }),
+        { timeout: 2_000 },
+      )
+      .toEqual({ testid: "board-card-open", task: fx.todo.id });
+
+    // Clicking the scrim also dismisses; the drawer itself stops the click.
+    await todoOpen.click();
+    await expect(drawer).toBeVisible();
+    await scrim.click({ position: { x: 4, y: 4 } });
+    await expect(drawer).toHaveCount(0);
 
     // Evidence: columns with the failed badge in 进行中, the sharing footer
     // in 待办, the archive fold and the preview banner all visible.
     await shot(page, "task-model-6-board-1440.png");
+  });
+
+  test("fetches /v1/projects on mount only, never on a poll interval", async ({ page }) => {
+    test.setTimeout(75_000);
+    await login(page);
+    const fx = fixture ?? (await makeFixture(page));
+    const requestedAt: number[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.endsWith("/v1/projects")) {
+        requestedAt.push(Date.now());
+      }
+    });
+
+    await page.goto(`/board?project=${fx.project}`);
+    await expect(page.getByTestId("board-page")).toBeVisible();
+    // The mount burst (Shell directory + board rail names).
+    await expect.poll(() => requestedAt.length).toBeGreaterThan(0);
+    await page.waitForTimeout(2_000);
+    const burst = requestedAt.length;
+
+    // Wait past the old 30s project interval; the board's own 5s poll is
+    // /v1/board, so the project count must not move.
+    await page.waitForTimeout(31_000);
+    expect(requestedAt.length).toBe(burst);
+  });
+
+  test("preview overlay: covered region is inert, polls do not refocus, move survives, Esc keeps the sidebar menu", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await login(page);
+    const fx = await makeFixture(page);
+    await page.goto("/board");
+    await page.getByTestId("sidebar-project-row").filter({ hasText: fx.projectName }).click();
+    await expect(page.getByTestId("board-page")).toBeVisible();
+    // Wait for the first projection to populate the columns (board visibility
+    // is true before the first /v1/board arrives); test 1 is slower and hid
+    // the race, the isolated focus run exposed it.
+    await expect(cardIn(page, fx.todo.id).getByTestId("board-card-open")).toBeVisible();
+
+    const focusInfo = () =>
+      page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        return {
+          testid: el?.getAttribute("data-testid") ?? null,
+          // A board card or a rail task row carries the id.
+          task:
+            (el?.closest('[data-task-id]') as HTMLElement | null)?.getAttribute("data-task-id") ??
+            null,
+          column: el?.closest('[data-testid="board-card"]')?.getAttribute("data-column") ?? null,
+          inInert: !!el?.closest("[inert]"),
+        };
+      });
+    const COVERED = new Set([
+      "board-card-open",
+      "board-card-archive",
+      "board-session",
+      "board-archive-toggle",
+      "board-index-open",
+    ]);
+
+    // Open the shared pending card's preview.
+    await cardIn(page, fx.todo.id).getByTestId("board-card-open").click();
+    const drawer = page.getByRole("dialog", { name: "任务预览" });
+    await expect(drawer).toBeVisible();
+    await expect(drawer).toBeFocused();
+
+    // ── #1 inert covered region + forward/reverse Tab ──────────────────────
+    // The covered region cannot be focused even by an explicit .focus().
+    expect(
+      await page.evaluate(() => {
+        const el = document.querySelector<HTMLElement>('[data-testid="board-card-archive"]');
+        el?.focus();
+        return {
+          testid: (document.activeElement as HTMLElement | null)?.getAttribute("data-testid"),
+          inert: !!el?.closest("[inert]"),
+        };
+      }),
+    ).toEqual({ testid: null, inert: true });
+    // Refocus the drawer for the keyboard walk.
+    await drawer.focus();
+
+    // Forward Tab walks the drawer only (never a covered control).
+    await page.keyboard.press("Tab");
+    let info = await focusInfo();
+    expect(info.testid).toBe("board-preview-open");
+    expect(COVERED.has(info.testid ?? "")).toBe(false);
+    await page.keyboard.press("Tab");
+    info = await focusInfo();
+    expect(info.testid).toBe("task-detail-open-session");
+    expect(info.inInert).toBe(false);
+
+    // Reverse Tab returns through the banner link into the task rail — never
+    // into a covered card behind the scrim.
+    await page.keyboard.press("Shift+Tab");
+    expect((await focusInfo()).testid).toBe("board-preview-open");
+    let reachedRail = false;
+    for (let i = 0; i < 10; i += 1) {
+      await page.keyboard.press("Shift+Tab");
+      info = await focusInfo();
+      expect(info.inInert, "reverse Tab never enters the covered region").toBe(false);
+      expect(
+        COVERED.has(info.testid ?? ""),
+        `reverse Tab never focuses a covered control (got ${info.testid})`,
+      ).toBe(false);
+      if (info.testid === "task-row" || info.testid === "task-session-link" || info.testid === "task-search") {
+        reachedRail = true;
+        break;
+      }
+    }
+    expect(reachedRail, "Shift+Tab from the drawer reaches the task rail").toBe(true);
+
+    // ── #2 a poll tick must not refocus the drawer ─────────────────────────
+    await page.focus('[data-testid="task-search"]');
+    expect((await focusInfo()).testid).toBe("task-search");
+    await page.waitForTimeout(6_000); // ≥ one 5s /v1/board poll
+    expect((await focusInfo()).testid).toBe("task-search");
+
+    await page.focus('[data-testid="board-preview-open"]');
+    await page.waitForTimeout(6_000);
+    expect((await focusInfo()).testid).toBe("board-preview-open");
+
+    // ── #3 Esc restore after the open task moves columns ──────────────────
+    await dispatchDrag(page, fx.todo.id, "in-progress");
+    await expect
+      .poll(
+        async () => cardIn(page, fx.todo.id).getAttribute("data-column"),
+        { timeout: 15_000 },
+      )
+      .toBe("in-progress");
+
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect
+      .poll(focusInfo, { timeout: 2_000 })
+      .toEqual(
+        expect.objectContaining({
+          testid: "board-card-open",
+          task: fx.todo.id,
+          column: "in-progress",
+        }),
+      );
+
+    // ── #2 (rail-origin) Esc from a rail-opened preview returns to the RAIL ──
+    // Open via a rail row click, not a card button; the restore target must
+    // be that rail row even though a card for the task exists on the board.
+    const railRowFor = (id: string) =>
+      page.locator(`[data-testid="task-row"][data-task-id="${id}"]`);
+    await railRowFor(fx.running.id).click();
+    await expect(drawer).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect
+      .poll(focusInfo, { timeout: 2_000 })
+      .toEqual(
+        expect.objectContaining({ testid: "task-row", task: fx.running.id }),
+      );
+
+    // ── #4 Esc in the drawer must not close the sidebar 管理 menu ──────────
+    await page.getByTestId("sidebar-admin").click();
+    const adminMenu = page.getByRole("menu", { name: "管理" });
+    await expect(adminMenu).toBeVisible();
+    // Open a preview from the rail via keyboard (no outside pointerdown that
+    // would dismiss the menu): focus a rail row, then Enter.
+    await page
+      .locator('[data-testid="task-list"] [data-testid="task-row"]')
+      .first()
+      .evaluate((el) => (el as HTMLElement).focus());
+    await page.keyboard.press("Enter");
+    await expect(drawer).toBeVisible();
+    await expect(adminMenu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect(adminMenu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(adminMenu).toHaveCount(0);
+  });
+
+  test("preview at 900px covers the folded rail overlay: inert rows and scrim click", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 900, height: 900 });
+    await login(page);
+    const fx = await makeFixture(page);
+    await page.goto(`/board?project=${fx.project}`);
+    await expect(page.getByTestId("board-page")).toBeVisible();
+
+    // Below 1024 the rail is folded behind a 清单 button.
+    const rail = page.getByTestId("task-list");
+    await expect(rail).not.toBeVisible();
+    await page.getByTestId("board-index-open").click();
+    await expect(rail).toBeVisible();
+    expect(await rail.getAttribute("inert")).toBeNull();
+
+    // Open a preview from the rail. The overlay rail is now UNDER the scrim
+    // (z-31 < scrim z-40) and must be inert.
+    const firstRailRow = page.locator('[data-testid="task-list"] [data-testid="task-row"]').first();
+    const railTaskId = (await firstRailRow.getAttribute("data-task-id")) ?? "";
+    await firstRailRow.click();
+    const drawer = page.getByRole("dialog", { name: "任务预览" });
+    await expect(drawer).toBeVisible();
+    await expect(rail).toHaveAttribute("inert", "");
+
+    const inRail = async () =>
+      page.evaluate(() => {
+        const el = document.activeElement;
+        return !!el?.closest('[data-testid="task-list"]');
+      });
+
+    // Forward and reverse Tab from the drawer never reach the covered rail.
+    await drawer.focus();
+    for (let i = 0; i < 12; i += 1) {
+      await page.keyboard.press("Tab");
+      expect(await inRail()).toBe(false);
+    }
+    for (let i = 0; i < 12; i += 1) {
+      await page.keyboard.press("Shift+Tab");
+      expect(await inRail()).toBe(false);
+    }
+    // Even an explicit .focus() cannot enter the inert rail.
+    expect(
+      await page.evaluate((id) => {
+        const el = document.querySelector<HTMLElement>(
+          `[data-testid="task-row"][data-task-id="${id}"]`,
+        );
+        el?.focus();
+        return {
+          focusedInRail: !!document.activeElement?.closest('[data-testid="task-list"]'),
+          inert: !!el?.closest("[inert]"),
+        };
+      }, railTaskId),
+    ).toEqual({ focusedInRail: false, inert: true });
+
+    // A pointer click on the covered rail position hits the scrim and
+    // dismisses the preview (it never opens a different task).
+    const rowBox = await firstRailRow.boundingBox();
+    expect(rowBox).toBeTruthy();
+    await page.mouse.click(rowBox!.x + rowBox!.width / 2, rowBox!.y + rowBox!.height / 2);
+    await expect(drawer).toHaveCount(0);
+    // Focus restored to the rail row that opened the preview (rail origin).
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => ({
+            testid: (document.activeElement as HTMLElement | null)?.getAttribute("data-testid"),
+            task:
+              (document.activeElement as HTMLElement | null)
+                ?.closest('[data-testid="task-row"]')
+                ?.getAttribute("data-task-id") ?? null,
+          })),
+        { timeout: 2_000 },
+      )
+      .toEqual(expect.objectContaining({ testid: "task-row", task: railTaskId }));
   });
 });

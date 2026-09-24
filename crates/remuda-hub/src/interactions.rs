@@ -336,13 +336,15 @@ pub async fn list_interactions(
             return Err(HubError::Forbidden);
         }
     }
+    // The inbox feed carries every actionable pending row plus recently
+    // ended/expired rows for the departed presentation (c-deadcards); the
+    // pending badge counters use the strictly-pending query elsewhere.
     let mut items: Vec<Value> = state
         .store
-        .list_interactions(
+        .list_inbox_interactions(
             query.host_id.clone(),
             query.instance_id.clone(),
             query.kind.clone(),
-            true,
         )
         .await?
         .into_iter()
@@ -547,6 +549,26 @@ pub async fn answer_interaction(
     } else {
         None
     };
+    // c-deadcards: a late answer to a durable card that is no longer pending
+    // gets the SAME well-defined rejection the owner would — never a 500 and
+    // never a forward that could release an allow on a dead generation. This
+    // runs BEFORE the in-memory CAS and BEFORE any Node RPC.
+    if let Some(stored) = &stored {
+        match stored.state.as_str() {
+            "expired" => return Err(HubError::Expired),
+            "invalidated" => {
+                // The generation/instance is gone (generation-ended): the
+                // entity no longer exists for this answer to act on.
+                return Err(HubError::NotFound);
+            }
+            "answer-committed" | "resolved" => {
+                return Err(HubError::Superseded {
+                    winner: String::new(),
+                });
+            }
+            _ => {}
+        }
+    }
     if let Some(result) = state
         .agent_approvals
         .answer(

@@ -344,6 +344,10 @@ impl Store {
     ) -> Result<(), StoreError> {
         self.run_named("reconcile_daemon_instances", move |conn| {
             let tx = conn.transaction()?;
+            // c-deadcards: instances a daemon report transitions INTO a
+            // terminal lifecycle have their pending interactions invalidated
+            // in the same transaction.
+            let mut ended: Vec<String> = Vec::new();
             for instance in instances {
                 if instance["hostId"].as_str() != Some(&host_id) { continue; }
                 let Some(id) = instance["id"].as_str().or_else(|| instance["instanceId"].as_str()) else { continue; };
@@ -358,11 +362,25 @@ impl Store {
                     Some(value @ ("idle" | "working" | "blocked" | "draining")) => value,
                     _ => "unknown",
                 };
+                let was_terminal = tx
+                    .query_row(
+                        "SELECT lifecycle FROM instances WHERE id = ?1 AND host_id = ?2",
+                        params![id, &host_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map(|previous| matches!(previous.as_str(), "exited" | "failed" | "closed"))
+                    .unwrap_or(true);
                 tx.execute(
                     "UPDATE instances SET lifecycle = ?3, activity = ?4, connectivity = 'connected',
                      last_error = ?5, updated_at = ?6 WHERE id = ?1 AND host_id = ?2",
                     params![id, host_id, lifecycle, activity, instance["lastError"].as_str(), now_rfc3339()],
                 )?;
+                if !was_terminal && matches!(lifecycle, "exited" | "failed" | "closed") {
+                    ended.push(id.to_string());
+                }
+            }
+            if !ended.is_empty() {
+                crate::store::settle_instance_interactions(&tx, &ended, &now_rfc3339())?;
             }
             tx.commit()?;
             Ok(())

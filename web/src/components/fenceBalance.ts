@@ -7,97 +7,77 @@
  * keeps the partial block a code block until the real one arrives. The stored
  * text is never changed; callers apply this only while the message streams.
  *
- * Fences follow CommonMark: up to three spaces of indent, then three or more
- * backticks or tildes. A closing fence uses the same character, is at least as
- * long as the opener, and carries no info string.
- *
- * Container-aware: a fence may sit inside block quotes and list items. Each
- * line first consumes the prefixes of the containers still open (`>` for a
- * quote, the content indent for a list item); a container that does not match
- * closes, and a fence inside it ends with it. The appended closer repeats the
- * open containers' prefixes, so it lands inside the same container instead
- * of opening a new, empty block after it.
+ * The decision is the shipped markdown parser's, not a hand scan: the text is
+ * parsed with the same remark plugins MarkdownText renders with, and a closer
+ * is appended only when the last block (through quotes and list items) is a
+ * fenced `code` node that runs to the end of the text without its closing
+ * fence. HTML blocks, indented code, inline code spans and fences whose
+ * container already ended are the parser's business and are left alone.
  */
+import Markdown, { type Options } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-type Container = { kind: "quote" } | { kind: "list"; indent: number };
+type Point = { offset?: number };
+type MdNode = {
+  type: string;
+  children?: MdNode[];
+  position?: { start: Point; end: Point };
+};
 
-const QUOTE = /^ {0,3}> ?/;
-const LIST = /^( {0,3})([-+*]|\d{1,9}[.)])( +|$)/;
-const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+/** Containers whose last child is still "the last block" of the document. */
+const CONTAINERS = new Set(["blockquote", "list", "listItem"]);
 
-/** Consume one container's prefix from `line`; null when it does not continue. */
-function continueContainer(container: Container, line: string): string | null {
-  if (container.kind === "quote") {
-    const m = QUOTE.exec(line);
-    return m ? line.slice(m[0].length) : null;
-  }
-  if (line.trim() === "") return "";
-  const lead = /^ */.exec(line)![0].length;
-  return lead >= container.indent ? line.slice(container.indent) : null;
+const OPENER = /^(`{3,}|~{3,})/;
+
+/**
+ * The mdast of `text` as MarkdownText parses it. react-markdown's `Markdown`
+ * is synchronous and uses no hooks; the capture plugin keeps the tree and
+ * hands an empty root on so nothing past parsing does real work.
+ */
+function parse(text: string): MdNode | null {
+  let tree: MdNode | null = null;
+  const capture = () => (root: MdNode) => {
+    tree = root;
+    return { type: "root", children: [] };
+  };
+  const plugins = [remarkGfm, capture] as NonNullable<Options["remarkPlugins"]>;
+  Markdown({ children: text, remarkPlugins: plugins });
+  return tree;
 }
 
-/** Open new containers at the start of `line`; returns the remaining content. */
-function openContainers(line: string, stack: Container[]): string {
-  for (;;) {
-    const quote = QUOTE.exec(line);
-    if (quote) {
-      stack.push({ kind: "quote" });
-      line = line.slice(quote[0].length);
-      continue;
-    }
-    const list = LIST.exec(line);
-    // A thematic break (`- - -`, `***`) is not a list item.
-    if (list && !/^ {0,3}([-*_])( *\1){2,} *$/.test(line)) {
-      const spaces = list[3].length;
-      // Five or more spaces after the marker start indented code: the content
-      // indent is then the marker plus one space.
-      const gap = spaces === 0 || spaces > 4 ? 1 : spaces;
-      const indent = list[1].length + list[2].length + gap;
-      stack.push({ kind: "list", indent });
-      line = line.slice(Math.min(line.length, indent));
-      continue;
-    }
-    return line;
-  }
+function lastBlock(root: MdNode): MdNode | null {
+  let node = root.children?.at(-1) ?? null;
+  while (node && CONTAINERS.has(node.type)) node = node.children?.at(-1) ?? null;
+  return node;
 }
 
-function prefixFor(stack: readonly Container[]): string {
-  return stack.map((c) => (c.kind === "quote" ? "> " : " ".repeat(c.indent))).join("");
+/** Strip container prefixes (`>` and indent) from one source line. */
+function content(line: string): string {
+  return line.replace(/^(?:\s*>)*\s*/, "");
 }
 
 export function balanceFences(text: string): string {
-  const stack: Container[] = [];
-  let open: { char: string; len: number; depth: number } | null = null;
-  for (const raw of text.split("\n")) {
-    let line = raw;
-    let matched = 0;
-    for (const container of stack) {
-      const rest = continueContainer(container, line);
-      if (rest === null) break;
-      line = rest;
-      matched += 1;
-    }
-    if (open && matched < open.depth) {
-      // The fence's container closed, and the fence with it.
-      open = null;
-    }
-    if (open) {
-      const m = FENCE.exec(line);
-      if (m && m[1][0] === open.char && m[1].length >= open.len && m[2].trim() === "") {
-        open = null;
-      }
-      continue;
-    }
-    stack.length = matched;
-    line = openContainers(line, stack);
-    const m = FENCE.exec(line);
-    if (!m) continue;
-    const run = m[1];
-    // A backtick fence's info string cannot itself contain a backtick.
-    if (run[0] === "`" && m[2].includes("`")) continue;
-    open = { char: run[0], len: run.length, depth: stack.length };
+  const root = parse(text);
+  const code = root && lastBlock(root);
+  const start = code?.position?.start.offset;
+  const end = code?.position?.end.offset;
+  if (!code || code.type !== "code" || start === undefined || end === undefined) return text;
+  // Only a block that runs to the end of the text can be the open one.
+  if (text.slice(end).trim() !== "") return text;
+  // A fenced block starts on its fence run; indented code starts on its
+  // indent and has no fence to close.
+  const opener = OPENER.exec(text.slice(start));
+  if (!opener) return text;
+  const run = opener[1];
+  const lines = text.slice(start, end).split("\n");
+  if (lines.length > 1) {
+    const closer = new RegExp(`^\\${run[0]}{${run.length},}\\s*$`);
+    if (closer.test(content(lines[lines.length - 1]))) return text;
   }
-  if (!open) return text;
-  const close = prefixFor(stack.slice(0, open.depth)) + open.char.repeat(open.len);
+  // The closer repeats the opener line's container prefix: quote markers stay,
+  // list markers become their content indent.
+  const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+  const prefix = text.slice(lineStart, start).replace(/[^>\s]/g, " ");
+  const close = prefix + run;
   return text.endsWith("\n") ? `${text}${close}` : `${text}\n${close}`;
 }

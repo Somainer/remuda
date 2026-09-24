@@ -34,6 +34,20 @@ describe("balanceFences", () => {
   it("does not treat a fence with an info string as a closer", () => {
     expect(balanceFences("```\nx\n```js\n")).toBe("```\nx\n```js\n```");
   });
+
+  it("leaves a backtick run inside an HTML block alone", () => {
+    // The parser reads `<pre>…</pre>` as one HTML block: the run is not a fence.
+    const text = "<pre>\n```\n</pre>\n\nhello";
+    expect(balanceFences(text)).toBe(text);
+    expect(shape(balanceFences(text))).toEqual(shape(text));
+    for (let cut = text.indexOf("</pre>"); cut <= text.length; cut += 1) {
+      expect(shape(balanceFences(text.slice(0, cut))), `cut ${cut}`).toEqual([]);
+    }
+  });
+
+  it("leaves indented code that starts with a backtick run alone", () => {
+    expect(balanceFences("    ```\n    more")).toBe("    ```\n    more");
+  });
 });
 
 /**

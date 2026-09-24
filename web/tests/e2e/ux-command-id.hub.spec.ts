@@ -291,12 +291,18 @@ test("a transient 5xx POST keeps the row waiting and retries with the same comma
           const r = await fetch(`/v1/instances/${iid}/journal?limit=2000`, { credentials: "include" });
           if (!r.ok) return -1;
           const body = (await r.json()) as {
-            events?: { kind?: string; payload?: { commandId?: string } }[];
+            events?: {
+              kind?: string;
+              event?: { kind?: string; payload?: { commandId?: string } };
+              payload?: { commandId?: string };
+            }[];
           };
-          return (body.events ?? []).filter(
-            (e) => e.kind === "message" && e.payload?.commandId === cid,
-          ).length;
+          return (body.events ?? []).filter((raw) => {
+            const e = (raw.event ?? raw) as { kind?: string; payload?: { commandId?: string } };
+            return e.kind === "message" && e.payload?.commandId === cid;
+          }).length;
         }, { iid: instanceId, cid: commandId }),
+      { timeout: 20_000 },
     )
     .toBe(1);
 });

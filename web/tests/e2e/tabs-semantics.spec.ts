@@ -10,6 +10,12 @@ function space(page: Page, name: string) {
   return page.getByTestId("spaces-panel").getByTestId("space-select").filter({ hasText: name });
 }
 
+/** UO-2a: the Space index lives on /sessions, reached in-app from the sidebar. */
+async function toList(page: Page) {
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "会话" }).click();
+  await expect(page).toHaveURL(/\/sessions$/);
+}
+
 async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
   // Publish only generic demo inventory. Mutate the in-browser fixture before
   // rendering evidence; production code and screenshot pixels stay untouched.
@@ -48,7 +54,13 @@ test("status and close are distinct, dismissal keeps sessions running, and exite
   await page.goto("/sessions");
   const panel = page.getByTestId("spaces-panel");
   const strip = page.getByTestId("space-tabs");
+  // UO-2a: list routes carry the Space index and no tab strip; the strip is
+  // the session page's own chrome.
   await space(page, "sfe-root").click();
+  await expect(strip).toHaveCount(0);
+  await page.getByTestId("session-row").first().click();
+  await expect(page).toHaveURL(/\/s\//);
+  await expect(panel).toHaveCount(0);
   await strip.getByRole("tab").first().click();
 
   // One × per tab, and it is the close control — the status never renders one.
@@ -62,9 +74,14 @@ test("status and close are distinct, dismissal keeps sessions running, and exite
     if (await dots.count()) await expect(dots.first()).toHaveAttribute("data-status", /.+/);
   }
 
-  // The active tab and the active sidebar rows both carry the brand marker.
+  // The active tab carries the brand marker, and so does its Space in the
+  // /sessions index (which has no open session to mark).
   await expect(active).toHaveAttribute("data-active", "true");
-  await expect(panel.getByTestId("space-session").and(page.locator('[data-active="true"]'))).toHaveCount(1);
+  await toList(page);
+  await expect(space(page, "sfe-root")).toHaveAttribute("aria-pressed", "true");
+  await expect(panel.getByTestId("space-session").and(page.locator('[data-active="true"]'))).toHaveCount(0);
+  await page.goBack();
+  await expect(page).toHaveURL(/\/s\//);
   await screenshot(page, "desktop-dark", "night");
   await screenshot(page, "desktop-light", "ledger");
 
@@ -97,7 +114,8 @@ test("status and close are distinct, dismissal keeps sessions running, and exite
   await expect(sheet).toHaveCount(0);
   await expect(strip.getByRole("tab").filter({ hasText: await runningTab.innerText().catch(() => "—") })).toHaveCount(0);
 
-  // The session is still listed in the sidebar and re-opens its tab on click.
+  // The session is still listed in the /sessions index and re-opens its tab on click.
+  await toList(page);
   const dismissed = panel.getByTestId("space-session").and(page.locator(`[href="${runningRoute}"]`));
   await expect(dismissed).toHaveCount(1);
   await dismissed.click();
@@ -105,6 +123,7 @@ test("status and close are distinct, dismissal keeps sessions running, and exite
   await expect(strip.getByRole("tab", { selected: true })).toHaveCount(1);
 
   // Exited sessions live in their own collapsed group with 恢复 and 删除.
+  await toList(page);
   const group = panel.getByTestId("exited-toggle").first();
   await expect(group).toContainText("已退出");
   await expect(group).toHaveAttribute("aria-expanded", "false");
@@ -131,7 +150,8 @@ test.describe("phone", () => {
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.setViewportSize({ width: 400, height: 860 });
-    await page.goto("/sessions");
+    // UO-2a: the phone strip lives on the compact home, not on list routes.
+    await page.goto("/m");
     const strip = page.getByTestId("space-tabs");
     expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches),
       "the phone run must match the coarse-pointer rules").toBe(true);

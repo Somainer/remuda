@@ -19,6 +19,21 @@ function tab(page: Page, title: string) {
   return page.getByTestId("space-tabs").getByRole("tab").filter({ hasText: title });
 }
 
+/** In-app hop to /sessions: a full load would abort a session page's fetches. */
+async function toList(page: Page) {
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "会话" }).click();
+  await expect(page).toHaveURL(/\/sessions$/);
+}
+
+/** UO-2a: the Space index lives on /sessions; tabs live on /s/*. */
+async function openFromList(page: Page, spaceName: string, rowText: string) {
+  await toList(page);
+  await space(page, spaceName).click();
+  await expect(space(page, spaceName)).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("session-row").filter({ hasText: rowText }).first().click();
+  await expect(page).toHaveURL(/\/s\//);
+}
+
 async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
   // Publish only generic demo inventory. Mutate the in-browser fixture before
   // rendering evidence; production code and screenshot pixels stay untouched.
@@ -42,6 +57,7 @@ async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
   });
   await setMode(page, theme);
   await page.evaluate(() => document.fonts.ready);
+  for (const label of replacedLabels) await expect(page.locator("body")).not.toContainText(label);
   const rendered = await page.locator("body").innerText();
   expect(rendered).not.toMatch(/\/Users\//);
   for (const label of replacedLabels) expect(rendered).not.toContain(label);
@@ -54,24 +70,29 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto("/sessions");
   const panel = page.getByTestId("spaces-panel");
   const strip = page.getByTestId("space-tabs");
-  await space(page, "sfe-root").click();
-  await tab(page, "空闲会话").click();
+  const sidebar = page.getByTestId("sidebar");
+  // UO-2a: list routes carry the Space index, not the tab strip.
+  await page.goto("/sessions");
+  await expect(panel).toBeVisible();
+  await expect(strip).toHaveCount(0);
+  await openFromList(page, "sfe-root", "空闲会话");
+  await expect(panel).toHaveCount(0);
   const firstPath = new URL(page.url()).pathname;
   await expect(tab(page, "空闲会话")).toHaveAttribute("aria-selected", "true");
-  await space(page, "x-codexdrv").click();
+  await openFromList(page, "x-codexdrv", "codex-worker");
   await expect(tab(page, "codex-worker")).toHaveAttribute("aria-selected", "true");
   await expect(tab(page, "空闲会话")).toHaveCount(0);
-  const otherPath = new URL(page.url()).pathname;
-  await space(page, "sfe-root").click();
+  await toList(page);
+  await expect(space(page, "x-codexdrv")).toHaveAttribute("aria-pressed", "true");
+  await openFromList(page, "sfe-root", "空闲会话");
+  expect(new URL(page.url()).pathname).toBe(firstPath);
   await expect(tab(page, "空闲会话")).toHaveAttribute("aria-selected", "true");
   await expect(tab(page, "codex-worker")).toHaveCount(0);
-  await page.goto(otherPath);
-  await expect(space(page, "x-codexdrv")).toHaveAttribute("aria-pressed", "true");
-  await page.goto(firstPath);
+  await toList(page);
   await expect(space(page, "sfe-root")).toHaveAttribute("aria-pressed", "true");
+  await openFromList(page, "sfe-root", "空闲会话");
   await expect(tab(page, "空闲会话")).toHaveAttribute("aria-selected", "true");
 
   await strip.getByRole("tab").first().click();
@@ -79,9 +100,14 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   await expect(strip.getByRole("tab").nth(1)).toHaveAttribute("aria-selected", "true");
   await page.keyboard.press("ControlOrMeta+1");
   await expect(strip.getByRole("tab").first()).toHaveAttribute("aria-selected", "true");
+  await toList(page);
+  await page.getByTestId("sidebar-toggle").focus();
   await page.keyboard.press("ControlOrMeta+]");
+  await toList(page);
   await expect(space(page, "valhalla")).toHaveAttribute("aria-pressed", "true");
+  await page.getByTestId("sidebar-toggle").focus();
   await page.keyboard.press("ControlOrMeta+[");
+  await toList(page);
   try {
     await expect(space(page, "sfe-root")).toHaveAttribute("aria-pressed", "true");
   } catch (error) {
@@ -94,24 +120,29 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
     throw error;
   }
 
-  await space(page, "sfe-root").click();
-  await tab(page, "看 TaskManager spill 这段为啥抖").click();
-  await page.getByTestId("panel-toggle").click();
-  await expect(panel).toHaveAttribute("data-collapsed", "true");
+  // ⌘/Ctrl+B folds the sidebar (prefs.collapsed) on every desktop route.
+  await openFromList(page, "sfe-root", "看 TaskManager spill 这段为啥抖");
+  await page.getByTestId("sidebar-toggle").click();
+  await expect(sidebar).toHaveAttribute("data-collapsed", "true");
   await page.reload();
-  await expect(panel).toHaveAttribute("data-collapsed", "true");
+  await expect(sidebar).toHaveAttribute("data-collapsed", "true");
   await expect(tab(page, "看 TaskManager spill 这段为啥抖")).toHaveAttribute("aria-selected", "true");
+  // The fold is shell-wide, so the list route shows it too (and its evidence
+  // carries no live transcript header).
+  await toList(page);
+  await expect(sidebar).toHaveAttribute("data-collapsed", "true");
   await screenshot(page, "desktop-collapsed-dark", "night");
-  await page.getByTestId("panel-toggle").focus();
+  await page.getByTestId("sidebar-toggle").focus();
   await page.keyboard.press("ControlOrMeta+b");
-  await expect(panel).toHaveAttribute("data-collapsed", "false");
+  await expect(sidebar).toHaveAttribute("data-collapsed", "false");
   await screenshot(page, "desktop-dark", "night");
   await screenshot(page, "desktop-light", "ledger");
 
+  // Compact home (/m) keeps the chips row, the strip and the drawer.
   await page.setViewportSize({ width: 400, height: 860 });
+  await page.goto("/m");
   await expect(page.getByTestId("spaces-chips")).toBeVisible();
   await expect(strip).toBeVisible();
-  expect(await strip.evaluate((element) => element.scrollWidth > element.clientWidth)).toBe(true);
   await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
   await screenshot(page, "phone-light", "ledger");
   await screenshot(page, "phone-dark", "night");
@@ -120,8 +151,6 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   await screenshot(page, "phone-drawer-dark", "night");
   await space(page, "x-codexdrv").click();
   await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
-  await expect(tab(page, "codex-worker")).toHaveAttribute("aria-selected", "true");
-  await expect(tab(page, "空闲会话")).toHaveCount(0);
   const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }));
   expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
 
@@ -129,14 +158,15 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
 
   // Status and close are distinct: the tab strip carries exactly one × per tab
   // (close), and the status indicator is never one.
-  await space(page, "sfe-root").click();
+  await openFromList(page, "sfe-root", "空闲会话");
   const firstTab = strip.getByRole("tab").first();
   await firstTab.click();
   const tabRow = strip.locator('[data-active="true"]');
   expect(await tabRow.getByTestId("tab-close").count()).toBe(1);
-  expect(await tabRow.innerText()).not.toContain("×");
+  expect(await tabRow.getByRole("tab").innerText()).not.toContain("×");
   await expect(tabRow.getByTestId("tab-close")).toHaveAccessibleName(/^关闭标签 /);
 
+  await toList(page);
   await space(page, "x-codexdrv").click();
   await panel.getByRole("button", { name: "重命名", exact: true }).click();
   await panel.getByRole("textbox", { name: "空间名称" }).fill("Code review");

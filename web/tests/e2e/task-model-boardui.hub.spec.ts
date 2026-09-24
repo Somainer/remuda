@@ -280,10 +280,11 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     await login(page);
     const fx = await makeFixture(page);
 
-    // The top-bar switcher is the board's project filter (task 8); global
-    // would show every project on the shared fake hub.
+    // The sidebar project rows are the board's project filter (UO-2a, formerly
+    // the top-bar switcher); global would show every project on the shared
+    // fake hub.
     await page.goto("/board");
-    await page.getByTestId("project-switcher").selectOption({ label: fx.projectName });
+    await page.getByTestId("sidebar-project-row").filter({ hasText: fx.projectName }).click();
     await expect(page.getByTestId("board-page")).toBeVisible();
 
     // Acceptance 1: exactly three work columns consume the projection.

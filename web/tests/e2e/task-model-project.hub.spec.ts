@@ -213,10 +213,12 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBe(
       crossHostProject.id,
     );
-    // Both the top-bar and the page-header switcher name the open project.
-    const switchers = page.getByTestId("project-switcher");
-    expect(await switchers.count()).toBeGreaterThanOrEqual(1);
-    for (const select of await switchers.all()) {
+    // The sidebar project rows (UO-2a, formerly the top-bar switcher) and any
+    // page-header switcher name the open project.
+    await expect(
+      page.getByTestId("sidebar-project-row").and(page.locator(`[data-project-id="${crossHostProject.id}"]`)),
+    ).toHaveAttribute("aria-pressed", "true");
+    for (const select of await page.getByTestId("project-switcher").all()) {
       await expect(select).toHaveValue(crossHostProject.id);
     }
   });
@@ -239,10 +241,13 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
       expect.arrayContaining([crossTask.id, otherTask.id]),
     );
 
-    // Select the single-host project in the TOP-BAR switcher (the page-header
-    // one would navigate; the top bar only sets the global scope).
-    const topSwitcher = page.locator("main").getByTestId("project-switcher").first();
-    await topSwitcher.selectOption(otherProject.id);
+    // Select the single-host project in the sidebar (UO-2a: the project rows
+    // replace the top-bar switcher; a row sets the global scope and opens the
+    // board).
+    const projectRow = (id: string) =>
+      page.getByTestId("sidebar-project-row").and(page.locator(`[data-project-id="${id}"]`));
+    await projectRow(otherProject.id).click();
+    await expect(page).toHaveURL(/\/board$/);
 
     // The selection is the device-local filter surfaces read.
     expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBe(
@@ -270,12 +275,14 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     expect(scopedBoardIds).not.toContain(crossTask.id);
 
     // The projects surface itself honours the scope: only that project row.
+    await page.getByTestId("sidebar-projects-link").click();
     await expect(page.getByTestId("project-row")).toHaveCount(1);
     await expect(page.getByTestId("project-row")).toContainText(otherProject.name);
 
     // Back to global: filter cleared and both projects show again.
-    await topSwitcher.selectOption("");
+    await projectRow("").click();
     expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
+    await page.getByTestId("sidebar-projects-link").click();
     await expect(page.getByTestId("project-row")).toHaveCount(2);
     const backToGlobal = await apiJson<BoardResponse>(page, "GET", "/v1/board");
     expect(backToGlobal.project).toBeNull();

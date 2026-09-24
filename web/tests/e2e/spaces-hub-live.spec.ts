@@ -77,6 +77,12 @@ function space(page: Page, workspaceId: string) {
     .and(page.locator(`[data-space-id*='"${workspaceId}"']`));
 }
 
+/** UO-2a: the Space index lives on /sessions, reached in-app from the sidebar. */
+async function toList(page: Page) {
+  await page.getByRole("navigation", { name: "主导航" }).getByRole("link", { name: "会话" }).click();
+  await expect(page).toHaveURL(/\/sessions$/);
+}
+
 async function createSession(page: Page, workspace: Workspace, prompt: string, created: string[]) {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
@@ -183,14 +189,36 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
 
     await expect(tab(page, first.instanceId)).toHaveCount(0);
     await expect(tab(page, second.instanceId)).toHaveCount(0);
+    // UO-2a: the Space index lives on /sessions (no strip there); the strip
+    // belongs to /s/*.
+    await toList(page);
+    await expect(strip).toHaveCount(0);
     await space(page, primary.id).click();
+    await expect(space(page, primary.id)).toHaveAttribute("aria-pressed", "true");
+    await expect(page).toHaveURL(/\/sessions$/);
+    await sidebarSession(page, second.instanceId).click();
     await expect(tab(page, second.instanceId)).toHaveAttribute("aria-selected", "true");
     await expect(tab(page, first.instanceId)).toBeVisible();
     await expect(tab(page, other.instanceId)).toHaveCount(0);
     await tab(page, first.instanceId).click();
+    await toList(page);
+    await expect(space(page, secondary.id)).toBeVisible();
+    const orderedSpaces = panel.getByTestId("space-select");
+    const spaceIds = await orderedSpaces.evaluateAll((items) => items.map((item) => item.getAttribute("data-space-id")));
+    const primaryId = await space(page, primary.id).getAttribute("data-space-id");
+    const secondaryId = await space(page, secondary.id).getAttribute("data-space-id");
     await space(page, secondary.id).click();
+    await sidebarSession(page, other.instanceId).click();
     await expect(tab(page, other.instanceId)).toHaveAttribute("aria-selected", "true");
-    await space(page, primary.id).click();
+    // Switching Spaces by keyboard lands on the Space's remembered tab. Other
+    // live specs add Spaces, so walk the shorter way round the rendered order.
+    const forward = (spaceIds.indexOf(primaryId) - spaceIds.indexOf(secondaryId) + spaceIds.length) % spaceIds.length;
+    const [key, steps] = forward <= spaceIds.length / 2 ? ["ControlOrMeta+]", forward] : ["ControlOrMeta+[", spaceIds.length - forward];
+    for (let step = 0; step < steps; step++) {
+      await page.getByTestId("sidebar-toggle").focus();
+      await page.keyboard.press(key);
+    }
+    await expect(page).toHaveURL(new RegExp(`/s/${first.instanceId}$`));
     await expect(tab(page, first.instanceId)).toHaveAttribute("aria-selected", "true");
 
     // A deep link restores both project and tab, including after a fresh load.
@@ -202,45 +230,50 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
 
     // The global New action inherits the selected project rather than another
     // project's last successful creation preferences.
+    await toList(page);
     await space(page, primary.id).click();
     await page.getByTitle("新建", { exact: true }).click();
     await expect(page.getByTestId("new-session-host")).toHaveValue(first.hostId);
     await expect(page.getByTestId("new-session-workspace")).toHaveValue(primary.id);
     await expect(page.getByTestId("new-session-workspace")).toContainText(primary.root);
     await page.getByTestId("new-session-sheet").getByRole("button", { name: "关闭", exact: true }).click();
+    await toList(page);
     await space(page, primary.id).click();
+    await sidebarSession(page, first.instanceId).click();
 
     // Use the rendered order so legacy sessions from the other live spec do not
     // make numeric keyboard shortcuts depend on the fixture's session count.
     const tabs = strip.getByRole("tab");
     await tabs.first().click();
-    await page.getByTestId("panel-toggle").focus();
+    await page.getByTestId("sidebar-toggle").focus();
     await page.keyboard.press("ControlOrMeta+2");
     await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");
-    await page.getByTestId("panel-toggle").focus();
+    await page.getByTestId("sidebar-toggle").focus();
     await page.keyboard.press("ControlOrMeta+1");
     await expect(tabs.first()).toHaveAttribute("aria-selected", "true");
-    const orderedSpaces = panel.getByTestId("space-select");
-    const spaceIds = await orderedSpaces.evaluateAll((items) => items.map((item) => item.getAttribute("data-space-id")));
-    const primaryId = await space(page, primary.id).getAttribute("data-space-id");
     const nextIndex = (spaceIds.indexOf(primaryId) + 1) % spaceIds.length;
-    await page.getByTestId("panel-toggle").focus();
+    await page.getByTestId("sidebar-toggle").focus();
     await page.keyboard.press("ControlOrMeta+]");
+    await toList(page);
     await expect(orderedSpaces.nth(nextIndex)).toHaveAttribute("aria-pressed", "true");
-    await page.getByTestId("panel-toggle").focus();
+    await page.getByTestId("sidebar-toggle").focus();
     await page.keyboard.press("ControlOrMeta+[");
+    await toList(page);
     await expect(space(page, primary.id)).toHaveAttribute("aria-pressed", "true");
 
-    await tab(page, first.instanceId).click();
-    await page.getByTestId("panel-toggle").click();
-    await expect(panel).toHaveAttribute("data-collapsed", "true");
+    // ⌘/Ctrl+B folds the sidebar (prefs.collapsed) on every desktop route.
+    await sidebarSession(page, first.instanceId).click();
+    await expect(tab(page, first.instanceId)).toHaveAttribute("aria-selected", "true");
+    const sidebar = page.getByTestId("sidebar");
+    await page.getByTestId("sidebar-toggle").click();
+    await expect(sidebar).toHaveAttribute("data-collapsed", "true");
     await page.reload();
-    await expect(panel).toHaveAttribute("data-collapsed", "true");
-    await expect(page.getByRole("button", { name: "展开空间面板", exact: true })).toBeVisible();
+    await expect(sidebar).toHaveAttribute("data-collapsed", "true");
+    await expect(page.getByRole("button", { name: "展开侧栏", exact: true })).toBeVisible();
     await screenshot(page, "desktop-collapsed-dark.png", "night");
-    await page.getByTestId("panel-toggle").focus();
+    await page.getByTestId("sidebar-toggle").focus();
     await page.keyboard.press("ControlOrMeta+b");
-    await expect(panel).toHaveAttribute("data-collapsed", "false");
+    await expect(sidebar).toHaveAttribute("data-collapsed", "false");
     await tab(page, first.instanceId).click();
     await screenshot(page, "desktop-dark.png", "night");
     await screenshot(page, "desktop-light.png", "ledger");
@@ -269,8 +302,10 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
     expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
 
     await page.setViewportSize({ width: 1440, height: 900 });
+    await toList(page);
     await space(page, primary.id).click();
-    await tab(page, second.instanceId).click();
+    await sidebarSession(page, second.instanceId).click();
+    await expect(tab(page, second.instanceId)).toHaveAttribute("aria-selected", "true");
 
     // Dismissing a running tab must not send a close command: the session
     // keeps running and only this device's tab goes away.
@@ -293,7 +328,8 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
     expect((await (await page.request.get(`/v1/instances/${second.instanceId}`)).json()).lifecycle)
       .not.toBe("exited");
 
-    // Clicking the dismissed session in the sidebar re-opens its tab.
+    // Clicking the dismissed session in the /sessions index re-opens its tab.
+    await toList(page);
     await sidebarSession(page, second.instanceId).click();
     await expect(tab(page, second.instanceId)).toHaveAttribute("aria-selected", "true");
 
@@ -316,7 +352,8 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
       await expect(page.getByTestId("tab-close-sheet")).toHaveCount(0);
       await expect(tab(page, exited)).toHaveCount(0);
 
-      // The sidebar keeps it in its own collapsed 已退出 group.
+      // The /sessions index keeps it in its own collapsed 已退出 group.
+      await toList(page);
       const group = panel.getByTestId("exited-toggle").first();
       await expect(group).toContainText("已退出");
       await expect(group).toHaveAttribute("aria-expanded", "false");
@@ -331,7 +368,9 @@ test("registered spaces isolate tabs, remember selection and collapse, and fit a
       expect((await page.request.get(`/v1/instances/${exited}`)).ok()).toBe(true);
     }
 
+    await toList(page);
     await space(page, secondary.id).click();
+    await sidebarSession(page, other.instanceId).click();
     await expect(tab(page, other.instanceId)).toHaveAttribute("aria-selected", "true");
     expect(pageErrors).toEqual([]);
   } finally {

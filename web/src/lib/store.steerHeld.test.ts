@@ -178,3 +178,69 @@ it("a real Node rejection (settled+rejected) is terminal, never re-POSTed and sh
   await hubStore.flushHeld(INSTANCE);
   expect(send).toHaveBeenCalledTimes(1);
 });
+
+it("a held bubble keeps ONE lifetime commandId when the first persistence attempt aborts, then retries it", async () => {
+  const { api, hubStore } = await fresh();
+  const heldId = hubStore.hold(INSTANCE, "abort once", "turn");
+  vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_placeholder", "accepted"));
+
+  // The FIRST durable enqueue aborts (IndexedDB transaction abort); the
+  // second attempt succeeds.
+  const realSetItem = Storage.prototype.setItem;
+  let firstPut = true;
+  const setSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key: string, value: string) {
+    // Only the first pending command-row write (the held bubble's enqueue).
+    if (firstPut && /"commandId":"cmd_/.test(value) && !value.includes("__lock__")) {
+      firstPut = false;
+      throw new DOMException("simulated abort", "QuotaExceededError");
+    }
+    return realSetItem.call(this, key, value);
+  });
+
+  // First flush: the persistence aborts; the bubble stays held but its
+  // lifetime commandId is already bound.
+  await hubStore.flushHeld(INSTANCE);
+  const boundAfterAbort = hubStore
+    .getSnapshot()
+    .bubbles.find((b) => b.clientRequestId === heldId)?.commandId;
+  expect(boundAfterAbort?.startsWith("cmd_")).toBe(true);
+  expect(api.instanceSend).not.toHaveBeenCalled();
+
+  // Retry: the SAME commandId persists (exactly one durable row) and POSTs.
+  setSpy.mockRestore();
+  await hubStore.flushHeld(INSTANCE);
+  await vi.waitFor(() => expect(api.instanceSend).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(api.instanceSend).mock.calls[0]?.[4]).toBe(boundAfterAbort);
+
+  const rows = JSON.parse(localStorage.getItem(OUTBOX_LS_KEY) ?? "[]") as Array<{ commandId: string }>;
+  const durable = rows.filter((r) => r.commandId === boundAfterAbort);
+  expect(durable).toHaveLength(1);
+});
+
+it("an offline steer resolves false (no 已打断 receipt) and stays a queued row with no POST", async () => {
+  const { api, hubStore } = await fresh();
+  const id = hubStore.hold(INSTANCE, "offline steer", "turn");
+  const send = vi.spyOn(api, "instanceSend");
+  hubStore.setConnectionStateForTest("offline");
+
+  const landed = await hubStore.steerHeld(INSTANCE, id);
+  // No authoritative acceptance while offline: the Composer must not raise
+  // 已打断, and nothing was POSTed.
+  expect(landed).toBe(false);
+  expect(send).not.toHaveBeenCalled();
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
+  // It degraded from steer to an ordinary queued turn under a durable id.
+  expect(bubble.commandId?.startsWith("cmd_")).toBe(true);
+  expect(bubble.promptMode).not.toBe("steer");
+});
+
+it("a direct steer sent while offline resolves false (no receipt) but enqueues under one id", async () => {
+  const { api, hubStore } = await fresh();
+  const send = vi.spyOn(api, "instanceSend");
+  hubStore.setConnectionStateForTest("offline");
+  const landed = await hubStore.send(INSTANCE, "urgent steer", [], [], "steer");
+  expect(landed).toBe(false);
+  expect(send).not.toHaveBeenCalled();
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.text === "urgent steer")!;
+  expect(bubble.commandId?.startsWith("cmd_")).toBe(true);
+});

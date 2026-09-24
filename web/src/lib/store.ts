@@ -1139,6 +1139,12 @@ class HubStore {
     this.lastFollowFrameAt = framed ? Date.now() : 0;
   }
 
+  /** Test-only: drive the machine live the way a fresh follow frame would. */
+  frameForTest() {
+    this.setFollowLiveForTest(true, true);
+    this.connection?.dispatch({ type: "frame" });
+  }
+
   /** Test-only: override the optimistic-live link state without a machine. */
   setConnectionStateForTest(state: ConnectionState) {
     this.emit({ connection: state, outboxPending: this.outbox?.pendingCount() ?? 0 });
@@ -1249,47 +1255,60 @@ class HubStore {
    * lock boundary and promotes that row before it is POSTed. Still a single
    * deliverer: the cross-tab/durable lock means two flushes never run a row
    * concurrently.
+   *
+   * `attempted` is the per-FLUSH set of rows that already got a POST: a row
+   * answered "held" (Node offline) must NOT be hammered again on the next pass
+   * of the SAME flush — its bounded retry timer / the next reconnect flush
+   * re-forwards it. Without this set the drain loop would tight-loop a held
+   * row up to MAX_FLUSH_PASSES in one flush. A genuinely new row (or a steer
+   * landing mid-flush) is not in the set and still drains.
    */
-  private async flushAllOutbox() {
+  private async flushAllOutbox(attempted: Set<Id> = new Set()) {
     const box = this.outbox;
     if (!box) return;
     if (this.pageIsUnloading) return;
     // Drain passes; each pass acquires the lock, posts at most the FIRST
-    // deliverable row, and releases — letting queued conversions interleave.
+    // deliverable unattempted row, and releases — letting queued conversions
+    // interleave.
     for (let pass = 0; pass < MAX_FLUSH_PASSES; pass += 1) {
       if (this.pageIsUnloading) return;
       const instances = [...new Set(box.pending().map((r) => r.instanceId))];
-      let deliveredAny = false;
+      let deliveredNew = false;
       for (const instanceId of instances) {
         if (this.pageIsUnloading) return;
         try {
-          const did = await box.withInstanceLock(instanceId, (id, deliverable) =>
-            this.deliverOneRow(id, deliverable),
+          const id = await box.withInstanceLock(instanceId, (iid, deliverable) =>
+            this.deliverOneRow(iid, deliverable.filter((r) => !attempted.has(r.commandId))),
           );
-          if (did) deliveredAny = true;
+          if (id) {
+            attempted.add(id);
+            deliveredNew = true;
+          }
         } catch {
           // The lease/lock acquisition failed (never a double POST: the row is
           // inflight with a fresh durable lease). A retry timer / reconnect
           // re-triggers under the same id; keep draining other instances.
         }
       }
-      if (!deliveredAny) break;
+      if (!deliveredNew) break;
     }
   }
 
   /**
    * Deliver ONE authoritative row (the first fresh one), re-reading its mode
    * from the box so a just-landed steer promotion takes effect. Runs inside the
-   * single-deliverer lock. Returns true when a POST was attempted.
+   * single-deliverer lock. Returns the POSTed row's commandId (added to the
+   * flush's attempted set) or null when nothing was POSTed.
    */
-  private async deliverOneRow(instanceId: Id, deliverable: OutboxRecord[]): Promise<boolean> {
+  private async deliverOneRow(instanceId: Id, deliverable: OutboxRecord[]): Promise<Id | null> {
     const box = this.outbox;
-    if (!box) return false;
+    if (!box) return null;
     const rec = deliverable[0];
-    if (!rec) return false;
+    if (!rec) return null;
     const fresh = box.get(rec.commandId) ?? rec;
-    if (!isDeliverableOutbox(fresh, Date.now())) return false;
-    await this.deliverOutboxRecord(fresh);
+    if (!isDeliverableOutbox(fresh, Date.now())) return null;
+    const attemptedPost = await this.deliverOutboxRecord(fresh);
+    if (!attemptedPost) return null;
     // If that drained the instance, run the post-delivery resync/screen chain
     // exactly once.
     if (!box.pendingFor(instanceId).length) {
@@ -1311,7 +1330,7 @@ class HubStore {
         }
       });
     }
-    return true;
+    return fresh.commandId;
   }
 
   /**
@@ -1401,21 +1420,24 @@ class HubStore {
   /**
    * Deliver ONE authoritative durable row (handed in by the single-deliverer
    * lock). Claims a durable inflight lease before POSTing; a storage abort on
-   * that claim releases the in-memory marker so this tab does not self-block.
-   * "held" retries do not spend the attempt budget; a queued-forwarded
-   * reconciling row is settled by GET under a bounded deadline.
+   * that claim means no POST and the row stays deliverable. "held" retries do
+   * not spend the attempt budget; a queued-forwarded reconciling row is
+   * settled by GET under a bounded deadline. Returns true when a POST ran.
    */
-  private async deliverOutboxRecord(current0: OutboxRecord) {
+  private async deliverOutboxRecord(current0: OutboxRecord): Promise<boolean> {
     const box = this.outbox;
-    if (!box) return;
+    if (!box) return false;
     const commandId = current0.commandId;
     if (!withinRetryWindow(current0)) {
       await this.safePatch(commandId, { state: "unknown", lastError: "retry window exhausted" });
-      return;
+      return false;
     }
 
     // Claim the durable inflight lease storage-first. If this write aborts,
-    // never POST (another owner might hold it) and release the in-memory bit.
+    // never POST: the cache/storage still show a deliverable row (the cache
+    // updates only after commit), so the next trigger retries under the same
+    // commandId. Another owner is excluded by the durable lease, not an
+    // in-memory marker.
     const isFreshAttempt = current0.state !== "held";
     try {
       await box.patch(commandId, {
@@ -1424,10 +1446,8 @@ class HubStore {
         lease: { owner: box.ownerId, until: Date.now() + LEASE_TTL_MS },
       });
     } catch {
-      box.clearInflight(commandId);
-      return;
+      return false;
     }
-    box.markInflight(commandId);
     this.syncBubbleFromOutbox(commandId);
 
     const finish = async (patch: Partial<OutboxRecord>) => {
@@ -1452,8 +1472,14 @@ class HubStore {
         });
       } else if (classified === "held") {
         // Node offline: Hub holds the row; bounded same-id retry, no attempt
-        // spent. A host online→online resume (flushAllOutbox) re-POSTs.
-        await finish({ state: "held", serverState: result.command.state, gotResponse: true });
+        // spent (the 20-attempt budget must not drain while the host is down).
+        // A host online→online resume (flushAllOutbox) re-POSTs.
+        await finish({
+          state: "held",
+          serverState: result.command.state,
+          gotResponse: true,
+          attempts: current0.attempts,
+        });
         this.scheduleHeldRetry(current0.instanceId);
       } else if (classified === "reconciling") {
         await finish({ state: "reconciling", serverState: result.command.state, gotResponse: true });
@@ -1471,32 +1497,27 @@ class HubStore {
         } else if (reconciled === "sent") {
           await finish({ state: "sent", gotResponse: true });
         } else if (reconciled === "held") {
-          await finish({ state: "held", gotResponse: true });
+          await finish({ state: "held", gotResponse: true, attempts: current0.attempts });
           this.scheduleHeldRetry(current0.instanceId);
         } else if (reconciled === "reconciling") {
           await finish({ state: "reconciling", gotResponse: true });
           await this.reconcileReconcilingRow(current0.instanceId, commandId);
         } else {
-          // Truly undelivered: keep pending, bounded same-id retry.
+          // Truly undelivered: keep pending, bounded same-id retry. Same-id
+          // retries are safe in ANY link state (the 20-attempt / 24 h envelope
+          // bounds them), and a reconnect flush also drains the row.
           await this.safePatch(commandId, { state: "pending", lease: undefined, lastError: String(err) });
-          if (this.connectionState !== "offline" && this.connectionState !== "recovering") {
-            this.scheduleOutboxRetry(current0.instanceId);
-          }
+          this.scheduleOutboxRetry(current0.instanceId);
         }
       } else if (err instanceof HubHttpError && err.status === 409) {
         await finish({ state: "unknown", lastError: err.message });
       } else if (err instanceof HubHttpError) {
         await finish({ state: "rejected", lastError: err.message });
       }
-    } finally {
-      // Always release this tab's in-memory marker. The durable lease was
-      // cleared by finish() on a committed terminal write; if that write
-      // aborted the row stays inflight durably and another owner retries after
-      // TTL — but this tab must not hold the in-memory bit.
-      box.clearInflight(commandId);
     }
     this.syncBubbleFromOutbox(commandId);
     if (!box.pendingFor(current0.instanceId).length) this.clearOutboxRetry(current0.instanceId);
+    return true;
   }
 
   private bubbleFromOutbox(r: OutboxRecord): LocalBubble {
@@ -2384,9 +2405,12 @@ class HubStore {
       // failure is honestly 状态待确认 — never an optimistic retry.
       return this.sendWithoutOutbox(instanceId, prompt, attachments, effectiveMode, clientRequestId);
     }
-    if (offline) {
+    if (this.connectionState !== "live") {
       // The row stays pending; the connection machine flushes it on recovery.
-      return true;
+      // An offline steer degraded to a queued turn must NOT report success:
+      // it has not interrupted anything, so no 已打断 receipt (and annotation
+      // drafts stay until it really lands).
+      return !(mode === "steer");
     }
     // Online: flush now in the background; the POST never blocks the caller.
     void this.flushAllOutbox();
@@ -2500,7 +2524,14 @@ class HubStore {
     for (const item of items) {
       const current = this.state.bubbles.find((b) => b.clientRequestId === item.clientRequestId);
       if (!current || !current.held || current.state !== "queued") continue;
-      await this.enqueueBubble(current, { steer: false });
+      // A persist abort leaves the row held with its lifetime commandId
+      // already bound; skip it this flush (the next trigger retries the SAME
+      // id) rather than aborting delivery of the remaining held rows.
+      try {
+        await this.enqueueBubble(current, { steer: false });
+      } catch {
+        /* retried under the same commandId on the next flush */
+      }
     }
     await this.flushAllOutbox();
   }
@@ -2520,7 +2551,11 @@ class HubStore {
     if (inFlight) return inFlight;
     const job = this.doEnqueueBubble(bubble, opts);
     this.enqueueInFlight.set(bubble.clientRequestId, job);
-    void job.finally(() => this.enqueueInFlight.delete(bubble.clientRequestId));
+    // Swallow the cleanup chain's own rejection: callers receive `job` itself
+    // and own its error; this tail must not surface as an unhandled rejection.
+    void job
+      .catch(() => undefined)
+      .finally(() => this.enqueueInFlight.delete(bubble.clientRequestId));
     return job;
   }
 
@@ -2640,7 +2675,10 @@ class HubStore {
     }
     if (!commandId) return false;
 
-    if (this.connectionState !== "live") return true; // degraded to queued
+    // Offline: the row is queued (and degraded from steer to an ordinary
+    // turn), but nothing was interrupted — report false so the Composer does
+    // not raise the 已打断 receipt; recovery flushes the queued row.
+    if (this.connectionState !== "live") return false;
     // Deliver the (steer-promoted) row through the single-deliverer lock.
     try {
       await this.outbox.withInstanceLock(instanceId, (id, rows) => this.deliverOneRow(id, rows));
@@ -2756,7 +2794,8 @@ class HubStore {
     this.outboxRetryAttempt.set(instanceId, n + 1);
     const timer = setTimeout(() => {
       this.outboxRetryTimer.delete(instanceId);
-      if (!this.state.authed) return;
+      // The timer is armed only by a real enqueue (authenticated UI); a stale
+      // device session answers 401 and the response path handles logout.
       void this.flushAllOutbox();
     }, delay);
     this.outboxRetryTimer.set(instanceId, timer);
@@ -2774,7 +2813,6 @@ class HubStore {
     this.heldRetryAttempt.set(instanceId, n + 1);
     const timer = setTimeout(() => {
       this.heldRetryTimer.delete(instanceId);
-      if (!this.state.authed) return;
       void this.flushAllOutbox();
     }, delay);
     this.heldRetryTimer.set(instanceId, timer);
@@ -2807,18 +2845,26 @@ class HubStore {
     // this one makes its late resolution a no-op — including its error.
     const gen = (this.screenReadGen.get(instanceId) ?? 0) + 1;
     this.screenReadGen.set(instanceId, gen);
-    // Basis = the greatest journal screen seq the browser KNOWS before the
-    // RPC, whether it was committed as a screen entry or only held in the
-    // REST seed/follow events (the carried-review gap: a seed screen never
-    // written to `screens` left the basis null). The live buffer is fresh
-    // through at least this seq; a journal candidate at/below it cannot roll
-    // the buffer back.
+    // Basis = the greatest journal seq the browser KNOWS before the RPC,
+    // whether it was committed as a screen entry, carried as a screen
+    // observation, or seen as ANY other event (the carried-review gap: a seed
+    // screen never written to `screens` left the basis null; the list-poll gap:
+    // events known through N with no screen observation left it null too). The
+    // live buffer is fresh through at least this seq, so a delayed journal
+    // screen at/below it — including one delivered by a late gap fill — cannot
+    // roll the buffer back. A journal frame strictly above the basis still wins.
     const basisSeq = (() => {
       const committed = this.state.screens[instanceId]?.journalSeq ?? null;
       const observed = latestScreenSnapshot(this.state.events[instanceId] ?? []).seq;
-      if (committed == null) return observed;
-      if (observed == null) return committed;
-      return BigInt(observed) > BigInt(committed) ? observed : committed;
+      let known: string | null = null;
+      for (const ev of this.state.events[instanceId] ?? []) {
+        if (known === null || BigInt(ev.seq) > BigInt(known)) known = ev.seq;
+      }
+      let basis: string | null = null;
+      for (const candidate of [committed, observed, known]) {
+        if (candidate != null && (basis === null || BigInt(candidate) > BigInt(basis))) basis = candidate;
+      }
+      return basis;
     })();
     let read: { lines: string[] };
     try {

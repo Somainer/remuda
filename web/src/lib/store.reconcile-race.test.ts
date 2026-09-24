@@ -645,7 +645,9 @@ it("a steer while offline degrades to an ordinary queued turn", async () => {
   const id = hubStore.hold(INSTANCE, "offline steer", "turn");
   hubStore.setConnectionStateForTest("offline");
   const landed = await hubStore.steerHeld(INSTANCE, id);
-  expect(landed).toBe(true); // accepted as a queued turn, not a steer
+  // NOT an authoritative acceptance: nothing was interrupted offline, so the
+  // Composer gets false and never raises 已打断; the row is merely queued.
+  expect(landed).toBe(false);
   expect(send).not.toHaveBeenCalled();
   const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id);
   expect(bubble?.promptMode).toBe("new-turn");
@@ -749,5 +751,169 @@ it("pagehide then persisted pageshow re-enables the outbox and flushes (BFCache,
   await (hubStore as unknown as { pageShowForTest: (p: boolean) => Promise<void> }).pageShowForTest(true);
   // pagehide set the flag, persisted pageshow cleared it and flushed.
   expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(false);
+  await vi.waitFor(() => expect(send).toHaveBeenCalled());
+});
+
+it("a delayed unseen journal screen (load-earlier) never overwrites a newer list-poll RPC screen", async () => {
+  // Item 7: the 2.5 s list poll starts a tty.screen read while the browser
+  // only knows non-screen events through seq 3. It commits the live buffer.
+  // A later load-earlier surfaces an unseen SCREEN observation at seq 1, and
+  // the next live non-screen batch re-derives that old screen: the RPC basis
+  // anchored on the greatest KNOWN event seq must keep the newer buffer.
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "eventsRead").mockImplementation(
+    async (args?: { afterSeq?: string; beforeSeq?: string }) => {
+      // load-earlier window (beforeSeq set): the unseen older screen.
+      if (args?.beforeSeq !== undefined) {
+        return {
+          events: [
+            {
+              kind: "raw_tty",
+              eventId: "evt_unseen_screen_1",
+              journalId: JOURNAL,
+              instanceId: INSTANCE,
+              seq: "1",
+              payload: { text: "DONE unseen old task", nativeName: "screen", status: "done?" },
+            } as unknown as Observation,
+          ],
+          durableSeq: "3",
+          windowFromSeq: "1",
+          reachedAfterSeq: true,
+        };
+      }
+      // REST seed: a bounded tail of non-screen events 2..3 (no screen).
+      return {
+        events: [
+          {
+            kind: "message",
+            eventId: "evt_msg_2",
+            journalId: JOURNAL,
+            instanceId: INSTANCE,
+            seq: "2",
+            completeness: "structured",
+            payload: { role: "assistant", text: "working" },
+          } as unknown as Observation,
+          {
+            kind: "lifecycle",
+            eventId: "evt_life_3",
+            journalId: JOURNAL,
+            instanceId: INSTANCE,
+            seq: "3",
+            payload: { type: "native", nativeName: "agent_status", status: "working" },
+          } as unknown as Observation,
+        ],
+        durableSeq: "3",
+        windowFromSeq: "2",
+        reachedAfterSeq: false,
+      };
+    },
+  );
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_unseen",
+    journalId: JOURNAL,
+    durableSeq: "3",
+    windowFromSeq: "2",
+    reachedAfterSeq: false,
+    getReadyState: () => 1,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_unseen",
+      asOfSeq: "3",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "2", complete: false },
+    },
+  });
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "1", durableSeq: "3" } as Awaited<
+      ReturnType<Api["instanceList"]>
+    >["items"][number]],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: ["LIVE BUFFER from the list poll"] });
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  expect(hubStore.getSnapshot().screens[INSTANCE]).toBeUndefined();
+
+  // The list poll commits the current buffer. Its basis is the greatest known
+  // JOURNAL seq (3), even though no screen observation has been seen.
+  await hubStore.refreshScreen(INSTANCE);
+  const rpc = hubStore.getSnapshot().screens[INSTANCE];
+  expect(rpc?.lines).toEqual(["LIVE BUFFER from the list poll"]);
+  expect(rpc?.journalSeq).toBe("3");
+
+  // The user scrolls up: the unseen seq-1 screen joins the known events.
+  expect(await hubStore.loadEarlier(INSTANCE)).toBeTruthy();
+
+  // A fresh non-screen live batch (seq 4) re-derives the latest SCREEN (seq 1);
+  // that stale screen must not roll the newer RPC buffer or its done badge.
+  const onBatch = vi.mocked(api.eventsSubscribe).mock.calls[0]?.[2] as (
+    batch: Record<string, unknown>,
+  ) => void;
+  onBatch({
+    subscriptionId: "sub_unseen",
+    journalId: JOURNAL,
+    fromSeq: "4",
+    toSeq: "4",
+    durableSeq: "4",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_msg_4",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "4",
+        completeness: "structured",
+        payload: { role: "assistant", text: "still working" },
+      } as unknown as Observation,
+    ],
+  });
+  const screen = hubStore.getSnapshot().screens[INSTANCE];
+  expect(screen?.lines).toEqual(["LIVE BUFFER from the list poll"]);
+  expect(screen?.done).toBe(false);
+  expect(screen?.journalSeq).toBe("3");
+});
+
+it("a cancelled beforeunload prompt unlatches outbox delivery via the scheduled setTimeout(0)", async () => {
+  // Item 7: beforeunload fires even when the user is shown the browser's
+  // "leave?" prompt and CANCELS — pagehide never fires, so the unload flag
+  // must clear itself on the next task instead of latching delivery off.
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<ReturnType<Api["hostList"]>>);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["passkeyList"]>>);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  const send = vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_cancel_unload", "accepted"));
+  await hubStore.bootstrap();
+  hubStore.setConnectionStateForTest("live");
+
+  // User triggers navigation but cancels the prompt: beforeunload fires, the
+  // flag goes up synchronously, then the scheduled task clears it.
+  window.dispatchEvent(new Event("beforeunload"));
+  expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(false);
+
+  // Delivery was not latched off: a queued row flushes.
+  hubStore.frameForTest();
+  await hubStore.send(INSTANCE, "after cancel");
   await vi.waitFor(() => expect(send).toHaveBeenCalled());
 });

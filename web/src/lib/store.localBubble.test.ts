@@ -136,7 +136,7 @@ it("a failed POST keeps the row pending under the same commandId and retries it"
   expect(wireId?.startsWith("cmd_")).toBe(true);
   // 5xx is a retriable network/server failure: the row stays queued under the
   // SAME id and the bounded live-retry re-POSTs that id (exactly-once).
-  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(2));
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(2), { timeout: 5_000 });
   expect(sendSpy.mock.calls[0]?.[4]).toBe(wireId);
   expect(sendSpy.mock.calls[1]?.[4]).toBe(wireId);
   // After the successful retry the row is delivered (sent), never unknown.
@@ -328,4 +328,43 @@ it("create returns the instance without awaiting the post-create list refresh", 
       created = value;
     });
   await vi.waitFor(() => expect(created?.id).toBe(INSTANCE), { timeout: 2_000 });
+});
+
+it("an aborted inflight-state claim never POSTs; recovered storage delivers the same commandId", async () => {
+  const { api, hubStore } = await fresh();
+  stubPostSend(api);
+  const sendSpy = vi
+    .spyOn(api, "instanceSend")
+    .mockImplementation(
+      ((_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) =>
+        Promise.resolve(commandResult(commandId ?? "cmd_x", "accepted"))) as Api["instanceSend"],
+    );
+  hubStore.setConnectionStateForTest("live");
+
+  // Storage accepts the durable enqueue but ABORTS the inflight-claim write for
+  // a command row (the lease row uses the __lock__ key and must still commit).
+  const realSetItem = Storage.prototype.setItem;
+  const setSpy = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key: string, value: string) {
+    if (/"state":"inflight"[^{]*"commandId":"cmd_/.test(value)) {
+      throw new DOMException("simulated IndexedDB transaction abort", "QuotaExceededError");
+    }
+    return realSetItem.call(this, key, value);
+  });
+
+  await hubStore.send(INSTANCE, "abort then recover");
+  const commandId = (await vi.waitFor(() => {
+    const b = hubStore.getSnapshot().bubbles.find((x) => x.text === "abort then recover");
+    if (!b?.commandId) throw new Error("bubble not persisted yet");
+    return b.commandId;
+  })) as string;
+
+  // The aborted flush settles without a POST; the row stays deliverable.
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  expect(sendSpy).not.toHaveBeenCalled();
+
+  // Storage recovers: the SAME intent delivers under the SAME commandId.
+  setSpy.mockRestore();
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(commandId);
 });

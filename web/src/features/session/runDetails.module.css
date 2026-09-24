@@ -1,6 +1,7 @@
+/* @tokens strict */
 .runDetails {
   flex: none;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
 }
 
 .runDetails > summary {
@@ -9,11 +10,11 @@
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-family: var(--mono);
-  font-size: var(--text-aux);
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
   user-select: none;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   padding: 2px 6px 2px 4px;
 }
 
@@ -22,14 +23,14 @@
 }
 
 .runDetails > summary:focus-visible {
-  outline: 2px solid var(--cold);
+  outline: var(--focus-ring);
   outline-offset: 1px;
 }
 
 .chev {
   display: inline-flex;
   width: 10px;
-  color: var(--mute);
+  color: var(--fg-muted);
 }
 
 .chev::before {
@@ -41,11 +42,11 @@
 }
 
 .count {
-  color: var(--line);
+  color: var(--fg-faint);
 }
 
 .metaBody {
-  padding-top: 4px;
+  padding-top: var(--space-1);
 }
 
 /* Compact: the trigger keeps a 21px visual row but gets the same invisible
@@ -83,10 +84,10 @@
   align-items: center;
   flex-wrap: wrap;
   gap: 9px;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   /* Status meta never goes below 12px, desktop or mobile. */
-  font-size: var(--text-aux);
-  color: var(--mute);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
   padding-left: 0;
 }
 

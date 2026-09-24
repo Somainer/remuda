@@ -50,7 +50,7 @@ export function RawEvents({ events }: { events: Observation[] }) {
       <div
         ref={scroller}
         data-testid="raw-events-list"
-        style={{ height, overflow: "auto", position: "relative", border: "1px solid var(--line)", borderRadius: 4 }}
+        style={{ height, overflow: "auto", position: "relative", border: "1px solid var(--border)", borderRadius: "var(--radius-xs)" }}
         onScroll={(e) => setScroll((e.target as HTMLDivElement).scrollTop)}
       >
         <div style={{ height: filtered.length * ROW, position: "relative" }}>

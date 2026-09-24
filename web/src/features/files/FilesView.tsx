@@ -162,7 +162,6 @@ export function FilesView({ hostId, workspaceId, hostLabel, taskFilter, onBack }
             role="tab"
             aria-selected={space === "project"}
             className={css.refresh}
-            style={space === "project" ? { borderColor: "var(--paper)" } : undefined}
             data-testid="files-space-project"
             onClick={() => switchSpace("project")}
           >
@@ -173,7 +172,6 @@ export function FilesView({ hostId, workspaceId, hostLabel, taskFilter, onBack }
             role="tab"
             aria-selected={space === "task"}
             className={css.refresh}
-            style={space === "task" ? { borderColor: "var(--paper)" } : undefined}
             data-testid="files-space-task"
             onClick={() => switchSpace("task")}
           >

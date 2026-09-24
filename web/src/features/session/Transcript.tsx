@@ -1469,9 +1469,11 @@ function renderNode(
     );
   }
   if (node.type === "thought") {
+    // UO-6b: the single disclosure caret comes from .thought summary::before;
+    // a literal triangle here painted twice (native marker + 「▸」).
     return (
       <details className={session.thought}>
-        <summary>▸ thinking{node.completeness === "screen-derived" ? " · 从屏幕猜测" : ""}</summary>
+        <summary>thinking{node.completeness === "screen-derived" ? " · 从屏幕猜测" : ""}</summary>
         <p>{node.text}</p>
       </details>
     );

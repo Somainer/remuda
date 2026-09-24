@@ -837,11 +837,11 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       await expect(page.getByTestId("run-details")).toBeVisible();
       const strip = page.getByTestId("live-status-strip");
       await expect(strip).toBeVisible();
-      await expect(strip).toHaveAttribute("data-phase", "tool-started");
-      await expect(page.getByTestId("live-health-hook")).toHaveAttribute(
-        "data-reason",
-        "stalled",
-      );
+      // UO-6b: an EXITED session settles the strip — the final fixture event
+      // is the entity("exited") record, so the stale tool-started latch and
+      // its stall note no longer survive on a session that has ended.
+      await expect(strip).toHaveAttribute("data-phase", "turn-ended");
+      await expect(page.getByTestId("live-health-hook")).toHaveCount(0);
       // The undismissed install offer the acceptance runs on iOS/WebKit must
       // show; on engines that never surface an offer the whole case skips
       // explicitly rather than passing without it.

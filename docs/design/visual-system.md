@@ -184,7 +184,7 @@ tokenGuard 断言两条：
 - **亮色**：brightBlack `#8f897e`、brightRed `#f4a59e`、brightGreen `#b9d6a4`、brightYellow `#ecd08f`、brightBlue `#a9c7ee`、brightMagenta `#dcb8e8`、brightCyan `#a0d8d3`、brightWhite `#f6f2ea`。
 - **256 色立方**：删除自绘的 `nightCorralExtendedAnsi`，改用 xterm 的标准 256 色立方，不再染色。
 - **字体**：`TERMINAL_FONT_FAMILY` 仍以 IBM Plex Mono 打头。
-- 终端是恒深色的仪器：深浅两态下终端相同，终端不订阅外观变化；每个非黑 ANSI 色在终端底上都 ≥ 4.5:1，终端输出的颜色不被改写。
+- 终端跟随外观（2026-09-24 所有者改定，取代恒深色口径）：深、浅两套调色板随外观切换，切换只设 `term.options.theme`、渲染器就地重绘，不重建终端、不丢滚动历史；两套板各自的 16 个非黑 ANSI 色在本板终端底上 ≥ 4.5:1，终端输出的颜色（含 256 色立方与 truecolor）不被改写。浅板 white/brightWhite 为深灰（TUI 默认文字仍可读），真白走 truecolor/256 色 231。
 
 ---
 

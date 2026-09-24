@@ -1,17 +1,11 @@
 /*
- * UO-10 terminal frame (D-053 item 4): the terminal is an always-dark
- * instrument in both appearances. The only terminal tokens on :root are
- * --term-bg / --term-fg (UO-1 tokens.css); the chrome shades below are
- * derived here, scoped to .lab, so they never leak and never swap with the
- * page's light appearance. No ink/paper/dust role tokens, no colour literals
- * in components.
+ * UO-10 terminal chrome. The terminal FOLLOWS the workbench appearance
+ * (owner 2026-09-24): every colour here is a --term-* role defined in
+ * tokens.css with dark and light branches. The 16 ANSI colours live in
+ * tty/theme.ts (applied on the xterm element). No page role tokens.
  */
 
 .lab {
-  /* Chrome surfaces/hairlines/muted ink derived from the always-dark pair. */
-  --tty-raised: color-mix(in srgb, var(--term-fg) 7%, var(--term-bg));
-  --tty-border: color-mix(in srgb, var(--term-fg) 18%, var(--term-bg));
-  --tty-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
   display: flex;
   flex-direction: column;
   flex: 1;
@@ -20,7 +14,6 @@
   color: var(--term-fg);
   background: var(--term-bg);
 }
-
 .lab[data-tty-fullscreen="1"] {
   /* c-mfix: fill the visualViewport band (keyboard aware), never the layout
      viewport — inset:0 + 100dvh let the keyboard cover the lower rows. */
@@ -51,8 +44,8 @@
   line-height: var(--lh-meta);
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--tty-muted);
-  border: 1px solid var(--tty-border);
+  color: var(--term-muted);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-pill);
   padding: 2px 10px;
 }
@@ -65,14 +58,14 @@
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
   color: var(--term-fg);
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-pill);
   padding: 2px 10px;
   white-space: nowrap;
 }
 
 .staleBadge[data-stale-reason="node-link-unavailable"] {
-  color: var(--tty-muted);
+  color: var(--term-muted);
   border-style: dashed;
 }
 
@@ -90,7 +83,7 @@
   /* Desktop toolbar is a 32px strip (ui-spec §2.3). */
   min-height: 32px;
   padding: 4px 16px;
-  border-bottom: 1px solid var(--tty-border);
+  border-bottom: 1px solid var(--term-border);
 }
 
 /* OSC 9;4 progress directly under the header: 2px (ui-spec §2.3). */
@@ -99,7 +92,7 @@
   position: relative;
   height: 2px;
   margin: -1px 0 0;
-  background: var(--tty-border);
+  background: var(--term-border);
   overflow: hidden;
 }
 
@@ -120,11 +113,11 @@
 }
 
 .progressFill[data-progress-state="error"] {
-  background: var(--term-red);
+  background: var(--term-danger-fg);
 }
 
 .progressFill[data-progress-state="paused"] {
-  background: var(--tty-muted);
+  background: var(--term-muted);
 }
 
 @keyframes tty-progress-slide {
@@ -148,7 +141,7 @@
   font-family: var(--font-mono);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
   background: transparent;
   border: 0;
   padding: 0;
@@ -157,7 +150,7 @@
 
 .seg {
   display: flex;
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
   overflow: hidden;
   height: var(--seg-item);
@@ -168,12 +161,12 @@
   align-items: center;
   padding: 0 11px;
   font-size: var(--text-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
   background: transparent;
   border: 0;
   border-radius: 0;
   min-height: var(--seg-item);
-  border-left: 1px solid var(--tty-border);
+  border-left: 1px solid var(--term-border);
 }
 
 .seg button:first-child {
@@ -182,13 +175,13 @@
 
 .segOn {
   color: var(--term-fg) !important;
-  background: var(--tty-raised) !important;
+  background: var(--term-raised) !important;
 }
 
 /* AuxKeys desktop strip: 28px keys, 12px mono (ui-spec §2.3). */
 .auxStrip {
   height: 28px;
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
@@ -196,7 +189,7 @@
   gap: 9px;
   font-family: var(--font-mono);
   font-size: var(--text-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .auxStrip button {
@@ -207,21 +200,21 @@
   background: transparent;
   font-family: var(--font-mono);
   font-size: var(--text-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .banner {
   flex: none;
   padding: 7px 14px;
-  background: var(--tty-raised);
-  border-bottom: 1px solid var(--tty-border);
+  background: var(--term-raised);
+  border-bottom: 1px solid var(--term-border);
   display: flex;
   align-items: center;
   gap: 8px;
   font-family: var(--font-mono);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .dots {
@@ -234,7 +227,7 @@
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: var(--tty-muted);
+  background: var(--term-muted);
   animation: dim 1.2s ease-in-out infinite;
 }
 
@@ -301,7 +294,7 @@ html[data-keyboard="1"] .host {
 
 .dock {
   flex: none;
-  border-top: 1px solid var(--tty-border);
+  border-top: 1px solid var(--term-border);
   padding: 12px 18px;
   display: flex;
   align-items: center;
@@ -311,12 +304,12 @@ html[data-keyboard="1"] .host {
 
 .note {
   flex: none;
-  border-top: 1px solid var(--tty-border);
+  border-top: 1px solid var(--term-border);
   padding: 9px 18px;
   font-family: var(--font-mono);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .localWrap {
@@ -336,9 +329,9 @@ html[data-keyboard="1"] .host {
   /* ui-spec §2.3: 36px with a fine pointer; the coarse override below takes
      the visible height to the 44px touch floor. */
   height: var(--control-h-lg);
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
-  background: var(--tty-raised);
+  background: var(--term-raised);
   display: flex;
   align-items: center;
   padding: 0 12px;
@@ -359,7 +352,7 @@ html[data-keyboard="1"] .host {
 }
 
 .localField input::placeholder {
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .localSend {
@@ -378,7 +371,7 @@ html[data-keyboard="1"] .host {
   font-family: var(--font-mono);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 /* Expanded raw-key row under the phone action bar. */
@@ -389,8 +382,8 @@ html[data-keyboard="1"] .host {
   overflow-x: auto;
   overflow-y: hidden;
   padding: 8px 10px;
-  background: var(--tty-raised);
-  border-top: 1px solid var(--tty-border);
+  background: var(--term-raised);
+  border-top: 1px solid var(--term-border);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -398,7 +391,7 @@ html[data-keyboard="1"] .host {
   height: 44px;
   min-width: 44px;
   min-height: 44px;
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--term-fg);
@@ -434,16 +427,16 @@ html[data-keyboard="1"] .host {
   height: 28px;
   min-width: 160px;
   padding: 0 10px;
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
-  background: var(--tty-raised);
+  background: var(--term-raised);
   color: var(--term-fg);
   font-family: var(--font-mono);
   font-size: var(--text-meta);
 }
 
 .searchInput::placeholder {
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .searchInput:focus-visible {
@@ -504,8 +497,8 @@ html[data-keyboard="1"] .host {
  */
 .phoneBar {
   flex: none;
-  background: var(--tty-raised);
-  border-top: 1px solid var(--tty-border);
+  background: var(--term-raised);
+  border-top: 1px solid var(--term-border);
 }
 
 .phoneRow {
@@ -552,7 +545,7 @@ html[data-keyboard="1"] .host {
      outline paints inside the 44px box, so the WHOLE hit surface — corners
      included — is the key itself (D-039). */
   border: 0;
-  outline: 1px solid var(--tty-border);
+  outline: 1px solid var(--term-border);
   outline-offset: -1px;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -588,13 +581,13 @@ html[data-keyboard="1"] .host {
   padding: 4px 12px 6px;
   font-size: var(--text-meta);
   line-height: 1.4;
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 /* UO-10: the history Sheet renders in a page-level portal outside .lab, so
    it does not inherit the terminal shades. Give the PANEL the dark
    instrument surface and its own derived border/muted colours; contents
-   below already paint with --term-fg / --tty-* tokens. */
+   below already paint with --term-fg / --term-* roles. */
 .historySheet {
   background: var(--term-bg);
   border-top: 1px solid color-mix(in srgb, var(--term-fg) 18%, var(--term-bg));
@@ -619,7 +612,7 @@ html[data-keyboard="1"] .host {
   flex: none;
   min-height: var(--touch);
   padding: 0 12px;
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--term-fg);
@@ -630,7 +623,7 @@ html[data-keyboard="1"] .host {
   margin: 0;
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }
 
 .historyList {
@@ -645,7 +638,7 @@ html[data-keyboard="1"] .host {
   min-height: var(--touch);
   padding: 8px 12px;
   text-align: left;
-  border: 1px solid var(--tty-border);
+  border: 1px solid var(--term-border);
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--term-fg);
@@ -659,5 +652,5 @@ html[data-keyboard="1"] .host {
   margin: 0;
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-  color: var(--tty-muted);
+  color: var(--term-muted);
 }

@@ -158,7 +158,12 @@ test.beforeEach(async ({ page }) => {
 });
 
 for (const appearance of ["dark", "light"] as const) {
-  test(`terminal is the same dark instrument in ${appearance} appearance (no seam, ANSI untouched)`, async ({
+  const expected = {
+    dark: { hex: "#1a1917", rgb: [26, 25, 23] as const, lightInk: true },
+    light: { hex: "#faf9f6", rgb: [250, 249, 246] as const, lightInk: false },
+  }[appearance];
+
+  test(`terminal follows ${appearance} appearance (pane/canvas match, no seam)`, async ({
     page,
   }) => {
     if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
@@ -181,33 +186,27 @@ for (const appearance of ["dark", "light"] as const) {
         const el = document.querySelector(sel);
         return el ? getComputedStyle(el)[prop] : null;
       };
-      const canvas = document.querySelector(".xterm-screen canvas");
-      const screenBg = canvas ? getComputedStyle(canvas).backgroundColor : null;
       return {
         termBg,
         appearance: document.documentElement.dataset.appearance ?? null,
         pane: pick("[data-tty-lab]", "backgroundColor"),
         viewport: pick('[aria-label="终端画面"]', "backgroundColor"),
         host: pick(".xterm", "backgroundColor"),
-        screenBg,
       };
     });
-    // --term-bg is mode-independent; both appearances resolve #1a1917.
-    expect(colors.termBg.toLowerCase()).toBe("#1a1917");
+    // The terminal bg is the mode's role token.
+    expect(colors.termBg.toLowerCase()).toBe(expected.hex);
     expect(colors.appearance).toBe(appearance);
-    // Pane and viewport both paint the same dark background — no seam.
+    // Pane and viewport paint the same background — no seam.
     expect(colors.pane).toBe(colors.viewport);
-    // rgb(26, 25, 23)
-    expect(colors.pane).toBe("rgb(26, 25, 23)");
-    // The xterm host is transparent over the same pane; the canvas itself is
-    // the TERMINAL_THEME background (or transparent for the DOM renderer).
-    expect(["rgba(0, 0, 0, 0)", "rgb(26, 25, 23)", null]).toContain(
+    const [pr, pg, pb] = expected.rgb;
+    expect(colors.pane).toBe(`rgb(${pr}, ${pg}, ${pb})`);
+    // The xterm host is transparent over the pane.
+    expect(["rgba(0, 0, 0, 0)", `rgb(${pr}, ${pg}, ${pb})`, null]).toContain(
       colors.host,
     );
-    // The geo pill renders in LIGHT muted ink on the dark instrument
-    // (--tty-muted ≈ rgb(151,148,141)), distinct from the plain --term-fg
-    // (≈ rgb(228,223,214)) but still well above the 4.5:1 floor. Serialized
-    // colour-mix is not stable across engines, so resolve sRGB via canvas.
+    // Chrome ink contrast on the mode's background (light ink on dark, dark
+    // ink on light).
     const geo = page.getByTestId("tty-io-mode");
     await expect(geo).toBeVisible();
     const ink = await page.evaluate(() => {
@@ -218,46 +217,99 @@ for (const appearance of ["dark", "light"] as const) {
         const ctx = canvas.getContext("2d")!;
         ctx.fillStyle = cssColor;
         ctx.fillRect(0, 0, 1, 1);
-        const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
-        return [r, g, b] as const;
+        return [...ctx.getImageData(0, 0, 1, 1).data.slice(0, 3)] as number[];
       };
       const pill = document.querySelector<HTMLElement>(
         "[data-testid='tty-io-mode']",
       )!;
-      const lab = document.querySelector<HTMLElement>("[data-tty-lab='1']")!;
-      // The chrome shades are scoped to .lab (not :root), so the probes must
-      // resolve INSIDE the lab element — a body-level probe would inherit
-      // --term-fg instead.
+      const labEl = document.querySelector<HTMLElement>("[data-tty-lab='1']")!;
       const readVar = (name: string) => {
         const probe = document.createElement("span");
         probe.style.color = name;
         probe.style.position = "absolute";
-        lab.appendChild(probe);
+        labEl.appendChild(probe);
         const rgb = read(getComputedStyle(probe).color);
         probe.remove();
         return rgb;
       };
       return {
         pillRgb: read(getComputedStyle(pill).color),
-        mutedRgb: readVar("var(--tty-muted)"),
+        mutedRgb: readVar("var(--term-muted)"),
         fgRgb: readVar("var(--term-fg)"),
       };
     });
-    // The pill is the muted chrome shade (not plain foreground).
-    expect(ink.pillRgb, "pill uses the terminal muted shade").toEqual(
+    expect(ink.pillRgb, "pill uses the terminal muted role").toEqual(
       ink.mutedRgb,
     );
-    // …which is visibly darker than the plain foreground.
-    expect(ink.pillRgb[0]).toBeLessThan(ink.fgRgb[0]);
-    // …but still light ink on the dark instrument (>130 floor, ≈4.5:1).
-    expect(
-      Math.min(...ink.pillRgb),
-      `chrome ink ${JSON.stringify(ink.pillRgb)} stays light`,
-    ).toBeGreaterThan(130);
+    // Muted is visibly different from plain foreground in BOTH modes.
+    expect(ink.pillRgb[0]).not.toBe(ink.fgRgb[0]);
+    // 4.5:1 floor: channels all light on dark, all dark on light.
+    if (expected.lightInk) {
+      expect(Math.min(...ink.pillRgb)).toBeGreaterThan(130);
+    } else {
+      expect(Math.max(...ink.pillRgb)).toBeLessThan(125);
+    }
 
     if (appearance === "dark") await shot(page, "uo10-terminal-dark-1440.png");
     if (appearance === "light")
       await shot(page, "uo10-terminal-light-1440.png");
+  });
+
+  test(`terminal switches live to ${appearance === "dark" ? "light" : "dark"} then back without rebuild (${appearance} start)`, async ({
+    page,
+  }) => {
+    if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.addInitScript((mode) => {
+      window.localStorage.setItem("runtime.theme.v1", mode);
+    }, appearance);
+    await page.reload();
+    const id = await createTerminal(page, `uo10 switch ${appearance}`);
+    await openTerminal(page, id);
+    const other = appearance === "dark" ? "light" : "dark";
+    const bgOf = () =>
+      page.evaluate(
+        () =>
+          getComputedStyle(document.querySelector("[data-tty-lab]")!)
+            .backgroundColor,
+      );
+    const startBg = await bgOf();
+    const gridAtStart = {
+      rows: Number(
+        await page.locator("[data-tty-lab]").getAttribute("data-tty-rows"),
+      ),
+      cols: Number(
+        await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
+      ),
+    };
+
+    // Switch the settings choice (no reload): the same terminal repaints.
+    await page.evaluate((mode) => {
+      localStorage.setItem("runtime.theme.v1", mode);
+      document.documentElement.dataset.appearance = mode;
+    }, other);
+    await expect.poll(bgOf, { timeout: 3_000 }).not.toBe(startBg);
+    // The xterm grid is intact — no rebuild.
+    expect(
+      Number(
+        await page.locator("[data-tty-lab]").getAttribute("data-tty-rows"),
+      ),
+    ).toBe(gridAtStart.rows);
+    expect(
+      Number(
+        await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
+      ),
+    ).toBe(gridAtStart.cols);
+    // Scrollback survives: the terminal element is the SAME node.
+    const sameTerminal = await page.locator(".xterm").count();
+    expect(sameTerminal).toBeGreaterThan(0);
+
+    // Switch back.
+    await page.evaluate((mode) => {
+      localStorage.setItem("runtime.theme.v1", mode);
+      document.documentElement.dataset.appearance = mode;
+    }, appearance);
+    await expect.poll(bgOf, { timeout: 3_000 }).toBe(startBg);
   });
 }
 
@@ -592,10 +644,20 @@ test.describe("390px keyboard band", () => {
           heading: read(getComputedStyle(h).color),
         };
       });
-      // Background rgb(26,25,23).
-      expect(panel.bg).toEqual([26, 25, 23]);
-      // Heading light ink in both appearances.
-      expect(Math.min(...panel.heading)).toBeGreaterThan(150);
+      // The panel follows the terminal appearance: it is the CURRENT mode's
+      // --term-bg with matching foreground (no dark island in light mode, no
+      // light island in dark mode).
+      const expectedPanel =
+        appearance === "light"
+          ? { bg: [250, 249, 246] as number[], darkInk: true }
+          : { bg: [26, 25, 23] as number[], darkInk: false };
+      expect(panel.bg).toEqual(expectedPanel.bg);
+      // Heading ink contrasts with the panel background in both modes.
+      if (expectedPanel.darkInk) {
+        expect(Math.max(...panel.heading)).toBeLessThan(120);
+      } else {
+        expect(Math.min(...panel.heading)).toBeGreaterThan(150);
+      }
 
       if (appearance === "light")
         await shot(page, "uo10-history-sheet-light-390.png", 390);

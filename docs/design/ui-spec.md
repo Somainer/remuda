@@ -540,14 +540,14 @@ pty-backed 会话（kind `terminal` / driver `shell-pty` / `generic-pty` / `clau
 
 **真·全屏**：隐藏 chrome，`position:fixed; inset:0; height:100dvh`，`env(safe-area-inset-*)`。
 
-**恒深色仪器（D-053）**：终端在深浅两态下相同，不订阅外观变化。pane 与 viewport 背景都用 `var(--term-bg)`，`TerminalView.module.css` 不保留色值字面量；xterm 用 `TERMINAL_THEME`（基础色、16 ANSI 与对比度见 [visual-system.md](./visual-system.md) §3.4/§4：background `#1a1917`、foreground `#e4dfd6`，每个非黑 ANSI 色 ≥ 4.5:1）；标准 256 色立方不再染色，终端输出的颜色不改写。
+**终端跟随外观（D-053，2026-09-24 所有者改定）**：终端有深、浅两套调色板并随外观切换；切换只设置 `term.options.theme`，WebGL/canvas 渲染器就地重绘，不重建终端、不丢滚动历史。pane 与 viewport 背景都用当前态的 `var(--term-bg)`，外框（工具栏、key bar、本地输入、历史面板、搜索框、stale 徽章、进度条）全部使用当前态的 terminal 角色（`--term-*`，两态各一值），`TerminalView.module.css` 不保留色值字面量。xterm 用 `DARK_TERMINAL_THEME` / `LIGHT_TERMINAL_THEME`（对比度见 [visual-system.md](./visual-system.md) §3.4/§4：两板各自每个非黑 ANSI 色 ≥ 4.5:1；浅板 white/brightWhite 为深灰）；标准 256 色立方不染色，truecolor 与终端输出不改写。
 
 **从 herdrx 抄交互与 viewport 算法，重接 runtime API**（不要搬 herdr snapshot 绑定）
 
 | 能力 | 算法来源 | 接到 |
 |---|---|---|
 | xterm + fit + WebGL/canvas + Search/Unicode11/WebLinks | `TerminalPane.tsx` | Hub `/v1/follow?tty=1` binary `tty.frame` |
-| 恒深色调色板 | `tty/theme.ts` `TERMINAL_THEME`（标准 256 色立方） | xterm `ITheme` |
+| 跟随外观的深浅调色板 | `tty/theme.ts` `DARK_TERMINAL_THEME` / `LIGHT_TERMINAL_THEME`（标准 256 色立方） | xterm `ITheme`，`term.options.theme` 在线切换 |
 | 手机默认 keys、桌面默认 raw | `WorkbenchPage.tsx` | follow 输入 channel |
 | IME 安全发送 | xterm composition + `composing()` | raw onData 不拆候选 |
 | 鼠标 | xterm mouse tracking (`onData` + `onBinary`) | 应用 DECSET 1000/1002/1003/1006 时转发 |
@@ -1190,7 +1190,7 @@ web/
 
 - **角色颜色**：颜色只按角色引用（背景 / 文字 / 线条 / 链接与焦点 / 状态 / 主按钮 / 终端与代码专用域），不按色相命名；十六进制字面量只允许出现在 `tokens.css`、`tty/theme.ts`、`index.html`、`manifest.webmanifest` 四处。
 - **「墨」一套调色板，深浅两态**：默认外观跟随系统，由纯 CSS 媒体查询解析，无阻塞脚本；偏好取 `system | dark | light`——只有显式选了 `dark` / `light` 时 `main.tsx` 才在挂载前写 `:root[data-appearance]`，选 `system`（及键缺失）时**不写属性**、完全交给 `@media (prefers-color-scheme: light)`；旧值 `night` / `ledger` 分别读作 `dark` / `light`。两态各自调校、不做反相。状态色有纪律：琥珀=需要你，红=失败/破坏，绿=权威确认（idle、在线、已连接不用绿），未知=中性虚线+文字。主按钮是中性反色填充，不用状态色。
-- **终端恒深色**：深浅两态终端相同；标准 256 色立方不再染色，每个非黑 ANSI 色 ≥ 4.5:1。
+- **终端跟随外观**：深、浅两套调色板随外观在线切换（不重建终端、不丢滚动历史）；两板各自每个非黑 ANSI 色 ≥ 4.5:1；标准 256 色立方不染色，truecolor 与终端输出不改写。
 - **字体**：UI 与长文同用平台系统无衬线字体栈（含 PingFang SC、微软雅黑、Noto Sans CJK），不打包正文 webfont；等宽只保留 IBM Plex Mono（OFL-1.1，许可入库），用于代码、路径、终端、ID 与对齐数字。
 - **度量**：正文 16px/28px；阅读列上限 720px，页边距 32 / 24 / 16；composer、live 行、结束条都与阅读列对齐。
 - **字号下限**：承载信息的文字 ≥ 12px，辅助文字 `--text-meta` 所有宽度都是 12px（D-039）；11px 只用于徽标数字与 kbd 这类图形标注（D-052 第 9 条）；coarse 指针下输入 16px。

@@ -115,6 +115,14 @@
     --ember-ring-top: rgba(140, 106, 22, 0.4);
     --ember-ring-ultra: rgba(154, 93, 8, 0.75);
     --ember-knob-ultra-bg: color-mix(in srgb, var(--ember-knob-face) 90%, #e8b866);
+    /* UO-10: light terminal roles — frame follows appearance. */
+    --term-bg: #faf9f6;
+    --term-fg: #2b2a27;
+    --term-raised: color-mix(in srgb, var(--term-fg) 5%, var(--term-bg));
+    --term-border: color-mix(in srgb, var(--term-fg) 16%, var(--term-bg));
+    --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
+    --term-danger-fg: var(--danger-fg);
+    --term-selection: #d8e2ee;
   }
 }
 
@@ -170,6 +178,14 @@
   --ember-ring-top: rgba(140, 106, 22, 0.4);
   --ember-ring-ultra: rgba(154, 93, 8, 0.75);
   --ember-knob-ultra-bg: color-mix(in srgb, var(--ember-knob-face) 90%, #e8b866);
+  /* UO-10: light terminal roles — frame follows appearance. */
+  --term-bg: #faf9f6;
+  --term-fg: #2b2a27;
+  --term-raised: color-mix(in srgb, var(--term-fg) 5%, var(--term-bg));
+  --term-border: color-mix(in srgb, var(--term-fg) 16%, var(--term-bg));
+  --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
+  --term-danger-fg: var(--danger-fg);
+  --term-selection: #d8e2ee;
 }
 
 /* ------------------------------------------------------------------ */
@@ -179,9 +195,20 @@
 :root {
   --unknown-fg: var(--fg-muted);
   --unknown-border: var(--border-control);
-  /* The terminal is an always-dark instrument: same in both modes. */
+  /*
+   * Terminal follows the workbench appearance (owner 2026-09-24). These are
+   * the DARK-mode terminal roles (frame background/foreground); the light
+   * branch below overrides them. The 16 ANSI colours live in
+   * tty/theme.ts and are applied on the xterm element, not here.
+   */
   --term-bg: #1a1917;
   --term-fg: #e4dfd6;
+  /* Frame shades derived from the dark pair; consumed by tty chrome. */
+  --term-raised: color-mix(in srgb, var(--term-fg) 7%, var(--term-bg));
+  --term-border: color-mix(in srgb, var(--term-fg) 18%, var(--term-bg));
+  --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
+  --term-danger-fg: var(--tok-red);
+  --term-selection: #3d3a35;
 
   --font-ui:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",

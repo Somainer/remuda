@@ -50,7 +50,7 @@ import {
 import { createReplayGuard, groupByOrigin, type OutChunk } from "./replayGuard";
 import { applyStdinPolicy, stdinPolicy } from "./stdinPolicy";
 import { StaleScreenBadge } from "./StaleScreenBadge";
-import { TERMINAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
+import { terminalThemeFor, TERMINAL_FONT_FAMILY } from "./theme";
 import css from "./TerminalView.module.css";
 
 export type TtyLabHandle = {
@@ -72,6 +72,48 @@ type DisplayMode = "fit" | "fixed" | "responsive";
 /** The font the terminal is built with, and the ceiling every fit measures from. */
 const BASE_FONT_SIZE = 14;
 
+type TerminalAppearance = "dark" | "light";
+
+/**
+ * Current terminal appearance. `data-appearance="light"` (settings choice)
+ * forces light; otherwise ("dark", or absent = system) follow
+ * prefers-color-scheme. Re-renders on settings changes AND system changes,
+ * so the xterm theme can be swapped live without rebuilding the terminal.
+ */
+function useTerminalAppearance(): TerminalAppearance {
+  const [appearance, setAppearance] = useState<TerminalAppearance>(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return "dark";
+    const stamped = document.documentElement.dataset.appearance;
+    if (stamped === "light" || stamped === "dark") return stamped;
+    return window.matchMedia("(prefers-color-scheme: light)").matches
+      ? "light"
+      : "dark";
+  });
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const compute = () => {
+      const stamped = document.documentElement.dataset.appearance;
+      if (stamped === "light" || stamped === "dark") {
+        setAppearance(stamped);
+        return;
+      }
+      setAppearance(media.matches ? "light" : "dark");
+    };
+    compute();
+    media.addEventListener("change", compute);
+    const observer = new MutationObserver(compute);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-appearance"],
+    });
+    return () => {
+      media.removeEventListener("change", compute);
+      observer.disconnect();
+    };
+  }, []);
+  return appearance;
+}
+
 export function TerminalView({
   instance,
   onAttachFailed,
@@ -92,6 +134,13 @@ export function TerminalView({
   const localWheelRef = useRef(false);
   const altScreenRef = useRef(false);
   const { mobile, coarsePointer, offsetTop } = useWorkbenchViewport();
+  // UO-10 change of direction: the terminal FOLLOWS the workbench appearance.
+  // Resolve "system" live (prefers-color-scheme) and react to explicit
+  // settings changes that stamp data-appearance.
+  const terminalAppearance = useTerminalAppearance();
+  // Ref form for the one-shot mount effect (which must not rebuild the
+  // terminal on appearance change).
+  const terminalAppearanceRef = useRef(terminalAppearance);
   const [inputOverride, setInputOverride] = useState<{
     direct: boolean;
     mode: DisplayMode;
@@ -164,6 +213,13 @@ export function TerminalView({
   useEffect(() => {
     frozenRef.current = frozen;
   }, [frozen]);
+  // Live theme switch: assign the palette on the EXISTING Terminal so the
+  // WebGL/canvas renderer repaints in place — no rebuild, no scrollback loss.
+  useEffect(() => {
+    terminalAppearanceRef.current = terminalAppearance;
+    if (termRef.current)
+      termRef.current.options.theme = terminalThemeFor(terminalAppearance);
+  }, [terminalAppearance]);
   useEffect(() => {
     gateRef.current = inputGate({ directInput, frozen, mouseReports });
   }, [directInput, frozen, mouseReports]);
@@ -200,7 +256,7 @@ export function TerminalView({
       convertEol: false,
       disableStdin: initialStdin.disableStdin,
       macOptionIsMeta: true,
-      theme: TERMINAL_THEME,
+      theme: terminalThemeFor(terminalAppearanceRef.current),
     });
     const fit = new FitAddon();
     const search = new SearchAddon();

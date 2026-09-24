@@ -439,6 +439,40 @@ function mergeInstanceSnapshots(
   return merged;
 }
 
+/**
+ * Merge an authoritative interaction list page with the current projection.
+ *
+ * Terminal state never regresses to `pending`: when an interaction was
+ * locally settled from an answer receipt (`locallySettled`), a delayed older
+ * poll that still returns the pending row must not re-enable its buttons. The
+ * committed/current row wins until the list itself reports a non-pending
+ * state (the caller then clears the guard for that id).
+ */
+function mergeInteractionSnapshots(incoming: Interaction[], current: Interaction[], locallySettled: ReadonlySet<Id>): Interaction[] {
+  const previous = new Map(current.map((row) => [row.id, row]));  const terminalOrder: Record<string, number> = {
+    pending: 0,
+    reconciling: 1,
+    "answer-committed": 2,
+    expired: 3,
+    invalidated: 3,
+    resolved: 3,
+    unknown: 0,
+  };
+  const rank = (state: Interaction["state"]) => terminalOrder[state] ?? 0;
+  return incoming.map((row) => {
+    const prior = previous.get(row.id);
+    if (
+      prior &&
+      locallySettled.has(row.id) &&
+      row.state === "pending" &&
+      rank(prior.state) > rank(row.state)
+    ) {
+      return prior;
+    }
+    return row;
+  });
+}
+
 class HubStore {
   private state: HubState = initial;
   private listeners = new Set<Listener>();
@@ -464,6 +498,14 @@ class HubStore {
   private listReqSeq = 0;
   private listOutstanding = new Set<number>();
   private pinnedCreates = new Map<Id, { seq: number; confirmedByNewer: boolean }>();
+  /**
+   * Interaction ids locally settled from an `interaction.answered` receipt
+   * before the authoritative list confirmed the new state. A delayed, older
+   * list poll can still return the pending row; the merge keeps the committed
+   * projection until the list itself reports a non-pending state, then drops
+   * the guard (same stale-response protection as mergeInstanceSnapshots).
+   */
+  private locallySettledInteractions = new Set<Id>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * Per-instance monotonic token for `tty.screen` reads: a stale response
@@ -1165,6 +1207,13 @@ class HubStore {
     try {
       const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
       if (epoch !== this.bootGen) return;
+      // An older in-flight poll that returns a still-pending row must not
+      // revert a locally committed review; merge terminal-state-aware.
+      const mergedInteractions = mergeInteractionSnapshots(
+        interactions,
+        this.state.interactions,
+        this.locallySettledInteractions,
+      );
       this.emit({
         instances: mergeInstanceSnapshots(
           instances.items,
@@ -1173,8 +1222,13 @@ class HubStore {
           reqSeq,
           this.listOutstanding,
         ),
-        interactions,
+        interactions: mergedInteractions,
       });
+      // Once the authoritative list confirms a non-pending state, the local
+      // settlement guard has done its job and is released.
+      for (const row of interactions) {
+        if (row.state !== "pending") this.locallySettledInteractions.delete(row.id);
+      }
       // A response newer than a pin proves the server has spoken after the
       // create. Combined with the in-flight sweep below (every older request
       // answered), that is when dropping the pin on a missing id is safe.
@@ -2174,17 +2228,13 @@ class HubStore {
     // the card leaves the queue instead of re-enabling approve/deny on a
     // already committed decision. The next successful list refresh confirms it.
     const interaction = this.state.interactions.find((i) => i.id === interactionId);
-    const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];
-    const receipt = events.find(
-      (ev) =>
-        ev.kind === "interaction.answered" &&
-        (ev.payload as { interactionId?: Id }).interactionId === interactionId,
-    );
-    const authoritativeSettled = interaction && interaction.state !== "pending";
-    // If the row is still pending despite a receipt in the journal (the list
-    // refresh failed or simply has not caught up), optimistically settle it so
-    // the card leaves the queue; the next authoritative list confirms it.
-    if (interaction && interaction.state === "pending" && receipt) {
+    // The POST's success IS the commit. Guard it locally so a delayed older
+    // list poll that still returns the pending row cannot revert the card;
+    // the guard is released in refresh() once an authoritative non-pending
+    // row arrives. Also settle the projection now so the card leaves the queue
+    // immediately (the journal receipt / next list confirms it).
+    this.locallySettledInteractions.add(interactionId);
+    if (interaction && interaction.state === "pending") {
       this.emit({
         interactions: this.state.interactions.map((row) =>
           row.id === interactionId
@@ -2193,11 +2243,9 @@ class HubStore {
         ),
       });
     }
-    // Clear the answering marker when the card has settled (authoritative
-    // list, receipt-driven optimistic update, or the row is gone). If neither
-    // happened (refresh failed before the receipt landed), leave the marker on
-    // so the card stays submitted rather than re-enabling a committed review.
-    if (!interaction || authoritativeSettled || receipt) {
+    // Clear the answering marker: the local guard keeps any delayed pending
+    // poll from re-enabling approve/deny even after the marker is gone.
+    {
       const { [interactionId]: _removed, ...rest } = this.state.answering;
       this.emit({ answering: rest });
     }

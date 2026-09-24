@@ -143,3 +143,94 @@ it("an answer receipt settles the card even when the post-answer refresh fails",
   const row = hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION);
   expect(row?.state).toBe("answer-committed");
 });
+
+/**
+ * A delayed pre-answer refresh (started before the POST) completes AFTER the
+ * successful answer + failed post-answer refresh, carrying the stale pending
+ * row: the committed review must survive it.
+ */
+it("a delayed older poll cannot revert a committed review to pending", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [ANSWERED_EVENT],
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_ordering2",
+    journalId: JOURNAL,
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_ordering2",
+      asOfSeq: "1",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "0", complete: true },
+    },
+  });
+
+  // Initial refresh seeds the pending row normally.
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([pendingPlanReview()]);
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+  ).toBe("pending");
+
+  // A NEW poll starts before the answer and is held open; it later resolves
+  // with the stale pending row. This is the delayed-older-poll race.
+  let releaseDelayedPoll: () => void = () => {};
+  const delayedPoll = new Promise<void>((resolve) => {
+    releaseDelayedPoll = resolve;
+  });
+  let interactionCalls = 0;
+  vi.spyOn(api, "interactionList").mockImplementation(async () => {
+    const n = ++interactionCalls;
+    if (n === 1) {
+      await delayedPoll;
+      return [pendingPlanReview()]; // stale pending row lands late
+    }
+    // Any later refresh (the one respond() triggers) fails fast so it does
+    // not consume the held poll; the receipt settles the card regardless.
+    throw new Error("post-answer interaction list fails fast");
+  });
+  const delayedRefresh = hubStore.refresh(); // held on the delayed interaction poll
+  await vi.waitFor(() => expect(interactionCalls).toBeGreaterThanOrEqual(1));
+
+  // Answer POST succeeds; its refresh rejects fast (does not touch the held
+  // delayed poll); the 200 settles the card optimistically.
+  vi.spyOn(api, "interactionRespond").mockResolvedValue({
+    command: { commandId: "cmd_1", id: "cmd_1" } as never,
+    relatedCommandIds: [],
+  });
+  await hubStore.respond(INTERACTION, {
+    kind: "plan-review",
+    optionId: "approve",
+    planRevision: "1",
+    planDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    feedback: null,
+  });
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+  ).toBe("answer-committed");
+
+  // Release the delayed pre-answer poll carrying the stale pending row and
+  // let its merge complete; the local settlement guard keeps it committed.
+  releaseDelayedPoll();
+  await delayedRefresh;
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+  ).toBe("answer-committed");
+});

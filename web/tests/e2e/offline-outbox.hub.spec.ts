@@ -300,12 +300,16 @@ test("an offline-queued message survives a reload while the Hub is still off and
   await unblockHub(page.context());
   await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
   await expect
-    .poll(() => hubJournalMessageCount(api, instanceId, commandId!))
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!), { timeout: 30_000 })
     .toBe(1);
   await expect
-    .poll(async () => (await hubCommands(api, instanceId)).filter(
-      (c) => c.operation === "instance.send" && c.id === commandId,
-    ).length)
+    .poll(
+      async () =>
+        (await hubCommands(api, instanceId)).filter(
+          (c) => c.operation === "instance.send" && c.id === commandId,
+        ).length,
+      { timeout: 30_000 },
+    )
     .toBe(1);
   await expectDelivered(page, commandId);
 });

@@ -165,10 +165,11 @@ async function measure(page: Page): Promise<number> {
   });
 }
 
-test("a streaming row keeps its height when the caret comes and goes", async ({ page }) => {
-  await page.setViewportSize({ width: 1440, height: 900 });
-  // Hold every follow frame after the stream opens so the streaming state is
-  // on screen long enough to measure; order is preserved.
+/**
+ * Hold every follow frame after a stream opens so the streaming state is on
+ * screen long enough to measure; order is preserved.
+ */
+async function holdStreams(page: Page, ms = 1500): Promise<void> {
   await page.routeWebSocket(/\/v1\/follow/, (ws) => {
     const server = ws.connectToServer();
     let holdUntil = 0;
@@ -184,12 +185,17 @@ test("a streaming row keeps its height when the caret comes and goes", async ({ 
       }
       ws.send(frame);
       if (typeof frame === "string" && frame.includes('"operation":"open"') && frame.includes('"stream-')) {
-        holdUntil = Date.now() + 1500;
-        setTimeout(flush, 1500);
+        holdUntil = Date.now() + ms;
+        setTimeout(flush, ms);
       }
     });
     ws.onMessage((frame) => server.send(frame));
   });
+}
+
+test("a streaming row keeps its height when the caret comes and goes", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await holdStreams(page);
   await login(page);
   await createSession(page);
 
@@ -207,6 +213,41 @@ test("a streaming row keeps its height when the caret comes and goes", async ({ 
   await expect(done).toContainText("echo: stream ab");
   const settledHeight = await done.evaluate((el) => el.getBoundingClientRect().height);
   expect(settledHeight - streamingHeight).toBe(0);
+});
+
+test("the caret on a long unwrapped code line never widens the transcript", async ({ page }) => {
+  await holdStreams(page, 2000);
+  await login(page);
+  const scroller = page.getByTestId("transcript-scroller");
+  const overflow = () => scroller.evaluate((el) => el.scrollWidth - el.clientWidth);
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+    // A fresh session at each width: the phone shell lands on it directly.
+    await createSession(page);
+    // The reply splits mid-line, so the streaming half ends inside the
+    // unclosed fence, on a ~150 character line wider than the measure.
+    await send(page, `stream ${width}\n\`\`\`\n${"x".repeat(300)}\n\`\`\``);
+    const row = page.getByTestId("transcript-row").filter({
+      has: page.getByTestId("streaming-cursor"),
+    });
+    await expect(row).toHaveCount(1, { timeout: 20_000 });
+    await expect(row.locator("pre")).toHaveCount(1);
+    const box = await row.evaluate((el) => {
+      const cursor = el.querySelector("[data-testid='streaming-cursor']")!.getBoundingClientRect();
+      const pre = el.querySelector("pre")!.getBoundingClientRect();
+      return { cursorRight: cursor.right, preRight: pre.right };
+    });
+    expect(box.cursorRight).toBeLessThanOrEqual(box.preRight + 0.5);
+    expect(await overflow()).toBe(0);
+    // Scrolling the block re-places the caret without widening anything.
+    await row.locator("pre").evaluate((el) => el.scrollBy(200, 0));
+    expect(await overflow()).toBe(0);
+    const anchor = await row.getAttribute("data-anchor");
+    const done = page.locator(`[data-testid="transcript-row"][data-anchor="${anchor}"]`);
+    await expect(done.getByTestId("streaming-cursor")).toHaveCount(0, { timeout: 20_000 });
+    expect(await overflow()).toBe(0);
+    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  }
 });
 
 let instanceId = "";

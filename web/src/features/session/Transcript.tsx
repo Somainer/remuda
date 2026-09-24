@@ -1493,8 +1493,10 @@ function lastTextNode(root: Element): Text | null {
 /**
  * The streaming caret. It is absolutely positioned at the end of the last
  * rendered glyph, so it takes no line box of its own: the row keeps the same
- * height when streaming starts and ends. Its 7px sits in the space after the
- * last glyph, or in the column's gutter when a line runs to the measure.
+ * height when streaming starts and ends. Its box is clamped to what is
+ * visible: inside every clipping ancestor of the glyph (a code block's
+ * horizontal scroller) and inside the section's content box, so a long
+ * unwrapped line can never push it out and widen any scroll extent.
  */
 function StreamingCursor({ text }: { text: string }) {
   const ref = useRef<HTMLSpanElement>(null);
@@ -1502,34 +1504,65 @@ function StreamingCursor({ text }: { text: string }) {
     const cursor = ref.current;
     const section = cursor?.parentElement;
     if (!cursor || !section) return;
-    const base = section.getBoundingClientRect();
-    let at: { left: number; top: number; height: number } | null = null;
+    let textNode: Text | null = null;
     // The body is everything between the author line and the cursor.
     for (let el = cursor.previousElementSibling; el && el !== section.firstElementChild; el = el.previousElementSibling) {
-      const textNode = lastTextNode(el);
-      if (!textNode) continue;
-      const range = section.ownerDocument.createRange();
-      const value = textNode.nodeValue ?? "";
-      const end = value.trimEnd().length;
-      range.setStart(textNode, Math.max(0, end - 1));
-      range.setEnd(textNode, end);
-      // jsdom has no layout: getClientRects is absent there.
-      const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
-      const rect = rects && rects.length ? rects[rects.length - 1] : null;
-      if (rect && rect.height > 0) {
-        at = { left: rect.right - base.left, top: rect.top - base.top, height: rect.height };
+      textNode = lastTextNode(el);
+      if (textNode) break;
+    }
+    // Ancestors between the glyph and the section that clip horizontally.
+    const clips: HTMLElement[] = [];
+    for (let el = textNode?.parentElement ?? null; el && el !== section; el = el.parentElement) {
+      if (getComputedStyle(el).overflowX !== "visible") clips.push(el);
+    }
+    const place = () => {
+      const at = textNode ? caretRect(textNode) : null;
+      if (!at) {
+        cursor.style.left = "";
+        cursor.style.top = "";
+        return;
       }
-      break;
-    }
-    if (at) {
-      cursor.style.left = `${at.left + 1}px`;
-      cursor.style.top = `${at.top + Math.max(0, (at.height - cursor.offsetHeight) / 2)}px`;
-    } else {
-      cursor.style.left = "";
-      cursor.style.top = "";
-    }
+      const base = section.getBoundingClientRect();
+      const pad = getComputedStyle(section);
+      let minX = base.left + section.clientLeft + parseFloat(pad.paddingLeft);
+      let maxX = base.left + section.clientLeft + section.clientWidth - parseFloat(pad.paddingRight);
+      for (const clip of clips) {
+        const box = clip.getBoundingClientRect();
+        minX = Math.max(minX, box.left + clip.clientLeft);
+        maxX = Math.min(maxX, box.left + clip.clientLeft + clip.clientWidth);
+      }
+      const width = cursor.offsetWidth;
+      const x = Math.max(minX, Math.min(at.right + 1, maxX - width));
+      cursor.style.left = `${x - base.left - section.clientLeft}px`;
+      cursor.style.top = `${at.top - base.top - section.clientTop + Math.max(0, (at.height - cursor.offsetHeight) / 2)}px`;
+    };
+    place();
+    for (const clip of clips) clip.addEventListener("scroll", place, { passive: true });
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
+    ro?.observe(section);
+    return () => {
+      for (const clip of clips) clip.removeEventListener("scroll", place);
+      ro?.disconnect();
+    };
   }, [text]);
   return <span ref={ref} className={css.cursor} data-testid="streaming-cursor" aria-hidden />;
+}
+
+/** Viewport rect of the last visible glyph (a whole code point) in `node`. */
+function caretRect(node: Text): DOMRect | null {
+  const value = node.nodeValue ?? "";
+  const end = value.trimEnd().length;
+  if (end === 0) return null;
+  let start = end - 1;
+  // Step back over a surrogate pair so an emoji measures its full glyph.
+  if (start > 0 && /[\uDC00-\uDFFF]/.test(value[start]) && /[\uD800-\uDBFF]/.test(value[start - 1])) start -= 1;
+  const range = node.ownerDocument.createRange();
+  range.setStart(node, start);
+  range.setEnd(node, end);
+  // jsdom has no layout: getClientRects is absent there.
+  const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
+  const rect = rects && rects.length ? rects[rects.length - 1] : null;
+  return rect && rect.height > 0 ? rect : null;
 }
 
 function CompactFold({

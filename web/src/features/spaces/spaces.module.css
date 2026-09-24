@@ -290,10 +290,13 @@
   width: 100%;
   height: 100%;
   min-width: 0;
+  /* Trailing inset is part of the scrollable content so the LAST active tab
+     can be scrolled clear of the end-cue fade, just as the first can of the
+     start cue; scroll-padding reserves the visible edge on each side. */
+  padding-right: var(--space-5);
   overflow-x: auto;
   overscroll-behavior-x: contain;
   scrollbar-width: none;
-  /* scrollIntoView keeps the active tab clear of the cue fade on each side. */
   scroll-padding-inline: var(--space-5);
 }
 
@@ -458,10 +461,11 @@
   display: none;
 }
 
-/* Space chips are the phone's primary space switcher (visual-system §8.5):
-   24px visible, coarse pointers get a 44px hit zone. The button itself
-   keeps overflow visible; truncation lives on the inner .chipText label,
-   or the extended hit area would be clipped. */
+/* Space chips are the phone's primary space switcher (visual-system §8.5).
+   Coarse pointers reserve a 44px target via width + vertical pseudo-element;
+   horizontal insets stay 0 so adjacent chips' hit areas never overlap the
+   8px gap. The button keeps overflow visible; truncation lives on the
+   inner .chipText label. */
 .chip {
   position: relative;
   display: inline-flex;
@@ -485,15 +489,20 @@
 }
 
 @media (pointer: coarse) {
-  /* 44px touch target around the 24px visible chip: 10px vertically and a
-     44px minimum width for short labels. */
+  /* 44px target: reserve the width on the button itself (short labels too),
+     and extend only vertically — horizontal insets stay 0 so the 8px gap
+     between adjacent chips keeps their hit areas disjoint. */
+  .chip {
+    min-width: var(--touch);
+  }
+
   .chip::after {
     content: "";
     position: absolute;
     top: -10px;
     bottom: -10px;
-    left: min(0px, calc((100% - var(--touch)) / 2));
-    right: min(0px, calc((100% - var(--touch)) / 2));
+    left: 0;
+    right: 0;
   }
 }
 
@@ -652,15 +661,12 @@
     min-height: var(--touch);
   }
 
+  /* The close control reserves a full 44px slot in the row (the glyph stays
+     visually centred in it); as a flex sibling after the title it never
+     overlaps the title's own target. */
   .tabClose {
-    position: relative;
-    width: 32px;
-  }
-
-  .tabClose::after {
-    content: "";
-    position: absolute;
-    inset: 6px 0;
+    flex: none;
+    width: var(--touch);
   }
 
   .tabTitle {

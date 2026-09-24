@@ -55,7 +55,12 @@ async function applyDemoInventory(page: Page): Promise<string[]> {
   }
 }
 
+/** Committed screenshots are only refreshed on request; a normal run writes
+ *  nothing to the tree (the merge gate rejects a dirty worktree). */
+const captureEvidence = process.env.REMUDA_EVIDENCE === "1";
+
 async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
+  if (!captureEvidence) return;
   const replacedLabels = await applyDemoInventory(page);
   await setMode(page, theme);
   await page.evaluate(() => document.fonts.ready);
@@ -170,9 +175,25 @@ test.describe("desktop", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/sessions");
     const strip = page.getByTestId("space-tabs");
+    // UO-2a: the strip only exists on /s/*. Enter via the list so the Vite dev
+    // server has served the whole route graph before the strip is queried.
     await space(page, "sfe-root").click();
     await page.getByTestId("session-row").first().click();
+    await expect(page).toHaveURL(/\/s\//);
     await expect(strip).toBeVisible();
+
+    // First exercise cue pinning with a MIDDLE tab active: it sits inside the
+    // scrollport at every pan position, so the resize/visibility observer
+    // never fights the manual scroll. The trailing-tab resize proof below
+    // activates the last tab separately.
+    const tabs = strip.getByRole("tab");
+    const tabCount = await tabs.count();
+    expect(tabCount).toBeGreaterThanOrEqual(3);
+    const lastIndex = tabCount - 1;
+    const middleIndex = Math.floor(tabCount / 2);
+    await tabs.nth(middleIndex).click();
+    await expect(page).toHaveURL(/\/s\//);
+    await expect(strip.locator('[data-testid="session-tab"]').nth(middleIndex)).toHaveAttribute("aria-selected", "true");
 
     const geometry = async () => strip.evaluate((element) => {
       const scroller = element;
@@ -180,16 +201,17 @@ test.describe("desktop", () => {
       const cue = (side: "left" | "right") =>
         scroller.parentElement?.querySelector<HTMLElement>(`[data-edge="${side}"]`);
       const active = scroller.querySelector<HTMLElement>('[data-active="true"]');
+      const close = active?.querySelector<HTMLElement>('[data-testid="tab-close"]') ?? null;
       const cueRect = (side: "left" | "right") => cue(side)?.getBoundingClientRect() ?? null;
       const activeRect = active?.getBoundingClientRect() ?? null;
+      const closeRect = close?.getBoundingClientRect() ?? null;
       return {
         overflow: scroller.scrollWidth > scroller.clientWidth + 1,
-        scrollLeft: scroller.scrollLeft,
-        maxScroll: scroller.scrollWidth - scroller.clientWidth,
         left: rect.left, right: rect.right,
         leftCue: cueRect("left") ? { left: cueRect("left")!.left, right: cueRect("left")!.right } : null,
         rightCue: cueRect("right") ? { left: cueRect("right")!.left, right: cueRect("right")!.right } : null,
         active: activeRect ? { left: activeRect.left, right: activeRect.right } : null,
+        close: closeRect ? { left: closeRect.left, right: closeRect.right } : null,
       };
     });
 
@@ -209,7 +231,7 @@ test.describe("desktop", () => {
     g = await geometry();
     expect(Math.abs(g.leftCue!.left - g.left)).toBeLessThanOrEqual(1);
 
-    await strip.evaluate((element) => { element.scrollLeft = element.scrollWidth / 2; element.dispatchEvent(new Event("scroll")); });
+    await strip.evaluate((element) => { element.scrollLeft = (element.scrollWidth - element.clientWidth) / 2; element.dispatchEvent(new Event("scroll")); });
     await expect.poll(cueStates).toEqual({ left: true, right: true });
     g = await geometry();
     expect(Math.abs(g.leftCue!.left - g.left)).toBeLessThanOrEqual(1);
@@ -221,12 +243,39 @@ test.describe("desktop", () => {
     g = await geometry();
     expect(Math.abs(g.rightCue!.right - g.right)).toBeLessThanOrEqual(1);
 
-    // Narrow the window: the active tab — close control included — must be
-    // pulled back fully inside the scrollport.
-    await page.setViewportSize({ width: 900, height: 900 });
-    await expect.poll(geometry).toMatchObject({ overflow: true });
+    // Now the trailing-tab resize proof: activate the LAST tab, then narrow.
+    await tabs.nth(lastIndex).click();
+    await expect(strip.locator('[data-testid="session-tab"]').nth(lastIndex)).toHaveAttribute("aria-selected", "true");
+    // Narrow within the DESKTOP breakpoint (≥768px; below it the compact
+    // shell correctly renders no strip at all). Each resize already runs the
+    // correction, so to prove it is what reveals the trailing tab: pin
+    // scrollLeft to 0 — a scroll event alone never re-reveals the active tab.
+    await page.setViewportSize({ width: 820, height: 900 });
+    await page.waitForTimeout(60);
     g = await geometry();
-    expect(g.active).toBeTruthy();
+    expect(g.overflow, "the narrowed strip overflows").toBe(true);
+    await strip.evaluate((element) => { element.scrollLeft = 0; element.dispatchEvent(new Event("scroll")); });
+    g = await geometry();
+    expect(g.close, "the active close control is measurable").toBeTruthy();
+    expect(g.close!.right, "with no correction the last tab's × is outside the scrollport").toBeGreaterThan(g.right + 1);
+    // A further width change fires the ResizeObserver, which must scroll the
+    // active tab — × included — fully back into the scrollport.
+    await page.setViewportSize({ width: 780, height: 900 });
+    await expect.poll(async () => {
+      const state = await geometry();
+      if (!state.close) return { dbg: "no close", ...state } as never;
+      // Sub-pixel tolerance: the scrollIntoView landing position can round to
+      // a fraction of a pixel.
+      return state.close.right <= state.right + 1 && state.close.left >= state.left - 1
+        ? { inside: true } : { outside: state.close.right - state.right, overflow: state.overflow };
+    }, undefined, { message: "last tab × inside after resize" }).toEqual({ inside: true });
+    g = await geometry();
+    const scrolled = await strip.evaluate((element) => element.scrollLeft);
+    expect(scrolled, "the strip panned right to reveal the last tab").toBeGreaterThan(0);
+    // Sub-pixel tolerance: the corrected scroll position can land a fraction
+    // of a pixel off the integer-rounded edge.
+    expect(g.close!.right, "the last tab's × returns inside the scrollport").toBeLessThanOrEqual(g.right + 1);
+    expect(g.close!.left, "…and its left edge too").toBeGreaterThanOrEqual(g.left - 1);
     expect(g.active!.left, "active tab clear of the 24px left cue").toBeGreaterThanOrEqual(g.left + 23);
     expect(g.active!.right, "active tab incl. its × clear of the 24px right cue").toBeLessThanOrEqual(g.right - 23);
   });
@@ -257,6 +306,7 @@ test.describe("phone", () => {
     // Without a hover to reveal it, × must not sit next to the status shape.
     await expect(phoneTab).not.toHaveAttribute("data-revealed", "true");
     expect(await close.evaluate((element) => getComputedStyle(element).opacity)).toBe("0");
+
     await screenshot(page, "phone-dark", "night");
     await screenshot(page, "phone-light", "ledger");
 
@@ -271,6 +321,29 @@ test.describe("phone", () => {
     await expect(phoneTab).toHaveAttribute("data-revealed", "true", { timeout: 3000 });
     await phoneTab.dispatchEvent("touchend", { touches: [], changedTouches: [] });
     expect(await close.evaluate((element) => getComputedStyle(element).opacity)).toBe("1");
+
+    // With the close revealed it is now hit-testable: verify the reserved
+    // 44px slot (full strip height, 44px wide) and that taps well inside its
+    // edges reach the control rather than the title. One evaluate keeps the
+    // layout reads atomic.
+    const boxes = await phoneTab.evaluate((element) => {
+      const close = element.querySelector<HTMLElement>('[data-testid="tab-close"]');
+      const title = element.querySelector<HTMLElement>('[data-testid="session-tab"]');
+      const c = close?.getBoundingClientRect();
+      const t = title?.getBoundingClientRect();
+      return c && t ? { close: { x: c.x, y: c.y, w: c.width, h: c.height }, titleRight: t.right } : null;
+    });
+    expect(boxes).toBeTruthy();
+    expect(boxes!.close.h, "close slot is the 44px strip height").toBeGreaterThanOrEqual(42.5);
+    expect(boxes!.close.w, "close slot is 44px wide").toBeGreaterThanOrEqual(43.5);
+    expect(boxes!.close.x, "close slot starts at/after the title's right edge").toBeGreaterThanOrEqual(boxes!.titleRight - 0.5);
+    for (const x of [boxes!.close.x + 4, boxes!.close.x + boxes!.close.w - 4]) {
+      const hit = await page.evaluate((point) =>
+        document.elementFromPoint(point.x, point.y)?.closest("[data-testid='tab-close']")?.getAttribute("data-testid") ?? null,
+        { x, y: boxes!.close.y + boxes!.close.h / 2 });
+      expect(hit, `close target hits inside the slot at x=${x}`).toBe("tab-close");
+    }
+
     await screenshot(page, "phone-close-revealed-dark", "night");
     await close.click();
     await expect(page.getByTestId("tab-close-sheet")).toBeVisible();
@@ -286,5 +359,59 @@ test.describe("phone", () => {
     const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }));
     expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
     expect(errors).toEqual([]);
+  });
+
+  test("adjacent short Space chips keep disjoint 44px hit areas", async ({ page }) => {
+    await page.setViewportSize({ width: 400, height: 860 });
+    // Load the app first (the mock is an in-browser adapter), then add a
+    // one-letter Space to the fixture and refresh the store so the chip row
+    // re-renders. The evaluate is retry-safe for the Vite optimizer reload.
+    await page.goto("/m");
+    await page.getByTestId("space-chip").first().waitFor();
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await page.evaluate(async () => {
+          const { mockDb } = await import("/src/lib/mock.ts");
+          if (!mockDb.workspaces.some((workspace: { rootPath?: string }) => workspace.rootPath === "/workspace/z")) {
+            mockDb.workspaces.push({
+              ...mockDb.workspaces[0],
+              id: "wsp_zzshort",
+              label: "z",
+              rootPath: "/workspace/z",
+              canonicalRoot: { state: "known", value: "/workspace/z" },
+            });
+          }
+          await (await import("/src/lib/store.ts")).hubStore.refresh();
+        });
+        break;
+      } catch (error) {
+        if (attempt >= 2 || !/garbage collected|Execution context was destroyed|Failed to resolve module/.test((error as Error).message)) throw error;
+        await page.waitForLoadState("domcontentloaded");
+        await page.waitForTimeout(500);
+      }
+    }
+    expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
+    const chips = page.getByTestId("space-chip");
+    const z = chips.filter({ hasText: /^z(?: ·|$)/ }).first();
+    // The new Space sorts to the end of the horizontally scrolling chips row;
+    // pan it into view before measuring.
+    await z.evaluate((element) => element.scrollIntoView({ block: "nearest", inline: "center" }));
+    await expect(z).toBeVisible();
+    const zBox = await z.boundingBox();
+    expect(zBox).toBeTruthy();
+    // The short label still reserves the 44px minimum width.
+    expect(zBox!.width).toBeGreaterThanOrEqual(43.5);
+    // The extended hit area is disjoint: taps 2px inside the chip's left and
+    // right edges land on z itself.
+    const hitAt = (x: number, y: number) => page.evaluate((point) => {
+      const element = document.elementFromPoint(point.x, point.y);
+      return element?.closest("[data-testid='space-chip']")?.textContent ?? null;
+    }, { x, y });
+    expect(await hitAt(zBox!.x + 2, zBox!.y + zBox!.height / 2)).toMatch(/^z(?: ·|$)/);
+    expect(await hitAt(zBox!.x + zBox!.width - 2, zBox!.y + zBox!.height / 2)).toMatch(/^z(?: ·|$)/);
+    // And the vertical extension (10px above/below the 24px visible chip)
+    // resolves to the chip too — the full 44px target.
+    expect(await hitAt(zBox!.x + zBox!.width / 2, zBox!.y - 2)).toMatch(/^z(?: ·|$)/);
+    expect(await hitAt(zBox!.x + zBox!.width / 2, zBox!.y + zBox!.height + 2)).toMatch(/^z(?: ·|$)/);
   });
 });

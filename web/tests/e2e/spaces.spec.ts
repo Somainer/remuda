@@ -49,7 +49,7 @@ async function applyDemoInventory(page: Page): Promise<string[]> {
           host.hostname = host.label;
         });
         mockDb.workspaces.forEach((workspace: { rootPath: string; canonicalRoot: unknown }) => {
-          workspace.rootPath = `/home/dev/projects/${workspace.rootPath.split("/").pop()}`;
+          workspace.rootPath = `/workspace/${workspace.rootPath.split("/").pop()}`;
           workspace.canonicalRoot = { state: "known", value: workspace.rootPath };
         });
         await hubStore.refresh();

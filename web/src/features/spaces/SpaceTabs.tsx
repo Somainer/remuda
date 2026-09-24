@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { StateDot } from "../../components/StateDot";
-import { hubStore, useHub } from "../../lib/store";
+import { hubStore } from "../../lib/store";
 import { projectStatus } from "../../lib/status";
 import { resolveTabSet } from "../../lib/sessionSlots";
 import { spaceStore, type Space, type SpacePrefs } from "./store";
@@ -19,7 +19,6 @@ type ScrollEdges = { left: boolean; right: boolean };
 
 export function SpaceTabs({ space, tabs, prefs, instanceId, newHref }: { space?: Space; tabs: Instance[]; prefs: SpacePrefs; instanceId?: string; newHref: string }) {
   const navigate = useNavigate();
-  const hub = useHub();
   // The container metadata (aria-label, per-tab owning Space) is derived from
   // the same snapshot the workbench hook renders `tabs` from, so the strip and
   // close/dismiss records never disagree across a Task's Spaces.
@@ -56,9 +55,20 @@ export function SpaceTabs({ space, tabs, prefs, instanceId, newHref }: { space?:
     if (!scroller || !active) return;
     const s = scroller.getBoundingClientRect();
     const a = active.getBoundingClientRect();
-    const pad = parseFloat(getComputedStyle(scroller).scrollPaddingLeft || "0") || 0;
-    if (a.left < s.left + pad || a.right > s.right - pad) {
-      active.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // Keep the whole active tab clear of the edge-cue fades. The inset is
+    // enforced explicitly (not only via scroll-padding + scrollIntoView,
+    // whose "nearest" position can leave the tab under a cue by a fraction).
+    const styles = getComputedStyle(scroller);
+    const padLeft = parseFloat(styles.scrollPaddingLeft || "0") || 0;
+    const padRight = parseFloat(styles.scrollPaddingRight || "0") || padLeft;
+    let nextLeft: number | undefined;
+    if (a.left < s.left + padLeft) {
+      nextLeft = scroller.scrollLeft - (s.left + padLeft - a.left);
+    } else if (a.right > s.right - padRight) {
+      nextLeft = scroller.scrollLeft + (a.right - (s.right - padRight));
+    }
+    if (nextLeft !== undefined) {
+      scroller.scrollLeft = Math.max(0, Math.min(nextLeft, scroller.scrollWidth - scroller.clientWidth));
     }
   }, []);
 
@@ -103,10 +113,12 @@ export function SpaceTabs({ space, tabs, prefs, instanceId, newHref }: { space?:
       setRevealed(undefined);
       // Do not navigate away if the user switched containers while close was pending.
       if (window.location.pathname.split("/")[2] === instance.id) {
-        // Re-derive the container from the hub snapshot and the CURRENT
-        // prefs after the await: a sibling dismissed in another window in the
-        // meantime (storage sync) must not be resurrected as the successor.
-        const fresh = resolveTabSet(hub.workspaces, hub.instances, spaceStore.getSnapshot(), instance.id)
+        // Re-derive from BOTH fresh stores after the await. Another window may
+        // have changed space prefs (a sibling dismissed meanwhile) AND the Hub
+        // data may have moved on (that sibling now idle) — reading either from
+        // the render closure would resurrect a tab the user cannot see.
+        const snapshot = hubStore.getSnapshot();
+        const fresh = resolveTabSet(snapshot.workspaces, snapshot.instances, spaceStore.getSnapshot(), instance.id)
           .tabs.filter((row) => row.id !== instance.id);
         const next = fresh[0];
         const restoreFocus = trigger === null || document.activeElement === trigger || document.activeElement === document.body;

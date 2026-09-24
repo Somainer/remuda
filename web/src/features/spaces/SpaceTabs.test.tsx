@@ -21,7 +21,14 @@ import {
 const hubState = vi.hoisted(() => ({ workspaces: [] as unknown as Workspace[], instances: [] as unknown[] }));
 
 vi.mock("../../lib/store", () => ({
-  hubStore: { close: vi.fn(), toast: vi.fn(), titleOf: (id: string) => id },
+  hubStore: {
+    close: vi.fn(),
+    toast: vi.fn(),
+    titleOf: (id: string) => id,
+    // The close path re-reads the live snapshot after its await, like the
+    // real store; tests replace hubState.instances to simulate window B.
+    getSnapshot: () => hubState,
+  },
   // Fresh wrapper + arrays each render, like a real store snapshot update, so
   // useTabSet's memo recomputes when a fixture instance is mutated in place.
   useHub: () => ({ workspaces: [...hubState.workspaces], instances: [...hubState.instances] }),
@@ -209,15 +216,24 @@ describe("SpaceTabs asynchronous closure", () => {
     expect(screen.queryByRole("tab", { name: /a1/ })).not.toBeInTheDocument();
   });
 
-  it("re-reads current dismissals after a delayed close and never resurrects a sibling dismissed in another window", async () => {
+  it("re-reads current dismissals and Hub data after a delayed close and never resurrects a sibling changed in another window", async () => {
     const user = userEvent.setup();
+    // a2 starts BLOCKED: it is visible through its dismissal's resurface
+    // rule, which is exactly the case a stale render-time snapshot would
+    // still pick as successor after it goes idle.
+    act(() => { spaces[0].instances[1].activity = known("waiting-interaction"); });
     const pending = deferredClose();
     renderWorkbench();
+    expect(screen.getByRole("tab", { name: /a2/ })).toBeInTheDocument();
     // Window A starts a slow 停止并关闭 on a1 (tabs a1, a2, a3).
     await stopAndClose(user, "a1");
 
-    // Window B dismisses a2 meanwhile. Other windows only talk through
-    // localStorage + the storage event, which the store listens for.
+    // Window B, meanwhile: dismisses a2 AND its state settles to idle. Both
+    // arrive before the stop resolves. Other windows only talk through
+    // localStorage + the storage event for prefs; Hub rows arrive through a
+    // fresh getSnapshot().
+    act(() => { spaces[0].instances[1].activity = known("idle"); });
+    hubState.instances = spaces.flatMap((space) => space.instances);
     const fromOtherWindow = {
       ...spaceStore.getSnapshot(),
       closedTabs: { [alpha]: [{ id: "a2", resurface: true }] },
@@ -228,7 +244,8 @@ describe("SpaceTabs asynchronous closure", () => {
 
     await act(async () => { pending.resolve(); });
 
-    // The successor is a3 — the still-visible tab — never the dismissed a2.
+    // The successor is a3 — the still-visible tab — never the dismissed,
+    // now-idle a2 that the stale snapshot/closure would have resurfaced.
     expect(screen.getByTestId("current-route")).toHaveTextContent("/s/a3");
     expect(screen.queryByRole("tab", { name: /a2/ })).not.toBeInTheDocument();
     const prefs = spaceStore.getSnapshot();

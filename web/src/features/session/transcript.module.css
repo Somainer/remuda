@@ -342,9 +342,11 @@
 /* Caret shown while a message is still streaming in (D-028 §7). Absolutely
    placed after the last glyph (Transcript.tsx StreamingCursor), so starting
    and ending a stream never changes the row's height. Reuses the `dim`
-   keyframes the run dot animates with. */
+   keyframes the run dot animates with. Margin 0: as a child of the section
+   it would otherwise take the `.assistant > * + *` gap and paint low. */
 .cursor {
   position: absolute;
+  margin: 0;
   width: 7px;
   height: 1.1em;
   background: var(--link);

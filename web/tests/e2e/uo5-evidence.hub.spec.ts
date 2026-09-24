@@ -169,15 +169,18 @@ async function measure(page: Page): Promise<number> {
  * Hold every follow frame after a stream opens so the streaming state is on
  * screen long enough to measure; order is preserved.
  */
-async function holdStreams(page: Page, ms = 1500): Promise<void> {
+async function holdStreams(page: Page, ms = 1500): Promise<() => void> {
+  const flushes: (() => void)[] = [];
   await page.routeWebSocket(/\/v1\/follow/, (ws) => {
     const server = ws.connectToServer();
     let holdUntil = 0;
     let queue: (string | Buffer)[] = [];
     const flush = () => {
+      holdUntil = 0;
       for (const frame of queue) ws.send(frame);
       queue = [];
     };
+    flushes.push(flush);
     server.onMessage((frame) => {
       if (Date.now() < holdUntil) {
         queue.push(frame);
@@ -186,11 +189,15 @@ async function holdStreams(page: Page, ms = 1500): Promise<void> {
       ws.send(frame);
       if (typeof frame === "string" && frame.includes('"operation":"open"') && frame.includes('"stream-')) {
         holdUntil = Date.now() + ms;
-        setTimeout(flush, ms);
+        // An infinite hold lasts until the test calls the returned release.
+        if (Number.isFinite(ms)) setTimeout(flush, ms);
       }
     });
     ws.onMessage((frame) => server.send(frame));
   });
+  return () => {
+    for (const flush of flushes) flush();
+  };
 }
 
 test("a streaming row keeps its height when the caret comes and goes", async ({ page }) => {
@@ -248,6 +255,66 @@ test("the caret on a long unwrapped code line never widens the transcript", asyn
     expect(await overflow()).toBe(0);
     await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   }
+});
+
+test("the caret stays at the visible end of a highlighted line while the block scrolls", async ({ page }) => {
+  // Held until measured: the lazily loaded highlighter lands mid-stream.
+  const release = await holdStreams(page, Number.POSITIVE_INFINITY);
+  // The turn-end check also catches up over HTTP; hold that too, or the
+  // close lands through it before the caret is measured.
+  let releaseJournal = () => {};
+  const journalHeld = new Promise<void>((done) => {
+    releaseJournal = done;
+  });
+  await page.route(/\/journal\?afterSeq=/, async (route) => {
+    await journalHeld;
+    await route.continue();
+  });
+  await login(page);
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await createSession(page);
+  // Language-tagged: highlighting lands after the text commits and swaps the
+  // code's text node for spans, under a caret that is already placed.
+  await send(page, `stream hl\n\`\`\`ts\n${"const value = 42; ".repeat(30)}\n\`\`\``);
+  const streaming = page.getByTestId("transcript-row").filter({ has: page.getByTestId("streaming-cursor") });
+  await expect(streaming).toHaveCount(1, { timeout: 20_000 });
+  // Pinned by anchor: the same row once the stream closes.
+  const anchor = await streaming.getAttribute("data-anchor");
+  const row = page.locator(`[data-testid="transcript-row"][data-anchor="${anchor}"]`);
+  const pre = row.locator("pre");
+  await expect(pre.locator("code span").first()).toBeAttached({ timeout: 10_000 });
+  const measure = () =>
+    row.evaluate((el) => {
+      const node = el.querySelector<HTMLElement>("[data-testid='streaming-cursor']");
+      if (!node) return null;
+      const cursor = node.getBoundingClientRect();
+      const box = el.querySelector("pre")!;
+      const pre = box.getBoundingClientRect();
+      return {
+        cursor: { left: cursor.left, right: cursor.right, top: cursor.top, bottom: cursor.bottom },
+        pre: { right: pre.left + box.clientLeft + box.clientWidth, top: pre.top, bottom: pre.bottom },
+        margin: getComputedStyle(node).marginTop,
+      };
+    });
+  for (const dx of [0, 200, 400]) {
+    await pre.evaluate((el, x) => el.scrollTo(x, 0), dx);
+    // One frame for the capturing scroll listener to re-place.
+    await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => done(null))));
+    const box = await measure();
+    expect(box,`still streaming at ${page.url()}`).not.toBeNull();
+    const { cursor, pre: code, margin } = box!;
+    // The line is wider than the block, so its end is past the right edge:
+    // the caret is clamped to the visible end, inside the block vertically.
+    expect(margin).toBe("0px");
+    expect(cursor.right).toBeLessThanOrEqual(code.right + 0.5);
+    expect(cursor.right).toBeGreaterThan(code.right - 2);
+    expect(cursor.top).toBeGreaterThanOrEqual(code.top);
+    expect(cursor.bottom).toBeLessThanOrEqual(code.bottom);
+  }
+  release();
+  releaseJournal();
+  await expect(row.getByTestId("streaming-cursor")).toHaveCount(0, { timeout: 20_000 });
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
 });
 
 let instanceId = "";

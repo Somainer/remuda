@@ -1557,6 +1557,12 @@ function lastTextNode(root: Element): Text | null {
  * visible: inside every clipping ancestor of the glyph (a code block's
  * horizontal scroller) and inside the section's content box, so a long
  * unwrapped line can never push it out and widen any scroll extent.
+ *
+ * The glyph is resolved again at every placement: async highlighting swaps
+ * a code block's text node for highlighted spans after the text commits, and
+ * a cached node would be detached (measuring as 0,0). A mutation observer
+ * re-places when that swap lands; a capturing scroll listener on the section
+ * catches any inner scroller, whichever one holds the glyph now.
  */
 function StreamingCursor({ text }: { text: string }) {
   const ref = useRef<HTMLSpanElement>(null);
@@ -1564,18 +1570,18 @@ function StreamingCursor({ text }: { text: string }) {
     const cursor = ref.current;
     const section = cursor?.parentElement;
     if (!cursor || !section) return;
-    let textNode: Text | null = null;
-    // The body is everything between the author line and the cursor.
-    for (let el = cursor.previousElementSibling; el && el !== section.firstElementChild; el = el.previousElementSibling) {
-      textNode = lastTextNode(el);
-      if (textNode) break;
-    }
-    // Ancestors between the glyph and the section that clip horizontally.
-    const clips: HTMLElement[] = [];
-    for (let el = textNode?.parentElement ?? null; el && el !== section; el = el.parentElement) {
-      if (getComputedStyle(el).overflowX !== "visible") clips.push(el);
-    }
     const place = () => {
+      let textNode: Text | null = null;
+      // The body is everything between the author line and the cursor.
+      for (let el = cursor.previousElementSibling; el && el !== section.firstElementChild; el = el.previousElementSibling) {
+        textNode = lastTextNode(el);
+        if (textNode) break;
+      }
+      // Ancestors between the glyph and the section that clip horizontally.
+      const clips: HTMLElement[] = [];
+      for (let el = textNode?.parentElement ?? null; el && el !== section; el = el.parentElement) {
+        if (getComputedStyle(el).overflowX !== "visible") clips.push(el);
+      }
       const at = textNode ? caretRect(textNode) : null;
       if (!at) {
         cursor.style.left = "";
@@ -1597,12 +1603,16 @@ function StreamingCursor({ text }: { text: string }) {
       cursor.style.top = `${at.top - base.top - section.clientTop + Math.max(0, (at.height - cursor.offsetHeight) / 2)}px`;
     };
     place();
-    for (const clip of clips) clip.addEventListener("scroll", place, { passive: true });
+    section.addEventListener("scroll", place, { capture: true, passive: true });
     const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
     ro?.observe(section);
+    // Only content changes: placing writes the caret's style attribute.
+    const mo = typeof MutationObserver === "undefined" ? null : new MutationObserver(place);
+    mo?.observe(section, { childList: true, subtree: true, characterData: true });
     return () => {
-      for (const clip of clips) clip.removeEventListener("scroll", place);
+      section.removeEventListener("scroll", place, { capture: true });
       ro?.disconnect();
+      mo?.disconnect();
     };
   }, [text]);
   return <span ref={ref} className={css.cursor} data-testid="streaming-cursor" aria-hidden />;

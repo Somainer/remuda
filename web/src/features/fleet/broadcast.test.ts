@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  SETTLED_STATES,
   buildBroadcastBody,
   classifyCommand,
   orderResults,
   provisionalState,
   resolveEntry,
   summarize,
+  summarizeRows,
   type BroadcastForm,
 } from "./broadcast";
 import type { components } from "../../lib/api.generated";
@@ -115,8 +117,12 @@ describe("fleet delivery state (D-053 §2)", () => {
     expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "cancelled" } }))).toBe("cancelled");
   });
 
-  it("settled/clear without an outcome is not a success", () => {
-    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true }))).toBe("forwarded");
+  it("a settled row without a known outcome is still terminal, never an open send", () => {
+    // The fleet row may report state=settled,resolution=clear with no outcome
+    // the client models: it must not look like a success NOR an in-flight
+    // send — it resolves to the neutral terminal label.
+    expect(SETTLED_STATES.has(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true })))).toBe(true);
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true }))).not.toBe("confirmed");
   });
 
   it("keeps replays and transport failures distinct at the row level", () => {
@@ -124,7 +130,14 @@ describe("fleet delivery state (D-053 §2)", () => {
     expect(provisionalState({ ok: false, error: "host offline" })).toBe("failed");
   });
 
-  it("resolveEntry reads the command once and confirms a completed settlement", async () => {
+  it("maps every terminal settlement outcome to a terminal label", () => {
+    const rejected = command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "rejected", reason: "denied" } });
+    expect(classifyCommand(rejected)).toBe("failed");
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "cancelled" } }))).toBe("cancelled");
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "expired" } }))).toBe("expired");
+  });
+
+  it("resolveEntry reads once for an already-settled command and confirms", async () => {
     const read = vi.fn(async () =>
       command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "completed" } }),
     );
@@ -134,7 +147,11 @@ describe("fleet delivery state (D-053 §2)", () => {
     );
     expect(settled).toEqual({ state: "confirmed", reason: undefined });
     expect(read).toHaveBeenCalledOnce();
-    expect(read).toHaveBeenCalledWith("ins_1", "cmd_1");
+    // A signal is always passed so the caller can abort a hung request.
+    const call = read.mock.calls[0] as unknown as [string, string, AbortSignal];
+    expect(call[0]).toBe("ins_1");
+    expect(call[1]).toBe("cmd_1");
+    expect(call[2]).toBeInstanceOf(AbortSignal);
   });
 
   it("resolveEntry surfaces the Node rejection reason as failure", async () => {
@@ -148,20 +165,34 @@ describe("fleet delivery state (D-053 §2)", () => {
     expect(settled).toEqual({ state: "failed", reason: "permission denied" });
   });
 
-  it("resolveEntry follows up briefly while the command is still open, then stays neutral", async () => {
+  it("does exactly one follow-up for an open row and accepts its settlement", async () => {
     const read = vi
       .fn()
       .mockResolvedValueOnce(command({ state: "accepted", resolution: "clear", forwarded: true }))
-      .mockResolvedValueOnce(command({ state: "accepted", resolution: "clear", forwarded: true }));
+      .mockResolvedValueOnce(
+        command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "completed" } }),
+      );
     const settled = await resolveEntry(
       { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: true, state: "accepted" },
       read,
-      300,
+    );
+    expect(settled.state).toBe("confirmed");
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the immediate authoritative state when the follow-up read fails", async () => {
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce(command({ state: "accepted", resolution: "clear", forwarded: true }))
+      .mockRejectedValueOnce(new Error("500"));
+    const settled = await resolveEntry(
+      { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: true, state: "accepted" },
+      read,
     );
     expect(settled).toEqual({ state: "forwarded" });
   });
 
-  it("resolveEntry stays provisional on a read failure (never fabricates)", async () => {
+  it("stays provisional on an immediate read failure (never fabricates)", async () => {
     const read = vi.fn(async () => {
       throw new Error("404");
     });
@@ -172,10 +203,38 @@ describe("fleet delivery state (D-053 §2)", () => {
     expect(settled).toEqual({ state: "queued" });
   });
 
-  it("resolveEntry does not read for failed or replayed rows", async () => {
+  it("aborts a hung read within the per-request deadline", async () => {
+    const signals: AbortSignal[] = [];
+    const read = vi.fn(((_i: string, _c: string, signal: AbortSignal) => {
+      signals.push(signal);
+      return new Promise<CommandRecord>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    }) as unknown as (i: string, c: string, s: AbortSignal) => Promise<CommandRecord>);
+    const start = Date.now();
+    const settled = await resolveEntry(
+      { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: true, state: "accepted" },
+      read,
+    );
+    // Bounded well under the old 10s poll window.
+    expect(Date.now() - start).toBeLessThan(4_000);
+    expect(settled).toEqual({ state: "forwarded" });
+    expect(signals[0]?.aborted).toBe(true);
+  });
+
+  it("does not read for failed or replayed rows", async () => {
     const read = vi.fn();
     expect(await resolveEntry({ ok: false, error: "x" }, read)).toEqual({ state: "failed" });
     expect(await resolveEntry({ ok: true, replayed: true, state: "queued" }, read)).toEqual({ state: "replayed" });
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("summarizeRows buckets authoritative states", () => {
+    expect(summarizeRows(["confirmed", "failed", "queued", "forwarded", "cancelled", "expired", "replayed"])).toEqual({
+      confirmed: 1,
+      failed: 1,
+      pending: 3,
+      cancelled: 2,
+    });
   });
 });

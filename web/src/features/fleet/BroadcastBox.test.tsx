@@ -58,12 +58,16 @@ describe("BroadcastBox", () => {
 
     // One authoritative read per accepted row, and the completed settlement
     // is the only thing that paints green 已确认.
-    await waitFor(() => expect(status).toHaveBeenCalledWith("ins_1", "cmd_1"));
+    await waitFor(() => expect(status).toHaveBeenCalledWith("ins_1", "cmd_1", expect.any(AbortSignal)));
     const okRow = screen.getAllByTestId("broadcast-result").find((r) => r.getAttribute("data-ok") === "true");
     await waitFor(() => expect(okRow).toHaveAttribute("data-delivery", "confirmed"));
     expect(okRow).toHaveTextContent("已确认");
 
-    expect(screen.getByTestId("broadcast-summary").textContent).toContain("已接受 1");
+    // The fan-out summary is recomputed from authoritative row states, so the
+    // completed send is counted 已确认 (not the old ledger 已接受 line).
+    const summary = screen.getByTestId("broadcast-summary");
+    await waitFor(() => expect(summary.textContent).toContain("已确认 1"));
+    expect(summary.textContent).toContain("失败 1");
     const rows = screen.getAllByTestId("broadcast-result");
     expect(rows).toHaveLength(2);
     // Failures sort first and surface their reason.

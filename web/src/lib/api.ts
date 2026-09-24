@@ -620,7 +620,7 @@ export type HubApi = {
   }>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
   /** `GET /v1/instances/{id}/commands/{commandId}` authoritative row. */
-  instanceCommandStatus(instanceId: Id, commandId: Id): Promise<components["schemas"]["CommandRecord"]>;
+  instanceCommandStatus(instanceId: Id, commandId: Id, signal?: AbortSignal): Promise<components["schemas"]["CommandRecord"]>;
   fleetBroadcast(body: FleetBroadcastBody): Promise<FleetBroadcastResult>;
   worktreeList(hostId?: string): Promise<WorktreePage>;
   worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
@@ -916,7 +916,7 @@ function createMockApi(): HubApi {
     async fleetBroadcast(body) {
       return mockFleetBroadcast(body ?? {});
     },
-    async instanceCommandStatus(instanceId, commandId): Promise<components["schemas"]["CommandRecord"]> {
+    async instanceCommandStatus(instanceId, commandId, _signal?): Promise<components["schemas"]["CommandRecord"]> {
       const hit = mockDb.instances.find((inst) => inst.id === instanceId);
       if (!hit) throw new HubHttpError(404, "NOT_FOUND", "command not found");
       return {
@@ -1422,9 +1422,10 @@ function createLiveApi(): HubApi {
         body: JSON.stringify(body),
       });
     },
-    async instanceCommandStatus(instanceId, commandId) {
+    async instanceCommandStatus(instanceId, commandId, signal) {
       return rest<components["schemas"]["CommandRecord"]>(
         `/v1/instances/${encodeURIComponent(instanceId)}/commands/${encodeURIComponent(commandId)}`,
+        signal ? { signal } : undefined,
       );
     },
     async worktreeList(hostId) {

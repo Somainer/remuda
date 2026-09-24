@@ -9,6 +9,7 @@ export {
   resolveEntry,
   orderResults,
   summarize,
+  summarizeRows,
   SETTLED_STATES,
   DELIVERY_LABEL,
   type BroadcastForm,

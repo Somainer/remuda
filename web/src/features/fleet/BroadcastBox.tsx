@@ -13,6 +13,7 @@ import {
   provisionalState,
   resolveEntry,
   summarize,
+  summarizeRows,
   type BroadcastForm,
   type DeliveryState,
 } from "./broadcast";
@@ -28,7 +29,7 @@ const EMPTY: BroadcastForm = {
 type RowState = {
   state: DeliveryState;
   reason?: string;
-  /** True while the authoritative command read is still being polled. */
+  /** True while the authoritative command follow-up read is in flight. */
   resolving?: boolean;
 };
 
@@ -48,9 +49,9 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
   /**
    * Read the authoritative settlement for each accepted row. The fleet
    * response never carries `settlement.outcome`, so green confirmation is
-   * only allowed after the command resource reports completed. Reads are
-   * bounded: one immediate read per row plus follow-ups inside resolveEntry
-   * for up to ~10s; still-open rows keep their neutral provisional label.
+   * only allowed after the command resource reports completed. Each GET is
+   * abort-bounded; one immediate read plus one follow-up per open row. Rows
+   * update in place and the summary is recomputed from their states.
    */
   async function resolveRows(value: FleetBroadcastResult) {
     const entries = value.results ?? [];
@@ -66,12 +67,34 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
         const key = entry.commandId ?? entry.instanceId;
         if (!key || !entry.ok || entry.replayed || !entry.commandId || !entry.instanceId) return;
         setRowStates((prev) => ({ ...prev, [key]: { state: provisionalState(entry), resolving: true } }));
-        const settled = await resolveEntry(entry, (instanceId, commandId) =>
-          api.instanceCommandStatus(instanceId as Id, commandId as Id),
+        const settled = await resolveEntry(entry, (instanceId, commandId, signal) =>
+          api.instanceCommandStatus(instanceId as Id, commandId as Id, signal),
         );
-        setRowStates((prev) => ({ ...prev, [key]: settled }));
+        setRowStates((prev) => ({ ...prev, [key]: { ...settled, resolving: false } }));
       }),
     );
+  }
+
+  /**
+   * The summary reflects authoritative settlement after the reads finish: a
+   * Node rejection counts 失败, a completion 已确认. While any follow-up read
+   * is still in flight the ledger-acceptance line from the POST is shown, so
+   * the counts always cover every row rather than flickering partial totals.
+   */
+  function summaryLine(value: FleetBroadcastResult, states: Record<string, RowState>): string {
+    const entries = value.results ?? [];
+    const tracked = entries.filter((entry) => {
+      const key = entry.commandId ?? entry.instanceId;
+      return key && states[key];
+    });
+    const anyResolving = tracked.some((entry) => {
+      const key = entry.commandId ?? entry.instanceId;
+      return states[key!].resolving;
+    });
+    if (anyResolving || tracked.length === 0) return summarize(value);
+    const counts = summarizeRows(tracked.map((entry) => states[(entry.commandId ?? entry.instanceId)!].state));
+    const skipped = value.skipped ?? 0;
+    return `已确认 ${counts.confirmed} · 失败 ${counts.failed} · 待处理 ${counts.pending} · 已结束 ${counts.cancelled} · 跳过 ${skipped}`;
   }
 
   async function submit() {
@@ -198,7 +221,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
       {result ? (
         <div className={css.resultBlock}>
           <p className={css.sectionSub} data-testid="broadcast-summary">
-            {summarize(result)}
+            {summaryLine(result, rowStates)}
           </p>
           <ul className={css.members} data-testid="broadcast-results">
             {orderResults(result).map((entry) => {

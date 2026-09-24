@@ -1,7 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
@@ -13,7 +12,8 @@ import { login } from "./hub-auth";
  *
  * REMUDA_EVIDENCE=1 captures:
  *  - 390/1440 into the committed docs/design/evidence/ui-overhaul/ tree
- *  - 768/1024 into an OS temp dir (layout verification is not committed)
+ *  - 768/1024 into the worktree's ignored .e2e-log scratch dir (layout
+ *    verification only; never committed)
  */
 
 test.skip(!process.env.REMUDA_EVIDENCE, "set REMUDA_EVIDENCE=1 to capture the committed screenshots");
@@ -21,7 +21,7 @@ test.describe.configure({ mode: "serial" });
 
 const committedDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/ui-overhaul");
 /** 768/1024 captures stay out of the repo even when capturing. */
-const scratchDir = path.join(os.tmpdir(), "remuda-uo13-evidence");
+const scratchDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.e2e-log/evidence/uo13");
 const COMMITTED_WIDTHS = new Set([390, 1440]);
 const MODES = ["dark", "light"] as const;
 const WIDTHS = [390, 768, 1024, 1440] as const;
@@ -146,9 +146,38 @@ for (const width of WIDTHS) {
     // Required coverage: the feishu static channel must exist.
     const feishu = page.locator('[data-testid=bot-row][data-channel="feishu"]');
     await expect(feishu).toBeVisible();
-    await feishu.click();
-    await expect(page.getByTestId("bot-detail")).toBeVisible();
-    for (const mode of MODES) await shoot(page, "bot-detail", mode, width);
+    feishu.click();
+    const botDetail = page.getByTestId("bot-detail");
+    await expect(botDetail).toBeVisible();
+
+    // Demo-inventory hygiene: the static channel fixture prints real-looking
+    // host/project labels (devbox-sg / sfe-root). They are fixture values, not
+    // evidence: replace them with generic demo labels in the rendered DOM
+    // before capturing (mirrors tabs-semantics' applyDemoInventory), then
+    // grep the rendered text so neither can leak into a committed frame.
+    await botDetail.evaluate((el) => {
+      const replacements: [RegExp, string][] = [
+        [/devbox-sg/g, "demo-node-1"],
+        [/sfe-root/g, "demo-project-1"],
+      ];
+      const walker = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      const nodes: Text[] = [];
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) nodes.push(node as Text);
+      for (const node of nodes) {
+        let value = node.textContent ?? "";
+        for (const [pattern, replacement] of replacements) value = value.replace(pattern, replacement);
+        node.textContent = value;
+      }
+    });
+    await expect(botDetail).not.toContainText("devbox-sg");
+    await expect(botDetail).not.toContainText("sfe-root");
+    for (const mode of MODES) {
+      await setMode(page, mode);
+      await page.evaluate(() => document.fonts.ready.then(() => undefined));
+      await expect(botDetail).not.toContainText("devbox-sg");
+      await expect(botDetail).not.toContainText("sfe-root");
+      await shoot(page, "bot-detail", mode, width);
+    }
   });
 
   test(`UO-13 login and pair card at ${width}`, async ({ browser }) => {

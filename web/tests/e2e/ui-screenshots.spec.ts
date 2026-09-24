@@ -1,14 +1,13 @@
 import { expect, test, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TTY_LAB = "ins_01993ab0-0000-7000-8000-00000000aa01";
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "__screenshots__");
 /** 768/1024 layout checks are asserted but never committed: captures for
- *  those widths go to an OS temp dir under REMUDA_EVIDENCE only. */
-const scratchDir = path.join(os.tmpdir(), "remuda-ui-screenshots");
+ *  those widths go to the worktree's ignored scratch dir under evidence only. */
+const scratchDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../.e2e-log/evidence/gallery");
 const COMMITTED_TAGS = new Set(["1440", "390"]);
 
 // Goldens are committed artifacts: an ordinary gate run must navigate and
@@ -28,6 +27,9 @@ test.describe("ui screenshots 1440 / 390", () => {
 
   test("gallery of every primary route", async ({ page }, info) => {
     test.skip(info.project.name !== "chromium", "golden screenshots from chromium only");
+    // Four widths sequentially, with a host-detail round-trip + flag clip
+    // check at 390 and 768.
+    test.setTimeout(75_000);
     await page.emulateMedia({ reducedMotion: "reduce" });
 
     // The mock client has no /v1/projects endpoint; give the gallery a small
@@ -125,11 +127,21 @@ test.describe("ui screenshots 1440 / 390", () => {
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(w);
 
       // The host detail install flag must be present at 390 too.
-      if (w === 390) {
+      if (w === 390 || w === 768) {
         await page.getByTestId("host-row").first().click();
         await expect(page.getByTestId("host-detail")).toBeVisible();
         await expect(page.getByTestId("host-cli-flags").first()).toBeVisible();
         await expect(page.getByTestId("host-cli-flags").first()).toContainText(/已安装|未安装/);
+        // At 768 the expanded sidebar narrows content: the full install flag
+        // text must wrap inside the row, never clip (scrollWidth == clientWidth
+        // and every glyph of the long string is painted).
+        if (w === 768) {
+          const flag = page.getByTestId("host-cli-flags").filter({ hasText: "nativeGateway" }).first();
+          await expect(flag).toContainText("已安装");
+          await expect(flag).toContainText("nativeGateway false");
+          const noClip = await flag.evaluate((el) => el.scrollWidth <= el.clientWidth + 1);
+          expect(noClip).toBe(true);
+        }
         await page.goto("/hosts");
         await expect(page.getByTestId("hosts-page")).toBeVisible();
       }
@@ -171,7 +183,7 @@ test.describe("ui screenshots 1440 / 390", () => {
       await loginPage.goto("/login");
       await expect(loginPage.getByTestId("login-page")).toBeVisible();
       await expect(loginPage.getByTestId("login-head")).toBeVisible();
-      await shot(loginPage, `login-${tag}.png`);
+      await shot(loginPage, `login-${tag}.png`, tag);
       await loginContext.close();
 
       await page.goto("/settings");

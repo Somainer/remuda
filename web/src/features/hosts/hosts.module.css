@@ -296,12 +296,13 @@ a.count {
   color: var(--fg-muted);
 }
 
-/* Install flag: its own column so it survives every width (unlike cliVer).
-   Sized to content (min-width keeps the two states aligned) and allowed to
-   wrap, so 「已安装 · nativeGateway false」 is never clipped. */
+/* Install flag: its own column that survives every width (unlike cliVer).
+   It can shrink and wrap inside the row (flex 0 1 auto + min-width 0), so at
+   768 with the expanded sidebar the full 「已安装 · nativeGateway false」
+   text wraps instead of being clipped by a fixed non-shrinking column. */
 .cliFlag {
-  flex: none;
-  min-width: 64px;
+  flex: 0 1 auto;
+  min-width: 0;
   color: var(--fg-body);
   white-space: normal;
   overflow-wrap: anywhere;

@@ -1,3 +1,4 @@
+import { formatListTime } from "../../lib/format";
 import { projectStatus } from "../../lib/status";
 import type { Instance, UiStatus } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
@@ -18,6 +19,13 @@ import { buildTaskGroups, type TaskListGroup } from "../tasks/taskRows";
  * percentage. This module only decides grouping order, the error-as-body
  * rule and the row shape, so every rule below is unit-testable without a
  * DOM.
+ *
+ * UO-3 split the projection in two for the commit probe: `buildHomeRows()`
+ * derives the per-instance display row (the part polling can change) and
+ * `arrangeHomeGroups()` does the cheap query filter / sort / group shaping.
+ * The phone list caches the derived rows by display signature, so a badge
+ * flip (`interactions` changing without a visible row change) never commits
+ * the list (`commit:HomeList`).
  */
 
 export type HomeOrder = "clock" | "list";
@@ -56,6 +64,8 @@ export type HomeRow = {
   blocked: boolean;
   /** Exited rows advertise 恢复 only when the resume capability is really there (D-026). */
   canResume: boolean;
+  /** 12px faint relative time for the row's right slot (formatListTime). */
+  timeLabel: string;
   updatedAt: string;
 };
 
@@ -83,6 +93,8 @@ export type HomeRowsInput = {
   screenOf?: (instanceId: string) => RowScreen;
   summaryOf?: (instanceId: string) => string | undefined;
   eventsOf?: (instanceId: string) => Observation[] | undefined;
+  /** Clock injection for the relative-time label; defaults to Date.now(). */
+  nowMs?: number;
 };
 
 /**
@@ -143,6 +155,63 @@ export function homeBody(
   return { text: step.text, isError: false };
 }
 
+/**
+ * The full per-instance display derivation, keyed by instance id. One entry
+ * per instance the spaces present (query filtering and sorting happen later
+ * in `arrangeHomeGroups`); this is the slice the home list caches.
+ */
+export function buildHomeRows(
+  input: Pick<
+    HomeRowsInput,
+    | "spaces"
+    | "interactions"
+    | "titleOf"
+    | "rollupOf"
+    | "screenOf"
+    | "summaryOf"
+    | "eventsOf"
+    | "nowMs"
+  >,
+): Map<string, HomeRow> {
+  const nowMs = input.nowMs ?? Date.now();
+  const rows = new Map<string, HomeRow>();
+  for (const space of input.spaces) {
+    for (const instance of space.instances) {
+      if (rows.has(instance.id)) continue;
+      const status = projectStatus(instance);
+      const pending =
+        input.interactions.find(
+          (interaction) =>
+            interaction.instanceId === instance.id && interaction.state === "pending",
+        ) ?? null;
+      const step = nextStep(
+        instance,
+        pending,
+        input.screenOf?.(instance.id),
+        input.summaryOf?.(instance.id),
+      );
+      const error = homeError(instance, input.eventsOf?.(instance.id));
+      const body = homeBody(status, step, error);
+      rows.set(instance.id, {
+        id: instance.id,
+        instance,
+        title: input.titleOf(instance.id) || "会话",
+        status,
+        body: body.text,
+        bodyIsError: body.isError,
+        contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
+        blocked: status === "blocked",
+        canResume:
+          status === "exited" &&
+          instance.capabilities.capabilities.resume?.state === "supported",
+        timeLabel: formatListTime(instance.updatedAt, nowMs),
+        updatedAt: instance.updatedAt,
+      });
+    }
+  }
+  return rows;
+}
+
 function rowTime(row: HomeRow): number {
   return Date.parse(row.updatedAt) || 0;
 }
@@ -170,8 +239,21 @@ function compareGroups(a: HomeGroup, b: HomeGroup, order: HomeOrder): number {
   return latest(b) - latest(a) || a.id.localeCompare(b.id);
 }
 
-export function buildHomeGroups(input: HomeRowsInput): HomeGroup[] {
-  const needle = input.query.trim().toLowerCase();
+/**
+ * Query filtering, per-group row shaping and ordering over pre-derived rows.
+ * Cheap to run on every keystroke — `nextStep()`/error derivation is not in
+ * here (see `buildHomeRows`).
+ */
+export function arrangeHomeGroups(input: {
+  spaces: Space[];
+  rows: ReadonlyMap<string, HomeRow>;
+  needle: string;
+  order: HomeOrder;
+  hostNameOf: HomeRowsInput["hostNameOf"];
+  branchOf?: HomeRowsInput["branchOf"];
+  titleOf: HomeRowsInput["titleOf"];
+}): HomeGroup[] {
+  const needle = input.needle.trim().toLowerCase();
   // The QuickFind ranker is the fixed title > project(Space) > host > id
   // boundary. Mobile search drops id hits: the phone home search promises
   // 标题 / 项目 / 主机 only, and an opaque id must not leak out here.
@@ -193,34 +275,8 @@ export function buildHomeGroups(input: HomeRowsInput): HomeGroup[] {
     const rows: HomeRow[] = [];
     for (const instance of space.instances) {
       if (needle && !allowed.has(instance.id)) continue;
-      const status = projectStatus(instance);
-      const pending =
-        input.interactions.find(
-          (interaction) =>
-            interaction.instanceId === instance.id && interaction.state === "pending",
-        ) ?? null;
-      const step = nextStep(
-        instance,
-        pending,
-        input.screenOf?.(instance.id),
-        input.summaryOf?.(instance.id),
-      );
-      const error = homeError(instance, input.eventsOf?.(instance.id));
-      const body = homeBody(status, step, error);
-      rows.push({
-        id: instance.id,
-        instance,
-        title: input.titleOf(instance.id) || "会话",
-        status,
-        body: body.text,
-        bodyIsError: body.isError,
-        contextPct: input.rollupOf(instance.id)?.contextPct ?? null,
-        blocked: status === "blocked",
-        canResume:
-          status === "exited" &&
-          instance.capabilities.capabilities.resume?.state === "supported",
-        updatedAt: instance.updatedAt,
-      });
+      const row = input.rows.get(instance.id);
+      if (row) rows.push(row);
     }
     if (!rows.length) continue;
     rows.sort((a, b) => compareRows(a, b, input.order));
@@ -235,6 +291,57 @@ export function buildHomeGroups(input: HomeRowsInput): HomeGroup[] {
   }
   groups.sort((a, b) => compareGroups(a, b, input.order));
   return groups;
+}
+
+export function buildHomeGroups(input: HomeRowsInput): HomeGroup[] {
+  const rows = buildHomeRows(input);
+  return arrangeHomeGroups({
+    spaces: input.spaces,
+    rows,
+    needle: input.query,
+    order: input.order,
+    hostNameOf: input.hostNameOf,
+    branchOf: input.branchOf,
+    titleOf: input.titleOf,
+  });
+}
+
+/**
+ * Stable signature over everything that can change a derived row's pixels
+ * (plus the pending-instance set). When two Hub snapshots sign the same, the
+ * phone list keeps the previous `buildHomeRows()` result and React bails out —
+ * the inbox badge changing alone (the same one pending interaction, more
+ * interactions arriving for an already-blocked session) never commits it.
+ */
+export function homeRowsSignature(
+  rows: ReadonlyMap<string, HomeRow>,
+  pendingInstanceIds: readonly string[],
+  spaces: readonly Space[],
+  hostNameOf: HomeRowsInput["hostNameOf"],
+): string {
+  const rowPart = [...rows.values()]
+    .map(
+      (row) =>
+        `${row.id}|${row.status}|${row.title}|${row.body}|${row.bodyIsError ? 1 : 0}|${row.contextPct ?? "-"}|${row.blocked ? 1 : 0}|${row.canResume ? 1 : 0}|${row.timeLabel}`,
+    )
+    .join("\n");
+  // Prefs/closed tabs and workspace membership change WHICH instances a space
+  // presents (and the group's blocked count); spaces are the cached selector's
+  // buildSpaces() output.
+  const spacePart = spaces
+    .map(
+      (space) =>
+        `${space.id}:${space.name}:${space.hostId ?? "-"}:${space.blockedCount}:${space.instances
+          .map((instance) => instance.id)
+          .join(",")}`,
+    )
+    .join("\n");
+  // Host renames change the group header's title tooltip.
+  const hostPart = spaces
+    .map((space) => (space.hostId ? `${space.hostId}=${hostNameOf(space.hostId)}` : ""))
+    .filter(Boolean)
+    .join(",");
+  return `${[...new Set(pendingInstanceIds)].sort().join(",")}⟦${spacePart}⟧${hostPart}⟦${rowPart}`;
 }
 
 /**

@@ -224,6 +224,8 @@
 
 .planSummary {
   cursor: pointer;
+  display: flex;
+  align-items: center;
   padding: var(--space-2) 0;
   color: var(--fg-muted);
   font-size: var(--text-ui);
@@ -585,6 +587,12 @@
   /* Question tabs are text controls: their whole 44px is visible on coarse
      pointers (no glyph-only ::after trick), so every tab is a full target. */
   .qTab {
+    min-height: var(--touch);
+  }
+
+  /* The plan disclosure summary is a text control; stretch it to a full
+     visible 44px target on coarse pointers. */
+  .planSummary {
     min-height: var(--touch);
   }
 }

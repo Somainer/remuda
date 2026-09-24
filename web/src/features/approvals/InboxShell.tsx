@@ -160,13 +160,30 @@ function compactView(
 /* Desktop-only slim 已离队 row (third tier, no actions).              */
 /* ------------------------------------------------------------------ */
 
+export type DepartedView = DecisionView & {
+  stateText: string;
+  previewText: string;
+  title: string;
+};
+
 export const DepartedRow = memo(
   function DepartedRow({
     view,
+    onRowRender,
   }: {
-    view: DecisionView & { stateText: string; previewText: string; title: string };
+    view: DepartedView;
+    /**
+     * Commit probe INSIDE the memo boundary: fired after every render that
+     * actually commits. A memo bail-out (equal sig) runs neither the function
+     * nor this effect, so tests can count real commits. The production shell
+     * never passes it (zero work on that path).
+     */
+    onRowRender?: (interactionId: string) => void;
   }) {
-  return (
+    useEffect(() => {
+      onRowRender?.(view.item.id);
+    });
+    return (
     <article
       className={desktopCss.departedRow}
       data-testid="approval-row"
@@ -200,6 +217,44 @@ function areDepartedEqual(
   next: { view: { sig: string } },
 ): boolean {
   return prev.view.sig === next.view.sig;
+}
+
+/**
+ * The real keyed 已离队 list. A 2 s poll re-derives fresh ApprovalRow/view
+ * objects; keys keep React identity stable and DepartedRow's sig comparator
+ * skips rows whose content did not change, so unchanged departed rows do not
+ * commit when a new interaction arrives.
+ */
+export function DepartedList({
+  rows,
+  workspaceLabel,
+  onRowRender,
+}: {
+  rows: ApprovalRow[];
+  workspaceLabel: (workspaceId: string) => string;
+  onRowRender?: (interactionId: string) => void;
+}) {
+  if (rows.length === 0) return null;
+  return (
+    <div className={desktopCss.departed} data-testid="inbox-departed">
+      <div className={desktopCss.departedLabel}>已离队</div>
+      {rows.map((row) => {
+        const base = desktopView(row, workspaceLabel(row.instance?.workspaceId ?? ""));
+        return (
+          <DepartedRow
+            key={row.item.id}
+            view={{
+              ...base,
+              stateText: DEPARTED_STATUS_TEXT[row.uiState as "expired" | "superseded"],
+              title: decisionTitle(row.item),
+              previewText: decisionPreview(row.item),
+            }}
+            onRowRender={onRowRender}
+          />
+        );
+      })}
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -404,7 +459,7 @@ function DesktopInbox({
 
   const { queue, departed } = rows;
   const pendingCount = queue.length;
-  const filterKey = `${kind} ${hostFilter} ${workspaceFilter}`;
+  const filterKey = `${kind}\u0000${hostFilter}\u0000${workspaceFilter}`;
   const queueLimit = useIncrementalLimit(queue.length, { resetKey: filterKey });
   const departedLimit = useIncrementalLimit(departed.length, { resetKey: filterKey });
 
@@ -458,23 +513,7 @@ function DesktopInbox({
             />
           ))}
           {departed.length ? (
-            <div className={desktopCss.departed}>
-              <div className={desktopCss.departedLabel}>已离队</div>
-              {departed.slice(0, departedLimit).map((row) => {
-                const base = desktopView(row, workspaceLabel(row.instance?.workspaceId ?? ""));
-                return (
-                  <DepartedRow
-                    key={row.item.id}
-                    view={{
-                      ...base,
-                      stateText: DEPARTED_STATUS_TEXT[row.uiState as "expired" | "superseded"],
-                      title: decisionTitle(row.item),
-                      previewText: decisionPreview(row.item),
-                    }}
-                  />
-                );
-              })}
-            </div>
+            <DepartedList rows={departed.slice(0, departedLimit)} workspaceLabel={workspaceLabel} />
           ) : null}
           {queue.length + departed.length === 0 ? <p className={desktopCss.empty}>没有待处理交互</p> : null}
         </div>

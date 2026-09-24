@@ -1181,25 +1181,23 @@ describe("streaming row (D-053)", () => {
   it("commits only the streaming row per batch", () => {
     profile.on = true;
     const settled = [userMessage(1, "问题"), assistantMessage(2, "上一轮回答"), userMessage(3, "继续")];
-    const first = streamingMessage(4, "第一段", 1);
-    const { rerender } = render(<Transcript events={[...settled, first]} compact={false} />);
-    for (let rev = 2; rev <= 4; rev += 1) {
+    const { rerender } = render(<Transcript events={[...settled, streamingMessage(4, "第一段", 1)]} compact={false} />);
+    const streamingId = (screen.getByTestId("streaming-cursor").closest("[data-anchor]") as HTMLElement).dataset
+      .anchor;
+    expect(streamingId).toBeTruthy();
+    let text = "第一段";
+    for (let batch = 1; batch <= 3; batch += 1) {
       profile.probes = [];
-      rerender(
-        <Transcript
-          events={[
-            ...settled,
-            first,
-            ...Array.from({ length: rev - 1 }, (_, i) => streamingMessage(5 + i, ` 追加${i}`, i + 2)),
-          ]}
-          compact={false}
-        />,
-      );
+      // The same node, revised with longer text: one message, not new ones.
+      text += ` 追加${batch}`;
+      rerender(<Transcript events={[...settled, streamingMessage(4, text, 1)]} compact={false} />);
+      expect(screen.getByText(text)).toBeTruthy();
+      expect(screen.getAllByTestId("message")).toHaveLength(4);
       const rows = profile.probes
         .filter((p) => p.kind === "commit:TranscriptRow")
         .map((p) => (p.value as { nodeId: string }).nodeId);
       expect(rows.length).toBeGreaterThan(0);
-      expect(new Set(rows).size).toBe(1);
+      expect([...new Set(rows)]).toEqual([streamingId]);
     }
   });
 

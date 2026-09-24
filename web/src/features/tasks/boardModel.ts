@@ -22,6 +22,7 @@
  * No React, no fetch: every rule is unit-tested in boardModel.test.ts.
  */
 import type { components } from "../../lib/api.generated";
+import { formatListTime } from "../../lib/format";
 import type { BoardColumn, Task, TaskState } from "../../types/generated";
 import { sharedWithTasksLabel } from "./binding";
 import {
@@ -251,6 +252,7 @@ function buildCard(
   instances: readonly CardSession[],
   counts: ReadonlyMap<string, number>,
   pendingInstanceIds: ReadonlySet<string>,
+  nowMs: number,
 ): BoardCard {
   const sessions = cardSessions(item, instances);
   const key = bindingShareKey(item);
@@ -283,17 +285,21 @@ function buildCard(
     },
     sig: "",
   };
-  card.sig = cardSignature(card);
+  card.sig = cardSignature(card, nowMs);
   return card;
 }
 
 /**
  * The exact set of values a card paints: placement/state (which fix the
  * column and drop table), attention/land signals, labels, and the rendered
- * session rows (two max on the card). Equal across polls while the card is
+ * session rows (two max on the card). The session timestamp contributes its
+ * **rendered relative-time label** (the same formatListTime the row paints),
+ * not the raw ISO value — a poll flips the signature exactly when the
+ * visible label crosses a boundary (45s / minute / day), and never while the
+ * label on screen is unchanged. Equal across polls while the card is
  * pixel-identical; any rendered change flips it.
  */
-export function cardSignature(card: BoardCard): string {
+export function cardSignature(card: BoardCard, nowMs: number = Date.now()): string {
   const parts: string[] = [
     card.id,
     card.item.state,
@@ -315,7 +321,7 @@ export function cardSignature(card: BoardCard): string {
         session.kind ?? "",
         session.name ?? "",
         session.lifecycle ?? "",
-        session.updatedAt,
+        formatListTime(session.updatedAt, nowMs),
       ].join("|"),
     );
   }
@@ -333,6 +339,8 @@ export function buildBoardModel(input: {
   instances?: readonly CardSession[];
   /** Instance ids with a pending human interaction (the attention signal). */
   pendingInstanceIds?: ReadonlySet<string>;
+  /** Build time for relative-time labels; Date.now() when omitted. */
+  nowMs?: number;
   query?: string;
 }): BoardModel {
   const groups = input.view?.columns;
@@ -342,10 +350,11 @@ export function buildBoardModel(input: {
   const counts = sharedCounts(all);
   const instances = input.instances ?? [];
   const pendingInstanceIds = input.pendingInstanceIds ?? new Set<string>();
+  const nowMs = input.nowMs ?? Date.now();
   const needle = input.query?.trim().toLowerCase() ?? "";
 
   const cardOf = (item: BoardItem): BoardCard =>
-    buildCard(item, instances, counts, pendingInstanceIds);
+    buildCard(item, instances, counts, pendingInstanceIds, nowMs);
   const visible = (item: BoardItem): boolean => !needle || matchesNeedle(item, needle);
 
   const makeColumn = (column: WorkColumn): BoardColumnModel => ({

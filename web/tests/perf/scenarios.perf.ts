@@ -106,7 +106,11 @@ type ScenarioResult = {
     initialCommitTotalMs: number;
     initialCommitMaxMs: number;
     quietTickCommits: number;
+    /** Quiet-window commits not explained by a relative-time label crossing. */
+    quietUnexplainedCommits: number;
     changedTickCommits: number;
+    /** Update commits attributed to the one PATCHed card (must be exactly 1). */
+    changedCardCommits: number;
   };
 };
 
@@ -643,13 +647,18 @@ test("C: 100 pending interactions with inbox scrolling", async ({ page, browser 
 const E_TASKS = 80;
 const E_PENDING = 40;
 
-type BoardCardCommit = { phase: string; actualDuration: number };
+type BoardCardCommit = { phase: string; actualDuration: number; cardId?: string };
+
+const cardIn = (page: Page, id: string) =>
+  page.locator(`[data-testid="board-card"][data-task-id="${id}"]`);
 
 function boardCardCommits(report: RemudaPerfReport): BoardCardCommit[] {
   return report.probes
     .filter((probe) => probe.kind === "commit:BoardCard")
-    .map((probe) => probe.value as BoardCardCommit);
+    .map((probe) => (probe.value ?? {}) as BoardCardCommit);
 }
+
+const cardIdOf = (commit: BoardCardCommit): string => commit.cardId ?? "";
 
 test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit no cards", async ({
   page,
@@ -766,50 +775,109 @@ test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit 
       {} as Record<string, number>,
     );
 
-    // Quiet window: one full /v1/board poll tick with nothing changing.
+    // Quiet window: one full /v1/board poll tick with nothing changing. A
+    // card MAY commit when a relative-time label crosses a boundary (45s /
+    // minute) — that is the one allowed reason; read every card's visible
+    // session-time labels before/after and require that every commit be a
+    // card whose label actually changed (and no other card committed).
+    const cardTimeLabels = async (): Promise<Record<string, string>> =>
+      page.evaluate(() => {
+        const out: Record<string, string> = {};
+        document
+          .querySelectorAll<HTMLElement>('[data-testid="board-card"]')
+          .forEach((card) => {
+            const id = card.getAttribute("data-task-id") ?? "";
+            const times = [...card.querySelectorAll<HTMLElement>('[data-testid="board-session"]')]
+              .map((row) => row.querySelector("span:last-child")?.textContent?.trim() ?? "")
+              .join(",");
+            out[id] = times;
+          });
+        return out;
+      });
+
     await page.evaluate(() => window.__remudaPerf?.reset());
     await markScenario(page, "E-quiet-tick");
+    const labelsBefore = await cardTimeLabels();
     await page.waitForTimeout(7_000);
-    const quietCommits = boardCardCommits(await getReport(page)).length;
+    const labelsAfter = await cardTimeLabels();
+    const labelFlipIds = new Set(
+      Object.keys(labelsAfter).filter((id) => labelsAfter[id] !== labelsBefore[id]),
+    );
+    const quietCommitsAll = boardCardCommits(await getReport(page));
+    const quietCommits = quietCommitsAll.length;
+    const quietUnexplained = quietCommitsAll.filter(
+      (commit) => !labelFlipIds.has(cardIdOf(commit)),
+    );
     expect(
-      quietCommits,
-      "an unchanged poll tick must not commit any BoardCard",
+      quietUnexplained.length,
+      "an unchanged tick commits nothing except cards whose time label changed",
     ).toBe(0);
     await markScenario(page, null);
 
-    // One task changes state (already PATCHed; advance another live one so
-    // the flip happens inside the measured window).
+    // One task changes state. Open the measurement window BEFORE the PATCH,
+    // check the response, then wait for that exact card's new state rather
+    // than counting commits, and attribute the commit to the card id.
     const changedTaskId = fixture.taskIds[E_PENDING + 2];
-    await driver.evaluate(async (id) => {
-      await fetch(`/v1/tasks/${id}`, {
+    const labelsBeforeChange = await cardTimeLabels();
+    await page.evaluate(() => window.__remudaPerf?.reset());
+    await markScenario(page, "E-board");
+
+    const patchStatus = await driver.evaluate(async (id) => {
+      const response = await fetch(`/v1/tasks/${id}`, {
         method: "PATCH",
         credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ state: "placed" }),
       });
+      return response.status;
     }, changedTaskId);
+    expect(patchStatus, "the state change PATCH succeeds").toBe(200);
 
-    await page.evaluate(() => window.__remudaPerf?.reset());
-    await markScenario(page, "E-board");
+    // Wait for THIS card to paint its new state (the poll projects placed).
     await expect
       .poll(
-        async () =>
-          boardCardCommits(await getReport(page)).filter(
-            (commit) => commit.phase === "update",
-          ).length,
+        () =>
+          cardIn(page, changedTaskId).getAttribute("data-state"),
         { timeout: 20_000, intervals: [500, 1_000] },
       )
-      .toBeGreaterThanOrEqual(1);
-    // Let the tick finish; the one changed card is the only update commit.
+      .toBe("placed");
+    // Let the tick settle so concurrent label flips are captured.
     await page.waitForTimeout(1_000);
+
+    const labelsAfterChange = await cardTimeLabels();
+    const changeLabelFlipIds = new Set(
+      Object.keys(labelsAfterChange).filter(
+        (id) => labelsAfterChange[id] !== labelsBeforeChange[id],
+      ),
+    );
     const changeReport = await getReport(page);
     const changedCommits = boardCardCommits(changeReport).filter(
       (commit) => commit.phase === "update",
     );
+    const targetCommits = changedCommits.filter(
+      (commit) => cardIdOf(commit) === changedTaskId,
+    );
+    const unexplainedCommits = changedCommits.filter(
+      (commit) => cardIdOf(commit) !== changedTaskId && !changeLabelFlipIds.has(cardIdOf(commit)),
+    );
+
+    // The changed card commits exactly once; any other commit must be a
+    // crossing relative-time label, never another card's data.
+    if (targetCommits.length !== 1 || unexplainedCommits.length !== 0) {
+      console.log(
+        "SCENARIO_E_DEBUG " +
+          JSON.stringify({
+            changedTaskId,
+            changedCommitValues: changedCommits,
+            changeLabelFlipIds: [...changeLabelFlipIds],
+          }),
+      );
+    }
+    expect(targetCommits.length, "the changed card commits exactly once").toBe(1);
     expect(
-      changedCommits.length,
-      "one tick commits only the card whose state changed",
-    ).toBe(1);
+      unexplainedCommits.length,
+      "no card commits except the changed one and time-label crossings",
+    ).toBe(0);
 
     const result = summarise(
       changeReport,
@@ -826,7 +894,9 @@ test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit 
       initialCommitTotalMs: Math.round(initial.reduce((sum, c) => sum + c.actualDuration, 0) * 100) / 100,
       initialCommitMaxMs: Math.round(Math.max(0, ...initial.map((c) => c.actualDuration)) * 100) / 100,
       quietTickCommits: quietCommits,
+      quietUnexplainedCommits: quietUnexplained.length,
       changedTickCommits: changedCommits.length,
+      changedCardCommits: targetCommits.length,
     };
     summaries.push(result);
     console.log(JSON.stringify(result, null, 2));

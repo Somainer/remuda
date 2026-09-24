@@ -468,7 +468,7 @@ describe("card render signature (commit:BoardCard probe contract)", () => {
     expect(after.sig).not.toBe(before.sig);
   });
 
-  it("flips when a pending interaction arrives or the session row updates", () => {
+  it("flips when a pending interaction arrives or the painted session row changes", () => {
     const task = item("running");
     const instances = [
       session({ id: "ins_1", taskId: task.id, lifecycle: "running", updatedAt: "2026-09-21T10:00:00Z" }),
@@ -485,12 +485,21 @@ describe("card render signature (commit:BoardCard probe contract)", () => {
     }).byId.get(task.id)!;
     expect(pending.sig).not.toBe(idle.sig);
 
-    const updated = buildBoardModel({
+    // A painted lifecycle change flips; two past timestamps that render the
+    // same date label deliberately do NOT (the card commits on visible text).
+    const changedLifecycle = buildBoardModel({
+      view: viewOf(task),
+      instances: [{ ...instances[0]!, lifecycle: "exited" }],
+      pendingInstanceIds: new Set(),
+    }).byId.get(task.id)!;
+    expect(changedLifecycle.sig).not.toBe(idle.sig);
+
+    const sameLabel = buildBoardModel({
       view: viewOf(task),
       instances: [{ ...instances[0]!, updatedAt: "2026-09-21T10:05:00Z" }],
       pendingInstanceIds: new Set(),
     }).byId.get(task.id)!;
-    expect(updated.sig).not.toBe(idle.sig);
+    expect(sameLabel.sig).toBe(idle.sig);
   });
 
   it("flips when the directory refcount changes the shared label", () => {
@@ -505,5 +514,35 @@ describe("card render signature (commit:BoardCard probe contract)", () => {
     const b = item("pending", { workspaceBinding: binding });
     const shared = buildBoardModel({ view: viewOf(a, b) }).byId.get(a.id)!;
     expect(shared.sig).not.toBe(alone.sig);
+  });
+
+  // The session timestamp contributes the RENDERED relative-time label, so a
+  // card commits only when the visible label crosses a boundary.
+  const TIME_TASK = item("running");
+  const TIME_AT = Date.parse("2026-09-21T12:00:00Z");
+  const timeCard = (nowMs: number) =>
+    buildBoardModel({
+      view: viewOf(TIME_TASK),
+      instances: [
+        session({ id: "ins_time", taskId: TIME_TASK.id, lifecycle: "running", updatedAt: "2026-09-21T12:00:00Z" }),
+      ],
+      nowMs,
+    }).byId.get(TIME_TASK.id)!;
+
+  it("keeps an equal signature while the relative-time label is unchanged (刚刚)", () => {
+    expect(timeCard(TIME_AT + 10_000).sig).toBe(timeCard(TIME_AT + 40_000).sig);
+  });
+
+  it("flips at the 45s boundary (刚刚 → Nm)", () => {
+    expect(timeCard(TIME_AT + 10_000).sig).not.toBe(timeCard(TIME_AT + 50_000).sig);
+  });
+
+  it("flips at a minute boundary (1m → 2m)", () => {
+    expect(timeCard(TIME_AT + 70_000).sig).not.toBe(timeCard(TIME_AT + 130_000).sig);
+  });
+
+  it("flips when the label leaves today (clock → 昨天/date)", () => {
+    // 26h ago is a previous calendar day in every timezone.
+    expect(timeCard(TIME_AT + 10_000).sig).not.toBe(timeCard(TIME_AT + 26 * 3_600_000).sig);
   });
 });

@@ -581,4 +581,138 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     await page.waitForTimeout(31_000);
     expect(requestedAt.length).toBe(burst);
   });
+
+  test("preview overlay: covered region is inert, polls do not refocus, move survives, Esc keeps the sidebar menu", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await login(page);
+    const fx = await makeFixture(page);
+    await page.goto("/board");
+    await page.getByTestId("sidebar-project-row").filter({ hasText: fx.projectName }).click();
+    await expect(page.getByTestId("board-page")).toBeVisible();
+    // Wait for the first projection to populate the columns (board visibility
+    // is true before the first /v1/board arrives); test 1 is slower and hid
+    // the race, the isolated focus run exposed it.
+    await expect(cardIn(page, fx.todo.id).getByTestId("board-card-open")).toBeVisible();
+
+    const focusInfo = () =>
+      page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        return {
+          testid: el?.getAttribute("data-testid") ?? null,
+          task: el?.closest('[data-testid="board-card"]')?.getAttribute("data-task-id") ?? null,
+          column: el?.closest('[data-testid="board-card"]')?.getAttribute("data-column") ?? null,
+          inInert: !!el?.closest("[inert]"),
+        };
+      });
+    const COVERED = new Set([
+      "board-card-open",
+      "board-card-archive",
+      "board-session",
+      "board-archive-toggle",
+      "board-index-open",
+    ]);
+
+    // Open the shared pending card's preview.
+    await cardIn(page, fx.todo.id).getByTestId("board-card-open").click();
+    const drawer = page.getByRole("dialog", { name: "任务预览" });
+    await expect(drawer).toBeVisible();
+    await expect(drawer).toBeFocused();
+
+    // ── #1 inert covered region + forward/reverse Tab ──────────────────────
+    // The covered region cannot be focused even by an explicit .focus().
+    expect(
+      await page.evaluate(() => {
+        const el = document.querySelector<HTMLElement>('[data-testid="board-card-archive"]');
+        el?.focus();
+        return {
+          testid: (document.activeElement as HTMLElement | null)?.getAttribute("data-testid"),
+          inert: !!el?.closest("[inert]"),
+        };
+      }),
+    ).toEqual({ testid: null, inert: true });
+    // Refocus the drawer for the keyboard walk.
+    await drawer.focus();
+
+    // Forward Tab walks the drawer only (never a covered control).
+    await page.keyboard.press("Tab");
+    let info = await focusInfo();
+    expect(info.testid).toBe("board-preview-open");
+    expect(COVERED.has(info.testid ?? "")).toBe(false);
+    await page.keyboard.press("Tab");
+    info = await focusInfo();
+    expect(info.testid).toBe("task-detail-open-session");
+    expect(info.inInert).toBe(false);
+
+    // Reverse Tab returns through the banner link into the task rail — never
+    // into a covered card behind the scrim.
+    await page.keyboard.press("Shift+Tab");
+    expect((await focusInfo()).testid).toBe("board-preview-open");
+    let reachedRail = false;
+    for (let i = 0; i < 10; i += 1) {
+      await page.keyboard.press("Shift+Tab");
+      info = await focusInfo();
+      expect(info.inInert, "reverse Tab never enters the covered region").toBe(false);
+      expect(
+        COVERED.has(info.testid ?? ""),
+        `reverse Tab never focuses a covered control (got ${info.testid})`,
+      ).toBe(false);
+      if (info.testid === "task-row" || info.testid === "task-session-link" || info.testid === "task-search") {
+        reachedRail = true;
+        break;
+      }
+    }
+    expect(reachedRail, "Shift+Tab from the drawer reaches the task rail").toBe(true);
+
+    // ── #2 a poll tick must not refocus the drawer ─────────────────────────
+    await page.focus('[data-testid="task-search"]');
+    expect((await focusInfo()).testid).toBe("task-search");
+    await page.waitForTimeout(6_000); // ≥ one 5s /v1/board poll
+    expect((await focusInfo()).testid).toBe("task-search");
+
+    await page.focus('[data-testid="board-preview-open"]');
+    await page.waitForTimeout(6_000);
+    expect((await focusInfo()).testid).toBe("board-preview-open");
+
+    // ── #3 Esc restore after the open task moves columns ──────────────────
+    await dispatchDrag(page, fx.todo.id, "in-progress");
+    await expect
+      .poll(
+        async () => cardIn(page, fx.todo.id).getAttribute("data-column"),
+        { timeout: 15_000 },
+      )
+      .toBe("in-progress");
+
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect
+      .poll(focusInfo, { timeout: 2_000 })
+      .toEqual(
+        expect.objectContaining({
+          testid: "board-card-open",
+          task: fx.todo.id,
+          column: "in-progress",
+        }),
+      );
+
+    // ── #4 Esc in the drawer must not close the sidebar 管理 menu ──────────
+    await page.getByTestId("sidebar-admin").click();
+    const adminMenu = page.getByRole("menu", { name: "管理" });
+    await expect(adminMenu).toBeVisible();
+    // Open a preview from the rail via keyboard (no outside pointerdown that
+    // would dismiss the menu): focus a rail row, then Enter.
+    await page
+      .locator('[data-testid="task-list"] [data-testid="task-row"]')
+      .first()
+      .evaluate((el) => (el as HTMLElement).focus());
+    await page.keyboard.press("Enter");
+    await expect(drawer).toBeVisible();
+    await expect(adminMenu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect(adminMenu).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(adminMenu).toHaveCount(0);
+  });
 });

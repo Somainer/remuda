@@ -36,6 +36,16 @@
   overflow: hidden;
 }
 
+/* Region covered by the preview scrim. It becomes inert while the drawer is
+   open (React sets the attribute), so its controls leave the tab order and
+   cannot be clicked — Tab only walks the rail and the drawer. */
+.boardContent {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .taskTotal {
   color: var(--fg-muted);
   font-size: var(--text-meta);

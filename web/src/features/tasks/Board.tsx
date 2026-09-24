@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ProfilerOnRenderCallback, Profiler } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { rest } from "../../lib/api";
 import { HubHttpError } from "../../lib/httpError";
@@ -11,7 +11,7 @@ import { buildTaskGroups, taskCardSignal } from "./taskRows";
 import { TaskDetailPanel } from "./TaskDetailPanel";
 import { boardPath, useProjectFilter, useProjects } from "./ProjectSwitcher";
 import { PageHeader } from "../../components/PageHeader";
-import { CommitProbe } from "../../components/CommitProbe";
+import { profilingEnabled, reportProbe } from "../../lib/profileFlags";
 import {
   BOARD_WORK_COLUMNS,
   buildBoardModel,
@@ -187,8 +187,12 @@ const BoardCardView = memo(
     const movable =
       !busy && BOARD_WORK_COLUMNS.some((workColumn) => card.drops[workColumn].allowed);
     const shownSessions = card.sessions.slice(0, CARD_SESSION_ROWS);
-    return (
-      <CommitProbe name="BoardCard">
+    // The commit probe carries the card id so scenario E can attribute each
+    // commit to the exact card that changed.
+    const onRender = useCallback<ProfilerOnRenderCallback>((_id, phase, actualDuration) => {
+      reportProbe("commit:BoardCard", { cardId: card.id, phase, actualDuration });
+    }, [card.id]);
+    const article = (
         <article
           className={`${css.card} ${selected ? css.cardSelected : ""} ${
             card.failed ? css.cardFailed : ""
@@ -269,7 +273,12 @@ const BoardCardView = memo(
             )}
           </footer>
         </article>
-      </CommitProbe>
+    );
+    if (!profilingEnabled) return article;
+    return (
+      <Profiler id="BoardCard" onRender={onRender}>
+        {article}
+      </Profiler>
     );
   },
   (prev, next) =>
@@ -366,6 +375,9 @@ function BoardColumnView({
 
 const noop = () => undefined;
 
+const cssEscape = (value: string): string =>
+  typeof CSS !== "undefined" && CSS.escape ? CSS.escape(value) : value.replace(/["\\]/g, "\\$&");
+
 // ── Page ──────────────────────────────────────────────────────────────────
 
 export function BoardPage() {
@@ -390,8 +402,10 @@ export function BoardPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Focus restoration for the preview drawer: the element that opened it.
-  const previewTrigger = useRef<HTMLElement | null>(null);
+  // Which surface opened the preview. On close we re-resolve the live card
+  // button for the task id (the card may have moved columns while the
+  // drawer was open); the captured node is only a fallback while connected.
+  const previewTrigger = useRef<{ taskId: string; from: "card" | "rail"; node: HTMLElement | null } | null>(null);
   const drawerRef = useRef<HTMLDivElement | null>(null);
 
   const projectName = useCallback(
@@ -468,39 +482,73 @@ export function BoardPage() {
   const modelRef = useRef(model);
   modelRef.current = model;
 
-  const openTask = useCallback((id: string) => {
-    previewTrigger.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const openTask = useCallback((id: string, from: "card" | "rail") => {
+    previewTrigger.current = {
+      taskId: id,
+      from,
+      node: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    };
     setSelectedId(id);
   }, []);
 
   const closePreview = useCallback(() => {
-    setSelectedId(null);
-    // Restore focus to the triggering card after React removes the drawer.
     const trigger = previewTrigger.current;
-    if (trigger) window.requestAnimationFrame(() => trigger.focus());
+    setSelectedId(null);
+    if (!trigger) return;
+    // Resolve AFTER the drawer unmounts. The card may have changed columns
+    // during the preview, so re-query the current card button by task id;
+    // the captured node is used only if that lookup misses but the node is
+    // still connected. Fallbacks: the rail row (rail-opened previews), then
+    // the rail search, so focus never lands on the covered board.
+    window.requestAnimationFrame(() => {
+      const selector = `[data-task-id="${cssEscape(trigger.taskId)}"]`;
+      const cardButton = document.querySelector<HTMLElement>(
+        `[data-testid="board-card"]${selector} [data-testid="board-card-open"]`,
+      );
+      if (cardButton?.isConnected) {
+        cardButton.focus();
+        return;
+      }
+      if (trigger.node?.isConnected) {
+        trigger.node.focus();
+        return;
+      }
+      if (trigger.from === "rail") {
+        const railRow = document.querySelector<HTMLElement>(
+          `[data-testid="task-row"]${selector}`,
+        );
+        if (railRow?.isConnected) {
+          railRow.focus();
+          return;
+        }
+      }
+      document.querySelector<HTMLElement>('[data-testid="task-search"]')?.focus();
+    });
   }, []);
 
-  // Esc closes the preview; focus returns to the triggering card. Esc also
-  // dismisses the folded rail overlay below 1024px.
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (selectedId) {
-        event.preventDefault();
-        closePreview();
-      } else if (indexOpen) {
-        setIndexOpen(false);
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [selectedId, indexOpen, closePreview]);
+  // Escape is handled on the board page React subtree (rail + drawer live
+  // inside it), never on document: stopPropagation here keeps the Shell
+  // sidebar 管理 menu's own document Escape listener from firing while the
+  // preview is open. With the preview closed, Escape still dismisses the
+  // folded rail overlay below 1024px.
+  const onPageKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key !== "Escape") return;
+    if (selectedId) {
+      event.preventDefault();
+      event.stopPropagation();
+      closePreview();
+    } else if (indexOpen) {
+      setIndexOpen(false);
+    }
+  };
 
-  // Move focus into the drawer while it is open.
+  // Move focus into the drawer only when the OPENED TASK changes. Keying on
+  // the id (not the selectedItem object) means a 5s poll — which rebuilds
+  // every model object — never re-steals focus from the rail search or a
+  // drawer link the user moved to.
   useEffect(() => {
-    if (selectedItem) drawerRef.current?.focus();
-  }, [selectedItem]);
+    if (selectedId) drawerRef.current?.focus();
+  }, [selectedId]);
 
   const moveCard = useCallback(
     async (card: BoardCard, column: WorkColumn) => {
@@ -587,7 +635,6 @@ export function BoardPage() {
     [model, moveCard],
   );
 
-  const onSelectStable = openTask;
   const onArchiveStable = useCallback(
     (id: string) => {
       const card = modelRef.current.byId.get(id);
@@ -596,10 +643,15 @@ export function BoardPage() {
     [archiveCard],
   );
 
+  // Stable selectors: a fresh identity each render would defeat the card
+  // memo's prop comparison and re-commit every card on every poll.
+  const onSelectCard = useCallback((id: string) => openTask(id, "card"), [openTask]);
+  const onSelectRail = useCallback((task: Task) => openTask(task.id, "rail"), [openTask]);
+
   const scopeTitle = projectId ? (projectName(projectId) ?? projectId) : "全局";
 
   return (
-    <div className={css.page} data-testid="board-page">
+    <div className={css.page} data-testid="board-page" onKeyDown={onPageKeyDown}>
       {indexOpen ? (
         <div
           className={css.railScrim}
@@ -624,96 +676,109 @@ export function BoardPage() {
             aria-label="搜索看板任务"
           />
         </div>
-        <TaskGroups groups={groups} variant="desktop" selectedId={selectedId} onSelect={(task) => openTask(task.id)} />
+        <TaskGroups
+          groups={groups}
+          variant="desktop"
+          selectedId={selectedId}
+          onSelect={onSelectRail}
+        />
       </aside>
 
       <main className={css.boardMain}>
-        <PageHeader
-          testId="board-header"
-          crumbs={[{ label: "任务看板", to: "/board" }]}
-          title={scopeTitle}
-          actions={
-            <>
-              <span className={css.taskTotal} data-testid="board-total">
-                {model.total} 个任务
-              </span>
-              <label className={css.archiveToggle}>
-                <input
-                  type="checkbox"
-                  data-testid="board-archive-toggle"
-                  checked={showArchived}
-                  onChange={(event) => setShowArchived(event.target.checked)}
-                />
-                <span>已归档 · {model.archived.length}</span>
-              </label>
-              <button
-                type="button"
-                className={css.indexOpen}
-                data-testid="board-index-open"
-                aria-expanded={indexOpen}
-                onClick={() => setIndexOpen((value) => !value)}
-              >
-                清单
-              </button>
-            </>
-          }
-        />
-
-        {error ? (
-          <p className={css.moveError} data-testid="board-move-error" role="alert">
-            <span aria-hidden="true">⚠ </span>
-            {error}
-          </p>
-        ) : null}
-
-        <div className={css.columns} data-testid="board-columns">
-          {BOARD_WORK_COLUMNS.map((column) => (
-            <BoardColumnView
-              key={column}
-              column={column}
-              label={model.columns.find((entry) => entry.column === column)?.label ?? ""}
-              cards={model.columns.find((entry) => entry.column === column)?.cards ?? []}
-              selectedId={selectedId}
-              draggedCard={draggedCard}
-              over={overColumn === column}
-              busyId={busyId}
-              onSelect={onSelectStable}
-              onArchive={onArchiveStable}
-              onDragCardStart={onCardDragStart}
-              onDragCardEnd={onCardDragEnd}
-              onColumnDragOver={onColumnDragOver}
-              onColumnDragLeave={onColumnDragLeave}
-              onColumnDrop={onColumnDrop}
-            />
-          ))}
-        </div>
-
-        {showArchived ? (
-          <section className={css.archiveFold} data-testid="board-archive-fold">
-            <header className={css.archiveHead}>
-              <span>已归档（过滤器，不是看板列；归档不改变状态）</span>
-              <span className={css.archiveCount}>{model.archived.length}</span>
-            </header>
-            {model.archived.length === 0 ? (
-              <p className={css.archiveEmpty}>暂无已归档任务</p>
-            ) : (
-              <div className={css.archiveCards}>
-                {model.archived.map((card) => (
-                  <BoardCardView
-                    key={card.id}
-                    card={card}
-                    selected={selectedId === card.id}
-                    busy={busyId === card.id}
-                    onSelect={onSelectStable}
-                    onArchive={noop}
-                    onDragStart={noop}
-                    onDragEnd={onCardDragEnd}
+        {/*
+          The region the scrim covers. While the preview is open it is inert:
+          the header actions, columns and archive fold leave the tab order and
+          cannot be activated, so forward/reverse Tab only walks the rail and
+          the drawer. The rail (a sibling) stays interactive.
+        */}
+        <div className={css.boardContent} inert={selectedItem ? true : undefined}>
+          <PageHeader
+            testId="board-header"
+            crumbs={[{ label: "任务看板", to: "/board" }]}
+            title={scopeTitle}
+            actions={
+              <>
+                <span className={css.taskTotal} data-testid="board-total">
+                  {model.total} 个任务
+                </span>
+                <label className={css.archiveToggle}>
+                  <input
+                    type="checkbox"
+                    data-testid="board-archive-toggle"
+                    checked={showArchived}
+                    onChange={(event) => setShowArchived(event.target.checked)}
                   />
-                ))}
-              </div>
-            )}
-          </section>
-        ) : null}
+                  <span>已归档 · {model.archived.length}</span>
+                </label>
+                <button
+                  type="button"
+                  className={css.indexOpen}
+                  data-testid="board-index-open"
+                  aria-expanded={indexOpen}
+                  onClick={() => setIndexOpen((value) => !value)}
+                >
+                  清单
+                </button>
+              </>
+            }
+          />
+
+          {error ? (
+            <p className={css.moveError} data-testid="board-move-error" role="alert">
+              <span aria-hidden="true">⚠ </span>
+              {error}
+            </p>
+          ) : null}
+
+          <div className={css.columns} data-testid="board-columns">
+            {BOARD_WORK_COLUMNS.map((column) => (
+              <BoardColumnView
+                key={column}
+                column={column}
+                label={model.columns.find((entry) => entry.column === column)?.label ?? ""}
+                cards={model.columns.find((entry) => entry.column === column)?.cards ?? []}
+                selectedId={selectedId}
+                draggedCard={draggedCard}
+                over={overColumn === column}
+                busyId={busyId}
+                onSelect={onSelectCard}
+                onArchive={onArchiveStable}
+                onDragCardStart={onCardDragStart}
+                onDragCardEnd={onCardDragEnd}
+                onColumnDragOver={onColumnDragOver}
+                onColumnDragLeave={onColumnDragLeave}
+                onColumnDrop={onColumnDrop}
+              />
+            ))}
+          </div>
+
+          {showArchived ? (
+            <section className={css.archiveFold} data-testid="board-archive-fold">
+              <header className={css.archiveHead}>
+                <span>已归档（过滤器，不是看板列；归档不改变状态）</span>
+                <span className={css.archiveCount}>{model.archived.length}</span>
+              </header>
+              {model.archived.length === 0 ? (
+                <p className={css.archiveEmpty}>暂无已归档任务</p>
+              ) : (
+                <div className={css.archiveCards}>
+                  {model.archived.map((card) => (
+                    <BoardCardView
+                      key={card.id}
+                      card={card}
+                      selected={selectedId === card.id}
+                      busy={busyId === card.id}
+                      onSelect={onSelectCard}
+                      onArchive={noop}
+                      onDragStart={noop}
+                      onDragEnd={onCardDragEnd}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          ) : null}
+        </div>
 
         {selectedItem ? (
           <div className={css.previewScrim} data-testid="board-preview-scrim" onClick={closePreview}>
@@ -721,6 +786,7 @@ export function BoardPage() {
               ref={drawerRef}
               className={css.previewDrawer}
               role="dialog"
+              aria-modal="false"
               aria-label="任务预览"
               tabIndex={-1}
               onClick={(event) => event.stopPropagation()}

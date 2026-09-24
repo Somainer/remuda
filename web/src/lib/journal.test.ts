@@ -394,3 +394,25 @@ it("a contiguous socket batch supersedes a pending resume read that later reject
   expect(client.status).toBe("live");
   expect(onStatus).not.toHaveBeenCalledWith("readonly-stale");
 });
+
+it("an existing client's snapshot never advances applied past un-emitted rows (bounded tail 3001-5000, applied=1)", () => {
+  const read = vi.fn(async () =>
+    page([obs(3001), obs(3002)], {
+      durableSeq: "5000",
+      windowFromSeq: "3001",
+      reachedAfterSeq: false,
+    }),
+  );
+  const client = new JournalClient("obj_gap2", read);
+  // Existing client already applied seq 1.
+  client.applySnapshot(snapshot(1));
+  expect(client.appliedSeq).toBe("1");
+  // A bounded snapshot (3001..) must NOT jump applied to 5000; rows 2..3000
+  // are un-emitted. applied stays at 1 and the cursor is recovered via
+  // follow frames / resumeAfterReconnect, not the snapshot.
+  client.applySnapshot({
+    ...snapshot(5000),
+    history: { earliestRetainedSeq: "3001", complete: false },
+  });
+  expect(client.appliedSeq).toBe("1");
+});

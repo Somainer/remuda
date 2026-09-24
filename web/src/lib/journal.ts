@@ -71,6 +71,8 @@ export class JournalClient {
   private listeners: JournalListener;
   private read: JournalRead;
   private filling = false;
+  /** The single shared in-flight gap-fill (concurrent onGap/resume join it). */
+  private fillingPromise: Promise<U64 | null> | null = null;
   private loadingEarlier = false;
   status: "live" | "reconnecting" | "gap-backfill" | "readonly-stale" = "live";
   /** Bumped per resumeAfterReconnect; stale attempts are no-ops. */
@@ -111,8 +113,16 @@ export class JournalClient {
   }
 
   applySnapshot(snapshot: Snapshot): void {
-    this.applied = n(snapshot.asOfSeq);
-    this.durableSeq = n(snapshot.asOfSeq);
+    const target = n(snapshot.asOfSeq);
+    this.durableSeq = Math.max(this.durableSeq, target);
+    // Never advance the applied cursor past rows the client has not EMITTED.
+    // Fresh client on the initial seed jumps to the snapshot cursor; an
+    // existing client keeps its applied cursor and catches up via the
+    // follow's live frames / resumeAfterReconnect (a snapshot that claims a
+    // higher cursor while rows are missing must not skip them).
+    if (this.applied === 0 && this.buffer.size === 0) {
+      this.applied = target;
+    }
     const nextFloor = n(snapshot.history.earliestRetainedSeq);
     // A partial snapshot carries a WINDOW floor, not a retention floor: it can
     // move up as the journal grows, and load-earlier must remember the lowest
@@ -176,12 +186,29 @@ export class JournalClient {
    * client settles readonly-stale instead of buffering forever.
    */
   async fillGap(from: U64, to: U64, gen?: number): Promise<U64 | null> {
-    if (this.filling) return null;
+    // Share one in-flight fill: a second onGap (or resume) for a gap already
+    // being backfilled joins the SAME promise rather than racing two reads /
+    // two status transitions.
+    if (this.fillingPromise) return this.fillingPromise;
     if (this.status === "readonly-stale") return null;
-    // A newer resume/socket recovery supersedes this fill: its status writes
-    // must never downgrade the client.
-    const stale = () => gen !== undefined && gen !== this.resumeGen;
+    // Capture the current resume generation by default (every fill is
+    // generation-guarded, not just explicit callers).
+    const ownerGen = gen ?? this.resumeGen;
+    const stale = () => ownerGen !== this.resumeGen;
     this.filling = true;
+    const run = this.doFillGap(from, to, stale);
+    this.fillingPromise = run.finally(() => {
+      this.filling = false;
+      this.fillingPromise = null;
+    });
+    return this.fillingPromise;
+  }
+
+  private async doFillGap(
+    from: U64,
+    to: U64,
+    stale: () => boolean,
+  ): Promise<U64 | null> {
     this.setStatus("gap-backfill");
     const gapFrom = n(from);
     const gapTo = n(to);
@@ -259,8 +286,6 @@ export class JournalClient {
       if (stale()) return null;
       this.setStatus("readonly-stale");
       return null;
-    } finally {
-      this.filling = false;
     }
   }
 

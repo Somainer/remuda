@@ -37,7 +37,9 @@ const upstream = (process.env.VITE_E2E_UPSTREAM || `http://${process.env.HUB_E2E
   "",
 );
 const GATEWAY_NAME = "e2e-uo13-gateway";
-const GATEWAY_TOKEN = "sk-e2e-uo13-evidence-qqqq";
+// Declared dummy (scripts/ci/secret-scan.py DUMMY_PART): the -fake- segment
+// keeps this obviously non-live for the landing gate's secret scanner.
+const GATEWAY_TOKEN = "sk-fake-e2e-uo13-gateway";
 
 async function shoot(page: Page, surface: string, mode: Mode, width: number): Promise<void> {
   await setMode(page, mode);

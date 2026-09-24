@@ -401,6 +401,8 @@ stateDiagram-v2
 
 图中的 `answer_committed` 对应 wire `answer-committed`。同一请求重放不产生第二个卡片；有答案的请求永不回到可回答 pending。`resolved` 只表示原生不再等待，不保证选择了 allow，也不保证工具已执行成功；必须读 resolution、delivery 与 application 字段。
 
+> **Hub 终结归属（2026-09-25，c-deadcards）**：当 instance 因任何原因进入终态（Node 新 epoch/reconcile 报告缺失、显式 kill/close/delete、Node 回复未知实例、launch 被拒、host-lost 到期、journaled exit/fail lifecycle），Hub 在写 instance 终态的**同一事务**里把该实例仍为 `pending` 的 durable interaction 置为 `invalidated`，清 `blocking`，entity 带 `resolution.reason=generation-ended`。这复用既有 `pending → invalidated（generation 结束）` 边，不引入新状态；幂等（仅改 `state='pending'` 的行）。终结后迟到的 answer 在任何 Node CAS / 转发**之前**被拒绝：`invalidated`/不存在 → 404，`expired` → 410，`answer-committed`/`resolved` → 409，绝不 500、绝不静默成功、绝不向可能仍存在的 hook 放行 allow。`GET /v1/interactions` 返回全部 pending 加最近（24h）终结行用于「已离队」展示；严格 pending 计数（推送角标）继续只读 pending。
+
 ### 2.7 工作区当前变更（只读 SCM 快照）
 
 工作台「工作区当前变更」视图只由 Node 对**注册工作区当前工作树**的实时只读计算支撑（[files-view-contract.md](./files-view-contract.md) §3）。这是三个 Hub→Node JSON-RPC 与三个 operator-only Hub REST 代理；不新增 observation kind、不写 journal、Hub 不缓存任何文件内容或 diff。方法名进入 Node 的显式 `match`，不能依赖 WSS 派发的 `{"ok":true}` 兜底。

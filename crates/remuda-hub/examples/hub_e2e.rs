@@ -1143,25 +1143,37 @@ async fn fake_node(
                     // reload. Nothing here is pre-ended.
                     if prompt.contains("ghostbadge-live") {
                         let iid = InteractionId::new();
-                        // Long enough that the e2e's create -> restart ->
-                        // reconcile path finishes while the card is still
-                        // open (it asserts 1/1 before watching the flip);
-                        // the spec waits on the flip with a generous timeout.
-                        let deadline_ts =
-                            time::OffsetDateTime::now_utc() + time::Duration::seconds(45);
-                        let deadline = format!(
-                            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-                            deadline_ts.year(),
-                            deadline_ts.month() as u8,
-                            deadline_ts.day(),
-                            deadline_ts.hour(),
-                            deadline_ts.minute(),
-                            deadline_ts.second(),
-                            deadline_ts.millisecond(),
-                        );
+                        // c-deadcards adds the UNKNOWN-deadline variant:
+                        // `ghostbadge-live-nodeadline` journals a live card
+                        // with deadline.state=unknown, so nothing but the
+                        // instance-end settlement can retire it. The default
+                        // sentinel keeps a short known deadline for the
+                        // clock-flip coverage.
+                        let unknown_deadline = prompt.contains("ghostbadge-live-nodeadline");
                         let mut card = fake_approval(&instance_id, host, iid.as_id().as_str());
-                        card["deadline"] = json!({ "state": "known", "value": deadline });
-                        card["deadlineSource"] = json!("runtime-policy");
+                        if unknown_deadline {
+                            card["deadline"] = json!({ "state": "unknown" });
+                            card["deadlineSource"] = json!("none");
+                        } else {
+                            // Long enough that the e2e's create -> restart ->
+                            // reconcile path finishes while the card is still
+                            // open (it asserts 1/1 before watching the flip);
+                            // the spec waits on the flip with a generous timeout.
+                            let deadline_ts =
+                                time::OffsetDateTime::now_utc() + time::Duration::seconds(45);
+                            let deadline = format!(
+                                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                                deadline_ts.year(),
+                                deadline_ts.month() as u8,
+                                deadline_ts.day(),
+                                deadline_ts.hour(),
+                                deadline_ts.minute(),
+                                deadline_ts.second(),
+                                deadline_ts.millisecond(),
+                            );
+                            card["deadline"] = json!({ "state": "known", "value": deadline });
+                            card["deadlineSource"] = json!("runtime-policy");
+                        }
                         append_n = append_interaction_requested(
                             &mut ws,
                             &mut frame_queue,

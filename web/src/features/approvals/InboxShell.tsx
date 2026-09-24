@@ -241,12 +241,19 @@ export function DepartedList({
       <div className={desktopCss.departedLabel}>已离队</div>
       {rows.map((row) => {
         const base = desktopView(row, workspaceLabel(row.instance?.workspaceId ?? ""));
+        // c-deadcards: a Hub-invalidated card (generation ended) shares the
+        // superseded projection but its reason is the process ending, not
+        // another device answering.
+        const stateText =
+          row.item.state === "invalidated"
+            ? "进程已结束，未作用于新进程"
+            : DEPARTED_STATUS_TEXT[row.uiState as "expired" | "superseded"];
         return (
           <DepartedRow
             key={row.item.id}
             view={{
               ...base,
-              stateText: DEPARTED_STATUS_TEXT[row.uiState as "expired" | "superseded"],
+              stateText,
               title: decisionTitle(row.item),
               previewText: decisionPreview(row.item),
             }}

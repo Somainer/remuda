@@ -673,6 +673,8 @@ Bot / `claude-print` 实例没有终端 tab。Artifact 产物页走订阅登录�
 | superseded | 别的设备先答；本设备按钮变「已在 Mac 处理」 |
 | paused | Node Agent 断线；禁止点，文案「主机离线，交互暂停」（`m-inbox-paused`） |
 
+> **Instance 终结即离队（2026-09-25，c-deadcards）**：Hub 在 instance 进入终态（Node 新 epoch/重启 reconcile、kill/close/delete、Node 报未知实例、launch 被拒、host-lost 到期、journaled exit/fail）的同一事务把该实例仍 `pending` 的卡置为 `invalidated`（`resolution.reason=generation-ended`）。UI 把 `invalidated` 投影为 superseded 一族（进程已结束，非「别的设备已答」）：compact 不渲染（无第三档），桌面进「已离队」；迟到回答得到 404（expired=410，已答=409），不是 500 也不是静默成功。未知 deadline 的卡也因此必然离队，不再依赖客户端到期投影。
+
 **字段** `interactionId, instanceId, hostId, type, title, preview, carrier?, createdAt, expiresAt, answeredByDeviceId?`
 
 **决策卡（`approval-row`）**：surface 底，1px `--border`，8px 圆角，内边距 20px 24px（手机 16px）；`?focus=` 命中的卡加 2px `--focus` 环。从上到下：

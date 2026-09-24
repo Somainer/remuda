@@ -2035,7 +2035,7 @@ impl Store {
     /// Hub-owned projection only: never forge a Node journal cursor or native completion.
     pub async fn expire_lost_hosts(&self, grace_ms: u64) -> Result<usize, StoreError> {
         self.run_named("expire_lost_hosts", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let grace = grace_ms.min(i64::MAX as u64) as i64;
             // Find the rows this sweep is about to end so their pending
@@ -2915,7 +2915,7 @@ impl Store {
             // The instance settlement and the interaction invalidation
             // (c-deadcards) commit in ONE transaction: an inbox must never
             // observe an exited instance whose card is still actionable.
-            let tx = conn.transaction()?;
+            let tx = immediate_tx(conn)?;
             let mut stmt = tx.prepare(
                 "SELECT id FROM instances
                  WHERE host_id = ?1 AND lifecycle NOT IN ('exited', 'failed', 'requested')",
@@ -2954,7 +2954,7 @@ impl Store {
         window_ms: u64,
     ) -> Result<Vec<(String, String)>, StoreError> {
         self.run_named("expire_stale_requested", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let window = window_ms.min(i64::MAX as u64) as i64;
             let mut stmt = tx.prepare(
@@ -2999,7 +2999,7 @@ impl Store {
             // c-deadcards: settle the instance and invalidate its still-pending
             // interactions atomically (explicit stop/kill/delete, or a stop for
             // an instance the Node no longer knows).
-            let tx = conn.transaction()?;
+            let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             let changed = tx.execute(
                 "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
@@ -3345,7 +3345,7 @@ impl Store {
         last_error: String,
     ) -> Result<(), StoreError> {
         self.run_named("fail_instance", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
             tx.execute(
                 "UPDATE instances
@@ -8955,6 +8955,16 @@ fn knowledge_value(value: Option<&Value>) -> Option<&str> {
 /// Terminal interaction states that no longer answer and leave the actionable
 /// queue.
 const TERMINAL_INSTANCE_LIFECYCLES: &[&str] = &["exited", "failed", "closed"];
+
+/// Open a write transaction that takes the RESERVED lock immediately
+/// (`BEGIN IMMEDIATE`). A read-then-write job MUST use this rather than a
+/// deferred transaction: a deferred tx first acquires a SHARED lock on its
+/// SELECT and then has to upgrade to EXCLUSIVE at commit, which deadlocks with
+/// SQLITE_BUSY if a pooled reader still holds SHARED (busy_timeout cannot
+/// resolve that upgrade). IMMEDIATE waits on the busy timeout instead.
+pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+}
 
 /// c-deadcards: invalidate every still-`pending` interaction owned by
 /// `instance_ids` when those instances settle into a terminal lifecycle

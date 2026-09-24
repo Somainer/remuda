@@ -343,7 +343,7 @@ impl Store {
         instances: Vec<Value>,
     ) -> Result<(), StoreError> {
         self.run_named("reconcile_daemon_instances", move |conn| {
-            let tx = conn.transaction()?;
+            let tx = crate::store::immediate_tx(conn)?;
             // c-deadcards: instances a daemon report transitions INTO a
             // terminal lifecycle have their pending interactions invalidated
             // in the same transaction.

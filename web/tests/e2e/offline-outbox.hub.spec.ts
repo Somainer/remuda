@@ -325,6 +325,12 @@ test("a committed POST whose browser response is lost retries with replayed:true
   const statusPattern = /\/v1\/instances\/[^/]+\/commands\/cmd_/;
   const replayResults: boolean[] = [];
   let firstPostLost = false;
+  // Gate the retry so the row's intermediate state is observable instead of
+  // the local harness completing the re-POST within milliseconds.
+  let releaseRetry: (() => void) | null = null;
+  const retryGate = new Promise<void>((resolve) => {
+    releaseRetry = resolve;
+  });
 
   await page.context().route(commandsPattern, async (route) => {
     if (route.request().method() !== "POST") return route.continue();
@@ -336,7 +342,10 @@ test("a committed POST whose browser response is lost retries with replayed:true
       // … then lose the browser's response (the wire dropped after commit).
       return route.abort("failed");
     }
-    // The same-id retry reaches the Hub, which dedupes and replays.
+    // The same-id retry parks until the test releases it, so the row is held
+    // in-flight (已发送，等待确认) — delivered to the Hub, never 状态待确认 —
+    // before the replay answer settles it.
+    await retryGate;
     const retry = await route.fetch();
     expect(retry.status()).toBe(200);
     const body = (await retry.json()) as { command?: { commandId?: string }; replayed?: boolean };
@@ -354,11 +363,14 @@ test("a committed POST whose browser response is lost retries with replayed:true
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
-  // After the lost response the row honestly returns to waiting (等待发送)
-  // while the bounded same-id retry is pending — never a premature receipt.
-  await expect(bubble).toContainText("等待发送", { timeout: 5_000 });
 
-  // The Hub answered the retry with replayed:true.
+  // While the parked retry is in flight the row says 已发送，等待确认
+  // (it reached the Hub), never 状态待确认 and never a terminal rejection.
+  await expect(bubble).toContainText("已发送，等待确认", { timeout: 15_000 });
+  await expect(bubble).not.toContainText("状态待确认");
+
+  // Release the retry: the Hub dedupes and answers replayed:true.
+  releaseRetry?.();
   await expect.poll(() => replayResults.length).toBeGreaterThan(0);
   expect(replayResults[0]).toBe(true);
 

@@ -133,20 +133,51 @@
 }
 
 /* Touch has no hover, and a phone-sized window wants the fat hit area even
-   when a mouse is driving it: the toolbar is always shown, the buttons carry
-   the full 44px hit area, and — because it is always shown there — the pre
-   keeps a toolbar lane so it never sits on top of code text. Placed AFTER
-   every base rule it overrides (equal specificity; source order breaks it). */
+   when a mouse is driving it. There the toolbar becomes a compact 32px header
+   row inside the block — language left in the faint ink, actions right —
+   instead of a floating pill over a reserved lane. Each action is a 44px box
+   whose extra height hangs below the row into the pre's top padding (never
+   over code text), so the reach is 44px while the visible row stays 32px.
+   Placed AFTER every base rule it overrides (equal specificity; source order
+   breaks it). */
 @media (pointer: coarse), (max-width: 560px) {
   .toolbar {
+    position: relative;
+    top: auto;
+    right: auto;
+    align-items: flex-start;
+    height: 32px;
+    gap: 0;
+    padding: 0 0 0 14px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
     opacity: 1;
+  }
+  .label,
+  .note {
+    line-height: 32px;
+    color: var(--fg-faint);
+  }
+  .label {
+    padding: 0 var(--space-2) 0 0;
+  }
+  .toolbar .button:first-of-type {
+    margin-left: auto;
   }
   .button {
     width: var(--touch);
     height: var(--touch);
+    margin-bottom: calc(32px - var(--touch));
+    padding-bottom: calc(var(--touch) - 32px);
+    background: transparent;
+  }
+  .button:hover,
+  .button[data-active="true"] {
+    background: transparent;
   }
   .root .pre {
-    padding-top: 56px;
+    padding-top: var(--space-3);
   }
 }
 

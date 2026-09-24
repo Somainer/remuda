@@ -296,6 +296,14 @@ a.count {
   color: var(--fg-muted);
 }
 
+/* Install flag: its own column so it survives every width (unlike cliVer). */
+.cliFlag {
+  flex: none;
+  width: 110px;
+  color: var(--fg-body);
+  white-space: nowrap;
+}
+
 .cliAuth {
   display: flex;
   flex: none;
@@ -342,6 +350,18 @@ a.count {
   display: block;
   margin: 0;
   color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Non-blocking doctor findings and offline hints use the attention role;
+   red stays reserved for blockers and hard failures (D-053 §2). */
+.sshWarning {
+  display: block;
+  margin: 0;
+  color: var(--attention-fg);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
   white-space: normal;
@@ -430,10 +450,16 @@ a.count {
   color: var(--attention-fg);
 }
 
+/* One compact breakpoint: below 1024 the desktop cells collapse and the
+   one-line mobile summary (status · CLI · sessions) takes over. There is no
+   width where the words exist in neither place. */
 @media (max-width: 1023px) {
-  .cellTransport,
-  .cellRtt {
+  .cell {
     display: none;
+  }
+
+  .mobileMeta {
+    display: block;
   }
 }
 
@@ -441,14 +467,6 @@ a.count {
   .row {
     gap: var(--space-2);
     padding: 0 var(--space-3);
-  }
-
-  .cell {
-    display: none;
-  }
-
-  .mobileMeta {
-    display: block;
   }
 
   .metrics {
@@ -471,8 +489,17 @@ a.count {
     color: var(--fg-muted);
   }
 
+  /* The version column hides on phones; the install flag has its own class
+     so 「已安装 / 未安装」 stays on the row next to the kind. */
   .cliVer {
     display: none;
+  }
+
+  .cliFlag {
+    flex: none;
+    width: auto;
+    order: 1;
+    align-self: center;
   }
 
   .cliAuth {

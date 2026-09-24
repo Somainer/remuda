@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildBroadcastBody, orderResults, summarize, type BroadcastForm } from "./broadcast";
+import { buildBroadcastBody, deliveryState, orderResults, summarize, type BroadcastForm } from "./broadcast";
 
 function form(over: Partial<BroadcastForm> = {}): BroadcastForm {
   return { mode: "prompt", text: "PAUSE", key: "enter", filter: { hostId: "", kind: "" }, ...over };
@@ -68,5 +68,32 @@ describe("fleet broadcast results", () => {
   it("tolerates a response with no results array", () => {
     expect(orderResults({})).toEqual([]);
     expect(summarize({})).toBe("已接受 0 · 失败 0 · 跳过 0");
+  });
+});
+
+describe("fleet delivery state (D-053 §2)", () => {
+  it("an accepted but unforwarded command is queued, never confirmed", () => {
+    expect(deliveryState({ ok: true, forwarded: false, state: "queued" })).toBe("queued");
+  });
+
+  it("a forwarded command whose outcome is unknown is only forwarded", () => {
+    expect(deliveryState({ ok: true, forwarded: true, state: "accepted" })).toBe("forwarded");
+    expect(deliveryState({ ok: true, forwarded: true, state: "settled", resolution: "unknown" })).toBe("forwarded");
+  });
+
+  it("green confirmed needs an authoritative completed settlement", () => {
+    expect(deliveryState({ ok: true, forwarded: true, state: "settled", resolution: "completed" })).toBe(
+      "confirmed",
+    );
+  });
+
+  it("keeps replays, explicit rejections and transport failures distinct", () => {
+    expect(deliveryState({ ok: true, replayed: true, state: "settled", resolution: "completed" })).toBe(
+      "replayed",
+    );
+    expect(deliveryState({ ok: true, forwarded: true, state: "settled", resolution: "rejected" })).toBe(
+      "forwarded",
+    );
+    expect(deliveryState({ ok: false, error: "host offline" })).toBe("failed");
   });
 });

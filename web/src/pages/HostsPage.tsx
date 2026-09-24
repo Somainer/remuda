@@ -44,14 +44,14 @@ function statusText(host: HostView): string {
   return "离线 —";
 }
 
-/** The one-line summary phones get in place of the desktop cells. */
+/** The one-line summary shown below 1024px: status, CLI inventory and the
+ *  session count are appended for every state, so phones keep all facts. */
 function mobileSummary(host: HostView): string {
-  if (host.state === "connecting") return "连接中…";
-  if (host.online) {
-    return `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}`;
-  }
-  const head = isStaleOffline(host) ? "状态待确认" : "离线";
-  const seen = host.lastSeenAt ? ` · 最后心跳 ${host.lastSeenAt.slice(11, 16)}` : "";
+  let head: string;
+  if (host.state === "connecting") head = "连接中…";
+  else if (host.online) head = `在线${host.rttMs != null ? ` ${host.rttMs}ms` : ""}`;
+  else head = isStaleOffline(host) ? "状态待确认" : "离线";
+  const seen = !host.online && host.lastSeenAt ? ` · 最后心跳 ${host.lastSeenAt.slice(11, 16)}` : "";
   const cli = cliSummary(host.cli) ? ` · ${cliSummary(host.cli)}` : "";
   return `${head}${seen}${cli} · 会话 ${host.instanceCount}`;
 }
@@ -301,7 +301,7 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
                     <span className={cli.auth === "logged_in" || cli.auth === "gateway-native" ? css.dotAuth : css.dotUnknown} />
                     {cli.auth}
                   </span>
-                  <span className={css.cliVer} data-testid="host-cli-flags">
+                  <span className={css.cliFlag} data-testid="host-cli-flags">
                     已安装
                     {cli.kind === "claude" ? ` · nativeGateway ${cli.nativeGateway || cli.auth === "gateway-native" ? "true" : "false"}` : ""}
                   </span>
@@ -321,7 +321,7 @@ function HostDetail({ host, workspaces }: { host: HostView; workspaces: Workspac
                     <span className={css.dotUnknown} />
                     {cli.auth}
                   </span>
-                  <span className={css.cliVer} data-testid="host-cli-flags">未安装</span>
+                  <span className={css.cliFlag} data-testid="host-cli-flags">未安装</span>
                 </div>
               ))}
             </div>

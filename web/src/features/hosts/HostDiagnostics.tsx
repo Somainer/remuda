@@ -60,8 +60,14 @@ function HostDiagnosticsRequest({ hostId, online, cli }: { hostId: Id; online: b
     {!online ? <p role="status" className={css.meta}>主机离线，无法检查当前权限</p> : null}
     {error ? <p role="alert" className={css.sshError}>{error}</p> : null}
     {report && findings.length === 0 ? <p role="status" className={css.meta}>主机检查通过</p> : null}
-    {findings.map((check) => <p key={check.name} role={check.status === "blocker" ? "alert" : "status"} className={css.sshError}>
-      {check.message}
-    </p>)}
+    {findings.map((check) => (
+      <p
+        key={check.name}
+        role={check.status === "blocker" ? "alert" : "status"}
+        className={check.status === "blocker" ? css.sshError : css.sshWarning}
+      >
+        {check.message}
+      </p>
+    ))}
   </section>;
 }

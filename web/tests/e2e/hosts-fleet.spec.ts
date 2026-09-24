@@ -38,7 +38,7 @@ test.describe("hosts + fleet", () => {
     await page.locator('[data-testid=host-row][data-label=devbox-sg]').click();
     await expect(page.getByTestId("host-detail")).toBeVisible();
     await expect(page.getByTestId("host-cli").first()).toContainText("claude");
-    await expect(page.getByTestId("host-cli").first()).toContainText("/home/");
+    await expect(page.getByTestId("host-cli").first()).toContainText("/opt/claude/");
     await expect(page.getByTestId("host-max-instances")).toBeVisible();
   });
 

@@ -4,6 +4,7 @@ import { useHub } from "../lib/store";
 import { rest } from "../lib/api";
 import { PageHeader } from "../components/PageHeader";
 import ui from "../styles/ui.module.css";
+import css from "./projects.module.css";
 import {
   ProjectSwitcher,
   projectFilterStore,
@@ -88,30 +89,32 @@ export function ProjectsPage() {
           {!loading && !error && visible.length === 0 ? (
             <p className={ui.listMeta}>{selected ? "所选项目不在当前范围内。" : "范围内还没有项目。"}</p>
           ) : null}
-          <div style={SURFACE_LIST}>
-            {visible.map((project) => {
-              const hosts = projectMemberHostIds(project);
-              return (
-                <Link
-                  key={project.id}
-                  to={`/projects/${project.id}`}
-                  className={ui.listItem}
-                  data-testid="project-row"
-                  onClick={() => openProject(project.id)}
-                >
-                  <span>
-                    <div>{project.name}</div>
-                    <div className={ui.listMeta}>
-                      {project.members?.length ?? 0} 个成员 · {hosts.length} 台主机 · 基线 {project.defaultBaseBranch ?? "main"}
-                    </div>
-                    <div className={ui.listMeta}>
-                      {hosts.map((hostId) => hostLabel(hostId)).join(" · ") || "尚无成员工作区"}
-                    </div>
-                  </span>
-                </Link>
-              );
-            })}
-          </div>
+          {visible.length > 0 ? (
+            <div style={SURFACE_LIST}>
+              {visible.map((project) => {
+                const hosts = projectMemberHostIds(project);
+                return (
+                  <Link
+                    key={project.id}
+                    to={`/projects/${project.id}`}
+                    className={ui.listItem}
+                    data-testid="project-row"
+                    onClick={() => openProject(project.id)}
+                  >
+                    <span className={css.rowBody}>
+                      <div className={css.rowName}>{project.name}</div>
+                      <div className={ui.listMeta}>
+                        {project.members?.length ?? 0} 个成员 · {hosts.length} 台主机 · 基线 {project.defaultBaseBranch ?? "main"}
+                      </div>
+                      <div className={ui.listMeta}>
+                        {hosts.map((hostId) => hostLabel(hostId)).join(" · ") || "尚无成员工作区"}
+                      </div>
+                    </span>
+                  </Link>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

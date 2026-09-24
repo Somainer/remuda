@@ -118,9 +118,9 @@ const workspaces: Workspace[] = [
     ...meta(workspaceId),
     hostId,
     label: "sfe-root",
-    rootPath: "/home/devuser/Projects/sfe-root",
+    rootPath: "/opt/projects/sfe-root",
     writePolicy: "workspace-write",
-    canonicalRoot: known("/home/devuser/Projects/sfe-root"),
+    canonicalRoot: known("/opt/projects/sfe-root"),
   },
 ];
 
@@ -833,10 +833,10 @@ function addPty(kind: Kind, driver: DriverKind, name: string, activity: Instance
   return ins.id;
 }
 
-const wspCodex = addWorktree("codex-worker", "wt/x-codexdrv/wire-review", "/home/dev/projects/remuda-wt/x-codexdrv");
-const wspGrok = addWorktree("grok-canary", "wt/x-acpwire/canary", "/home/dev/projects/remuda-wt/x-acpwire");
-const wspAgy = addWorktree("agy-board", "wt/x-design/agent-board", "/home/dev/projects/remuda-wt/x-design2");
-const wspClaudePty = addWorktree("claude-pty", "wt/x-tty/push-ui", "/home/dev/projects/remuda-wt/x-tty");
+const wspCodex = addWorktree("codex-worker", "wt/x-codexdrv/wire-review", "/opt/projects/remuda-wt/x-codexdrv");
+const wspGrok = addWorktree("grok-canary", "wt/x-acpwire/canary", "/opt/projects/remuda-wt/x-acpwire");
+const wspAgy = addWorktree("agy-board", "wt/x-design/agent-board", "/opt/projects/remuda-wt/x-design2");
+const wspClaudePty = addWorktree("claude-pty", "wt/x-tty/push-ui", "/opt/projects/remuda-wt/x-tty");
 
 export const mockBoardIds = {
   insCodexPty: addPty("codex", "generic-pty", "codex-worker", known("working"), wspCodex, [

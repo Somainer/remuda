@@ -115,6 +115,17 @@
   white-space: nowrap;
 }
 
+/* Human display name: system sans, not monospace. Machine ids use .id. */
+.name {
+  overflow: hidden;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 500;
+  line-height: var(--lh-title);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .dashTitle {
   color: var(--fg-strong);
   font-size: var(--text-ui);
@@ -518,6 +529,14 @@
   line-height: var(--lh-meta);
 }
 
+/* Pre-save advisory (offline proxy host, …): attention, not failure red. */
+.warning {
+  margin: 0;
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
 /* ----------------------------------------------------------------- */
 /* Provider form (inside the modal): segmented kind/scope/delivery.   */
 /* ----------------------------------------------------------------- */
@@ -605,5 +624,73 @@
 
   .modelBulkBtn {
     flex: 1 1 auto;
+  }
+}
+
+/* ----------------------------------------------------------------- */
+/* Coarse pointers: visible glyphs stay compact, hit areas grow to    */
+/* 44px with a non-overlapping ::after (visual-system.md §8.2/§6.2).  */
+/* ----------------------------------------------------------------- */
+
+@media (pointer: coarse) {
+  .choice {
+    min-height: var(--touch);
+  }
+
+  /* Row-level affordances get the full row height; adjacent rows are
+     separated by their divider, so the 44px bands never overlap. */
+  .modelRow {
+    min-height: var(--touch);
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  .modelGroupHead {
+    min-height: var(--touch);
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+
+  /* The whole header row is the group toggle; extend its band. */
+  .modelGroupToggle {
+    align-self: stretch;
+  }
+
+  /* The remove × keeps its glyph size; its hit area is the after-pseudo. */
+  .modelRemove {
+    position: relative;
+    flex: none;
+    align-self: center;
+    width: var(--icon-btn);
+    height: var(--icon-btn);
+    padding: 0;
+  }
+
+  .modelRemove::after {
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+    content: "";
+  }
+
+  .modelBulkBtn {
+    min-height: var(--touch);
+  }
+
+  /* Default-model radio and the tri-state checkbox ride the 44px row. */
+  .modelDefault {
+    position: relative;
+    flex: none;
+    width: var(--touch);
+    justify-content: center;
+  }
+
+  .modelGroupPick {
+    align-self: stretch;
+    width: var(--touch);
+    flex: 0 0 var(--touch);
+    justify-content: center;
   }
 }

@@ -4,6 +4,7 @@ import { readDeviceSettings } from "../features/settings/prefs";
 import { passkeyErrorText } from "../lib/passkeys";
 import { hubStore, useHub } from "../lib/store";
 import { useWorkbenchViewport } from "../lib/viewport";
+import { PageHeader } from "../components/PageHeader";
 import css from "./LoginPage.module.css";
 
 export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
@@ -105,20 +106,23 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
 
   return (
     <div className={css.page} data-testid="login-page" data-mode={tab}>
-      <form
-        className={css.card}
-        onSubmit={(e) => {
-          e.preventDefault();
-          submit();
-        }}
-      >
-        <header className={css.head}>
-          <h1 className={css.title}>Remuda</h1>
+      <PageHeader
+        testId="login-head"
+        crumbs={pairDefault ? [{ label: "登录", to: "/login" }] : []}
+        title={pairDefault ? "手机配对" : "Remuda"}
+      />
+      <div className={css.body}>
+        <form
+          className={css.card}
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
           <p className={css.hint}>
             {tab === "pair" ? "手机用配对码加入已登录的设备。" : "用 Passkey 直接登录，或首次用访问码进入。"}
           </p>
-        </header>
-        <div className={css.body}>
+          <div>
           {passkeySupported ? (
             <section className={css.passkey} data-testid="login-passkey">
               <button
@@ -234,8 +238,9 @@ export function LoginPage({ mode }: { mode?: "bootstrap" | "pair" }) {
               {error}
             </p>
           ) : null}
-        </div>
-      </form>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

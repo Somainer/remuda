@@ -106,7 +106,7 @@ export function ProvidersPage() {
               >
                 <div className={css.cardHead}>
                   {healthDot(p.health?.ok ?? true)}
-                  <span className={css.id}>{p.name || p.profileId}</span>
+                  <span className={css.name}>{p.name || p.profileId}</span>
                   {p.defaultGateway ? <span className={ui.chip}>默认网关</span> : null}
                   {p.scope?.startsWith("host:") ? <span className={ui.chip}>host</span> : null}
                   <span className={css.proto}>{p.protocol}</span>

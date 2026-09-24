@@ -1,50 +1,42 @@
 /* @tokens strict */
-/* /login and /pair (UO-13, visual-system.md §5.2): a centered 400px surface
-   card on the canvas. The title uses --text-page. Inputs follow pointer:
+/* /login and /pair (UO-13, visual-system.md §5.2): the shared PageHeader
+   over a centered 400px surface card on the canvas. Inputs follow pointer:
    coarse for hit height and 16px type, fine for 32/14. Role tokens only. */
 
 .page {
-  min-height: 100dvh;
-  display: grid;
-  place-items: center;
-  padding: var(--space-5) var(--space-4);
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--bg-canvas);
   color: var(--fg-body);
+}
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  place-items: start center;
+  padding: var(--space-5) var(--space-4);
 }
 
 .card {
   display: flex;
   flex-direction: column;
+  gap: var(--space-4);
   width: min(400px, 100%);
+  padding: var(--space-4);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
 }
 
-.head {
-  padding: var(--space-4) var(--space-4) var(--space-3);
-}
-
-.title {
-  margin: 0;
-  color: var(--fg-strong);
-  font-size: var(--text-page);
-  font-weight: 600;
-  line-height: var(--lh-page);
-}
-
 .hint {
-  margin: var(--space-2) 0 0;
+  margin: 0;
   color: var(--fg-muted);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
-}
-
-.body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  padding: 0 var(--space-4) var(--space-4);
 }
 
 .tabs {
@@ -148,6 +140,7 @@
 }
 
 .toggle {
+  position: relative;
   align-self: center;
   min-height: var(--control-h-sm);
   border: 0;
@@ -155,6 +148,17 @@
   color: var(--link);
   font-size: var(--text-meta);
   line-height: var(--lh-meta);
+}
+
+@media (pointer: coarse) {
+  .toggle::after {
+    position: absolute;
+    inset: 50% auto auto 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+    content: "";
+  }
 }
 
 .codes {

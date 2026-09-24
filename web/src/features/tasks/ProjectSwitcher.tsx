@@ -23,6 +23,7 @@ import type { components } from "../../lib/api.generated";
 import { spaceKey, type Space } from "../spaces/store";
 import type { Workspace } from "../../types/workspace";
 import ui from "../../styles/ui.module.css";
+import css2 from "./projectSwitcher.module.css";
 
 export type Project = components["schemas"]["Project"];
 export type ProjectMember = components["schemas"]["ProjectMember"];
@@ -317,14 +318,10 @@ export function ProjectSwitcher({ projects, navigateOnSelect = false }: ProjectS
   }
 
   return (
-    <label
-      className={ui.field}
-      style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: "var(--space-2)", margin: 0 }}
-    >
-      <span className={ui.listMeta}>项目范围</span>
+    <label className={css2.field}>
+      <span className={css2.label}>项目范围</span>
       <select
-        className={`${ui.select} ${ui.touchSelect}`}
-        style={{ width: "auto", minWidth: 160 }}
+        className={`${ui.select} ${ui.touchSelect} ${css2.select}`}
         data-testid="project-switcher"
         aria-label="按项目过滤任务列表与看板"
         value={value}

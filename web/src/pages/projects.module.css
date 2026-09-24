@@ -1,0 +1,21 @@
+/* @tokens strict */
+/* /projects list rows: the human project name truncates on narrow screens
+   instead of painting past the surface card. */
+
+.rowBody {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rowName {
+  overflow: hidden;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 500;
+  line-height: var(--lh-title);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

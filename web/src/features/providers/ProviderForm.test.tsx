@@ -242,11 +242,11 @@ describe("ProviderForm 交付方式 (D-047)", () => {
     // First host in the list is the online mac-relay; no offline warning yet.
     expect(screen.queryByTestId("provider-delivery-host-offline")).toBeNull();
     await user.selectOptions(screen.getByTestId("provider-delivery-host"), hosts[1].id);
-    // An offline proxy host shows the amber/red refusal warning, not a reroute.
-    expect(screen.getByTestId("provider-delivery-host-offline")).toBeVisible();
-    expect(screen.getByTestId("provider-delivery-host-offline")).toHaveTextContent(
-      "api-via-host-offline",
-    );
+    // An offline proxy host shows the amber refusal warning, not a reroute.
+    const offlineWarning = screen.getByTestId("provider-delivery-host-offline");
+    expect(offlineWarning).toBeVisible();
+    expect(offlineWarning.className).toMatch(/warning/);
+    expect(offlineWarning).toHaveTextContent("api-via-host-offline");
     await user.selectOptions(screen.getByTestId("provider-delivery-route"), "hub-relay");
     await user.click(screen.getByTestId("provider-save"));
     expect(onSubmit).toHaveBeenCalledWith(

@@ -145,8 +145,9 @@
   line-height: var(--lh-meta);
 }
 
-/* Result word marks: the × glyph is reserved for closing tabs, so outcomes
-   read as text with a role colour (visual-system.md §2/§8.6). */
+/* Result word marks. The × glyph is reserved for closing tabs, so outcomes
+   read as text with a role colour. Green (success role) is for authoritative
+   confirmation only: accepted/queued/forwarded stay neutral (D-053 §2). */
 .mark {
   flex: none;
   font-size: var(--text-meta);
@@ -154,10 +155,16 @@
   line-height: var(--lh-meta);
 }
 
-.markOk {
+.markFailed {
+  color: var(--danger-fg);
+}
+
+.markConfirmed {
   color: var(--success-fg);
 }
 
-.markFail {
-  color: var(--danger-fg);
+.markQueued,
+.markForwarded,
+.markReplayed {
+  color: var(--fg-muted);
 }

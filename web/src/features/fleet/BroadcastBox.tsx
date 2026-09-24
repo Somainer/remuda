@@ -6,7 +6,9 @@ import ui from "../../styles/ui.module.css";
 import type { HostView } from "../hosts/model";
 import {
   BROADCAST_KEYS,
+  DELIVERY_LABEL,
   buildBroadcastBody,
+  deliveryState,
   orderResults,
   summarize,
   type BroadcastForm,
@@ -155,26 +157,30 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
             {summarize(result)}
           </p>
           <ul className={css.members} data-testid="broadcast-results">
-            {orderResults(result).map((entry) => (
-              <li
-                key={entry.commandId ?? entry.instanceId}
-                className={css.member}
-                data-testid="broadcast-result"
-                data-ok={String(entry.ok ?? false)}
-              >
-                <span className={`${css.mark} ${entry.ok ? css.markOk : css.markFail}`}>
-                  {entry.ok ? "成功" : "失败"}
-                </span>
-                <span className={css.memberBody}>
-                  {entry.instanceId}
-                  <div className={css.memberMeta}>
-                    {entry.kind} · {entry.hostId}
-                    {entry.replayed ? " · 重放" : ""}
-                    {entry.error ? ` · ${entry.error}` : entry.state ? ` · ${entry.state}` : ""}
-                  </div>
-                </span>
-              </li>
-            ))}
+            {orderResults(result).map((entry) => {
+              const state = deliveryState(entry);
+              return (
+                <li
+                  key={entry.commandId ?? entry.instanceId}
+                  className={css.member}
+                  data-testid="broadcast-result"
+                  data-ok={String(entry.ok ?? false)}
+                  data-delivery={state}
+                >
+                  <span className={`${css.mark} ${css[`mark${state[0].toUpperCase()}${state.slice(1)}`]}`}>
+                    {DELIVERY_LABEL[state]}
+                  </span>
+                  <span className={css.memberBody}>
+                    {entry.instanceId}
+                    <div className={css.memberMeta}>
+                      {entry.kind} · {entry.hostId}
+                      {entry.replayed ? " · 重放" : ""}
+                      {entry.error ? ` · ${entry.error}` : entry.state ? ` · ${entry.state}` : ""}
+                    </div>
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         </div>
       ) : null}

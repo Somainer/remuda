@@ -345,7 +345,7 @@ export function ProviderForm({
                       (api-via-host-offline); warn before the save, never
                       silently reroute. */}
                   {viaHostOffline ? (
-                    <p className={css.error} data-testid="provider-delivery-host-offline">
+                    <p className={css.warning} data-testid="provider-delivery-host-offline">
                       代理主机 {viaHost?.label || viaHostId} 当前离线：经它的派发会在启动时被 Hub 拒绝（api-via-host-offline），不会改道直连。
                     </p>
                   ) : null}

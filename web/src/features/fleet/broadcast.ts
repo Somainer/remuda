@@ -83,3 +83,27 @@ export function orderResults(result: FleetBroadcastResult): FleetBroadcastEntry[
   const entries = result.results ?? [];
   return [...entries].sort((a, b) => Number(a.ok ?? false) - Number(b.ok ?? false));
 }
+
+/**
+ * Authoritative delivery state of one broadcast result row.
+ *
+ * `ok: true` alone means the Hub accepted the command — it may still be
+ * queued on an offline host (D-053 item 2: green is reserved for confirmed
+ * success, never for "accepted").
+ */
+export type DeliveryState = "queued" | "forwarded" | "confirmed" | "replayed" | "failed";
+
+export function deliveryState(entry: FleetBroadcastEntry): DeliveryState {
+  if (!entry.ok) return "failed";
+  if (entry.replayed) return "replayed";
+  if (entry.state === "settled" && entry.resolution === "completed") return "confirmed";
+  return entry.forwarded ? "forwarded" : "queued";
+}
+
+export const DELIVERY_LABEL: Record<DeliveryState, string> = {
+  queued: "已排队",
+  forwarded: "已发送",
+  confirmed: "已确认",
+  replayed: "重放",
+  failed: "失败",
+};

@@ -1106,3 +1106,25 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 4. 会话有 `instance.taskId` 时 tab 集合是该 Task 的会话，否则是所在 Space 的会话；⌘1..9 跟随眼前的可见编号（4A）。
 
 **依据**：[visual-system.md](./visual-system.md)（令牌契约与对比度全集）。代码锚点在 `42ccd7ee` 上复核：`web/src/styles/tokens.css:1-196`、`web/src/styles/ui.module.css:10-15,52,323-324,356-372,386-391`、`web/src/features/session/tty/theme.ts:15-68`、`web/src/pages/SessionPage.tsx:95,154,452-596,669`、`web/src/app/Shell.tsx:207-237,337`、`web/index.html:2,9`、`crates/remuda-hub/src/web.rs:1-9,100-107`。
+
+## D-055
+
+**客户端以同一 commandId 自动重发（取代「重连不重发」；修订 D4）** · 2026-09-24
+
+手机端自动重连设计（见协调者简报 auto-reconnect §3.4）的客户端半（任务 A）所采用的新规则。
+
+**决定**：Web/PWA 对已有实例的 `instance.send` 采用「先落盘、后发送」的本地 outbox。每条消息在创建时由客户端生成 `commandId`（`cmd_` 加规范 UUIDv7），先持久化（IndexedDB，localStorage 降级）再 POST。网络失败、超时、5xx 或 503 retryable 时，客户端在连接恢复后**以同一 `commandId`** 自动重发，直到服务端给出确定结果（accepted/settled/rejected）或超出重试窗口（≤20 次、≤24 h）。
+
+**前提（缺一不可，即本规则的 precondition: commandId dedup）**：
+1. Hub 对同一 `commandId` 且同一 payload 返回原记录，不产生第二条命令；payload 不同则返回 `COMMAND_ID_CONFLICT`（`queue_command`）。
+2. Node 按 `commandId + digest` 持久去重，重启后仍然有效。
+3. Hub 与 Node 的去重记录保留期 ≥ 客户端重试窗口加安全余量（≥7 天）；任何命令表清理策略都必须遵守这一下限。
+4. Hub 对同一 id 的重 POST 只转发尚未转发（`forwarded=0`）的行；已转发的行不会因为重 POST 而再次转发到 Node（任务 B 补齐；在它落地前，常见路径「消息从未到达 Hub」已由前提 1–2 保证恰好一次，GET command status 为可选调和手段，客户端按存在性 feature-detect）。
+
+**不变的部分**：Hub 与 Node 自身仍然绝不因为 ACK 不明而重发到 native（protocol §2.5）；unknown 的命令绝不以**新** `commandId` 自动重试，只有用户明确点击「仍要再送一条？」才生成新 id。
+
+**范围**：仅限对已有实例的 `instance.send`，包括由 steer 离线降级而来的排队发送。`instance.cancel`（打断）时效性强且跨 turn 不幂等，离线时禁用、不入队；`instance.create` 离线时拒绝（没有客户端幂等键，重试会创建多个会话）。
+
+**退化**：前提不满足（Hub 库丢失、实例已删除、本机存储不可用），或超出重试窗口、收到 409 `COMMAND_ID_CONFLICT` 时，行状态退回「状态待确认」，保留显式的「仍要再送一条？」。
+
+**修订**：本节取代此前分散在 ui-spec 与 workbench-ux-exploration 中的「重连只补事件，不重发」规则，并修订所有者早先的 D4「no offline queue」：D4 的「不排队」只对 create 与 cancel 继续成立；普通 send 与降级的 steer 在 commandId 去重前提满足时改为离线入 outbox、恢复后同 id 补发。hub-resilience §5.4/§7 据此修订。

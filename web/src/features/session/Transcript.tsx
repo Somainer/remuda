@@ -1133,6 +1133,10 @@ function renderNode(
       ? projectCommandStatus({
           hasServerCommandId: node.local.commandId !== null,
           localState: node.local.state,
+          // D-055: the durable outbox row + live link state decide
+          // 待发送（离线）/ 发送中 / 未送达 instead of the old null-id rule.
+          outboxState: node.local.outboxState,
+          offline: hubStore.connectionState !== "live",
         })
       : null;
     return (
@@ -1252,7 +1256,10 @@ function renderNode(
             </button>
           </div>
         ) : null}
-        {node.local?.state === "unknown" ? (
+        {/* D-055: the explicit new-id resend chip exists ONLY for the narrowed
+            unconfirmed set (retry window exhausted / 409 conflict / no durable
+            store). Offline-pending rows auto-deliver and never show this. */}
+        {node.local?.state === "unknown" && node.local.outboxState !== "rejected" ? (
           <button className={ui.chip} onClick={() => void hubStore.send(node.local!.instanceId, node.local!.text)}>
             仍要再送一条？
           </button>

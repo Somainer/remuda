@@ -1,17 +1,18 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandResult } from "../types/command";
+import { OUTBOX_LS_KEY } from "./outbox";
 
 const INSTANCE = "ins_steer_held";
 
 type Api = typeof import("./api").api;
 type Store = typeof import("./store").hubStore;
 
-function commandResult(commandId: string, state: CommandResult["command"]["state"]): CommandResult {
+function commandResult(commandId: string | undefined, state: CommandResult["command"]["state"]): CommandResult {
   return {
     relatedCommandIds: [],
     command: {
-      commandId,
-      id: commandId,
+      commandId: commandId ?? "cmd_x",
+      id: commandId ?? "cmd_x",
       revision: "1",
       createdAt: "2026-09-18T00:00:00.000Z",
       updatedAt: "2026-09-18T00:00:00.000Z",
@@ -36,6 +37,7 @@ async function fresh(): Promise<{ api: Api; hubStore: Store }> {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  localStorage.removeItem(OUTBOX_LS_KEY);
 });
 
 it("a steer landing mid-flush is not posted again by the stale flush snapshot", async () => {
@@ -44,67 +46,85 @@ it("a steer landing mid-flush is not posted again by the stale flush snapshot", 
   const first = hubStore.hold(INSTANCE, "first held", "turn");
   const second = hubStore.hold(INSTANCE, "second held", "turn");
 
-  type Call = { prompt: string; mode?: string };
+  type Call = { prompt: string; mode?: string; commandId?: string };
   const calls: Call[] = [];
   let resolveFirst: (value: CommandResult) => void = () => {};
   const firstPending = new Promise<CommandResult>((resolve) => {
     resolveFirst = resolve;
   });
   vi.spyOn(api, "instanceSend").mockImplementation(
-    ((_instanceId: string, prompt: string, _refs?: unknown[], mode?: string) => {
-      calls.push({ prompt, mode });
-      // The flush's first-row POST stays pending until the test says so; the
-      // steer (mode=steer) lands immediately, while that first POST is in
-      // flight — exactly the blocked→working answered-flush window.
+    ((_instanceId: string, prompt: string, _refs?: unknown[], mode?: string, commandId?: string) => {
+      calls.push({ prompt, mode, commandId });
+      // The flush's first-row POST stays pending; the steer lands immediately.
       return mode === "steer"
-        ? Promise.resolve(commandResult("cmd_steer", "accepted"))
-        : firstPending;
+        ? Promise.resolve(commandResult(commandId, "accepted"))
+        : firstPending.then(() => commandResult(commandId, "accepted"));
     }) as Api["instanceSend"],
   );
 
-  // Begin the flush; it suspends on the first row's pending POST.
+  // Begin the flush; it suspends on the first row's pending POST. The steer
+  // lock is per-instance, so flushHeld's await yields before steering.
   const flushing = hubStore.flushHeld(INSTANCE);
-  await Promise.resolve();
-  expect(calls).toEqual([{ prompt: "first held", mode: undefined }]);
+  await vi.waitFor(() => expect(calls).toHaveLength(1));
+  expect(calls[0]?.prompt).toBe("first held");
+  expect(calls[0]?.mode).toBeUndefined();
 
-  // Steer the SECOND row while the first POST is still pending.
+  // Steer the SECOND row while the first POST is still pending. Its own
+  // outbox row is delivered directly (steer awaits its POST for the receipt).
   const landed = await hubStore.steerHeld(INSTANCE, second);
   expect(landed).toBe(true);
-  expect(calls).toEqual([
-    { prompt: "first held", mode: undefined },
-    { prompt: "second held", mode: "steer" },
-  ]);
+  expect(calls).toHaveLength(2);
+  expect(calls[1]?.prompt).toBe("second held");
+  expect(calls[1]?.mode).toBe("steer");
+  // Each attempt used the row's own client-generated id.
+  expect(calls[0]?.commandId?.startsWith("cmd_")).toBe(true);
+  expect(calls[1]?.commandId?.startsWith("cmd_")).toBe(true);
+  expect(calls[0]?.commandId).not.toBe(calls[1]?.commandId);
 
-  // Let the flush's first POST land and the flush run to completion.
-  resolveFirst(commandResult("cmd_first", "accepted"));
+  // Let the flush finish; the drain must not re-post either row.
+  resolveFirst(commandResult(calls[0]?.commandId, "accepted"));
   await flushing;
+  await new Promise((r) => setTimeout(r, 50));
 
-  // Exactly two POSTs total; the steered text appears exactly once, as a steer.
   expect(calls).toHaveLength(2);
   expect(calls.filter((c) => c.prompt === "second held")).toHaveLength(1);
-  expect(calls[1]).toEqual({ prompt: "second held", mode: "steer" });
 
-  // The flush must not have overwritten the steer's commandId/promptMode.
   const bubbles = hubStore.getSnapshot().bubbles;
   const steered = bubbles.find((b) => b.clientRequestId === second)!;
-  expect(steered.commandId).toBe("cmd_steer");
   expect(steered.promptMode).toBe("steer");
   expect(steered.held).toBe(false);
+  expect(steered.commandId).toBe(calls[1]?.commandId);
   const flushed = bubbles.find((b) => b.clientRequestId === first)!;
-  expect(flushed.commandId).toBe("cmd_first");
   expect(flushed.promptMode).toBe("new-turn");
+  expect(flushed.commandId).toBe(calls[0]?.commandId);
 });
 
-it("a steer whose POST fails resolves false and leaves the row 状态待确认", async () => {
+it("a steer whose POST fails with a retriable error resolves false and stays queued under the same id", async () => {
   const { api, hubStore } = await fresh();
   const id = hubStore.hold(INSTANCE, "failed steer", "turn");
   vi.spyOn(api, "instanceSend").mockRejectedValue(new Error("HTTP 500"));
 
   const landed = await hubStore.steerHeld(INSTANCE, id);
+  // The interrupt did not land, so no 已打断 receipt; the row persists for
+  // same-id auto-retry (not the old null-id 状态待确认 dead end).
   expect(landed).toBe(false);
   const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
-  expect(bubble.state).toBe("unknown");
-  expect(bubble.commandId).toBeNull();
-  // Marker/promptMode still flipped before the POST; no held row lingers.
+  expect(bubble.state).toBe("queued");
+  expect(bubble.commandId?.startsWith("cmd_")).toBe(true);
   expect(bubble.held).toBe(false);
+  expect(bubble.promptMode).toBe("steer");
+});
+
+it("a steer is delivered immediately while live", async () => {
+  const { api, hubStore } = await fresh();
+  const id = hubStore.hold(INSTANCE, "live steer", "turn");
+  const send = vi.spyOn(api, "instanceSend").mockResolvedValue(
+    commandResult(undefined, "accepted"),
+  );
+  const landed = await hubStore.steerHeld(INSTANCE, id);
+  expect(landed).toBe(true);
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(send.mock.calls[0]?.[3]).toBe("steer");
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
+  expect(bubble.commandId).toBe(send.mock.calls[0]?.[4]);
 });

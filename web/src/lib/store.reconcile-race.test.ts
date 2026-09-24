@@ -1,6 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import type { CommandResult } from "../types/command";
 import type { Observation } from "../types/observation";
+import { OUTBOX_LS_KEY } from "./outbox";
 
 const INSTANCE = "ins_reconcile_race";
 const JOURNAL = "obj_reconcile_race_journal";
@@ -104,6 +105,7 @@ function screenBatch(seq: string, text: string): Record<string, unknown> {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  localStorage.removeItem(OUTBOX_LS_KEY);
 });
 
 it("a list poll that began before create completes never drops the created instance", async () => {
@@ -176,9 +178,10 @@ it("a failed catch-up settles the per-session journal status (not a latched 重�
 
   // The per-session status SessionPage actually renders must not stay at
   // reconnecting: the client settles at the truthful readonly-stale state
-  // (JournalBanner shows 只读 + 重试), and the global indicator follows.
+  // (JournalBanner shows 只读 + 重试). Without a connection machine (unit
+  // harness) the coarse global indicator honestly goes offline.
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("readonly-stale");
-  expect(hubStore.getSnapshot().connection).toBe("reconnecting");
+  expect(hubStore.getSnapshot().connection).toBe("offline");
   expect(toast).toHaveBeenCalled();
 
   // The existing retry action (the banner 重试 button calls catchup) with a
@@ -194,6 +197,32 @@ it("a failed catch-up settles the per-session journal status (not a latched 重�
   expect(hubStore.getSnapshot().connection).toBe("live");
 });
 
+it("a slow failed catch-up cannot downgrade a newer successful recovery (resume generation)", async () => {
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+
+  // Catch-up A's read is held open; catch-up B starts after it and succeeds
+  // with an empty resync (cursor does not advance). A's late 502 must not
+  // touch status.
+  let releaseA: (v: never) => void = () => {};
+  const aRead = new Promise<never>((_resolve, reject) => {
+    releaseA = () => reject(new Error("HTTP 502 A"));
+  });
+  vi.spyOn(hubStore, "toast").mockImplementation(() => undefined);
+  vi.mocked(api.eventsRead)
+    .mockReturnValueOnce(aRead)
+    .mockResolvedValueOnce({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+
+  void hubStore.catchup(INSTANCE);
+  await hubStore.catchup(INSTANCE); // B succeeds → live
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
+
+  releaseA(undefined as never);
+  await new Promise((r) => setTimeout(r, 10));
+  expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
+  expect(hubStore.getSnapshot().connection).toBe("live");
+});
+
 it("a failed catch-up is cleared automatically when the follow socket delivers a contiguous batch", async () => {
   const { api, hubStore } = await fresh();
   const onBatch = await mountFollow(api, hubStore);
@@ -204,7 +233,7 @@ it("a failed catch-up is cleared automatically when the follow socket delivers a
   vi.spyOn(hubStore, "toast").mockImplementation(() => undefined);
   await hubStore.catchup(INSTANCE);
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("readonly-stale");
-  expect(hubStore.getSnapshot().connection).toBe("reconnecting");
+  expect(hubStore.getSnapshot().connection).toBe("offline");
 
   // No manual retry: the still-open follow socket delivers the next turn's
   // contiguous frame. applyBatch flushes it and the client returns to live,
@@ -416,4 +445,165 @@ it("a stale tty.screen read cannot supersede a newer read that already committed
   releaseOld({ lines: ["STALE-READ"] });
   await old;
   expect(hubStore.getSnapshot().screens[INSTANCE]?.lines).toEqual(["NEWER-READ"]);
+});
+
+it("an unseen screen known only in the REST seed still orders the live RPC buffer", async () => {
+  // Carried review case: the follow REST seed carries a screen at seq 1 but
+  // the socket never re-delivers it, so screens[id] is absent when the RPC
+  // runs. The RPC basis must still come from the observed events (seq 1), and
+  // a later non-screen event at seq 2 must not roll the RPC buffer back.
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  // Seed directly with a seq-1 screen; no live onBatch ever delivers it.
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [
+      {
+        kind: "raw_tty",
+        eventId: "evt_seed_screen",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        payload: { text: "DONE old task", nativeName: "screen", status: "done?" },
+      } as unknown as Observation,
+    ],
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_seed",
+    journalId: JOURNAL,
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "seed-epoch",
+      asOfSeq: "1",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "1", complete: true },
+    },
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [
+      { id: INSTANCE, journalId: JOURNAL, durableSeq: "0" } as Awaited<
+        ReturnType<Api["instanceList"]>
+      >["items"][number],
+    ],
+    nextCursor: null,
+  });
+
+  await hubStore.refresh();
+  await hubStore.follow(INSTANCE);
+  // The REST seed is in events, but follow() never wrote it to screens.
+  expect(hubStore.getSnapshot().screens[INSTANCE]).toBeUndefined();
+
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: ["working on new task"] });
+  await hubStore.refreshScreen(INSTANCE);
+  const afterRpc = hubStore.getSnapshot().screens[INSTANCE];
+  expect(afterRpc?.lines).toEqual(["working on new task"]);
+  expect(afterRpc?.done).toBe(false);
+  expect(afterRpc?.journalSeq).toBe("1");
+
+  // A non-screen live event at seq 2 re-derives seq 1; it must not win.
+  const subscribe = vi.mocked(api.eventsSubscribe);
+  const onBatch = subscribe.mock.calls[0]?.[2] as (b: Record<string, unknown>) => void;
+  onBatch({
+    subscriptionId: "sub_seed",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [
+      {
+        kind: "lifecycle",
+        eventId: "evt_native_status_2",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        payload: { type: "native", nativeName: "agent_status", status: "working" },
+      } as unknown as Observation,
+    ],
+  });
+  const final = hubStore.getSnapshot().screens[INSTANCE];
+  expect(final?.lines).toEqual(["working on new task"]);
+  expect(final?.done).toBe(false);
+});
+
+it("cancel is refused offline and sends nothing (canInterrupt gate)", async () => {
+  const { api, hubStore } = await fresh();
+  await mountFollow(api, hubStore);
+  const cancel = vi.spyOn(api, "instanceCancel");
+  // Simulate the connection machine going offline.
+  hubStore.setConnectionStateForTest("offline");
+  expect(hubStore.canInterrupt).toBe(false);
+  await hubStore.cancel(INSTANCE);
+  expect(cancel).not.toHaveBeenCalled();
+  hubStore.setConnectionStateForTest("live");
+  expect(hubStore.canInterrupt).toBe(true);
+  cancel.mockResolvedValue(commandResult("cmd_cancel", "settled"));
+  await hubStore.cancel(INSTANCE);
+  expect(cancel).toHaveBeenCalledTimes(1);
+});
+
+it("a steer while offline degrades to an ordinary queued turn", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  const send = vi.spyOn(api, "instanceSend");
+  const id = hubStore.hold(INSTANCE, "offline steer", "turn");
+  hubStore.setConnectionStateForTest("offline");
+  const landed = await hubStore.steerHeld(INSTANCE, id);
+  expect(landed).toBe(true); // accepted as a queued turn, not a steer
+  expect(send).not.toHaveBeenCalled();
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id);
+  expect(bubble?.promptMode).toBe("new-turn");
+});
+
+it("a queued 2xx that was forwarded is not re-POSTed by a later flush", async () => {
+  // Regression from hub-live steer ordering: the fake Node answers a plain
+  // {ok:true}, so the Hub row is queued + transport-written + reconciling. A
+  // later outbox flush must NOT send it again (the journal settles it).
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, durableSeq: "0" } as Awaited<ReturnType<Api["instanceList"]>>["items"][number]],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
+
+  const queuedForwarded = commandResult("cmd_acked_once", "accepted");
+  // The fake non-durable ack: queued + forwarded (transport-written).
+  queuedForwarded.command.state = "queued";
+  queuedForwarded.command.dispatch = "transport-written";
+  queuedForwarded.command.resolution = "reconciling";
+  const send = vi.spyOn(api, "instanceSend").mockImplementation(
+    async (_i, _p, _a, _m, clientCommandId) => ({
+      relatedCommandIds: [],
+      command: {
+        ...queuedForwarded.command,
+        commandId: clientCommandId ?? "cmd_acked_once",
+        id: clientCommandId ?? "cmd_acked_once",
+      },
+    }),
+  );
+
+  await hubStore.send(INSTANCE, "a prompt the node acked loosely");
+  await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  const wireId = send.mock.calls[0]?.[4];
+  expect(wireId?.startsWith("cmd_")).toBe(true);
+  // A second flush (e.g. a turn-end edge) must not re-POST it.
+  await hubStore["flushAllOutbox"]();
+  await new Promise((r) => setTimeout(r, 20));
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(hubStore.getSnapshot().bubbles[0]?.commandId).toBe(wireId);
 });

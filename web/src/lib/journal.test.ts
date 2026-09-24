@@ -172,6 +172,52 @@ describe("JournalClient", () => {
     expect(client.status).toBe("live");
   });
 
+  it("a slower failed resume cannot downgrade a newer successful empty resume (generation)", async () => {
+    // Overlapping catch-ups (send resolves while catch-up is pending, then a
+    // steer/visibility starts another): A's read rejects AFTER B's empty read
+    // (cursor does not advance) succeeds. A must be a no-op — status live.
+    let rejectA: (err: Error) => void = () => {};
+    const aRead = new Promise<never>((_resolve, reject) => {
+      rejectA = reject;
+    });
+    const read: JournalRead = vi
+      .fn()
+      .mockReturnValueOnce(aRead)
+      .mockResolvedValueOnce(page([], { durableSeq: "0" }));
+    const client = new JournalClient("obj_journal" as Id, read);
+    client.markReconnecting();
+
+    const a = client.resumeAfterReconnect().catch((err: unknown) => err);
+    const b = await client.resumeAfterReconnect();
+    expect(b).toBe("0"); // empty read, cursor unchanged
+    expect(client.status).toBe("live");
+
+    rejectA(new Error("HTTP 502"));
+    await a;
+    expect(client.status).toBe("live");
+  });
+
+  it("a slower successful resume cannot overwrite a newer failed one either (generation both ways)", async () => {
+    let resolveA: (value: ReadPage) => void = () => {};
+    const aRead = new Promise<ReadPage>((resolve) => {
+      resolveA = resolve;
+    });
+    const read: JournalRead = vi
+      .fn()
+      .mockReturnValueOnce(aRead)
+      .mockRejectedValueOnce(new Error("HTTP 502"));
+    const client = new JournalClient("obj_journal" as Id, read);
+    client.markReconnecting();
+    const a = client.resumeAfterReconnect().catch((err: unknown) => err);
+    await expect(client.resumeAfterReconnect()).rejects.toThrow("502");
+    expect(client.status).toBe("readonly-stale");
+
+    resolveA(page([], { durableSeq: "0" }));
+    await a;
+    // The older successful resume cannot restore a false "live".
+    expect(client.status).toBe("readonly-stale");
+  });
+
   it("goes readonly-stale when the same seq has a different eventId", () => {
     const client = new JournalClient("obj_journal" as Id, async () => page([]));
     client.applyBatch({

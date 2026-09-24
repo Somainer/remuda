@@ -59,7 +59,7 @@ it("shares one journal subscription when concurrent follows finish reading histo
   await Promise.all([first, second]);
 
   expect(subscribe).toHaveBeenCalledTimes(1);
-  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "1", expect.any(Function), expect.any(Function));
+  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "1", expect.any(Function), expect.any(Function), expect.any(Object));
   expect(hubStore.getSnapshot().events[instance.id]).toEqual([event]);
 });
 
@@ -130,7 +130,7 @@ it("follows a bounded partial tail window without claiming earliestRetainedSeq 1
   // One tail seed, no ascending loop; follow resumes from the window's last row.
   expect(read).toHaveBeenCalledTimes(1);
   expect(subscribe).toHaveBeenCalledTimes(1);
-  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "100", expect.any(Function), expect.any(Function));
+  expect(subscribe).toHaveBeenCalledWith(instance.journalId, "100", expect.any(Function), expect.any(Function), expect.any(Object));
   const loaded = hubStore.getSnapshot().events[instance.id];
   expect(loaded?.map((e) => Number(e.seq))).toEqual(Array.from({ length: 10 }, (_, i) => i + 91));
   const journals = (hubStore as unknown as { journals: Map<string, { retainedFloorSeq: string }> }).journals;

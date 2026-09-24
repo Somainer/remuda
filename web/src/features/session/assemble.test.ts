@@ -3,6 +3,7 @@ import type { MessagePayload, Observation, ToolCallPayload, ToolResultPayload } 
 import type { WorkflowRunPayload } from "../../types/generated";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
 import { assembleTranscript, compactTranscript, diffState, isToolFailure, type TranscriptNode } from "./assemble";
+import type { LocalBubble } from "../../lib/store";
 import print3TurnFixture from "../../../../crates/remuda/tests/fixtures/journal-parity/print-3turn.json";
 import pty3TurnFixture from "../../../../crates/remuda/tests/fixtures/journal-parity/pty-3turn.json";
 
@@ -130,6 +131,58 @@ describe("assembleTranscript", () => {
     const previous = message(2, "older", { revision: "18446744073709551614", operation: "replace" });
     expect(assembleTranscript([newest, message(1, "oldest"), previous, newest]))
       .toMatchObject([{ text: "newest", status: "complete" }]);
+  });
+
+  it("carries a settled bubble's attachment thumbnails onto the journal node (D-055)", () => {
+    const events = [
+      obs(1, "message", {
+        nodeId: "u1",
+        messageId: "u1",
+        role: "user",
+        phase: "input",
+        revision: "1",
+        baseRevision: null,
+        operation: "replace",
+        status: "complete",
+        blocks: [{ type: "text", text: "see image" }],
+        targetBlock: null,
+        parentToolCallId: null,
+        nativeOrigin: known("user"),
+        commandId: "cmd_img",
+      } as MessagePayload),
+    ];
+    const settledBubble: LocalBubble = {
+      clientRequestId: "local_img",
+      instanceId: "ins_x",
+      text: "see image",
+      commandId: "cmd_img",
+      state: "settled",
+      outboxState: "done",
+      promptMode: "new-turn",
+      createdAt: "2026-09-24T00:00:00.000Z",
+      attachments: [
+        {
+          objectId: "obj_img",
+          name: "red.png",
+          previewUrl: "blob:thumb",
+          kind: "image",
+          mediaType: "image/png",
+          size: 1,
+          index: 1,
+        },
+      ],
+    };
+    const nodes = assembleTranscript(events, [settledBubble]);
+    // The optimistic row is hidden (settled) but the journal node kept the
+    // thumbnail; no second optimistic node.
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0]).toMatchObject({
+      type: "message",
+      role: "user",
+      commandId: "cmd_img",
+      localAttachments: [{ objectId: "obj_img", previewUrl: "blob:thumb" }],
+    });
+    expect(nodes[0] && "local" in nodes[0] && nodes[0].local).toBeFalsy();
   });
 
   it("keeps one bubble through targeted deltas, replay, and complete snapshots", () => {

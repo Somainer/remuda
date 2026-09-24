@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { OUTBOX_LS_KEY } from "./outbox";
 import type { CommandResult } from "../types/command";
 import type { Observation } from "../types/observation";
 
@@ -7,6 +8,10 @@ const JOURNAL = "obj_local_bubble_journal";
 
 type Api = typeof import("./api").api;
 type Store = typeof import("./store").hubStore;
+
+function sendSpyCallIds(api: Api): (string | undefined)[] {
+  return vi.mocked(api.instanceSend).mock.calls.map((c) => c[4]);
+}
 
 function commandResult(commandId: string, state: CommandResult["command"]["state"]): CommandResult {
   return {
@@ -65,49 +70,69 @@ function stubPostSend(api: Api) {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  localStorage.removeItem(OUTBOX_LS_KEY);
 });
 
-it("a fresh bubble has a local id, no command id, and projects 等待发送", async () => {
+it("a fresh bubble carries a client cmd_ id from creation and projects 等待发送", async () => {
   const { api, hubStore } = await fresh();
   vi.spyOn(api, "instanceSend").mockReturnValue(new Promise(() => {}));
-  void hubStore.send(INSTANCE, "queued prompt");
+  await hubStore.send(INSTANCE, "queued prompt");
+  await vi.waitFor(() => expect(hubStore.getSnapshot().bubbles[0]).toBeTruthy());
   const bubble = hubStore.getSnapshot().bubbles[0];
   expect(bubble.clientRequestId.startsWith("local_")).toBe(true);
-  expect(bubble.commandId).toBeNull();
+  // D-055: the wire commandId exists before the POST (same-id retry).
+  expect(bubble.commandId?.startsWith("cmd_")).toBe(true);
+  expect(bubble.state).toBe("queued");
   const { projectCommandStatus } = await import("./commandStatus");
-  const row = projectCommandStatus({ hasServerCommandId: false, localState: bubble.state });
+  // Before the first POST resolves the row is an ordinary live queued send.
+  const row = projectCommandStatus({
+    hasServerCommandId: true,
+    localState: "queued",
+    outboxState: "pending",
+    offline: false,
+  });
   expect(row.label).toBe("等待发送");
+  // While offline the same pending row reads as 待发送（离线）.
+  const offlineRow = projectCommandStatus({
+    hasServerCommandId: true,
+    localState: "queued",
+    outboxState: "pending",
+    offline: true,
+  });
+  expect(offlineRow.label).toBe("待发送（离线）");
 });
 
-it("the server response alone assigns commandId and keeps the local id distinct", async () => {
+it("every POST attempt uses the same client-generated commandId", async () => {
   const { api, hubStore } = await fresh();
   stubPostSend(api);
-  vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_server_1", "accepted"));
+  const sendSpy = vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_server_1", "accepted"));
 
   await hubStore.send(INSTANCE, "accepted prompt");
-  const bubble = hubStore.getSnapshot().bubbles[0];
-  expect(bubble.commandId).toBe("cmd_server_1");
-  expect(bubble.clientRequestId).not.toBe("cmd_server_1");
-  expect(bubble.clientRequestId.startsWith("local_")).toBe(true);
-  expect(bubble.state).toBe("accepted");
+  const bubble = () => hubStore.getSnapshot().bubbles[0];
+  await vi.waitFor(() => expect(bubble().state).toBe("settled"));
+  // Local render id and wire commandId stay distinct, and the wire id is the
+  // client-generated one (server echoes dedup, never assigns a new one).
+  expect(bubble().commandId?.startsWith("cmd_")).toBe(true);
+  expect(bubble().clientRequestId).not.toBe(bubble().commandId);
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(bubble().commandId);
 });
 
-it("a failed POST leaves commandId null and projects 状态待确认", async () => {
+it("a failed POST keeps the row pending under the same commandId and retries it", async () => {
   const { api, hubStore } = await fresh();
   stubPostSend(api);
-  vi.spyOn(api, "instanceSend").mockRejectedValue(new Error("HTTP 500"));
+  const sendSpy = vi
+    .spyOn(api, "instanceSend")
+    .mockRejectedValueOnce(new Error("HTTP 500"))
+    .mockResolvedValueOnce(commandResult("cmd_retry", "accepted"));
 
   await hubStore.send(INSTANCE, "failed prompt");
-  const bubble = hubStore.getSnapshot().bubbles[0];
-  expect(bubble.commandId).toBeNull();
-  expect(bubble.state).toBe("unknown");
-  const { projectCommandStatus } = await import("./commandStatus");
-  const row = projectCommandStatus({
-    hasServerCommandId: bubble.commandId !== null,
-    localState: bubble.state,
-  });
-  expect(row.key).toBe("unconfirmed");
-  expect(row.label).toBe("状态待确认");
+  const first = hubStore.getSnapshot().bubbles[0];
+  const wireId = first.commandId;
+  expect(wireId?.startsWith("cmd_")).toBe(true);
+  // 5xx is a retriable network/server failure: still queued, not unknown.
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
+  expect(hubStore.getSnapshot().bubbles[0]?.state).toBe("queued");
+  expect(hubStore.getSnapshot().bubbles[0]?.commandId).toBe(wireId);
 });
 
 it("concurrent sends get distinct clientRequestIds before either response lands", async () => {
@@ -119,17 +144,22 @@ it("concurrent sends get distinct clientRequestIds before either response lands"
   });
   vi.spyOn(api, "instanceSend").mockReturnValueOnce(held).mockResolvedValueOnce(commandResult("cmd_second", "accepted"));
 
-  void hubStore.send(INSTANCE, "first");
-  void hubStore.send(INSTANCE, "second");
-  const ids = hubStore.getSnapshot().bubbles.map((b) => b.clientRequestId);
-  expect(ids).toHaveLength(2);
-  expect(new Set(ids).size).toBe(2);
-  expect(ids.every((id) => id.startsWith("local_"))).toBe(true);
-  resolveFirst(commandResult("cmd_first", "accepted"));
+  await hubStore.send(INSTANCE, "first");
+  await hubStore.send(INSTANCE, "second");
+  const bubbles = () => hubStore.getSnapshot().bubbles;
+  await vi.waitFor(() => expect(bubbles()).toHaveLength(2));
+  const localIds = () => bubbles().map((b) => b.clientRequestId);
+  expect(new Set(localIds()).size).toBe(2);
+  const wireIds = () => bubbles().map((b) => b.commandId);
+  expect(new Set(wireIds()).size).toBe(2);
+  expect(wireIds().every((id) => id?.startsWith("cmd_"))).toBe(true);
+  resolveFirst(commandResult(wireIds()[0]!, "accepted"));
   await vi.waitFor(() => {
-    const settled = hubStore.getSnapshot().bubbles.map((b) => b.commandId);
-    expect(settled).toEqual(["cmd_first", "cmd_second"]);
+    expect(bubbles().length).toBe(2);
+    expect(bubbles().every((b) => b.state === "settled")).toBe(true);
   });
+  // Each POST used its own generated id (order follows the serial flush).
+  expect(sendSpyCallIds(api).sort()).toEqual(wireIds().sort());
 });
 
 it("settles by the journal observation carrying the same commandId, even with identical text", async () => {
@@ -145,11 +175,16 @@ it("settles by the journal observation carrying the same commandId, even with id
   vi.spyOn(api, "interactionList").mockResolvedValue([] as Awaited<ReturnType<Api["interactionList"]>>);
   await hubStore.refresh();
   await hubStore.follow(INSTANCE);
-  vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_twin", "accepted"));
+  // queued (host offline): the outbox row stays pending and only the journal
+  // observation settles the bubble.
+  vi.spyOn(api, "instanceSend").mockImplementation(async (_id, _p, _a, _m, commandId) =>
+    commandResult(commandId ?? "cmd_twin", "queued"),
+  );
 
   await hubStore.send(INSTANCE, "twin prompt");
   const bubble = () => hubStore.getSnapshot().bubbles[0];
-  expect(bubble().state).toBe("accepted");
+  expect(bubble().state).toBe("queued");
+  const wireId = bubble().commandId;
 
   // Simulate the live journal batch: a user node with the delivering
   // commandId — the shape the Node now emits for hook+transcript joins.
@@ -198,7 +233,7 @@ it("settles by the journal observation carrying the same commandId, even with id
           parentToolCallId: null,
           nativeOrigin: { state: "known", value: "ui" },
           origin: "human",
-          commandId: "cmd_twin",
+          commandId: wireId,
           status: "complete",
         },
       } as unknown as Observation,
@@ -226,9 +261,11 @@ it("send returns as soon as the POST lands, without awaiting catchup's HTTP chai
   stubPostSend(api);
   await hubStore.follow(INSTANCE);
 
-  vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_fast", "accepted"));
-  // Every reconciliation read now hangs: the old awaited chain could never
-  // resolve this test; the background chain in the new code simply stays open.
+  vi.spyOn(api, "instanceSend").mockImplementation(async (_id, _p, _a, _m, commandId) =>
+    commandResult(commandId ?? "cmd_fast", "accepted"),
+  );
+  // Every reconciliation read now hangs: the background chain in the new code
+  // simply stays open and cannot delay the send resolution.
   vi.spyOn(api, "eventsRead").mockReturnValue(new Promise(() => {}));
   vi.spyOn(api, "instanceList").mockReturnValue(new Promise(() => {}));
   vi.spyOn(api, "interactionList").mockReturnValue(new Promise(() => {}));
@@ -238,8 +275,9 @@ it("send returns as soon as the POST lands, without awaiting catchup's HTTP chai
     landed = value;
   });
   await vi.waitFor(() => expect(landed).toBe(true), { timeout: 2_000 });
-  // The commandId emit rides the POST response, not the reconciliation.
-  expect(hubStore.getSnapshot().bubbles[0]?.commandId).toBe("cmd_fast");
+  // The client-generated commandId is known before the POST returns.
+  expect(hubStore.getSnapshot().bubbles[0]?.commandId?.startsWith("cmd_")).toBe(true);
+  await vi.waitFor(() => expect(hubStore.getSnapshot().bubbles[0]?.state).toBe("settled"));
 });
 
 it("create returns the instance without awaiting the post-create list refresh", async () => {

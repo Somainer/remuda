@@ -30,6 +30,8 @@ export type CommandStatusKey =
   | "awaiting-send"
   | "accepted"
   | "sent-awaiting-ack"
+  | "pending-offline"
+  | "send-rejected"
   | "unconfirmed"
   | "needs-answer"
   | "answer-submitted"
@@ -79,6 +81,8 @@ export const COMMAND_STATUS_LABEL: Record<CommandStatusKey, string> = {
   "awaiting-send": "等待发送",
   accepted: "已受理",
   "sent-awaiting-ack": "已发送，等待确认",
+  "pending-offline": "待发送（离线）",
+  "send-rejected": "未送达",
   unconfirmed: "状态待确认",
   "needs-answer": "需要你回答",
   "answer-submitted": "回答已提交，等待处理",
@@ -117,6 +121,8 @@ function row(
 
 const ROW_AWAITING_SEND = row("awaiting-send", "queued", ["view", "cancel-unsent"]);
 const ROW_ACCEPTED = row("accepted", "accepted", ["view"]);
+const ROW_PENDING_OFFLINE = row("pending-offline", "queued", ["view", "cancel-unsent"]);
+const ROW_SEND_REJECTED = row("send-rejected", "attention", ["copy-diagnostic"]);
 const ROW_SENT_AWAITING_ACK = row("sent-awaiting-ack", "in-flight", ["view"]);
 const ROW_UNCONFIRMED = row("unconfirmed", "unknown", ["refresh", "copy-diagnostic"]);
 const ROW_NEEDS_ANSWER = row("needs-answer", "attention", ["open-interaction"]);
@@ -143,6 +149,14 @@ export type CommandStatusFacts = {
   hasServerCommandId?: boolean;
   /** Optimistic local bubble state, before/without a server command. */
   localState?: Command["state"] | "unknown";
+  /**
+   * D-055 durable outbox state for this bubble (present when it is backed by
+   * an outbox row), plus whether the link is currently non-live. Together
+   * these distinguish an offline-queued message (待发送（离线）) from an
+   * ordinary queued send and a definite rejection (未送达).
+   */
+  outboxState?: "pending" | "inflight" | "done" | "rejected" | "unknown";
+  offline?: boolean;
   instance?: {
     lifecycle?: Lifecycle;
     connectivity?: Connectivity;
@@ -243,7 +257,12 @@ export function projectCommandStatus(facts: CommandStatusFacts): CommandStatusRo
     // nothing about the turn either. Fall through to rules 4-8.
   }
 
-  // 4 — anything unproven outranks every optimistic row below.
+  // 4 — anything unproven outranks every optimistic row below. The D-055
+  // outbox states are decided locally and narrow the old fallback:
+  if (facts.outboxState === "rejected") return ROW_SEND_REJECTED;
+  if (facts.outboxState === "unknown") return ROW_UNCONFIRMED;
+  if (facts.outboxState === "inflight") return ROW_SENT_AWAITING_ACK;
+  if (facts.outboxState === "pending" && facts.offline) return ROW_PENDING_OFFLINE;
   if (instanceUnconfirmed(facts.instance)) return ROW_UNCONFIRMED;
   if (commandUnconfirmed(facts.command)) return ROW_UNCONFIRMED;
   // No server identity yet: only a plainly-queued bubble may claim a phase.

@@ -73,6 +73,8 @@ export class JournalClient {
   private filling = false;
   private loadingEarlier = false;
   status: "live" | "reconnecting" | "gap-backfill" | "readonly-stale" = "live";
+  /** Bumped per resumeAfterReconnect; stale attempts are no-ops. */
+  private resumeGen = 0;
 
   constructor(journalId: Id, read: JournalRead, listeners: JournalListener = {}) {
     this.journalId = journalId;
@@ -306,6 +308,11 @@ export class JournalClient {
   }
 
   async resumeAfterReconnect(): Promise<U64 | null> {
+    // Each resume gets a generation: overlapping catch-ups (send resolves
+    // while one is pending, then steer/visibility starts another) must never
+    // let a SLOWER read downgrade the newer one's result. A stale attempt
+    // neither changes status nor throws — the newest attempt owns the outcome.
+    const gen = ++this.resumeGen;
     let page;
     try {
       page = await this.read({
@@ -314,6 +321,7 @@ export class JournalClient {
         limit: 128,
       });
     } catch (err) {
+      if (gen !== this.resumeGen) return this.appliedSeq;
       // A rejected resync read must never leave the client latched at
       // "reconnecting": settle at the same truthful retryable state a gap
       // budget exhaustion uses. onStatus mirrors it to the UI (只读 banner
@@ -323,6 +331,7 @@ export class JournalClient {
       this.setStatus("readonly-stale");
       throw err;
     }
+    if (gen !== this.resumeGen) return this.appliedSeq;
     if (page.events.length === 0) {
       this.setStatus("live");
       return this.appliedSeq;
@@ -337,7 +346,9 @@ export class JournalClient {
       events: page.events,
       durableSeq: page.durableSeq,
     });
+    if (gen !== this.resumeGen) return this.appliedSeq;
     if (result.gap) await this.fillGap(result.gap.from, result.gap.to);
+    if (gen !== this.resumeGen) return this.appliedSeq;
     // fillGap settles readonly-stale when its descent budget runs out; do not
     // overwrite that verdict with a blanket "live".
     if (this.status !== "readonly-stale") this.setStatus("live");

@@ -602,7 +602,15 @@ export type HubApi = {
     prompt: string,
     attachments?: AttachmentRef[],
     mode?: PromptMode,
+    /**
+     * D-055 client-generated command id. Present on every attempt of the same
+     * message so Hub/Node dedup makes retries exactly-once; undefined keeps
+     * the legacy server-assigned path (mock / old callers).
+     */
+    commandId?: Id,
   ): Promise<CommandResult>;
+  /** D-055 G2 (Task B): read one command's current state for reconciliation. */
+  instanceCommandStatus(instanceId: Id, commandId: Id): Promise<CommandResult>;
   /** D-028 §5.3: interrupt the current turn; the process and session stay alive. */
   instanceCancel(instanceId: Id): Promise<CommandResult>;
   /** Stage one attachment for a later send (D-027/D-027b). Returns its id. */
@@ -654,6 +662,12 @@ export type HubApi = {
     afterSeq: U64 | null,
     onBatch: (batch: EventsBatch["params"]) => void,
     onGap?: (windowFloor: U64) => void,
+    hooks?: {
+      /** Follow socket closed (or errored after the snapshot settled). */
+      onClose?: () => void;
+      /** Any frame (event/control) received — the connection liveness tick. */
+      onFrame?: () => void;
+    },
   ): Promise<{
     subscriptionId: Id;
     journalId: Id;
@@ -696,6 +710,23 @@ function followUrl(instanceId: Id): string {
 }
 
 /** Authenticated Hub JSON request; shared by the api object and feature code. */
+/**
+ * Client-side timeouts for REST (auto-reconnect §3.1.3): a half-open SSH
+ * forward can hang a fetch forever otherwise. Reads 10 s, writes 15 s. A
+ * caller-supplied signal (e.g. the 65 s doctor probe) still works and aborts
+ * the request when either it or the internal timeout fires.
+ */
+const REST_READ_TIMEOUT_MS = 10_000;
+const REST_WRITE_TIMEOUT_MS = 15_000;
+
+/** Network-layer failure (timeout/offline), retriable by the outbox. */
+export class RestNetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RestNetworkError";
+  }
+}
+
 export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   const session = readSession();
   const headers = {
@@ -704,11 +735,39 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     ...(session ? { "X-Remuda-Device-Id": session.deviceId } : {}),
     ...(req.headers as Record<string, string> | undefined),
   };
-  const res = await fetch(`${hubBase()}${path}`, {
-    credentials: "include",
-    ...req,
-    headers,
-  });
+  const method = (req.method ?? "GET").toUpperCase();
+  const isWrite = method !== "GET" && method !== "HEAD";
+  const timeoutMs = isWrite ? REST_WRITE_TIMEOUT_MS : REST_READ_TIMEOUT_MS;
+  // A caller-supplied signal owns the timeout (e.g. the 65 s doctor probe);
+  // only attach our own when none was given.
+  const external = req.signal;
+  const controller = new AbortController();
+  const timer = external
+    ? null
+    : setTimeout(
+        () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
+        timeoutMs,
+      );
+  external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
+  let res: Response;
+  try {
+    res = await fetch(`${hubBase()}${path}`, {
+      credentials: "include",
+      ...req,
+      headers,
+      signal: external ?? controller.signal,
+    });
+  } catch (err) {
+    // A half-open link / offline / our own timeout never reached the Hub: a
+    // retriable network error, never a business rejection (the outbox keeps
+    // the same commandId and retries).
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
+    }
+    throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   if (!res.ok) {
     const text = await res.text();
     let code = `HTTP_${res.status}`;
@@ -889,9 +948,21 @@ function createMockApi(): HubApi {
         },
       };
     },
-    async instanceSend(instanceId, prompt, _attachments, mode) {
+    async instanceSend(instanceId, prompt, _attachments, mode, commandId) {
       void mode;
-      return mockSend(instanceId, prompt);
+      const result = mockSend(instanceId, prompt);
+      // Echo the client-generated id like the live Hub dedup path would.
+      if (commandId) {
+        result.command.commandId = commandId;
+        result.command.id = commandId;
+      }
+      return result;
+    },
+    async instanceCommandStatus(instanceId, commandId: Id) {
+      const result = mockSend(instanceId, `reconcile ${commandId}`);
+      result.command.commandId = commandId;
+      result.command.id = commandId;
+      return result;
     },
     async instanceCancel(instanceId) {
       return mockCancel(instanceId);
@@ -1114,7 +1185,7 @@ function createMockApi(): HubApi {
     },
     hostWorkspaceSubscribe() { return () => undefined; },
     eventsRead: async ({ journalId, afterSeq, beforeSeq, limit }) => mockReadJournal(journalId, afterSeq, beforeSeq, limit),
-    async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap) {
+    async eventsSubscribe(journalId, _afterSeq, onBatch, _onGap, _hooks) {
       const instance = mockDb.instances.find((i) => i.journalId === journalId);
       if (!instance) throw new Error("JOURNAL_NOT_FOUND");
       const subscriptionId = id("sub_");
@@ -1193,11 +1264,19 @@ function createLiveApi(): HubApi {
     return journals.get(journalId) ?? journalId;
   }
 
-  async function command(instanceId: Id, operation: string, payload: Record<string, unknown> = {}): Promise<CommandResult> {
+  async function command(
+    instanceId: Id,
+    operation: string,
+    payload: Record<string, unknown> = {},
+    commandId?: Id,
+  ): Promise<CommandResult> {
     const req: HubBody<"/v1/instances/{id}/commands", "post"> = {
       operation,
       payload,
     };
+    // D-055: the client-generated id rides every retry unchanged, so Hub/Node
+    // commandId dedup makes the POST exactly-once.
+    if (commandId) req.commandId = commandId;
     const result = await rest<HubJson<"/v1/instances/{id}/commands", "post">>(
       `/v1/instances/${instanceId}/commands`,
       { method: "POST", body: JSON.stringify(req) },
@@ -1339,11 +1418,23 @@ function createLiveApi(): HubApi {
       titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
       return { instance, command: mapCommand(created.command, instance.id) };
     },
-    async instanceSend(instanceId, prompt, attachments, mode) {
+    /**
+     * `GET /v1/instances/:id/commands/:commandId` (Task B / D-055 G2): read
+     * one command's current state, used to reconcile an outbox row whose POST
+     * ended unknown/reconciling instead of blindly re-POSTing.
+     */
+    async instanceCommandStatus(instanceId: Id, commandId: Id) {
+      // The GET returns a bare CommandRecord (not the POST's {command} envelope).
+      const row = await rest<HubJson<"/v1/instances/{id}/commands/{commandId}", "get">>(
+        `/v1/instances/${instanceId}/commands/${commandId}`,
+      );
+      return { command: mapCommand(row, instanceId), relatedCommandIds: [] };
+    },
+    async instanceSend(instanceId, prompt, attachments, mode, commandId) {
       const payload: Record<string, unknown> = { prompt };
       if (attachments?.length) payload.attachments = attachments;
       if (mode && mode !== "new-turn") payload.mode = mode;
-      return command(instanceId, "instance.send", payload);
+      return command(instanceId, "instance.send", payload, commandId);
     },
     async instanceCancel(instanceId) {
       return command(instanceId, "instance.cancel", {});
@@ -1607,7 +1698,7 @@ function createLiveApi(): HubApi {
         reachedAfterSeq,
       };
     },
-    async eventsSubscribe(journalId, afterSeq, onBatch, onGap) {
+    async eventsSubscribe(journalId, afterSeq, onBatch, onGap, hooks) {
       const instanceId = instanceIdOf(journalId);
       follows.get(journalId)?.close();
       const subscriptionId = id("sub_") as Id;
@@ -1677,6 +1768,11 @@ function createLiveApi(): HubApi {
           clearTimeout(timer);
           reject(new Error("FOLLOW_CONNECT_FAILED"));
         });
+        // A close after the snapshot settled is a drop, not a connect
+        // failure: the connection machine's onClose reopens the socket.
+        ws.addEventListener("close", () => {
+          if (settled) hooks?.onClose?.();
+        });
         ws.addEventListener("message", (ev) => {
           if (typeof ev.data !== "string") return;
           let msg: { type?: string; asOfSeq?: string; durableSeq?: string; fromSeq?: string | null; reachedAfterSeq?: boolean; seq?: string; events?: unknown; event?: unknown };
@@ -1685,6 +1781,9 @@ function createLiveApi(): HubApi {
           } catch {
             return;
           }
+          // Every received frame proves liveness, including ticks and
+          // control frames (the connection machine's 15 s clock).
+          hooks?.onFrame?.();
           if (msg.type === "event") {
             const obs = coerceObservation(msg.event ?? msg, journalId, instanceId, msg.seq);
             if (!obs) return;

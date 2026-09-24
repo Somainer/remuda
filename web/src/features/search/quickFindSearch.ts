@@ -60,7 +60,7 @@ export type QuickFindInput = {
   titleOf: (instanceId: string) => string;
   hostNameOf: (hostId?: string) => string;
   /** Hub connection; anything but `live` makes the result cache-only. */
-  connection?: "live" | "reconnecting" | "offline";
+  connection?: "live" | "stale" | "recovering" | "reconnecting" | "offline";
   /** Upper bound on returned hits; the full count still comes back as `total`. */
   limit?: number;
 };

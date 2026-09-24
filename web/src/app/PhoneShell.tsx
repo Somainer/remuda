@@ -50,8 +50,9 @@ export function PhoneShell() {
     const onVis = () => {
       if (document.visibilityState === "visible") {
         const id = location.pathname.startsWith("/s/") ? location.pathname.split("/")[2] : null;
-        if (id) void hubStore.catchup(id);
-        else void hubStore.refresh();
+        // D-055: foreground drives the connection machine, not a raw catch-up.
+        hubStore.resumeActive(id);
+        if (!id) void hubStore.refresh();
       }
     };
     document.addEventListener("visibilitychange", onVis);

@@ -1,3 +1,4 @@
+/* @tokens strict */
 /*
  * Workflow timeline card (workbench batch W).
  *
@@ -5,19 +6,19 @@
  * line while collapsed; the body holds phase heads and agent rows. Status is
  * driven entirely by `data-status` (card) / `data-state` (rows).
  *
- * Tokens come from styles/tokens.css (warm paper/ink palette); no per-app RGB
- * channels exist here. New module per the workbench ownership contract.
+ * Role tokens from styles/tokens.css only; both modes resolve there. New
+ * module per the workbench ownership contract.
  */
 .card {
-  --wf-accent: var(--paper);
-  font-size: var(--text);
+  --wf-accent: var(--fg-body);
+  font-size: var(--text-ui);
   line-height: 22px;
-  color: var(--mute);
+  color: var(--fg-muted);
   padding: 2px 0;
 }
-.card[data-status="failed"] { --wf-accent: var(--danger); }
-.card[data-status="killed"] { --wf-accent: var(--mute); }
-.card[data-status="paused"] { --wf-accent: var(--dust); }
+.card[data-status="failed"] { --wf-accent: var(--danger-border); }
+.card[data-status="killed"] { --wf-accent: var(--fg-muted); }
+.card[data-status="paused"] { --wf-accent: var(--attention-fg); }
 
 /* Header = the Workflow tool row itself; collapsed, it is the one-liner. */
 .head {
@@ -33,14 +34,14 @@
   cursor: pointer;
   font: inherit;
   line-height: 22px;
-  color: var(--mute);
+  color: var(--fg-muted);
   text-align: left;
-  border-radius: var(--radius);
+  border-radius: var(--radius-xs);
 }
-.head:hover { color: var(--paper); }
-.head:focus-visible { outline: 1px solid var(--cold); outline-offset: 1px; }
+.head:hover { color: var(--fg-body); }
+.head:focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
 .head:disabled { cursor: default; }
-.head:disabled:hover { color: var(--mute); }
+.head:disabled:hover { color: var(--fg-muted); }
 
 .chev {
   flex: none;
@@ -55,7 +56,7 @@
   flex: none;
   width: 14px;
   height: 14px;
-  color: var(--mute);
+  color: var(--fg-muted);
 }
 
 .name {
@@ -63,13 +64,13 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--ink-1);
+  color: var(--fg-strong);
   font-weight: 500;
 }
 .name em {
   font-style: normal;
   font-weight: 400;
-  color: var(--mute);
+  color: var(--fg-muted);
   margin-right: 4px;
 }
 
@@ -81,49 +82,54 @@
   flex: none;
   height: 20px;
   padding: 0 7px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 9999px;
-  background: rgba(255, 255, 255, 0.03);
-  font-size: 11px;
+  background: var(--bg-inset);
+  font-size: var(--text-meta);
   line-height: 16px;
   font-weight: 500;
-  color: var(--paper);
+  color: var(--fg-body);
 }
-.chipDot { width: 6px; height: 6px; border-radius: 9999px; background: var(--mute); }
+.chipDot { width: 6px; height: 6px; border-radius: 9999px; background: var(--fg-muted); }
 .card[data-status="completed"] .chip {
-  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
-  color: var(--ok);
-  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-color: color-mix(in srgb, var(--success-fg) 40%, transparent);
+  color: var(--success-fg);
+  background: color-mix(in srgb, var(--success-fg) 12%, transparent);
 }
-.card[data-status="completed"] .chipDot { background: var(--ok); }
+.card[data-status="completed"] .chipDot { background: var(--success-fg); }
 .card[data-status="failed"] .chip {
-  border-color: color-mix(in srgb, var(--danger) 45%, transparent);
-  color: #d98a78;
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border-color: color-mix(in srgb, var(--danger-border) 45%, transparent);
+  color: var(--danger-fg);
+  background: color-mix(in srgb, var(--danger-border) 14%, transparent);
 }
-.card[data-status="failed"] .chipDot { background: #d98a78; }
+.card[data-status="failed"] .chipDot { background: var(--danger-fg); }
 .card[data-status="paused"] .chip {
-  border-color: color-mix(in srgb, var(--dust) 45%, transparent);
-  color: var(--dust);
-  background: color-mix(in srgb, var(--dust) 12%, transparent);
+  border-color: color-mix(in srgb, var(--attention-fg) 45%, transparent);
+  color: var(--attention-fg);
+  background: color-mix(in srgb, var(--attention-fg) 12%, transparent);
 }
-.card[data-status="paused"] .chipDot { background: var(--dust); }
-.card[data-status="killed"] .chip { background: none; color: var(--mute); }
-.card[data-status="killed"] .chipDot { background: var(--mute); }
+.card[data-status="paused"] .chipDot { background: var(--attention-fg); }
+.card[data-status="killed"] .chip { background: none; color: var(--fg-muted); }
+.card[data-status="killed"] .chipDot { background: var(--fg-muted); }
 
 .meta {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 8px;
+  gap: 4px 6px;
   margin-left: auto;
-  font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-meta);
   line-height: 16px;
   font-variant-numeric: tabular-nums;
-  color: var(--mute);
+  color: var(--fg-muted);
 }
-.meta i { font-style: normal; color: var(--paper); }
+.meta i { font-style: normal; color: var(--fg-body); }
+/* Quiet `·` between the header numbers; the rail leads without one. */
+.meta > span:not(.rail) ~ span::before {
+  content: "·";
+  margin-right: 6px;
+  color: var(--fg-faint);
+}
 
 /* Dotted 72px progress rail with an accent fill. */
 .rail {
@@ -134,10 +140,10 @@
   max-width: 100%;
   height: 10px;
   overflow: hidden;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 2px;
   /* Unfilled band: muted dotted grid. */
-  background-image: radial-gradient(circle, var(--mute) 1px, transparent 1.35px);
+  background-image: radial-gradient(circle, var(--fg-muted) 1px, transparent 1.35px);
   background-size: 4px 4px;
 }
 .railFill {
@@ -150,30 +156,40 @@
   transition: width 240ms ease;
 }
 
-/* Live / result line under the header. */
+/* Live / result line under the header: sans, tabular numerals. */
 .live {
   display: flex;
   gap: 6px;
   min-width: 0;
   margin: 0;
   padding: 0 0 4px 22px;
-  font-family: var(--mono);
-  font-size: 11px;
+  font-size: var(--text-meta);
   line-height: 16px;
-  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-muted);
 }
-.live b { font-weight: 400; color: var(--paper); flex: none; }
+.live b { font-weight: 400; color: var(--fg-body); flex: none; }
 .live span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* The result is a sentence: body text in the muted colour, wrapping. */
+.result {
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+.result span {
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 
 /* Indented body track. */
 .body {
   margin: 2px 0 4px 7px;
-  border-left: 1px solid var(--line);
+  border-left: 1px solid var(--border);
   padding-left: 12px;
 }
 
@@ -193,69 +209,57 @@
   font: inherit;
   font-size: 12px;
   line-height: 18px;
-  color: var(--mute);
-  border-radius: var(--radius);
+  color: var(--fg-muted);
+  border-radius: var(--radius-xs);
 }
-.phaseHead:hover { color: var(--ink-1); }
-.phaseHead:focus-visible { outline: 1px solid var(--cold); outline-offset: 1px; }
+.phaseHead:hover { color: var(--fg-strong); }
+.phaseHead:focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
 .phaseHead .chev { width: 12px; height: 12px; }
 .phaseTitle {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--ink-1);
+  color: var(--fg-strong);
   font-weight: 500;
 }
 .phaseCount {
-  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  font-size: 11px;
-  color: var(--mute);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
 }
 .phaseMeta {
   margin-left: auto;
-  font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  font-size: 11px;
-  color: var(--mute);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
 }
 
-/* Agent list: rows shared by list and grid layouts. */
+/* Agent list: one column at every width, no per-row borders. */
 .agents {
   list-style: none;
   margin: 0 0 2px;
-  padding: 0 0 0 16px;
+  padding: 0 0 0 12px;
 }
-.agentsGrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
-  column-gap: 16px;
-}
-.agentsGrid .more { grid-column: 1 / -1; }
 
 .agent {
-  display: grid;
-  grid-template-columns: 12px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 0 8px;
-  padding: 2px 0;
-  min-height: 22px;
+  min-width: 0;
   font-size: 12px;
   line-height: 18px;
 }
-.state { display: inline-flex; align-items: center; justify-content: center; }
-.stateIco { width: 12px; height: 12px; flex: none; color: var(--mute); }
-.stateIcoDone { color: var(--ok); }
-.stateIcoFailed { color: #d98a78; }
-.stateIcoKilled { color: var(--mute); }
+.stateIco { width: 12px; height: 12px; flex: none; color: var(--fg-muted); }
+.stateIcoDone { color: var(--success-fg); }
+.stateIcoFailed { color: var(--danger-fg); }
+.stateIcoKilled { color: var(--fg-muted); }
 
 .agentLabel {
   display: flex;
   align-items: center;
   gap: 5px;
-  min-width: 0;
-  color: var(--mute);
+  flex: 1 1 0;
+  /* The name keeps its room; the meta yields first on a tight row. */
+  min-width: min(45%, 12em);
+  color: var(--fg-body);
 }
 .agentName {
   min-width: 0;
@@ -263,31 +267,42 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent[data-state="running"] .agentLabel { color: var(--paper); }
-.agent[data-state="failed"] .agentLabel { color: #d98a78; }
-.agent[data-state="queued"] .agentLabel { color: var(--mute); }
-.agent[data-state="killed"] .agentLabel { color: var(--mute); }
+.agent[data-state="running"] .agentLabel { color: var(--fg-strong); }
+.agent[data-state="failed"] .agentLabel { color: var(--danger-fg); }
+.agent[data-state="queued"] .agentLabel { color: var(--fg-muted); }
+.agent[data-state="killed"] .agentLabel { color: var(--fg-muted); }
 
+/* Right-aligned quiet sans meta, `1m 39s · 36k`, tabular numerals. When the
+   row is tight the meta gives way from its start edge; tokens stay last. */
 .agentMeta {
   display: flex;
-  flex-wrap: wrap;
+  flex: 0 1 auto;
   align-items: center;
   justify-content: flex-end;
-  gap: 0 8px;
-  font-family: var(--mono);
-  font-size: 11px;
+  gap: 0 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: var(--text-meta);
   line-height: 16px;
   font-variant-numeric: tabular-nums;
-  color: var(--mute);
+  color: var(--fg-muted);
 }
-.agentMeta b { font-weight: 400; color: var(--ink-1); }
+/* The separator trails each field, so a field hidden on narrow screens
+   takes its own `·` with it. */
+.agentMeta > :not(:last-child)::after {
+  content: "·";
+  margin-left: 6px;
+  color: var(--fg-faint);
+}
+.agentMeta b { font-weight: 400; color: var(--fg-muted); }
 /* c-wfcard: one-character clock prefix (等/闲) and the absent-value dash. */
 .clockTag {
   font-style: normal;
   margin-right: 2px;
-  color: var(--mute);
+  color: var(--fg-faint);
 }
-.agentMeta .missing { color: var(--mute); }
+.agentMeta .missing { color: var(--fg-faint); }
 
 .model {
   max-width: 144px;
@@ -295,32 +310,26 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 0 6px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.03);
-  font-size: 10px;
-  line-height: 15px;
-  font-weight: 500;
-  color: var(--mute);
+  color: var(--fg-faint);
 }
 .tool {
   max-width: 96px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--fg-faint);
 }
 
 .retry {
   flex: none;
   padding: 0 4px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.03);
-  font-family: var(--mono);
-  font-size: 10px;
+  background: var(--bg-inset);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
   line-height: 15px;
-  color: var(--mute);
+  color: var(--fg-muted);
 }
 
 /* 「… 还有 n 个」 in-place fold. */
@@ -331,19 +340,19 @@
   cursor: pointer;
   padding: 2px 0;
   font: inherit;
-  font-family: var(--mono);
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
   line-height: 18px;
-  color: var(--mute);
-  border-radius: var(--radius);
+  color: var(--fg-muted);
+  border-radius: var(--radius-xs);
 }
-.more button:hover { color: var(--ink-1); text-decoration: underline; }
-.more button:focus-visible { outline: 1px solid var(--cold); outline-offset: 1px; }
+.more button:hover { color: var(--fg-strong); text-decoration: underline; }
+.more button:focus-visible { outline: 1px solid var(--focus); outline-offset: 1px; }
 
 .note {
-  color: var(--mute);
-  font-family: var(--mono);
-  font-size: 11px;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .sr {
@@ -379,34 +388,50 @@
   .chev, .railFill { transition: none; }
 }
 
-/* c-wfdrill: drill-in member rows. */
+/* c-wfdrill / UO-5: the whole member row is the drill-in link. Hover and
+   focus paint the row; the ghost 「打开」 appears with them, and stays on a
+   coarse pointer, where the row itself is the 44px target. */
 .agentOpen {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  min-height: 24px;
+  padding: 2px 4px;
+  margin: 0 -4px;
   text-decoration: none;
   color: inherit;
-  border-radius: var(--radius);
+  border-radius: var(--radius-xs);
 }
-.agentOpen:hover { background: var(--ink-2); }
-.agentOpen .agentLabel { flex: 0 1 auto; min-width: 80px; }
-.agentOpen .agentMeta { flex: 1 1 auto; }
-.agentOpenBtn { display: inline-flex; align-items: center; }
+.agentOpen:hover { background: var(--bg-hover); text-decoration: none; }
+.agentOpen:focus-visible { outline: 1px solid var(--focus); outline-offset: 0; background: var(--bg-hover); }
+.state { flex: none; display: inline-flex; align-items: center; justify-content: center; }
+.agentOpenHint {
+  flex: none;
+  font-size: var(--text-meta);
+  line-height: 16px;
+  color: var(--link);
+  visibility: hidden;
+}
+.agentOpen:hover .agentOpenHint,
+.agentOpen:focus-visible .agentOpenHint { visibility: visible; }
+@media (pointer: coarse) {
+  .agentOpen { min-height: var(--touch); }
+  .agentOpenHint { visibility: visible; }
+}
 .memberTools {
-  grid-column: 2 / -1;
-  margin: 2px 0 4px;
+  margin: 2px 0 4px 20px;
 }
 .memberToolsToggle {
   border: 0;
   background: transparent;
-  color: var(--mute);
+  color: var(--fg-muted);
   font: inherit;
-  font-size: 11px;
+  font-size: var(--text-meta);
   cursor: pointer;
   padding: 1px 0;
 }
-.memberToolsToggle:hover { color: var(--paper); }
+.memberToolsToggle:hover { color: var(--fg-body); }
 .memberToolRows {
   display: flex;
   flex-direction: column;
@@ -414,6 +439,6 @@
   margin-top: 4px;
 }
 .memberToolFail {
-  border-left: 2px solid var(--danger);
+  border-left: 2px solid var(--danger-border);
   padding-left: 8px;
 }

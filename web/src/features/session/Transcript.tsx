@@ -1,7 +1,22 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Profiler,
+  forwardRef,
+  memo,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ForwardedRef,
+  type ProfilerOnRenderCallback,
+  type ReactNode,
+} from "react";
 import { useInRouterContext, useParams } from "react-router-dom";
 import type { Observation } from "../../types/observation";
 import { MarkdownText } from "../../components/MarkdownText";
+import { balanceFences } from "../../components/fenceBalance";
 import type { LocalBubble } from "../../lib/store";
 import { SentAttachments } from "./AttachmentChips";
 import { AnchorText } from "./AnchorText";
@@ -15,7 +30,7 @@ import { WorkflowTree } from "./WorkflowTree";
 import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
 import { ObservedChangeRow } from "./ObservedChangeRow";
-import { SubagentFolds } from "./subagent/SubagentRows";
+import { NestedToolContext, SubagentFolds, type NestedToolState } from "./subagent/SubagentRows";
 import css from "./transcript.module.css";
 import session from "./toolCard.module.css";
 import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
@@ -26,7 +41,7 @@ import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSea
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
-import { profileRegion } from "../../lib/profileFlags";
+import { profileRegion, profilingEnabled, reportProbe } from "../../lib/profileFlags";
 
 /**
  * c-steer 插队发送 from a transcript held row. The page supplies it so the
@@ -112,7 +127,15 @@ function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocat
   return null;
 }
 
-export function Transcript(props: {
+/** Imperative actions a page may drive from its own header controls. */
+export type TranscriptHandle = {
+  /** Open the in-transcript search bar and focus its input. */
+  openSearch(): void;
+  /** Fold every tool card that is not a failure (same as 全部折叠). */
+  collapseAll(): void;
+};
+
+export type TranscriptProps = {
   events: Observation[];
   bubbles?: LocalBubble[];
   compact?: boolean;
@@ -122,23 +145,28 @@ export function Transcript(props: {
   steerHeld?: SteerHeldControl;
   /** c-steer 插队发送 action for a held row; defaults to the store. */
   onSteerHeld?: SteerHeldHandler;
-}) {
+  /**
+   * Whether the transcript draws its own action strip (全部折叠 / 搜索正文 /
+   * 注入内容). A page that moves these actions into its header passes false
+   * and drives them through TranscriptHandle instead.
+   */
+  toolbar?: boolean;
+};
+
+type InnerProps = TranscriptProps & {
+  routeInstanceId: string;
+  handleRef: ForwardedRef<TranscriptHandle>;
+};
+
+export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function Transcript(props, ref) {
   // SessionPage mounts this inside a route; standalone unit tests do not.
   // useParams throws outside a Router, so only read it when one is present.
   const inRouter = useInRouterContext();
-  if (inRouter) return <TranscriptWithRoute {...props} />;
-  return <TranscriptInner {...props} routeInstanceId="" />;
-}
+  if (inRouter) return <TranscriptWithRoute {...props} handleRef={ref} />;
+  return <TranscriptInner {...props} routeInstanceId="" handleRef={ref} />;
+});
 
-function TranscriptWithRoute(props: {
-  events: Observation[];
-  bubbles?: LocalBubble[];
-  compact?: boolean;
-  journalStatus?: JournalUiStatus;
-  onRetryJournal?: () => void;
-  steerHeld?: SteerHeldControl;
-  onSteerHeld?: SteerHeldHandler;
-}) {
+function TranscriptWithRoute(props: Omit<InnerProps, "routeInstanceId">) {
   const { instanceId = "" } = useParams();
   return <TranscriptInner {...props} routeInstanceId={instanceId} />;
 }
@@ -152,16 +180,9 @@ function TranscriptInner({
   routeInstanceId,
   steerHeld,
   onSteerHeld,
-}: {
-  events: Observation[];
-  bubbles?: LocalBubble[];
-  compact?: boolean;
-  journalStatus?: JournalUiStatus;
-  onRetryJournal?: () => void;
-  routeInstanceId: string;
-  steerHeld?: SteerHeldControl;
-  onSteerHeld?: SteerHeldHandler;
-}) {
+  toolbar = true,
+  handleRef,
+}: InnerProps) {
   // Per-instance reading position/follow persistence. The id comes from the
   // route (read by the wrapper) so SessionPage needs no new prop; tests that
   // mount without a router simply get no persistence.
@@ -343,9 +364,13 @@ function TranscriptInner({
       if (!located) return;
       const topId = nodes[located.index].id;
       const prev = map.get(topId);
+      // The nested child to open is the SELECTED hit when it sits under this
+      // parent; otherwise the first nested hit. A later match must not steal
+      // it, or 上一项/下一项 would never open the one the counter points at.
+      const nested = located.compactId ? match.nodeId : null;
       map.set(topId, {
         current: i === selectedIdx || Boolean(prev?.current),
-        childId: located.compactId ? match.nodeId : prev?.childId ?? null,
+        childId: nested && (i === selectedIdx || !prev?.childId) ? nested : prev?.childId ?? null,
       });
     });
     return map;
@@ -410,6 +435,49 @@ function TranscriptInner({
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
 
+  // Reading anchor: the first row in view, its offset from the scroller top,
+  // and the scrollTop it was sampled at (on every scroll). A row above it that
+  // grows after first paint (a late result, an image, a padTop re-estimate)
+  // would push the text being read down; holding the anchor moves scrollTop
+  // by the same delta unless the reader follows the bottom. A scrollTop that
+  // moved since sampling is a programmatic jump, not growth: re-sample.
+  // Native scroll anchoring is off on the scroller so this is the one
+  // mechanism on every engine. Only a row that intersects the viewport can
+  // anchor: a jump samples while the old window is still mounted, and its
+  // rows all sit outside the view.
+  const readingAnchorRef = useRef<{ id: string; offset: number; top: number } | null>(null);
+  const sampleReadingAnchor = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const top = el.getBoundingClientRect().top;
+    const bottom = top + el.clientHeight;
+    readingAnchorRef.current = null;
+    for (const row of el.querySelectorAll<HTMLElement>("[data-anchor]")) {
+      const box = row.getBoundingClientRect();
+      if (box.bottom > top && box.top < bottom) {
+        readingAnchorRef.current = { id: row.dataset.anchor ?? "", offset: box.top - top, top: el.scrollTop };
+        return;
+      }
+    }
+  }, []);
+  const holdReadingAnchor = useCallback(() => {
+    const el = scrollerRef.current;
+    const held = readingAnchorRef.current;
+    if (!el || pinRef.current || pendingScroll.current || prependAnchorRef.current) return;
+    // No anchor, or one the window has since unmounted: take a new one from
+    // the rows now in view. Growth that already landed is not undone.
+    const row = held ? el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.id)}"]`) : null;
+    if (!held || !row || Math.abs(el.scrollTop - held.top) >= 1) {
+      sampleReadingAnchor();
+      return;
+    }
+    const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
+    if (Math.abs(delta) < 1) return;
+    el.scrollTop += delta;
+    scrollTopRef.current = el.scrollTop;
+    held.top = el.scrollTop;
+  }, [sampleReadingAnchor]);
+
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every
   // frame): TranscriptRow's measuring effect depends on it, so an inline
@@ -417,6 +485,8 @@ function TranscriptInner({
   // read) for every visible row on every scroll frame.
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
+    // The row has already grown in the DOM: hold the reader before paint.
+    holdReadingAnchor();
     // Sub-pixel tolerance: measured heights jitter by fractions of a px
     // between frames; ignore deltas under 1 instead of thrashing state.
     setRowHeights((prev) => {
@@ -426,7 +496,7 @@ function TranscriptInner({
       next.set(id, height);
       return next;
     });
-  }, []);
+  }, [holdReadingAnchor]);
 
   // Converge the unmeasured-row estimate on this visit's real average so
   // offsets outside the window (search hits, saved position) stop drifting.
@@ -568,6 +638,13 @@ function TranscriptInner({
     pending.tries += 1;
   }, [sizes, nodes, estimate, applyOffset]);
 
+  // A commit that moves rows above the anchor (padTop re-estimated, a row
+  // inserted above) holds the reader the same way a measured growth does. A
+  // range commit after a jump re-acquires the anchor from the rows it mounted.
+  useLayoutEffect(() => {
+    holdReadingAnchor();
+  }, [sizes, nodes, estimate, range.start, range.end, holdReadingAnchor]);
+
   useLayoutEffect(() => {
     const el = scrollerRef.current;
     if (!el || !pinRef.current) return;
@@ -649,6 +726,36 @@ function TranscriptInner({
     openButtonRef.current?.focus();
   }, []);
 
+  // Explicit collapse wins over a prior reader expansion; the bumped row key
+  // remounts each card with its local latch reset. Failures stay open
+  // (ToolRow never passes defaultFolded to a failed card).
+  const collapseAll = useCallback(() => {
+    setExpandedTools(new Set());
+    setCollapseTick((n) => n + 1);
+  }, []);
+
+  useImperativeHandle(handleRef, () => ({ openSearch, collapseAll }), [openSearch, collapseAll]);
+
+  // Rows are memoised (see TranscriptRow), so the props they receive must keep
+  // their identity across streaming batches. The page builds a fresh steer
+  // control object and handler on every render; hold them by value / by ref.
+  const steerEnabled = steerHeld?.enabled;
+  const steerReason = steerHeld?.reason;
+  const hasSteerHeld = steerHeld !== undefined;
+  const stableSteerHeld = useMemo<SteerHeldControl | undefined>(
+    () => (hasSteerHeld ? { enabled: Boolean(steerEnabled), reason: steerReason ?? "" } : undefined),
+    [hasSteerHeld, steerEnabled, steerReason],
+  );
+  const onSteerHeldRef = useRef(onSteerHeld);
+  useLayoutEffect(() => {
+    onSteerHeldRef.current = onSteerHeld;
+  });
+  const hasSteerHandler = onSteerHeld !== undefined;
+  const stableOnSteerHeld = useMemo<SteerHeldHandler | undefined>(
+    () => (hasSteerHandler ? (iid, bid) => onSteerHeldRef.current?.(iid, bid) : undefined),
+    [hasSteerHandler],
+  );
+
   const gotoMatch = useCallback((next: number) => {
     const match = matches[next];
     if (!match) return;
@@ -714,6 +821,7 @@ function TranscriptInner({
   return (
     <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
+      {toolbar ? (
       <div
         className={css.toolbar}
         data-testid="transcript-toolbar"
@@ -740,10 +848,7 @@ function TranscriptInner({
               className={ui.chip}
               data-testid="collapse-all"
               onClick={() => {
-                // Explicit collapse wins over a prior reader expansion; the
-                // bumped row key remounts each card with its local latch reset.
-                setExpandedTools(new Set());
-                setCollapseTick((n) => n + 1);
+                collapseAll();
                 if (compactLayout) setToolsOpen(false);
               }}
             >
@@ -782,6 +887,7 @@ function TranscriptInner({
           </>
         )}
       </div>
+      ) : null}
       {searchOpen ? (
         <div
           className={css.searchbar}
@@ -846,12 +952,13 @@ function TranscriptInner({
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          sampleReadingAnchor();
           persistSoon();
         }}
       >
         <div className={css.list}>
           {canLoadEarlier ? (
-            <div data-testid="load-earlier-wrap" style={{ display: "flex", justifyContent: "center", padding: "8px 12px" }}>
+            <div data-testid="load-earlier-wrap" className={css.loadEarlier}>
               <button
                 type="button"
                 className={ui.chip}
@@ -878,8 +985,10 @@ function TranscriptInner({
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
                 instanceId={instanceId}
-                steerHeld={steerHeld}
-                onSteerHeld={onSteerHeld}
+                // Only held rows read the steer control; scoping it keeps an
+                // instance-state flip from re-committing every visible row.
+                steerHeld={node.type === "message" && node.local?.held ? stableSteerHeld : undefined}
+                onSteerHeld={stableOnSteerHeld}
                 steering={steeringRef.current}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
                 hitChildId={
@@ -921,27 +1030,7 @@ function TranscriptInner({
   );
 }
 
-function TranscriptRow({
-  node,
-  active,
-  defaultFolded,
-  collapseTick,
-  settle,
-  onSize,
-  searchHit,
-  searchCurrent,
-  expandTick,
-  hitChildId,
-  instanceId,
-  steerHeld,
-  onSteerHeld,
-  steering,
-  dismissedWorkflows,
-  onToggleWorkflowDismiss,
-  expandedTools,
-  onToggleToolExpand,
-  currentHitIds,
-}: {
+type TranscriptRowProps = {
   node: TranscriptNode;
   active: boolean;
   defaultFolded: boolean;
@@ -961,14 +1050,113 @@ function TranscriptRow({
   expandedTools: ReadonlySet<string>;
   onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
   currentHitIds: ReadonlySet<string>;
-}) {
+};
+
+/**
+ * Structural equality for assembled nodes. assembleTranscript rebuilds every
+ * node object on each journal batch, so identity says nothing; only the
+ * mounted window (a few dozen rows) is ever compared.
+ */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) if (!sameValue(a[i], b[i])) return false;
+    return true;
+  }
+  if (Array.isArray(b)) return false;
+  // Only plain records recurse; anything else (Date, Map, class instances)
+  // compares by identity above.
+  const proto = Object.getPrototypeOf(a);
+  if ((proto !== Object.prototype && proto !== null) || Object.getPrototypeOf(b) !== proto) return false;
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!sameValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+  }
+  return true;
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
+
+/**
+ * A streaming batch must commit only the row whose content changed. The
+ * parent rebuilds nodes and derived sets per batch, so compare by value; the
+ * callbacks are stable by construction (see TranscriptInner).
+ */
+function sameRowProps(prev: TranscriptRowProps, next: TranscriptRowProps): boolean {
+  return (
+    prev.active === next.active
+    && prev.defaultFolded === next.defaultFolded
+    && prev.collapseTick === next.collapseTick
+    && prev.settle === next.settle
+    && prev.onSize === next.onSize
+    && prev.searchHit === next.searchHit
+    && prev.searchCurrent === next.searchCurrent
+    && prev.expandTick === next.expandTick
+    && prev.hitChildId === next.hitChildId
+    && prev.instanceId === next.instanceId
+    && prev.steerHeld === next.steerHeld
+    && prev.onSteerHeld === next.onSteerHeld
+    && prev.steering === next.steering
+    && prev.onToggleWorkflowDismiss === next.onToggleWorkflowDismiss
+    && prev.onToggleToolExpand === next.onToggleToolExpand
+    && sameSet(prev.dismissedWorkflows, next.dismissedWorkflows)
+    && sameSet(prev.expandedTools, next.expandedTools)
+    && sameSet(prev.currentHitIds, next.currentHitIds)
+    && sameValue(prev.node, next.node)
+  );
+}
+
+// c-perfaudit probe (?profile=1 only): one `commit:TranscriptRow` sample per
+// row that actually re-rendered in a commit, tagged with its node id.
+function rowCommitProbe(nodeId: string): ProfilerOnRenderCallback {
+  return (_id, phase, actualDuration) => {
+    reportProbe("commit:TranscriptRow", { phase, actualDuration, nodeId });
+  };
+}
+
+const TranscriptRow = memo(function TranscriptRow({
+  node,
+  active,
+  defaultFolded,
+  collapseTick,
+  settle,
+  onSize,
+  searchHit,
+  searchCurrent,
+  expandTick,
+  hitChildId,
+  instanceId,
+  steerHeld,
+  onSteerHeld,
+  steering,
+  dismissedWorkflows,
+  onToggleWorkflowDismiss,
+  expandedTools,
+  onToggleToolExpand,
+  currentHitIds,
+}: TranscriptRowProps) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = () => onSize(node.id, el.getBoundingClientRect().height + 12);
+    // The row's own padding carries the gap to the next row (no margins, and
+    // display: flow-root keeps child margins inside), so the border box IS
+    // the slot the virtual window must reserve.
+    const report = () => onSize(node.id, el.getBoundingClientRect().height);
     report();
     if (typeof ResizeObserver === "undefined") return;
+    // Also re-measures asynchronous growth (syntax highlight, lazy math,
+    // images); the scroller keeps the reading anchor across it.
     const ro = new ResizeObserver(report);
     ro.observe(el);
     return () => ro.disconnect();
@@ -978,6 +1166,24 @@ function TranscriptRow({
     // rebuild the observer on every parent scroll re-render, since the
     // assembled node list is re-created each render.
   }, [onSize, node.id]);
+  const probe = useMemo(() => (profilingEnabled ? rowCommitProbe(node.id) : null), [node.id]);
+  const content = renderNode(node, {
+    defaultFolded,
+    collapseTick,
+    settle,
+    expandTick,
+    hitChildId,
+    instanceId,
+    steerHeld,
+    onSteerHeld,
+    steering,
+    dismissedWorkflows,
+    onToggleWorkflowDismiss,
+    expandedTools,
+    onToggleToolExpand,
+    searchCurrent,
+    currentHitIds,
+  });
   return (
     <div
       ref={ref}
@@ -1005,25 +1211,16 @@ function TranscriptRow({
         searchCurrent ? css.rowCurrent : "",
       ].join(" ").trim()}
     >
-      {renderNode(node, {
-        defaultFolded,
-        collapseTick,
-        settle,
-        expandTick,
-        hitChildId,
-        instanceId,
-        steerHeld,
-        onSteerHeld,
-        steering,
-        dismissedWorkflows,
-        onToggleWorkflowDismiss,
-        expandedTools,
-        onToggleToolExpand,
-        searchCurrent,
-        currentHitIds,
-      })}    </div>
+      {probe ? (
+        <Profiler id="TranscriptRow" onRender={probe}>
+          {content}
+        </Profiler>
+      ) : (
+        content
+      )}
+    </div>
   );
-}
+}, sameRowProps);
 
 /** A failed tool gets a visible inline tag and never obeys collapse-all. */
 function ToolRow({
@@ -1056,6 +1253,7 @@ function ToolRow({
       diffState={node.diffState}
       workflow={node.workflow}
       defaultFolded={failed ? false : opts.defaultFolded}
+      foldSettled
       settle={opts.settle}
       // A current in-transcript search hit inside this card must not stay
       // hidden behind the D-041 fold (same auto-open the transcript gives
@@ -1070,12 +1268,18 @@ function ToolRow({
   const folds = (node.subagents?.length ?? 0) > 0 ? (
     <SubagentFolds refs={node.subagents ?? []} openChildId={hitChildId ?? null} />
   ) : null;
+  // Nested rows (subagent folds, workflow member folds) keep their expansion
+  // in the same session set 全部折叠 clears, so it survives virtualisation.
+  const nested = useMemo<NestedToolState>(
+    () => ({ openChildId: hitChildId ?? null, expanded: opts.expandedTools, onToggle: opts.onToggleToolExpand }),
+    [hitChildId, opts.expandedTools, opts.onToggleToolExpand],
+  );
   if (!failed) {
     return (
-      <>
+      <NestedToolContext.Provider value={nested}>
         {card}
         {folds}
-      </>
+      </NestedToolContext.Provider>
     );
   }
   return (
@@ -1083,8 +1287,10 @@ function ToolRow({
       <span className={css.failTag} data-testid="tool-failure-tag">
         工具失败 · {node.result?.outcome === "denied" ? "已拒绝" : "失败"}
       </span>
-      {card}
-      {folds}
+      <NestedToolContext.Provider value={nested}>
+        {card}
+        {folds}
+      </NestedToolContext.Provider>
     </div>
   );
 }
@@ -1180,7 +1386,9 @@ function renderNode(
           ) : null}
         </div>
         {node.role === "assistant" ? (
-          <MarkdownText text={node.text} />
+          // The stored text is untouched; only the streaming render closes a
+          // dangling ``` so the partial block does not flip prose/code.
+          <MarkdownText text={streaming ? balanceFences(node.text) : node.text} />
         ) : node.local ? (
           // Optimistic local bubble: inline [Image #n] thumbnails can render
           // from the staged previews. Journaled user messages keep plain text
@@ -1201,7 +1409,7 @@ function renderNode(
         ) : (
           <p className={session.bubble}>{node.text}</p>
         )}
-        {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
+        {streaming ? <StreamingCursor text={node.text} /> : null}
         {node.local?.attachments?.length || node.localAttachments?.length ? (
           <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
@@ -1337,6 +1545,101 @@ function renderNode(
   return null;
 }
 
+/** Last non-blank text node inside `root`, in document order. */
+function lastTextNode(root: Element): Text | null {
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let last: Text | null = null;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if ((n.nodeValue ?? "").trim()) last = n as Text;
+  }
+  return last;
+}
+
+/**
+ * The streaming caret. It is absolutely positioned at the end of the last
+ * rendered glyph, so it takes no line box of its own: the row keeps the same
+ * height when streaming starts and ends. Its box is clamped to what is
+ * visible: inside every clipping ancestor of the glyph (a code block's
+ * horizontal scroller) and inside the section's content box, so a long
+ * unwrapped line can never push it out and widen any scroll extent.
+ *
+ * The glyph is resolved again at every placement: async highlighting swaps
+ * a code block's text node for highlighted spans after the text commits, and
+ * a cached node would be detached (measuring as 0,0). A mutation observer
+ * re-places when that swap lands; a capturing scroll listener on the section
+ * catches any inner scroller, whichever one holds the glyph now.
+ */
+function StreamingCursor({ text }: { text: string }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const cursor = ref.current;
+    const section = cursor?.parentElement;
+    if (!cursor || !section) return;
+    const place = () => {
+      let textNode: Text | null = null;
+      // The body is everything between the author line and the cursor.
+      for (let el = cursor.previousElementSibling; el && el !== section.firstElementChild; el = el.previousElementSibling) {
+        textNode = lastTextNode(el);
+        if (textNode) break;
+      }
+      // Ancestors between the glyph and the section that clip horizontally.
+      const clips: HTMLElement[] = [];
+      for (let el = textNode?.parentElement ?? null; el && el !== section; el = el.parentElement) {
+        if (getComputedStyle(el).overflowX !== "visible") clips.push(el);
+      }
+      const at = textNode ? caretRect(textNode) : null;
+      if (!at) {
+        cursor.style.left = "";
+        cursor.style.top = "";
+        return;
+      }
+      const base = section.getBoundingClientRect();
+      const pad = getComputedStyle(section);
+      let minX = base.left + section.clientLeft + parseFloat(pad.paddingLeft);
+      let maxX = base.left + section.clientLeft + section.clientWidth - parseFloat(pad.paddingRight);
+      for (const clip of clips) {
+        const box = clip.getBoundingClientRect();
+        minX = Math.max(minX, box.left + clip.clientLeft);
+        maxX = Math.min(maxX, box.left + clip.clientLeft + clip.clientWidth);
+      }
+      const width = cursor.offsetWidth;
+      const x = Math.max(minX, Math.min(at.right + 1, maxX - width));
+      cursor.style.left = `${x - base.left - section.clientLeft}px`;
+      cursor.style.top = `${at.top - base.top - section.clientTop + Math.max(0, (at.height - cursor.offsetHeight) / 2)}px`;
+    };
+    place();
+    section.addEventListener("scroll", place, { capture: true, passive: true });
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(place);
+    ro?.observe(section);
+    // Only content changes: placing writes the caret's style attribute.
+    const mo = typeof MutationObserver === "undefined" ? null : new MutationObserver(place);
+    mo?.observe(section, { childList: true, subtree: true, characterData: true });
+    return () => {
+      section.removeEventListener("scroll", place, { capture: true });
+      ro?.disconnect();
+      mo?.disconnect();
+    };
+  }, [text]);
+  return <span ref={ref} className={css.cursor} data-testid="streaming-cursor" aria-hidden />;
+}
+
+/** Viewport rect of the last visible glyph (a whole code point) in `node`. */
+function caretRect(node: Text): DOMRect | null {
+  const value = node.nodeValue ?? "";
+  const end = value.trimEnd().length;
+  if (end === 0) return null;
+  let start = end - 1;
+  // Step back over a surrogate pair so an emoji measures its full glyph.
+  if (start > 0 && /[\uDC00-\uDFFF]/.test(value[start]) && /[\uD800-\uDBFF]/.test(value[start - 1])) start -= 1;
+  const range = node.ownerDocument.createRange();
+  range.setStart(node, start);
+  range.setEnd(node, end);
+  // jsdom has no layout: getClientRects is absent there.
+  const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
+  const rect = rects && rects.length ? rects[rects.length - 1] : null;
+  return rect && rect.height > 0 ? rect : null;
+}
+
 function CompactFold({
   toolCount,
   thoughtCount,
@@ -1361,7 +1664,7 @@ function CompactFold({
         <span>▸</span>
         <span>{open ? "收起过程" : `${toolCount} 次工具 · ${thoughtCount} 段思考`}</span>
       </button>
-      {open ? <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>{children}</div> : null}
+      {open ? <div className={css.foldBody}>{children}</div> : null}
     </div>
   );
 }

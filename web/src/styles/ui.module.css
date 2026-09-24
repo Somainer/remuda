@@ -508,6 +508,24 @@
   margin-bottom: 0;
 }
 
+/* Calm edges: the first block never pushes down from the author line, and
+   the last never adds a gap the row padding already provides. */
+.md > :global(:first-child),
+.prose > :global(:first-child) {
+  margin-top: 0;
+}
+
+.md > :global(:last-child),
+.prose > :global(:last-child) {
+  margin-bottom: 0;
+}
+
+.md :global(:is(strong, b)),
+.prose :global(:is(strong, b)) {
+  color: var(--fg-strong);
+  font-weight: 600;
+}
+
 .md :global(:is(h1, h2, h3, h4, h5, h6)),
 .prose :global(:is(h1, h2, h3, h4, h5, h6)) {
   margin: var(--space-4) 0 var(--space-2);
@@ -545,6 +563,26 @@
   padding-left: 1.4em;
 }
 
+.md :global(li + li),
+.prose :global(li + li) {
+  margin-top: var(--space-1);
+}
+
+.md :global(li > :is(ul, ol)),
+.prose :global(li > :is(ul, ol)) {
+  margin: var(--space-1) 0 0;
+}
+
+.md :global(li > p),
+.prose :global(li > p) {
+  margin: 0;
+}
+
+.md :global(li::marker),
+.prose :global(li::marker) {
+  color: var(--fg-muted);
+}
+
 .md :global(blockquote),
 .prose :global(blockquote) {
   margin: 0 0 var(--space-3);
@@ -553,10 +591,15 @@
   color: var(--fg-muted);
 }
 
+.md :global(blockquote > :last-child),
+.prose :global(blockquote > :last-child) {
+  margin-bottom: 0;
+}
+
 .md :global(pre),
 .prose :global(pre) {
   margin: 0 0 var(--space-3);
-  padding: var(--space-3);
+  padding: var(--space-3) 14px;
   overflow: auto;
   border-radius: var(--radius-md);
   background: var(--bg-inset);
@@ -582,6 +625,14 @@
   font-size: inherit;
 }
 
+/* Fenced code renders CodeBlock's root (a div, not a pre) straight into the
+   flow, so it takes the same block gap as a bare pre. `:where` keeps it
+   below the last-child trim above. */
+.md :global(:where([data-testid="code-block"])),
+.prose :global(:where([data-testid="code-block"])) {
+  margin: 0 0 var(--space-3);
+}
+
 .md :global(a),
 .prose :global(a) {
   color: var(--link);
@@ -604,6 +655,9 @@
   border-bottom: 1px solid var(--divider);
   text-align: left;
   vertical-align: top;
+  /* Figures line up down a column; an authored `:---:` alignment still wins
+     (it arrives as an inline style). */
+  font-variant-numeric: tabular-nums;
 }
 
 .md :global(th),

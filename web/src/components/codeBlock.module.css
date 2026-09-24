@@ -1,37 +1,23 @@
+/* @tokens strict */
 /*
- * Code block + syntax-token palette.
- *
- * No highlight.js theme file is vendored: token colours are CSS variables
- * declared per theme here, and the `.hljs-*` classes the tokeniser emits are
- * mapped onto them below. The block sits inside a `.md` markdown container,
- * so `.root .pre` is scoped with extra specificity to win over
- * `.md :global(pre)`.
+ * Code block. No highlight.js theme file is vendored: the `.hljs-*` classes
+ * the tokeniser emits map onto the global `--tok-*` roles (tokens.css, both
+ * modes). The block sits inside a `.md` markdown container, so `.root .pre`
+ * is scoped with extra specificity to win over `.md :global(pre)`.
  */
 
 .root {
-  --tok-comment: #8a8175;
-  --tok-keyword: #d08770;
-  --tok-type: #7fa8b8;
-  --tok-string: #a3b87a;
-  --tok-number: #d2a65a;
-  --tok-function: #e0c9a0;
-  --tok-meta: #b08d57;
-  --tok-attr: #8fb3c2;
-  --tok-del: #b4634f;
-  --tok-add: #7a8f62;
-
   position: relative;
-  margin: 0 0 0.6em;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-0);
+  /* No margin: the reading flow (`.md`) owns block spacing. */
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
   max-width: 100%;
   /* The pre owns horizontal scroll; rounded corners must not leak it. */
   overflow: hidden;
 }
 
 /*
- * MarkdownText is a column-flex item inside an assistant row, where the
+ * MarkdownText can sit in a flex item inside an assistant row, where the
  * automatic minimum size would grow the wrapper to a code block's
  * max-content and push the overflow past the transcript column. Opting into
  * shrink here keeps every long line inside the pre instead.
@@ -41,37 +27,22 @@
   max-width: 100%;
 }
 
-:global([data-theme="ledger"]) .root {
-  --tok-comment: #8a8378;
-  --tok-keyword: #9a4a33;
-  --tok-type: #3d5a68;
-  --tok-string: #556a3c;
-  --tok-number: #8c6a16;
-  --tok-function: #6d5a2e;
-  --tok-meta: #7a5a30;
-  --tok-attr: #3d5a68;
-  --tok-del: #8f3d2c;
-  --tok-add: #556a3c;
-}
-
-/* Floating pill, top-right inside the block. It stays out of the way until
+/* Floating toolbar, top-right inside the block. It stays out of the way until
    the pointer or keyboard reaches the block. */
 .toolbar {
   position: absolute;
-  top: 4px;
-  right: 4px;
+  top: var(--space-1);
+  right: var(--space-1);
   z-index: 1;
   display: flex;
   align-items: center;
   gap: 1px;
   padding: 2px;
-  border: 1px solid color-mix(in srgb, var(--line) 65%, transparent);
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--ink-1) 90%, transparent);
-  -webkit-backdrop-filter: blur(4px);
-  backdrop-filter: blur(4px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
   opacity: 0;
-  transition: opacity 140ms ease;
+  transition: opacity var(--dur-2) var(--ease-out);
 }
 
 .root:hover .toolbar,
@@ -81,10 +52,10 @@
 
 .label,
 .note {
-  font-family: var(--mono);
-  font-size: 10.5px;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
   line-height: 1;
-  color: var(--mute);
+  color: var(--fg-muted);
   user-select: none;
   white-space: nowrap;
 }
@@ -94,44 +65,44 @@
 }
 
 .note {
-  padding: 0 8px 0 2px;
+  padding: 0 var(--space-2) 0 2px;
 }
 
 .button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--mute);
+  color: var(--fg-muted);
   cursor: pointer;
   transition:
-    color 120ms ease,
-    background-color 120ms ease;
+    color var(--dur-1) var(--ease-out),
+    background-color var(--dur-1) var(--ease-out);
 }
 
 .button:hover {
-  color: var(--paper);
-  background: color-mix(in srgb, var(--paper) 8%, transparent);
+  color: var(--fg-strong);
+  background: var(--bg-hover);
 }
 
 .button:focus-visible {
-  outline: 2px solid var(--cold);
+  outline: var(--focus-ring);
   outline-offset: 1px;
-  color: var(--paper);
+  color: var(--fg-strong);
 }
 
 .button[data-active="true"] {
-  color: var(--paper);
-  background: color-mix(in srgb, var(--paper) 10%, transparent);
+  color: var(--fg-strong);
+  background: var(--bg-selected);
 }
 
 .button[data-copied="true"] {
-  color: var(--ok);
+  color: var(--success-fg);
 }
 
 /* Touch/narrow overrides live below — they must follow the base .button and
@@ -139,17 +110,14 @@
 
 .root .pre {
   margin: 0;
-  /* The top strip is the floating toolbar's lane: it must never sit on top of
-     code text (long first lines on narrow screens), so the pre starts below
-     it. */
-  padding: 34px 12px 10px;
+  padding: var(--space-3) 14px;
   border: 0;
-  border-radius: var(--radius);
+  border-radius: 0;
   background: transparent;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.55;
-  color: var(--paper);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: var(--lh-code);
+  color: var(--fg-body);
   white-space: pre;
   overflow-x: auto;
   /* Keep scroll inside the pre under every flex/grid ancestor. */
@@ -165,24 +133,55 @@
 }
 
 /* Touch has no hover, and a phone-sized window wants the fat hit area even
-   when a mouse is driving it: the toolbar is always shown, the buttons carry
-   the full 44px hit area, and the pre leaves a taller toolbar lane. Placed
-   AFTER every base rule it overrides — equal specificity, and in dev source
-   order is the cascade tiebreak. */
+   when a mouse is driving it. There the toolbar becomes a compact 32px header
+   row inside the block — language left in the faint ink, actions right —
+   instead of a floating pill over a reserved lane. Each action is a 44px box
+   whose extra height hangs below the row into the pre's top padding (never
+   over code text), so the reach is 44px while the visible row stays 32px.
+   Placed AFTER every base rule it overrides (equal specificity; source order
+   breaks it). */
 @media (pointer: coarse), (max-width: 560px) {
   .toolbar {
+    position: relative;
+    top: auto;
+    right: auto;
+    align-items: flex-start;
+    height: 32px;
+    gap: 0;
+    padding: 0 0 0 14px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
     opacity: 1;
+  }
+  .label,
+  .note {
+    line-height: 32px;
+    color: var(--fg-faint);
+  }
+  .label {
+    padding: 0 var(--space-2) 0 0;
+  }
+  .toolbar .button:first-of-type {
+    margin-left: auto;
   }
   .button {
     width: var(--touch);
     height: var(--touch);
+    margin-bottom: calc(32px - var(--touch));
+    padding-bottom: calc(var(--touch) - 32px);
+    background: transparent;
+  }
+  .button:hover,
+  .button[data-active="true"] {
+    background: transparent;
   }
   .root .pre {
-    padding-top: 52px;
+    padding-top: var(--space-3);
   }
 }
 
-/* highlight.js token classes → palette variables. */
+/* highlight.js token classes → palette roles. */
 .root :global(.hljs-comment),
 .root :global(.hljs-quote) {
   color: var(--tok-comment);
@@ -250,11 +249,4 @@
 
 .root :global(.hljs-strong) {
   font-weight: 700;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .toolbar,
-  .button {
-    transition: none;
-  }
 }

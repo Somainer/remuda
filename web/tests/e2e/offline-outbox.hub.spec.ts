@@ -196,12 +196,12 @@ test.afterAll(async ({ request }) => {
 
 /**
  * Wait for the optimistic bubble to be replaced by the authoritative journal
- * message node carrying the SAME commandId (what "delivered" renders as once
+ * transcript row carrying the SAME commandId (what "delivered" renders as once
  * the journal joins), and assert no waiting/unconfirmed chip is left behind.
  */
 async function expectDelivered(page: Page, commandId: string | null) {
   const authoritative = page.locator(
-    `[data-testid="message"][data-command-id="${commandId}"]`,
+    `[data-testid="transcript-row"][data-role="user"][data-command-id="${commandId}"]`,
   );
   await expect(authoritative).toHaveCount(1, { timeout: 30_000 });
   const bubble = page.locator(

@@ -210,7 +210,7 @@ it("a poll-projected read-back settles a pending push-down without a live event 
     },
   };
   vi.spyOn(api, "instanceList").mockResolvedValue({ items: [projected] } as never);
-  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
 
   await hubStore.setEffort(ctx.instance.id, {
     index: 4,
@@ -227,7 +227,7 @@ it("a queued push-down survives a poll returning the unchanged level, then settl
   const working = { state: "known", value: "working" } as const;
   const ctx = await startFollowing("poll-queued", working);
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   // Baseline read-back the session already had before the push-down.
   ctx.receive(effortEvent(2, "xhigh", false, "remuda"));
   const baselineAt = "2026-09-16T00:02:00Z";
@@ -275,7 +275,7 @@ it("a poll-settled clamp still leaves the slider on the requested stop when its 
   // the observed (terminal-switch) level.
   const ctx = await startFollowing("poll-clamp");
   vi.spyOn(api, "instanceConfigure").mockResolvedValue({} as never);
-  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
   const clampedAt = "2026-09-21T00:00:05.000Z";
   vi.spyOn(api, "instanceList").mockResolvedValue({
     items: [
@@ -316,7 +316,7 @@ it("an older poll projection cannot overwrite a newer live effective or move the
   // of order after the live socket already advanced) must never roll the
   // effective level back, and the projection path never writes the slider.
   const ctx = await startFollowing("monotonic");
-  vi.spyOn(api, "interactionList").mockResolvedValue({ items: [] } as never);
+  vi.spyOn(api, "interactionList").mockResolvedValue([] as never);
 
   // A terminal-side switch arrives live: effective max, slider folds to max.
   const newerAt = "2026-09-21T01:00:09.000Z";

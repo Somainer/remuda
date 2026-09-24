@@ -1,11 +1,31 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { act, createRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
 import type { Observation } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
-import { Transcript } from "./Transcript";
+import { Transcript, type TranscriptHandle } from "./Transcript";
+
+// The commit probe is only mounted under ?profile=1; the flag is a getter so
+// one describe block can turn it on without affecting the rest of the file.
+const profile = vi.hoisted(() => ({
+  on: false,
+  probes: [] as Array<{ kind: string; value: unknown }>,
+}));
+vi.mock("../../lib/profileFlags", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/profileFlags")>();
+  return {
+    ...actual,
+    get profilingEnabled() {
+      return profile.on;
+    },
+    reportProbe: (kind: string, value: unknown) => {
+      profile.probes.push({ kind, value });
+    },
+  };
+});
 
 function obs(
   seq: number,
@@ -335,7 +355,7 @@ describe("Transcript", () => {
       },
     );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12,
+      height: ROW,
       top: 0,
       left: 0,
       right: 0,
@@ -430,7 +450,7 @@ describe("Transcript", () => {
       },
     );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12,
+      height: ROW,
       top: 0,
       left: 0,
       right: 0,
@@ -488,8 +508,9 @@ describe("Transcript", () => {
 
 describe("Transcript search (batch E)", () => {
   // jsdom performs no layout, so virtualization math gets zeros unless rows
-  // get a deterministic height (84 + the component's 12px margin = 96,
-  // matching virtualWindow.DEFAULT_ROW) and the scroller a viewport/height.
+  // get a deterministic height (96, matching virtualWindow.DEFAULT_ROW; the
+  // row's spacing is padding inside its box, so the rect is the whole row)
+  // and the scroller a viewport/height.
   // Patches live on the prototypes so they also cover a remounted scroller.
   afterEach(() => {
     vi.restoreAllMocks();
@@ -511,7 +532,7 @@ describe("Transcript search (batch E)", () => {
       },
     );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12,
+      height: ROW,
       top: 0,
       left: 0,
       right: 0,
@@ -774,5 +795,130 @@ describe("D-049 compact transcript toolbar fold", () => {
     expect(screen.getByTestId("collapse-all")).toBeTruthy();
     expect(screen.getByTestId("transcript-search-open")).toBeTruthy();
     expect(screen.queryByTestId("transcript-tools-open")).toBeNull();
+  });
+});
+
+/** One streaming assistant message: open, then text appends, then close. */
+function streamingMessage(seq: number, text: string, revision: number): Observation {
+  const event = assistantMessage(seq, text);
+  const payload = event.payload as Record<string, unknown>;
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      nodeId: "n-stream" as Id,
+      messageId: "m-stream" as Id,
+      status: "streaming",
+      operation: revision === 1 ? "open" : "append",
+      revision: String(revision),
+      baseRevision: revision === 1 ? null : String(revision - 1),
+      targetBlock: revision === 1 ? null : 0,
+    },
+  } as Observation;
+}
+
+function closeStreaming(seq: number, text: string, revision: number): Observation {
+  const event = streamingMessage(seq, text, revision);
+  return {
+    ...event,
+    payload: {
+      ...(event.payload as Record<string, unknown>),
+      operation: "close",
+      status: "complete",
+      targetBlock: null,
+    },
+  } as Observation;
+}
+
+describe("TranscriptHandle (D-053)", () => {
+  it("opens search and collapses every expanded card through the ref", () => {
+    const ref = createRef<TranscriptHandle>();
+    render(
+      <MemoryRouter initialEntries={["/s/ins_handle"]}>
+        <Routes>
+          <Route
+            path="/s/:instanceId"
+            element={
+              <Transcript
+                ref={ref}
+                events={[userMessage(1, "跑一下"), ...settledBash(2, 3), assistantMessage(4, "done")]}
+                compact={false}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(ref.current).not.toBeNull();
+    // Desktop reading column: the settled card starts folded.
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+    fireEvent.click(screen.getByTestId("tool-fold-open"));
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    act(() => ref.current?.collapseAll());
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+
+    expect(screen.queryByTestId("transcript-search-input")).toBeNull();
+    act(() => ref.current?.openSearch());
+    expect(screen.getByTestId("transcript-search-input")).toBeTruthy();
+  });
+
+  it("shows the toolbar by default and hides it with toolbar={false}", () => {
+    const events = [userMessage(1, "alpha"), assistantMessage(2, "beta")];
+    const { unmount } = render(<Transcript events={events} compact={false} />);
+    expect(screen.getByTestId("transcript-toolbar")).toBeTruthy();
+    unmount();
+    const ref = createRef<TranscriptHandle>();
+    render(<Transcript ref={ref} events={events} compact={false} toolbar={false} />);
+    expect(screen.queryByTestId("transcript-toolbar")).toBeNull();
+    expect(screen.queryByTestId("collapse-all")).toBeNull();
+    // The handle still drives search when the host owns the controls.
+    act(() => ref.current?.openSearch());
+    expect(screen.getByTestId("transcript-search-input")).toBeTruthy();
+  });
+});
+
+describe("streaming row (D-053)", () => {
+  afterEach(() => {
+    profile.on = false;
+    profile.probes = [];
+  });
+
+  it("commits only the streaming row per batch", () => {
+    profile.on = true;
+    const settled = [userMessage(1, "问题"), assistantMessage(2, "上一轮回答"), userMessage(3, "继续")];
+    const first = streamingMessage(4, "第一段", 1);
+    const { rerender } = render(<Transcript events={[...settled, first]} compact={false} />);
+    for (let rev = 2; rev <= 4; rev += 1) {
+      profile.probes = [];
+      rerender(
+        <Transcript
+          events={[
+            ...settled,
+            first,
+            ...Array.from({ length: rev - 1 }, (_, i) => streamingMessage(5 + i, ` 追加${i}`, i + 2)),
+          ]}
+          compact={false}
+        />,
+      );
+      const rows = profile.probes
+        .filter((p) => p.kind === "commit:TranscriptRow")
+        .map((p) => (p.value as { nodeId: string }).nodeId);
+      expect(rows.length).toBeGreaterThan(0);
+      expect(new Set(rows).size).toBe(1);
+    }
+  });
+
+  it("shows the caret while streaming and removes it on close without touching the text", () => {
+    const open = streamingMessage(1, "```ts\nconst a = 1;", 1);
+    const { rerender } = render(<Transcript events={[open]} compact={false} />);
+    expect(screen.getByTestId("streaming-cursor")).toBeTruthy();
+    // An open fence renders closed while streaming, so the block is already
+    // a code block and does not reflow when the closing fence arrives.
+    expect(screen.getByTestId("code-block")).toBeTruthy();
+    rerender(
+      <Transcript events={[open, closeStreaming(2, "```ts\nconst a = 1;\n```", 2)]} compact={false} />,
+    );
+    expect(screen.queryByTestId("streaming-cursor")).toBeNull();
+    expect(screen.getByTestId("code-block")).toBeTruthy();
   });
 });

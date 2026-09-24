@@ -98,6 +98,7 @@ export function SubagentFold({
                 result={node.result}
                 completeness={node.completeness}
                 diffState={node.diffState}
+                foldSettled
               />
             ),
           )}

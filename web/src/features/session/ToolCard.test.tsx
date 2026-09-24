@@ -105,3 +105,70 @@ describe("ToolCard · image tool result (D-045 §6.2)", () => {
     expect(screen.getByText(/image not attached: image\/png/)).toBeTruthy();
   });
 });
+
+describe("ToolCard · reading-column fold (D-053)", () => {
+  it("folds a settled card at desktop width inside the reading column", () => {
+    render(
+      <ToolCard
+        driverKind="claude-pty"
+        call={mcpCall()}
+        result={imageResult()}
+        completeness="structured"
+        diffState="unknown"
+        foldSettled
+      />,
+    );
+    const card = screen.getByTestId("tool-card");
+    expect(card.getAttribute("data-folded")).toBe("1");
+    expect(card.hasAttribute("data-running")).toBe(false);
+    expect(screen.queryByTestId("tool-fold-partial")).toBeNull();
+    fireEvent.click(screen.getByTestId("tool-fold-open"));
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    expect(screen.getByTestId("tool-thumb")).toBeTruthy();
+  });
+
+  it("keeps 不完整 visible on a folded partial record", () => {
+    render(
+      <ToolCard
+        driverKind="claude-pty"
+        call={mcpCall()}
+        result={imageResult()}
+        completeness="partial"
+        diffState="unknown"
+        foldSettled
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+    expect(screen.getByTestId("tool-fold-partial").textContent).toBe("不完整");
+  });
+
+  it("never folds a failed card", () => {
+    const failed = imageResult();
+    failed.outcome = "failed";
+    render(
+      <ToolCard
+        driverKind="claude-pty"
+        call={mcpCall()}
+        result={failed}
+        completeness="structured"
+        diffState="unknown"
+        foldSettled
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+  });
+
+  it("leaves a running card open", () => {
+    render(
+      <ToolCard
+        driverKind="claude-pty"
+        call={mcpCall()}
+        result={null}
+        completeness="structured"
+        diffState="unknown"
+        foldSettled
+      />,
+    );
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+  });
+});

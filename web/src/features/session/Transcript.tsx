@@ -1,7 +1,22 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Profiler,
+  forwardRef,
+  memo,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ForwardedRef,
+  type ProfilerOnRenderCallback,
+  type ReactNode,
+} from "react";
 import { useInRouterContext, useParams } from "react-router-dom";
 import type { Observation } from "../../types/observation";
 import { MarkdownText } from "../../components/MarkdownText";
+import { balanceFences } from "../../components/fenceBalance";
 import type { LocalBubble } from "../../lib/store";
 import { SentAttachments } from "./AttachmentChips";
 import { AnchorText } from "./AnchorText";
@@ -26,7 +41,7 @@ import { findMatches, resolveSelection, type SearchMatch } from "./transcriptSea
 import type { SteerHeldControl } from "../composer/state";
 import type { MessageOrigin } from "../../types/generated";
 import { COMPACT_WORKBENCH_QUERY } from "../../lib/viewport";
-import { profileRegion } from "../../lib/profileFlags";
+import { profileRegion, profilingEnabled, reportProbe } from "../../lib/profileFlags";
 
 /**
  * c-steer 插队发送 from a transcript held row. The page supplies it so the
@@ -112,7 +127,15 @@ function locateNode(nodes: readonly TranscriptNode[], nodeId: string): NodeLocat
   return null;
 }
 
-export function Transcript(props: {
+/** Imperative actions a page may drive from its own header controls. */
+export type TranscriptHandle = {
+  /** Open the in-transcript search bar and focus its input. */
+  openSearch(): void;
+  /** Fold every tool card that is not a failure (same as 全部折叠). */
+  collapseAll(): void;
+};
+
+export type TranscriptProps = {
   events: Observation[];
   bubbles?: LocalBubble[];
   compact?: boolean;
@@ -122,23 +145,28 @@ export function Transcript(props: {
   steerHeld?: SteerHeldControl;
   /** c-steer 插队发送 action for a held row; defaults to the store. */
   onSteerHeld?: SteerHeldHandler;
-}) {
+  /**
+   * Whether the transcript draws its own action strip (全部折叠 / 搜索正文 /
+   * 注入内容). A page that moves these actions into its header passes false
+   * and drives them through TranscriptHandle instead.
+   */
+  toolbar?: boolean;
+};
+
+type InnerProps = TranscriptProps & {
+  routeInstanceId: string;
+  handleRef: ForwardedRef<TranscriptHandle>;
+};
+
+export const Transcript = forwardRef<TranscriptHandle, TranscriptProps>(function Transcript(props, ref) {
   // SessionPage mounts this inside a route; standalone unit tests do not.
   // useParams throws outside a Router, so only read it when one is present.
   const inRouter = useInRouterContext();
-  if (inRouter) return <TranscriptWithRoute {...props} />;
-  return <TranscriptInner {...props} routeInstanceId="" />;
-}
+  if (inRouter) return <TranscriptWithRoute {...props} handleRef={ref} />;
+  return <TranscriptInner {...props} routeInstanceId="" handleRef={ref} />;
+});
 
-function TranscriptWithRoute(props: {
-  events: Observation[];
-  bubbles?: LocalBubble[];
-  compact?: boolean;
-  journalStatus?: JournalUiStatus;
-  onRetryJournal?: () => void;
-  steerHeld?: SteerHeldControl;
-  onSteerHeld?: SteerHeldHandler;
-}) {
+function TranscriptWithRoute(props: Omit<InnerProps, "routeInstanceId">) {
   const { instanceId = "" } = useParams();
   return <TranscriptInner {...props} routeInstanceId={instanceId} />;
 }
@@ -152,16 +180,9 @@ function TranscriptInner({
   routeInstanceId,
   steerHeld,
   onSteerHeld,
-}: {
-  events: Observation[];
-  bubbles?: LocalBubble[];
-  compact?: boolean;
-  journalStatus?: JournalUiStatus;
-  onRetryJournal?: () => void;
-  routeInstanceId: string;
-  steerHeld?: SteerHeldControl;
-  onSteerHeld?: SteerHeldHandler;
-}) {
+  toolbar = true,
+  handleRef,
+}: InnerProps) {
   // Per-instance reading position/follow persistence. The id comes from the
   // route (read by the wrapper) so SessionPage needs no new prop; tests that
   // mount without a router simply get no persistence.
@@ -649,6 +670,36 @@ function TranscriptInner({
     openButtonRef.current?.focus();
   }, []);
 
+  // Explicit collapse wins over a prior reader expansion; the bumped row key
+  // remounts each card with its local latch reset. Failures stay open
+  // (ToolRow never passes defaultFolded to a failed card).
+  const collapseAll = useCallback(() => {
+    setExpandedTools(new Set());
+    setCollapseTick((n) => n + 1);
+  }, []);
+
+  useImperativeHandle(handleRef, () => ({ openSearch, collapseAll }), [openSearch, collapseAll]);
+
+  // Rows are memoised (see TranscriptRow), so the props they receive must keep
+  // their identity across streaming batches. The page builds a fresh steer
+  // control object and handler on every render; hold them by value / by ref.
+  const steerEnabled = steerHeld?.enabled;
+  const steerReason = steerHeld?.reason;
+  const hasSteerHeld = steerHeld !== undefined;
+  const stableSteerHeld = useMemo<SteerHeldControl | undefined>(
+    () => (hasSteerHeld ? { enabled: Boolean(steerEnabled), reason: steerReason ?? "" } : undefined),
+    [hasSteerHeld, steerEnabled, steerReason],
+  );
+  const onSteerHeldRef = useRef(onSteerHeld);
+  useLayoutEffect(() => {
+    onSteerHeldRef.current = onSteerHeld;
+  });
+  const hasSteerHandler = onSteerHeld !== undefined;
+  const stableOnSteerHeld = useMemo<SteerHeldHandler | undefined>(
+    () => (hasSteerHandler ? (iid, bid) => onSteerHeldRef.current?.(iid, bid) : undefined),
+    [hasSteerHandler],
+  );
+
   const gotoMatch = useCallback((next: number) => {
     const match = matches[next];
     if (!match) return;
@@ -714,6 +765,7 @@ function TranscriptInner({
   return (
     <div className={css.root} data-testid="transcript" aria-live="off">
       <JournalBanner status={journalStatus} onRetry={onRetryJournal} />
+      {toolbar ? (
       <div
         className={css.toolbar}
         data-testid="transcript-toolbar"
@@ -740,10 +792,7 @@ function TranscriptInner({
               className={ui.chip}
               data-testid="collapse-all"
               onClick={() => {
-                // Explicit collapse wins over a prior reader expansion; the
-                // bumped row key remounts each card with its local latch reset.
-                setExpandedTools(new Set());
-                setCollapseTick((n) => n + 1);
+                collapseAll();
                 if (compactLayout) setToolsOpen(false);
               }}
             >
@@ -782,6 +831,7 @@ function TranscriptInner({
           </>
         )}
       </div>
+      ) : null}
       {searchOpen ? (
         <div
           className={css.searchbar}
@@ -851,7 +901,7 @@ function TranscriptInner({
       >
         <div className={css.list}>
           {canLoadEarlier ? (
-            <div data-testid="load-earlier-wrap" style={{ display: "flex", justifyContent: "center", padding: "8px 12px" }}>
+            <div data-testid="load-earlier-wrap" className={css.loadEarlier}>
               <button
                 type="button"
                 className={ui.chip}
@@ -878,8 +928,8 @@ function TranscriptInner({
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
                 instanceId={instanceId}
-                steerHeld={steerHeld}
-                onSteerHeld={onSteerHeld}
+                steerHeld={stableSteerHeld}
+                onSteerHeld={stableOnSteerHeld}
                 steering={steeringRef.current}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}
                 hitChildId={
@@ -921,27 +971,7 @@ function TranscriptInner({
   );
 }
 
-function TranscriptRow({
-  node,
-  active,
-  defaultFolded,
-  collapseTick,
-  settle,
-  onSize,
-  searchHit,
-  searchCurrent,
-  expandTick,
-  hitChildId,
-  instanceId,
-  steerHeld,
-  onSteerHeld,
-  steering,
-  dismissedWorkflows,
-  onToggleWorkflowDismiss,
-  expandedTools,
-  onToggleToolExpand,
-  currentHitIds,
-}: {
+type TranscriptRowProps = {
   node: TranscriptNode;
   active: boolean;
   defaultFolded: boolean;
@@ -961,14 +991,113 @@ function TranscriptRow({
   expandedTools: ReadonlySet<string>;
   onToggleToolExpand: (nodeId: string, expanded: boolean) => void;
   currentHitIds: ReadonlySet<string>;
-}) {
+};
+
+/**
+ * Structural equality for assembled nodes. assembleTranscript rebuilds every
+ * node object on each journal batch, so identity says nothing; only the
+ * mounted window (a few dozen rows) is ever compared.
+ */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  if (Array.isArray(a)) {
+    if (!Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) if (!sameValue(a[i], b[i])) return false;
+    return true;
+  }
+  if (Array.isArray(b)) return false;
+  // Only plain records recurse; anything else (Date, Map, class instances)
+  // compares by identity above.
+  const proto = Object.getPrototypeOf(a);
+  if ((proto !== Object.prototype && proto !== null) || Object.getPrototypeOf(b) !== proto) return false;
+  const ak = Object.keys(a);
+  const bk = Object.keys(b);
+  if (ak.length !== bk.length) return false;
+  for (const k of ak) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+    if (!sameValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+  }
+  return true;
+}
+
+function sameSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
+
+/**
+ * A streaming batch must commit only the row whose content changed. The
+ * parent rebuilds nodes and derived sets per batch, so compare by value; the
+ * callbacks are stable by construction (see TranscriptInner).
+ */
+function sameRowProps(prev: TranscriptRowProps, next: TranscriptRowProps): boolean {
+  return (
+    prev.active === next.active
+    && prev.defaultFolded === next.defaultFolded
+    && prev.collapseTick === next.collapseTick
+    && prev.settle === next.settle
+    && prev.onSize === next.onSize
+    && prev.searchHit === next.searchHit
+    && prev.searchCurrent === next.searchCurrent
+    && prev.expandTick === next.expandTick
+    && prev.hitChildId === next.hitChildId
+    && prev.instanceId === next.instanceId
+    && prev.steerHeld === next.steerHeld
+    && prev.onSteerHeld === next.onSteerHeld
+    && prev.steering === next.steering
+    && prev.onToggleWorkflowDismiss === next.onToggleWorkflowDismiss
+    && prev.onToggleToolExpand === next.onToggleToolExpand
+    && sameSet(prev.dismissedWorkflows, next.dismissedWorkflows)
+    && sameSet(prev.expandedTools, next.expandedTools)
+    && sameSet(prev.currentHitIds, next.currentHitIds)
+    && sameValue(prev.node, next.node)
+  );
+}
+
+// c-perfaudit probe (?profile=1 only): one `commit:TranscriptRow` sample per
+// row that actually re-rendered in a commit, tagged with its node id.
+function rowCommitProbe(nodeId: string): ProfilerOnRenderCallback {
+  return (_id, phase, actualDuration) => {
+    reportProbe("commit:TranscriptRow", { phase, actualDuration, nodeId });
+  };
+}
+
+const TranscriptRow = memo(function TranscriptRow({
+  node,
+  active,
+  defaultFolded,
+  collapseTick,
+  settle,
+  onSize,
+  searchHit,
+  searchCurrent,
+  expandTick,
+  hitChildId,
+  instanceId,
+  steerHeld,
+  onSteerHeld,
+  steering,
+  dismissedWorkflows,
+  onToggleWorkflowDismiss,
+  expandedTools,
+  onToggleToolExpand,
+  currentHitIds,
+}: TranscriptRowProps) {
   const ref = useRef<HTMLDivElement>(null);
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const report = () => onSize(node.id, el.getBoundingClientRect().height + 12);
+    // The row's own padding carries the gap to the next row (no margins, and
+    // display: flow-root keeps child margins inside), so the border box IS
+    // the slot the virtual window must reserve.
+    const report = () => onSize(node.id, el.getBoundingClientRect().height);
     report();
     if (typeof ResizeObserver === "undefined") return;
+    // Also re-measures asynchronous growth (syntax highlight, lazy math,
+    // images); the scroller keeps the reading anchor across it.
     const ro = new ResizeObserver(report);
     ro.observe(el);
     return () => ro.disconnect();
@@ -978,6 +1107,24 @@ function TranscriptRow({
     // rebuild the observer on every parent scroll re-render, since the
     // assembled node list is re-created each render.
   }, [onSize, node.id]);
+  const probe = useMemo(() => (profilingEnabled ? rowCommitProbe(node.id) : null), [node.id]);
+  const content = renderNode(node, {
+    defaultFolded,
+    collapseTick,
+    settle,
+    expandTick,
+    hitChildId,
+    instanceId,
+    steerHeld,
+    onSteerHeld,
+    steering,
+    dismissedWorkflows,
+    onToggleWorkflowDismiss,
+    expandedTools,
+    onToggleToolExpand,
+    searchCurrent,
+    currentHitIds,
+  });
   return (
     <div
       ref={ref}
@@ -1005,25 +1152,16 @@ function TranscriptRow({
         searchCurrent ? css.rowCurrent : "",
       ].join(" ").trim()}
     >
-      {renderNode(node, {
-        defaultFolded,
-        collapseTick,
-        settle,
-        expandTick,
-        hitChildId,
-        instanceId,
-        steerHeld,
-        onSteerHeld,
-        steering,
-        dismissedWorkflows,
-        onToggleWorkflowDismiss,
-        expandedTools,
-        onToggleToolExpand,
-        searchCurrent,
-        currentHitIds,
-      })}    </div>
+      {probe ? (
+        <Profiler id="TranscriptRow" onRender={probe}>
+          {content}
+        </Profiler>
+      ) : (
+        content
+      )}
+    </div>
   );
-}
+}, sameRowProps);
 
 /** A failed tool gets a visible inline tag and never obeys collapse-all. */
 function ToolRow({
@@ -1056,6 +1194,7 @@ function ToolRow({
       diffState={node.diffState}
       workflow={node.workflow}
       defaultFolded={failed ? false : opts.defaultFolded}
+      foldSettled
       settle={opts.settle}
       // A current in-transcript search hit inside this card must not stay
       // hidden behind the D-041 fold (same auto-open the transcript gives
@@ -1180,7 +1319,9 @@ function renderNode(
           ) : null}
         </div>
         {node.role === "assistant" ? (
-          <MarkdownText text={node.text} />
+          // The stored text is untouched; only the streaming render closes a
+          // dangling ``` so the partial block does not flip prose/code.
+          <MarkdownText text={streaming ? balanceFences(node.text) : node.text} />
         ) : node.local ? (
           // Optimistic local bubble: inline [Image #n] thumbnails can render
           // from the staged previews. Journaled user messages keep plain text
@@ -1201,7 +1342,7 @@ function renderNode(
         ) : (
           <p className={session.bubble}>{node.text}</p>
         )}
-        {streaming ? <span className={session.cursor} data-testid="streaming-cursor" aria-hidden /> : null}
+        {streaming ? <StreamingCursor text={node.text} /> : null}
         {node.local?.attachments?.length || node.localAttachments?.length ? (
           <SentAttachments attachments={(node.local?.attachments ?? node.localAttachments)!} />
         ) : null}
@@ -1337,6 +1478,58 @@ function renderNode(
   return null;
 }
 
+/** Last non-blank text node inside `root`, in document order. */
+function lastTextNode(root: Element): Text | null {
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let last: Text | null = null;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if ((n.nodeValue ?? "").trim()) last = n as Text;
+  }
+  return last;
+}
+
+/**
+ * The streaming caret. It is absolutely positioned at the end of the last
+ * rendered glyph, so it takes no line box of its own: the row keeps the same
+ * height when streaming starts and ends. Its 7px sits in the space after the
+ * last glyph, or in the column's gutter when a line runs to the measure.
+ */
+function StreamingCursor({ text }: { text: string }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const cursor = ref.current;
+    const section = cursor?.parentElement;
+    if (!cursor || !section) return;
+    const base = section.getBoundingClientRect();
+    let at: { left: number; top: number; height: number } | null = null;
+    // The body is everything between the author line and the cursor.
+    for (let el = cursor.previousElementSibling; el && el !== section.firstElementChild; el = el.previousElementSibling) {
+      const textNode = lastTextNode(el);
+      if (!textNode) continue;
+      const range = section.ownerDocument.createRange();
+      const value = textNode.nodeValue ?? "";
+      const end = value.trimEnd().length;
+      range.setStart(textNode, Math.max(0, end - 1));
+      range.setEnd(textNode, end);
+      // jsdom has no layout: getClientRects is absent there.
+      const rects = typeof range.getClientRects === "function" ? range.getClientRects() : null;
+      const rect = rects && rects.length ? rects[rects.length - 1] : null;
+      if (rect && rect.height > 0) {
+        at = { left: rect.right - base.left, top: rect.top - base.top, height: rect.height };
+      }
+      break;
+    }
+    if (at) {
+      cursor.style.left = `${at.left + 1}px`;
+      cursor.style.top = `${at.top + Math.max(0, (at.height - cursor.offsetHeight) / 2)}px`;
+    } else {
+      cursor.style.left = "";
+      cursor.style.top = "";
+    }
+  }, [text]);
+  return <span ref={ref} className={css.cursor} data-testid="streaming-cursor" aria-hidden />;
+}
+
 function CompactFold({
   toolCount,
   thoughtCount,
@@ -1361,7 +1554,7 @@ function CompactFold({
         <span>▸</span>
         <span>{open ? "收起过程" : `${toolCount} 次工具 · ${thoughtCount} 段思考`}</span>
       </button>
-      {open ? <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>{children}</div> : null}
+      {open ? <div className={css.foldBody}>{children}</div> : null}
     </div>
   );
 }

@@ -200,6 +200,7 @@ function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
                 result={node.result}
                 completeness={node.completeness}
                 diffState={node.diffState}
+                foldSettled
               />
             ),
           )}

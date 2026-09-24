@@ -93,8 +93,8 @@ function cwdOf(call: ToolCallPayload): string | null {
 
 /**
  * Whether the workbench is in the compact (mobile) layout. ToolCard owns the
- * read so the D-041 default fold needs no prop plumbing through the
- * transcript; a missing matchMedia (unit DOM) reads as the desktop default.
+ * read so the D-041 default fold needs no prop plumbing for bare cards; a
+ * missing matchMedia (unit DOM) reads as the desktop default.
  */
 function useCompactLayout(): boolean {
   const read = () =>
@@ -391,6 +391,8 @@ function FoldedToolRow({
   family,
   call,
   result,
+  completeness,
+  running,
   onExpand,
 }: {
   title: string;
@@ -400,6 +402,9 @@ function FoldedToolRow({
   family: ReturnType<typeof familyFor>;
   call: ToolCallPayload;
   result: ToolResultPayload | null;
+  completeness: string;
+  /** Only an explicit 全部折叠 folds a card that has not settled yet. */
+  running: boolean;
   onExpand: () => void;
 }) {
   const keyArg = foldedKeyArgument(nativeName, call, result);
@@ -408,9 +413,18 @@ function FoldedToolRow({
   const showFamily = family !== "Generic" && (grok || nativeName !== family);
   // Distinguishable name when N rows are folded: 展开 + heading + key arg.
   const expandLabel = `展开 ${title}${keyArg ? ` ${keyArg.title}` : ""}`;
+  // D-052 §3: folding never hides that a record is incomplete.
+  const partial = completeness !== "structured";
   return (
-    <article className={foldCss.fold} data-testid="tool-card" data-folded="1" data-family={family}>
+    <article
+      className={partial ? `${foldCss.fold} ${foldCss.foldPartial}` : foldCss.fold}
+      data-testid="tool-card"
+      data-folded="1"
+      data-family={family}
+      data-running={running ? "1" : undefined}
+    >
       <div className={foldCss.foldHead}>
+        <span className={running ? `${foldCss.foldDot} ${foldCss.foldDotRun}` : foldCss.foldDot} aria-hidden />
         <span className={foldCss.foldTitle} title={title}>
           {title}
         </span>
@@ -421,9 +435,14 @@ function FoldedToolRow({
             {keyArg.text}
           </span>
         ) : null}
+        {partial ? (
+          <span className={foldCss.foldPartialTag} data-testid="tool-fold-partial">
+            不完整
+          </span>
+        ) : null}
         <button
           type="button"
-          className={`${css.openBtn} ${foldCss.foldOpen}`}
+          className={foldCss.foldOpen}
           data-testid="tool-fold-open"
           aria-expanded={false}
           aria-label={expandLabel}
@@ -444,6 +463,7 @@ export function ToolCard({
   diffState,
   workflow,
   defaultFolded = false,
+  foldSettled = false,
   settle = true,
   expanded: expandedProp,
   onExpand: onExpandProp,
@@ -465,6 +485,11 @@ export function ToolCard({
     subagents?: import("./assemble").SubagentRef[];
   };
   defaultFolded?: boolean;
+  /**
+   * D-053: fold every settled card at every width (the reading column). Off,
+   * the D-041 rule applies: only the compact layout folds by default.
+   */
+  foldSettled?: boolean;
   settle?: boolean;
   /**
    * D-041: controlled expansion state owned by the transcript. Rows virtualise
@@ -490,7 +515,6 @@ export function ToolCard({
   // mean the call is still running); error = failed/denied outcome.
   const settled = settle && result?.stage === "final";
   const failed = settled && (result.outcome === "failed" || result.outcome === "denied");
-  const compact = useCompactLayout();
   const shown = settle ? result : null;
   // Dispatch on the stable native name; the human title is the heading only.
   const nativeName = knowledgeValue(call.toolName) ?? "tool";
@@ -498,16 +522,18 @@ export function ToolCard({
   const family = familyFor(driverKind, nativeName);
   // grok's file-adapter observations are all stamped driverKind shell-pty.
   const grok = driverKind === "shell-pty" && isGrokTool(nativeName);
-  // The fold decision happens AFTER family is determined. Under the automatic
-  // compact fold a live card folds the instant its final result lands — a
-  // live phone session is the scroll problem D-041 exists for. The
-  // Workflow/error/interaction exemptions live inside shouldFoldToolCard.
+  // The fold decision happens AFTER family is determined. A live card folds
+  // the instant its final result lands. D-053 extends the D-041 automatic fold
+  // to every width inside the reading column (`foldSettled`); a bare card keeps
+  // the D-041 compact-layout rule. The Workflow/error/interaction exemptions
+  // live inside shouldFoldToolCard.
+  const compactLayout = useCompactLayout();
   const folded =
     !userExpanded &&
     shouldFoldToolCard({
       family,
       settled,
-      compact,
+      compact: foldSettled || compactLayout,
       failed,
       interaction: isInteractionTool(nativeName),
       requested: defaultFolded,
@@ -522,6 +548,8 @@ export function ToolCard({
         family={family}
         call={call}
         result={result}
+        completeness={completeness}
+        running={!settled}
         onExpand={expand}
       />
     );

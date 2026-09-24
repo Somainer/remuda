@@ -39,6 +39,9 @@
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* The transcript holds its own reading anchor (Transcript.tsx); native
+     anchoring would race it on the engines that have it. */
+  overflow-anchor: none;
 }
 
 /* D-053 reading column: one measure for every row, centred, with the

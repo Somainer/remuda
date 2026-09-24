@@ -252,6 +252,48 @@ test("the caret on a long unwrapped code line never widens the transcript", asyn
 
 let instanceId = "";
 
+test("a row above the viewport that grows does not move the text being read", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  await createSession(page);
+  for (let i = 0; i < 14; i += 1) {
+    await send(page, `锚点 ${i}\n\n${"一段用来撑高的正文。".repeat(30)}`);
+    await expect(page.getByTestId("message").filter({ hasText: `echo: 锚点 ${i}` })).toHaveCount(1, {
+      timeout: 20_000,
+    });
+  }
+  const scroller = page.getByTestId("transcript-scroller");
+  // Read from the middle, away from the bottom follow.
+  await scroller.evaluate((el) => {
+    el.scrollTop = Math.round((el.scrollHeight - el.clientHeight) / 2);
+  });
+  await page.waitForTimeout(300);
+  const firstVisible = () =>
+    scroller.evaluate((el) => {
+      const top = el.getBoundingClientRect().top;
+      const rows = [...el.querySelectorAll<HTMLElement>("[data-anchor]")];
+      const index = rows.findIndex((row) => row.getBoundingClientRect().bottom > top);
+      return {
+        id: rows[index]?.dataset.anchor ?? "",
+        top: rows[index] ? rows[index].getBoundingClientRect().top - top : 0,
+        above: index > 0 ? (rows[index - 1].dataset.anchor ?? "") : "",
+      };
+    });
+  const before = await firstVisible();
+  expect(before.above, "a mounted row sits above the viewport").not.toBe("");
+  // Grow that row by 200px after first paint, the way a late result would.
+  await scroller.evaluate((el, id) => {
+    const row = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(id)}"]`)!;
+    const grow = document.createElement("div");
+    grow.style.height = "200px";
+    row.firstElementChild!.appendChild(grow);
+  }, before.above);
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  const after = await firstVisible();
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+});
+
 test("the reading column holds 720 / 504 / 358 and folds settled tools on desktop", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await login(page);

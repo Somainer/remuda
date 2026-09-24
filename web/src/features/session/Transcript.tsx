@@ -431,6 +431,45 @@ function TranscriptInner({
     }
   }, [instanceId, loadingEarlier, canLoadEarlier, range.start]);
 
+  // Reading anchor: the first row in view, its offset from the scroller top,
+  // and the scrollTop it was sampled at (on every scroll). A row above it that
+  // grows after first paint (a late result, an image, a padTop re-estimate)
+  // would push the text being read down; holding the anchor moves scrollTop
+  // by the same delta unless the reader follows the bottom. A scrollTop that
+  // moved since sampling is a programmatic jump, not growth: re-sample.
+  // Native scroll anchoring is off on the scroller so this is the one
+  // mechanism on every engine.
+  const readingAnchorRef = useRef<{ id: string; offset: number; top: number } | null>(null);
+  const sampleReadingAnchor = useCallback(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const top = el.getBoundingClientRect().top;
+    readingAnchorRef.current = null;
+    for (const row of el.querySelectorAll<HTMLElement>("[data-anchor]")) {
+      const box = row.getBoundingClientRect();
+      if (box.bottom > top) {
+        readingAnchorRef.current = { id: row.dataset.anchor ?? "", offset: box.top - top, top: el.scrollTop };
+        return;
+      }
+    }
+  }, []);
+  const holdReadingAnchor = useCallback(() => {
+    const el = scrollerRef.current;
+    const held = readingAnchorRef.current;
+    if (!el || !held || pinRef.current || pendingScroll.current || prependAnchorRef.current) return;
+    if (Math.abs(el.scrollTop - held.top) >= 1) {
+      sampleReadingAnchor();
+      return;
+    }
+    const row = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.id)}"]`);
+    if (!row) return;
+    const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
+    if (Math.abs(delta) < 1) return;
+    el.scrollTop += delta;
+    scrollTopRef.current = el.scrollTop;
+    held.top = el.scrollTop;
+  }, [sampleReadingAnchor]);
+
   // Stable per-row size reporter keyed by node id. The identity MUST stay
   // constant across parent re-renders (scroll fires setScrollTop on every
   // frame): TranscriptRow's measuring effect depends on it, so an inline
@@ -438,6 +477,8 @@ function TranscriptInner({
   // read) for every visible row on every scroll frame.
   const setRowSize = useCallback((id: string, height: number) => {
     if (height <= 0) return;
+    // The row has already grown in the DOM: hold the reader before paint.
+    holdReadingAnchor();
     // Sub-pixel tolerance: measured heights jitter by fractions of a px
     // between frames; ignore deltas under 1 instead of thrashing state.
     setRowHeights((prev) => {
@@ -447,7 +488,7 @@ function TranscriptInner({
       next.set(id, height);
       return next;
     });
-  }, []);
+  }, [holdReadingAnchor]);
 
   // Converge the unmeasured-row estimate on this visit's real average so
   // offsets outside the window (search hits, saved position) stop drifting.
@@ -588,6 +629,12 @@ function TranscriptInner({
     }
     pending.tries += 1;
   }, [sizes, nodes, estimate, applyOffset]);
+
+  // A commit that moves rows above the anchor (padTop re-estimated, a row
+  // inserted above) holds the reader the same way a measured growth does.
+  useLayoutEffect(() => {
+    holdReadingAnchor();
+  }, [sizes, nodes, estimate, holdReadingAnchor]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;
@@ -896,6 +943,7 @@ function TranscriptInner({
           setScrollTop(el.scrollTop);
           scrollTopRef.current = el.scrollTop;
           pinRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+          sampleReadingAnchor();
           persistSoon();
         }}
       >

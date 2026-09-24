@@ -1,0 +1,97 @@
+/* @tokens strict */
+/* Compact home bar (ui-overhaul §4.1): 56px + safe area, four equal cells. */
+
+.bar {
+  display: grid;
+  flex: none;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  min-height: calc(var(--phone-nav-h) + var(--safe-bottom));
+  padding-bottom: var(--safe-bottom);
+  border-top: 1px solid var(--divider);
+  background: var(--bg-nav);
+  box-sizing: border-box;
+}
+
+.item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: var(--touch);
+  min-height: var(--phone-nav-h);
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-muted);
+  text-decoration: none;
+}
+
+.item[data-active] {
+  color: var(--fg-strong);
+}
+
+.item[data-active] .label {
+  font-weight: 600;
+}
+
+.glyph {
+  position: relative;
+  display: inline-flex;
+}
+
+.label {
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.badge {
+  position: absolute;
+  top: -6px;
+  left: 14px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-pill);
+  background: var(--attention-fg);
+  color: var(--on-attention);
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  box-sizing: border-box;
+}
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+}
+
+.sheetItem {
+  display: flex;
+  align-items: center;
+  min-height: 48px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm);
+  color: var(--fg-body);
+  font-size: var(--text-title);
+  text-decoration: none;
+}
+
+.sheetItem:hover,
+.sheetItem[data-active] {
+  background: var(--bg-hover);
+  color: var(--fg-strong);
+}

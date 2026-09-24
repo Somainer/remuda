@@ -1,3 +1,7 @@
+/* @tokens strict */
+/* /sessions (ui-overhaul §3.2–3.3): page header over an --index column
+   (SpacesPanel) beside the session list. */
+
 .page {
   min-height: 0;
   flex: 1;
@@ -13,4 +17,72 @@
 
 .placeholder {
   display: none;
+}
+
+.body {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.index {
+  flex: none;
+  width: var(--index);
+  min-height: 0;
+  overflow: auto;
+  border-right: 1px solid var(--divider);
+  background: var(--bg-canvas);
+}
+
+/* The sidebar owns folding now (⌘/Ctrl+B); the panel's own fold is moot. */
+.index [data-testid="panel-toggle"] {
+  display: none;
+}
+
+.list {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+
+.indexOpen {
+  display: none;
+}
+
+.scrim {
+  display: none;
+}
+
+@media (max-width: 1023px) {
+  .indexOpen {
+    display: inline-flex;
+  }
+
+  .index {
+    display: none;
+  }
+
+  .index[data-open] {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    display: block;
+    width: min(var(--index), 88%);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-3);
+  }
+
+  .scrim {
+    position: absolute;
+    inset: 0;
+    z-index: 19;
+    display: block;
+    background: var(--scrim);
+  }
 }

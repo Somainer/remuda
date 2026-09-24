@@ -1374,9 +1374,16 @@ class HubStore {
   /**
    * Bounded reconciliation of a "reconciling" row: poll the GET endpoint until
    * it is accepted/settled (→ sent), rejected, or the deadline passes (→
-   * unknown). NEVER re-POSTs — the Hub already forwarded the command.
+   * unknown). NEVER re-POSTs — the Hub already forwarded the command. Runs
+   * OUTSIDE the single-deliverer lock (it can take the whole 30 s deadline and
+   * must not block another row of the instance, e.g. a steer); a reconciling
+   * row is non-deliverable, so no other owner can POST it meanwhile.
    */
-  private async reconcileReconcilingRow(instanceId: Id, commandId: Id): Promise<void> {
+  private reconcileReconcilingRow(instanceId: Id, commandId: Id): void {
+    void this.runReconcileReconcilingRow(instanceId, commandId);
+  }
+
+  private async runReconcileReconcilingRow(instanceId: Id, commandId: Id): Promise<void> {
     const deadline = Date.now() + RECONCILE_GET_DEADLINE_MS;
     for (;;) {
       const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
@@ -1395,8 +1402,14 @@ class HubStore {
         return;
       }
       if (verdict === "held") {
-        // Host went offline mid-reconcile: fall back to held retry.
-        await this.safePatch(commandId, { state: "held", gotResponse: true });
+        // Host went offline mid-reconcile: fall back to held retry (refund the
+        // attempt and arm the bounded same-id re-POST).
+        await this.safePatch(commandId, {
+          state: "held",
+          gotResponse: true,
+          attempts: this.outbox?.get(commandId)?.attempts ?? 0,
+        });
+        this.scheduleHeldRetry(instanceId);
         return;
       }
       if (Date.now() >= deadline) {

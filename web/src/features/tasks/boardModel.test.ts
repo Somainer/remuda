@@ -383,3 +383,127 @@ describe("empty view", () => {
     expect(model.byId.size).toBe(0);
   });
 });
+
+describe("card attention and land signals (ui-spec §2.9)", () => {
+  it("flags needsHuman from a pending interaction on one of the task's sessions", () => {
+    const task = item("running");
+    const instances = [
+      session({ id: "ins_pending", taskId: task.id, lifecycle: "running" }),
+      session({ id: "ins_other", taskId: "tsk_other" }),
+    ];
+    const model = buildBoardModel({
+      view: viewOf(task),
+      instances,
+      pendingInstanceIds: new Set(["ins_pending"]),
+    });
+    expect(model.byId.get(task.id)!.needsHuman).toBe(true);
+  });
+
+  it("does not flag an interaction pending on another task's session", () => {
+    const task = item("running");
+    const instances = [session({ id: "ins_other", taskId: "tsk_other" })];
+    const model = buildBoardModel({
+      view: viewOf(task),
+      instances,
+      pendingInstanceIds: new Set(["ins_other"]),
+    });
+    expect(model.byId.get(task.id)!.needsHuman).toBe(false);
+  });
+
+  it("treats an owner-facing blocked reason as needing a human, and failed cards carry it", () => {
+    const blocked = item("failed", { blockedReason: "supply exhausted" });
+    const model = buildBoardModel({ view: viewOf(blocked) });
+    const card = model.byId.get(blocked.id)!;
+    expect(card.needsHuman).toBe(true);
+    expect(card.failed).toBe(true);
+  });
+
+  it("exposes the landed sha7 and distinguishes it from a done-but-unlanded card", () => {
+    const landed = item("done", { landedSha: "abcdef0123456789abcdef" });
+    const plain = item("done");
+    const model = buildBoardModel({ view: viewOf(landed, plain) });
+    const done = model.columns[2].cards;
+    expect(done.find((card) => card.id === landed.id)!.landed).toEqual({
+      sha: "abcdef0123456789abcdef",
+      sha7: "abcdef0",
+    });
+    expect(done.find((card) => card.id === plain.id)!.landed).toBeNull();
+  });
+});
+
+describe("card render signature (commit:BoardCard probe contract)", () => {
+  it("stays equal when an unchanged projection is rebuilt from a fresh poll", () => {
+    const task = item("running", { title: "same shape" });
+    const instances = [
+      session({ id: "ins_1", taskId: task.id, lifecycle: "running", updatedAt: "2026-09-21T10:00:00Z" }),
+    ];
+    const first = buildBoardModel({
+      view: viewOf(task),
+      instances,
+      pendingInstanceIds: new Set(),
+    }).byId.get(task.id)!;
+    // A 5s poll rebuilds every object from JSON, but nothing rendered changed.
+    const polledItem = { ...task };
+    const second = buildBoardModel({
+      view: viewOf(polledItem),
+      instances: instances.map((row) => ({ ...row })),
+      pendingInstanceIds: new Set(),
+    }).byId.get(task.id)!;
+    expect(second.sig).toBe(first.sig);
+  });
+
+  it.each([
+    ["state", (t: BoardItem) => ({ ...t, state: "done" as TaskState })],
+    ["blocked reason", (t: BoardItem) => ({ ...t, blockedReason: "now blocked" })],
+    ["landed sha", (t: BoardItem) => ({ ...t, landedSha: "abcdef0" })],
+    ["title", (t: BoardItem) => ({ ...t, title: "rewritten title" })],
+    ["archive stamp", (t: BoardItem) => ({ ...t, archivedAt: "2026-09-21T12:00:00.000Z" })],
+  ])("flips when the card's %s changes", (_name, mutate) => {
+    const task = item("running");
+    const before = buildBoardModel({ view: viewOf(task) }).byId.get(task.id)!;
+    const changed = mutate(task);
+    const after = buildBoardModel({
+      view: viewOf({ ...changed, boardColumn: boardColumn(changed), displayKey: changed.id === task.id ? task.displayKey : changed.displayKey }),
+    }).byId.get(task.id)!;
+    expect(after.sig).not.toBe(before.sig);
+  });
+
+  it("flips when a pending interaction arrives or the session row updates", () => {
+    const task = item("running");
+    const instances = [
+      session({ id: "ins_1", taskId: task.id, lifecycle: "running", updatedAt: "2026-09-21T10:00:00Z" }),
+    ];
+    const idle = buildBoardModel({
+      view: viewOf(task),
+      instances,
+      pendingInstanceIds: new Set(),
+    }).byId.get(task.id)!;
+    const pending = buildBoardModel({
+      view: viewOf(task),
+      instances,
+      pendingInstanceIds: new Set(["ins_1"]),
+    }).byId.get(task.id)!;
+    expect(pending.sig).not.toBe(idle.sig);
+
+    const updated = buildBoardModel({
+      view: viewOf(task),
+      instances: [{ ...instances[0]!, updatedAt: "2026-09-21T10:05:00Z" }],
+      pendingInstanceIds: new Set(),
+    }).byId.get(task.id)!;
+    expect(updated.sig).not.toBe(idle.sig);
+  });
+
+  it("flips when the directory refcount changes the shared label", () => {
+    const binding = {
+      mode: "reuse" as const,
+      hostId: "hst_1",
+      workspaceId: "wsp_1",
+      worktreeName: "agent-two",
+    };
+    const a = item("pending", { workspaceBinding: binding });
+    const alone = buildBoardModel({ view: viewOf(a) }).byId.get(a.id)!;
+    const b = item("pending", { workspaceBinding: binding });
+    const shared = buildBoardModel({ view: viewOf(a, b) }).byId.get(a.id)!;
+    expect(shared.sig).not.toBe(alone.sig);
+  });
+});

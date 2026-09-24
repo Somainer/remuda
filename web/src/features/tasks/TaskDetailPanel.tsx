@@ -35,10 +35,10 @@ export function TaskDetailPanel({
   const failed = task.state === "failed";
   const chain = [...(task.mandate?.chain ?? [])].sort((a, b) => a.depth - b.depth);
   const detailSessionId = primarySessionId ?? sessionIds[0] ?? null;
-  // t-annotations: a ① selected here rides the task's workbench session.
-  // Archived tasks are a read-only preview — the selection affordance must
-  // not raise (readAnnotationSelection honours data-annotation-readonly).
-  const annotationReadonly = task.archivedAt != null;
+  // This panel only mounts inside the board's read-only preview drawer
+  // (ui-spec §2.9): annotations are created in the workbench session, never
+  // from the overlay — the anchor surface is always read-only.
+  const annotationReadonly = true;
 
   return (
     <aside className={css.detail} data-testid="task-detail" aria-label="任务详情">

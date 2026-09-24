@@ -94,6 +94,20 @@ type ScenarioResult = {
   peakJsHeapBytes: number | null;
   terminalRenderer: string | null;
   terminalContextLosses: number;
+  /**
+   * Scenario E (UO-8): board-card commit probes. An unchanged 5s poll tick
+   * must commit zero cards; changing one task commits exactly that card.
+   */
+  boardCard?: {
+    tasks: number;
+    pendingInteractions: number;
+    initialMountCommits: number;
+    initialUpdateCommits: number;
+    initialCommitTotalMs: number;
+    initialCommitMaxMs: number;
+    quietTickCommits: number;
+    changedTickCommits: number;
+  };
 };
 
 const summaries: ScenarioResult[] = [];
@@ -611,6 +625,209 @@ test("C: 100 pending interactions with inbox scrolling", async ({ page, browser 
       { pending: C_PENDING },
       await readPeakHeap(page),
     );
+    summaries.push(result);
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    await driver.close();
+    await cleanupPage(browser);
+  }
+});
+
+/**
+ * Scenario E (UO-8): 80 board tasks, 40 with a pending human interaction.
+ * The follower opens the real `/board` projection with ?profile=1 and the
+ * `commit:BoardCard` probe proves incremental rendering: an unchanged poll
+ * tick commits zero cards (cards are memoized on their render signature);
+ * changing one task's state commits exactly one card on the next tick.
+ */
+const E_TASKS = 80;
+const E_PENDING = 40;
+
+type BoardCardCommit = { phase: string; actualDuration: number };
+
+function boardCardCommits(report: RemudaPerfReport): BoardCardCommit[] {
+  return report.probes
+    .filter((probe) => probe.kind === "commit:BoardCard")
+    .map((probe) => probe.value as BoardCardCommit);
+}
+
+test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit no cards", async ({
+  page,
+  browser,
+}) => {
+  test.setTimeout(300_000);
+  await installHeapSampler(page);
+  await ensureLogin(page, "e2e-perf");
+
+  const driver = await browser.newPage();
+  await ensureLogin(driver, "e2e-perf");
+  try {
+    await patchMaxInstances(driver, Math.max(E_TASKS, 80));
+
+    const fixture = await driver.evaluate(
+      async ({ total, pending }) => {
+        const auth = { credentials: "include" as RequestCredentials };
+        const hosts = (await (await fetch("/v1/hosts", auth)).json()) as {
+          items?: { hostId?: string }[];
+        };
+        const hostId = hosts.items?.find((host) => host.hostId)?.hostId;
+        if (!hostId) throw new Error("fake node host missing");
+
+        const post = async (pathName: string, body: unknown) => {
+          const response = await fetch(pathName, {
+            method: "POST",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) throw new Error(`${pathName} -> ${response.status}`);
+          return response.json();
+        };
+        const patch = async (pathName: string, body: unknown) => {
+          const response = await fetch(pathName, {
+            method: "PATCH",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) throw new Error(`${pathName} -> ${response.status}`);
+        };
+
+        const stamp = Date.now().toString(36);
+        const project = (await post("/v1/projects", { name: `perf E ${stamp}` })) as {
+          id: string;
+        };
+        const taskIds: string[] = [];
+        for (let i = 0; i < total; i += 1) {
+          const task = (await post("/v1/tasks", {
+            projectId: project.id,
+            title: `perf E ${i} ${stamp}`,
+            intent: "perf scenario E board load",
+          })) as { id: string };
+          taskIds.push(task.id);
+        }
+        // One parked approval per first N task: each is a distinct instance
+        // owned by its task, exactly like the production attention signal.
+        const instanceIds: string[] = [];
+        for (let i = 0; i < pending; i += 1) {
+          const launched = (await post("/v1/instances", {
+            hostId,
+            workspaceId: "wsp_e2e",
+            kind: "claude",
+            driver: "claude-print",
+            taskId: taskIds[i],
+            prompt: `UO8 perf mhome-blocked approval gate ${i} ${stamp}`,
+          })) as { instance: { instanceId: string } };
+          instanceIds.push(launched.instance.instanceId);
+        }
+        // One plain task advances placed → it stays in the to-do column but
+        // its render signature flips, isolating a single-card commit.
+        await patch(`/v1/tasks/${taskIds[pending + 1]}`, { state: "placed" });
+        return { projectId: project.id, taskIds, instanceIds };
+      },
+      { total: E_TASKS, pending: E_PENDING },
+    );
+
+    // Wait until all 40 approvals are actually pending.
+    await expect
+      .poll(
+        () =>
+          driver.evaluate(async (ids) => {
+            const list = (await (await fetch("/v1/interactions", { credentials: "include" })).json()) as {
+              items?: { instanceId?: string; state?: string }[];
+            };
+            const owned = new Set(ids);
+            return (list.items ?? []).filter(
+              (item) => item.state === "pending" && owned.has(item.instanceId),
+            ).length;
+          }, fixture.instanceIds),
+        { timeout: 120_000, intervals: [1_000, 2_000] },
+      )
+      .toBeGreaterThanOrEqual(E_PENDING);
+
+    await page.goto(`/board?project=${fixture.projectId}&profile=1`);
+    await expect(page.getByTestId("board-card")).toHaveCount(E_TASKS, { timeout: 60_000 });
+    await expect
+      .poll(
+        () => page.locator('[data-testid="board-signal"][data-kind="needs-human"]').count(),
+        { timeout: 60_000, intervals: [1_000, 2_000] },
+      )
+      .toBeGreaterThanOrEqual(E_PENDING);
+    // Let the mount-time data streams settle before measuring tick commits.
+    await page.waitForTimeout(7_000);
+
+    // Initial load: record every BoardCard commit since the page mounted.
+    const initial = boardCardCommits(await getReport(page));
+    const initialPhases = initial.reduce(
+      (acc, commit) => {
+        acc[commit.phase] = (acc[commit.phase] ?? 0) + 1;
+        return acc;
+      },
+      {} as Record<string, number>,
+    );
+
+    // Quiet window: one full /v1/board poll tick with nothing changing.
+    await page.evaluate(() => window.__remudaPerf?.reset());
+    await markScenario(page, "E-quiet-tick");
+    await page.waitForTimeout(7_000);
+    const quietCommits = boardCardCommits(await getReport(page)).length;
+    expect(
+      quietCommits,
+      "an unchanged poll tick must not commit any BoardCard",
+    ).toBe(0);
+    await markScenario(page, null);
+
+    // One task changes state (already PATCHed; advance another live one so
+    // the flip happens inside the measured window).
+    const changedTaskId = fixture.taskIds[E_PENDING + 2];
+    await driver.evaluate(async (id) => {
+      await fetch(`/v1/tasks/${id}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ state: "placed" }),
+      });
+    }, changedTaskId);
+
+    await page.evaluate(() => window.__remudaPerf?.reset());
+    await markScenario(page, "E-board");
+    await expect
+      .poll(
+        async () =>
+          boardCardCommits(await getReport(page)).filter(
+            (commit) => commit.phase === "update",
+          ).length,
+        { timeout: 20_000, intervals: [500, 1_000] },
+      )
+      .toBeGreaterThanOrEqual(1);
+    // Let the tick finish; the one changed card is the only update commit.
+    await page.waitForTimeout(1_000);
+    const changeReport = await getReport(page);
+    const changedCommits = boardCardCommits(changeReport).filter(
+      (commit) => commit.phase === "update",
+    );
+    expect(
+      changedCommits.length,
+      "one tick commits only the card whose state changed",
+    ).toBe(1);
+
+    const result = summarise(
+      changeReport,
+      browser.browserType().name(),
+      "E-board",
+      { tasks: E_TASKS, pendingInteractions: E_PENDING },
+      await readPeakHeap(page),
+    );
+    result.boardCard = {
+      tasks: E_TASKS,
+      pendingInteractions: E_PENDING,
+      initialMountCommits: initialPhases.mount ?? 0,
+      initialUpdateCommits: initialPhases.update ?? 0,
+      initialCommitTotalMs: Math.round(initial.reduce((sum, c) => sum + c.actualDuration, 0) * 100) / 100,
+      initialCommitMaxMs: Math.round(Math.max(0, ...initial.map((c) => c.actualDuration)) * 100) / 100,
+      quietTickCommits: quietCommits,
+      changedTickCommits: changedCommits.length,
+    };
     summaries.push(result);
     console.log(JSON.stringify(result, null, 2));
   } finally {

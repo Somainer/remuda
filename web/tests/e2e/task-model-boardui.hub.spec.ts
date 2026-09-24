@@ -85,6 +85,8 @@ type Fixture = {
   running: TaskDoc;
   done: TaskDoc;
   failed: TaskDoc;
+  blocked: TaskDoc;
+  landed: TaskDoc;
   archived: TaskDoc;
   sharedA: TaskDoc;
   sharedB: TaskDoc;
@@ -209,6 +211,50 @@ async function makeFixture(page: Page): Promise<Fixture> {
   });
   await setState(failed, "failed", "worker exited 42");
 
+  // A live session parked on a pending approval: the card's 需要你 signal.
+  const blocked = await create("needs-you");
+  const blockedLaunch = await apiJson<{ instance?: { instanceId?: string; id?: string } }>(
+    page,
+    "POST",
+    "/v1/instances",
+    {
+      hostId: host,
+      workspaceId: "wsp_e2e",
+      kind: "claude",
+      driver: "claude-print",
+      taskId: blocked.id,
+      prompt: `BUI mhome-blocked approval gate ${suffix}`,
+    },
+  );
+  const blockedInstanceId = blockedLaunch.instance?.instanceId ?? blockedLaunch.instance?.id;
+  expect(blockedInstanceId).toBeTruthy();
+  createdInstances.push(blockedInstanceId!);
+  await expect
+    .poll(
+      async () => {
+        const list = await apiJson<{ items?: { instanceId?: string; state?: string }[] }>(
+          page,
+          "GET",
+          `/v1/interactions?instanceId=${blockedInstanceId}`,
+        );
+        return (list.items ?? []).some(
+          (item) => item.instanceId === blockedInstanceId && item.state === "pending",
+        );
+      },
+      { timeout: 20_000 },
+    )
+    .toBe(true);
+
+  // A genuinely landed card: done through the state machine, then the
+  // gate/land record writes the sha (the only path to 已合入).
+  const landed = await create("landed");
+  await setState(landed, "placed");
+  await setState(landed, "running");
+  await setState(landed, "done");
+  await apiJson(page, "POST", `/v1/tasks/${landed.id}/land`, {
+    sha: "abcdef0123456789abcdef",
+  });
+
   // One archived card (state untouched).
   const archived = await create("archived");
   await apiJson<TaskDoc>(page, "POST", `/v1/tasks/${archived.id}/archive`, {});
@@ -246,6 +292,8 @@ async function makeFixture(page: Page): Promise<Fixture> {
     running,
     done,
     failed,
+    blocked,
+    landed,
     archived,
     sharedA,
     sharedB,
@@ -274,11 +322,14 @@ test.afterAll(async ({ browser }) => {
 test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
 
-  test("three columns, sessions, sharing, failed badge, legal drags and the read-only preview", async ({
-    page,
-  }) => {
+  // Shared across the serial tests in this describe (the project poll test
+  // only needs a project id to deep-link).
+  let fixture: Fixture | null = null;
+
+  test("three columns, card states, legal drags and the overlay preview", async ({ page }) => {
     await login(page);
     const fx = await makeFixture(page);
+    fixture = fx;
 
     // The sidebar project rows are the board's project filter (UO-2a, formerly
     // the top-bar switcher); global would show every project on the shared
@@ -338,6 +389,55 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     const fold = page.getByTestId("board-archive-fold");
     await expect(fold).toBeVisible();
     await expect(cardIn(fold, fx.archived.id)).toBeVisible();
+
+    // UO-8: the six card states. Failed keeps its badge; the rest render the
+    // one signal line (needs-you / landed / unlanded / derived next step).
+    const blockedCard = cardIn(column(page, "todo"), fx.blocked.id);
+    await expect(blockedCard.getByTestId("board-signal")).toHaveAttribute(
+      "data-kind",
+      "needs-human",
+    );
+    await expect(blockedCard.getByTestId("board-signal")).toContainText("需要你处理");
+
+    const landedCard = cardIn(column(page, "done"), fx.landed.id);
+    await expect(landedCard.getByTestId("board-signal")).toHaveAttribute("data-kind", "landed");
+    await expect(landedCard.getByTestId("board-signal")).toContainText("abcdef0");
+    await expect(landedCard.getByTestId("board-signal")).toContainText("已合入");
+
+    const doneCard = cardIn(column(page, "done"), fx.done.id);
+    await expect(doneCard.getByTestId("board-signal")).toHaveAttribute("data-kind", "unlanded");
+    await expect(doneCard.getByTestId("board-signal")).toContainText("尚未合入");
+
+    await expect(
+      cardIn(column(page, "in-progress"), fx.running.id).getByTestId("board-signal"),
+    ).toHaveAttribute("data-kind", "next-step");
+    await expect(
+      cardIn(column(page, "todo"), fx.sharedA.id).getByTestId("board-signal"),
+    ).toContainText("待派发");
+
+    // UO-8: the board exposes no land entry — 已合入/尚未合入 are status
+    // lines, never a button or link. (Scope to the board surface and match
+    // the action word, not task titles, which may contain "landed".)
+    const boardSurface = page.getByTestId("board-page");
+    expect(await boardSurface.locator('[data-testid*="land" i]').count()).toBe(0);
+    for (const role of ["button", "link"] as const) {
+      expect(
+        await boardSurface.getByRole(role, { name: /合入|land\b/i }).count(),
+        `no ${role} offers a land action`,
+      ).toBe(0);
+    }
+
+    // UO-8: three tracks at 1440. Sidebar 248 + rail 272 + 32px gutters leave
+    // ~269px per column (the exact pixel depends on the scroller width).
+    const widths = await page
+      .getByTestId("board-column")
+      .evaluateAll((nodes) => nodes.map((node) => (node as HTMLElement).getBoundingClientRect().width));
+    expect(widths).toHaveLength(3);
+    for (const width of widths) {
+      expect(Math.round(width), `column width ${width} ≈ 269`).toBeGreaterThanOrEqual(255);
+      expect(Math.round(width)).toBeLessThanOrEqual(285);
+    }
+    console.log(`UO-8 column widths at 1440: ${widths.map((w) => Math.round(w)).join(", ")}px`);
 
     // Acceptance 4: to-do → in-progress runs the pending→placed→running
     // multi-hop through legal PATCHes.
@@ -404,18 +504,81 @@ test.describe("desktop board at 1440 (HUB_E2E_TASK_BIND=1)", () => {
     // The refusal left the card where it was.
     await expect(cardIn(column(page, "in-progress"), fx.running.id)).toBeVisible();
 
-    // Acceptance 6: the card detail is an explicit read-only preview with a
-    // link into the shared workbench. There is no composer on /board.
-    await cardIn(page, fx.todo.id).getByTestId("board-card-open").click();
+    // Acceptance 6 + UO-8: the detail is an overlay drawer, not a fixed
+    // right rail — width min(400px, 100% - 48px), raised surface over a
+    // scrim, 预览模式 banner, link into the shared workbench.
+    const todoOpen = cardIn(page, fx.todo.id).getByTestId("board-card-open");
+    await todoOpen.click();
+    const scrim = page.getByTestId("board-preview-scrim");
+    const drawer = page.getByRole("dialog", { name: "任务预览" });
+    await expect(scrim).toBeVisible();
+    await expect(drawer).toBeVisible();
+    const drawerBox = await drawer.boundingBox();
+    expect(drawerBox).toBeTruthy();
+    expect(Math.round(drawerBox!.width)).toBe(400);
+    expect(Math.round(drawerBox!.height)).toBeGreaterThan(600);
+    // The drawer overlays the board rather than participating in its grid.
+    expect(drawerBox!.x).toBeGreaterThan(1440 - 400 - 24);
+
     await expect(page.getByTestId("board-preview-banner")).toContainText("预览模式");
     await expect(page.getByTestId("board-preview-open")).toHaveAttribute(
       "href",
       `/s/${fx.instanceId}`,
     );
     await expect(page.getByTestId("task-detail-title")).toContainText("bui todo");
+    // Focus moved into the drawer while open.
+    await expect(drawer).toBeFocused();
+
+    // Esc closes the overlay and returns focus to the originating card.
+    await page.keyboard.press("Escape");
+    await expect(drawer).toHaveCount(0);
+    await expect(scrim).toHaveCount(0);
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const el = document.activeElement;
+            return {
+              testid: el?.getAttribute("data-testid"),
+              task: el?.closest('[data-testid="board-card"]')?.getAttribute("data-task-id"),
+            };
+          }),
+        { timeout: 2_000 },
+      )
+      .toEqual({ testid: "board-card-open", task: fx.todo.id });
+
+    // Clicking the scrim also dismisses; the drawer itself stops the click.
+    await todoOpen.click();
+    await expect(drawer).toBeVisible();
+    await scrim.click({ position: { x: 4, y: 4 } });
+    await expect(drawer).toHaveCount(0);
 
     // Evidence: columns with the failed badge in 进行中, the sharing footer
     // in 待办, the archive fold and the preview banner all visible.
     await shot(page, "task-model-6-board-1440.png");
+  });
+
+  test("fetches /v1/projects on mount only, never on a poll interval", async ({ page }) => {
+    test.setTimeout(75_000);
+    await login(page);
+    const fx = fixture ?? (await makeFixture(page));
+    const requestedAt: number[] = [];
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname.endsWith("/v1/projects")) {
+        requestedAt.push(Date.now());
+      }
+    });
+
+    await page.goto(`/board?project=${fx.project}`);
+    await expect(page.getByTestId("board-page")).toBeVisible();
+    // The mount burst (Shell directory + board rail names).
+    await expect.poll(() => requestedAt.length).toBeGreaterThan(0);
+    await page.waitForTimeout(2_000);
+    const burst = requestedAt.length;
+
+    // Wait past the old 30s project interval; the board's own 5s poll is
+    // /v1/board, so the project count must not move.
+    await page.waitForTimeout(31_000);
+    expect(requestedAt.length).toBe(burst);
   });
 });

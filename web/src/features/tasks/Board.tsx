@@ -1,16 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { rest } from "../../lib/api";
-import type { components } from "../../lib/api.generated";
 import { HubHttpError } from "../../lib/httpError";
 import { useHub } from "../../lib/store";
 import { formatListTime } from "../../lib/format";
 import { buildSpaces, useSpacesPrefs } from "../spaces/store";
 import { HarnessGlyph } from "../spaces/SpacesPanel";
 import { TaskGroups, useLiveBranches } from "./TaskList";
-import { buildTaskGroups } from "./taskRows";
+import { buildTaskGroups, taskCardSignal } from "./taskRows";
 import { TaskDetailPanel } from "./TaskDetailPanel";
-import { boardPath, useProjectFilter } from "./ProjectSwitcher";
+import { boardPath, useProjectFilter, useProjects } from "./ProjectSwitcher";
+import { PageHeader } from "../../components/PageHeader";
+import { CommitProbe } from "../../components/CommitProbe";
 import {
   BOARD_WORK_COLUMNS,
   buildBoardModel,
@@ -24,22 +25,25 @@ import listCss from "./tasklist.module.css";
 import css from "./board.module.css";
 
 /**
- * Desktop kanban at `/board` (plan task-model task 6 t-board-ui, D-050 §5/§9,
- * ui-spec §2.9). Three work columns consume the server projection
- * `GET /v1/board`; archived is a fold behind a filter, never another column.
- * The same projection feeds the 280px task rail on the left. Drag legality
- * is precomputed per card from the state machine: an unreachable column
- * renders its reason and refuses the drag up front instead of failing a drop
- * with a 4xx. The card detail is an explicit read-only preview — there is no
- * composer on this surface; full control lives in the shared workbench.
+ * Desktop kanban at `/board` (D-050 §5/§9, ui-spec §2.9, UO-8). Three work
+ * columns consume the server projection `GET /v1/board`; archived is a fold
+ * behind a filter, never another column. The same projection feeds the task
+ * rail on the left, which below 1024px folds into a header-button overlay.
+ *
+ * Drag legality is precomputed per card from the state machine: an
+ * unreachable column renders its reason and refuses the drag up front
+ * instead of failing a drop with a 4xx. The card detail is an overlay
+ * drawer — an explicit read-only preview with no composer; Esc closes it and
+ * returns focus to the card that opened it. Full control lives in the
+ * shared workbench `/s/:id`.
  *
  * Compact widths never render this component: the route sits behind the
  * D-049 ViewportGate and collapses onto the `/m` task layer.
  */
 
-type ProjectPage = components["schemas"]["ProjectPage"];
-
 const DRAG_MIME = "text/x-remuda-task";
+/** The card paints at most two session rows; the rest collapse to a count. */
+const CARD_SESSION_ROWS = 2;
 
 async function fetchBoard(path: string): Promise<BoardView> {
   return rest<BoardView>(path);
@@ -83,37 +87,6 @@ function useBoardView(projectId: string | null): {
   return { view, reload };
 }
 
-/** Project names for the rail's project groups (ids render otherwise). */
-function useProjectNames(): Map<string, string> {
-  const [names, setNames] = useState<Map<string, string>>(new Map());
-  useEffect(() => {
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const page = await rest<ProjectPage>("/v1/projects");
-        if (!cancelled) {
-          setNames(
-            new Map(
-              (page.items ?? [])
-                .filter((project) => project.id && project.name)
-                .map((project) => [project.id, project.name]),
-            ),
-          );
-        }
-      } catch {
-        /* Raw project ids are an acceptable degraded rail. */
-      }
-    };
-    void tick();
-    const timer = window.setInterval(tick, 30_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-  return names;
-}
-
 function moveErrorMessage(err: unknown): string {
   if (err instanceof HubHttpError) {
     if (err.status === 403) {
@@ -147,107 +120,175 @@ function SessionLine({ session, onNavigate }: { session: CardSession; onNavigate
   );
 }
 
-function BoardCardView({
-  card,
-  selected,
-  busy,
-  onSelect,
-  onArchive,
-  onDragStart,
-  onDragEnd,
-}: {
-  card: BoardCard;
-  selected: boolean;
-  busy: boolean;
-  onSelect: () => void;
-  onArchive: () => void;
-  onDragStart: (event: React.DragEvent) => void;
-  onDragEnd: () => void;
-}) {
-  // Terminal (done/failed) and archived cards compute zero legal drops, so
-  // they are not draggable at all rather than offering a move every column
-  // must refuse.
-  const movable =
-    !busy && BOARD_WORK_COLUMNS.some((workColumn) => card.drops[workColumn].allowed);
+/**
+ * The one signal line (ui-spec §2.9). Failure renders as the badge row
+ * above this component; every other card gets the first established signal:
+ * 需要你 (amber), the landed sha7 (success), 尚未合入 (muted, with no land
+ * entry), or the shared next-step phrase.
+ */
+function CardSignal({ card }: { card: BoardCard }) {
+  const signal = taskCardSignal({
+    task: card.item,
+    needsHuman: card.needsHuman,
+    sessionCount: card.sessionCount,
+  });
+  if (signal.kind === "failed") return null;
+  if (signal.kind === "needs-human") {
+    return (
+      <p className={`${css.signal} ${css.signalAttention}`} data-testid="board-signal" data-kind="needs-human">
+        <span className={css.signalDot} aria-hidden="true" />
+        需要你处理
+      </p>
+    );
+  }
+  if (signal.kind === "landed") {
+    return (
+      <p className={`${css.signal} ${css.signalLanded}`} data-testid="board-signal" data-kind="landed">
+        <span className={css.signalSha}>{signal.sha7}</span>
+        <span>已合入</span>
+      </p>
+    );
+  }
+  if (signal.kind === "unlanded") {
+    return (
+      <p className={`${css.signal} ${css.signalMute}`} data-testid="board-signal" data-kind="unlanded">
+        尚未合入
+      </p>
+    );
+  }
   return (
-    <article
-      className={`${css.card} ${selected ? css.cardSelected : ""} ${
-        card.failed ? css.cardFailed : ""
-      } ${card.archived ? css.cardArchived : ""}`}
-      data-testid="board-card"
-      data-task-id={card.id}
-      data-state={card.item.state}
-      data-column={card.column}
-      data-failed={card.failed ? "1" : "0"}
-      data-archived={card.archived ? "1" : "0"}
-      draggable={movable}
-      onDragStart={movable ? onDragStart : undefined}
-      onDragEnd={onDragEnd}
-    >
-      <header className={css.cardHead}>
-        <button
-          type="button"
-          className={css.cardOpen}
-          data-testid="board-card-open"
-          onClick={onSelect}
-        >
-          <span className={css.cardKey}>{card.displayKey}</span>
-          <span className={css.cardTitle} title={card.title}>
-            {card.title}
-          </span>
-        </button>
-        {!card.archived ? (
-          <button
-            type="button"
-            className={css.cardArchive}
-            data-testid="board-card-archive"
-            title="归档此任务（不改状态）"
-            onClick={(event) => {
-              event.stopPropagation();
-              onArchive();
-            }}
-          >
-            归档
-          </button>
-        ) : null}
-      </header>
-
-      {card.failed ? (
-        <p className={css.failBadge} data-testid="board-failed-badge" role="status">
-          <span className={css.failMark} aria-hidden="true">
-            ⚠
-          </span>
-          <span className={css.failText}>失败{card.blockedReason ? ` · ${card.blockedReason}` : ""}</span>
-        </p>
-      ) : null}
-
-      <div className={css.cardSessions} data-testid="board-card-sessions">
-        {card.sessions.length > 0 ? (
-          card.sessions.map((session) => <SessionLine key={session.id} session={session} />)
-        ) : (
-          <p className={css.cardNoSession}>还没有会话</p>
-        )}
-      </div>
-
-      <footer className={css.cardFoot}>
-        <span className={css.configChip} data-testid="board-config" title="当前应用的配置（config-reuse）">
-          {card.configLabel}
-        </span>
-        {card.sharedLabel ? (
-          <span className={css.shared} data-testid="board-shared" title="同目录串行轮用（attach 期间独占）">
-            {card.sharedLabel}
-          </span>
-        ) : (
-          <span className={css.sharedMute} data-testid="board-shared">
-            独占目录
-          </span>
-        )}
-      </footer>
-    </article>
+    <p className={`${css.signal} ${css.signalMute}`} data-testid="board-signal" data-kind="next-step">
+      {signal.text}
+    </p>
   );
 }
 
+type CardProps = {
+  card: BoardCard;
+  selected: boolean;
+  busy: boolean;
+  onSelect: (id: string) => void;
+  onArchive: (id: string) => void;
+  onDragStart: (id: string, event: React.DragEvent) => void;
+  onDragEnd: () => void;
+};
+
+/**
+ * Memoized on the card's render signature (boardModel.cardSignature) plus
+ * selection/busy: a 5s poll that brings an unchanged projection commits no
+ * BoardCard — only cards whose painted inputs changed re-render
+ * (`commit:BoardCard`, perf scenario E).
+ */
+const BoardCardView = memo(
+  function BoardCardView({ card, selected, busy, onSelect, onArchive, onDragStart, onDragEnd }: CardProps) {
+    // Terminal (done/failed) and archived cards compute zero legal drops, so
+    // they are not draggable at all rather than offering a move every column
+    // must refuse.
+    const movable =
+      !busy && BOARD_WORK_COLUMNS.some((workColumn) => card.drops[workColumn].allowed);
+    const shownSessions = card.sessions.slice(0, CARD_SESSION_ROWS);
+    return (
+      <CommitProbe name="BoardCard">
+        <article
+          className={`${css.card} ${selected ? css.cardSelected : ""} ${
+            card.failed ? css.cardFailed : ""
+          } ${card.archived ? css.cardArchived : ""}`}
+          data-testid="board-card"
+          data-task-id={card.id}
+          data-state={card.item.state}
+          data-column={card.column}
+          data-failed={card.failed ? "1" : "0"}
+          data-archived={card.archived ? "1" : "0"}
+          draggable={movable}
+          onDragStart={movable ? (event) => onDragStart(card.id, event) : undefined}
+          onDragEnd={onDragEnd}
+        >
+          <header className={css.cardHead}>
+            <button
+              type="button"
+              className={css.cardOpen}
+              data-testid="board-card-open"
+              onClick={() => onSelect(card.id)}
+            >
+              <span className={css.cardKey}>{card.displayKey}</span>
+              <span className={css.cardTitle} title={card.title}>
+                {card.title}
+              </span>
+            </button>
+            {!card.archived ? (
+              <button
+                type="button"
+                className={css.cardArchive}
+                data-testid="board-card-archive"
+                title="归档此任务（不改状态）"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onArchive(card.id);
+                }}
+              >
+                归档
+              </button>
+            ) : null}
+          </header>
+
+          {card.failed ? (
+            <p className={css.failBadge} data-testid="board-failed-badge" role="status">
+              <span className={css.failMark} aria-hidden="true">
+                ⚠
+              </span>
+              <span className={css.failText}>
+                失败{card.blockedReason ? ` · ${card.blockedReason}` : ""}
+              </span>
+            </p>
+          ) : null}
+          <CardSignal card={card} />
+
+          <div className={css.cardSessions} data-testid="board-card-sessions">
+            {shownSessions.length > 0 ? (
+              shownSessions.map((session) => <SessionLine key={session.id} session={session} />)
+            ) : (
+              <p className={css.cardNoSession}>还没有会话</p>
+            )}
+            {card.sessions.length > CARD_SESSION_ROWS ? (
+              <p className={css.cardMoreSessions}>另有 {card.sessions.length - CARD_SESSION_ROWS} 个会话</p>
+            ) : null}
+          </div>
+
+          <footer className={css.cardFoot}>
+            <span className={css.configChip} data-testid="board-config" title="当前应用的配置（config-reuse）">
+              {card.configLabel}
+            </span>
+            {card.sharedLabel ? (
+              <span className={css.shared} data-testid="board-shared" title="同目录串行轮用（attach 期间独占）">
+                {card.sharedLabel}
+              </span>
+            ) : (
+              <span className={css.sharedMute} data-testid="board-shared">
+                独占目录
+              </span>
+            )}
+          </footer>
+        </article>
+      </CommitProbe>
+    );
+  },
+  (prev, next) =>
+    prev.card.sig === next.card.sig &&
+    prev.selected === next.selected &&
+    prev.busy === next.busy &&
+    prev.onSelect === next.onSelect &&
+    prev.onArchive === next.onArchive &&
+    prev.onDragStart === next.onDragStart &&
+    prev.onDragEnd === next.onDragEnd,
+);
+
 // ── Column ────────────────────────────────────────────────────────────────
+
+const COLUMN_GLYPH: Record<WorkColumn, string> = {
+  todo: "○",
+  "in-progress": "◐",
+  done: "✓",
+};
 
 function BoardColumnView({
   column,
@@ -256,7 +297,7 @@ function BoardColumnView({
   selectedId,
   draggedCard,
   over,
-  busy,
+  busyId,
   onSelect,
   onArchive,
   onDragCardStart,
@@ -271,10 +312,10 @@ function BoardColumnView({
   selectedId: string | null;
   draggedCard: BoardCard | null;
   over: boolean;
-  busy: boolean;
-  onSelect: (card: BoardCard) => void;
-  onArchive: (card: BoardCard) => void;
-  onDragCardStart: (card: BoardCard, event: React.DragEvent) => void;
+  busyId: string | null;
+  onSelect: (id: string) => void;
+  onArchive: (id: string) => void;
+  onDragCardStart: (id: string, event: React.DragEvent) => void;
   onDragCardEnd: () => void;
   onColumnDragOver: (column: WorkColumn, event: React.DragEvent) => void;
   onColumnDragLeave: (column: WorkColumn) => void;
@@ -293,6 +334,9 @@ function BoardColumnView({
       onDrop={(event) => onColumnDrop(column, event)}
     >
       <header className={css.columnHead}>
+        <span className={css.columnGlyph} aria-hidden="true">
+          {COLUMN_GLYPH[column]}
+        </span>
         <span className={css.columnTitle}>{label}</span>
         <span className={css.columnCount}>{cards.length}</span>
       </header>
@@ -308,10 +352,10 @@ function BoardColumnView({
             key={card.id}
             card={card}
             selected={selectedId === card.id}
-            busy={busy}
-            onSelect={() => onSelect(card)}
-            onArchive={() => onArchive(card)}
-            onDragStart={(event) => onDragCardStart(card, event)}
+            busy={busyId === card.id}
+            onSelect={onSelect}
+            onArchive={onArchive}
+            onDragStart={onDragCardStart}
             onDragEnd={onDragCardEnd}
           />
         ))}
@@ -320,26 +364,40 @@ function BoardColumnView({
   );
 }
 
+const noop = () => undefined;
+
 // ── Page ──────────────────────────────────────────────────────────────────
 
 export function BoardPage() {
   const hub = useHub();
   const prefs = useSpacesPrefs();
   const [params] = useSearchParams();
-  // A deep link ?project= wins (ui-spec route table); otherwise the top-bar
-  // switcher's device-local selection scopes the projection (task 8).
+  // A deep link ?project= wins (ui-spec route table); otherwise the sidebar
+  // project rows / switcher write one device-local selection (task 8).
   const switcherProject = useProjectFilter();
   const projectId = params.get("project") ?? switcherProject;
   const { view, reload } = useBoardView(projectId);
-  const projectNames = useProjectNames();
+  // The Shell already loads the project directory once per mount; reuse it
+  // for rail group names instead of polling /v1/projects from this surface.
+  const { projects } = useProjects();
 
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+  const [indexOpen, setIndexOpen] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [overColumn, setOverColumn] = useState<WorkColumn | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Focus restoration for the preview drawer: the element that opened it.
+  const previewTrigger = useRef<HTMLElement | null>(null);
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+
+  const projectName = useCallback(
+    (id: string) => projects.find((project) => project.id === id)?.name,
+    [projects],
+  );
 
   const items = useMemo<Task[]>(
     () =>
@@ -360,14 +418,26 @@ export function BoardPage() {
   );
   const { branchOf } = useLiveBranches(spaces);
 
+  // One Set per hub snapshot, shared by the board model and nothing else.
+  const pendingByInstance = useMemo(
+    () =>
+      new Set(
+        hub.interactions
+          .filter((interaction) => interaction.state === "pending")
+          .map((interaction) => interaction.instanceId),
+      ),
+    [hub.interactions],
+  );
+
   const model = useMemo(
     () =>
       buildBoardModel({
         view,
         instances: hub.instances as readonly CardSession[],
+        pendingInstanceIds: pendingByInstance,
         query,
       }),
-    [view, hub.instances, query],
+    [view, hub.instances, pendingByInstance, query],
   );
 
   const groups = useMemo(
@@ -377,11 +447,11 @@ export function BoardPage() {
         instances: hub.instances,
         interactions: hub.interactions,
         spaces,
-        projectName: (id) => projectNames.get(id),
+        projectName,
         branchOfSpace: branchOf,
         query,
       }),
-    [items, hub.instances, hub.interactions, spaces, projectNames, branchOf, query],
+    [items, hub.instances, hub.interactions, spaces, projectName, branchOf, query],
   );
 
   // Clear a selection the projection no longer carries.
@@ -392,6 +462,45 @@ export function BoardPage() {
   const selectedCard = selectedId ? model.byId.get(selectedId) ?? null : null;
   const selectedItem = (selectedCard?.item ?? null) as Task | null;
   const draggedCard = dragId ? model.byId.get(dragId) ?? null : null;
+
+  // Latest model for stable event handlers (the card memo must not see a new
+  // onArchive identity every 5s poll — that would defeat the sig comparison).
+  const modelRef = useRef(model);
+  modelRef.current = model;
+
+  const openTask = useCallback((id: string) => {
+    previewTrigger.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setSelectedId(id);
+  }, []);
+
+  const closePreview = useCallback(() => {
+    setSelectedId(null);
+    // Restore focus to the triggering card after React removes the drawer.
+    const trigger = previewTrigger.current;
+    if (trigger) window.requestAnimationFrame(() => trigger.focus());
+  }, []);
+
+  // Esc closes the preview; focus returns to the triggering card. Esc also
+  // dismisses the folded rail overlay below 1024px.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (selectedId) {
+        event.preventDefault();
+        closePreview();
+      } else if (indexOpen) {
+        setIndexOpen(false);
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [selectedId, indexOpen, closePreview]);
+
+  // Move focus into the drawer while it is open.
+  useEffect(() => {
+    if (selectedItem) drawerRef.current?.focus();
+  }, [selectedItem]);
 
   const moveCard = useCallback(
     async (card: BoardCard, column: WorkColumn) => {
@@ -434,38 +543,76 @@ export function BoardPage() {
     [reload],
   );
 
-  const onDragCardStart = (card: BoardCard, event: React.DragEvent) => {
-    event.dataTransfer.setData(DRAG_MIME, card.id);
+  const onCardDragStart = useCallback((id: string, event: React.DragEvent) => {
+    event.dataTransfer.setData(DRAG_MIME, id);
     event.dataTransfer.effectAllowed = "move";
     setError(null);
-    setDragId(card.id);
-  };
+    setDragId(id);
+  }, []);
 
-  const onColumnDragOver = (column: WorkColumn, event: React.DragEvent) => {
-    const card = dragId ? model.byId.get(dragId) : null;
-    if (!card || busyId) return;
-    if (card.drops[column].allowed) {
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-      setOverColumn(column);
-    } else {
-      event.dataTransfer.dropEffect = "none";
-      setOverColumn(null);
-    }
-  };
-
-  const onColumnDrop = (column: WorkColumn, event: React.DragEvent) => {
-    event.preventDefault();
-    setOverColumn(null);
-    const id = event.dataTransfer.getData(DRAG_MIME);
+  const onCardDragEnd = useCallback(() => {
     setDragId(null);
-    const card = id ? model.byId.get(id) : null;
-    if (card) void moveCard(card, column);
-  };
+    setOverColumn(null);
+  }, []);
+
+  const onColumnDragOver = useCallback(
+    (column: WorkColumn, event: React.DragEvent) => {
+      const card = dragId ? model.byId.get(dragId) : null;
+      if (!card || busyId) return;
+      if (card.drops[column].allowed) {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        setOverColumn(column);
+      } else {
+        event.dataTransfer.dropEffect = "none";
+        setOverColumn(null);
+      }
+    },
+    [dragId, model, busyId],
+  );
+
+  const onColumnDragLeave = useCallback((column: WorkColumn) => {
+    setOverColumn((value) => (value === column ? null : value));
+  }, []);
+
+  const onColumnDrop = useCallback(
+    (column: WorkColumn, event: React.DragEvent) => {
+      event.preventDefault();
+      setOverColumn(null);
+      const id = event.dataTransfer.getData(DRAG_MIME);
+      setDragId(null);
+      const card = id ? model.byId.get(id) : null;
+      if (card) void moveCard(card, column);
+    },
+    [model, moveCard],
+  );
+
+  const onSelectStable = openTask;
+  const onArchiveStable = useCallback(
+    (id: string) => {
+      const card = modelRef.current.byId.get(id);
+      if (card) void archiveCard(card);
+    },
+    [archiveCard],
+  );
+
+  const scopeTitle = projectId ? (projectName(projectId) ?? projectId) : "全局";
 
   return (
     <div className={css.page} data-testid="board-page">
-      <div className={listCss.rail} data-testid="task-list">
+      {indexOpen ? (
+        <div
+          className={css.railScrim}
+          data-testid="board-index-scrim"
+          onClick={() => setIndexOpen(false)}
+        />
+      ) : null}
+      <aside
+        className={`${listCss.rail} ${css.rail}`}
+        data-testid="task-list"
+        data-open={indexOpen ? "1" : undefined}
+        aria-label="任务清单"
+      >
         <div className={listCss.toolbar}>
           <input
             className={listCss.search}
@@ -477,34 +624,47 @@ export function BoardPage() {
             aria-label="搜索看板任务"
           />
         </div>
-        <TaskGroups
-          groups={groups}
-          variant="desktop"
-          selectedId={selectedId}
-          onSelect={(task) => setSelectedId(task.id)}
-        />
-      </div>
+        <TaskGroups groups={groups} variant="desktop" selectedId={selectedId} onSelect={(task) => openTask(task.id)} />
+      </aside>
 
       <main className={css.boardMain}>
-        <header className={css.boardToolbar}>
-          <h1 className={css.boardTitle}>看板</h1>
-          <label className={css.archiveToggle}>
-            <input
-              type="checkbox"
-              data-testid="board-archive-toggle"
-              checked={showArchived}
-              onChange={(event) => setShowArchived(event.target.checked)}
-            />
-            <span>
-              已归档 · {model.archived.length}
-            </span>
-          </label>
-          {error ? (
-            <p className={css.moveError} data-testid="board-move-error" role="alert">
-              {error}
-            </p>
-          ) : null}
-        </header>
+        <PageHeader
+          testId="board-header"
+          crumbs={[{ label: "任务看板", to: "/board" }]}
+          title={scopeTitle}
+          actions={
+            <>
+              <span className={css.taskTotal} data-testid="board-total">
+                {model.total} 个任务
+              </span>
+              <label className={css.archiveToggle}>
+                <input
+                  type="checkbox"
+                  data-testid="board-archive-toggle"
+                  checked={showArchived}
+                  onChange={(event) => setShowArchived(event.target.checked)}
+                />
+                <span>已归档 · {model.archived.length}</span>
+              </label>
+              <button
+                type="button"
+                className={css.indexOpen}
+                data-testid="board-index-open"
+                aria-expanded={indexOpen}
+                onClick={() => setIndexOpen((value) => !value)}
+              >
+                清单
+              </button>
+            </>
+          }
+        />
+
+        {error ? (
+          <p className={css.moveError} data-testid="board-move-error" role="alert">
+            <span aria-hidden="true">⚠ </span>
+            {error}
+          </p>
+        ) : null}
 
         <div className={css.columns} data-testid="board-columns">
           {BOARD_WORK_COLUMNS.map((column) => (
@@ -516,18 +676,13 @@ export function BoardPage() {
               selectedId={selectedId}
               draggedCard={draggedCard}
               over={overColumn === column}
-              busy={busyId != null}
-              onSelect={(card) => setSelectedId(card.id)}
-              onArchive={(card) => void archiveCard(card)}
-              onDragCardStart={onDragCardStart}
-              onDragCardEnd={() => {
-                setDragId(null);
-                setOverColumn(null);
-              }}
+              busyId={busyId}
+              onSelect={onSelectStable}
+              onArchive={onArchiveStable}
+              onDragCardStart={onCardDragStart}
+              onDragCardEnd={onCardDragEnd}
               onColumnDragOver={onColumnDragOver}
-              onColumnDragLeave={(current) =>
-                setOverColumn((value) => (value === current ? null : value))
-              }
+              onColumnDragLeave={onColumnDragLeave}
               onColumnDrop={onColumnDrop}
             />
           ))}
@@ -548,43 +703,52 @@ export function BoardPage() {
                     key={card.id}
                     card={card}
                     selected={selectedId === card.id}
-                    busy={busyId != null}
-                    onSelect={() => setSelectedId(card.id)}
-                    onArchive={() => undefined}
-                    onDragStart={() => undefined}
-                    onDragEnd={() => undefined}
+                    busy={busyId === card.id}
+                    onSelect={onSelectStable}
+                    onArchive={noop}
+                    onDragStart={noop}
+                    onDragEnd={onCardDragEnd}
                   />
                 ))}
               </div>
             )}
           </section>
         ) : null}
-      </main>
 
-      {selectedItem ? (
-        <div className={css.preview}>
-          <div className={css.previewBanner} data-testid="board-preview-banner">
-            <span className={css.previewMode}>预览模式</span>
-            {selectedCard?.primarySessionId ? (
-              <Link
-                className={css.previewLink}
-                to={`/s/${selectedCard.primarySessionId}`}
-                data-testid="board-preview-open"
-              >
-                在工作台打开以完整操作
-              </Link>
-            ) : (
-              <span className={css.previewMute}>启动会话后可在工作台完整操作</span>
-            )}
+        {selectedItem ? (
+          <div className={css.previewScrim} data-testid="board-preview-scrim" onClick={closePreview}>
+            <div
+              ref={drawerRef}
+              className={css.previewDrawer}
+              role="dialog"
+              aria-label="任务预览"
+              tabIndex={-1}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className={css.previewBanner} data-testid="board-preview-banner">
+                <span className={css.previewMode}>预览模式</span>
+                {selectedCard?.primarySessionId ? (
+                  <Link
+                    className={css.previewLink}
+                    to={`/s/${selectedCard.primarySessionId}`}
+                    data-testid="board-preview-open"
+                  >
+                    在工作台打开
+                  </Link>
+                ) : (
+                  <span className={css.previewMute}>启动会话后可在工作台完整操作</span>
+                )}
+              </div>
+              <TaskDetailPanel
+                task={selectedItem}
+                displayKey={selectedCard?.displayKey}
+                sessionIds={selectedCard?.sessions.map((session) => session.id)}
+                primarySessionId={selectedCard?.primarySessionId}
+              />
+            </div>
           </div>
-          <TaskDetailPanel
-            task={selectedItem}
-            displayKey={selectedCard?.displayKey}
-            sessionIds={selectedCard?.sessions.map((session) => session.id)}
-            primarySessionId={selectedCard?.primarySessionId}
-          />
-        </div>
-      ) : null}
+        ) : null}
+      </main>
     </div>
   );
 }

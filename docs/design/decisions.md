@@ -956,7 +956,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 **(1) Agent 一跳审批（c-deleg1/2）**
 
-- 中间件白名单：Agent 的非 approval pending 交互在 `GET /v1/interactions` 中对 caller instance 为 self 或直接子实例时可见；approval 与 bypass-posture 调用者在中间件与 answer handler 两侧都被拒绝。
+- 路由准入与授权分离：agent 中间件**只做路径白名单**——放行 `GET /v1/interactions`（`crates/remuda-hub/src/agent_scope.rs:698`）与 `POST /v1/interactions/{id}/answer`（`:715`），本身不做 kind/bypass/家庭边判定。真正的授权在交互处理器里：list 合并页经 `delegated_visible_items` 过滤（`crates/remuda-hub/src/interactions.rs:145`：caller 侧 bypass 拒绝 `:159`、approval 排除 `:170`、self plan-review 排除 `:176`、一跳边 `:189`、target 侧 bypass 拒绝 `:195`），answer 经 `authorize_agent_answer` 逐行复核（`:209`：approval `:223`、self plan-review `:229`、`owns()` 一跳边 `:237`、target/caller 两侧 bypass `:250`/`:257`）；list handler 在 `:435` 调过滤器，answer handler 在 `:458` 调授权。删掉这些处理器检查不会被中间件拦住。
 - 答案走**既有** Node first-answer-wins CAS（`interaction.answer` → broker），Hub 不裁决、不翻译。
 - 人仍可从 inbox 回答任何 pending 交互；先到者赢，后到者拿 Superseded。
 - Actor 真实化（c-deleg2）：Node 不再把所有答案的 actor 当 Human，而是用 Hub 盖章的 `origin`/`byInstanceId`/`byDevice` 解析 `AnswerCaller`，committed `ActorRef.instance_id` 记录真实回答者；审计链 answer→command→journal 可重建。
@@ -983,9 +983,9 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 事实基础：Node 的 `InteractionOwner` 按 instance 注册、与 kind 无关；Claude 的 `ExitPlanMode` 在 stream-json 上是一个真正可回复的原生暂停（`can_use_tool`）。真录 fixture（Claude 2.1.277）证明：`allow` 且不带 `updatedPermissions` 时 CLI 自行从 plan 退到 default；`deny.message` 原样作为 `is_error` tool_result 喂给模型。
 
-- **(6a) driver 铸票**：print/sdk 上，仅当①拿到原生 `can_use_tool` 暂停、②该 tool_use 被 mapper 以**顶层**（`parent_tool_use_id == null`）见过（非 sub-agent）、③`input.plan` 是 ≤ 32 KiB 的字符串（空字符串也铸）时，铸 `InteractionRequest::PlanReview{plan, planDigest=sha256(plan), planRevision=1, options=[approve,deny], allowFeedback=true}`。其余（nested/oversized/absent/非 ExitPlanMode）fail-closed 回人类 Approval。
+- **(6a) driver 铸票**：print/sdk 上，仅当①拿到原生 `can_use_tool` 暂停、②该 tool_use 被 mapper 以**顶层**（`parent_tool_use_id == null`）见过（非 sub-agent）、③`input.plan` 是 ≤ 32 KiB 的字符串（空字符串也铸）时，铸 `InteractionRequest::PlanReview{plan, planDigest=sha256(plan), planRevision=1, options=[approve,deny], allowFeedback=true}`（谓词集中在 `crates/remuda-driver/src/claude_print.rs:1987` `exit_plan_review_request`，由 `build_interaction` `:1908-1912` 调用）。该 Approval 兜底**只针对 ExitPlanMode 暂停谓词不满足的形状**（nested/oversized/absent）：原生 `AskUserQuestion` 暂停不进该兜底，driver 照旧铸 `InteractionKind::Question`（`claude_print.rs:1903` 的 `ask` 分支、`:1913-1922`，`question_request` `:2043`）；其余工具专属交互种类也保持既有处理，不被改写。
 - **(6b) 正文 inline**：加性可选 `PlanReviewRequest.plan: Option<String>`（serde default），旧读者忽略、新读者缺失为 None；`planRef` 是不解析的占位 id。**不写对象表、不新增 `AttachmentKind`、零新 wire enum**。
-- **(6c) consumer**：approve 只回 allow + 原 input，**绝不附带 `updatedPermissions`/setMode**（CLI 自行 plan→default）；deny 以 reviewer `feedback` 逐字作为 deny message 回喂模型，feedback 为 null（字段缺失）时才用默认 `"plan review denied"`。
+- **(6c) consumer**：approve 只回 allow + 原 input，**绝不附带 `updatedPermissions`/setMode**（CLI 自行 plan→default）；deny 以 reviewer `feedback` 逐字作为 deny message 回喂模型，wire 上 `feedback` 是**必填但可空**字段（`crates/remuda-protocol/src/interaction.rs:278-280`，`#[serde(deserialize_with = "required_option")]`，`crates/remuda-protocol/src/scalar.rs:15-21`）：显式 `"feedback": null` 表示无批注，consumer 才替换为默认 `"plan review denied"`（`crates/remuda-driver/src/claude_print.rs:2143-2148` 的 `unwrap_or_else`）；**整个 `feedback` 键缺失不是 null**，反序列化直接失败（InvalidRequest/400）。
 - **(6d) self-exclusion**：plan-review 不吃 `owns()` 的 self 边——child 不能列出或回答自己的 plan review；直接父或人可答。
 - **(6e) 先校验后 CAS**：Node 对 plan-review 答复**不论 carrier**（含 ClaudeControl）一律先跑 `validate_answer`（`crates/remuda-driver/src/interaction.rs:504`，Node 在 `crates/remuda-node/src/interactions.rs:346-350` 调用）：选项必须是请求 offer 的、revision 必须等于**请求的** revision、digest 必须一致、`allow_feedback=false` 时 deny 不得带 feedback、approve 永不带 feedback、feedback ≤ 4096 UTF-8 字节。坏答复在 CAS 消费 ticket **之前**就被拒（InvalidRequest/400），ticket 保持 pending、driver 不收到任何答复；此后**只有直接父或人可以更正后再答，child 自己仍不能答**（(6d) 的 self-exclusion 不变，见 `interactions.rs:226-239` `authorize_agent_answer`）。
 

@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { canSubmitAnswer } from "./interactionStatus";
 import type { Interaction } from "../types/interaction";
 import type { Observation } from "../types/observation";
 
@@ -233,4 +234,102 @@ it("a delayed older poll cannot revert a committed review to pending", async () 
   expect(
     hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
   ).toBe("answer-committed");
+});
+
+/**
+ * The omission case the pending-only list normally returns: the answer
+ * succeeds and the post-answer refresh resolves with an EMPTY list (so the
+ * committed local row is removed from the projection), and only THEN does the
+ * older poll held open since before the answer complete with the stale
+ * pending row. The committed card must neither stay answerable nor be
+ * resurrected by the late poll — it stays committed (or gone), never
+ * submittable.
+ */
+it("a newer empty list plus a late older poll cannot resurrect a committed review", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "instanceGet").mockResolvedValue({
+    id: INSTANCE,
+    journalId: JOURNAL,
+  } as Awaited<ReturnType<Api["instanceGet"]>>);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({
+    events: [ANSWERED_EVENT],
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+  });
+  vi.spyOn(api, "eventsSubscribe").mockResolvedValue({
+    subscriptionId: "sub_ordering3",
+    journalId: JOURNAL,
+    durableSeq: "1",
+    windowFromSeq: null,
+    reachedAfterSeq: true,
+    snapshot: {
+      projectionVersion: "v1",
+      projectionEpoch: "epoch_ordering3",
+      asOfSeq: "1",
+      instance: {} as never,
+      runs: [],
+      commands: [],
+      pendingInteractions: [],
+      nodes: [],
+      history: { earliestRetainedSeq: "0", complete: true },
+    },
+  });
+
+  // Initial refresh seeds the pending row normally.
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([pendingPlanReview()]);
+  await hubStore.refresh();
+  expect(
+    hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION)?.state,
+  ).toBe("pending");
+
+  // Poll A starts BEFORE the answer and is held open; it later resolves with
+  // the stale pending row.
+  let releaseDelayedPoll: () => void = () => {};
+  const delayedPoll = new Promise<void>((resolve) => {
+    releaseDelayedPoll = resolve;
+  });
+  let interactionCalls = 0;
+  vi.spyOn(api, "interactionList").mockImplementation(async () => {
+    const n = ++interactionCalls;
+    if (n === 1) {
+      await delayedPoll;
+      return [pendingPlanReview()]; // stale pending row lands last
+    }
+    // Every newer response (the post-answer refresh and anything after)
+    // resolves successfully with the row OMITTED — the normal pending-only
+    // response after answer-committed.
+    return [];
+  });
+  const delayedRefresh = hubStore.refresh(); // held on poll A
+  await vi.waitFor(() => expect(interactionCalls).toBeGreaterThanOrEqual(1));
+
+  // Answer POST succeeds; its follow-up refresh resolves with the EMPTY list
+  // while poll A is still outstanding.
+  vi.spyOn(api, "interactionRespond").mockResolvedValue({
+    command: { commandId: "cmd_1", id: "cmd_1" } as never,
+    relatedCommandIds: [],
+  });
+  await hubStore.respond(INTERACTION, {
+    kind: "plan-review",
+    optionId: "approve",
+    planRevision: "1",
+    planDigest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    feedback: null,
+  });
+  // The post-answer refresh really did run (it did not fail): the newer empty
+  // list was applied while poll A was still in flight.
+  expect(interactionCalls).toBeGreaterThanOrEqual(2);
+  expect(hubStore.getSnapshot().answering[INTERACTION]).toBeUndefined();
+
+  // Now poll A completes with the stale pending row.
+  releaseDelayedPoll();
+  await delayedRefresh;
+
+  // The review is committed (or gone from the list) — never pending — and the
+  // approve/deny controls cannot be submitted again.
+  const row = hubStore.getSnapshot().interactions.find((i) => i.id === INTERACTION);
+  expect(row === undefined || row.state !== "pending").toBe(true);
+  if (row) expect(canSubmitAnswer(row)).toBe(false);
 });

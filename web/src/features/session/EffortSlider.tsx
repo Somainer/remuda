@@ -19,7 +19,7 @@ import {
   type EffortStop,
 } from "./effort";
 import type { ModelCatalogView, ModelSelectionPath } from "./modelEffective";
-import css from "./session.module.css";
+import css from "./effort.module.css";
 
 /**
  * Half the knob, in px — keep in step with `--knob-size` in session.module.css,

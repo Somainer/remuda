@@ -283,6 +283,11 @@ struct Inner {
     exit_emitted: AtomicBool,
     /// Last successfully launched spec; `resume` re-materializes from this.
     last_spec: Mutex<Option<InstanceSpec>>,
+    /// The real OS exit status of the most recently reaped child, captured for
+    /// tests that must assert the spawned peer exited cleanly. Production code
+    /// does not read this.
+    #[cfg(any(test, feature = "test-stub"))]
+    child_exit_status: Mutex<Option<std::process::ExitStatus>>,
 }
 
 /// Native Claude print driver (`claude -p` stream-json).
@@ -303,6 +308,14 @@ impl ClaudePrintDriver {
     /// Build a driver from explicit options.
     pub fn new(options: ClaudePrintOptions) -> Self {
         Self::with_carrier(options, DriverKind::ClaudePrint)
+    }
+
+    /// The real OS exit status of the child reaped during the most recent
+    /// [`Driver::close`]. Test-only: lets a driven VCR test assert the spawned
+    /// peer's actual disposition rather than a status the peer self-reported.
+    #[cfg(any(test, feature = "test-stub"))]
+    pub async fn child_exit_status(&self) -> Option<std::process::ExitStatus> {
+        *self.inner.child_exit_status.lock().await
     }
 
     /// Wire name of the carrier this object drives, for user-facing messages and
@@ -344,6 +357,8 @@ impl ClaudePrintDriver {
                 closed: AtomicBool::new(false),
                 exit_emitted: AtomicBool::new(false),
                 last_spec: Mutex::new(None),
+                #[cfg(any(test, feature = "test-stub"))]
+                child_exit_status: Mutex::new(None),
             }),
             reader: Mutex::new(None),
             carrier,
@@ -705,7 +720,15 @@ impl Driver for ClaudePrintDriver {
         let mut live_guard = self.inner.live.lock().await;
         let recipe = live_guard.as_ref().map(|live| live.recipe.clone());
         if let Some(live) = live_guard.as_mut() {
-            close_ladder(live, self.options.close_timeout, self.carrier_name()).await;
+            let status = close_ladder(live, self.options.close_timeout, self.carrier_name()).await;
+            // Capture the child's REAL OS exit status from the reap for
+            // tests that must prove the peer finished cleanly.
+            #[cfg(any(test, feature = "test-stub"))]
+            if let Some(status) = status {
+                *self.inner.child_exit_status.lock().await = Some(status);
+            }
+            #[cfg(not(any(test, feature = "test-stub")))]
+            let _ = status;
         }
         *live_guard = None;
         drop(live_guard);
@@ -796,7 +819,14 @@ impl Driver for ClaudePrintDriver {
 /// stops reading and the 64-slot writer channel fills, enqueuing the EOF blocks
 /// exactly the way the subsequent wait could. The function never returns while
 /// still holding a live child it could kill.
-async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
+/// Reap the child on a bounded ladder, returning its real OS exit status when
+/// a `wait()` completed (None only if every bounded rung timed out and the
+/// process had to be abandoned still alive).
+async fn close_ladder(
+    live: &mut Live,
+    timeout: Duration,
+    carrier: &str,
+) -> Option<std::process::ExitStatus> {
     // The group id equals the direct child's pid because `spawn_command` puts it
     // in its own group. Read it before any wait: once reaped, `id()` is `None`.
     let pgid = live.process.id().and_then(|pid| i32::try_from(pid).ok());
@@ -808,14 +838,14 @@ async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
     // the timeout, not before it. Most closes end here.
     let first_slice = timeout.mul_f32(0.5);
     let request_eof_and_wait = async {
+        // Best-effort stdin EOF; if the child already exited (a one-shot VCR
+        // peer that finished its frames, say), the write errors and we still
+        // MUST reap it below and report its real status.
         let _ = live.process.close_stdin().await;
-        let _ = live.process.wait().await;
+        live.process.wait().await
     };
-    if tokio::time::timeout(first_slice, request_eof_and_wait)
-        .await
-        .is_ok()
-    {
-        return;
+    if let Ok(status) = tokio::time::timeout(first_slice, request_eof_and_wait).await {
+        return status.ok();
     }
 
     // Rung 2: SIGTERM to the whole group, then the second slice. The native
@@ -831,11 +861,8 @@ async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
     debug!(carrier, "close: stdin EOF ignored, terminating the group");
     terminate_group(pgid, carrier);
     let second_slice = timeout.saturating_sub(first_slice);
-    if tokio::time::timeout(second_slice, live.process.wait())
-        .await
-        .is_ok()
-    {
-        return;
+    if let Ok(status) = tokio::time::timeout(second_slice, live.process.wait()).await {
+        return status.ok();
     }
 
     // Rung 3: SIGKILL to the group, which nothing can ignore, then reap so a
@@ -846,7 +873,10 @@ async fn close_ladder(live: &mut Live, timeout: Duration, carrier: &str) {
     warn!(carrier, "close: SIGTERM ignored, killing the process group");
     kill_group(pgid, carrier);
     let _ = live.process.kill();
-    let _ = tokio::time::timeout(Duration::from_secs(2), live.process.wait()).await;
+    tokio::time::timeout(Duration::from_secs(2), live.process.wait())
+        .await
+        .ok()
+        .and_then(|result| result.ok())
 }
 
 /// SIGTERM every member of the child's process group. Unix only; on other

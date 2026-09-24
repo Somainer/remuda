@@ -1,0 +1,900 @@
+.effortCard[data-harness="codex"] .effortRow {
+  display: grid;
+  grid-template-columns: 11px minmax(0, 1fr);
+  gap: 4px 10px;
+}
+
+.effortCard[data-harness="codex"] .effortName,
+.effortCard[data-harness="codex"] .effortDesc {
+  grid-column: 2;
+  width: auto;
+}
+
+.effortCard[data-harness="codex"] .radio {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+/*
+ * Pill scale shared by both frames: the composer's framed card and New
+ * Session's frameless inline field. Knob face reads as the palette's "white":
+ * cream on night, paper-white on ledger. --knob is half the knob, fed in
+ * inline from KNOB_INSET in EffortSlider.tsx: it is both the knob's radius and
+ * the inset its centre travels within.
+ */
+.effortCard,
+.effortForm {
+  --knob-face: var(--paper);
+  --knob-edge: rgba(12, 15, 20, 0.3);
+  --pill: 40px;
+  --knob-size: 36px;
+  --brand: var(--cold);
+  /* Ladder colours, night theme: top = dust, ultracode = bright amber. */
+  --ember-ultra: #f2b95e;
+  --knob-ring-top: rgba(201, 132, 42, 0.45);
+  --knob-ring-ultra: rgba(255, 196, 104, 0.85);
+}
+
+:global([data-theme="ledger"]) .effortCard,
+:global([data-theme="ledger"]) .effortForm {
+  --knob-face: #ffffff;
+  --knob-edge: rgba(30, 42, 50, 0.2);
+  /* Ledger theme: darker burnt ambers stay readable on paper. */
+  --ember-ultra: #9a5d08;
+  --knob-ring-top: rgba(140, 106, 22, 0.4);
+  --knob-ring-ultra: rgba(154, 93, 8, 0.75);
+}
+
+.effortCard {
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  /* Fill the height-capped popover so the list body owns the scroll. */
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/*
+ * New Session layout A: no card at all. The slider sits in the form's own
+ * column with the same outline/spacing/typography tokens as the other fields —
+ * a label row (label · level + description · ultracode), the dotted pill with
+ * tick labels under its stops, then the spec helper in the muted field slot.
+ */
+.effortForm {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+
+/* Label row: label left, current level + description muted, ultracode far right. */
+.effortFormRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.effortFormLabel {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+  flex: none;
+}
+
+.effortFormMeta {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.effortFormName {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--paper);
+  white-space: nowrap;
+  flex: none;
+}
+
+.effortFormDesc {
+  font-size: 12px;
+  color: var(--mute);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* Same muted helper slot/position as every other New Session field. */
+.effortFormFoot {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+  line-height: 1.5;
+}
+
+/* Tick labels under the pill stops. Full names on wide tracks, shortened on narrow. */
+.effortTicks {
+  position: relative;
+  height: 14px;
+  margin: 0 var(--knob, 18px);
+}
+
+.effortTick {
+  position: absolute;
+  top: 0;
+  left: calc(var(--tick, 0) * 100%);
+  transform: translateX(-50%);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+  color: var(--mute);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/*
+ * End labels pin to the edge like a native slider (inline field only), so the
+ * long "medium"/"ultracode" names never overhang; the cramped popover keeps
+ * its centred short labels.
+ */
+.effortTicks:not(.effortTicksPop) .effortTick:first-child {
+  transform: translateX(0);
+}
+
+.effortTicks:not(.effortTicksPop) .effortTick:last-child {
+  transform: translateX(-100%);
+}
+
+.effortTickOn {
+  color: var(--paper);
+}
+
+/* Restrained top-tier tick (`xhigh`/`max`): warm dust, never animated. */
+.effortTickTop {
+  color: var(--dust);
+}
+
+/* Ultracode stop's own tick colour: brighter cream-amber than dust. */
+.effortTickUltra {
+  color: var(--ember-ultra);
+}
+
+/* Full tier names on the wide inline field. */
+.effortTickFull {
+  display: inline;
+}
+
+.effortTickShort {
+  display: none;
+}
+
+/*
+ * The composer popover is only ~280px wide, so its six Claude stops always
+ * carry the short tick labels (see EffortStop.short); the inline New Session
+ * field uses full names until the mobile breakpoint, where the end labels
+ * ("medium", "ultracode") would otherwise hang past the track's edge.
+ */
+.effortTicksPop {
+  margin-top: 2px;
+  font-size: 10px;
+}
+
+.effortTicksPop .effortTickFull {
+  display: none;
+}
+
+.effortTicksPop .effortTickShort {
+  display: inline;
+}
+
+/* Codex keeps the picker's full English labels, including Extra high. */
+.effortTicksPop[data-harness="codex"] {
+  height: 25px;
+}
+
+.effortTicksPop[data-harness="codex"] .effortTick {
+  width: 42px;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.1;
+}
+
+@media (max-width: 767px) {
+  .effortTicks:not(.effortTicksPop) .effortTickFull {
+    display: none;
+  }
+
+  .effortTicks:not(.effortTicksPop) .effortTickShort {
+    display: inline;
+  }
+
+  .effortTicks[data-harness="codex"] {
+    height: 25px;
+  }
+
+  .effortTicks[data-harness="codex"] .effortTick {
+    width: 42px;
+    white-space: normal;
+    text-align: center;
+    line-height: 1.1;
+  }
+}
+
+.effortHead {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) 26px;
+  align-items: center;
+  gap: 4px;
+}
+
+.effortBolt {
+  width: 26px;
+  height: 26px;
+  color: var(--mute);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Restrained top-tier bolt/title: dust, no animation. */
+.effortBoltTop {
+  color: var(--dust);
+}
+
+/* Ultracode gets its own brighter amber glyph. */
+.effortBoltUltra {
+  color: var(--ember-ultra);
+}
+
+.effortTitleBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 0;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--brand);
+}
+
+.effortTitle {
+  font-family: var(--mono);
+  font-size: var(--text-xl);
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Restrained top-tier title: dust. */
+.effortTitleTop {
+  --brand: var(--dust);
+}
+
+/* Ultracode's own title colour — visibly not the `max` dust. */
+.effortTitleUltra {
+  --brand: var(--ember-ultra);
+}
+
+/* Inline form name colours per ladder level. */
+.effortTextTop {
+  color: var(--dust);
+}
+
+.effortTextUltra {
+  color: var(--ember-ultra);
+}
+
+.effortChevron {
+  display: inline-flex;
+  opacity: 0.8;
+  flex: none;
+}
+
+.effortIconBtn {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex: none;
+}
+
+.effortIconBtn:hover:not(:disabled) {
+  color: var(--paper);
+}
+
+.effortIconBtn:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+
+.effortModel {
+  text-align: center;
+  font-size: 13px;
+  color: var(--mute);
+  line-height: 1.4;
+  min-height: 18px;
+  padding: 0 26px 7px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.effortCard[data-harness="codex"] .effortModel {
+  padding-inline: 8px;
+  white-space: normal;
+}
+
+.effortHit {
+  min-height: var(--pill);
+  display: flex;
+  align-items: center;
+  touch-action: none;
+  cursor: pointer;
+  user-select: none;
+  border-radius: 999px;
+}
+
+.effortHit[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+.effortHit[aria-disabled="true"]:not([data-ember="1"]) {
+  opacity: 0.45;
+}
+
+.effortHit:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+
+/* Thick pill. The knob centre travels between --knob and 100% - --knob. */
+.effortTrack {
+  position: relative;
+  flex: 1;
+  height: var(--pill);
+  border-radius: 999px;
+  min-width: 0;
+}
+
+.effortClip {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--ink);
+  box-shadow: inset 0 0 0 1px var(--line);
+  overflow: hidden;
+}
+
+/*
+ * Width = knob centre + knob radius. The fill therefore runs under the knob to
+ * its far edge instead of stopping at its centre, so no dark track is left
+ * beside or beneath the thumb. Both ends work out: at the first stop the fill
+ * is exactly one knob wide, at the last it is exactly the track wide, and in
+ * between its rounded cap is the pill's own radius, hidden under the knob.
+ */
+.effortFill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: calc(var(--knob, 18px) * 2 + var(--pos, 0) * (100% - var(--knob, 18px) * 2));
+  border-radius: 999px;
+  background: var(--brand);
+  pointer-events: none;
+}
+
+.effortFillEmber {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--dust) 58%, var(--ink)) 0%,
+    var(--dust) 52%,
+    color-mix(in srgb, var(--dust) 72%, #f2c882) 100%
+  );
+}
+
+/*
+ * Restrained top-tier accent (`xhigh`/`max`; the native top row on codex/
+ * grok), same family as the Desktop's "max" look: the cold fill warms toward
+ * dust toward its cap, but there is NO glow, NO spark field and NO animation.
+ * The animated ember below exists only on the ultracode stop, so the two are
+ * impossible to confuse in either theme.
+ */
+.effortFillTop {
+  background: linear-gradient(
+    90deg,
+    var(--cold) 0%,
+    color-mix(in srgb, var(--cold) 62%, var(--dust)) 68%,
+    color-mix(in srgb, var(--dust) 78%, var(--cold)) 100%
+  );
+}
+
+/*
+ * Ultracode stop ONLY: three spark layers drifting across the amber gradient
+ * at different speeds, plus a breathing warm wash — the strongest treatment
+ * in the ladder, rendered at no other stop (not even `max`). Each layer is
+ * one painted element animated on transform and opacity alone: no layout, no
+ * repaint, no per-spark nodes, no JS. The popover unmounts when it closes, so
+ * nothing animates behind a closed card; prefers-reduced-motion keeps the
+ * still field and drops the motion.
+ */
+.effortEmbers {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* Warm wash over the gradient, pulsing on opacity only. */
+.effortEmberGlow {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse 70% 140% at 50% 50%,
+    rgba(255, 206, 138, 0.45) 0%,
+    rgba(255, 176, 96, 0.18) 55%,
+    transparent 100%
+  );
+  will-change: opacity;
+  animation: emberGlow 4.5s ease-in-out infinite;
+}
+
+/*
+ * Each layer paints two pill-widths of sparks and slides by exactly half its
+ * own width, so the pattern wraps seamlessly. Sparks span the whole tile, so
+ * the field stays evenly covered as it drifts.
+ */
+.effortEmberLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 200%;
+  background-repeat: repeat-x;
+  background-size: 50% 100%;
+  will-change: transform, opacity;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+/* Far layer: small, dim, slowest. */
+.effortEmberBack {
+  background-image:
+    radial-gradient(circle 1px at 4% 68%, rgba(255, 236, 206, 0.5), transparent 100%),
+    radial-gradient(circle 1.2px at 19% 31%, rgba(255, 240, 214, 0.55), transparent 100%),
+    radial-gradient(circle 1px at 33% 77%, rgba(255, 234, 202, 0.45), transparent 100%),
+    radial-gradient(circle 1.1px at 48% 44%, rgba(255, 238, 210, 0.5), transparent 100%),
+    radial-gradient(circle 1px at 62% 71%, rgba(255, 235, 204, 0.45), transparent 100%),
+    radial-gradient(circle 1.2px at 78% 35%, rgba(255, 240, 214, 0.55), transparent 100%),
+    radial-gradient(circle 1px at 91% 62%, rgba(255, 236, 206, 0.48), transparent 100%);
+  animation-name: emberDrift, emberTwinkleSlow;
+  animation-duration: 19s, 6.5s;
+}
+
+/* Middle layer: mid size, mid speed, counter-drifting so the field has depth. */
+.effortEmberMid {
+  background-image:
+    radial-gradient(circle 1.5px at 8% 38%, rgba(255, 243, 222, 0.75), transparent 100%),
+    radial-gradient(circle 1.3px at 22% 72%, rgba(255, 239, 214, 0.65), transparent 100%),
+    radial-gradient(circle 1.6px at 37% 26%, rgba(255, 245, 226, 0.8), transparent 100%),
+    radial-gradient(circle 1.2px at 53% 63%, rgba(255, 237, 208, 0.6), transparent 100%),
+    radial-gradient(circle 1.5px at 68% 33%, rgba(255, 243, 222, 0.72), transparent 100%),
+    radial-gradient(circle 1.3px at 84% 69%, rgba(255, 239, 214, 0.62), transparent 100%),
+    radial-gradient(circle 1.4px at 96% 42%, rgba(255, 241, 218, 0.7), transparent 100%);
+  animation-name: emberDriftBack, emberTwinkle;
+  animation-duration: 13s, 4.2s;
+}
+
+/* Near layer: largest and brightest, fastest drift, quickest twinkle. */
+.effortEmberFront {
+  background-image:
+    radial-gradient(circle 2px at 11% 56%, rgba(255, 248, 232, 0.95), transparent 100%),
+    radial-gradient(circle 1.7px at 26% 23%, rgba(255, 244, 224, 0.85), transparent 100%),
+    radial-gradient(circle 1.4px at 43% 80%, rgba(255, 241, 218, 0.7), transparent 100%),
+    radial-gradient(circle 1.9px at 58% 40%, rgba(255, 247, 230, 0.9), transparent 100%),
+    radial-gradient(circle 1.5px at 73% 74%, rgba(255, 243, 222, 0.75), transparent 100%),
+    radial-gradient(circle 2px at 88% 29%, rgba(255, 248, 232, 0.92), transparent 100%);
+  animation-name: emberDrift, emberTwinkleFast;
+  animation-duration: 8.5s, 2.8s;
+}
+
+/*
+ * A fourth layer of small, tightly-spaced bright dots counter-drifting over
+ * the three ember layers — the Desktop's dotted glow, the ultracode stop's
+ * signature. Denser and whiter than the near layer, but the same
+ * transform/opacity motion so nothing extra repaints.
+ */
+.effortEmberDots {
+  background-image:
+    radial-gradient(circle 1.3px at 2% 30%, rgba(255, 250, 238, 0.9), transparent 100%),
+    radial-gradient(circle 1.3px at 6% 70%, rgba(255, 246, 228, 0.8), transparent 100%),
+    radial-gradient(circle 1.2px at 10% 45%, rgba(255, 250, 238, 0.85), transparent 100%),
+    radial-gradient(circle 1.3px at 14% 82%, rgba(255, 248, 234, 0.78), transparent 100%),
+    radial-gradient(circle 1.2px at 18% 22%, rgba(255, 250, 238, 0.88), transparent 100%),
+    radial-gradient(circle 1.3px at 22% 58%, rgba(255, 246, 228, 0.82), transparent 100%),
+    radial-gradient(circle 1.2px at 26% 36%, rgba(255, 250, 238, 0.9), transparent 100%),
+    radial-gradient(circle 1.3px at 30% 74%, rgba(255, 248, 234, 0.8), transparent 100%),
+    radial-gradient(circle 1.2px at 34% 48%, rgba(255, 250, 238, 0.86), transparent 100%),
+    radial-gradient(circle 1.3px at 38% 16%, rgba(255, 246, 228, 0.84), transparent 100%),
+    radial-gradient(circle 1.2px at 42% 64%, rgba(255, 250, 238, 0.9), transparent 100%),
+    radial-gradient(circle 1.3px at 46% 40%, rgba(255, 248, 234, 0.78), transparent 100%);
+  animation-name: emberDriftBack, emberTwinkle;
+  animation-duration: 6s, 2.1s;
+}
+
+/* The ultracode field runs slightly brighter and denser overall. */
+.effortEmbersUltra .effortEmberGlow {
+  background: radial-gradient(
+    ellipse 75% 150% at 50% 50%,
+    rgba(255, 214, 152, 0.55) 0%,
+    rgba(255, 182, 102, 0.24) 55%,
+    transparent 100%
+  );
+  animation-duration: 3.2s;
+}
+
+/* A tighter, brighter halo at the ultracode stop. */
+.effortKnobGlowUltra {
+  width: calc(var(--knob-size) + 24px);
+  height: calc(var(--knob-size) + 24px);
+  background: radial-gradient(
+    circle,
+    rgba(255, 222, 160, 0.65) 0%,
+    rgba(255, 194, 112, 0.32) 45%,
+    transparent 72%
+  );
+  animation-duration: 2.4s;
+}
+
+/* Soft amber halo behind the knob, breathing in step with the pill's wash. */
+.effortKnobGlow {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--knob, 18px) + var(--pos, 0) * (100% - var(--knob, 18px) * 2));
+  width: calc(var(--knob-size) + 18px);
+  height: calc(var(--knob-size) + 18px);
+  border-radius: 50%;
+  /* Base centring must live here too: knobBreath is dropped under reduced motion. */
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  background: radial-gradient(
+    circle,
+    rgba(255, 214, 148, 0.55) 0%,
+    rgba(255, 190, 110, 0.28) 45%,
+    transparent 72%
+  );
+  will-change: transform, opacity;
+  animation: knobBreath 3.4s ease-in-out infinite;
+}
+
+.effortDot {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--knob, 18px) + var(--dot, 0) * (100% - var(--knob, 18px) * 2));
+  width: 5px;
+  height: 5px;
+  margin: -2.5px 0 0 -2.5px;
+  border-radius: 50%;
+  background: var(--mute);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+/* Dots under the fill read as knocked-out, not painted on. */
+.effortDotOn {
+  background: var(--knob-face);
+  opacity: 0.5;
+}
+
+/* On the ember field the knocked-out dots warm to a cream spark. */
+.effortDotEmber {
+  background: #fff3da;
+  opacity: 0.7;
+}
+
+.effortKnob {
+  position: absolute;
+  top: 50%;
+  left: calc(var(--knob, 18px) + var(--pos, 0) * (100% - var(--knob, 18px) * 2));
+  width: var(--knob-size);
+  height: var(--knob-size);
+  border-radius: 50%;
+  background: var(--knob-face);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  box-shadow:
+    0 1px 2px var(--knob-edge),
+    0 4px 12px var(--knob-edge);
+}
+
+/*
+ * Top-tier thumb (`xhigh`/`max`): one static thin dust ring, no glow, no
+ * motion — the thumb-state half of the restrained accent.
+ */
+.effortKnobTop {
+  box-shadow:
+    0 0 0 1.5px var(--knob-ring-top),
+    0 1px 2px var(--knob-edge),
+    0 4px 10px var(--knob-edge);
+}
+
+/*
+ * Ultracode thumb, its own state: a brighter, thicker amber ring and a warm
+ * face tint, static in itself (the breathing halo beside it is the animated
+ * part and is frozen under reduced motion). Clearly stronger than the top
+ * ring at a glance, in both themes.
+ */
+.effortKnobUltra {
+  box-shadow:
+    0 0 0 2.5px var(--knob-ring-ultra),
+    0 1px 2px var(--knob-edge),
+    0 6px 16px var(--knob-ring-ultra);
+}
+
+:global([data-theme="night"]) .effortKnobUltra {
+  background: color-mix(in srgb, var(--knob-face) 88%, #ffce85);
+}
+
+:global([data-theme="ledger"]) .effortKnobUltra {
+  background: color-mix(in srgb, var(--knob-face) 90%, #e8b866);
+}
+
+.effortListHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-bottom: 4px;
+  /* Head stays put while the list body scrolls in the capped popover. */
+  flex: 0 0 auto;
+}
+
+.effortListTitle {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  color: var(--mute);
+  padding: 6px 4px 2px;
+}
+
+.effortListBody {
+  display: flex;
+  flex-direction: column;
+  margin: 0 -12px;
+  /* The popover's max-height bounds this; the catalog can be 75+ rows.
+     x: clip keeps the rows' edge-to-edge hover bleed without producing a
+     horizontal scrollbar (visible would compute to auto alongside y:auto). */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: clip;
+  overscroll-behavior: contain;
+}
+
+/* Catalog provenance warning: a list the session's own terminal could
+   reject is never shown as the session's own list without this mark. */
+.effortCatalogNote {
+  margin: 4px 12px 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--ink-1, var(--ink-2));
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--mute);
+}
+
+.effortCatalogNote[data-reason="host-fallback"] {
+  color: var(--ember-ultra);
+}
+
+/* Verbatim /model <id> fallback input at the foot of the model section. */
+.effortTypeRow {
+  padding: 6px 12px 4px;
+}
+
+.effortTypeInput {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--ink-0);
+  color: var(--paper);
+  font-size: 12px;
+  padding: 6px 8px;
+}
+
+.effortTypeInput:disabled {
+  opacity: 0.55;
+}
+
+/* "直输 id" / "列表内" path marker on the current model row. */
+.effortPathTag {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--cold);
+  white-space: nowrap;
+}
+
+/* Ember motion: transform + opacity only, so every layer stays on the compositor. */
+@keyframes emberDrift {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    transform: translate3d(-50%, 0, 0);
+  }
+}
+
+@keyframes emberDriftBack {
+  from {
+    transform: translate3d(-50%, 0, 0);
+  }
+  to {
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes emberTwinkleSlow {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
+@keyframes emberTwinkle {
+  0%,
+  100% {
+    opacity: 0.9;
+  }
+  40% {
+    opacity: 0.5;
+  }
+  70% {
+    opacity: 1;
+  }
+}
+
+@keyframes emberTwinkleFast {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  35% {
+    opacity: 0.55;
+  }
+  60% {
+    opacity: 0.95;
+  }
+}
+
+@keyframes emberGlow {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes knobBreath {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: translate(-50%, -50%) scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.06);
+  }
+}
+
+/* UO-4 ownership: `.ember`/`.emberSpark*` and their @keyframes ember /
+   emberChipGlow / spark moved to composer.module.css (they style the desktop
+   effort chip and must follow `.chip` in cascade order). */
+
+@media (prefers-reduced-motion: reduce) {
+  .effortEmbers,
+  .effortEmberGlow,
+  .effortEmberLayer,
+  .effortKnobGlow,
+  .effortTriggerGlow {
+    animation: none !important;
+  }
+
+  /* Still frame: the spark field and both glows stay, the motion goes. */
+  .effortEmberGlow {
+    opacity: 0.7;
+  }
+
+  .effortKnobGlow {
+    opacity: 0.8;
+  }
+}
+
+@media (max-width: 767px) {
+  /*
+   * Touch targets stay >= 44px through hit area, never visual size: the pill
+   * keeps its 40px look and gains invisible padding; the icon buttons keep
+   * their 26px glyph box and grow via an absolutely-positioned ::after.
+   */
+  .effortHit {
+    min-height: 48px;
+    padding: 4px 0;
+  }
+
+  .effortIconBtn::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+  }
+
+  .effortTitleBtn {
+    min-height: 44px;
+  }
+}
+
+.effortRow:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+
+   class carries the original declarations. */
+
+.menuFoot {
+  composes: menuFoot from "./optionRows.module.css";
+}
+
+.effortRow {
+  composes: effortRow from "./optionRows.module.css";
+}
+
+.effortOn {
+  composes: effortOn from "./optionRows.module.css";
+}
+
+.radio {
+  composes: radio from "./optionRows.module.css";
+}
+
+.radioOn {
+  composes: radioOn from "./optionRows.module.css";
+}
+
+.effortName {
+  composes: effortName from "./optionRows.module.css";
+}
+
+.effortDesc {
+  composes: effortDesc from "./optionRows.module.css";
+}

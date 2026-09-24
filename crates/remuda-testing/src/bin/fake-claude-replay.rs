@@ -26,34 +26,7 @@ use serde_json::Value;
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    let result = run();
-    // Test-only side channel (does not touch stdout): a driver-driven test
-    // sets FAKE_CLAUDE_RESULT_FILE and reads the replay's real exit
-    // disposition (0 ok / 1 failure) after the run. Published ATOMICALLY via a
-    // temp-file rename so a polling reader never observes a created-but-empty
-    // file before the final status is on disk.
-    if let Ok(status_path) = std::env::var("FAKE_CLAUDE_RESULT_FILE") {
-        let code = if result.is_ok() { "0" } else { "1" };
-        let path = std::path::PathBuf::from(status_path);
-        if let Some(parent) = path.parent() {
-            let tmp = parent.join(format!(
-                ".{}.tmp",
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("replay-status")
-            ));
-            if std::fs::write(&tmp, code)
-                .and_then(|()| std::fs::rename(&tmp, &path))
-                .is_err()
-            {
-                // Best effort: fall back to a direct write if rename fails.
-                let _ = std::fs::write(&path, code);
-            }
-        } else {
-            let _ = std::fs::write(&path, code);
-        }
-    }
-    match result {
+    match run() {
         Ok(()) => std::process::exit(0),
         Err(err) => {
             eprintln!("fake-claude-replay: {err}");
@@ -97,59 +70,36 @@ fn mismatch(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// Deep-compare the WHOLE permission-response envelope the driver sent with
-/// the one recorded: top-level type, the `response` object's exact key set
-/// (`type`, `subtype`, `request_id`, `response` — nothing added), and a
-/// deep-equal inner payload. An added `updatedPermissions`, a changed
-/// `updatedInput`, a wrong `subtype`, or an altered envelope is a mismatch.
+/// Deep-compare the COMPLETE permission-response frame the driver sent with
+/// the recorded one. The expected frame has only its curation-only `_dir`
+/// marker removed; everything else must be byte-for-byte equal as JSON:
+/// the root `type`, the EXACT root key set (no added fields), the `response`
+/// envelope (`subtype`, `request_id`, inner payload key set), exact
+/// `updatedInput`, and the absence of extras such as `updatedPermissions`.
+/// A changed input, an added permission, a wrong subtype, or an extra ROOT
+/// field is a mismatch.
 fn verify_permission(expected: &Value, got: &Value) -> Result<(), io::Error> {
-    if got.get("type").and_then(Value::as_str) != Some("control_response") {
+    let mut expected = expected.clone();
+    if let Some(obj) = expected.as_object_mut() {
+        obj.remove("_dir");
+    }
+    let expected_keys = root_key_set(&expected);
+    let got_keys = root_key_set(got);
+    if expected_keys != got_keys {
         return Err(mismatch(format!(
-            "permission frame type must be control_response, got: {got}"
+            "permission root key set mismatch:\n recorded: {expected_keys:?}\n host: {got_keys:?}"
         )));
     }
-    let expected_response = expected
-        .get("response")
-        .ok_or_else(|| mismatch("fixture permission frame missing /response"))?;
-    let got_response = got
-        .get("response")
-        .ok_or_else(|| mismatch("host frame missing /response"))?;
-    let expected_keys = response_key_set(expected_response);
-    let got_keys = response_key_set(got_response);
-    if got_keys != expected_keys {
+    if got != &expected {
         return Err(mismatch(format!(
-            "permission envelope key set mismatch:\n recorded: {expected_keys:?}\n host: {got_keys:?}"
-        )));
-    }
-    if got_response.get("subtype").and_then(Value::as_str) != Some("success") {
-        return Err(mismatch(format!(
-            "permission response subtype must be success, got: {got_response}"
-        )));
-    }
-    // Exact key set on the inner payload (behavior/updatedInput/message only).
-    let expected_inner = expected_response.get("response").and_then(Value::as_object);
-    let got_inner = got_response.get("response").and_then(Value::as_object);
-    match (expected_inner, got_inner) {
-        (Some(e), Some(g)) if e.len() == g.len() && e.keys().eq(g.keys()) => {}
-        (Some(e), Some(g)) => {
-            return Err(mismatch(format!(
-                "permission inner payload key set mismatch:\n recorded: {:?}\n host: {:?}",
-                e.keys().collect::<Vec<_>>(),
-                g.keys().collect::<Vec<_>>()
-            )));
-        }
-        _ => return Err(mismatch("permission inner payload missing")),
-    }
-    if got_response != expected_response {
-        return Err(mismatch(format!(
-            "permission envelope mismatch:\n recorded: {expected_response}\n host sent: {got_response}"
+            "permission frame mismatch:\n recorded: {expected}\n host sent: {got}"
         )));
     }
     Ok(())
 }
 
-/// Sorted top-level keys of a JSON object, for exact-envelope comparison.
-fn response_key_set(value: &Value) -> Option<Vec<String>> {
+/// Sorted top-level keys of a JSON value (None unless it is an object).
+fn root_key_set(value: &Value) -> Option<Vec<String>> {
     value.as_object().map(|map| {
         let mut keys: Vec<String> = map.keys().cloned().collect();
         keys.sort();

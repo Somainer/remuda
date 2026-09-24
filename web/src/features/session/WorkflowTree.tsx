@@ -2,7 +2,7 @@ import { Link, useParams } from "react-router-dom";
 import type { WorkflowMemberPayload, WorkflowPhasePayload, WorkflowRunPayload } from "../../types/generated";
 import { knowledgeValue } from "../../types/command";
 import { subagentHref } from "./subagent/SubagentRows";
-import css from "./session.module.css";
+import css from "./toolCard.module.css";
 
 export function WorkflowTree({
   run,

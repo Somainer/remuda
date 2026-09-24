@@ -12,6 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 #[derive(Deserialize)]
@@ -1917,6 +1919,17 @@ pub async fn post_command(
 ) -> Result<Json<Value>, HubError> {
     require_origin(&headers, &state.config)?;
     let device = crate::agent_scope::caller(&state, &headers).await?;
+    // The Node accepts only `cmd_` + a canonical lowercase UUIDv7
+    // (`remuda_protocol::CommandId`). Reject a malformed client id at the HTTP
+    // boundary so the bad id is a 400 the caller can fix, never a row that
+    // reaches a Node and comes back rejected.
+    if let Some(command_id) = body.command_id.as_deref()
+        && remuda_protocol::CommandId::try_from(command_id.to_owned()).is_err()
+    {
+        return Err(HubError::BadRequest(format!(
+            "commandId must be `cmd_` plus a canonical lowercase UUIDv7, got {command_id}"
+        )));
+    }
     let instance = state
         .store
         .get_instance(instance_id.clone())
@@ -1943,6 +1956,41 @@ pub async fn post_command(
         &mut payload,
     )
     .await?;
+    // Same-id client retry (protocol §2.5: a retry keeps its id). Identifier
+    // identity — executable payload and idempotency key — is enforced for
+    // EVERY operation here and, authoritatively for the concurrent-first-POST
+    // race, inside `Store::queue_command`'s serialized writer job.
+    if let Some(command_id) = body.command_id.as_deref()
+        && let Some(existing) = state.store.get_command(command_id.to_owned()).await?
+    {
+        if !retry_matches_row(&existing, &body.operation, &instance_id, &payload) {
+            return Err(HubError::Conflict(
+                "commandId reused with a different payload".into(),
+            ));
+        }
+        // The idempotency key is part of the command's identity: a replay may
+        // omit the key, but a key it carries must be the exact key already
+        // stored with this command — an unused key still names a *different*
+        // request and is a 409, not a silent rebinding.
+        if !replay_key_matches(
+            body.idempotency_key.as_deref(),
+            existing.idempotency_key.as_deref(),
+        ) {
+            return Err(HubError::Conflict(
+                "commandId replayed with a different idempotency key".into(),
+            ));
+        }
+        let command = replay_existing_command(
+            &state,
+            &device,
+            &instance,
+            &body.operation,
+            existing,
+            &mut payload,
+        )
+        .await?;
+        return Ok(Json(json!({ "command": command, "replayed": true })));
+    }
     if body.operation == "instance.send" {
         crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload).await?;
     }
@@ -1958,15 +2006,39 @@ pub async fn post_command(
         )
         .await
         .map_err(map_store)?;
-    if command.operation == "instance.configure" {
-        state
+    if !created {
+        // Existing row via the idempotency-key path or a serialized
+        // lookup/insert race (key identity already enforced inside the store).
+        let command = replay_existing_command(
+            &state,
+            &device,
+            &instance,
+            &command.operation.clone(),
+            command,
+            // Payload is already stored; this path mutates nothing.
+            &mut json!({}),
+        )
+        .await?;
+        return Ok(Json(json!({ "command": command, "replayed": true })));
+    }
+    // First POST only: project the configure into the Hub's instance spec
+    // before forwarding. A replay never re-enters this merge. On failure the
+    // pre-dispatch rejection is persisted WITH the command so a replay
+    // reproduces the original 500 instead of a do-nothing `replayed:true`.
+    if command.operation == "instance.configure"
+        && let Err(store_error) = state
             .store
             .patch_instance_configure(instance_id, command.payload.clone())
             .await
-            .map_err(map_store)?;
-    }
-    if !created {
-        return Ok(Json(json!({ "command": command, "replayed": true })));
+    {
+        let error = map_store(store_error);
+        // Persist the pre-dispatch rejection WITH the command so a replay
+        // reproduces this exact outcome instead of a do-nothing success.
+        let _ = state
+            .store
+            .reject_command(command.command_id.clone(), error.to_string())
+            .await;
+        return Err(error);
     }
     let live = state.nodes.kind_of(&instance.host_id).await.is_some();
     let command = forward_if_online(&state, command, live).await?;
@@ -1981,6 +2053,67 @@ pub async fn post_command(
         .await;
     }
     Ok(Json(json!({ "command": command, "replayed": false })))
+}
+
+/// Key identity for a same-id replay: omitting the key is allowed; a present
+/// key must equal the key the command was stored with (a keyless original
+/// cannot be replayed under any key).
+fn replay_key_matches(incoming: Option<&str>, stored: Option<&str>) -> bool {
+    match (incoming, stored) {
+        (None, _) => true,
+        (Some(incoming), Some(stored)) => incoming == stored,
+        (Some(_), None) => false,
+    }
+}
+
+/// A `configure` whose spec merge failed before dispatch rests at a
+/// `rejected` settlement with `forwarded=0` — the unique shape of a Hub-side
+/// merge failure (a Node rejection is always recorded after a forward intent).
+fn configure_merge_failed(command: &CommandRecord) -> bool {
+    command.operation == "instance.configure"
+        && command.state == "settled"
+        && command.settlement_outcome.as_deref() == Some("rejected")
+        && !command.forwarded
+}
+
+/// Operation-specific handling for a replay of an already-stored command. The
+/// incoming row is first settled against any in-flight forward attempt, so the
+/// result is never a stale early snapshot:
+/// - `instance.configure` is read-only and reproduces its ORIGINAL outcome —
+///   the stored row on success, the persisted merge error (500) on failure;
+/// - `instance.send` re-checks attachment liveness while still unsent and
+///   takes the G1 forward;
+/// - other queued ops take the G1 forward; terminal rows pass through.
+async fn replay_existing_command(
+    state: &AppState,
+    device: &crate::store::Device,
+    instance: &crate::store::InstanceRecord,
+    operation: &str,
+    existing: CommandRecord,
+    payload: &mut Value,
+) -> Result<CommandRecord, HubError> {
+    let command = settled_command_row(state, existing).await;
+    match operation {
+        "instance.configure" => {
+            if configure_merge_failed(&command) {
+                let reason = command
+                    .settlement_reason
+                    .clone()
+                    .unwrap_or_else(|| "configure spec merge failed".to_string());
+                return Err(HubError::Internal(reason));
+            }
+            Ok(command)
+        }
+        "instance.send" => {
+            // A row that never went out is not "already delivered": its
+            // objects must still be live exactly as a fresh send requires.
+            if !command.forwarded && command.state == "queued" {
+                crate::objects::validate_send_attachments(state, device, instance, payload).await?;
+            }
+            forward_unforwarded_retry(state, command).await
+        }
+        _ => forward_unforwarded_retry(state, command).await,
+    }
 }
 
 /// Maximum message text copied into a journal record (the full text still
@@ -2010,6 +2143,285 @@ fn send_message_text(payload: &Value) -> Option<String> {
     } else {
         Some(parts.join("\n"))
     }
+}
+
+/// Canonical form of one top-level attachments array entry for replay
+/// comparison: the trimmed `objectId` plus the EFFECTIVE anchor index.
+///
+/// The first-POST validator rewrites top-level entries to resolved manifests
+/// and, for both sides, the effective index is the client's `index` when it is
+/// a positive integer, else the 1-based array position
+/// (`objects::validate_send_attachments`). Those are the only two client
+/// fields that survive validation — kind/mediaType/name/size/digest in the
+/// stored manifest derive from the object itself, and unknown client fields
+/// are discarded — so they are the only two compared. A missing/blank
+/// `objectId` projects to null and can never match a stored manifest.
+fn canonical_top_level_attachment(position: usize, entry: &Value) -> Value {
+    let object_id = entry
+        .get("objectId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    // The validator casts the wire u64 to i64 before its positive check, so
+    // values above i64::MAX cast negative and fall back to the array position
+    // (`objects::validate_send_attachments`). Reproduce that cast exactly so
+    // an out-of-range index on an identical retry still matches.
+    let index = entry
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| index as i64)
+        .filter(|index| *index >= 1)
+        .unwrap_or(position as i64 + 1);
+    json!({ "objectId": object_id, "index": index })
+}
+
+/// Project the top-level `attachments` field in place for replay comparison.
+/// Null and empty arrays are dropped (the first-POST validator strips them, so
+/// a stored row lacks the key); arrays become the canonical id+index entries.
+/// Any other shape is left untouched because it cannot be a shape the Hub
+/// stored, so it must mismatch.
+///
+/// `input.attachments` is deliberately NOT projected: the validator never
+/// rewrites that location, so the nested metadata the Node consumes directly
+/// (`kind`, `mediaType`, `name`, `digest`, `index`, …) stays verbatim and any
+/// change to it is a conflict.
+fn normalize_top_level_attachments(object: &mut serde_json::Map<String, Value>) {
+    let projected = match object.get("attachments") {
+        None => return,
+        Some(Value::Null) => None,
+        Some(Value::Array(entries)) => Some(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(position, entry)| canonical_top_level_attachment(position, entry))
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => return,
+    };
+    match projected {
+        Some(entries) if !entries.is_empty() => {
+            object.insert("attachments".to_owned(), Value::Array(entries));
+        }
+        _ => {
+            object.remove("attachments");
+        }
+    }
+}
+
+/// Canonical form of the executable `instance.send` payload used to decide
+/// whether a same-id retry denotes the same command (G3).
+///
+/// Everything the Node interprets survives the projection, so a difference in
+/// ANY of it is a 409 rather than a silently dropped command:
+/// - provenance: the stamped `origin` and `input.origin` (a Human-stored row
+///   must not be replayed by an Agent-stamped retry);
+/// - the prompt in every shape the Node's `InstanceSendParams::prompt_text`
+///   reads (`input.text`, a string `input`, `input.blocks`, flattened
+///   `text`/`prompt`) — `input` is carried whole, so block structure and the
+///   nested `mode` / `attachments` metadata stay significant;
+/// - the flattened `mode`, `runId` and any other future executable field;
+/// - nested `input.attachments` verbatim — the Node reads every field there
+///   (kind decides image vs. file delivery);
+/// - top-level `attachments` projected to trimmed id + effective index, the
+///   only fields the first-POST validator leaves client-controlled.
+///
+/// The sole rewrites normalized away are the Hub's own: the path-inserted
+/// top-level `instanceId` and the resolved top-level attachment manifests.
+fn normalized_send_payload(payload: &Value) -> Value {
+    let mut out = payload.clone();
+    if let Some(object) = out.as_object_mut() {
+        object.remove("instanceId");
+        normalize_top_level_attachments(object);
+    }
+    out
+}
+
+/// Whether a same-id retry denotes the same command as the stored row.
+///
+/// `instance.send` rows compare by full normalized executable payload
+/// (prompt in every shape, both mode locations, both attachment locations,
+/// provenance and any other Node-run field). Other operations carry no
+/// Hub-rewritten fields, so they compare exactly. A mismatched operation or
+/// instance path is always a conflict.
+fn retry_matches_row(
+    row: &CommandRecord,
+    operation: &str,
+    instance_id: &str,
+    payload: &Value,
+) -> bool {
+    if row.operation != operation || row.instance_id.as_deref() != Some(instance_id) {
+        return false;
+    }
+    if operation == "instance.send" {
+        return normalized_send_payload(&row.payload) == normalized_send_payload(payload);
+    }
+    row.payload == *payload
+}
+
+/// G1: route a queued replay through the forward path. `forward_if_online`
+/// handles every state honestly: host offline leaves the row queued, an
+/// already-forwarded row reloads the committed row, and a never-forwarded row
+/// is dispatched once. Concurrent retries serialize at the forward slot and
+/// Node-side commandId+digest dedup is the second floor. Non-queued rows
+/// (accepted/settled) are returned untouched. The input must already be the
+/// settled snapshot from [`settled_command_row`], never an early-read row.
+async fn forward_unforwarded_retry(
+    state: &AppState,
+    command: CommandRecord,
+) -> Result<CommandRecord, HubError> {
+    if command.state == "queued" {
+        let live = state.nodes.kind_of(&command.host_id).await.is_some();
+        forward_if_online(state, command, live).await
+    } else {
+        Ok(command)
+    }
+}
+
+/// Roll a just-marked forward intent back when the forward proved the Node
+/// never received the frame (`nodes.call` returned `Ok(None)`). The row
+/// returns to `forwarded=0` / `resolution='clear'` while still `queued`, so a
+/// later same-id retry after the host reconnects can forward it exactly once.
+/// Rows that already left `queued` (accepted/settled by a mirrored journal)
+/// are never rewritten.
+async fn release_forward_intent(
+    state: &AppState,
+    command_id: &str,
+) -> Result<CommandRecord, HubError> {
+    state
+        .store
+        .run_named("release_forward_intent", {
+            let command_id = command_id.to_owned();
+            move |conn| {
+                let now = crate::config::now_rfc3339();
+                conn.execute(
+                    "UPDATE commands
+                        SET forwarded = 0, resolution = 'clear', updated_at = ?1
+                      WHERE id = ?2 AND state = 'queued' AND forwarded = 1",
+                    rusqlite::params![now, command_id],
+                )?;
+                Ok(())
+            }
+        })
+        .await?;
+    state
+        .store
+        .get_command(command_id.to_owned())
+        .await?
+        .ok_or(HubError::NotFound)
+}
+
+/// Broadcast capacity for one attempt's followers. A leader publishes exactly
+/// one result; followers wait immediately, so a bounded ring is ample.
+const FORWARD_ATTEMPT_FOLLOWERS: usize = 16;
+
+/// In-flight forward attempts keyed by command id. The leader publishes the
+/// exact settled `CommandRecord` its attempt produced, so a follower is bound
+/// to THAT attempt's outcome: even if a newer attempt sets `forwarded=1`
+/// between the wait and any reload, the follower still reports attempt 1's
+/// released row rather than attempt 2's temporary intent. Hub-local state is
+/// enough: the Hub is a single process and the durable guard stays in SQLite.
+static FORWARD_ATTEMPTS: LazyLock<
+    Mutex<HashMap<String, tokio::sync::broadcast::Sender<CommandRecord>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// RAII registration of one forward attempt. `complete` carries the attempt's
+/// settled row; on drop it is published to every follower BEFORE the slot is
+/// removed, then the sender closes. An attempt that ends on an early `Err`
+/// (no Ok row to publish) drops without sending — followers then reload the
+/// committed row, which those error paths leave truthful (rejected, or
+/// forwarded/reconciling for a frame that may already be running).
+struct ForwardAttempt {
+    command_id: String,
+    completed: Option<CommandRecord>,
+}
+
+impl ForwardAttempt {
+    /// Record the row this attempt actually settled to.
+    fn complete(&mut self, command: CommandRecord) {
+        self.completed = Some(command);
+    }
+}
+
+impl Drop for ForwardAttempt {
+    fn drop(&mut self) {
+        if let Ok(mut attempts) = FORWARD_ATTEMPTS.lock() {
+            if let Some(tx) = attempts.get(&self.command_id)
+                && let Some(row) = self.completed.take()
+            {
+                // Send before removing: every subscriber registered while the
+                // slot was active receives this exact attempt's row.
+                let _ = tx.send(row);
+            }
+            attempts.remove(&self.command_id);
+        }
+    }
+}
+
+/// Become the attempt owner if no attempt is active. Acquired BEFORE the
+/// SQLite intent mark so concurrent losers observe the active slot.
+fn acquire_forward_leader(command_id: String) -> Option<ForwardAttempt> {
+    let mut attempts = FORWARD_ATTEMPTS.lock().expect("forward attempts lock");
+    if attempts.contains_key(&command_id) {
+        return None;
+    }
+    let (tx, _rx) = tokio::sync::broadcast::channel(FORWARD_ATTEMPT_FOLLOWERS);
+    attempts.insert(command_id.clone(), tx);
+    Some(ForwardAttempt {
+        command_id,
+        completed: None,
+    })
+}
+
+/// Subscribe to an active attempt, if any. The subscription is created while
+/// holding the slot lock, so it precedes any result publication.
+fn subscribe_forward_attempt(
+    command_id: &str,
+) -> Option<tokio::sync::broadcast::Receiver<CommandRecord>> {
+    FORWARD_ATTEMPTS
+        .lock()
+        .expect("forward attempts lock")
+        .get(command_id)
+        .map(tokio::sync::broadcast::Sender::subscribe)
+}
+
+/// Wait for the subscribed attempt's settled row. `None` means the leader
+/// ended without publishing (an early error path) — the caller reloads the
+/// committed row instead.
+async fn await_attempt_result(
+    mut rx: tokio::sync::broadcast::Receiver<CommandRecord>,
+) -> Option<CommandRecord> {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match rx.recv().await {
+            Ok(row) => return Some(row),
+            Err(RecvError::Closed) => return None,
+            // One message is ever sent per attempt; a lag means the ring
+            // wrapped under a follower storm, so re-loop onto the same
+            // receiver (the sender closes right after publication).
+            Err(RecvError::Lagged(_)) => continue,
+        }
+    }
+}
+
+/// Settle an existing-row replay against any in-flight forward attempt:
+/// - an active attempt publishes THIS attempt's final row, which is returned
+///   verbatim (so a follower never reports a newer attempt's transient
+///   `forwarded=1`, nor a released intent as forwarded);
+/// - otherwise the durable row is re-read now, so an early-path snapshot that
+///   observed a transient flag cannot outlive the attempt that set it.
+async fn settled_command_row(state: &AppState, command: CommandRecord) -> CommandRecord {
+    if let Some(rx) = subscribe_forward_attempt(&command.command_id)
+        && let Some(row) = await_attempt_result(rx).await
+    {
+        return row;
+    }
+    state
+        .store
+        .get_command(command.command_id.clone())
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(command)
 }
 
 fn journal_text(text: &str) -> String {
@@ -2611,6 +3023,42 @@ pub async fn list_instance_commands(
     })))
 }
 
+/// `GET /v1/instances/{id}/commands/{commandId}`: one command ledger row, so a
+/// reconnecting client can read a send's `state`/`resolution` without
+/// re-POSTing it (G2). Read authorization matches the journal and commands
+/// list: a Human/Bot device that can read the instance may read its commands,
+/// so separately authenticated same-owner Human devices intentionally share
+/// visibility (there is no per-device command binding, matching journal
+/// reads), while Agent callers are refused at the route middleware (a commands
+/// detail path is not an agent read target) and again here. The row must
+/// belong to the instance named in the path — command ids are a global
+/// ledger, so a mismatch answers 404 rather than leaking another instance's
+/// row.
+pub async fn get_instance_command(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((instance_id, command_id)): Path<(String, String)>,
+) -> Result<Json<CommandRecord>, HubError> {
+    crate::agent_scope::require_instance_read(&state, &headers, &instance_id).await?;
+    if state
+        .store
+        .get_instance(instance_id.clone())
+        .await?
+        .is_none()
+    {
+        return Err(HubError::NotFound);
+    }
+    let command = state
+        .store
+        .get_command(command_id)
+        .await?
+        .ok_or(HubError::NotFound)?;
+    if command.instance_id.as_deref() != Some(instance_id.as_str()) {
+        return Err(HubError::NotFound);
+    }
+    Ok(Json(command))
+}
+
 pub(crate) async fn forward_if_online(
     state: &AppState,
     command: CommandRecord,
@@ -2619,17 +3067,45 @@ pub(crate) async fn forward_if_online(
     if !host_online {
         return Ok(command);
     }
-    let first = state
-        .store
-        .mark_forward_intent(command.command_id.clone())
-        .await?;
-    if !first {
-        return state
-            .store
-            .get_command(command.command_id.clone())
-            .await?
-            .ok_or(HubError::NotFound);
-    }
+    // Serialize in-process forward attempts per command. A follower binds to
+    // the active attempt's PUBLISHED settled row (including an `Ok(None)`
+    // release), so it can never report a transient `forwarded=1` belonging to
+    // this or a later attempt. The durable guard remains the SQLite mark.
+    let mut forward_attempt = match acquire_forward_leader(command.command_id.clone()) {
+        Some(attempt) => {
+            let first = state
+                .store
+                .mark_forward_intent(command.command_id.clone())
+                .await?;
+            if !first {
+                // Durably forwarded/advanced already: a committed row. A
+                // follower could only have joined the slot before this point
+                // if a publish happened; there was none, so reload.
+                return state
+                    .store
+                    .get_command(command.command_id.clone())
+                    .await?
+                    .ok_or(HubError::NotFound);
+            }
+            attempt
+        }
+        None => {
+            // Another attempt owns the command: return ITS settled result.
+            if let Some(rx) = subscribe_forward_attempt(&command.command_id)
+                && let Some(row) = await_attempt_result(rx).await
+            {
+                return Ok(row);
+            }
+            // The owner ended on an early error path without publishing; its
+            // committed row is truthful (rejected, or may-have-run).
+            return state
+                .store
+                .get_command(command.command_id.clone())
+                .await?
+                .ok_or(HubError::NotFound);
+        }
+    };
+    let outcome = async {
     // A forwarded non-create command now has resolution `unknown`. There is
     // deliberately no Hub-side ack deadline that settles it: a forward intent
     // exists, so §2.5 forbids expiring or rejecting the command without asking
@@ -2775,12 +3251,17 @@ pub(crate) async fn forward_if_online(
                 .ok_or(HubError::NotFound)
         }
         Ok(None) => {
-            tracing::debug!(command_id = %command.command_id, "node offline at forward; not resent");
-            state
-                .store
-                .get_command(command.command_id.clone())
-                .await?
-                .ok_or(HubError::NotFound)
+            // No live link / pre-send failure: `WssTransport::call` proves the
+            // frame was never queued on the Node. The forward intent this call
+            // marked must therefore be rolled back while the row is still
+            // `queued`, so a later same-id re-POST after the host returns can
+            // forward it. Timeouts and dropped waiters take the Err arm below
+            // and keep the intent, because those frames may already be running.
+            tracing::debug!(
+                command_id = %command.command_id,
+                "node link gone after forward intent; frame never queued; releasing intent"
+            );
+            release_forward_intent(state, &command.command_id).await
         }
 
         Err(err) => {
@@ -2820,6 +3301,15 @@ pub(crate) async fn forward_if_online(
             Ok(reconciled)
         }
     }
+    }
+    .await;
+    if let Ok(row) = &outcome {
+        // Publish the exact committed row so followers report THIS attempt's
+        // outcome — including the `Ok(None)` release — never a later attempt's
+        // transient intent.
+        forward_attempt.complete(row.clone());
+    }
+    outcome
 }
 
 /// Settle a stop/close the Node cannot honour because it lost the instance.
@@ -3007,5 +3497,100 @@ pub(crate) fn map_store(err: crate::store::StoreError) -> HubError {
 impl crate::store::StoreError {
     fn clone_as_internal(&self) -> Self {
         crate::store::StoreError::Id(self.to_string())
+    }
+}
+
+#[cfg(test)]
+mod forward_slot_tests {
+    use super::*;
+
+    fn attempt_row(command_id: &str, forwarded: bool) -> CommandRecord {
+        CommandRecord {
+            command_id: command_id.to_string(),
+            instance_id: Some("ins_slot_fixture".to_string()),
+            host_id: "hst_slot_fixture".to_string(),
+            operation: "instance.send".to_string(),
+            state: "queued".to_string(),
+            resolution: if forwarded { "unknown" } else { "clear" }.to_string(),
+            forwarded,
+            payload: json!({ "text": "slot" }),
+            idempotency_key: None,
+            created_at: "t0".to_string(),
+            updated_at: "t0".to_string(),
+            settlement_outcome: None,
+            settlement_reason: None,
+            settlement: None,
+        }
+    }
+
+    /// A follower binds to the specific attempt it waited on: attempt 1 rolls
+    /// its intent back (forwarded=false); attempt 2 starts and publishes a
+    /// temporary forwarded=true before the follower task resumes. The follower
+    /// must still report attempt 1's released row.
+    #[tokio::test]
+    async fn follower_is_bound_to_its_attempt_not_a_newer_one() {
+        let command_id = "cmd_slot_handoff_fixture".to_string();
+
+        let mut leader1 = acquire_forward_leader(command_id.clone()).expect("attempt 1 leads");
+        // Subscribe while attempt 1 is active — this receiver is bound to
+        // attempt 1's channel even after the slot is replaced.
+        let rx1 = subscribe_forward_attempt(&command_id).expect("follower subscribes");
+
+        // Attempt 1 finds no live link: publish the released row.
+        leader1.complete(attempt_row(&command_id, false));
+        drop(leader1);
+
+        // Attempt 2 starts immediately (as request C does) and publishes its
+        // own temporary forwarded=true row.
+        let mut leader2 = acquire_forward_leader(command_id.clone()).expect("attempt 2 leads");
+        leader2.complete(attempt_row(&command_id, true));
+
+        // The parked follower of attempt 1 receives attempt 1's row regardless
+        // of attempt 2's intervening publication.
+        let got = await_attempt_result(rx1)
+            .await
+            .expect("attempt 1 published");
+        assert!(
+            !got.forwarded,
+            "follower must report attempt 1's released row, not attempt 2's intent: {got:?}"
+        );
+        assert_eq!(got.resolution, "clear");
+        drop(leader2);
+    }
+
+    /// A leader that ends on an early error path publishes nothing: followers
+    /// observe `Closed` and the caller reloads the committed row instead.
+    #[tokio::test]
+    async fn follower_learns_when_leader_ends_without_publishing() {
+        let command_id = "cmd_slot_closed_fixture".to_string();
+        let leader = acquire_forward_leader(command_id.clone()).expect("leads");
+        let rx = subscribe_forward_attempt(&command_id).expect("subscribes");
+        let waiter = tokio::spawn(async move { await_attempt_result(rx).await });
+        // No complete(...): simulate the early-Err arm.
+        drop(leader);
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter finishes")
+            .expect("task joins");
+        assert!(result.is_none(), "closed without a result yields None");
+        assert!(
+            subscribe_forward_attempt(&command_id).is_none(),
+            "the slot is vacant after the leader drops"
+        );
+    }
+
+    /// Only one leader at a time; the slot frees after the guard drops.
+    #[tokio::test]
+    async fn leader_slot_is_exclusive() {
+        let command_id = "cmd_slot_exclusive_fixture".to_string();
+        let leader = acquire_forward_leader(command_id.clone()).expect("first leads");
+        assert!(
+            acquire_forward_leader(command_id.clone()).is_none(),
+            "a second acquirer cannot lead concurrently"
+        );
+        drop(leader);
+        let next = acquire_forward_leader(command_id.clone());
+        assert!(next.is_some(), "the slot is leader-vacant after settle");
+        drop(next);
     }
 }

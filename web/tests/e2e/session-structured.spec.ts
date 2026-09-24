@@ -35,10 +35,10 @@ test.describe("structured session M0-13", () => {
     } else {
       await compactFold.click();
     }
-    // D-041: at 390px (mobile-webkit) the settled Edit card mounts folded,
-    // so 已写入 lives only inside the expanded EditWriteCard — open the row
+    // D-053 (D-041 at every width): the settled Edit card mounts folded, so
+    // 已写入 lives only inside the expanded EditWriteCard — open the row
     // first; its folded line already carries the src/exec.cc key argument.
-    if (info.project.name === "mobile-webkit") {
+    {
       // The running Read card renders the same path too; distinguish the
       // folded Edit row through its accessible toggle name.
       const editToggle = page.getByRole("button", { name: "展开 Edit src/exec.cc" });

@@ -109,9 +109,9 @@ test.describe("transcript virtualization and session chrome", () => {
     };
 
     await openNamedSession(page, "看 TaskManager spill");
-    // D-041: a settled ordinary card is already folded by default on the
-    // mobile-webkit (390px) project; the desktop project starts unfolded. The
-    // point of this case is the explicit collapse-all that follows.
+    // D-053: a settled ordinary card is folded by default at every width
+    // (D-041 extended to desktop). The point of this case is that an opened
+    // card goes back under the explicit collapse-all.
     await openDensityMenu();
     await expect(densityToggle()).toHaveAttribute("data-mode", "compact");
     await densityToggle().click();
@@ -120,10 +120,9 @@ test.describe("transcript virtualization and session chrome", () => {
     await openDensityMenu();
     await expect(densityToggle()).toHaveAttribute("data-mode", "full");
     await closeDensityMenu();
-    await expect(page.getByTestId("tool-card").first()).toHaveAttribute(
-      "data-folded",
-      compact ? "1" : "0",
-    );
+    await expect(page.getByTestId("tool-card").first()).toHaveAttribute("data-folded", "1");
+    await page.getByTestId("tool-fold-open").first().click();
+    await expect(page.getByTestId("tool-card").first()).toHaveAttribute("data-folded", "0");
     await page.getByTestId("collapse-all").click();
     await expect(page.getByTestId("tool-card").first()).toHaveAttribute("data-folded", "1");
   });

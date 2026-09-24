@@ -125,6 +125,68 @@ async function latestJournal(page: Page, instanceId: string): Promise<string> {
   }, instanceId);
 }
 
+test("coarse: multi-question tabs are >=44px and answers stay mapped per question", async ({
+  browser,
+}) => {
+  // UO-9 round-2: on a coarse pointer every question tab is a 44px target, and
+  // a several-question form (one single-select, one multi-select) keeps each
+  // answer on its own question through tab switches before one submit.
+  const ctx = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    hasTouch: true,
+    isMobile: true,
+  });
+  const page = await ctx.newPage();
+  try {
+    await login(page);
+    const instanceId = await createSession(page, "ask-question coarse multi tab");
+
+    // The dock form renders on the shared session route at every width.
+    const form = page.getByTestId("question-form");
+    await expect(form).toBeVisible({ timeout: 20_000 });
+    const tabNext = page.getByRole("tab", { name: /下一步/ });
+    const tabMemory = page.getByRole("tab", { name: /记忆/ });
+    await expect(tabNext).toBeVisible();
+    await expect(tabMemory).toBeVisible();
+    for (const tab of [tabNext, tabMemory]) {
+      const box = await tab.boundingBox();
+      expect(box, "question tab rendered").toBeTruthy();
+      expect(box!.height).toBeGreaterThanOrEqual(43);
+    }
+
+    // Question 1: single select.
+    const radioNext = form.getByRole("radio", { name: /回到 GravityDB 开发/ });
+    await radioNext.click();
+    await expect(radioNext).toHaveAttribute("aria-checked", "true");
+
+    // Question 2: multi select (one option); switching away and back must not
+    // move the first answer onto the second question or lose either.
+    await tabMemory.click();
+    const port = form.getByRole("checkbox", { name: /保存端口/ });
+    await port.click();
+    await expect(port).toHaveAttribute("aria-checked", "true");
+    await tabNext.click();
+    await expect(radioNext).toHaveAttribute("aria-checked", "true");
+    await tabMemory.click();
+    await expect(port).toHaveAttribute("aria-checked", "true");
+
+    await form.getByTestId("question-submit").click();
+    await expect(form).toHaveCount(0, { timeout: 15_000 });
+    await expect.poll(() => pendingCount(page, instanceId), { timeout: 15_000 }).toBe(0);
+    // The harness received each chosen label (answers mapped to their fields).
+    await expect
+      .poll(async () => (await latestJournal(page, instanceId)).includes("answered via hook"), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+    const journal = await latestJournal(page, instanceId);
+    expect(journal).toContain("回到 GravityDB 开发");
+    expect(journal).toContain("保存端口");
+  } finally {
+    await ctx.close();
+  }
+});
+
 test("AskUserQuestion renders options (not raw JSON) and one Submit answers the hook", async ({ page }) => {
   const instanceId = await createSession(page, "ask-question please raise the form");
 
@@ -196,7 +258,7 @@ test("AskUserQuestion renders options (not raw JSON) and one Submit answers the 
     await page.goto("/approvals");
     await expect(page).toHaveURL(/\/m\/inbox(?:\?|$)/);
     const phoneRow = page
-      .getByTestId("m-inbox-row")
+      .getByTestId("approval-row")
       .filter({ hasText: "AskUserQuestion" })
       .first();
     await expect(phoneRow).toBeVisible({ timeout: 20_000 });

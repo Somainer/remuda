@@ -83,4 +83,54 @@ test.describe("plan review card", () => {
     await expect(error).toHaveCount(0);
     await expect(row.getByRole("button", { name: "拒绝" })).toBeEnabled();
   });
+
+  test("coarse: the compact 查看计划 disclosure is a full 44px tap target", async ({ browser }) => {
+    // UO-9 round-3: on /m/inbox the inline-plan summary must be 44px tall on a
+    // coarse pointer, and taps 2px inside the top/bottom of that band (points
+    // outside the glyph/text box) must both hit the disclosure and toggle it.
+    const ctx = await browser.newContext({
+      viewport: { width: 390, height: 844 },
+      hasTouch: true,
+      isMobile: true,
+    });
+    const page = await ctx.newPage();
+    try {
+      await page.goto("/m/inbox");
+      await expect(page).toHaveURL(/\/m\/inbox/);
+      const row = page.getByTestId("approval-row").filter({ hasText: "实施计划" });
+      await expect(row).toBeVisible();
+      const details = row.locator("details");
+      const summary = details.locator("summary");
+      await expect(summary).toBeVisible();
+      const box = await summary.boundingBox();
+      expect(box, "plan summary rendered").toBeTruthy();
+      expect(box!.height).toBeGreaterThanOrEqual(43);
+
+      const ownerAt = async (x: number, y: number) =>
+        page.evaluate(
+          ({ x, y }) => {
+            const el = document.elementFromPoint(x, y) as HTMLElement | null;
+            return el ? (el.closest("summary") != null ? "summary" : el.tagName) : null;
+          },
+          { x, y },
+        );
+
+      const cx = box!.x + box!.width / 2;
+      const topY = box!.y + 2; // 2px inside the band top (above the text box)
+      const bottomY = box!.y + box!.height - 2; // 2px inside the band bottom
+      expect(await ownerAt(cx, topY)).toBe("summary");
+      expect(await ownerAt(cx, bottomY)).toBe("summary");
+
+      // Collapsed by default; a tap on the upper edge opens the plan.
+      await expect(row.getByText("先读取 README")).toBeHidden();
+      await page.mouse.click(cx, topY);
+      await expect(details).toHaveAttribute("open", "");
+      await expect(row.getByText("先读取 README")).toBeVisible();
+      // A second tap on the lower edge closes it again.
+      await page.mouse.click(cx, bottomY);
+      await expect(row.getByText("先读取 README")).toBeHidden();
+    } finally {
+      await ctx.close();
+    }
+  });
 });

@@ -220,7 +220,7 @@ test("a delayed POST shows 等待发送, never a duplicate, then upgrades in pla
   expect(recorder.count()).toBe(setupActions + 1);
 });
 
-test("a transient 5xx POST keeps the row waiting and retries with the same commandId exactly once", async ({ page, request }) => {
+test("a transient 5xx POST keeps the row waiting and retries with the same commandId exactly once", async ({ page }) => {
   const instanceId = await createReadySession(page, "cid create prompt for fail test");
   const prompt = `cid failed post ${Date.now()}`;
 
@@ -259,22 +259,44 @@ test("a transient 5xx POST keeps the row waiting and retries with the same comma
   expect(new Set(seenCommandIds).size).toBe(1);
 
   // The retry committed once: one Hub command row and one journal message.
+  // Browser-side fetch (this spec shares the browser's cookie session; the
+  // independent request fixture does not). A non-200 returns -1 so a failed
+  // read can never poll as an empty == delivered list.
   const commandId = seenCommandIds[0]!;
-  const commands = await request.get(`/v1/instances/${instanceId}/commands?limit=100`);
-  expect(commands.ok()).toBe(true);
-  const commandBody = (await commands.json()) as {
-    commands?: { id?: string; commandId?: string; operation?: string }[];
-  };
-  expect(
-    (commandBody.commands ?? []).filter((c) => c.operation === "instance.send" && (c.id ?? c.commandId) === commandId),
-  ).toHaveLength(1);
   await expect
-    .poll(async () => {
-      const journal = await request.get(`/v1/instances/${instanceId}/journal?limit=2000`);
-      const jb = (await journal.json()) as {
-        events?: { kind?: string; payload?: { commandId?: string } }[];
-      };
-      return (jb.events ?? []).filter((e) => e.kind === "message" && e.payload?.commandId === commandId).length;
-    })
+    .poll(
+      () =>
+        page.evaluate(
+          async ({ iid, cid }) => {
+            const r = await fetch(`/v1/instances/${iid}/commands?limit=100`, {
+              credentials: "include",
+            });
+            if (!r.ok) return -1;
+            const body = (await r.json()) as {
+              commands?: { id?: string; commandId?: string; operation?: string }[];
+            };
+            return (body.commands ?? []).filter(
+              (c) => c.operation === "instance.send" && (c.id ?? c.commandId) === cid,
+            ).length;
+          },
+          { iid: instanceId, cid: commandId },
+        ),
+      { timeout: 20_000 },
+    )
+    .toBe(1);
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async ({ iid, cid }) => {
+          const r = await fetch(`/v1/instances/${iid}/journal?limit=2000`, { credentials: "include" });
+          if (!r.ok) return -1;
+          const body = (await r.json()) as {
+            events?: { kind?: string; payload?: { commandId?: string } }[];
+          };
+          return (body.events ?? []).filter(
+            (e) => e.kind === "message" && e.payload?.commandId === cid,
+          ).length;
+        }, { iid: instanceId, cid: commandId }),
+    )
     .toBe(1);
 });

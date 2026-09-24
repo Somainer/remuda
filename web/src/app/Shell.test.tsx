@@ -1,10 +1,10 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, useLocation } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { INFO_DEBOUNCE_MS, notify, notifyStore, type NotifyInput } from "../lib/notify";
 import { projectFilterStore } from "../features/tasks/ProjectSwitcher";
-import { ShellNotify, Sidebar, shellChrome } from "./Shell";
+import { BoardScopeSync, ShellNotify, Sidebar, shellChrome } from "./Shell";
 import { PhoneNav } from "./PhoneNav";
 
 afterEach(() => {
@@ -249,6 +249,46 @@ describe("Sidebar (UO-2a)", () => {
       expect(screen.getByTestId("where")).toHaveTextContent("/board?project=p%201");
       await userEvent.click(screen.getByRole("button", { name: "全局" }));
       expect(screen.getByTestId("where").textContent).toBe("/board");
+    } finally {
+      projectFilterStore.clear();
+    }
+  });
+
+  it("follows the /board URL through back and forward: 全局 → A → back → 全局 → forward → A", async () => {
+    function History() {
+      const navigate = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => navigate(-1)}>back</button>
+          <button type="button" onClick={() => navigate(1)}>forward</button>
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/sessions"]}>
+        <BoardScopeSync />
+        <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[{ id: "pa", name: "A" }]} quickFindOwned={false} />
+        <History />
+        <Where />
+      </MemoryRouter>,
+    );
+    const pressed = () => screen.getAllByTestId("sidebar-project-row").find((row) => row.getAttribute("aria-pressed") === "true")?.textContent;
+    try {
+      await userEvent.click(screen.getByRole("button", { name: "全局" }));
+      await userEvent.click(screen.getByRole("button", { name: "A" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board?project=pa");
+      expect(pressed()).toBe("A");
+      expect(projectFilterStore.getSnapshot()).toBe("pa");
+
+      await userEvent.click(screen.getByRole("button", { name: "back" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board");
+      expect(pressed()).toBe("全局");
+      expect(projectFilterStore.getSnapshot()).toBeNull();
+
+      await userEvent.click(screen.getByRole("button", { name: "forward" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board?project=pa");
+      expect(pressed()).toBe("A");
+      expect(projectFilterStore.getSnapshot()).toBe("pa");
     } finally {
       projectFilterStore.clear();
     }

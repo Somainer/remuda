@@ -228,6 +228,28 @@ const ADMIN_ICONS: Record<(typeof ADMIN_NAV)[number]["id"], LucideIcon> = {
  * the 主导航 landmark (会话 first), the project scope list, then 新建会话 and
  * the upward 管理 menu. Folded (`prefs.collapsed`, ⌘/Ctrl+B) it keeps icons only.
  */
+/** The project a /board URL names ("" for 全局); null off /board. */
+function boardScope({ pathname, search }: { pathname: string; search: string }): string | null {
+  if (routePath(pathname) !== "/board") return null;
+  return new URLSearchParams(search).get("project")?.trim() ?? "";
+}
+
+/**
+ * Keeps the stored project filter in step with the /board URL, which is the
+ * only source of the board scope: Board falls back to the stored filter on a
+ * bare /board, so back from ?project=A to /board must clear it to 全局.
+ */
+export function BoardScopeSync() {
+  const location = useLocation();
+  const scope = boardScope(location);
+  useEffect(() => {
+    if (scope === null) return;
+    if (scope) projectFilterStore.select(scope);
+    else projectFilterStore.clear();
+  }, [scope]);
+  return null;
+}
+
 export function Sidebar({
   collapsed,
   pending,
@@ -272,13 +294,13 @@ export function Sidebar({
   const navActive = (id: (typeof PRIMARY_NAV)[number]["id"], to: string) =>
     id === "sessions" ? isSessionRoute(location.pathname) : isUnder(location.pathname, to);
   const adminActive = ADMIN_NAV.some((item) => isUnder(location.pathname, item.to));
-  const scope = selectedProject && projects.some((p) => p.id === selectedProject) ? selectedProject : "";
+  // On /board the URL is the scope (BoardScopeSync); elsewhere the stored one.
+  const current = boardScope(location) ?? selectedProject;
+  const scope = current && projects.some((p) => p.id === current) ? current : "";
 
-  // ui-spec §1.1: the scope lives in the URL too, so a copied link and each
+  // ui-spec §1.1: the scope lives in the URL, so a copied link and each
   // history entry keep their project; 全局 is the bare /board.
   function pickProject(id: string) {
-    if (id) projectFilterStore.select(id);
-    else projectFilterStore.clear();
     navigate(id ? `/board?project=${encodeURIComponent(id)}` : "/board");
   }
 
@@ -478,6 +500,7 @@ export function Shell() {
     <CommitProbe name="Shell">
     <AnnotationProvider>
     <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout}data-collapsed={collapsed}>
+      <BoardScopeSync />
       <div className={css.install}>
         <InstallBar />
       </div>

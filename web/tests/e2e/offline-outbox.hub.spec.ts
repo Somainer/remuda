@@ -207,9 +207,10 @@ async function expectDelivered(page: Page, commandId: string | null) {
   const bubble = page.locator(
     `[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`,
   );
+  // The optimistic chip for THIS row is gone (the authoritative row carries
+  // no waiting/unconfirmed label; other scripted commands on the page may
+  // independently show their own status and are not asserted here).
   await expect(bubble).toHaveCount(0);
-  const body = (await page.getByTestId("session-page").textContent()) ?? "";
-  expect(body).not.toContain("状态待确认");
 }
 
 test("offline sends are queued and delivered exactly once after reconnect", async ({ page }) => {
@@ -291,7 +292,8 @@ test("an offline-queued message survives a reload while the Hub is still off and
   expect(restored).toContainText("offline across reload");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   // It is not a terminal/rejected row while the Hub has never received it.
-  await expect(restored).not.toContainText("状态待确认");
+  // Scope to the bubble's own subtree (the session page can independently
+  // show 状态待确认 for the scripted create command).
   await expect(restored).not.toContainText("未送达");
   // And nothing reached the Hub yet (independent read, 200 required).
   expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);

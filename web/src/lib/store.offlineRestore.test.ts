@@ -87,3 +87,43 @@ it("an offline reload restores the full instance projection (capabilities/native
     state.events[INSTANCE] === undefined && bubblesForInstance.length === 0;
   expect(wouldGateTranscript).toBe(false);
 });
+
+it("an offline-reloaded session stays bound to the connection machine across the failed follow open", async () => {
+  const { api, hubStore } = await fresh();
+  const known: Instance = {
+    ...mockDb.instances[0],
+    id: INSTANCE,
+    journalId: JOURNAL,
+  };
+  // A device session + reachable hello builds the connection machine
+  // (bootstrap), then follow() fails with the Hub unreachable.
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
+    ReturnType<Api["passkeyList"]>
+  >);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  await hubStore.bootstrap();
+  vi.spyOn(api, "instanceGet").mockResolvedValue(known);
+  vi.spyOn(api, "eventsRead").mockRejectedValue(new Error("offline"));
+  vi.spyOn(api, "eventsSubscribe").mockRejectedValue(new Error("offline"));
+  await hubStore.follow(INSTANCE).catch(() => undefined);
+
+  // Even though the socket (and its seed read) never succeeded, the machine
+  // already knows which session to reopen on recovery (pre-bind). A journal
+  // client is registered only once a seed read succeeds; reopenFollow handles
+  // the missing client by running follow() again on recovery.
+  const internal = hubStore as unknown as {
+    connectionBoundTo: string | null;
+    connectionBoundJournal: string | null;
+  };
+  expect(internal.connectionBoundTo).toBe(INSTANCE);
+  expect(internal.connectionBoundJournal).toBe(JOURNAL);
+});

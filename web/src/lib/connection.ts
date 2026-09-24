@@ -51,11 +51,12 @@ export type MachineDeps = {
   /** Lightweight REST probe used while the socket looks silently stale. */
   probe: () => Promise<boolean>;
   /**
-   * Whether the follow WebSocket is currently OPEN. Foreground/online resume
-   * from a cached "live" trusts the socket only when this is true; a silently
-   * closed socket (no close event delivered during suspension) forces reopen.
+   * Whether the follow link is genuinely usable RIGHT NOW: the socket is OPEN
+   * AND a frame was received within LIVE_FRAME_MS. Foreground/online resume
+   * from a cached "live" trusts the link only when this is true; an OPEN but
+   * silent, or a closed, socket forces reopen.
    */
-  isFollowOpen: () => boolean;
+  isFollowLive: () => boolean;
   schedule?: Scheduler;
   cancel?: ScheduleCancel;
   random?: () => number;
@@ -122,6 +123,16 @@ export class ConnectionMachine {
   }
 
   /**
+   * Begin in recovering WITHOUT firing a resume action (bootstrap uses this:
+   * the follow socket being opened independently drives the first frame →
+   * live; an explicit resume later reopens if needed).
+   */
+  markRecovering() {
+    this.attempt = 0;
+    this.setState("recovering");
+  }
+
+  /**
    * Begin offline (bootstrap failed to reach the Hub with a device session
    * still present): schedule the reconnect loop immediately and run the frame
    * watchdog off the machine's own retry/probe rhythm.
@@ -152,13 +163,12 @@ export class ConnectionMachine {
         return;
       case "online":
       case "resume": {
-        // Foreground / back-online / manual resume: zero the backoff. The
-        // cached state may be stale — a socket can die silently while the
-        // page is suspended before a close callback fires — so trust "live"
-        // only if the follow socket is actually OPEN; otherwise reopen (an
-        // in-flight recovery is coalesced by beginResume).
+        // Foreground / back-online / manual resume: the cached state can be
+        // stale — a socket can die silently while the page is suspended before
+        // any close callback fires. Trust "live" ONLY when the socket is open
+        // AND recently framed; otherwise reopen (coalesced by beginResume).
         this.attempt = 0;
-        if ((this.state === "live" || this.state === "stale") && this.deps.isFollowOpen()) {
+        if ((this.state === "live" || this.state === "stale") && this.deps.isFollowLive()) {
           this.armFrameWatchdog();
           return;
         }
@@ -171,9 +181,11 @@ export class ConnectionMachine {
       case "probe":
         if (this.state !== "stale") return;
         if (event.ok) {
+          // REST reachable is NOT proof the follow stream works: a live
+          // transcript needs the socket. Reopen + catch up (which certifies
+          // live on success) instead of optimistically setting live.
           this.attempt = 0;
-          this.setState("live");
-          this.armFrameWatchdog();
+          this.beginResume();
         } else {
           this.goOfflineAndSchedule();
         }

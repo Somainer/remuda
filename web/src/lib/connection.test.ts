@@ -43,18 +43,18 @@ function setup() {
   const clock = fakeTimers();
   const resume = vi.fn(() => Promise.resolve());
   const probe = vi.fn(() => Promise.resolve(true));
-  const isFollowOpen = vi.fn(() => true);
+  const isFollowLive = vi.fn(() => true);
   const onState = vi.fn();
   const machine = new ConnectionMachine({
     resume,
     probe,
-    isFollowOpen,
+    isFollowLive,
     schedule: clock.schedule,
     cancel: clock.cancel,
     random: () => 0.5,
     onState,
   });
-  return { clock, resume, probe, onState, machine, isFollowOpen };
+  return { clock, resume, probe, onState, machine, isFollowLive };
 }
 
 describe("ConnectionMachine", () => {
@@ -159,36 +159,39 @@ describe("ConnectionMachine", () => {
     expect(machine.state).toBe("offline");
   });
 
-  it("a successful REST probe restores live from stale", async () => {
-    const { clock, machine, probe } = setupTracked();
+  it("a successful REST probe triggers reopen+catch-up, never a false live", async () => {
+    const { clock, machine, probe, resume } = setupTracked();
     machine.startLive();
     clock.advance(LIVE_FRAME_MS);
     expect(machine.state).toBe("stale");
     clock.advance(15_000);
     expect(probe).toHaveBeenCalledTimes(1);
     await Promise.resolve();
-    expect(machine.state).toBe("live");
+    // REST reachable is not live: it forces a resume (socket reopen+catch-up),
+    // which certifies live only on success.
+    expect(machine.state).toBe("recovering");
+    expect(resume).toHaveBeenCalledTimes(1);
   });
 
   it("backoff is full-jitter within the doubling 30 s cap", () => {
     const withRandom = (r: number) =>
-      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowOpen: () => true, random: () => r }).backoffDelay(10);
+      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowLive: () => true, random: () => r }).backoffDelay(10);
     expect(withRandom(0)).toBe(0);
     expect(withRandom(1)).toBe(MAX_BACKOFF_MS);
   });
 
   it("foreground/online from cached live reopens when the follow socket is silently dead", async () => {
-    const { clock, machine, resume, isFollowOpen } = setupTracked();
+    const { clock, machine, resume, isFollowLive } = setupTracked();
     machine.startLive();
     expect(machine.state).toBe("live");
     // Socket silently died while suspended; no close callback fired.
-    isFollowOpen.mockReturnValue(false);
+    isFollowLive.mockReturnValue(false);
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("recovering");
     await vi.waitFor(() => expect(resume).toHaveBeenCalledTimes(1));
     await clock.advance(0);
     // Online event behaves the same.
-    isFollowOpen.mockReturnValue(false);
+    isFollowLive.mockReturnValue(false);
     machine.dispatch({ type: "online" });
     expect(resume.mock.calls.length).toBeGreaterThanOrEqual(1);
   });

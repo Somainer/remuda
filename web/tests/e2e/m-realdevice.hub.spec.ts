@@ -235,6 +235,24 @@ async function raiseKeyboardIosExact(page: Page, kb: number) {
   await page.waitForTimeout(300);
 }
 
+/** Restore the full-size visual viewport (keyboard close). */
+async function lowerKeyboardIosExact(page: Page) {
+  await page.evaluate(() => {
+    const vv = window.visualViewport;
+    Object.defineProperty(vv, "height", {
+      configurable: true,
+      get: () => window.innerHeight,
+    });
+    Object.defineProperty(vv, "offsetTop", {
+      configurable: true,
+      get: () => 0,
+    });
+    vv.dispatchEvent(new Event("resize"));
+    window.dispatchEvent(new Event("resize"));
+  });
+  await page.waitForTimeout(300);
+}
+
 async function bandRect(page: Page, selector: string) {
   return page.evaluate((sel) => {
     const el = document.querySelector(sel);
@@ -440,6 +458,10 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   page,
 }, testInfo) => {
   if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+  // UO-10: the keyboard-freeze assertions require the COMPACT layout — the
+  // chromium project defaults to a 1280px desktop viewport where the
+  // keyboard band never engages. Drive every engine at a 393px phone width.
+  await page.setViewportSize({ width: 393, height: 659 });
   const id = await createTerminal(page);
   await page.goto(`/s/${id}/tty`);
   const lab = page.locator("[data-tty-lab]");
@@ -493,9 +515,27 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   });
   await shot(page, "m-realdevice-2-terminal-390.png");
 
-  // Keyboard up: the terminal keeps its band and refits to the shorter box
-  // instead of collapsing to zero behind the keyboard.
+  // UO-10: record the fitted grid and the PTY resize counter, then open the
+  // keyboard. The freeze rule keeps xterm on its current grid (CSS clips and
+  // bottom-aligns) — no fit, no sessionRef.resize at all.
+  const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
+  const colsBefore = Number(await lab.getAttribute("data-tty-cols"));
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => {
+            window.__ttyLab?.resetResizeCount();
+            resolve();
+          }),
+        );
+      }),
+  );
+
+  // Keyboard up: the terminal keeps the band; the xterm viewport stays
+  // visible (clipped to the band) rather than collapsing behind the keyboard.
   await raiseKeyboard(page);
+  await page.waitForTimeout(300);
   const after = await waitForInBand(page, '[aria-label="终端画面"]', 120);
   expect(after, "terminal viewport after keyboard").not.toBeNull();
   expect(
@@ -505,7 +545,26 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   await expect
     .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
     .toBeGreaterThan(3);
+  // Grid frozen: identical rows/cols and ZERO resize commands to the PTY.
+  expect(Number(await lab.getAttribute("data-tty-rows"))).toBe(rowsBefore);
+  expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
+  expect(
+    await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+    "no PTY resize while the keyboard is open",
+  ).toBe(0);
   await shot(page, "m-realdevice-3-terminal-keyboard-390.png", true);
+
+  // Keyboard closes: fit resumes, but a grid that settles back to the same
+  // cols/rows still sends no resize — the full open/close cycle stays at 0.
+  await lowerKeyboardIosExact(page);
+  await expect
+    .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
+    .toBe(rowsBefore);
+  expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
+  expect(
+    await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+    "no PTY resize across keyboard open/close",
+  ).toBe(0);
 });
 
 test("(c) model/effort observations render as change records, never as 未识别事件", async ({
@@ -920,6 +979,9 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       await expect(input).toBeEnabled();
       await input.click();
       await expect(input).toBeFocused();
+      // The transcript scroller mounts a beat after navigation; wait for it
+      // before measuring so a slow settle can't read a null scroller.
+      await expect(page.getByTestId("transcript-scroller")).toBeVisible();
 
       await raiseKeyboardIosExact(page, kb);
       const band = await currentBand(page, height, kb);

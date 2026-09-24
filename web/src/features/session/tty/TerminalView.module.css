@@ -1,10 +1,19 @@
+/*
+ * UO-10 terminal frame (D-053 item 4): the terminal is an always-dark
+ * instrument in both appearances. Every colour here is a mode-independent
+ * --term-* token (see tokens.css); no ink/paper/dust literals, no role tokens
+ * that swap with the light theme. The pane and the xterm canvas share
+ * --term-bg, so there is no seam between frame and canvas.
+ */
+
 .lab {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
   width: 100%;
-  background: var(--ink);
+  color: var(--term-fg);
+  background: var(--term-bg);
 }
 
 .lab[data-tty-fullscreen="1"] {
@@ -30,33 +39,41 @@
   padding: 8px;
 }
 
+/* TUI mode capsule: 12px mono, pill shape, muted ink on the dark frame. */
 .modePill {
-  font-family: var(--mono);
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--dust);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 2px 8px;
+  color: var(--term-muted);
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-pill);
+  padding: 2px 10px;
 }
 
-/* A stale frame's badge. Deliberately louder than `.modePill`: the renderer
-   pill describes how the terminal draws, this one says the picture is no
-   longer the process. It keeps the pill geometry so the strip stays one row. */
+/* Stale-frame badge. Two evidence shapes (ui-spec §2.3):
+   - node-link-unavailable: freshness UNKNOWN — dashed neutral mark + text;
+   - instance-gone: a verified end state — no dash, regular frame text. */
 .staleBadge {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--dust);
-  border: 1px solid var(--dust);
-  border-radius: 4px;
-  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-fg);
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-pill);
+  padding: 2px 10px;
   white-space: nowrap;
 }
 
+.staleBadge[data-stale-reason="node-link-unavailable"] {
+  color: var(--term-muted);
+  border-style: dashed;
+}
+
 .keyOn {
-  color: var(--dust) !important;
-  border-color: var(--dust) !important;
+  color: var(--term-fg) !important;
+  border-color: var(--term-fg) !important;
 }
 
 .toolbar {
@@ -65,17 +82,19 @@
   flex-wrap: wrap;
   gap: 12px;
   align-items: center;
-  padding: 10px 18px;
-  border-bottom: 1px solid var(--line);
+  /* Desktop toolbar is a 32px strip (ui-spec §2.3). */
+  min-height: 32px;
+  padding: 4px 16px;
+  border-bottom: 1px solid var(--term-border);
 }
 
-/* OSC 9;4 progress directly under the header (native-config, 2026-09-16). */
+/* OSC 9;4 progress directly under the header: 2px (ui-spec §2.3). */
 .progressTrack {
   flex: none;
   position: relative;
-  height: 3px;
+  height: 2px;
   margin: -1px 0 0;
-  background: var(--line);
+  background: var(--term-border);
   overflow: hidden;
 }
 
@@ -83,7 +102,7 @@
   position: absolute;
   inset: 0 auto 0 0;
   width: 100%;
-  background: var(--dust);
+  background: var(--term-fg);
 }
 
 .progressFill[data-progress-state="indeterminate"] {
@@ -96,11 +115,11 @@
 }
 
 .progressFill[data-progress-state="error"] {
-  background: #d97757;
+  background: var(--term-red);
 }
 
 .progressFill[data-progress-state="paused"] {
-  background: var(--mute);
+  background: var(--term-muted);
 }
 
 @keyframes tty-progress-slide {
@@ -121,9 +140,10 @@
 }
 
 .geo {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-muted);
   background: transparent;
   border: 0;
   padding: 0;
@@ -132,23 +152,23 @@
 
 .seg {
   display: flex;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-sm);
   overflow: hidden;
-  height: 28px;
+  height: var(--seg-item);
 }
 
 .seg button {
   display: flex;
   align-items: center;
   padding: 0 11px;
-  font-size: 12px;
-  color: var(--mute);
+  font-size: var(--text-meta);
+  color: var(--term-muted);
   background: transparent;
   border: 0;
   border-radius: 0;
-  min-height: 28px;
-  border-left: 1px solid var(--line);
+  min-height: var(--seg-item);
+  border-left: 1px solid var(--term-border);
 }
 
 .seg button:first-child {
@@ -156,45 +176,47 @@
 }
 
 .segOn {
-  color: var(--paper) !important;
-  background: var(--ink-2, #1a212b) !important;
+  color: var(--term-fg) !important;
+  background: var(--term-raised) !important;
 }
 
+/* AuxKeys desktop strip: 28px keys, 12px mono (ui-spec §2.3). */
 .auxStrip {
   height: 28px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-sm);
   display: flex;
   align-items: center;
   padding: 0 10px;
   gap: 9px;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--term-muted);
 }
 
 .auxStrip button {
   min-height: 0;
-  height: auto;
+  height: 28px;
   padding: 0;
   border: 0;
   background: transparent;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--term-muted);
 }
 
 .banner {
   flex: none;
   padding: 7px 14px;
-  background: var(--ink-2, #1a212b);
-  border-bottom: 1px solid var(--line);
+  background: var(--term-raised);
+  border-bottom: 1px solid var(--term-border);
   display: flex;
   align-items: center;
   gap: 8px;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-muted);
 }
 
 .dots {
@@ -207,7 +229,7 @@
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: var(--mute);
+  background: var(--term-muted);
   animation: dim 1.2s ease-in-out infinite;
 }
 
@@ -236,7 +258,7 @@
      or a wheel gesture near the bottom edge moves this div instead. */
   overflow: hidden;
   position: relative;
-  background: var(--ink-0, #0f1319);
+  background: var(--term-bg);
 }
 
 .host {
@@ -252,23 +274,46 @@
   height: 100%;
 }
 
+/*
+ * UO-10 keyboard freeze (ui-spec §2.3/§4.7): while the soft keyboard owns the
+ * band the fit loop is gated in TerminalView.tsx — no fit, no PTY resize —
+ * and xterm keeps its pre-keyboard grid. The viewport becomes a clipping,
+ * bottom-aligning flex box: the fixed-height host (its pre-keyboard pixel
+ * size) overflows the top and is cut off, so the bottom rows the operator
+ * reads stay attached to the local input. The keyboard-close fit restores
+ * normal layout with the same rows/cols.
+ */
+html[data-keyboard="1"] .viewport {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+
+html[data-keyboard="1"] .host {
+  flex: none;
+  min-height: 0;
+  height: auto;
+}
+
 .dock {
   flex: none;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--term-border);
   padding: 12px 18px;
   display: flex;
   align-items: center;
   gap: 12px;
-  background: var(--ink);
+  background: var(--term-bg);
 }
 
 .note {
   flex: none;
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--term-border);
   padding: 9px 18px;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-muted);
 }
 
 .localWrap {
@@ -285,10 +330,12 @@
 
 .localField {
   flex: 1;
-  height: 38px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--ink-0, #0f1319);
+  /* ui-spec §2.3: 36px with a fine pointer; the coarse override below takes
+     the visible height to the 44px touch floor. */
+  height: var(--control-h-lg);
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-sm);
+  background: var(--term-raised);
   display: flex;
   align-items: center;
   padding: 0 12px;
@@ -302,28 +349,36 @@
   padding: 0;
   min-height: 0;
   height: 22px;
-  font-size: 14px;
-  color: var(--paper);
+  /* --text-input is 14px fine / 16px coarse: iOS never zoom-shrinks a focused
+     16px field, and the frame text is the same size as the app composer. */
+  font-size: var(--text-input);
+  color: var(--term-fg);
+}
+
+.localField input::placeholder {
+  color: var(--term-muted);
 }
 
 .localSend {
-  height: 32px;
-  border: 1px solid var(--paper);
-  border-radius: 4px;
+  height: var(--control-h-lg);
+  border: 1px solid var(--term-fg);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
-  min-height: 32px;
+  color: var(--term-fg);
+  min-height: var(--control-h-lg);
   padding: 0 16px;
-  font-size: 13px;
+  font-size: var(--text-title);
 }
 
 .localHint {
   margin: 8px 0 0;
-  font-family: var(--mono);
-  font-size: 10.5px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-muted);
 }
 
+/* Expanded raw-key row under the phone action bar. */
 .keys {
   display: flex;
   gap: 6px;
@@ -331,8 +386,8 @@
   overflow-x: auto;
   overflow-y: hidden;
   padding: 8px 10px;
-  background: var(--ink-2, #1a212b);
-  border-top: 1px solid var(--line);
+  background: var(--term-raised);
+  border-top: 1px solid var(--term-border);
   -webkit-overflow-scrolling: touch;
 }
 
@@ -340,12 +395,13 @@
   height: 44px;
   min-width: 44px;
   min-height: 44px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
-  font-family: var(--mono);
-  font-size: 12px;
+  color: var(--term-fg);
+  font-family: var(--font-mono);
+  /* 13px mono on the phone raw-key row (ui-spec §2.3). */
+  font-size: var(--text-code);
   padding: 0 10px;
   flex: none;
   touch-action: manipulation;
@@ -369,9 +425,24 @@
   align-items: center;
 }
 
+@media (pointer: coarse) {
+  /* Touch: the local field is a 44px box and the send glyph becomes a 44px
+     square in the same thumb zone as the nine-key bar. */
+  .localField,
+  .localSend {
+    height: var(--touch);
+    min-height: var(--touch);
+  }
+
+  .localSend {
+    width: 44px;
+    padding: 0;
+  }
+}
+
 @media (max-width: 767px) {
   .toolbar {
-    padding: 8px 14px;
+    padding: 4px 12px;
     gap: 10px;
   }
 
@@ -384,32 +455,9 @@
     align-items: flex-start;
   }
 
-  .geo {
-    font-size: 10.5px;
-  }
-
-  .localField {
-    height: 44px;
-  }
-
-  .localSend {
-    width: 44px;
-    height: 44px;
-    min-height: 44px;
-    padding: 0;
-    font-size: 15px;
-  }
-
   .keys {
     padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
     gap: 8px;
-  }
-
-  .keys button {
-    height: 44px;
-    min-height: 44px;
-    min-width: 44px;
-    font-size: 13px;
   }
 }
 
@@ -430,8 +478,8 @@
  */
 .phoneBar {
   flex: none;
-  background: var(--ink-2, #1a212b);
-  border-top: 1px solid var(--line);
+  background: var(--term-raised);
+  border-top: 1px solid var(--term-border);
 }
 
 .phoneRow {
@@ -478,13 +526,13 @@
      outline paints inside the 44px box, so the WHOLE hit surface — corners
      included — is the key itself (D-039). */
   border: 0;
-  outline: 1px solid var(--line);
+  outline: 1px solid var(--term-border);
   outline-offset: -1px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
-  font-family: var(--mono);
-  font-size: 13px;
+  color: var(--term-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
   touch-action: manipulation;
 }
 
@@ -502,20 +550,19 @@
   opacity: 0.45;
 }
 
-/* Sticky Ctrl / 键 pressed state: dust outline instead of border-colour
-   (the phone keys frame themselves with an inset outline). */
+/* Sticky Ctrl / 键 pressed state. */
 .phoneKey.keyOn {
-  outline-color: var(--dust);
+  outline-color: var(--term-fg);
 }
 
 /* The clipboard key's reason is visible INLINE, never only a hover title
-   (acceptance 4). Uses the aux-text token floor (ui-spec §3.4). */
+   (acceptance 4). */
 .clipReason {
   margin: 0;
   padding: 4px 12px 6px;
-  font-size: var(--text-aux);
+  font-size: var(--text-meta);
   line-height: 1.4;
-  color: var(--mute);
+  color: var(--term-muted);
 }
 
 .historyHead {
@@ -527,23 +574,27 @@
 
 .historyHead h2 {
   margin: 0;
-  font-size: 15px;
+  font-size: var(--text-title);
+  line-height: var(--lh-title);
+  color: var(--term-fg);
 }
 
 .historyClose {
   flex: none;
   min-height: var(--touch);
   padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
+  color: var(--term-fg);
+  font-size: var(--text-meta);
 }
 
 .historyHint {
   margin: 0;
-  font-size: var(--text-aux);
-  color: var(--mute);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-muted);
 }
 
 .historyList {
@@ -558,11 +609,11 @@
   min-height: var(--touch);
   padding: 8px 12px;
   text-align: left;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  border: 1px solid var(--term-border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
-  font-size: 14px;
+  color: var(--term-fg);
+  font-size: var(--text-title);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -570,6 +621,7 @@
 
 .historyEmpty {
   margin: 0;
-  font-size: var(--text-aux);
-  color: var(--mute);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--term-muted);
 }

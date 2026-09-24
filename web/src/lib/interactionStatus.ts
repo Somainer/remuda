@@ -59,10 +59,23 @@ export function settledOnThisDevice(
 /** UI interaction state (ui-spec §2.5). answering is local until journal interaction.answered. */
 export function projectInteraction(
   interaction: Interaction,
-  opts: { answering?: boolean; host?: Host; connectivity?: string; deviceId?: string },
+  opts: {
+    answering?: boolean;
+    host?: Host;
+    connectivity?: string;
+    deviceId?: string;
+    /**
+     * Clock injection for deadline evaluation (c-ghostbadge round 2): the
+     * shared inbox deadline clock passes the tick instant so queue
+     * projections recompute against a value the memo actually reads. Defaults
+     * to the wall clock.
+     */
+    nowMs?: number;
+  },
 ): InteractionUiState {
   const deviceId = opts.deviceId ?? thisDeviceId();
-  if (interaction.state === "expired" || deadlinePassed(interaction)) return "expired";
+  const nowMs = opts.nowMs ?? Date.now();
+  if (interaction.state === "expired" || deadlinePassed(interaction, nowMs)) return "expired";
   if (opts.answering && (interaction.state === "pending" || interaction.state === "unknown")) return "answering";
   if (interaction.state === "invalidated") return "superseded";
   if (interaction.state === "answer-committed" || interaction.state === "resolved") {

@@ -215,7 +215,10 @@ export type InboxSource = {
 export type InboxQueueSource = Pick<
   InboxSource,
   "interactions" | "instances" | "hosts" | "answering" | "deviceId"
->;
+> & {
+  /** Clock injection (c-ghostbadge round 2); defaults to the wall clock. */
+  nowMs?: number;
+};
 
 /**
  * One interaction the 待你处理 queue shows. This is the SINGLE projection both
@@ -257,6 +260,7 @@ function isActiveUiState(
 export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
   const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
   const hostById = new Map(source.hosts.map((host) => [host.id, host]));
+  const nowMs = source.nowMs ?? Date.now();
   const queue: InboxQueueItem[] = [];
   for (const item of source.interactions) {
     const instance = instanceById.get(item.instanceId);
@@ -266,6 +270,7 @@ export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
       host,
       connectivity: instance?.connectivity,
       deviceId: source.deviceId,
+      nowMs,
     });
     if (!isActiveUiState(uiState)) continue;
     queue.push({ item, instance, host, uiState });

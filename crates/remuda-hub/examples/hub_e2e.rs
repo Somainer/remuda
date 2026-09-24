@@ -632,6 +632,57 @@ fn node_hello_frame(host_id: &HostId, workspaces: &Value, epoch: u64, live: &[St
 /// with calls that park for their full node timeout.
 const GATED_METHODS: &[&str] = &["tty.screen", "workspace.list", "worktree.list"];
 
+/// c-ghostbadge: drop the current WebSocket and reconnect with a NEW epoch,
+/// re-announcing exactly `survivors` as live. A new epoch is what makes the
+/// Hub run reconcile_reported_instances: every created instance missing from
+/// `survivors` settles exited (`node-epoch-changed`). The caller owns which
+/// ids survive; the durable host token re-authenticates the reconnect (a
+/// second node.hello on one socket is rejected, hence the new connection).
+///
+/// Frames arriving before the hello reply share the socket with unrelated Hub
+/// RPCs; they are stashed into `frame_queue`, never swallowed.
+async fn node_restart_reconnect(
+    addr: SocketAddr,
+    durable_token: &str,
+    host_id: &HostId,
+    workspaces: &Value,
+    node_epoch: &mut u64,
+    survivors: Vec<String>,
+    frame_queue: &mut std::collections::VecDeque<String>,
+) -> Result<NodeWs> {
+    *node_epoch += 1;
+    let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {durable_token}")
+            .parse()
+            .context("authorization header")?,
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    ws.send(Message::Text(
+        node_hello_frame(host_id, workspaces, *node_epoch, &survivors)
+            .to_string()
+            .into(),
+    ))
+    .await?;
+    loop {
+        let Some(Ok(Message::Text(text))) =
+            tokio::time::timeout(Duration::from_secs(5), ws.next()).await?
+        else {
+            anyhow::bail!("hub closed during the fake node restart");
+        };
+        let value: Value = serde_json::from_str(&text)?;
+        if value.get("id").and_then(Value::as_str) == Some("hello") {
+            anyhow::ensure!(
+                value.get("result").is_some(),
+                "restart hello rejected: {value}"
+            );
+            return Ok(ws);
+        }
+        frame_queue.push_back(text.to_string());
+    }
+}
+
 /// Build the D-047 create-result `apiRoute` echo from the requested spec.
 ///
 /// The fake Node stands in for the real listener half: it accepts a via
@@ -1078,44 +1129,55 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
-                    // c-ghostbadge: a hook approval whose agent died HARD
-                    // while blocked. The Node journals interaction.requested
-                    // (the Hub's DURABLE interactions row; the hook's known
-                    // deadline is already in the past, as once the 15-min
-                    // BLOCKING_WAIT has elapsed) but no answered / expired /
-                    // invalidated event ever lands, and the instance settles
-                    // exited. The Hub keeps the interaction row at
-                    // state='pending' forever (restart reconcile settles
-                    // instances only — crates/remuda-hub/src/store.rs
-                    // reconcile_reported_instances). Before the web fix the
-                    // phone badge counted the raw-pending ghost (1) while the
-                    // inbox's 待你处理 tier showed 0 (deadline projects
-                    // expired). The card is deliberately NOT inserted into
-                    // the live `pending` map: a dead node serves no
-                    // interaction.list, so the durable Hub row is the ghost's
-                    // only source — exactly the demo reproduction.
-                    if prompt.contains("ghostbadge-expired") {
+                    // c-ghostbadge round 2: a GENUINELY live hook approval
+                    // with a short known deadline. The card is journaled
+                    // durably AND held in the live broker, so badge and
+                    // inbox both show 1/1 while the agent is blocked. The
+                    // spec then ends the instance through a REAL node
+                    // restart (instance.send sentinel `GHOSTNODE_RESTART`):
+                    // the new epoch omits the instance, the Hub's
+                    // reconcile_reported_instances settles it exited, the
+                    // new process serves no interaction.list for it, and
+                    // once the deadline crosses the shared projection drops
+                    // the durable pending row to expired — 0/0 with no
+                    // reload. Nothing here is pre-ended.
+                    if prompt.contains("ghostbadge-live") {
                         let iid = InteractionId::new();
-                        let past = time::OffsetDateTime::now_utc() - time::Duration::minutes(20);
+                        // Long enough that the e2e's create -> restart ->
+                        // reconcile path finishes while the card is still
+                        // open (it asserts 1/1 before watching the flip);
+                        // the spec waits on the flip with a generous timeout.
+                        let deadline_ts =
+                            time::OffsetDateTime::now_utc() + time::Duration::seconds(45);
                         let deadline = format!(
                             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-                            past.year(),
-                            past.month() as u8,
-                            past.day(),
-                            past.hour(),
-                            past.minute(),
-                            past.second(),
-                            past.millisecond(),
+                            deadline_ts.year(),
+                            deadline_ts.month() as u8,
+                            deadline_ts.day(),
+                            deadline_ts.hour(),
+                            deadline_ts.minute(),
+                            deadline_ts.second(),
+                            deadline_ts.millisecond(),
                         );
                         let mut card = fake_approval(&instance_id, host, iid.as_id().as_str());
                         card["deadline"] = json!({ "state": "known", "value": deadline });
                         card["deadlineSource"] = json!("runtime-policy");
-                        append_n =
-                            append_interaction_requested(&mut ws, &instance_id, append_n, &card)
-                                .await?;
-                        append_n =
-                            append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
-                                .await?;
+                        append_n = append_interaction_requested(
+                            &mut ws,
+                            &mut frame_queue,
+                            &instance_id,
+                            append_n,
+                            &card,
+                        )
+                        .await?;
+                        // Live broker agrees with the durable journal while
+                        // the process runs (the real Node serves both).
+                        pending
+                            .lock()
+                            .await
+                            .insert(iid.as_id().as_str().to_string(), card);
+                        append_n = append_native_status(&mut ws, &instance_id, append_n, "blocked")
+                            .await?;
                         send_rpc_ok(
                             &mut ws,
                             id,
@@ -1291,6 +1353,37 @@ async fn fake_node(
                         .and_then(Value::as_str)
                         .unwrap_or("hello");
                     let command_id = params.get("commandId").and_then(Value::as_str);
+                    // c-ghostbadge round 2: end THIS instance for real. Ack
+                    // the send, drop the instance's in-memory live cards (a
+                    // restarted process has no broker memory), then reconnect
+                    // under a new epoch re-announcing every OTHER created
+                    // instance as a survivor. The Hub's epoch reconcile then
+                    // settles only this instance exited while other specs'
+                    // live sessions stay untouched.
+                    if prompt == GHOST_RESTART_SENTINEL {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        pending.lock().await.retain(|_iid, card| {
+                            card.get("instanceId").and_then(Value::as_str)
+                                != Some(instance_id.as_str())
+                        });
+                        let survivors: Vec<String> = instance_kinds
+                            .keys()
+                            .filter(|id| id.as_str() != instance_id.as_str())
+                            .cloned()
+                            .collect();
+                        let _ = ws.close(None).await;
+                        ws = node_restart_reconnect(
+                            addr,
+                            &durable_token,
+                            &host_id,
+                            &workspaces,
+                            &mut node_epoch,
+                            survivors,
+                            &mut frame_queue,
+                        )
+                        .await?;
+                        continue;
+                    }
                     // c-journalpage bounded-window seeding hook:
                     // `__journal_burst__:<n>` appends n assistant message
                     // events in one batched journal.append frame (plus idle),
@@ -2202,7 +2295,6 @@ async fn fake_node(
                         == Some(std::str::from_utf8(NODE_RESTART_SENTINEL).unwrap_or_default())
                     {
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
-                        node_epoch += 1;
                         let mut survivors: Vec<String> = ttys
                             .keys()
                             .chain(claude_ptys.iter())
@@ -2212,39 +2304,17 @@ async fn fake_node(
                         survivors.sort();
                         survivors.dedup();
                         let _ = ws.close(None).await;
-                        let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
-                        req.headers_mut().insert(
-                            "Authorization",
-                            format!("Bearer {durable_token}")
-                                .parse()
-                                .context("authorization header")?,
-                        );
-                        let (next_ws, _) = tokio_tungstenite::connect_async(req).await?;
-                        ws = next_ws;
-                        ws.send(Message::Text(
-                            node_hello_frame(&host_id, &workspaces, node_epoch, &survivors)
-                                .to_string()
-                                .into(),
-                        ))
+                        // node_restart_reconnect bumps node_epoch itself.
+                        ws = node_restart_reconnect(
+                            addr,
+                            &durable_token,
+                            &host_id,
+                            &workspaces,
+                            &mut node_epoch,
+                            survivors,
+                            &mut frame_queue,
+                        )
                         .await?;
-                        // The hello reply shares the socket with unrelated Hub
-                        // RPCs; stash those rather than swallowing them.
-                        loop {
-                            let Some(Ok(Message::Text(text))) =
-                                tokio::time::timeout(Duration::from_secs(5), ws.next()).await?
-                            else {
-                                anyhow::bail!("hub closed during the fake node restart");
-                            };
-                            let value: Value = serde_json::from_str(&text)?;
-                            if value.get("id").and_then(Value::as_str) == Some("hello") {
-                                anyhow::ensure!(
-                                    value.get("result").is_some(),
-                                    "restart hello rejected: {value}"
-                                );
-                                break;
-                            }
-                            frame_queue.push_back(text.to_string());
-                        }
                         continue;
                     }
                     if let Some(line) = submitted {
@@ -2606,6 +2676,10 @@ const TTY_ALT_OFF_SENTINEL: &[u8] = b"TTYMODE_ALT_OFF";
 /// diff, so the rows of every process that died with the previous Node stayed
 /// `running` and kept holding placement slots.
 const NODE_RESTART_SENTINEL: &[u8] = b"TTYNODE_RESTART";
+/// c-ghostbadge round 2: an `instance.send` prompt that restarts the fake
+/// Node under a new epoch re-announcing every other instance as a survivor,
+/// so reconcile settles the addressed instance exited.
+const GHOST_RESTART_SENTINEL: &str = "GHOSTNODE_RESTART";
 
 /// OSC 9;4 progress sentinels (native-config, 2026-09-16). Each emits the raw
 /// ConEmu sequence plus a `tty.mode` notice carrying the parsed progress,
@@ -5780,6 +5854,7 @@ fn drill_subagent_answer(agent_id: &str) -> Value {
 /// stays `state='pending'` even after the instance lifecycle settles exited.
 async fn append_interaction_requested(
     ws: &mut NodeWs,
+    frame_queue: &mut std::collections::VecDeque<String>,
     instance_id: &str,
     n: u64,
     card: &Value,
@@ -5800,7 +5875,10 @@ async fn append_interaction_requested(
         .into(),
     ))
     .await?;
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    // Match the ack by id through the shared frame queue: an unconditional
+    // ws.next() could swallow a concurrent interaction.list RPC the Hub fans
+    // out over this socket.
+    wait_frame_ack(ws, frame_queue, &format!("j{seq}")).await?;
     Ok(seq)
 }
 

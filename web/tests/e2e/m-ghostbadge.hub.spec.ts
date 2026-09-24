@@ -2,17 +2,19 @@ import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
- * c-ghostbadge: the phone-nav inbox badge must count exactly the rows the
- * inbox shows as 待你处理.
+ * c-ghostbadge round 2: the badge must count exactly the rows the inbox shows
+ * as 待你处理 — including across a REAL instance death and a deadline crossing
+ * with no page reload.
  *
- * The fake node's `ghostbadge-expired` sentinel reproduces the demo ghost:
- * while blocked on a hook approval the agent dies hard — the Node journals
- * `interaction.requested` (the Hub's durable row, known deadline already in
- * the past) but never journals answered/expired/invalidated, and the
- * instance settles exited. The Hub keeps `interactions.state='pending'`
- * forever (crates/remuda-hub/src/store.rs `reconcile_reported_instances`
- * settles instances only), so before the web fix the raw
- * `state === "pending"` badge showed 1 while /m/inbox said 待你处理 (0).
+ * The fake node `ghostbadge-live` sentinel creates a genuinely live hook
+ * approval (durable interaction.requested journal + live broker) carrying a
+ * short known deadline: badge 1 / inbox 1. Then `GHOSTNODE_RESTART` via
+ * instance.send drops the socket and reconnects under a new epoch that omits
+ * the instance, so the Hub's reconcile_reported_instances settles it exited
+ * and the new process serves no interaction.list for it. The durable row is
+ * still state='pending' until the deadline crosses; the shared deadline
+ * clock then flips the projection to expired in place — badge 0 / 待你处理
+ * (0), observed on the already-mounted /m and /m/inbox pages (no reload).
  */
 test.describe.configure({ mode: "serial" });
 
@@ -48,42 +50,45 @@ type RawInteraction = {
   deadline?: { state?: string; value?: string };
 };
 
-/**
- * Wait until the Hub durably shows the ghost for this instance: the
- * interaction is still state='pending' with a KNOWN deadline already in the
- * past, while the owning instance has settled exited. Asserting this first
- * proves the rest of the test is exercising the ghost, not an empty queue.
- */
-async function waitForGhostInteraction(page: Page, instanceId: string): Promise<string> {
-  const deadline = Date.now() + 20_000;
-  for (;;) {
-    const body = await page.evaluate(async () => {
-      const res = await fetch("/v1/interactions", { credentials: "include" });
-      return (await res.json()) as { items?: RawInteraction[] };
-    });
+async function pendingInteractionId(page: Page, instanceId: string): Promise<string> {
+  const id = await page.evaluate(async (iid) => {
+    const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
     const found = (body.items ?? []).find(
-      (item) => item.instanceId === instanceId && item.state === "pending",
+      (item: RawInteraction) => item.instanceId === iid && item.state === "pending",
     );
-    if (found) {
-      const deadlineValue = Date.parse(found.deadline?.value ?? "");
-      if (
-        found.deadline?.state === "known" &&
-        Number.isFinite(deadlineValue) &&
-        deadlineValue < Date.now()
-      ) {
-        return found.interactionId ?? found.id!;
-      }
-    }
-    if (Date.now() > deadline) {
-      throw new Error(
-        `ghost interaction (pending + elapsed known deadline) never appeared for ${instanceId}`,
-      );
-    }
-    await page.waitForTimeout(500);
-  }
+    return found?.interactionId ?? found?.id ?? null;
+  }, instanceId);
+  expect(id, "the ghost session raises a pending approval").toBeTruthy();
+  return id as string;
 }
 
-test.describe("390px ghost badge: badge and 待你处理 agree", () => {
+async function postCommand(page: Page, id: string, prompt: string): Promise<void> {
+  const result = await page.evaluate(
+    async ({ id, prompt }) => {
+      const res = await fetch(`/v1/instances/${id}/commands`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operation: "instance.send", payload: { prompt } }),
+      });
+      return { status: res.status, body: await res.text() };
+    },
+    { id, prompt },
+  );
+  expect(result.status, `instance.send: ${result.body}`).toBe(200);
+}
+
+async function instanceLifecycle(page: Page, instanceId: string): Promise<string | null> {
+  return page.evaluate(async (iid) => {
+    const res = await fetch("/v1/instances", { credentials: "include" });
+    const body = (await res.json()) as {
+      items?: { instanceId?: string; lifecycle?: string }[];
+    };
+    return body.items?.find((item) => item.instanceId === iid)?.lifecycle ?? null;
+  }, instanceId);
+}
+
+test.describe("390px ghost badge across a real node restart and deadline", () => {
   test.use({
     viewport: { width: 390, height: 844 },
     hasTouch: true,
@@ -95,52 +100,61 @@ test.describe("390px ghost badge: badge and 待你处理 agree", () => {
   });
 
   test.afterEach(async ({ page }) => {
-    // Instance removal purges the Hub's interactions rows too (http.rs
-    // delete_instance), so the ghost cannot leak into later serial specs.
     for (const id of created.splice(0)) {
       await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
     }
   });
 
-  test("a pending card whose instance died and deadline elapsed counts in neither badge nor inbox", async ({
+  test("live card is 1/1; node restart settles the instance exited; deadline crossing flips to 0/0 in place", async ({
     page,
   }) => {
-    const instanceId = await createSession(page, "ghostbadge-expired sentinel");
-    const interactionId = await waitForGhostInteraction(page, instanceId);
+    const instanceId = await createSession(page, "ghostbadge-live sentinel");
+    const interactionId = await pendingInteractionId(page, instanceId);
 
-    // The owning instance is exited: the interaction is the ghost the brief
-    // describes (durable pending, process gone).
-    await expect
-      .poll(
-        async () => {
-          const body = await page.evaluate(async () => {
-            const res = await fetch("/v1/instances", { credentials: "include" });
-            return (await res.json()) as {
-              items?: { instanceId?: string; lifecycle?: string }[];
-            };
-          });
-          return (
-            body.items?.find((item) => item.instanceId === instanceId)?.lifecycle ?? null
-          );
-        },
-        { timeout: 20_000 },
-      )
-      .toBe("exited");
-
-    // Phone home: the badge renders nothing — it must not count the raw
-    // state='pending' ghost. Before the fix the badge read "1".
+    // --- While the agent is blocked, badge and inbox both count the card. ---
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
-    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0, { timeout: 15_000 });
-    await expect(page.getByTestId("phone-nav-inbox")).not.toHaveAttribute(
-      "aria-label",
-      /\(1\)$/,
-    );
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
 
-    // The compact inbox: 待你处理 (0) and no row for the ghost.
     await page.goto("/m/inbox");
     await expect(page.getByTestId("m-inbox")).toBeVisible();
-    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)");
+    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
+    await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toBeVisible();
+
+    // --- End the instance for real: a new-epoch node hello that omits it. ---
+    await postCommand(page, instanceId, "GHOSTNODE_RESTART");
+    await expect
+      .poll(() => instanceLifecycle(page, instanceId), { timeout: 20_000 })
+      .toBe("exited");
+
+    // The durable interaction row survives the restart still pending (the
+    // Hub only settles the instance today; the card's own deadline retires
+    // it). This pins the scenario as a genuine ghost-in-waiting.
+    const stillPending = await page.evaluate(async (iid) => {
+      const body = await (await fetch("/v1/interactions", { credentials: "include" })).json();
+      const found = (body.items ?? []).find(
+        (item: RawInteraction) => item.interactionId === iid || item.id === iid,
+      );
+      return found?.state === "pending"
+        ? (found.deadline?.state === "known" ? "pending-known-deadline" : "pending")
+        : found?.state ?? "missing";
+    }, interactionId);
+    expect(stillPending).toBe("pending-known-deadline");
+
+    // --- With NO reload: the card is still pending (deadline open); watch
+    // the mounted inbox tier flip 1 -> 0 when the known deadline crosses —
+    // the shared clock drives it, with no store emission or navigation. ---
+    await page.goto("/m/inbox");
+    await expect(page.getByTestId("m-inbox")).toBeVisible();
+    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
+    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
+      timeout: 70_000,
+    });
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
+
+    // The phone badge flipped together with the rows, on the same clock.
+    await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
   });
 });

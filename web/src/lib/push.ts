@@ -2,6 +2,10 @@ import { deletePushSubscription, fetchPushConfig, postPushSubscription } from ".
 import { isIosDevice, isStandalone } from "./pwa";
 import { readDeviceSettings } from "../features/settings";
 import { deriveInboxQueue } from "../features/mobile/inboxRows";
+import {
+  subscribeInboxClock,
+  syncInboxDeadlineClock,
+} from "../features/mobile/inboxClock";
 import { thisDeviceId } from "./interactionStatus";
 import { hubStore } from "./store";
 import { resolvePushDeepLink } from "./pushLink";
@@ -140,7 +144,11 @@ let lastBadgeCount: number | null = null;
  */
 export function startAppBadgeSync(): () => void {
   if (!badgeUnsubscribe) {
+    // Recompute on every store emission AND when a known deadline crosses
+    // with no emission (c-ghostbadge round 2): (re)arm the shared clock from
+    // each page so the OS badge flips together with the in-app badge.
     const apply = () => {
+      syncInboxDeadlineClock(hubStore.getSnapshot().interactions);
       const count = pendingInteractionCount();
       if (count !== lastBadgeCount) {
         lastBadgeCount = count;
@@ -148,7 +156,12 @@ export function startAppBadgeSync(): () => void {
       }
     };
     apply();
-    badgeUnsubscribe = hubStore.subscribe(apply);
+    const offStore = hubStore.subscribe(apply);
+    const offClock = subscribeInboxClock(apply);
+    badgeUnsubscribe = () => {
+      offStore();
+      offClock();
+    };
   }
   return stopAppBadgeSync;
 }

@@ -361,6 +361,55 @@ test("a row above the viewport that grows does not move the text being read", as
   expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
 });
 
+test("after a jump past the mounted window, a row that grows above does not move the text", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page);
+  await createSession(page);
+  // Tall rows, each measured as it arrives at the followed bottom.
+  for (let i = 0; i < 14; i += 1) {
+    await send(page, `跳转 ${i}\n\n${"一段用来撑高的正文。".repeat(160)}`);
+    await expect(page.getByTestId("message").filter({ hasText: `echo: 跳转 ${i}` })).toHaveCount(1, {
+      timeout: 20_000,
+    });
+  }
+  const scroller = page.getByTestId("transcript-scroller");
+  // One assignment several viewports up: the scroll event samples while the
+  // old window is still mounted, so no mounted row is in view yet.
+  const jump = await scroller.evaluate((el) => {
+    const from = el.scrollTop;
+    const mounted = [...el.querySelectorAll<HTMLElement>("[data-anchor]")].map((row) => row.dataset.anchor);
+    el.scrollTop = 1200;
+    return { from, to: el.scrollTop, mounted };
+  });
+  expect(jump.from - jump.to, "the jump spans several viewports").toBeGreaterThan(900 * 4);
+  // Let the window commit the new range, and nothing else scroll.
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  const firstVisible = () =>
+    scroller.evaluate((el) => {
+      const top = el.getBoundingClientRect().top;
+      const rows = [...el.querySelectorAll<HTMLElement>("[data-anchor]")];
+      const index = rows.findIndex((row) => row.getBoundingClientRect().bottom > top);
+      return {
+        id: rows[index]?.dataset.anchor ?? "",
+        top: rows[index] ? rows[index].getBoundingClientRect().top - top : 0,
+        above: index > 0 ? (rows[index - 1].dataset.anchor ?? "") : "",
+      };
+    });
+  const before = await firstVisible();
+  expect(jump.mounted, "the jump lands beyond the mounted window").not.toContain(before.id);
+  expect(before.above, "a mounted row sits above the viewport").not.toBe("");
+  await scroller.evaluate((el, id) => {
+    const row = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(id)}"]`)!;
+    const grow = document.createElement("div");
+    grow.style.height = "200px";
+    row.firstElementChild!.appendChild(grow);
+  }, before.above);
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  const after = await firstVisible();
+  expect(after.id).toBe(before.id);
+  expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+});
+
 test("the reading column holds 720 / 504 / 358 and folds settled tools on desktop", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await login(page);

@@ -442,16 +442,19 @@ function TranscriptInner({
   // by the same delta unless the reader follows the bottom. A scrollTop that
   // moved since sampling is a programmatic jump, not growth: re-sample.
   // Native scroll anchoring is off on the scroller so this is the one
-  // mechanism on every engine.
+  // mechanism on every engine. Only a row that intersects the viewport can
+  // anchor: a jump samples while the old window is still mounted, and its
+  // rows all sit outside the view.
   const readingAnchorRef = useRef<{ id: string; offset: number; top: number } | null>(null);
   const sampleReadingAnchor = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
     const top = el.getBoundingClientRect().top;
+    const bottom = top + el.clientHeight;
     readingAnchorRef.current = null;
     for (const row of el.querySelectorAll<HTMLElement>("[data-anchor]")) {
       const box = row.getBoundingClientRect();
-      if (box.bottom > top) {
+      if (box.bottom > top && box.top < bottom) {
         readingAnchorRef.current = { id: row.dataset.anchor ?? "", offset: box.top - top, top: el.scrollTop };
         return;
       }
@@ -460,13 +463,14 @@ function TranscriptInner({
   const holdReadingAnchor = useCallback(() => {
     const el = scrollerRef.current;
     const held = readingAnchorRef.current;
-    if (!el || !held || pinRef.current || pendingScroll.current || prependAnchorRef.current) return;
-    if (Math.abs(el.scrollTop - held.top) >= 1) {
+    if (!el || pinRef.current || pendingScroll.current || prependAnchorRef.current) return;
+    // No anchor, or one the window has since unmounted: take a new one from
+    // the rows now in view. Growth that already landed is not undone.
+    const row = held ? el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.id)}"]`) : null;
+    if (!held || !row || Math.abs(el.scrollTop - held.top) >= 1) {
       sampleReadingAnchor();
       return;
     }
-    const row = el.querySelector<HTMLElement>(`[data-anchor="${CSS.escape(held.id)}"]`);
-    if (!row) return;
     const delta = row.getBoundingClientRect().top - el.getBoundingClientRect().top - held.offset;
     if (Math.abs(delta) < 1) return;
     el.scrollTop += delta;
@@ -635,10 +639,11 @@ function TranscriptInner({
   }, [sizes, nodes, estimate, applyOffset]);
 
   // A commit that moves rows above the anchor (padTop re-estimated, a row
-  // inserted above) holds the reader the same way a measured growth does.
+  // inserted above) holds the reader the same way a measured growth does. A
+  // range commit after a jump re-acquires the anchor from the rows it mounted.
   useLayoutEffect(() => {
     holdReadingAnchor();
-  }, [sizes, nodes, estimate, holdReadingAnchor]);
+  }, [sizes, nodes, estimate, range.start, range.end, holdReadingAnchor]);
 
   useLayoutEffect(() => {
     const el = scrollerRef.current;

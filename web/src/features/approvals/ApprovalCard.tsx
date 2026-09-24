@@ -298,7 +298,10 @@ export const DecisionCard = memo(function DecisionCard({
           <button
             type="button"
             className={css.submitting}
-            data-testid="approval-submitting"
+            // ui-spec §2.5 names the compact state m-inbox-submitting; the
+            // desktop centre uses the approval- prefixed id. Both are the same
+            // disabled, single control — a second answer cannot be POSTed.
+            data-testid={compact ? "m-inbox-submitting" : "approval-submitting"}
             disabled
           >
             <span className={css.spin} aria-hidden />

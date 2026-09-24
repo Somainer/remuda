@@ -581,6 +581,12 @@
   .qOptRow {
     min-height: var(--touch);
   }
+
+  /* Question tabs are text controls: their whole 44px is visible on coarse
+     pointers (no glyph-only ::after trick), so every tab is a full target. */
+  .qTab {
+    min-height: var(--touch);
+  }
 }
 
 /* Layout helpers composed from pre-existing modules (single css binding). */

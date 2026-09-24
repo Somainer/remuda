@@ -228,6 +228,50 @@ test.describe("390px phone inbox", () => {
     await expect(page.getByTestId("approval-row")).toHaveCount(2);
   });
 
+  test("kind radiogroup is fully 44px tappable at the coarse band edges", async ({ page }) => {
+    // UO-9 round-2: the shared segItem is 26px VISIBLE and its 44px reach is
+    // the ::after band 9px above/below it. Inside an overflow-x scrollport
+    // that band must stay hittable (kept inside the track's block padding,
+    // not an outer margin the scrollport clips). Tap 2px inside the top and
+    // bottom of the 44px band — both points are OUTSIDE the 26px item.
+    await page.goto("/m/inbox");
+    await expect(page.getByTestId("m-inbox")).toBeVisible();
+    const group = page.getByRole("radiogroup", { name: "交互类型" });
+    await expect(group).toBeVisible();
+    const band = await group.boundingBox();
+    expect(band, "kind track rendered").toBeTruthy();
+    expect(band!.height).toBeGreaterThanOrEqual(43);
+
+    const testIdAt = async (x: number, y: number): Promise<string | null> =>
+      page.evaluate(
+        ({ x, y }) => {
+          const el = document.elementFromPoint(x, y) as HTMLElement | null;
+          return el ? (el.dataset.testid ?? el.tagName) : null;
+        },
+        { x, y },
+      );
+
+    const approval = page.getByTestId("inbox-kind-approval");
+    const ab = await approval.boundingBox();
+    expect(ab).toBeTruthy();
+    const cx = ab!.x + ab!.width / 2;
+    const topY = band!.y + 1 + 2; // 2px inside the band top (above the item)
+    const bottomY = band!.y + band!.height - 1 - 2; // 2px inside the band bottom
+    // The ::after reach, not the 26px glyph box, owns these points.
+    expect(await testIdAt(cx, topY)).toBe("inbox-kind-approval");
+    expect(await testIdAt(cx, bottomY)).toBe("inbox-kind-approval");
+
+    // Functional: a tap on the upper edge selects 审批; on the lower edge of
+    // 全部 it clears again.
+    await page.mouse.click(cx, topY);
+    await expect(page).toHaveURL(/kind=approval$/);
+    const all = page.getByTestId("inbox-kind-all");
+    const allBox = await all.boundingBox();
+    expect(allBox).toBeTruthy();
+    await page.mouse.click(allBox!.x + allBox!.width / 2, bottomY);
+    await expect(page).toHaveURL(/\/m\/inbox$/);
+  });
+
   test("evidence: inbox banner and both tiers at 390px", async ({ page }) => {
     test.skip(!evidence, "set REMUDA_EVIDENCE=1 to capture the committed screenshot");
     await page.emulateMedia({ reducedMotion: "reduce" });

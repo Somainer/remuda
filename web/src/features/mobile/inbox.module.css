@@ -50,6 +50,7 @@
    (26px tall, reaching 44px on coarse pointers). */
 .seg {
   display: flex;
+  align-items: center;
   gap: 2px;
   padding: 2px;
   border: 1px solid var(--border);
@@ -233,9 +234,13 @@
 }
 
 @media (pointer: coarse) {
-  /* Reserve the 44px vertical reach the shared segItem ::after claims. */
+  /* Grow the 44px reach INSIDE the scrollport rather than reserving it with
+     an outer margin: overflow-x:auto makes overflow-y clip, so the shared
+     segItem ::after (9px past the 26px item) must land within this track.
+     (44 - 26) / 2 = 9px of block padding makes the content box exactly 44px
+     tall and the ::after band flush to its edges, never clipped. */
   .seg {
-    margin-block: calc((var(--touch) - 32px) / 2);
+    padding-block: calc((var(--touch) - var(--seg-item)) / 2);
   }
 
   .bannerAction,

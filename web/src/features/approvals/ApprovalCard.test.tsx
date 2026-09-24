@@ -217,13 +217,21 @@ describe("DecisionCard unified across desktop and compact", () => {
   });
 
   it("disables the controls and shows 已提交 · 等待确认 while answering", () => {
-    renderCard(viewFor(cnItem(), { uiState: "answering" }));
-    const submitting = screen.getByTestId("approval-submitting");
-    expect(submitting).toBeDisabled();
-    expect(submitting).toHaveTextContent("已提交 · 等待确认");
+    const desktop = renderCard(viewFor(cnItem(), { uiState: "answering" }), "desktop");
+    const desktopSubmitting = desktop.getByTestId("approval-submitting");
+    expect(desktopSubmitting).toBeDisabled();
+    expect(desktopSubmitting).toHaveTextContent("已提交 · 等待确认");
     // The option buttons unmount, so no second answer can be POSTed.
-    expect(screen.queryByRole("button", { name: "允许一次" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "拒绝" })).toBeNull();
+    expect(desktop.queryByRole("button", { name: "允许一次" })).toBeNull();
+    expect(desktop.queryByRole("button", { name: "拒绝" })).toBeNull();
+    desktop.unmount();
+
+    // ui-spec §2.5 names the compact control m-inbox-submitting.
+    const compact = renderCard(viewFor(cnItem(), { uiState: "answering" }), "compact");
+    const compactSubmitting = compact.getByTestId("m-inbox-submitting");
+    expect(compactSubmitting).toBeDisabled();
+    expect(compactSubmitting).toHaveTextContent("已提交 · 等待确认");
+    expect(compact.queryByTestId("approval-submitting")).toBeNull();
   });
 
   it("disables every option and names the pause when the host is offline", () => {

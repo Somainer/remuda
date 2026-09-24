@@ -160,11 +160,12 @@ function compactView(
 /* Desktop-only slim 已离队 row (third tier, no actions).              */
 /* ------------------------------------------------------------------ */
 
-const DepartedRow = memo(function DepartedRow({
-  view,
-}: {
-  view: DecisionView & { stateText: string; previewText: string; title: string };
-}) {
+export const DepartedRow = memo(
+  function DepartedRow({
+    view,
+  }: {
+    view: DecisionView & { stateText: string; previewText: string; title: string };
+  }) {
   return (
     <article
       className={desktopCss.departedRow}
@@ -185,7 +186,21 @@ const DepartedRow = memo(function DepartedRow({
       <div className={desktopCss.departedState}>{view.stateText}</div>
     </article>
   );
-});
+}, areDepartedEqual);
+
+/**
+ * The parent builds a fresh `view` object every 2 s poll. Bail out when its
+ * sig is unchanged. The sig (approvalRows.rowSignature) already covers every
+ * field this row renders — createdAt (time), host label/state, workspace
+ * label, instance kind, uiState (stateText) and the request title/preview —
+ * so an equal sig means an identical DOM and the row skips the commit.
+ */
+function areDepartedEqual(
+  prev: { view: { sig: string } },
+  next: { view: { sig: string } },
+): boolean {
+  return prev.view.sig === next.view.sig;
+}
 
 /* ------------------------------------------------------------------ */
 /* Compact-only recent-instance row (进行中 · 最近).                   */

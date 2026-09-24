@@ -213,10 +213,12 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBe(
       crossHostProject.id,
     );
-    // Both the top-bar and the page-header switcher name the open project.
-    const switchers = page.getByTestId("project-switcher");
-    expect(await switchers.count()).toBeGreaterThanOrEqual(1);
-    for (const select of await switchers.all()) {
+    // The sidebar project rows (UO-2a, formerly the top-bar switcher) and any
+    // page-header switcher name the open project.
+    await expect(
+      page.getByTestId("sidebar-project-row").and(page.locator(`[data-project-id="${crossHostProject.id}"]`)),
+    ).toHaveAttribute("aria-pressed", "true");
+    for (const select of await page.getByTestId("project-switcher").all()) {
       await expect(select).toHaveValue(crossHostProject.id);
     }
   });
@@ -239,10 +241,37 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
       expect.arrayContaining([crossTask.id, otherTask.id]),
     );
 
-    // Select the single-host project in the TOP-BAR switcher (the page-header
-    // one would navigate; the top bar only sets the global scope).
-    const topSwitcher = page.locator("main").getByTestId("project-switcher").first();
-    await topSwitcher.selectOption(otherProject.id);
+    // Select the single-host project in the sidebar (UO-2a: the project rows
+    // replace the top-bar switcher; a row sets the global scope and opens the
+    // board).
+    const projectRow = (id: string) =>
+      page.getByTestId("sidebar-project-row").and(page.locator(`[data-project-id="${id}"]`));
+    const boardRead = (id: string | null, target: Page = page) =>
+      target.waitForRequest((request) => new URL(request.url()).pathname === "/v1/board" && new URL(request.url()).searchParams.get("project") === id);
+    // ui-spec §1.1: the row lands on /board?project={id}, so history and a
+    // copied link keep the project.
+    await projectRow(crossHostProject.id).click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
+    await projectRow(otherProject.id).click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+    const backRead = boardRead(crossHostProject.id);
+    await page.goBack();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
+    await backRead;
+    await page.goForward();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+
+    // A copied link opens the same scope in a browser with no stored filter.
+    const copied = await page.context().browser()!.newPage();
+    try {
+      await login(copied);
+      expect(await copied.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
+      const copiedRead = boardRead(otherProject.id, copied);
+      await copied.goto(page.url());
+      await copiedRead;
+    } finally {
+      await copied.close();
+    }
 
     // The selection is the device-local filter surfaces read.
     expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBe(
@@ -270,18 +299,55 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     expect(scopedBoardIds).not.toContain(crossTask.id);
 
     // The projects surface itself honours the scope: only that project row.
+    await page.getByTestId("sidebar-projects-link").click();
     await expect(page.getByTestId("project-row")).toHaveCount(1);
     await expect(page.getByTestId("project-row")).toContainText(otherProject.name);
 
     // Back to global: filter cleared and both projects show again.
-    await topSwitcher.selectOption("");
-    expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
+    await projectRow("").click();
+    await expect(page).toHaveURL(/\/board$/);
+    await expect.poll(() => page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
+    await page.getByTestId("sidebar-projects-link").click();
     await expect(page.getByTestId("project-row")).toHaveCount(2);
     const backToGlobal = await apiJson<BoardResponse>(page, "GET", "/v1/board");
     expect(backToGlobal.project).toBeNull();
     expect(boardTaskIds(backToGlobal)).toEqual(
       expect.arrayContaining([crossTask.id, otherTask.id]),
     );
+
+    // The URL is the only scope: 全局 → A → back lands on the bare /board and
+    // both the board read and the sidebar go back to 全局; forward is A again.
+    await projectRow("").click();
+    await expect(page).toHaveURL(/\/board$/);
+    await projectRow(crossHostProject.id).click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
+    const globalRead = boardRead(null);
+    await page.goBack();
+    await expect(page).toHaveURL(/\/board$/);
+    await globalRead;
+    await expect(projectRow("")).toHaveAttribute("aria-pressed", "true");
+    await expect(projectRow(crossHostProject.id)).toHaveAttribute("aria-pressed", "false");
+    await expect.poll(() => page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
+    const forwardRead = boardRead(crossHostProject.id);
+    await page.goForward();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
+    await forwardRead;
+    await expect(projectRow(crossHostProject.id)).toHaveAttribute("aria-pressed", "true");
+
+    // D-053: 任务看板 in the main nav carries the selected scope into the URL.
+    const mainNav = page.getByRole("navigation", { name: "主导航" });
+    const boardLink = mainNav.getByRole("link", { name: "任务看板" });
+    await projectRow(otherProject.id).click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+    await mainNav.getByRole("link", { name: "会话" }).click();
+    await expect(page).toHaveURL(/\/sessions$/);
+    const navRead = boardRead(otherProject.id);
+    await boardLink.click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+    await navRead;
+    await expect(projectRow(otherProject.id)).toHaveAttribute("aria-pressed", "true");
+    await projectRow("").click();
+    await expect(boardLink).toHaveAttribute("href", "/board");
   });
 
   test("the bot channel defaultProject reference stays a valid display reference", async ({ page }) => {

@@ -1,8 +1,11 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { INFO_DEBOUNCE_MS, notify, notifyStore, type NotifyInput } from "../lib/notify";
-import { ShellNotify } from "./Shell";
+import { projectFilterStore } from "../features/tasks/ProjectSwitcher";
+import { BoardScopeSync, ShellNotify, Sidebar, shellChrome } from "./Shell";
+import { PhoneNav } from "./PhoneNav";
 
 afterEach(() => {
   notifyStore.reset();
@@ -190,5 +193,177 @@ describe("ShellNotify — blocking errors persist", () => {
     const errors = screen.getAllByTestId("blocking-error");
     expect(errors).toHaveLength(2);
     expect(screen.getByText("重试后仍失败")).toBeInTheDocument();
+  });
+});
+
+function renderSidebar(path = "/sessions", props: Partial<Parameters<typeof Sidebar>[0]> = {}) {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[]} quickFindOwned={false} {...props} />
+    </MemoryRouter>,
+  );
+}
+
+function Where() {
+  const location = useLocation();
+  return <output data-testid="where">{location.pathname + location.search}</output>;
+}
+
+describe("Sidebar (UO-2a)", () => {
+  it("main nav leads with 会话, then 收件箱 and 任务看板", () => {
+    renderSidebar();
+    const links = within(screen.getByRole("navigation", { name: "主导航" })).getAllByRole("link");
+    expect(links.map((link) => link.textContent)).toEqual(["会话", "收件箱", "任务看板"]);
+    expect(links[0]).toHaveAttribute("href", "/sessions");
+  });
+
+  it("keeps 会话 current on a session page", () => {
+    renderSidebar("/s/abc");
+    expect(screen.getByRole("link", { name: "会话" })).toHaveAttribute("aria-current", "page");
+  });
+
+  it("reaches /fleet from the 管理 menu", async () => {
+    renderSidebar("/board");
+    await userEvent.click(screen.getByRole("button", { name: "管理" }));
+    const menu = screen.getByRole("menu", { name: "管理" });
+    expect(within(menu).getByRole("menuitem", { name: "集群" })).toHaveAttribute("href", "/fleet");
+    expect(within(menu).getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["主机", "集群", "Provider", "Bot", "设置"]);
+  });
+
+  it("lists 全局 then each project as sidebar-project-row", () => {
+    renderSidebar("/board", { projects: [{ id: "p1", name: "web-app" }] });
+    const rows = screen.getAllByTestId("sidebar-project-row");
+    expect(rows.map((row) => row.textContent)).toEqual(["全局", "web-app"]);
+    expect(rows[0]).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("puts the project in the board URL; 全局 is the bare /board", async () => {
+    render(
+      <MemoryRouter initialEntries={["/sessions"]}>
+        <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[{ id: "p 1", name: "web-app" }]} quickFindOwned={false} />
+        <Where />
+      </MemoryRouter>,
+    );
+    try {
+      await userEvent.click(screen.getByRole("button", { name: "web-app" }));
+      expect(screen.getByTestId("where")).toHaveTextContent("/board?project=p%201");
+      await userEvent.click(screen.getByRole("button", { name: "全局" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board");
+    } finally {
+      projectFilterStore.clear();
+    }
+  });
+
+  it("follows the /board URL through back and forward: 全局 → A → back → 全局 → forward → A", async () => {
+    function History() {
+      const navigate = useNavigate();
+      return (
+        <>
+          <button type="button" onClick={() => navigate(-1)}>back</button>
+          <button type="button" onClick={() => navigate(1)}>forward</button>
+        </>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/sessions"]}>
+        <BoardScopeSync />
+        <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[{ id: "pa", name: "A" }]} quickFindOwned={false} />
+        <History />
+        <Where />
+      </MemoryRouter>,
+    );
+    const pressed = () => screen.getAllByTestId("sidebar-project-row").find((row) => row.getAttribute("aria-pressed") === "true")?.textContent;
+    try {
+      await userEvent.click(screen.getByRole("button", { name: "全局" }));
+      await userEvent.click(screen.getByRole("button", { name: "A" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board?project=pa");
+      expect(pressed()).toBe("A");
+      expect(projectFilterStore.getSnapshot()).toBe("pa");
+
+      await userEvent.click(screen.getByRole("button", { name: "back" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board");
+      expect(pressed()).toBe("全局");
+      expect(projectFilterStore.getSnapshot()).toBeNull();
+
+      await userEvent.click(screen.getByRole("button", { name: "forward" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board?project=pa");
+      expect(pressed()).toBe("A");
+      expect(projectFilterStore.getSnapshot()).toBe("pa");
+    } finally {
+      projectFilterStore.clear();
+    }
+  });
+
+  it("任务看板 carries the selected project; under 全局 it is the bare /board", async () => {
+    render(
+      <MemoryRouter initialEntries={["/sessions"]}>
+        <BoardScopeSync />
+        <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[{ id: "pa", name: "A" }]} quickFindOwned={false} />
+        <Where />
+      </MemoryRouter>,
+    );
+    const board = () => screen.getByRole("link", { name: "任务看板" });
+    try {
+      expect(board()).toHaveAttribute("href", "/board");
+      await userEvent.click(screen.getByRole("button", { name: "A" }));
+      await userEvent.click(screen.getByRole("link", { name: "会话" }));
+      expect(screen.getByTestId("where").textContent).toBe("/sessions");
+      expect(board()).toHaveAttribute("href", "/board?project=pa");
+      await userEvent.click(board());
+      expect(screen.getByTestId("where").textContent).toBe("/board?project=pa");
+
+      await userEvent.click(screen.getByRole("button", { name: "全局" }));
+      expect(board()).toHaveAttribute("href", "/board");
+    } finally {
+      projectFilterStore.clear();
+    }
+  });
+
+  it("keeps only the one 新建 title, and labels survive folding", () => {
+    renderSidebar("/hosts", { collapsed: true });
+    expect(screen.getAllByTitle("新建", { exact: true })).toHaveLength(1);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByTestId("sidebar-toggle")).toHaveAccessibleName("展开侧栏");
+    expect(screen.getByRole("link", { name: "收件箱" })).toBeInTheDocument();
+  });
+
+  it("leaves quickfind-trigger to the /sessions panel when it owns QuickFind", () => {
+    const { unmount } = renderSidebar("/board");
+    expect(screen.getAllByTestId("quickfind-trigger")).toHaveLength(1);
+    unmount();
+    renderSidebar("/sessions", { quickFindOwned: true });
+    expect(screen.queryByTestId("quickfind-trigger")).toBeNull();
+  });
+});
+
+describe("shellChrome (UO-2a)", () => {
+  it("renders the tab strip on /s/* only", () => {
+    expect(shellChrome("/s/abc", false).tabs).toBe(true);
+    expect(shellChrome("/sessions", false).tabs).toBe(false);
+    expect(shellChrome("/sessions/new", false).tabs).toBe(false);
+    expect(shellChrome("/board", false).tabs).toBe(false);
+  });
+
+  it("never renders the phone home bar on /s/*", () => {
+    expect(shellChrome("/s/abc", true).phoneNav).toBe(false);
+    expect(shellChrome("/s/abc/structured", true).phoneNav).toBe(false);
+    expect(shellChrome("/settings", true).phoneNav).toBe(true);
+    expect(shellChrome("/settings", false).phoneNav).toBe(false);
+  });
+});
+
+describe("PhoneNav (UO-2a)", () => {
+  it("keeps the four phone-nav entries and the inbox badge", () => {
+    render(
+      <MemoryRouter initialEntries={["/settings"]}>
+        <PhoneNav pending={3} newHref="/sessions/new" />
+      </MemoryRouter>,
+    );
+    const bar = screen.getByRole("navigation", { name: "手机底栏" });
+    expect(within(bar).getByTestId("phone-nav-home")).toHaveTextContent("会话");
+    expect(within(bar).getByTestId("phone-nav-inbox")).toHaveAccessibleName("收件箱(3)");
+    expect(within(bar).getByTestId("phone-inbox-badge")).toHaveTextContent("3");
+    expect(within(bar).getByTestId("phone-nav-new")).toHaveAccessibleName("新建");
+    expect(within(bar).getByTestId("phone-nav-more")).toHaveAttribute("data-active", "1");
   });
 });

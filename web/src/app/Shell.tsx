@@ -1,29 +1,67 @@
-import { useEffect, useLayoutEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
-import { isSessionRoute, MORE_NAV } from "../lib/nav";
+import {
+  Boxes,
+  Bot,
+  Ellipsis,
+  Folder,
+  Globe,
+  Inbox,
+  MessagesSquare,
+  Network,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Plug,
+  Search,
+  Server,
+  Settings,
+  SquareKanban,
+  SquarePen,
+  type LucideIcon,
+} from "lucide-react";
+import { ADMIN_NAV, PRIMARY_NAV, isSessionRoute, isUnder } from "../lib/nav";
 import { hubStore, useHub } from "../lib/store";
 import { formatDiagnostic, notify, notifyStore, toastAdapter, useLiveAnnouncement, useNotifications, type Notification, type NotifyInput } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
-import { isTypingTarget } from "../lib/keyboardScope";
-import { switchSlots } from "../lib/sessionSlots";
-import { SpacesPanel } from "../features/spaces/SpacesPanel";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
 import { spaceStore } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
-import { ProjectSwitcher, useProjects } from "../features/tasks/ProjectSwitcher";
+import { QuickFind, QUICKFIND_HINT, openQuickFind } from "../features/search/QuickFind";
+import { projectFilterStore, useProjectFilter, useProjects, type Project } from "../features/tasks/ProjectSwitcher";
 import { SessionsPage } from "../pages/SessionsPage";
+import { Icon } from "../components/Icon";
 import { InstallBar } from "./InstallBar";
+import { PhoneNav } from "./PhoneNav";
+import { useWorkbenchKeys } from "./useWorkbenchKeys";
 import { AnnotationProvider } from "../features/tasks/AnnotationPanel";
 import { AnnotationCapture } from "../features/session/AnnotationCapture";
+import { CommitProbe } from "../components/CommitProbe";
+import ui from "../styles/ui.module.css";
 import css from "./Shell.module.css";
 import notifyCss from "./shellNotify.module.css";
 
+/** The router matches `/sessions/` as `/sessions`; route checks here must too. */
+function routePath(pathname: string): string {
+  return pathname.replace(/\/+$/, "") || "/";
+}
+
 function layoutOf(pathname: string): "sessions" | "session" | "sheet" | "page" {
-  if (pathname === "/sessions/new") return "sheet";
-  if (pathname.startsWith("/s/")) return "session";
-  if (pathname === "/sessions") return "sessions";
+  const path = routePath(pathname);
+  if (path === "/sessions/new") return "sheet";
+  if (path.startsWith("/s/")) return "session";
+  if (path === "/sessions") return "sessions";
   return "page";
+}
+
+/**
+ * Which pieces of app chrome a route gets. The tab strip is a /s/* surface
+ * (desktop); the phone home bar is for home-level screens and never renders
+ * on /s/* (D-049).
+ */
+export function shellChrome(pathname: string, mobile: boolean) {
+  const session = layoutOf(pathname) === "session";
+  return { sidebar: !mobile, tabs: !mobile && session, phoneNav: mobile && !session };
 }
 
 /** Test seam for the notification surfaces; mirrors `window.__ttyLab`. */
@@ -171,32 +209,254 @@ export function ShellNotify() {
   );
 }
 
+const NAV_ICONS: Record<(typeof PRIMARY_NAV)[number]["id"], LucideIcon> = {
+  sessions: MessagesSquare,
+  inbox: Inbox,
+  board: SquareKanban,
+};
+
+const ADMIN_ICONS: Record<(typeof ADMIN_NAV)[number]["id"], LucideIcon> = {
+  hosts: Server,
+  fleet: Network,
+  providers: Plug,
+  bots: Bot,
+  settings: Settings,
+};
+
+/**
+ * Desktop sidebar (ui-overhaul §4.1). A quiet `--bg-nav` column: brand row,
+ * the 主导航 landmark (会话 first), the project scope list, then 新建会话 and
+ * the upward 管理 menu. Folded (`prefs.collapsed`, ⌘/Ctrl+B) it keeps icons only.
+ */
+/** The project a /board URL names ("" for 全局); null off /board. */
+function boardScope({ pathname, search }: { pathname: string; search: string }): string | null {
+  if (routePath(pathname) !== "/board") return null;
+  return new URLSearchParams(search).get("project")?.trim() ?? "";
+}
+
+/**
+ * Keeps the stored project filter in step with the /board URL, which is the
+ * only source of the board scope: Board falls back to the stored filter on a
+ * bare /board, so back from ?project=A to /board must clear it to 全局.
+ */
+export function BoardScopeSync() {
+  const location = useLocation();
+  const scope = boardScope(location);
+  useEffect(() => {
+    if (scope === null) return;
+    if (scope) projectFilterStore.select(scope);
+    else projectFilterStore.clear();
+  }, [scope]);
+  return null;
+}
+
+export function Sidebar({
+  collapsed,
+  pending,
+  newHref,
+  projects,
+  quickFindOwned,
+}: {
+  collapsed: boolean;
+  pending: number;
+  newHref: string;
+  projects: readonly Pick<Project, "id" | "name">[];
+  /** The /sessions index panel carries its own `quickfind-trigger`. */
+  quickFindOwned: boolean;
+}) {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const selectedProject = useProjectFilter();
+  const [adminOpen, setAdminOpen] = useState(false);
+  const [adminPath, setAdminPath] = useState(location.pathname);
+  const adminRef = useRef<HTMLDivElement>(null);
+  if (adminPath !== location.pathname) {
+    setAdminPath(location.pathname);
+    setAdminOpen(false);
+  }
+
+  useEffect(() => {
+    if (!adminOpen) return;
+    const onPointer = (event: PointerEvent) => {
+      if (!adminRef.current?.contains(event.target as Node)) setAdminOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setAdminOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [adminOpen]);
+
+  const navActive = (id: (typeof PRIMARY_NAV)[number]["id"], to: string) =>
+    id === "sessions" ? isSessionRoute(location.pathname) : isUnder(location.pathname, to);
+  const adminActive = ADMIN_NAV.some((item) => isUnder(location.pathname, item.to));
+  // On /board the URL is the scope (BoardScopeSync); elsewhere the stored one.
+  const current = boardScope(location) ?? selectedProject;
+  const scope = current && projects.some((p) => p.id === current) ? current : "";
+
+  // ui-spec §1.1: the scope lives in the URL, so a copied link and each
+  // history entry keep their project; 全局 is the bare /board.
+  function pickProject(id: string) {
+    navigate(id ? `/board?project=${encodeURIComponent(id)}` : "/board");
+  }
+
+  return (
+    <aside className={css.sidebar} data-testid="sidebar" data-collapsed={collapsed} aria-label="侧栏">
+      <div className={css.brand}>
+        {!collapsed ? (
+          <>
+            <span className={css.brandName}>Remuda</span>
+            <button
+              type="button"
+              className={ui.iconBtn}
+              data-testid={quickFindOwned ? undefined : "quickfind-trigger"}
+              aria-label="快速查找会话"
+              aria-haspopup="dialog"
+              title={`快速查找（${QUICKFIND_HINT}）`}
+              onClick={() => openQuickFind()}
+            >
+              <Icon icon={Search} />
+            </button>
+          </>
+        ) : null}
+        <button
+          type="button"
+          className={ui.iconBtn}
+          data-testid="sidebar-toggle"
+          aria-label={collapsed ? "展开侧栏" : "折叠侧栏"}
+          aria-expanded={!collapsed}
+          title="⌘/Ctrl+B"
+          onClick={() => spaceStore.setCollapsed(!collapsed)}
+        >
+          <Icon icon={collapsed ? PanelLeftOpen : PanelLeftClose} />
+        </button>
+      </div>
+
+      <nav className={css.nav} aria-label="主导航">
+        {PRIMARY_NAV.map((item) => {
+          const active = navActive(item.id, item.to);
+          // D-053: 任务看板 carries the stored scope into the URL, the only
+          // scope /board reads (BoardScopeSync); 全局 stays the bare /board.
+          const to = item.id === "board" && selectedProject ? `/board?project=${encodeURIComponent(selectedProject)}` : item.to;
+          return (
+            <Link
+              key={item.id}
+              to={to}
+              className={css.item}
+              aria-current={active ? "page" : undefined}
+              title={collapsed ? item.label : undefined}
+            >
+              <Icon icon={NAV_ICONS[item.id]} />
+              <span className={css.label}>{item.label}</span>
+              {item.id === "inbox" && pending ? (
+                <span className={css.count} data-testid="sidebar-inbox-count">
+                  {pending}
+                </span>
+              ) : null}
+            </Link>
+          );
+        })}
+      </nav>
+
+      {!collapsed ? (
+        <section className={css.projects} aria-label="项目">
+          <div className={css.sectionHead}>
+            <span>项目</span>
+            <Link className={ui.iconBtn} to="/projects" aria-label="全部项目" title="全部项目" data-testid="sidebar-projects-link">
+              <Icon icon={Ellipsis} />
+            </Link>
+          </div>
+          <div className={css.projectRows}>
+            {[{ id: "", name: "全局" }, ...projects].map((project) => (
+              <button
+                key={project.id || "global"}
+                type="button"
+                className={css.projectRow}
+                data-testid="sidebar-project-row"
+                data-project-id={project.id}
+                aria-pressed={project.id === scope}
+                title={project.name}
+                onClick={() => pickProject(project.id)}
+              >
+                <Icon icon={project.id ? Folder : Globe} />
+                <span className={css.label}>{project.name}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : (
+        <div className={css.spacer} />
+      )}
+
+      <div className={css.foot}>
+        <Link className={css.item} to={newHref} title="新建">
+          <Icon icon={SquarePen} />
+          <span className={css.label}>新建会话</span>
+        </Link>
+        <div className={css.admin} ref={adminRef}>
+          <button
+            type="button"
+            className={css.item}
+            data-testid="sidebar-admin"
+            data-active={adminActive ? "1" : undefined}
+            aria-haspopup="menu"
+            aria-expanded={adminOpen}
+            title={collapsed ? "管理" : undefined}
+            onClick={() => setAdminOpen((v) => !v)}
+          >
+            <Icon icon={Boxes} />
+            <span className={css.label}>管理</span>
+          </button>
+          {adminOpen ? (
+            <div className={`${ui.menu} ${css.adminMenu}`} role="menu" aria-label="管理">
+              {ADMIN_NAV.map((item) => (
+                <Link
+                  key={item.id}
+                  role="menuitem"
+                  className={ui.menuItem}
+                  aria-current={isUnder(location.pathname, item.to) ? "page" : undefined}
+                  to={item.to}
+                >
+                  <Icon icon={ADMIN_ICONS[item.id]} />
+                  <span>{item.label}</span>
+                </Link>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </aside>
+  );
+}
+
 export function Shell() {
   const hub = useHub();
   const { mobile } = useWorkbenchViewport();
-  // D-050 §9: the top-bar 全局▸project switcher scopes the task list and the
-  // board (their surfaces read useProjectFilter). Loaded once per shell mount.
+  // D-050 §9: the sidebar's 项目 section scopes the task list and the board
+  // (their surfaces read useProjectFilter). Loaded once per shell mount.
   const projectDirectory = useProjects();
   const location = useLocation();
-  const navigate = useNavigate();
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
   const onSessions = isSessionRoute(location.pathname);
-  const onNew = location.pathname === "/sessions/new";
-  // D-040: on compact /s/:id* the full chips row folds into one current-space
-  // chip rendered by the session header; the strip stays on index routes.
-  const onSessionPage = layoutOf(location.pathname) === "session";
+  const layout = layoutOf(location.pathname);
+  const onNew = layout === "sheet";
+  // Tabs render on /s/* only (desktop). On compact /s/:id* the chips row
+  // folds into the session header's current-space chip (D-040 / D-049).
+  const onSessionPage = layout === "session";
+  const chrome = shellChrome(location.pathname, mobile);
   const workbench = useSpaceWorkbench();
   const activeSpaceId = workbench.active?.id;
   const activeInstanceId = workbench.instanceId;
   const knownInstance = hub.instances.some((i) => i.id === activeInstanceId);
-  const showSidebarList = !mobile && onSessions;
-  const moreActive = MORE_NAV.some((item) => location.pathname.startsWith(item.to));
-  const [moreOpen, setMoreOpen] = useState(false);
-  const [morePath, setMorePath] = useState(location.pathname);
-  if (morePath !== location.pathname) {
-    setMorePath(location.pathname);
-    setMoreOpen(false);
-  }
+  const collapsed = !mobile && workbench.prefs.collapsed;
+  // /sessions (and the dimmed list behind /sessions/new) mounts SpacesPanel,
+  // which owns QuickFind there; every other desktop route mounts it here.
+  const quickFindOwned = layout === "sessions" || onNew;
+  const newHref = onSessions ? workbench.newHref : "/sessions/new";
 
   useEffect(() => {
     if (activeSpaceId && activeInstanceId && knownInstance) {
@@ -204,37 +464,7 @@ export function Shell() {
     }
   }, [activeSpaceId, activeInstanceId, knownInstance]);
 
-  useLayoutEffect(() => {
-    if (mobile || !onSessions || onNew) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.isComposing || event.repeat) return;
-      // Never steal a chord from the composer, a form field or an attached
-      // terminal. QuickFind's ⌘K shares this guard, so a digit can never
-      // switch tabs while the finder is open and owns the keystroke.
-      if (isTypingTarget(event.target)) return;
-      if (event.key.toLowerCase() === "b") {
-        event.preventDefault();
-        spaceStore.setCollapsed(!workbench.prefs.collapsed);
-      } else if (/^[1-9]$/.test(event.key)) {
-        if (!workbench.active) return;
-        // Same ordered list SessionList numbers its badges from: the visible
-        // tabs of the active Space, dismissal-filtered, capped at nine.
-        const tab = switchSlots(workbench.active, workbench.prefs)[Number(event.key) - 1];
-        if (!tab) return;
-        event.preventDefault();
-        spaceStore.selectTab(workbench.active.id, tab.id);
-        navigate(`/s/${tab.id}`);
-      } else if (event.code === "BracketLeft" || event.code === "BracketRight") {
-        if (!workbench.spaces.length) return;
-        event.preventDefault();
-        const index = workbench.spaces.findIndex((s) => s.id === workbench.active?.id);
-        const step = event.code === "BracketLeft" ? -1 : 1;
-        workbench.select(workbench.spaces[(index + step + workbench.spaces.length) % workbench.spaces.length]);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [mobile, onSessions, onNew, workbench, navigate]);
+  useWorkbenchKeys({ mobile, onSessions, onNew, workbench });
 
   useEffect(() => {
     const onVis = () => {
@@ -270,128 +500,40 @@ export function Shell() {
   }, [hub.toast]);
 
   return (
+    <CommitProbe name="Shell">
     <AnnotationProvider>
-    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layoutOf(location.pathname)} data-spaces={showSidebarList ? "1" : "0"} data-panel-collapsed={workbench.prefs.collapsed}>
+    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout}data-collapsed={collapsed}>
+      <BoardScopeSync />
       <div className={css.install}>
         <InstallBar />
       </div>
-      <nav className={css.rail} aria-label="主导航">
-        <Link className={`${css.icon} ${onSessions && !onNew ? css.iconActive : ""}`} to="/sessions" title="会话">
-          ▤
-        </Link>
-        <Link
-          className={`${css.icon} ${location.pathname.startsWith("/approvals") ? css.iconActive : ""}`}
-          to="/approvals"
-          title="审批"
-        >
-          ◆
-          {pending ? <span className={css.badge}>{pending}</span> : null}
-        </Link>
-        {!mobile ? (
-          <Link
-            className={`${css.icon} ${location.pathname.startsWith("/board") ? css.iconActive : ""}`}
-            to="/board"
-            title="任务"
-          >
-            ▦
-          </Link>
-        ) : null}
-        <Link className={css.icon} to={onSessions ? workbench.newHref : "/sessions/new"} title="新建">
-          <span className={css.plusBox}>＋</span>
-        </Link>
-        <div className={css.more}>
-          <button
-            type="button"
-            className={`${css.icon} ${moreActive ? css.iconActive : ""}`}
-            title="更多"
-            aria-expanded={moreOpen}
-            aria-haspopup="menu"
-            onClick={() => setMoreOpen((v) => !v)}
-          >
-            ⋯
-          </button>
-        </div>
-        <Link className={css.me} to="/settings" title="设置">
-          <span className={css.meDot}>me</span>
-        </Link>
-      </nav>
-      {showSidebarList ? (
-        <aside className={css.list}>
-          <SpacesPanel spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} collapsed={workbench.prefs.collapsed} onSelect={workbench.select} />
-        </aside>
+      {chrome.sidebar ? (
+        <Sidebar
+          collapsed={collapsed}
+          pending={pending}
+          newHref={newHref}
+          projects={projectDirectory.projects}
+          quickFindOwned={quickFindOwned}
+        />
       ) : null}
       <main className={css.main}>
-        {/* Top-bar project scope: desktop only; compact carries project
-            grouping on /m (ui-spec §2.9/§4.7, D-049). */}
-        {!mobile ? (
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "flex-end",
-              alignItems: "center",
-              gap: 8,
-              padding: "6px 12px",
-              borderBottom: "1px solid var(--line)",
-            }}
-          >
-            <ProjectSwitcher projects={projectDirectory.projects} />
-          </div>
-        ) : null}
         {onSessions && mobile && !onSessionPage ? <SpacesMobile spaces={workbench.spaces} active={workbench.active} prefs={workbench.prefs} instanceId={workbench.instanceId} onSelect={workbench.select} /> : null}
-        {/* D-049: on compact /s/:id* the SpaceTabs row does not render — the
-            header chip's drawer (spaces-drawer-open) and Jump To keep every
-            switching capability. Index routes keep their tab strip. */}
-        {onSessions && !(mobile && onSessionPage) ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
+        {/* The tab strip belongs to /s/* only; list routes carry the index
+            column instead. D-049: compact /s/:id* renders no strip either —
+            the header chip's drawer and Jump To keep every switch. */}
+        {chrome.tabs ? <SpaceTabs space={workbench.active} tabs={workbench.tabs} prefs={workbench.prefs} instanceId={workbench.instanceId} newHref={workbench.newHref} /> : null}
         {onNew ? <SessionsPage dimmed /> : null}
         <Outlet />
       </main>
-      {/* D-049: compact /s/:id* renders no app bottom navigation bar — that
-          route's bottom strip is the collapsed composer (structured) or the
-          terminal input/key bars (tty). Back-to-list is the header back
-          link; desktop and the phone /m tree keep their own bars. */}
-      {!(mobile && onSessionPage) ? (
-        <nav className={css.bar} aria-label="手机底栏">
-          <Link className={onSessions && !location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/sessions">
-            <span className={css.barGlyph}>▤</span>
-            会话
-          </Link>
-          <Link className={location.pathname.startsWith("/approvals") ? css.barActive : ""} to="/approvals">
-            <span className={css.barGlyph}>◆</span>
-            {pending ? <span className={css.barBadge}>{pending}</span> : null}
-            审批
-          </Link>
-          <button type="button" onClick={() => navigate(onSessions ? workbench.newHref : "/sessions/new")} aria-label="新建">
-            <span className={css.barPlus}>＋</span>
-          </button>
-          <button
-            type="button"
-            className={moreActive ? css.barActive : ""}
-            aria-expanded={moreOpen}
-            aria-haspopup="menu"
-            onClick={() => setMoreOpen((v) => !v)}
-          >
-            <span className={css.barGlyph}>⋯</span>
-            更多
-          </button>
-        </nav>
-      ) : null}
-      {moreOpen ? (
-        <div className={css.moreMenu} role="menu">
-          {MORE_NAV.map((item) => (
-            <Link
-              key={item.id}
-              role="menuitem"
-              className={`${css.moreItem} ${location.pathname.startsWith(item.to) ? css.moreItemActive : ""}`}
-              to={item.to}
-            >
-              {item.label}
-            </Link>
-          ))}
-        </div>
-      ) : null}
+      {/* D-049: compact /s/:id* renders no app bottom bar — that route's
+          bottom strip is the collapsed composer (structured) or the terminal
+          input/key bars (tty). Back-to-list is the header back link. */}
+      {chrome.phoneNav ? <PhoneNav pending={pending} newHref={newHref} /> : null}
+      {!mobile && !quickFindOwned ? <QuickFind /> : null}
       <ShellNotify />
       <AnnotationCapture />
     </div>
     </AnnotationProvider>
+    </CommitProbe>
   );
 }

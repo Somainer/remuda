@@ -1,9 +1,12 @@
+/* @tokens strict */
 /*
  * Notification surfaces (plan §2, exploration §5 P0-3).
  *
  * Two regions with different lifetimes and different visual weight. The info
  * strip replaces the old 2.4-second `.toast`; the blocking area is new and is
  * the reason the toast could be removed — a failure now has somewhere to stay.
+ * ui-overhaul §4.1: position and behaviour unchanged; raised surface,
+ * --shadow-2, 8px radius.
  */
 
 /*
@@ -13,12 +16,13 @@
  */
 .stack {
   position: fixed;
-  bottom: calc(var(--bar) + var(--safe-bottom) + 12px);
+  /* Unchanged anchor: clear of the phone home bar where one shows. */
+  bottom: calc(var(--phone-nav-h) + var(--safe-bottom) + var(--space-3));
   left: 50%;
   transform: translateX(-50%);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   align-items: center;
   width: min(92vw, 520px);
   z-index: 30;
@@ -34,11 +38,15 @@
 }
 
 .infoItem {
-  background: var(--ink-2);
-  border: 1px solid var(--line);
-  padding: 8px 12px;
-  border-radius: var(--radius);
   max-width: min(92vw, 420px);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-2);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 /*
@@ -49,72 +57,79 @@
 .blocking {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
 }
 
 .blockingItem {
-  background: var(--ink-2);
-  border: 1px solid var(--danger, #b4483f);
-  border-left-width: 3px;
-  border-radius: var(--radius);
-  padding: 10px 12px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
+  padding: 10px var(--space-3);
+  border: 1px solid var(--danger-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-2);
+  color: var(--fg-body);
 }
 
 .blockingHead {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: var(--space-2);
   justify-content: space-between;
 }
 
 .blockingText {
-  font-size: 14px;
-  line-height: 1.45;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  line-height: var(--lh-title);
 }
 
 /* The reason, when known. Never a placeholder when it is not. */
 .blockingReason {
   display: block;
-  color: var(--muted);
-  font-size: 13px;
   margin-top: 2px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 .actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .action {
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: inherit;
-  /* 44px touch target (P1-3), without the button looking oversized. */
-  min-height: 32px;
-  padding: 6px 10px;
-  font-size: 13px;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
   cursor: pointer;
 }
 
 .action:hover {
-  background: var(--ink-3, rgba(255, 255, 255, 0.06));
+  background: var(--bg-hover);
 }
 
 .dismiss {
-  background: transparent;
+  margin: -4px -6px 0 0;
+  padding: 4px 6px;
   border: 0;
-  color: var(--muted);
-  cursor: pointer;
+  background: transparent;
+  color: var(--fg-muted);
   font-size: 16px;
   line-height: 1;
-  padding: 4px 6px;
-  margin: -4px -6px 0 0;
+  cursor: pointer;
+}
+
+.dismiss:hover {
+  color: var(--fg-strong);
 }
 
 @media (max-width: 767px) {

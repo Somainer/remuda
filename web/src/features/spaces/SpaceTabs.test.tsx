@@ -35,8 +35,8 @@ function makeInstance(id: string, hostId: string, workspaceId: string, taskId?: 
 const alpha = spaceKey("host-a", "workspace-a");
 const beta = spaceKey("host-a", "workspace-b");
 const spaces: Space[] = [
-  { id: alpha, hostId: "host-a", workspaceId: "workspace-a", name: "alpha", liveCount: 2, blockedCount: 0,
-    instances: [makeInstance("a1", "host-a", "workspace-a"), makeInstance("a2", "host-a", "workspace-a")] },
+  { id: alpha, hostId: "host-a", workspaceId: "workspace-a", name: "alpha", liveCount: 3, blockedCount: 0,
+    instances: [makeInstance("a1", "host-a", "workspace-a"), makeInstance("a2", "host-a", "workspace-a"), makeInstance("a3", "host-a", "workspace-a")] },
   { id: beta, hostId: "host-a", workspaceId: "workspace-b", name: "beta", liveCount: 1, blockedCount: 0,
     instances: [makeInstance("b1", "host-a", "workspace-b"),
     { ...makeInstance("b-exited", "host-a", "workspace-b"), lifecycle: "exited" }] },
@@ -207,6 +207,34 @@ describe("SpaceTabs asynchronous closure", () => {
     expect(successor).toHaveAttribute("aria-selected", "true");
     await waitFor(() => expect(successor).toHaveFocus());
     expect(screen.queryByRole("tab", { name: /a1/ })).not.toBeInTheDocument();
+  });
+
+  it("re-reads current dismissals after a delayed close and never resurrects a sibling dismissed in another window", async () => {
+    const user = userEvent.setup();
+    const pending = deferredClose();
+    renderWorkbench();
+    // Window A starts a slow 停止并关闭 on a1 (tabs a1, a2, a3).
+    await stopAndClose(user, "a1");
+
+    // Window B dismisses a2 meanwhile. Other windows only talk through
+    // localStorage + the storage event, which the store listens for.
+    const fromOtherWindow = {
+      ...spaceStore.getSnapshot(),
+      closedTabs: { [alpha]: [{ id: "a2", resurface: true }] },
+    };
+    localStorage.setItem(SPACES_PREFS_KEY, JSON.stringify(fromOtherWindow));
+    window.dispatchEvent(new StorageEvent("storage", { key: SPACES_PREFS_KEY }));
+    await waitFor(() => expect(screen.queryByRole("tab", { name: /a2/ })).not.toBeInTheDocument());
+
+    await act(async () => { pending.resolve(); });
+
+    // The successor is a3 — the still-visible tab — never the dismissed a2.
+    expect(screen.getByTestId("current-route")).toHaveTextContent("/s/a3");
+    expect(screen.queryByRole("tab", { name: /a2/ })).not.toBeInTheDocument();
+    const prefs = spaceStore.getSnapshot();
+    expect(prefs.closedTabs[alpha]?.map((entry) => entry.id).sort()).toEqual(["a1", "a2"]);
+    // Landing on a3 recorded the selection without clearing a2's dismissal.
+    expect(prefs.selectedTabs[alpha]).toBe("a3");
   });
 });
 

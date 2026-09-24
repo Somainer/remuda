@@ -36,7 +36,7 @@ async function applyDemoInventory(page: Page): Promise<string[]> {
           host.hostname = host.label;
         });
         mockDb.workspaces.forEach((workspace: { rootPath: string; canonicalRoot: unknown }) => {
-          workspace.rootPath = `/home/dev/projects/${workspace.rootPath.split("/").pop()}`;
+          workspace.rootPath = `/workspace/${workspace.rootPath.split("/").pop()}`;
           workspace.canonicalRoot = { state: "known", value: workspace.rootPath };
         });
         // Host labels reach the sidebar through hub.hosts, so reload those too.
@@ -45,8 +45,12 @@ async function applyDemoInventory(page: Page): Promise<string[]> {
         return labels;
       });
     } catch (error) {
-      if (attempt >= 1 || !/garbage collected|Execution context was destroyed/.test((error as Error).message)) throw error;
-      await page.waitForLoadState("networkidle");
+      if (attempt >= 2 || !/garbage collected|Execution context was destroyed/.test((error as Error).message)) throw error;
+      // The Vite dev optimizer reloads the page once on first dynamic import;
+      // wait for the fresh document instead of networkidle (HMR keeps a
+      // websocket open, which can make that state slow to settle).
+      await page.waitForLoadState("domcontentloaded");
+      await page.waitForTimeout(500);
     }
   }
 }
@@ -160,6 +164,71 @@ test.describe("desktop", () => {
     await page.getByTestId("delete-session-sheet-cancel").click();
     await expect(page.getByTestId("delete-session-sheet")).toHaveCount(0);
     expect(errors).toEqual([]);
+  });
+
+  test("overflow cues stay pinned to the strip edges and the active tab survives narrowing", async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/sessions");
+    const strip = page.getByTestId("space-tabs");
+    await space(page, "sfe-root").click();
+    await page.getByTestId("session-row").first().click();
+    await expect(strip).toBeVisible();
+
+    const geometry = async () => strip.evaluate((element) => {
+      const scroller = element;
+      const rect = scroller.getBoundingClientRect();
+      const cue = (side: "left" | "right") =>
+        scroller.parentElement?.querySelector<HTMLElement>(`[data-edge="${side}"]`);
+      const active = scroller.querySelector<HTMLElement>('[data-active="true"]');
+      const cueRect = (side: "left" | "right") => cue(side)?.getBoundingClientRect() ?? null;
+      const activeRect = active?.getBoundingClientRect() ?? null;
+      return {
+        overflow: scroller.scrollWidth > scroller.clientWidth + 1,
+        scrollLeft: scroller.scrollLeft,
+        maxScroll: scroller.scrollWidth - scroller.clientWidth,
+        left: rect.left, right: rect.right,
+        leftCue: cueRect("left") ? { left: cueRect("left")!.left, right: cueRect("left")!.right } : null,
+        rightCue: cueRect("right") ? { left: cueRect("right")!.left, right: cueRect("right")!.right } : null,
+        active: activeRect ? { left: activeRect.left, right: activeRect.right } : null,
+      };
+    });
+
+    const cueStates = () => geometry().then((state) => ({
+      left: Boolean(state.leftCue),
+      right: Boolean(state.rightCue),
+    }));
+
+    let g = await geometry();
+    expect(g.overflow, "the sfe-root strip overflows at 1440px").toBe(true);
+
+    // Pan the content fully to the trailing edge; the start cue must stay
+    // pinned to the visible left edge, not ride along with the scrolled
+    // content, and no end cue remains at the very end.
+    await strip.evaluate((element) => { element.scrollLeft = element.scrollWidth; element.dispatchEvent(new Event("scroll")); });
+    await expect.poll(cueStates).toEqual({ left: true, right: false });
+    g = await geometry();
+    expect(Math.abs(g.leftCue!.left - g.left)).toBeLessThanOrEqual(1);
+
+    await strip.evaluate((element) => { element.scrollLeft = element.scrollWidth / 2; element.dispatchEvent(new Event("scroll")); });
+    await expect.poll(cueStates).toEqual({ left: true, right: true });
+    g = await geometry();
+    expect(Math.abs(g.leftCue!.left - g.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(g.rightCue!.right - g.right)).toBeLessThanOrEqual(1);
+
+    // Back to the start: only the end cue, pinned to the right edge.
+    await strip.evaluate((element) => { element.scrollLeft = 0; element.dispatchEvent(new Event("scroll")); });
+    await expect.poll(cueStates).toEqual({ left: false, right: true });
+    g = await geometry();
+    expect(Math.abs(g.rightCue!.right - g.right)).toBeLessThanOrEqual(1);
+
+    // Narrow the window: the active tab — close control included — must be
+    // pulled back fully inside the scrollport.
+    await page.setViewportSize({ width: 900, height: 900 });
+    await expect.poll(geometry).toMatchObject({ overflow: true });
+    g = await geometry();
+    expect(g.active).toBeTruthy();
+    expect(g.active!.left, "active tab clear of the 24px left cue").toBeGreaterThanOrEqual(g.left + 23);
+    expect(g.active!.right, "active tab incl. its × clear of the 24px right cue").toBeLessThanOrEqual(g.right - 23);
   });
 });
 

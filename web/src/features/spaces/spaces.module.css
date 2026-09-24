@@ -276,13 +276,25 @@
   border-bottom: 1px solid var(--divider);
 }
 
-.tabs {
+/* Non-scrolling positioned wrapper: the scroller inside pans the tabs, the
+   edge cues stay pinned to this viewport's edges. */
+.tabViewport {
   position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tabs {
   display: flex;
+  width: 100%;
+  height: 100%;
   min-width: 0;
   overflow-x: auto;
   overscroll-behavior-x: contain;
   scrollbar-width: none;
+  /* scrollIntoView keeps the active tab clear of the cue fade on each side. */
+  scroll-padding-inline: var(--space-5);
 }
 
 .tabs::-webkit-scrollbar {
@@ -365,9 +377,9 @@
   }
 }
 
-/* Overflow edge cues: a fade painted at each side that still has tabs off
-   screen. They are non-interactive and the active tab is scrolled into view,
-   so a cue never hides what the user is on. */
+/* Overflow edge cues: non-interactive fades pinned to the viewport (never
+   scrolling with the content). They appear only while tabs are hidden on
+   that side; the active tab is scrolled clear of them, including its ×. */
 .edge {
   position: absolute;
   top: 0;
@@ -436,7 +448,9 @@
   min-width: 0;
   gap: var(--space-2);
   overflow-x: auto;
-  padding: var(--space-2) var(--space-2) var(--space-2) 0;
+  /* Vertical padding reserves room for the chips' 44px coarse hit area
+     (24px visible + 10px each side), so nothing clips it. */
+  padding: 10px var(--space-2);
   scrollbar-width: none;
 }
 
@@ -445,7 +459,9 @@
 }
 
 /* Space chips are the phone's primary space switcher (visual-system §8.5):
-   24px visible, and coarse pointers stretch the hit zone to 44px. */
+   24px visible, coarse pointers get a 44px hit zone. The button itself
+   keeps overflow visible; truncation lives on the inner .chipText label,
+   or the extended hit area would be clipped. */
 .chip {
   position: relative;
   display: inline-flex;
@@ -454,9 +470,6 @@
   max-width: 210px;
   min-height: 24px;
   padding: 0 var(--space-2);
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: transparent;
@@ -472,18 +485,21 @@
 }
 
 @media (pointer: coarse) {
+  /* 44px touch target around the 24px visible chip: 10px vertically and a
+     44px minimum width for short labels. */
   .chip::after {
     content: "";
     position: absolute;
-    inset: -10px 0;
+    top: -10px;
+    bottom: -10px;
+    left: min(0px, calc((100% - var(--touch)) / 2));
+    right: min(0px, calc((100% - var(--touch)) / 2));
   }
 }
 
-/* D-040 folded chip in the compact session header: the button must NOT clip
-   its own 44px ::after hot zone (base .chip has overflow:hidden), so the
-   ellipsis clip moves onto the inner label. */
+/* D-040 folded chip in the compact session header shares the same unclipped
+   hit zone; only its selected look differs. */
 .chipHeader {
-  overflow: visible;
   border-color: var(--border-control);
   background: var(--bg-selected);
   color: var(--fg-strong);

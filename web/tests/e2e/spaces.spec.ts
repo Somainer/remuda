@@ -34,27 +34,39 @@ async function openFromList(page: Page, spaceName: string, rowText: string) {
   await expect(page).toHaveURL(/\/s\//);
 }
 
+async function applyDemoInventory(page: Page): Promise<string[]> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await page.evaluate(async () => {
+        const mockModule = "/src/lib/mock.ts";
+        const storeModule = "/src/lib/store.ts";
+        const { mockDb } = await import(mockModule);
+        const { hubStore } = await import(storeModule);
+        const labels: string[] = [];
+        mockDb.hosts.forEach((host: { label: string; hostname?: string }, index: number) => {
+          if (!host.label.startsWith("demo-node-")) labels.push(host.label);
+          host.label = `demo-node-${index + 1}`;
+          host.hostname = host.label;
+        });
+        mockDb.workspaces.forEach((workspace: { rootPath: string; canonicalRoot: unknown }) => {
+          workspace.rootPath = `/home/dev/projects/${workspace.rootPath.split("/").pop()}`;
+          workspace.canonicalRoot = { state: "known", value: workspace.rootPath };
+        });
+        await hubStore.refresh();
+        return labels;
+      });
+    } catch (error) {
+      if (attempt >= 2 || !/garbage collected|Execution context was destroyed/.test((error as Error).message)) throw error;
+      await page.waitForLoadState("domcontentloaded");
+      await page.waitForTimeout(500);
+    }
+  }
+}
+
 async function screenshot(page: Page, name: string, theme: "night" | "ledger") {
   // Publish only generic demo inventory. Mutate the in-browser fixture before
   // rendering evidence; production code and screenshot pixels stay untouched.
-  const replacedLabels = await page.evaluate(async () => {
-    const mockModule = "/src/lib/mock.ts";
-    const storeModule = "/src/lib/store.ts";
-    const { mockDb } = await import(mockModule);
-    const { hubStore } = await import(storeModule);
-    const labels: string[] = [];
-    mockDb.hosts.forEach((host: { label: string; hostname?: string }, index: number) => {
-      if (!host.label.startsWith("demo-node-")) labels.push(host.label);
-      host.label = `demo-node-${index + 1}`;
-      host.hostname = host.label;
-    });
-    mockDb.workspaces.forEach((workspace: { rootPath: string; canonicalRoot: unknown }) => {
-      workspace.rootPath = `/home/dev/projects/${workspace.rootPath.split("/").pop()}`;
-      workspace.canonicalRoot = { state: "known", value: workspace.rootPath };
-    });
-    await hubStore.refresh();
-    return labels;
-  });
+  const replacedLabels = await applyDemoInventory(page);
   await setMode(page, theme);
   await page.evaluate(() => document.fonts.ready);
   for (const label of replacedLabels) await expect(page.locator("body")).not.toContainText(label);

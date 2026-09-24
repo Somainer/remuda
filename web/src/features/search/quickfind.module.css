@@ -81,18 +81,20 @@
 }
 
 /* Clock/list toggle for the grouped phone Jump To sheet (ui-spec §4.7):
-   an inset segmented track, pressed item raised. */
+   an inset segmented track, pressed item raised. No overflow clip: under a
+   coarse pointer the buttons extend a 44px hit area above/below the track. */
 .order {
+  position: relative;
   flex: none;
   display: flex;
   padding: 2px;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-inset);
-  overflow: hidden;
 }
 
 .order button {
+  position: relative;
   min-height: var(--seg-item);
   padding: 0 var(--space-2);
   border: 0;
@@ -406,6 +408,17 @@
 
   .order button {
     min-width: var(--touch);
+  }
+
+  /* 44px touch target around the 26px visible segmented item (visual-system
+     §8.2); the panel's gaps reserve the vertical room. */
+  .order button::after {
+    content: "";
+    position: absolute;
+    top: -9px;
+    bottom: -9px;
+    left: 0;
+    right: 0;
   }
 
   .list {

@@ -89,7 +89,9 @@ export function SpacesMobile({ spaces, active, prefs, instanceId, onSelect, vari
       <div className={css.mobileSpaces}>
         {openerButton}
         <div className={css.chips} data-testid="spaces-chips" aria-label="空间">
-          {spaces.map((space) => <button type="button" key={space.id} className={css.chip} data-testid="space-chip" aria-pressed={space.id === active?.id} ref={space.id === active?.id ? activeChip : undefined} onClick={() => onSelect(space)}>{space.name}{space.blockedCount ? ` · ${space.blockedCount} 待处理` : ""}</button>)}
+          {spaces.map((space) => <button type="button" key={space.id} className={css.chip} data-testid="space-chip" aria-pressed={space.id === active?.id} ref={space.id === active?.id ? activeChip : undefined} onClick={() => onSelect(space)}>
+            <span className={css.chipText}>{space.name}{space.blockedCount ? ` · ${space.blockedCount} 待处理` : ""}</span>
+          </button>)}
         </div>
       </div>
     )}

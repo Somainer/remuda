@@ -279,6 +279,67 @@ test.describe("desktop", () => {
     expect(g.active!.left, "active tab clear of the 24px left cue").toBeGreaterThanOrEqual(g.left + 23);
     expect(g.active!.right, "active tab incl. its × clear of the 24px right cue").toBeLessThanOrEqual(g.right - 23);
   });
+  test("Space header select and disclosure stretch to the full header hit area", async ({ page, browser }) => {
+    const checkHeader = async (target: Page, coarse: boolean, label: string) => {
+      const panel = target.getByTestId("spaces-panel");
+      const select = panel.getByTestId("space-select").first();
+      await expect(select).toBeVisible();
+      expect(await target.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(coarse);
+
+      // CSS-module class names are hashed, so measure through the rendered
+      // structure: the select's parent is the header row, and the disclosure
+      // toggle (its labelled 折叠/展开 button) is a sibling.
+      const measured = await select.evaluate((element) => {
+        const head = element.parentElement as HTMLElement;
+        // Header children: disclosure button, then the select button.
+        const disclosureButton = head.querySelector<HTMLElement>("button:first-of-type");
+        const h = head.getBoundingClientRect();
+        const s = element.getBoundingClientRect();
+        const d = disclosureButton?.getBoundingClientRect();
+        return {
+          head: { h: h.height },
+          select: { x: s.x, y: s.y, h: s.height },
+          disclosure: d ? { h: d.height } : null,
+          isDisclosureSibling: disclosureButton?.parentElement === head,
+        };
+      });
+      expect(measured.disclosure && measured.isDisclosureSibling).toBeTruthy();
+      const min = coarse ? 43.5 : 31.5;
+      expect(measured.select.h, `${label}: select fills the header height`).toBeGreaterThanOrEqual(min);
+      expect(measured.disclosure.h, `${label}: disclosure fills the header height`).toBeGreaterThanOrEqual(min);
+      expect(measured.select.h, `${label}: select does not exceed the header`).toBeLessThanOrEqual(measured.head.h + 0.5);
+
+      // The very top and bottom interior edges of the header both resolve to
+      // the select button — the whole band, not just text-height, is active.
+      const hits = await select.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const at = (y: number) =>
+          document.elementFromPoint(rect.x + 30, y)?.closest('[data-testid="space-select"]') !== null;
+        return { top: at(rect.y + 1), bottom: at(rect.y + rect.height - 1) };
+      });
+      expect(hits, `${label}: header top/bottom edges activate the select`).toEqual({ top: true, bottom: true });
+    };
+
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/sessions");
+    await checkHeader(page, false, "desktop");
+
+    // A touch-enabled 1024×1366 tablet still renders the desktop Spaces
+    // index, but matches (pointer: coarse) → the 44px header band.
+    const tablet = await browser.newContext({
+      viewport: { width: 1024, height: 1366 },
+      hasTouch: true,
+      isMobile: false,
+      deviceScaleFactor: 1,
+    });
+    const tabletPage = await tablet.newPage();
+    try {
+      await tabletPage.goto("/sessions");
+      await checkHeader(tabletPage, true, "coarse tablet");
+    } finally {
+      await tablet.close();
+    }
+  });
 });
 
 test.describe("phone", () => {
@@ -361,27 +422,30 @@ test.describe("phone", () => {
     expect(errors).toEqual([]);
   });
 
-  test("adjacent short Space chips keep disjoint 44px hit areas", async ({ page }) => {
+  test("adjacent short Space chips keep disjoint 44px hit areas and edge taps select the right Space", async ({ page }) => {
     await page.setViewportSize({ width: 400, height: 860 });
-    // Load the app first (the mock is an in-browser adapter), then add a
-    // one-letter Space to the fixture and refresh the store so the chip row
-    // re-renders. The evaluate is retry-safe for the Vite optimizer reload.
+    // Load the app first (the mock is an in-browser adapter), then add TWO
+    // adjacent one-letter Spaces to the fixture and refresh the store. The
+    // evaluate is retry-safe for the Vite optimizer reload.
     await page.goto("/m");
     await page.getByTestId("space-chip").first().waitFor();
     for (let attempt = 0; ; attempt += 1) {
       try {
         await page.evaluate(async () => {
           const { mockDb } = await import("/src/lib/mock.ts");
-          if (!mockDb.workspaces.some((workspace: { rootPath?: string }) => workspace.rootPath === "/workspace/z")) {
-            mockDb.workspaces.push({
-              ...mockDb.workspaces[0],
-              id: "wsp_zzshort",
-              label: "z",
-              rootPath: "/workspace/z",
-              canonicalRoot: { state: "known", value: "/workspace/z" },
-            });
+          for (const letter of ["y", "z"] as const) {
+            if (!mockDb.workspaces.some((workspace: { rootPath?: string }) => workspace.rootPath === `/workspace/${letter}`)) {
+              mockDb.workspaces.push({
+                ...mockDb.workspaces[0],
+                id: `wsp_zzshort_${letter}`,
+                label: letter,
+                rootPath: `/workspace/${letter}`,
+                canonicalRoot: { state: "known", value: `/workspace/${letter}` },
+              });
+            }
           }
-          await (await import("/src/lib/store.ts")).hubStore.refresh();
+          // refreshHosts (not refresh) rebuilds the workspace list.
+          await (await import("/src/lib/store.ts")).hubStore.refreshHosts();
         });
         break;
       } catch (error) {
@@ -392,26 +456,75 @@ test.describe("phone", () => {
     }
     expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
     const chips = page.getByTestId("space-chip");
-    const z = chips.filter({ hasText: /^z(?: ·|$)/ }).first();
-    // The new Space sorts to the end of the horizontally scrolling chips row;
-    // pan it into view before measuring.
-    await z.evaluate((element) => element.scrollIntoView({ block: "nearest", inline: "center" }));
-    await expect(z).toBeVisible();
-    const zBox = await z.boundingBox();
-    expect(zBox).toBeTruthy();
-    // The short label still reserves the 44px minimum width.
-    expect(zBox!.width).toBeGreaterThanOrEqual(43.5);
-    // The extended hit area is disjoint: taps 2px inside the chip's left and
-    // right edges land on z itself.
-    const hitAt = (x: number, y: number) => page.evaluate((point) => {
-      const element = document.elementFromPoint(point.x, point.y);
-      return element?.closest("[data-testid='space-chip']")?.textContent ?? null;
-    }, { x, y });
-    expect(await hitAt(zBox!.x + 2, zBox!.y + zBox!.height / 2)).toMatch(/^z(?: ·|$)/);
-    expect(await hitAt(zBox!.x + zBox!.width - 2, zBox!.y + zBox!.height / 2)).toMatch(/^z(?: ·|$)/);
-    // And the vertical extension (10px above/below the 24px visible chip)
-    // resolves to the chip too — the full 44px target.
-    expect(await hitAt(zBox!.x + zBox!.width / 2, zBox!.y - 2)).toMatch(/^z(?: ·|$)/);
-    expect(await hitAt(zBox!.x + zBox!.width / 2, zBox!.y + zBox!.height + 2)).toMatch(/^z(?: ·|$)/);
+    const chip = (letter: string) => chips.filter({ hasText: new RegExp(`^${letter}(?: ·|$)`) }).first();
+    const yChip = chip("y");
+    const zChip = chip("z");
+    // y and z are the two trailing Spaces; pan the chips row to its END once
+    // so both sit in view simultaneously and their boxes stay stable.
+    await page.locator('[data-testid="spaces-chips"]').evaluate((element) => {
+      const scroller = element as HTMLElement;
+      scroller.scrollLeft = scroller.scrollWidth;
+    });
+    await expect(yChip).toBeVisible();
+    await expect(zChip).toBeVisible();
+    const yBox = await yChip.boundingBox();
+    const zBox = await zChip.boundingBox();
+    expect(yBox && zBox).toBeTruthy();
+    // They are directly adjacent (only the 8px gap separates them).
+    const gap = zBox!.x - (yBox!.x + yBox!.width);
+    expect(gap).toBeGreaterThanOrEqual(6);
+    expect(gap).toBeLessThanOrEqual(12);
+    expect(Math.min(yBox!.width, zBox!.width)).toBeGreaterThanOrEqual(43.5);
+
+    // Selecting an empty Space briefly visits /sessions then bounces back to
+    // /m and re-mounts the chip row, so wait for that landing and assert the
+    // CURRENT pressed chip (queried fresh) after each tap.
+    const showTail = async () => {
+      await page.locator('[data-testid="spaces-chips"]').evaluate((element) => {
+        (element as HTMLElement).scrollLeft = (element as HTMLElement).scrollWidth;
+      });
+      // Let the scroll/relayout settle (a prior tap bounces /sessions→/m and
+      // re-mounts this row; measuring synchronously reads stale geometry).
+      await page.waitForTimeout(100);
+    };
+    const pressedLetter = () => page.evaluate(() =>
+      ([...document.querySelectorAll("[data-testid='space-chip'][aria-pressed='true']")] as HTMLElement[])
+        .map((element) => element.textContent?.trim().replace(/ · .*$/, "")));
+    const tapChip = async (letter: string, edge: "left" | "right") => {
+      await showTail();
+      // Choose the tap point in-page and verify elementFromPoint resolves to
+      // the intended chip BEFORE issuing the click. Probe from 3px inward
+      // (the literal boundary pixel can belong to the scroller/clip); the
+      // 44px target assertion is the 44px reserved width, not that pixel.
+      const point = await page.evaluate(({ l, side }) => {
+        const chipsRow = document.querySelector('[data-testid="spaces-chips"]');
+        const target = ([...(chipsRow?.querySelectorAll("[data-testid='space-chip']") ?? [])] as HTMLElement[])
+          .find((element) => new RegExp(`^${l}(?: ·|$)`).test(element.textContent?.trim() ?? ""));
+        if (!target) return null;
+        const r = target.getBoundingClientRect();
+        const y = r.y + r.height / 2;
+        for (const inset of [3, 5, 8]) {
+          const x = side === "left" ? r.left + inset : r.right - inset;
+          const hit = document.elementFromPoint(x, y)?.closest("[data-testid='space-chip']")?.textContent?.trim().replace(/ · .*$/, "") ?? null;
+          if (hit === l) return { x, y, hit, inset };
+        }
+        return { x: 0, y, hit: null, inset: -1 };
+      }, { l: letter, side: edge });
+      expect(point, `${letter} ${edge} point measurable`).toBeTruthy();
+      expect(point!.hit, `${letter} ${edge}: a point 3–8px inside the edge hit-tests to ${letter}, not the neighbour`).toBe(letter);
+      await page.mouse.click(point!.x, point!.y);
+      await expect(page).toHaveURL(/\/m$/);
+    };
+    // z's LEFT edge must belong to z, not y.
+    await tapChip("z", "left");
+    expect(await pressedLetter()).toEqual(["z"]);
+    // y's RIGHT edge must belong to y, not z (the gap stays unclaimed).
+    await tapChip("y", "right");
+    expect(await pressedLetter()).toEqual(["y"]);
+    // y's LEFT edge and z's RIGHT edge resolve to their own chips too.
+    await tapChip("y", "left");
+    expect(await pressedLetter()).toEqual(["y"]);
+    await tapChip("z", "right");
+    expect(await pressedLetter()).toEqual(["z"]);
   });
 });

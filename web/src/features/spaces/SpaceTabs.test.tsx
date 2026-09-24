@@ -216,23 +216,31 @@ describe("SpaceTabs asynchronous closure", () => {
     expect(screen.queryByRole("tab", { name: /a1/ })).not.toBeInTheDocument();
   });
 
-  it("re-reads current dismissals and Hub data after a delayed close and never resurrects a sibling changed in another window", async () => {
+  it("re-reads current owner, dismissals and Hub data after a delayed close and never resurrects a sibling changed in another window", async () => {
     const user = userEvent.setup();
     // a2 starts BLOCKED: it is visible through its dismissal's resurface
     // rule, which is exactly the case a stale render-time snapshot would
     // still pick as successor after it goes idle.
-    act(() => { spaces[0].instances[1].activity = known("waiting-interaction"); });
+    const blockedA2: Instance = { ...makeInstance("a2", "host-a", "workspace-a"), activity: known("waiting-interaction") };
+    act(() => { spaces[0].instances[1] = blockedA2; });
+    hubState.instances = spaces.flatMap((space) => space.instances);
     const pending = deferredClose();
     renderWorkbench();
     expect(screen.getByRole("tab", { name: /a2/ })).toBeInTheDocument();
     // Window A starts a slow 停止并关闭 on a1 (tabs a1, a2, a3).
     await stopAndClose(user, "a1");
 
-    // Window B, meanwhile: dismisses a2 AND its state settles to idle. Both
-    // arrive before the stop resolves. Other windows only talk through
-    // localStorage + the storage event for prefs; Hub rows arrive through a
-    // fresh getSnapshot().
-    act(() => { spaces[0].instances[1].activity = known("idle"); });
+    // Window B, meanwhile: a2 settles to idle AND is dismissed. The Hub row
+    // is published as an IMMUTABLE REPLACEMENT — a new object, not a mutation
+    // of blockedA2 (the exact object the stale closure captured) — so a
+    // component reading its render snapshot still sees the blocked status and
+    // would wrongly resurrect it. The fixed dismiss() reads getSnapshot()
+    // after the await.
+    const idleA2: Instance = { ...blockedA2, activity: known("idle") };
+    expect(idleA2).not.toBe(blockedA2);
+    expect((blockedA2.activity as { value: string }).value, "old captured status: blocked").toBe("waiting-interaction");
+    expect((idleA2.activity as { value: string }).value, "new published status: idle").toBe("idle");
+    act(() => { spaces[0].instances[1] = idleA2; });
     hubState.instances = spaces.flatMap((space) => space.instances);
     const fromOtherWindow = {
       ...spaceStore.getSnapshot(),

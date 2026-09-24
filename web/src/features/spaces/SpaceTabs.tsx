@@ -105,19 +105,23 @@ export function SpaceTabs({ space, tabs, prefs, instanceId, newHref }: { space?:
     setClosing((ids) => [...ids, instance.id]);
     try {
       if (stop) await hubStore.close(instance.id);
-      // A stopped session is gone for good; a dismissed one may come back when
-      // it next needs a human. The record always lands on the session's OWN
-      // Space — task containers share one dismissal record per Space.
-      spaceStore.closeTab(tabSet.ownerOf(instance), instance.id, !stop);
+      // Ownership and dismissals are resolved from CURRENT state after the
+      // await, never from the render closure: a workspace can be registered
+      // or unregistered while the stop is pending (the session then belongs
+      // to 其他), and another window may have changed the prefs. The
+      // dismissal therefore always lands in the Space that owns the session
+      // right now, so it stays dismissed in its current Space.
+      const snapshot = hubStore.getSnapshot();
+      const currentOwner = resolveTabSet(snapshot.workspaces, snapshot.instances, spaceStore.getSnapshot(), instance.id)
+        .ownerOf(instance);
+      spaceStore.closeTab(currentOwner, instance.id, !stop);
       setSheet(undefined);
       setRevealed(undefined);
       // Do not navigate away if the user switched containers while close was pending.
       if (window.location.pathname.split("/")[2] === instance.id) {
-        // Re-derive from BOTH fresh stores after the await. Another window may
-        // have changed space prefs (a sibling dismissed meanwhile) AND the Hub
-        // data may have moved on (that sibling now idle) — reading either from
-        // the render closure would resurrect a tab the user cannot see.
-        const snapshot = hubStore.getSnapshot();
+        // Re-derive the successor from the fresh hub snapshot AND the prefs
+        // that now include this close. A sibling dismissed in another window
+        // meanwhile (or one whose state moved on) must not be resurrected.
         const fresh = resolveTabSet(snapshot.workspaces, snapshot.instances, spaceStore.getSnapshot(), instance.id)
           .tabs.filter((row) => row.id !== instance.id);
         const next = fresh[0];

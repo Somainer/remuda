@@ -44,7 +44,7 @@
 
 .groupHead {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   min-height: var(--control-h);
   border-radius: var(--radius-sm);
 }
@@ -63,6 +63,7 @@
 .disclosure {
   flex: none;
   width: 28px;
+  min-height: var(--control-h);
   padding: 0;
   border: 0;
   background: transparent;
@@ -110,8 +111,11 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  width: 100%;
+  /* Fills the stretched header row, so the whole 32/44px band is the button's
+     hit area — clicks near the top and bottom edges activate the Space. */
+  flex: 1 1 auto;
   min-width: 0;
+  min-height: var(--control-h);
   padding: 0 var(--space-2);
   text-align: left;
   font-size: var(--text-ui);
@@ -489,6 +493,17 @@
 }
 
 @media (pointer: coarse) {
+  /* The Spaces index rows are touch targets on a coarse tablet/phone: the
+     whole 44px band selects, not just the text-height middle. */
+  .groupHead {
+    min-height: var(--touch);
+  }
+
+  .spaceSelect,
+  .disclosure {
+    min-height: var(--touch);
+  }
+
   /* 44px target: reserve the width on the button itself (short labels too),
      and extend only vertically — horizontal insets stay 0 so the 8px gap
      between adjacent chips keeps their hit areas disjoint. */

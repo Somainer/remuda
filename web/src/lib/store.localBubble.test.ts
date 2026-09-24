@@ -53,6 +53,7 @@ function stubPostSend(api: Api) {
     durableSeq: "0",
     windowFromSeq: null,
     reachedAfterSeq: true,
+        getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_local_bubble",
@@ -133,10 +134,15 @@ it("a failed POST keeps the row pending under the same commandId and retries it"
   const first = hubStore.getSnapshot().bubbles[0];
   const wireId = first.commandId;
   expect(wireId?.startsWith("cmd_")).toBe(true);
-  // 5xx is a retriable network/server failure: still queued, not unknown.
-  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1));
-  expect(hubStore.getSnapshot().bubbles[0]?.state).toBe("queued");
-  expect(hubStore.getSnapshot().bubbles[0]?.commandId).toBe(wireId);
+  // 5xx is a retriable network/server failure: the row stays queued under the
+  // SAME id and the bounded live-retry re-POSTs that id (exactly-once).
+  await vi.waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(2));
+  expect(sendSpy.mock.calls[0]?.[4]).toBe(wireId);
+  expect(sendSpy.mock.calls[1]?.[4]).toBe(wireId);
+  // After the successful retry the row is delivered (sent), never unknown.
+  await vi.waitFor(() =>
+    expect(hubStore.getSnapshot().bubbles[0]?.outboxState).toBe("sent"),
+  );
 });
 
 it("concurrent sends get distinct clientRequestIds before either response lands", async () => {

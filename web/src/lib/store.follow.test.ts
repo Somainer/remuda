@@ -34,6 +34,7 @@ function subscription(instance: Instance): Awaited<ReturnType<typeof api.eventsS
     durableSeq: "1",
     windowFromSeq: "1",
     reachedAfterSeq: true,
+        getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1", projectionEpoch: "epoch_follow_test", asOfSeq: "1", instance,
       runs: [], commands: [], pendingInteractions: [], nodes: [],
@@ -118,6 +119,7 @@ it("follows a bounded partial tail window without claiming earliestRetainedSeq 1
     durableSeq: "100",
     windowFromSeq: "91",
     reachedAfterSeq: false,
+        getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1", projectionEpoch: "epoch_follow_partial", asOfSeq: "100", instance,
       runs: [], commands: [], pendingInteractions: [], nodes: [],

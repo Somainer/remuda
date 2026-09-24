@@ -11,6 +11,7 @@ describe("JournalBanner", () => {
   afterEach(() => setConnection("live"));
 
   it("hides when live", () => {
+    setConnection("live");
     const { container } = render(<JournalBanner status="live" />);
     expect(container).toBeEmptyDOMElement();
   });

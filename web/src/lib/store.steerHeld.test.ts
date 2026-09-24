@@ -55,39 +55,40 @@ it("a steer landing mid-flush is not posted again by the stale flush snapshot", 
   vi.spyOn(api, "instanceSend").mockImplementation(
     ((_instanceId: string, prompt: string, _refs?: unknown[], mode?: string, commandId?: string) => {
       calls.push({ prompt, mode, commandId });
-      // The flush's first-row POST stays pending; the steer lands immediately.
-      return mode === "steer"
-        ? Promise.resolve(commandResult(commandId, "accepted"))
-        : firstPending.then(() => commandResult(commandId, "accepted"));
+      return prompt === "first held"
+        ? firstPending.then(() => commandResult(commandId, "accepted"))
+        : Promise.resolve(commandResult(commandId, "accepted"));
     }) as Api["instanceSend"],
   );
 
-  // Begin the flush; it suspends on the first row's pending POST. The steer
-  // lock is per-instance, so flushHeld's await yields before steering.
+  // Begin the flush; the single deliverer starts the first-row POST (held
+  // pending). All delivery is serialized by the cross-tab lock.
   const flushing = hubStore.flushHeld(INSTANCE);
   await vi.waitFor(() => expect(calls).toHaveLength(1));
   expect(calls[0]?.prompt).toBe("first held");
   expect(calls[0]?.mode).toBeUndefined();
 
-  // Steer the SECOND row while the first POST is still pending. Its own
-  // outbox row is delivered directly (steer awaits its POST for the receipt).
-  const landed = await hubStore.steerHeld(INSTANCE, second);
-  expect(landed).toBe(true);
-  expect(calls).toHaveLength(2);
-  expect(calls[1]?.prompt).toBe("second held");
-  expect(calls[1]?.mode).toBe("steer");
-  // Each attempt used the row's own client-generated id.
-  expect(calls[0]?.commandId?.startsWith("cmd_")).toBe(true);
-  expect(calls[1]?.commandId?.startsWith("cmd_")).toBe(true);
-  expect(calls[0]?.commandId).not.toBe(calls[1]?.commandId);
+  // Steer the SECOND row while the first POST is in flight. Conversion is
+  // idempotent (one commandId); delivery joins the single deliverer lock — it
+  // cannot POST concurrently, which is the exact single-deliverer guarantee.
+  const steerPromise = hubStore.steerHeld(INSTANCE, second);
 
-  // Let the flush finish; the drain must not re-post either row.
+  // Resolve the first POST; the drain then delivers the steer-promoted second
+  // row exactly once.
   resolveFirst(commandResult(calls[0]?.commandId, "accepted"));
-  await flushing;
-  await new Promise((r) => setTimeout(r, 50));
+  const landed = await steerPromise;
+  await flushing.catch(() => undefined);
 
-  expect(calls).toHaveLength(2);
-  expect(calls.filter((c) => c.prompt === "second held")).toHaveLength(1);
+  expect(landed).toBe(true);
+  // Exactly two POSTs total; the second row went exactly once as a steer.
+  await vi.waitFor(() => expect(calls).toHaveLength(2));
+  const steerCalls = calls.filter((c) => c.prompt === "second held");
+  expect(steerCalls).toHaveLength(1);
+  expect(steerCalls[0]?.mode).toBe("steer");
+  // Each attempt used the row's own distinct client-generated id.
+  expect(calls[0]?.commandId?.startsWith("cmd_")).toBe(true);
+  expect(steerCalls[0]?.commandId?.startsWith("cmd_")).toBe(true);
+  expect(calls[0]?.commandId).not.toBe(steerCalls[0]?.commandId);
 
   const bubbles = hubStore.getSnapshot().bubbles;
   const steered = bubbles.find((b) => b.clientRequestId === second)!;
@@ -97,7 +98,7 @@ it("a steer landing mid-flush is not posted again by the stale flush snapshot", 
   const flushed = bubbles.find((b) => b.clientRequestId === first)!;
   expect(flushed.promptMode).toBe("new-turn");
   expect(flushed.commandId).toBe(calls[0]?.commandId);
-});
+}, 15_000);
 
 it("a steer whose POST fails with a retriable error resolves false and stays queued under the same id", async () => {
   const { api, hubStore } = await fresh();

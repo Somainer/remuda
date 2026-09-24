@@ -25,6 +25,7 @@ function subscription(instance: Instance) {
     durableSeq: "1",
     windowFromSeq: "1",
     reachedAfterSeq: true,
+        getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_model_store",
@@ -67,6 +68,7 @@ async function startFollowing(idSuffix: string, launchModel?: string) {
     durableSeq: "1",
     windowFromSeq: "1",
     reachedAfterSeq: true,
+        getReadyState: () => 1,
   } as unknown as History);
   let deliver!: Parameters<typeof api.eventsSubscribe>[2];
   vi.spyOn(api, "eventsSubscribe").mockImplementation(async (_j, _a, onBatch) => {

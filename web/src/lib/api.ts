@@ -693,6 +693,8 @@ export type HubApi = {
     /** False when older rows exist below the snapshot window. */
     reachedAfterSeq: boolean;
     durableSeq: U64;
+    /** WebSocket readyState (1 = OPEN); used to certify the link is live. */
+    getReadyState: () => number;
   }>;
   eventsAck(subscriptionId: Id, journalId: Id, throughSeq: U64): Promise<{ acknowledgedSeq: U64 }>;
   eventsUnsubscribe(subscriptionId: Id): Promise<void>;
@@ -1260,6 +1262,7 @@ function createMockApi(): HubApi {
         windowFromSeq: page.windowFromSeq,
         reachedAfterSeq: page.reachedAfterSeq,
         durableSeq: snapshot.asOfSeq,
+        getReadyState: () => 1,
       };
     },
     async eventsAck(_subscriptionId, _journalId, throughSeq) {
@@ -1905,6 +1908,7 @@ function createLiveApi(): HubApi {
         windowFromSeq: snapshotMeta.fromSeq,
         reachedAfterSeq: snapshotMeta.reachedAfterSeq,
         durableSeq: asOfSeq,
+        getReadyState: () => ws.readyState,
       };
     },
     async eventsAck(_subscriptionId, _journalId, throughSeq) {

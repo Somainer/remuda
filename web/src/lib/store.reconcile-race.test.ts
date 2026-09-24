@@ -60,6 +60,7 @@ async function mountFollow(api: Api, hubStore: Store) {
     durableSeq: "0",
     windowFromSeq: null,
     reachedAfterSeq: true,
+        getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "epoch_reconcile_race",
@@ -167,7 +168,9 @@ it("a failed catch-up settles the per-session journal status (not a latched 重�
   const { api, hubStore } = await fresh();
   const onBatch = await mountFollow(api, hubStore);
   expect(onBatch).toBeTypeOf("function");
-  expect(hubStore.getSnapshot().connection).toBe("live");
+  // In the machine-less unit harness the link starts recovering; the
+  // per-session journal status is live after follow and is what this test
+  // asserts (global connection is owned solely by the connection machine).
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
 
   // The bounded journal read fails (HTTP 502 / network drop): no events.
@@ -176,12 +179,10 @@ it("a failed catch-up settles the per-session journal status (not a latched 重�
 
   await hubStore.catchup(INSTANCE);
 
-  // The per-session status SessionPage actually renders must not stay at
-  // reconnecting: the client settles at the truthful readonly-stale state
-  // (JournalBanner shows 只读 + 重试). Without a connection machine (unit
-  // harness) the coarse global indicator honestly goes offline.
+  // The per-session status settles at the truthful readonly-stale state
+  // (JournalBanner shows 只读 + 重试). The global connection is owned solely
+  // by the connection machine and is NOT written by journal onStatus.
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("readonly-stale");
-  expect(hubStore.getSnapshot().connection).toBe("offline");
   expect(toast).toHaveBeenCalled();
 
   // The existing retry action (the banner 重试 button calls catchup) with a
@@ -194,7 +195,6 @@ it("a failed catch-up settles the per-session journal status (not a latched 重�
   });
   await hubStore.catchup(INSTANCE);
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
-  expect(hubStore.getSnapshot().connection).toBe("live");
 });
 
 it("a slow failed catch-up cannot downgrade a newer successful recovery (resume generation)", async () => {
@@ -220,7 +220,6 @@ it("a slow failed catch-up cannot downgrade a newer successful recovery (resume 
   releaseA(undefined as never);
   await new Promise((r) => setTimeout(r, 10));
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
-  expect(hubStore.getSnapshot().connection).toBe("live");
 });
 
 it("a failed catch-up is cleared automatically when the follow socket delivers a contiguous batch", async () => {
@@ -233,14 +232,13 @@ it("a failed catch-up is cleared automatically when the follow socket delivers a
   vi.spyOn(hubStore, "toast").mockImplementation(() => undefined);
   await hubStore.catchup(INSTANCE);
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("readonly-stale");
-  expect(hubStore.getSnapshot().connection).toBe("offline");
 
   // No manual retry: the still-open follow socket delivers the next turn's
-  // contiguous frame. applyBatch flushes it and the client returns to live,
-  // clearing both the per-session banner and the global indicator.
+  // contiguous frame. applyBatch flushes it and the journal returns to live
+  // (the global connection indicator is owned solely by the connection
+  // machine; this test asserts the per-session status).
   onBatch(screenBatch("2", "JOURNAL-2"));
   expect(hubStore.getSnapshot().journalStatus[INSTANCE]).toBe("live");
-  expect(hubStore.getSnapshot().connection).toBe("live");
 });
 
 it("an RPC screen committed first is not rolled back by catch-up re-deriving the same journal screen", async () => {
@@ -479,6 +477,7 @@ it("an unseen screen known only in the REST seed still orders the live RPC buffe
     durableSeq: "1",
     windowFromSeq: null,
     reachedAfterSeq: true,
+        getReadyState: () => 1,
     snapshot: {
       projectionVersion: "v1",
       projectionEpoch: "seed-epoch",

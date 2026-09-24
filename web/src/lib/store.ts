@@ -2004,6 +2004,13 @@ class HubStore {
 
   async follow(instanceId: Id) {
     const instance = this.state.instances.find((i) => i.id === instanceId) ?? (await api.instanceGet(instanceId));
+    // This mounted session owns the connection machine BEFORE the socket is
+    // opened: if the subscribe fails while the Hub is unreachable (offline
+    // reload), the machine's reconnect resume must still know which instance
+    // to reopen — binding only after a successful open left reloaded sessions
+    // with a delivered row but no follow and no journal join.
+    this.connectionBoundTo = instance.id;
+    this.connectionBoundJournal = instance.journalId;
     if (!this.state.instances.some((i) => i.id === instanceId)) {
       this.emit({ instances: [instance, ...this.state.instances] });
     }
@@ -2165,12 +2172,8 @@ class HubStore {
       earliestRetainedSeq: seed.windowFromSeq ?? "1",
       complete: seed.reachedAfterSeq,
     });
-    // This is the active session socket: bind the connection machine to it.
-    this.connectionBoundTo = instance.id;
-    this.connectionBoundJournal = instance.journalId;
-    // Events landing between the REST seed and the socket open arrive on the
-    // follow snapshot (filtered past `last`) and flow through applyBatch, so no
-    // second tail read is needed.
+    // (connectionBoundTo/Journal were bound at the top of follow(), so the
+    // machine owns this session even when this first open failed offline.)
   }
 
   /**

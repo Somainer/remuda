@@ -83,13 +83,23 @@ for (const width of WIDTHS) {
     for (const mode of MODES) await shoot(page, "bot-detail", mode, width);
   });
 
-  test(`UO-13 login and pair card at ${width}`, async ({ browser }) {
+  test(`UO-13 login and pair card at ${width}`, async ({ page: probe }) => {
     test.setTimeout(120_000);
-    // The card only renders while unauthenticated: a context that never logs
-    // in bounces neither /login nor /pair.
-    const page = await browser.newPage({ viewport: { width, height: width < 768 ? 844 : 900 } });
+    // The card only renders while unauthenticated: a fresh context that never
+    // logs in renders both /login and /pair. Clear its storage so the mock's
+    // auto-bootstrap (dev only) cannot turn it back into an authed session.
+    const browser = probe.context().browser();
+    if (!browser) throw new Error("no browser for the login/pair evidence");
+    const context = await browser.newContext({
+      viewport: { width, height: width < 768 ? 844 : 900 },
+      reducedMotion: "reduce",
+    });
+    const page = await context.newPage();
+    await page.addInitScript(() => {
+      localStorage.clear();
+      localStorage.setItem("runtime.logged-out", "1");
+    });
     try {
-      await page.emulateMedia({ reducedMotion: "reduce" });
       await page.goto("/login");
       await expect(page.getByTestId("login-page")).toBeVisible();
       for (const mode of MODES) await shoot(page, "login", mode, width);
@@ -98,7 +108,7 @@ for (const width of WIDTHS) {
       await expect(page.getByTestId("login-page")).toHaveAttribute("data-mode", "pair");
       for (const mode of MODES) await shoot(page, "pair", mode, width);
     } finally {
-      await page.close();
+      await context.close();
     }
   });
 }

@@ -990,22 +990,22 @@ export function NewSessionPage() {
                         : ""}
                     </span>
                     {driver === "shell-pty" ? (
-                      <div className={css.yolo} data-testid="new-session-pty-hint">
-                        <div className={css.yoloHead}>
-                          <span className={css.yoloDot} />
-                          <span className={css.yoloTitle}>shell-pty · 原生终端</span>
+                      <div className={css.carrier} data-testid="new-session-pty-hint">
+                        <div className={css.carrierHead}>
+                          <span className={css.carrierDot} />
+                          <span className={css.carrierTitle}>shell-pty · 原生终端</span>
                         </div>
-                        <div className={css.yoloBody}>
+                        <div className={css.carrierBody}>
                           launch shim + per-session overlay · {PTY_YOLO_FLAGS[activeKind as keyof typeof PTY_YOLO_FLAGS] ?? ""} 仅在绕过全部时追加
                         </div>
                       </div>
                     ) : activeKind === "codex" || activeKind === "grok" || activeKind === "agy" ? (
-                      <div className={css.yolo} data-testid="new-session-pty-hint">
-                        <div className={css.yoloHead}>
-                          <span className={css.yoloDot} />
-                          <span className={css.yoloTitle}>generic-pty</span>
+                      <div className={css.carrier} data-testid="new-session-pty-hint">
+                        <div className={css.carrierHead}>
+                          <span className={css.carrierDot} />
+                          <span className={css.carrierTitle}>generic-pty</span>
                         </div>
-                        <div className={css.yoloBody}>
+                        <div className={css.carrierBody}>
                           {ptyYoloHint(activeKind)} · {PTY_YOLO_FLAGS[activeKind]}
                         </div>
                       </div>

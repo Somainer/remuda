@@ -52,6 +52,7 @@
 }
 
 .close {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -338,6 +339,48 @@
 }
 
 .yoloBody {
+  padding-left: var(--space-4);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+/* Neutral carrier information (shell-pty / generic-pty). This is a plain
+   explanation of how the session is carried, not a destructive choice — the
+   danger role stays on the bypass/YOLO warning above only. */
+.carrier {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.carrierHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.carrierDot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fg-muted);
+}
+
+.carrierTitle {
+  flex: 1;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+
+.carrierBody {
   padding-left: var(--space-4);
   color: var(--fg-muted);
   font-size: var(--text-meta);
@@ -654,9 +697,17 @@
 }
 
 /* Coarse pointers: text buttons and inputs may visibly grow to 44px (they are
-   not glyph controls). This never keys off width (ui-spec §3.4). */
+   not glyph controls). This never keys off width (ui-spec §3.4). The header ✕
+   keeps its 32px visual size and reaches 44×44 through a centred ::after, the
+   same pattern as .iconBtn. */
 @media (pointer: coarse) {
   .choice {
     padding: 0 var(--space-4);
+  }
+
+  .close::after {
+    content: "";
+    position: absolute;
+    inset: calc((var(--icon-btn) - var(--touch)) / 2);
   }
 }

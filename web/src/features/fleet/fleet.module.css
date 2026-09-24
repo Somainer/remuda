@@ -165,6 +165,7 @@
 
 .markQueued,
 .markForwarded,
-.markReplayed {
+.markReplayed,
+.markCancelled {
   color: var(--fg-muted);
 }

@@ -637,6 +637,11 @@
     min-height: var(--touch);
   }
 
+  /* Form toggles (default gateway, scope): the whole label is a 44px band. */
+  .toggleRow {
+    min-height: var(--touch);
+  }
+
   /* Row-level affordances get the full row height; adjacent rows are
      separated by their divider, so the 44px bands never overlap. */
   .modelRow {
@@ -654,6 +659,22 @@
   /* The whole header row is the group toggle; extend its band. */
   .modelGroupToggle {
     align-self: stretch;
+  }
+
+  /* Enable-default label: stretches through the row's full 44px height so
+     the radio and the word 默认 share one tall, non-overlapping band. */
+  .modelPick {
+    align-self: stretch;
+  }
+
+  /* Default-model radio label keeps its glyph height but gets a full 44px
+     band via the stretched row; the radio itself is centered. */
+  .modelTail {
+    align-self: stretch;
+  }
+
+  .modelDefault {
+    min-height: var(--touch);
   }
 
   /* The remove × keeps its glyph size; its hit area is the after-pseudo. */
@@ -680,13 +701,6 @@
   }
 
   /* Default-model radio and the tri-state checkbox ride the 44px row. */
-  .modelDefault {
-    position: relative;
-    flex: none;
-    width: var(--touch);
-    justify-content: center;
-  }
-
   .modelGroupPick {
     align-self: stretch;
     width: var(--touch);

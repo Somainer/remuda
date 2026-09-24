@@ -2,16 +2,19 @@ import { useState } from "react";
 import { Button } from "../../components/Button";
 import { api, type FleetBroadcastResult } from "../../lib/api";
 import type { Instance } from "../../types/instance";
+import type { Id } from "../../types/wire";
 import ui from "../../styles/ui.module.css";
 import type { HostView } from "../hosts/model";
 import {
   BROADCAST_KEYS,
   DELIVERY_LABEL,
   buildBroadcastBody,
-  deliveryState,
   orderResults,
+  provisionalState,
+  resolveEntry,
   summarize,
   type BroadcastForm,
+  type DeliveryState,
 } from "./broadcast";
 import css from "./fleet.module.css";
 
@@ -20,6 +23,13 @@ const EMPTY: BroadcastForm = {
   text: "",
   key: "enter",
   filter: { hostId: "", kind: "" },
+};
+
+type RowState = {
+  state: DeliveryState;
+  reason?: string;
+  /** True while the authoritative command read is still being polled. */
+  resolving?: boolean;
 };
 
 /**
@@ -31,8 +41,38 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FleetBroadcastResult | null>(null);
+  const [rowStates, setRowStates] = useState<Record<string, RowState>>({});
 
   const kinds = [...new Set(instances.map((instance) => instance.kind))].sort();
+
+  /**
+   * Read the authoritative settlement for each accepted row. The fleet
+   * response never carries `settlement.outcome`, so green confirmation is
+   * only allowed after the command resource reports completed. Reads are
+   * bounded: one immediate read per row plus follow-ups inside resolveEntry
+   * for up to ~10s; still-open rows keep their neutral provisional label.
+   */
+  async function resolveRows(value: FleetBroadcastResult) {
+    const entries = value.results ?? [];
+    const initial: Record<string, RowState> = {};
+    for (const entry of entries) {
+      const key = entry.commandId ?? entry.instanceId;
+      if (key) initial[key] = { state: provisionalState(entry) };
+    }
+    setRowStates(initial);
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        const key = entry.commandId ?? entry.instanceId;
+        if (!key || !entry.ok || entry.replayed || !entry.commandId || !entry.instanceId) return;
+        setRowStates((prev) => ({ ...prev, [key]: { state: provisionalState(entry), resolving: true } }));
+        const settled = await resolveEntry(entry, (instanceId, commandId) =>
+          api.instanceCommandStatus(instanceId as Id, commandId as Id),
+        );
+        setRowStates((prev) => ({ ...prev, [key]: settled }));
+      }),
+    );
+  }
 
   async function submit() {
     const built = buildBroadcastBody(form);
@@ -45,7 +85,11 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
     try {
       const value = await api.fleetBroadcast({ ...built.body, confirm: true });
       setResult(value);
+      setRowStates({});
       if (form.mode === "prompt") setForm((prev) => ({ ...prev, text: "" }));
+      // Do not block the send button on the bounded settlement follow-up:
+      // rows update in place as authoritative outcomes arrive.
+      void resolveRows(value);
     } catch (err) {
       setError(err instanceof Error ? err.message : "广播失败");
     } finally {
@@ -158,24 +202,35 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
           </p>
           <ul className={css.members} data-testid="broadcast-results">
             {orderResults(result).map((entry) => {
-              const state = deliveryState(entry);
+              const key = entry.commandId ?? entry.instanceId;
+              const row = (key ? rowStates[key] : undefined) ?? { state: provisionalState(entry) };
+              const state: DeliveryState = row.state;
+              const markClass = `mark${state[0].toUpperCase()}${state.slice(1)}`;
               return (
                 <li
-                  key={entry.commandId ?? entry.instanceId}
+                  key={key}
                   className={css.member}
                   data-testid="broadcast-result"
                   data-ok={String(entry.ok ?? false)}
                   data-delivery={state}
+                  data-resolving={row.resolving ? "1" : undefined}
                 >
-                  <span className={`${css.mark} ${css[`mark${state[0].toUpperCase()}${state.slice(1)}`]}`}>
+                  <span className={`${css.mark} ${css[markClass]}`}>
                     {DELIVERY_LABEL[state]}
+                    {row.resolving ? "…" : ""}
                   </span>
                   <span className={css.memberBody}>
                     {entry.instanceId}
                     <div className={css.memberMeta}>
                       {entry.kind} · {entry.hostId}
                       {entry.replayed ? " · 重放" : ""}
-                      {entry.error ? ` · ${entry.error}` : entry.state ? ` · ${entry.state}` : ""}
+                      {row.reason
+                        ? ` · ${row.reason}`
+                        : entry.error
+                          ? ` · ${entry.error}`
+                          : entry.state
+                            ? ` · ${entry.state}`
+                            : ""}
                     </div>
                   </span>
                 </li>

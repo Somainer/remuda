@@ -1,18 +1,26 @@
 import { expect, test, type Page } from "@playwright/test";
+import { mkdir, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const TTY_LAB = "ins_01993ab0-0000-7000-8000-00000000aa01";
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "__screenshots__");
+/** 768/1024 layout checks are asserted but never committed: captures for
+ *  those widths go to an OS temp dir under REMUDA_EVIDENCE only. */
+const scratchDir = path.join(os.tmpdir(), "remuda-ui-screenshots");
+const COMMITTED_TAGS = new Set(["1440", "390"]);
 
 // Goldens are committed artifacts: an ordinary gate run must navigate and
 // assert every route but never write into the tracked tree. Captures happen
 // only with REMUDA_EVIDENCE=1.
 const capture = process.env.REMUDA_EVIDENCE === "1";
 
-async function shot(page: Page, name: string) {
+async function shot(page: Page, name: string, tag: string) {
   if (!capture) return;
-  await page.screenshot({ path: path.join(dir, name), animations: "disabled", fullPage: false });
+  const targetDir = COMMITTED_TAGS.has(tag) ? dir : scratchDir;
+  await mkdir(targetDir, { recursive: true });
+  await writeFile(path.join(targetDir, name), await page.screenshot({ animations: "disabled", fullPage: false }));
 }
 
 test.describe("ui screenshots 1440 / 390", () => {
@@ -71,26 +79,26 @@ test.describe("ui screenshots 1440 / 390", () => {
       if (w < 768) {
         await page.goto("/m");
         await expect(page.getByTestId("home-list")).toBeVisible();
-        if (w >= 1024 || w < 768) await shot(page, `sessions-${tag}.png`);
+        if (w >= 1024 || w < 768) await shot(page, `sessions-${tag}.png`, tag);
         await page.getByTestId("home-row-link").filter({ hasText: "看 TaskManager spill" }).first().click();
       } else {
         await page.goto("/sessions");
         await expect(page.getByTestId("session-list").first()).toBeVisible();
-        if (w >= 1024 || w < 768) await shot(page, `sessions-${tag}.png`);
+        if (w >= 1024 || w < 768) await shot(page, `sessions-${tag}.png`, tag);
         await page.getByTestId("session-row").filter({ hasText: "看 TaskManager spill" }).first().click();
       }
       await expect(page.getByTestId("session-page")).toBeVisible();
       await expect(page.getByTestId("composer")).toBeVisible();
-      if (w >= 1024 || w < 768) await shot(page, `session-${tag}.png`);
+      if (w >= 1024 || w < 768) await shot(page, `session-${tag}.png`, tag);
 
       await page.goto(`/s/${TTY_LAB}/tty`);
       await expect(page.locator("[data-tty-lab='1']")).toBeVisible();
       await expect(page.locator("[data-tty-ready='1']")).toBeVisible({ timeout: 15_000 });
-      if (w >= 1024 || w < 768) await shot(page, `tty-${tag}.png`);
+      if (w >= 1024 || w < 768) await shot(page, `tty-${tag}.png`, tag);
 
       await page.goto("/sessions/new");
       await expect(page.getByTestId("new-session-sheet")).toBeVisible();
-      if (w >= 1024 || w < 768) await shot(page, `new-${tag}.png`);
+      if (w >= 1024 || w < 768) await shot(page, `new-${tag}.png`, tag);
 
       await page.goto("/approvals");
       // c-minbox: below 768 the /approvals entry redirects to the phone inbox
@@ -101,11 +109,11 @@ test.describe("ui screenshots 1440 / 390", () => {
       } else {
         await expect(page.getByTestId("approvals-page")).toBeVisible();
       }
-      if (w >= 1024 || w < 768) await shot(page, `approvals-${tag}.png`);
+      if (w >= 1024 || w < 768) await shot(page, `approvals-${tag}.png`, tag);
 
       await page.goto("/hosts");
       await expect(page.getByTestId("hosts-page")).toBeVisible();
-      await shot(page, `hosts-${tag}.png`);
+      await shot(page, `hosts-${tag}.png`, tag);
       // The status line, CLI inventory and session count must be readable at
       // every width (the mobile summary carries them under 1024px).
       await expect(page.getByTestId("hosts-head").locator("h1")).toHaveText("主机");
@@ -128,21 +136,21 @@ test.describe("ui screenshots 1440 / 390", () => {
 
       await page.goto("/fleet");
       await expect(page.getByTestId("fleet-page")).toBeVisible();
-      await shot(page, `fleet-${tag}.png`);
+      await shot(page, `fleet-${tag}.png`, tag);
 
       await page.goto("/projects");
       await expect(page.getByTestId("projects-page")).toBeVisible();
-      await shot(page, `projects-${tag}.png`);
+      await shot(page, `projects-${tag}.png`, tag);
       // A long project name must not push the header past the viewport.
       expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(w);
 
       await page.goto("/providers");
       await expect(page.getByTestId("providers-page")).toBeVisible();
-      await shot(page, `providers-${tag}.png`);
+      await shot(page, `providers-${tag}.png`, tag);
 
       await page.goto("/bots");
       await expect(page.getByTestId("bots-page")).toBeVisible();
-      await shot(page, `bots-${tag}.png`);
+      await shot(page, `bots-${tag}.png`, tag);
 
       // The login card only renders unauthenticated. The mock otherwise
       // bootstraps every page into an authed session, so use a separate
@@ -168,7 +176,7 @@ test.describe("ui screenshots 1440 / 390", () => {
 
       await page.goto("/settings");
       await expect(page.getByTestId("settings-page")).toBeVisible();
-      if (w >= 1024 || w < 768) await shot(page, `settings-${tag}.png`);
+      if (w >= 1024 || w < 768) await shot(page, `settings-${tag}.png`, tag);
     }
 
     await page.addInitScript(() => {
@@ -177,6 +185,6 @@ test.describe("ui screenshots 1440 / 390", () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await page.goto("/sessions");
     await expect(page.getByTestId("install-bar")).toBeVisible();
-    await shot(page, "install-390.png"); // 390-only shot, unchanged
+    await shot(page, "install-390.png", "390"); // 390-only shot, unchanged
   });
 });

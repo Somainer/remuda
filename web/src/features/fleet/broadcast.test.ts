@@ -1,5 +1,16 @@
-import { describe, expect, it } from "vitest";
-import { buildBroadcastBody, deliveryState, orderResults, summarize, type BroadcastForm } from "./broadcast";
+import { describe, expect, it, vi } from "vitest";
+import {
+  buildBroadcastBody,
+  classifyCommand,
+  orderResults,
+  provisionalState,
+  resolveEntry,
+  summarize,
+  type BroadcastForm,
+} from "./broadcast";
+import type { components } from "../../lib/api.generated";
+
+type CommandRecord = components["schemas"]["CommandRecord"];
 
 function form(over: Partial<BroadcastForm> = {}): BroadcastForm {
   return { mode: "prompt", text: "PAUSE", key: "enter", filter: { hostId: "", kind: "" }, ...over };
@@ -72,28 +83,99 @@ describe("fleet broadcast results", () => {
 });
 
 describe("fleet delivery state (D-053 §2)", () => {
-  it("an accepted but unforwarded command is queued, never confirmed", () => {
-    expect(deliveryState({ ok: true, forwarded: false, state: "queued" })).toBe("queued");
-  });
+  function command(over: Partial<CommandRecord>): CommandRecord {
+    return {
+      commandId: "cmd_1",
+      instanceId: "ins_1",
+      hostId: "hst_1",
+      operation: "instance.send",
+      state: "accepted",
+      resolution: "clear",
+      forwarded: false,
+      idempotencyKey: null,
+      payload: {},
+      createdAt: "2026-09-24T00:00:00.000Z",
+      updatedAt: "2026-09-24T00:00:00.000Z",
+      ...over,
+    };
+  }
 
-  it("a forwarded command whose outcome is unknown is only forwarded", () => {
-    expect(deliveryState({ ok: true, forwarded: true, state: "accepted" })).toBe("forwarded");
-    expect(deliveryState({ ok: true, forwarded: true, state: "settled", resolution: "unknown" })).toBe("forwarded");
-  });
-
-  it("green confirmed needs an authoritative completed settlement", () => {
-    expect(deliveryState({ ok: true, forwarded: true, state: "settled", resolution: "completed" })).toBe(
-      "confirmed",
-    );
-  });
-
-  it("keeps replays, explicit rejections and transport failures distinct", () => {
-    expect(deliveryState({ ok: true, replayed: true, state: "settled", resolution: "completed" })).toBe(
-      "replayed",
-    );
-    expect(deliveryState({ ok: true, forwarded: true, state: "settled", resolution: "rejected" })).toBe(
+  it("the fan-out row alone is never confirmed: queued vs forwarded only", () => {
+    expect(provisionalState({ ok: true, forwarded: false, state: "queued" })).toBe("queued");
+    expect(provisionalState({ ok: true, forwarded: true, state: "accepted" })).toBe("forwarded");
+    // A settled fleet row still carries no settlement.outcome — provisional.
+    expect(provisionalState({ ok: true, forwarded: true, state: "settled", resolution: "clear" })).toBe(
       "forwarded",
     );
-    expect(deliveryState({ ok: false, error: "host offline" })).toBe("failed");
+  });
+
+  it("classifies the authoritative command record by settlement.outcome", () => {
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "completed" } }))).toBe("confirmed");
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "rejected", reason: "tool denied" } }))).toBe("failed");
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "cancelled" } }))).toBe("cancelled");
+  });
+
+  it("settled/clear without an outcome is not a success", () => {
+    expect(classifyCommand(command({ state: "settled", resolution: "clear", forwarded: true }))).toBe("forwarded");
+  });
+
+  it("keeps replays and transport failures distinct at the row level", () => {
+    expect(provisionalState({ ok: true, replayed: true, state: "queued" })).toBe("replayed");
+    expect(provisionalState({ ok: false, error: "host offline" })).toBe("failed");
+  });
+
+  it("resolveEntry reads the command once and confirms a completed settlement", async () => {
+    const read = vi.fn(async () =>
+      command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "completed" } }),
+    );
+    const settled = await resolveEntry(
+      { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: true, state: "accepted" },
+      read,
+    );
+    expect(settled).toEqual({ state: "confirmed", reason: undefined });
+    expect(read).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledWith("ins_1", "cmd_1");
+  });
+
+  it("resolveEntry surfaces the Node rejection reason as failure", async () => {
+    const read = vi.fn(async () =>
+      command({ state: "settled", resolution: "clear", forwarded: true, settlement: { outcome: "rejected", reason: "permission denied" } }),
+    );
+    const settled = await resolveEntry(
+      { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: true, state: "settled", resolution: "clear" },
+      read,
+    );
+    expect(settled).toEqual({ state: "failed", reason: "permission denied" });
+  });
+
+  it("resolveEntry follows up briefly while the command is still open, then stays neutral", async () => {
+    const read = vi
+      .fn()
+      .mockResolvedValueOnce(command({ state: "accepted", resolution: "clear", forwarded: true }))
+      .mockResolvedValueOnce(command({ state: "accepted", resolution: "clear", forwarded: true }));
+    const settled = await resolveEntry(
+      { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: true, state: "accepted" },
+      read,
+      300,
+    );
+    expect(settled).toEqual({ state: "forwarded" });
+  });
+
+  it("resolveEntry stays provisional on a read failure (never fabricates)", async () => {
+    const read = vi.fn(async () => {
+      throw new Error("404");
+    });
+    const settled = await resolveEntry(
+      { ok: true, instanceId: "ins_1", commandId: "cmd_1", hostId: "hst_1", kind: "claude", forwarded: false, state: "queued" },
+      read,
+    );
+    expect(settled).toEqual({ state: "queued" });
+  });
+
+  it("resolveEntry does not read for failed or replayed rows", async () => {
+    const read = vi.fn();
+    expect(await resolveEntry({ ok: false, error: "x" }, read)).toEqual({ state: "failed" });
+    expect(await resolveEntry({ ok: true, replayed: true, state: "queued" }, read)).toEqual({ state: "replayed" });
+    expect(read).not.toHaveBeenCalled();
   });
 });

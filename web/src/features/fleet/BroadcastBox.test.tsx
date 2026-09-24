@@ -11,16 +11,38 @@ const hosts = [{ id: "hst_1" as Id, label: "sg-node" }] as HostView[];
 const instances = [{ id: "ins_1" as Id, kind: "claude" }, { id: "ins_2" as Id, kind: "codex" }] as Instance[];
 
 describe("BroadcastBox", () => {
-  it("posts the typed prompt and renders per-instance results", async () => {
+  it("posts the typed prompt and resolves each row from the command resource", async () => {
     const user = userEvent.setup();
     const broadcast = vi.spyOn(api, "fleetBroadcast").mockResolvedValue({
       accepted: 1,
       failed: 1,
       skipped: 0,
       results: [
-        { instanceId: "ins_1", hostId: "hst_1", kind: "claude", ok: true, state: "accepted" },
+        {
+          instanceId: "ins_1",
+          hostId: "hst_1",
+          kind: "claude",
+          ok: true,
+          commandId: "cmd_1",
+          state: "accepted",
+          forwarded: true,
+        },
         { instanceId: "ins_2", hostId: "hst_1", kind: "codex", ok: false, error: "host offline" },
       ],
+    });
+    const status = vi.spyOn(api, "instanceCommandStatus").mockResolvedValue({
+      commandId: "cmd_1",
+      instanceId: "ins_1",
+      hostId: "hst_1",
+      operation: "instance.send",
+      state: "settled",
+      resolution: "clear",
+      forwarded: true,
+      idempotencyKey: null,
+      settlement: { outcome: "completed" },
+      payload: {},
+      createdAt: "2026-09-24T00:00:00.000Z",
+      updatedAt: "2026-09-24T00:00:00.000Z",
     });
 
     render(<BroadcastBox hosts={hosts} instances={instances} />);
@@ -34,13 +56,106 @@ describe("BroadcastBox", () => {
     expect(body.confirm).toBe(true);
     expect(body.all).toBe(true);
 
+    // One authoritative read per accepted row, and the completed settlement
+    // is the only thing that paints green 已确认.
+    await waitFor(() => expect(status).toHaveBeenCalledWith("ins_1", "cmd_1"));
+    const okRow = screen.getAllByTestId("broadcast-result").find((r) => r.getAttribute("data-ok") === "true");
+    await waitFor(() => expect(okRow).toHaveAttribute("data-delivery", "confirmed"));
+    expect(okRow).toHaveTextContent("已确认");
+
     expect(screen.getByTestId("broadcast-summary").textContent).toContain("已接受 1");
     const rows = screen.getAllByTestId("broadcast-result");
     expect(rows).toHaveLength(2);
     // Failures sort first and surface their reason.
     expect(rows[0]).toHaveAttribute("data-ok", "false");
+    expect(rows[0]).toHaveAttribute("data-delivery", "failed");
     expect(rows[0].textContent).toContain("host offline");
     broadcast.mockRestore();
+    status.mockRestore();
+  });
+
+  it("marks a Node rejection as failure with its reason, never green", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "fleetBroadcast").mockResolvedValue({
+      accepted: 1,
+      failed: 0,
+      skipped: 0,
+      results: [
+        {
+          instanceId: "ins_1",
+          hostId: "hst_1",
+          kind: "claude",
+          ok: true,
+          commandId: "cmd_r",
+          state: "settled",
+          resolution: "clear",
+          forwarded: true,
+        },
+      ],
+    });
+    vi.spyOn(api, "instanceCommandStatus").mockResolvedValue({
+      commandId: "cmd_r",
+      instanceId: "ins_1",
+      hostId: "hst_1",
+      operation: "instance.send",
+      state: "settled",
+      resolution: "clear",
+      forwarded: true,
+      idempotencyKey: null,
+      settlement: { outcome: "rejected", reason: "blocker: approval required" },
+      payload: {},
+      createdAt: "2026-09-24T00:00:00.000Z",
+      updatedAt: "2026-09-24T00:00:00.000Z",
+    });
+
+    render(<BroadcastBox hosts={hosts} instances={instances} />);
+    await user.type(screen.getByTestId("broadcast-text"), "x");
+    await user.click(screen.getByTestId("broadcast-send"));
+    const row = (await screen.findByTestId("broadcast-result"));
+    await waitFor(() => expect(row).toHaveAttribute("data-delivery", "failed"));
+    expect(row).toHaveTextContent("失败");
+    expect(row).toHaveTextContent("approval required");
+    expect(row).not.toHaveTextContent("已确认");
+  });
+
+  it("stays neutral 已发送 while the command is still accepted/open", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(api, "fleetBroadcast").mockResolvedValue({
+      accepted: 1,
+      failed: 0,
+      skipped: 0,
+      results: [
+        {
+          instanceId: "ins_1",
+          hostId: "hst_1",
+          kind: "claude",
+          ok: true,
+          commandId: "cmd_o",
+          state: "accepted",
+          forwarded: true,
+        },
+      ],
+    });
+    vi.spyOn(api, "instanceCommandStatus").mockResolvedValue({
+      commandId: "cmd_o",
+      instanceId: "ins_1",
+      hostId: "hst_1",
+      operation: "instance.send",
+      state: "accepted",
+      resolution: "clear",
+      forwarded: true,
+      idempotencyKey: null,
+      payload: {},
+      createdAt: "2026-09-24T00:00:00.000Z",
+      updatedAt: "2026-09-24T00:00:00.000Z",
+    });
+
+    render(<BroadcastBox hosts={hosts} instances={instances} />);
+    await user.type(screen.getByTestId("broadcast-text"), "x");
+    await user.click(screen.getByTestId("broadcast-send"));
+    const row = await screen.findByTestId("broadcast-result");
+    await waitFor(() => expect(row).toHaveAttribute("data-delivery", "forwarded"));
+    expect(row).toHaveTextContent("已发送");
   });
 
   it("applies the host and kind filter to the request", async () => {

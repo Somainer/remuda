@@ -296,12 +296,24 @@ a.count {
   color: var(--fg-muted);
 }
 
-/* Install flag: its own column so it survives every width (unlike cliVer). */
+/* Install flag: its own column so it survives every width (unlike cliVer).
+   Sized to content (min-width keeps the two states aligned) and allowed to
+   wrap, so 「已安装 · nativeGateway false」 is never clipped. */
 .cliFlag {
   flex: none;
-  width: 110px;
+  min-width: 64px;
   color: var(--fg-body);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+/* Capability note (未上报 / explanation): visible at every width, unlike the
+   version column which hides on phones. */
+.cliNote {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg-muted);
 }
 
 .cliAuth {
@@ -498,8 +510,15 @@ a.count {
   .cliFlag {
     flex: none;
     width: auto;
+    min-width: 0;
     order: 1;
     align-self: center;
+    text-align: left;
+  }
+
+  .cliNote {
+    flex: 1 1 100%;
+    order: 3;
   }
 
   .cliAuth {
@@ -510,6 +529,6 @@ a.count {
 
   .cliPath {
     flex: 1 1 100%;
-    order: 3;
+    order: 4;
   }
 }

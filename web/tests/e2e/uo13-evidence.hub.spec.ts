@@ -1,6 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { setMode } from "./appearanceHelper";
 import { login } from "./hub-auth";
@@ -8,15 +9,20 @@ import { login } from "./hub-auth";
 /**
  * UO-13 evidence: the management surfaces (§4.10) — hosts + detail, fleet,
  * projects, providers + detail, bots + detail, and the login/pair card — in
- * both modes at 390, 768, 1024 and 1440. A default run skips everything;
- * REMUDA_EVIDENCE=1 writes
- * docs/design/evidence/ui-overhaul/UO-13-<surface>-<mode>-<width>.png.
+ * both modes at 390, 768, 1024 and 1440. A default run skips everything.
+ *
+ * REMUDA_EVIDENCE=1 captures:
+ *  - 390/1440 into the committed docs/design/evidence/ui-overhaul/ tree
+ *  - 768/1024 into an OS temp dir (layout verification is not committed)
  */
 
 test.skip(!process.env.REMUDA_EVIDENCE, "set REMUDA_EVIDENCE=1 to capture the committed screenshots");
 test.describe.configure({ mode: "serial" });
 
-const shotDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/ui-overhaul");
+const committedDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../docs/design/evidence/ui-overhaul");
+/** 768/1024 captures stay out of the repo even when capturing. */
+const scratchDir = path.join(os.tmpdir(), "remuda-uo13-evidence");
+const COMMITTED_WIDTHS = new Set([390, 1440]);
 const MODES = ["dark", "light"] as const;
 const WIDTHS = [390, 768, 1024, 1440] as const;
 type Mode = (typeof MODES)[number];
@@ -37,11 +43,15 @@ async function shoot(page: Page, surface: string, mode: Mode, width: number): Pr
   await setMode(page, mode);
   await page.evaluate(() => document.fonts.ready.then(() => undefined));
   await page.waitForTimeout(300);
-  await writeFile(path.join(shotDir, `UO-13-${surface}-${mode}-${width}.png`), await page.screenshot({ animations: "disabled" }));
+  // 390/1440 are the committed goldens; the intermediate widths are
+  // captured for local review only and never written into the repo.
+  const dir = COMMITTED_WIDTHS.has(width) ? committedDir : scratchDir;
+  await writeFile(path.join(dir, `UO-13-${surface}-${mode}-${width}.png`), await page.screenshot({ animations: "disabled" }));
 }
 
 test.beforeAll(async () => {
-  await mkdir(shotDir, { recursive: true });
+  await mkdir(committedDir, { recursive: true });
+  await mkdir(scratchDir, { recursive: true });
 });
 
 test.beforeEach(async ({ page }) => {
@@ -75,11 +85,21 @@ for (const width of WIDTHS) {
     await page.waitForTimeout(300);
     for (const mode of MODES) await shoot(page, "projects", mode, width);
 
-    // Deterministic provider detail: create the gateway against the harness
-    // upstream first (idempotent — a repeat capture updates the same name).
-    // Required coverage must never silently skip on a missing fixture.
+    // Deterministic provider detail. The harness data dir is ephemeral and a
+    // name is NOT unique on re-create, so delete any stale rows first and POST
+    // exactly one fresh gateway. Required coverage must never silently skip.
+    const origin = new URL(page.url()).origin;
+    const existing = await page.request.get("/v1/providers", { headers: { Origin: origin } });
+    if (existing.ok()) {
+      const stale = ((await existing.json()).items ?? []) as { id?: string; name?: string }[];
+      for (const row of stale) {
+        if (row.id && row.name === GATEWAY_NAME) {
+          await page.request.delete(`/v1/providers/${row.id}`, { headers: { Origin: origin } });
+        }
+      }
+    }
     const create = await page.request.post("/v1/providers", {
-      headers: { Origin: new URL(page.url()).origin },
+      headers: { Origin: origin },
       data: {
         name: GATEWAY_NAME,
         kind: "gateway",
@@ -88,19 +108,36 @@ for (const width of WIDTHS) {
         defaultGateway: true,
       },
     });
-    if (!create.ok() && create.status() !== 409) {
+    if (!create.ok()) {
       throw new Error(`gateway seed failed: ${create.status()} ${await create.text()}`);
     }
+    const createdId = ((await create.json()) as { id?: string }).id;
+    if (!createdId) throw new Error("gateway seed returned no id");
 
     await page.goto("/providers");
     await expect(page.getByTestId("providers-page")).toBeVisible();
     for (const mode of MODES) await shoot(page, "providers", mode, width);
 
-    const gateway = page.locator('[data-testid="provider-row"]', { hasText: GATEWAY_NAME }).first();
-    await expect(gateway).toBeVisible();
-    await gateway.click();
-    await expect(page.getByTestId("provider-detail")).toBeVisible();
-    for (const mode of MODES) await shoot(page, "provider-detail", mode, width);
+    // Navigate by id rather than clicking a possibly duplicated name row.
+    await page.goto(`/providers/${createdId}`);
+    const detail = page.getByTestId("provider-detail");
+    await expect(detail).toBeVisible();
+    // The detail must be the seeded gateway's populated card, never the
+    // empty 「未知 profile」 shell: heading/delegation/baseUrl present in
+    // every captured frame (dark and light).
+    await expect(detail.locator("h1")).toContainText(GATEWAY_NAME);
+    await expect(detail).toHaveAttribute("data-delegation", "gateway");
+    await expect(detail).toContainText(upstream.replace(/\/v1\/?$/, ""));
+
+    for (const mode of MODES) {
+      await setMode(page, mode);
+      await page.evaluate(() => document.fonts.ready.then(() => undefined));
+      // Re-assert populated content inside the mode loop so a dark frame
+      // cannot silently capture the shell.
+      await expect(detail.locator("h1")).toContainText(GATEWAY_NAME);
+      await expect(detail).toHaveAttribute("data-delegation", "gateway");
+      await shoot(page, "provider-detail", mode, width);
+    }
 
     await page.goto("/bots");
     await expect(page.getByTestId("bots-page")).toBeVisible();

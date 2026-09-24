@@ -619,6 +619,8 @@ export type HubApi = {
     mediaType: string;
   }>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
+  /** `GET /v1/instances/{id}/commands/{commandId}` authoritative row. */
+  instanceCommandStatus(instanceId: Id, commandId: Id): Promise<components["schemas"]["CommandRecord"]>;
   fleetBroadcast(body: FleetBroadcastBody): Promise<FleetBroadcastResult>;
   worktreeList(hostId?: string): Promise<WorktreePage>;
   worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
@@ -913,6 +915,24 @@ function createMockApi(): HubApi {
     },
     async fleetBroadcast(body) {
       return mockFleetBroadcast(body ?? {});
+    },
+    async instanceCommandStatus(instanceId, commandId): Promise<components["schemas"]["CommandRecord"]> {
+      const hit = mockDb.instances.find((inst) => inst.id === instanceId);
+      if (!hit) throw new HubHttpError(404, "NOT_FOUND", "command not found");
+      return {
+        commandId: commandId as string,
+        instanceId: instanceId as string,
+        hostId: hit.hostId as string,
+        operation: "instance.send",
+        state: "accepted",
+        resolution: "clear",
+        forwarded: true,
+        idempotencyKey: null,
+        settlement: { outcome: "completed" },
+        payload: {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
     },
     async worktreeList() {
       return {
@@ -1401,6 +1421,11 @@ function createLiveApi(): HubApi {
         method: "POST",
         body: JSON.stringify(body),
       });
+    },
+    async instanceCommandStatus(instanceId, commandId) {
+      return rest<components["schemas"]["CommandRecord"]>(
+        `/v1/instances/${encodeURIComponent(instanceId)}/commands/${encodeURIComponent(commandId)}`,
+      );
     },
     async worktreeList(hostId) {
       const qs = hostId ? `?hostId=${encodeURIComponent(hostId)}` : "";

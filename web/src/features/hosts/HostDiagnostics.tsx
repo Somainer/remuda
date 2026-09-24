@@ -25,8 +25,9 @@ function ComputerUseRow({ cli }: { cli?: HostCli[] }) {
   if (state.reported) return null;
   return <div className={css.cliRow} data-testid="computer-use-row" data-state="unreported">
     <span className={css.cliKind}>{COMPUTER_USE_KIND}</span>
-    <span className={css.cliVer}>未上报</span>
-    <span className={css.cliVer} data-testid="computer-use-detail">
+    {/* cliNote stays visible at every width (cliVer hides <=767). */}
+    <span className={css.cliNote}>未上报</span>
+    <span className={css.cliNote} data-testid="computer-use-detail">
       该 Node 未回报此行；不代表本机不支持
     </span>
   </div>;

@@ -17,25 +17,20 @@ export interface MathExpressionProps {
   display: boolean;
 }
 
-/** Faces whose readiness gates the placeholder→formula swap. */
+/** Faces that must be ready before the placeholder is allowed to swap. */
 const REQUIRED_FONTS = ['16px "KaTeX_Main"', '16px "KaTeX_Math"'];
-/** Never stall forever on a slow font fetch; after this the formula shows. */
-const FONT_GRACE_MS = 2000;
 
 export function MathExpression({ source: tokenSource, display }: MathExpressionProps) {
   const engine = useSyncExternalStore(subscribeMath, getMathState);
+  // The placeholder is removed only once the KaTeX faces are ready; a font
+  // failure still proceeds (the @font-face uses font-display: swap), it never
+  // swaps to invisible glyphs on a timer.
   const [fontsReady, setFontsReady] = useState(false);
   useEffect(() => {
     void loadMath();
   }, []);
-  // The tokenizer hid real dollars from micromark behind MATH_DOLLAR; bring
-  // them back for both the engine and the clipboard.
   const source = restoreMathSource(tokenSource);
 
-  // Once the engine (and its @font-face declarations) is present, keep the
-  // visible source placeholder until the main KaTeX faces are actually ready,
-  // so the swap never paints an invisible formula (FOIT). A short grace
-  // timeout covers environments without the Font Loading API.
   useEffect(() => {
     if (engine.status !== "ready") {
       setFontsReady(false);
@@ -47,20 +42,14 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
       setFontsReady(true);
       return;
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    Promise.race([
-      Promise.all(REQUIRED_FONTS.map((spec) => fonts.load(spec))).then(
-        () => fonts.ready,
-      ),
-      new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, FONT_GRACE_MS);
-      }),
-    ]).then(() => {
-      if (!cancelled) setFontsReady(true);
-    });
+    // Resolve on either success or failure — never an invisible timed swap.
+    void Promise.all(REQUIRED_FONTS.map((spec) => fonts.load(spec)))
+      .catch(() => undefined)
+      .then(() => {
+        if (!cancelled) setFontsReady(true);
+      });
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
     };
   }, [engine.status]);
 
@@ -69,8 +58,6 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
     rootRef.current = el;
   }, []);
 
-  // Copying a selection wholly inside the formula yields its TeX source; a
-  // selection that reaches into surrounding prose keeps the browser default.
   const onCopy = useCallback(
     (event: ClipboardEvent<HTMLElement>) => {
       const root = rootRef.current;
@@ -86,15 +73,12 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
 
   const placeholderClass = display
     ? `${css.placeholder} ${css.displayPlaceholder}`
-    : css.placeholder;
-  const engineReady = engine.status === "ready";
+    : `${css.placeholder} ${css.inlinePlaceholder}`;
 
   let body: ReactNode;
-  if (engineReady && fontsReady) {
+  if (engine.status === "ready" && fontsReady) {
     const result = renderMath(engine.katex, source, display);
     if (!result.ok) {
-      // Parse error, oversized source, or engine throw: raw source, danger
-      // role (or neutral for the size cap), message still intact.
       const tooLarge = result.error === "too-large";
       body = (
         <span
@@ -122,6 +106,9 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
         />
       );
     } else {
+      // Plain inline KaTeX: no height cap, so ordinary formulas sit on the
+      // text baseline and explicitly tall ones (\dfrac/matrices) may grow the
+      // line (round-3 ruling J).
       body = (
         <span
           ref={attach}
@@ -134,8 +121,6 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
       );
     }
   } else {
-    // Chunk loading, chunk failed (a later mount retries), or faces not yet
-    // ready: the TeX source stays visibly in a neutral style.
     const state = engine.status === "error" ? "load-error" : "loading";
     body = (
       <span

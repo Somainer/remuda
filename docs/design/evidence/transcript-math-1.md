@@ -140,3 +140,63 @@ lib/ 新文件在范围内、主 chunk ~3.5 KB gzip 增量）获接受；按下�
 - 主 chunk（最终）：1515.79 KB（gzip 449.35 KB），相对基线
   1501.63 KB（444.60 KB）为 +14.16 KB（gzip **+4.75 KB**）；
   KaTeX JS/CSS/字体仍全部懒加载，体积不变。
+
+---
+
+## Round 3（codex + grok REJECT round 2：换方案，停止边缘打地鼠，2026-09-25）
+
+放弃手写源码重写器的逐案修补，按下发的 A–K 重写：
+
+- **A 代码归属解析器。** `mathCodeRanges.ts` 用与渲染相同的 remark-parse +
+  remark-gfm（不带 math）解析一次，取 `code`/`inlineCode`/`html` 节点的源码
+  区间，定界符扫描整段跳过——缩进围栏（`  ~~~`）、bracket 前瞻吞 fence、
+  以及未来代码形态一并解决。带 `mightContainCode` 预检（无反引号/波浪号/`<`/
+  缩进行直接返回空），不含代码的对抗输入完全不碰解析器。
+- **B 单趟线性。** 一次前向 char walk（跳过代码区间）收集括号 span、单 `$`、
+  `$$` run；配对只在这些数组上做、游标不回退；未闭合 `\(`/`\[` 未命中时把
+  同线扫描游标推到行尾，不重扫。四个 **100 KB** 输入 best-of-7（jsdom/Vitest，
+  加载态 gate devbox）：
+  - `"\(".repeat(50000)`（100000b）：**31.4 ms**
+  - `"$$x\n\n".repeat(20000)`（100000b）：**7.9 ms**
+  - `"$1".repeat(50000)`（100000b）：**6.8 ms**
+  - 100 KB 公式 `$ + "x+1"*33334 + $`（100004b）：**2.9 ms**
+- **C 就地改写。** 只把同行 `\(x\)`→`$x$`、`\[x\]`→`$$x$$` 替换，不注入
+  换行/fence、不碰 `>` 与列表 marker。同线 `$$x$$`（含 `- before $$x$$ after`、
+  `> before $$x$$ after`、`- \[x\]`）留在原容器，由 mdast provenance 标成
+  display 块在容器内渲染；`    $$x$$` 仍是缩进代码。
+- **D 配对即逃逸。** 非已接受配对定界符的 `$` 一律输出 `\$`，remark-math
+  配对结果不可能与扫描器分歧：`Cost $5 and $10; use $x$.` 只有 x 是数学。
+- **E 空行。** `$$\n\nx\n\n$$y$$\n\n$z$` 中坏开 run 只杀死自己，`$$y$$`、
+  `$z$` 都渲染。
+- **F provenance。** remark 插件 `mathProvenance.ts` 在 mdast math 节点的
+  `data.hProperties.dataMath` 打 `inline`/`display`（flow 在 `<pre>`、同线
+  `$$`/`$` 在 `<code>`）；sanitizer 在默认 schema 上仅对 `pre`/`code` 放行
+  `dataMath`。` ```mathdisplay ` / ` ```mathinline ` / `~~~math` 围栏无该
+  属性 → CodeBlock，不加载 KaTeX。
+- **G 流式字面尾巴。** 悬空 `$$`/`\[` 的整段作为纯 React 文本节点
+  （`math-literal`）渲染，不经 markdown、无反斜杠翻倍：`intro \[a *b* + \{c\}`
+  逐字可见，无 `<em>`。
+- **H 字体。** 20 个 `@font-face` 全部 `font-display: swap`（重生成
+  mathKatex.css 第 3 步）；MathBlock `document.fonts.load(...).catch(...)`，
+  主字面就绪才撤占位，无定时器、无不可见字形切换。
+- **I 占位/skip 节点。** `max-width:100%`；display 变体块内横向滚动、inline
+  变体 `overflow-wrap:anywhere`，transcript 永不横滚。
+- **J inline 行高放宽。** 去掉 max-height cap；普通 inline 公式（`$x^2$`、
+  `$\frac{a}{b}$`、`$\sum_i x_i$`、`$\sqrt{x}$`）段落高度 ≤ 单行 +2px
+  （e2e 钉），显式 `\dfrac`/`\displaystyle`/矩阵允许撑大所在行（e2e 钉）。
+- **K 失败后第二组件渲染。** `MathBlock.test.tsx` 用 importer seam：第一次
+  import reject → 第一组件显源码；卸载后第二个组件挂载触发新 import →
+  ready、渲染 KaTeX。
+
+### Round-3 测试 / 体积 / 协调
+
+- 数学单元 59 例；全量 `pnpm test` 1844 passed；typecheck、lint 干净。
+- hub e2e 8 例：原 softmax/inline/390/1440/无 KaTeX 请求 5 例 + round-3
+  结构/边界 1 例 + J 普通行高/显式撑高 2 例（fenceBalance 合入后的回归另跑）。
+- 主 chunk：1518.19 KB（gzip 450.03 KB）；KaTeX JS 259.16 KB / gz 77.74、
+  CSS 27.24 KB / gz 7.49、20 面 woff2 ≈292 KB，全部懒加载。新增直接依赖
+  `unified`、`remark-parse`（代码区间解析）、`hast-util-sanitize`（扩展
+  默认 schema 取 defaultSchema）。
+- fenceBalance（UO-5）尚未合入 main（已 accepted/queued）：落地后单独提交——
+  同步 remark 插件列表并修「无 `>` 空行已结束引用围栏仍追加闭合」（仅 code
+  节点到 EOF 才追加）。

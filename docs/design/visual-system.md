@@ -429,7 +429,7 @@ transcript 正文（`.md`）支持 LaTeX 公式，引擎 KaTeX（MIT）。机械
 
 - KaTeX 输出的唯一颜色声明是 `currentColor`（其上游样式表核实如此），因此不引入任何颜色字面量：inline/display 节点统一显式 `color: var(--fg-body)`，深浅两态各自就是阅读墨色；错误态用 `--danger-fg` + `--danger-border`。
 - 数学不新增字体令牌。KaTeX 自带字族（KaTeX_Main / KaTeX_Math / KaTeX_AMS 等）随其独立 CSS chunk 按需加载；占位 TeX 源码与错误态用 `--font-mono`。
-- KaTeX 样式表以 `web/src/components/mathKatex.css` 入库：由 `katex/dist/katex.css` 删掉全部 ttf/woff `src`（只保留 woff2，20 个字面、合计约 292 KB）并把字体 URL 改写为构建产物路径；KaTeX 升级后按文件头注释重新生成。
+- KaTeX 样式表以 `web/src/components/mathKatex.css` 入库：由 `katex/dist/katex.css` 删掉全部 ttf/woff `src`（只保留 woff2，20 个字面、合计约 292 KB）、把字体 URL 改写为构建产物路径、并把每个 `@font-face` 的 `font-display` 从 `block` 改为 `swap`（慢字体不再隐藏已渲染公式）；KaTeX 升级后按文件头注释重新生成。
 
 ### 10.2 布局
 
@@ -438,34 +438,38 @@ transcript 正文（`.md`）支持 LaTeX 公式，引擎 KaTeX（MIT）。机械
 | display 外边距 | `0.6em 0`，在阅读列内 `text-align: center` |
 | display 超宽 | 外层 `overflow-x: auto; overflow-y: hidden; max-width: 100%; min-width: 0`，横向滚动条只属于公式块，页面永不横向滚动 |
 | display 超高 | KaTeX `maxSize: 20em`，`\rule{…}` 等尺寸被钳制，永不撑出超高元素 |
-| inline 字号 / 行盒 | KaTeX 默认 1.21em 收紧到 `1.1em`；inline 节点是 `max-height: 1.4em; overflow: visible` 的 inline-block，所以 `\dfrac` 嵌套等高公式会超出但**可见地**绘制，行盒/段落高度保持一行，普通公式不增加 28px 阅读行高 |
-| 占位/错误块（display） | `--bg-inset` 底、1px `--border`（错误态换 `--danger-border`）、`--radius-md`、10px 12px 内边距；超长源码（>4000 字符）为中性 skip 态，不上 danger 色 |
+| inline 行盒 | KaTeX 默认 1.21em 收紧到 `1.1em`；**不设高度上限**：普通公式（`$x^2$`、`$\frac{a}{b}$`、`$\sum$`、`$\sqrt{}$`）坐在基线上、段落高度在单行 +2px 内（e2e 断言）；显式高公式（`\dfrac`、`\displaystyle`、矩阵）允许撑大所在行（round-3 放宽 J） |
+| 占位/skip 节点 | 占位与超长 skip 节点 `max-width: 100%`，display 变体自身 `overflow-x:auto`、inline 变体 `overflow-wrap:anywhere`，transcript 永不被长源码撑出横向滚动 |
+| 错误块（display） | `--bg-inset` 底、1px `--danger-border`、`--radius-md`、10px 12px 内边距、danger 文字；超长源码（>4000 字符）为中性 skip 态，不上 danger 色 |
 
 ### 10.3 加载、工作量边界与行为
 
 - KaTeX JS（约 259 KB / gzip 78 KB）、CSS（约 27 KB / gzip 7.5 KB）与 woff2 字面全部为异步 chunk：第一条数学节点挂载时才请求；无数学的 transcript 页面零请求（e2e 断言）。
-- chunk 到达前显示 TeX 源码占位；引擎就绪后还要等 KaTeX_Main/KaTeX_Math 主字面加载（`document.fonts.load`，2 s 兜底，避免占位消失后的 FOIT 不可见期）才原位替换；虚拟行由 Transcript 的 per-row ResizeObserver 重新测量，阅读锚点不动。
+- 占位保留到引擎就绪**且** KaTeX_Main/KaTeX_Math 主字面可用（`document.fonts.load().catch(…)`，配合 `font-display: swap`）才撤；没有定时器、也不会在字体失败时换成不可见字形。虚拟行由 Transcript 的 per-row ResizeObserver 重新测量，阅读锚点不动。
 - 渲染选项固定 `output: "htmlAndMathml"`（MathML 供屏幕阅读器）、`throwOnError: false`、`trust: false`、`strict: "ignore"`、`maxSize: 20`（em）、`maxExpand: 1000`。坏公式显示带 `--danger-fg` 的源码与错误 title；宏炸弹（`\def\a{\a}\a`）被 `maxExpand` 截断成错误节点；超过 `MATH_MAX_SOURCE = 4000` 字符的源码直接跳过引擎、以中性源码显示（e2e 钉 100 KB）。成功 HTML 按 `(source, display)` 记忆化，流式重渲染同一条只解析一次。
-- 扫描器是线性的（单趟标记代码/配对，闭合搜索游标不回退）：`"$1".repeat(50000)` 与 100 KB 输入都在亚帧~几十毫秒内（单测带时间预算与 10× 线性比）。
-- chunk 加载失败不是粘性错误：发布 `error` 后清空去重槽，下一次 `loadMath()` 从 `loading` 重新发起 import（浏览器对失败的动态 import 会重新取）。
-- 流式：消息末尾未闭合的 `$$`/`\[` 其后整段按转义后的字面文本渲染（定界符、反斜杠、星号、大括号都保持原样、不出现 `<em>`），闭合后才整体成为公式。
+- 工作量线性（见 10.4 的解析器归属与单趟游标）：四个 100 KB 对抗输入 best-of-7 均在个位数~31ms：`"\(".repeat(50000)`、`"$$x\n\n".repeat(20000)`、`"$1".repeat(50000)`、100 KB 公式。
+- chunk 加载失败不是粘性错误：发布 `error` 后清空去重槽，下一次 `loadMath()` 从 `loading` 重新发起 import；e2e/单测钉「先 reject 一个组件、第二个挂载组件随后渲染成功」。
+- 流式：消息末尾真正悬空（EOF 前无闭合）的最后一个 `$$`/`\[`，其整段尾巴作为**纯 React 文本节点**渲染（`math-literal`），定界符、反斜杠、`\*`、`_` 原样、不经 markdown、不出现 `<em>`；闭合后才整体成为公式。
 - 复制：选区完全位于公式内时，剪贴板写入 TeX 源码；选区延伸到公式外时保持浏览器默认行为。
 
 ### 10.4 定界符与 markdown 结构
 
 | 写法 | 含义 |
 |---|---|
-| `$$…$$`、`\[…\]` | display math（块级，允许跨行） |
+| `$$…$$`、`\[…\]` | display math（块级；同一行的 `$$x$$`/`\[x\]` 由 mdast 标记为 display 块） |
 | `$…$`、`\(…\)` | inline math |
 
-- `$`/`$$` 的文档结构（blockquote、列表、缩进代码、代码 span、段落与空行边界）完全交给 remark-math/micromark，预处理不搬运块、不注入顶层空行：`> $$x$$`、`- $$x$$` 的公式留在引用/列表项内；`    $$x$$` 仍是缩进代码块；同一行的 `$$x$$` 会被改写成带容器前缀的 `$$` flow fence（列表续行用等宽空格而非重复 marker），从而得到 display 语义。
-- 单 `$` 按 pandoc 规则：开 `$` 后紧跟非空白字符；闭 `$` 前为非空白、其后不能是数字。`花了 $5 和 $10`、`$HOME and $PATH`（闭合前是空白）为文本；`$PATH:$HOME` 与 pandoc 一致仍为数学。代码 span、fenced code block（含 ` ```math ` 与 `~~~math` 围栏——它们是**代码**，不是公式）、缩进代码块内不解析数学；`\$` 为字面美元符。
-- `$$…$$` 内出现空行时该对的开/闭两个 run 都作废（字面显示），但不影响其后的合法公式；只有真正悬空、EOF 前无闭合 run 的最后一个 `$$`/`\[` 才触发流式字面尾巴。
-- 数学节点用专用 class 标记（`language-mathinline` / `language-mathdisplay`，默认 sanitizer 的 `language-*` 规则放行）与围栏代码的 `language-math` 区分，不放宽 sanitizer，也不为 `math` 围栏加载 KaTeX。
+- **代码归属解析器（A）**：用与渲染相同的 remark 管线（remark-parse + remark-gfm，**不带** math）解析一次，取 `code`/`inlineCode`/`html` 节点的源码区间，定界符扫描整段跳过——围栏（含 2 空格缩进的 `  ~~~`）、tilde、缩进块、代码 span 与未来代码形态都自动覆盖。带一个廉价的「可能含代码」预检（无反引号/波浪号/`<`/缩进行就跳过整次解析），让不含代码的对抗输入完全不碰解析器。
+- **就地改写（C）**：扫描只做线性的 `\(x\)`→`$x$`、`\[x\]`→`$$x$$` 同行替换，绝不注入换行/空行/fence、不碰列表 marker 或 `>`。`$`/`$$` 的容器/段落/空行结构交给 remark-math：`- before $$x$$ after`、`> before $$x$$ after` 的公式留在列表项/引用内并由 mdast provenance 标记成 display 块；`    $$x$$` 仍是缩进代码。
+- **配对即逃逸（D）**：任何不是已接受配对定界符的 `$` 都输出为 `\$`，remark-math 不可能配出与扫描器不同的结果：`Cost $5 and $10; use $x$.` 只有 `x` 是数学；`echo $HOME and $PATH` 全为文本。单 `$` 接受规则按 pandoc：开 `$` 后非空白、闭 `$` 前非空白且其后非数字；`$PATH:$HOME` 与 pandoc 一致仍为数学。
+- **空行（E）**：`$$\n\nx\n\n$$y$$\n\n$z$` 里第一个空行后的坏开 run 只杀死自己，随后 `$$y$$`、`$z$` 都正常渲染（扫描在该 run 之后继续，不吞到 EOF）。
+- **provenance（F）**：真正的 mdast math 节点由 remark 插件在 `node.data.hProperties.dataMath` 上打 `inline`/`display`（flow math 落在 `<pre>`，同线 `$$`/`$` 落在 `<code>`）；sanitizer 仅对 `pre`/`code` 放行 `dataMath` 一个属性。` ```mathdisplay `、` ```mathinline `、`~~~math` 围栏没有 mdast math 节点、不产生该属性，故走 CodeBlock 且不加载 KaTeX。
 
 ### 10.5 证据
 
-- 单元（vitest）：`mathSegments.test.ts`（定界符/货币/代码/缩进块/容器/空行/流式 + 线性时间预算）、`mathRender.test.ts`（htmlAndMathml、坏公式、引擎异常、trust 边界、maxSize/maxExpand、尺寸跳过、记忆化）、`mathLoader.test.ts`（失败后重试）、`MathBlock.test.tsx`（占位→KaTeX、字体、display、currentColor、错误/skip、inline cap、复制）、`MarkdownText.test.tsx` math 段（端到端管线、容器结构、math 围栏、字面尾巴）。
-- e2e：`web/tests/e2e/math-render.hub.spec.ts`——owner softmax + inline + 货币 + 坏公式（深浅×1440/390、KaTeX 输出、无原始 TeX、无页面级横向溢出）；一个 round-2 加固用例钉死：未闭合 `\[` 字面完整、引用/列表内公式、缩进代码、` ```math ` 围栏为代码、`\rule{100000em}` 高度钳制、宏炸弹报错、100 KB 跳过、超高 inline 的行盒几何；另有一例断言无数学页面不请求 KaTeX chunk。
+- 单元（vitest，59 例）：`mathSegments.test.ts`（接受对、货币 D、解析器归属代码 A、空行 E、流式字面 G、四个 100 KB 线性计时 B）、`mathRender.test.ts`、`mathLoader.test.ts`（失败后第二组件渲染 K）、`MathBlock.test.tsx`（占位→字体→KaTeX、display、currentColor、错误/skip、复制、失败重试 K）、`MarkdownText.test.tsx` math 段（端到端管线、容器就地 C、math 围栏 F、字面 React 文本 G、空行 E）。
+- e2e：`web/tests/e2e/math-render.hub.spec.ts`——owner softmax + inline + 货币 + 坏公式（深浅×1440/390、KaTeX 输出、无原始 TeX、无页面横向溢出）；一个 round-3 用例钉：解析器归属代码（缩进/`mathdisplay` 围栏）、容器就地 display、字面尾巴精确文本、`\rule{100000em}` 钳制、宏炸弹、100 KB skip；两个 J 用例钉普通 inline 段落 ≤单行+2px、显式 `\dfrac` 允许撑高；一例断言无数学页面零 KaTeX 请求。
 - 截图仅在 `REMUDA_EVIDENCE=1` 时落库，宽度 390 与 1440（D-053「不做什么」末条不变）。
+
+> fenceBalance（UO-5）：该文件落地后需用与 MarkdownText 相同的 remark 插件列表（含 remark-math），并单独一个提交修复「被无 `>` 空行结束的引用围栏仍被追加闭合」的已知问题（追加闭合仅当解析出的 code 节点真正到达 EOF）。
 

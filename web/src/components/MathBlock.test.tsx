@@ -1,7 +1,11 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MathExpression } from "./MathBlock";
-import { getMathState, resetMathEngineForTest } from "../lib/mathRender";
+import {
+  __setMathImporterForTest,
+  getMathState,
+  resetMathEngineForTest,
+} from "../lib/mathRender";
 
 beforeEach(() => {
   resetMathEngineForTest();
@@ -61,13 +65,13 @@ describe("MathExpression", () => {
     expect(screen.queryByTestId("math-display")).toBeNull();
   });
 
-  it("uses the height-capped inline class even for a tall nested fraction (#8)", async () => {
+  it("renders a tall nested fraction inline without a height cap (round-3 J)", async () => {
     render(<MathExpression source={"\\dfrac{1}{\\dfrac{1}{x}}"} display={false} />);
     const inline = await screen.findByTestId("math-inline");
-    // The `.inline` class is what math.module.css caps to max-height:1.4em
-    // (jsdom does no CSS layout, so the geometry itself is asserted in e2e).
+    // Explicitly tall inline formulas are allowed to grow their line: the
+    // node is a plain inline `.inline` (no max-height cap). The ordinary-formula
+    // paragraph-line geometry is asserted in e2e (jsdom does no layout).
     expect(inline.className).toMatch(/inline/);
-    expect(inline.getAttribute("data-testid")).toBe("math-inline");
     expect(inline.querySelector(".mfrac")).toBeTruthy();
   });
 
@@ -116,12 +120,37 @@ describe("MathExpression", () => {
     expect(event.clipboardData.setData).not.toHaveBeenCalled();
   });
 
-  it("keeps the placeholder until the engine state moves past error (sticky failure → retry) (#6)", async () => {
-    // First mount: the dynamic import is present, so normal load succeeds and
-    // the store ends ready. Drive the failure path directly by stubbing the
-    // module graph once is not feasible in jsdom; instead assert the store
-    // contract: after an error a new loadMath() resets to loading.
+  it("renders a SECOND mounted component after the first import rejects (K)", async () => {
     resetMathEngineForTest();
-    expect(getMathState().status).toBe("loading");
+    let attempts = 0;
+    __setMathImporterForTest(() => {
+      attempts += 1;
+      return attempts === 1
+        ? Promise.reject(new Error("chunk fetch failed"))
+        : Promise.resolve({
+            default: {
+              renderToString: () => '<span class="katex"><span>r2</span></span>',
+            },
+          });
+    });
+
+    // First mounted component: import rejects, it shows its raw source (load
+    // error state), never KaTeX.
+    const first = render(<MathExpression source={"fail^2"} display={false} />);
+    await waitFor(() => expect(getMathState().status).toBe("error"));
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+    expect(first.getByTestId("math-loading").textContent).toBe("fail^2");
+    expect(attempts).toBe(1);
+
+    // A SECOND component mounts later: loadMath() must retry a fresh import
+    // and this one renders KaTeX.
+    first.unmount();
+    render(<MathExpression source={"ok^2"} display={false} />);
+    await waitFor(() => expect(getMathState().status).toBe("ready"));
+    const inline = await screen.findByTestId("math-inline");
+    expect(inline.textContent).toContain("r2");
+    expect(attempts).toBe(2);
+
+    resetMathEngineForTest();
   });
 });

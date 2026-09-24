@@ -2,17 +2,24 @@
 /*
  * Math (KaTeX) presentation, c-math / D-053 addendum 15.
  *
- * KaTeX output is currentColor-only (see mathKatex.css), so the formulas
- * inherit the reading-ink role and are correct in both appearances. The
- * display wrapper owns the horizontal scrollbar: a formula wider than the
- * reading column scrolls inside its own block, never the page.
+ * KaTeX output is currentColor-only (see mathKatex.css), so formulas inherit
+ * the reading-ink role and are correct in both appearances. The display
+ * wrapper owns the horizontal scrollbar: a formula wider than the reading
+ * column scrolls inside its own block, never the page.
  */
 
 .placeholder {
   font-family: var(--font-mono);
   font-size: 0.85em;
   color: var(--fg-muted);
-  white-space: nowrap;
+  /* A long raw source never pushes the transcript sideways: it wraps (the
+     display variant scrolls its own box instead). */
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.inlinePlaceholder {
+  white-space: normal;
 }
 
 .displayPlaceholder {
@@ -22,8 +29,9 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--bg-inset);
-  overflow-x: auto;
   white-space: pre;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
 
 .error {
@@ -39,20 +47,21 @@
   overflow-y: hidden;
   scrollbar-width: thin;
   min-width: 0;
+  color: var(--fg-body);
+}
+
+.displayScroll :global(.katex-display) {
+  margin: 0.6em 0;
+  text-align: center;
 }
 
 /*
- * Inline policy: the inline node is an inline-block whose margin box is capped
- * to one reading line, so a tall construct (e.g. a nested \dfrac) overflows
- * visibly but never enlarges the surrounding line box / paragraph height.
+ * Inline math is ordinary inline content on the text baseline. No height cap:
+ * ordinary formulas ($x^2$, $\frac{a}{b}$, $\sum$, $\sqrt{}$) do not change
+ * the line box, while explicitly tall constructs (\dfrac, \displaystyle,
+ * matrices) are allowed to grow their line (round-3 ruling J).
  */
 .inline {
-  display: inline-block;
-  max-height: 1.4em;
-  overflow: visible;
-  vertical-align: baseline;
-  padding: 0 0.05em;
-  /* KaTeX glyphs are currentColor; pin the role for both appearances. */
   color: var(--fg-body);
 }
 
@@ -60,11 +69,8 @@
   font-size: 1.1em;
 }
 
-.displayScroll {
-  color: var(--fg-body);
-}
-
-.displayScroll :global(.katex-display) {
-  margin: 0.6em 0;
-  text-align: center;
+/* Exact streaming source of an unclosed display formula: plain text. */
+.literalTail {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

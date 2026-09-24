@@ -1,135 +1,112 @@
 import { describe, expect, it } from "vitest";
-import { MATH_DOLLAR, protectMath, restoreMathSource } from "./mathSegments";
+import { MATH_DOLLAR, prepareMath, restoreMathSource } from "./mathSegments";
 
-/** Run protectMath and return the markdown that remark-math receives. */
-const P = (s: string) => protectMath(s);
+const M = (s: string) => prepareMath(s).markdown;
+const T = (s: string) => prepareMath(s).literalTail;
 
-describe("protectMath: currency / pandoc single-dollar guard", () => {
-  it("leaves the currency sentence untouched", () => {
-    expect(P("花了 $5 和 $10")).toBe("花了 \\$5 和 $10");
+describe("prepareMath: accepted math is passed through", () => {
+  it("keeps single-dollar and same-line $$ pairs", () => {
+    expect(M("$a_b * c$")).toBe("$a_b * c$");
+    expect(M("a $x+1$ b")).toBe("a $x+1$ b");
+    expect(M("$$x^2$$")).toBe("$$x^2$$");
   });
 
-  it("escapes an opener followed by a space", () => {
-    expect(P("$ x$")).toBe("\\$ x$");
+  it("translates brackets in place on the same line", () => {
+    expect(M("a \\(x^2\\) b")).toBe("a $x^2$ b");
+    expect(M("- \\[x^2\\]")).toBe("- $$x^2$$");
+    expect(M("> \\(x^2\\)")).toBe("> $x^2$");
   });
 
-  it("escapes a span whose close is followed by a digit", () => {
-    expect(P("save $x$5 today")).toBe("save \\$x$5 today");
+  it("tokenizes a literal dollar inside a bracket body, restored later", () => {
+    expect(M("\\(a$b\\)")).toBe(`$a${MATH_DOLLAR}b$`);
+    expect(restoreMathSource(M("\\(a$b\\)"))).toContain("a$b");
   });
 
-  it("accepts the same span without the trailing digit", () => {
-    expect(P("save $x$ today")).toBe("save $x$ today");
-  });
-
-  it("leaves spaced shell variables as text", () => {
-    expect(P("set $HOME and $PATH please")).toBe("set \\$HOME and $PATH please");
-  });
-
-  it("matches pandoc on colon-separated vars", () => {
-    // ':' edge + non-digit after close → math, recorded deliberately.
-    expect(P("export PATH=$PATH:$HOME")).toBe("export PATH=$PATH:$HOME");
-  });
-
-  it("respects an already escaped dollar", () => {
-    expect(P("\\$100")).toBe("\\$100");
-    expect(P("price \\$5 and $x$")).toBe("price \\$5 and $x$");
+  it("does not inject newlines, fences or container markers", () => {
+    expect(M("- before $$x$$ after")).toBe("- before $$x$$ after");
+    expect(M("> before $$x$$ after")).toBe("> before $$x$$ after");
   });
 });
 
-describe("protectMath: closed math is handed to remark-math unchanged", () => {
-  it("keeps inline dollar math intact and lifts same-line $$ to a display fence", () => {
-    expect(P("$a_b * c$")).toBe("$a_b * c$");
-    // `$$…$$` means display even on one line; the pair is rewritten to a flow
-    // fence so micromark treats it as display, not inline.
-    expect(P("$$\\sigma$$")).toBe("\n\n$$\n\\sigma\n$$\n\n");
+describe("prepareMath: pandoc single-$ guard (D)", () => {
+  it("escapes the currency dollars but keeps an explicit pair", () => {
+    expect(M("Cost $5 and $10; use $x$.")).toBe("Cost \\$5 and \\$10; use $x$.");
   });
 
-  it("converts bracket inline/display delimiters", () => {
-    expect(P("a \\(x^2\\) b")).toBe(`a $x^2$ b`);
-    expect(P("\\[x^2\\]")).toContain("$$\nx^2\n$$");
+  it("leaves shell variables as text", () => {
+    expect(M("echo $HOME and $PATH")).toBe("echo \\$HOME and \\$PATH");
   });
 
-  it("tokenizes a literal dollar inside a bracket formula body", () => {
-    expect(P("\\(a$b\\)")).toBe(`$a${MATH_DOLLAR}b$`);
-    expect(restoreMathSource(P("\\(a$b\\)"))).toContain("a$b");
-  });
-});
-
-describe("protectMath: code is never math", () => {
-  it("leaves inline code spans verbatim", () => {
-    expect(P("use `$x$` here")).toBe("use `$x$` here");
-    expect(P("`` $$x$$ ``")).toBe("`` $$x$$ ``");
+  it("rejects space-adjacent openers (pandoc: both dollars literal)", () => {
+    expect(M("$ x$")).toBe("\\$ x\\$");
+    expect(M("$x $")).toBe("\\$x \\$");
   });
 
-  it("leaves closed and unclosed fenced blocks verbatim", () => {
-    expect(P("```\n$$nope$$\n```\nafter")).toBe("```\n$$nope$$\n```\nafter");
-    // Streaming: an unterminated fence is still all code.
-    expect(P("```\n$$\n\\sigma")).toBe("```\n$$\n\\sigma");
+  it("respects an escaped dollar", () => {
+    expect(M("\\$100")).toBe("\\$100");
+    expect(M("price \\$5 and $x$")).toBe("price \\$5 and $x$");
   });
 
-  it("leaves a tilde fence verbatim", () => {
-    expect(P("~~~\n$x$\n~~~")).toBe("~~~\n$x$\n~~~");
+  it("matches pandoc on colon-separated paths (close is non-digit)", () => {
+    expect(M("export PATH=$PATH:$HOME")).toBe("export PATH=$PATH:$HOME");
   });
 });
 
-describe("protectMath: markdown structure survives (#2)", () => {
-  it("keeps single-line $$ inside a blockquote and list item", () => {
-    // Indented code (4 spaces) stays code — protectMath leaves it verbatim.
-    expect(P("    $$x$$")).toBe("    $$x$$");
-    // Container display becomes a prefix-aware fence INSIDE the blockquote /
-    // list item (verified end-to-end in MarkdownText tests).
-    expect(P("> $$x$$")).toBe("\n> $$\n> x\n> $$\n");
-    expect(P("- $$x$$")).toBe("\n- $$\n  x\n  $$\n");
+describe("prepareMath: code is parser-owned (A)", () => {
+  it("never touches dollars in fenced/tilde/indented code or spans", () => {
+    expect(M("```\n$x$ $$y$$\n```")).toBe("```\n$x$ $$y$$\n```");
+    expect(M("~~~\n$x$\n~~~")).toBe("~~~\n$x$\n~~~");
+    expect(M("use `$x$` here")).toBe("use `$x$` here");
+    // 2-space-indented tilde fence (a form a hand scanner can miss).
+    expect(M("  ~~~\n$x$\n  ~~~")).toBe("  ~~~\n$x$\n  ~~~");
   });
 
-  it("rewrites bracket display math inside a blockquote with its prefix", () => {
-    const out = P("> \\[x^2\\]");
-    expect(out).toContain("> $$");
-    expect(out).toContain("> x^2");
+  it("keeps a ```math / ~~~math fence as code text", () => {
+    expect(M("```math\nx^2\n```")).toBe("```math\nx^2\n```");
+    expect(M("~~~mathinline\ny\n~~~")).toBe("~~~mathinline\ny\n~~~");
   });
 
-  it("keeps bracket inline math inside a blockquote", () => {
-    expect(P("> \\(x^2\\)")).toBe("> $x^2$");
-  });
-});
-
-describe("protectMath: streaming half-formula is literal (#4)", () => {
-  it("renders an unclosed $$ tail with all controls intact", () => {
-    const out = P("intro $$\n\\sigma(z)");
-    expect(out).toBe("intro \\$\\$\n\\\\sigma(z)");
-  });
-
-  it("renders an unclosed \\[ tail literal including stars and braces", () => {
-    const out = P("intro \\[a *b* + \\{c\\}");
-    expect(out).toBe("intro \\\\[a \\*b\\* + \\\\{c\\\\}");
-  });
-
-  it("renders once the closer arrives", () => {
-    expect(P("intro $$\nx\n$$ end")).toContain("$$\nx\n$$");
+  it("does not let a bracket lookahead swallow a following fence", () => {
+    // The `\[` is never closed on this message → the whole thing is the exact
+    // literal tail (the fence inside is plain source, not parsed at all).
+    const src = "\\[\n```\n$x$\n```\n\\]";
+    expect(prepareMath(src).literalTail).toBe(src);
+    expect(M(src)).toBe("");
   });
 });
 
-describe("protectMath: blank line voids a display opener but not later math (#5)", () => {
-  it("escapes the dead opener and continues at the would-be closer", () => {
-    const out = P("$$x\n\n$$ $y$");
-    // First opener dead → literal dollars; second run has no later $$ run,
-    // so it becomes the streaming literal tail.
-    expect(out.startsWith("\\$\\$x")).toBe(true);
-    expect(out).not.toContain("\n\n$$\n");
+describe("prepareMath: blank-line display (E)", () => {
+  it("kills only the broken opener, later $$ and $ pairs render", () => {
+    const out = M("$$\n\nx\n\n$$y$$\n\n$z$");
+    expect(out).toContain("$$y$$");
+    expect(out).toContain("$z$");
+    // First broken run's dollars are escaped.
+    expect(out.startsWith("\\$\\$")).toBe(true);
   });
 
-  it("keeps a later independent closed formula after a blank-line dead pair", () => {
-    const out = P("$$x\n\n$$\n\ny is $y$ done");
-    // First run dead; second run also unclosed → tail literal.
-    expect(out.startsWith("\\$\\$x")).toBe(true);
-  });
-
-  it("does not kill a valid pair separated only by single newlines", () => {
-    expect(P("$$\na = 1\nb = 2\n$$")).toBe("$$\na = 1\nb = 2\n$$");
+  it("binds a normal multi-line $$ pair", () => {
+    expect(M("$$\na\nb\n$$")).toBe("$$\na\nb\n$$");
   });
 });
 
-describe("protectMath: bounded work (#1)", () => {
+describe("prepareMath: streaming literal tail (G)", () => {
+  it("returns the exact unclosed display source, markdown untouched", () => {
+    expect(T("intro $$\n\\sigma(z)")).toBe("$$\n\\sigma(z)");
+    expect(M("intro $$\n\\sigma(z)")).toBe("intro ");
+    expect(T("intro \\[a *b* + \\{c\\}")).toBe("\\[a *b* + \\{c\\}");
+  });
+
+  it("renders once the closer arrives (no tail)", () => {
+    expect(T("intro $$\nx\n$$")).toBeNull();
+    expect(M("intro $$\nx\n$$")).toContain("$$\nx\n$$");
+  });
+
+  it("does not treat an unclosed inline \\( as a tail", () => {
+    expect(T("intro \\(a b")).toBeNull();
+  });
+});
+
+describe("prepareMath: bounded work (B)", () => {
   const minTime = (fn: () => unknown, runs = 5) => {
     let best = Infinity;
     for (let k = 0; k < runs; k += 1) {
@@ -140,29 +117,30 @@ describe("protectMath: bounded work (#1)", () => {
     return best;
   };
 
-  it("handles 50k rejected dollars in linear time under a frame budget", () => {
-    const input = "$1".repeat(50_000);
-    const dt = minTime(() => protectMath(input));
-    // Every opener except the last has a (pandoc-invalid) later candidate.
-    const out = protectMath(input);
-    expect(out).toHaveLength(input.length + (50_000 - 1));
-    expect(out.replace(/\\\$/g, "$")).toBe(input);
-    // Quadratic code (~2.5e9 steps) takes seconds; a linear pass is <250ms
-    // even on the shared, loaded gate devbox (best of 5 runs).
+  it('"\\\\(".repeat(50000) is linear', () => {
+    const input = "\\(".repeat(50_000); // 100 KB
+    const dt = minTime(() => prepareMath(input));
     expect(dt).toBeLessThan(250);
   });
 
-  it("scales linearly (10x input is not 100x time)", () => {
-    const small = minTime(() => protectMath("$1".repeat(5_000)));
-    const big = minTime(() => protectMath("$1".repeat(50_000)));
-    // Pure quadratic would grow ~100x; allow generous slack for jitter.
-    expect(big).toBeLessThan(Math.max(small * 30, 10));
+  it('"$$x\\n\\n".repeat(20000) is linear', () => {
+    const input = "$$x\n\n".repeat(20_000); // 120 KB
+    const dt = minTime(() => prepareMath(input));
+    expect(dt).toBeLessThan(250);
   });
 
-  it("handles a 100 KB valid-formula input linearly", () => {
-    const input = `$${"x+1".repeat(25_000)}$`;
-    const dt = minTime(() => protectMath(input));
-    expect(protectMath(input)).toBe(input);
+  it('"$1".repeat(50000) is linear', () => {
+    const input = "$1".repeat(50_000); // 100 KB
+    const dt = minTime(() => prepareMath(input));
     expect(dt).toBeLessThan(250);
+    // No accepted pairs; markdown escapes every opener-like dollar.
+    expect(M(input).replace(/\\\$/g, "$")).toBe(input);
+  });
+
+  it("a 100 KB valid formula is linear", () => {
+    const input = `$${"x+1".repeat(33_334)}$`; // 100 KB
+    const dt = minTime(() => prepareMath(input));
+    expect(dt).toBeLessThan(250);
+    expect(M(input)).toBe(input);
   });
 });

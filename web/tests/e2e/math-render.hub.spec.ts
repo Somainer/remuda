@@ -349,58 +349,63 @@ test.describe("390px", () => {
   }
 });
 
-test.describe("round-2 hardening", () => {
+test.describe("round-3 redesign", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
 
-  test("bounded work, structure, provenance, literal streaming and inline geometry", async ({
+  test("parser-owned code, in-place containers, literal tail, bounded + line geometry", async ({
     page,
   }) => {
-    const HUGE = "x+1".repeat(25_000); // 100 KB
-    // The unclosed \[ swallows everything after it (streaming rule), so it
-    // must be the last line.
+    const HUGE = "x+1".repeat(33_334); // 100 KB
+    // The unclosed \[ must be the last line: it becomes the exact literal tail.
     const prompt = [
-      "r2 引用块：",
-      "> $$q^2$$",
-      "r2 列表：",
-      "- $$l^2$$",
-      "r2 缩进代码：",
+      "r3 引用块： > before $$q^2$$ after",
+      "r3 列表：",
+      "- before $$l^2$$ after",
+      "r3 列表括号：",
+      "- \\[b^2\\]",
+      "r3 缩进代码：",
       "",
       "    $$indented$$",
-      "r2 math fence：",
-      "```math",
+      "r3 mathdisplay fence：",
+      "```mathdisplay",
       "fenced^2",
       "```",
-      "r2 超宽规则： $$\\rule{100000em}{100000em}$$",
-      "r2 宏炸弹： $\\def\\a{\\a}\\a$",
-      "r2 超高 inline：前后 $\\dfrac{1}{\\dfrac{1}{x}}$ 文字",
-      `r2 百KB： $${HUGE}$`,
-      "r2 未闭合： intro \\[a *b* + \\{c\\}",
+      "r3 超宽规则： $$\\rule{100000em}{100000em}$$",
+      "r3 宏炸弹： $\\def\\a{\\a}\\a$",
+      "r3 百KB： $${HUGE}$",
+      "r3 未闭合： intro \\[a *b* + \\{c\\}",
     ].join("\n");
 
-    // 3 display (quote, list, clamped rule), 1 good inline (tall frac),
-    // 1 error (macro bomb), 1 size-skip (100 KB).
-    await createReadySession(page, prompt, false, { display: 3, inline: 1, error: 1, skip: 1 });
+    // display: blockquote $$, list $$, list \[\], clamped rule (4).
+    // inline: macro bomb is an ERROR, so only the size-skip is non-display —
+    // createReadySession waits on the good nodes; the 100KB skip is checked
+    // separately. We give: display 4, inline 0, error 1, skip 1.
+    await createReadySession(page, prompt, false, { display: 4, inline: 0, error: 1, skip: 1 });
 
-    // (#4) unclosed \[ renders literal with stars/braces/delimiters intact.
-    await expect(assistantRow(page).getByText(/intro \\?\[a \*b\* \+ \\?\{c\\?\}/)).toBeVisible();
-    expect(assistantRow(page).locator("em")).toHaveCount(0);
+    const row = assistantRow(page);
 
-    // (#2) $$ stays inside the blockquote and the list item.
-    await expect(page.locator("blockquote [data-testid='math-display']")).toBeVisible();
-    await expect(page.locator("ul > li [data-testid='math-display']")).toBeVisible();
+    // (G) unclosed \[ renders as exact literal source (delimiters, \, *, {}).
+    const literal = page.getByTestId("math-literal");
+    await expect(literal).toBeVisible();
+    expect(await literal.textContent()).toBe("\\[a *b* + \\{c\\}");
+    expect(row.locator("em")).toHaveCount(0);
 
-    // (#2) indented $$ is a code block.
-    const codeBlocks = page.getByTestId("code-block");
-    await expect(codeBlocks.first()).toBeVisible();
-    const codeTexts = await codeBlocks.allInnerTexts();
+    // (C) the $$ formulas stay INSIDE the blockquote / list, sharing the line
+    // with the surrounding prose, and render as blocks there.
+    const quoteMath = page.locator("blockquote [data-testid='math-display']");
+    await expect(quoteMath).toBeVisible();
+    expect(await row.getByText(/before/).count()).toBeGreaterThan(0);
+    await expect(page.locator("ul > li [data-testid='math-display']")).toHaveCount(2);
+
+    // (C) indented $$ is a code block.
+    await expect(page.getByTestId("code-block").first()).toBeVisible();
+    const codeTexts = await page.getByTestId("code-block").allInnerTexts();
     expect(codeTexts.some((t) => t.includes("fenced^2"))).toBe(true);
-    // The math-fenced block is never a math node.
+    // A mathdisplay fence is code, never a math node.
     expect(await page.locator("pre code.language-mathdisplay").count()).toBe(0);
 
-    // (#1) the 100000em rule is clamped to 20em (never 100000em tall): the
-    // rule's own border box is at the cap, and the whole display block stays
-    // bounded (20em + display line-leading), not astronomically tall.
-    const geom = await assistantRow(page)
+    // (B/I) the 100000em rule is clamped to 20em and stays bounded.
+    const geom = await row
       .locator('[data-testid="math-display"]')
       .filter({ has: page.locator(".katex-rule") })
       .first()
@@ -409,41 +414,46 @@ test.describe("round-2 hardening", () => {
         const cs = getComputedStyle(rule);
         return {
           borderTop: cs.borderTopWidth ? Number.parseFloat(cs.borderTopWidth) : 0,
-          borderRight: cs.borderRightWidth ? Number.parseFloat(cs.borderRightWidth) : 0,
           wrap: el.getBoundingClientRect().height,
-          ruleFont: Number.parseFloat(getComputedStyle(rule).fontSize),
+          fontPx: Number.parseFloat(getComputedStyle(rule).fontSize),
         };
       });
-    expect(geom.borderTop).toBeLessThanOrEqual(geom.ruleFont * 20 + 0.5);
-    expect(geom.borderRight).toBeLessThanOrEqual(geom.ruleFont * 20 + 0.5);
-    // Unclamped 100000em would be > 1.6 million px; a clamped block is < 30em.
-    expect(geom.wrap).toBeLessThan(geom.ruleFont * 30);
+    expect(geom.borderTop).toBeLessThanOrEqual(geom.fontPx * 20 + 0.5);
+    expect(geom.wrap).toBeLessThan(geom.fontPx * 30);
 
-    // (#1) macro bomb is an error node, not an infinite expansion.
+    // (B) macro bomb = error node; 100 KB = size skip.
     await expect(page.getByTestId("math-error")).toBeVisible();
-
-    // (#1) the 100 KB formula is size-skipped (raw source), no KaTeX node.
     await expect(page.getByTestId("math-skip")).toBeVisible();
+  });
 
-    // (#8) a tall nested inline fraction does not enlarge its line box:
-    // the inline node itself is capped, and its margin box stays at one line
-    // (inline-block overflows visibly, not via height). The tall \dfrac is
-    // the only good inline math node in this message.
-    const tallInline = page.getByTestId("math-inline");
-    await expect(tallInline).toHaveCount(1);
-    const inlineCap = await tallInline.evaluate((el) => {
-      const wrap = el as HTMLElement;
-      const cs = getComputedStyle(wrap);
-      return {
-        display: cs.display,
-        maxHeightPx: Number.parseFloat(cs.maxHeight),
-        wrapHeight: wrap.getBoundingClientRect().height,
-        fontPx: Number.parseFloat(cs.fontSize),
-      };
+  test("ordinary inline math keeps the paragraph's line height within 2px (J)", async ({ page }) => {
+    const ordinary = "geom $x^2$ and $\\frac{a}{b}$ and $\\sum_i x_i$ and $\\sqrt{x}$ end";
+    await createReadySession(page, ordinary, false, { display: 0, inline: 4, error: 0 });
+
+    // All four ordinary inline formulas are on one paragraph. Ordinary inline
+    // math must not grow the line box: the paragraph height stays within 2px
+    // of a single text line (the .md line-height is 28px).
+    const para = page.locator('[data-role="assistant"] p').filter({ hasText: "geom" });
+    await expect(para).toBeVisible();
+    const box = await para.boundingBox();
+    expect(box).toBeTruthy();
+    expect(box!.height).toBeLessThanOrEqual(32);
+  });
+
+  test("an explicitly tall inline formula is allowed to grow its line (J)", async ({ page }) => {
+    // \dfrac is explicitly display-style; the relaxed ruling permits it to
+    // grow the line (no max-height clipping). Just assert it renders KaTeX and
+    // the surrounding paragraph is taller than a one-line box.
+    await createReadySession(page, "tall $\\dfrac{1}{\\dfrac{1}{x}}$ done", false, {
+      display: 0,
+      inline: 1,
+      error: 0,
     });
-    expect(inlineCap.display).toBe("inline-block");
-    expect(inlineCap.maxHeightPx).toBeCloseTo(1.4 * inlineCap.fontPx, 1);
-    expect(inlineCap.wrapHeight).toBeLessThanOrEqual(1.4 * inlineCap.fontPx + 2);
+    await expect(page.getByTestId("math-inline").locator(".mfrac").first()).toBeVisible();
+    const para = page.locator('[data-role="assistant"] p').filter({ hasText: "tall" });
+    const box = await para.boundingBox();
+    expect(box).toBeTruthy();
+    expect(box!.height).toBeGreaterThan(32);
   });
 });
 

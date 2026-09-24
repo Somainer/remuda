@@ -1,14 +1,17 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useMemo, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { remarkMathProvenance } from "../lib/mathProvenance";
 import rehypeSanitize from "rehype-sanitize";
+import { defaultSchema } from "hast-util-sanitize";
 import ui from "../styles/ui.module.css";
 import css from "./codeBlock.module.css";
 import mentionCss from "./fileMention.module.css";
+import mathCss from "./math.module.css";
 import { CodeBlock } from "./CodeBlock";
 import { MathExpression } from "./MathBlock";
-import { protectMath } from "../lib/mathSegments";
+import { prepareMath } from "../lib/mathSegments";
 
 function nodeText(node: ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
@@ -61,7 +64,18 @@ function FileMentionRow({ mention }: { mention: FileMention }) {
  * no `inline` flag, so the pre override marks its subtree: any code inside is
  * a fence.
  */
-const FenceContext = createContext(false);
+type PreContextValue = "fence" | "displayMath";
+const FenceContext = createContext<PreContextValue | null>(null);
+
+type PreProps = {
+  children?: ReactNode;
+  node?: { properties?: Record<string, unknown> };
+};
+function FenceMarkdownPre({ children, node }: PreProps) {
+  const ctx: PreContextValue =
+    node?.properties?.dataMath === "display" ? "displayMath" : "fence";
+  return <FenceContext.Provider value={ctx}>{children}</FenceContext.Provider>;
+}
 
 /**
  * Stable `pre` override. This must be a module-level component: react-markdown
@@ -74,71 +88,46 @@ const FenceContext = createContext(false);
  * No `<pre>` element is emitted: fenced code renders CodeBlock (which owns its
  * pre) and display math renders MathExpression.
  */
-function FenceMarkdownPre({ children }: { children?: ReactNode }) {
-  return <FenceContext.Provider value={true}>{children}</FenceContext.Provider>;
-}
-
 type CodeProps = {
   className?: string;
   children?: ReactNode;
   /** micromark keeps the fence meta (`a.ts` in ` ```ts a.ts `) on the hast node. */
   node?: { data?: { meta?: string | null } };
+  /** Genuine inline-math provenance stamped on the `<code>` (design F). */
+  "data-math"?: "inline" | "display";
 };
 
-/** Class tokens our remark-rehype math handlers stamp (sanitizer keeps them). */
-const INLINE_MATH_CLASS = "language-mathinline";
-const DISPLAY_MATH_CLASS = "language-mathdisplay";
-
-type MarkdownProps = Parameters<typeof Markdown>[0];
-
 /**
- * Provenance markers for mdast math nodes. A fenced code block with info
- * string `math` compiles to `<code class="language-math">` and MUST stay a
- * code block; only mdast `inlineMath`/`math` carry the dedicated tokens, so
- * the `code` override can tell them apart without widening the sanitizer.
+ * Sanitizer = default GitHub schema plus the single `data-math` provenance
+ * attribute, on `<code>` (inline math) and `<pre>` (flow math). A
+ * ```math / ~~~math fence cannot produce it (it has no mdast math node), and
+ * no raw message HTML is let through.
  */
-// mdast-util-to-hast handlers are (state, node); state is intentionally
-// untyped (the package is a transitive dep) so only node is inspected.
-type HastState = unknown;
-type MathNode = { value?: string };
-
-const mathHastHandlers = {
-  inlineMath(_state: HastState, node: MathNode) {
-    const value = node.value ?? "";
-    return {
-      type: "element" as const,
-      tagName: "code",
-      properties: { className: [INLINE_MATH_CLASS] },
-      children: [{ type: "text" as const, value }],
-    };
+const sanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    code: [...(defaultSchema.attributes?.code ?? []), "dataMath"],
+    pre: [...(defaultSchema.attributes?.pre ?? []), "dataMath"],
   },
-  math(_state: HastState, node: MathNode) {
-    const value = node.value ?? "";
-    return {
-      type: "element" as const,
-      tagName: "pre",
-      properties: {},
-      children: [
-        {
-          type: "element" as const,
-          tagName: "code",
-          properties: { className: [DISPLAY_MATH_CLASS] },
-          children: [{ type: "text" as const, value }],
-        },
-      ],
-    };
-  },
-} as NonNullable<NonNullable<MarkdownProps["remarkRehypeOptions"]>["handlers"]>;
+};
 
-/** react-markdown's code override: inline stays a bare <code>, fences become CodeBlock. */
+/** The code override: genuine math -> KaTeX; everything else stays code. */
 function FencedCode(rawProps: unknown) {
   const props = rawProps as CodeProps;
-  const fenced = useContext(FenceContext);
-  const className = props.className ?? "";
-  if (className === INLINE_MATH_CLASS || className === DISPLAY_MATH_CLASS) {
-    return <MathExpression source={nodeText(props.children)} display={className === DISPLAY_MATH_CLASS} />;
+  const preCtx = useContext(FenceContext);
+  const provenance = props["data-math"];
+  // Genuine math: flow math inside a `<pre>` (preCtx), or an inline/same-line
+  // math whose provenance is on the `<code>` itself.
+  if (preCtx === "displayMath" || provenance === "inline" || provenance === "display") {
+    return (
+      <MathExpression
+        source={nodeText(props.children)}
+        display={preCtx === "displayMath" || provenance === "display"}
+      />
+    );
   }
-  if (!fenced) {
+  if (preCtx !== "fence") {
     return <code className={props.className}>{props.children}</code>;
   }
   const match = /language-(\S+)/.exec(props.className ?? "");
@@ -158,26 +147,43 @@ function FencedCode(rawProps: unknown) {
  * structured message; it is a file reference, not prose the user typed, so it
  * renders as a collapsed row exactly like the other attachment anchors.
  */
+function MathMarkdown({ text }: { text: string }) {
+  // prepareMath is O(n); memoize per text so streaming re-renders don't
+  // re-parse an unchanged prefix more than necessary.
+  const prepared = useMemo(() => prepareMath(text), [text]);
+  return (
+    <>
+      <Markdown
+        remarkPlugins={[remarkGfm, remarkMath, remarkMathProvenance]}
+        rehypePlugins={[[rehypeSanitize, sanitizeSchema]]}
+        components={{
+          pre: FenceMarkdownPre,
+          code: FencedCode,
+        }}
+      >
+        {prepared.markdown}
+      </Markdown>
+      {/*
+       * Streaming half-formula: rendered as a plain React text node with the
+       * EXACT source (delimiters, backslashes, *, _ intact). React text is
+       * escaped and never re-parsed as markdown.
+       */}
+      {prepared.literalTail !== null && (
+        <span className={mathCss.literalTail} data-testid="math-literal">
+          {prepared.literalTail}
+        </span>
+      )}
+    </>
+  );
+}
+
 function renderWithFileMentions(text: string): ReactNode {
   const lines = text.split("\n");
   const out: ReactNode[] = [];
   let markdown: string[] = [];
   const flush = (key: number) => {
     if (markdown.length === 0) return;
-    out.push(
-      <Markdown
-        key={`md-${key}`}
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeSanitize]}
-        remarkRehypeOptions={{ handlers: mathHastHandlers }}
-        components={{
-          pre: FenceMarkdownPre,
-          code: FencedCode,
-        }}
-      >
-        {protectMath(markdown.join("\n"))}
-      </Markdown>,
-    );
+    out.push(<MathMarkdown key={`md-${key}`} text={markdown.join("\n")} />);
     markdown = [];
   };
   lines.forEach((line, index) => {

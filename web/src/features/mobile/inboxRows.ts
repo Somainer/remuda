@@ -184,6 +184,13 @@ export type InboxRows = {
 };
 
 export type InboxSource = {
+  /**
+   * Pending-interaction queue inputs, shared verbatim with
+   * [`deriveInboxQueue`]. The phone-nav badge derives its count from that
+   * projection with these same slices (c-ghostbadge: the badge must never
+   * count a card — e.g. a raw-pending row whose deadline has passed — that
+   * the 待你处理 tier does not show).
+   */
   interactions: Interaction[];
   instances: Instance[];
   hosts: Host[];
@@ -200,6 +207,30 @@ export type InboxSource = {
   nowMs?: number;
 };
 
+/**
+ * The queue membership inputs every 待你处理 projection shares. A strict
+ * subset of {@link InboxSource}: callers that only need the count (the phone
+ * nav badge) supply just these fields.
+ */
+export type InboxQueueSource = Pick<
+  InboxSource,
+  "interactions" | "instances" | "hosts" | "answering" | "deviceId"
+>;
+
+/**
+ * One interaction the 待你处理 queue shows. This is the SINGLE projection both
+ * surfaces read: the compact inbox builds its tier-1 rows from it, and the
+ * phone-nav badge is `deriveInboxQueue(...).length`. Never re-derive queue
+ * membership at a call site (c-ghostbadge: a raw `state === "pending"` count
+ * diverges from this once a row projects expired/paused/settled).
+ */
+export type InboxQueueItem = {
+  item: Interaction;
+  instance: Instance | undefined;
+  host: Host | undefined;
+  uiState: Extract<InteractionUiState, "pending" | "answering" | "paused">;
+};
+
 const RECENT_STATUSES: ReadonlySet<UiStatus> = new Set(["working", "idle", "exited"]);
 const ACTIVE_INTERACTION_STATES: ReadonlySet<InteractionUiState> = new Set([
   "pending",
@@ -211,6 +242,35 @@ function isActiveUiState(
   state: InteractionUiState,
 ): state is Extract<InteractionUiState, "pending" | "answering" | "paused"> {
   return ACTIVE_INTERACTION_STATES.has(state);
+}
+
+/**
+ * Project every interaction exactly once and return those the 待你处理 queue
+ * shows (pending / answering / paused — the same projection ApprovalsPage
+ * uses). Pure and join-based; no kind filter (the queue count is the
+ * unfiltered 待你处理 total; callers rendering a filtered tier apply the kind
+ * filter themselves).
+ *
+ * This is the ONE source of truth shared by the compact inbox rows and the
+ * phone-nav badge count (c-ghostbadge).
+ */
+export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
+  const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
+  const hostById = new Map(source.hosts.map((host) => [host.id, host]));
+  const queue: InboxQueueItem[] = [];
+  for (const item of source.interactions) {
+    const instance = instanceById.get(item.instanceId);
+    const host = hostById.get(item.hostId);
+    const uiState = projectInteraction(item, {
+      answering: Boolean(source.answering[item.id]),
+      host,
+      connectivity: instance?.connectivity,
+      deviceId: source.deviceId,
+    });
+    if (!isActiveUiState(uiState)) continue;
+    queue.push({ item, instance, host, uiState });
+  }
+  return queue;
 }
 
 function byRecency(a: { createdAt: string; rowId: string }, b: { createdAt: string; rowId: string }): number {
@@ -237,25 +297,19 @@ export function deriveInboxRows(
   const kind = opts.kind ?? "all";
   const focus = opts.focus ?? null;
   const nowMs = source.nowMs ?? Date.now();
-  const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
-  const hostById = new Map(source.hosts.map((host) => [host.id, host]));
+
+  // Single membership projection, shared with the phone-nav badge
+  // (deriveInboxQueue). The kind filter is applied only while building tier-1
+  // rows below.
+  const queue = deriveInboxQueue(source);
 
   const pending: InboxInteractionRow[] = [];
   // A blocked instance already has a row in the interaction tier (kind
-  // filtering can hide it; it is still blocked — never advertise it as
-  // working or idle).
+  // filtering can hide it; the instance is still blocked — never
+  // advertise it as working or idle).
   const blockedInstanceIds = new Set<Id>();
 
-  for (const item of source.interactions) {
-    const instance = instanceById.get(item.instanceId);
-    const host = hostById.get(item.hostId);
-    const uiState = projectInteraction(item, {
-      answering: Boolean(source.answering[item.id]),
-      host,
-      connectivity: instance?.connectivity,
-      deviceId: source.deviceId,
-    });
-    if (!isActiveUiState(uiState)) continue;
+  for (const { item, instance, uiState } of queue) {
     // A blocked instance already has a row in the interaction tier (kind
     // filtering can hide the row; the instance is still blocked — never
     // advertise it as working or idle).

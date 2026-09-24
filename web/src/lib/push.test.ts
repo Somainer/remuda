@@ -18,7 +18,7 @@ const storeMock = vi.hoisted(() => {
   const listeners = new Set<() => void>();
   return {
     listeners,
-    interactions: [] as Array<{ state: string }>,
+    interactions: [] as Array<{ state: string; deadline?: { state: string } }>,
     hubStore: {
       subscribe: vi.fn((listener: () => void) => {
         listeners.add(listener);
@@ -26,7 +26,14 @@ const storeMock = vi.hoisted(() => {
           listeners.delete(listener);
         };
       }),
-      getSnapshot: vi.fn(() => ({ interactions: storeMock.interactions })),
+      getSnapshot: vi.fn(() => ({
+        // c-ghostbadge: the badge count is the shared deriveInboxQueue
+        // projection, which joins instances/hosts and the answering map.
+        interactions: storeMock.interactions,
+        instances: [],
+        hosts: [],
+        answering: {},
+      })),
     },
     emit() {
       for (const listener of [...listeners]) listener();
@@ -214,11 +221,17 @@ describe("startAppBadgeSync follows the store pending count", () => {
     // Starting at zero clears a stale badge left by a previous session.
     expect(clearAppBadge).toHaveBeenCalledOnce();
 
+    // Minimal Interaction shape the shared projectInteraction reads.
+    const row = (state: string) => ({
+      state,
+      deadline: { state: "unknown" },
+      answer: { state: "unknown" },
+    });
     storeMock.interactions.push(
-      { state: "pending" },
-      { state: "pending" },
-      { state: "expired" },
-      { state: "answer-committed" },
+      row("pending"),
+      row("pending"),
+      row("expired"),
+      row("answer-committed"),
     );
     storeMock.emit();
     expect(setAppBadge).toHaveBeenCalledWith(2);
@@ -231,7 +244,7 @@ describe("startAppBadgeSync follows the store pending count", () => {
 
   it("does not call the API again while the count is unchanged", () => {
     startAppBadgeSync();
-    storeMock.interactions.push({ state: "pending" });
+    storeMock.interactions.push({ state: "pending", deadline: { state: "unknown" } });
     storeMock.emit();
     storeMock.emit();
     expect(setAppBadge).toHaveBeenCalledTimes(1);
@@ -253,7 +266,7 @@ describe("startAppBadgeSync follows the store pending count", () => {
     delete (navigator as { setAppBadge?: unknown }).setAppBadge;
     delete (navigator as { clearAppBadge?: unknown }).clearAppBadge;
     startAppBadgeSync();
-    storeMock.interactions.push({ state: "pending" });
+    storeMock.interactions.push({ state: "pending", deadline: { state: "unknown" } });
     expect(() => storeMock.emit()).not.toThrow();
     expect(setAppBadge).not.toHaveBeenCalled();
   });

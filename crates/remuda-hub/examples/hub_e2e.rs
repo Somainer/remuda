@@ -1078,6 +1078,52 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-ghostbadge: a hook approval whose agent died HARD
+                    // while blocked. The Node journals interaction.requested
+                    // (the Hub's DURABLE interactions row; the hook's known
+                    // deadline is already in the past, as once the 15-min
+                    // BLOCKING_WAIT has elapsed) but no answered / expired /
+                    // invalidated event ever lands, and the instance settles
+                    // exited. The Hub keeps the interaction row at
+                    // state='pending' forever (restart reconcile settles
+                    // instances only — crates/remuda-hub/src/store.rs
+                    // reconcile_reported_instances). Before the web fix the
+                    // phone badge counted the raw-pending ghost (1) while the
+                    // inbox's 待你处理 tier showed 0 (deadline projects
+                    // expired). The card is deliberately NOT inserted into
+                    // the live `pending` map: a dead node serves no
+                    // interaction.list, so the durable Hub row is the ghost's
+                    // only source — exactly the demo reproduction.
+                    if prompt.contains("ghostbadge-expired") {
+                        let iid = InteractionId::new();
+                        let past = time::OffsetDateTime::now_utc() - time::Duration::minutes(20);
+                        let deadline = format!(
+                            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                            past.year(),
+                            past.month() as u8,
+                            past.day(),
+                            past.hour(),
+                            past.minute(),
+                            past.second(),
+                            past.millisecond(),
+                        );
+                        let mut card = fake_approval(&instance_id, host, iid.as_id().as_str());
+                        card["deadline"] = json!({ "state": "known", "value": deadline });
+                        card["deadlineSource"] = json!("runtime-policy");
+                        append_n =
+                            append_interaction_requested(&mut ws, &instance_id, append_n, &card)
+                                .await?;
+                        append_n =
+                            append_instance_state(&mut ws, &instance_id, append_n, "exited", None)
+                                .await?;
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        continue;
+                    }
                     // c-mfix round 2: the full phone-chrome combo fixture
                     // (exited resumable instance + live hook/tool/status strip).
                     if prompt == "mfix-chrome-combo" {
@@ -5724,6 +5770,38 @@ fn drill_subagent_answer(agent_id: &str) -> Value {
         },
         "events": events,
     })
+}
+
+/// c-ghostbadge: journal `interaction.requested` carrying the full entity.
+/// This is the event that creates the Hub's DURABLE `interactions` row for a
+/// hook card. The fake node's normal cards are live-only (served from the
+/// in-memory map through `interaction.list`); a card journaled this way is
+/// exactly what a hard-killed instance leaves behind in the Hub — the row
+/// stays `state='pending'` even after the instance lifecycle settles exited.
+async fn append_interaction_requested(
+    ws: &mut NodeWs,
+    instance_id: &str,
+    n: u64,
+    card: &Value,
+) -> Result<u64> {
+    let seq = n + 1;
+    ws.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": format!("j{seq}"), "method": "journal.append",
+            "params": {
+                "instanceId": instance_id,
+                "event": {
+                    "kind": "interaction.requested",
+                    "payload": { "interaction": card }
+                }
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+    Ok(seq)
 }
 
 fn fake_approval(instance_id: &str, host_id: &str, interaction_id: &str) -> Value {

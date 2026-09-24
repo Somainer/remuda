@@ -492,26 +492,11 @@ export function QuickFind({ onNavigate, inline = false }: { onNavigate?: () => v
 }
 
 /**
- * The panel entry point. Two shapes: a labelled search field in the expanded
- * panel and drawer, and a glyph for the collapsed rail. Both carry the
- * shortcut hint and are plain buttons — the finder owns no Space state.
+ * The panel entry point: a labelled search field in the /sessions index
+ * column and the phone Spaces drawer. It carries the shortcut hint and is a
+ * plain button — the finder owns no Space state.
  */
-export function QuickFindTrigger({ collapsed = false }: { collapsed?: boolean }) {
-  if (collapsed) {
-    return (
-      <button
-        type="button"
-        className={css.railTrigger}
-        data-testid="quickfind-trigger"
-        aria-label="快速查找会话"
-        title={`快速查找（${QUICKFIND_HINT}）`}
-        aria-haspopup="dialog"
-        onClick={() => openQuickFind()}
-      >
-        ⌕
-      </button>
-    );
-  }
+export function QuickFindTrigger() {
   return (
     <button
       type="button"

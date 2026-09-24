@@ -144,6 +144,36 @@ async function sendMessage(page: Page, text: string) {
   else await send.click();
 }
 
+const V1 = /\/v1\//;
+
+/**
+ * Make the Hub fully unreachable to the app. Network emulation kills the
+ * ALREADY-OPEN follow socket immediately (a route only intercepts future
+ * requests, including WS upgrades); the /v1 route then keeps aborting Hub
+ * REST calls and any NEW follow upgrade (the WebSocket handshake is an HTTP
+ * request, so an aborted upgrade closes the page's socket). With both in
+ * place, network emulation can later be lifted for an offline RELOAD (the dev
+ * origin must still serve the document) while the Hub stays unreachable.
+ */
+async function blockHub(context: import('@playwright/test').BrowserContext) {
+  await context.route(V1, (route) => route.abort("failed"));
+  await context.setOffline(true);
+}
+
+/**
+ * Lift network emulation while KEEPING the Hub route active: use this before
+ * reloading offline so the Vite document reloads but Hub REST/follow stay
+ * down exactly as a Hub-only outage looks to the restored page.
+ */
+async function keepHubBlockedByRoutes(context: import('@playwright/test').BrowserContext) {
+  await context.setOffline(false);
+}
+
+async function unblockHub(context: import('@playwright/test').BrowserContext) {
+  await context.setOffline(false);
+  await context.unroute(V1);
+}
+
 test.beforeEach(async ({ page }) => {
   await login(page);
 });
@@ -160,8 +190,8 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   const api = await hubApi(page, request);
   await page.waitForTimeout(500);
 
-  // Block everything Hub-bound (REST and the ws upgrade) — the app's network.
-  await page.context().route(/\/v1\//, (route) => route.abort("failed"));
+  // Block everything Hub-bound (REST and the follow socket).
+  await blockHub(page.context());
   const banner = page.getByTestId("journal-banner");
   await expect(banner).toHaveAttribute("data-state", "offline");
   expect(await banner.textContent()).toContain("离线");
@@ -186,7 +216,7 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   ).length;
   expect(seedSends).toBe(0);
 
-  await page.context().unroute(/\/v1\//);
+  await unblockHub(page.context());
   await expect(banner).toHaveCount(0, { timeout: 20_000 });
 
   // Exactly one Hub command row per id …
@@ -208,8 +238,8 @@ test("an offline-queued message survives a reload while the Hub is still off and
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   const api = await hubApi(page, request);
 
-  // The Hub goes unreachable.
-  await page.context().route(/\/v1\//, (route) => route.abort("failed"));
+  // The Hub goes fully unreachable (REST and follow socket both down).
+  await blockHub(page.context());
   await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline");
   await sendMessage(page, "offline across reload");
   const queued = page.locator('[data-testid="optimistic-bubble"]');
@@ -217,9 +247,10 @@ test("an offline-queued message survives a reload while the Hub is still off and
   const commandId = await queued.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
 
-  // Reload WITH the Hub still unreachable (the Vite origin keeps serving the
-  // app; only Hub traffic is blocked, exactly as a real outage looks to the
-  // app — the production service worker would cover a fully-offline document).
+  // Reload WITH the Hub still unreachable: lift network emulation (so the dev
+  // document loads) while the routes keep every Hub call and follow upgrade
+  // failing — a true offline reload of the app, not a frozen page.
+  await keepHubBlockedByRoutes(page.context());
   await page.reload({ waitUntil: "domcontentloaded" });
   // The session renders from the persisted instance projection (no
   // 会话不存在 / cast stub), and the durable row restores and still waits
@@ -231,7 +262,7 @@ test("an offline-queued message survives a reload while the Hub is still off and
   expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
 
   // Reconnect: the restored row delivers exactly once under the same id.
-  await page.context().unroute(/\/v1\//);
+  await unblockHub(page.context());
   await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
   await expect
     .poll(() => hubJournalMessageCount(api, instanceId, commandId!))

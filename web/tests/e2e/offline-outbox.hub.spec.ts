@@ -1,4 +1,4 @@
-import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
+import { expect, request as apiRequest, test, type APIRequestContext, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
@@ -99,11 +99,21 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   return id;
 }
 
-/** An authenticated API client that is independent of the browser context. */
-async function hubApi(page: Page, request: import("@playwright/test").APIRequestContext) {
-  return request.newContext({
-    baseURL: new URL(page.url()).origin,
-    storageState: { cookies: await page.context().cookies(), origins: [] },
+/**
+ * An authenticated API client independent of the browser context. Playwright's
+ * `request.newContext` is the STATIC APIRequest factory (the per-test `request`
+ * fixture is an already-built context and has no newContext). Cookies are
+ * copied explicitly (httpOnly cookies are not in document.cookie).
+ */
+async function hubApi(page: Page): Promise<APIRequestContext> {
+  const cookies = await page.context().cookies();
+  const origin = new URL(page.url()).origin;
+  return apiRequest.newContext({
+    baseURL: origin,
+    extraHTTPHeaders: {
+      Cookie: cookies.map((c) => `${c.name}=${c.value}`).join("; "),
+      Origin: origin,
+    },
   });
 }
 
@@ -202,10 +212,10 @@ async function expectDelivered(page: Page, commandId: string | null) {
   expect(body).not.toContain("状态待确认");
 }
 
-test("offline sends are queued and delivered exactly once after reconnect", async ({ page, request }) => {
+test("offline sends are queued and delivered exactly once after reconnect", async ({ page }) => {
   const instanceId = await createSession(page, "offline outbox seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
-  const api = await hubApi(page, request);
+  const api = await hubApi(page);
   await page.waitForTimeout(500);
 
   // Block everything Hub-bound (REST and the follow socket).
@@ -250,10 +260,10 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   }
 });
 
-test("an offline-queued message survives a reload while the Hub is still off and sends once after", async ({ page, request }) => {
+test("an offline-queued message survives a reload while the Hub is still off and sends once after", async ({ page }) => {
   const instanceId = await createSession(page, "offline reload seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
-  const api = await hubApi(page, request);
+  const api = await hubApi(page);
 
   // The Hub goes fully unreachable (REST and follow socket both down).
   await blockHub(page.context());
@@ -292,10 +302,10 @@ test("an offline-queued message survives a reload while the Hub is still off and
   await expectDelivered(page, commandId);
 });
 
-test("a committed POST whose browser response is lost retries with replayed:true and runs once", async ({ page, request }) => {
+test("a committed POST whose browser response is lost retries with replayed:true and runs once", async ({ page }) => {
   const instanceId = await createSession(page, "lost response seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
-  const api = await hubApi(page, request);
+  const api = await hubApi(page);
 
   const commandsPattern = /\/v1\/instances\/[^/]+\/commands$/;
   const statusPattern = /\/v1\/instances\/[^/]+\/commands\/cmd_/;

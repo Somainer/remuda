@@ -97,6 +97,8 @@ const HEX = "0123456789abcdef";
  */
 let lastIdTs = -1;
 let lastIdTail = 0n;
+const TAIL_74_MASK = (1n << 74n) - 1n;
+const RAND_B_62_MASK = (1n << 62n) - 1n;
 
 export function newCommandId(nowMs: number = Date.now(), randomBytes?: Uint8Array): Id {
   const bytes = randomBytes ?? crypto.getRandomValues(new Uint8Array(16));
@@ -107,30 +109,34 @@ export function newCommandId(nowMs: number = Date.now(), randomBytes?: Uint8Arra
     b[i] = Number(ts & 0xffn);
     ts >>= 8n;
   }
-  b[6] = (b[6] & 0x0f) | 0x70; // version 7
-  b[8] = (b[8] & 0x3f) | 0x80; // variant 10
-  // 74-bit monotonic tail occupies UUID nibbles 13..31: the 12 rand_a bits
-  // below the version and the 62 rand_b bits below the variant.
-  const tailOf = (arr: number[]) => {
-    const hex13 = arr
-      .slice(6)
-      .map((x) => x.toString(16).padStart(2, "0"))
-      .join(""); // nibbles 12..31 (version nibble first)
-    return ((BigInt(`0x0${hex13.slice(1, 4)}`) << 62n) |
-      (BigInt(`0x${hex13.slice(4)}`) & 0x3fffffffffffffffn)) &
-      0x3fffffffffffffffffn;
-  };
-  let tail = tailOf(b);
+  // 74-bit tail: rand_a 12 bits (b[6] low nibble + b[7]) over rand_b 62 bits
+  // (b[8] low 6 bits + b[9..15]).
+  const randA = ((BigInt(b[6] & 0x0f) << 8n) | BigInt(b[7])) & 0xfffn;
+  const randB =
+    ((BigInt(b[8] & 0x3f) << 56n) |
+      BigInt(
+        `0x${b
+          .slice(9)
+          .map((x) => x.toString(16).padStart(2, "0"))
+          .join("")}`,
+      )) &
+    RAND_B_62_MASK;
+  let tail = (randA << 62n) | randB;
   if (nowMs === lastIdTs) {
-    tail = (lastIdTail + 1n) & 0x3fffffffffffffffffn;
+    tail = (lastIdTail + 1n) & TAIL_74_MASK;
   }
   lastIdTs = nowMs;
   lastIdTail = tail;
-  const t = tail.toString(16).padStart(19, "0"); // 74 bits -> 19 nibbles
-  b[6] = 0x70 | parseInt(t.slice(0, 1), 16);
-  b[7] = parseInt(t.slice(1, 3), 16);
-  b[8] = 0x80 | parseInt(t.slice(3, 5), 16);
-  for (let i = 0; i < 7; i += 1) b[9 + i] = parseInt(t.slice(5 + i * 2, 7 + i * 2), 16);
+
+  // Re-encode: version 7 nibble, then the monotonic tail; variant 10 on b[8].
+  const tailA = tail >> 62n; // 12 bits
+  const tailB = tail & RAND_B_62_MASK; // 62 bits
+  b[6] = 0x70 | Number((tailA >> 8n) & 0x0fn);
+  b[7] = Number(tailA & 0xffn);
+  b[8] = 0x80 | Number((tailB >> 56n) & 0x3fn);
+  for (let i = 0; i < 7; i += 1) {
+    b[9 + i] = Number((tailB >> BigInt(48 - i * 8)) & 0xffn);
+  }
   const hex = b.map((x) => HEX[x >> 4] + HEX[x & 0x0f]).join("");
   return `cmd_${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
@@ -292,7 +298,6 @@ export class Outbox {
   private cache = new Map<Id, OutboxRecord>();
   private flushChain = new Map<Id, Promise<unknown>>();
   private queuedFlush = new Map<Id, Promise<unknown>>();
-  private inflightCommands = new Set<Id>();
   private listeners = new Set<() => void>();
   private storage: OutboxStorage;
   private readonly owner: Id;
@@ -364,18 +369,6 @@ export class Outbox {
 
   get(commandId: Id): OutboxRecord | undefined {
     return this.cache.get(commandId);
-  }
-
-  isInflight(commandId: Id): boolean {
-    return this.inflightCommands.has(commandId);
-  }
-
-  markInflight(commandId: Id) {
-    this.inflightCommands.add(commandId);
-  }
-
-  clearInflight(commandId: Id) {
-    this.inflightCommands.delete(commandId);
   }
 
   /**

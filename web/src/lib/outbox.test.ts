@@ -68,6 +68,19 @@ describe("newCommandId (UUIDv7, Node-acceptable)", () => {
   it("orders by timestamp regardless of the random tail", () => {
     expect(newCommandId(1000) < newCommandId(1001)).toBe(true);
   });
+
+  it("orders ids minted in the SAME millisecond by mint order (monotonic tail)", () => {
+    // Two ids within one ms must sort in mint order even if the random tails
+    // would have inverted (the outbox FIFO tiebreak is the commandId string).
+    const ids = Array.from({ length: 256 }, () => newCommandId(42));
+    for (let i = 1; i < ids.length; i += 1) {
+      expect(ids[i - 1]! < ids[i]!).toBe(true);
+    }
+    // Each is still a canonical UUIDv7.
+    for (const id of ids) {
+      expect(id).toMatch(/^cmd_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    }
+  });
 });
 
 describe("withinRetryWindow", () => {

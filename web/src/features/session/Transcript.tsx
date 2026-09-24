@@ -928,7 +928,9 @@ function TranscriptInner({
                 searchHit={Boolean(hit)}
                 searchCurrent={Boolean(hit?.current)}
                 instanceId={instanceId}
-                steerHeld={stableSteerHeld}
+                // Only held rows read the steer control; scoping it keeps an
+                // instance-state flip from re-committing every visible row.
+                steerHeld={node.type === "message" && node.local?.held ? stableSteerHeld : undefined}
                 onSteerHeld={stableOnSteerHeld}
                 steering={steeringRef.current}
                 expandTick={node.type === "compact" && compactHit?.compactId === node.id ? expandTick : 0}

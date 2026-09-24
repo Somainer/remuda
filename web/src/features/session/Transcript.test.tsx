@@ -921,4 +921,32 @@ describe("streaming row (D-053)", () => {
     expect(screen.queryByTestId("streaming-cursor")).toBeNull();
     expect(screen.getByTestId("code-block")).toBeTruthy();
   });
+
+  it("re-commits only held rows when the steer control flips", () => {
+    profile.on = true;
+    const events = [userMessage(1, "问题"), assistantMessage(2, "回答")];
+    const held = {
+      clientRequestId: "req-held" as Id,
+      instanceId: "ins_steer" as Id,
+      text: "排队的消息",
+      commandId: null,
+      state: "queued" as const,
+      createdAt: "2026-09-24T00:00:00Z",
+      held: true,
+      holdReason: "turn" as const,
+    };
+    const { rerender } = render(
+      <Transcript events={events} bubbles={[held]} compact={false} steerHeld={{ enabled: false, reason: "" }} />,
+    );
+    expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(true);
+    profile.probes = [];
+    rerender(
+      <Transcript events={events} bubbles={[held]} compact={false} steerHeld={{ enabled: true, reason: "" }} />,
+    );
+    const rows = profile.probes
+      .filter((p) => p.kind === "commit:TranscriptRow")
+      .map((p) => (p.value as { nodeId: string }).nodeId);
+    expect(new Set(rows).size).toBe(1);
+    expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(false);
+  });
 });

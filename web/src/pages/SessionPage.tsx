@@ -235,7 +235,15 @@ export function SessionPage({
   const tasks = collectTasks(
     compactTranscript(assembleTranscript(events, bubbles), hub.compact, readDismissedWorkflows(instanceId)),
   );
-  const snapshotLoading = Boolean(instance) && hub.events[instanceId] === undefined && !isTtyLabFixtureId(instanceId);
+  // The initial seed is loading only while there is nothing to render.
+  // Offline restore deliberately has NO events (the seed/follow fail), but
+  // the durable outbox restores bubbles that must be shown over a working
+  // composer — never held behind this gate until the network returns.
+  const snapshotLoading =
+    Boolean(instance) &&
+    hub.events[instanceId] === undefined &&
+    bubbles.length === 0 &&
+    !isTtyLabFixtureId(instanceId);
 
   if (!instance && hub.ready) {
     return <p style={{ padding: 16 }}>会话不存在</p>;

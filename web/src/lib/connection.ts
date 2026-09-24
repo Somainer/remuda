@@ -64,7 +64,7 @@ export type MachineDeps = {
   onState?: (state: ConnectionState, detail?: { pendingCount?: number }) => void;
 };
 
-type TimerName = "stale" | "offline" | "reconnect" | "watchdog" | "probe";
+type TimerName = "stale" | "offline" | "reconnect" | "watchdog" | "probe" | "bind";
 
 export class ConnectionMachine {
   state: ConnectionState = "offline";
@@ -123,13 +123,74 @@ export class ConnectionMachine {
   }
 
   /**
-   * Begin in recovering WITHOUT firing a resume action (bootstrap uses this:
-   * the follow socket being opened independently drives the first frame →
-   * live; an explicit resume later reopens if needed).
+   * Begin in recovering WITHOUT firing a resume action (bootstrap uses this
+   * when no REST hello succeeded yet — a genuinely offline reload drives
+   * setStateOffline instead).
    */
   markRecovering() {
     this.attempt = 0;
     this.setState("recovering");
+  }
+
+  /**
+   * Bootstrap over REST SUCCEEDED (hello + list), but no follow socket exists
+   * yet (the caller is on the session list / new-session page), so there is no
+   * frame stream to watchdog: report live without arming the frame timer. The
+   * live claim for an ACTIVE session is enforced separately — followBound()
+   * starts a frame deadline the moment a session's follow socket opens, so a
+   * frozen transcript can never sit behind 已连接.
+   */
+  bootstrapLive() {
+    this.attempt = 0;
+    this.clearTimers("stale", "offline", "probe", "reconnect", "watchdog", "bind");
+    this.setState("live");
+  }
+
+  /**
+   * A follow socket is being opened for the active session. Require its first
+   * frame (the subscribe snapshot or an event) within LIVE_FRAME_MS: a frame
+   * dispatches {frame} and takes over via armFrameWatchdog; silence means the
+   * open socket is not actually carrying data — live degrades to stale (probe
+   * then reopen), recovering retries the resume.
+   */
+  followBound() {
+    this.clearTimer("bind");
+    if (this.state === "offline") {
+      this.beginResume();
+      return;
+    }
+    const wasLive = this.state === "live";
+    this.timers.set(
+      "bind",
+      this.schedule(() => {
+        this.timers.delete("bind");
+        // A frame landed just in time and already proved the link.
+        if (this.state === "live" && this.deps.isFollowLive()) {
+          this.armFrameWatchdog();
+          return;
+        }
+        if (wasLive) {
+          // OPEN but silent: stale, then the same probe/offline dance the
+          // frame watchdog runs (REST reachable triggers reopen+catch-up).
+          this.setState("stale");
+          this.timers.set(
+            "probe",
+            this.schedule(() => {
+              if (this.state !== "stale") return;
+              void this.deps.probe().then((ok) => this.dispatch({ type: "probe", ok }));
+            }, REST_PROBE_MS),
+          );
+          this.timers.set(
+            "offline",
+            this.schedule(() => {
+              if (this.state === "stale") this.goOfflineAndSchedule();
+            }, STALE_TO_OFFLINE_MS),
+          );
+        } else {
+          this.beginResume();
+        }
+      }, LIVE_FRAME_MS),
+    );
   }
 
   /**
@@ -216,7 +277,7 @@ export class ConnectionMachine {
   }
 
   private armFrameWatchdog() {
-    this.clearTimers("stale", "offline", "probe", "reconnect");
+    this.clearTimers("bind", "stale", "offline", "probe", "reconnect");
     this.timers.set(
       "stale",
       this.schedule(() => {
@@ -242,7 +303,7 @@ export class ConnectionMachine {
   }
 
   private goOffline() {
-    this.clearTimers("stale", "offline", "probe", "watchdog");
+    this.clearTimers("bind", "stale", "offline", "probe", "watchdog");
     if (this.state !== "offline") this.setState("offline");
   }
 

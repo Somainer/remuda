@@ -214,4 +214,41 @@ describe("ConnectionMachine", () => {
     machine.dispatch({ type: "online" });
     expect(resume).toHaveBeenCalledTimes(1);
   });
+
+  it("bootstrapLive is live with no watchdog; followBound requires a frame and a silent open goes offline", async () => {
+    const { clock, machine, probe, resume, isFollowLive } = setupTracked();
+    machine.bootstrapLive();
+    expect(machine.state).toBe("live");
+    // No follow bound yet: a live session stays live even with no frames
+    // (there is nothing to watch on the session-list/new-session pages).
+    clock.advance(LIVE_FRAME_MS);
+    clock.advance(STALE_TO_OFFLINE_MS);
+    expect(machine.state).toBe("live");
+
+    // A follow binds but never delivers a frame (open socket, frozen stream).
+    machine.followBound();
+    isFollowLive.mockReturnValue(false);
+    clock.advance(LIVE_FRAME_MS);
+    expect(machine.state).toBe("stale");
+    // REST probe fails: a reachable-but-frameless link still goes offline.
+    probe.mockResolvedValue(false);
+    clock.advance(15_000);
+    await Promise.resolve();
+    expect(machine.state).toBe("offline");
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("followBound: a frame before the deadline certifies live and arms the watchdog", () => {
+    const { clock, machine } = setupTracked();
+    machine.bootstrapLive();
+    machine.followBound();
+    // Snapshot/frame arrives in time.
+    machine.dispatch({ type: "frame" });
+    expect(machine.state).toBe("live");
+    clock.advance(LIVE_FRAME_MS - 1);
+    expect(machine.state).toBe("live");
+    // No further frames: the regular frame watchdog now owns staleness.
+    clock.advance(1);
+    expect(machine.state).toBe("stale");
+  });
 });

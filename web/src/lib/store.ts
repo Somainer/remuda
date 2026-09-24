@@ -1050,12 +1050,14 @@ class HubStore {
       },
     });
     this.connection = machine;
-    // Honest bootstrap: do NOT optimistically publish live. The machine waits
-    // for the follow socket to open AND frame (or a successful resume) before
-    // live; only a genuinely offline bootstrap (no device session after a
-    // network error) starts the offline retry loop.
+    // A successful REST bootstrap proves reachability, but on the list/new
+    // pages there is no follow socket to watchdog yet: start live WITHOUT a
+    // frame timer. The instant a session's follow socket binds
+    // (openFollowSocket → followBound) the framed-socket deadline takes over,
+    // so an active session whose transcript is frozen can never show 已连接.
+    // A failed bootstrap starts the offline reconnect loop instead.
     if (offline) machine.setStateOffline();
-    else machine.markRecovering();
+    else machine.bootstrapLive();
 
     if (typeof window !== "undefined") {
       window.addEventListener("online", this.onConnOnline);
@@ -2183,6 +2185,11 @@ class HubStore {
     /** REST-seed floor for the FIRST subscribe; null on a reopen (keep the client's). */
     seedFloor: { earliestRetainedSeq: string; complete: boolean } | null = null,
   ) {
+    // The active session's link claim starts here: the machine requires a
+    // frame within LIVE_FRAME_MS of the socket opening (a silent open must not
+    // keep 已连接 over a frozen transcript). The subscribe snapshot/any event
+    // dispatches {frame} and satisfies it.
+    this.connection?.followBound();
     const sub = await api.eventsSubscribe(
       instance.journalId,
       afterSeq,

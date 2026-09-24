@@ -232,6 +232,170 @@ async fn device_and_enroll(
     Ok((cookie, token, enroll))
 }
 
+/// model-pin-1 §5.4 public-API regression: a launch `model_pin_mismatch`
+/// diagnostic the Node appends is projected onto the instance and served
+/// verbatim on the public GET instance JSON, so run details keeps it even
+/// when the launch event is older than the bounded journal tail.
+#[tokio::test]
+async fn model_pin_mismatch_is_served_on_public_instance_json() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let mut req = format!("ws://{}/v1/node", hub.addr).into_client_request()?;
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {enroll}").parse()?);
+    let (mut node, _) = tokio_tungstenite::connect_async(req).await?;
+    let host_id = HostId::new();
+    node.send(Message::Text(
+        json!({
+            "jsonrpc": "2.0", "id": "h",
+            "method": "runtime.hello",
+            "params": { "hostId": host_id.as_id().as_str(), "nodeVersion": "0.1.0", "label": "modelpin-api" }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await?;
+    let _ = recv_json(&mut node).await?;
+    // Accept every RPC the Hub issues (create/send/…); after the test sends
+    // the diagnostic event on this channel, the handler appends it onto the
+    // (already-created) instance.
+    let (append_tx, append_rx) = tokio::sync::oneshot::channel::<(String, Value)>();
+    tokio::spawn(async move {
+        let mut pending: Option<(String, Value)> = append_rx.await.ok();
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let method = frame["method"].as_str().unwrap_or_default().to_owned();
+            let command_id = frame
+                .pointer("/params/commandId")
+                .cloned()
+                .unwrap_or_else(|| json!("cmd_pin"));
+            let reply = json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": { "command": { "commandId": command_id, "state": "accepted", "operation": method } }
+            });
+            let _ = node.send(Message::Text(reply.to_string().into())).await;
+            if let Some((instance_id, event)) = pending.take() {
+                let _ = node
+                    .send(Message::Text(
+                        json!({
+                            "jsonrpc": "2.0", "id": "pin",
+                            "method": "journal.append",
+                            "params": { "instanceId": instance_id, "event": event }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+            }
+        }
+    });
+
+    // Create the instance over the public HTTP API (pins model A).
+    let create = json!({
+        "hostId": host_id.as_id().as_str(),
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "model": "model_hub/es1_orange_o50[1m]",
+        "prompt": "pin probe"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let created: Value = serde_json::from_str(body.trim())?;
+    let instance_id = created["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+
+    // Queue the Node's launch mismatch diagnostic for append on the live
+    // Node link (the same channel the production pump uses). The background
+    // handler sends it right after accepting the create RPC.
+    let pin_event: Value = serde_json::from_str(
+        &json!({
+            "kind": "lifecycle",
+            "observedAt": "2026-09-24T00:00:00.000Z",
+            "payload": {
+                "type": "native",
+                "topic": "diagnostic",
+                "nativeName": "model_pin_mismatch",
+                "nativeId": { "state": "not-applicable" },
+                "status": { "state": "known", "value": "diverged" },
+                "severity": "warning",
+                "affectsCompletion": false,
+                "dataRef": null,
+                "relatedIds": {
+                    "reason": "model-mismatch",
+                    "requested": "model_hub/es1_orange_o50[1m]",
+                    "observed": "model_hub/es1_orange_o48[1m]"
+                }
+            }
+        })
+        .to_string(),
+    )?;
+    append_tx
+        .send((instance_id.clone(), pin_event))
+        .map_err(|_| anyhow!("append channel closed"))?;
+    // The background accepter owns the socket now; the append is persisted on
+    // arrival regardless of when its JSON-RPC reply is drained. Poll the
+    // public record until the projection lands.
+
+    // Read it back through the PUBLIC instance endpoint, polling briefly until
+    // the append's projection lands, and assert the exact projected JSON
+    // values — not private store internals.
+    let inst: Value = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let (status, _, body) = http(
+                hub.addr,
+                "GET",
+                &format!("/v1/instances/{instance_id}"),
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await?;
+            assert_eq!(status, 200, "{body}");
+            let inst: Value = serde_json::from_str(body.trim())?;
+            if inst.get("modelPinMismatches").is_some() {
+                return Ok::<_, anyhow::Error>(inst);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("projection did not reach the public instance record")??;
+    let records = inst["modelPinMismatches"]
+        .as_array()
+        .context("modelPinMismatches array on public record")?;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["requested"].as_str(),
+        Some("model_hub/es1_orange_o50[1m]")
+    );
+    assert_eq!(
+        records[0]["observed"].as_str(),
+        Some("model_hub/es1_orange_o48[1m]")
+    );
+    assert_eq!(
+        records[0]["observedAt"].as_str(),
+        Some("2026-09-24T00:00:00.000Z")
+    );
+    hub.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn healthz_ok() -> Result<()> {
     let (hub, _, _dir) = boot().await?;

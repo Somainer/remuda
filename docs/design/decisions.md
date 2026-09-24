@@ -1119,7 +1119,7 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 1. Hub 对同一 `commandId` 且同一 payload 返回原记录，不产生第二条命令；payload 不同则返回 `COMMAND_ID_CONFLICT`（`queue_command`）。
 2. Node 按 `commandId + digest` 持久去重，重启后仍然有效。
 3. Hub 与 Node 的去重记录保留期 ≥ 客户端重试窗口加安全余量（≥7 天）；任何命令表清理策略都必须遵守这一下限。
-4. Hub 对同一 id 的重 POST 只转发尚未转发（`forwarded=0`）的行；已转发的行不会因为重 POST 而再次转发到 Node（任务 B 补齐；在它落地前，常见路径「消息从未到达 Hub」已由前提 1–2 保证恰好一次，GET command status 为可选调和手段，客户端按存在性 feature-detect）。
+4. Hub 对同一 id 的重 POST 只转发尚未转发（`forwarded=0`）的行；已转发的行不会因为重 POST 而再次转发到 Node（任务 B 已落地）。
 
 **不变的部分**：Hub 与 Node 自身仍然绝不因为 ACK 不明而重发到 native（protocol §2.5）；unknown 的命令绝不以**新** `commandId` 自动重试，只有用户明确点击「仍要再送一条？」才生成新 id。
 
@@ -1141,3 +1141,14 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 - **GET 调和**：任务 B 已落地，客户端直接使用 `GET /v1/instances/{id}/commands/{commandId}`（不做 feature-detect）在疑似丢响应时判定真相。
 - **屏幕排序**：null-basis 的 RPC 屏幕不得覆盖已提交的 journal 屏幕；过期 gap fill 不得在更新的 resume/socket 恢复后压回只读。
 - **横幅**：回到 live 短暂显示「已恢复」（约 1.5 s）。`ConnectionIndicator` 的最小改动属于 UO-1 清单的已接受例外（仅新增 stale 点的文案/颜色，不动其结构）。
+
+**轮次 3 精化（2026-09-25，round-3 复审：意图只执行一次、transcript 冻结时绝不显示已连接）**：
+- **提交后发布（commit-before-publish）**：outbox 的内存缓存与订阅者通知只在 IndexedDB 事务 `oncomplete` 后更新；事务 abort 时缓存保持不变，未提交的行既不渲染也不 POST。bubble 的终身 commandId 在**首次持久化之前**绑定，首次写入 abort 后重试仍用同一个 id（一条用户意图、一个 commandId、一条 durable 行）。
+- **单一投递者**：所有投递都在跨标签 Web Lock 内进行；锁内**重读 authoritative durable 行**（不是各标签启动时加载的缓存），状态写回后才释放，因此另一标签已标记 sent/done 的行不会被再次 POST。Web Locks 不可用时（内嵌 webview 等）退化为 IndexedDB 中的**租约行**（owner + `LEASE_TTL_MS=30s` 到期时间）：持有者在 finally 中释放，崩溃持有者的租约到期后可被接管。投递链自身在异常时绝不静默二次调用投递函数（那会造成双 POST）；获取锁失败向调用方传播，由同 id 重试兜底。
+- **`reconciling` 是独立状态**：2xx 返回 `queued` 且已转发（transport-written/native-acknowledged）但 `resolution=reconciling` 时，行进入 `reconciling`（不是 `sent`）：在 30 s 有界截止内以 1 s 间隔 GET 同一行（**绝不重新转发**），收敛到 accepted（`sent`）/`rejected`（保留并展示 Node 原因）/超时 `unknown`（状态待确认）。投影上 `reconciling` 与 `sent` 一样显示已送达，不显示待确认。
+- **held 的有界重试**：`held`（queued、未转发）不消耗 20 次尝试预算，以 2s 起指数退避（上限 30s）的同 id 重 POST 等待主机恢复；主机 offline→online 的恢复 flush 也会冲掉 held 行。同一次 flush 内已尝试过的 held 行不会在相邻 pass 里被紧紧密 POST（per-flush attempted 集合），由其定时器或下一次重连重试。
+- **live 的唯一判据**：只有连接状态机可以发布全局 `live`，且 live 必须满足 (a) follow socket `readyState === OPEN` **且** `LIVE_FRAME_MS` 内收到过帧，或 (b) 一次 reopen + catch-up 成功。前台/pageshow/online 从缓存 live 恢复时必须用 (a) 重新验证，否则重开；REST probe 成功**永不**置 live，只触发 reopen+catch-up；journal 的 `onStatus` 只写 per-session 的 `journalStatus`，**绝不写全局 `connection`**（REST 可达、journal live 都不能证明 follow 流健康，避免 transcript 冻结却显示已连接）。bootstrap 从 `recovering` 开始，由首帧或成功 resume 置 live。
+- **gap-fill 有确定结局**：并发 onGap/resume 共享同一个 in-flight fill promise；每次 fill 默认捕获当前 resume generation，被更新的 resume 取代后绝不写状态；失败/不完整保持可重试的 readonly-stale。snapshot 永不把已存在 client 的 applied 游标推进到它未 EMIT 过的行（bounded tail 3001..5000 在 applied=1 时保持 1），连续 apply（先 backfill 后推进）恢复游标。
+- **离线重载恢复完整实例投影**：每条 outbox 行持久化最后已知的完整 Instance 投影；离线 reload（实例列表不可达）时恢复真实投影（capabilities、nativeRef 可直接解引用），不再使用 `as unknown as Instance` 桩；下一次成功的列表刷新以权威行替换。SessionPage/gate 据此在断网下仍可渲染。
+- **打断回执只认真权威受理**：steer（直接或插队）仅在状态为 `sent/done` 时返回成功；离线排队、reconciling、held 都不显示「已打断」。
+- **小项**：被取消的 beforeunload 提示通过 handler 内安排的 `setTimeout(0)` 清除「卸载中」标记（pagehide 真正发生时会重新置位）；inflight 租约声明写 abort 时不 POST、行保持可投递（移除了已无作用的内存 inflight 标记，durable 租约是唯一互斥机制）；迟到的、未见过的 journal 屏幕（含 load-earlier 补出的屏幕与列表轮询）不得覆盖更新的已提交 RPC 屏幕——RPC basis 锚定在浏览器已知的最大 journal 事件 seq，而不仅是屏幕观测的 seq。

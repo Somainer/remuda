@@ -18,7 +18,7 @@ import {
   type TranscriptNode,
 } from "../assemble";
 import { ToolCard } from "../ToolCard";
-import sessionCss from "../session.module.css";
+import sessionCss from "../transcript.module.css";
 import { fmtDuration, fmtTokens } from "../workflow/workflowProgress";
 import {
   fetchSubagentTranscript,

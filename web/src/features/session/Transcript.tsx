@@ -17,7 +17,7 @@ import { OpaqueRow } from "./OpaqueRow";
 import { ObservedChangeRow } from "./ObservedChangeRow";
 import { SubagentFolds } from "./subagent/SubagentRows";
 import css from "./transcript.module.css";
-import session from "./session.module.css";
+import session from "./toolCard.module.css";
 import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
 import { readShowInjected, writeShowInjected } from "./injectedPref";
 import { readPosition, writePosition } from "./readingPosition";

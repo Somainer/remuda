@@ -1,0 +1,84 @@
+.menuHead {
+  padding: 5px 12px 8px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--mute);
+  letter-spacing: 0.06em;
+}
+
+.menuFoot {
+  border-top: 1px solid var(--line);
+  margin-top: 5px;
+  padding: 8px 12px 3px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--mute);
+  line-height: 1.5;
+  /* Stays below the scrolling list body inside the height-capped popover. */
+  flex: 0 0 auto;
+}
+
+.effortRow,
+.harnessRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  background: transparent;
+  border: 0;
+  color: var(--paper);
+  text-align: left;
+  width: 100%;
+}
+
+.effortOn,
+.harnessOn {
+  background: var(--ink);
+}
+
+.harnessOff {
+  color: var(--mute);
+}
+
+.harnessName {
+  font-size: 13px;
+}
+
+.harnessMeta {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.harnessPlus {
+  margin-left: auto;
+  font-size: 16px;
+  color: var(--mute);
+}
+
+.radio {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  box-sizing: border-box;
+  flex: none;
+}
+
+.radioOn {
+  border: 3px solid var(--paper);
+}
+
+.effortName {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  width: 92px;
+  flex: none;
+}
+
+.effortDesc {
+  font-size: 12px;
+  color: var(--mute);
+  flex: 1;
+}

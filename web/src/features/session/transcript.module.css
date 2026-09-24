@@ -221,3 +221,113 @@
     transform: translate(-50%, -50%);
   }
 }
+
+/* UO-4: migrated from session.module.css. NOTE: session.module.css's
+
+   compact-fold BUTTON `.fold` lives in toolCard.module.css — this file's
+
+   existing `.fold` is the D-041 folded tool-row container; the two locals
+
+   must not be unified. */
+
+.user {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: flex-end;
+}
+
+.you {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--mute);
+}
+
+.bubble {
+  max-width: 66%;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-2);
+  padding: 9px 12px;
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.assistant {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+/* Caret shown while a message is still streaming in (D-028 §7). Reuses the
+   `dim` keyframes the run dot already animates with, so the two read as the
+   same "still working" signal. */
+.cursor {
+  display: inline-block;
+  width: 7px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--cold);
+  animation: dim 1.1s ease-in-out infinite;
+}
+
+.thought {
+  color: var(--mute);
+  font-size: 13px;
+  font-family: var(--mono);
+}
+
+.thought summary {
+  cursor: pointer;
+}
+
+.opaque {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mute);
+}
+
+/* c-mfix: known effort/model observations rendered as a light change record
+   (ObservedChangeRow), not 未识别事件. Same weight as .opaque; the disclosure
+   keeps the raw payload one click away. */
+.changeRow {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--mute);
+}
+
+.changeRow details summary {
+  cursor: pointer;
+}
+
+@keyframes dim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (max-width: 767px) {
+  .bubble {
+    max-width: 88%;
+    padding: 9px 11px;
+  }
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+
+   class carries the original declarations. */
+
+.heldRowActions {
+  composes: heldRowActions from "./composer.module.css";
+}

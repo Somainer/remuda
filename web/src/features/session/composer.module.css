@@ -1,0 +1,452 @@
+.composerRoot {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+}
+
+.input {
+  flex: 1;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  padding: 11px 12px;
+  font-size: 14px;
+  color: var(--paper);
+  resize: vertical;
+}
+
+.input:disabled {
+  opacity: 0.5;
+}
+
+.send {
+  height: 32px;
+  border: 1px solid var(--paper);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0 16px;
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+}
+
+.send:disabled {
+  opacity: 0.5;
+}
+
+/* D-028 §6: queue / interrupt controls. */
+.queueBtn {
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 13px;
+  font-weight: 500;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  white-space: nowrap;
+}
+
+.queueBtn:disabled {
+  opacity: 0.5;
+}
+
+.interruptBtn {
+  height: 32px;
+  border: 1px solid var(--danger, #e06c5c);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--danger, #e06c5c);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  white-space: nowrap;
+}
+
+.interruptBtn:disabled {
+  opacity: 0.5;
+}
+
+.controlSub {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  opacity: 0.75;
+}
+
+.controlNote {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--mute);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.queuedRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.queuedChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--ink-0);
+  font-size: 12px;
+  color: var(--paper);
+}
+
+.queuedTag {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--mute);
+  flex: none;
+}
+
+.queuedText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.queuedRemove {
+  border: 0;
+  background: transparent;
+  color: var(--mute);
+  font-size: 11px;
+  padding: 2px;
+  line-height: 1;
+}
+
+.queuedRemove:hover {
+  color: var(--danger, #e06c5c);
+}
+
+/* c-steer 插队发送: per-queued-row interrupt-and-send. */
+.queuedSteer {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--paper);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 7px;
+  line-height: 1.6;
+  flex: none;
+  white-space: nowrap;
+}
+
+.queuedSteer:disabled {
+  opacity: 0.5;
+}
+
+.heldRowActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.controlBar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: none;
+  white-space: nowrap;
+  min-width: max-content;
+  position: relative;
+}
+
+/* UO-4 ownership: the desktop effort chip's top-tier modifier and its spark
+   layers live HERE, immediately after the `.chip` base. In the old single
+   session.module.css `.ember` followed `.chip`, so at equal specificity the
+   amber color/border/gradient won. Re-exporting it from effort.module.css via
+   composes injected the effort sheet before this module, letting `.chip`
+   (and its `background:`/`border:` shorthands) reset the ember accent. */
+@keyframes ember {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}
+
+/* Chip-scale twin of knobBreath: glow only, no ring that pushes at the layout. */
+@keyframes emberChipGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 6px 0 rgba(201, 132, 42, 0.25), inset 0 0 6px -2px rgba(255, 190, 110, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 13px 2px rgba(201, 132, 42, 0.5), inset 0 0 10px -1px rgba(255, 198, 124, 0.35);
+  }
+}
+
+@keyframes spark {
+  0% {
+    transform: translateY(0) scale(1);
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-13px) scale(0.4);
+    opacity: 0;
+  }
+}
+
+/*
+ * Collapsed trigger in the top tier: the same amber breath as the card's knob
+ * halo, at chip scale — a slow warm sweep plus a soft outer glow. Subtle on
+ * purpose; the pill is where the ember effect belongs.
+ */
+.ember {
+  color: var(--dust);
+  border-color: var(--dust);
+  background-image: linear-gradient(90deg, transparent, rgba(201, 132, 42, 0.18), transparent);
+  background-size: 200% 100%;
+  animation: ember 4.5s linear infinite, emberChipGlow 3.4s ease-in-out infinite;
+}
+
+.emberSpark {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--dust);
+  left: 8px;
+  bottom: 6px;
+  animation: spark 1.2s ease-out infinite;
+  pointer-events: none;
+}
+
+.emberSpark2 {
+  left: 18px;
+  animation-delay: 0.35s;
+}
+
+.emberSpark3 {
+  left: 28px;
+  animation-delay: 0.7s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ember,
+  .emberSpark,
+  .emberSpark2,
+  .emberSpark3 {
+    animation: none !important;
+  }
+}
+
+.chipMark {
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--paper);
+  flex: none;
+}
+
+.chipCaret {
+  color: var(--mute);
+  font-size: 11px;
+}
+
+.chipModel {
+  color: var(--paper);
+  min-width: 76px;
+  text-align: center;
+}
+
+/* §9.1: unobserved effective level renders the `?` greyed, never as the
+   requested tier — see D-028 §9.1. */
+.chip:has([data-effort-effective="unknown"]) .chipModel {
+  color: var(--mute);
+}
+
+.chipEffortMismatch {
+  color: var(--warn);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+}
+
+/* §9.1: a push-down in flight — the requested word with a pulsing tag so the
+   chip never shows the old level ambiguously (切换中 idle, 排队中 working). */
+.chipEffortPending .chipModel {
+  opacity: 0.85;
+}
+
+.chipEffortPendingTag {
+  color: var(--info);
+  font-size: 11px;
+  white-space: nowrap;
+  padding: 0 2px;
+  animation: effortPendingPulse 1.4s ease-in-out infinite;
+}
+
+@keyframes effortPendingPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.barSpacer {
+  flex: 1;
+}
+
+.contextRing {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  box-sizing: border-box;
+  position: relative;
+  flex: none;
+}
+
+.contextRing::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: var(--cold);
+  clip-path: polygon(0 0, 100% 0, 100% var(--ctx-pct, 0%), 0 var(--ctx-pct, 0%));
+}
+
+@media (max-width: 767px) {
+  .composer {
+    align-items: center;
+    gap: 10px;
+  }
+
+  .chip {
+    height: 32px;
+  }
+
+  .input {
+    min-height: 44px;
+    height: 44px;
+    resize: none;
+    padding: 0 12px;
+  }
+}
+
+/* D-027: inline guidance when a paste carried no readable image. */
+.attachNotice {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 2px 0;
+}
+
+.permissionName {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-body);
+  color: var(--paper);
+}
+
+.permissionNative {
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--mute);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.permissionDust {
+  color: var(--dust);
+  font-size: 11px;
+}
+
+.launchOnlyTag {
+  font-size: 10px;
+  color: var(--mute);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 16px;
+}
+
+.chipPending {
+  color: var(--mute);
+  font-variant-numeric: tabular-nums;
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+
+   class carries the original declarations. */
+
+.effortRow {
+  composes: effortRow from "./effort.module.css";
+}
+
+.effortOn {
+  composes: effortOn from "./effort.module.css";
+}
+
+.radio {
+  composes: radio from "./effort.module.css";
+}
+
+.radioOn {
+  composes: radioOn from "./effort.module.css";
+}

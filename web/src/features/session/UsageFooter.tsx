@@ -1,6 +1,6 @@
 import type { UsagePayload } from "../../types/generated";
 import { usageLine } from "./usage";
-import css from "./session.module.css";
+import css from "./toolCard.module.css";
 
 export function UsageFooter({ payload }: { payload: UsagePayload }) {
   const line = usageLine(payload);

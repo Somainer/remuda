@@ -1,5 +1,5 @@
 import type { DiffState } from "../features/session/assemble";
-import css from "../features/session/session.module.css";
+import css from "./diff.module.css";
 
 export function DiffBlock({
   path,

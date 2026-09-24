@@ -30,7 +30,7 @@ import { WorkflowTree } from "./WorkflowTree";
 import { UsageFooter } from "./UsageFooter";
 import { OpaqueRow } from "./OpaqueRow";
 import { ObservedChangeRow } from "./ObservedChangeRow";
-import { SubagentFolds } from "./subagent/SubagentRows";
+import { NestedToolContext, SubagentFolds, type NestedToolState } from "./subagent/SubagentRows";
 import css from "./transcript.module.css";
 import session from "./toolCard.module.css";
 import { DEFAULT_ROW, OVERSCAN, indexAtOffset, rowOffsets, visibleRange } from "./virtualWindow";
@@ -1263,12 +1263,18 @@ function ToolRow({
   const folds = (node.subagents?.length ?? 0) > 0 ? (
     <SubagentFolds refs={node.subagents ?? []} openChildId={hitChildId ?? null} />
   ) : null;
+  // Nested rows (subagent folds, workflow member folds) keep their expansion
+  // in the same session set 全部折叠 clears, so it survives virtualisation.
+  const nested = useMemo<NestedToolState>(
+    () => ({ openChildId: hitChildId ?? null, expanded: opts.expandedTools, onToggle: opts.onToggleToolExpand }),
+    [hitChildId, opts.expandedTools, opts.onToggleToolExpand],
+  );
   if (!failed) {
     return (
-      <>
+      <NestedToolContext.Provider value={nested}>
         {card}
         {folds}
-      </>
+      </NestedToolContext.Provider>
     );
   }
   return (
@@ -1276,8 +1282,10 @@ function ToolRow({
       <span className={css.failTag} data-testid="tool-failure-tag">
         工具失败 · {node.result?.outcome === "denied" ? "已拒绝" : "失败"}
       </span>
-      {card}
-      {folds}
+      <NestedToolContext.Provider value={nested}>
+        {card}
+        {folds}
+      </NestedToolContext.Provider>
     </div>
   );
 }

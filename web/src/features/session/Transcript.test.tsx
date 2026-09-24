@@ -812,6 +812,77 @@ describe("D-041 fold vs in-transcript search hit", () => {
   });
 });
 
+describe("nested tool rows share the transcript expansion set", () => {
+  it("全部折叠 closes an opened subagent fold and re-folds the card the reader expanded", async () => {
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "派个子任务"),
+        nestedCall(2, "tc-task", "Task", { description: "look around" }, null),
+        nestedCall(3, "tc-a", "Bash", { command: "ls a" }, "tc-task", "agent-sub"),
+        nestedResult(4, "tc-a", "nested body", "agent-sub"),
+        nestedResult(5, "tc-task", "sub done"),
+        assistantMessage(6, "好了"),
+      ],
+      "/s/ins_nested_collapse",
+    );
+    const toggle = () => screen.getByTestId("subagent-fold-toggle");
+    await user.click(toggle());
+    expect(toggle().getAttribute("aria-expanded")).toBe("true");
+    const nested = () =>
+      screen.getByTestId("subagent-fold").querySelector("[data-testid='tool-card']") as HTMLElement;
+    expect(nested().getAttribute("data-folded")).toBe("1");
+    fireEvent.click(nested().querySelector("[data-testid='tool-fold-open']") as HTMLElement);
+    expect(nested().getAttribute("data-folded")).toBe("0");
+
+    await user.click(screen.getByTestId("collapse-all"));
+    expect(toggle().getAttribute("aria-expanded")).toBe("false");
+    await user.click(toggle());
+    expect(nested().getAttribute("data-folded")).toBe("1");
+  });
+
+  it("keeps a nested expansion when the parent row remounts", () => {
+    const events = [
+      userMessage(1, "派个子任务"),
+      nestedCall(2, "tc-task", "Task", { description: "look around" }, null),
+      nestedCall(3, "tc-a", "Bash", { command: "ls a" }, "tc-task", "agent-sub"),
+      nestedResult(4, "tc-a", "nested body", "agent-sub"),
+      nestedResult(5, "tc-task", "sub done"),
+      assistantMessage(6, "好了"),
+    ];
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/s/ins_nested_keep"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByTestId("subagent-fold-toggle"));
+    const nested = () =>
+      screen.getByTestId("subagent-fold").querySelector("[data-testid='tool-card']") as HTMLElement;
+    fireEvent.click(nested().querySelector("[data-testid='tool-fold-open']") as HTMLElement);
+    // Hide then re-show injected rows: the Task row leaves and re-enters the
+    // mounted list the way a virtualised row does.
+    rerender(
+      <MemoryRouter initialEntries={["/s/ins_nested_keep"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events.slice(0, 1)} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("subagent-fold")).toBeNull();
+    rerender(
+      <MemoryRouter initialEntries={["/s/ins_nested_keep"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("subagent-fold-toggle").getAttribute("aria-expanded")).toBe("true");
+    expect(nested().getAttribute("data-folded")).toBe("0");
+  });
+});
+
 const nestedExecutor = known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null });
 
 /** A tool call, optionally stamped as a subagent's own (source agent id). */

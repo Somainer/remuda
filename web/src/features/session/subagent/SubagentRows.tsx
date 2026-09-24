@@ -6,9 +6,9 @@
  * session. The full transcript (prompt, model, tokens, final text) lives in
  * the drill-in view the header links to.
  */
-import { useState, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { SubagentRef } from "../assemble";
+import type { SubagentRef, ToolNode } from "../assemble";
 import { ToolCard } from "../ToolCard";
 import { isToolFailure } from "../assemble";
 import sessionCss from "../toolCard.module.css";
@@ -17,6 +17,66 @@ import css from "./subagent.module.css";
 /** Route for a subagent's full drill-in transcript. */
 export function subagentHref(instanceId: string, agentId: string): string {
   return `/s/${encodeURIComponent(instanceId)}/agents/${encodeURIComponent(agentId)}`;
+}
+
+/**
+ * Expansion of rows nested under a parent tool (Task subagent folds and
+ * workflow member folds). The transcript virtualises rows, so a fold's own
+ * useState would be lost when the parent scrolls out of the overscan, and
+ * 全部折叠 could not reach it. The transcript provides its session-scoped
+ * `expandedTools` set here (keyed by child node id, and by `nestedFoldKey`
+ * for the fold itself), plus the child holding the current search hit.
+ * Without a provider (drill-in views, unit tests) everything stays local.
+ */
+export type NestedToolState = {
+  openChildId: string | null;
+  expanded: ReadonlySet<string>;
+  onToggle: (id: string, expanded: boolean) => void;
+};
+
+export const NestedToolContext = createContext<NestedToolState | null>(null);
+
+/** Set key for the open state of the fold listing one agent's tool rows. */
+export function nestedFoldKey(kind: "subagent" | "member", agentId: string): string {
+  return `${kind}-fold:${agentId}`;
+}
+
+/**
+ * Open state of one nested fold: the reader's toggle (shared set when
+ * provided), forced open while it holds the current search hit.
+ */
+export function useNestedFold(
+  key: string,
+  nodes: readonly ToolNode[],
+  openChildId?: string | null,
+): { open: boolean; toggle: () => void; hitId: string | null; state: NestedToolState | null } {
+  const state = useContext(NestedToolContext);
+  const [local, setLocal] = useState(false);
+  const hitId = openChildId ?? state?.openChildId ?? null;
+  const manual = state ? state.expanded.has(key) : local;
+  const forced = Boolean(hitId && nodes.some((node) => node.id === hitId));
+  const toggle = () => {
+    if (state) state.onToggle(key, !manual);
+    else setLocal((value) => !value);
+  };
+  return { open: manual || forced, toggle, hitId, state };
+}
+
+/**
+ * Controlled expansion for one nested card: the searched row opens past its
+ * settled fold; the others follow the shared set (or the card's own state
+ * without a provider).
+ */
+export function nestedCardExpansion(
+  node: ToolNode,
+  hitId: string | null,
+  state: NestedToolState | null,
+): { expanded?: boolean; onExpand?: () => void } {
+  if (!state) return { expanded: hitId === node.id ? true : undefined };
+  return {
+    expanded: hitId === node.id || state.expanded.has(node.id),
+    onExpand: () => state.onToggle(node.id, true),
+  };
 }
 
 function lastToolName(ref: SubagentRef): string | null {
@@ -54,10 +114,11 @@ export function SubagentFold({
   subagent: SubagentRef;
   openChildId?: string | null;
 }) {
-  const [manualOpen, setManualOpen] = useState(false);
-  // A search hit inside one of the folded rows forces the fold open.
-  const forceOpen = Boolean(openChildId && subagent.nodes.some((node) => node.id === openChildId));
-  const open = manualOpen || forceOpen;
+  const { open, toggle, hitId, state } = useNestedFold(
+    nestedFoldKey("subagent", subagent.agentId),
+    subagent.nodes,
+    openChildId,
+  );
   const calls = subagent.nodes.length;
   const last = lastToolName(subagent);
   return (
@@ -68,7 +129,7 @@ export function SubagentFold({
           className={css.toggle}
           aria-expanded={open}
           data-testid="subagent-fold-toggle"
-          onClick={() => setManualOpen((value) => !value)}
+          onClick={toggle}
         >
           <span className={css.caret}>{open ? "▾" : "▸"}</span>
           <span>
@@ -99,9 +160,7 @@ export function SubagentFold({
                 completeness={node.completeness}
                 diffState={node.diffState}
                 foldSettled
-                // The searched row opens past its settled fold; the others keep
-                // whatever the reader chose (undefined = the card's own state).
-                expanded={openChildId === node.id ? true : undefined}
+                {...nestedCardExpansion(node, hitId, state)}
               />
             ),
           )}

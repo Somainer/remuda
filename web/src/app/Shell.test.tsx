@@ -294,6 +294,31 @@ describe("Sidebar (UO-2a)", () => {
     }
   });
 
+  it("任务看板 carries the selected project; under 全局 it is the bare /board", async () => {
+    render(
+      <MemoryRouter initialEntries={["/sessions"]}>
+        <BoardScopeSync />
+        <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[{ id: "pa", name: "A" }]} quickFindOwned={false} />
+        <Where />
+      </MemoryRouter>,
+    );
+    const board = () => screen.getByRole("link", { name: "任务看板" });
+    try {
+      expect(board()).toHaveAttribute("href", "/board");
+      await userEvent.click(screen.getByRole("button", { name: "A" }));
+      await userEvent.click(screen.getByRole("link", { name: "会话" }));
+      expect(screen.getByTestId("where").textContent).toBe("/sessions");
+      expect(board()).toHaveAttribute("href", "/board?project=pa");
+      await userEvent.click(board());
+      expect(screen.getByTestId("where").textContent).toBe("/board?project=pa");
+
+      await userEvent.click(screen.getByRole("button", { name: "全局" }));
+      expect(board()).toHaveAttribute("href", "/board");
+    } finally {
+      projectFilterStore.clear();
+    }
+  });
+
   it("keeps only the one 新建 title, and labels survive folding", () => {
     renderSidebar("/hosts", { collapsed: true });
     expect(screen.getAllByTitle("新建", { exact: true })).toHaveLength(1);

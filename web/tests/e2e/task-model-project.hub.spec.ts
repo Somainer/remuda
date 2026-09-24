@@ -333,6 +333,21 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
     await forwardRead;
     await expect(projectRow(crossHostProject.id)).toHaveAttribute("aria-pressed", "true");
+
+    // D-053: 任务看板 in the main nav carries the selected scope into the URL.
+    const mainNav = page.getByRole("navigation", { name: "主导航" });
+    const boardLink = mainNav.getByRole("link", { name: "任务看板" });
+    await projectRow(otherProject.id).click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+    await mainNav.getByRole("link", { name: "会话" }).click();
+    await expect(page).toHaveURL(/\/sessions$/);
+    const navRead = boardRead(otherProject.id);
+    await boardLink.click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+    await navRead;
+    await expect(projectRow(otherProject.id)).toHaveAttribute("aria-pressed", "true");
+    await projectRow("").click();
+    await expect(boardLink).toHaveAttribute("href", "/board");
   });
 
   test("the bot channel defaultProject reference stays a valid display reference", async ({ page }) => {

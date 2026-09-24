@@ -339,10 +339,13 @@ export function Sidebar({
       <nav className={css.nav} aria-label="主导航">
         {PRIMARY_NAV.map((item) => {
           const active = navActive(item.id, item.to);
+          // D-053: 任务看板 carries the stored scope into the URL, the only
+          // scope /board reads (BoardScopeSync); 全局 stays the bare /board.
+          const to = item.id === "board" && selectedProject ? `/board?project=${encodeURIComponent(selectedProject)}` : item.to;
           return (
             <Link
               key={item.id}
-              to={item.to}
+              to={to}
               className={css.item}
               aria-current={active ? "page" : undefined}
               title={collapsed ? item.label : undefined}

@@ -60,9 +60,15 @@ export const LIGHT_TERMINAL_THEME: ITheme = {
   blue: "#2f5a9e",
   magenta: "#9335a8",
   cyan: "#1f6f6b",
-  // Dark grey, not near-white: TUI "white" default text stays readable on
-  // the light background (true white is available via truecolor/cube 231).
-  white: "#5a554c",
+  /*
+   * ANSI white / brightWhite on the LIGHT theme are light GREYS, not near
+   * white: TUIs (htop, dialog, ncurses status bars) paint black/default
+   * text ON these slots, so black and the default foreground must clear
+   * 4.5:1 on each (verified in theme.test.ts). The accepted trade-off:
+   * these slots used as FOREGROUND on the light page are low-contrast —
+   * programs wanting pale text emit truecolor or 256-cube colour 231.
+   */
+  white: "#96918a",
   brightBlack: "#767066",
   brightRed: "#a52a22",
   brightGreen: "#2e5c24",
@@ -70,7 +76,7 @@ export const LIGHT_TERMINAL_THEME: ITheme = {
   brightBlue: "#224a8a",
   brightMagenta: "#7c2790",
   brightCyan: "#165e5a",
-  brightWhite: "#2b2a27",
+  brightWhite: "#a39e96",
 };
 
 export type TerminalAppearance = "dark" | "light";

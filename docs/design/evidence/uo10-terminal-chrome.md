@@ -61,8 +61,7 @@ per-worker ports, servers in setsid process groups with trap cleanup.
   (sub-threshold frame then full height), zero resize calls, unchanged
   rows/cols, every engine.
 
-Screenshots (390/1440; copied outside git to
-`~/Projects/remuda-agents/scratch/c-uo10/screenshots/`):
+Screenshots (390/1440, behind REMUDA_EVIDENCE):
 
 - `uo10-terminal-dark-1440.png` / `uo10-terminal-light-1440.png`;
 - `uo10-terminal-keyboard-390.png`;

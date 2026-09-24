@@ -97,7 +97,7 @@ tokenGuard 断言两条：
 | `--on-attention` | 琥珀色计数徽标上的数字 | `#1f1e1b` | `#ffffff` |
 | `--scrim` | 遮罩 | `rgb(10 9 8 / .62)` | `rgb(31 30 27 / .28)` |
 | `--diff-add-bg` / `-del-bg` / `-ctx-bg` | diff（必须配 +/- 字形） | `rgb(163 194 154/.14)`、`rgb(236 154 148/.14)`、`rgb(255 246 230/.03)` | `rgb(58 104 67/.10)`、`rgb(163 56 62/.09)`、`rgb(60 45 20/.03)` |
-| `--term-bg` / `--term-fg` | 终端，两态相同 | `#1a1917` / `#e4dfd6` | 同左 |
+| `--term-bg` / `--term-fg` | 终端，跟随外观（2026-09-24 改定） | `#1a1917` / `#e4dfd6` | `#faf9f6` / `#2b2a27` |
 | `--tok-*` | 代码语法色，两态分设 | UO-1 从 `components/codeBlock.module.css` 现有的两组 `[data-theme]` 值平移，并逐个校到 `--bg-inset` 上 ≥ 4.5:1 | 同左 |
 | `--ember-*` | effort 顶档余烬 | UO-1 从 `features/session/session.module.css` 现有 `.effortCard` / `.effortKnobUltra` 的 night/ledger 模式分支原值平移 | 同左 |
 
@@ -178,10 +178,25 @@ tokenGuard 断言两条：
 
 ## 4. 终端配色（`features/session/tty/theme.ts`）
 
-- **命名**：新增 `export const TERMINAL_THEME`，同时保留 `export const NIGHT_CORRAL_THEME = TERMINAL_THEME` 作为过渡别名；引用方切到新名字后，别名在最后一个界面任务删除。
-- **基础色**：background `#1a1917`，foreground `#e4dfd6`，cursor `#e0b872`，cursorAccent `#1a1917`，selectionBackground `#3d3a35`。
-- **常规色**：black `#2c2a27`、red `#e8837c`、green `#9dbf87`、yellow `#dcb46a`、blue `#86aee0`、magenta `#c79ad8`、cyan `#7fbfbb`、white `#cfc9be`。
-- **亮色**：brightBlack `#8f897e`、brightRed `#f4a59e`、brightGreen `#b9d6a4`、brightYellow `#ecd08f`、brightBlue `#a9c7ee`、brightMagenta `#dcb8e8`、brightCyan `#a0d8d3`、brightWhite `#f6f2ea`。
+- **命名**：`DARK_TERMINAL_THEME` / `LIGHT_TERMINAL_THEME`，经 `terminalThemeFor(appearance)` 选择（`TERMINAL_THEME` / `NIGHT_CORRAL_THEME` 为暗色过渡别名）。终端跟随外观（所有者 2026-09-24 改定）；切换只赋值 `term.options.theme`，不重建终端、不丢滚动历史。
+- **深色基础色**：background `#1a1917`，foreground `#e4dfd6`，cursor `#e0b872`，cursorAccent `#1a1917`，selectionBackground `#3d3a35`。
+- **深色常规色**：black `#2c2a27`、red `#e8837c`、green `#9dbf87`、yellow `#dcb46a`、blue `#86aee0`、magenta `#c79ad8`、cyan `#7fbfbb`、white `#cfc9be`。
+- **深色亮色**：brightBlack `#8f897e`、brightRed `#f4a59e`、brightGreen `#b9d6a4`、brightYellow `#ecd08f`、brightBlue `#a9c7ee`、brightMagenta `#dcb8e8`、brightCyan `#a0d8d3`、brightWhite `#f6f2ea`。
+- **浅色基础色**（bg `#faf9f6`）：foreground `#2b2a27`，cursor `#8a630f`，cursorAccent `#faf9f6`，selectionBackground `#d8e2ee`。
+- **浅色 ANSI（相对 `#faf9f6`，全部 ≥4.5:1）**：
+
+  | 槽位 | hex | 对比 | 槽位 | hex | 对比 |
+  |---|---|---|---|---|---|
+  | black | `#1f1e1b` | 15.8 | white（TUI 底色） | `#96918a` | 4.6/5.3* |
+  | red | `#c13d32` | 5.0 | brightRed | `#a52a22` | 6.8 |
+  | green | `#3a702e` | 5.6 | brightGreen | `#2e5c24` | 7.5 |
+  | yellow | `#8a630f` | 5.2 | brightYellow | `#755308` | 6.7 |
+  | blue | `#2f5a9e` | 6.5 | brightBlue | `#224a8a` | 8.3 |
+  | magenta | `#9335a8` | 6.0 | brightMagenta | `#7c2790` | 7.8 |
+  | cyan | `#1f6f6b` | 5.6 | brightCyan | `#165e5a` | 7.2 |
+  | brightBlack | `#767066` | 4.7 | brightWhite（TUI 底色） | `#a39e96` | 6.3/5.4* |
+
+  \*black-on-slot / default-fg-on-slot。white/brightWhite 是浅灰而非近白：htop/dialog/ncurses 把默认或黑色文字画在这些槽位上，必须 ≥4.5:1；它们作为前景字印在浅页面上是被接受的低对比情形，真白由 truecolor/256 色 231 提供。
 - **256 色立方**：删除自绘的 `nightCorralExtendedAnsi`，改用 xterm 的标准 256 色立方，不再染色。
 - **字体**：`TERMINAL_FONT_FAMILY` 仍以 IBM Plex Mono 打头。
 - 终端跟随外观（2026-09-24 所有者改定，取代恒深色口径）：深、浅两套调色板随外观切换，切换只设 `term.options.theme`、渲染器就地重绘，不重建终端、不丢滚动历史；两套板各自的 16 个非黑 ANSI 色在本板终端底上 ≥ 4.5:1，终端输出的颜色（含 256 色立方与 truecolor）不被改写。浅板 white/brightWhite 为深灰（TUI 默认文字仍可读），真白走 truecolor/256 色 231。

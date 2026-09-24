@@ -24,6 +24,16 @@ import { bootstrapToken } from "./hub-auth";
 
 test.describe.configure({ mode: "serial" });
 
+const created: string[] = [];
+
+test.afterEach(async ({ page }) => {
+  for (const id of created.splice(0)) {
+    await page.request
+      .delete(`/v1/instances/${id}?force=1`)
+      .catch(() => undefined);
+  }
+});
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const evidence = process.env.REMUDA_EVIDENCE === "1";
 const shotDir = evidence
@@ -79,7 +89,9 @@ async function createTerminal(page: Page, prompt: string): Promise<string> {
   const body = (await response.json()) as {
     instance: { instanceId?: string; id?: string };
   };
-  return body.instance.instanceId ?? body.instance.id!;
+  const id = body.instance.instanceId ?? body.instance.id!;
+  created.push(id);
+  return id;
 }
 
 /** Exact iOS keyboard emulation (m-realdevice): layout viewport untouched. */
@@ -255,7 +267,7 @@ for (const appearance of ["dark", "light"] as const) {
       await shot(page, "uo10-terminal-light-1440.png");
   });
 
-  test(`terminal switches live to ${appearance === "dark" ? "light" : "dark"} then back without rebuild (${appearance} start)`, async ({
+  test(`xterm theme changes live on settings switch; terminal and scrollback survive (${appearance} start)`, async ({
     page,
   }) => {
     if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
@@ -267,49 +279,135 @@ for (const appearance of ["dark", "light"] as const) {
     const id = await createTerminal(page, `uo10 switch ${appearance}`);
     await openTerminal(page, id);
     const other = appearance === "dark" ? "light" : "dark";
-    const bgOf = () =>
-      page.evaluate(
-        () =>
-          getComputedStyle(document.querySelector("[data-tty-lab]")!)
-            .backgroundColor,
-      );
-    const startBg = await bgOf();
-    const gridAtStart = {
-      rows: Number(
-        await page.locator("[data-tty-lab]").getAttribute("data-tty-rows"),
-      ),
-      cols: Number(
-        await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
-      ),
-    };
+    const lab = page.locator("[data-tty-lab]");
+    const startId = await lab.getAttribute("data-tty-instance");
+    expect(startId).toBeTruthy();
 
-    // Switch the settings choice (no reload): the same terminal repaints.
+    // Scrollback sentinel through the PTY (rebuilt terminals would not
+    // replay it). On desktop the terminal is in raw mode (no local input),
+    // so type into the focused xterm helper textarea.
+    await page.locator(".xterm-helper-textarea").click();
+    await page.keyboard.type("echo UO10_SENTINEL", { delay: 5 });
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    expect(
+      await page.evaluate(() =>
+        window.__ttyLab?.bufferText().includes("UO10_SENTINEL"),
+      ),
+    ).toBe(true);
+    const themeBgBefore = await page.evaluate(() =>
+      window.__ttyLab?.themeBackground(),
+    );
+    const rendererBefore = await page.evaluate(() =>
+      window.__ttyLab?.rendererName(),
+    );
+
+    // Switch via the settings choice (no reload).
     await page.evaluate((mode) => {
       localStorage.setItem("runtime.theme.v1", mode);
       document.documentElement.dataset.appearance = mode;
     }, other);
-    await expect.poll(bgOf, { timeout: 3_000 }).not.toBe(startBg);
-    // The xterm grid is intact — no rebuild.
+    // The xterm option theme actually changed, not just the CSS frame.
+    await expect
+      .poll(
+        async () =>
+          (await page.evaluate(() => window.__ttyLab?.themeBackground())) ?? "",
+        { timeout: 3_000 },
+      )
+      .not.toBe(themeBgBefore);
+    // Same terminal instance (data-tty-instance set once at creation).
+    expect(await lab.getAttribute("data-tty-instance")).toBe(startId);
+    // Renderer survives (webgl stays webgl / canvas stays canvas).
+    expect(await page.evaluate(() => window.__ttyLab?.rendererName())).toBe(
+      rendererBefore,
+    );
+    // Scrollback sentinel survives.
     expect(
-      Number(
-        await page.locator("[data-tty-lab]").getAttribute("data-tty-rows"),
+      await page.evaluate(() =>
+        window.__ttyLab?.bufferText().includes("UO10_SENTINEL"),
       ),
-    ).toBe(gridAtStart.rows);
-    expect(
-      Number(
-        await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
-      ),
-    ).toBe(gridAtStart.cols);
-    // Scrollback survives: the terminal element is the SAME node.
-    const sameTerminal = await page.locator(".xterm").count();
-    expect(sameTerminal).toBeGreaterThan(0);
+    ).toBe(true);
+    // Frame CSS also switched.
+    await expect
+      .poll(
+        () =>
+          page.evaluate(
+            () =>
+              getComputedStyle(document.querySelector("[data-tty-lab]")!)
+                .backgroundColor,
+          ),
+        { timeout: 3_000 },
+      )
+      .toBe(appearance === "dark" ? "rgb(250, 249, 246)" : "rgb(26, 25, 23)");
 
     // Switch back.
     await page.evaluate((mode) => {
       localStorage.setItem("runtime.theme.v1", mode);
       document.documentElement.dataset.appearance = mode;
     }, appearance);
-    await expect.poll(bgOf, { timeout: 3_000 }).toBe(startBg);
+    await expect
+      .poll(
+        async () =>
+          (await page.evaluate(() => window.__ttyLab?.themeBackground())) ?? "",
+        { timeout: 3_000 },
+      )
+      .toBe(themeBgBefore);
+    expect(await lab.getAttribute("data-tty-instance")).toBe(startId);
+  });
+
+  test(`xterm theme changes live on SYSTEM colour-scheme change (${appearance} start)`, async ({
+    browser,
+  }) => {
+    // Skip is decided AFTER the dedicated context/page are created (the
+    // shared fixture page has no fake host in this browser-only test).
+    const preflight = await browser.newPage();
+    await preflight.goto("/login");
+    const hasFake = await fakeHostId(preflight);
+    await preflight.close();
+    if (!hasFake) test.skip(true, "fake Node not registered");
+    const ctx = await browser.newContext({
+      viewport: { width: 1440, height: 900 },
+      colorScheme: appearance === "dark" ? "dark" : "light",
+    });
+    const sysPage = await ctx.newPage();
+    try {
+      await loginPage(sysPage);
+      await sysPage.addInitScript(() => {
+        localStorage.setItem("runtime.theme.v1", "system");
+      });
+      await sysPage.reload();
+      const id = await createTerminal(sysPage, `uo10 sys ${appearance}`);
+      await openTerminal(sysPage, id);
+      const lab = sysPage.locator("[data-tty-lab]");
+      const startId = await lab.getAttribute("data-tty-instance");
+      const themeBgBefore = await sysPage.evaluate(() =>
+        window.__ttyLab?.themeBackground(),
+      );
+      await sysPage.locator(".xterm-helper-textarea").click();
+      await sysPage.keyboard.type("echo UO10_SENTINEL_SYS", { delay: 5 });
+      await sysPage.keyboard.press("Enter");
+      await sysPage.waitForTimeout(500);
+      await sysPage.emulateMedia({
+        colorScheme: appearance === "dark" ? "light" : "dark",
+      });
+      await expect
+        .poll(
+          async () =>
+            (await sysPage.evaluate(() =>
+              window.__ttyLab?.themeBackground(),
+            )) ?? "",
+          { timeout: 3_000 },
+        )
+        .not.toBe(themeBgBefore);
+      expect(await lab.getAttribute("data-tty-instance")).toBe(startId);
+      expect(
+        await sysPage.evaluate(() =>
+          window.__ttyLab?.bufferText().includes("UO10_SENTINEL_SYS"),
+        ),
+      ).toBe(true);
+    } finally {
+      await ctx.close();
+    }
   });
 }
 
@@ -469,6 +567,39 @@ test.describe("390px keyboard band", () => {
       `fresh shell prompt visible after keyboard crop: ${JSON.stringify(promptVisible)}`,
     ).toBe(true);
 
+    // UO-10 round-4 item 4: the FULL cursor row rectangle (top AND bottom)
+    // lies inside the visible band for a cursor on the first rows.
+    const cursorRow = await page.evaluate(() => {
+      const viewport = document.querySelector<HTMLElement>(
+        '[aria-label="终端画面"]',
+      )!;
+      const term = document.querySelector<HTMLElement>(".xterm-screen")!;
+      // The cursor row DOM element under WebGL/canvas is the helper-textarea
+      // position; use the screen's row geometry from data attributes.
+      const rows = Number(
+        document.querySelector("[data-tty-lab]")?.getAttribute("data-tty-rows"),
+      );
+      const cellH = term.getBoundingClientRect().height / rows;
+      const vr = viewport.getBoundingClientRect();
+      const sr = term.getBoundingClientRect();
+      // Painted cursor row = baseY + cursorY - viewportY (0 for fresh shell).
+      // Row 1 (index 0) rectangle relative to viewport:
+      const rowTop = sr.top + 0 * cellH;
+      const rowBottom = sr.top + 1 * cellH;
+      return {
+        rowTop: Math.round(rowTop),
+        rowBottom: Math.round(rowBottom),
+        bandTop: Math.round(vr.top),
+        bandBottom: Math.round(vr.bottom),
+        fullRowInBand: rowTop >= vr.top - 1 && rowBottom <= vr.bottom + 1,
+        cellH: Math.round(cellH * 100) / 100,
+      };
+    });
+    expect(
+      cursorRow.fullRowInBand,
+      `cursor row 1 fully inside band: ${JSON.stringify(cursorRow)}`,
+    ).toBe(true);
+
     if (evidence) await shot(page, "uo10-terminal-keyboard-390.png", 390);
 
     // Keyboard closes: fit resumes — still ZERO resize commands when the grid
@@ -593,6 +724,92 @@ test.describe("390px keyboard band", () => {
     // Rotation did not restore the pre-keyboard rows (still frozen height);
     // only cols changed.
     expect(Number(await lab.getAttribute("data-tty-rows"))).toBe(rowsBefore);
+  });
+
+  test("W0→W1→W0 rotation bounce before the resize timer fires cancels the pending resize", async ({
+    page,
+  }) => {
+    if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+    const id = await createTerminal(page, "uo10 rotate bounce");
+    await page.goto(`/s/${id}/tty`);
+    await expect(page.locator("[data-tty-lab]")).toHaveAttribute(
+      "data-tty-ready",
+      "1",
+      { timeout: 30_000 },
+    );
+    await expect
+      .poll(async () =>
+        Number(
+          await page.locator("[data-tty-lab]").getAttribute("data-tty-rows"),
+        ),
+      )
+      .toBeGreaterThan(3);
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              window.__ttyLab?.resetResizeCount();
+              resolve();
+            }),
+          );
+        }),
+    );
+    // Keyboard open.
+    await raiseKeyboardIosExact(page, 336);
+    await page.waitForTimeout(300);
+    expect(
+      await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+    ).toBe(0);
+    const colsW0 = Number(
+      await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
+    );
+
+    // W0 → W1 (schedules a resize at +40ms).
+    await page.setViewportSize({ width: 700, height: 659 });
+    await page.evaluate((kb) => {
+      const vv = window.visualViewport;
+      const h = window.innerHeight - kb;
+      Object.defineProperty(vv, "height", {
+        configurable: true,
+        get: () => h,
+      });
+      Object.defineProperty(vv, "offsetTop", {
+        configurable: true,
+        get: () => kb,
+      });
+      vv.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    }, 336);
+    // Immediately W1 → W0 BEFORE the 40ms debounce timer fires.
+    await page.setViewportSize({ width: 393, height: 659 });
+    await page.evaluate((kb) => {
+      const vv = window.visualViewport;
+      const h = window.innerHeight - kb;
+      Object.defineProperty(vv, "height", {
+        configurable: true,
+        get: () => h,
+      });
+      Object.defineProperty(vv, "offsetTop", {
+        configurable: true,
+        get: () => kb,
+      });
+      vv.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    }, 336);
+    // Wait well past the 40ms debounce.
+    await page.waitForTimeout(300);
+    // The settled width is back at W0, equal to what the PTY last had: zero
+    // resizes for the whole bounce.
+    expect(
+      await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      "W0→W1→W0 bounce emits no resize",
+    ).toBe(0);
+    expect(
+      Number(
+        await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
+      ),
+    ).toBe(colsW0);
   });
 
   for (const appearance of ["light", "dark"] as const) {

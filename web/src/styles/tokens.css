@@ -120,7 +120,7 @@
     --term-fg: #2b2a27;
     --term-raised: color-mix(in srgb, var(--term-fg) 5%, var(--term-bg));
     --term-border: color-mix(in srgb, var(--term-fg) 16%, var(--term-bg));
-    --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
+    --term-muted: color-mix(in srgb, var(--term-fg) 68%, var(--term-bg));
     --term-danger-fg: var(--danger-fg);
     --term-selection: #d8e2ee;
   }
@@ -183,7 +183,7 @@
   --term-fg: #2b2a27;
   --term-raised: color-mix(in srgb, var(--term-fg) 5%, var(--term-bg));
   --term-border: color-mix(in srgb, var(--term-fg) 16%, var(--term-bg));
-  --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
+  --term-muted: color-mix(in srgb, var(--term-fg) 68%, var(--term-bg));
   --term-danger-fg: var(--danger-fg);
   --term-selection: #d8e2ee;
 }
@@ -206,8 +206,8 @@
   /* Frame shades derived from the dark pair; consumed by tty chrome. */
   --term-raised: color-mix(in srgb, var(--term-fg) 7%, var(--term-bg));
   --term-border: color-mix(in srgb, var(--term-fg) 18%, var(--term-bg));
-  --term-muted: color-mix(in srgb, var(--term-fg) 62%, var(--term-bg));
-  --term-danger-fg: var(--tok-red);
+  --term-muted: color-mix(in srgb, var(--term-fg) 68%, var(--term-bg));
+  --term-danger-fg: var(--danger-fg);
   --term-selection: #3d3a35;
 
   --font-ui:

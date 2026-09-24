@@ -3448,6 +3448,15 @@ impl Store {
                         "idempotency key reused with a different payload".into(),
                     ));
                 }
+                // Full (commandId, key) identity: a key that resolves to a row
+                // cannot be presented under a different commandId.
+                if let Some(cmd) = command_id.as_ref()
+                    && cmd != &existing.command_id
+                {
+                    return Err(StoreError::Id(
+                        "idempotency key reused with a different commandId".into(),
+                    ));
+                }
                 return Ok((existing, false));
             }
             let command_id = match command_id {
@@ -3457,6 +3466,21 @@ impl Store {
                             return Err(StoreError::Id(
                                 "commandId reused with a different payload".into(),
                             ));
+                        }
+                        // Key identity checked HERE, inside the writer job:
+                        // two concurrent same-id first POSTs that both missed
+                        // the HTTP-level lookup serialize at this closure, so
+                        // the divergent-key loser cannot take the
+                        // `!created` replay branch. An omitted replay key is
+                        // allowed; any present key must equal the stored one.
+                        match (idempotency_key.as_ref(), existing.idempotency_key.as_ref()) {
+                            (None, _) => {}
+                            (Some(incoming), Some(stored)) if incoming == stored => {}
+                            _ => {
+                                return Err(StoreError::Id(
+                                    "commandId reused with a different idempotency key".into(),
+                                ));
+                            }
                         }
                         return Ok((existing, false));
                     }

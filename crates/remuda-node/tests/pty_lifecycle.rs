@@ -405,7 +405,7 @@ async fn a_node_restart_ends_native_pty_sessions_and_says_why() {
     });
     assert!(
         diagnostic,
-        "the web renders 「Node 重启，会话已结束」 plus a Resume affordance from this \
+        "the web renders 「Node 重启，会话已中断」 plus a Resume affordance from this \
          diagnostic; without it the restart is silent"
     );
 }

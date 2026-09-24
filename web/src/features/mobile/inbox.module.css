@@ -186,6 +186,35 @@
   color: var(--danger-fg);
 }
 
+/* c-endreason: interrupted / ordinary endings are muted — red stays reserved
+   for .subtitleError (a proven failure, D-053 item 2). */
+.subtitleMuted {
+  color: var(--fg-muted);
+}
+
+/* Collapsed-by-default 最近结束 group. The summary reuses the tier-title
+   typography; its rows only paint when expanded. */
+.endedDetails {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.endedDetails .tierTitle {
+  cursor: pointer;
+  list-style: revert;
+}
+
+.endedDetails .tierTitle::-webkit-details-marker {
+  display: inline-block;
+}
+
+.endedBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
 .meta {
   display: flex;
   flex-wrap: wrap;

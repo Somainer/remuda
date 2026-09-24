@@ -19,7 +19,7 @@ use std::{
 /// confessed first or the Hub worked it out.
 pub const NODE_EPOCH_CHANGED: &str = "node-epoch-changed";
 
-/// The journal entry the web turns into 「Node 重启，会话已结束」 plus Resume.
+/// The journal entry the web turns into 「Node 重启，会话已中断」 plus Resume.
 fn node_epoch_diagnostic() -> remuda_protocol::ObservationPayload {
     remuda_protocol::ObservationPayload::Lifecycle(Box::new(
         remuda_protocol::LifecyclePayload::Native(Box::new(remuda_protocol::NativeLifecycle {
@@ -329,7 +329,7 @@ impl DevNode {
     /// than left as a row that claims to be ready — so every such row from the
     /// previous process is marked exited with `node-epoch-changed`, and a
     /// diagnostic carries the same reason into the journal for the web to
-    /// render as 「Node 重启，会话已结束」 beside a Resume affordance.
+    /// render as 「Node 重启，会话已中断」 beside a Resume affordance.
     ///
     /// This sweeps **every** driver, not `shell-pty` alone. Restricting it to
     /// in-process PTYs left `claude-pty`, `claude-bg`, `codex-appserver` and

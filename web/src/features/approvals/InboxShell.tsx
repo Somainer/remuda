@@ -302,13 +302,23 @@ function MetaLine({ host, workspace, harness, time }: { host: string; workspace:
 }
 
 const RecentRowCard = memo(
-  function RecentRowCard({ row }: { row: InboxInstanceRow }) {
+  function RecentRowCard({ row, ended = false }: { row: InboxInstanceRow; ended?: boolean }) {
+    // Red only for a proven failure (D-053 item 2). Interrupted and ordinary
+    // endings are muted; the raw machine code lives in the title tooltip.
+    const subtitleTone = row.end?.tone;
+    const subtitleClass =
+      subtitleTone === "failed"
+        ? compactCss.subtitleError
+        : subtitleTone
+          ? compactCss.subtitleMuted
+          : "";
     return (
       <article
         className={compactCss.row}
-        data-testid="m-inbox-recent-row"
+        data-testid={ended ? "m-inbox-ended-row" : "m-inbox-recent-row"}
         data-instance-id={row.instanceId}
         data-status={row.status}
+        data-end-tone={subtitleTone ?? undefined}
       >
         <div className={compactCss.rowHead}>
           <StateDot status={row.status} />
@@ -320,8 +330,8 @@ const RecentRowCard = memo(
         </div>
         {row.subtitle ? (
           <p
-            className={`${compactCss.subtitle} ${row.status === "exited" ? compactCss.subtitleError : ""}`}
-            title={row.subtitle}
+            className={`${compactCss.subtitle} ${subtitleClass}`}
+            title={row.end?.detail ?? row.subtitle}
           >
             {row.subtitle}
           </p>
@@ -330,7 +340,7 @@ const RecentRowCard = memo(
       </article>
     );
   },
-  (prev, next) => prev.row.sig === next.row.sig,
+  (prev, next) => prev.row.sig === next.row.sig && prev.ended === next.ended,
 );
 
 /* ------------------------------------------------------------------ */
@@ -715,6 +725,23 @@ function CompactInbox({
           <RecentRowCard key={row.instanceId} row={row} />
         ))}
       </section>
+
+      {rows.ended.length ? (
+        <section className={compactCss.tier}>
+          {/* Quiet by default: ended sessions never sit under a 进行中
+              heading, and the group stays collapsed so it never shouts. */}
+          <details className={compactCss.endedDetails} data-testid="m-inbox-ended">
+            <summary className={compactCss.tierTitle} data-testid="m-inbox-ended-summary">
+              最近结束 ({rows.ended.length})
+            </summary>
+            <div className={compactCss.endedBody}>
+              {rows.ended.map((row) => (
+                <RecentRowCard key={row.instanceId} row={row} ended />
+              ))}
+            </div>
+          </details>
+        </section>
+      ) : null}
     </div>
   );
 }

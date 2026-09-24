@@ -73,6 +73,81 @@ function inboxRow(page: Page, interactionId: string) {
   return page.locator(`[data-interaction-id="${interactionId}"]`);
 }
 
+/**
+ * A `claude-pty` session created straight through the REST API: it reaches
+ * `running` (so it belongs to 进行中 · 最近) and its tty accepts
+ * TTYNODE_RESTART, the fake Node's own epoch-bump fixture.
+ */
+async function createRunningPty(page: Page): Promise<string> {
+  const hosts = (await (await page.request.get("/v1/hosts")).json()) as {
+    items: { hostId: string; label: string }[];
+  };
+  const host = hosts.items.find((item) => item.label === "e2e-fake-node");
+  expect(host).toBeTruthy();
+  const workspaces = (await (
+    await page.request.get(`/v1/hosts/${host!.hostId}/workspaces`)
+  ).json()) as { workspaces: { workspaceId: string; root: string }[] };
+  const workspace = workspaces.workspaces[0];
+  expect(workspace).toBeTruthy();
+  const create = await page.request.post("/v1/instances", {
+    headers: { Origin: new URL(page.url()).origin },
+    data: {
+      hostId: host!.hostId,
+      workspaceId: workspace.workspaceId,
+      cwd: workspace.root,
+      kind: "claude",
+      driver: "claude-pty",
+      model: "e2e/auto",
+      name: "e2e-m-inbox-restart",
+    },
+  });
+  expect(create.ok(), await create.text()).toBe(true);
+  const instanceId = ((await create.json()) as { instance: { instanceId: string } }).instance
+    .instanceId;
+  created.push(instanceId);
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/v1/instances/${instanceId}`)).json()) as {
+          lifecycle?: string;
+        }).lifecycle,
+      { timeout: 20_000 },
+    )
+    .toBe("running");
+  return instanceId;
+}
+
+async function restartNodeFromTty(page: Page, instanceId: string): Promise<void> {
+  await page.goto(`/s/${instanceId}/tty`);
+  await expect(page.locator("[data-tty-lab='1']")).toHaveAttribute("data-tty-status", "live", {
+    timeout: 30_000,
+  });
+  await page
+    .locator(".xterm-helper-textarea")
+    .first()
+    .evaluate((el) => (el as HTMLTextAreaElement).focus());
+  await page.keyboard.type("TTYNODE_RESTART");
+  await page.keyboard.press("Enter");
+}
+
+async function expectSettledByRestart(page: Page, instanceId: string): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        ((await (await page.request.get(`/v1/instances/${instanceId}`)).json()) as {
+          lifecycle?: string;
+          lastError?: string;
+        }).lifecycle,
+      { timeout: 30_000 },
+    )
+    .toBe("exited");
+  expect(
+    ((await (await page.request.get(`/v1/instances/${instanceId}`)).json()) as {
+      lastError?: string;
+    }).lastError,
+  ).toBe("node-epoch-changed");
+}
+
 test.describe("390px phone inbox", () => {
   test.use({
     viewport: { width: 390, height: VIEWPORT_H },
@@ -270,6 +345,101 @@ test.describe("390px phone inbox", () => {
     expect(allBox).toBeTruthy();
     await page.mouse.click(allBox!.x + allBox!.width / 2, bottomY);
     await expect(page).toHaveURL(/\/m\/inbox$/);
+  });
+
+  test("a Node-restarted session leaves 进行中 for a quiet neutral 最近结束 row", async ({
+    page,
+    browser,
+  }) => {
+    test.slow();
+    // The mobile page is logged in by beforeEach and lands on /m, whose home
+    // list polls screens/summaries for every instance every few seconds. That
+    // traffic queues on the shared fake Node's single websocket and can starve
+    // the TTYNODE_RESTART bytes, so park it on a blank page: create, restart
+    // and verify the settle entirely from a desktop page (the deterministic
+    // node-inventory ordering), and mount the inbox only once the row is
+    // settled.
+    await page.goto("about:blank");
+    // browser.newPage() inherits THIS test's mobile context (isMobile/touch),
+    // under which the xterm helper swallows raw keyboard input and the
+    // sentinel never reaches the node. The restart is driven from a separate,
+    // explicitly-desktop context (cookies are copied by login), mirroring
+    // node-inventory.hub.spec's non-touch run.
+    const desktopContext = await browser.newContext({
+      viewport: { width: 1280, height: 800 },
+      hasTouch: false,
+      isMobile: false,
+    });
+    const desktop = await desktopContext.newPage();
+    await login(desktop, "m-inbox-restart-driver");
+    // The Hub ignores an epoch hello that carries NO instance inventory (the
+    // 2026-09-18 demo guard: never wipe rows on a silent node). The fixture
+    // drops only the session whose tty sent the sentinel, so create a
+    // surviving pty too — the exact shape node-inventory.hub.spec uses.
+    const instanceId = await createRunningPty(desktop);
+    const survivorId = await createRunningPty(desktop);
+    await restartNodeFromTty(desktop, instanceId);
+    await expectSettledByRestart(desktop, instanceId);
+    void survivorId; // both ids are in created[] and force-deleted by afterEach
+    await desktopContext.close().catch(() => undefined);
+
+    await page.goto("/m/inbox");
+    await expect(page.getByTestId("m-inbox")).toBeVisible();
+    // Never under a 进行中 heading.
+    await expect(
+      page.locator(`[data-testid="m-inbox-recent-row"][data-instance-id="${instanceId}"]`),
+    ).toHaveCount(0);
+
+    // It lands in the quiet, collapsed 最近结束 group.
+    const ended = page.getByTestId("m-inbox-ended");
+    await expect(ended).toBeVisible();
+    const endedRow = ended
+      .locator(`[data-testid="m-inbox-ended-row"][data-instance-id="${instanceId}"]`)
+      .first();
+    await expect(endedRow).toHaveCount(1);
+    await expect(endedRow).toBeHidden();
+
+    // Expand: the human sentence, the neutral tone, and the raw code nowhere
+    // in visible text — only in the tooltip.
+    await page.getByTestId("m-inbox-ended-summary").click();
+    await expect(endedRow).toBeVisible();
+    await expect(endedRow).toHaveAttribute("data-end-tone", "interrupted");
+    const sentence = endedRow.getByText("Node 重启，会话已中断");
+    await expect(sentence).toBeVisible();
+    expect(endedRow).not.toContainText("node-epoch-changed");
+    await expect(sentence).toHaveAttribute("title", "node-epoch-changed");
+
+    // Neutral colour: interrupted is muted, never the danger red. Compare
+    // resolved rgb() values (the token is a hex/var, not an rgb literal).
+    const colors = await sentence.evaluate((el) => {
+      const probe = document.createElement("span");
+      probe.style.color = "var(--danger-fg)";
+      document.body.appendChild(probe);
+      const danger = getComputedStyle(probe).color;
+      probe.remove();
+      return { actual: getComputedStyle(el).color, danger };
+    });
+    expect(colors.danger).not.toBe("");
+    expect(colors.actual).not.toBe(colors.danger);
+
+    // The row opens the session page, which keeps the Resume affordance.
+    if (evidence) {
+      await shot(page, "mobile-ui-5-inbox-ended-390.png");
+      const evidenceContext = await browser.newContext({
+        viewport: { width: 1440, height: 900 },
+        hasTouch: false,
+        isMobile: false,
+      });
+      const desktop = await evidenceContext.newPage();
+      await login(desktop, "m-inbox-ended-evidence");
+      await desktop.goto(`/s/${instanceId}`);
+      await expect(desktop.getByTestId("node-restart-banner")).toContainText(
+        "Node 重启，会话已中断",
+        { timeout: 20_000 },
+      );
+      await shot(desktop, "desktop-endreason-node-restart-1440.png");
+      await evidenceContext.close();
+    }
   });
 
   test("evidence: inbox banner and both tiers at 390px", async ({ page }) => {

@@ -199,7 +199,7 @@ tokenGuard 断言两条：
   \*black-on-slot / default-fg-on-slot。white/brightWhite 是浅灰而非近白：htop/dialog/ncurses 把默认或黑色文字画在这些槽位上，必须 ≥4.5:1；它们作为前景字印在浅页面上是被接受的低对比情形，真白由 truecolor/256 色 231 提供。
 - **256 色立方**：删除自绘的 `nightCorralExtendedAnsi`，改用 xterm 的标准 256 色立方，不再染色。
 - **字体**：`TERMINAL_FONT_FAMILY` 仍以 IBM Plex Mono 打头。
-- 终端跟随外观（2026-09-24 所有者改定，取代恒深色口径）：深、浅两套调色板随外观切换，切换只设 `term.options.theme`、渲染器就地重绘，不重建终端、不丢滚动历史；两套板各自的 16 个非黑 ANSI 色在本板终端底上 ≥ 4.5:1，终端输出的颜色（含 256 色立方与 truecolor）不被改写。浅板 white/brightWhite 为深灰（TUI 默认文字仍可读），真白走 truecolor/256 色 231。
+- 终端跟随外观（2026-09-24 所有者改定，取代恒深色口径）：深、浅两套调色板随外观切换，切换只设 `term.options.theme`、渲染器就地重绘，不重建终端、不丢滚动历史；两套板各自的 16 个非黑 ANSI 色在本板终端底上 ≥ 4.5:1，终端输出的颜色（含 256 色立方与 truecolor）不被改写。浅板 white/brightWhite 为浅灰（#96918a/#a39e96），使黑字与默认前景字印在其上 ≥4.5:1（htop/dialog/ncurses 状态栏）；它们作为前景字印在浅页面上是被接受的低对比例外，真白走 truecolor/256 色 231。
 
 ---
 

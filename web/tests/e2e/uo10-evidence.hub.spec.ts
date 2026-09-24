@@ -262,6 +262,21 @@ for (const appearance of ["dark", "light"] as const) {
       expect(Math.max(...ink.pillRgb)).toBeLessThan(125);
     }
 
+    // UO-10 round-5 item 4: the progress error fill resolves to a real
+    // colour in both modes (the old dark --tok-red token did not exist).
+    const errorFill = await page.evaluate(() => {
+      const fill = document.createElement("div");
+      fill.className = "x";
+      fill.style.cssText =
+        "background: var(--term-danger-fg); position:absolute;";
+      document.querySelector("[data-tty-lab]")!.appendChild(fill);
+      const c = getComputedStyle(fill).backgroundColor;
+      fill.remove();
+      return c;
+    });
+    expect(errorFill, "--term-danger-fg resolves").not.toBe("rgba(0, 0, 0, 0)");
+    expect(errorFill).not.toBe("");
+
     if (appearance === "dark") await shot(page, "uo10-terminal-dark-1440.png");
     if (appearance === "light")
       await shot(page, "uo10-terminal-light-1440.png");
@@ -567,38 +582,107 @@ test.describe("390px keyboard band", () => {
       `fresh shell prompt visible after keyboard crop: ${JSON.stringify(promptVisible)}`,
     ).toBe(true);
 
-    // UO-10 round-4 item 4: the FULL cursor row rectangle (top AND bottom)
-    // lies inside the visible band for a cursor on the first rows.
-    const cursorRow = await page.evaluate(() => {
-      const viewport = document.querySelector<HTMLElement>(
-        '[aria-label="终端画面"]',
-      )!;
-      const term = document.querySelector<HTMLElement>(".xterm-screen")!;
-      // The cursor row DOM element under WebGL/canvas is the helper-textarea
-      // position; use the screen's row geometry from data attributes.
-      const rows = Number(
-        document.querySelector("[data-tty-lab]")?.getAttribute("data-tty-rows"),
-      );
-      const cellH = term.getBoundingClientRect().height / rows;
-      const vr = viewport.getBoundingClientRect();
-      const sr = term.getBoundingClientRect();
-      // Painted cursor row = baseY + cursorY - viewportY (0 for fresh shell).
-      // Row 1 (index 0) rectangle relative to viewport:
-      const rowTop = sr.top + 0 * cellH;
-      const rowBottom = sr.top + 1 * cellH;
-      return {
-        rowTop: Math.round(rowTop),
-        rowBottom: Math.round(rowBottom),
-        bandTop: Math.round(vr.top),
-        bandBottom: Math.round(vr.bottom),
-        fullRowInBand: rowTop >= vr.top - 1 && rowBottom <= vr.bottom + 1,
-        cellH: Math.round(cellH * 100) / 100,
-      };
-    });
+    // UO-10 round-5 item 4: the FULL cursor row rectangle (top AND bottom)
+    // lies inside the visible band — first for a cursor near row 1 on the
+    // fresh shell, then for a cursor driven to the LAST grid row.
+    const measureCursorRow = () =>
+      page.evaluate(() => {
+        const viewport = document.querySelector<HTMLElement>(
+          '[aria-label="终端画面"]',
+        )!;
+        const term = document.querySelector<HTMLElement>(".xterm-screen")!;
+        const lab = document.querySelector<HTMLElement>("[data-tty-lab]")!;
+        const rows = Number(lab.getAttribute("data-tty-rows"));
+        const active = (
+          window as unknown as {
+            __ttyLab?: {
+              bufferActive?: () => {
+                cursorY: number;
+                baseY: number;
+                viewportY: number;
+              };
+            };
+          }
+        ).__ttyLab;
+        const cellH = term.getBoundingClientRect().height / rows;
+        const vr = viewport.getBoundingClientRect();
+        const sr = term.getBoundingClientRect();
+        // PAINTED grid row under the cursor (baseY+cursorY-viewportY): after
+        // many echoed lines the shell prompt has cursorY≈0 but it paints on
+        // the LAST grid row because the buffer scrolled.
+        const a = active?.bufferActive?.();
+        const gridRow = a
+          ? Math.max(0, Math.min(rows - 1, a.baseY + a.cursorY - a.viewportY))
+          : 0;
+        const rowTop = sr.top + gridRow * cellH;
+        const rowBottom = sr.top + (gridRow + 1) * cellH;
+        return {
+          gridRow,
+          rows,
+          cursorY: a?.cursorY ?? 0,
+          rowTop: Math.round(rowTop),
+          rowBottom: Math.round(rowBottom),
+          bandTop: Math.round(vr.top),
+          bandBottom: Math.round(vr.bottom),
+          fullRowInBand: rowTop >= vr.top - 1 && rowBottom <= vr.bottom + 1,
+        };
+      });
+
+    // (a) cursor near row 1 on the fresh shell.
+    const firstRow = await measureCursorRow();
+    expect(firstRow.gridRow).toBeLessThan(3);
     expect(
-      cursorRow.fullRowInBand,
-      `cursor row 1 fully inside band: ${JSON.stringify(cursorRow)}`,
+      firstRow.fullRowInBand,
+      `cursor row 1 fully inside band: ${JSON.stringify(firstRow)}`,
     ).toBe(true);
+
+    // (b) drive the cursor to the LAST grid row via the fake harness's
+    // `__tty_fill__:N` sentinel: one raw tty.write that floods a frame with
+    // N real CRLF lines + fresh prompt (the cooked echo path does not emit
+    // CR/LF, so plain typed commands would not move the cursor down). Sent
+    // via the lab handle so the keys/raw chrome never changes.
+    await page.evaluate(() =>
+      window.__ttyLab?.writeRaw("__tty_fill__:60\r"),
+    );
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() =>
+            window.__ttyLab?.bufferText().includes("FILLLINE-60"),
+          ),
+        { timeout: 15_000 },
+      )
+      .toBe(true);
+    await page.waitForTimeout(300);
+    const lastRow = await measureCursorRow();
+    expect(
+      lastRow.gridRow,
+      `painted cursor driven to last grid row ${lastRow.rows - 1}: ${JSON.stringify(lastRow)}`,
+    ).toBe(lastRow.rows - 1);
+    expect(
+      lastRow.fullRowInBand,
+      `cursor last row (${lastRow.gridRow}) fully inside band: ${JSON.stringify(lastRow)}`,
+    ).toBe(true);
+
+    // UO-10 round-5 item 3: scrolling back into history re-runs the frozen
+    // crop via term.onScroll — the scrolled view must not stay shifted by
+    // the live-cursor upward offset.
+    const cropTransform = () =>
+      page.evaluate(() => {
+        const region = document.querySelector<HTMLElement>(
+          '[aria-label="终端画面"]',
+        )!;
+        return (region.firstElementChild as HTMLElement).style.transform;
+      });
+    const liveCrop = await cropTransform();
+    expect(
+      liveCrop,
+      `live cursor on the last grid row pulls the crop upward: ${liveCrop}`,
+    ).toMatch(/translateY\(-\d+px\)/);
+    await page.evaluate(() => window.__ttyLab?.scrollLines(-100));
+    await expect
+      .poll(cropTransform, { timeout: 2_000 })
+      .toBe("translateY(0px)");
 
     if (evidence) await shot(page, "uo10-terminal-keyboard-390.png", 390);
 
@@ -724,6 +808,24 @@ test.describe("390px keyboard band", () => {
     // Rotation did not restore the pre-keyboard rows (still frozen height);
     // only cols changed.
     expect(Number(await lab.getAttribute("data-tty-rows"))).toBe(rowsBefore);
+
+    // UO-10 round-5 item 1: the rotation resize has COMMITTED. A later
+    // same-width (height-only refire) viewport event must not roll xterm
+    // back to the pre-rotation cols while the PTY keeps the new ones.
+    await page.evaluate(() => {
+      window.visualViewport?.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    });
+    await page.waitForTimeout(300);
+    expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsRotated);
+    expect(
+      await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      "same-width event after commit sends no further resize",
+    ).toBe(1);
+    expect(
+      await page.evaluate(() => window.__ttyLab?.lastResize()),
+      "PTY grid matches the rotated xterm grid",
+    ).toEqual({ cols: colsRotated, rows: rowsBefore });
   });
 
   test("W0→W1→W0 rotation bounce before the resize timer fires cancels the pending resize", async ({
@@ -810,6 +912,75 @@ test.describe("390px keyboard band", () => {
         await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
       ),
     ).toBe(colsW0);
+  });
+
+  test("same-width refit burst (height-only resize + fit→fixed→responsive) ends with one PTY resize at the final grid", async ({
+    page,
+  }) => {
+    if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const id = await createTerminal(page, "uo10 mode cycle");
+    const lab = page.locator("[data-tty-lab]");
+    await page.goto(`/s/${id}/tty`);
+    await expect(lab).toHaveAttribute("data-tty-ready", "1", {
+      timeout: 30_000,
+    });
+    await expect
+      .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
+      .toBeGreaterThan(3);
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) => {
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => {
+              window.__ttyLab?.resetResizeCount();
+              resolve();
+            }),
+          );
+        }),
+    );
+    const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
+
+    // Height-only viewport change (same width): the local grid changes. The
+    // old scheduler let the ResizeObserver/window-event pair (and the mode
+    // cycle below) CANCEL the pending timer and arm nothing, so the PTY
+    // stayed at the old grid.
+    await page.setViewportSize({ width: 1440, height: 640 });
+    // Rapid fit → fixed → responsive cycle (the geo button shows the CURRENT
+    // mode; two clicks on the same button queue the functional state
+    // updaters fit→fixed→responsive even though React renders once). Reset
+    // the resize counter in the SAME task and let the burst land within the
+    // 40ms resize debounce (awaited Playwright clicks are spaced >40ms apart
+    // and would let the timer fire mid-cycle).
+    await page.evaluate(() => {
+      window.__ttyLab?.resetResizeCount();
+      const btn = [...document.querySelectorAll("button")].find((b) =>
+        /^(fit|fixed|responsive)$/.test(b.textContent?.trim() ?? ""),
+      );
+      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await expect(page.getByTestId("tty-io-mode")).toContainText(
+      "responsive",
+    );
+    await page.waitForTimeout(600);
+
+    const finalCols = Number(await lab.getAttribute("data-tty-cols"));
+    const finalRows = Number(await lab.getAttribute("data-tty-rows"));
+    expect(finalRows, "height-only change shrank the local grid").toBeLessThan(
+      rowsBefore,
+    );
+    // Exactly one resize for the whole burst (target-aware replacement).
+    await expect
+      .poll(async () =>
+        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      )
+      .toBe(1);
+    // The PTY's last resize equals xterm's FINAL cols/rows.
+    expect(await page.evaluate(() => window.__ttyLab?.lastResize())).toEqual({
+      cols: finalCols,
+      rows: finalRows,
+    });
   });
 
   for (const appearance of ["light", "dark"] as const) {

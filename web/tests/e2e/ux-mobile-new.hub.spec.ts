@@ -316,7 +316,15 @@ test.describe("mobile new session (390px)", () => {
     // HomeList rather than the desktop SessionList.
     await expect(page).toHaveURL(/\/m$/);
     await expect(page.getByTestId("home-list")).toBeVisible();
-    await page.getByTestId("space-chip").filter({ hasText: "remuda-e2e" }).first().click();
+    // UO-3: the /m chips row is gone — switching Space opens the drawer.
+    await page.getByTestId("spaces-drawer-open").click();
+    await expect(page.getByTestId("spaces-drawer")).toBeVisible();
+    await page
+      .getByTestId("spaces-panel")
+      .getByTestId("space-select")
+      .filter({ hasText: "remuda-e2e" })
+      .first()
+      .click();
     // Mobile auto-opens the space's first tab (an id owned by whichever suite
     // populated this shared hub first — do not assert which one). Navigate to a
     // session this test created explicitly.

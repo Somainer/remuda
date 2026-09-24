@@ -150,12 +150,13 @@ test("mock spaces remember tabs, names, order and panel state across desktop and
   await screenshot(page, "desktop-dark", "night");
   await screenshot(page, "desktop-light", "ledger");
 
-  // Compact home (/m) keeps the chips row, the strip and the drawer.
+  // Compact home (/m): UO-3 removed the chips row and the tab strip — the
+  // home header's Space button opens the same SpacesDrawer instead.
   await page.setViewportSize({ width: 400, height: 860 });
   await page.goto("/m");
-  await expect(page.getByTestId("spaces-chips")).toBeVisible();
-  await expect(strip).toBeVisible();
-  await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
+  await expect(page.getByTestId("spaces-chips")).toHaveCount(0);
+  await expect(page.getByTestId("space-chip")).toHaveCount(0);
+  await expect(strip).toHaveCount(0);
   await screenshot(page, "phone-light", "ledger");
   await screenshot(page, "phone-dark", "night");
   await page.getByTestId("spaces-drawer-open").click();

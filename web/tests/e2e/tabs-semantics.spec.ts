@@ -344,97 +344,86 @@ test.describe("desktop", () => {
 
 test.describe("phone", () => {
   // Touch emulation is what makes (pointer: coarse) / (hover: none) match, so
-  // the hover-free close affordance is exercised as a phone really sees it.
+  // the 44px hit-area rules exercise the layout the way a real phone sees it.
   test.use({ hasTouch: true, isMobile: true });
 
-  test("a long press reveals close on a phone, and the sheet fits 400px", async ({ page }) => {
+  test("compact renders no strip and no chips; the header trigger opens the SpacesDrawer", async ({
+    page,
+  }) => {
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.setViewportSize({ width: 400, height: 860 });
-    // UO-2a/D-049: the phone strip lives ONLY on the compact home; compact
-    // /s/:id folds switching into the header chip. The long-press gesture is
-    // therefore exercised on /m, against the strip itself — no tab click
-    // (which would navigate to /s/:id and unmount the strip).
-    await page.goto("/m");
-    const strip = page.getByTestId("space-tabs");
-    expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches),
-      "the phone run must match the coarse-pointer rules").toBe(true);
-    await expect(strip.getByRole("tab").first()).toBeVisible();
-    await expect(page.getByTestId("spaces-chips")).toBeVisible();
-    const phoneTab = strip.locator('[data-testid="session-tab"]').first().locator("..");
-    const close = phoneTab.getByTestId("tab-close");
 
-    // Without a hover to reveal it, × must not sit next to the status shape.
-    await expect(phoneTab).not.toHaveAttribute("data-revealed", "true");
-    expect(await close.evaluate((element) => getComputedStyle(element).opacity)).toBe("0");
+    // UO-3/D-053: the list route /m owns no chips row and no tab strip.
+    await page.goto("/m");
+    expect(
+      await page.evaluate(() => matchMedia("(pointer: coarse)").matches),
+      "the phone run must match the coarse-pointer rules",
+    ).toBe(true);
+    await expect(page.getByTestId("space-tabs")).toHaveCount(0);
+    await expect(page.getByTestId("spaces-chips")).toHaveCount(0);
+    await expect(page.getByTestId("space-chip")).toHaveCount(0);
+    const trigger = page.getByTestId("spaces-drawer-open");
+    await expect(trigger).toBeVisible();
+
+    // The trigger itself owns the 44px coarse hit area.
+    const triggerBox = await trigger.boundingBox();
+    expect(triggerBox).toBeTruthy();
+    expect(triggerBox!.height).toBeGreaterThanOrEqual(43.5);
+    expect(triggerBox!.width).toBeGreaterThanOrEqual(43.5);
 
     await screenshot(page, "phone-dark", "night");
     await screenshot(page, "phone-light", "ledger");
 
-    // A long press reveals it. The component listens to the same touch-event
-    // sequence a phone sends; dispatch it directly on the tab row (a trusted
-    // tap would activate the tab and navigate away).
-    const box = await phoneTab.boundingBox();
-    expect(box).not.toBeNull();
-    await phoneTab.dispatchEvent("touchstart", {
-      touches: [{ identifier: 1, clientX: box!.x + 20, clientY: box!.y + box!.height / 2 }],
-    });
-    await expect(phoneTab).toHaveAttribute("data-revealed", "true", { timeout: 3000 });
-    await phoneTab.dispatchEvent("touchend", { touches: [], changedTouches: [] });
-    expect(await close.evaluate((element) => getComputedStyle(element).opacity)).toBe("1");
-
-    // With the close revealed it is now hit-testable: verify the reserved
-    // 44px slot (full strip height, 44px wide) and that taps well inside its
-    // edges reach the control rather than the title. One evaluate keeps the
-    // layout reads atomic.
-    const boxes = await phoneTab.evaluate((element) => {
-      const close = element.querySelector<HTMLElement>('[data-testid="tab-close"]');
-      const title = element.querySelector<HTMLElement>('[data-testid="session-tab"]');
-      const c = close?.getBoundingClientRect();
-      const t = title?.getBoundingClientRect();
-      return c && t ? { close: { x: c.x, y: c.y, w: c.width, h: c.height }, titleRight: t.right } : null;
-    });
-    expect(boxes).toBeTruthy();
-    expect(boxes!.close.h, "close slot is the 44px strip height").toBeGreaterThanOrEqual(42.5);
-    expect(boxes!.close.w, "close slot is 44px wide").toBeGreaterThanOrEqual(43.5);
-    expect(boxes!.close.x, "close slot starts at/after the title's right edge").toBeGreaterThanOrEqual(boxes!.titleRight - 0.5);
-    for (const x of [boxes!.close.x + 4, boxes!.close.x + boxes!.close.w - 4]) {
-      const hit = await page.evaluate((point) =>
-        document.elementFromPoint(point.x, point.y)?.closest("[data-testid='tab-close']")?.getAttribute("data-testid") ?? null,
-        { x, y: boxes!.close.y + boxes!.close.h / 2 });
-      expect(hit, `close target hits inside the slot at x=${x}`).toBe("tab-close");
-    }
-
-    await screenshot(page, "phone-close-revealed-dark", "night");
-    await close.click();
-    await expect(page.getByTestId("tab-close-sheet")).toBeVisible();
-    await screenshot(page, "phone-close-sheet-dark", "night");
-    await screenshot(page, "phone-close-sheet-light", "ledger");
-    await page.getByTestId("tab-close-sheet-cancel").click();
-    // The sheet dismiss keeps us on the compact home, where the opener lives.
-    await expect(page).toHaveURL(/\/m$/);
-    await page.getByTestId("spaces-drawer-open").click();
-    await expect(page.getByTestId("spaces-drawer")).toBeVisible();
+    // The same SpacesPanel the desktop index shows lives in the drawer, with
+    // QuickFind, and switching Space closes the drawer.
+    await trigger.click();
+    const drawer = page.getByTestId("spaces-drawer");
+    await expect(drawer).toBeVisible();
+    await expect(page.getByTestId("spaces-panel")).toBeVisible();
     await screenshot(page, "phone-drawer-dark", "night");
+    for (const row of await page
+      .getByTestId("spaces-panel")
+      .getByTestId("space-select")
+      .all()) {
+      const box = await row.boundingBox();
+      expect(box).toBeTruthy();
+      expect(box!.height, "drawer Space row reaches the 44px touch band").toBeGreaterThanOrEqual(43.5);
+    }
+    await space(page, "x-codexdrv").click();
+    await expect(drawer).toHaveCount(0);
 
-    const dimensions = await page.evaluate(() => ({ width: window.innerWidth, content: document.documentElement.scrollWidth }));
+    // The compact session route (/s/:id) keeps the single header chip that
+    // opens this same drawer; it still renders no strip.
+    await expect(page.getByTestId("space-tabs")).toHaveCount(0);
+    await expect(page.getByTestId("space-chip")).toHaveCount(0);
+    const headerChips = page.locator("header").getByTestId("spaces-chips");
+    await expect(headerChips).toHaveCount(1);
+    await expect(headerChips.getByTestId("spaces-drawer-open")).toBeVisible();
+
+    const dimensions = await page.evaluate(() => ({
+      width: window.innerWidth,
+      content: document.documentElement.scrollWidth,
+    }));
     expect(dimensions.content).toBeLessThanOrEqual(dimensions.width);
     expect(errors).toEqual([]);
   });
 
-  test("adjacent short Space chips keep disjoint 44px hit areas and edge taps select the right Space", async ({ page }) => {
+  test("adjacent short Space names are both reachable inside the drawer", async ({ page }) => {
     await page.setViewportSize({ width: 400, height: 860 });
     // Load the app first (the mock is an in-browser adapter), then add TWO
     // adjacent one-letter Spaces to the fixture and refresh the store. The
     // evaluate is retry-safe for the Vite optimizer reload.
     await page.goto("/m");
-    await page.getByTestId("space-chip").first().waitFor();
+    await page.getByTestId("spaces-drawer-open").waitFor();
     for (let attempt = 0; ; attempt += 1) {
       try {
         await page.evaluate(async () => {
           const { mockDb } = await import("/src/lib/mock.ts");
           for (const letter of ["y", "z"] as const) {
-            if (!mockDb.workspaces.some((workspace: { rootPath?: string }) => workspace.rootPath === `/workspace/${letter}`)) {
+            if (
+              !mockDb.workspaces.some((workspace: { rootPath?: string }) => workspace.rootPath === `/workspace/${letter}`)
+            ) {
               mockDb.workspaces.push({
                 ...mockDb.workspaces[0],
                 id: `wsp_zzshort_${letter}`,
@@ -449,82 +438,53 @@ test.describe("phone", () => {
         });
         break;
       } catch (error) {
-        if (attempt >= 2 || !/garbage collected|Execution context was destroyed|Failed to resolve module/.test((error as Error).message)) throw error;
+        if (
+          attempt >= 2 ||
+          !/garbage collected|Execution context was destroyed|Failed to resolve module/.test((error as Error).message)
+        )
+          throw error;
         await page.waitForLoadState("domcontentloaded");
         await page.waitForTimeout(500);
       }
     }
     expect(await page.evaluate(() => matchMedia("(pointer: coarse)").matches)).toBe(true);
-    const chips = page.getByTestId("space-chip");
-    const chip = (letter: string) => chips.filter({ hasText: new RegExp(`^${letter}(?: ·|$)`) }).first();
-    const yChip = chip("y");
-    const zChip = chip("z");
-    // y and z are the two trailing Spaces; pan the chips row to its END once
-    // so both sit in view simultaneously and their boxes stay stable.
-    await page.locator('[data-testid="spaces-chips"]').evaluate((element) => {
-      const scroller = element as HTMLElement;
-      scroller.scrollLeft = scroller.scrollWidth;
-    });
-    await expect(yChip).toBeVisible();
-    await expect(zChip).toBeVisible();
-    const yBox = await yChip.boundingBox();
-    const zBox = await zChip.boundingBox();
-    expect(yBox && zBox).toBeTruthy();
-    // They are directly adjacent (only the 8px gap separates them).
-    const gap = zBox!.x - (yBox!.x + yBox!.width);
-    expect(gap).toBeGreaterThanOrEqual(6);
-    expect(gap).toBeLessThanOrEqual(12);
-    expect(Math.min(yBox!.width, zBox!.width)).toBeGreaterThanOrEqual(43.5);
 
-    // Selecting an empty Space briefly visits /sessions then bounces back to
-    // /m and re-mounts the chip row, so wait for that landing and assert the
-    // CURRENT pressed chip (queried fresh) after each tap.
-    const showTail = async () => {
-      await page.locator('[data-testid="spaces-chips"]').evaluate((element) => {
-        (element as HTMLElement).scrollLeft = (element as HTMLElement).scrollWidth;
-      });
-      // Let the scroll/relayout settle (a prior tap bounces /sessions→/m and
-      // re-mounts this row; measuring synchronously reads stale geometry).
-      await page.waitForTimeout(100);
-    };
-    const pressedLetter = () => page.evaluate(() =>
-      ([...document.querySelectorAll("[data-testid='space-chip'][aria-pressed='true']")] as HTMLElement[])
-        .map((element) => element.textContent?.trim().replace(/ · .*$/, "")));
-    const tapChip = async (letter: string, edge: "left" | "right") => {
-      await showTail();
-      // Choose the tap point in-page and verify elementFromPoint resolves to
-      // the intended chip BEFORE issuing the click. Probe from 3px inward
-      // (the literal boundary pixel can belong to the scroller/clip); the
-      // 44px target assertion is the 44px reserved width, not that pixel.
-      const point = await page.evaluate(({ l, side }) => {
-        const chipsRow = document.querySelector('[data-testid="spaces-chips"]');
-        const target = ([...(chipsRow?.querySelectorAll("[data-testid='space-chip']") ?? [])] as HTMLElement[])
-          .find((element) => new RegExp(`^${l}(?: ·|$)`).test(element.textContent?.trim() ?? ""));
-        if (!target) return null;
-        const r = target.getBoundingClientRect();
-        const y = r.y + r.height / 2;
-        for (const inset of [3, 5, 8]) {
-          const x = side === "left" ? r.left + inset : r.right - inset;
-          const hit = document.elementFromPoint(x, y)?.closest("[data-testid='space-chip']")?.textContent?.trim().replace(/ · .*$/, "") ?? null;
-          if (hit === l) return { x, y, hit, inset };
-        }
-        return { x: 0, y, hit: null, inset: -1 };
-      }, { l: letter, side: edge });
-      expect(point, `${letter} ${edge} point measurable`).toBeTruthy();
-      expect(point!.hit, `${letter} ${edge}: a point 3–8px inside the edge hit-tests to ${letter}, not the neighbour`).toBe(letter);
-      await page.mouse.click(point!.x, point!.y);
-      await expect(page).toHaveURL(/\/m$/);
-    };
-    // z's LEFT edge must belong to z, not y.
-    await tapChip("z", "left");
-    expect(await pressedLetter()).toEqual(["z"]);
-    // y's RIGHT edge must belong to y, not z (the gap stays unclaimed).
-    await tapChip("y", "right");
-    expect(await pressedLetter()).toEqual(["y"]);
-    // y's LEFT edge and z's RIGHT edge resolve to their own chips too.
-    await tapChip("y", "left");
-    expect(await pressedLetter()).toEqual(["y"]);
-    await tapChip("z", "right");
-    expect(await pressedLetter()).toEqual(["z"]);
+    // The two trailing Spaces are stacked full-width rows in the drawer; each
+    // owns the 44px band and taps resolve to the row itself, never its
+    // neighbour. The row label is a one-letter space name followed by the
+    // live/blocked count, so anchor on the letter-then-digit text.
+    await page.getByTestId("spaces-drawer-open").click();
+    await expect(page.getByTestId("spaces-drawer")).toBeVisible();
+    const rows = page.getByTestId("spaces-panel").getByTestId("space-select");
+    const row = (letter: string) => rows.filter({ hasText: new RegExp(`^${letter}\\d`) }).first();
+    const yRow = row("y");
+    const zRow = row("z");
+    await expect(yRow).toBeVisible();
+    await expect(zRow).toBeVisible();
+    const yBox = await yRow.boundingBox();
+    const zBox = await zRow.boundingBox();
+    expect(yBox && zBox).toBeTruthy();
+    // Stacked vertically: no shared band, and both reach the touch height.
+    expect(Math.min(yBox!.height, zBox!.height)).toBeGreaterThanOrEqual(43.5);
+    expect(zBox!.y).toBeGreaterThanOrEqual(yBox!.y + yBox!.height - 0.5);
+
+    // The rows are appended at the END of the drawer list and may sit below
+    // its scroll fold — use locator clicks (Playwright scrolls them in and
+    // re-checks actionability) rather than raw coordinates into a possibly
+    // off-screen point. Empty Spaces navigate to the index (bounced back to
+    // /m) and remount the home header, so reopen the drawer per tap and
+    // query the freshly rendered pressed state.
+    await zRow.scrollIntoViewIfNeeded();
+    await zRow.click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
+    await page.getByTestId("spaces-drawer-open").click();
+    await expect(row("z")).toHaveAttribute("aria-pressed", "true");
+    await row("y").scrollIntoViewIfNeeded();
+    await row("y").click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
+    await page.getByTestId("spaces-drawer-open").click();
+    await expect(row("y")).toHaveAttribute("aria-pressed", "true");
   });
 });

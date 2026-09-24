@@ -105,14 +105,22 @@ test.describe("mobile visual QA", () => {
     expect(box!.height).toBeGreaterThanOrEqual(44);
   });
 
-  test("space chips are at least 44px", async ({ page }) => {
+  test("home space switching is a 44px header control with 44px drawer rows", async ({ page }) => {
     await page.goto("/sessions");
-    const strip = page.getByTestId("spaces-chips");
-    await expect(strip).toBeVisible();
-    const chips = page.getByTestId("space-chip");
-    expect(await chips.count()).toBeGreaterThan(0);
-    for (const chip of await chips.all()) {
-      const box = await chip.boundingBox();
+    // UO-3: the /m chips row is gone; the home header owns the Space button.
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("space-chip")).toHaveCount(0);
+    const trigger = page.getByTestId("spaces-drawer-open");
+    await expect(trigger).toBeVisible();
+    const triggerBox = await trigger.boundingBox();
+    expect(triggerBox).toBeTruthy();
+    expect(triggerBox!.height).toBeGreaterThanOrEqual(44);
+    await trigger.click();
+    await expect(page.getByTestId("spaces-drawer")).toBeVisible();
+    const rows = page.getByTestId("spaces-panel").getByTestId("space-select");
+    expect(await rows.count()).toBeGreaterThan(0);
+    for (const row of await rows.all()) {
+      const box = await row.boundingBox();
       expect(box).toBeTruthy();
       expect(box!.height).toBeGreaterThanOrEqual(44);
     }

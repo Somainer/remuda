@@ -237,10 +237,14 @@ test("390px: the chips strip folds, Stop and the switch stay reachable, and ever
     try {
       await login(page);
 
-      // Baseline: the index route still carries the full chips strip.
+      // Baseline: the compact index (/sessions → /m) carries no chips row and
+      // no tab strip (UO-3); its Space switch is the header drawer trigger.
       await page.goto("/sessions");
-      await expect(page.getByTestId("spaces-chips").first()).toBeVisible();
-      expect(await page.getByTestId("space-chip").count()).toBeGreaterThan(0);
+      await expect(page).toHaveURL(/\/m$/);
+      await expect(page.getByTestId("spaces-chips")).toHaveCount(0);
+      expect(await page.getByTestId("space-chip").count()).toBe(0);
+      expect(await page.getByTestId("space-tabs").count()).toBe(0);
+      await expect(page.getByTestId("spaces-drawer-open")).toBeVisible();
 
       const instanceId = await createClaudeSession(page);
       await clearApprovals(page, instanceId);

@@ -191,15 +191,22 @@ test.describe("390px phone", () => {
     // from home it carries the active space like the desktop rail's +.
     // Select a known space first (this test's session lives in another
     // space), then assert the carry concretely rather than accepting the
-    // bare route.
+    // bare route. UO-3: the /m chips strip is gone — Space switching opens
+    // the shared SpacesDrawer from the home header.
     await page.goto("/m");
-    const changedChip = page
-      .getByTestId("space-chip")
+    await expect(page.getByTestId("space-chip")).toHaveCount(0);
+    await page.getByTestId("spaces-drawer-open").click();
+    await expect(page.getByTestId("spaces-drawer")).toBeVisible();
+    await page
+      .getByTestId("spaces-panel")
+      .getByTestId("space-select")
       .filter({ hasText: /^changed/ })
-      .first();
-    await changedChip.click();
+      .first()
+      .click();
+    await expect(page.getByTestId("spaces-drawer")).toHaveCount(0);
+    // The changed space has no tabs in this run, so selecting it lands on the
+    // compact index (bounced back to /m) rather than a session.
     await expect(page).toHaveURL(/\/m$/);
-    await expect(changedChip).toHaveAttribute("aria-pressed", "true");
     await page.getByTestId("phone-nav-new").click();
     await expect(page).toHaveURL(/\/sessions\/new\?/);
     const newUrl = new URL(page.url());

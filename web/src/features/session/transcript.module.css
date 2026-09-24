@@ -191,9 +191,12 @@
   background: var(--link);
 }
 
+/* The tool name keeps its width; the key argument is what truncates. A
+   genuinely long name (a qualified MCP id) still ends in an ellipsis. */
 .foldTitle {
   color: var(--fg-body);
-  flex: 0 1 auto;
+  flex: 0 0 auto;
+  max-width: 60%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -212,7 +215,7 @@
   font-size: var(--text-meta);
   color: var(--fg-muted);
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

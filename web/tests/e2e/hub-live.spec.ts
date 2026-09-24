@@ -146,7 +146,7 @@ test("device login, hosts, create/send/close, follow, approvals", async ({ page 
   });
   await login(page);
 
-  await page.getByTitle("更多", { exact: true }).click();
+  await page.getByRole("button", { name: "管理" }).click();
   await page.getByRole("menuitem", { name: "主机", exact: true }).click();
   await expect(page.getByTestId("hosts-page")).toBeVisible();
   await expect(page.getByTestId("host-row").filter({ hasText: "e2e-fake-node" })).toBeVisible({

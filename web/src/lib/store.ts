@@ -1783,6 +1783,13 @@ class HubStore {
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
     this.outboxRetryAttempt.clear();
+    for (const [, t] of this.heldRetryTimer) clearTimeout(t);
+    this.heldRetryTimer.clear();
+    this.heldRetryAttempt.clear();
+    if (this.unloadClearTimer) {
+      clearTimeout(this.unloadClearTimer);
+      this.unloadClearTimer = null;
+    }
     if (typeof window !== "undefined") {
       window.removeEventListener("online", this.onConnOnline);
       window.removeEventListener("offline", this.onConnOffline);

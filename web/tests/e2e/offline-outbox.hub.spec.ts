@@ -313,8 +313,9 @@ test("a committed POST whose browser response is lost retries with replayed:true
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
-  // While the first POST is unresolved the row honestly waits (等待发送).
-  await expect(bubble).toContainText("等待发送");
+  // After the lost response the row honestly returns to waiting (等待发送)
+  // while the bounded same-id retry is pending — never a premature receipt.
+  await expect(bubble).toContainText("等待发送", { timeout: 5_000 });
 
   // The Hub answered the retry with replayed:true.
   await expect.poll(() => replayResults.length).toBeGreaterThan(0);

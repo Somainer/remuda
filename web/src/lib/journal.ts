@@ -185,12 +185,12 @@ export class JournalClient {
    * the contiguous prefix flushes, the residual gap is reported once, and the
    * client settles readonly-stale instead of buffering forever.
    */
-  async fillGap(from: U64, to: U64, gen?: number): Promise<U64 | null> {
+  fillGap(from: U64, to: U64, gen?: number): Promise<U64 | null> {
     // Share one in-flight fill: a second onGap (or resume) for a gap already
-    // being backfilled joins the SAME promise rather than racing two reads /
-    // two status transitions.
+    // being backfilled joins the EXACT SAME promise (not an async-wrapped
+    // copy) rather than racing two reads and two status transitions.
     if (this.fillingPromise) return this.fillingPromise;
-    if (this.status === "readonly-stale") return null;
+    if (this.status === "readonly-stale") return Promise.resolve(null);
     // Capture the current resume generation by default (every fill is
     // generation-guarded, not just explicit callers).
     const ownerGen = gen ?? this.resumeGen;

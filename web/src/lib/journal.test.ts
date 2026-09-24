@@ -416,3 +416,67 @@ it("an existing client's snapshot never advances applied past un-emitted rows (b
   });
   expect(client.appliedSeq).toBe("1");
 });
+
+it("concurrent fillGap calls share ONE in-flight fill and its definite outcome", async () => {
+  let resolveRead: (value: ReadPage) => void = () => {};
+  const pending = new Promise<ReadPage>((resolve) => {
+    resolveRead = resolve;
+  });
+  const read = vi.fn(async () => pending);
+  const client = new JournalClient("obj_journal" as Id, read);
+  client.applySnapshot(snapshot(1));
+
+  // Two onGap-style calls for the same gap while nothing is in store yet.
+  const first = client.fillGap("2", "10");
+  const second = client.fillGap("2", "10");
+
+  // Both join the SAME promise and exactly ONE read is in flight.
+  expect(second).toBe(first);
+  expect(read).toHaveBeenCalledTimes(1);
+
+  resolveRead(
+    page(
+      [obs(2), obs(3)],
+      { durableSeq: "10", windowFromSeq: "2", reachedAfterSeq: true },
+    ),
+  );
+  const [a, b] = await Promise.all([first, second]);
+  expect(a).toBe("3");
+  expect(b).toBe("3");
+  expect(client.appliedSeq).toBe("3");
+  expect(client.status).toBe("live");
+});
+
+it("a stale fill whose deferred read rejects after a newer resume went live never writes status", async () => {
+  let rejectFill: (err: Error) => void = () => {};
+  const fillRead = new Promise<ReadPage>((_resolve, reject) => {
+    rejectFill = reject;
+  });
+  const read = vi
+    .fn()
+    .mockReturnValueOnce(fillRead)
+    .mockResolvedValueOnce(
+      page([obs(2), obs(3), obs(4), obs(5), obs(6)], { durableSeq: "6", windowFromSeq: "2" }),
+    );
+  const statuses: string[] = [];
+  const client = new JournalClient("obj_journal" as Id, read, {
+    onStatus: (s) => statuses.push(s),
+  });
+  client.applySnapshot(snapshot(1));
+
+  // The fill for gap 2..6 is in flight (bounded tail would return
+  // 3001-style rows; here it simply rejects late).
+  const fill = client.fillGap("2", "6");
+  expect(client.status).toBe("gap-backfill");
+
+  // A NEWER resume succeeds and goes live (bumps the generation).
+  await client.resumeAfterReconnect();
+  expect(client.status).toBe("live");
+
+  // Now the old fill's read rejects: its catch is generation-guarded, so it
+  // must return the definite null outcome without downgrading to readonly-stale.
+  rejectFill(new Error("HTTP 502 on the stale fill read"));
+  expect(await fill).toBeNull();
+  expect(client.status).toBe("live");
+  expect(statuses.at(-1)).toBe("live");
+});

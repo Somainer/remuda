@@ -184,6 +184,24 @@ test.afterAll(async ({ request }) => {
   }
 });
 
+/**
+ * Wait for the optimistic bubble to be replaced by the authoritative journal
+ * message node carrying the SAME commandId (what "delivered" renders as once
+ * the journal joins), and assert no waiting/unconfirmed chip is left behind.
+ */
+async function expectDelivered(page: Page, commandId: string | null) {
+  const authoritative = page.locator(
+    `[data-testid="message"][data-command-id="${commandId}"]`,
+  );
+  await expect(authoritative).toHaveCount(1, { timeout: 30_000 });
+  const bubble = page.locator(
+    `[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`,
+  );
+  await expect(bubble).toHaveCount(0);
+  const body = (await page.getByTestId("session-page").textContent()) ?? "";
+  expect(body).not.toContain("状态待确认");
+}
+
 test("offline sends are queued and delivered exactly once after reconnect", async ({ page, request }) => {
   const instanceId = await createSession(page, "offline outbox seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
@@ -226,10 +244,9 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   // … and exactly one journal execution each.
   for (const cid of commandIds) {
     await expect.poll(() => hubJournalMessageCount(api, instanceId, cid!)).toBe(1);
-    // The delivered row no longer reads waiting/unconfirmed; it is accepted.
-    await expect(
-      page.locator(`[data-testid="optimistic-bubble"][data-command-id="${cid}"]`),
-    ).toContainText("已受理", { timeout: 20_000 });
+    // The delivered row becomes the authoritative journal message (same id);
+    // the optimistic chip is gone and no 状态待确认 is shown.
+    await expectDelivered(page, cid);
   }
 });
 
@@ -272,7 +289,7 @@ test("an offline-queued message survives a reload while the Hub is still off and
       (c) => c.operation === "instance.send" && c.id === commandId,
     ).length)
     .toBe(1);
-  await expect(restored).toContainText("已受理", { timeout: 20_000 });
+  await expectDelivered(page, commandId);
 });
 
 test("a committed POST whose browser response is lost retries with replayed:true and runs once", async ({ page, request }) => {
@@ -333,6 +350,5 @@ test("a committed POST whose browser response is lost retries with replayed:true
     .toBe(1);
   // … and one journal message for the id (executed exactly once).
   await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!)).toBe(1);
-  // Delivered, never stuck at 状态待确认.
-  await expect(bubble).toContainText("已受理", { timeout: 20_000 });
+  await expectDelivered(page, commandId);
 });

@@ -2197,7 +2197,13 @@ class HubStore {
     );
     this.subs.set(instance.journalId, sub.subscriptionId);
     this.followReadyState = sub.getReadyState();
-    if (this.followReadyState === 1) this.lastFollowFrameAt = Date.now(); // snapshot proves the link
+    // The subscribe SNAPSHOT is the reopen + catch-up certificate: the server
+    // answered over this exact socket. Count it as a frame so a resume
+    // certifies live even for an idle session with no subsequent events.
+    if (this.followReadyState === 1) {
+      this.lastFollowFrameAt = Date.now();
+      this.connection?.dispatch({ type: "frame" });
+    }
     if (Number(sub.snapshot.asOfSeq) >= Number(afterSeq)) {
       // An EMPTY follow snapshot only says "no events past the afterSeq
       // cursor" — it says nothing about retention below it. Only the first

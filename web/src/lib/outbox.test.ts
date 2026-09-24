@@ -9,17 +9,34 @@ import {
   type OutboxStorage,
 } from "./outbox";
 
-/** Deterministic in-memory storage standing in for IndexedDB. */
+/** Deterministic in-memory storage standing in for IndexedDB. Read/modify/
+ * write inside `put` is serialized (an async turn is awaited before commit),
+ * modelling IndexedDB transaction atomicity so the lease fallback can exclude
+ * a truly concurrent second owner. */
 class MemStorage implements OutboxStorage {
   map = new Map<string, OutboxRecord>();
+  private writeChain: Promise<void> = Promise.resolve();
   async all() {
+    await this.writeChain;
     return [...this.map.values()];
   }
   async put(rec: OutboxRecord) {
-    this.map.set(rec.commandId, rec);
+    // Serialize writes; one tick before committing gives a concurrent owner a
+    // chance to observe the lease (mirrors IDB readwrite transaction order).
+    const run = this.writeChain.then(async () => {
+      await new Promise((r) => setTimeout(r, 1));
+      this.map.set(rec.commandId, rec);
+    });
+    this.writeChain = run.catch(() => undefined);
+    await run;
   }
   async delete(id: string) {
-    this.map.delete(id);
+    const run = this.writeChain.then(async () => {
+      await new Promise((r) => setTimeout(r, 1));
+      this.map.delete(id);
+    });
+    this.writeChain = run.catch(() => undefined);
+    await run;
   }
 }
 
@@ -141,5 +158,62 @@ describe("Outbox", () => {
     await box.patch("cmd_n", { state: "inflight" });
     await box.remove("cmd_n");
     expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  it("enqueue leaves the in-memory cache unchanged and emits nothing when storage aborts (commit-before-publish)", async () => {
+    const failing: OutboxStorage = {
+      all: async () => [],
+      put: async () => {
+        throw new Error("IDB transaction aborted");
+      },
+      delete: async () => undefined,
+    };
+    const b = await Outbox.load(failing, "owner_abort");
+    const fn = vi.fn();
+    b.subscribe(fn);
+    await expect(b.enqueue(rec({ commandId: "cmd_aborted" }))).rejects.toThrow(/aborted/);
+    // No durable entry, no cache entry, no subscriber notification: an
+    // uncommitted row must never be rendered or POSTed.
+    expect(b.get("cmd_aborted")).toBeUndefined();
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("a crashed owner's expired lease is stealable and a sent row is never re-POSTed (lease fallback)", async () => {
+    // No navigator.locks in this harness → exercises the durable lease path.
+    const originalLocks = (globalThis.navigator as { locks?: LockManager }).locks;
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: undefined,
+      configurable: true,
+    });
+    const shared = new MemStorage();
+    // Owner A loaded and crashed holding a row mid-inflight with an EXPIRED lease.
+    const stale: OutboxRecord = rec({
+      commandId: "cmd_crashed",
+      state: "inflight",
+      lease: { owner: "owner_DEAD", until: Date.now() - 1 },
+    });
+    await shared.put(stale);
+
+    // Owner B (a fresh process) loads; the dead owner's expired inflight row
+    // is returned to a deliverable state in B's cache.
+    const b = await Outbox.load(shared, "owner_B");
+    expect(b.get("cmd_crashed")?.state).toBe("pending");
+    let postedRows: string[] = [];
+    const result = await b.withInstanceLock("ins_1", (_id, rows) => {
+      postedRows = rows.map((r) => r.commandId);
+      return Promise.resolve(rows.length);
+    });
+    expect(result).toBe(1);
+    expect(postedRows).toContain("cmd_crashed");
+
+    // Once A (now B) marks the row sent, a subsequent lock re-read must NOT
+    // hand it out for delivery again.
+    await b.patch("cmd_crashed", { state: "sent", gotResponse: true, lease: undefined });
+    const second = await b.withInstanceLock("ins_1", (_id, rows) => Promise.resolve(rows.length));
+    expect(second).toBe(0);
+    Object.defineProperty(globalThis.navigator, "locks", {
+      value: originalLocks,
+      configurable: true,
+    });
   });
 });

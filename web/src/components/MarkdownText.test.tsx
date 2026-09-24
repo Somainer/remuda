@@ -294,7 +294,68 @@ describe("math rendering (c-math)", () => {
     expect(await screen.findByTestId("math-error")).toBeTruthy();
     expect(screen.getByText(/花了 \$5 和 \$10 都不渲染。/)).toBeTruthy();
   });
+
+  it("keeps a $$ formula inside a blockquote and a list item (#2)", async () => {
+    const { container, rerender } = render(<MarkdownText text={"> $$x^2$$"} />);
+    const quote = container.querySelector("blockquote");
+    expect(quote).toBeTruthy();
+    expect(quote!.querySelector('[data-testid="math-display"]')).toBeTruthy();
+    expect(quote!.querySelector(".katex-display")).toBeTruthy();
+
+    rerender(<MarkdownText text={"- $$y^2$$"} />);
+    const item = container.querySelector("ul > li");
+    expect(item).toBeTruthy();
+    expect(item!.querySelector('[data-testid="math-display"]')).toBeTruthy();
+  });
+
+  it("renders an indented $$ line as a code block, not a formula (#2)", async () => {
+    render(<MarkdownText text={"    $$x^2$$"} />);
+    expect(await screen.findByTestId("code-block")).toBeTruthy();
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+  });
+
+  it("treats a ```math / ~~~math fence as code, never loading KaTeX (#3)", async () => {
+    const { rerender } = render(<MarkdownText text={"```math\nx^2\n```"} />);
+    const block = await screen.findByTestId("code-block");
+    expect(block.textContent).toContain("x^2");
+    expect(screen.queryByTestId("math-display")).toBeNull();
+
+    rerender(<MarkdownText text={"~~~math\ny^2\n~~~"} />);
+    expect((await screen.findAllByTestId("code-block")).length).toBeGreaterThan(0);
+    expect(screen.queryByTestId("math-display")).toBeNull();
+  });
+
+  it("renders an unclosed display opener's tail as literal, intact (#4)", async () => {
+    const { rerender } = render(<MarkdownText text={"intro \\[a *b* + \\{c\\}"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+    // Backslash, asterisks and braces must all show as typed (no <em>, no
+    // swallowed delimiter).
+    expect(container_text(document.body)).toContain("intro \\[a *b* + \\{c\\}");
+    expect(document.body.querySelector("em")).toBeNull();
+
+    // Same for the $$ form.
+    rerender(<MarkdownText text={"intro $$\n\\sigma(z)"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect(container_text(document.body)).toContain("intro $$");
+    expect(container_text(document.body)).toContain("\\sigma(z)");
+  });
+
+  it("keeps a later closed formula after a blank-line-voided $$ pair (#5)", async () => {
+    render(<MarkdownText text={"$$x\n\n$$\n\n$y$"} />);
+    // First $$ pair is dead across the blank line (literal text); the later
+    // $y$ is a valid inline formula and still renders.
+    expect(await screen.findByTestId("math-inline")).toBeTruthy();
+    expect(screen.queryByTestId("math-display")).toBeNull();
+  });
 });
+
+function container_text(root: ParentNode): string {
+  return root.textContent ?? "";
+}
 
 describe("D-027b file-mention folding", () => {
   it("renders a quoted [File #n] saved-at line as a collapsed row", () => {

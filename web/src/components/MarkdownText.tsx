@@ -85,15 +85,58 @@ type CodeProps = {
   node?: { data?: { meta?: string | null } };
 };
 
+/** Class tokens our remark-rehype math handlers stamp (sanitizer keeps them). */
+const INLINE_MATH_CLASS = "language-mathinline";
+const DISPLAY_MATH_CLASS = "language-mathdisplay";
+
+type MarkdownProps = Parameters<typeof Markdown>[0];
+
+/**
+ * Provenance markers for mdast math nodes. A fenced code block with info
+ * string `math` compiles to `<code class="language-math">` and MUST stay a
+ * code block; only mdast `inlineMath`/`math` carry the dedicated tokens, so
+ * the `code` override can tell them apart without widening the sanitizer.
+ */
+// mdast-util-to-hast handlers are (state, node); state is intentionally
+// untyped (the package is a transitive dep) so only node is inspected.
+type HastState = unknown;
+type MathNode = { value?: string };
+
+const mathHastHandlers = {
+  inlineMath(_state: HastState, node: MathNode) {
+    const value = node.value ?? "";
+    return {
+      type: "element" as const,
+      tagName: "code",
+      properties: { className: [INLINE_MATH_CLASS] },
+      children: [{ type: "text" as const, value }],
+    };
+  },
+  math(_state: HastState, node: MathNode) {
+    const value = node.value ?? "";
+    return {
+      type: "element" as const,
+      tagName: "pre",
+      properties: {},
+      children: [
+        {
+          type: "element" as const,
+          tagName: "code",
+          properties: { className: [DISPLAY_MATH_CLASS] },
+          children: [{ type: "text" as const, value }],
+        },
+      ],
+    };
+  },
+} as NonNullable<NonNullable<MarkdownProps["remarkRehypeOptions"]>["handlers"]>;
+
 /** react-markdown's code override: inline stays a bare <code>, fences become CodeBlock. */
 function FencedCode(rawProps: unknown) {
   const props = rawProps as CodeProps;
   const fenced = useContext(FenceContext);
-  const isMath = /(?:^|\s)language-math(?:\s|$)/.test(props.className ?? "");
-  if (isMath) {
-    // mdast-util-math compiles flow math to `<pre><code class="language-math …">`
-    // (fence context set) and inline math to bare `<code class="language-math">`.
-    return <MathExpression source={nodeText(props.children)} display={fenced} />;
+  const className = props.className ?? "";
+  if (className === INLINE_MATH_CLASS || className === DISPLAY_MATH_CLASS) {
+    return <MathExpression source={nodeText(props.children)} display={className === DISPLAY_MATH_CLASS} />;
   }
   if (!fenced) {
     return <code className={props.className}>{props.children}</code>;
@@ -126,6 +169,7 @@ function renderWithFileMentions(text: string): ReactNode {
         key={`md-${key}`}
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeSanitize]}
+        remarkRehypeOptions={{ handlers: mathHastHandlers }}
         components={{
           pre: FenceMarkdownPre,
           code: FencedCode,

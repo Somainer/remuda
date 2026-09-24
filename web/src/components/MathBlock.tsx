@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   useSyncExternalStore,
   type ClipboardEvent,
   type ReactNode,
@@ -16,18 +17,14 @@ export interface MathExpressionProps {
   display: boolean;
 }
 
-/**
- * One math node. KaTeX is a lazy chunk: until it loads, the TeX source shows
- * in a neutral style (never blank, never raw after paint). A parse error
- * shows the source in the danger role instead of crashing the message —
- * throwOnError is also false inside the engine.
- *
- * The rendered HTML is KaTeX-generated with trust:false; rehype-sanitize
- * never sees it (the markdown `code` override renders this component), and
- * no raw message HTML is involved.
- */
+/** Faces whose readiness gates the placeholder→formula swap. */
+const REQUIRED_FONTS = ['16px "KaTeX_Main"', '16px "KaTeX_Math"'];
+/** Never stall forever on a slow font fetch; after this the formula shows. */
+const FONT_GRACE_MS = 2000;
+
 export function MathExpression({ source: tokenSource, display }: MathExpressionProps) {
   const engine = useSyncExternalStore(subscribeMath, getMathState);
+  const [fontsReady, setFontsReady] = useState(false);
   useEffect(() => {
     void loadMath();
   }, []);
@@ -35,14 +32,45 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
   // them back for both the engine and the clipboard.
   const source = restoreMathSource(tokenSource);
 
+  // Once the engine (and its @font-face declarations) is present, keep the
+  // visible source placeholder until the main KaTeX faces are actually ready,
+  // so the swap never paints an invisible formula (FOIT). A short grace
+  // timeout covers environments without the Font Loading API.
+  useEffect(() => {
+    if (engine.status !== "ready") {
+      setFontsReady(false);
+      return;
+    }
+    let cancelled = false;
+    const fonts = typeof document !== "undefined" ? document.fonts : undefined;
+    if (!fonts?.load) {
+      setFontsReady(true);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    Promise.race([
+      Promise.all(REQUIRED_FONTS.map((spec) => fonts.load(spec))).then(
+        () => fonts.ready,
+      ),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, FONT_GRACE_MS);
+      }),
+    ]).then(() => {
+      if (!cancelled) setFontsReady(true);
+    });
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [engine.status]);
+
   const rootRef = useRef<HTMLElement | null>(null);
   const attach = useCallback((el: HTMLElement | null) => {
     rootRef.current = el;
   }, []);
 
   // Copying a selection wholly inside the formula yields its TeX source; a
-  // selection that reaches into surrounding prose keeps the browser default
-  // (rendered text) so mixed copies are not replaced by the formula alone.
+  // selection that reaches into surrounding prose keeps the browser default.
   const onCopy = useCallback(
     (event: ClipboardEvent<HTMLElement>) => {
       const root = rootRef.current;
@@ -59,19 +87,25 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
   const placeholderClass = display
     ? `${css.placeholder} ${css.displayPlaceholder}`
     : css.placeholder;
+  const engineReady = engine.status === "ready";
 
   let body: ReactNode;
-  if (engine.status === "ready") {
+  if (engineReady && fontsReady) {
     const result = renderMath(engine.katex, source, display);
     if (!result.ok) {
+      // Parse error, oversized source, or engine throw: raw source, danger
+      // role (or neutral for the size cap), message still intact.
+      const tooLarge = result.error === "too-large";
       body = (
         <span
-          className={`${placeholderClass} ${css.error}`}
-          data-testid="math-error"
-          data-state="error"
-          title={result.error}
+          className={`${placeholderClass} ${tooLarge ? "" : css.error}`}
+          data-testid={tooLarge ? "math-skip" : "math-error"}
+          data-state={tooLarge ? "too-large" : "error"}
+          title={tooLarge ? "公式过长，已按源码显示" : result.error}
           role="img"
-          aria-label={`数学公式解析失败：${result.error ?? ""}`}
+          aria-label={
+            tooLarge ? "数学公式过长，显示源码" : `数学公式解析失败：${result.error ?? ""}`
+          }
         >
           {source}
         </span>
@@ -100,14 +134,16 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
       );
     }
   } else {
-    // Loading: neutral TeX source. The engine caches no chunk-load failure,
-    // so a later remount retries and swaps this placeholder for the formula.
+    // Chunk loading, chunk failed (a later mount retries), or faces not yet
+    // ready: the TeX source stays visibly in a neutral style.
+    const state = engine.status === "error" ? "load-error" : "loading";
     body = (
       <span
         ref={display ? undefined : attach}
         className={placeholderClass}
         data-testid="math-loading"
-        data-state={engine.status === "error" ? "load-error" : "loading"}
+        data-state={state}
+        aria-label={engine.status === "error" ? "数学排版加载失败，将重试" : "数学公式排版中"}
       >
         {source}
       </span>

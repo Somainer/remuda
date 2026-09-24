@@ -1163,12 +1163,12 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 15. **Transcript 数学排版（KaTeX）。**
     - 引擎 KaTeX，`output: htmlAndMathml`（保留 MathML 可达性）、`throwOnError:false`（坏公式以错误样式显示 TeX 源码，绝不炸消息）、`trust:false`（禁 `\href`/`\url`/html 类指令）、`strict:"ignore"`。
-    - 定界符：`$$…$$` 与 `\[…\]` 为 display，`$…$` 与 `\(…\)` 为 inline。数学在 markdown 之前先切分（`web/src/lib/mathSegments.ts`），公式内的下划线、星号、反斜杠不被 markdown 处理。
-    - 单 `$` 走 pandoc 口径：开 `$` 后必须紧跟非空白；闭 `$` 前必须是非空白且其后不能是数字。故「花了 $5 和 $10」保持文本；代码 span/fence 与链接目标内永不解析数学；`\$` 为字面量。（实测 pandoc 3.5 源码确认：`$PATH:$HOME` 因 `:` 与 `H` 满足闭合规则仍算数学，这是规则本身而非 bug；空格分隔的 `$HOME and $PATH` 是文本。）
-    - 懒加载：KaTeX（JS+CSS+字体）为独立 chunk，仅当第一条数学节点渲染时拉取；无数学的消息/页面零请求。加载完成前以中性样式显示 TeX 源码；行高变化由 Transcript 既有的 per-row ResizeObserver 重新测量，无需改 Transcript。
-    - 消毒：数学节点由 React 组件渲染（`web/src/components/MathBlock.tsx`），KaTeX 输出不经过 rehype-sanitize，也不允许消息原始 HTML 透传。
-    - 流式：消息末尾未闭合的 `$$`/`\[` 在闭合定界符到达前一律按纯文本显示，绝不渲染半个公式；闭合时除公式自身高度外无页面跳动。
-    - 版式与主题：公式只用 currentColor，深浅两态都正确；display 公式在阅读列内居中，超宽公式在自身块内横向滚动、页面不出现横向滚动条；inline 公式不撑高正文行。
+    - 定界符：`$$…$$` 与 `\[…\]` 为 display，`$…$` 与 `\(…\)` 为 inline。`$`/`$$` 的文档结构（引用、列表、缩进代码、代码 span、空行边界）交给 remark-math，预处理只做 pandoc 单 `$` 守卫、`\(…\)`/`\[…\]` 改写与流式尾巴处理，不搬运块；`> $$x$$`、`- $$x$$` 留在容器内，`    $$x$$` 仍是缩进代码，同一行 `$$x$$` 改写为带容器前缀的 display fence。扫描为单趟线性（闭合游标不回退），`"$1".repeat(50000)` 与 100 KB 输入亚帧~几十毫秒。
+    - 单 `$` 走 pandoc 口径：开 `$` 后必须紧跟非空白；闭 `$` 前必须是非空白且其后不能是数字。故「花了 $5 和 $10」保持文本；代码 span/fence（含 ```` ```math ```` 与 `~~~math`，它们是代码不是公式）、缩进代码块内永不解析数学；`\$` 为字面量。（实测 pandoc 3.5 源码确认：`$PATH:$HOME` 因 `:` 与 `H` 满足闭合规则仍算数学，这是规则本身而非 bug；空格分隔的 `$HOME and $PATH` 是文本。）
+    - 工作量边界与懒加载：KaTeX（JS+CSS+字体）为独立 chunk，仅当第一条数学节点渲染时拉取；无数学的消息/页面零请求。固定 `maxSize:20em`、`maxExpand:1000`；源码超过 4000 字符直接跳过引擎、中性显示源码（100 KB 单测/e2e 钉住）；成功 HTML 按 `(source,display)` 记忆化，流式重渲染只解析一次；chunk 失败不粘性，下一条数学节点重新 import。占位保留到 KaTeX 主字面 `document.fonts.load` 完成（2 s 兜底），不出现占位消失后的不可见期；行高变化由 Transcript 既有的 per-row ResizeObserver 重新测量，无需改 Transcript。
+    - 消毒：数学节点由 React 组件渲染（`web/src/components/MathBlock.tsx`），以专用 class（`language-mathinline`/`language-mathdisplay`）与围栏代码的 `language-math` 区分；KaTeX 输出不经过 rehype-sanitize（sanitizer 也不放宽），也不允许消息原始 HTML 透传。
+    - 流式：消息末尾真正悬空（EOF 前无闭合）的最后一个 `$$`/`\[`，其后整段按转义字面文本渲染（定界符、反斜杠、星号、大括号原样、无 `<em>`）；`$$…$$` 内出现空行则该对作废但不影响其后公式。绝不渲染半个公式；闭合时除公式自身高度外无页面跳动。
+    - 版式与主题：公式只用 currentColor，深浅两态都正确；display 公式在阅读列内居中，超宽公式在自身块内横向滚动、超高（`\rule`）被 maxSize 钳制，页面不出现横向滚动条；inline 节点 `max-height:1.4em; overflow:visible`，`\dfrac` 嵌套等高公式可见地超出但不撑大正文行/段落。
     - 复制：选中并复制公式得到其 TeX 源码。
     - 机械取值见 [visual-system.md](./visual-system.md) §10。许可证（MIT）已入库 `web/LICENSES/KaTeX-MIT.txt` 并登记于根 NOTICE。
 

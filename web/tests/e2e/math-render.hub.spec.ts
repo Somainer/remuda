@@ -92,7 +92,21 @@ async function answerPendingApprovals(page: Page, id: string): Promise<void> {
   }, id);
 }
 
-async function createReadySession(page: Page, prompt: string, mobile = false): Promise<string> {
+interface ReadyCounts {
+  display: number;
+  inline: number;
+  error: number;
+  skip?: number;
+}
+
+const DEFAULT_COUNTS: ReadyCounts = { display: 2, inline: 1, error: 1 };
+
+async function createReadySession(
+  page: Page,
+  prompt: string,
+  mobile = false,
+  counts: ReadyCounts = DEFAULT_COUNTS,
+): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
   await expect(hostPicker).toContainText("e2e-fake-node", { timeout: 20_000 });
@@ -124,17 +138,17 @@ async function createReadySession(page: Page, prompt: string, mobile = false): P
   } else {
     await composer.press("Enter");
   }
-  // Two good display formulas (softmax + the deliberately wide one).
-  await expect(page.getByTestId("math-display")).toHaveCount(2, { timeout: 30_000 });
-  await expect(page.getByTestId("math-inline")).toHaveCount(1);
-  await expect(page.getByTestId("math-error")).toHaveCount(1);
+  await expect(page.getByTestId("math-display")).toHaveCount(counts.display, { timeout: 30_000 });
+  await expect(page.getByTestId("math-inline")).toHaveCount(counts.inline);
+  await expect(page.getByTestId("math-error")).toHaveCount(counts.error);
+  if (counts.skip) await expect(page.getByTestId("math-skip")).toHaveCount(counts.skip);
   // Let the lazy KaTeX chunk, CSS and fonts settle (both display blocks).
   await expect
     .poll(() => page.locator('[data-testid="math-display"] .katex-display').count())
-    .toBe(2);
+    .toBe(counts.display);
   await expect
     .poll(() => page.locator('[data-testid="math-inline"] .katex').count())
-    .toBe(1);
+    .toBe(counts.inline);
   await page.evaluate(() => (document as Document & { fonts?: { ready: Promise<unknown> } }).fonts?.ready);
   await page.waitForTimeout(400);
   return instanceId;
@@ -333,6 +347,104 @@ test.describe("390px", () => {
       }
     });
   }
+});
+
+test.describe("round-2 hardening", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  test("bounded work, structure, provenance, literal streaming and inline geometry", async ({
+    page,
+  }) => {
+    const HUGE = "x+1".repeat(25_000); // 100 KB
+    // The unclosed \[ swallows everything after it (streaming rule), so it
+    // must be the last line.
+    const prompt = [
+      "r2 引用块：",
+      "> $$q^2$$",
+      "r2 列表：",
+      "- $$l^2$$",
+      "r2 缩进代码：",
+      "",
+      "    $$indented$$",
+      "r2 math fence：",
+      "```math",
+      "fenced^2",
+      "```",
+      "r2 超宽规则： $$\\rule{100000em}{100000em}$$",
+      "r2 宏炸弹： $\\def\\a{\\a}\\a$",
+      "r2 超高 inline：前后 $\\dfrac{1}{\\dfrac{1}{x}}$ 文字",
+      `r2 百KB： $${HUGE}$`,
+      "r2 未闭合： intro \\[a *b* + \\{c\\}",
+    ].join("\n");
+
+    // 3 display (quote, list, clamped rule), 1 good inline (tall frac),
+    // 1 error (macro bomb), 1 size-skip (100 KB).
+    await createReadySession(page, prompt, false, { display: 3, inline: 1, error: 1, skip: 1 });
+
+    // (#4) unclosed \[ renders literal with stars/braces/delimiters intact.
+    await expect(assistantRow(page).getByText(/intro \\?\[a \*b\* \+ \\?\{c\\?\}/)).toBeVisible();
+    expect(assistantRow(page).locator("em")).toHaveCount(0);
+
+    // (#2) $$ stays inside the blockquote and the list item.
+    await expect(page.locator("blockquote [data-testid='math-display']")).toBeVisible();
+    await expect(page.locator("ul > li [data-testid='math-display']")).toBeVisible();
+
+    // (#2) indented $$ is a code block.
+    const codeBlocks = page.getByTestId("code-block");
+    await expect(codeBlocks.first()).toBeVisible();
+    const codeTexts = await codeBlocks.allInnerTexts();
+    expect(codeTexts.some((t) => t.includes("fenced^2"))).toBe(true);
+    // The math-fenced block is never a math node.
+    expect(await page.locator("pre code.language-mathdisplay").count()).toBe(0);
+
+    // (#1) the 100000em rule is clamped to 20em (never 100000em tall): the
+    // rule's own border box is at the cap, and the whole display block stays
+    // bounded (20em + display line-leading), not astronomically tall.
+    const geom = await assistantRow(page)
+      .locator('[data-testid="math-display"]')
+      .filter({ has: page.locator(".katex-rule") })
+      .first()
+      .evaluate((el) => {
+        const rule = el.querySelector(".katex-rule") as HTMLElement;
+        const cs = getComputedStyle(rule);
+        return {
+          borderTop: cs.borderTopWidth ? Number.parseFloat(cs.borderTopWidth) : 0,
+          borderRight: cs.borderRightWidth ? Number.parseFloat(cs.borderRightWidth) : 0,
+          wrap: el.getBoundingClientRect().height,
+          ruleFont: Number.parseFloat(getComputedStyle(rule).fontSize),
+        };
+      });
+    expect(geom.borderTop).toBeLessThanOrEqual(geom.ruleFont * 20 + 0.5);
+    expect(geom.borderRight).toBeLessThanOrEqual(geom.ruleFont * 20 + 0.5);
+    // Unclamped 100000em would be > 1.6 million px; a clamped block is < 30em.
+    expect(geom.wrap).toBeLessThan(geom.ruleFont * 30);
+
+    // (#1) macro bomb is an error node, not an infinite expansion.
+    await expect(page.getByTestId("math-error")).toBeVisible();
+
+    // (#1) the 100 KB formula is size-skipped (raw source), no KaTeX node.
+    await expect(page.getByTestId("math-skip")).toBeVisible();
+
+    // (#8) a tall nested inline fraction does not enlarge its line box:
+    // the inline node itself is capped, and its margin box stays at one line
+    // (inline-block overflows visibly, not via height). The tall \dfrac is
+    // the only good inline math node in this message.
+    const tallInline = page.getByTestId("math-inline");
+    await expect(tallInline).toHaveCount(1);
+    const inlineCap = await tallInline.evaluate((el) => {
+      const wrap = el as HTMLElement;
+      const cs = getComputedStyle(wrap);
+      return {
+        display: cs.display,
+        maxHeightPx: Number.parseFloat(cs.maxHeight),
+        wrapHeight: wrap.getBoundingClientRect().height,
+        fontPx: Number.parseFloat(cs.fontSize),
+      };
+    });
+    expect(inlineCap.display).toBe("inline-block");
+    expect(inlineCap.maxHeightPx).toBeCloseTo(1.4 * inlineCap.fontPx, 1);
+    expect(inlineCap.wrapHeight).toBeLessThanOrEqual(1.4 * inlineCap.fontPx + 2);
+  });
 });
 
 test("never requests the KaTeX chunk for a session without math", async ({ page }) => {

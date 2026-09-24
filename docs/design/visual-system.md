@@ -437,29 +437,35 @@ transcript 正文（`.md`）支持 LaTeX 公式，引擎 KaTeX（MIT）。机械
 |---|---|
 | display 外边距 | `0.6em 0`，在阅读列内 `text-align: center` |
 | display 超宽 | 外层 `overflow-x: auto; overflow-y: hidden; max-width: 100%; min-width: 0`，横向滚动条只属于公式块，页面永不横向滚动 |
-| inline 字号 | KaTeX 默认 1.21em 收紧到 `1.1em`；普通公式不增加 28px 阅读行高度，分式等 tall 结构取自然高 |
-| 占位/错误块（display） | `--bg-inset` 底、1px `--border`（错误态换 `--danger-border`）、`--radius-md`、10px 12px 内边距 |
+| display 超高 | KaTeX `maxSize: 20em`，`\rule{…}` 等尺寸被钳制，永不撑出超高元素 |
+| inline 字号 / 行盒 | KaTeX 默认 1.21em 收紧到 `1.1em`；inline 节点是 `max-height: 1.4em; overflow: visible` 的 inline-block，所以 `\dfrac` 嵌套等高公式会超出但**可见地**绘制，行盒/段落高度保持一行，普通公式不增加 28px 阅读行高 |
+| 占位/错误块（display） | `--bg-inset` 底、1px `--border`（错误态换 `--danger-border`）、`--radius-md`、10px 12px 内边距；超长源码（>4000 字符）为中性 skip 态，不上 danger 色 |
 
-### 10.3 加载与行为
+### 10.3 加载、工作量边界与行为
 
 - KaTeX JS（约 259 KB / gzip 78 KB）、CSS（约 27 KB / gzip 7.5 KB）与 woff2 字面全部为异步 chunk：第一条数学节点挂载时才请求；无数学的 transcript 页面零请求（e2e 断言）。
-- chunk 到达前显示 TeX 源码占位（inline：`--fg-muted` 等宽；display：inset 块），不留白、不闪烁；到达后原位替换，虚拟行由 Transcript 的 per-row ResizeObserver 重新测量，阅读锚点不动。
-- 渲染选项固定 `output: "htmlAndMathml"`（MathML 供屏幕阅读器）、`throwOnError: false`、`trust: false`、`strict: "ignore"`。坏公式不渲染半成品：显示带 `--danger-fg` 的源码与错误 title，消息其余部分照常。
-- 流式：未闭合的 `$$` / `\[` 在闭合前整段按纯文本处理（包括其中的 `$…$` / `\(…\)`），闭合后才整体成为公式。
+- chunk 到达前显示 TeX 源码占位；引擎就绪后还要等 KaTeX_Main/KaTeX_Math 主字面加载（`document.fonts.load`，2 s 兜底，避免占位消失后的 FOIT 不可见期）才原位替换；虚拟行由 Transcript 的 per-row ResizeObserver 重新测量，阅读锚点不动。
+- 渲染选项固定 `output: "htmlAndMathml"`（MathML 供屏幕阅读器）、`throwOnError: false`、`trust: false`、`strict: "ignore"`、`maxSize: 20`（em）、`maxExpand: 1000`。坏公式显示带 `--danger-fg` 的源码与错误 title；宏炸弹（`\def\a{\a}\a`）被 `maxExpand` 截断成错误节点；超过 `MATH_MAX_SOURCE = 4000` 字符的源码直接跳过引擎、以中性源码显示（e2e 钉 100 KB）。成功 HTML 按 `(source, display)` 记忆化，流式重渲染同一条只解析一次。
+- 扫描器是线性的（单趟标记代码/配对，闭合搜索游标不回退）：`"$1".repeat(50000)` 与 100 KB 输入都在亚帧~几十毫秒内（单测带时间预算与 10× 线性比）。
+- chunk 加载失败不是粘性错误：发布 `error` 后清空去重槽，下一次 `loadMath()` 从 `loading` 重新发起 import（浏览器对失败的动态 import 会重新取）。
+- 流式：消息末尾未闭合的 `$$`/`\[` 其后整段按转义后的字面文本渲染（定界符、反斜杠、星号、大括号都保持原样、不出现 `<em>`），闭合后才整体成为公式。
 - 复制：选区完全位于公式内时，剪贴板写入 TeX 源码；选区延伸到公式外时保持浏览器默认行为。
 
-### 10.4 定界符（先于 markdown 的扫描）
+### 10.4 定界符与 markdown 结构
 
 | 写法 | 含义 |
 |---|---|
 | `$$…$$`、`\[…\]` | display math（块级，允许跨行） |
 | `$…$`、`\(…\)` | inline math |
 
-单 `$` 按 pandoc 规则：开 `$` 后紧跟非空白字符；闭 `$` 前为非空白、其后不能是数字。`花了 $5 和 $10`、`$HOME and $PATH`（闭合前是空白）为文本；`$PATH:$HOME` 与 pandoc 一致仍为数学。代码 span、fenced code block（含流式未闭合 fence）、链接 `](…)` 目标内不解析数学；`\$` 为字面美元符。
+- `$`/`$$` 的文档结构（blockquote、列表、缩进代码、代码 span、段落与空行边界）完全交给 remark-math/micromark，预处理不搬运块、不注入顶层空行：`> $$x$$`、`- $$x$$` 的公式留在引用/列表项内；`    $$x$$` 仍是缩进代码块；同一行的 `$$x$$` 会被改写成带容器前缀的 `$$` flow fence（列表续行用等宽空格而非重复 marker），从而得到 display 语义。
+- 单 `$` 按 pandoc 规则：开 `$` 后紧跟非空白字符；闭 `$` 前为非空白、其后不能是数字。`花了 $5 和 $10`、`$HOME and $PATH`（闭合前是空白）为文本；`$PATH:$HOME` 与 pandoc 一致仍为数学。代码 span、fenced code block（含 ` ```math ` 与 `~~~math` 围栏——它们是**代码**，不是公式）、缩进代码块内不解析数学；`\$` 为字面美元符。
+- `$$…$$` 内出现空行时该对的开/闭两个 run 都作废（字面显示），但不影响其后的合法公式；只有真正悬空、EOF 前无闭合 run 的最后一个 `$$`/`\[` 才触发流式字面尾巴。
+- 数学节点用专用 class 标记（`language-mathinline` / `language-mathdisplay`，默认 sanitizer 的 `language-*` 规则放行）与围栏代码的 `language-math` 区分，不放宽 sanitizer，也不为 `math` 围栏加载 KaTeX。
 
 ### 10.5 证据
 
-- 单元：`web/src/lib/mathSegments.test.ts`（定界符/货币/代码/流式规则）、`web/src/components/MathBlock.test.tsx`（占位、渲染、错误、复制）、`MarkdownText.test.tsx` 的 math 段（端到端管线）。
-- e2e：`web/tests/e2e/math-render.hub.spec.ts`，owner 的 softmax 公式 + inline + 货币句 + 坏公式，深浅两态，断言 KaTeX 输出、无原始 TeX 可见、无页面级横向溢出，且无数学的页面不请求 KaTeX chunk。
+- 单元（vitest）：`mathSegments.test.ts`（定界符/货币/代码/缩进块/容器/空行/流式 + 线性时间预算）、`mathRender.test.ts`（htmlAndMathml、坏公式、引擎异常、trust 边界、maxSize/maxExpand、尺寸跳过、记忆化）、`mathLoader.test.ts`（失败后重试）、`MathBlock.test.tsx`（占位→KaTeX、字体、display、currentColor、错误/skip、inline cap、复制）、`MarkdownText.test.tsx` math 段（端到端管线、容器结构、math 围栏、字面尾巴）。
+- e2e：`web/tests/e2e/math-render.hub.spec.ts`——owner softmax + inline + 货币 + 坏公式（深浅×1440/390、KaTeX 输出、无原始 TeX、无页面级横向溢出）；一个 round-2 加固用例钉死：未闭合 `\[` 字面完整、引用/列表内公式、缩进代码、` ```math ` 围栏为代码、`\rule{100000em}` 高度钳制、宏炸弹报错、100 KB 跳过、超高 inline 的行盒几何；另有一例断言无数学页面不请求 KaTeX chunk。
 - 截图仅在 `REMUDA_EVIDENCE=1` 时落库，宽度 390 与 1440（D-053「不做什么」末条不变）。
 

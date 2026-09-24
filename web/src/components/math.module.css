@@ -41,16 +41,26 @@
   min-width: 0;
 }
 
-/* Tighten KaTeX's 1.21em a little for inline use so ordinary formulas add no
-   height to the 28px reading line; tall constructs (fractions) still take
-   their natural space. */
+/*
+ * Inline policy: the inline node is an inline-block whose margin box is capped
+ * to one reading line, so a tall construct (e.g. a nested \dfrac) overflows
+ * visibly but never enlarges the surrounding line box / paragraph height.
+ */
+.inline {
+  display: inline-block;
+  max-height: 1.4em;
+  overflow: visible;
+  vertical-align: baseline;
+  padding: 0 0.05em;
+  /* KaTeX glyphs are currentColor; pin the role for both appearances. */
+  color: var(--fg-body);
+}
+
 .inline :global(.katex) {
   font-size: 1.1em;
 }
 
-.inline,
-.displayScroll :global(.katex) {
-  /* KaTeX's glyphs are currentColor; pin the role for both appearances. */
+.displayScroll {
   color: var(--fg-body);
 }
 

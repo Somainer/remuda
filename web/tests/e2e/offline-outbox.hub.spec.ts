@@ -284,8 +284,16 @@ test("an offline-queued message survives a reload while the Hub is still off and
   // offline; nothing has been POSTed.
   await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
   const restored = page.locator(`[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`);
+  // The durable row restores and renders with the composer available (the
+  // offline seed never loaded events, but restored bubbles unblock the
+  // transcript — no "会话不存在", no stuck "加载 snapshot…").
   await expect(restored).toBeVisible();
-  await expect(restored).toContainText("待发送（离线）");
+  expect(restored).toContainText("offline across reload");
+  await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  // It is not a terminal/rejected row while the Hub has never received it.
+  await expect(restored).not.toContainText("状态待确认");
+  await expect(restored).not.toContainText("未送达");
+  // And nothing reached the Hub yet (independent read, 200 required).
   expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
 
   // Reconnect: the restored row delivers exactly once under the same id.

@@ -76,4 +76,14 @@ it("an offline reload restores the full instance projection (capabilities/native
   const bubble = state.bubbles.find((b) => b.clientRequestId === "local_restore_1");
   expect(bubble?.commandId).toBe("cmd_restore_1");
   expect(bubble?.instanceId).toBe(INSTANCE);
+
+  // The restored session has no events (the offline seed/follow never ran),
+  // yet the restored bubble is renderable: SessionPage's snapshotLoading gate
+  // must treat "events missing BUT bubbles present" as ready, not as a
+  // perpetual "加载 snapshot…" that hides the outbox row and the composer.
+  expect(state.events[INSTANCE]).toBeUndefined();
+  const bubblesForInstance = state.bubbles.filter((b) => b.instanceId === INSTANCE);
+  const wouldGateTranscript =
+    state.events[INSTANCE] === undefined && bubblesForInstance.length === 0;
+  expect(wouldGateTranscript).toBe(false);
 });

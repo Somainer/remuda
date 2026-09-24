@@ -1,11 +1,14 @@
 import { createContext, useContext, type ReactNode } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import rehypeSanitize from "rehype-sanitize";
 import ui from "../styles/ui.module.css";
 import css from "./codeBlock.module.css";
 import mentionCss from "./fileMention.module.css";
 import { CodeBlock } from "./CodeBlock";
+import { MathExpression } from "./MathBlock";
+import { protectMath } from "../lib/mathSegments";
 
 function nodeText(node: ReactNode): string {
   if (node == null || typeof node === "boolean") return "";
@@ -67,6 +70,9 @@ const FenceContext = createContext(false);
  * and CodeBlock included) on each transcript re-render. The remount restarted
  * the CodeBlock highlighter effect, detaching the block node mid-assertion in
  * the evidence screenshot loops ("Element is not attached to the DOM").
+ *
+ * No `<pre>` element is emitted: fenced code renders CodeBlock (which owns its
+ * pre) and display math renders MathExpression.
  */
 function FenceMarkdownPre({ children }: { children?: ReactNode }) {
   return <FenceContext.Provider value={true}>{children}</FenceContext.Provider>;
@@ -82,7 +88,14 @@ type CodeProps = {
 /** react-markdown's code override: inline stays a bare <code>, fences become CodeBlock. */
 function FencedCode(rawProps: unknown) {
   const props = rawProps as CodeProps;
-  if (!useContext(FenceContext)) {
+  const fenced = useContext(FenceContext);
+  const isMath = /(?:^|\s)language-math(?:\s|$)/.test(props.className ?? "");
+  if (isMath) {
+    // mdast-util-math compiles flow math to `<pre><code class="language-math …">`
+    // (fence context set) and inline math to bare `<code class="language-math">`.
+    return <MathExpression source={nodeText(props.children)} display={fenced} />;
+  }
+  if (!fenced) {
     return <code className={props.className}>{props.children}</code>;
   }
   const match = /language-(\S+)/.exec(props.className ?? "");
@@ -111,14 +124,14 @@ function renderWithFileMentions(text: string): ReactNode {
     out.push(
       <Markdown
         key={`md-${key}`}
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[rehypeSanitize]}
         components={{
           pre: FenceMarkdownPre,
           code: FencedCode,
         }}
       >
-        {markdown.join("\n")}
+        {protectMath(markdown.join("\n"))}
       </Markdown>,
     );
     markdown = [];

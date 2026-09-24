@@ -418,3 +418,48 @@ tokenGuard 断言两条：
 3. 迁移完成前，由过渡镜像 `data-theme` 保持这些分支继续生效。
 
 **护栏**：重做过的模块首行标 `/* @tokens strict */`。tokenGuard 在这些模块里禁止：十六进制颜色、旧 token 名、`[data-theme`、`[data-appearance`、`prefers-color-scheme`、小于 12px 的字号字面量（登记过的图形站点除外）、`transition: all`、`backdrop-filter`。
+
+---
+
+## 10. 数学排版（D-053 addendum 第 15 条，2026-09-24）
+
+transcript 正文（`.md`）支持 LaTeX 公式，引擎 KaTeX（MIT）。机械实现以 `web/src/components/MathBlock.tsx`、`web/src/components/math.module.css`、`web/src/lib/mathSegments.ts`、`web/src/lib/mathRender.ts` 为准；本节只钉取值与边界。
+
+### 10.1 颜色与字体
+
+- KaTeX 输出的唯一颜色声明是 `currentColor`（其上游样式表核实如此），因此不引入任何颜色字面量：inline/display 节点统一显式 `color: var(--fg-body)`，深浅两态各自就是阅读墨色；错误态用 `--danger-fg` + `--danger-border`。
+- 数学不新增字体令牌。KaTeX 自带字族（KaTeX_Main / KaTeX_Math / KaTeX_AMS 等）随其独立 CSS chunk 按需加载；占位 TeX 源码与错误态用 `--font-mono`。
+- KaTeX 样式表以 `web/src/components/mathKatex.css` 入库：由 `katex/dist/katex.css` 删掉全部 ttf/woff `src`（只保留 woff2，20 个字面、合计约 292 KB）并把字体 URL 改写为构建产物路径；KaTeX 升级后按文件头注释重新生成。
+
+### 10.2 布局
+
+| 项 | 取值 |
+|---|---|
+| display 外边距 | `0.6em 0`，在阅读列内 `text-align: center` |
+| display 超宽 | 外层 `overflow-x: auto; overflow-y: hidden; max-width: 100%; min-width: 0`，横向滚动条只属于公式块，页面永不横向滚动 |
+| inline 字号 | KaTeX 默认 1.21em 收紧到 `1.1em`；普通公式不增加 28px 阅读行高度，分式等 tall 结构取自然高 |
+| 占位/错误块（display） | `--bg-inset` 底、1px `--border`（错误态换 `--danger-border`）、`--radius-md`、10px 12px 内边距 |
+
+### 10.3 加载与行为
+
+- KaTeX JS（约 259 KB / gzip 78 KB）、CSS（约 27 KB / gzip 7.5 KB）与 woff2 字面全部为异步 chunk：第一条数学节点挂载时才请求；无数学的 transcript 页面零请求（e2e 断言）。
+- chunk 到达前显示 TeX 源码占位（inline：`--fg-muted` 等宽；display：inset 块），不留白、不闪烁；到达后原位替换，虚拟行由 Transcript 的 per-row ResizeObserver 重新测量，阅读锚点不动。
+- 渲染选项固定 `output: "htmlAndMathml"`（MathML 供屏幕阅读器）、`throwOnError: false`、`trust: false`、`strict: "ignore"`。坏公式不渲染半成品：显示带 `--danger-fg` 的源码与错误 title，消息其余部分照常。
+- 流式：未闭合的 `$$` / `\[` 在闭合前整段按纯文本处理（包括其中的 `$…$` / `\(…\)`），闭合后才整体成为公式。
+- 复制：选区完全位于公式内时，剪贴板写入 TeX 源码；选区延伸到公式外时保持浏览器默认行为。
+
+### 10.4 定界符（先于 markdown 的扫描）
+
+| 写法 | 含义 |
+|---|---|
+| `$$…$$`、`\[…\]` | display math（块级，允许跨行） |
+| `$…$`、`\(…\)` | inline math |
+
+单 `$` 按 pandoc 规则：开 `$` 后紧跟非空白字符；闭 `$` 前为非空白、其后不能是数字。`花了 $5 和 $10`、`$HOME and $PATH`（闭合前是空白）为文本；`$PATH:$HOME` 与 pandoc 一致仍为数学。代码 span、fenced code block（含流式未闭合 fence）、链接 `](…)` 目标内不解析数学；`\$` 为字面美元符。
+
+### 10.5 证据
+
+- 单元：`web/src/lib/mathSegments.test.ts`（定界符/货币/代码/流式规则）、`web/src/components/MathBlock.test.tsx`（占位、渲染、错误、复制）、`MarkdownText.test.tsx` 的 math 段（端到端管线）。
+- e2e：`web/tests/e2e/math-render.hub.spec.ts`，owner 的 softmax 公式 + inline + 货币句 + 坏公式，深浅两态，断言 KaTeX 输出、无原始 TeX 可见、无页面级横向溢出，且无数学的页面不请求 KaTeX chunk。
+- 截图仅在 `REMUDA_EVIDENCE=1` 时落库，宽度 390 与 1440（D-053「不做什么」末条不变）。
+

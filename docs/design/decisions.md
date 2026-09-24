@@ -1144,7 +1144,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 - 不打包衬线或 CJK webfont；不做阅读字体偏好。
 - 不做调色板选择器、URL 参数外观、顶栏主题开关、阅读模式、检查器。
-- 不做数学排版、交互可视化、成果预览。
+- 不做交互可视化、成果预览（数学排版按所有者 2026-09-24 要求移入范围，见文末 addendum 第 15 条）。
 - 不做新建 Task 的界面；不做 compact 看板分段。
 - 不改路由、wire、端点；不新增轮询；不做第二份 transcript；不做手机专用会话路由。
 - 审批卡不显示 risk、置信度，也不断言会话边界。
@@ -1158,5 +1158,18 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 2. UI 与正文同用系统无衬线字体，不打包衬线或 CJK webfont（2A）；
 3. 只发布「墨」一套调色板，深色、浅色两态（3A）；
 4. 会话有 `instance.taskId` 时 tab 集合是该 Task 的会话，否则是所在 Space 的会话；⌘1..9 跟随眼前的可见编号（4A）。
+
+**Addendum 2026-09-24（所有者，c-math）：数学排版移入范围。** 所有者 2026-09-24 附截图反馈「现在 latex 公式没有渲染」：transcript 里 `$$…$$` 既原样显示又被 markdown 破坏（下划线变强调、反斜杠丢失）。本 addendum 只新增第 15 条并把「不做什么」中的「数学排版」移出，不动其它条文。规则：
+
+15. **Transcript 数学排版（KaTeX）。**
+    - 引擎 KaTeX，`output: htmlAndMathml`（保留 MathML 可达性）、`throwOnError:false`（坏公式以错误样式显示 TeX 源码，绝不炸消息）、`trust:false`（禁 `\href`/`\url`/html 类指令）、`strict:"ignore"`。
+    - 定界符：`$$…$$` 与 `\[…\]` 为 display，`$…$` 与 `\(…\)` 为 inline。数学在 markdown 之前先切分（`web/src/lib/mathSegments.ts`），公式内的下划线、星号、反斜杠不被 markdown 处理。
+    - 单 `$` 走 pandoc 口径：开 `$` 后必须紧跟非空白；闭 `$` 前必须是非空白且其后不能是数字。故「花了 $5 和 $10」保持文本；代码 span/fence 与链接目标内永不解析数学；`\$` 为字面量。（实测 pandoc 3.5 源码确认：`$PATH:$HOME` 因 `:` 与 `H` 满足闭合规则仍算数学，这是规则本身而非 bug；空格分隔的 `$HOME and $PATH` 是文本。）
+    - 懒加载：KaTeX（JS+CSS+字体）为独立 chunk，仅当第一条数学节点渲染时拉取；无数学的消息/页面零请求。加载完成前以中性样式显示 TeX 源码；行高变化由 Transcript 既有的 per-row ResizeObserver 重新测量，无需改 Transcript。
+    - 消毒：数学节点由 React 组件渲染（`web/src/components/MathBlock.tsx`），KaTeX 输出不经过 rehype-sanitize，也不允许消息原始 HTML 透传。
+    - 流式：消息末尾未闭合的 `$$`/`\[` 在闭合定界符到达前一律按纯文本显示，绝不渲染半个公式；闭合时除公式自身高度外无页面跳动。
+    - 版式与主题：公式只用 currentColor，深浅两态都正确；display 公式在阅读列内居中，超宽公式在自身块内横向滚动、页面不出现横向滚动条；inline 公式不撑高正文行。
+    - 复制：选中并复制公式得到其 TeX 源码。
+    - 机械取值见 [visual-system.md](./visual-system.md) §10。许可证（MIT）已入库 `web/LICENSES/KaTeX-MIT.txt` 并登记于根 NOTICE。
 
 **依据**：[visual-system.md](./visual-system.md)（令牌契约与对比度全集）。代码锚点在 `42ccd7ee` 上复核：`web/src/styles/tokens.css:1-196`、`web/src/styles/ui.module.css:10-15,52,323-324,356-372,386-391`、`web/src/features/session/tty/theme.ts:15-68`、`web/src/pages/SessionPage.tsx:95,154,452-596,669`、`web/src/app/Shell.tsx:207-237,337`、`web/index.html:2,9`、`crates/remuda-hub/src/web.rs:1-9,100-107`。

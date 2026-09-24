@@ -209,6 +209,93 @@ describe("sanitising fence bodies", () => {
   });
 });
 
+describe("math rendering (c-math)", () => {
+  const SOFTMAX =
+    "$$\\sigma(\\mathbf{z})_i = \\frac{e^{z_i}}{\\sum_{j=1}^{K} e^{z_j}}$$";
+
+  it("renders the owner softmax formula as display KaTeX, not raw TeX", async () => {
+    render(<MarkdownText text={SOFTMAX} />);
+    const display = await screen.findByTestId("math-display");
+    expect(display.querySelector(".katex-display")).toBeTruthy();
+    expect(display.querySelector(".mfrac")).toBeTruthy();
+    // The underscores inside the formula must never survive as markdown
+    // emphasis: no <em> anywhere in the message.
+    expect(display.querySelector("em")).toBeNull();
+    expect(screen.queryByTestId("code-block")).toBeNull();
+  });
+
+  it("renders inline math and keeps surrounding prose", async () => {
+    render(<MarkdownText text={"函数 $f(x)=x^2$ 的值"} />);
+    const inline = await screen.findByTestId("math-inline");
+    expect(inline.querySelector(".katex")).toBeTruthy();
+    expect(screen.getByText(/函数/)).toBeTruthy();
+    expect(screen.getByText(/的值/)).toBeTruthy();
+  });
+
+  it("accepts the bracket delimiters", async () => {
+    render(<MarkdownText text={"a \\(x^2\\) b and\n\\[y^2\\]"} />);
+    expect((await screen.findByTestId("math-inline")).querySelector(".katex")).toBeTruthy();
+    expect((await screen.findByTestId("math-display")).querySelector(".katex-display")).toBeTruthy();
+  });
+
+  it("leaves a currency sentence as plain text", async () => {
+    render(<MarkdownText text={"花了 $5 和 $10"} />);
+    // No engine is needed for plain text: assert synchronously after a tick.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect(screen.getByText("花了 $5 和 $10")).toBeTruthy();
+  });
+
+  it("keeps escaped dollars literal", () => {
+    render(<MarkdownText text={"价格 \\$5"} />);
+    expect(screen.getByText(/价格/).textContent).toContain("$5");
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+  });
+
+  it("never parses math inside code spans or fenced blocks", async () => {
+    render(
+      <MarkdownText text={"inline `$a_b$` and\n```\n$$not math$$\n```"} />,
+    );
+    const block = await screen.findByTestId("code-block");
+    expect(block.textContent).toContain("$$not math$$");
+    expect(screen.getByText("$a_b$")).toBeTruthy();
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+    expect(screen.queryByTestId("math-display")).toBeNull();
+  });
+
+  it("shows an unclosed streaming $$ as plain text until it closes", async () => {
+    const { rerender } = render(<MarkdownText text={"intro $$\n\\sigma(z)"} />);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect(screen.getByText(/intro/)).toBeTruthy();
+
+    // The closing delimiter arrives: same message now renders the formula.
+    rerender(<MarkdownText text={"intro $$\n\\sigma(z)\n$$"} />);
+    expect(await screen.findByTestId("math-display")).toBeTruthy();
+  });
+
+  it("renders a broken formula as its source without breaking the message", async () => {
+    render(<MarkdownText text={"坏的 $$\\frac{$$ 后面"} />);
+    const error = await screen.findByTestId("math-error");
+    expect(error.textContent).toBe("\\frac{");
+    expect(screen.getByText(/后面/)).toBeTruthy();
+  });
+
+  it("keeps currency prose separate from a later broken and good display formula", async () => {
+    // Regression: the rejected `$10` must not pair across the line break with
+    // the `$$` opener, which would leave the final formula as raw text.
+    render(
+      <MarkdownText
+        text={"花了 $5 和 $10 都不渲染。\n坏的 $$\\frac{$$ 结束。\n$$x_1+x_2+x_3$$"}
+      />,
+    );
+    expect((await screen.findAllByTestId("math-display"))).toHaveLength(1);
+    expect(await screen.findByTestId("math-error")).toBeTruthy();
+    expect(screen.getByText(/花了 \$5 和 \$10 都不渲染。/)).toBeTruthy();
+  });
+});
+
 describe("D-027b file-mention folding", () => {
   it("renders a quoted [File #n] saved-at line as a collapsed row", () => {
     const text =

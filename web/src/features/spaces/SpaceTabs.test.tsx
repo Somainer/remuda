@@ -1,33 +1,58 @@
 import { useEffect, useLayoutEffect } from "react";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockDb } from "../../lib/mock";
 import { hubStore } from "../../lib/store";
 import { known } from "../../types/wire";
+import type { Workspace } from "../../types/workspace";
+import type { Instance } from "../../types/instance";
 import { SpaceTabs } from "./SpaceTabs";
+import { useTabSet } from "./useSpaceWorkbench";
 import {
   newSessionPath, selectedSpace, selectedTab, spaceKey, spaceStore, SPACES_PREFS_KEY,
-  useSpacesPrefs, visibleTabs, type Space,
+  useSpacesPrefs, type Space,
 } from "./store";
 
+// SpaceTabs resolves its container (aria-label, per-tab owning Space) from the
+// hub snapshot through useTabSet; the mock serves the same synthetic spaces
+// the harness renders.
+const hubState = vi.hoisted(() => ({ workspaces: [] as unknown as Workspace[], instances: [] as unknown[] }));
+
 vi.mock("../../lib/store", () => ({
-  hubStore: { close: vi.fn(), toast: vi.fn(), titleOf: (id: string) => id },
+  hubStore: {
+    close: vi.fn(),
+    toast: vi.fn(),
+    titleOf: (id: string) => id,
+    // The close path re-reads the live snapshot after its await, like the
+    // real store; tests replace hubState.instances to simulate window B.
+    getSnapshot: () => hubState,
+  },
+  // Fresh wrapper + arrays each render, like a real store snapshot update, so
+  // useTabSet's memo recomputes when a fixture instance is mutated in place.
+  useHub: () => ({ workspaces: [...hubState.workspaces], instances: [...hubState.instances] }),
 }));
+
+function makeInstance(id: string, hostId: string, workspaceId: string, taskId?: string | null): Instance {
+  return { ...mockDb.instances[0], id, hostId, workspaceId, taskId: taskId ?? null,
+    lifecycle: "ready", connectivity: "connected", activity: known("idle") };
+}
 
 const alpha = spaceKey("host-a", "workspace-a");
 const beta = spaceKey("host-a", "workspace-b");
 const spaces: Space[] = [
-  { id: alpha, hostId: "host-a", workspaceId: "workspace-a", name: "alpha", liveCount: 2, blockedCount: 0,
-    instances: ["a1", "a2"].map((id) => ({ ...mockDb.instances[0], id, hostId: "host-a", workspaceId: "workspace-a",
-      lifecycle: "ready", connectivity: "connected", activity: known("idle") })) },
+  { id: alpha, hostId: "host-a", workspaceId: "workspace-a", name: "alpha", liveCount: 3, blockedCount: 0,
+    instances: [makeInstance("a1", "host-a", "workspace-a"), makeInstance("a2", "host-a", "workspace-a"), makeInstance("a3", "host-a", "workspace-a")] },
   { id: beta, hostId: "host-a", workspaceId: "workspace-b", name: "beta", liveCount: 1, blockedCount: 0,
-    instances: [{ ...mockDb.instances[0], id: "b1", hostId: "host-a", workspaceId: "workspace-b",
-      lifecycle: "ready", connectivity: "connected", activity: known("idle") },
-    { ...mockDb.instances[0], id: "b-exited", hostId: "host-a", workspaceId: "workspace-b",
-      lifecycle: "exited", connectivity: "connected", activity: known("idle") }] },
+    instances: [makeInstance("b1", "host-a", "workspace-b"),
+    { ...makeInstance("b-exited", "host-a", "workspace-b"), lifecycle: "exited" }] },
 ];
+hubState.workspaces = [
+  { id: "workspace-a", hostId: "host-a", label: "alpha", rootPath: "/alpha", writePolicy: "x", canonicalRoot: { state: "known", value: "/alpha" } },
+  { id: "workspace-b", hostId: "host-a", label: "beta", rootPath: "/beta", writePolicy: "x", canonicalRoot: { state: "known", value: "/beta" } },
+] as Workspace[];
+hubState.instances = spaces.flatMap((space) => space.instances);
 
 /** The strip asks before stopping anything; take the "stop and close" branch. */
 async function stopAndClose(user: ReturnType<typeof userEvent.setup>, title: string) {
@@ -49,6 +74,9 @@ function Workbench() {
   const prefs = useSpacesPrefs();
   const instanceId = location.pathname.split("/")[2];
   const active = selectedSpace(spaces, prefs, instanceId)!;
+  // Production Shell hands the strip the D-053 container (task set or Space
+  // tabs) from useSpaceWorkbench; the harness mirrors it through useTabSet.
+  const tabSet = useTabSet();
   // Production uses BrowserRouter; mirror its address-bar update for the
   // component's async navigation guard while keeping this test in MemoryRouter.
   useLayoutEffect(() => { window.history.replaceState(null, "", location.pathname); }, [location.pathname]);
@@ -62,7 +90,7 @@ function Workbench() {
       const tab = selectedTab(space, spaceStore.getSnapshot());
       navigate(tab ? `/s/${tab.id}` : "/sessions");
     }}>切换 {space.name}</button>)}
-    <SpaceTabs space={active} tabs={visibleTabs(active, prefs)} prefs={prefs} instanceId={instanceId} newHref={newSessionPath(active)} />
+    <SpaceTabs space={active} tabs={tabSet.tabs} prefs={prefs} instanceId={instanceId} newHref={newSessionPath(active)} />
   </>;
 }
 
@@ -186,5 +214,88 @@ describe("SpaceTabs asynchronous closure", () => {
     expect(successor).toHaveAttribute("aria-selected", "true");
     await waitFor(() => expect(successor).toHaveFocus());
     expect(screen.queryByRole("tab", { name: /a1/ })).not.toBeInTheDocument();
+  });
+
+  it("re-reads current owner, dismissals and Hub data after a delayed close and never resurrects a sibling changed in another window", async () => {
+    const user = userEvent.setup();
+    // a2 starts BLOCKED: it is visible through its dismissal's resurface
+    // rule, which is exactly the case a stale render-time snapshot would
+    // still pick as successor after it goes idle.
+    const blockedA2: Instance = { ...makeInstance("a2", "host-a", "workspace-a"), activity: known("waiting-interaction") };
+    act(() => { spaces[0].instances[1] = blockedA2; });
+    hubState.instances = spaces.flatMap((space) => space.instances);
+    const pending = deferredClose();
+    renderWorkbench();
+    expect(screen.getByRole("tab", { name: /a2/ })).toBeInTheDocument();
+    // Window A starts a slow 停止并关闭 on a1 (tabs a1, a2, a3).
+    await stopAndClose(user, "a1");
+
+    // Window B, meanwhile: a2 settles to idle AND is dismissed. The Hub row
+    // is published as an IMMUTABLE REPLACEMENT — a new object, not a mutation
+    // of blockedA2 (the exact object the stale closure captured) — so a
+    // component reading its render snapshot still sees the blocked status and
+    // would wrongly resurrect it. The fixed dismiss() reads getSnapshot()
+    // after the await.
+    const idleA2: Instance = { ...blockedA2, activity: known("idle") };
+    expect(idleA2).not.toBe(blockedA2);
+    expect((blockedA2.activity as { value: string }).value, "old captured status: blocked").toBe("waiting-interaction");
+    expect((idleA2.activity as { value: string }).value, "new published status: idle").toBe("idle");
+    act(() => { spaces[0].instances[1] = idleA2; });
+    hubState.instances = spaces.flatMap((space) => space.instances);
+    const fromOtherWindow = {
+      ...spaceStore.getSnapshot(),
+      closedTabs: { [alpha]: [{ id: "a2", resurface: true }] },
+    };
+    localStorage.setItem(SPACES_PREFS_KEY, JSON.stringify(fromOtherWindow));
+    window.dispatchEvent(new StorageEvent("storage", { key: SPACES_PREFS_KEY }));
+    await waitFor(() => expect(screen.queryByRole("tab", { name: /a2/ })).not.toBeInTheDocument());
+
+    await act(async () => { pending.resolve(); });
+
+    // The successor is a3 — the still-visible tab — never the dismissed,
+    // now-idle a2 that the stale snapshot/closure would have resurfaced.
+    expect(screen.getByTestId("current-route")).toHaveTextContent("/s/a3");
+    expect(screen.queryByRole("tab", { name: /a2/ })).not.toBeInTheDocument();
+    const prefs = spaceStore.getSnapshot();
+    expect(prefs.closedTabs[alpha]?.map((entry) => entry.id).sort()).toEqual(["a1", "a2"]);
+    // Landing on a3 recorded the selection without clearing a2's dismissal.
+    expect(prefs.selectedTabs[alpha]).toBe("a3");
+  });
+});
+
+describe("SpaceTabs container semantics (D-053 §1.4)", () => {
+  it("names the Space container for an unbound session", () => {
+    renderWorkbench();
+    expect(screen.getByRole("tablist")).toHaveAccessibleName("空间 alpha 的会话");
+  });
+
+  it("names the Task container for a bound session and closes against each tab's owning Space", async () => {
+    const user = userEvent.setup();
+    act(() => {
+      // a1 (alpha) and b1 (beta) are the same task; a2 stays unbound.
+      spaces[0].instances[0].taskId = "tsk_1";
+      spaces[1].instances[0].taskId = "tsk_1";
+    });
+    try {
+      render(<MemoryRouter initialEntries={["/s/a1"]}><Workbench /></MemoryRouter>);
+      const tablist = screen.getByRole("tablist");
+      expect(tablist).toHaveAccessibleName("本任务的会话");
+      const tabs = within(tablist).getAllByRole("tab");
+      expect(tabs.map((tab) => tab.getAttribute("data-instance-id"))).toEqual(["a1", "b1"]);
+      // The unbound Space mate never rides into the task container.
+      expect(screen.queryByRole("tab", { name: /a2/ })).not.toBeInTheDocument();
+
+      // Dismissing the other-Space tab records the dismissal on beta, not alpha.
+      await user.click(screen.getByRole("button", { name: "关闭标签 b1" }));
+      await user.click(screen.getByTestId("tab-close-keep"));
+      expect(spaceStore.getSnapshot().closedTabs[beta]).toEqual([{ id: "b1", resurface: true }]);
+      expect(spaceStore.getSnapshot().closedTabs[alpha] ?? []).toEqual([]);
+      expect(screen.queryByRole("tab", { name: /b1/ })).not.toBeInTheDocument();
+    } finally {
+      act(() => {
+        spaces[0].instances[0].taskId = null;
+        spaces[1].instances[0].taskId = null;
+      });
+    }
   });
 });

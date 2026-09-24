@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { projectStatus } from "./status";
 import { known } from "../types/wire";
-import { defaultSpacePrefs, type Space } from "../features/spaces/store";
-import { SWITCH_SLOT_COUNT, switchSlotOf, switchSlots } from "./sessionSlots";
+import type { Workspace } from "../types/workspace";
+import { defaultSpacePrefs, OTHER_SPACE, spaceKey, type Space, type SpacePrefs } from "../features/spaces/store";
+import { resolveTabSet, SWITCH_SLOT_COUNT, switchSlotOf, switchSlots, tabSlots } from "./sessionSlots";
 import type { Instance } from "../types/instance";
 
 function instance(id: string, createdAt: string, patch: Partial<Instance> = {}): Instance {
@@ -75,5 +76,108 @@ describe("switchSlots — the shared ⌘digit ordering", () => {
     const slots = switchSlots(sp, prefs);
     expect(slots.map((slot) => slot.id)).toEqual(["ins_a", "ins_b", "ins_c"]);
     expect(switchSlotOf(slots, "ins_b")).toBe(2);
+  });
+});
+
+function workspace(hostId: string, workspaceId: string, label: string): Workspace {
+  return { id: workspaceId, hostId, label, rootPath: `/${label}`, writePolicy: "workspace-write",
+    canonicalRoot: { state: "known", value: `/${label}` } } as Workspace;
+}
+
+function taskInstance(id: string, hostId: string, workspaceId: string, createdAt: string, taskId?: string | null): Instance {
+  return instance(id, createdAt, { hostId, workspaceId, taskId: taskId ?? null });
+}
+
+describe("tabSlots — the /s/* digit ordering", () => {
+  it("is the rendered strip order capped at nine", () => {
+    const tabs = Array.from({ length: 11 }, (_, i) => instance(`ins_${i}`, "2026-09-01T00:00:00Z"));
+    expect(tabSlots(tabs)).toHaveLength(SWITCH_SLOT_COUNT);
+    expect(tabSlots(tabs).map((tab) => tab.id)).toEqual(tabs.slice(0, 9).map((tab) => tab.id));
+  });
+});
+
+describe("resolveTabSet — Task sessions vs Space tabs (D-053 §10)", () => {
+  const workspaces = [
+    workspace("hst_a", "wsp_a", "alpha"),
+    workspace("hst_a", "wsp_b", "beta"),
+  ];
+
+  it("falls back to the active Space's visible tabs for an unbound session", () => {
+    const instances = [
+      taskInstance("ins_a1", "hst_a", "wsp_a", "2026-09-10T00:00:00Z", null),
+      taskInstance("ins_a2", "hst_a", "wsp_a", "2026-09-11T00:00:00Z", null),
+      taskInstance("ins_b1", "hst_a", "wsp_b", "2026-09-12T00:00:00Z", null),
+    ];
+    const set = resolveTabSet(workspaces, instances, defaultSpacePrefs(), "ins_a2");
+    expect(set.kind).toBe("space");
+    expect(set.tabs.map((tab) => tab.id)).toEqual(["ins_a1", "ins_a2"]);
+    expect(set.ariaLabel).toBe(`空间 alpha 的会话`);
+    expect(set.space?.id).toBe(spaceKey("hst_a", "wsp_a"));
+  });
+
+  it("collects every snapshot instance of the bound task across Spaces, sorted", () => {
+    const instances = [
+      taskInstance("ins_b1", "hst_a", "wsp_b", "2026-09-12T00:00:00Z", "tsk_1"),
+      taskInstance("ins_a2", "hst_a", "wsp_a", "2026-09-11T00:00:00Z", "tsk_1"),
+      taskInstance("ins_a1", "hst_a", "wsp_a", "2026-09-10T00:00:00Z", "tsk_1"),
+      taskInstance("ins_a3", "hst_a", "wsp_a", "2026-09-13T00:00:00Z", null),
+      taskInstance("ins_b2", "hst_a", "wsp_b", "2026-09-14T00:00:00Z", "tsk_other"),
+    ];
+    const set = resolveTabSet(workspaces, instances, defaultSpacePrefs(), "ins_b1");
+    expect(set.kind).toBe("task");
+    expect(set.taskId).toBe("tsk_1");
+    expect(set.ariaLabel).toBe("本任务的会话");
+    // createdAt order; neither the unbound Space mate nor the other task shows.
+    expect(set.tabs.map((tab) => tab.id)).toEqual(["ins_a1", "ins_a2", "ins_b1"]);
+    // A deep link selects the tab's owning Space even while showing the task set.
+    expect(set.space?.id).toBe(spaceKey("hst_a", "wsp_b"));
+  });
+
+  it("filters a task tab by its owning Space dismissal, and records close on that owner", () => {
+    const instances = [
+      taskInstance("ins_a1", "hst_a", "wsp_a", "2026-09-10T00:00:00Z", "tsk_1"),
+      taskInstance("ins_b1", "hst_a", "wsp_b", "2026-09-11T00:00:00Z", "tsk_1"),
+    ];
+    const prefs: SpacePrefs = {
+      ...defaultSpacePrefs(),
+      closedTabs: { [spaceKey("hst_a", "wsp_b")]: [{ id: "ins_b1", resurface: true }] },
+    };
+    const set = resolveTabSet(workspaces, instances, prefs, "ins_a1");
+    expect(set.tabs.map((tab) => tab.id)).toEqual(["ins_a1"]);
+    expect(set.ownerOf(instances[0])).toBe(spaceKey("hst_a", "wsp_a"));
+    expect(set.ownerOf(instances[1])).toBe(spaceKey("hst_a", "wsp_b"));
+  });
+
+  it("re-surfaces a dismissed task tab from another Space when it becomes blocked", () => {
+    const instances = [
+      taskInstance("ins_a1", "hst_a", "wsp_a", "2026-09-10T00:00:00Z", "tsk_1"),
+      taskInstance("ins_b1", "hst_a", "wsp_b", "2026-09-11T00:00:00Z", "tsk_1"),
+    ];
+    instances[1].activity = known("waiting-interaction");
+    const prefs: SpacePrefs = {
+      ...defaultSpacePrefs(),
+      closedTabs: { [spaceKey("hst_a", "wsp_b")]: [{ id: "ins_b1", resurface: true }] },
+    };
+    const set = resolveTabSet(workspaces, instances, prefs, "ins_a1");
+    expect(set.tabs.map((tab) => tab.id)).toEqual(["ins_a1", "ins_b1"]);
+  });
+
+  it("owns an unregistered task session through the 其他 Space bucket", () => {
+    const instances = [
+      taskInstance("ins_a1", "hst_a", "wsp_a", "2026-09-10T00:00:00Z", "tsk_1"),
+      taskInstance("ins_x1", "hst_zzz", "wsp_zzz", "2026-09-11T00:00:00Z", "tsk_1"),
+    ];
+    const set = resolveTabSet(workspaces, instances, defaultSpacePrefs(), "ins_x1");
+    expect(set.tabs.map((tab) => tab.id)).toEqual(["ins_a1", "ins_x1"]);
+    expect(set.ownerOf(instances[1])).toBe(OTHER_SPACE);
+  });
+
+  it("tabSlots numbers the task strip in the same order resolveTabSet renders it", () => {
+    const instances = [
+      taskInstance("ins_b1", "hst_a", "wsp_b", "2026-09-12T00:00:00Z", "tsk_1"),
+      taskInstance("ins_a1", "hst_a", "wsp_a", "2026-09-10T00:00:00Z", "tsk_1"),
+    ];
+    const set = resolveTabSet(workspaces, instances, defaultSpacePrefs(), "ins_b1");
+    expect(tabSlots(set.tabs).map((tab) => tab.id)).toEqual(["ins_a1", "ins_b1"]);
   });
 });

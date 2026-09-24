@@ -1,101 +1,115 @@
-/* QuickFind (exploration §5 P1-1). Only the finder's own surfaces are styled
+/* @tokens strict */
+/* QuickFind (ui-spec §1.4 finder). Only the finder's own surfaces are styled
    here; the scrim/panel geometry comes from components/overlay.module.css. */
 
 .sheet {
-  width: min(560px, calc(100vw - 24px));
-  padding: 14px 14px 12px;
-  gap: 10px;
+  width: min(560px, calc(100vw - var(--space-5)));
+  padding: var(--space-3) var(--space-3) var(--space-3);
+  gap: var(--space-2);
 }
 
 .head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-2);
 }
 
 .title {
   margin: 0;
-  font-size: 14px;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
   font-weight: 600;
+  line-height: var(--lh-title);
 }
 
 .close {
   margin-left: auto;
-  height: 32px;
-  min-width: 32px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  min-height: var(--control-h);
+  min-width: var(--control-h);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--mute);
-  font-size: 13px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
 }
 
 .close:hover {
-  color: var(--paper);
+  border-color: var(--border-control);
+  color: var(--fg-strong);
 }
 
 .input {
   width: 100%;
-  height: 38px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-0);
-  color: var(--paper);
-  font: 14px var(--font);
+  height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-size: var(--text-input);
 }
 
 .input::placeholder {
-  color: var(--mute);
+  color: var(--fg-faint);
 }
 
 .cacheNote {
   margin: 0;
-  padding: 8px 10px;
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  color: var(--dust);
-  font-size: 12px;
-  line-height: 1.5;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--attention-border);
+  border-radius: var(--radius-sm);
+  background: var(--attention-bg);
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .listHead {
   display: flex;
   justify-content: space-between;
-  gap: 12px;
-  color: var(--mute);
-  font-size: 12px;
+  gap: var(--space-3);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .scopeNote {
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
-/* Clock/list toggle for the grouped phone Jump To sheet (ui-spec §4.7). */
+/* Clock/list toggle for the grouped phone Jump To sheet (ui-spec §4.7):
+   an inset segmented track, pressed item raised. No overflow clip: under a
+   coarse pointer the buttons extend a 44px hit area above/below the track. */
 .order {
+  position: relative;
   flex: none;
   display: flex;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  overflow: hidden;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
 }
 
 .order button {
-  min-height: 32px;
-  padding: 0 10px;
+  position: relative;
+  min-height: var(--seg-item);
+  padding: 0 var(--space-2);
   border: 0;
-  background: var(--ink-1);
-  color: var(--mute);
-  font-family: var(--font);
-  font-size: 12px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  font-weight: 500;
 }
 
 .order button[aria-pressed="true"] {
-  background: var(--ink-2);
-  color: var(--paper);
+  background: var(--bg-raised);
+  color: var(--fg-strong);
+  box-shadow: inset 0 0 0 1px var(--border-control);
 }
 
 /* Grouped Jump To: project + branch + blocked-count headers. The leaves are
@@ -106,17 +120,18 @@
   z-index: 1;
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  padding: 6px 10px;
-  background: var(--ink-2);
-  font-size: 12px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-raised);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .groupProject {
   flex: 1 1 auto;
   min-width: 0;
   font-weight: 600;
-  color: var(--paper);
+  color: var(--fg-strong);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -124,21 +139,22 @@
 
 .groupBranch {
   flex: none;
-  color: var(--cold);
-  font-family: var(--mono);
-  font-size: 11px;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
   white-space: nowrap;
 }
 
+/* 待处理 count is attention amber, never red (D-053 state discipline). */
 .groupBlocked {
   flex: none;
-  color: var(--danger-strong);
-  font-size: 11px;
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
   white-space: nowrap;
 }
 
 .groupBlocked[data-zero="1"] {
-  color: var(--mute);
+  color: var(--fg-muted);
 }
 
 .list {
@@ -149,31 +165,35 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
-  margin: 0 -4px;
-  padding: 0 4px;
+  margin: 0 calc(var(--space-1) * -1);
+  padding: 0 var(--space-1);
 }
 
 .optionSlot {
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
 }
 
 .option {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-2);
   width: 100%;
-  padding: 7px 10px;
+  padding: 7px var(--space-2);
   border: 0;
-  border-radius: var(--radius);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
+  color: var(--fg-body);
   text-align: left;
   cursor: pointer;
 }
 
 .option[data-selected="true"] {
-  background: var(--ink-1);
-  box-shadow: inset 2px 0 0 var(--dust);
+  background: var(--bg-selected);
+}
+
+.option[data-selected="true"] .optionTitle {
+  color: var(--fg-strong);
+  font-weight: 600;
 }
 
 .optionBody {
@@ -185,101 +205,103 @@
 }
 
 .optionTitle {
-  font-size: 13px;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 .optionMeta {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-2);
   min-width: 0;
-  color: var(--mute);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .optionScope {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
   flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .optionStatus {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   flex: none;
 }
 
 .optionTime {
   margin-left: auto;
   flex: none;
-  font-family: var(--mono);
-  font-size: 11px;
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .empty {
-  padding: 14px 10px 6px;
-  color: var(--paper);
-  font-size: 13px;
+  padding: var(--space-3) var(--space-2) var(--space-2);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
   line-height: 1.6;
 }
 
 .empty p {
-  margin: 0 0 6px;
+  margin: 0 0 var(--space-2);
 }
 
 .emptyHint {
-  color: var(--mute);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .clear {
-  margin-top: 4px;
-  height: 32px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  margin-top: var(--space-1);
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
-  font-size: 13px;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
 }
 
-/* Entry point wrapper in the Spaces panel. */
+.clear:hover {
+  border-color: var(--border-control);
+}
+
+/* Entry point in the Spaces index panel and drawer. */
 .panelSearch {
   display: flex;
-  padding: 0 8px;
-}
-
-.panelSearch[data-collapsed="true"] {
-  justify-content: center;
-  padding: 0;
+  flex: none;
+  padding: var(--space-2) var(--space-2) 0;
 }
 
 .trigger {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
-  min-height: 34px;
-  padding: 0 10px;
-  margin: 6px 0 2px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-1);
-  color: var(--mute);
-  font-size: 13px;
+  min-height: var(--control-h);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
   text-align: left;
   cursor: pointer;
 }
 
 .trigger:hover {
-  color: var(--paper);
-  border-color: var(--cold);
+  color: var(--fg-strong);
 }
 
 .triggerIcon {
@@ -292,121 +314,111 @@
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .kbd {
   flex: none;
   padding: 1px 5px;
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  font: 11px var(--mono);
-  color: var(--mute);
-  background: var(--ink-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg-inset);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
 }
 
-.railTrigger {
-  width: 30px;
-  min-height: 30px;
-  border: 0;
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--paper);
-  font-size: 16px;
-  cursor: pointer;
-}
-
-.railTrigger:hover {
-  background: var(--ink-2);
-}
-
-/* Delete-session confirmation rendered through the shared Sheet (the panel's
-   old bespoke ActionSheet mask is gone). */
+/* Delete-session confirmation rendered through the shared Sheet. */
 .confirmSheet {
-  width: min(420px, calc(100vw - 24px));
+  width: min(420px, calc(100vw - var(--space-5)));
 }
 
 .confirmTitle {
   margin: 0;
-  font-size: 14px;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
   font-weight: 600;
+  line-height: var(--lh-title);
 }
 
 .confirmDetail {
   margin: 0;
-  color: var(--mute);
-  font-size: 13px;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
   line-height: 1.6;
 }
 
 .confirmActions {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin-top: 4px;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
 }
 
 .confirmButton {
-  min-height: 36px;
-  padding: 0 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  min-height: var(--control-h-lg);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
-  font-size: 13px;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  font-weight: 500;
 }
 
 .confirmButton:hover:not(:disabled) {
-  border-color: var(--cold);
+  border-color: var(--border-control);
 }
 
 .confirmDanger {
-  border-color: var(--danger);
-  color: var(--paper);
+  border-color: var(--danger-border);
+  color: var(--danger-fg);
+}
+
+.confirmDanger:hover:not(:disabled) {
+  background: var(--danger-bg);
 }
 
 .confirmButton:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
 }
 
-/* Phones: bottom-sheet geometry and the project's 44px touch targets
-   (exploration §5 P1-3). min-height survives fractional borders under
-   border-box, unlike height. */
-@media (max-width: 767px) {
-  .confirmSheet {
-    width: 100%;
-  }
-
-  .confirmButton {
-    min-height: 44px;
-  }
-
+/* Coarse pointers get 44px targets and the bottom-sheet sheet geometry
+   (visual-system §6.2). Pointer, not width: a narrow fine window keeps the
+   dense layout. */
+@media (pointer: coarse) {
+  .confirmSheet,
   .sheet {
     width: 100%;
   }
 
+  .confirmButton,
   .close,
-  .clear {
-    min-height: 44px;
-  }
-
-  .input {
-    height: 44px;
+  .clear,
+  .input,
+  .trigger {
+    min-height: var(--touch);
   }
 
   .option {
-    min-height: 44px;
-    padding: 6px 8px;
+    min-height: var(--touch);
+    padding: var(--space-2) var(--space-2);
   }
 
-  .trigger {
-    min-height: 44px;
+  .order button {
+    min-width: var(--touch);
   }
 
-  .railTrigger {
-    width: 44px;
-    min-height: 44px;
+  /* 44px touch target around the 26px visible segmented item (visual-system
+     §8.2); the panel's gaps reserve the vertical room. */
+  .order button::after {
+    content: "";
+    position: absolute;
+    top: -9px;
+    bottom: -9px;
+    left: 0;
+    right: 0;
   }
 
   .list {
@@ -415,9 +427,5 @@
 
   .optionTime {
     display: none;
-  }
-
-  .order button {
-    min-height: 44px;
   }
 }

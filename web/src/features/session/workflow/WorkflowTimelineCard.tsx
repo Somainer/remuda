@@ -22,7 +22,6 @@ import type {
 import type { SubagentRef } from "../assemble";
 import { ToolCard } from "../ToolCard";
 import { isToolFailure } from "../assemble";
-import sessionCss from "../toolCard.module.css";
 import { subagentHref } from "../subagent/SubagentRows";
 import {
   agentClocks,
@@ -262,6 +261,8 @@ function AgentRow({
   const { instanceId = "" } = useParams();
   const clocks = agentClocks(agent, launchedAtMs, nowMs);
   const running = agent.state === "running";
+  // The whole row is the open target: one link, focusable, with the ghost
+  // 「打开」 revealed on hover/focus (always on a coarse pointer).
   return (
     <li
       className={css.agent}
@@ -270,16 +271,16 @@ function AgentRow({
       data-agent-id={agent.id}
       id={rowId}
     >
-      <span className={css.state}>
-        <StateGlyph state={agent.state} />
-        <span className={css.sr}>{STATE_WORD[agent.state]}</span>
-      </span>
       <Link
         className={css.agentOpen}
         to={subagentHref(instanceId, agent.id)}
-        data-testid="workflow-agent-open"
+        data-testid="workflow-agent-open-btn"
         title="打开子会话"
       >
+        <span className={css.state}>
+          <StateGlyph state={agent.state} />
+          <span className={css.sr}>{STATE_WORD[agent.state]}</span>
+        </span>
         <span className={css.agentLabel} title={agent.label}>
           <span className={css.agentName}>{agent.label}</span>
           {agent.attempt && agent.attempt > 1 ? (
@@ -289,7 +290,7 @@ function AgentRow({
           ) : null}
         </span>
         <span className={css.agentMeta}>
-          {model ? <span className={`${css.model} ${css.soft}`}>{model}</span> : null}
+          {model ? <span className={`${css.model} ${css.soft}`} title={agent.model}>{model}</span> : null}
           {starting ? <span className={css.soft}>启动中</span> : null}
           {!starting && agent.latestTool ? <span className={`${css.tool} ${css.soft}`}>{agent.latestTool}</span> : null}
           {!starting ? (
@@ -327,16 +328,10 @@ function AgentRow({
             title={agent.tokens === undefined ? missingTitle(T_TOKENS, "tokens（agent transcript 暂无 usage）") : T_TOKENS}
           />
         </span>
-      </Link>
-      <span className={css.agentOpenBtn}>
-        <Link
-          className={sessionCss.openBtn}
-          to={subagentHref(instanceId, agent.id)}
-          data-testid="workflow-agent-open-btn"
-        >
+        <span className={css.agentOpenHint} aria-hidden="true">
           打开
-        </Link>
-      </span>
+        </span>
+      </Link>
       {memberRef ? <MemberToolFold subagent={memberRef} /> : null}
     </li>
   );
@@ -398,6 +393,8 @@ function PhaseBlock({
   };
 
   return (
+    // Members sit in one column at every width; the projection's grid hint
+    // only marks the phase (data-grid), so names never split the row.
     <div className={css.phase} data-testid="workflow-phase" data-grid={phase.grid ? "1" : "0"}>
       <button
         type="button"
@@ -413,7 +410,7 @@ function PhaseBlock({
         <span className={css.phaseMeta}>{phase.metaText}</span>
       </button>
       {open ? (
-        <ul className={`${css.agents} ${phase.grid ? css.agentsGrid : ""}`} id={bodyId}>
+        <ul className={css.agents} id={bodyId}>
           {laid.rows.map((agent, index) => (
             <Fragment key={agent.id}>
               {laid.foldIndex === index ? <FoldToggle key="fold" phaseId={phase.id} folded={laid.folded} open={showFolded} onToggle={() => setShowFolded(!showFolded)} /> : null}
@@ -566,7 +563,7 @@ function DetailedCard({
             </p>
           ) : null}
           {!running && card.summary ? (
-            <p className={css.live}>
+            <p className={`${css.live} ${css.result}`}>
               <b>结果</b>
               <span>{card.summary}</span>
             </p>

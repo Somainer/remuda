@@ -116,15 +116,20 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 8px;
+  gap: 4px 6px;
   margin-left: auto;
-  font-family: var(--font-mono);
   font-size: var(--text-meta);
   line-height: 16px;
   font-variant-numeric: tabular-nums;
   color: var(--fg-muted);
 }
 .meta i { font-style: normal; color: var(--fg-body); }
+/* Quiet `·` between the header numbers; the rail leads without one. */
+.meta > span:not(.rail) ~ span::before {
+  content: "·";
+  margin-right: 6px;
+  color: var(--fg-faint);
+}
 
 /* Dotted 72px progress rail with an accent fill. */
 .rail {
@@ -151,16 +156,16 @@
   transition: width 240ms ease;
 }
 
-/* Live / result line under the header. */
+/* Live / result line under the header: sans, tabular numerals. */
 .live {
   display: flex;
   gap: 6px;
   min-width: 0;
   margin: 0;
   padding: 0 0 4px 22px;
-  font-family: var(--font-mono);
   font-size: var(--text-meta);
   line-height: 16px;
+  font-variant-numeric: tabular-nums;
   color: var(--fg-muted);
 }
 .live b { font-weight: 400; color: var(--fg-body); flex: none; }
@@ -169,6 +174,16 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* The result is a sentence: body text in the muted colour, wrapping. */
+.result {
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+.result span {
+  overflow: visible;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* Indented body track. */
@@ -209,43 +224,29 @@
   font-weight: 500;
 }
 .phaseCount {
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: var(--text-meta);
   color: var(--fg-muted);
 }
 .phaseMeta {
   margin-left: auto;
-  font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
   font-size: var(--text-meta);
   color: var(--fg-muted);
 }
 
-/* Agent list: rows shared by list and grid layouts. */
+/* Agent list: one column at every width, no per-row borders. */
 .agents {
   list-style: none;
   margin: 0 0 2px;
-  padding: 0 0 0 16px;
+  padding: 0 0 0 12px;
 }
-.agentsGrid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
-  column-gap: 16px;
-}
-.agentsGrid .more { grid-column: 1 / -1; }
 
 .agent {
-  display: grid;
-  grid-template-columns: 12px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 0 8px;
-  padding: 2px 0;
-  min-height: 22px;
+  min-width: 0;
   font-size: 12px;
   line-height: 18px;
 }
-.state { display: inline-flex; align-items: center; justify-content: center; }
 .stateIco { width: 12px; height: 12px; flex: none; color: var(--fg-muted); }
 .stateIcoDone { color: var(--success-fg); }
 .stateIcoFailed { color: var(--danger-fg); }
@@ -255,8 +256,10 @@
   display: flex;
   align-items: center;
   gap: 5px;
-  min-width: 0;
-  color: var(--fg-muted);
+  flex: 1 1 0;
+  /* The name keeps its room; the meta yields first on a tight row. */
+  min-width: min(45%, 12em);
+  color: var(--fg-body);
 }
 .agentName {
   min-width: 0;
@@ -264,31 +267,42 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent[data-state="running"] .agentLabel { color: var(--fg-body); }
+.agent[data-state="running"] .agentLabel { color: var(--fg-strong); }
 .agent[data-state="failed"] .agentLabel { color: var(--danger-fg); }
 .agent[data-state="queued"] .agentLabel { color: var(--fg-muted); }
 .agent[data-state="killed"] .agentLabel { color: var(--fg-muted); }
 
+/* Right-aligned quiet sans meta, `1m 39s · 36k`, tabular numerals. When the
+   row is tight the meta gives way from its start edge; tokens stay last. */
 .agentMeta {
   display: flex;
-  flex-wrap: wrap;
+  flex: 0 1 auto;
   align-items: center;
   justify-content: flex-end;
-  gap: 0 8px;
-  font-family: var(--font-mono);
+  gap: 0 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
   font-size: var(--text-meta);
   line-height: 16px;
   font-variant-numeric: tabular-nums;
   color: var(--fg-muted);
 }
-.agentMeta b { font-weight: 400; color: var(--fg-strong); }
+/* The separator trails each field, so a field hidden on narrow screens
+   takes its own `·` with it. */
+.agentMeta > :not(:last-child)::after {
+  content: "·";
+  margin-left: 6px;
+  color: var(--fg-faint);
+}
+.agentMeta b { font-weight: 400; color: var(--fg-muted); }
 /* c-wfcard: one-character clock prefix (等/闲) and the absent-value dash. */
 .clockTag {
   font-style: normal;
   margin-right: 2px;
-  color: var(--fg-muted);
+  color: var(--fg-faint);
 }
-.agentMeta .missing { color: var(--fg-muted); }
+.agentMeta .missing { color: var(--fg-faint); }
 
 .model {
   max-width: 144px;
@@ -296,20 +310,14 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  padding: 0 6px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg-inset);
-  font-size: var(--text-2xs);
-  line-height: 15px;
-  font-weight: 500;
-  color: var(--fg-muted);
+  color: var(--fg-faint);
 }
 .tool {
   max-width: 96px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--fg-faint);
 }
 
 .retry {
@@ -380,23 +388,39 @@
   .chev, .railFill { transition: none; }
 }
 
-/* c-wfdrill: drill-in member rows. */
+/* c-wfdrill / UO-5: the whole member row is the drill-in link. Hover and
+   focus paint the row; the ghost 「打开」 appears with them, and stays on a
+   coarse pointer, where the row itself is the 44px target. */
 .agentOpen {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  min-height: 24px;
+  padding: 2px 4px;
+  margin: 0 -4px;
   text-decoration: none;
   color: inherit;
   border-radius: var(--radius-xs);
 }
-.agentOpen:hover { background: var(--bg-hover); }
-.agentOpen .agentLabel { flex: 0 1 auto; min-width: 80px; }
-.agentOpen .agentMeta { flex: 1 1 auto; }
-.agentOpenBtn { display: inline-flex; align-items: center; }
+.agentOpen:hover { background: var(--bg-hover); text-decoration: none; }
+.agentOpen:focus-visible { outline: 1px solid var(--focus); outline-offset: 0; background: var(--bg-hover); }
+.state { flex: none; display: inline-flex; align-items: center; justify-content: center; }
+.agentOpenHint {
+  flex: none;
+  font-size: var(--text-meta);
+  line-height: 16px;
+  color: var(--link);
+  visibility: hidden;
+}
+.agentOpen:hover .agentOpenHint,
+.agentOpen:focus-visible .agentOpenHint { visibility: visible; }
+@media (pointer: coarse) {
+  .agentOpen { min-height: var(--touch); }
+  .agentOpenHint { visibility: visible; }
+}
 .memberTools {
-  grid-column: 2 / -1;
-  margin: 2px 0 4px;
+  margin: 2px 0 4px 20px;
 }
 .memberToolsToggle {
   border: 0;

@@ -3,6 +3,16 @@ import type { Host, Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { known, na, unknownKnowledge, type Id } from "../../types/wire";
 import { deriveApprovalRows, type ApprovalFilters, type ApprovalSource } from "./approvalRows";
+import {
+  CARRIER_LABEL,
+  DEPARTED_STATUS_TEXT,
+  QUEUE_STATUS_TEXT,
+  carrierLabel,
+  deadlineLabel,
+  decisionPreview,
+  decisionTitle,
+  statusDotOf,
+} from "./approvalRows";
 
 const T0 = "2026-09-20T10:00:00.000Z";
 const T1 = "2026-09-20T11:00:00.000Z";
@@ -321,5 +331,94 @@ describe("deriveApprovalRows joins and order", () => {
     ];
     const { queue } = deriveApprovalRows(source(items), FILTERS);
     expect(queue.map((row) => row.item.id)).toEqual(["itx_1", "itx_2", "itx_3"]);
+  });
+});
+
+describe("decision card presentational helpers", () => {
+  it("labels every known carrier and maps unsupported to 未知", () => {
+    expect(Object.keys(CARRIER_LABEL).sort()).toEqual(
+      [
+        "acp-rpc",
+        "claude-control",
+        "claude-hook",
+        "codex-rpc",
+        "harness-hook",
+        "native-tty",
+        "unsupported",
+      ].sort(),
+    );
+    expect(carrierLabel("native-tty")).toBe("终端屏幕");
+    expect(carrierLabel("harness-hook")).toBe("工具钩子");
+    expect(carrierLabel("unsupported")).toBe("未知");
+    for (const label of Object.values(CARRIER_LABEL)) expect(label.length).toBeGreaterThan(0);
+  });
+
+  it("renders an unknown/absent deadline as an em dash, never 0 or 无限期", () => {
+    const unknownDeadline = approval({ id: "itx_1", instanceId: "ins_1" });
+    expect(unknownDeadline.deadline.state).not.toBe("known");
+    expect(deadlineLabel(unknownDeadline)).toBe("—");
+  });
+
+  it("renders a known deadline as a clock time rather than a dash", () => {
+    const knownDeadline = approval({
+      id: "itx_1",
+      instanceId: "ins_1",
+      deadline: known("2026-09-20T09:05:00.000Z"),
+    });
+    const label = deadlineLabel(knownDeadline);
+    expect(label).not.toBe("—");
+    expect(label).toMatch(/\d{1,2}[:：]\d{2}/);
+  });
+
+  it("encodes the §2.5 status sentences", () => {
+    expect(QUEUE_STATUS_TEXT.pending).toBe("等待你的选择");
+    expect(QUEUE_STATUS_TEXT.answering).toBe("已提交 · 等待确认");
+    expect(QUEUE_STATUS_TEXT.paused).toBe("主机离线，交互暂停");
+    expect(DEPARTED_STATUS_TEXT.expired).toContain("过期");
+    expect(DEPARTED_STATUS_TEXT.superseded).toContain("其它设备");
+  });
+
+  it("maps each ui state to a shape-encoded status dot", () => {
+    expect(statusDotOf("pending")).toBe("blocked");
+    expect(statusDotOf("answering")).toBe("working");
+    expect(statusDotOf("paused")).toBe("unknown");
+    expect(statusDotOf("expired")).toBe("exited");
+    expect(statusDotOf("superseded")).toBe("idle");
+  });
+
+  it("titles approvals by tool name and terminal questions by carrier", () => {
+    expect(decisionTitle(approval({ id: "i", instanceId: "ins_1" }))).toBe("Bash");
+    const tty = approval({
+      id: "i",
+      instanceId: "ins_1",
+      kind: "question",
+      carrier: "native-tty",
+      request: { kind: "question", title: "x", fields: [] },
+    });
+    expect(decisionTitle(tty)).toBe("终端提问");
+  });
+
+  it("previews approvals verbatim and composes the hook-question line", () => {
+    expect(decisionPreview(approval({ id: "i", instanceId: "ins_1" }))).toBe(
+      "rm -rf /tmp/i",
+    );
+    const field = {
+      id: "q0",
+      title: "下一步",
+      description: null,
+      input: "single-select" as const,
+      required: true,
+      options: [],
+      allowFreeText: false,
+      sensitive: false,
+    };
+    const hookQuestion = approval({
+      id: "i",
+      instanceId: "ins_1",
+      kind: "question",
+      carrier: "claude-control",
+      request: { kind: "question", title: "AskUserQuestion", fields: [field, { ...field, id: "q1" }] },
+    });
+    expect(decisionPreview(hookQuestion)).toBe("问你 2 题 · AskUserQuestion");
   });
 });

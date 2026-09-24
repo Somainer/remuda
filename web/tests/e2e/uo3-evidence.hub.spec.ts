@@ -309,8 +309,21 @@ test("both appearances resolve role tokens at 390 and 1440", async ({ browser })
   try {
     const page = await context.newPage();
     await login(page);
+    await createSession(page, "mhome-blocked UO-3 appearances");
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
+    await expect(page.getByTestId("home-row")).toHaveCount(1);
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
+    // Wait for the instance itself to settle into blocked (badge leads by a
+    // poll): the committed frame shows the ⚠ row and the group's 1 待处理.
+    await expect(page.getByTestId("home-row")).toHaveAttribute("data-status", "blocked", {
+      timeout: 15_000,
+    });
+    await expect(page.getByTestId("home-group")).toHaveAttribute("data-blocked", "1");
+    // Dismiss the install hint so the committed frames show only the 52+52
+    // head and the row (the banner is surface chrome above the home, not it).
+    const dismiss = page.getByRole("button", { name: "知道了" });
+    if (await dismiss.isVisible().catch(() => false)) await dismiss.click();
     for (const mode of ["dark", "light"] as const) {
       await setMode(page, mode);
       const tokens = await page.evaluate(() => {
@@ -406,27 +419,37 @@ test("perf: gaining pending bottom-bar interactions never commits HomeList", asy
     // The interactions list gets `extra` extra pending rows per response.
     let extra = 0;
     await page.route("**/v1/interactions", async (route) => {
-      if (route.request().method() !== "GET") {
-        await route.continue();
-        return;
-      }
-      const response = await route.fetch();
-      const body = (await response.json()) as { items?: Array<Record<string, unknown>> };
-      const items = [...(body.items ?? [])];
-      const first = items.find((item) => item.state === "pending");
-      if (first && extra > 0) {
-        for (let n = 0; n < extra; n += 1) {
-          const suffix = `_synth_${items.length}_${n}`;
-          items.push({
-            ...first,
-            id: `${String(first.id ?? "int")}${suffix}`,
-            interactionId: first.interactionId
-              ? `${String(first.interactionId)}${suffix}`
-              : undefined,
-          });
+      try {
+        if (route.request().method() !== "GET") {
+          await route.continue();
+          return;
+        }
+        const response = await route.fetch();
+        const body = (await response.json()) as { items?: Array<Record<string, unknown>> };
+        const items = [...(body.items ?? [])];
+        const first = items.find((item) => item.state === "pending");
+        if (first && extra > 0) {
+          for (let n = 0; n < extra; n += 1) {
+            const suffix = `_synth_${items.length}_${n}`;
+            items.push({
+              ...first,
+              id: `${String(first.id ?? "int")}${suffix}`,
+              interactionId: first.interactionId
+                ? `${String(first.interactionId)}${suffix}`
+                : undefined,
+            });
+          }
+        }
+        await route.fulfill({ response, json: { ...body, items } });
+      } catch {
+        // The context can close (cleanup) while a polled fetch is mid-flight;
+        // there is no response to forge then — swallow the disposal.
+        try {
+          await route.abort().catch(() => undefined);
+        } catch {
+          /* already disposed */
         }
       }
-      await route.fulfill({ response, json: { ...body, items } });
     });
 
     // Let one post-freeze refresh cycle (and the task ledger poll it crosses)
@@ -457,7 +480,11 @@ test("perf: gaining pending bottom-bar interactions never commits HomeList", asy
         baseline,
       );
     }
+    // Stop intercepting before the context closes so no route.fetch can race
+    // cleanup teardown.
+    await page.unrouteAll();
   } finally {
+    await page.unrouteAll().catch(() => undefined);
     await cleanup(context);
     await context.close();
   }

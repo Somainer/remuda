@@ -391,5 +391,18 @@ test.describe("with a coarse pointer", () => {
     }));
     expect(overflow.doc).toBeLessThanOrEqual(overflow.win + 1);
     await shot(page, "ux2026-toolfold-longname-390.png");
+
+    // UO-5: a coarse pointer never makes the folded line itself taller; the
+    // reach is the ::after alone, at the desktop width too.
+    for (const width of [390, 1280]) {
+      await page.setViewportSize({ width, height: 844 });
+      await expect(card).toHaveAttribute("data-folded", "1");
+      const line = await toggle.evaluate((el) => ({
+        head: (el.parentElement as HTMLElement).getBoundingClientRect().height,
+        after: getComputedStyle(el, "::after").height,
+      }));
+      expect(line.head).toBe(24);
+      expect(line.after).toBe("44px");
+    }
   });
 });

@@ -237,9 +237,17 @@
   background: var(--bg-hover);
 }
 
+/* A coarse pointer keeps the visible line at 24px; the open control reaches
+   44px through an invisible ::after, not a taller row. */
 @media (pointer: coarse) {
-  .foldHead {
-    min-height: var(--touch);
+  .foldOpen::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
   }
 }
 

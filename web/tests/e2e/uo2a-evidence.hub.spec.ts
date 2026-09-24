@@ -80,10 +80,13 @@ for (const width of WIDTHS) {
     await page.emulateMedia({ reducedMotion: "reduce" });
     const bottomBar = page.locator('nav[aria-label="手机底栏"]');
 
-    await page.goto("/sessions");
+    // Compact /sessions redirects to the phone home /m, whose bar is PhoneShell's.
+    await page.goto(phone ? "/m" : "/sessions");
     await page.waitForLoadState("networkidle").catch(() => undefined);
-    if (phone) await expect(bottomBar).toBeVisible();
-    else await expect(page.getByTestId("sidebar")).toBeVisible();
+    if (phone) {
+      await expect(page).toHaveURL(/\/m$/);
+      await expect(bottomBar).toBeVisible();
+    } else await expect(page.getByTestId("sidebar")).toBeVisible();
     for (const mode of MODES) await shoot(page, "sessions", mode, width);
 
     await page.goto(`/s/${sessionId}`);

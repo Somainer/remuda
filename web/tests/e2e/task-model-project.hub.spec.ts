@@ -246,8 +246,32 @@ test.describe("Project entity + top-bar project switcher (HUB_E2E_PROJECT_SWITCH
     // board).
     const projectRow = (id: string) =>
       page.getByTestId("sidebar-project-row").and(page.locator(`[data-project-id="${id}"]`));
+    const boardRead = (id: string, target: Page = page) =>
+      target.waitForRequest((request) => new URL(request.url()).pathname === "/v1/board" && new URL(request.url()).searchParams.get("project") === id);
+    // ui-spec §1.1: the row lands on /board?project={id}, so history and a
+    // copied link keep the project.
+    await projectRow(crossHostProject.id).click();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
     await projectRow(otherProject.id).click();
-    await expect(page).toHaveURL(/\/board$/);
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+    const backRead = boardRead(crossHostProject.id);
+    await page.goBack();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${crossHostProject.id}$`));
+    await backRead;
+    await page.goForward();
+    await expect(page).toHaveURL(new RegExp(`/board\\?project=${otherProject.id}$`));
+
+    // A copied link opens the same scope in a browser with no stored filter.
+    const copied = await page.context().browser()!.newPage();
+    try {
+      await login(copied);
+      expect(await copied.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBeNull();
+      const copiedRead = boardRead(otherProject.id, copied);
+      await copied.goto(page.url());
+      await copiedRead;
+    } finally {
+      await copied.close();
+    }
 
     // The selection is the device-local filter surfaces read.
     expect(await page.evaluate(() => localStorage.getItem("remuda.project-filter.v1"))).toBe(

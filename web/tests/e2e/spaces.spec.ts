@@ -217,3 +217,60 @@ test("filter conditions survive a deep link and a reload, and the scope names it
   expect(await page.getByTestId("board-card").count()).toBeGreaterThanOrEqual(matched);
   expect(errors).toEqual([]);
 });
+
+/** UO-2a: folded to 48px, the 管理 menu still shows and takes input in full. */
+test("the folded sidebar opens the whole 管理 menu and reaches /fleet by keyboard", async ({ page, browserName }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/board");
+  const sidebar = page.getByTestId("sidebar");
+  await page.getByTestId("sidebar-toggle").click();
+  await expect(sidebar).toHaveAttribute("data-collapsed", "true");
+  try {
+    const admin = page.getByTestId("sidebar-admin");
+    await admin.focus();
+    await page.keyboard.press("Enter");
+    const menu = page.getByRole("menu", { name: "管理" });
+    await expect(menu).toBeVisible();
+    const column = (await sidebar.boundingBox())!;
+    const box = (await menu.boundingBox())!;
+    // Wider than the column and inside the viewport: nothing is clipped.
+    expect(box.width).toBeGreaterThan(column.width);
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.y).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(1440);
+    expect(box.y + box.height).toBeLessThanOrEqual(900);
+    for (const item of await menu.getByRole("menuitem").all()) {
+      await expect(item).toBeVisible();
+      const hit = await item.evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const probe = (x: number, y: number) => element.contains(document.elementFromPoint(x, y));
+        return probe(rect.left + 4, rect.top + rect.height / 2) && probe(rect.right - 4, rect.top + rect.height / 2);
+      });
+      expect(hit, `${await item.innerText()} is hittable edge to edge`).toBe(true);
+    }
+    // DOM order keeps the menu next in the Tab sequence (WebKit's plain Tab
+    // skips links by default; ⌥Tab is its link-inclusive Tab).
+    const tabKey = browserName === "webkit" ? "Alt+Tab" : "Tab";
+    await page.keyboard.press(tabKey);
+    await expect(menu.getByRole("menuitem", { name: "主机" })).toBeFocused();
+    await page.keyboard.press(tabKey);
+    await expect(menu.getByRole("menuitem", { name: "集群" })).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(page).toHaveURL(/\/fleet$/);
+  } finally {
+    await page.getByTestId("sidebar-toggle").click();
+    await expect(sidebar).toHaveAttribute("data-collapsed", "false");
+  }
+});
+
+/** UO-2a: `/sessions/` is the list route, so only the Space panel owns QuickFind. */
+test("a trailing-slash /sessions/ mounts one QuickFind", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("/sessions/");
+  await expect(page.getByTestId("spaces-panel")).toBeVisible();
+  await expect(page.getByTestId("quickfind-trigger")).toHaveCount(1);
+  await page.getByTestId("quickfind-trigger").click();
+  await expect(page.getByTestId("quickfind-panel")).toHaveCount(1);
+  await expect(page.locator("#quickfind-heading")).toHaveCount(1);
+  await expect(page.getByTestId("quickfind-input")).toBeFocused();
+});

@@ -810,6 +810,38 @@ describe("D-041 fold vs in-transcript search hit", () => {
     expect(count()).toBe("1/2");
     await expect.poll(folded).toEqual(["0", "1"]);
   });
+
+  it("opens the workflow member list and card that hold the selected hit", async () => {
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "跑个 workflow"),
+        ...workflowRun(2, "tc-wf", "agent-m"),
+        nestedCall(6, "tc-m1", "Bash", { command: "ls one" }, null, "agent-m"),
+        nestedResult(7, "tc-m1", "memberhit-5120 one", "agent-m"),
+        nestedCall(8, "tc-m2", "Bash", { command: "ls two" }, null, "agent-m"),
+        nestedResult(9, "tc-m2", "memberhit-5120 two", "agent-m"),
+        assistantMessage(10, "好了"),
+      ],
+      "/s/ins_member_hit",
+    );
+    const toggle = () => screen.getByTestId("workflow-member-tools-toggle");
+    expect(toggle().getAttribute("aria-expanded")).toBe("false");
+
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "memberhit-5120");
+    const folded = () =>
+      [...screen.getByTestId("workflow-card").querySelectorAll("[data-testid='tool-card']")].map((card) =>
+        card.getAttribute("data-folded"),
+      );
+    await expect.poll(() => toggle().getAttribute("aria-expanded")).toBe("true");
+    await expect.poll(folded).toEqual(["0", "1"]);
+    await user.click(screen.getByTestId("transcript-search-next"));
+    await expect.poll(folded).toEqual(["1", "0"]);
+    // Leaving search hands the list back to the reader: closed again.
+    await user.click(screen.getByTestId("transcript-search-close"));
+    await expect.poll(() => toggle().getAttribute("aria-expanded")).toBe("false");
+  });
 });
 
 describe("nested tool rows share the transcript expansion set", () => {
@@ -929,6 +961,54 @@ function nestedResult(seq: number, id: string, text: string, agent?: string): Ob
   });
   if (agent) (event.source as { nativeAgentId: unknown }).nativeAgentId = known(agent);
   return event;
+}
+
+/** A Workflow tool row with one running phase and one member agent (4 events). */
+function workflowRun(seq: number, toolCallId: string, agent: string): Observation[] {
+  const wfId = "wf_nested" as Id;
+  return [
+    nestedCall(seq, toolCallId, "Workflow", { name: "nested" }, null),
+    obs(seq + 1, "workflow.run", {
+      workflowId: wfId,
+      engine: "claude-workflow",
+      nativeRunId: known("wf_x"),
+      nativeTaskId: known("task-1"),
+      toolCallId: toolCallId as Id,
+      state: "running",
+      revision: "1",
+      title: known("nested"),
+      resultRef: null,
+    }),
+    obs(seq + 2, "workflow.phase", {
+      workflowId: wfId,
+      phaseId: "ph1" as Id,
+      nativePhaseId: known("Review"),
+      label: known("Review"),
+      state: "running",
+      revision: "1",
+      parentPhaseId: null,
+    }),
+    obs(seq + 3, "workflow.member", {
+      workflowId: wfId,
+      memberId: "mem_a" as Id,
+      nativeAgentId: known(agent),
+      nativeKey: known("key-a"),
+      attempt: known("1"),
+      phaseId: "ph1" as Id,
+      label: known("review:nested"),
+      state: "running",
+      modelRequested: known("claude-opus-5"),
+      modelResolved: known("claude-opus-5"),
+      resultRef: null,
+      revision: "1",
+      latestTool: known("Bash"),
+      tokens: "1000",
+      calls: "2",
+      durationMs: null,
+      startedAt: null,
+      endedAt: null,
+    }),
+  ];
 }
 
 /** A user-role message the agent did not write: hook context injection. */

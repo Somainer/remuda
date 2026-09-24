@@ -12,7 +12,7 @@
  * live in the pure projection; this file renders, owns the one-second hand,
  * and forwards dismiss/undismiss.
  */
-import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type {
   WorkflowMemberPayload,
@@ -22,7 +22,7 @@ import type {
 import type { SubagentRef } from "../assemble";
 import { ToolCard } from "../ToolCard";
 import { isToolFailure } from "../assemble";
-import { subagentHref } from "../subagent/SubagentRows";
+import { nestedCardExpansion, nestedFoldKey, NestedToolContext, subagentHref, useNestedFold } from "../subagent/SubagentRows";
 import {
   agentClocks,
   fmtDuration,
@@ -164,9 +164,11 @@ function Chip({ status }: { status: WfStatus }) {
   );
 }
 
-/** Inline fold of a member's live tool calls. */
+/** Inline fold of a member's live tool calls. Open state and card expansion
+ * live in the transcript's shared set; a search hit forces its list open and
+ * its card expanded (same rule as the Task subagent folds). */
 function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
-  const [open, setOpen] = useState(false);
+  const { open, toggle, hitId, state } = useNestedFold(nestedFoldKey("member", subagent.agentId), subagent.nodes);
   if (!subagent.nodes.length) return null;
   return (
     <div className={css.memberTools}>
@@ -174,7 +176,8 @@ function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
         type="button"
         className={css.memberToolsToggle}
         aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
+        data-testid="workflow-member-tools-toggle"
+        onClick={toggle}
       >
         {open ? "▾" : "▸"} {subagent.nodes.length} tool calls
       </button>
@@ -200,6 +203,7 @@ function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
                 completeness={node.completeness}
                 diffState={node.diffState}
                 foldSettled
+                {...nestedCardExpansion(node, hitId, state)}
               />
             ),
           )}
@@ -377,10 +381,17 @@ function PhaseBlock({
   // Following the prop matters because the phase head mounts before members
   // stream in: an initializer would lock it to "0 agents → collapsed" forever.
   const [toggled, setToggled] = useState<boolean | null>(null);
-  const open = toggled ?? phase.expandedByDefault;
-  const [showFolded, setShowFolded] = useState(false);
+  const [showFoldedLocal, setShowFolded] = useState(false);
   const bodyId = useMemo(() => `wf-phase-${phase.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`, [phase.id]);
   const laid = useMemo(() => layoutRows(phase.agents), [phase]);
+  // A search hit on a member's tool row opens this phase, and the 「还有 N 个」
+  // list too when the member sits in it, so the hit is on screen.
+  const hitId = useContext(NestedToolContext)?.openChildId ?? null;
+  const holdsHit = (agent: WfAgent) =>
+    Boolean(hitId && refsByAgent.get(agent.id)?.nodes.some((node) => node.id === hitId));
+  const hitHere = phase.agents.some(holdsHit);
+  const open = hitHere || (toggled ?? phase.expandedByDefault);
+  const showFolded = showFoldedLocal || laid.folded.some(holdsHit);
 
   const onKey = (event: React.KeyboardEvent) => {
     // Only a button the user is focused on can collapse; keys sent to an

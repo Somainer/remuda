@@ -41,10 +41,16 @@ import ui from "../styles/ui.module.css";
 import css from "./Shell.module.css";
 import notifyCss from "./shellNotify.module.css";
 
+/** The router matches `/sessions/` as `/sessions`; route checks here must too. */
+function routePath(pathname: string): string {
+  return pathname.replace(/\/+$/, "") || "/";
+}
+
 function layoutOf(pathname: string): "sessions" | "session" | "sheet" | "page" {
-  if (pathname === "/sessions/new") return "sheet";
-  if (pathname.startsWith("/s/")) return "session";
-  if (pathname === "/sessions") return "sessions";
+  const path = routePath(pathname);
+  if (path === "/sessions/new") return "sheet";
+  if (path.startsWith("/s/")) return "session";
+  if (path === "/sessions") return "sessions";
   return "page";
 }
 
@@ -268,10 +274,12 @@ export function Sidebar({
   const adminActive = ADMIN_NAV.some((item) => isUnder(location.pathname, item.to));
   const scope = selectedProject && projects.some((p) => p.id === selectedProject) ? selectedProject : "";
 
+  // ui-spec §1.1: the scope lives in the URL too, so a copied link and each
+  // history entry keep their project; 全局 is the bare /board.
   function pickProject(id: string) {
     if (id) projectFilterStore.select(id);
     else projectFilterStore.clear();
-    navigate("/board");
+    navigate(id ? `/board?project=${encodeURIComponent(id)}` : "/board");
   }
 
   return (
@@ -409,10 +417,11 @@ export function Shell() {
   const location = useLocation();
   const pending = hub.interactions.filter((i) => i.state === "pending").length;
   const onSessions = isSessionRoute(location.pathname);
-  const onNew = location.pathname === "/sessions/new";
+  const layout = layoutOf(location.pathname);
+  const onNew = layout === "sheet";
   // Tabs render on /s/* only (desktop). On compact /s/:id* the chips row
   // folds into the session header's current-space chip (D-040 / D-049).
-  const onSessionPage = layoutOf(location.pathname) === "session";
+  const onSessionPage = layout === "session";
   const chrome = shellChrome(location.pathname, mobile);
   const workbench = useSpaceWorkbench();
   const activeSpaceId = workbench.active?.id;
@@ -421,7 +430,7 @@ export function Shell() {
   const collapsed = !mobile && workbench.prefs.collapsed;
   // /sessions (and the dimmed list behind /sessions/new) mounts SpacesPanel,
   // which owns QuickFind there; every other desktop route mounts it here.
-  const quickFindOwned = location.pathname === "/sessions" || onNew;
+  const quickFindOwned = layout === "sessions" || onNew;
   const newHref = onSessions ? workbench.newHref : "/sessions/new";
 
   useEffect(() => {
@@ -468,7 +477,7 @@ export function Shell() {
   return (
     <CommitProbe name="Shell">
     <AnnotationProvider>
-    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layoutOf(location.pathname)} data-collapsed={collapsed}>
+    <div className={css.shell} data-compact={mobile ? "1" : "0"} data-layout={layout}data-collapsed={collapsed}>
       <div className={css.install}>
         <InstallBar />
       </div>

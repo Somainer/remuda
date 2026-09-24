@@ -239,10 +239,18 @@
   z-index: 40;
 }
 
-/* Folded: a 48px icon column; labels stay in the accessibility tree. */
+/* Folded: a 48px icon column; labels stay in the accessibility tree. It has
+   no scrolling project list, so it stops clipping and the 管理 menu opens
+   beside the column at full width, still in DOM (and Tab) order. */
 .sidebar[data-collapsed="true"] {
   align-items: center;
   padding: 0 0 var(--space-2);
+  overflow: visible;
+}
+
+.sidebar[data-collapsed="true"] .adminMenu {
+  left: calc(100% + var(--space-2));
+  bottom: 0;
 }
 
 .sidebar[data-collapsed="true"] .brand {

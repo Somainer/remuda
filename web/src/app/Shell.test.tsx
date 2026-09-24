@@ -1,8 +1,9 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { INFO_DEBOUNCE_MS, notify, notifyStore, type NotifyInput } from "../lib/notify";
+import { projectFilterStore } from "../features/tasks/ProjectSwitcher";
 import { ShellNotify, Sidebar, shellChrome } from "./Shell";
 import { PhoneNav } from "./PhoneNav";
 
@@ -203,6 +204,11 @@ function renderSidebar(path = "/sessions", props: Partial<Parameters<typeof Side
   );
 }
 
+function Where() {
+  const location = useLocation();
+  return <output data-testid="where">{location.pathname + location.search}</output>;
+}
+
 describe("Sidebar (UO-2a)", () => {
   it("main nav leads with 会话, then 收件箱 and 任务看板", () => {
     renderSidebar();
@@ -229,6 +235,23 @@ describe("Sidebar (UO-2a)", () => {
     const rows = screen.getAllByTestId("sidebar-project-row");
     expect(rows.map((row) => row.textContent)).toEqual(["全局", "web-app"]);
     expect(rows[0]).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("puts the project in the board URL; 全局 is the bare /board", async () => {
+    render(
+      <MemoryRouter initialEntries={["/sessions"]}>
+        <Sidebar collapsed={false} pending={0} newHref="/sessions/new" projects={[{ id: "p 1", name: "web-app" }]} quickFindOwned={false} />
+        <Where />
+      </MemoryRouter>,
+    );
+    try {
+      await userEvent.click(screen.getByRole("button", { name: "web-app" }));
+      expect(screen.getByTestId("where")).toHaveTextContent("/board?project=p%201");
+      await userEvent.click(screen.getByRole("button", { name: "全局" }));
+      expect(screen.getByTestId("where").textContent).toBe("/board");
+    } finally {
+      projectFilterStore.clear();
+    }
   });
 
   it("keeps only the one 新建 title, and labels survive folding", () => {

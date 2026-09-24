@@ -167,16 +167,3 @@
   z-index: 60;
 }
 
-/* UO-4 mechanical split: re-exported class stubs so existing importers
-
-   keep a single `css` binding. Empty rules emit no CSS; the composed
-
-   class carries the original declarations. */
-
-.popover {
-  composes: popover from "./popover.module.css";
-}
-
-.popoverCard {
-  composes: popoverCard from "./popover.module.css";
-}

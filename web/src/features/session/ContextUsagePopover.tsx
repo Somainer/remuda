@@ -8,6 +8,14 @@ import {
   type UsageCell,
   type UsageRollup,
 } from "./contextUsage";
+// UO-4: popover.module.css is imported BEFORE contextUsage.module.css so the
+// base .popover/.popoverCard rules precede contextUsage's overrides — the
+// source order they had in the old single session.module.css. The panel
+// combines both bindings directly; using composes-only stubs here made the
+// composed stylesheet inject AFTER contextUsage, flipping .usageSheet's
+// z-index:60 under .popover's z-index:5 so the mobile sheet fell behind the
+// options sheet.
+import popover from "./popover.module.css";
 import css from "./contextUsage.module.css";
 
 /**
@@ -55,8 +63,8 @@ export function ContextUsagePopover({
     <div
       ref={panelRef}
       style={mobile ? undefined : anchorStyle}
-      className={`${css.popover} ${css.usagePopover} ${
-        mobile ? css.usageSheet : css.popoverCard
+      className={`${popover.popover} ${css.usagePopover} ${
+        mobile ? css.usageSheet : popover.popoverCard
       }`}
       data-testid="context-usage-popover"
       data-mobile={mobile ? "1" : "0"}

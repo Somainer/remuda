@@ -238,6 +238,23 @@ for (const [rel, p] of perModule) {
   }
 }
 
+// 1d. cascade-order guard: .popover/.popoverCard are base rules that
+// .usageSheet (z-index:60) overrides by source order. They must NOT be
+// re-exported as composes stubs from composer/contextUsage — a stub pulls
+// popover.module.css into that module's dependency position AFTER the
+// overrides, flipping z-index so the mobile context sheet falls behind the
+// options sheet. Those two importers must bind popover.module.css directly
+// and import it first.
+for (const rel of [
+  "src/features/session/composer.module.css",
+  "src/features/session/contextUsage.module.css",
+]) {
+  const bad = perModule.get(rel)?.stubs.filter((s) => s.cls === "popover" || s.cls === "popoverCard");
+  for (const s of bad ?? []) {
+    errors.push(`${rel}: .${s.cls} must bind popover.module.css directly, not via composes (cascade order)`);
+  }
+}
+
 // 2. dead classes: not really declared, not referenced from ts/tsx
 for (const cls of DEAD) {
   for (const [rel, p] of perModule) {

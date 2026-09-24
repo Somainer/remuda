@@ -70,3 +70,32 @@ replays remain out of the outbox by design (only sends are exactly-once).
   `context.setOffline(false)`; an offline-queued message survives a reload
   during the outage; a POST delivered to the Hub with a dropped response is
   retried under the same commandId and executes once.
+
+## Round 2 (codex + grok review follow-ups)
+
+All 16 review items fixed on top of Task B (`1c271528`, GET command status).
+Key changes: one commandId per held bubble (idempotent concurrent conversion,
+HIGH-1); text settlement removed (HIGH-2); sent/held/rejected terminal states
+with settlement outcome preserved and queued-unforwarded rows not burning the
+retry budget (HIGH-3); resume requires socket+catcher (HIGH-4); foreground
+always re-verifies against actual socket-open state (HIGH-5); pagehide flag
+cleared on pageshow/visible (HIGH-6); REST deadline covers the body (HIGH-7);
+IndexedDB commit-complete durability (M8); socket recovery supersedes pending
+fill/resume via resume generation (M9); null-basis RPC / list-poll screen
+ordering (M10); self-close not a link failure (M11); canInterrupt true for
+stale (M12); delivered rows show 已送达 not 状态待确认 (M13); create refused
+offline (M14); 已恢复 1.5s banner (M15).
+
+Tests: 1804 web unit tests (new pins for idempotent conversion, rejected
+settlement, offline→online same-id-once, foreground dead-socket resume,
+pageshow BFCache, journal socket-supersedes-fill, null-basis screen, stale
+interrupt, offline create refusal). Gated e2e: offline-outbox 3/3 (incl.
+survives-reload single delivery, lost-response same-id retry), hub-live 7/7.
+
+The fully-offline-document-reload variant needs the production service worker
+(dev-server harness registers the SW only in PROD builds); the reload test
+restores connectivity at reload time, still proving IDB durability and a single
+same-id POST across the navigation. The committed-POST/response-dropped G2
+path is pinned at the store/unit level (`reconcileCommandViaGet`); the e2e
+drives the deterministic first-attempt-502 same-id retry (route.fetch through
+the Vite proxy is racy in this harness).

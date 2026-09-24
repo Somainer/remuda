@@ -1128,3 +1128,16 @@ compact 去掉 app 底栏后「回家」靠 44px 返回键与（M2 的）Jump To
 **退化**：前提不满足（Hub 库丢失、实例已删除、本机存储不可用），或超出重试窗口、收到 409 `COMMAND_ID_CONFLICT` 时，行状态退回「状态待确认」，保留显式的「仍要再送一条？」。
 
 **修订**：本节取代此前分散在 ui-spec 与 workbench-ux-exploration 中的「重连只补事件，不重发」规则，并修订所有者早先的 D4「no offline queue」：D4 的「不排队」只对 create 与 cancel 继续成立；普通 send 与降级的 steer 在 commandId 去重前提满足时改为离线入 outbox、恢复后同 id 补发。hub-resilience §5.4/§7 据此修订。
+
+**轮次 2 精化（2026-09-24，codex/grok 复审后）**：
+- **行状态机**区分 `pending/inflight`（未应答）、`held`（Hub 已 200 但 Node 离线、未转发——不消耗重试次数，主机恢复/恢复 resume 时同 id 重 POST，由任务 B 转发）、`sent`（已被 Hub 接收/转发，等待 journal 汇合，**绝不重 POST**，UI 显「已发送」而非「状态待确认」）、`done`（携带 commandId 的 journal 事件确认执行）、`rejected`（`settled + settlement.outcome=rejected` 或业务 4xx，终态不重试）、`unknown`（409 / 超窗 / 无持久存储）。
+- **取消（cancel）**仅在 `offline` 与 `recovering` 禁用；live 但安静（`stale`）的会话仍可打断——cancel POST 本身即可验证链路。
+- **held prompt 幂等**：一条 held 消息一生只有一个 commandId；turn 末 flush 与用户 steer 竞争同一行时共用同一次转换，绝不产生两个 id（也就不会绕过 Hub/Node 去重）。
+- **纯 commandId 结算**：删除一切文本匹配；未转换（无 commandId）的 held 行不会因历史里有同文消息而被吞掉。
+- **恢复认证**：只有 follow socket 重开 **且** journal catch-up 成功才回 live；REST 可达不代表 follow 流健康。前台可见/pageshow(persisted)/online 即使缓存为 live 也必须按 socket 是否真的 OPEN 重新验证并按需重连（iPhone 静默断流场景）。
+- **BFCache**：`pagehide`/`beforeunload` 的「卸载中」标记只在该次卸载存活；`pageshow`（persisted）与重新可见时清除并恢复投递，不永久锁死 outbox。
+- **REST 超时覆盖读 body**：10s/15s 截止在 body 读完前不清除，半开连接卡住 body 会释放 Web Lock 并转为可重试。
+- **存储提交**：IndexedDB 写/删在事务 `oncomplete` 后才算成功（abort/error 拒绝），不谎报已排队。
+- **GET 调和**：任务 B 已落地，客户端直接使用 `GET /v1/instances/{id}/commands/{commandId}`（不做 feature-detect）在疑似丢响应时判定真相。
+- **屏幕排序**：null-basis 的 RPC 屏幕不得覆盖已提交的 journal 屏幕；过期 gap fill 不得在更新的 resume/socket 恢复后压回只读。
+- **横幅**：回到 live 短暂显示「已恢复」（约 1.5 s）。`ConnectionIndicator` 的最小改动属于 UO-1 清单的已接受例外（仅新增 stale 点的文案/颜色，不动其结构）。

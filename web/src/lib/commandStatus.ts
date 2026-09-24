@@ -5,6 +5,7 @@ import type { Interaction } from "../types/interaction";
 import type { CapabilitySnapshot } from "../types/nativeRef";
 import { provisionOf } from "./capabilities";
 import { nativeCleared as nativeClearedFact, projectInteraction } from "./interactionStatus";
+import type { OutboxState } from "./outbox";
 
 /**
  * P0-3 display vocabulary: a pure projection of facts the backend already
@@ -155,7 +156,7 @@ export type CommandStatusFacts = {
    * these distinguish an offline-queued message (待发送（离线）) from an
    * ordinary queued send and a definite rejection (未送达).
    */
-  outboxState?: "pending" | "inflight" | "done" | "rejected" | "unknown";
+  outboxState?: OutboxState;
   offline?: boolean;
   instance?: {
     lifecycle?: Lifecycle;
@@ -261,6 +262,12 @@ export function projectCommandStatus(facts: CommandStatusFacts): CommandStatusRo
   // outbox states are decided locally and narrow the old fallback:
   if (facts.outboxState === "rejected") return ROW_SEND_REJECTED;
   if (facts.outboxState === "unknown") return ROW_UNCONFIRMED;
+  // "sent" reached the Hub/Node (accepted or forwarded) and "done" is
+  // journal-confirmed: project as delivered, never 状态待确认, while the
+  // journal join is awaited (item 13).
+  if (facts.outboxState === "sent") return ROW_SENT_AWAITING_ACK;
+  if (facts.outboxState === "done") return ROW_ACCEPTED;
+  if (facts.outboxState === "held") return ROW_AWAITING_SEND;
   if (facts.outboxState === "inflight") return ROW_SENT_AWAITING_ACK;
   if (facts.outboxState === "pending" && facts.offline) return ROW_PENDING_OFFLINE;
   if (instanceUnconfirmed(facts.instance)) return ROW_UNCONFIRMED;

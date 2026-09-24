@@ -436,6 +436,20 @@ function mapCommand(row: components["schemas"]["CommandRecord"], instanceId: Id)
     state,
     dispatch: row.forwarded ? "transport-written" : "intent-durable",
     resolution,
+    // Preserve the terminal settlement (D-055: a rejected settled command is
+    // a real rejection, not a delivery).
+    ...(row.settlement
+      ? {
+          settlement: {
+            outcome: row.settlement.outcome as
+              | "cancelled"
+              | "completed"
+              | "expired"
+              | "rejected",
+            ...(row.settlement.reason ? { reason: row.settlement.reason } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -663,6 +677,8 @@ export type HubApi = {
     onBatch: (batch: EventsBatch["params"]) => void,
     onGap?: (windowFloor: U64) => void,
     hooks?: {
+      /** Follow socket opened (including a successful reopen). */
+      onOpen?: () => void;
       /** Follow socket closed (or errored after the snapshot settled). */
       onClose?: () => void;
       /** Any frame (event/control) received — the connection liveness tick. */
@@ -742,12 +758,19 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
   // only attach our own when none was given.
   const external = req.signal;
   const controller = new AbortController();
+  // The deadline must cover BOTH receiving headers AND reading the body: a
+  // server that sends headers then stalls mid-body would otherwise leave the
+  // fetch (and any outbox row/Web Lock behind it) pending forever. The timer
+  // is only cleared once the body has been fully consumed (json/text below).
   const timer = external
     ? null
     : setTimeout(
         () => controller.abort(new DOMException("REST_TIMEOUT", "AbortError")),
         timeoutMs,
       );
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+  };
   external?.addEventListener("abort", () => controller.abort(external.reason), { once: true });
   let res: Response;
   try {
@@ -758,6 +781,7 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
       signal: external ?? controller.signal,
     });
   } catch (err) {
+    clearTimer();
     // A half-open link / offline / our own timeout never reached the Hub: a
     // retriable network error, never a business rejection (the outbox keeps
     // the same commandId and retries).
@@ -765,11 +789,19 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
       throw new RestNetworkError(external?.aborted ? "request aborted" : `REST timeout after ${timeoutMs} ms`);
     }
     throw new RestNetworkError(err instanceof Error ? err.message : String(err));
-  } finally {
-    if (timer) clearTimeout(timer);
   }
   if (!res.ok) {
-    const text = await res.text();
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      clearTimer();
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new RestNetworkError(`REST timeout reading error body after ${timeoutMs} ms`);
+      }
+      throw new RestNetworkError(err instanceof Error ? err.message : String(err));
+    }
+    clearTimer();
     let code = `HTTP_${res.status}`;
     let message = text || `HTTP ${res.status}`;
     let reasons: string[] = [];
@@ -797,8 +829,20 @@ export async function rest<T>(path: string, req: RequestInit = {}): Promise<T> {
     }
     throw new HubHttpError(res.status, code, message, reasons, retryAfterMs);
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  if (res.status === 204) {
+    clearTimer();
+    return undefined as T;
+  }
+  try {
+    return (await res.json()) as T;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new RestNetworkError(`REST timeout reading body after ${timeoutMs} ms`);
+    }
+    throw err;
+  } finally {
+    clearTimer();
+  }
 }
 
 /** Dummy URLs stand in for a gateway that is not listening. */
@@ -1700,7 +1744,12 @@ function createLiveApi(): HubApi {
     },
     async eventsSubscribe(journalId, afterSeq, onBatch, onGap, hooks) {
       const instanceId = instanceIdOf(journalId);
-      follows.get(journalId)?.close();
+      // Close the previous socket WITHOUT forwarding its close: it is being
+      // intentionally replaced, and its close event arriving after the new
+      // socket opens would make the connection machine bounce offline again
+      // and clear the recovering watchdog (item 11).
+      const previous = follows.get(journalId);
+      if (previous) previous.close();
       const subscriptionId = id("sub_") as Id;
       const ws = new WebSocket(followUrl(instanceId));
       follows.set(journalId, ws);
@@ -1762,6 +1811,7 @@ function createLiveApi(): HubApi {
           flushScheduled = true;
           setTimeout(flushPending, 0);
         };
+        ws.addEventListener("open", () => hooks?.onOpen?.());
         ws.addEventListener("error", () => {
           if (settled) return;
           settled = true;
@@ -1770,8 +1820,12 @@ function createLiveApi(): HubApi {
         });
         // A close after the snapshot settled is a drop, not a connect
         // failure: the connection machine's onClose reopens the socket.
+        // Ignore a close from a socket that this very call replaced (or a
+        // later replacement) so resume never looks like a link failure.
         ws.addEventListener("close", () => {
-          if (settled) hooks?.onClose?.();
+          if (!settled) return; // connect failure handled by the error arm
+          if (follows.get(journalId) !== ws) return; // intentionally replaced
+          hooks?.onClose?.();
         });
         ws.addEventListener("message", (ev) => {
           if (typeof ev.data !== "string") return;

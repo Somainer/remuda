@@ -549,9 +549,93 @@ it("cancel is refused offline and sends nothing (canInterrupt gate)", async () =
   expect(cancel).not.toHaveBeenCalled();
   hubStore.setConnectionStateForTest("live");
   expect(hubStore.canInterrupt).toBe(true);
-  cancel.mockResolvedValue(commandResult("cmd_cancel", "settled"));
+  // A quiet-but-linked (stale) session can still be interrupted; only offline
+  // and recovering refuse (round-2 item 12).
+  hubStore.setConnectionStateForTest("stale");
+  expect(hubStore.canInterrupt).toBe(true);
+  cancel.mockClear();
+  cancel.mockResolvedValue(commandResult("cmd_cancel2", "settled"));
   await hubStore.cancel(INSTANCE);
   expect(cancel).toHaveBeenCalledTimes(1);
+  hubStore.setConnectionStateForTest("recovering");
+  expect(hubStore.canInterrupt).toBe(false);
+  hubStore.setConnectionStateForTest("live");
+  cancel.mockResolvedValue(commandResult("cmd_cancel", "settled"));
+  await hubStore.cancel(INSTANCE);
+  expect(cancel).toHaveBeenCalledTimes(2);
+});
+
+it("create is refused while disconnected (D-055 item 14)", async () => {
+  const { api, hubStore } = await fresh();
+  const create = vi.spyOn(api, "instanceCreate");
+  hubStore.setConnectionStateForTest("offline");
+  await expect(hubStore.create({} as never)).rejects.toThrow(/disconnected/);
+  expect(create).not.toHaveBeenCalled();
+  hubStore.setConnectionStateForTest("recovering");
+  await expect(hubStore.create({} as never)).rejects.toThrow(/disconnected/);
+  expect(create).not.toHaveBeenCalled();
+});
+
+it("a held row with repeated text is not settled by an older journal message (HIGH-2)", async () => {
+  const { api, hubStore } = await fresh();
+  const onBatch = await mountFollow(api, hubStore);
+  // History already contains a user message "continue" (seq 1).
+  onBatch({
+    subscriptionId: "sub",
+    journalId: JOURNAL,
+    fromSeq: "1",
+    toSeq: "1",
+    durableSeq: "1",
+    events: [
+      {
+        kind: "message",
+        eventId: "evt_continue_1",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "1",
+        payload: {
+          nodeId: "u1",
+          messageId: "u1",
+          role: "user",
+          phase: "input",
+          revision: "1",
+          baseRevision: null,
+          operation: "replace",
+          status: "complete",
+          blocks: [{ type: "text", text: "continue" }],
+          targetBlock: null,
+          parentToolCallId: null,
+          nativeOrigin: { state: "known", value: "user" },
+          commandId: "cmd_old_continue",
+        },
+      } as unknown as Observation,
+    ],
+  });
+  // Hold a NEW unsent "continue" while a turn is working (no commandId yet).
+  const id = hubStore.hold(INSTANCE, "continue", "turn");
+  // Any later journal event re-runs bubble settlement.
+  onBatch({
+    subscriptionId: "sub",
+    journalId: JOURNAL,
+    fromSeq: "2",
+    toSeq: "2",
+    durableSeq: "2",
+    events: [
+      {
+        kind: "lifecycle",
+        eventId: "evt_lc_2",
+        journalId: JOURNAL,
+        instanceId: INSTANCE,
+        seq: "2",
+        payload: { type: "native", nativeName: "agent_status", status: "working" },
+      } as unknown as Observation,
+    ],
+  });
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
+  // Text matching was removed: the new unsent held row is still queued/held.
+  expect(bubble.state).toBe("queued");
+  expect(bubble.held).toBe(true);
+  expect(bubble.commandId).toBeNull();
 });
 
 it("a steer while offline degrades to an ordinary queued turn", async () => {
@@ -606,4 +690,65 @@ it("a queued 2xx that was forwarded is not re-POSTed by a later flush", async ()
   await new Promise((r) => setTimeout(r, 20));
   expect(send).toHaveBeenCalledTimes(1);
   expect(hubStore.getSnapshot().bubbles[0]?.commandId).toBe(wireId);
+});
+
+it("offline enqueue then online flush POSTs each commandId exactly once (fake API)", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  const postIds: string[] = [];
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    ((_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => {
+      const id = commandId!;
+      postIds.push(id);
+      return Promise.resolve(commandResult(id, "accepted"));
+    }) as Api["instanceSend"],
+  );
+  await hubStore.refresh();
+
+  // Offline: two sends enqueue, zero POSTs.
+  hubStore.setConnectionStateForTest("offline");
+  await hubStore.send(INSTANCE, "off one");
+  await hubStore.send(INSTANCE, "off two");
+  expect(api.instanceSend).not.toHaveBeenCalled();
+  const queuedIds = hubStore
+    .getSnapshot()
+    .bubbles.filter((b) => b.instanceId === INSTANCE && b.text.startsWith("off "))
+    .map((b) => b.commandId!)
+    .filter(Boolean);
+  expect(queuedIds).toHaveLength(2);
+
+  // Back online: one flush delivers both, same ids, once each.
+  hubStore.setConnectionStateForTest("live");
+  await (hubStore as unknown as { flushAllOutbox: () => Promise<void> }).flushAllOutbox();
+  expect(postIds.sort()).toEqual([...queuedIds].sort());
+  expect(postIds).toHaveLength(2);
+});
+
+it("pagehide then persisted pageshow re-enables the outbox and flushes (BFCache, item 6)", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  vi.spyOn(api, "instanceList").mockResolvedValue({
+    items: [{ id: INSTANCE, journalId: JOURNAL, revision: "0", durableSeq: "0", lifecycle: "running" } as never],
+    nextCursor: null,
+  });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  const send = vi.spyOn(api, "instanceSend").mockResolvedValue(commandResult("cmd_bf", "accepted"));
+  await hubStore.refresh();
+
+  hubStore.setConnectionStateForTest("live");
+  await hubStore.send(INSTANCE, "bfcache msg");
+  // Simulate the first POST being retriable so a row is deliverable, then
+  // pagehide (app backgrounded).
+  expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(false);
+  await (hubStore as unknown as { pageShowForTest: (p: boolean) => Promise<void> }).pageShowForTest(true);
+  // pagehide set the flag, persisted pageshow cleared it and flushed.
+  expect((hubStore as unknown as { pageIsUnloadingForTest: boolean }).pageIsUnloadingForTest).toBe(false);
+  await vi.waitFor(() => expect(send).toHaveBeenCalled());
 });

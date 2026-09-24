@@ -128,3 +128,52 @@ it("a steer is delivered immediately while live", async () => {
   const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
   expect(bubble.commandId).toBe(send.mock.calls[0]?.[4]);
 });
+
+it("concurrent flush and steer of the SAME held row mint exactly one commandId (HIGH-1)", async () => {
+  const { api, hubStore } = await fresh();
+  const id = hubStore.hold(INSTANCE, "race row", "turn");
+
+  const seenCommandIds = new Set<string | undefined>();
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    ((_iid: string, _prompt: string, _refs?: unknown[], _mode?: string, commandId?: string) => {
+      seenCommandIds.add(commandId);
+      // Delay the POST so both conversions overlap before it resolves.
+      return new Promise((resolve) =>
+        setTimeout(() => resolve(commandResult(commandId, "accepted")), 5),
+      );
+    }) as Api["instanceSend"],
+  );
+
+  // Fire both conversions of the same row without awaiting between them.
+  const flush = hubStore.flushHeld(INSTANCE);
+  const steer = hubStore.steerHeld(INSTANCE, id);
+  const [flushed, landed] = await Promise.all([flush.then(() => true), steer]);
+  expect(flushed).toBe(true);
+  expect(landed).toBe(true);
+
+  // Exactly one commandId for the bubble's lifetime and exactly one POST.
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
+  expect(bubble.commandId).toBeTruthy();
+  expect(seenCommandIds.size).toBe(1);
+  expect([...seenCommandIds][0]).toBe(bubble.commandId);
+  expect(api.instanceSend).toHaveBeenCalledTimes(1);
+});
+
+it("a real Node rejection (settled+rejected) is terminal, never re-POSTed and shows 未送达 (HIGH-3)", async () => {
+  const { api, hubStore } = await fresh();
+  const id = hubStore.hold(INSTANCE, "doomed", "turn");
+  const rejected = commandResult(undefined, "settled");
+  rejected.command.dispatch = "transport-written";
+  rejected.command.resolution = "clear";
+  rejected.command.settlement = { outcome: "rejected", reason: "turn does not exist" };
+  const send = vi.spyOn(api, "instanceSend").mockResolvedValue(rejected);
+  const landed = await hubStore.steerHeld(INSTANCE, id);
+  expect(landed).toBe(false); // no interrupt receipt
+  expect(send).toHaveBeenCalledTimes(1);
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
+  expect(bubble.state).toBe("unknown");
+  expect(bubble.outboxState).toBe("rejected");
+  // A second flush must not retry the rejected row.
+  await hubStore.flushHeld(INSTANCE);
+  expect(send).toHaveBeenCalledTimes(1);
+});

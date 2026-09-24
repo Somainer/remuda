@@ -9,7 +9,26 @@ import type { Id } from "../types/wire";
  * client half.
  */
 
-export type OutboxState = "pending" | "inflight" | "done" | "rejected" | "unknown";
+/**
+ * Outbox row state.
+ * - pending: not yet given an answer (a transient network failure returns here).
+ * - inflight: a POST is running.
+ * - sent: the POST was accepted/forwarded by the Hub; awaiting the journal
+ *   join. Never re-POSTed; restored on reload; projected as 已送达.
+ * - done: journal observation carrying the commandId confirmed execution.
+ * - rejected: definite business rejection (settlement.outcome=rejected / 4xx).
+ * - unknown: 409 conflict, retry window exhausted, or no durable store.
+ * - held: Hub holds the row but the Node is offline / never forwarded; the
+ *   SAME id is re-POSTed on host reconnect (does not burn the retry budget).
+ */
+export type OutboxState =
+  | "pending"
+  | "inflight"
+  | "sent"
+  | "done"
+  | "rejected"
+  | "unknown"
+  | "held";
 
 export type OutboxRecord = {
   /** Client-generated `cmd_<uuidv7>`; the ONLY id the POST ever uses. */
@@ -113,13 +132,25 @@ class IdbOutboxStorage implements OutboxStorage {
     return new IdbOutboxStorage(db);
   }
 
+  /**
+   * Run one write/read transaction and resolve only when the TRANSACTION
+   * commits. A request's `onsuccess` fires before commit; resolving there
+   * would let the caller believe an enqueue/delete is durable even if the
+   * transaction aborts afterwards. `oncomplete` is the durability point;
+   * `onabort`/`onerror` reject so the caller can surface the failure.
+   */
   private tx(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBRequest): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const t = this.db.transaction(IDB_STORE, mode);
       const req = fn(t.objectStore(IDB_STORE));
-      req.onsuccess = () => resolve(req.result);
+      let result: unknown = undefined;
+      req.onsuccess = () => {
+        result = req.result;
+      };
       req.onerror = () => reject(req.error);
-      t.onerror = () => reject(t.error);
+      t.oncomplete = () => resolve(result);
+      t.onabort = () => reject(t.error ?? req.error ?? new Error("IndexedDB transaction aborted"));
+      t.onerror = () => reject(t.error ?? req.error);
     });
   }
 
@@ -242,7 +273,10 @@ export class Outbox {
   pending(): OutboxRecord[] {
     const rank = (r: OutboxRecord) => (r.state === "inflight" ? 0 : r.mode === "steer" ? 1 : 2);
     return [...this.cache.values()]
-      .filter((r) => r.state === "pending" || r.state === "inflight")
+      // Deliverable now: not-yet-answered (pending/inflight) or Hub-held but
+      // never forwarded to the Node ("held"). "sent" already reached the Hub
+      // and must never be re-POSTed.
+      .filter((r) => r.state === "pending" || r.state === "inflight" || r.state === "held")
       .sort((a, b) => {
         const ra = rank(a);
         const rb = rank(b);
@@ -257,11 +291,17 @@ export class Outbox {
 
   pendingCount(): number {
     let n = 0;
-    for (const r of this.cache.values()) if (r.state === "pending" || r.state === "inflight") n++;
+    for (const r of this.cache.values()) {
+      if (r.state === "pending" || r.state === "inflight" || r.state === "held") n++;
+    }
     return n;
   }
 
-  /** Unresolved records (incl. unknown), restored as bubbles at bootstrap. */
+  /**
+   * Records restored as bubbles at bootstrap: everything not journal-confirmed
+   * ("done"). Includes "sent" (delivered, awaiting journal) and "unknown"
+   * (explicit resend chip) so neither is lost on reload.
+   */
   unresolved(): OutboxRecord[] {
     return [...this.cache.values()].filter((r) => r.state !== "done");
   }

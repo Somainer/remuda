@@ -50,6 +50,12 @@ export type MachineDeps = {
   resume: () => Promise<void>;
   /** Lightweight REST probe used while the socket looks silently stale. */
   probe: () => Promise<boolean>;
+  /**
+   * Whether the follow WebSocket is currently OPEN. Foreground/online resume
+   * from a cached "live" trusts the socket only when this is true; a silently
+   * closed socket (no close event delivered during suspension) forces reopen.
+   */
+  isFollowOpen: () => boolean;
   schedule?: Scheduler;
   cancel?: ScheduleCancel;
   random?: () => number;
@@ -146,9 +152,13 @@ export class ConnectionMachine {
         return;
       case "online":
       case "resume": {
-        // Foreground / back-online: zero the backoff and try immediately.
+        // Foreground / back-online / manual resume: zero the backoff. The
+        // cached state may be stale — a socket can die silently while the
+        // page is suspended before a close callback fires — so trust "live"
+        // only if the follow socket is actually OPEN; otherwise reopen (an
+        // in-flight recovery is coalesced by beginResume).
         this.attempt = 0;
-        if (this.state === "live") {
+        if ((this.state === "live" || this.state === "stale") && this.deps.isFollowOpen()) {
           this.armFrameWatchdog();
           return;
         }

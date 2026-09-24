@@ -1,9 +1,10 @@
+import { useEffect, useRef, useState } from "react";
 import { useHub } from "../../lib/store";
 import ui from "../../styles/ui.module.css";
 
 export type JournalUiStatus = "live" | "reconnecting" | "recovering" | "stale" | "gap-backfill" | "readonly-stale";
 
-type BannerState = JournalUiStatus | "offline";
+type BannerState = JournalUiStatus | "offline" | "restored";
 
 /**
  * Event-completeness (gap-backfill / readonly-stale) comes from the per
@@ -29,6 +30,28 @@ export function JournalBanner({
   const pendingCount = useHub().outboxPending;
   const shown = effectiveStatus(status, connection);
 
+  // Brief 「已恢复」 notice when the link returns live after a non-live spell
+  // (offline/recovering/stale), ~1.5 s (D-055 §3.3 UI copy).
+  const [restored, setRestored] = useState(false);
+  const prev = useRef(connection);
+  useEffect(() => {
+    const wasDown = prev.current === "offline" || prev.current === "recovering" || prev.current === "stale";
+    if (wasDown && connection === "live") {
+      setRestored(true);
+      const t = setTimeout(() => setRestored(false), 1500);
+      prev.current = connection;
+      return () => clearTimeout(t);
+    }
+    prev.current = connection;
+  }, [connection]);
+
+  if (restored && shown === "live") {
+    return (
+      <div className={ui.card} data-testid="journal-banner" data-state="restored" style={{ margin: "8px 12px 0" }}>
+        已恢复
+      </div>
+    );
+  }
   if (shown === "live" || shown === "stale") return null;
   if (shown === "reconnecting" || shown === "recovering") {
     return (

@@ -43,16 +43,18 @@ function setup() {
   const clock = fakeTimers();
   const resume = vi.fn(() => Promise.resolve());
   const probe = vi.fn(() => Promise.resolve(true));
+  const isFollowOpen = vi.fn(() => true);
   const onState = vi.fn();
   const machine = new ConnectionMachine({
     resume,
     probe,
+    isFollowOpen,
     schedule: clock.schedule,
     cancel: clock.cancel,
     random: () => 0.5,
     onState,
   });
-  return { clock, resume, probe, onState, machine };
+  return { clock, resume, probe, onState, machine, isFollowOpen };
 }
 
 describe("ConnectionMachine", () => {
@@ -170,8 +172,43 @@ describe("ConnectionMachine", () => {
 
   it("backoff is full-jitter within the doubling 30 s cap", () => {
     const withRandom = (r: number) =>
-      new ConnectionMachine({ resume: async () => {}, probe: async () => true, random: () => r }).backoffDelay(10);
+      new ConnectionMachine({ resume: async () => {}, probe: async () => true, isFollowOpen: () => true, random: () => r }).backoffDelay(10);
     expect(withRandom(0)).toBe(0);
     expect(withRandom(1)).toBe(MAX_BACKOFF_MS);
+  });
+
+  it("foreground/online from cached live reopens when the follow socket is silently dead", async () => {
+    const { clock, machine, resume, isFollowOpen } = setupTracked();
+    machine.startLive();
+    expect(machine.state).toBe("live");
+    // Socket silently died while suspended; no close callback fired.
+    isFollowOpen.mockReturnValue(false);
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    await vi.waitFor(() => expect(resume).toHaveBeenCalledTimes(1));
+    await clock.advance(0);
+    // Online event behaves the same.
+    isFollowOpen.mockReturnValue(false);
+    machine.dispatch({ type: "online" });
+    expect(resume.mock.calls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("foreground from cached live with an OPEN socket is a no-op (no churn)", () => {
+    const { machine, resume } = setupTracked();
+    machine.startLive();
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("live");
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("pageshow(persisted) semantics: resume coalesces an in-flight recovery", async () => {
+    const { machine, resume } = setupTracked();
+    resume.mockReturnValue(new Promise(() => {})); // never resolves
+    machine.setStateOffline();
+    machine.dispatch({ type: "resume" });
+    expect(machine.state).toBe("recovering");
+    // A second foreground signal must not start a second resume.
+    machine.dispatch({ type: "online" });
+    expect(resume).toHaveBeenCalledTimes(1);
   });
 });

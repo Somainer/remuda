@@ -109,7 +109,11 @@ it("every POST attempt uses the same client-generated commandId", async () => {
 
   await hubStore.send(INSTANCE, "accepted prompt");
   const bubble = () => hubStore.getSnapshot().bubbles[0];
-  await vi.waitFor(() => expect(bubble().state).toBe("settled"));
+  // An accepted POST makes the row "sent" (delivered, awaiting the journal
+  // join) — the bubble reads accepted, not settled and not 状态待确认
+  // (D-055 item 13); it settles only on the matching journal event.
+  await vi.waitFor(() => expect(bubble().outboxState).toBe("sent"));
+  expect(bubble().state).toBe("accepted");
   // Local render id and wire commandId stay distinct, and the wire id is the
   // client-generated one (server echoes dedup, never assigns a new one).
   expect(bubble().commandId?.startsWith("cmd_")).toBe(true);
@@ -156,7 +160,8 @@ it("concurrent sends get distinct clientRequestIds before either response lands"
   resolveFirst(commandResult(wireIds()[0]!, "accepted"));
   await vi.waitFor(() => {
     expect(bubbles().length).toBe(2);
-    expect(bubbles().every((b) => b.state === "settled")).toBe(true);
+    // Both POSTs landed → "sent" (accepted, awaiting journal), distinct ids.
+    expect(bubbles().every((b) => b.outboxState === "sent")).toBe(true);
   });
   // Each POST used its own generated id (order follows the serial flush).
   expect(sendSpyCallIds(api).sort()).toEqual(wireIds().sort());
@@ -277,7 +282,8 @@ it("send returns as soon as the POST lands, without awaiting catchup's HTTP chai
   await vi.waitFor(() => expect(landed).toBe(true), { timeout: 2_000 });
   // The client-generated commandId is known before the POST returns.
   expect(hubStore.getSnapshot().bubbles[0]?.commandId?.startsWith("cmd_")).toBe(true);
-  await vi.waitFor(() => expect(hubStore.getSnapshot().bubbles[0]?.state).toBe("settled"));
+  await vi.waitFor(() => expect(hubStore.getSnapshot().bubbles[0]?.outboxState).toBe("sent"));
+  expect(hubStore.getSnapshot().bubbles[0]?.state).toBe("accepted");
 });
 
 it("create returns the instance without awaiting the post-create list refresh", async () => {

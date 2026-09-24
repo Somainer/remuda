@@ -359,3 +359,38 @@ describe("JournalClient", () => {
     expect(client.retainedFloorSeq).toBe("1001");
   });
 });
+
+it("a contiguous socket batch supersedes a pending resume read that later rejects (item 9)", async () => {
+  const readRejects = [false];
+  const read = vi.fn(async (args: { afterSeq?: string }) => {
+    // Resume A's read hangs; it rejects after the socket catches up.
+    if (args.afterSeq === "0" && readRejects[0]) throw new Error("read gone stale");
+    return page([], { durableSeq: "0" });
+  });
+  const onStatus = vi.fn();
+  const client = new JournalClient("obj_x", read, { onStatus });
+  client.markReconnecting();
+
+  // Resume A starts (read will reject when told to).
+  const resumeA = client.resumeAfterReconnect();
+  await new Promise((r) => setTimeout(r, 4));
+  expect(read).toHaveBeenCalled();
+
+  // Socket delivers a contiguous batch up to seq 1 — caught up, live.
+  readRejects[0] = true;
+  client.applyBatch({
+    subscriptionId: "sub",
+    journalId: "obj_x" as Id,
+    fromSeq: "1",
+    toSeq: "1",
+    events: [obs(1)],
+    durableSeq: "1",
+  });
+  client.noteSocketCaughtUp();
+
+  // Resume A's read now rejects; it must NOT downgrade to readonly-stale.
+  await resumeA;
+  await new Promise((r) => setTimeout(r, 4));
+  expect(client.status).toBe("live");
+  expect(onStatus).not.toHaveBeenCalledWith("readonly-stale");
+});

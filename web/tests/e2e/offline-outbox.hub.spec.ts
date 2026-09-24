@@ -1,20 +1,26 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
  * D-055 client auto-reconnect + offline outbox, end to end against the fake
  * Hub/Node.
  *
- *  - two messages sent while the browser is offline are durably queued
- *    (待发送（离线）, zero commands at the Hub) and, once back online,
+ *  - two messages sent while the Hub is unreachable are durably queued
+ *    (待发送（离线）, zero commands at the Hub) and, once reachable again,
  *    delivered with the same commandIds exactly once;
- *  - a queued message survives a full page reload during the outage;
- *  - a POST that reached the Hub but whose response was lost retries with the
- *    same commandId and executes once (replayed).
+ *  - a queued message survives a full page reload WHILE the Hub is still
+ *    unreachable: the restored session renders from the persisted instance
+ *    projection, then one delivery happens after reconnect;
+ *  - a POST the Hub COMMITTED but whose browser response was lost is retried
+ *    with the same commandId; the Hub answers the retry replayed:true and the
+ *    command executes exactly once (one command row, one journal message).
+ *
+ * Hub state is always read through Playwright's INDEPENDENT request fixture
+ * (never the browser's fetch, never a swallowed failure): every read requires
+ * HTTP 200, so an empty list can never masquerade as "delivered".
  */
 test.describe.configure({ mode: "serial" });
 
-const here = new URL(".", import.meta.url).pathname;
 const created: string[] = [];
 
 async function clearApprovals(page: Page, instanceId: string) {
@@ -28,7 +34,6 @@ async function clearApprovals(page: Page, instanceId: string) {
       };
       return (body.items ?? []).filter((i) => i.instanceId === id && i.state === "pending").length;
     }, instanceId);
-  // The approval is scripted for the launch prompt; wait for it to appear.
   const seen = await expect
     .poll(pendingCount, { timeout: 20_000 })
     .toBeGreaterThan(0)
@@ -88,76 +93,58 @@ async function createSession(page: Page, prompt: string): Promise<string> {
   const id = new URL(page.url()).pathname.split("/").pop()!;
   created.push(id);
   await clearApprovals(page, id);
-  // Wait for the turn to finish so the primary action is the idle send button.
   await expect(page.getByTestId("session-page")).toHaveAttribute("data-status", "idle", {
     timeout: 20_000,
   });
   return id;
 }
 
-async function listCommands(page: Page, instanceId: string) {
-  // During reconnect the first poll(s) can still hit a dead socket; return an
-  // empty list instead of rejecting so expect.poll survives the transition.
-  try {
-    return await page.evaluate(async (iid) => {
-      const res = await fetch(`/v1/instances/${iid}/commands?limit=100`, { credentials: "include" });
-      const body = (await res.json()) as {
-        commands?: {
-          id?: string;
-          commandId?: string;
-          state: string;
-          operation: string;
-        }[];
-      };
-      // The endpoint returns { commands: [...] }; normalise to items locally.
-      // The ledger row keys the command on `commandId` (the web client also
-      // exposes it as `id`); accept either when filtering.
-      return { items: (body.commands ?? []).map((c) => ({ ...c, id: c.id ?? c.commandId ?? "" })) };
-    }, instanceId);
-  } catch {
-    return { items: [] };
-  }
+/** An authenticated API client that is independent of the browser context. */
+async function hubApi(page: Page, request: import("@playwright/test").APIRequestContext) {
+  return request.newContext({
+    baseURL: new URL(page.url()).origin,
+    storageState: { cookies: await page.context().cookies(), origins: [] },
+  });
 }
 
-async function countUserMessagesForCommand(page: Page, instanceId: string, commandId: string) {
-  try {
-    return await page.evaluate(
-      async ({ iid, cid }) => {
-        const res = await fetch(`/v1/instances/${iid}/journal?limit=2000`, { credentials: "include" });
-        const body = (await res.json()) as {
-          events?: {
-            kind?: string;
-            event?: { kind?: string; payload?: { commandId?: string } };
-            payload?: { commandId?: string };
-          }[];
-        };
-        // The Hub nests each observation as { event: {…} }; the web client
-        // unwraps it (coerceObservation). Mirror both shapes here.
-        return (body.events ?? []).filter((raw) => {
-          const e = (raw.event ?? raw) as { kind?: string; payload?: { commandId?: string } };
-          return e.kind === "message" && e.payload?.commandId === cid;
-        }).length;
-      },
-      { iid: instanceId, cid: commandId },
-    );
-  } catch {
-    return 0;
-  }
+/** Commands for one instance via the independent client; a non-200 fails the test. */
+async function hubCommands(api: APIRequestContext, instanceId: string) {
+  const res = await api.get(`/v1/instances/${instanceId}/commands?limit=100`);
+  // A failed Hub read must never be swallowed into an empty (== delivered) list.
+  expect(res.status(), `GET commands HTTP ${res.status()}`).toBe(200);
+  const body = (await res.json()) as {
+    commands?: { id?: string; commandId?: string; state: string; operation: string }[];
+  };
+  return (body.commands ?? []).map((c) => ({ ...c, id: c.id ?? c.commandId ?? "" }));
+}
+
+/** Journal user messages for one commandId via the independent client (200 required). */
+async function hubJournalMessageCount(api: APIRequestContext, instanceId: string, commandId: string) {
+  const res = await api.get(`/v1/instances/${instanceId}/journal?limit=2000`);
+  expect(res.status(), `GET journal HTTP ${res.status()}`).toBe(200);
+  const body = (await res.json()) as {
+    events?: {
+      kind?: string;
+      event?: { kind?: string; payload?: { commandId?: string } };
+      payload?: { commandId?: string };
+    }[];
+  };
+  return (body.events ?? []).filter((raw) => {
+    const e = (raw.event ?? raw) as { kind?: string; payload?: { commandId?: string } };
+    return e.kind === "message" && e.payload?.commandId === commandId;
+  }).length;
 }
 
 async function sendMessage(page: Page, text: string) {
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
   await page.getByTestId("composer-input").fill(text);
-  // The primary action is composer-send while idle and composer-queue while a
-  // turn is working (Enter-held). Either one enqueues into the outbox.
   const send = page.getByTestId("composer-send");
   const queue = page.getByTestId("composer-queue");
   if (await queue.isVisible().catch(() => false)) await queue.click();
   else await send.click();
 }
 
-test.beforeEach(async ({ context, page }) => {
-  void context;
+test.beforeEach(async ({ page }) => {
   await login(page);
 });
 
@@ -167,15 +154,14 @@ test.afterAll(async ({ request }) => {
   }
 });
 
-test("offline sends are queued and delivered exactly once after reconnect", async ({ page, context }) => {
+test("offline sends are queued and delivered exactly once after reconnect", async ({ page, request }) => {
   const instanceId = await createSession(page, "offline outbox seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
-
-  // Baseline: the seed itself issued one send-free create; wait for any seed
-  // settle so the command list is stable before going offline.
+  const api = await hubApi(page, request);
   await page.waitForTimeout(500);
 
-  await context.setOffline(true);
+  // Block everything Hub-bound (REST and the ws upgrade) — the app's network.
+  await page.context().route(/\/v1\//, (route) => route.abort("failed"));
   const banner = page.getByTestId("journal-banner");
   await expect(banner).toHaveAttribute("data-state", "offline");
   expect(await banner.textContent()).toContain("离线");
@@ -183,112 +169,138 @@ test("offline sends are queued and delivered exactly once after reconnect", asyn
   await sendMessage(page, "offline one");
   await sendMessage(page, "offline two");
 
-  // Two optimistic bubbles, both pending offline; nothing reached the Hub.
   const pending = page.locator('[data-testid="optimistic-bubble"]');
   await expect(pending).toHaveCount(2);
-  const before = await listCommands(page, instanceId);
-  const seedSends = (before.items ?? []).filter((c) => c.operation === "instance.send").length;
-  expect(seedSends).toBe(0);
+  // Row labels while offline.
+  await expect(pending.first()).toContainText("待发送（离线）");
 
-  // The two queued commandIds (rendered on the bubbles).
-  const commandIds = await page
-    .locator('[data-testid="optimistic-bubble"]')
-    .evaluateAll((nodes) => nodes.map((n) => n.getAttribute("data-command-id")));
+  const commandIds = await pending.evaluateAll((nodes) =>
+    nodes.map((n) => n.getAttribute("data-command-id")),
+  );
   expect(commandIds).toHaveLength(2);
   expect(commandIds.every((id) => id?.startsWith("cmd_"))).toBe(true);
 
-  await context.setOffline(false);
-  // Banner clears and both rows become delivered (no 待发送 offline remains).
+  // The Hub has nothing yet (read independently, require 200).
+  const seedSends = (await hubCommands(api, instanceId)).filter(
+    (c) => c.operation === "instance.send",
+  ).length;
+  expect(seedSends).toBe(0);
+
+  await page.context().unroute(/\/v1\//);
   await expect(banner).toHaveCount(0, { timeout: 20_000 });
 
-  // Exactly one Hub command row per generated id, executed exactly once.
+  // Exactly one Hub command row per id …
   await expect
-    .poll(async () => (await listCommands(page, instanceId)).items?.filter((c) => c.operation === "instance.send").length ?? 0)
+    .poll(async () => (await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send").length)
     .toBe(2);
+  // … and exactly one journal execution each.
   for (const cid of commandIds) {
-    await expect
-      .poll(() => countUserMessagesForCommand(page, instanceId, cid!), { timeout: 20_000 })
-      .toBe(1);
+    await expect.poll(() => hubJournalMessageCount(api, instanceId, cid!)).toBe(1);
+    // The delivered row no longer reads waiting/unconfirmed; it is accepted.
+    await expect(
+      page.locator(`[data-testid="optimistic-bubble"][data-command-id="${cid}"]`),
+    ).toContainText("已受理", { timeout: 20_000 });
   }
 });
 
-test("an offline-queued message survives a page reload and still sends once", async ({ page, context }) => {
+test("an offline-queued message survives a reload while the Hub is still off and sends once after", async ({ page, request }) => {
   const instanceId = await createSession(page, "offline reload seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page, request);
 
-  await context.setOffline(true);
+  // The Hub goes unreachable.
+  await page.context().route(/\/v1\//, (route) => route.abort("failed"));
   await expect(page.getByTestId("journal-banner")).toHaveAttribute("data-state", "offline");
   await sendMessage(page, "offline across reload");
   const queued = page.locator('[data-testid="optimistic-bubble"]');
   await expect(queued).toHaveCount(1);
-  const [commandId] = await queued.evaluateAll((nodes) =>
-    nodes.map((n) => n.getAttribute("data-command-id")),
-  );
+  const commandId = await queued.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
 
-  // The message was written to the durable outbox while offline. Restore
-  // connectivity and reload in the same instant: the old page's in-memory
-  // queue is destroyed by the navigation, so delivery after the reload proves
-  // the row was persisted (IndexedDB) and is restored by the fresh bootstrap —
-  // with exactly one POST for the same commandId.
-  // (A reload fully *offline* needs the production service worker, which the
-  // dev-server harness does not register — SW is import.meta.env.PROD-only.)
-  await context.setOffline(false);
-  await page.reload();
+  // Reload WITH the Hub still unreachable (the Vite origin keeps serving the
+  // app; only Hub traffic is blocked, exactly as a real outage looks to the
+  // app — the production service worker would cover a fully-offline document).
+  await page.reload({ waitUntil: "domcontentloaded" });
+  // The session renders from the persisted instance projection (no
+  // 会话不存在 / cast stub), and the durable row restores and still waits
+  // offline; nothing has been POSTed.
   await expect(page.getByTestId("session-page")).toBeVisible({ timeout: 20_000 });
+  const restored = page.locator(`[data-testid="optimistic-bubble"][data-command-id="${commandId}"]`);
+  await expect(restored).toBeVisible();
+  await expect(restored).toContainText("待发送（离线）");
+  expect((await hubCommands(api, instanceId)).filter((c) => c.operation === "instance.send")).toHaveLength(0);
 
-  // Exactly one execution of the persisted commandId.
+  // Reconnect: the restored row delivers exactly once under the same id.
+  await page.context().unroute(/\/v1\//);
+  await expect(page.getByTestId("journal-banner")).toHaveCount(0, { timeout: 20_000 });
   await expect
-    .poll(() => countUserMessagesForCommand(page, instanceId, commandId!), { timeout: 20_000 })
+    .poll(() => hubJournalMessageCount(api, instanceId, commandId!))
     .toBe(1);
-  // Exactly one user-send command row for that id (the unloading page starts
-  // no competing POST), so the message really ran once across the reload.
   await expect
-    .poll(async () => (await listCommands(page, instanceId)).items?.filter((c) => c.operation === "instance.send").length ?? 0)
+    .poll(async () => (await hubCommands(api, instanceId)).filter(
+      (c) => c.operation === "instance.send" && c.id === commandId,
+    ).length)
     .toBe(1);
+  await expect(restored).toContainText("已受理", { timeout: 20_000 });
 });
 
-test("a POST whose response is lost is retried with the same id and runs once", async ({ page, context }) => {
+test("a committed POST whose browser response is lost retries with replayed:true and runs once", async ({ page, request }) => {
   const instanceId = await createSession(page, "lost response seed");
   await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+  const api = await hubApi(page, request);
 
-  // The very first POST never gets a response (network loss before delivery).
-  // The outbox retries under the SAME commandId; the retry passes through and
-  // executes exactly once. (Fulfilling 500 instead of abort keeps this
-  // deterministic — route.abort/route.fetch through the Vite proxy races and
-  // frequently drops the server-side POST entirely.)
-  let droppedOnce = false;
-  await context.route("**/v1/instances/*/commands", async (route) => {
-    if (!droppedOnce && route.request().method() === "POST") {
-      droppedOnce = true;
-      return route.fulfill({
-        status: 502,
-        contentType: "application/json",
-        body: JSON.stringify({ error: { code: "BAD_GATEWAY", message: "response lost before delivery" } }),
-      });
+  const commandsPattern = /\/v1\/instances\/[^/]+\/commands$/;
+  const statusPattern = /\/v1\/instances\/[^/]+\/commands\/cmd_/;
+  const replayResults: boolean[] = [];
+  let firstPostLost = false;
+
+  await page.context().route(commandsPattern, async (route) => {
+    if (route.request().method() !== "POST") return route.continue();
+    if (!firstPostLost) {
+      firstPostLost = true;
+      // Let the Hub COMMIT the first POST for real …
+      const server = await route.fetch();
+      expect(server.status()).toBe(200);
+      // … then lose the browser's response (the wire dropped after commit).
+      return route.abort("failed");
     }
-    return route.continue();
+    // The same-id retry reaches the Hub, which dedupes and replays.
+    const retry = await route.fetch();
+    expect(retry.status()).toBe(200);
+    const body = (await retry.json()) as { command?: { commandId?: string }; replayed?: boolean };
+    replayResults.push(body.replayed === true);
+    return route.fulfill({ response: retry });
   });
+  // The post-loss GET reconciliation must also fail, so the client keeps the
+  // row pending and re-POSTs (rather than settling on the GET verdict).
+  await page.context().route(statusPattern, (route) =>
+    route.request().method() === "GET" ? route.abort("failed") : route.continue(),
+  );
 
   await sendMessage(page, "lost response message");
-
-  // The same commandId eventually executes exactly once (replayed on retry).
   const bubble = page.locator('[data-testid="optimistic-bubble"]').first();
   await expect(bubble).toBeVisible();
   const commandId = await bubble.getAttribute("data-command-id");
   expect(commandId).toBeTruthy();
+  // While the first POST is unresolved the row honestly waits (等待发送).
+  await expect(bubble).toContainText("等待发送");
 
-  await expect
-    .poll(() => countUserMessagesForCommand(page, instanceId, commandId!), { timeout: 30_000 })
-    .toBe(1);
+  // The Hub answered the retry with replayed:true.
+  await expect.poll(() => replayResults.length).toBeGreaterThan(0);
+  expect(replayResults[0]).toBe(true);
 
-  // Exactly one command row for that id.
+  // One command row …
   await expect
     .poll(
       async () =>
-        (await listCommands(page, instanceId)).items?.filter(
+        (await hubCommands(api, instanceId)).filter(
           (c) => c.operation === "instance.send" && c.id === commandId,
-        ).length ?? 0,
+        ).length,
+      { timeout: 30_000 },
     )
     .toBe(1);
+  // … and one journal message for the id (executed exactly once).
+  await expect.poll(() => hubJournalMessageCount(api, instanceId, commandId!)).toBe(1);
+  // Delivered, never stuck at 状态待确认.
+  await expect(bubble).toContainText("已受理", { timeout: 20_000 });
 });

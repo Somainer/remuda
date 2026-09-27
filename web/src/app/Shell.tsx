@@ -28,6 +28,7 @@ import { SpaceTabs } from "../features/spaces/SpaceTabs";
 import { spaceStore } from "../features/spaces/store";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
 import { QuickFind, QUICKFIND_HINT, openQuickFind } from "../features/search/QuickFind";
+import { useInboxPendingCount } from "../features/mobile/useInboxPendingCount";
 import { projectFilterStore, useProjectFilter, useProjects, type Project } from "../features/tasks/ProjectSwitcher";
 import { SessionsPage } from "../pages/SessionsPage";
 import { Icon } from "../components/Icon";
@@ -440,7 +441,10 @@ export function Shell() {
   // (their surfaces read useProjectFilter). Loaded once per shell mount.
   const projectDirectory = useProjects();
   const location = useLocation();
-  const pending = hub.interactions.filter((i) => i.state === "pending").length;
+  // c-ghostbadge: the sidebar/bar badge counts exactly the rows the compact
+  // inbox shows as 待你处理 — one shared projection (useInboxPendingCount),
+  // never a second raw `state === "pending"` filter.
+  const pending = useInboxPendingCount();
   const onSessions = isSessionRoute(location.pathname);
   const layout = layoutOf(location.pathname);
   const onNew = layout === "sheet";

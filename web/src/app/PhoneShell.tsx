@@ -7,6 +7,7 @@ import { useWorkbenchViewport } from "../lib/viewport";
 import { SpacesMobile } from "../features/spaces/SpacesMobile";
 import { SpaceTabs } from "../features/spaces/SpaceTabs";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
+import { useInboxPendingCount } from "../features/mobile/useInboxPendingCount";
 import { InstallBar } from "./InstallBar";
 import { ShellNotify } from "./Shell";
 import css from "./phoneShell.module.css";
@@ -33,8 +34,8 @@ export function PhoneShell() {
   const navigate = useNavigate();
   const workbench = useSpaceWorkbench();
   const onHome = location.pathname === "/m";
-  // Badge rule identical to Shell.tsx: pending interactions only.
-  const pending = hub.interactions.filter((i) => i.state === "pending").length;
+  // c-ghostbadge: one source of truth with the /m/inbox 待你处理 tier.
+  const pending = useInboxPendingCount();
   const [moreOpen, setMoreOpen] = useState(false);
   const [morePath, setMorePath] = useState(location.pathname);
   if (morePath !== location.pathname) {

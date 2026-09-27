@@ -42,6 +42,34 @@ export function responsiveTerminalSize(
   };
 }
 
+/**
+ * A4: FitAddon proposes rows from its own cell-height estimate, which can
+ * round one row taller than the cell the renderer actually paints; that row
+ * overflows the host and its bottom line is clipped. Drop rows while the
+ * proposal at the PAINTED cell would exceed the available content height.
+ *
+ * `cellHeight` MUST be the cell the CURRENT screen was painted with (painted
+ * px / the current rows, or xterm's measured `css.cell.height`). Dividing the
+ * painted height by the NEW `proposedRows` rescales the cell on a shrink:
+ * 40 painted rows of 16px read as ~17px per proposed 37 rows, so the already
+ * correct proposal is trimmed a SECOND time (37 → 34) and the PTY stays on
+ * the too-short grid until an unrelated layout signal happens to re-measure
+ * (UO-10 round-7).
+ */
+export function rowsFittingHeight(
+  proposedRows: number,
+  cellHeight: number,
+  availableHeight: number,
+  minRows = 3,
+): number {
+  if (!(cellHeight > 0) || !(availableHeight > 0)) return proposedRows;
+  if (proposedRows * cellHeight <= availableHeight) return proposedRows;
+  return Math.min(
+    proposedRows,
+    Math.max(minRows, Math.floor(availableHeight / cellHeight)),
+  );
+}
+
 export function fittedTerminalFont(bounds: FitBounds, measure: FontMeasure, maxFontSize = 14): number | null {
   if (bounds.width <= 0 || bounds.height <= 0 || bounds.cols <= 0 || bounds.rows <= 0) return null;
   let low = 100;

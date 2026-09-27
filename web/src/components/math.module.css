@@ -1,0 +1,98 @@
+/* @tokens strict */
+/*
+ * Math (KaTeX) presentation, c-math / D-053 addendum 15.
+ *
+ * KaTeX output is currentColor-only (see mathKatex.css), so formulas inherit
+ * the reading-ink role and are correct in both appearances. The display
+ * wrapper owns the horizontal scrollbar: a formula wider than the reading
+ * column scrolls inside its own block, never the page.
+ */
+
+.placeholder {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--fg-muted);
+  /* A long raw source never pushes the transcript sideways: it wraps (the
+     display variant scrolls its own box instead). */
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.inlinePlaceholder {
+  white-space: normal;
+}
+
+.displayPlaceholder {
+  display: block;
+  margin: 0.5em 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-inset);
+  white-space: pre;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.error {
+  color: var(--danger-fg);
+  border-color: var(--danger-border);
+}
+
+.displayScroll {
+  max-width: 100%;
+  margin: 0;
+  /* The formula scrolls inside its own block; the page never does. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  min-width: 0;
+  color: var(--fg-body);
+}
+
+.displayScroll :global(.katex-display) {
+  margin: 0.6em 0;
+  text-align: center;
+}
+
+/*
+ * Inline math is ordinary inline content on the text baseline. No height cap:
+ * ordinary formulas ($x^2$, $\frac{a}{b}$, $\sum$, $\sqrt{}$) do not change
+ * the line box, while explicitly tall constructs (\dfrac, \displaystyle,
+ * matrices) are allowed to grow their line (round-3 ruling J).
+ *
+ * The wrapper is an inline-block so a WIDE formula can scroll inside its own
+ * box instead of widening the transcript (max-width 100%, same contract as
+ * the placeholder). The default is `overflow-x: clip`, deliberately NOT
+ * `auto`: a scroll container reserves its gutter even with no overflow, and
+ * even a 1-2px overflow (e.g. $\sum_i x_i$) would grow the line by the gutter
+ * height. The component measures the rendered node and adds `.inlineScroll`
+ * only when the formula genuinely overflows (round-4 fix 4).
+ */
+.inline {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: clip;
+  vertical-align: baseline;
+  color: var(--fg-body);
+}
+
+.inline :global(.katex) {
+  font-size: 1.1em;
+  /* Keep the formula on one axis: an over-wide formula scrolls, never wraps
+     onto extra lines (a display `.katex-display` gets this from KaTeX; inline
+     does not). */
+  white-space: nowrap;
+}
+
+.inlineScroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+/* Exact streaming source of an unclosed display formula: plain text. */
+.literalTail {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

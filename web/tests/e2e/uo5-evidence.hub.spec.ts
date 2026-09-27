@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Route } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -223,37 +223,61 @@ test("a streaming row keeps its height when the caret comes and goes", async ({ 
 });
 
 test("the caret on a long unwrapped code line never widens the transcript", async ({ page }) => {
-  await holdStreams(page, 2000);
+  // Held until measured: a timed hold can expire on a loaded host before the
+  // streaming row resolves, and the close frame would already be past us.
+  const releaseStream = await holdStreams(page, Number.POSITIVE_INFINITY);
   await login(page);
   const scroller = page.getByTestId("transcript-scroller");
   const overflow = () => scroller.evaluate((el) => el.scrollWidth - el.clientWidth);
   for (const width of [1440, 390]) {
+    // The turn-end check also catches up over HTTP; hold that too, or the
+    // close lands through it before the caret is measured. The gate is
+    // per session so the second width starts with a fresh hold.
+    let releaseJournal = () => {};
+    const journalHeld = new Promise<void>((done) => {
+      releaseJournal = done;
+    });
+    const journalRoute = async (route: Route) => {
+      await journalHeld;
+      await route.continue();
+    };
+    await page.route(/\/journal\?afterSeq=/, journalRoute);
     await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
     // A fresh session at each width: the phone shell lands on it directly.
     await createSession(page);
-    // The reply splits mid-line, so the streaming half ends inside the
-    // unclosed fence, on a ~150 character line wider than the measure.
-    await send(page, `stream ${width}\n\`\`\`\n${"x".repeat(300)}\n\`\`\``);
-    const row = page.getByTestId("transcript-row").filter({
-      has: page.getByTestId("streaming-cursor"),
-    });
-    await expect(row).toHaveCount(1, { timeout: 20_000 });
-    await expect(row.locator("pre")).toHaveCount(1);
-    const box = await row.evaluate((el) => {
-      const cursor = el.querySelector("[data-testid='streaming-cursor']")!.getBoundingClientRect();
-      const pre = el.querySelector("pre")!.getBoundingClientRect();
-      return { cursorRight: cursor.right, preRight: pre.right };
-    });
-    expect(box.cursorRight).toBeLessThanOrEqual(box.preRight + 0.5);
-    expect(await overflow()).toBe(0);
-    // Scrolling the block re-places the caret without widening anything.
-    await row.locator("pre").evaluate((el) => el.scrollBy(200, 0));
-    expect(await overflow()).toBe(0);
-    const anchor = await row.getAttribute("data-anchor");
+    let anchor = "";
+    try {
+      // The reply splits mid-line, so the streaming half ends inside the
+      // unclosed fence, on a ~150 character line wider than the measure.
+      await send(page, `stream ${width}\n\`\`\`\n${"x".repeat(300)}\n\`\`\``);
+      const row = page.getByTestId("transcript-row").filter({
+        has: page.getByTestId("streaming-cursor"),
+      });
+      await expect(row).toHaveCount(1, { timeout: 20_000 });
+      await expect(row.locator("pre")).toHaveCount(1);
+      const box = await row.evaluate((el) => {
+        const cursor = el.querySelector("[data-testid='streaming-cursor']")!.getBoundingClientRect();
+        const pre = el.querySelector("pre")!.getBoundingClientRect();
+        return { cursorRight: cursor.right, preRight: pre.right };
+      });
+      expect(box.cursorRight).toBeLessThanOrEqual(box.preRight + 0.5);
+      expect(await overflow()).toBe(0);
+      // Scrolling the block re-places the caret without widening anything.
+      await row.locator("pre").evaluate((el) => el.scrollBy(200, 0));
+      expect(await overflow()).toBe(0);
+      anchor = (await row.getAttribute("data-anchor")) ?? "";
+    } finally {
+      // Release the closing frame only after the measurements are done;
+      // flush the held stream before the journal catch-up, mirroring the
+      // other held-caret test.
+      releaseStream();
+      releaseJournal();
+    }
     const done = page.locator(`[data-testid="transcript-row"][data-anchor="${anchor}"]`);
     await expect(done.getByTestId("streaming-cursor")).toHaveCount(0, { timeout: 20_000 });
     expect(await overflow()).toBe(0);
-    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_000 });
+    await expect(page.getByTestId("composer-input")).toBeEnabled({ timeout: 20_0_000 });
+    await page.unroute(/\/journal\?afterSeq=/, journalRoute);
   }
 });
 

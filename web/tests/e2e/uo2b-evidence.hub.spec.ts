@@ -144,13 +144,14 @@ for (const width of WIDTHS) {
       // Space selection, then return to the compact home.
       await page.goto(`/s/${created[0]}`);
       await expect(page.getByTestId("spaces-chips")).toBeVisible();
-      // Compact home: Space chips + the strip (Space fallback on /m, no
-      // instance in the route). Six tabs exceed 390px, so an edge cue shows
-      // while the remembered active tab stays visible.
+      // UO-3: the compact home carries no chips row and no strip — the header
+      // Space button opens the same drawer. The task/space tab surface only
+      // exists on the /s/* session route (still reachable via the deep link
+      // above).
       await page.goto("/m");
-      await expect(page.getByTestId("spaces-chips")).toBeVisible();
-      await expect(strip).toBeVisible();
-      await expect(strip).toHaveAttribute("data-overflow", /left|right|both/);
+      await expect(page.getByTestId("space-chip")).toHaveCount(0);
+      await expect(strip).toHaveCount(0);
+      await expect(page.getByTestId("spaces-drawer-open")).toBeVisible();
       for (const mode of MODES) await shoot(page, "home", mode, width);
 
       // The same panel as the desktop index lives behind the drawer, and the

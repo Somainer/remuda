@@ -98,6 +98,30 @@ IBM Plex Mono
   text uses the platform system font, so no other webfont is shipped.
 
 -------------------------------------------------------------------------------
+MIT (bundled web libraries)
+
+KaTeX
+  Copyright (c) 2013-2020 Khan Academy and other contributors
+  License: MIT (full text: web/LICENSES/KaTeX-MIT.txt)
+  Source: https://github.com/KaTeX/KaTeX, npm package katex 0.18.9
+  Bundled: the engine ships in a lazy async chunk loaded only when a message
+  contains math; the KaTeX stylesheet is regenerated at
+  web/src/components/mathKatex.css with the ttf/woff @font-face sources
+  removed (woff2 only, ~292 KB across 20 faces) and font URLs rewritten to
+  hashed /assets/ names. Rendered with trust:false, throwOnError:false,
+  strict:"ignore", output htmlAndMathml; colors are currentColor only.
+  Modifications: stylesheet font-source pruning (documented at the top of
+  the file); no source-code changes.
+
+remark-math / micromark-extension-math / mdast-util-math
+  Copyright (c) the respective unified collective authors
+  License: MIT
+  Source: https://github.com/remarkjs/remark-math, npm packages
+  remark-math 6.0.0, micromark-extension-math 3.1.0, mdast-util-math 3.0.0
+  Bundled: math mdast parsing only; the transcript applies its own
+  pre-markdown delimiter scanner (web/src/lib/mathSegments.ts) on top.
+
+-------------------------------------------------------------------------------
 Not copied (referenced by absolute path at runtime only)
 
 OpenAI Codex / ChatGPT Computer Use

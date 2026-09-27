@@ -4,6 +4,7 @@ import {
   type InteractionUiState,
 } from "../../lib/interactionStatus";
 import { formatClock } from "../../lib/format";
+import { deriveInboxQueue } from "../mobile/inboxRows";
 import type { Host, Instance, UiStatus } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 
@@ -50,6 +51,8 @@ export type ApprovalSource = {
   answering: Record<string, true>;
   deviceId: string;
   workspaceLabel: (workspaceId: string) => string;
+  /** Clock injection (c-ghostbadge round 2); defaults to the wall clock. */
+  nowMs?: number;
 };
 
 export type ApprovalFilters = {
@@ -58,8 +61,6 @@ export type ApprovalFilters = {
   workspaceId: string;
   focus: string | null;
 };
-
-const QUEUE_STATES = new Set<InteractionUiState>(["pending", "answering", "paused"]);
 
 /**
  * Signature of the card's render inputs. `request` is immutable per
@@ -114,31 +115,32 @@ export function deriveApprovalRows(
   const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
   const hostById = new Map(source.hosts.map((host) => [host.id, host]));
 
+  // c-ghostbadge round 2: the queue tier is the SAME projection the compact
+  // inbox and every badge read (deriveInboxQueue) — one pending/answering/
+  // paused membership, no second QUEUE_STATES loop. Desktop's host/workspace
+  // query chips are applied only while turning queue membership into rows.
+  const queueMembers = deriveInboxQueue({
+    interactions: source.interactions,
+    instances: source.instances,
+    hosts: source.hosts,
+    answering: source.answering,
+    deviceId: source.deviceId,
+    nowMs: source.nowMs,
+  });
+  const queueIds = new Set(queueMembers.map((member) => member.item.id));
+
+  const passesFilters = (item: Interaction, instance: Instance | undefined): boolean => {
+    if (filters.kind !== "all" && item.kind !== filters.kind) return false;
+    if (filters.hostId && item.hostId !== filters.hostId) return false;
+    if (filters.workspaceId && instance?.workspaceId !== filters.workspaceId) return false;
+    return true;
+  };
+
   const queue: ApprovalRow[] = [];
-  const departed: ApprovalRow[] = [];
-
-  for (const item of source.interactions) {
-    // Cheap, join-free rejection first: kind/host filters need no join.
-    if (filters.kind !== "all" && item.kind !== filters.kind) continue;
-    if (filters.hostId && item.hostId !== filters.hostId) continue;
-
-    // Settled on this device renders nowhere — skip projection and joins.
-    if (settledOnThisDevice(item, source.deviceId)) continue;
-
-    const instance = instanceById.get(item.instanceId);
-    if (filters.workspaceId && instance?.workspaceId !== filters.workspaceId) continue;
-
-    const host = hostById.get(item.hostId);
-    const uiState = projectInteraction(item, {
-      answering: Boolean(source.answering[item.id]),
-      host,
-      connectivity: instance?.connectivity,
-      deviceId: source.deviceId,
-    });
-    if (uiState === "settled") continue;
-
+  for (const { item, instance, host, uiState } of queueMembers) {
+    if (!passesFilters(item, instance)) continue;
     const focused = filters.focus === item.id;
-    const row: ApprovalRow = {
+    queue.push({
       item,
       instance,
       host,
@@ -152,9 +154,47 @@ export function deriveApprovalRows(
         source.workspaceLabel(instance?.workspaceId ?? ""),
         focused,
       ),
-    };
-    if (QUEUE_STATES.has(uiState)) queue.push(row);
-    else departed.push(row); // expired / superseded
+    });
+  }
+
+  // Departed: interactions outside the shared queue projection. The only
+  // visible projections left are expired / superseded; settled-on-this-device
+  // rows render nowhere.
+  const departed: ApprovalRow[] = [];
+  for (const item of source.interactions) {
+    if (queueIds.has(item.id)) continue;
+    // Cheap, join-free rejection first: kind/host filters need no join.
+    if (filters.kind !== "all" && item.kind !== filters.kind) continue;
+    if (filters.hostId && item.hostId !== filters.hostId) continue;
+    // Settled on this device renders nowhere — skip projection and joins.
+    if (settledOnThisDevice(item, source.deviceId)) continue;
+    const instance = instanceById.get(item.instanceId);
+    if (filters.workspaceId && instance?.workspaceId !== filters.workspaceId) continue;
+    const host = hostById.get(item.hostId);
+    const uiState = projectInteraction(item, {
+      answering: Boolean(source.answering[item.id]),
+      host,
+      connectivity: instance?.connectivity,
+      deviceId: source.deviceId,
+      nowMs: source.nowMs,
+    });
+    if (uiState !== "expired" && uiState !== "superseded") continue;
+    const focused = filters.focus === item.id;
+    departed.push({
+      item,
+      instance,
+      host,
+      uiState,
+      focused,
+      sig: rowSignature(
+        item,
+        instance,
+        host,
+        uiState,
+        source.workspaceLabel(instance?.workspaceId ?? ""),
+        focused,
+      ),
+    });
   }
 
   return { queue, departed };

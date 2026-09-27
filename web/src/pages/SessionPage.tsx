@@ -37,6 +37,7 @@ import { ViewSwitch } from "../features/session/ViewSwitch";
 import { nativeShort, isGenericPty, isPromoted, projectStatus, uiMode, UI_STATUS_LABEL } from "../lib/status";
 import { apiRouteClause, apiRouteKind, routeDownMessage } from "../lib/apiRoute";
 import { projectCommandStatus } from "../lib/commandStatus";
+import { endReason } from "../lib/endReason";
 import { bindingChipText, transcriptBinding } from "../lib/transcriptBinding";
 import type { ResumeMode } from "../lib/api";
 import { hubStore, useHub } from "../lib/store";
@@ -177,6 +178,9 @@ export function SessionPage({
       status === "blocked" ? "blocked" : status === "working" ? "working" : "idle";
   }
   const nodeRestarted = instance?.lastError === "node-epoch-changed";
+  // c-endreason: the shared human sentence (「Node 重启，会话已中断」),
+  // neutral — the session was interrupted by the restart, never failed.
+  const nodeRestartEnd = nodeRestarted && instance ? endReason(instance) : null;
   const resolvedView = view === "auto" ? baseView : view;
   // Terminal segments offer no annotations; archived-task sessions are a
   // read-only preview (plan task-model task 9 acceptance 3).
@@ -598,8 +602,12 @@ export function SessionPage({
         <RunDetails count={diagnostics.length}>{diagnosticRows}</RunDetails>
       </header>
       {nodeRestarted ? (
-        <div className={session.nodeRestart} data-testid="node-restart-banner">
-          <span>Node 重启，会话已结束</span>
+        <div
+          className={session.nodeRestart}
+          data-testid="node-restart-banner"
+          title={nodeRestartEnd?.detail ?? undefined}
+        >
+          <span>{nodeRestartEnd?.label ?? "Node 重启，会话已中断"}</span>
           <Button
             variant="primary"
             disabled={resuming || !canResume}

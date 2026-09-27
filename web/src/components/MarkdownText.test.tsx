@@ -209,6 +209,143 @@ describe("sanitising fence bodies", () => {
   });
 });
 
+describe("math rendering (c-math round 3)", () => {
+  const SOFTMAX =
+    "$$\\sigma(\\mathbf{z})_i = \\frac{e^{z_i}}{\\sum_{j=1}^{K} e^{z_j}}$$";
+
+  it("renders the owner softmax formula as display KaTeX, not raw TeX", async () => {
+    render(<MarkdownText text={SOFTMAX} />);
+    const display = await screen.findByTestId("math-display");
+    expect(display.querySelector(".katex-display")).toBeTruthy();
+    expect(display.querySelector(".mfrac")).toBeTruthy();
+    expect(display.querySelector("em")).toBeNull();
+    expect(screen.queryByTestId("code-block")).toBeNull();
+  });
+
+  it("renders inline math and keeps surrounding prose", async () => {
+    render(<MarkdownText text={"函数 $f(x)=x^2$ 的值"} />);
+    const inline = await screen.findByTestId("math-inline");
+    expect(inline.querySelector(".katex")).toBeTruthy();
+    expect(screen.getByText(/函数/)).toBeTruthy();
+    expect(screen.getByText(/的值/)).toBeTruthy();
+  });
+
+  it("translates bracket delimiters in place (no structure moved)", async () => {
+    render(<MarkdownText text={"a \\(x^2\\) b and \\[y^2\\]"} />);
+    expect((await screen.findByTestId("math-inline")).querySelector(".katex")).toBeTruthy();
+    expect((await screen.findByTestId("math-display")).querySelector(".katex-display")).toBeTruthy();
+  });
+
+  it("renders currency as text but an explicit pair in the same sentence (D)", async () => {
+    render(<MarkdownText text={"Cost $5 and $10; use $x$."} />);
+    expect(await screen.findByTestId("math-inline")).toBeTruthy();
+    expect(screen.getByText(/Cost \$5 and \$10; use/)).toBeTruthy();
+  });
+
+  it("leaves shell variables as plain text", async () => {
+    render(<MarkdownText text={"echo $HOME and $PATH"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+    expect(screen.getByText("echo $HOME and $PATH")).toBeTruthy();
+  });
+
+  it("keeps escaped dollars literal", () => {
+    render(<MarkdownText text={"价格 \\$5"} />);
+    expect(screen.getByText(/价格/).textContent).toContain("$5");
+  });
+
+  it("never parses math inside code spans, fences or indented tilde fences (A)", async () => {
+    render(<MarkdownText text={"inline `$a_b$` and\n```\n$$not math$$\n```"} />);
+    const block = await screen.findByTestId("code-block");
+    expect(block.textContent).toContain("$$not math$$");
+    expect(screen.getByText("$a_b$")).toBeTruthy();
+    expect(screen.queryByTestId("math-display")).toBeNull();
+
+    const { unmount } = render(
+      <MarkdownText text={"  ~~~\n$x$\n  ~~~\nend"} />,
+    );
+    expect(screen.getAllByTestId("code-block").length).toBeGreaterThan(0);
+    unmount();
+  });
+
+  it("keeps a same-line $$ inside a blockquote and a list item, as a block (C)", async () => {
+    const { container, rerender } = render(<MarkdownText text={"> before $$x^2$$ after"} />);
+    const quote = container.querySelector("blockquote")!;
+    expect(quote).toBeTruthy();
+    expect(screen.getByText(/before/)).toBeTruthy();
+    expect(screen.getByText(/after/)).toBeTruthy();
+    expect(quote.querySelector('[data-testid="math-display"] .katex-display')).toBeTruthy();
+
+    rerender(<MarkdownText text={"- before $$y^2$$ after"} />);
+    const item = container.querySelector("ul > li")!;
+    expect(item).toBeTruthy();
+    expect(item.textContent).toContain("before");
+    expect(item.textContent).toContain("after");
+    expect(item.querySelector('[data-testid="math-display"]')).toBeTruthy();
+  });
+
+  it("translates a list bracket display in place (C: - \\[x\\])", async () => {
+    const { container } = render(<MarkdownText text={"- \\[x^2\\]"} />);
+    const item = container.querySelector("ul > li")!;
+    expect(item).toBeTruthy();
+    expect(item.querySelector('[data-testid="math-display"] .katex-display')).toBeTruthy();
+  });
+
+  it("renders an indented $$ line as a code block, not a formula (C)", async () => {
+    render(<MarkdownText text={"    $$x^2$$"} />);
+    expect(await screen.findByTestId("code-block")).toBeTruthy();
+    expect(screen.queryByTestId("math-display")).toBeNull();
+  });
+
+  it("treats mathdisplay / mathinline / ~~~math fences as code (F)", async () => {
+    const { rerender } = render(<MarkdownText text={"```mathdisplay\nx\n```"} />);
+    expect((await screen.findByTestId("code-block")).textContent).toContain("x");
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    rerender(<MarkdownText text={"```mathinline\ny\n```"} />);
+    expect((await screen.findAllByTestId("code-block")).length).toBeGreaterThan(0);
+    expect(screen.queryByTestId("math-inline")).toBeNull();
+    rerender(<MarkdownText text={"~~~math\nz\n~~~"} />);
+    expect((await screen.findAllByTestId("code-block")).length).toBeGreaterThan(0);
+  });
+
+  it("renders an unclosed display tail as an exact-source React text node (G)", async () => {
+    const { rerender } = render(<MarkdownText text={"intro \\[a *b* + \\{c\\}"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect(document.body.querySelector("em")).toBeNull();
+    const literal = await screen.findByTestId("math-literal");
+    expect(literal.textContent).toBe("\\[a *b* + \\{c\\}");
+
+    rerender(<MarkdownText text={"intro $$\n\\sigma(z)"} />);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    const lit2 = await screen.findByTestId("math-literal");
+    expect(lit2.textContent).toBe("$$\n\\sigma(z)");
+  });
+
+  it("kills only the broken $$ opener, then later $$ and $ render (E)", async () => {
+    render(<MarkdownText text={"$$\n\nx\n\n$$y$$\n\n$z$"} />);
+    expect(await screen.findByTestId("math-display")).toBeTruthy();
+    expect(await screen.findByTestId("math-inline")).toBeTruthy();
+  });
+
+  it("renders a broken formula as its source without breaking the message", async () => {
+    render(<MarkdownText text={"坏的 $$\\frac{$$ 后面"} />);
+    const error = await screen.findByTestId("math-error");
+    expect(error.textContent).toBe("\\frac{");
+    expect(screen.getByText(/后面/)).toBeTruthy();
+  });
+
+  it("closes a streaming formula when the closer arrives", async () => {
+    const { rerender } = render(<MarkdownText text={"$$\n\\sigma(z)"} />);
+    expect(screen.queryByTestId("math-display")).toBeNull();
+    expect((await screen.findByTestId("math-literal")).textContent).toBe("$$\n\\sigma(z)");
+    rerender(<MarkdownText text={"$$\n\\sigma(z)\n$$"} />);
+    expect(await screen.findByTestId("math-display")).toBeTruthy();
+    expect(screen.queryByTestId("math-literal")).toBeNull();
+  });
+});
+
 describe("D-027b file-mention folding", () => {
   it("renders a quoted [File #n] saved-at line as a collapsed row", () => {
     const text =

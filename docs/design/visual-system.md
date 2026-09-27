@@ -97,7 +97,7 @@ tokenGuard 断言两条：
 | `--on-attention` | 琥珀色计数徽标上的数字 | `#1f1e1b` | `#ffffff` |
 | `--scrim` | 遮罩 | `rgb(10 9 8 / .62)` | `rgb(31 30 27 / .28)` |
 | `--diff-add-bg` / `-del-bg` / `-ctx-bg` | diff（必须配 +/- 字形） | `rgb(163 194 154/.14)`、`rgb(236 154 148/.14)`、`rgb(255 246 230/.03)` | `rgb(58 104 67/.10)`、`rgb(163 56 62/.09)`、`rgb(60 45 20/.03)` |
-| `--term-bg` / `--term-fg` | 终端，两态相同 | `#1a1917` / `#e4dfd6` | 同左 |
+| `--term-bg` / `--term-fg` | 终端，跟随外观（2026-09-24 改定） | `#1a1917` / `#e4dfd6` | `#faf9f6` / `#2b2a27` |
 | `--tok-*` | 代码语法色，两态分设 | UO-1 从 `components/codeBlock.module.css` 现有的两组 `[data-theme]` 值平移，并逐个校到 `--bg-inset` 上 ≥ 4.5:1 | 同左 |
 | `--ember-*` | effort 顶档余烬 | UO-1 从 `features/session/session.module.css` 现有 `.effortCard` / `.effortKnobUltra` 的 night/ledger 模式分支原值平移 | 同左 |
 
@@ -178,13 +178,28 @@ tokenGuard 断言两条：
 
 ## 4. 终端配色（`features/session/tty/theme.ts`）
 
-- **命名**：新增 `export const TERMINAL_THEME`，同时保留 `export const NIGHT_CORRAL_THEME = TERMINAL_THEME` 作为过渡别名；引用方切到新名字后，别名在最后一个界面任务删除。
-- **基础色**：background `#1a1917`，foreground `#e4dfd6`，cursor `#e0b872`，cursorAccent `#1a1917`，selectionBackground `#3d3a35`。
-- **常规色**：black `#2c2a27`、red `#e8837c`、green `#9dbf87`、yellow `#dcb46a`、blue `#86aee0`、magenta `#c79ad8`、cyan `#7fbfbb`、white `#cfc9be`。
-- **亮色**：brightBlack `#8f897e`、brightRed `#f4a59e`、brightGreen `#b9d6a4`、brightYellow `#ecd08f`、brightBlue `#a9c7ee`、brightMagenta `#dcb8e8`、brightCyan `#a0d8d3`、brightWhite `#f6f2ea`。
+- **命名**：`DARK_TERMINAL_THEME` / `LIGHT_TERMINAL_THEME`，经 `terminalThemeFor(appearance)` 选择（`TERMINAL_THEME` / `NIGHT_CORRAL_THEME` 为暗色过渡别名）。终端跟随外观（所有者 2026-09-24 改定）；切换只赋值 `term.options.theme`，不重建终端、不丢滚动历史。
+- **深色基础色**：background `#1a1917`，foreground `#e4dfd6`，cursor `#e0b872`，cursorAccent `#1a1917`，selectionBackground `#3d3a35`。
+- **深色常规色**：black `#2c2a27`、red `#e8837c`、green `#9dbf87`、yellow `#dcb46a`、blue `#86aee0`、magenta `#c79ad8`、cyan `#7fbfbb`、white `#cfc9be`。
+- **深色亮色**：brightBlack `#8f897e`、brightRed `#f4a59e`、brightGreen `#b9d6a4`、brightYellow `#ecd08f`、brightBlue `#a9c7ee`、brightMagenta `#dcb8e8`、brightCyan `#a0d8d3`、brightWhite `#f6f2ea`。
+- **浅色基础色**（bg `#faf9f6`）：foreground `#2b2a27`，cursor `#8a630f`，cursorAccent `#faf9f6`，selectionBackground `#d8e2ee`。
+- **浅色 ANSI（相对 `#faf9f6`，全部 ≥4.5:1）**：
+
+  | 槽位 | hex | 对比 | 槽位 | hex | 对比 |
+  |---|---|---|---|---|---|
+  | black | `#1f1e1b` | 15.8 | white（TUI 底色） | `#96918a` | 4.6/5.3* |
+  | red | `#c13d32` | 5.0 | brightRed | `#a52a22` | 6.8 |
+  | green | `#3a702e` | 5.6 | brightGreen | `#2e5c24` | 7.5 |
+  | yellow | `#8a630f` | 5.2 | brightYellow | `#755308` | 6.7 |
+  | blue | `#2f5a9e` | 6.5 | brightBlue | `#224a8a` | 8.3 |
+  | magenta | `#9335a8` | 6.0 | brightMagenta | `#7c2790` | 7.8 |
+  | cyan | `#1f6f6b` | 5.6 | brightCyan | `#165e5a` | 7.2 |
+  | brightBlack | `#767066` | 4.7 | brightWhite（TUI 底色） | `#a39e96` | 6.3/5.4* |
+
+  \*black-on-slot / default-fg-on-slot。white/brightWhite 是浅灰而非近白：htop/dialog/ncurses 把默认或黑色文字画在这些槽位上，必须 ≥4.5:1；它们作为前景字印在浅页面上是被接受的低对比情形，真白由 truecolor/256 色 231 提供。
 - **256 色立方**：删除自绘的 `nightCorralExtendedAnsi`，改用 xterm 的标准 256 色立方，不再染色。
 - **字体**：`TERMINAL_FONT_FAMILY` 仍以 IBM Plex Mono 打头。
-- 终端是恒深色的仪器：深浅两态下终端相同，终端不订阅外观变化；每个非黑 ANSI 色在终端底上都 ≥ 4.5:1，终端输出的颜色不被改写。
+- 终端跟随外观（2026-09-24 所有者改定，取代恒深色口径）：深、浅两套调色板随外观切换，切换只设 `term.options.theme`、渲染器就地重绘，不重建终端、不丢滚动历史；两套板各自的 16 个非黑 ANSI 色在本板终端底上 ≥ 4.5:1，终端输出的颜色（含 256 色立方与 truecolor）不被改写。浅板 white/brightWhite 为浅灰（#96918a/#a39e96），使黑字与默认前景字印在其上 ≥4.5:1（htop/dialog/ncurses 状态栏）；它们作为前景字印在浅页面上是被接受的低对比例外，真白走 truecolor/256 色 231。
 
 ---
 
@@ -418,3 +433,58 @@ tokenGuard 断言两条：
 3. 迁移完成前，由过渡镜像 `data-theme` 保持这些分支继续生效。
 
 **护栏**：重做过的模块首行标 `/* @tokens strict */`。tokenGuard 在这些模块里禁止：十六进制颜色、旧 token 名、`[data-theme`、`[data-appearance`、`prefers-color-scheme`、小于 12px 的字号字面量（登记过的图形站点除外）、`transition: all`、`backdrop-filter`。
+
+---
+
+## 10. 数学排版（D-053 addendum 第 15 条，2026-09-24）
+
+transcript 正文（`.md`）支持 LaTeX 公式，引擎 KaTeX（MIT）。机械实现以 `web/src/components/MathBlock.tsx`、`web/src/components/math.module.css`、`web/src/lib/mathSegments.ts`、`web/src/lib/mathRender.ts` 为准；本节只钉取值与边界。
+
+### 10.1 颜色与字体
+
+- KaTeX 输出的唯一颜色声明是 `currentColor`（其上游样式表核实如此），因此不引入任何颜色字面量：inline/display 节点统一显式 `color: var(--fg-body)`，深浅两态各自就是阅读墨色；错误态用 `--danger-fg` + `--danger-border`。
+- 数学不新增字体令牌。KaTeX 自带字族（KaTeX_Main / KaTeX_Math / KaTeX_AMS 等）随其独立 CSS chunk 按需加载；占位 TeX 源码与错误态用 `--font-mono`。
+- KaTeX 样式表以 `web/src/components/mathKatex.css` 入库：由 `katex/dist/katex.css` 删掉全部 ttf/woff `src`（只保留 woff2，20 个字面、合计约 292 KB）、把字体 URL 改写为构建产物路径、并把每个 `@font-face` 的 `font-display` 从 `block` 改为 `swap`（慢字体不再隐藏已渲染公式）；KaTeX 升级后按文件头注释重新生成。
+
+### 10.2 布局
+
+| 项 | 取值 |
+|---|---|
+| display 外边距 | `0.6em 0`，在阅读列内 `text-align: center` |
+| display 超宽 | 外层 `overflow-x: auto; overflow-y: hidden; max-width: 100%; min-width: 0`，横向滚动条只属于公式块，页面永不横向滚动 |
+| display 超高 | KaTeX `maxSize: 20em`，`\rule{…}` 等尺寸被钳制，永不撑出超高元素 |
+| inline 行盒 | KaTeX 默认 1.21em 收紧到 `1.1em`；**不设高度上限**：普通公式（`$x^2$`、`$\frac{a}{b}$`、`$\sum$`、`$\sqrt{}$`）坐在基线上、段落高度在单行 +2px 内（e2e 断言）；显式高公式（`\dfrac`、`\displaystyle`、矩阵）允许撑大所在行（round-3 放宽 J） |
+| 占位/skip 节点 | 占位与超长 skip 节点 `max-width: 100%`，display 变体自身 `overflow-x:auto`、inline 变体 `overflow-wrap:anywhere`，transcript 永不被长源码撑出横向滚动 |
+| 错误块（display） | `--bg-inset` 底、1px `--danger-border`、`--radius-md`、10px 12px 内边距、danger 文字；超长源码（>4000 字符）为中性 skip 态，不上 danger 色 |
+
+### 10.3 加载、工作量边界与行为
+
+- KaTeX JS（约 259 KB / gzip 78 KB）、CSS（约 27 KB / gzip 7.5 KB）与 woff2 字面全部为异步 chunk：第一条数学节点挂载时才请求；无数学的 transcript 页面零请求（e2e 断言）。
+- 占位保留到引擎就绪**且** KaTeX_Main/KaTeX_Math 主字面可用（`document.fonts.load().catch(…)`，配合 `font-display: swap`）才撤；没有定时器、也不会在字体失败时换成不可见字形。虚拟行由 Transcript 的 per-row ResizeObserver 重新测量，阅读锚点不动。
+- 渲染选项固定 `output: "htmlAndMathml"`（MathML 供屏幕阅读器）、`throwOnError: false`、`trust: false`、`strict: "ignore"`、`maxSize: 20`（em）、`maxExpand: 1000`。坏公式显示带 `--danger-fg` 的源码与错误 title；宏炸弹（`\def\a{\a}\a`）被 `maxExpand` 截断成错误节点；超过 `MATH_MAX_SOURCE = 4000` 字符的源码直接跳过引擎、以中性源码显示（e2e 钉 100 KB）。成功 HTML 按 `(source, display)` 记忆化，流式重渲染同一条只解析一次。
+- 工作量线性（见 10.4 的解析器归属与单趟游标）：四个 100 KB 对抗输入 best-of-7 均在个位数~31ms：`"\(".repeat(50000)`、`"$$x\n\n".repeat(20000)`、`"$1".repeat(50000)`、100 KB 公式。
+- chunk 加载失败不是粘性错误：发布 `error` 后清空去重槽，下一次 `loadMath()` 从 `loading` 重新发起 import；e2e/单测钉「先 reject 一个组件、第二个挂载组件随后渲染成功」。
+- 流式：消息末尾真正悬空（EOF 前无闭合）的最后一个 `$$`/`\[`，其整段尾巴作为**纯 React 文本节点**渲染（`math-literal`），定界符、反斜杠、`\*`、`_` 原样、不经 markdown、不出现 `<em>`；闭合后才整体成为公式。
+- 复制：选区完全位于公式内时，剪贴板写入 TeX 源码；选区延伸到公式外时保持浏览器默认行为。
+
+### 10.4 定界符与 markdown 结构
+
+| 写法 | 含义 |
+|---|---|
+| `$$…$$`、`\[…\]` | display math（块级；同一行的 `$$x$$`/`\[x\]` 由 mdast 标记为 display 块） |
+| `$…$`、`\(…\)` | inline math |
+
+- **代码归属解析器（A）**：用与渲染相同的 remark 管线（remark-parse + remark-gfm，**不带** math）解析一次，取 `code`/`inlineCode`/`html` 节点的源码区间，定界符扫描整段跳过——围栏（含 2 空格缩进的 `  ~~~`）、tilde、缩进块、代码 span 与未来代码形态都自动覆盖。带一个廉价的「可能含代码」预检（无反引号/波浪号/`<`/缩进行就跳过整次解析），让不含代码的对抗输入完全不碰解析器。
+- **就地改写（C）**：扫描只做线性的 `\(x\)`→`$x$`、`\[x\]`→`$$x$$` 同行替换，绝不注入换行/空行/fence、不碰列表 marker 或 `>`。`$`/`$$` 的容器/段落/空行结构交给 remark-math：`- before $$x$$ after`、`> before $$x$$ after` 的公式留在列表项/引用内并由 mdast provenance 标记成 display 块；`    $$x$$` 仍是缩进代码。
+- **配对即逃逸（D）**：任何不是已接受配对定界符的 `$` 都输出为 `\$`，remark-math 不可能配出与扫描器不同的结果：`Cost $5 and $10; use $x$.` 只有 `x` 是数学；`echo $HOME and $PATH` 全为文本。单 `$` 接受规则按 pandoc：开 `$` 后非空白、闭 `$` 前非空白且其后非数字；`$PATH:$HOME` 与 pandoc 一致仍为数学。
+- **空行（E）**：`$$\n\nx\n\n$$y$$\n\n$z$` 里第一个空行后的坏开 run 只杀死自己，随后 `$$y$$`、`$z$` 都正常渲染（扫描在该 run 之后继续，不吞到 EOF）。
+- **provenance（F）**：真正的 mdast math 节点由 remark 插件在 `node.data.hProperties.dataMath` 上打 `inline`/`display`（flow math 落在 `<pre>`，同线 `$$`/`$` 落在 `<code>`）；sanitizer 仅对 `pre`/`code` 放行 `dataMath` 一个属性。` ```mathdisplay `、` ```mathinline `、`~~~math` 围栏没有 mdast math 节点、不产生该属性，故走 CodeBlock 且不加载 KaTeX。
+
+### 10.5 证据
+
+- 单元（vitest，59 例）：`mathSegments.test.ts`（接受对、货币 D、解析器归属代码 A、空行 E、流式字面 G、四个 100 KB 线性计时 B）、`mathRender.test.ts`、`mathLoader.test.ts`（失败后第二组件渲染 K）、`MathBlock.test.tsx`（占位→字体→KaTeX、display、currentColor、错误/skip、复制、失败重试 K）、`MarkdownText.test.tsx` math 段（端到端管线、容器就地 C、math 围栏 F、字面 React 文本 G、空行 E）。
+- e2e：`web/tests/e2e/math-render.hub.spec.ts`——owner softmax + inline + 货币 + 坏公式（深浅×1440/390、KaTeX 输出、无原始 TeX、无页面横向溢出）；一个 round-3 用例钉：解析器归属代码（缩进/`mathdisplay` 围栏）、容器就地 display、字面尾巴精确文本、`\rule{100000em}` 钳制、宏炸弹、100 KB skip；两个 J 用例钉普通 inline 段落 ≤单行+2px、显式 `\dfrac` 允许撑高；一例断言无数学页面零 KaTeX 请求。
+- 截图仅在 `REMUDA_EVIDENCE=1` 时落库，宽度 390 与 1440（D-053「不做什么」末条不变）。
+
+> fenceBalance（UO-5）：该文件落地后需用与 MarkdownText 相同的 remark 插件列表（含 remark-math），并单独一个提交修复「被无 `>` 空行结束的引用围栏仍被追加闭合」的已知问题（追加闭合仅当解析出的 code 节点真正到达 EOF）。
+

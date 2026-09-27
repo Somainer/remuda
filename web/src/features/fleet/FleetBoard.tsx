@@ -15,12 +15,14 @@ export function FleetBoard({ fleets, hosts }: { fleets: Fleet[]; hosts: HostView
   const [error, setError] = useState<string | null>(null);
 
   return (
-    <div data-testid="fleet-board">
-      <section className={ui.card} style={{ marginBottom: 16 }}>
-        <strong>创建 fleet</strong>
-        <p className={ui.listMeta}>POST /v1/fleet/instances · 同一 spec 在 N 台主机各起一个 Instance</p>
+    <div data-testid="fleet-board" className={css.groups}>
+      <section className={css.section}>
+        <div className={css.sectionHead}>
+          <h2 className={css.sectionTitle}>创建 fleet</h2>
+          <p className={css.sectionSub}>POST /v1/fleet/instances · 同一 spec 在 N 台主机各起一个 Instance</p>
+        </div>
         <PlacementPicker hosts={hosts} value={placement} onChange={setPlacement} />
-        <label className={ui.field} style={{ marginTop: 8 }}>
+        <label className={ui.field}>
           N
           <input
             className={ui.input}
@@ -33,11 +35,11 @@ export function FleetBoard({ fleets, hosts }: { fleets: Fleet[]; hosts: HostView
           />
         </label>
         {error ? (
-          <p data-testid="fleet-error" style={{ color: "var(--dust)" }}>
+          <p data-testid="fleet-error" className={css.error}>
             {error}
           </p>
         ) : null}
-        <div className={ui.row} style={{ marginTop: 8, justifyContent: "flex-end" }}>
+        <div className={css.actions}>
           <Button
             variant="primary"
             data-testid="fleet-create"
@@ -57,19 +59,19 @@ export function FleetBoard({ fleets, hosts }: { fleets: Fleet[]; hosts: HostView
       {fleets.map((fleet) => {
         const counts = countFleet(fleet.members);
         return (
-          <section key={fleet.id} className={ui.card} style={{ marginBottom: 12 }} data-testid="fleet-card">
-            <div className={ui.row} style={{ justifyContent: "space-between" }}>
-              <strong>{fleet.label}</strong>
+          <section key={fleet.id} className={css.section} data-testid="fleet-card">
+            <div className={css.groupHead}>
+              <span className={css.groupTitle}>{fleet.label}</span>
               <Button data-testid="fleet-cancel" onClick={() => fleetStore.cancel(fleet.id)}>
                 广播 cancel
               </Button>
             </div>
-            <p className={ui.listMeta}>
+            <p className={css.sectionSub}>
               working {counts.working} · idle {counts.idle} · blocked {counts.blocked} · unknown {counts.unknown}
               {counts.cancelled ? ` · cancelled ${counts.cancelled}` : ""}
             </p>
             {counts.offlineHosts ? (
-              <p className={ui.listMeta} data-testid="fleet-offline-host">
+              <p className={css.sectionSub} data-testid="fleet-offline-host">
                 主机离线，任务状态未知
               </p>
             ) : null}
@@ -77,13 +79,13 @@ export function FleetBoard({ fleets, hosts }: { fleets: Fleet[]; hosts: HostView
               {fleet.members.map((member) => (
                 <li key={member.instanceId} className={css.member} data-testid="fleet-member" data-status={member.status}>
                   {member.status === "cancelled" ? (
-                    <span className={ui.listMeta}>×</span>
+                    <span className={`${ui.dot} ${ui.dotExited}`} role="img" aria-label="已取消" />
                   ) : (
                     <StateDot status={member.status} />
                   )}
-                  <span>
+                  <span className={css.memberBody}>
                     <Link to={`/s/${member.instanceId}`}>{member.title}</Link>
-                    <div className={ui.listMeta}>
+                    <div className={css.memberMeta}>
                       {member.hostLabel} · {member.status}
                       {member.hostOnline ? "" : " · 主机离线"}
                     </div>

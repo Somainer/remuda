@@ -38,6 +38,7 @@ import {
   type InboxInteractionRow,
   type PushBannerState,
 } from "../mobile/inboxRows";
+import { useInboxClockNow } from "../mobile/useInboxPendingCount";
 import compactCss from "../mobile/inbox.module.css";
 
 const BANNER_DISMISS_KEY = "runtime.m-inbox-push-banner-dismissed";
@@ -319,10 +320,7 @@ const RecentRowCard = memo(
           <ContextRing pct={row.contextPct} />
         </div>
         {row.subtitle ? (
-          <p
-            className={`${compactCss.subtitle} ${row.status === "exited" ? compactCss.subtitleError : ""}`}
-            title={row.subtitle}
-          >
+          <p className={compactCss.subtitle} title={row.subtitle}>
             {row.subtitle}
           </p>
         ) : null}
@@ -428,6 +426,9 @@ function DesktopInbox({
   onToggleFilter: (key: "host" | "workspace", value: string) => void;
   respond: RespondFn;
 }) {
+  // c-ghostbadge round 2: the clock store provides the current instant; a
+  // deadline crossing flips the tiers without a store emission.
+  const nowMs = useInboxClockNow();
   const rows = useMemo(
     () =>
       profileRegion("approvals.deriveRows", () =>
@@ -439,6 +440,7 @@ function DesktopInbox({
             answering: hub.answering,
             deviceId,
             workspaceLabel,
+            nowMs,
           },
           { kind, hostId: hostFilter, workspaceId: workspaceFilter, focus },
         ),
@@ -450,6 +452,7 @@ function DesktopInbox({
       hub.answering,
       deviceId,
       workspaceLabel,
+      nowMs,
       kind,
       hostFilter,
       workspaceFilter,
@@ -546,6 +549,9 @@ function CompactInbox({
   const [push, setPush] = useState<PushStatus | null>(null);
   const [dismissed, setDismissed] = useState(bannerDismissed);
   const [showHomeHint, setShowHomeHint] = useState(false);
+  // c-ghostbadge round 2: the clock store provides the current instant; a
+  // deadline crossing flips the tiers without a store emission.
+  const nowMs = useInboxClockNow();
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -572,6 +578,7 @@ function CompactInbox({
           titleOf: (id) => hubStore.titleOf(id),
           hostName: (id) => hubStore.hostName(id),
           workspaceLabel,
+          nowMs,
         },
         { kind, focus },
       ),
@@ -584,6 +591,7 @@ function CompactInbox({
       hub.usageRollup,
       deviceId,
       workspaceLabel,
+      nowMs,
       kind,
       focus,
     ],
@@ -714,6 +722,7 @@ function CompactInbox({
         {rows.recent.slice(0, recentLimit).map((row) => (
           <RecentRowCard key={row.instanceId} row={row} />
         ))}
+        {rows.recent.length === 0 ? <p className={compactCss.tierEmpty}>这里没有进行中的会话</p> : null}
       </section>
     </div>
   );

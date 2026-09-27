@@ -1,102 +1,153 @@
+/* @tokens strict */
 /*
- * /m phone home (D-049, ui-spec §4.7 / §2.1). One column: search + ordering,
- * project group headers (project · git branch · blocked count), then rows of
- * dot + title + one next-step/error sentence + remaining-context ring.
- * Compact-only: this module is never imported by a desktop route.
+ * /m phone home (D-049, ui-spec §4.7 / §2.1; UO-3). One sticky head — a 52px
+ * title row (「会话」 + the Space button that opens SpacesDrawer) over a 52px
+ * search/order row — then project + git branch groups of 64px rows: status
+ * dot + title + one next-step/error sentence + relative time + remaining-
+ * context ring. Compact-only: this module is never imported by a desktop
+ * route. Role tokens only; hit areas follow pointer:coarse.
  */
 
 .home {
+  /* The sticky head's height (52 + 52); group headers pin below it. */
+  --home-head: 104px;
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--ink);
+  background: var(--bg-canvas);
 }
 
-.toolbar {
+.head {
   position: sticky;
   top: 0;
   z-index: 5;
+  background: var(--bg-canvas);
+}
+
+.titleRow {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  /* 4px each side + the 44px controls keeps this bar at the 52px
-     --top-mobile budget while every control owns var(--touch) (D-039). */
-  padding: var(--space-1) var(--space-3);
-  background: var(--ink-0);
-  border-bottom: 1px solid var(--line);
+  gap: var(--space-3);
+  box-sizing: border-box;
+  height: var(--top-mobile);
+  padding: 0 var(--gutter);
+  border-bottom: 1px solid var(--divider);
+}
+
+.title {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-page);
+  font-weight: 600;
+  line-height: var(--lh-page);
+}
+
+/* Text button, so its visible height is the 44px control height on a coarse
+   pointer (ui-spec §3.4); the long space name truncates instead of wrapping. */
+.spaceBtn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-1);
+  min-width: var(--touch);
+  max-width: 60%;
+  height: var(--control-h);
+  margin-left: auto;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  font-weight: 500;
+  line-height: var(--lh-meta);
+}
+
+.spaceBtnName {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spaceBtnCaret {
+  flex: none;
+  color: var(--fg-muted);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  box-sizing: border-box;
+  height: var(--top-mobile);
+  padding: 0 var(--gutter);
+  border-bottom: 1px solid var(--divider);
 }
 
 .search {
   flex: 1 1 auto;
   min-width: 0;
-  /* min-height rather than height: a fractional device-pixel border must not
-     paint the box just under the 44px target (ui-spec §3.4). */
-  height: auto;
-  min-height: var(--touch);
+  height: var(--control-h);
+  margin: 0;
   padding: 0 var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-1);
-  color: var(--paper);
-  font-family: var(--font);
-  font-size: var(--text-aux);
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-family: var(--font-ui);
+  font-size: var(--text-input);
 }
 
 .search::placeholder {
-  color: var(--mute);
+  color: var(--fg-faint);
 }
 
-.order {
-  flex: none;
-  display: flex;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  overflow: hidden;
-}
-
-.order button {
-  min-height: var(--touch);
-  padding: 0 10px;
-  border: 0;
-  background: var(--ink-1);
-  color: var(--mute);
-  font-family: var(--font);
-  font-size: var(--text-label);
-}
-
-.order button[aria-pressed="true"] {
-  background: var(--ink-2);
-  color: var(--paper);
-}
+/* The ordering control is the shared §8.2 segmented control: 26px visible
+   items (32px track), 44px coarse hot zones via the global .segItem ::after;
+   on a coarse pointer .seg keeps its 6px block margins inside this 52px
+   band. The class is composed on the element (ui.seg), so no bespoke styles. */
 
 .groups {
+  order: 2;
   flex: 1 1 auto;
-  padding-bottom: var(--space-3);
+  padding-bottom: var(--space-5);
+}
+
+/* The D-050 task layer renders outside the commit:HomeList probe subtree but
+   stays in the same visual position: under the sticky head, above the project
+   groups (flex order; the head is order 0). */
+.taskLayer {
+  order: 1;
+  flex: none;
 }
 
 .group {
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--divider);
 }
 
 .groupHead {
   position: sticky;
-  top: 53px;
+  top: var(--home-head);
   z-index: 4;
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
   min-height: 32px;
-  padding: var(--space-1) var(--space-3);
-  background: var(--ink-1);
-  font-size: var(--text-aux);
+  padding: var(--space-1) var(--gutter);
+  background: var(--bg-surface);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .groupProject {
   flex: 1 1 auto;
   min-width: 0;
   font-weight: 600;
-  color: var(--paper);
+  color: var(--fg-strong);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -104,35 +155,34 @@
 
 .groupBranch {
   flex: none;
-  color: var(--cold);
-  font-family: var(--mono);
-  font-size: var(--text-label);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
   white-space: nowrap;
 }
 
 .groupBlocked {
   flex: none;
-  color: var(--danger-strong);
-  font-size: var(--text-label);
+  color: var(--attention-fg);
+  font-size: var(--text-meta);
   white-space: nowrap;
 }
 
 .groupBlocked[data-zero="1"] {
-  color: var(--mute);
+  color: var(--fg-muted);
 }
 
+/* The row is one flex line: main link + the 恢复 action can never wrap under
+   a long body sentence (it truncates inside .rowText). Only the resume-error
+   note is allowed a second line. */
 .row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
-  min-height: 56px;
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--line);
-}
-
-.row[data-blocked="1"] {
-  background: color-mix(in srgb, var(--dust) 7%, transparent);
+  gap: var(--space-3);
+  min-height: 64px;
+  padding: var(--space-2) var(--gutter);
+  border-bottom: 1px solid var(--divider);
 }
 
 .rowMain {
@@ -140,8 +190,12 @@
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
   color: inherit;
+  text-decoration: none;
+}
+
+.rowMain:hover {
   text-decoration: none;
 }
 
@@ -158,31 +212,43 @@
 }
 
 .rowTitle {
-  font-size: var(--text-body);
-  color: var(--paper);
+  font-size: var(--text-ui);
+  font-weight: 500;
+  line-height: var(--lh-ui);
+  color: var(--fg-strong);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .rowBody {
-  font-size: var(--text-aux);
-  color: var(--mute);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--fg-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .rowBody[data-error="1"] {
-  color: var(--danger-strong);
+  color: var(--danger-fg);
 }
 
-/* The ring never shrinks the text column: it reserves its own 28px slot. */
+.rowTime {
+  flex: none;
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* The ring never shrinks the text column: it reserves its own 20px slot. */
 .ring {
   flex: none;
   position: relative;
-  width: 28px;
-  height: 28px;
+  width: 20px;
+  height: 20px;
   display: inline-grid;
   place-items: center;
 }
@@ -196,54 +262,43 @@
 
 .ringTrack {
   fill: none;
-  stroke: var(--line);
+  stroke: var(--divider);
   stroke-width: 2.5;
 }
 
 .ringArc {
   fill: none;
-  stroke: var(--cold);
+  stroke: var(--link);
   stroke-width: 2.5;
   stroke-linecap: round;
-  transition: stroke-dasharray 160ms ease;
+  transition: stroke-dasharray var(--dur-2) var(--ease-out);
 }
 
 .ringText {
   position: relative;
-  font-family: var(--mono);
-  font-size: 8px;
+  font-size: var(--text-2xs);
   line-height: 1;
-  color: var(--paper);
+  color: var(--fg-strong);
 }
 
 .resume {
   flex: none;
-  min-height: var(--touch);
-  min-width: var(--touch);
-  padding: 0 var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  color: var(--paper);
-  font-family: var(--font);
-  font-size: var(--text-aux);
-}
-
-.resume:disabled {
-  color: var(--mute);
+  white-space: nowrap;
 }
 
 .rowError {
   flex: 0 0 100%;
   margin: 0;
-  padding: 0 var(--space-3) var(--space-2);
-  font-size: var(--text-label);
-  color: var(--danger-strong);
+  padding: 0 var(--gutter) var(--space-2);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--danger-fg);
 }
 
 .empty {
-  padding: var(--space-5) var(--space-3);
+  padding: var(--space-5) var(--gutter);
   text-align: center;
-  color: var(--mute);
-  font-size: var(--text-aux);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }

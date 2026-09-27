@@ -154,26 +154,26 @@ describe("nextStep — six projected states", () => {
 
   it("blocked with a pending plan review names the plan", () => {
     const step = nextStep(instance({ activity: known("waiting-interaction") }), planReview);
-    expect(step).toEqual({ text: "计划待审 · 重构方案 v2", tone: "blocked" });
+    expect(step).toEqual({ text: "计划待审 · 重构方案 v2", tone: "blocked", detail: null });
   });
 
   it("blocked with a pending elicitation names the form", () => {
     const step = nextStep(instance({ activity: known("waiting-interaction") }), elicitation);
-    expect(step).toEqual({ text: "待处理表单 · 补充参数", tone: "blocked" });
+    expect(step).toEqual({ text: "待处理表单 · 补充参数", tone: "blocked", detail: null });
   });
 
   it("blocked without a loaded interaction still says what to do", () => {
     const step = nextStep(instance({ activity: known("waiting-interaction") }), null);
-    expect(step).toEqual({ text: "等待处理交互", tone: "blocked" });
+    expect(step).toEqual({ text: "等待处理交互", tone: "blocked", detail: null });
   });
 
   it("working says just that with no known phrase, and uses the live phrase when one is projected", () => {
     const running = instance({ activity: known("working") });
-    expect(nextStep(running)).toEqual({ text: "运行中…", tone: "working" });
+    expect(nextStep(running)).toEqual({ text: "运行中…", tone: "working", detail: null });
     const phrased = nextStep(running, null, undefined, "Workflow wf_ab12 · phase compile");
-    expect(phrased).toEqual({ text: "Workflow wf_ab12 · phase compile", tone: "working" });
+    expect(phrased).toEqual({ text: "Workflow wf_ab12 · phase compile", tone: "working", detail: null });
     // Blank/whitespace phrases are treated as "nothing known", never invented.
-    expect(nextStep(running, null, undefined, "   ")).toEqual({ text: "运行中…", tone: "working" });
+    expect(nextStep(running, null, undefined, "   ")).toEqual({ text: "运行中…", tone: "working", detail: null });
     const marked = nextStep(running, null, screenDone);
     expect(marked.tone).toBe("working");
     expect(marked.text).toContain("DONE");
@@ -185,6 +185,7 @@ describe("nextStep — six projected states", () => {
     expect(nextStep(instance({ activity: known("idle") }))).toEqual({
       text: "回合结束、进程仍在 · 可继续发送",
       tone: "idle",
+      detail: null,
     });
   });
 
@@ -198,15 +199,16 @@ describe("nextStep — six projected states", () => {
     expect(step.text).not.toContain("starting");
   });
 
-  it("exited carries the known exit code, and null code stays unguessed", () => {
-    const exited = instance({
-      lifecycle: "exited",
+  it("exited routes its sentence/tone through endReason and keeps the raw code in detail", () => {
+    const crashed = instance({
+      lifecycle: "failed",
       activity: known("idle"),
       exit: known({ code: 1, signal: null, observedAt: "2026-09-19T00:00:00Z" }),
     });
-    const coded = nextStep(withCapability(exited, "resume", "supported"));
-    expect(coded.tone).toBe("exited");
-    expect(coded.text).toBe("会话已退出 · exit 1 · 可恢复");
+    const coded = nextStep(withCapability(crashed, "resume", "supported"));
+    expect(coded.tone).toBe("failed");
+    expect(coded.text).toBe("会话异常退出（exit 1） · 可恢复");
+    expect(coded.detail).toBeNull();
 
     const noCode = nextStep(
       withCapability(
@@ -215,7 +217,48 @@ describe("nextStep — six projected states", () => {
         "supported",
       ),
     );
-    expect(noCode.text).toBe("会话已退出 · 可恢复");
+    expect(noCode.text).toBe("已结束 · 可恢复");
+    expect(noCode.tone).toBe("ended");
+
+    const restarted = instance({
+      lifecycle: "exited",
+      activity: known("idle"),
+      lastError: "node-epoch-changed",
+    });
+    const restart = nextStep(withCapability(restarted, "resume", "supported"));
+    expect(restart.text).toBe("Node 重启，会话已中断 · 可恢复");
+    expect(restart.tone).toBe("interrupted");
+    expect(restart.detail).toBe("node-epoch-changed");
+  });
+
+  it("split crash vs termination signals on the exited sentence", () => {
+    const segv = nextStep(
+      withCapability(
+        instance({
+          lifecycle: "failed",
+          activity: known("idle"),
+          lastError: "native-exit-signal-SIGSEGV",
+        }),
+        "resume",
+        "unsupported",
+      ),
+    );
+    expect(segv.text).toBe("进程崩溃（SIGSEGV）");
+    expect(segv.tone).toBe("failed");
+
+    const term = nextStep(
+      withCapability(
+        instance({
+          lifecycle: "failed",
+          activity: known("idle"),
+          lastError: "native-exit-signal-SIGTERM",
+        }),
+        "resume",
+        "unsupported",
+      ),
+    );
+    expect(term.text).toBe("进程被终止（SIGTERM），会话已中断");
+    expect(term.tone).toBe("interrupted");
   });
 
   it("exited promises recovery only while the resume capability is supported", () => {
@@ -224,9 +267,18 @@ describe("nextStep — six projected states", () => {
       activity: known("idle"),
       exit: known({ code: 0, signal: null, observedAt: "2026-09-19T00:00:00Z" }),
     });
-    expect(nextStep(withCapability(exited, "resume", "unsupported")).text).toBe("会话已退出 · exit 0");
-    expect(nextStep(withCapability(exited, "resume", "unknown")).text).toBe("会话已退出 · exit 0");
-    expect(nextStep(withCapability(exited, "resume", "supported")).text).toBe("会话已退出 · exit 0 · 可恢复");
+    expect(nextStep(withCapability(exited, "resume", "unsupported"))).toMatchObject({
+      text: "已结束",
+      tone: "ended",
+    });
+    expect(nextStep(withCapability(exited, "resume", "unknown"))).toMatchObject({
+      text: "已结束",
+      tone: "ended",
+    });
+    expect(nextStep(withCapability(exited, "resume", "supported"))).toMatchObject({
+      text: "已结束 · 可恢复",
+      tone: "ended",
+    });
   });
 
   it("unknown never borrows idle or working copy", () => {

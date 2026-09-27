@@ -3114,6 +3114,104 @@ fn drive_counting_node(
     })
 }
 
+/// Drive a fake Node that accepts every RPC and, for `instance.configure`,
+/// additionally mirrors the Node-side settle notification so the command
+/// reaches `settled`/`completed` (rather than resting at `accepted`). Counts
+/// inbound sends/configures and can delay `instance.configure` by `delay`.
+/// Unlike [`drive_counting_node`] the configure becomes terminal, which is
+/// what a terminal configure replay needs (D-055 round 2).
+fn drive_settling_configure_node(
+    node: FakeNode,
+    sends: Arc<AtomicUsize>,
+    configures: Arc<AtomicUsize>,
+    delay: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut node = node;
+        let mut settled = 0u64;
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            if frame.get("method").is_none() {
+                continue;
+            }
+            // The settle notification's own {ok} reply also loops back here;
+            // only answer frames that carry a command params object once.
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let method = frame["method"].as_str().unwrap_or_default().to_owned();
+            let params = frame.get("params").cloned().unwrap_or(json!({}));
+            let command_id = params
+                .get("commandId")
+                .cloned()
+                .unwrap_or_else(|| json!("cmd_test"));
+            if method == "instance.send" {
+                sends.fetch_add(1, Ordering::Relaxed);
+            }
+            let is_configure = method == "instance.configure";
+            if is_configure {
+                configures.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(delay).await;
+            }
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "command": {
+                        "commandId": command_id,
+                        "state": "accepted",
+                        "operation": method
+                    }
+                }
+            });
+            if node
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            if is_configure {
+                // Node-side completion notification: drives mark_settled.
+                settled += 1;
+                let note = json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("settle-{settled}"),
+                    "method": "instance.configure",
+                    "params": { "commandId": command_id }
+                });
+                if node
+                    .send(Message::Text(note.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Poll a command row until its state equals `expected` (or timeout).
+async fn wait_command_state(
+    addr: std::net::SocketAddr,
+    cookie: &str,
+    detail: &str,
+    expected: &str,
+) -> Result<Value> {
+    for _ in 0..80 {
+        let (status, _, row) = http(addr, "GET", detail, &[("Cookie", cookie)], None).await?;
+        if status == 200 {
+            let row: Value = serde_json::from_str(row.trim())?;
+            if row["state"].as_str() == Some(expected) {
+                return Ok(row);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    anyhow::bail!("command at {detail} never reached state {expected}")
+}
+
 /// Hello an accepting fake Node and start its driver. Returns the reconnect
 /// token and the driver task.
 async fn accepting_node(
@@ -4547,8 +4645,10 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
     let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
     let host_id = HostId::new();
     let sends = Arc::new(AtomicUsize::new(0));
-    let (_token, _link) =
-        accepting_node(hub.addr, &enroll, &host_id, "r4-configure", sends.clone()).await?;
+    let configures = Arc::new(AtomicUsize::new(0));
+    let (node, _token) = open_fake_node(hub.addr, &enroll, &host_id, "r4-configure").await?;
+    let _link =
+        drive_settling_configure_node(node, sends.clone(), configures.clone(), Duration::ZERO);
     let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
     let path = format!("/v1/instances/{instance_id}/commands");
 
@@ -4589,6 +4689,11 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
     )
     .await?;
     assert_eq!(status, 200, "{body}");
+
+    // Wait until A is terminal (settled/completed) before replaying it: an
+    // accepted configure is still in flight and answers 409.
+    let detail_a = format!("{path}/{}", id_x.as_id().as_str());
+    wait_command_state(hub.addr, &cookie, &detail_a, "settled").await?;
 
     // Replay A: read-only. The stored row X comes back, B's spec survives.
     let (status, _, replay) = http(
@@ -4712,12 +4817,11 @@ async fn configure_replay_in_flight_is_409_then_returns_stored_original() -> Res
     let sends = Arc::new(AtomicUsize::new(0));
     let configures = Arc::new(AtomicUsize::new(0));
     let (node, _token) = open_fake_node(hub.addr, &enroll, &host_id, "cfg-inflight").await?;
-    let _link = drive_counting_node(
+    let _link = drive_settling_configure_node(
         node,
         sends.clone(),
         configures.clone(),
         Duration::from_millis(500),
-        vec!["instance.configure".to_string()],
     );
     let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
     let path = format!("/v1/instances/{instance_id}/commands");
@@ -4753,24 +4857,105 @@ async fn configure_replay_in_flight_is_409_then_returns_stored_original() -> Res
         "{conflict}"
     );
 
-    // The original completes exactly once.
+    // The original completes exactly once. It answers accepted (the Node's
+    // settle notification can even land before the response serializes, in
+    // which case it already reads settled) — never replayed.
     let (status, _, original) = first.await??;
     assert_eq!(status, 200);
     let original: Value = serde_json::from_str(original.trim())?;
     assert_eq!(original["replayed"], json!(false));
-    assert_eq!(original["command"]["state"], json!("accepted"));
+    assert!(
+        matches!(
+            original["command"]["state"].as_str(),
+            Some("accepted" | "settled")
+        ),
+        "{original}"
+    );
 
-    // Terminal replay: the stored original record, verbatim.
+    // Terminal replay once the Node settles it: the stored original record,
+    // verbatim.
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+    let stored = wait_command_state(hub.addr, &cookie, &detail, "settled").await?;
+    assert_eq!(
+        stored["settlement"]["outcome"],
+        json!("completed"),
+        "{stored}"
+    );
     let (status, _, replay) =
         http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
     assert_eq!(status, 200, "{replay}");
     let replay: Value = serde_json::from_str(replay.trim())?;
     assert_eq!(replay["replayed"], json!(true));
-    assert_eq!(replay["command"], original["command"]);
+    assert_eq!(replay["command"]["state"], json!("settled"));
+    assert_eq!(
+        replay["command"]["commandId"],
+        original["command"]["commandId"]
+    );
     assert_eq!(
         configures.load(Ordering::Relaxed),
         1,
         "the Node must see instance.configure exactly once"
+    );
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// D-055 round 2, item 2: an `accepted` configure is the Node running it — an
+/// unfinished command — so a replay is classified by its stored state and
+/// answers the in-flight 409 rather than a stored success. The command is
+/// forwarded exactly once.
+#[tokio::test]
+async fn configure_replay_while_accepted_is_409_in_flight() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let configures = Arc::new(AtomicUsize::new(0));
+    let (node, _token) = open_fake_node(hub.addr, &enroll, &host_id, "cfg-accepted").await?;
+    // Accepts and never settles: the configure rests at `accepted`.
+    let _link = drive_counting_node(
+        node,
+        sends.clone(),
+        configures.clone(),
+        Duration::ZERO,
+        Vec::new(),
+    );
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    let path = format!("/v1/instances/{instance_id}/commands");
+    let command_id = remuda_protocol::CommandId::new();
+    let body = json!({
+        "commandId": command_id.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "model": "opus" }
+    })
+    .to_string();
+
+    let (status, _, first) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 200, "{first}");
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+    let row = wait_command_state(hub.addr, &cookie, &detail, "accepted").await?;
+    assert_eq!(row["forwarded"], json!(true), "{row}");
+
+    // Replaying the accepted (still-running) configure is an in-flight 409.
+    for _ in 0..2 {
+        let (status, _, conflict) =
+            http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+        assert_eq!(status, 409, "{conflict}");
+        let conflict: Value = serde_json::from_str(conflict.trim())?;
+        assert_eq!(conflict["code"], json!("COMMAND_ID_CONFLICT"));
+        assert!(
+            conflict["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("still in flight"),
+            "{conflict}"
+        );
+    }
+    assert_eq!(
+        configures.load(Ordering::Relaxed),
+        1,
+        "the accepted configure is forwarded exactly once"
     );
     assert_eq!(sends.load(Ordering::Relaxed), 0);
     Ok(())
@@ -4880,7 +5065,9 @@ async fn queued_offline_configure_replay_is_rejected_and_never_forwards() -> Res
 /// D-055 (2026-09-25): two clients racing the same configure commandId merge
 /// the spec exactly once. The serialized store writer admits one create; the
 /// race loser takes the replay rule (409 in flight, or the stored terminal row
-/// once settled) — never a second merge/forward.
+/// once settled) — never a second merge/forward. The AUTHORITATIVE check is
+/// the instance's stored `configureSeq` (item 4): response and Node-frame
+/// counts alone cannot prove a merge that raced ahead of a failed forward.
 #[tokio::test]
 async fn concurrent_same_id_configure_merges_and_forwards_once() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
@@ -4889,15 +5076,38 @@ async fn concurrent_same_id_configure_merges_and_forwards_once() -> Result<()> {
     let sends = Arc::new(AtomicUsize::new(0));
     let configures = Arc::new(AtomicUsize::new(0));
     let (node, _token) = open_fake_node(hub.addr, &enroll, &host_id, "cfg-race").await?;
-    let _link = drive_counting_node(
+    let _link = drive_settling_configure_node(
         node,
         sends.clone(),
         configures.clone(),
         Duration::from_millis(300),
-        vec!["instance.configure".to_string()],
     );
     let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
     let path = format!("/v1/instances/{instance_id}/commands");
+
+    // The durable merge counter starts at 0 for a fresh instance.
+    let get_seq = |cookie: String| {
+        let instance_id = instance_id.clone();
+        async move {
+            let (status, _, body) = http(
+                hub.addr,
+                "GET",
+                &format!("/v1/instances/{instance_id}"),
+                &[("Cookie", &cookie)],
+                None,
+            )
+            .await?;
+            assert_eq!(status, 200, "{body}");
+            let body: Value = serde_json::from_str(body.trim())?;
+            anyhow::Ok(body["configureSeq"].as_i64().unwrap_or(-1))
+        }
+    };
+    assert_eq!(
+        get_seq(cookie.clone()).await?,
+        0,
+        "no merges before the race"
+    );
+
     let command_id = remuda_protocol::CommandId::new();
     let body = json!({
         "commandId": command_id.as_id().as_str(),
@@ -4949,8 +5159,18 @@ async fn concurrent_same_id_configure_merges_and_forwards_once() -> Result<()> {
         );
     }
 
+    // The Hub-side spec merge committed EXACTLY once, however the HTTP
+    // responses interleaved — this is the authoritative merge count (item 4).
+    assert_eq!(
+        get_seq(cookie.clone()).await?,
+        1,
+        "exactly one Hub spec merge, regardless of response/frame ordering"
+    );
+
     // After settlement every replay returns the same stored record; the Node
     // still saw the configure exactly once (the join awaited both attempts).
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+    wait_command_state(hub.addr, &cookie, &detail, "settled").await?;
     assert_eq!(configures.load(Ordering::Relaxed), 1);
     let mut last = None;
     for _ in 0..3 {
@@ -4967,8 +5187,10 @@ async fn concurrent_same_id_configure_merges_and_forwards_once() -> Result<()> {
         "exactly one instance.configure frame, racing replays included"
     );
     assert_eq!(sends.load(Ordering::Relaxed), 0);
+    // Replays never re-merge: the counter is still exactly one.
+    assert_eq!(get_seq(cookie.clone()).await?, 1, "replays must not merge");
     let last = last.context("replay body")?;
-    assert_eq!(last["command"]["state"], json!("accepted"), "{last}");
+    assert_eq!(last["command"]["state"], json!("settled"), "{last}");
     Ok(())
 }
 
@@ -5056,7 +5278,132 @@ async fn get_command_during_in_flight_send_reports_the_attempt_outcome() -> Resu
     Ok(())
 }
 
-/// Idempotency-key precedence on the same-id send shortcut: the key is part
+/// D-055 round 2, item 3: GET on a configure whose forward attempt releases
+/// its intent and rolls back (`Ok(None)` — the frame never queued on the Node)
+/// must never return an obsolete `forwarded=true` snapshot followed by the
+/// rolled-back `forwarded=false` row. The read binds to the attempt or reads
+/// state and intent under one epoch witness. Unlike the send test above, the
+/// Node here REFUSES the forward rather than accepting it.
+#[tokio::test]
+async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    // A real node long enough to create the instance, then it is replaced by a
+    // live transport that refuses every frame BEFORE queueing (Ok(None)).
+    let (node_token, link) = accepting_node(
+        hub.addr,
+        &enroll,
+        &host_id,
+        "get-cfg-rollback",
+        sends.clone(),
+    )
+    .await?;
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    link.abort();
+    wait_host_online(hub.addr, &cookie, host_id.as_id().as_str(), false).await?;
+    // Host row live, but every RPC reports the frame was never queued.
+    hub.test_set_node_reply(host_id.as_id().as_str(), None)
+        .await;
+
+    let path = format!("/v1/instances/{instance_id}/commands");
+    let command_id = remuda_protocol::CommandId::new();
+    let body = json!({
+        "commandId": command_id.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "model": "opus" }
+    })
+    .to_string();
+
+    let addr = hub.addr;
+    let path1 = path.clone();
+    let cookie1 = cookie.clone();
+    let body1 = body.clone();
+    let post = tokio::spawn(async move {
+        http(addr, "POST", &path1, &[("Cookie", &cookie1)], Some(&body1)).await
+    });
+
+    // Poll through the mark-intent → rollback window. A read must never see
+    // forwarded=true on a queued row, and a forwarded=true must never walk
+    // back to forwarded=false.
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+    let mut saw_intent = false;
+    let mut observations = Vec::new();
+    for _ in 0..40 {
+        if post.is_finished() {
+            break;
+        }
+        let (status, _, row) = http(hub.addr, "GET", &detail, &[("Cookie", &cookie)], None).await?;
+        if status == 404 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        assert_eq!(status, 200, "{row}");
+        let row: Value = serde_json::from_str(row.trim())?;
+        let state = row["state"].as_str().unwrap_or("").to_string();
+        let forwarded = row["forwarded"].as_bool().unwrap_or(false);
+        observations.push((state.clone(), forwarded));
+        assert!(
+            !(state == "queued" && forwarded),
+            "GET exposed the transient forward intent before rollback: {observations:?}"
+        );
+        if forwarded {
+            saw_intent = true;
+        } else if saw_intent {
+            panic!("a rolled-back intent was read after forwarded=true: {observations:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, _, posted) = post.await??;
+    assert_eq!(status, 200, "{posted}");
+    let posted: Value = serde_json::from_str(posted.trim())?;
+    // The first POST itself reports the rolled-back, never-forwarded row.
+    assert_eq!(posted["replayed"], json!(false), "{posted}");
+    assert_eq!(posted["command"]["state"], json!("queued"), "{posted}");
+    assert_eq!(posted["command"]["forwarded"], json!(false), "{posted}");
+    assert_eq!(posted["command"]["resolution"], json!("clear"), "{posted}");
+
+    // A final read agrees: queued, intent released.
+    let (status, _, row) = http(hub.addr, "GET", &detail, &[("Cookie", &cookie)], None).await?;
+    assert_eq!(status, 200, "{row}");
+    let row: Value = serde_json::from_str(row.trim())?;
+    assert_eq!(row["state"], json!("queued"), "{row}");
+    assert_eq!(row["forwarded"], json!(false), "{row}");
+    assert_eq!(row["resolution"], json!("clear"), "{row}");
+
+    // The queued configure is non-replayable even after the refused forward.
+    let (status, _, conflict) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 409, "{conflict}");
+    let conflict: Value = serde_json::from_str(conflict.trim())?;
+    assert!(
+        conflict["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("new commandId"),
+        "{conflict}"
+    );
+
+    // The real node never saw the frame (it was refused before queueing).
+    let (node, _) = open_fake_node(hub.addr, &node_token, &host_id, "get-cfg-back").await?;
+    let configures = Arc::new(AtomicUsize::new(0));
+    let _link = drive_counting_node(
+        node,
+        Arc::new(AtomicUsize::new(0)),
+        configures.clone(),
+        Duration::ZERO,
+        Vec::new(),
+    );
+    wait_host_online(hub.addr, &cookie, host_id.as_id().as_str(), true).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        configures.load(Ordering::Relaxed),
+        0,
+        "the rejected queued configure must not forward on reconnect"
+    );
+    Ok(())
+}
 /// of the command's identity. A replay may omit the key, but ANY key that
 /// differs from the one stored with the commandId — bound elsewhere or merely
 /// unused — is 409.

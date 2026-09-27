@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -2023,8 +2024,9 @@ pub async fn post_command(
     }
     // First POST only: project the configure into the Hub's instance spec
     // before forwarding. A replay never re-enters this merge. On failure the
-    // pre-dispatch rejection is persisted WITH the command so a replay
-    // reproduces the original 500 instead of a do-nothing `replayed:true`.
+    // pre-dispatch rejection is persisted WITH the command — including the
+    // exact HTTP status and body it answered — so a replay reproduces the
+    // original outcome instead of a do-nothing `replayed:true`.
     if command.operation == "instance.configure"
         && let Err(store_error) = state
             .store
@@ -2032,11 +2034,17 @@ pub async fn post_command(
             .await
     {
         let error = map_store(store_error);
+        let (http_status, http_body) = error.status_code_and_body();
         // Persist the pre-dispatch rejection WITH the command so a replay
-        // reproduces this exact outcome instead of a do-nothing success.
+        // reproduces this exact status and body instead of a fresh success.
         let _ = state
             .store
-            .reject_command(command.command_id.clone(), error.to_string())
+            .reject_command_outcome(
+                command.command_id.clone(),
+                error.to_string(),
+                Some(http_status as i64),
+                Some(http_body.to_string()),
+            )
             .await;
         return Err(error);
     }
@@ -2066,26 +2074,52 @@ fn replay_key_matches(incoming: Option<&str>, stored: Option<&str>) -> bool {
     }
 }
 
-/// A `configure` whose spec merge failed before dispatch rests at a
-/// `rejected` settlement with `forwarded=0` — the unique shape of a Hub-side
-/// merge failure (a Node rejection is always recorded after a forward intent).
-fn configure_merge_failed(command: &CommandRecord) -> bool {
-    command.operation == "instance.configure"
-        && command.state == "settled"
-        && command.settlement_outcome.as_deref() == Some("rejected")
-        && !command.forwarded
+/// Replay a terminal (`settled`) `instance.configure` strictly by the stored
+/// outcome: every terminal failure is replayed with its ORIGINAL status and
+/// body, never as a fresh 200 success.
+fn replay_configure_settlement(command: CommandRecord) -> Result<CommandRecord, HubError> {
+    if command.settlement_outcome.as_deref() != Some("rejected") {
+        // `completed` / `cancelled`: the stored row itself is the outcome.
+        return Ok(command);
+    }
+    // The first attempt answered with an error and persisted that exact pair.
+    if let (Some(status), Some(body)) = (
+        command.settlement_http_status,
+        command.settlement_http_body.as_deref(),
+    ) && let Ok(body) = serde_json::from_str::<Value>(body)
+    {
+        return Err(HubError::StoredOutcome {
+            status: status.clamp(100, 599) as u16,
+            body,
+        });
+    }
+    // A post-forward Node rejection whose first answer was 200 (the rejection
+    // lives in the row's settlement) is returned as that 200 row.
+    if command.forwarded {
+        return Ok(command);
+    }
+    // Legacy pre-round-2 merge failure: reconstruct the original Hub error.
+    let reason = command
+        .settlement_reason
+        .clone()
+        .unwrap_or_else(|| "configure spec merge failed".to_string());
+    Err(HubError::Internal(reason))
 }
 
 /// Operation-specific handling for a replay of an already-stored command.
 /// - `instance.configure` is NON-replayable (D-055, 2026-09-25). Its spec
-///   merge runs exactly once, on the first POST; a re-POST only reads the
-///   stored outcome. A live forward attempt is detected WITHOUT awaiting it,
-///   so a replay answers a clear 409 immediately instead of merging or
-///   returning a premature terminal 200. A terminal row is returned verbatim —
-///   including the persisted pre-dispatch merge failure, reproduced with its
-///   original 500; a `queued` row (forward in flight, RPC-unknown, or an
-///   offline queue) is a 409 telling the caller to poll the row or issue a new
-///   command;
+///   merge runs exactly once, on the first POST; a re-POST only classifies the
+///   stored command by its durable state and never merges, forwards or settles
+///   anything a second time:
+///   * a live forward attempt answers a clear 409 immediately (the peek does
+///     not await the attempt's eventual terminal row);
+///   * `accepted` (the Node is running it) or a `queued` row whose intent is
+///     marked / reconciling is an in-progress command → 409 "still in flight";
+///   * a `queued`, never-forwarded row (offline queue, or the window before the
+///     attempt registered) is rejected with a clear "issue a new commandId";
+///   * a `settled` row is returned by its stored outcome — a persisted failure
+///     reproduces its ORIGINAL status and body, including the pre-dispatch
+///     merge failure's 500 and a post-forward 503/overload refusal;
 /// - `instance.send` re-checks attachment liveness while still unsent and
 ///   settles against the in-flight attempt before taking the G1 forward;
 /// - other queued ops take the G1 forward; terminal rows pass through.
@@ -2110,31 +2144,30 @@ async fn replay_existing_command(
                 .get_command(existing.command_id.clone())
                 .await?
                 .unwrap_or(existing);
-            if configure_merge_failed(&command) {
-                let reason = command
-                    .settlement_reason
-                    .clone()
-                    .unwrap_or_else(|| "configure spec merge failed".to_string());
-                return Err(HubError::Internal(reason));
-            }
-            if command.state == "queued" {
-                // Re-peek after the read closes the subscribe→intent-mark race
-                // (still non-blocking): a slot acquired in the gap is in flight.
-                if command.forwarded || subscribe_forward_attempt(&command.command_id).is_some() {
-                    return Err(configure_in_flight());
+            match command.state.as_str() {
+                // The Node accepted the configure and it has not settled: it is
+                // still in progress there, so the caller polls.
+                "accepted" => Err(configure_in_flight()),
+                // Stored durable state decides: an in-flight intent vs a row
+                // that never went out (offline queue / pre-registration window).
+                "queued" => {
+                    if command.forwarded || subscribe_forward_attempt(&command.command_id).is_some()
+                    {
+                        // Intent marked and RPC running / resting unknown, or a
+                        // slot acquired while the read ran: in progress.
+                        Err(configure_in_flight())
+                    } else {
+                        // Unfinished and never forwarded. Applying anything
+                        // again is forbidden, and the web outbox replays
+                        // instance.send only, so no client needs a queued
+                        // configure forwarded on replay.
+                        Err(configure_queued_rejected())
+                    }
                 }
-                // The original outcome is not terminal and applying anything
-                // again is forbidden; answering 200 could contradict the
-                // attempt still running (it may yet fail the merge). The web
-                // outbox replays instance.send only, so no client needs a
-                // queued configure forwarded on replay.
-                return Err(HubError::Conflict(
-                    "a queued instance.configure cannot be replayed; \
-                     issue a new command with a new commandId"
-                        .to_string(),
-                ));
+                // Terminal: hand back exactly the outcome the first attempt
+                // produced, with its original status and body.
+                _ => replay_configure_settlement(command),
             }
-            Ok(command)
         }
         other => {
             let command = settled_command_row(state, existing).await;
@@ -2161,6 +2194,17 @@ fn configure_in_flight() -> HubError {
     HubError::Conflict(
         "instance.configure is still in flight; poll GET \
          /v1/instances/{id}/commands/{commandId} for its outcome"
+            .to_string(),
+    )
+}
+
+/// Clear 409 for a configure resting in the queue without ever being
+/// forwarded (host offline, or the first attempt had not registered its
+/// forward yet): replay cannot apply it, so the caller starts a new command.
+fn configure_queued_rejected() -> HubError {
+    HubError::Conflict(
+        "a queued instance.configure cannot be replayed; \
+         issue a new command with a new commandId"
             .to_string(),
     )
 }
@@ -2373,6 +2417,15 @@ static FORWARD_ATTEMPTS: LazyLock<
     Mutex<HashMap<String, tokio::sync::broadcast::Sender<CommandRecord>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Monotonic counter bumped (under the same lock that guards
+/// [`FORWARD_ATTEMPTS`]) on every attempt slot insert AND removal. A command
+/// reader samples it alongside the slot, reads the durable row, then samples
+/// it again: an unchanged epoch with no slot proves no intent registered or
+/// released across the read, so a `forwarded=1` the read saw cannot have been
+/// rolled back immediately afterwards (D-055 round 2, item 3). Global rather
+/// than per-key: a bump for an unrelated command only costs one re-read.
+static FORWARD_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// RAII registration of one forward attempt. `complete` carries the attempt's
 /// settled row; on drop it is published to every follower BEFORE the slot is
 /// removed, then the sender closes. An attempt that ends on an early `Err`
@@ -2402,6 +2455,10 @@ impl Drop for ForwardAttempt {
                 let _ = tx.send(row);
             }
             attempts.remove(&self.command_id);
+            // Bump after the slot is gone: a reader that observes this epoch
+            // can no longer subscribe to this attempt and must take a durable
+            // read that started after the release committed.
+            FORWARD_EPOCH.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -2415,6 +2472,9 @@ fn acquire_forward_leader(command_id: String) -> Option<ForwardAttempt> {
     }
     let (tx, _rx) = tokio::sync::broadcast::channel(FORWARD_ATTEMPT_FOLLOWERS);
     attempts.insert(command_id.clone(), tx);
+    // Bump while the slot is present: a reader that saw no slot before this
+    // point re-reads instead of trusting a row read across the registration.
+    FORWARD_EPOCH.fetch_add(1, Ordering::AcqRel);
     Some(ForwardAttempt {
         command_id,
         completed: None,
@@ -2431,6 +2491,20 @@ fn subscribe_forward_attempt(
         .expect("forward attempts lock")
         .get(command_id)
         .map(tokio::sync::broadcast::Sender::subscribe)
+}
+
+/// Probe the intent registry under its lock, returning both a subscriber for
+/// any active attempt AND the current [`FORWARD_EPOCH`]. Both are observed in
+/// the same critical section, so they form one consistent witness a durable
+/// read can be validated against.
+fn probe_forward_attempt(
+    command_id: &str,
+) -> (Option<tokio::sync::broadcast::Receiver<CommandRecord>>, u64) {
+    let attempts = FORWARD_ATTEMPTS.lock().expect("forward attempts lock");
+    let rx = attempts
+        .get(command_id)
+        .map(tokio::sync::broadcast::Sender::subscribe);
+    (rx, FORWARD_EPOCH.load(Ordering::Acquire))
 }
 
 /// Wait for the subscribed attempt's settled row. `None` means the leader
@@ -2452,40 +2526,63 @@ async fn await_attempt_result(
     }
 }
 
-/// Settle an existing-row replay against any in-flight forward attempt:
-/// - an active attempt publishes THIS attempt's final row, which is returned
-///   verbatim (so a follower never reports a newer attempt's transient
-///   `forwarded=1`, nor a released intent as forwarded);
-/// - otherwise the durable row is re-read now, so an early-path snapshot that
-///   observed a transient flag cannot outlive the attempt that set it.
-///
-/// The first subscription is taken before the durable re-read, but an attempt
-/// can still acquire its slot (and mark the intent) in that gap: a re-read
-/// that comes back `queued` therefore subscribes once more and binds to that
-/// attempt too. Without this a status reader could observe `forwarded=1` and,
-/// on its next read, the released intent — the rolled-back shape a poller must
-/// never see.
+/// Settle a command read (GET, or an existing-row replay) against any in-flight
+/// forward attempt, without ever returning an obsolete intent snapshot:
+/// - an active attempt publishes THIS attempt's final row, which the reader
+///   binds to and returns verbatim (so a follower never reports a newer
+///   attempt's transient `forwarded=1`, nor a released intent as forwarded);
+/// - otherwise the durable row is read BETWEEN two samples of the forward
+///   epoch. The row is accepted only when the epoch is identical before and
+///   after the read and no slot is present — together that proves no attempt
+///   registered or released its intent across the read, so a `forwarded=1`
+///   the read saw cannot have been rolled back immediately afterwards. If the
+///   epoch moved, the read raced an attempt; the reader re-probes and re-reads
+///   after observing the new epoch (same-id attempts are serialized, so this
+///   converges rather than spins).
 async fn settled_command_row(state: &AppState, command: CommandRecord) -> CommandRecord {
-    async fn await_active(command_id: &str) -> Option<CommandRecord> {
-        let rx = subscribe_forward_attempt(command_id)?;
-        await_attempt_result(rx).await
+    let command_id = command.command_id.clone();
+    let mut fallback = command;
+    loop {
+        // Probe under the intent lock: an active slot binds this read.
+        let (rx, epoch_before) = probe_forward_attempt(&command_id);
+        if let Some(rx) = rx
+            && let Some(row) = await_attempt_result(rx).await
+        {
+            return row;
+        }
+        let reloaded = state
+            .store
+            .get_command(command_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fallback.clone());
+        // Re-probe under the SAME lock that registers and removes intents.
+        let (rx_after, epoch_after) = probe_forward_attempt(&command_id);
+        if epoch_after == epoch_before {
+            // No start/finish crossed the read: this row is a stable snapshot.
+            if let Some(rx) = rx_after
+                && let Some(row) = await_attempt_result(rx).await
+            {
+                // Defensive: a slot at an unchanged epoch can only be one the
+                // first probe already saw; bind rather than trust the read.
+                return row;
+            }
+            return reloaded;
+        }
+        // An intent registered and/or released while the read ran. Bind to a
+        // still-active attempt; otherwise take the next read AFTER observing
+        // the post-transition epoch, which therefore includes the release.
+        if let Some(rx) = rx_after
+            && let Some(row) = await_attempt_result(rx).await
+        {
+            return row;
+        }
+        fallback = reloaded;
+        // The epoch also moves on OTHER commands' attempts; yield so a burst
+        // of unrelated forwards costs a few cooperative re-reads, not a spin.
+        tokio::task::yield_now().await;
     }
-    if let Some(row) = await_active(&command.command_id).await {
-        return row;
-    }
-    let reloaded = state
-        .store
-        .get_command(command.command_id.clone())
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(command);
-    if reloaded.state == "queued"
-        && let Some(row) = await_active(&reloaded.command_id).await
-    {
-        return row;
-    }
-    reloaded
 }
 
 fn journal_text(text: &str) -> String {
@@ -3348,6 +3445,20 @@ pub(crate) async fn forward_if_online(
                         .store
                         .fail_instance(instance_id, err.to_string())
                         .await?;
+                } else if command.operation == "instance.configure" {
+                    // Persist the 503 (and its body) WITH the terminal row: a
+                    // configure is non-replayable, so a same-id retry must
+                    // answer the same refusal instead of a replayed 200.
+                    let (http_status, http_body) = err.status_code_and_body();
+                    state
+                        .store
+                        .reject_command_outcome(
+                            command.command_id.clone(),
+                            err.to_string(),
+                            Some(http_status as i64),
+                            Some(http_body.to_string()),
+                        )
+                        .await?;
                 } else {
                     state
                         .store
@@ -3586,6 +3697,8 @@ mod forward_slot_tests {
             updated_at: "t0".to_string(),
             settlement_outcome: None,
             settlement_reason: None,
+            settlement_http_status: None,
+            settlement_http_body: None,
             settlement: None,
         }
     }

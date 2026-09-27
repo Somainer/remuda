@@ -326,6 +326,8 @@ pub mod store_test_support {
             forwarded: true,
             settlement_outcome: Some("rejected".into()),
             settlement_reason: Some("node rejected the send".into()),
+            settlement_http_status: None,
+            settlement_http_body: None,
             settlement: Some(CommandSettlement {
                 outcome: "rejected".into(),
                 reason: Some("node rejected the send".into()),

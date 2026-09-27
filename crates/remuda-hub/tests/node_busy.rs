@@ -91,7 +91,11 @@ async fn enroll_token(addr: std::net::SocketAddr, cookie: &str) -> Result<String
 
 type NodeWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
-async fn connect_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -> Result<NodeWs> {
+async fn connect_node(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    host_id: &str,
+) -> Result<(NodeWs, String)> {
     let mut req = format!("ws://{addr}/v1/node").into_client_request()?;
     req.headers_mut()
         .insert("Authorization", format!("Bearer {bearer}").parse()?);
@@ -102,7 +106,7 @@ async fn connect_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -
         json!({
             "jsonrpc": "2.0",
             "id": "1",
-            "method": "node.hello",
+            "method": "runtime.hello",
             "params": {
                 "hostId": host_id,
                 "nodeVersion": "0.1.0-test",
@@ -114,7 +118,24 @@ async fn connect_node(addr: std::net::SocketAddr, bearer: &str, host_id: &str) -
         .into(),
     ))
     .await?;
-    Ok(node)
+    // Read the hello result so a reconnect can authenticate with the minted
+    // node token instead of the one-shot enrollment token.
+    let hello = loop {
+        match node.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                if frame.get("id") == Some(&json!("1")) {
+                    break frame;
+                }
+            }
+            other => anyhow::bail!("hello closed unexpectedly: {other:?}"),
+        }
+    };
+    let node_token = hello["result"]["nodeToken"]
+        .as_str()
+        .unwrap_or(bearer)
+        .to_string();
+    Ok((node, node_token))
 }
 
 /// Reads every RPC frame off the socket and never replies, so the Hub's
@@ -129,7 +150,7 @@ fn park_node(
     let frames = Arc::new(AtomicUsize::new(0));
     let node_frames = frames.clone();
     let handle = tokio::spawn(async move {
-        let Ok(mut node) = connect_node(addr, &bearer, &host_id).await else {
+        let Ok((mut node, _token)) = connect_node(addr, &bearer, &host_id).await else {
             return;
         };
         // Answer host.resources immediately (placement/worktree calls issue one
@@ -254,6 +275,207 @@ async fn saturated_control_budget_refuses_create_with_503_and_fails_row() -> Res
         .find(|item| item["hostId"] == host_id)
         .context("refused create left no instance row")?;
     assert_eq!(fresh["lifecycle"], "failed", "{fresh}");
+
+    for handle in parked {
+        handle.abort();
+    }
+    Ok(())
+}
+
+/// Drive a connected Node that answers `host.resources` and accepts every
+/// command RPC, long enough to create an instance against before the link is
+/// swapped for a parked one. Returns the driver task and the Node's minted
+/// reconnect token.
+async fn accepting_create_node(
+    addr: std::net::SocketAddr,
+    bearer: &str,
+    host_id: &str,
+) -> Result<(JoinHandle<()>, String)> {
+    let (mut node, node_token) = connect_node(addr, bearer, host_id).await?;
+    let handle = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = node.next().await {
+            let Ok(frame) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(method) = frame.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            let id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let reply = if method == "host.resources" {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "resources": { "cpuPct": 1, "memPct": 1 } }
+                })
+            } else {
+                let params = frame.get("params").cloned().unwrap_or(json!({}));
+                let command_id = params.get("commandId").cloned().unwrap_or(Value::Null);
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "command": {
+                            "commandId": command_id,
+                            "state": "accepted",
+                            "operation": method
+                        }
+                    }
+                })
+            };
+            if node
+                .send(Message::Text(reply.to_string().into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    Ok((handle, node_token))
+}
+
+/// Poll the host's `online` flag until it equals `want` (the host row itself
+/// persists across disconnects, so presence in the list is not enough).
+async fn wait_host_present(addr: std::net::SocketAddr, cookie: &str, host_id: &str, want: bool) {
+    for _ in 0..100 {
+        let (status, _, body) = http(addr, "GET", "/v1/hosts", &[("Cookie", cookie)], None)
+            .await
+            .expect("host list");
+        assert_eq!(status, 200);
+        let online = serde_json::from_str::<Value>(&body).ok().and_then(|v| {
+            v["items"]
+                .as_array()
+                .and_then(|items| items.iter().find(|h| h["hostId"] == host_id))
+                .and_then(|h| h["online"].as_bool())
+        });
+        if online == Some(want) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("host {host_id} never reached online={want}");
+}
+
+/// D-055 round 2, item 1: a `instance.configure` refused with NODE_BUSY
+/// (pre-send overload) is a TERMINAL rejection carrying the 503. A same-id
+/// replay must reproduce that exact 503 status and body — never a 200
+/// `replayed` success — and the row reads back as a forwarded, rejected
+/// settlement.
+#[tokio::test]
+async fn saturated_configure_refuses_503_and_replay_reproduces_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let cookie = login(hub.addr, &hub.bootstrap_token).await?;
+    let host_id = HostId::new().as_id().as_str().to_string();
+    let token = enroll_token(hub.addr, &cookie).await?;
+
+    // Bring up an accepting node long enough to create an instance.
+    let (create_link, node_token) = accepting_create_node(hub.addr, &token, &host_id).await?;
+    wait_host_present(hub.addr, &cookie, &host_id, true).await;
+    let create = json!({
+        "hostId": host_id,
+        "kind": "claude",
+        "driver": "claude-print",
+        "delegation": "none",
+        "prompt": "hi"
+    })
+    .to_string();
+    let (status, _, body) = http(
+        hub.addr,
+        "POST",
+        "/v1/instances",
+        &[("Cookie", &cookie)],
+        Some(&create),
+    )
+    .await?;
+    assert_eq!(status, 200, "{body}");
+    let instance_id = serde_json::from_str::<Value>(body.trim())?["instance"]["instanceId"]
+        .as_str()
+        .context("instanceId")?
+        .to_string();
+    create_link.abort();
+    wait_host_present(hub.addr, &cookie, &host_id, false).await;
+
+    // Swap in a parked link (reconnecting with the minted node token) and fill
+    // every control slot so the next RPC is refused before the frame queues.
+    let (_park, node_frames) = park_node(hub.addr, &node_token, &host_id);
+    wait_host_present(hub.addr, &cookie, &host_id, true).await;
+    let parked: Vec<JoinHandle<()>> = (0..32)
+        .map(|_| {
+            let addr = hub.addr;
+            let cookie = cookie.clone();
+            let host_id = host_id.clone();
+            tokio::spawn(async move {
+                let _ = http(
+                    addr,
+                    "GET",
+                    &format!("/v1/worktrees?hostId={host_id}"),
+                    &[("Cookie", &cookie)],
+                    None,
+                )
+                .await;
+            })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while node_frames.load(Ordering::SeqCst) < 32 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("fake Node never received the 32 parked control frames");
+
+    let path = format!("/v1/instances/{instance_id}/commands");
+    let command_id = remuda_protocol::CommandId::new();
+    let configure = json!({
+        "commandId": command_id.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "model": "opus" }
+    })
+    .to_string();
+
+    // First attempt: refused pre-send with 503 NODE_BUSY.
+    let (status, _, first) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&configure),
+    )
+    .await?;
+    assert_eq!(status, 503, "first configure body: {first}");
+    let first_body: Value = serde_json::from_str(first.trim())?;
+    assert_eq!(first_body["code"], json!("NODE_BUSY"), "{first_body}");
+    assert_eq!(first_body["retryable"], json!(true), "{first_body}");
+    assert!(
+        first_body["retryAfterMs"].as_u64().is_some_and(|ms| ms > 0),
+        "{first_body}"
+    );
+
+    // Same-id replay reproduces the SAME 503 status and body, never a success.
+    let (status, _, replay) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&configure),
+    )
+    .await?;
+    assert_eq!(status, 503, "a replay must reproduce the 503: {replay}");
+    let replay_body: Value = serde_json::from_str(replay.trim())?;
+    assert_eq!(
+        replay_body, first_body,
+        "the replay body equals the original 503"
+    );
+
+    // The row is a terminal, forwarded rejection — not reconciling, not queued.
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+    let (status, _, row) = http(hub.addr, "GET", &detail, &[("Cookie", &cookie)], None).await?;
+    assert_eq!(status, 200, "{row}");
+    let row: Value = serde_json::from_str(row.trim())?;
+    assert_eq!(row["state"], json!("settled"), "{row}");
+    assert_eq!(row["forwarded"], json!(true), "{row}");
+    assert_eq!(row["settlement"]["outcome"], json!("rejected"), "{row}");
 
     for handle in parked {
         handle.abort();

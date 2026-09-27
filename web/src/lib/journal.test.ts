@@ -474,6 +474,99 @@ it("concurrent fillGap calls share ONE in-flight fill and its definite outcome",
   expect(client.status).toBe("live");
 });
 
+it("ROUND5-2: a resume that joins the fill its generation just invalidated fails while the hole remains", async () => {
+  // The owner's-phone sequence:
+  //   1. the live socket delivers the tail 3001..5000 -> deferred fill 2..3000
+  //   2. a resume bumps the generation mid-fill; its own bounded read returns
+  //      the taller tail 4873..5000 -> gap 2..4872
+  //   3. the deferred fill ends without reaching seq 2
+  // The resume must NOT accept the superseded fill and publish live over the
+  // hole: it waits for that fill, starts a replacement, and because the gap
+  // is still present it settles readonly-stale and REJECTS (machine offline).
+  const range = (from: number, to: number) => {
+    const events: Observation[] = [];
+    for (let seq = from; seq <= to; seq += 1) events.push(obs(seq));
+    return events;
+  };
+  let resolveDeferredFill: (page: ReadPage) => void = () => {};
+  const deferredFill = new Promise<ReadPage>((resolve) => {
+    resolveDeferredFill = resolve;
+  });
+  // Call 1: the gen-0 fill (hung until we resolve it). Call 2: the resume's
+  // own read, bounded tail 4873..5000. Calls 3+: the replacement fill, whose
+  // window never descends toward seq 2.
+  const read: JournalRead = vi
+    .fn()
+    .mockReturnValueOnce(deferredFill)
+    .mockResolvedValueOnce(
+      page(range(4873, 5000), { durableSeq: "5000", windowFromSeq: "4873", reachedAfterSeq: false }),
+    )
+    .mockResolvedValue(
+      page([], { durableSeq: "5000", windowFromSeq: "4873", reachedAfterSeq: false }),
+    );
+
+  const statuses: string[] = [];
+  const client = new JournalClient("obj_journal" as Id, read, {
+    onStatus: (s) => statuses.push(s),
+    // Emulate the store: every onGap joins/launches a fill at the current gen.
+    onGap: (from, to) => void client.fillGap(from, to, client.currentResumeGen()),
+  });
+  client.applySnapshot(snapshot(1));
+
+  // 1. Socket tail 3001..5000: gapped, the gen-0 fill for 2..3000 starts and
+  // blocks on its deferred read.
+  const tailed = client.applyBatch({
+    subscriptionId: "sub",
+    journalId: "obj_journal" as Id,
+    fromSeq: "3001",
+    toSeq: "5000",
+    events: range(3001, 5000),
+    durableSeq: "5000",
+  });
+  expect(tailed.gap).toEqual({ from: "2", to: "3000" });
+  expect(read).toHaveBeenCalledTimes(1);
+
+  // 2. Resume (bumps the generation); its read sees the taller tail.
+  const resume = client.resumeAfterReconnect().catch((err: unknown) => err);
+  await new Promise((r) => setTimeout(r, 0));
+  expect(read).toHaveBeenCalledTimes(2);
+
+  // 3. The deferred gen-0 fill ends with rows that still leave seq 2 missing.
+  resolveDeferredFill(
+    page(range(2001, 3000), { durableSeq: "5000", windowFromSeq: "2001", reachedAfterSeq: false }),
+  );
+
+  const err = await resume;
+  // The resume failed: no false live over the hole.
+  expect(err).toBeInstanceOf(JournalResumeStaleError);
+  expect(client.status).toBe("readonly-stale");
+  expect(statuses).not.toContain("live");
+  // The cursor never crossed the missing rows.
+  expect(client.appliedSeq).toBe("1");
+  // The resume STARTED A REPLACEMENT fill after the superseded one ended (at
+  // least one read beyond the resume read), rather than trusting the join.
+  expect(read.mock.calls.length).toBeGreaterThanOrEqual(3);
+});
+
+it("a newer resume with a taller gap reuses an in-flight same-generation fill only once it covers its target", async () => {
+  // Companion to ROUND5-2: when the in-flight fill already runs at the
+  // caller's generation AND covers the requested range, callers still join the
+  // exact same promise (one read, one fill) — the sharing optimization is
+  // preserved for the usable case.
+  const read: JournalRead = vi
+    .fn()
+    .mockResolvedValueOnce(
+      page([obs(2), obs(3)], { durableSeq: "3", windowFromSeq: "2", reachedAfterSeq: true }),
+    );
+  const client = new JournalClient("obj_journal" as Id, read);
+  client.applySnapshot(snapshot(1));
+  const a = client.fillGap("2", "3", 0);
+  const b = client.fillGap("2", "3", 0);
+  expect(b).toBe(a);
+  expect(await Promise.all([a, b])).toEqual(["3", "3"]);
+  expect(read).toHaveBeenCalledTimes(1);
+});
+
 it("a stale fill whose deferred read rejects after a newer resume went live never writes status", async () => {
   let rejectFill: (err: Error) => void = () => {};
   const fillRead = new Promise<ReadPage>((_resolve, reject) => {

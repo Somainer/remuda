@@ -86,6 +86,11 @@ export class JournalClient {
   private filling = false;
   /** The single shared in-flight gap-fill (concurrent onGap/resume join it). */
   private fillingPromise: Promise<U64 | null> | null = null;
+  /** Range/generation of the in-flight fill, so a caller can tell whether
+   * joining it can actually reach ITS target. */
+  private fillingFrom = 0;
+  private fillingTo = 0;
+  private fillingGen = -1;
   private loadingEarlier = false;
   status: "live" | "reconnecting" | "gap-backfill" | "readonly-stale" = "live";
   /** Bumped per resumeAfterReconnect; stale attempts are no-ops. */
@@ -199,16 +204,33 @@ export class JournalClient {
    * client settles readonly-stale instead of buffering forever.
    */
   fillGap(from: U64, to: U64, gen?: number): Promise<U64 | null> {
-    // Share one in-flight fill: a second onGap (or resume) for a gap already
-    // being backfilled joins the EXACT SAME promise (not an async-wrapped
-    // copy) rather than racing two reads and two status transitions.
-    if (this.fillingPromise) return this.fillingPromise;
+    // Share one in-flight fill only when it can serve THIS caller: its owner
+    // generation must match (a fill superseded by a newer resume/socket
+    // recovery must not be accepted as the newer caller's outcome) and its
+    // range must reach the caller's target. A queued+forwarded "unknown" hole
+    // discovered from the tail (gap 2..3000) and a resume whose own read sees
+    // the taller tail (gap 2..4872) differ in BOTH: the resume waits for the
+    // superseded fill to end and then starts a replacement, instead of
+    // publishing live over the part the old fill never reached.
     if (this.status === "readonly-stale") return Promise.resolve(null);
+    if (this.fillingPromise) {
+      const callerGen = gen ?? this.resumeGen;
+      const covers = this.fillingFrom <= n(from) && this.fillingTo >= n(to);
+      if (this.fillingGen === callerGen && covers) return this.fillingPromise;
+      // In-flight fill is stale or too short: do not race its reads. Wait for
+      // it to finish (its finally clears the slot first), then re-enter — the
+      // first waiter starts the replacement; later waiters join that one when
+      // it covers their range/generation.
+      return this.fillingPromise.then(() => this.fillGap(from, to, callerGen));
+    }
     // Capture the current resume generation by default (every fill is
     // generation-guarded, not just explicit callers).
     const ownerGen = gen ?? this.resumeGen;
     const stale = () => ownerGen !== this.resumeGen;
     this.filling = true;
+    this.fillingFrom = n(from);
+    this.fillingTo = n(to);
+    this.fillingGen = ownerGen;
     const run = this.doFillGap(from, to, stale);
     this.fillingPromise = run.finally(() => {
       this.filling = false;
@@ -418,6 +440,15 @@ export class JournalClient {
     // retries (the read-rejection path above fails the same way). A
     // contiguous socket recovery flushes status to live first and skips this.
     if (this.status === "readonly-stale") throw new JournalResumeStaleError();
+    // Contiguity is the success certificate, not the fill promise's mere
+    // resolution: a joined/replacement fill can end while rows below its
+    // target are still missing (e.g. a superseded tail fill the resume had to
+    // replace). The applied cursor must actually have reached the gap's far
+    // edge; otherwise fail the resume instead of going live over the hole.
+    if (result.gap && this.applied < n(result.gap.to)) {
+      this.setStatus("readonly-stale");
+      throw new JournalResumeStaleError();
+    }
     this.setStatus("live");
     return this.appliedSeq;
   }

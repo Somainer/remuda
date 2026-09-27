@@ -4999,7 +4999,7 @@ async fn configure_replay_before_forward_registration_is_409_in_flight() -> Resu
     let path1 = path.clone();
     let cookie1 = cookie.clone();
     let body1 = body.clone();
-    let first = tokio::spawn(async move {
+    let mut first = tokio::spawn(async move {
         http(addr, "POST", &path1, &[("Cookie", &cookie1)], Some(&body1)).await
     });
 
@@ -5017,7 +5017,7 @@ async fn configure_replay_before_forward_registration_is_409_in_flight() -> Resu
 
     // The first POST is parked: merge done, forward not registered.
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), &first)
+        tokio::time::timeout(Duration::from_millis(300), &mut first)
             .await
             .is_err(),
         "the first POST must stay parked while the registry lookup is held"
@@ -5459,15 +5459,14 @@ async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<(
         }
         // It returned: only 404 (pre-insert) or the honest queued row are
         // allowed before the attempt registers.
-        if let Ok(Ok((status, _, row))) = probe.await? {
-            if status == 404 {
-                continue;
-            }
-            assert_eq!(status, 200, "{row}");
-            let row: Value = serde_json::from_str(row.trim())?;
-            assert_eq!(row["state"], json!("queued"), "pre-window row: {row}");
-            assert_eq!(row["forwarded"], json!(false), "pre-window row: {row}");
+        let (status, _, row) = probe.await??;
+        if status == 404 {
+            continue;
         }
+        assert_eq!(status, 200, "{row}");
+        let row: Value = serde_json::from_str(row.trim())?;
+        assert_eq!(row["state"], json!("queued"), "pre-window row: {row}");
+        assert_eq!(row["forwarded"], json!(false), "pre-window row: {row}");
     };
     // Two more GETs, all bound to the same open attempt.
     let mut blocked: Vec<tokio::task::JoinHandle<Result<(u16, String, String)>>> = vec![bound];

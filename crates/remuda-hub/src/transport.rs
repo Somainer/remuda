@@ -549,7 +549,7 @@ impl ConnectedNodes {
     #[doc(hidden)]
     pub async fn test_hold_lock_until(
         &self,
-        mut release: tokio::sync::oneshot::Receiver<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
         acquired: tokio::sync::oneshot::Sender<()>,
     ) {
         let _guard = self.inner.lock().await;

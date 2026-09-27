@@ -58,6 +58,19 @@ function s(v: number): U64 {
   return String(v);
 }
 
+/**
+ * Thrown by {@link JournalClient.resumeAfterReconnect} when the resume read
+ * (or its gap fill) settles readonly-stale: the journal is NOT whole, so the
+ * connection machine's resume action must fail and retry instead of
+ * certifying a false live. The status stays "readonly-stale" for the UI.
+ */
+export class JournalResumeStaleError extends Error {
+  constructor(message = "journal resume ended readonly-stale") {
+    super(message);
+    this.name = "JournalResumeStaleError";
+  }
+}
+
 /** Client-side snapshot + seq follow + gap fill (protocol.md §7.3). */
 export class JournalClient {
   readonly journalId: Id;
@@ -398,9 +411,14 @@ export class JournalClient {
     if (gen !== this.resumeGen) return this.appliedSeq;
     if (result.gap) await this.fillGap(result.gap.from, result.gap.to, gen);
     if (gen !== this.resumeGen) return this.appliedSeq;
-    // fillGap settles readonly-stale when its descent budget runs out; do not
-    // overwrite that verdict with a blanket "live".
-    if (this.status !== "readonly-stale") this.setStatus("live");
+    // A fill that settled readonly-stale (descent budget exhausted,
+    // divergence, or a failed fill read) means the resume did NOT make the
+    // journal whole. Resolving here would let the machine publish live over
+    // a hole; throw so the resume action fails, the machine stays offline and
+    // retries (the read-rejection path above fails the same way). A
+    // contiguous socket recovery flushes status to live first and skips this.
+    if (this.status === "readonly-stale") throw new JournalResumeStaleError();
+    this.setStatus("live");
     return this.appliedSeq;
   }
 

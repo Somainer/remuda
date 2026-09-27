@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Observation, Snapshot } from "../types/observation";
-import { JournalClient, type JournalRead } from "./journal";
+import { JournalClient, JournalResumeStaleError, type JournalRead } from "./journal";
 import { known, unknownKnowledge, type Id } from "../types/wire";
 
 type ReadPage = Awaited<ReturnType<JournalRead>>;
@@ -149,6 +149,33 @@ describe("JournalClient", () => {
     expect(acked).toBe("3");
     expect(emitted).toEqual([1, 2, 3]);
     expect(client.status).toBe("live");
+  });
+
+  it("a resume whose gap fill settles readonly-stale REJECTS (ROUND4-3): the machine must not publish live", async () => {
+    // The resume read comes back gapped (seq 2 missing: 3..5 arrive), and the
+    // Hub's tail window never descends to seq 2 — the fill settles
+    // readonly-stale. The resume must THROW instead of resolving, so the
+    // connection machine's resume action fails and retries offline.
+    const read: JournalRead = vi
+      .fn()
+      .mockResolvedValueOnce(
+        page([obs(3), obs(4), obs(5)], { durableSeq: "5", windowFromSeq: "3", reachedAfterSeq: false }),
+      )
+      .mockResolvedValue(
+        page([], { durableSeq: "5", windowFromSeq: "3", reachedAfterSeq: false }),
+      );
+    const statuses: string[] = [];
+    const client = new JournalClient("obj_journal" as Id, read, {
+      onStatus: (status) => statuses.push(status),
+    });
+    client.applySnapshot(snapshot(1));
+    client.markReconnecting();
+
+    await expect(client.resumeAfterReconnect()).rejects.toBeInstanceOf(JournalResumeStaleError);
+    expect(client.status).toBe("readonly-stale");
+    // The failure status was published for the banner; no false "live".
+    expect(statuses.at(-1)).toBe("readonly-stale");
+    expect(statuses).not.toContain("live");
   });
 
   it("resumes after reconnect from the last applied seq", async () => {

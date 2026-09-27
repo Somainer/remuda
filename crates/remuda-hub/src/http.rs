@@ -2013,9 +2013,15 @@ pub async fn post_command(
         .await
         .map_err(map_store)?;
     if !created {
-        // A serialized-insert loser never owns the creator's dispatch window:
-        // drop any participation before classifying the replay.
-        drop(dispatch.take());
+        // The insert loser never owns the dispatch window after losing — not
+        // even when IT acquired the pre-insert marker (under multi-thread
+        // scheduling the other task's INSERT can reach the FIFO writer first,
+        // so the loser can be the marker owner while the winner has not claimed
+        // yet). Disarm WITHOUT removing the entry: the winner's merge/forward
+        // window stays covered and any same-id replay keeps getting 409.
+        if let Some(guard) = dispatch.take() {
+            guard.disarm();
+        }
         // Existing row via the idempotency-key path or a serialized
         // lookup/insert race (key identity already enforced inside the store).
         let command = replay_existing_command(
@@ -2032,7 +2038,8 @@ pub async fn post_command(
     }
     // The insert winner owns the dispatch window. If the serialized writer ran
     // another task's insert first (it began while our marker was absent), claim
-    // now: that loser holds a non-owning guard and cannot clear ours.
+    // now: that loser was disarmed without touching the entry and can never
+    // clear ours.
     let _dispatch = match dispatch.take() {
         Some(guard) if guard.is_owner() => guard,
         _ => claim_dispatch(&command.command_id),
@@ -2113,13 +2120,17 @@ fn replay_configure_settlement(command: CommandRecord) -> Result<CommandRecord, 
     if command.forwarded {
         // Legacy pre-round-3 rows carry no persisted outcome. A NODE_BUSY
         // refusal settled the row rejected+forwarded, yet its first POST
-        // answered 503 — reconstruct that 503 from the stored reason so it
-        // never replays as 200 (round 3, item 2). The reason is the
-        // HubError::NodeBusy Display prefix.
-        if command
-            .settlement_reason
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with("node busy"))
+        // answered 503 — reconstruct that 503 ONLY when the stored reason is
+        // exactly the Hub's own NODE_BUSY display (the string the hub
+        // persisted for HubError::NodeBusy) and the row lacks an outcome. A
+        // mere "node busy…" prefix must not rewrite an explicit Node
+        // rejection whose first POST answered 200 (round 4, item 2).
+        let node_busy_reason = HubError::NodeBusy {
+            retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+        }
+        .to_string();
+        if command.settlement_http_status.is_none()
+            && command.settlement_reason.as_deref() == Some(node_busy_reason.as_str())
         {
             return Err(HubError::NodeBusy {
                 retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
@@ -2480,18 +2491,29 @@ static COMMAND_DISPATCH: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static DISPATCH_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Ownership of one [`COMMAND_DISPATCH`] entry. On drop it removes the entry
-/// only while it is still the current owner, so a serialized-insert loser can
-/// never clear the actual creator's marker.
+/// Ownership of one [`COMMAND_DISPATCH`] entry. An armed, owning guard removes
+/// the entry on drop only while it is still the current owner. A guard can be
+/// **disarmed** without removing the entry: the serialized-insert loser must
+/// always disarm rather than drop, because the writer thread can run the other
+/// task's INSERT first and the loser can therefore be the marker OWNER while
+/// the insert winner has not claimed yet (D-055 round 4, item 1).
 struct DispatchGuard {
     command_id: String,
-    /// 0 means this task did not win ownership (another POST registered first).
+    /// 0 means this task does not own the window: it never registered, or it
+    /// registered but lost the insert and has been disarmed.
     token: u64,
 }
 
 impl DispatchGuard {
     fn is_owner(&self) -> bool {
         self.token != 0
+    }
+
+    /// Give up any participation WITHOUT removing the registry entry. Used by
+    /// the insert loser: the winner owns the window from now on, and a
+    /// same-id replay in the gap must keep seeing the in-flight marker.
+    fn disarm(mut self) {
+        self.token = 0;
     }
 }
 
@@ -3842,18 +3864,21 @@ mod forward_slot_tests {
         row
     }
 
-    /// D-055 round 3, item 2: legacy persisted failures (NULL outcome columns)
-    /// replay their ORIGINAL status, not 200 — a pre-forward merge failure as
-    /// 500, a NODE_BUSY refusal as 503; an explicit Node error that answered
-    /// 200 stays the 200 row.
+    /// D-055 round 3 item 2 / round 4 item 2: legacy persisted failures (NULL
+    /// outcome columns) replay their ORIGINAL status, not 200 — a pre-forward
+    /// merge failure as 500, a NODE_BUSY refusal as 503; the NODE_BUSY
+    /// backfill matches the Hub's exact NODE_BUSY reason ONLY, so an explicit
+    /// Node rejection whose text merely starts with "node busy" still replays
+    /// its 200 row.
     #[test]
     fn legacy_rejected_configure_replays_original_status() {
         // Legacy NODE_BUSY: forwarded rejection (intent marked before the
-        // pre-send refusal), reason carries the NodeBusy Display prefix.
-        let busy = rejected_configure(
-            true,
-            "node busy: too many in-flight node rpcs; retry after 2500 ms",
-        );
+        // pre-send refusal), reason exactly the Hub's NodeBusy display.
+        let busy_reason = HubError::NodeBusy {
+            retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+        }
+        .to_string();
+        let busy = rejected_configure(true, &busy_reason);
         let err = replay_configure_settlement(busy).expect_err("legacy NODE_BUSY is an error");
         assert!(matches!(err, HubError::NodeBusy { .. }), "{err:?}");
         assert_eq!(err.status_code_and_body().0, 503);
@@ -3867,6 +3892,28 @@ mod forward_slot_tests {
         // An explicit Node error reply on a non-create command answered 200.
         let node_reject = rejected_configure(true, "configure rejected by node policy");
         let row = replay_configure_settlement(node_reject).expect("200 row passes through");
+        assert!(row.forwarded);
+
+        // Round 4, item 2: a Node-supplied reason that only shares the
+        // "node busy" prefix is NOT the Hub's NODE_BUSY — its 200 row must
+        // survive unchanged instead of being rewritten into a 503.
+        for lookalike in [
+            "node busy",
+            "node busy: scheduler queue full",
+            "node busy: try again later",
+        ] {
+            let row = rejected_configure(true, lookalike);
+            let row = replay_configure_settlement(row)
+                .unwrap_or_else(|err| panic!("{lookalike:?} must replay its 200 row, got {err:?}"));
+            assert!(row.forwarded, "{lookalike:?}");
+        }
+
+        // A row that already carries an outcome is never backfilled, even with
+        // the exact NODE_BUSY reason and a missing/unparseable body.
+        let mut half_outcome = rejected_configure(true, &busy_reason);
+        half_outcome.settlement_http_status = Some(503);
+        let row = replay_configure_settlement(half_outcome)
+            .expect("a row with an outcome is left unchanged");
         assert!(row.forwarded);
 
         // A round-2 row with a persisted pair replays that exact status/body.
@@ -3901,6 +3948,38 @@ mod forward_slot_tests {
         );
         drop(owner);
         assert!(!dispatch_in_flight(id));
+    }
+
+    /// D-055 round 4, item 1: under thread preemption the second POST's INSERT
+    /// can reach the serialized writer first, so the FIRST-to-begin POST (the
+    /// marker OWNER) can lose the insert while the winner has not claimed yet.
+    /// The loser must stand down WITHOUT removing the entry — otherwise a
+    /// third same-id POST landing in that gap is wrongly told "issue a new
+    /// commandId" instead of the in-flight 409.
+    #[test]
+    fn insert_loser_that_owns_the_marker_never_clears_it() {
+        let id = "cmd_dispatch_loser_owner_fixture";
+        // POST A begins first and owns the marker.
+        let loser = begin_dispatch(id);
+        assert!(loser.is_owner());
+        // POST B begins second, before the writer has run either INSERT.
+        let winner_to_be = begin_dispatch(id);
+        assert!(!winner_to_be.is_owner());
+        // The writer runs B's INSERT first, then A's. A loses BEFORE B claims.
+        loser.disarm();
+        assert!(
+            dispatch_in_flight(id),
+            "the owner-loser standing down must keep the winner's window covered"
+        );
+        // A's dropped guard stays a no-op after disarm.
+        // B (the insert winner) now claims ownership for its merge/forward.
+        let winner = claim_dispatch(id);
+        drop(winner_to_be);
+        assert!(dispatch_in_flight(id), "the non-owner join never clears");
+        // A third same-id POST during the winner's merge sees the marker.
+        assert!(dispatch_in_flight(id));
+        drop(winner);
+        assert!(!dispatch_in_flight(id), "the winner closes the window");
     }
 
     /// A follower binds to the specific attempt it waited on: attempt 1 rolls

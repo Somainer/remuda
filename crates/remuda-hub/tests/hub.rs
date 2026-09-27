@@ -5066,6 +5066,169 @@ async fn configure_replay_before_forward_registration_is_409_in_flight() -> Resu
     Ok(())
 }
 
+/// D-055 round 4, item 1: TWO concurrent same-id first POSTs race into one
+/// insert. The winner proceeds through its merge (parked before forward
+/// registration); the insert loser and a THIRD same-id replay arriving during
+/// the winner's merge must both answer the in-flight 409 — the loser
+/// surrenders its marker participation without ever clearing the window. The
+/// configure still forwards exactly once.
+#[tokio::test]
+async fn configure_concurrent_inserts_loser_and_replay_are_409_in_flight() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let configures = Arc::new(AtomicUsize::new(0));
+    let (node, _token) = open_fake_node(hub.addr, &enroll, &host_id, "cfg-race").await?;
+    let _link =
+        drive_settling_configure_node(node, sends.clone(), configures.clone(), Duration::ZERO);
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    let path = format!("/v1/instances/{instance_id}/commands");
+
+    // Park the winner after merge, before the forward attempt registers.
+    let (release_lookup, hold_lookup) = tokio::sync::oneshot::channel::<()>();
+    hub.test_hold_node_lookups(hold_lookup).await;
+
+    let command_id = remuda_protocol::CommandId::new();
+    let mk_body = || {
+        json!({
+            "commandId": command_id.as_id().as_str(),
+            "operation": "instance.configure",
+            "payload": { "model": "opus" }
+        })
+        .to_string()
+    };
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+
+    // Two concurrent first POSTs with one commandId. Whichever insert loses,
+    // its response (and every later replay's) must be the in-flight 409.
+    let mut posts: Vec<tokio::task::JoinHandle<Result<(u16, String, String)>>> = (0..2)
+        .map(|_| {
+            let addr = hub.addr;
+            let path = path.clone();
+            let cookie = cookie.clone();
+            let body = mk_body();
+            tokio::spawn(async move {
+                http(addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await
+            })
+        })
+        .collect();
+
+    // Wait until one row exists and at least one POST is parked in the
+    // winner's merge window.
+    loop {
+        let (status, _, row) = http(hub.addr, "GET", &detail, &[("Cookie", &cookie)], None).await?;
+        if status == 200 {
+            let row: Value = serde_json::from_str(row.trim())?;
+            if row["state"] == json!("queued") && row["forwarded"] == json!(false) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The insert loser classifies without the Node-registry lock and returns
+    // while the winner stays parked; capture any finished output instead of
+    // polling its JoinHandle a second time later.
+    let mut early: Vec<Option<Result<(u16, String, String)>>> = vec![None, None];
+    for (i, handle) in posts.iter_mut().enumerate() {
+        if let Ok(output) = tokio::time::timeout(Duration::from_millis(300), handle).await {
+            early[i] = Some(output?);
+        }
+    }
+    assert!(
+        early.iter().any(Option::is_none),
+        "the insert winner must stay parked in the merge window"
+    );
+    for output in early.iter().flatten() {
+        let (status, body) = match output {
+            Ok(tuple) => (tuple.0, tuple.2.as_str()),
+            Err(err) => panic!("racing POST failed: {err}"),
+        };
+        assert_in_flight_conflict(status, body)?;
+    }
+
+    // A THIRD same-id replay during the winner's merge: in-flight 409.
+    let (status, _, conflict) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&mk_body()),
+    )
+    .await?;
+    assert_in_flight_conflict(status, &conflict)?;
+
+    // Release the winner; collect both racing POSTs: exactly one 200 (the
+    // insert winner) and one in-flight 409 (the loser).
+    release_lookup.send(()).expect("holder alive");
+    let mut saw_200 = 0;
+    let mut saw_409 = 0;
+    for (i, handle) in posts.into_iter().enumerate() {
+        // Reuse the output captured above for a handle that already finished.
+        let result = match early[i].take() {
+            Some(output) => output,
+            None => handle.await?,
+        };
+        let (status, _, body) = result?;
+        match status {
+            200 => {
+                assert_eq!(
+                    serde_json::from_str::<Value>(body.trim())?["replayed"],
+                    json!(false)
+                );
+                saw_200 += 1;
+            }
+            409 => {
+                assert_in_flight_conflict(status, &body)?;
+                saw_409 += 1;
+            }
+            other => panic!("unexpected racing POST status {other}: {body}"),
+        }
+    }
+    assert_eq!((saw_200, saw_409), (1, 1), "one winner, one loser");
+
+    wait_command_state(hub.addr, &cookie, &detail, "settled").await?;
+    assert_eq!(
+        configures.load(Ordering::Relaxed),
+        1,
+        "the configure forwards exactly once despite the racing inserts"
+    );
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
+
+    // Terminal replay returns the stored row, still a single forward.
+    let (status, _, replay) = http(
+        hub.addr,
+        "POST",
+        &path,
+        &[("Cookie", &cookie)],
+        Some(&mk_body()),
+    )
+    .await?;
+    assert_eq!(status, 200, "{replay}");
+    assert_eq!(
+        serde_json::from_str::<Value>(replay.trim())?["replayed"],
+        json!(true)
+    );
+    assert_eq!(configures.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+/// Assert a 409 body is the configure in-flight conflict (not the offline
+/// "issue a new commandId" rejection).
+fn assert_in_flight_conflict(status: u16, body: &str) -> Result<()> {
+    assert_eq!(status, 409, "{body}");
+    let body: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(body["code"], json!("COMMAND_ID_CONFLICT"), "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still in flight"),
+        "must be the in-flight conflict, not a new-command rejection: {body}"
+    );
+    Ok(())
+}
+
 /// D-055 (2026-09-25): a configure queued while the host is offline is merged
 /// once on its first POST but never forwarded; a same-id replay is rejected
 /// with a clear 409 (issue a new command), reconnect alone forwards nothing,
@@ -5447,19 +5610,22 @@ async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<(
             let cookie = cookie.clone();
             async move { http(addr, "GET", &detail, &[("Cookie", &cookie)], None).await }
         });
-        if tokio::time::timeout(Duration::from_millis(400), &mut probe)
-            .await
-            .is_err()
-            && tokio::time::timeout(Duration::from_millis(300), &mut probe)
-                .await
-                .is_err()
-        {
+        // Capture the completed output FROM the timeout that resolved it:
+        // polling a JoinHandle a second time after Ready panics, so the
+        // handle must never be awaited again once it has finished.
+        let resolved = match tokio::time::timeout(Duration::from_millis(400), &mut probe).await {
+            Ok(output) => Some(output),
             // Pending through both windows: bound to the active attempt.
+            Err(_) => tokio::time::timeout(Duration::from_millis(300), &mut probe)
+                .await
+                .ok(),
+        };
+        let Some(output) = resolved else {
             break probe;
-        }
+        };
         // It returned: only 404 (pre-insert) or the honest queued row are
         // allowed before the attempt registers.
-        let (status, _, row) = probe.await??;
+        let (status, _, row) = output??;
         if status == 404 {
             continue;
         }

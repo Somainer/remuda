@@ -5,6 +5,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
 import type { Observation } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
+import type { LocalBubble } from "../../lib/store";
 import { Transcript } from "./Transcript";
 
 function obs(
@@ -646,6 +647,41 @@ describe("Transcript search (batch E)", () => {
     expect(
       screen.getByTestId("transcript-search-count").getAttribute("aria-live"),
     ).toBe("off");
+  });
+
+  it("shows a rejected bubble's stored reason inline next to 未送达 (ROUND4-4), not a toast", () => {
+    const rejectedBubble: LocalBubble = {
+      clientRequestId: "local_rej",
+      instanceId: "ins_t",
+      text: "doomed steer",
+      commandId: "cmd_rej",
+      state: "unknown",
+      outboxState: "rejected",
+      outboxError: "turn does not exist",
+      createdAt: "2026-09-24T00:00:00.000Z",
+    };
+    render(<Transcript events={[]} bubbles={[rejectedBubble]} compact={false} />);
+    const row = screen.getByTestId("optimistic-bubble");
+    expect(row.textContent).toContain("未送达");
+    // The Node/Hub's own reason is neutral inline text in the same row.
+    const reason = screen.getByTestId("send-rejected-reason");
+    expect(reason.textContent).toContain("turn does not exist");
+    expect(row.contains(reason)).toBe(true);
+  });
+
+  it("shows 未送达 without a reason suffix when the rejected row carries none (ROUND4-4)", () => {
+    const rejectedBubble: LocalBubble = {
+      clientRequestId: "local_rej2",
+      instanceId: "ins_t",
+      text: "doomed no reason",
+      commandId: "cmd_rej2",
+      state: "unknown",
+      outboxState: "rejected",
+      createdAt: "2026-09-24T00:00:00.000Z",
+    };
+    render(<Transcript events={[]} bubbles={[rejectedBubble]} compact={false} />);
+    expect(screen.getByTestId("optimistic-bubble").textContent).toContain("未送达");
+    expect(screen.queryByTestId("send-rejected-reason")).toBeNull();
   });
 });
 

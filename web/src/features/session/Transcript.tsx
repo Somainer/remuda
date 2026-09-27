@@ -1168,7 +1168,17 @@ function renderNode(
                 : ` · 排队中 · 第 ${node.holdOrdinal ?? 1} 条 · 回车后送出`}
             </span>
           ) : localRow ? (
-            ` · ${localRow.label}`
+            <>
+              {` · ${localRow.label}`}
+              {/* A rejection carries the Node/Hub's own reason (the outbox
+                  row's lastError): neutral inline text next to 未送达, never a
+                  toast. */}
+              {localRow.key === "send-rejected" && node.local?.outboxError ? (
+                <span className={session.stat} data-testid="send-rejected-reason">
+                  {` · ${node.local.outboxError}`}
+                </span>
+              ) : null}
+            </>
           ) : null}
           {/* Status order the composer and transcript share: a queued
               journal node has not been sent; the local bubble's own wording

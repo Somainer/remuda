@@ -256,6 +256,13 @@ export type LocalBubble = {
    * 待发送（离线）/ 发送中 / 未送达 instead of the old unconfirmed fallback.
    */
   outboxState?: OutboxState;
+  /**
+   * The Node/Hub's own reason for a definite rejection (the outbox row's
+   * lastError, e.g. settlement.reason), shown inline next to 未送达 as
+   * neutral text in the row — never a toast. Present only for a rejected
+   * row; other states carry no user-facing reason here.
+   */
+  outboxError?: string;
   createdAt: string;
   /**
    * Thumbnails for images sent with this message (D-027). Held locally
@@ -1562,6 +1569,9 @@ class HubStore {
               ? "queued"
               : "accepted",
       outboxState: r.state,
+      // The rejection reason rides along on the rejected row so 未送达 can
+      // show the Node/Hub's own neutral explanation inline.
+      ...(r.state === "rejected" && r.lastError ? { outboxError: r.lastError } : {}),
       ...(attachments.length ? { attachments } : {}),
       promptMode: r.mode ?? "new-turn",
       createdAt: new Date(r.createdAt).toISOString(),

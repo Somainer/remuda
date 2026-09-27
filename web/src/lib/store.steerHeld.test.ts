@@ -217,6 +217,24 @@ it("a held bubble keeps ONE lifetime commandId when the first persistence attemp
   expect(durable).toHaveLength(1);
 });
 
+it("a rejected steer carries the Node's settlement reason onto the bubble for inline display (ROUND4-4)", async () => {
+  const { api, hubStore } = await fresh();
+  const id = hubStore.hold(INSTANCE, "doomed with reason", "turn");
+  const rejected = commandResult(undefined, "settled");
+  rejected.command.dispatch = "transport-written";
+  rejected.command.resolution = "clear";
+  rejected.command.settlement = { outcome: "rejected", reason: "turn does not exist" };
+  vi.spyOn(api, "instanceSend").mockResolvedValue(rejected);
+
+  await hubStore.steerHeld(INSTANCE, id);
+
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.clientRequestId === id)!;
+  expect(bubble.outboxState).toBe("rejected");
+  // The reason was already stored on the outbox row; it must reach the
+  // bubble too so the row can show it next to 未送达.
+  expect(bubble.outboxError).toBe("turn does not exist");
+});
+
 it("an offline steer resolves false (no 已打断 receipt) and stays a queued row with no POST", async () => {
   const { api, hubStore } = await fresh();
   const id = hubStore.hold(INSTANCE, "offline steer", "turn");

@@ -3,6 +3,7 @@ import type { Host, Instance } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 import { known, na, unknownKnowledge, type Id } from "../../types/wire";
 import { deriveApprovalRows, type ApprovalFilters, type ApprovalSource } from "./approvalRows";
+import { deriveInboxQueue } from "../mobile/inboxRows";
 import {
   CARRIER_LABEL,
   DEPARTED_STATUS_TEXT,
@@ -127,6 +128,42 @@ function source(interactions: Interaction[], instances: Instance[] = []): Approv
 }
 
 describe("deriveApprovalRows tiering", () => {
+  it("queue tier is exactly the shared deriveInboxQueue membership, unfiltered", () => {
+    // c-ghostbadge round 2: no second QUEUE_STATES loop — desktop and the
+    // compact inbox/badge must derive the same queue set.
+    const pending = approval({ id: "itx_p", instanceId: "ins_1" });
+    const answering = approval({ id: "itx_a", instanceId: "ins_1" });
+    const paused = approval({ id: "itx_z", instanceId: "ins_off", hostId: "hst_off" });
+    const expired = approval({ id: "itx_e", instanceId: "ins_1", state: "expired" });
+    const superseded = approval({ id: "itx_i", instanceId: "ins_1", state: "invalidated" });
+    const settled = approval({
+      id: "itx_s",
+      instanceId: "ins_1",
+      state: "answer-committed",
+      answer: {
+        state: "known",
+        value: {
+          commandId: "cmd_1",
+          actor: { principalId: "p", type: "human", deviceId: "dev_1", instanceId: null },
+          value: { kind: "approval", optionId: "allow-once", inputDigest: "sha256:abab" },
+          committedAt: T1,
+        },
+      },
+    });
+    const s = source(
+      [pending, answering, paused, expired, superseded, settled],
+      [inst({ id: "ins_1" }), inst({ id: "ins_off", hostId: "hst_off" })],
+    );
+    s.hosts = [host({ id: "hst_1" }), host({ id: "hst_off", state: "offline" })];
+    s.answering = { itx_a: true };
+
+    const { queue, departed } = deriveApprovalRows(s, FILTERS);
+    const sharedIds = deriveInboxQueue(s).map((q) => q.item.id).sort();
+    expect(queue.map((r) => r.item.id).sort()).toEqual(sharedIds);
+    expect(sharedIds).toEqual(["itx_a", "itx_p", "itx_z"]);
+    expect(departed.map((r) => r.item.id).sort()).toEqual(["itx_e", "itx_i"]);
+  });
+
   it("queues a pending approval on a connected online host", () => {
     const item = approval({ id: "itx_1", instanceId: "ins_1" });
     const { queue, departed } = deriveApprovalRows(source([item]), FILTERS);

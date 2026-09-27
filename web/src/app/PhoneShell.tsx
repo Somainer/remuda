@@ -4,6 +4,7 @@ import { hubStore, useHub } from "../lib/store";
 import { toastAdapter } from "../lib/notify";
 import { useWorkbenchViewport } from "../lib/viewport";
 import { useSpaceWorkbench } from "../features/spaces/useSpaceWorkbench";
+import { useInboxPendingCount } from "../features/mobile/useInboxPendingCount";
 import { InstallBar } from "./InstallBar";
 import { PhoneNav } from "./PhoneNav";
 import { ShellNotify } from "./Shell";
@@ -28,8 +29,10 @@ export function PhoneShell() {
   const location = useLocation();
   const workbench = useSpaceWorkbench();
   const onHome = location.pathname === "/m";
-  // Badge rule identical to Shell.tsx: pending interactions only.
-  const pending = hub.interactions.filter((i) => i.state === "pending").length;
+  // c-ghostbadge: one source of truth with the /m/inbox 待你处理 tier.
+  // UO-3 feeds the same count to the shared PhoneNav component (which owns
+  // the more-menu sheet itself), so the shell keeps no legacy more state.
+  const pending = useInboxPendingCount();
 
   // Equivalent to Shell.tsx's visibilitychange effect: on return to the
   // foreground a session route catches up its journal gap, every other route

@@ -2,4 +2,16 @@ export { FleetBoard } from "./FleetBoard";
 export { BroadcastBox } from "./BroadcastBox";
 export { fleetStore, useFleets } from "./store";
 export { countFleet, type Fleet } from "./model";
-export { buildBroadcastBody, orderResults, summarize, type BroadcastForm } from "./broadcast";
+export {
+  buildBroadcastBody,
+  classifyCommand,
+  provisionalState,
+  resolveEntry,
+  orderResults,
+  summarize,
+  summarizeRows,
+  SETTLED_STATES,
+  DELIVERY_LABEL,
+  type BroadcastForm,
+  type DeliveryState,
+} from "./broadcast";

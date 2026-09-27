@@ -407,8 +407,13 @@ test.describe("round-3 redesign", () => {
     const codeTexts = await page.getByTestId("code-block").allInnerTexts();
     expect(codeTexts.some((t) => t.includes("$$indented$$"))).toBe(true);
     expect(codeTexts.some((t) => t.includes("fenced^2"))).toBe(true);
-    // A mathdisplay fence is code, never a math node.
-    expect(await page.locator("pre code.language-mathdisplay").count()).toBe(0);
+    // A mathdisplay fence is code, never a math node (design F): it renders
+    // through CodeBlock with the language class and loads no KaTeX.
+    const mathdisplayFence = page.locator(
+      '[data-testid="code-block"]:has(code.language-mathdisplay)',
+    );
+    await expect(mathdisplayFence).toHaveCount(1);
+    await expect(mathdisplayFence.locator(".katex")).toHaveCount(0);
 
     // (B/I) the 100000em rule is clamped to 20em and stays bounded.
     const geom = await row

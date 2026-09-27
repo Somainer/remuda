@@ -14,7 +14,8 @@ import { login } from "./hub-auth";
  * and the new process serves no interaction.list for it. The durable row is
  * still state='pending' until the deadline crosses; the shared deadline
  * clock then flips the projection to expired in place — badge 0 / 待你处理
- * (0), observed on the already-mounted /m and /m/inbox pages (no reload).
+ * (0), asserted on the same mounted PhoneShell (no reload, in-shell client
+ * navigation only) and only then re-checked after a real reload.
  */
 test.describe.configure({ mode: "serial" });
 
@@ -143,16 +144,32 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
 
     // --- With NO reload: the card is still pending (deadline open); watch
     // the mounted inbox tier flip 1 -> 0 when the known deadline crosses —
-    // the shared clock drives it, with no store emission or navigation. ---
+    // the shared clock drives it, with no store emission or navigation. The
+    // PERSISTENT PhoneShell bottom bar (and its badge) stays mounted on this
+    // page, so pin the badge to 1 here first. ---
     await page.goto("/m/inbox");
     await expect(page.getByTestId("m-inbox")).toBeVisible();
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1");
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
       timeout: 70_000,
     });
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
 
-    // The phone badge flipped together with the rows, on the same clock.
+    // The exact badge element pinned above flips in place — no reload, not even a
+    // route change (round 3: round 2 reloaded via goto before this assertion, so
+    // it never proved the persistent shell updated itself).
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
+
+    // Navigate WITHIN the mounted shell: the bottom-bar Link is a client-side
+    // route, the shell is never remounted, and the badge stays 0 on /m.
+    await page.getByTestId("phone-nav-home").click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
+
+    // A genuine reload afterwards keeps it 0 — the 0 is the durable projection,
+    // not live-frame-only state.
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
     await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);

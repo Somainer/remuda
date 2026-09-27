@@ -88,7 +88,7 @@ describe("ConnectionMachine", () => {
     // Full-jitter cap at attempt 0 with random()=0.5 is 250 ms.
     clock.advance(250);
     expect(machine.state).toBe("recovering");
-    machine.dispatch({ type: "resumeAttempt", ok: true });
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
     expect(machine.state).toBe("live");
   });
 
@@ -106,7 +106,7 @@ describe("ConnectionMachine", () => {
     // Complete the resume, then run past every backoff window: had the old
     // reconnect timer survived, it would have begun a second attempt while
     // the machine was already live.
-    machine.dispatch({ type: "resumeAttempt", ok: true });
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
     expect(machine.state).toBe("live");
     clock.advance(16_000);
     expect(resume).toHaveBeenCalledTimes(1);
@@ -129,10 +129,10 @@ describe("ConnectionMachine", () => {
     machine.dispatch({ type: "close" });
     machine.dispatch({ type: "resume" });
     expect(machine.state).toBe("recovering");
-    machine.dispatch({ type: "resumeAttempt", ok: false });
+    machine.dispatch({ type: "resumeAttempt", ok: false, attemptId: 1 });
     expect(machine.state).toBe("offline");
     machine.dispatch({ type: "resume" });
-    machine.dispatch({ type: "resumeAttempt", ok: true });
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 2 });
     expect(machine.state).toBe("live");
   });
 
@@ -145,7 +145,56 @@ describe("ConnectionMachine", () => {
     clock.advance(RECOVERING_WATCHDOG_MS);
     expect(machine.state).toBe("offline");
     // A late response after the watchdog must not resurrect the attempt.
-    machine.dispatch({ type: "resumeAttempt", ok: true });
+    machine.dispatch({ type: "resumeAttempt", ok: true, attemptId: 1 });
+    expect(machine.state).toBe("offline");
+  });
+
+  it("a timed-out attempt's late success can never consume the next attempt (ROUND5-4)", async () => {
+    // A times out (watchdog -> offline -> backoff), B starts, A resolves ok
+    // while B is still pending, then B fails. A's completion must be dropped
+    // (it is not the current attempt) and B's failure must land offline —
+    // never a false live certified by the dead attempt A.
+    const { clock, machine, resume } = setupTracked();
+    let resolveA: () => void = () => {};
+    let rejectB: (err: Error) => void = () => {};
+    resume
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveA = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectB = reject;
+          }),
+      );
+    machine.startLive();
+    machine.dispatch({ type: "close" });
+    // Backoff at attempt 0 with random()=0.5 is 250 ms: attempt A starts.
+    clock.advance(250);
+    expect(machine.state).toBe("recovering");
+    expect(resume).toHaveBeenCalledTimes(1);
+    // A hangs past the watchdog: offline, reconnect scheduled.
+    clock.advance(RECOVERING_WATCHDOG_MS);
+    expect(machine.state).toBe("offline");
+    // Watchdog bumped the attempt to 2: backoff is 1000 ms (cap 2_000 * 0.5).
+    clock.advance(1_000);
+    expect(machine.state).toBe("recovering");
+    expect(resume).toHaveBeenCalledTimes(2);
+
+    // A resolves successfully AFTER it was timed out, while B is pending.
+    resolveA();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Still recovering on B: the stale success must not certify live.
+    expect(machine.state).toBe("recovering");
+
+    // B then fails: the machine goes offline, never live.
+    rejectB(new Error("follow reopen failed"));
+    await Promise.resolve();
+    await Promise.resolve();
     expect(machine.state).toBe("offline");
   });
 

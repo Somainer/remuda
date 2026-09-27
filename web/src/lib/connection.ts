@@ -28,8 +28,8 @@ export type ConnectionEvent =
     { type: "resume" }
   | /** A REST probe finished; ok=frames reachable. */
     { type: "probe"; ok: boolean }
-  | /** The resume action finished. */
-    { type: "resumeAttempt"; ok: boolean };
+  | /** The resume action finished. Only accepted for the current attempt. */
+    { type: "resumeAttempt"; ok: boolean; attemptId: number };
 
 export const LIVE_FRAME_MS = 15_000;
 export const STALE_TO_OFFLINE_MS = 30_000;
@@ -72,6 +72,12 @@ export class ConnectionMachine {
   private attempt = 0;
   private timers = new Map<TimerName, unknown>();
   private resumeInFlight = false;
+  /**
+   * Monotonic id of the current resume attempt. A completion (or watchdog)
+   * from a timed-out attempt carries a stale id and is ignored: the watchdog
+   * fires attempt A, B starts, A resolves late — A must never consume B.
+   */
+  private resumeAttemptId = 0;
   private readonly schedule: Scheduler;
   private readonly cancel: ScheduleCancel;
   private readonly random: () => number;
@@ -242,7 +248,10 @@ export class ConnectionMachine {
         }
         return;
       case "resumeAttempt": {
-        if (!this.resumeInFlight) return;
+        // Accept a completion only for the CURRENT attempt. A late resolution
+        // from an attempt the watchdog already timed out (B is now running)
+        // must not certify live nor consume B's outcome.
+        if (!this.resumeInFlight || event.attemptId !== this.resumeAttemptId) return;
         this.resumeInFlight = false;
         this.clearTimer("watchdog");
         if (event.ok) {
@@ -321,12 +330,15 @@ export class ConnectionMachine {
     this.clearTimers("stale", "offline", "probe", "reconnect");
     this.setState("recovering");
     this.resumeInFlight = true;
+    const attemptId = ++this.resumeAttemptId;
     // The resume can never strand us in recovering: the watchdog forces the
-    // attempt closed, and the promise also reports success/failure.
+    // attempt closed, and the promise also reports success/failure. Both carry
+    // this id, so once a later attempt owns the slot the stale attempt's
+    // watchdog and completion are ignored.
     this.timers.set(
       "watchdog",
       this.schedule(() => {
-        if (!this.resumeInFlight) return;
+        if (!this.resumeInFlight || this.resumeAttemptId !== attemptId) return;
         this.resumeInFlight = false;
         this.attempt += 1;
         this.goOfflineAndSchedule();
@@ -335,8 +347,8 @@ export class ConnectionMachine {
     this.attempt += 1;
     void this.deps
       .resume()
-      .then(() => this.dispatch({ type: "resumeAttempt", ok: true }))
-      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false }));
+      .then(() => this.dispatch({ type: "resumeAttempt", ok: true, attemptId }))
+      .catch(() => this.dispatch({ type: "resumeAttempt", ok: false, attemptId }));
   }
 
   dispose() {

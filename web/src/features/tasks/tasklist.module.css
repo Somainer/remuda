@@ -1,48 +1,35 @@
+/* @tokens strict */
 /*
- * Task list + detail body (D-050, ui-spec §2.9). Desktop /board is a fixed
- * 280px task rail beside the detail panel; the same row/group classes back
- * the phone /m task layer. Groups: 需要你 first, project + git branch groups
- * (header carries the buildSpaces() blocked count), 已归档 last.
+ * Task rail + task detail body (D-050, ui-spec §2.9, UO-8). The desktop
+ * /board rail is an --index column on --bg-nav (below 1024px Board.tsx
+ * promotes it to a header-button overlay); the same row/group classes back
+ * the phone /m task layer. Groups: 需要你 first in attention colors, project
+ * + git branch groups (header carries the buildSpaces() blocked count),
+ * 已归档 last. The detail styles render inside the board's read-only
+ * preview drawer (--bg-raised).
  */
 
-.board {
-  flex: 1 1 auto;
-  min-height: 0;
-  display: flex;
-  align-items: stretch;
-  background: var(--ink);
-  color: var(--paper);
-}
-
 .rail {
-  flex: 0 0 280px;
-  min-width: 240px;
+  flex: 0 0 var(--index);
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--line);
-  background: var(--ink-0);
+  border-right: 1px solid var(--divider);
+  background: var(--bg-nav);
 }
 
 .toolbar {
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--line);
+  flex: none;
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--divider);
 }
 
 .search {
   width: 100%;
+  height: 36px;
   box-sizing: border-box;
-  min-height: 36px;
-  padding: 0 var(--space-2);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-1);
-  color: var(--paper);
-  font-family: var(--font);
-  font-size: var(--text-aux);
-}
-
-.search::placeholder {
-  color: var(--mute);
+  padding: 0 var(--space-3);
+  font-size: var(--text-ui);
 }
 
 .groups {
@@ -51,7 +38,7 @@
 }
 
 .group {
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--divider);
 }
 
 .groupHead {
@@ -61,23 +48,27 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
-  padding: 6px var(--space-3);
-  background: var(--ink-1);
-  font-size: var(--text-label);
-  color: var(--mute);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-nav);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .groupAttention {
-  background: color-mix(in srgb, var(--danger) 22%, var(--ink-1));
-  color: var(--danger-strong);
+  background: var(--attention-bg);
+  color: var(--attention-fg);
 }
 
 .groupProject {
+  color: var(--fg-strong);
   font-weight: 600;
-  color: var(--paper);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.groupAttention .groupProject {
+  color: var(--attention-fg);
 }
 
 .groupBranch {
@@ -86,42 +77,52 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-family: var(--font);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .groupCount {
   flex: none;
+  font-variant-numeric: tabular-nums;
 }
 
 .groupBlocked {
   flex: none;
-  color: var(--danger-strong);
+  color: var(--attention-fg);
 }
 
 .groupBlocked[data-zero="1"] {
-  color: var(--mute);
+  color: var(--fg-faint);
 }
 
 .row {
   display: block;
   width: 100%;
   box-sizing: border-box;
-  text-align: left;
-  padding: 6px var(--space-3) 6px calc(var(--space-3) + var(--depth, 0) * 16px);
+  padding: 6px var(--space-3) 6px
+    calc(var(--space-3) + var(--depth, 0) * var(--space-4));
   border: 0;
-  border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+  border-bottom: 1px solid var(--divider);
   background: transparent;
   color: inherit;
   font: inherit;
+  text-align: left;
   cursor: pointer;
 }
 
 .row:hover {
-  background: var(--ink-1);
+  background: var(--bg-hover);
+}
+
+.row:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
 }
 
 .rowSelected {
-  background: var(--ink-2);
+  background: var(--bg-selected);
+  box-shadow: inset 2px 0 0 var(--focus);
 }
 
 .rowMain {
@@ -133,9 +134,9 @@
 
 .rowKey {
   flex: none;
-  font-family: var(--font);
-  font-size: var(--text-label);
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .rowTitle {
@@ -144,16 +145,17 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--fg-body);
 }
 
 .rowChildCount {
   flex: none;
-  font-size: var(--text-label);
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .rowFail {
-  color: var(--danger-strong);
+  color: var(--danger-fg);
 }
 
 .rowMeta {
@@ -161,8 +163,8 @@
   align-items: baseline;
   gap: var(--space-2);
   margin-top: 2px;
-  font-size: var(--text-label);
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .rowStep {
@@ -175,36 +177,57 @@
 
 .rowSession {
   flex: none;
-  font-family: var(--font);
+  font-family: var(--font-mono);
 }
 
 .rowSessionLink {
-  color: var(--mute);
+  flex: none;
+  color: var(--fg-muted);
   text-decoration: none;
 }
 
 .rowSessionLink:hover {
-  color: var(--paper);
+  color: var(--fg-strong);
   text-decoration: underline;
 }
 
 .rowReason {
-  color: var(--danger-strong);
+  color: var(--danger-fg);
 }
 
-/* Detail panel */
+.rowLink {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+}
+
+.empty {
+  margin: var(--space-4);
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
+}
+
+/* On /m the layer sits inside the home's own scroll body. */
+.groupsPhone {
+  flex: 0 0 auto;
+  overflow: visible;
+  border-bottom: 1px solid var(--divider);
+}
+
+/* ── Task detail (read-only preview drawer) ─────────────────────────────── */
 
 .detail {
   flex: 1 1 auto;
   min-width: 0;
   overflow-y: auto;
   padding: var(--space-4) var(--space-4) var(--space-5);
-  background: var(--ink);
+  background: transparent;
+  color: var(--fg-body);
 }
 
 .detailEmpty {
-  color: var(--mute);
-  font-size: var(--text-aux);
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
 }
 
 .detailHead {
@@ -215,28 +238,30 @@
 }
 
 .detailKey {
-  font-family: var(--font);
-  font-size: var(--text-aux);
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .detailState {
-  font-size: var(--text-label);
   padding: 1px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--mute);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .detailState[data-failed="1"] {
-  color: var(--danger-strong);
-  border-color: var(--danger);
+  color: var(--danger-fg);
+  border-color: var(--danger-border);
 }
 
 .detailTitle {
-  margin: 0 0 var(--space-2);
-  font-size: 20px;
-  line-height: 1.35;
+  margin: 0 0 var(--space-3);
+  color: var(--fg-strong);
+  font-size: var(--text-page);
+  font-weight: 600;
+  line-height: var(--lh-page);
 }
 
 .detailBlocked {
@@ -244,11 +269,11 @@
   gap: var(--space-2);
   margin: 0 0 var(--space-3);
   padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--danger);
-  border-radius: var(--radius);
-  background: color-mix(in srgb, var(--danger) 16%, transparent);
-  color: var(--danger-strong);
-  font-size: var(--text-aux);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: var(--text-ui);
 }
 
 .detailBlockedMark {
@@ -257,9 +282,9 @@
 
 .detailSectionTitle {
   margin: var(--space-4) 0 var(--space-2);
-  font-size: var(--text-label);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
   font-weight: 600;
-  color: var(--mute);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -274,73 +299,59 @@
 }
 
 .mandateLink {
-  border-left: 2px solid var(--line);
+  border-left: 2px solid var(--divider);
   padding: 2px 0 2px var(--space-3);
 }
 
 .mandateTitle {
   display: block;
+  color: var(--fg-strong);
   font-weight: 600;
-  font-size: var(--text-aux);
+  font-size: var(--text-ui);
 }
 
 .mandateIntent {
   display: block;
   margin-top: 2px;
   white-space: pre-wrap;
-  font-size: var(--text-aux);
-  color: var(--paper);
   user-select: text;
+  color: var(--fg-body);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 .detailSubtle {
-  color: var(--mute);
-  font-size: var(--text-aux);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .detailOpenSession {
   display: inline-block;
   padding: 4px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--paper);
-  font-size: var(--text-aux);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--fg-body);
+  font-size: var(--text-ui);
   text-decoration: none;
 }
 
 .detailOpenSession:hover {
-  background: var(--ink-1);
-}
-
-/* Phone /m task layer: the rail fills the screen and the detail panel is
-   not rendered by the phone home. */
-@media (max-width: 720px) {
-  .board {
-    flex-direction: column;
-  }
-
-  .rail {
-    flex: 1 1 auto;
-    min-width: 0;
-    border-right: 0;
-  }
-}
-
-.rowLink {
-  display: block;
+  border-color: var(--border-control);
   text-decoration: none;
-  color: inherit;
 }
 
-.empty {
-  margin: var(--space-4);
-  color: var(--mute);
-  font-size: var(--text-aux);
-}
+/* Hit area follows the pointer: coarse rows are at least 44px tall
+   (visual-system.md §8), fine pointers keep the 28px-class density. */
+@media (pointer: coarse) {
+  .search {
+    height: var(--touch);
+  }
 
-/* On /m the layer sits inside the home's own scroll body. */
-.groupsPhone {
-  flex: 0 0 auto;
-  overflow: visible;
-  border-bottom: 1px solid var(--line);
+  .row {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: var(--touch);
+  }
 }

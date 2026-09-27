@@ -1,3 +1,4 @@
+/* @tokens strict */
 .root {
   display: flex;
   flex-direction: column;
@@ -8,40 +9,29 @@
 
 .toolbar {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   align-items: center;
-  padding: 8px 12px 0;
+  padding: var(--space-2) var(--space-3) 0;
   flex-shrink: 0;
 }
 
 .searchbar {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   align-items: center;
-  padding: 8px 12px 0;
+  padding: var(--space-2) var(--space-3) 0;
   flex-shrink: 0;
 }
 
 .searchInput {
   flex: 1;
   min-width: 0;
-  padding: 6px 10px;
-  border: 1px solid var(--line, rgba(127, 127, 127, 0.35));
-  border-radius: 4px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-}
-
-.searchInput:focus-visible {
-  outline: 2px solid var(--cold);
-  outline-offset: 1px;
 }
 
 .searchCount {
   font-variant-numeric: tabular-nums;
-  color: var(--mute);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
   white-space: nowrap;
 }
 
@@ -49,51 +39,85 @@
   flex: 1;
   min-height: 0;
   overflow: auto;
+  /* The transcript holds its own reading anchor (Transcript.tsx); native
+     anchoring would race it on the engines that have it. */
+  overflow-anchor: none;
 }
 
+/* D-053 reading column: one measure for every row, centred, with the
+   gutter outside it. content-box so the measure is the text width itself:
+   720 at 1440, 504 at 768 (sidebar 216), 358 at 390. */
 .list {
-  padding: 14px 18px 24px;
-  display: flex;
-  flex-direction: column;
+  box-sizing: content-box;
+  max-width: var(--read-measure);
+  margin: 0 auto;
+  padding: var(--space-5) var(--read-gutter) var(--space-6);
 }
 
+@media (min-width: 1024px) {
+  .list {
+    padding-top: var(--space-6);
+    padding-bottom: 40px;
+  }
+}
+
+@media (max-width: 767px) {
+  .list {
+    padding-top: 20px;
+    padding-bottom: var(--space-5);
+  }
+}
+
+/* Spacing lives only on the measured element's own padding: the virtual
+   window reports the border box, so a margin (or a sibling selector) would
+   be a gap it cannot see. flow-root keeps child margins inside the box. */
 .row {
-  margin-bottom: 11px;
-  border-radius: 4px;
+  display: flow-root;
+  margin: 0;
+  padding-bottom: var(--space-3);
+  border-radius: var(--radius-xs);
+}
+
+.row[data-role="user"] {
+  padding-top: var(--space-4);
 }
 
 .rowActive {
-  outline: 1px solid var(--cold);
+  outline: 1px solid var(--focus);
+  outline-offset: 2px;
 }
 
-/* Search dimming/highlight: the current hit uses the stronger border. */
+/* Search highlight: the current hit uses the stronger ring. */
 .rowHit {
-  box-shadow: inset 3px 0 0 var(--cold);
+  box-shadow: -6px 0 0 -3px var(--link);
 }
 
 .rowCurrent {
-  outline: 2px solid var(--cold);
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
 }
 
+/* A failure stays visible: a rule and a tag, never folded by default. */
 .failWrap {
-  border-left: 3px solid var(--danger);
-  padding-left: 8px;
+  border-left: 2px solid var(--danger-border);
+  padding-left: var(--space-3);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
 }
 
 .failTag {
   align-self: flex-start;
-  font-size: 12px;
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
   font-weight: 600;
-  color: var(--danger);
+  color: var(--danger-fg);
 }
 
 .jump {
   position: absolute;
-  right: 16px;
-  bottom: 16px;
+  right: var(--space-4);
+  bottom: var(--space-4);
   z-index: 2;
 }
 
@@ -112,42 +136,67 @@
 
 .taskToggle {
   border: 0;
-  padding: 0 0 0 4px;
+  padding: 0 0 0 var(--space-1);
   background: none;
-  color: var(--cold);
+  color: var(--link);
   font: inherit;
-  font-size: 12px;
+  font-size: var(--text-meta);
   cursor: pointer;
 }
 
 .taskFailed {
-  color: var(--danger);
+  color: var(--danger-fg);
   font-weight: 600;
 }
 
-/* D-041 compact folded tool row: family + key argument on one truncated
-   line. Visual frame matches .tool so an expanded card reads as the same
-   surface opening up. */
+/* D-041 / D-053 folded tool row: one quiet line, no frame. A leading dot,
+   the tool, its key argument, and the expand control. */
 .fold {
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  overflow: hidden;
+  min-width: 0;
 }
 
 .foldHead {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  gap: var(--space-2);
+  min-height: 24px;
   min-width: 0;
+  font-size: var(--text-ui);
+  line-height: var(--lh-meta);
+  color: var(--fg-muted);
 }
 
+/* D-052 §3: an incomplete record keeps its dashed edge when folded. */
+.foldPartial .foldHead {
+  border: 1px dashed var(--unknown-border);
+  border-radius: var(--radius-xs);
+  padding: 0 var(--space-2);
+}
+
+.foldPartialTag {
+  flex: none;
+  font-size: var(--text-meta);
+  color: var(--unknown-fg);
+}
+
+.foldDot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--fg-faint);
+}
+
+.foldDotRun {
+  background: var(--link);
+}
+
+/* The tool name keeps its width; the key argument is what truncates. A
+   genuinely long name (a qualified MCP id) still ends in an ellipsis. */
 .foldTitle {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--paper);
-  flex: 0 1 auto;
+  color: var(--fg-body);
+  flex: 0 0 auto;
+  max-width: 60%;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -155,43 +204,66 @@
 }
 
 .foldFamily {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-faint);
   flex: none;
 }
 
 .foldArg {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
   min-width: 0;
-  flex: 1 1 auto;
+  flex: 1 1 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-/* Anchor for the compact touch hot zone below; the visual 22px button box
-   is unchanged on every layout. */
+/* The expand control: a quiet text button. It anchors the touch hot zone
+   below; its visual box stays small on every layout. */
 .foldOpen {
   position: relative;
   flex: none;
   margin-left: auto;
+  padding: 0 var(--space-1);
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: var(--text-meta);
+  line-height: 20px;
+  cursor: pointer;
+}
+
+.foldOpen:hover {
+  color: var(--fg-strong);
+  background: var(--bg-hover);
+}
+
+/* A coarse pointer keeps the visible line at 24px; the open control reaches
+   44px through an invisible ::after, not a taller row. */
+@media (pointer: coarse) {
+  .foldOpen::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+  }
 }
 
 /* ui-spec §3.4: both folds render whenever COMPACT_WORKBENCH_QUERY matches
    (the narrow clause OR the coarse-pointer landscape clause), so the 44px
    hot zones must key off the SAME query — not max-width alone, which would
    leave a 32px chip on a coarse landscape phone. The reach is an invisible
-   ::after, never a bigger visual glyph; the D-041 head gets the same
-   min-height so its pseudo is never clipped by overflow:hidden. The D-049
-   toolbar wraps instead of overflowing once the chips fold. */
+   ::after, never a bigger visual glyph. The D-049 toolbar wraps instead of
+   overflowing once the chips fold. */
 @media (max-width: 767px), (pointer: coarse) and (max-width: 1023px) and (max-height: 600px) {
-  .foldHead {
-    min-height: var(--touch);
-  }
-
   .foldOpen::after {
     content: "";
     position: absolute;
@@ -223,86 +295,163 @@
 }
 
 /* UO-4: migrated from session.module.css. NOTE: session.module.css's
-
    compact-fold BUTTON `.fold` lives in toolCard.module.css — this file's
-
    existing `.fold` is the D-041 folded tool-row container; the two locals
-
    must not be unified. */
 
+/* D-053: user and assistant share one measure and one size. The author line
+   and a quiet rule on the user's words tell them apart, not a bubble. The
+   section is the caret's positioning box. */
+.user,
+.assistant {
+  position: relative;
+  min-width: 0;
+  font-family: var(--font-read);
+  font-size: var(--text-read);
+  line-height: var(--lh-read);
+  color: var(--fg-body);
+}
+
 .user {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  align-items: flex-end;
+  border-left: 2px solid var(--border-control);
+  padding-left: var(--space-3);
+}
+
+.user > * + *,
+.assistant > * + * {
+  margin-top: var(--space-1);
 }
 
 .you {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--mute);
+  flex-wrap: wrap;
+  gap: 0 var(--space-2);
+  font-family: var(--font-ui);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--fg-muted);
 }
 
 .bubble {
-  max-width: 66%;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  padding: 9px 12px;
-  font-size: 14px;
-  line-height: 1.5;
   margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
 }
 
-.assistant {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  align-items: flex-start;
-}
-
-/* Caret shown while a message is still streaming in (D-028 §7). Reuses the
-   `dim` keyframes the run dot already animates with, so the two read as the
-   same "still working" signal. */
+/* Caret shown while a message is still streaming in (D-028 §7). Absolutely
+   placed after the last glyph (Transcript.tsx StreamingCursor), so starting
+   and ending a stream never changes the row's height. Reuses the `dim`
+   keyframes the run dot animates with. Margin 0: as a child of the section
+   it would otherwise take the `.assistant > * + *` gap and paint low. */
 .cursor {
-  display: inline-block;
+  position: absolute;
+  margin: 0;
   width: 7px;
-  height: 1em;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  background: var(--cold);
+  height: 1.1em;
+  background: var(--link);
+  pointer-events: none;
   animation: dim 1.1s ease-in-out infinite;
 }
 
 .thought {
-  color: var(--mute);
-  font-size: 13px;
-  font-family: var(--mono);
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
 }
 
 .thought summary {
   cursor: pointer;
+  width: fit-content;
+}
+
+.thought p {
+  margin: var(--space-1) 0 0;
+  white-space: pre-wrap;
+  font-family: var(--font-read);
 }
 
 .opaque {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
 }
 
 /* c-mfix: known effort/model observations rendered as a light change record
    (ObservedChangeRow), not 未识别事件. Same weight as .opaque; the disclosure
    keeps the raw payload one click away. */
 .changeRow {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
 }
 
 .changeRow details summary {
   cursor: pointer;
+}
+
+/* CompactFold's opened process list and the load-earlier strip. */
+.foldBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.loadEarlier {
+  display: flex;
+  justify-content: center;
+  padding: var(--space-2) var(--space-3);
+}
+
+/* Journal connection state (JournalBanner): one quiet 32px line above the
+   column, with a ghost retry when the stream went read-only. */
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 32px;
+  margin: var(--space-2) var(--space-3) 0;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+  color: var(--fg-muted);
+}
+
+.banner[data-state="readonly-stale"] {
+  border-color: var(--attention-border);
+  color: var(--fg-body);
+}
+
+.bannerRetry {
+  margin-left: auto;
+  min-height: 24px;
+  padding: 0 var(--space-2);
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--link);
+  font: inherit;
+  cursor: pointer;
+}
+
+.bannerRetry:hover {
+  background: var(--bg-hover);
+}
+
+.bannerRetry:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 1px;
+}
+
+@media (pointer: coarse) {
+  .bannerRetry {
+    min-height: var(--touch);
+  }
 }
 
 @keyframes dim {
@@ -316,16 +465,13 @@
 }
 
 @media (max-width: 767px) {
-  .bubble {
-    max-width: 88%;
-    padding: 9px 11px;
+  .user {
+    padding-left: 10px;
   }
 }
 
 /* UO-4 mechanical split: re-exported class stubs so existing importers
-
    keep a single `css` binding. Empty rules emit no CSS; the composed
-
    class carries the original declarations. */
 
 .heldRowActions {

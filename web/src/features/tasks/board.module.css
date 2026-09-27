@@ -1,21 +1,34 @@
+/* @tokens strict */
 /*
- * Desktop kanban board (D-050, ui-spec §2.9). The 280px task rail and the
- * read-only detail panel reuse tasklist.module.css; this sheet owns the
- * three-column board surface, the cards and the archive fold (a filter
- * section below the columns — never a fourth column).
+ * Desktop kanban board (D-050, ui-spec §2.9, UO-8). Sidebar ｜ task rail
+ * (--bg-nav; below 1024px a header-button overlay) ｜ three-column board.
+ * The columns carry no fill: region separation comes from the canvas and
+ * spacing; only the preview drawer and the folded rail float (shadow-3).
  */
 
 .page {
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
   align-items: stretch;
-  background: var(--ink);
-  color: var(--paper);
+  background: var(--bg-canvas);
+  color: var(--fg-body);
   overflow: hidden;
 }
 
+/* Rail overlay behaviour below 1024px. Base geometry/colors live in
+   tasklist.module.css (.rail), shared with the phone task layer. */
+.railScrim {
+  display: none;
+}
+
+.indexOpen {
+  display: none;
+}
+
 .boardMain {
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
@@ -23,67 +36,74 @@
   overflow: hidden;
 }
 
-.boardToolbar {
-  flex: none;
+/* Region covered by the preview scrim. It becomes inert while the drawer is
+   open (React sets the attribute), so its controls leave the tab order and
+   cannot be clicked — Tab only walks the rail and the drawer. */
+.boardContent {
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--line);
+  flex-direction: column;
 }
 
-.boardTitle {
-  margin: 0;
-  font-size: var(--text-aux);
-  font-weight: 600;
+.taskTotal {
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  font-variant-numeric: tabular-nums;
 }
 
 .archiveToggle {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  font-size: var(--text-label);
-  color: var(--mute);
+  gap: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
   cursor: pointer;
   user-select: none;
 }
 
-.moveError {
+.archiveToggle input {
+  width: auto;
   margin: 0;
-  padding: 4px 10px;
-  border: 1px solid var(--danger);
-  border-radius: var(--radius);
-  background: color-mix(in srgb, var(--danger) 16%, transparent);
-  color: var(--danger-strong);
-  font-size: var(--text-label);
 }
 
+.moveError {
+  flex: none;
+  margin: 0;
+  padding: var(--space-2) var(--space-6) 0;
+  color: var(--danger-fg);
+  font-size: var(--text-ui);
+}
+
+/* Columns: no fills, no outer frame; 24px top / 32px sides (<1200: 16px).
+   When the window cannot fit three 240px tracks plus gaps, THIS region
+   scrolls horizontally — the page itself never overflows. */
 .columns {
   flex: 1 1 auto;
   min-height: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1px;
-  background: var(--line);
-  overflow-y: auto;
+  grid-template-columns: repeat(3, minmax(240px, 1fr));
+  column-gap: 20px;
+  overflow: auto;
+  padding: var(--space-5) var(--space-6) var(--space-5);
 }
 
 .column {
   display: flex;
   flex-direction: column;
-  background: var(--ink-0);
   min-width: 0;
+  border-radius: var(--radius-md);
+  transition: background-color var(--dur-2) var(--ease-out), opacity var(--dur-2) var(--ease-out);
 }
 
 .columnOver {
-  background: var(--ink-2);
-  box-shadow: inset 0 0 0 2px var(--paper);
+  background: var(--bg-hover);
+  outline: 2px dashed var(--focus);
+  outline-offset: -2px;
 }
 
 .columnBlocked {
-  background: color-mix(in srgb, var(--danger) 10%, var(--ink-0));
-  box-shadow: inset 0 0 0 2px var(--danger);
+  opacity: 0.55;
 }
 
 .columnHead {
@@ -91,58 +111,66 @@
   top: 0;
   z-index: 1;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: var(--space-2);
-  padding: 8px var(--space-3);
-  background: var(--ink-1);
-  border-bottom: 1px solid var(--line);
-  font-size: var(--text-label);
-  color: var(--mute);
+  height: 32px;
+  padding: 0 var(--space-1);
+  color: var(--fg-muted);
+}
+
+.columnGlyph {
+  flex: none;
+  font-size: var(--text-ui);
 }
 
 .columnTitle {
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
   font-weight: 600;
-  color: var(--paper);
+  line-height: var(--lh-ui);
 }
 
 .columnCount {
   margin-left: auto;
+  font-size: var(--text-meta);
+  font-variant-numeric: tabular-nums;
 }
 
 .dropReason {
-  margin: 0;
-  padding: 6px var(--space-3);
-  border-bottom: 1px solid var(--danger);
-  background: color-mix(in srgb, var(--danger) 14%, transparent);
-  color: var(--danger-strong);
-  font-size: var(--text-label);
+  margin: 0 0 var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
 }
 
 .columnBody {
   flex: 1 1 auto;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-2);
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-1) var(--space-4);
 }
 
 .columnEmpty {
   margin: var(--space-3);
-  color: var(--mute);
-  font-size: var(--text-aux);
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
   text-align: center;
 }
 
-/* Cards */
+/* ── Cards ─────────────────────────────────────────────────────────────── */
 
 .card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--ink-1);
+  gap: var(--space-2);
+  padding: var(--space-3) 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
 }
 
 .card[draggable="true"] {
@@ -154,16 +182,22 @@
 }
 
 .card:hover {
-  border-color: color-mix(in srgb, var(--paper) 35%, var(--line));
+  border-color: var(--border-control);
+}
+
+.card:focus-within {
+  border-color: var(--border-control);
 }
 
 .cardSelected {
-  border-color: var(--paper);
-  box-shadow: inset 0 0 0 1px var(--paper);
+  border-color: var(--border-control);
+  background: var(--bg-selected);
 }
 
+/* Failed cards keep their placement column; the 2px rail is inset so the
+   card's 1px box never reflows. */
 .cardFailed {
-  border-color: var(--danger);
+  box-shadow: inset 2px 0 0 var(--danger-border);
 }
 
 .cardArchived {
@@ -172,7 +206,7 @@
 
 .cardHead {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   gap: var(--space-2);
 }
 
@@ -191,54 +225,98 @@
   cursor: pointer;
 }
 
+.cardOpen:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+  border-radius: var(--radius-xs);
+}
+
 .cardKey {
   flex: none;
-  font-family: var(--font);
-  font-size: var(--text-label);
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
 }
 
 .cardTitle {
   flex: 1 1 auto;
   min-width: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: var(--text-aux);
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 500;
+  line-height: var(--lh-title);
 }
 
 .cardArchive {
   flex: none;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--mute);
-  font-size: var(--text-label);
   padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
   cursor: pointer;
 }
 
 .cardArchive:hover {
-  color: var(--paper);
-  border-color: var(--paper);
+  color: var(--fg-strong);
+  border-color: var(--border-control);
+}
+
+/* Signal line: failure badge, amber 需要你, landed sha, muted 尚未合入, or
+   the shared next-step phrase. */
+.signal {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  font-size: var(--text-meta);
+}
+
+.signalAttention {
+  color: var(--attention-fg);
+}
+
+.signalDot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-pill);
+  background: var(--attention-fg);
+}
+
+.signalLanded {
+  gap: var(--space-1);
+  color: var(--success-fg);
+}
+
+.signalSha {
+  font-family: var(--font-mono);
+}
+
+.signalMute {
+  color: var(--fg-muted);
 }
 
 .failBadge {
   display: flex;
   align-items: baseline;
-  gap: 6px;
+  gap: var(--space-2);
   margin: 0;
-  padding: 4px 8px;
-  border: 1px solid var(--danger);
-  border-radius: var(--radius);
-  background: color-mix(in srgb, var(--danger) 18%, transparent);
-  color: var(--danger-strong);
-  font-size: var(--text-label);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
 }
 
 .failMark {
   flex: none;
-  font-weight: 700;
 }
 
 .failText {
@@ -257,15 +335,22 @@
 .sessionLine {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-2);
   padding: 2px 0;
-  color: inherit;
+  color: var(--fg-body);
+  font-size: var(--text-meta);
   text-decoration: none;
-  font-size: var(--text-label);
 }
 
 .sessionLine:hover {
-  text-decoration: underline;
+  color: var(--fg-strong);
+  text-decoration: none;
+}
+
+.sessionLine:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: -2px;
+  border-radius: var(--radius-xs);
 }
 
 .sessionName {
@@ -278,14 +363,15 @@
 
 .sessionTime {
   flex: none;
-  color: var(--mute);
-  font-family: var(--font);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
 }
 
-.cardNoSession {
+.cardNoSession,
+.cardMoreSessions {
   margin: 0;
-  color: var(--mute);
-  font-size: var(--text-label);
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
 }
 
 .cardFoot {
@@ -297,35 +383,34 @@
 .configChip {
   flex: none;
   padding: 1px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--mute);
-  font-size: var(--text-label);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .shared {
   flex: 1 1 auto;
   text-align: right;
-  color: var(--paper);
-  font-size: var(--text-label);
+  color: var(--fg-body);
+  font-size: var(--text-meta);
 }
 
 .sharedMute {
   flex: 1 1 auto;
   text-align: right;
-  color: var(--mute);
-  font-size: var(--text-label);
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
 }
 
-/* Archive fold: a filter section, never a board column. */
+/* ── Archive fold: a filter section below the columns, never a column. ──── */
 
 .archiveFold {
   flex: none;
   max-height: 34%;
   display: flex;
   flex-direction: column;
-  border-top: 1px solid var(--line);
-  background: var(--ink-0);
+  border-top: 1px solid var(--divider);
 }
 
 .archiveHead {
@@ -333,20 +418,21 @@
   display: flex;
   align-items: baseline;
   gap: var(--space-2);
-  padding: 6px var(--space-3);
-  font-size: var(--text-label);
-  color: var(--mute);
-  border-bottom: 1px solid var(--line);
+  padding: var(--space-2) var(--space-6);
+  border-bottom: 1px solid var(--divider);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .archiveCount {
   margin-left: auto;
+  font-variant-numeric: tabular-nums;
 }
 
 .archiveEmpty {
   margin: var(--space-3);
-  color: var(--mute);
-  font-size: var(--text-aux);
+  color: var(--fg-faint);
+  font-size: var(--text-meta);
 }
 
 .archiveCards {
@@ -354,46 +440,145 @@
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-  gap: var(--space-2);
-  padding: var(--space-2);
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
 }
 
-/* Read-only preview */
+/* ── Read-only preview: overlay drawer (ui-spec §2.9, D-053) ───────────── */
 
-.preview {
-  flex: 0 0 360px;
-  min-width: 300px;
+.previewScrim {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  justify-content: flex-end;
+  background: var(--scrim);
+}
+
+.previewDrawer {
+  width: min(400px, calc(100% - 48px));
+  height: 100%;
   display: flex;
   flex-direction: column;
-  border-left: 1px solid var(--line);
-  background: var(--ink);
   overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-3);
+  animation: slide-in var(--dur-2) var(--ease-out);
+}
+
+@keyframes slide-in {
+  from {
+    transform: translateX(16px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
 }
 
 .previewBanner {
   flex: none;
   display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  padding: 8px var(--space-4);
-  border-bottom: 1px solid var(--line);
-  background: var(--ink-1);
-  font-size: var(--text-label);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--divider);
+  font-size: var(--text-meta);
 }
 
 .previewMode {
   flex: none;
   padding: 1px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  color: var(--mute);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
 }
 
 .previewLink {
-  color: var(--paper);
+  margin-left: auto;
+  color: var(--link);
 }
 
 .previewMute {
-  color: var(--mute);
+  margin-left: auto;
+  color: var(--fg-faint);
+}
+
+/* ── Narrow desktop: the rail folds into a header overlay. ──────────────── */
+
+@media (max-width: 1199px) {
+  .moveError {
+    padding-right: var(--space-4);
+    padding-left: var(--space-4);
+  }
+
+  .columns {
+    padding-right: var(--space-4);
+    padding-left: var(--space-4);
+  }
+
+  .archiveHead,
+  .archiveCards {
+    padding-right: var(--space-4);
+    padding-left: var(--space-4);
+  }
+}
+
+@media (max-width: 1023px) {
+  .indexOpen {
+    display: inline-flex;
+    align-items: center;
+    min-height: var(--control-h-sm);
+    padding: 0 var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--fg-body);
+    font-size: var(--text-ui);
+    cursor: pointer;
+  }
+
+  .rail {
+    display: none;
+  }
+
+  .rail[data-open] {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 31;
+    display: flex;
+    width: min(var(--index), 88%);
+    border-right: 1px solid var(--border);
+    background: var(--bg-raised);
+    box-shadow: var(--shadow-3);
+  }
+
+  .railScrim {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    display: block;
+    background: var(--scrim);
+  }
+}
+
+/* Coarse pointers: the rail rows and the archive/preview affordances keep
+   the 44px hit area (hit target follows pointer, never width — §8). */
+@media (pointer: coarse) {
+  .cardArchive {
+    min-height: var(--touch);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .column,
+  .previewDrawer {
+    animation: none;
+    transition: none;
+  }
 }

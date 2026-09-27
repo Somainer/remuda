@@ -405,6 +405,21 @@ test("a bounded tail window pages older rows and descends a resync gap to live",
   const anchorScrollAfter = await scroller.evaluate((el) => el.scrollTop);
   expect(anchorScrollAfter).toBeGreaterThan(anchorBefore!.scrollTop);
 
+  // D-053: zero per-row drift. Row spacing is padding inside the measured
+  // box (no outside margin, no +12 fudge), so consecutive mounted rows are
+  // contiguous: each row's slot is exactly its rendered height.
+  const gaps = await scroller.evaluate((el) => {
+    const rows = Array.from(el.querySelectorAll<HTMLElement>('[data-testid="transcript-row"]'));
+    const out: number[] = [];
+    for (let i = 1; i < rows.length; i += 1) {
+      const prev = rows[i - 1].getBoundingClientRect();
+      out.push(Math.round((rows[i].getBoundingClientRect().top - prev.bottom) * 100) / 100);
+    }
+    return out;
+  });
+  expect(gaps.length).toBeGreaterThan(0);
+  for (const gap of gaps) expect(Math.abs(gap)).toBeLessThanOrEqual(0.5);
+
   // At the top, an older burst window renders in ascending seq order.
   await scroller.evaluate((el) => {
     el.scrollTop = 0;

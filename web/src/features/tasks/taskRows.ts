@@ -259,6 +259,52 @@ export function taskNextStep(row: Pick<TaskRow, "needsHuman" | "blocked" | "task
   return TASK_STATE_LABEL[row.task.state];
 }
 
+/**
+ * The one signal line on a board card (ui-spec §2.9). The first established
+ * condition wins, in this exact order:
+ *
+ *  1. failure — the badge row with the blocked reason (a failed card stays in
+ *     its placement column, never folds into done);
+ *  2. 需要你 — a pending human interaction or an owner-blocked reason;
+ *  3. 已合入 — an authoritative gate/land sha (D-050 invariant I1);
+ *  4. 尚未合入 — a done card without a land record; the board offers no land
+ *     entry, land only ever goes through the gate;
+ *  5. otherwise the same {@link taskNextStep} phrase the task list renders.
+ *
+ * Pure: the component never infers success and never invents a state.
+ */
+export type TaskCardSignal =
+  | { kind: "failed"; reason: string | null }
+  | { kind: "needs-human" }
+  | { kind: "landed"; sha7: string }
+  | { kind: "unlanded" }
+  | { kind: "next-step"; text: string };
+
+export function taskCardSignal(input: {
+  task: Pick<Task, "state" | "blockedReason" | "landedSha">;
+  needsHuman: boolean;
+  sessionCount: number;
+}): TaskCardSignal {
+  const { task, needsHuman, sessionCount } = input;
+  if (task.state === "failed") {
+    return { kind: "failed", reason: task.blockedReason?.trim() || null };
+  }
+  if (needsHuman) return { kind: "needs-human" };
+  const sha = task.landedSha?.trim();
+  if (task.state === "done") {
+    return sha ? { kind: "landed", sha7: sha.slice(0, 7) } : { kind: "unlanded" };
+  }
+  return {
+    kind: "next-step",
+    text: taskNextStep({
+      needsHuman,
+      blocked: Boolean(task.blockedReason?.trim()),
+      task: task as Task,
+      sessionCount,
+    }),
+  };
+}
+
 function matchesNeedle(
   row: Pick<Prepared, "displayKey" | "task">,
   needle: string,

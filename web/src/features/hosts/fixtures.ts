@@ -3,19 +3,19 @@ import type { HostCli, HostView } from "./model";
 
 /** Mock ~/.ssh/config aliases (proposal.md §4.4 / §4.6). */
 export const SSH_ALIASES: { alias: string; hostname: string; user: string }[] = [
-  { alias: "devbox", hostname: "devbox", user: "devuser" },
-  { alias: "devbox-sg", hostname: "devbox-sg", user: "devuser" },
-  { alias: "devbox-sg-host", hostname: "devbox-sg-host", user: "devuser" },
-  { alias: "devbox-sg-small", hostname: "devbox-sg-small", user: "devuser" },
-  { alias: "forge-doloris", hostname: "forge-doloris", user: "devuser" },
-  { alias: "devbox-gpu", hostname: "devbox-gpu", user: "devuser" },
-  { alias: "lyre-devbox", hostname: "lyre-devbox", user: "devuser" },
+  { alias: "devbox", hostname: "devbox", user: "operator" },
+  { alias: "devbox-sg", hostname: "devbox-sg", user: "operator" },
+  { alias: "devbox-sg-host", hostname: "devbox-sg-host", user: "operator" },
+  { alias: "devbox-sg-small", hostname: "devbox-sg-small", user: "operator" },
+  { alias: "forge-doloris", hostname: "forge-doloris", user: "operator" },
+  { alias: "devbox-gpu", hostname: "devbox-gpu", user: "operator" },
+  { alias: "lyre-devbox", hostname: "lyre-devbox", user: "operator" },
 ];
 
 const claudeCli = (auth: HostCli["auth"] = "unknown"): HostCli => ({
   kind: "claude",
   version: "2.1.268",
-  path: "/home/devuser/.local/bin/claude",
+  path: "/opt/claude/bin/claude",
   auth,
 });
 
@@ -30,7 +30,7 @@ const COMPUTER_USE_CLIENT =
 const computerUseInstalled: HostCli = {
   kind: "computer-use",
   version: "2.7.0",
-  path: `/home/devuser/.codex/${COMPUTER_USE_CLIENT}`,
+  path: `/opt/codex/${COMPUTER_USE_CLIENT}`,
   auth: "unknown",
   installed: true,
 };
@@ -51,7 +51,7 @@ export const HOST_FIXTURES: HostView[] = [
     resources: { cpuPct: 8, memPct: 31 },
     cli: [
       claudeCli("logged_in"),
-      { kind: "codex", version: "0.147.0", path: "/home/devuser/.local/bin/codex", auth: "unknown" },
+      { kind: "codex", version: "0.147.0", path: "/opt/codex/bin/codex", auth: "unknown" },
       { kind: "grok", version: "1.0.30", path: "/usr/local/bin/grok", auth: "unknown" },
       computerUseInstalled,
     ],

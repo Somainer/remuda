@@ -1,11 +1,31 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { act, createRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { buildLongObservations } from "../../fixtures/session/longEvents";
 import type { Observation } from "../../types/observation";
 import { known, unknownKnowledge, type Id } from "../../types/wire";
-import { Transcript } from "./Transcript";
+import { Transcript, type TranscriptHandle } from "./Transcript";
+
+// The commit probe is only mounted under ?profile=1; the flag is a getter so
+// one describe block can turn it on without affecting the rest of the file.
+const profile = vi.hoisted(() => ({
+  on: false,
+  probes: [] as Array<{ kind: string; value: unknown }>,
+}));
+vi.mock("../../lib/profileFlags", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/profileFlags")>();
+  return {
+    ...actual,
+    get profilingEnabled() {
+      return profile.on;
+    },
+    reportProbe: (kind: string, value: unknown) => {
+      profile.probes.push({ kind, value });
+    },
+  };
+});
 
 function obs(
   seq: number,
@@ -335,7 +355,7 @@ describe("Transcript", () => {
       },
     );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12,
+      height: ROW,
       top: 0,
       left: 0,
       right: 0,
@@ -430,7 +450,7 @@ describe("Transcript", () => {
       },
     );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12,
+      height: ROW,
       top: 0,
       left: 0,
       right: 0,
@@ -488,8 +508,9 @@ describe("Transcript", () => {
 
 describe("Transcript search (batch E)", () => {
   // jsdom performs no layout, so virtualization math gets zeros unless rows
-  // get a deterministic height (84 + the component's 12px margin = 96,
-  // matching virtualWindow.DEFAULT_ROW) and the scroller a viewport/height.
+  // get a deterministic height (96, matching virtualWindow.DEFAULT_ROW; the
+  // row's spacing is padding inside its box, so the rect is the whole row)
+  // and the scroller a viewport/height.
   // Patches live on the prototypes so they also cover a remounted scroller.
   afterEach(() => {
     vi.restoreAllMocks();
@@ -511,7 +532,7 @@ describe("Transcript search (batch E)", () => {
       },
     );
     vi.spyOn(Element.prototype, "getBoundingClientRect").mockReturnValue({
-      height: ROW - 12,
+      height: ROW,
       top: 0,
       left: 0,
       right: 0,
@@ -693,7 +714,302 @@ describe("D-041 fold vs in-transcript search hit", () => {
       .poll(() => screen.getByTestId("tool-card").getAttribute("data-folded"))
       .toBe("1");
   });
+
+  it("opens a nested settled subagent result that holds the only hit", async () => {
+    const user = userEvent.setup();
+    const executor = known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null });
+    const call = (seq: number, id: string, name: string, input: unknown, parent: string | null) =>
+      obs(seq, "tool_call", {
+        nodeId: `nc-${seq}` as Id,
+        revision: "1",
+        operation: "open",
+        baseRevision: null,
+        toolCallId: id as Id,
+        parentToolCallId: parent as Id | null,
+        toolName: known(name),
+        displayTitle: known(name),
+        category: name === "Bash" ? "shell" : "agent",
+        input: known(input),
+        inputTextDelta: null,
+        state: "running",
+        executor,
+      });
+    const result = (seq: number, id: string, text: string) =>
+      obs(seq, "tool_result", {
+        nodeId: `nr-${seq}` as Id,
+        revision: "1",
+        operation: "close",
+        baseRevision: null,
+        toolCallId: id as Id,
+        stage: "final",
+        outcome: "succeeded",
+        blocks: [{ type: "text", text }],
+        structuredResult: unknownKnowledge("text"),
+        exitCode: known(0),
+        changes: [],
+      });
+    const child = call(3, "tc-child", "Bash", { command: "ls" }, "tc-task");
+    const childResult = result(4, "tc-child", "quillon-nested-9921");
+    for (const event of [child, childResult]) {
+      (event.source as { nativeAgentId: unknown }).nativeAgentId = known("agent-sub");
+    }
+    renderRouted(
+      [
+        userMessage(1, "派个子任务"),
+        call(2, "tc-task", "Task", { description: "look around" }, null),
+        child,
+        childResult,
+        result(5, "tc-task", "sub done"),
+        assistantMessage(6, "好了"),
+      ],
+      "/s/ins_nested_hit",
+    );
+    expect(screen.getByTestId("subagent-fold-toggle").getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("quillon-nested-9921")).toBeNull();
+
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "quillon-nested-9921");
+
+    // The hit opens the subagent fold AND the settled card inside it.
+    await expect.poll(() => screen.queryByText("quillon-nested-9921")).not.toBeNull();
+    const nested = screen
+      .getByTestId("subagent-fold")
+      .querySelector("[data-testid='tool-card']") as HTMLElement;
+    expect(nested.getAttribute("data-folded")).toBe("0");
+  });
+
+  it("steps through two nested settled hits under one parent, opening each in turn", async () => {
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "派个子任务"),
+        nestedCall(2, "tc-task", "Task", { description: "look around" }, null),
+        nestedCall(3, "tc-a", "Bash", { command: "ls a" }, "tc-task", "agent-sub"),
+        nestedResult(4, "tc-a", "twinhit-3301 first", "agent-sub"),
+        nestedCall(5, "tc-b", "Bash", { command: "ls b" }, "tc-task", "agent-sub"),
+        nestedResult(6, "tc-b", "twinhit-3301 second", "agent-sub"),
+        nestedResult(7, "tc-task", "sub done"),
+        assistantMessage(8, "好了"),
+      ],
+      "/s/ins_twin_hit",
+    );
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "twinhit-3301");
+    const count = () => screen.getByTestId("transcript-search-count").textContent;
+    const folded = () =>
+      [...screen.getByTestId("subagent-fold").querySelectorAll("[data-testid='tool-card']")].map((card) =>
+        card.getAttribute("data-folded"),
+      );
+
+    await expect.poll(count).toBe("1/2");
+    await expect.poll(folded).toEqual(["0", "1"]);
+    await user.click(screen.getByTestId("transcript-search-next"));
+    expect(count()).toBe("2/2");
+    await expect.poll(folded).toEqual(["1", "0"]);
+    await user.click(screen.getByTestId("transcript-search-prev"));
+    expect(count()).toBe("1/2");
+    await expect.poll(folded).toEqual(["0", "1"]);
+  });
+
+  it("opens the workflow member list and card that hold the selected hit", async () => {
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "跑个 workflow"),
+        ...workflowRun(2, "tc-wf", "agent-m"),
+        nestedCall(6, "tc-m1", "Bash", { command: "ls one" }, null, "agent-m"),
+        nestedResult(7, "tc-m1", "memberhit-5120 one", "agent-m"),
+        nestedCall(8, "tc-m2", "Bash", { command: "ls two" }, null, "agent-m"),
+        nestedResult(9, "tc-m2", "memberhit-5120 two", "agent-m"),
+        assistantMessage(10, "好了"),
+      ],
+      "/s/ins_member_hit",
+    );
+    const toggle = () => screen.getByTestId("workflow-member-tools-toggle");
+    expect(toggle().getAttribute("aria-expanded")).toBe("false");
+
+    await user.click(screen.getByTestId("transcript-search-open"));
+    await user.type(screen.getByTestId("transcript-search-input"), "memberhit-5120");
+    const folded = () =>
+      [...screen.getByTestId("workflow-card").querySelectorAll("[data-testid='tool-card']")].map((card) =>
+        card.getAttribute("data-folded"),
+      );
+    await expect.poll(() => toggle().getAttribute("aria-expanded")).toBe("true");
+    await expect.poll(folded).toEqual(["0", "1"]);
+    await user.click(screen.getByTestId("transcript-search-next"));
+    await expect.poll(folded).toEqual(["1", "0"]);
+    // Leaving search hands the list back to the reader: closed again.
+    await user.click(screen.getByTestId("transcript-search-close"));
+    await expect.poll(() => toggle().getAttribute("aria-expanded")).toBe("false");
+  });
 });
+
+describe("nested tool rows share the transcript expansion set", () => {
+  it("全部折叠 closes an opened subagent fold and re-folds the card the reader expanded", async () => {
+    const user = userEvent.setup();
+    renderRouted(
+      [
+        userMessage(1, "派个子任务"),
+        nestedCall(2, "tc-task", "Task", { description: "look around" }, null),
+        nestedCall(3, "tc-a", "Bash", { command: "ls a" }, "tc-task", "agent-sub"),
+        nestedResult(4, "tc-a", "nested body", "agent-sub"),
+        nestedResult(5, "tc-task", "sub done"),
+        assistantMessage(6, "好了"),
+      ],
+      "/s/ins_nested_collapse",
+    );
+    const toggle = () => screen.getByTestId("subagent-fold-toggle");
+    await user.click(toggle());
+    expect(toggle().getAttribute("aria-expanded")).toBe("true");
+    const nested = () =>
+      screen.getByTestId("subagent-fold").querySelector("[data-testid='tool-card']") as HTMLElement;
+    expect(nested().getAttribute("data-folded")).toBe("1");
+    fireEvent.click(nested().querySelector("[data-testid='tool-fold-open']") as HTMLElement);
+    expect(nested().getAttribute("data-folded")).toBe("0");
+
+    await user.click(screen.getByTestId("collapse-all"));
+    expect(toggle().getAttribute("aria-expanded")).toBe("false");
+    await user.click(toggle());
+    expect(nested().getAttribute("data-folded")).toBe("1");
+  });
+
+  it("keeps a nested expansion when the parent row remounts", () => {
+    const events = [
+      userMessage(1, "派个子任务"),
+      nestedCall(2, "tc-task", "Task", { description: "look around" }, null),
+      nestedCall(3, "tc-a", "Bash", { command: "ls a" }, "tc-task", "agent-sub"),
+      nestedResult(4, "tc-a", "nested body", "agent-sub"),
+      nestedResult(5, "tc-task", "sub done"),
+      assistantMessage(6, "好了"),
+    ];
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/s/ins_nested_keep"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByTestId("subagent-fold-toggle"));
+    const nested = () =>
+      screen.getByTestId("subagent-fold").querySelector("[data-testid='tool-card']") as HTMLElement;
+    fireEvent.click(nested().querySelector("[data-testid='tool-fold-open']") as HTMLElement);
+    // Hide then re-show injected rows: the Task row leaves and re-enters the
+    // mounted list the way a virtualised row does.
+    rerender(
+      <MemoryRouter initialEntries={["/s/ins_nested_keep"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events.slice(0, 1)} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.queryByTestId("subagent-fold")).toBeNull();
+    rerender(
+      <MemoryRouter initialEntries={["/s/ins_nested_keep"]}>
+        <Routes>
+          <Route path="/s/:instanceId" element={<Transcript events={events} compact={false} />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("subagent-fold-toggle").getAttribute("aria-expanded")).toBe("true");
+    expect(nested().getAttribute("data-folded")).toBe("0");
+  });
+});
+
+const nestedExecutor = known({ hostId: "hst" as Id, workspaceId: null, nativeAgentId: null });
+
+/** A tool call, optionally stamped as a subagent's own (source agent id). */
+function nestedCall(
+  seq: number,
+  id: string,
+  name: string,
+  input: unknown,
+  parent: string | null,
+  agent?: string,
+): Observation {
+  const event = obs(seq, "tool_call", {
+    nodeId: `nc-${seq}` as Id,
+    revision: "1",
+    operation: "open",
+    baseRevision: null,
+    toolCallId: id as Id,
+    parentToolCallId: parent as Id | null,
+    toolName: known(name),
+    displayTitle: known(name),
+    category: name === "Bash" ? "shell" : name === "Workflow" ? "workflow" : "agent",
+    input: known(input),
+    inputTextDelta: null,
+    state: "running",
+    executor: nestedExecutor,
+  });
+  if (agent) (event.source as { nativeAgentId: unknown }).nativeAgentId = known(agent);
+  return event;
+}
+
+function nestedResult(seq: number, id: string, text: string, agent?: string): Observation {
+  const event = obs(seq, "tool_result", {
+    nodeId: `nr-${seq}` as Id,
+    revision: "1",
+    operation: "close",
+    baseRevision: null,
+    toolCallId: id as Id,
+    stage: "final",
+    outcome: "succeeded",
+    blocks: [{ type: "text", text }],
+    structuredResult: unknownKnowledge("text"),
+    exitCode: known(0),
+    changes: [],
+  });
+  if (agent) (event.source as { nativeAgentId: unknown }).nativeAgentId = known(agent);
+  return event;
+}
+
+/** A Workflow tool row with one running phase and one member agent (4 events). */
+function workflowRun(seq: number, toolCallId: string, agent: string): Observation[] {
+  const wfId = "wf_nested" as Id;
+  return [
+    nestedCall(seq, toolCallId, "Workflow", { name: "nested" }, null),
+    obs(seq + 1, "workflow.run", {
+      workflowId: wfId,
+      engine: "claude-workflow",
+      nativeRunId: known("wf_x"),
+      nativeTaskId: known("task-1"),
+      toolCallId: toolCallId as Id,
+      state: "running",
+      revision: "1",
+      title: known("nested"),
+      resultRef: null,
+    }),
+    obs(seq + 2, "workflow.phase", {
+      workflowId: wfId,
+      phaseId: "ph1" as Id,
+      nativePhaseId: known("Review"),
+      label: known("Review"),
+      state: "running",
+      revision: "1",
+      parentPhaseId: null,
+    }),
+    obs(seq + 3, "workflow.member", {
+      workflowId: wfId,
+      memberId: "mem_a" as Id,
+      nativeAgentId: known(agent),
+      nativeKey: known("key-a"),
+      attempt: known("1"),
+      phaseId: "ph1" as Id,
+      label: known("review:nested"),
+      state: "running",
+      modelRequested: known("claude-opus-5"),
+      modelResolved: known("claude-opus-5"),
+      resultRef: null,
+      revision: "1",
+      latestTool: known("Bash"),
+      tokens: "1000",
+      calls: "2",
+      durationMs: null,
+      startedAt: null,
+      endedAt: null,
+    }),
+  ];
+}
 
 /** A user-role message the agent did not write: hook context injection. */
 function injectedMessage(seq: number, text: string): Observation {
@@ -774,5 +1090,156 @@ describe("D-049 compact transcript toolbar fold", () => {
     expect(screen.getByTestId("collapse-all")).toBeTruthy();
     expect(screen.getByTestId("transcript-search-open")).toBeTruthy();
     expect(screen.queryByTestId("transcript-tools-open")).toBeNull();
+  });
+});
+
+/** One streaming assistant message: open, then text appends, then close. */
+function streamingMessage(seq: number, text: string, revision: number): Observation {
+  const event = assistantMessage(seq, text);
+  const payload = event.payload as Record<string, unknown>;
+  return {
+    ...event,
+    payload: {
+      ...payload,
+      nodeId: "n-stream" as Id,
+      messageId: "m-stream" as Id,
+      status: "streaming",
+      operation: revision === 1 ? "open" : "append",
+      revision: String(revision),
+      baseRevision: revision === 1 ? null : String(revision - 1),
+      targetBlock: revision === 1 ? null : 0,
+    },
+  } as Observation;
+}
+
+function closeStreaming(seq: number, text: string, revision: number): Observation {
+  const event = streamingMessage(seq, text, revision);
+  return {
+    ...event,
+    payload: {
+      ...(event.payload as Record<string, unknown>),
+      operation: "close",
+      status: "complete",
+      targetBlock: null,
+    },
+  } as Observation;
+}
+
+describe("TranscriptHandle (D-053)", () => {
+  it("opens search and collapses every expanded card through the ref", () => {
+    const ref = createRef<TranscriptHandle>();
+    render(
+      <MemoryRouter initialEntries={["/s/ins_handle"]}>
+        <Routes>
+          <Route
+            path="/s/:instanceId"
+            element={
+              <Transcript
+                ref={ref}
+                events={[userMessage(1, "跑一下"), ...settledBash(2, 3), assistantMessage(4, "done")]}
+                compact={false}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(ref.current).not.toBeNull();
+    // Desktop reading column: the settled card starts folded.
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+    fireEvent.click(screen.getByTestId("tool-fold-open"));
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("0");
+    act(() => ref.current?.collapseAll());
+    expect(screen.getByTestId("tool-card").getAttribute("data-folded")).toBe("1");
+
+    expect(screen.queryByTestId("transcript-search-input")).toBeNull();
+    act(() => ref.current?.openSearch());
+    expect(screen.getByTestId("transcript-search-input")).toBeTruthy();
+  });
+
+  it("shows the toolbar by default and hides it with toolbar={false}", () => {
+    const events = [userMessage(1, "alpha"), assistantMessage(2, "beta")];
+    const { unmount } = render(<Transcript events={events} compact={false} />);
+    expect(screen.getByTestId("transcript-toolbar")).toBeTruthy();
+    unmount();
+    const ref = createRef<TranscriptHandle>();
+    render(<Transcript ref={ref} events={events} compact={false} toolbar={false} />);
+    expect(screen.queryByTestId("transcript-toolbar")).toBeNull();
+    expect(screen.queryByTestId("collapse-all")).toBeNull();
+    // The handle still drives search when the host owns the controls.
+    act(() => ref.current?.openSearch());
+    expect(screen.getByTestId("transcript-search-input")).toBeTruthy();
+  });
+});
+
+describe("streaming row (D-053)", () => {
+  afterEach(() => {
+    profile.on = false;
+    profile.probes = [];
+  });
+
+  it("commits only the streaming row per batch", () => {
+    profile.on = true;
+    const settled = [userMessage(1, "问题"), assistantMessage(2, "上一轮回答"), userMessage(3, "继续")];
+    const { rerender } = render(<Transcript events={[...settled, streamingMessage(4, "第一段", 1)]} compact={false} />);
+    const streamingId = (screen.getByTestId("streaming-cursor").closest("[data-anchor]") as HTMLElement).dataset
+      .anchor;
+    expect(streamingId).toBeTruthy();
+    let text = "第一段";
+    for (let batch = 1; batch <= 3; batch += 1) {
+      profile.probes = [];
+      // The same node, revised with longer text: one message, not new ones.
+      text += ` 追加${batch}`;
+      rerender(<Transcript events={[...settled, streamingMessage(4, text, 1)]} compact={false} />);
+      expect(screen.getByText(text)).toBeTruthy();
+      expect(screen.getAllByTestId("message")).toHaveLength(4);
+      const rows = profile.probes
+        .filter((p) => p.kind === "commit:TranscriptRow")
+        .map((p) => (p.value as { nodeId: string }).nodeId);
+      expect(rows.length).toBeGreaterThan(0);
+      expect([...new Set(rows)]).toEqual([streamingId]);
+    }
+  });
+
+  it("shows the caret while streaming and removes it on close without touching the text", () => {
+    const open = streamingMessage(1, "```ts\nconst a = 1;", 1);
+    const { rerender } = render(<Transcript events={[open]} compact={false} />);
+    expect(screen.getByTestId("streaming-cursor")).toBeTruthy();
+    // An open fence renders closed while streaming, so the block is already
+    // a code block and does not reflow when the closing fence arrives.
+    expect(screen.getByTestId("code-block")).toBeTruthy();
+    rerender(
+      <Transcript events={[open, closeStreaming(2, "```ts\nconst a = 1;\n```", 2)]} compact={false} />,
+    );
+    expect(screen.queryByTestId("streaming-cursor")).toBeNull();
+    expect(screen.getByTestId("code-block")).toBeTruthy();
+  });
+
+  it("re-commits only held rows when the steer control flips", () => {
+    profile.on = true;
+    const events = [userMessage(1, "问题"), assistantMessage(2, "回答")];
+    const held = {
+      clientRequestId: "req-held" as Id,
+      instanceId: "ins_steer" as Id,
+      text: "排队的消息",
+      commandId: null,
+      state: "queued" as const,
+      createdAt: "2026-09-24T00:00:00Z",
+      held: true,
+      holdReason: "turn" as const,
+    };
+    const { rerender } = render(
+      <Transcript events={events} bubbles={[held]} compact={false} steerHeld={{ enabled: false, reason: "" }} />,
+    );
+    expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(true);
+    profile.probes = [];
+    rerender(
+      <Transcript events={events} bubbles={[held]} compact={false} steerHeld={{ enabled: true, reason: "" }} />,
+    );
+    const rows = profile.probes
+      .filter((p) => p.kind === "commit:TranscriptRow")
+      .map((p) => (p.value as { nodeId: string }).nodeId);
+    expect(new Set(rows).size).toBe(1);
+    expect((screen.getByTestId("held-queue-steer") as HTMLButtonElement).disabled).toBe(false);
   });
 });

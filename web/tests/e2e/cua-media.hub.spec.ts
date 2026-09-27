@@ -160,10 +160,15 @@ test("a computer-use screenshot renders as a bounded thumbnail from the object r
   await page.getByTestId("composer-send").click();
 
 
-  // The MCP card names server/tool.
+  // The MCP card names server/tool. D-053 folds the settled card to one line
+  // at every width; open it to reach the result body.
   const card = page.getByTestId("tool-card").filter({ hasText: "codex-computer-use" }).first();
   await expect(card).toBeVisible({ timeout: 20_000 });
   await expect(card).toContainText("get_app_state");
+  const open = card.getByTestId("tool-fold-open");
+  await expect(open).toHaveCount(1, { timeout: 20_000 });
+  await open.click();
+  await expect(card).toHaveAttribute("data-folded", "0");
 
   // The thumbnail resolves to the object route and actually decodes. Lazy
   // images only load when visible, so scroll it into view first.

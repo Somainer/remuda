@@ -352,15 +352,18 @@ test("grok shell card shows growing stdout partials before the Final result", as
       ).toBe(true);
     }
     // At a mobile viewport the pre-final sampling would need the card kept
-    // expanded (it folds into a compact group) and the Final assertion below
-    // would need a tool-fold-open click; this spec drives the desktop width.
+    // expanded (it folds into a compact group); this spec drives the desktop
+    // width.
 
     // 2 — THE FINAL IS AUTHORITATIVE. At turn end the routine tools fold into
-    // a compact group; expand it and assert the settled shell card.
+    // a compact group; expand it. D-053 folds the settled card to one line at
+    // every width, so open that line and assert the settled shell card.
     const fold = page.getByTestId("compact-fold").first();
     await expect(fold).toHaveAttribute("aria-expanded", "false", { timeout: 5_000 });
     await fold.click();
     const shellCard = page.getByTestId("tool-card").filter({ hasText: "printf" }).first();
+    await expect(shellCard).toHaveAttribute("data-folded", "1", { timeout: 5_000 });
+    await shellCard.getByTestId("tool-fold-open").click();
     await expect(shellCard).toContainText("exit 0", { timeout: 5_000 });
     const settledAll = (await shellCard.textContent()) ?? "";
     expect(settledAll).toContain("one\ntwo\nthree\n");

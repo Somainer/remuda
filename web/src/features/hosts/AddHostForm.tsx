@@ -30,7 +30,7 @@ export function AddHostForm({ open, onClose }: { open: boolean; onClose: () => v
         }).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "添加失败"))
           .finally(() => setBusy(false));
       }}>
-        <h2 style={{ margin: 0, fontSize: 18 }}>添加主机</h2>
+        <h2 className={css.modalTitle}>添加主机</h2>
         <p className={css.meta}>填写 Hub 所在机器能够 SSH 登录的地址或 SSH 配置别名。连接中断后自动重连。</p>
         <label className={ui.field}>SSH 目标
           <input autoFocus required autoCapitalize="none" autoCorrect="off" spellCheck={false} className={ui.input} data-testid="add-host-target" placeholder="dev@host 或 SSH 别名" maxLength={255} value={target} onChange={(e) => setTarget(e.target.value)} />
@@ -49,7 +49,7 @@ export function AddHostForm({ open, onClose }: { open: boolean; onClose: () => v
         </label>
         <p className={css.meta}>上传和运行数据保存在远端专属临时目录。版本不兼容时显示错误。</p>
         {error ? <p role="alert" className={css.sshError}>{error}</p> : null}
-        <div className={ui.row} style={{ justifyContent: "flex-end", marginTop: 12 }}>
+        <div className={`${ui.row} ${css.formActions}`}>
           <Button type="button" disabled={busy} onClick={onClose}>取消</Button>
           <Button type="submit" variant="primary" disabled={busy || !target.trim()} data-testid="add-host-submit">{busy ? "正在添加…" : "添加主机"}</Button>
         </div>

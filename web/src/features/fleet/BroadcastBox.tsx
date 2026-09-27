@@ -2,14 +2,20 @@ import { useState } from "react";
 import { Button } from "../../components/Button";
 import { api, type FleetBroadcastResult } from "../../lib/api";
 import type { Instance } from "../../types/instance";
+import type { Id } from "../../types/wire";
 import ui from "../../styles/ui.module.css";
 import type { HostView } from "../hosts/model";
 import {
   BROADCAST_KEYS,
+  DELIVERY_LABEL,
   buildBroadcastBody,
   orderResults,
+  provisionalState,
+  resolveEntry,
   summarize,
+  summarizeRows,
   type BroadcastForm,
+  type DeliveryState,
 } from "./broadcast";
 import css from "./fleet.module.css";
 
@@ -18,6 +24,13 @@ const EMPTY: BroadcastForm = {
   text: "",
   key: "enter",
   filter: { hostId: "", kind: "" },
+};
+
+type RowState = {
+  state: DeliveryState;
+  reason?: string;
+  /** True while the authoritative command follow-up read is in flight. */
+  resolving?: boolean;
 };
 
 /**
@@ -29,8 +42,60 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FleetBroadcastResult | null>(null);
+  const [rowStates, setRowStates] = useState<Record<string, RowState>>({});
 
   const kinds = [...new Set(instances.map((instance) => instance.kind))].sort();
+
+  /**
+   * Read the authoritative settlement for each accepted row. The fleet
+   * response never carries `settlement.outcome`, so green confirmation is
+   * only allowed after the command resource reports completed. Each GET is
+   * abort-bounded; one immediate read plus one follow-up per open row. Rows
+   * update in place and the summary is recomputed from their states.
+   */
+  async function resolveRows(value: FleetBroadcastResult) {
+    const entries = value.results ?? [];
+    const initial: Record<string, RowState> = {};
+    for (const entry of entries) {
+      const key = entry.commandId ?? entry.instanceId;
+      if (key) initial[key] = { state: provisionalState(entry) };
+    }
+    setRowStates(initial);
+
+    await Promise.all(
+      entries.map(async (entry) => {
+        const key = entry.commandId ?? entry.instanceId;
+        if (!key || !entry.ok || entry.replayed || !entry.commandId || !entry.instanceId) return;
+        setRowStates((prev) => ({ ...prev, [key]: { state: provisionalState(entry), resolving: true } }));
+        const settled = await resolveEntry(entry, (instanceId, commandId, signal) =>
+          api.instanceCommandStatus(instanceId as Id, commandId as Id, signal),
+        );
+        setRowStates((prev) => ({ ...prev, [key]: { ...settled, resolving: false } }));
+      }),
+    );
+  }
+
+  /**
+   * The summary reflects authoritative settlement after the reads finish: a
+   * Node rejection counts 失败, a completion 已确认. While any follow-up read
+   * is still in flight the ledger-acceptance line from the POST is shown, so
+   * the counts always cover every row rather than flickering partial totals.
+   */
+  function summaryLine(value: FleetBroadcastResult, states: Record<string, RowState>): string {
+    const entries = value.results ?? [];
+    const tracked = entries.filter((entry) => {
+      const key = entry.commandId ?? entry.instanceId;
+      return key && states[key];
+    });
+    const anyResolving = tracked.some((entry) => {
+      const key = entry.commandId ?? entry.instanceId;
+      return states[key!].resolving;
+    });
+    if (anyResolving || tracked.length === 0) return summarize(value);
+    const counts = summarizeRows(tracked.map((entry) => states[(entry.commandId ?? entry.instanceId)!].state));
+    const skipped = value.skipped ?? 0;
+    return `已确认 ${counts.confirmed} · 失败 ${counts.failed} · 待处理 ${counts.pending} · 已结束 ${counts.cancelled} · 跳过 ${skipped}`;
+  }
 
   async function submit() {
     const built = buildBroadcastBody(form);
@@ -43,7 +108,11 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
     try {
       const value = await api.fleetBroadcast({ ...built.body, confirm: true });
       setResult(value);
+      setRowStates({});
       if (form.mode === "prompt") setForm((prev) => ({ ...prev, text: "" }));
+      // Do not block the send button on the bounded settlement follow-up:
+      // rows update in place as authoritative outcomes arrive.
+      void resolveRows(value);
     } catch (err) {
       setError(err instanceof Error ? err.message : "广播失败");
     } finally {
@@ -52,11 +121,15 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
   }
 
   return (
-    <section className={ui.card} style={{ marginBottom: 16 }} data-testid="fleet-broadcast">
-      <strong>群发</strong>
-      <p className={ui.listMeta}>POST /v1/fleet/broadcast · 对筛选到的运行中 Instance 发送 prompt 或按键</p>
+    <section className={css.section} data-testid="fleet-broadcast">
+      <div className={css.sectionHead}>
+        <h2 className={css.sectionTitle}>群发</h2>
+        <p className={css.sectionSub}>
+          POST /v1/fleet/broadcast · 对筛选到的运行中 Instance 发送 prompt 或按键
+        </p>
+      </div>
 
-      <div className={ui.row} style={{ gap: 8, marginTop: 8 }}>
+      <div className={css.formRow}>
         <label className={ui.field}>
           主机
           <select
@@ -104,7 +177,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
       </div>
 
       {form.mode === "prompt" ? (
-        <label className={ui.field} style={{ marginTop: 8 }}>
+        <label className={ui.field}>
           <span className={ui.listMeta}>群发内容</span>
           <textarea
             className={ui.textarea}
@@ -116,7 +189,7 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
           />
         </label>
       ) : (
-        <label className={ui.field} style={{ marginTop: 8 }}>
+        <label className={ui.field}>
           <span className={ui.listMeta}>按键</span>
           <select
             className={ui.select}
@@ -134,41 +207,58 @@ export function BroadcastBox({ hosts, instances }: { hosts: HostView[]; instance
       )}
 
       {error ? (
-        <p data-testid="broadcast-error" style={{ color: "var(--dust)" }}>
+        <p data-testid="broadcast-error" className={css.error}>
           {error}
         </p>
       ) : null}
 
-      <div className={ui.row} style={{ marginTop: 8, justifyContent: "flex-end" }}>
+      <div className={css.actions}>
         <Button variant="primary" data-testid="broadcast-send" disabled={busy} onClick={submit}>
           {busy ? "发送中…" : "确认群发"}
         </Button>
       </div>
 
       {result ? (
-        <div style={{ marginTop: 8 }}>
-          <p className={ui.listMeta} data-testid="broadcast-summary">
-            {summarize(result)}
+        <div className={css.resultBlock}>
+          <p className={css.sectionSub} data-testid="broadcast-summary">
+            {summaryLine(result, rowStates)}
           </p>
           <ul className={css.members} data-testid="broadcast-results">
-            {orderResults(result).map((entry) => (
-              <li
-                key={entry.commandId ?? entry.instanceId}
-                className={css.member}
-                data-testid="broadcast-result"
-                data-ok={String(entry.ok ?? false)}
-              >
-                <span className={ui.listMeta}>{entry.ok ? "✓" : "×"}</span>
-                <span>
-                  {entry.instanceId}
-                  <div className={ui.listMeta}>
-                    {entry.kind} · {entry.hostId}
-                    {entry.replayed ? " · 重放" : ""}
-                    {entry.error ? ` · ${entry.error}` : entry.state ? ` · ${entry.state}` : ""}
-                  </div>
-                </span>
-              </li>
-            ))}
+            {orderResults(result).map((entry) => {
+              const key = entry.commandId ?? entry.instanceId;
+              const row = (key ? rowStates[key] : undefined) ?? { state: provisionalState(entry) };
+              const state: DeliveryState = row.state;
+              const markClass = `mark${state[0].toUpperCase()}${state.slice(1)}`;
+              return (
+                <li
+                  key={key}
+                  className={css.member}
+                  data-testid="broadcast-result"
+                  data-ok={String(entry.ok ?? false)}
+                  data-delivery={state}
+                  data-resolving={row.resolving ? "1" : undefined}
+                >
+                  <span className={`${css.mark} ${css[markClass]}`}>
+                    {DELIVERY_LABEL[state]}
+                    {row.resolving ? "…" : ""}
+                  </span>
+                  <span className={css.memberBody}>
+                    {entry.instanceId}
+                    <div className={css.memberMeta}>
+                      {entry.kind} · {entry.hostId}
+                      {entry.replayed ? " · 重放" : ""}
+                      {row.reason
+                        ? ` · ${row.reason}`
+                        : entry.error
+                          ? ` · ${entry.error}`
+                          : entry.state
+                            ? ` · ${entry.state}`
+                            : ""}
+                    </div>
+                  </span>
+                </li>
+              );
+            })}
           </ul>
         </div>
       ) : null}

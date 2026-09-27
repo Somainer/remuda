@@ -8,8 +8,8 @@ import { login } from "./hub-auth";
  * ordinary tool cards fold to one line carrying family + key argument
  * (Bash = command first line); Workflow cards never auto-fold and their live
  * clock keeps ticking; a card seen running folds the instant it settles;
- * expanding a fold mounts the full, desktop-identical card; the desktop
- * default stays unfolded. The explicit 全部折叠 keeps main's exact behaviour:
+ * expanding a fold mounts the full, desktop-identical card; D-053 extends the
+ * same default fold to the desktop reading column. The explicit 全部折叠 keeps main's exact behaviour:
  * every non-failed card (running/Workflow included) folds. Driven by the fake
  * Node's `workflow card live` and `toolfold settle*` scenarios. No real
  * models.
@@ -278,16 +278,22 @@ test.describe("with a coarse pointer", () => {
   });
 });
 
-test("the desktop default stays unfolded; collapse-all folds every non-failed card (main behaviour)", async ({
+test("the desktop default folds settled cards (D-053); collapse-all folds every non-failed card", async ({
   page,
 }) => {
   await openLiveSession(page);
 
-  // 1280px: the settled Bash card renders the full card by default.
+  // 1280px: D-053 extends the D-041 fold to the desktop reading column — the
+  // settled Bash card is one quiet line until the reader opens it.
   await page.getByTestId("compact-fold").click();
   const bashCard = page.getByTestId("compact-fold-wrap").getByTestId("tool-card");
+  await expect(bashCard).toHaveAttribute("data-folded", "1");
+  await expect(bashCard.getByTestId("tool-fold-arg")).toHaveText("echo workflow-running");
+  await bashCard.getByTestId("tool-fold-open").click();
   await expect(bashCard).toHaveAttribute("data-folded", "0");
   await expect(page.getByText("$ echo workflow-running")).toBeVisible();
+  // The running Workflow card stays open by default at every width.
+  await expect(page.getByTestId("workflow-card").first()).toHaveAttribute("data-status", "running");
 
   // Explicit collapse-all keeps main's exact behaviour: the ordinary card
   // folds AND the live Workflow card folds (its timeline inner unmounts) —
@@ -385,5 +391,18 @@ test.describe("with a coarse pointer", () => {
     }));
     expect(overflow.doc).toBeLessThanOrEqual(overflow.win + 1);
     await shot(page, "ux2026-toolfold-longname-390.png");
+
+    // UO-5: a coarse pointer never makes the folded line itself taller; the
+    // reach is the ::after alone, at the desktop width too.
+    for (const width of [390, 1280]) {
+      await page.setViewportSize({ width, height: 844 });
+      await expect(card).toHaveAttribute("data-folded", "1");
+      const line = await toggle.evaluate((el) => ({
+        head: (el.parentElement as HTMLElement).getBoundingClientRect().height,
+        after: getComputedStyle(el, "::after").height,
+      }));
+      expect(line.head).toBe(24);
+      expect(line.after).toBe("44px");
+    }
   });
 });

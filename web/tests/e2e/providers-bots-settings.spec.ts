@@ -5,10 +5,12 @@ test.describe("providers bots settings", () => {
     await page.goto("/providers");
     await expect(page.getByTestId("providers-page")).toBeVisible();
     await expect(page.locator('[data-testid=provider-row][data-delegation=none]')).toBeVisible();
-    await expect(page.locator('[data-testid=provider-row][data-delegation=gateway]')).toBeVisible();
+    await expect(page.locator('[data-testid=provider-row][data-delegation=gateway]').first()).toBeVisible();
     await expect(page.locator('[data-testid=provider-row][data-delegation=direct]')).toBeVisible();
     await expect(page.locator("body")).not.toContainText(/astergate/i);
-    await page.locator('[data-testid=provider-row][data-delegation=gateway]').click();
+    // The mock seeds two gateway profiles (default + via-host); the row under
+    // test is the default gateway, whose health/secret lines are asserted.
+    await page.locator('[data-testid="provider-row"][data-delegation="gateway"][data-default="1"]').click();
     await expect(page.getByTestId("provider-detail")).toBeVisible();
     await expect(page.getByTestId("provider-health")).toContainText("健康 200");
     await expect(page.getByTestId("provider-secret")).toContainText("••••34ef");

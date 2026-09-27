@@ -3,7 +3,8 @@ import {
   settledOnThisDevice,
   type InteractionUiState,
 } from "../../lib/interactionStatus";
-import type { Host, Instance } from "../../types/instance";
+import { formatClock } from "../../lib/format";
+import type { Host, Instance, UiStatus } from "../../types/instance";
 import type { Interaction } from "../../types/interaction";
 
 /**
@@ -157,4 +158,99 @@ export function deriveApprovalRows(
   }
 
   return { queue, departed };
+}
+
+/* ------------------------------------------------------------------ */
+/* Shared presentational labels for the single decision card          */
+/* (ui-spec §2.5 facts <dl>, §2.2 approval card). Pure and unit-tested*/
+/* so desktop and mobile never disagree about what a fact says.       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Human label for the harness carrier the request arrived on. The wireframe
+ * fact is 「来源 …」; a carrier the UI does not know (or `unsupported`) reads
+ * 「未知」 rather than being invented (ui-spec §2.5).
+ */
+export const CARRIER_LABEL: Record<Interaction["carrier"], string> = {
+  "claude-control": "Claude 控制面",
+  "claude-hook": "Claude 钩子",
+  "harness-hook": "工具钩子",
+  "codex-rpc": "Codex",
+  "acp-rpc": "ACP",
+  "native-tty": "终端屏幕",
+  unsupported: "未知",
+};
+
+export function carrierLabel(carrier: Interaction["carrier"]): string {
+  return CARRIER_LABEL[carrier] ?? "未知";
+}
+
+/**
+ * The 截止 fact: a known deadline renders as a clock; an unknown / absent
+ * deadline is an em dash — never 「无限期」 and never 0 (ui-spec §2.2/§2.5).
+ */
+export function deadlineLabel(item: Interaction): string {
+  return item.deadline.state === "known" ? formatClock(item.deadline.value) : "—";
+}
+
+/**
+ * The status line text (ui-spec §2.5 state table). superseded keeps the
+ * honest 「其它设备」 wording — the actor is another enrolled device, never a
+ * specific platform name the data does not carry.
+ */
+export const QUEUE_STATUS_TEXT: Record<"pending" | "answering" | "paused", string> = {
+  pending: "等待你的选择",
+  answering: "已提交 · 等待确认",
+  paused: "主机离线，交互暂停",
+};
+
+export const DEPARTED_STATUS_TEXT: Record<"expired" | "superseded", string> = {
+  expired: "过期，未作用于新进程",
+  superseded: "已在其它设备处理",
+};
+
+/** Shape-encoded status dot for the card's status line (visual-system §8.6). */
+export function statusDotOf(uiState: InteractionUiState): UiStatus {
+  switch (uiState) {
+    case "answering":
+      return "working";
+    case "paused":
+      return "unknown";
+    case "expired":
+      return "exited";
+    case "superseded":
+      return "idle";
+    case "pending":
+    default:
+      return "blocked";
+  }
+}
+
+/**
+ * Request title for the card header (line 3 of the §2.5 card). The title is
+ * the tool name for approvals, a carrier-aware label for terminal questions,
+ * and the request's own title otherwise.
+ */
+export function decisionTitle(item: Interaction): string {
+  if (item.request.kind === "approval") return item.request.title;
+  if (item.request.kind === "question") {
+    return item.carrier === "native-tty" ? "终端提问" : item.request.title;
+  }
+  return item.request.title;
+}
+
+/**
+ * Verbatim preview text (line 4). Approvals show the raw command/patch; a
+ * native-tty question joins its field lines; an AskUserQuestion shows the
+ * composed line. Never re-written.
+ */
+export function decisionPreview(item: Interaction): string {
+  if (item.request.kind === "approval") return item.request.description;
+  if (item.request.kind === "question") {
+    return item.carrier === "native-tty"
+      ? item.request.fields.map((field) => field.description ?? field.title).join("\n")
+      : `问你 ${item.request.fields.length} 题 · AskUserQuestion`;
+  }
+  if (item.request.kind === "plan-review") return item.request.title;
+  return item.request.title;
 }

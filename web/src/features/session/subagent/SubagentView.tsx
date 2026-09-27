@@ -82,6 +82,7 @@ function NodeRow({ node }: { node: TranscriptNode }) {
         result={node.result}
         completeness={node.completeness}
         diffState={node.diffState}
+        foldSettled
       />
     );
     if (!isToolFailure(node)) return card;

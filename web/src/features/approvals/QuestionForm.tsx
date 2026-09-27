@@ -24,10 +24,13 @@ function isAnswered(value: FieldAnswer | undefined): boolean {
 export function QuestionForm({
   interaction,
   busy,
+  embedded = false,
   onRespond,
 }: {
   interaction: Interaction;
   busy?: boolean;
+  /** Inside the unified decision card: drop the second card chrome/title. */
+  embedded?: boolean;
   onRespond: (answer: InteractionAnswer) => void;
 }) {
   const [index, setIndex] = useState(0);
@@ -98,18 +101,20 @@ export function QuestionForm({
     <section
       ref={rootRef}
       tabIndex={-1}
-      className={css.question}
+      className={`${css.question} ${embedded ? css.questionEmbedded : ""}`}
       data-testid="question-form"
       onKeyDown={onKeyDown}
     >
-      <div className={css.approvalHead} style={{ padding: 0, borderBottom: 0 }}>
-        <span className={css.dustDot} />
-        <span className={css.approvalTitle}>{req.title}</span>
-        <span className={css.spacer} />
-        <span className={css.approvalHint}>
-          {fields.length} 题 · Enter 提交 · 数字键选择
-        </span>
-      </div>
+      {!embedded ? (
+        <div className={css.approvalHead}>
+          <span className={css.dustDot} />
+          <span className={css.approvalTitle}>{req.title}</span>
+          <span className={css.spacer} />
+          <span className={css.approvalHint}>
+            {fields.length} 题 · Enter 提交 · 数字键选择
+          </span>
+        </div>
+      ) : null}
 
       {fields.length > 1 ? (
         <div className={css.qTabs} role="tablist" aria-label="问题">

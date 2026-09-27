@@ -1,142 +1,409 @@
-.dustDot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--dust);
-  flex: none;
+/* @tokens strict */
+/* Decision surfaces (ui-spec §2.2/§2.5, visual-system §8). One card shell is
+   shared by the desktop approvals centre, the compact inbox and the session
+   dock. Role tokens only; hit areas follow pointer: coarse, never width. */
+
+/* ---------------------------------------------------------------- */
+/* Shared decision card (approval-row): the single card both routes  */
+/* render. Surface + 1px border; the ?focus card gets a 2px ring.    */
+/* ---------------------------------------------------------------- */
+
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
 }
 
+.cardCompact {
+  composes: card;
+  padding: var(--space-4);
+}
+
+.cardFocus {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* 1. Context line — 12px meta, identical on both surfaces. */
+.context {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  min-width: 0;
+}
+
+.contextTime {
+  font-variant-numeric: tabular-nums;
+}
+
+.contextSep {
+  color: var(--divider);
+}
+
+.contextHost {
+  color: var(--fg-body);
+}
+
+/* 2. Status line — dot + state sentence; colour carries the state and the
+   dot supplies the shape, so it never relies on colour alone. */
+.status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  min-width: 0;
+}
+
+.statusText {
+  margin: 0;
+}
+
+.statusPending {
+  color: var(--attention-fg);
+}
+
+.statusAnswering {
+  color: var(--link);
+}
+
+.statusPaused {
+  color: var(--fg-muted);
+}
+
+/* 3. Title. */
+.title {
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
+  line-height: var(--lh-title);
+  overflow-wrap: anywhere;
+}
+
+/* 4. Verbatim preview. Monospace, inset ground, capped height; multiline
+   command/patch text is shown raw and never re-written. */
+.preview {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-inset);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: 1.6;
+  color: var(--fg-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  max-height: 16em;
+}
+
+/* 5. Facts <dl>: 来源 / 截止 / 位置. 12px meta, three rows. */
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.factTerm {
+  color: var(--fg-faint);
+}
+
+.factData {
+  margin: 0;
+  color: var(--fg-body);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.factDataMuted {
+  color: var(--fg-muted);
+}
+
+/* Carrier / fallback / paused explanatory notes. */
+.note {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.pausedNote {
+  composes: note;
+  color: var(--fg-muted);
+}
+
+/* 6. Actions. Allow-class uses the neutral primary fill; deny stays a surface
+   button. The shared .btn already gives 32px on fine pointers and 44px on
+   coarse ones (--control-h), so touch hit areas need no width query. */
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-1);
+}
+
+.actionPrimary {
+  composes: btnPrimary from "../../styles/ui.module.css";
+}
+
+.actionBtn {
+  composes: btn from "../../styles/ui.module.css";
+}
+
+.actionGhost {
+  composes: btnGhost from "../../styles/ui.module.css";
+}
+
+/* Compact: the first two options share the row (ui-spec §2.5). */
+.actionsCompact .actionPrimary,
+.actionsCompact .actionBtn {
+  flex: 1 1 0;
+}
+
+.openLink {
+  composes: btn from "../../styles/ui.module.css";
+  text-decoration: none;
+}
+
+/* allow-session sub-copy: restate the grant scope in the harness's words;
+   never name a session/forever boundary the option does not carry. */
+.grantHint {
+  flex-basis: 100%;
+  margin: calc(var(--space-1) * -1) 0 0;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+/* Submitting state: the control is disabled and names what is happening;
+   the option buttons unmount, so a second answer cannot be POSTed. */
+.submitting {
+  composes: btnPrimary from "../../styles/ui.module.css";
+}
+
+.submitting:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border-control);
+  border-top-color: transparent;
+  animation: decisionSpin var(--dur-3) linear infinite;
+}
+
+@keyframes decisionSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Plan review disclosure + reject feedback (byte-capped). */
+.planDetails {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-3);
+}
+
+.planSummary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: var(--space-2) 0;
+  color: var(--fg-muted);
+  font-size: var(--text-ui);
+  user-select: none;
+}
+
+.planBody {
+  margin: 0;
+  padding: var(--space-2) 0 var(--space-3);
+  border-top: 1px solid var(--divider);
+  max-height: 16em;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: 1.6;
+  color: var(--fg-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.planFeedback {
+  flex-basis: 100%;
+  width: 100%;
+  min-height: var(--control-h);
+  padding: var(--space-2) 10px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-size: var(--text-input);
+  resize: vertical;
+}
+
+.planFeedbackInvalid {
+  border-color: var(--danger-fg);
+}
+
+.planError {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--danger-fg);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.planSessionLink {
+  color: var(--link);
+  font-weight: 600;
+  text-decoration: underline;
+  margin: 0 0.25em;
+}
+
+/* ---------------------------------------------------------------- */
+/* Session-dock standalone cards (ApprovalCard / QuestionForm /      */
+/* ElicitationCard). Same shell language as the inbox card.         */
+/* ---------------------------------------------------------------- */
+
 .approval {
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  background: var(--ink-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
   overflow: hidden;
 }
 
 .approvalHead {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--line);
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--divider);
 }
 
 .approvalTitle {
-  font-size: 13px;
+  margin: 0;
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
   font-weight: 600;
-  color: var(--dust);
 }
 
 .approvalHint {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+}
+
+.dustDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--attention-fg);
+  flex: none;
 }
 
 .approvalBody {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 11px 12px;
+  gap: var(--space-4);
+  padding: var(--space-3);
   flex-wrap: wrap;
 }
 
-.preview {
-  font-family: var(--mono);
-  font-size: 13px;
-  color: var(--paper);
-  flex: 1;
-  min-width: 0;
-  margin: 0;
-}
-
 .allowBtn {
-  height: 32px;
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--dust);
-  font-size: 13px;
-  font-weight: 500;
-  padding: 0 14px;
-  min-height: 32px;
+  composes: btnPrimary from "../../styles/ui.module.css";
 }
 
-.denyBtn {
-  height: 32px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--paper);
-  font-size: 13px;
-  padding: 0 14px;
-  min-height: 32px;
-}
-
+.denyBtn,
 .quietBtn {
-  height: 32px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: transparent;
-  color: var(--mute);
-  font-size: 13px;
-  padding: 0 14px;
-  min-height: 32px;
+  composes: btn from "../../styles/ui.module.css";
 }
 
 .question {
-  border: 1px solid var(--dust);
-  border-radius: var(--radius);
-  background: var(--ink-2);
-  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  padding: var(--space-3);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
+  /* A programmatic focus sink (tabIndex=-1) for digit/Enter shortcuts; it is
+     never a tab stop, so it carries no focus box. Inner controls keep their
+     own :focus-visible rings. The scoped selector outranks the global bare
+     :focus-visible rule regardless of stylesheet order. */
+  outline: none;
+}
+
+.question:focus-visible {
+  outline: none;
+}
+
+/* Embedded inside the unified inbox card: drop the second border/ground and
+   the outer padding — the card already supplies both (ui-spec §2.5). */
+.questionEmbedded {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  width: 100%;
 }
 
 .qTitle {
-  font-size: 14px;
-  color: var(--paper);
   margin: 0;
-}
-
-.qOptOn {
-  border-color: var(--paper);
-  color: var(--paper);
+  color: var(--fg-strong);
+  font-size: var(--text-title);
+  font-weight: 600;
 }
 
 .qRow {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 
-/* AskUserQuestion: tabs per question, option rows, free text, raw disclosure */
+/* AskUserQuestion: tabs per question, option rows, free text, raw. */
 .qTabs {
   display: flex;
-  gap: 6px;
+  gap: var(--space-2);
   flex-wrap: wrap;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 8px;
+  border-bottom: 1px solid var(--divider);
+  padding-bottom: var(--space-2);
 }
 
 .qTab {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  gap: var(--space-2);
+  min-height: var(--control-h-sm);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--mute);
-  font-size: 12px;
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .qTabOn {
-  border-color: var(--dust);
-  color: var(--dust);
+  border-color: var(--border-control);
+  color: var(--fg-strong);
 }
 
 .qTabDot,
@@ -148,45 +415,47 @@
 }
 
 .qTabDot {
-  background: var(--line);
+  background: var(--divider);
 }
 
 .qTabDotOn {
-  background: var(--dust);
+  background: var(--attention-fg);
 }
 
 .qPanel {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .qOptList {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-2);
 }
 
+/* Option rows: 36px fine, 44px coarse (ui-spec §2.5). */
 .qOptRow {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: var(--space-3);
   text-align: left;
   width: 100%;
-  padding: 8px 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  min-height: 36px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--paper);
+  color: var(--fg-body);
 }
 
-.qOptRow:hover {
-  border-color: var(--mute);
+.qOptRow:hover:not(:disabled) {
+  border-color: var(--border-control);
 }
 
 .qOptOn {
-  border-color: var(--paper);
-  background: color-mix(in srgb, var(--dust) 8%, transparent);
+  border-color: var(--border-control);
+  background: var(--bg-selected);
 }
 
 .qRadio,
@@ -197,7 +466,7 @@
   height: 14px;
   margin-top: 2px;
   flex: none;
-  border: 1px solid var(--mute);
+  border: 1px solid var(--border-control);
   box-sizing: border-box;
 }
 
@@ -208,17 +477,17 @@
 
 .qCheck,
 .qCheckOn {
-  border-radius: 3px;
+  border-radius: var(--radius-xs);
 }
 
 .qRadioOn {
-  border: 4px solid var(--dust);
+  border: 4px solid var(--focus);
 }
 
 .qCheckOn {
-  border-color: var(--dust);
-  background: var(--dust);
-  box-shadow: inset 0 0 0 2px var(--ink-2);
+  border-color: var(--attention-fg);
+  background: var(--attention-fg);
+  box-shadow: inset 0 0 0 2px var(--bg-surface);
 }
 
 .qOptText {
@@ -229,28 +498,29 @@
 }
 
 .qOptLabel {
-  font-size: 13px;
-  color: var(--paper);
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-2);
+  color: var(--fg-strong);
+  font-size: var(--text-ui);
 }
 
 .qOptNum {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
 }
 
 .qOptDesc {
-  font-size: 12px;
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
 }
 
 .qFree {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-3);
 }
 
 .qFree .input {
@@ -259,15 +529,15 @@
 }
 
 .qFreeTag {
-  font-size: 12px;
-  color: var(--mute);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
   flex: none;
 }
 
 .qRaw {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--mute);
+  font-family: var(--font-mono);
+  color: var(--fg-muted);
+  font-size: var(--text-meta);
   min-width: 0;
 }
 
@@ -277,52 +547,57 @@
 }
 
 .qRawPre {
-  margin: 6px 0 0;
+  margin: var(--space-2) 0 0;
   max-height: 240px;
   overflow: auto;
-  padding: 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  font-size: 11px;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-meta);
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-@media (max-width: 767px) {
-  .approvalBody {
-    flex-direction: column;
-    align-items: stretch;
-  }
+/* Native-tty one-field quick answers (PtyQuestionAnswers). */
+.pty {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  flex-basis: 100%;
+}
 
-  .allowBtn,
-  .denyBtn,
-  .quietBtn {
-    min-height: 44px;
-    height: 44px;
-  }
+.ptyInput {
+  flex: 1 1 12rem;
+  min-width: 0;
+  min-height: var(--control-h);
+  padding: 0 10px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--fg-strong);
+  font-size: var(--text-input);
+}
 
+@media (pointer: coarse) {
   .qOptRow {
-    min-height: 44px;
-    padding: 10px 12px;
+    min-height: var(--touch);
   }
 
+  /* Question tabs are text controls: their whole 44px is visible on coarse
+     pointers (no glyph-only ::after trick), so every tab is a full target. */
   .qTab {
-    min-height: 36px;
-    height: 36px;
+    min-height: var(--touch);
   }
 
-  .question {
-    padding: 14px;
-    gap: 13px;
+  /* The plan disclosure summary is a text control; stretch it to a full
+     visible 44px target on coarse pointers. */
+  .planSummary {
+    min-height: var(--touch);
   }
 }
 
-/* UO-4 mechanical split: re-exported class stubs so existing importers
-
-   keep a single `css` binding. Empty rules emit no CSS; the composed
-
-   class carries the original declarations. */
-
+/* Layout helpers composed from pre-existing modules (single css binding). */
 .spacer {
   composes: spacer from "../../chrome/sessionHeader.module.css";
 }

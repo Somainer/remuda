@@ -14,10 +14,13 @@ type ElicitationAction = "accept" | "decline" | "cancel";
 export function ElicitationCard({
   interaction,
   busy,
+  embedded = false,
   onRespond,
 }: {
   interaction: Interaction;
   busy?: boolean;
+  /** Inside the unified decision card: drop the second card chrome/title. */
+  embedded?: boolean;
   onRespond: (answer: InteractionAnswer) => void;
 }) {
   const [raw, setRaw] = useState("");
@@ -45,13 +48,18 @@ export function ElicitationCard({
   };
 
   return (
-    <section className={css.question} data-testid="elicitation-card">
-      <div className={css.approvalHead} style={{ padding: 0, borderBottom: 0 }}>
-        <span className={css.dustDot} />
-        <span className={css.approvalTitle}>表单请求 · {req.title}</span>
-        <span className={css.spacer} />
-        <span className={css.approvalHint}>{interaction.id.slice(0, 12)}</span>
-      </div>
+    <section
+      className={`${css.question} ${embedded ? css.questionEmbedded : ""}`}
+      data-testid="elicitation-card"
+    >
+      {!embedded ? (
+        <div className={css.approvalHead}>
+          <span className={css.dustDot} />
+          <span className={css.approvalTitle}>表单请求 · {req.title}</span>
+          <span className={css.spacer} />
+          <span className={css.approvalHint}>{interaction.id.slice(0, 12)}</span>
+        </div>
+      ) : null}
       {req.mode === "url" && req.url ? (
         <p className={css.qTitle}>
           <a href={req.url} target="_blank" rel="noreferrer">

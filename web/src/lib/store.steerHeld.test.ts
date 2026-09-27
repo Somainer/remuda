@@ -244,3 +244,53 @@ it("a direct steer sent while offline resolves false (no receipt) but enqueues u
   const bubble = hubStore.getSnapshot().bubbles.find((b) => b.text === "urgent steer")!;
   expect(bubble.commandId?.startsWith("cmd_")).toBe(true);
 });
+
+it("a live DIRECT steer awaits the POST verdict and resolves false (no 已打断) when the Hub holds it (ROUND4-2)", async () => {
+  const { api, hubStore } = await fresh();
+  let resolveSend: (value: CommandResult) => void = () => {};
+  const pending = new Promise<CommandResult>((resolve) => {
+    resolveSend = resolve;
+  });
+  const send = vi.spyOn(api, "instanceSend").mockReturnValue(pending);
+
+  const promise = hubStore.send(INSTANCE, "direct held steer", [], [], "steer");
+  let settled: boolean | undefined;
+  void promise.then((v) => {
+    settled = v;
+  });
+
+  // The POST is in flight; the old code returned true synchronously here,
+  // raising 已打断 for an interrupt the Hub had not accepted.
+  await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  expect(send.mock.calls[0]?.[3]).toBe("steer");
+  expect(settled).toBeUndefined();
+
+  // Hub holds the row (Node offline): queued + non-forwarded dispatch.
+  resolveSend(commandResult(send.mock.calls[0]?.[4] as string, "queued"));
+  const landed = await promise;
+  expect(landed).toBe(false);
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.text === "direct held steer")!;
+  expect(bubble.outboxState).toBe("held");
+});
+
+it("a live DIRECT steer resolves true only after authoritative sent acceptance (ROUND4-2)", async () => {
+  const { api, hubStore } = await fresh();
+  let resolveSend: (value: CommandResult) => void = () => {};
+  const pending = new Promise<CommandResult>((resolve) => {
+    resolveSend = resolve;
+  });
+  const send = vi.spyOn(api, "instanceSend").mockReturnValue(pending);
+
+  const promise = hubStore.send(INSTANCE, "direct good steer", [], [], "steer");
+  let settled: boolean | undefined;
+  void promise.then((v) => {
+    settled = v;
+  });
+  await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+  expect(settled).toBeUndefined();
+
+  resolveSend(commandResult(send.mock.calls[0]?.[4] as string, "accepted"));
+  expect(await promise).toBe(true);
+  const bubble = hubStore.getSnapshot().bubbles.find((b) => b.text === "direct good steer")!;
+  expect(bubble.outboxState).toBe("sent");
+});

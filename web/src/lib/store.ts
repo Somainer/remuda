@@ -2448,7 +2448,26 @@ class HubStore {
       // drafts stay until it really lands).
       return !(mode === "steer");
     }
-    // Online: flush now in the background; the POST never blocks the caller.
+    if (mode === "steer") {
+      // A live steer is an interrupt: the 已打断 receipt must mean the
+      // interrupt was actually accepted, so await the SAME single-deliverer
+      // delivery steerHeld uses instead of resolving before the POST settles.
+      // True only on authoritative acceptance (sent/done); held (host
+      // offline), reconciling, rejected, unknown, or a lock/lease failure
+      // report false even though the durable row keeps retrying.
+      try {
+        await this.outbox.withInstanceLock(instanceId, (iid, rows) =>
+          this.deliverOneRow(iid, rows),
+        );
+      } catch {
+        return false;
+      }
+      this.syncBubbleFromOutbox(commandId);
+      const finalState = this.outbox.get(commandId)?.state;
+      return finalState === "sent" || finalState === "done";
+    }
+    // Online ordinary send: flush now in the background; the POST never
+    // blocks the caller.
     void this.flushAllOutbox();
     return true;
   }

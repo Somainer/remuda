@@ -357,12 +357,17 @@ test.describe("round-3 redesign", () => {
   }) => {
     const HUGE = "x+1".repeat(33_334); // 100 KB
     // The unclosed \[ must be the last line: it becomes the exact literal tail.
+    // The blank line after each list actually ends it: a 4-space-indented
+    // line following a list with only one blank line is a lazy list
+    // continuation paragraph, never an indented code block (CommonMark).
     const prompt = [
-      "r3 引用块： > before $$q^2$$ after",
+      "r3 引用块：",
+      "> before $$q^2$$ after",
       "r3 列表：",
       "- before $$l^2$$ after",
       "r3 列表括号：",
       "- \\[b^2\\]",
+      "",
       "r3 缩进代码：",
       "",
       "    $$indented$$",
@@ -372,7 +377,7 @@ test.describe("round-3 redesign", () => {
       "```",
       "r3 超宽规则： $$\\rule{100000em}{100000em}$$",
       "r3 宏炸弹： $\\def\\a{\\a}\\a$",
-      "r3 百KB： $${HUGE}$",
+      `r3 百KB： $$${HUGE}$$`,
       "r3 未闭合： intro \\[a *b* + \\{c\\}",
     ].join("\n");
 
@@ -397,9 +402,10 @@ test.describe("round-3 redesign", () => {
     expect(await row.getByText(/before/).count()).toBeGreaterThan(0);
     await expect(page.locator("ul > li [data-testid='math-display']")).toHaveCount(2);
 
-    // (C) indented $$ is a code block.
+    // (C) indented $$ is a code block (not a KaTeX display).
     await expect(page.getByTestId("code-block").first()).toBeVisible();
     const codeTexts = await page.getByTestId("code-block").allInnerTexts();
+    expect(codeTexts.some((t) => t.includes("$$indented$$"))).toBe(true);
     expect(codeTexts.some((t) => t.includes("fenced^2"))).toBe(true);
     // A mathdisplay fence is code, never a math node.
     expect(await page.locator("pre code.language-mathdisplay").count()).toBe(0);

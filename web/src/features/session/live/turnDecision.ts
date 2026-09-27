@@ -11,6 +11,7 @@ import { knowledgeValue } from "../../../types/command";
 import { channelHealth, expectedTiersFor } from "./channelHealth";
 import { livePhase } from "./phase";
 import { liveStatus } from "./liveStatus";
+import { nativeLifecycle } from "./payloadGuard";
 import { lastAssistantMessageAt, turnEnd, type TurnDecision } from "./turnEnd";
 
 const SCREEN_CHANNELS = new Set(["pty", "screen", "osc"]);
@@ -47,15 +48,16 @@ export function turnStartAnchor(events: readonly Observation[]): string | null {
   let screenSince: string | null = null;
   let screenAt: number | null = null;
   for (const ev of events) {
-    if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
-    const tags = ev.payload.relatedIds ?? {};
+    const payload = nativeLifecycle(ev);
+    if (!payload) continue;
+    const tags = (payload.relatedIds ?? {}) as Record<string, string>;
     if (tags.phase === "prompt-accepted") {
       const at = parseTs(tags.since);
       if (at !== null && (promptAt === null || at >= promptAt)) {
         promptAt = at;
         promptSince = tags.since ?? null;
       }
-    } else if (ev.payload.nativeName === "live.status" && tags.liveStatus !== "0") {
+    } else if (payload.nativeName === "live.status" && tags.liveStatus !== "0") {
       const at = parseTs(tags.since);
       if (at !== null && (screenAt === null || at >= screenAt)) {
         screenAt = at;
@@ -76,15 +78,15 @@ export function turnStartAnchor(events: readonly Observation[]): string | null {
 export function screenAgentState(events: readonly Observation[]): string | null {
   let latest: Observation | null = null;
   for (const ev of events) {
-    if (ev.kind !== "lifecycle") continue;
-    const payload = ev.payload;
-    if (payload.type !== "native" || payload.nativeName !== "agent_status") continue;
+    const payload = nativeLifecycle(ev);
+    if (!payload || payload.nativeName !== "agent_status") continue;
     if (!SCREEN_CHANNELS.has(ev.source?.channel ?? "")) continue;
     if (!latest || seqOf(ev) >= seqOf(latest)) latest = ev;
   }
-  if (!latest || latest.payload.type !== "native") return null;
-  const value = knowledgeValue(latest.payload.status);
-  return value ?? null;
+  const payload = latest ? nativeLifecycle(latest) : null;
+  if (!payload || !payload.status) return null;
+  const value = knowledgeValue(payload.status);
+  return typeof value === "string" ? value : null;
 }
 
 /**

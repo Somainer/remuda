@@ -11,6 +11,7 @@
  * the TUI's own chrome, never message content.
  */
 import type { Observation } from "../../../types/generated";
+import { nativeLifecycle } from "./payloadGuard";
 
 const TAGS: Record<string, string> = {
   live: "liveStatus",
@@ -42,9 +43,7 @@ export type ScreenLiveStatus = {
 type TurnLifecycle = Extract<Observation, { kind: "lifecycle" }>;
 
 function isStatusEvent(ev: Observation): ev is TurnLifecycle {
-  return (
-    ev.kind === "lifecycle" && ev.payload.type === "native" && ev.payload.nativeName === "live.status"
-  );
+  return nativeLifecycle(ev)?.nativeName === "live.status";
 }
 
 function seqOf(ev: Observation): bigint {
@@ -61,8 +60,10 @@ export function liveStatus(events: readonly Observation[]): ScreenLiveStatus | n
     if (!isStatusEvent(ev)) continue;
     if (!latest || seqOf(ev) >= seqOf(latest)) latest = ev;
   }
-  if (!latest || latest.payload.type !== "native") return null;
-  const tags = latest.payload.relatedIds ?? {};
+  if (!latest) return null;
+  const payload = nativeLifecycle(latest);
+  if (!payload) return null;
+  const tags = (payload.relatedIds ?? {}) as Record<string, string>;
   const active = tags[TAGS.live] !== "0";
   if (!active) {
     return {

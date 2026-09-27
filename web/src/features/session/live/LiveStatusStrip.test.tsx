@@ -2,7 +2,7 @@ import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Observation } from "../../../types/generated";
 import type { NativeRef } from "../../../types/nativeRef";
-import { LiveStatusStrip } from "./LiveStatusStrip";
+import { LiveStatusStrip, sessionSettlement } from "./LiveStatusStrip";
 
 function turnLiveEvent(
   seq: number,
@@ -170,6 +170,32 @@ function epochChangedEvent(seq: number, at = new Date().toISOString()): Observat
       affectsCompletion: true,
     },
   } as unknown as Observation;
+}
+
+/**
+ * The Hub-authored diagnostic `reconcile_lost_instances` appends via
+ * `append_hub_diagnostic` (store.rs) when the HUB — not the Node — notices
+ * the restart. Exact wire shape: `origin: "hub"`, severity + message, and NO
+ * `status` / `relatedIds` / `nativeId` fields. Round 1 settled only on the
+ * Node shape and `knowledgeValue(undefined)` THREW on this one.
+ */
+function hubEpochChangedEvent(seq: number, at = new Date().toISOString()): Observation {
+  return {
+    ...turnLiveEvent(seq, {}, at, "stdout"),
+    payload: {
+      type: "native",
+      topic: "diagnostic",
+      origin: "hub",
+      nativeName: "node_epoch_changed",
+      severity: "warning",
+      message: "node epoch changed; instance lost",
+    },
+  } as unknown as Observation;
+}
+
+/** A lifecycle observation whose payload is deliberately malformed. */
+function malformedLifecycle(seq: number, payload: unknown): Observation {
+  return { ...turnLiveEvent(seq, {}, new Date().toISOString()), payload } as unknown as Observation;
 }
 
 /** A Node-side hook-silence probe with a verified/unknown reason. It rides
@@ -482,6 +508,111 @@ describe("LiveStatusStrip", () => {
     expect(strip.getAttribute("data-turn")).toBe("ended");
     expect(strip.getAttribute("data-settled")).toBe("node-restart");
     expect(screen.queryByTestId("live-interrupt")).toBeNull();
+  });
+
+  it("UO-6b r2: settles on the HUB-authored restart diagnostic (exact shape, no status)", () => {
+    // The owner's every-demo-refresh case: the Hub, not the Node, noticed the
+    // restart, so the only terminal record is append_hub_diagnostic's payload
+    // — nativeName node_epoch_changed with severity + message and NO status.
+    const at = new Date().toISOString();
+    const hub = hubEpochChangedEvent(3, at);
+    expect(sessionSettlement([hub])).toEqual({ ended: true, at, reason: "node-restart" });
+
+    // Through the strip as well, while the hook latch and spinner are fresh.
+    const events = [
+      turnLiveEvent(1, { phase: "text-streaming", since: at, phrase: "writing" }, at),
+      screenStatusEvent(2, { liveStatus: "1", verb: "Running", since: at, interruptible: "1" }, at),
+      hub,
+    ];
+    render(<LiveStatusStrip events={events} nativeRef={ref(["hook"])} onInterrupt={() => {}} />);
+    const strip = screen.getByTestId("live-status-strip");
+    expect(strip.getAttribute("data-turn")).toBe("ended");
+    expect(strip.getAttribute("data-phase")).toBe("turn-ended");
+    expect(strip.getAttribute("data-settled")).toBe("node-restart");
+    expect(screen.queryByTestId("live-interrupt")).toBeNull();
+  });
+
+  it("UO-6b r2: never throws on a malformed lifecycle payload", () => {
+    // Any journal payload, however partial or wrongly typed, is skipped rather
+    // than allowed to crash the strip (the Hub diagnostic's missing `status`
+    // was exactly this class of failure).
+    const at = new Date().toISOString();
+    const malformed = [
+      null,
+      "lifecycle",
+      42,
+      ["lifecycle"],
+      {},
+      { type: "native" },
+      { type: "native", nativeName: "some.other.diagnostic", status: undefined },
+      { type: "entity", entityType: "instance", state: 42 },
+      { type: "entity", entityType: "instance", state: "ready" },
+    ];
+    const events = malformed.map((payload, i) => malformedLifecycle(i + 1, payload));
+    // The fold itself never throws and nothing malformed settles it…
+    expect(sessionSettlement(events)).toEqual({ ended: false, at: null, reason: null });
+    // …and a genuinely terminal payload still wins amid the garbage.
+    const terminal = malformedLifecycle(99, {
+      type: "entity",
+      entityType: "instance",
+      state: "exited",
+    });
+    expect(sessionSettlement([...events, terminal]).reason).toBe("exited");
+
+    // Rendering the strip with the malformed tail plus a live spinner must
+    // not throw either; the spinner keeps painting normally.
+    render(
+      <LiveStatusStrip
+        events={[screenStatusEvent(1, { liveStatus: "1", verb: "Working", since: at }, at), ...events]}
+        nativeRef={null}
+      />,
+    );
+    expect(screen.getByTestId("live-status-strip").getAttribute("data-turn")).not.toBe("ended");
+  });
+
+  it("UO-6b r2: settles from the instance row when the journal tail omits the end", () => {
+    const at = new Date().toISOString();
+    const rowAt = new Date(Date.now() + 1_000).toISOString();
+    // A live spinner, no terminal journal record at all (page reopened after
+    // the restart; the bounded tail lost it).
+    const live = [
+      turnLiveEvent(1, { phase: "text-streaming", since: at, phrase: "writing" }, at),
+      screenStatusEvent(2, { liveStatus: "1", verb: "Running", since: at, interruptible: "1" }, at),
+    ];
+    // An open row settles nothing.
+    expect(sessionSettlement(live, { lifecycle: "running" }).ended).toBe(false);
+    // A terminal lifecycle settles at the row's timestamp.
+    expect(sessionSettlement(live, { lifecycle: "exited", updatedAt: rowAt })).toEqual({
+      ended: true,
+      at: rowAt,
+      reason: "exited",
+    });
+    // lastError node-epoch-changed settles as a restart, outranking the
+    // lifecycle spelling, and a later ready row never unsettles the journal.
+    expect(
+      sessionSettlement(live, { lifecycle: "exited", lastError: "node-epoch-changed" }),
+    ).toMatchObject({ ended: true, reason: "node-restart" });
+    expect(sessionSettlement([hubEpochChangedEvent(3, at)], { lifecycle: "ready" })).toEqual({
+      ended: true,
+      at,
+      reason: "node-restart",
+    });
+
+    // Through the strip: the terminal row ends the frozen-in-flight turn.
+    const { rerender } = render(
+      <LiveStatusStrip events={live} instance={{ lifecycle: "running" }} nativeRef={ref(["hook"])} />,
+    );
+    expect(screen.getByTestId("live-status-strip").getAttribute("data-turn")).not.toBe("ended");
+    rerender(
+      <LiveStatusStrip
+        events={live}
+        instance={{ lifecycle: "exited", lastError: "node-epoch-changed", updatedAt: rowAt }}
+        nativeRef={ref(["hook"])}
+      />,
+    );
+    const strip = screen.getByTestId("live-status-strip");
+    expect(strip.getAttribute("data-turn")).toBe("ended");
+    expect(strip.getAttribute("data-settled")).toBe("node-restart");
   });
 
   it("hides the strip interrupt when the carrier explicitly reports it unsupported", () => {

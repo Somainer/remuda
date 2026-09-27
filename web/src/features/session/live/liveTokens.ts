@@ -6,6 +6,7 @@
  * late) the screen spinner estimate is shown. The two never appear together.
  */
 import type { Observation } from "../../../types/generated";
+import { nativeLifecycle, usagePayload } from "./payloadGuard";
 
 function seqOf(ev: Observation): bigint {
   try {
@@ -20,8 +21,10 @@ function seqOf(ev: Observation): bigint {
 function lastTurnStartSeq(events: readonly Observation[]): bigint | null {
   let start: bigint | null = null;
   for (const ev of events) {
-    if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
-    if (ev.payload.relatedIds?.phase === "prompt-accepted") start = seqOf(ev);
+    const payload = nativeLifecycle(ev);
+    if (!payload) continue;
+    const tags = (payload.relatedIds ?? {}) as Record<string, unknown>;
+    if (tags.phase === "prompt-accepted") start = seqOf(ev);
   }
   return start;
 }
@@ -34,16 +37,27 @@ export function usageOutputTokens(events: readonly Observation[]): number | null
   for (const ev of events) {
     if (ev.kind !== "usage") continue;
     if (start != null && seqOf(ev) < start) continue;
-    const scope = ev.payload.scope;
+    const payload = usagePayload(ev);
+    if (!payload) continue;
+    const scope = payload.scope;
     if (scope !== "message" && scope !== "turn") continue;
-    const output = ev.payload.outputTokens;
-    if (output.state !== "known") continue;
+    const output = payload.outputTokens as
+      | { state?: string; value?: unknown }
+      | null
+      | undefined;
+    if (!output || output.state !== "known") continue;
+    let value: bigint;
+    try {
+      value = BigInt(String(output.value));
+    } catch {
+      continue;
+    }
     // Keep the newest reading (seq, not encounter order — gap backfill);
     // per-message snapshots replace, they do not add.
     const here = seqOf(ev);
     if (latest == null || here >= latest) {
       latest = here;
-      count = BigInt(output.value);
+      count = value;
     }
   }
   return count == null ? null : Number(count);

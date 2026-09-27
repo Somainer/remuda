@@ -164,6 +164,59 @@ test("the live strip settles on the fake-Node exited-combo fixture (m-realdevice
   await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
 });
 
+test("UO-6b r2: a HUB-detected Node restart settles the live strip and shows Resume", async ({ page }) => {
+  test.slow();
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.stack ?? error.message));
+  await login(page, "e2e-uo6b-epoch");
+  await page.goto("/sessions/new");
+  const host = await page
+    .getByTestId("new-session-host")
+    .locator("option")
+    .filter({ hasText: "e2e-fake-node" })
+    .getAttribute("value");
+  await page.getByTestId("new-session-host").selectOption(host!);
+  await expect(page.getByTestId("new-session-workspace").locator("option")).not.toHaveCount(0);
+  await page.getByTestId("new-session-prompt").fill("uo6b-epoch-live");
+  await page.getByTestId("new-session-start").click();
+  await page.waitForURL(/\/s\//, { timeout: 20_000 });
+  const id = new URL(page.url()).pathname.split("/")!.pop()!;
+
+  const strip = page.getByTestId("live-status-strip");
+  // The fixture keeps a turn genuinely live: hook text-streaming latch plus a
+  // fresh screen spinner, and the local clock is growing.
+  await expect(strip).not.toHaveAttribute("data-turn", "ended", { timeout: 20_000 });
+  const elapsed = page.getByTestId("live-elapsed");
+  await expect(elapsed).toBeVisible();
+  const before = await elapsed.textContent();
+  await page.waitForTimeout(2_200);
+  expect(await elapsed.textContent(), "the live clock was not growing").not.toBe(before);
+
+  // Restart the fake Node while the turn is live. Its next hello drops this
+  // session from the inventory, so the HUB reconciles the row to exited and
+  // appends node_epoch_changed itself — a hub-origin native lifecycle with
+  // severity + message and NO status (the payload round 1 threw on).
+  await rawKeys(page, id, "TTYNODE_RESTART\r");
+
+  // The strip settles: ended, node-restart attribution, frozen clock, every
+  // live affordance gone — no React error from the status-less diagnostic.
+  await expect(strip).toHaveAttribute("data-turn", "ended", { timeout: 30_000 });
+  await expect(strip).toHaveAttribute("data-phase", "turn-ended");
+  await expect(strip).toHaveAttribute("data-settled", "node-restart");
+  await expect(page.getByTestId("live-interrupt")).toHaveCount(0);
+  const frozen = await elapsed.textContent();
+  await page.waitForTimeout(2_200);
+  expect(await elapsed.textContent(), "the settled clock kept growing").toBe(frozen);
+
+  // The instance row the Hub reconciled drives the banner + Resume.
+  await expect(page.getByTestId("node-restart-banner")).toContainText("Node 重启，会话已结束", {
+    timeout: 20_000,
+  });
+  await expect(page.getByTestId("node-restart-resume")).toBeEnabled();
+  expect(pageErrors, `page errors during restart: ${pageErrors.join("\n")}`).toEqual([]);
+  await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
+});
+
 test("a thought disclosure carries exactly one marker", async ({ page }) => {
   // Compact mode would fold the thought behind a group trigger; turn it off
   // up front so the disclosure renders on its own near the followed bottom.

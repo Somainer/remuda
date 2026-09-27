@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { Observation } from "../../../types/generated";
 import type { NativeRef } from "../../../types/nativeRef";
 import { knowledgeValue } from "../../../types/command";
+import { NODE_EPOCH_CHANGED } from "../../../lib/commandStatus";
 import { formatTokens } from "../../../lib/format";
 import type { ToolCallPayload } from "../../../types/generated";
 import { profilingEnabled, reportProbe } from "../../../lib/profileFlags";
@@ -12,6 +13,7 @@ import {
 } from "./channelHealth";
 import { isActivePhase, livePhase, toolAnchors, toolFingerprint, type LivePhaseName } from "./phase";
 import { liveStatus, phraseIsThinking } from "./liveStatus";
+import { entityLifecycle, nativeLifecycle } from "./payloadGuard";
 import { projectTurnDecision, turnStartAnchor } from "./turnDecision";
 import type { TurnDecision } from "./turnEnd";
 import { usageOutputTokens } from "./liveTokens";
@@ -89,42 +91,86 @@ export type SessionSettlement = {
   reason: SessionSettleReason | null;
 };
 
+/**
+ * The instance-row fields the settlement reads. The Hub keeps these durably
+ * even when the bounded journal tail omits the terminal record (a page opened
+ * much later, or the live socket missing one frame).
+ */
+export type SessionSettleInstance = {
+  lifecycle?: string | null;
+  lastError?: string | null;
+  updatedAt?: string | null;
+};
+
 const NOT_SETTLED: SessionSettlement = { ended: false, at: null, reason: null };
 
 /**
- * Session-level settlement (owner defect UO-6b, 2026-09-25 demo): the turn
- * machinery only decides whether one *turn* is open, so an EXITED session
- * whose hook latch and spinner both froze mid-turn kept painting 「文本生成中」
- * with a clock that counted for hours. This fold reads the same two durable
- * records the Node writes for those deaths:
+ * Session-level settlement (owner defect UO-6b, 2026-09-25 demo; round 2:
+ * 2026-09-27 — the Hub-detected restart case): the turn machinery only decides
+ * whether one *turn* is open, so an EXITED session whose hook latch and
+ * spinner both froze mid-turn kept painting 「文本生成中」 with a clock that
+ * counted for hours. This fold reads the durable records the two sides write
+ * for those deaths:
  *
  *  - the instance entity lifecycle (`exited` / `failed`, journaled by
  *    `journal_instance_phase` on native exit, explicit close and reclaim);
- *  - the `node_epoch_changed` diagnostic the new Node journals on restart
- *    (`reclaim.rs`, status known `exited`).
+ *  - the `node_epoch_changed` diagnostic a loss produces. The name alone is
+ *    the terminal signal: the restarted Node journals it with status known
+ *    `exited` (`reclaim.rs`), while the Hub's `reconcile_lost_instances`
+ *    appends the SAME name via `append_hub_diagnostic` with NO `status` field
+ *    at all (only severity + message). Requiring `status === "exited"` let
+ *    the Hub shape slip through — and `knowledgeValue(undefined)` then threw
+ *    on the missing field, so the strip crashed instead of settling;
+ *  - the instance row itself (`lifecycle` terminal, or `lastError:
+ *    node-epoch-changed`), the Hub's current durable truth when the journal
+ *    tail lags or omits the record on a fresh page load.
  *
- * Pure; newest terminal record wins. A ready/unknown/absent record never
- * unsettles an earlier terminal one within the same (bounded) event window.
+ * Pure; newest terminal record wins among events, then the row may settle an
+ * otherwise-open session (node-restart outranks a plain exited row). Every
+ * payload is untrusted wire data: a malformed record is skipped, never
+ * allowed to throw the strip.
  */
-export function sessionSettlement(events: readonly Observation[]): SessionSettlement {
+export function sessionSettlement(
+  events: readonly Observation[],
+  instance?: SessionSettleInstance | null,
+): SessionSettlement {
   let settled: SessionSettlement = NOT_SETTLED;
   for (const ev of events) {
-    if (ev.kind !== "lifecycle") continue;
-    if (ev.payload.type === "entity" && ev.payload.entityType === "instance") {
-      const state = ev.payload.state;
+    const entity = entityLifecycle(ev);
+    if (entity) {
+      if (entity.entityType === "instance") {
+        const state = entity.state;
+        if (typeof state === "string" && SESSION_TERMINAL_STATES.has(state)) {
+          settled = {
+            ended: true,
+            at: ev.observedAt,
+            reason: state as SessionSettleReason,
+          };
+        }
+      }
+      continue;
+    }
+    // No `status` requirement: the Hub-authored diagnostic carries none.
+    if (nativeLifecycle(ev)?.nativeName === "node_epoch_changed") {
+      settled = { ended: true, at: ev.observedAt, reason: "node-restart" };
+    }
+  }
+  if (instance) {
+    if (instance.lastError === NODE_EPOCH_CHANGED) {
+      settled = {
+        ended: true,
+        at: settled.at ?? (typeof instance.updatedAt === "string" ? instance.updatedAt : null),
+        reason: "node-restart",
+      };
+    } else if (!settled.ended) {
+      const state = instance.lifecycle;
       if (typeof state === "string" && SESSION_TERMINAL_STATES.has(state)) {
         settled = {
           ended: true,
-          at: ev.observedAt,
+          at: typeof instance.updatedAt === "string" ? instance.updatedAt : null,
           reason: state as SessionSettleReason,
         };
       }
-    } else if (
-      ev.payload.type === "native" &&
-      ev.payload.nativeName === "node_epoch_changed" &&
-      knowledgeValue(ev.payload.status) === "exited"
-    ) {
-      settled = { ended: true, at: ev.observedAt, reason: "node-restart" };
     }
   }
   return settled;
@@ -179,9 +225,9 @@ function HealthNote({
 function hookSilenceReason(events: readonly Observation[]): string | null {
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i]!;
-    if (ev.kind !== "lifecycle" || ev.payload.type !== "native") continue;
-    if (ev.payload.nativeName !== "hook.silence") continue;
-    const reason = ev.payload.relatedIds?.reason;
+    const payload = nativeLifecycle(ev);
+    if (!payload || payload.nativeName !== "hook.silence") continue;
+    const reason = payload.relatedIds?.reason;
     if (reason && reason in SILENCE_REASON_COPY) return reason;
   }
   return null;
@@ -212,12 +258,19 @@ function earliestAnchor(a: string | null | undefined, b: string | null | undefin
  */
 export function LiveStatusStrip({
   events,
+  instance,
   nativeRef,
   onInterrupt,
   hasPending = false,
   decision: decisionProp,
 }: {
   events: readonly Observation[];
+  /**
+   * The Hub's current instance row. Its terminal lifecycle / restart
+   * lastError settles the strip even when the bounded journal tail omits the
+   * end record (a page reopened long after the Node restarted).
+   */
+  instance?: SessionSettleInstance | null;
   nativeRef: NativeRef | null | undefined;
   onInterrupt?: () => void;
   /** A real dialog/permission is pending for this instance. */
@@ -231,10 +284,12 @@ export function LiveStatusStrip({
   const usageCount = useMemo(() => usageOutputTokens(events), [events]);
   const anchors = useMemo(() => toolAnchors(events), [events]);
   // Session-level death outranks every turn channel: once the instance is
-  // exited/failed or the Node restarted, the strip settles with the session
-  // whatever the hook latch and spinner froze on, and its clock stops for
-  // good (UO-6b owner defect: an exited session kept the timer growing).
-  const settlement = useMemo(() => sessionSettlement(events), [events]);
+  // exited/failed, the row says so, or the Node restarted (whoever noticed
+  // first — the new Node's reclaim journal OR the Hub's reconcile
+  // diagnostic), the strip settles with the session whatever the hook latch
+  // and spinner froze on, and its clock stops for good (UO-6b owner defect:
+  // an exited session kept the timer growing).
+  const settlement = useMemo(() => sessionSettlement(events, instance), [events, instance]);
   // The 1 Hz clock runs only while a turn is genuinely live; the settled row
   // freezes and a hidden page pauses via the rAF loop in useNow.
   const now = useNow(!settlement.ended && decisionProp?.state !== "ended");  const health = useMemo(

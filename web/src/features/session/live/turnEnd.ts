@@ -43,6 +43,7 @@ import type { Observation } from "../../../types/generated";
 import type { TierHealth } from "./channelHealth";
 import type { ScreenLiveStatus } from "./liveStatus";
 import type { LivePhase } from "./phase";
+import { messagePayload } from "./payloadGuard";
 
 export type TurnState = "working" | "waiting" | "ended" | "unknown";
 export type DecidedBy = "hook" | "file" | "screen" | "transcript";
@@ -157,8 +158,8 @@ export function lastAssistantMessageAt(events: readonly Observation[]): string |
   let latestSeq = -1n;
   for (const ev of events) {
     if (ev.kind !== "message") continue;
-    const payload = ev.payload as { role?: string };
-    if (payload.role !== "assistant") continue;
+    const payload = messagePayload(ev);
+    if (!payload || payload.role !== "assistant") continue;
     let seq: bigint;
     try {
       seq = BigInt(ev.seq);

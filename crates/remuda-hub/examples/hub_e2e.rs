@@ -1091,6 +1091,18 @@ async fn fake_node(
                             append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
                         continue;
                     }
+                    // UO-6b round 2: a live turn the Hub must settle when the
+                    // Node restarts (the spec then types TTYNODE_RESTART).
+                    if prompt == "uo6b-epoch-live" {
+                        send_rpc_ok(
+                            &mut ws,
+                            id,
+                            json!({ "ok": true, "instanceId": instance_id }),
+                        )
+                        .await?;
+                        append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
+                        continue;
+                    }
                     let interaction_id = InteractionId::new();
                     // c-nextstep list-row phrase: a create prompt with the
                     // `workflow card <scenario> row-phrase` form raises NO
@@ -1412,6 +1424,13 @@ async fn fake_node(
                         send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
                         append_n =
                             append_mfix_chrome_combo(&mut ws, &instance_id, append_n).await?;
+                        continue;
+                    }
+                    // UO-6b round 2: a live turn the Hub must settle when the
+                    // Node restarts (the spec then types TTYNODE_RESTART).
+                    if prompt == "uo6b-epoch-live" {
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        append_n = append_uo6b_epoch_live(&mut ws, &instance_id, append_n).await?;
                         continue;
                     }
                     // r-ux-comment: reply with a fenced code block so the browser
@@ -3161,6 +3180,107 @@ async fn append_mfix_chrome_combo(ws: &mut NodeWs, instance_id: &str, mut n: u64
     )
     .await?;
     append_full_event(ws, instance_id, n, entity("exited", &now_at)).await
+}
+
+/// UO-6b round 2: a turn that stays LIVE — a latched hook text-streaming
+/// phase plus a fresh screen spinner — with no terminal record of any kind.
+///
+/// The scenario the owner hit on every demo refresh: the operator is looking
+/// at this session when the Node restarts, the HUB's
+/// `reconcile_lost_instances` marks the row exited and appends the
+/// `node_epoch_changed` hub diagnostic (native lifecycle with severity +
+/// message and NO `status`), and the strip must settle on that instead of
+/// throwing / keeping the growing timer. The web spec triggers the restart
+/// with `TTYNODE_RESTART` after this fixture lands.
+async fn append_uo6b_epoch_live(ws: &mut NodeWs, instance_id: &str, mut n: u64) -> Result<u64> {
+    let now_at = {
+        let t = time::OffsetDateTime::now_utc();
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            t.year(),
+            t.month() as u8,
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second(),
+            t.millisecond(),
+        )
+    };
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "lifecycle",
+            "completeness": "structured",
+            "observedAt": now_at,
+            "payload": {
+                "type": "entity",
+                "entityType": "instance",
+                "state": "ready",
+                "entity": {}
+            }
+        }),
+    )
+    .await?;
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "message",
+            "completeness": "structured",
+            "observedAt": now_at,
+            "payload": { "role": "user", "text": "uo6b epoch live", "origin": "human" }
+        }),
+    )
+    .await?;
+    n = append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "lifecycle",
+            "completeness": "structured",
+            "observedAt": now_at,
+            "source": { "channel": "hook" },
+            "payload": {
+                "type": "native",
+                "topic": "turn",
+                "nativeName": "turn.phase",
+                "relatedIds": {
+                    "phase": "text-streaming",
+                    "tier": "hook",
+                    "messageId": "obj_uo6b_msg",
+                    "phrase": "writing",
+                    "since": now_at
+                }
+            }
+        }),
+    )
+    .await?;
+    append_full_event(
+        ws,
+        instance_id,
+        n,
+        json!({
+            "kind": "lifecycle",
+            "completeness": "structured",
+            "observedAt": now_at,
+            "source": { "channel": "screen" },
+            "payload": {
+                "type": "native",
+                "nativeName": "live.status",
+                "relatedIds": {
+                    "liveStatus": "1",
+                    "verb": "Running",
+                    "interruptible": "1",
+                    "since": now_at
+                }
+            }
+        }),
+    )
+    .await
 }
 
 /// One full-shape user message observation. A composer/command send carries

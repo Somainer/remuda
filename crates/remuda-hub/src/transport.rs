@@ -273,6 +273,103 @@ pub struct StdioTransport {
     host_id: String,
 }
 
+/// Gate for a [`GatedTransport`] call: the transport blocks every RPC until the
+/// test opens the gate, then reports the frame was never queued (`Ok(None)`).
+/// Lets a test hold a forward attempt inside its mark-intent → rollback window
+/// while it exercises command GETs bound to that attempt.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct CallGate {
+    open: Arc<tokio::sync::Mutex<bool>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl CallGate {
+    /// Create a closed gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            open: Arc::new(tokio::sync::Mutex::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Block until the gate is open (returns immediately once it is).
+    async fn wait(&self) {
+        loop {
+            if *self.open.lock().await {
+                return;
+            }
+            let notified = self.notify.notified();
+            if *self.open.lock().await {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Open the gate and release every blocked call.
+    pub async fn open_gate(&self) {
+        *self.open.lock().await = true;
+        self.notify.notify_waiters();
+    }
+}
+
+impl Default for CallGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Scripted Node transport that blocks each `call` on a [`CallGate`], then
+/// answers `Ok(None)` ("frame never queued"), modelling a live-looking link
+/// that refuses the frame before queueing — while a test holds the forward
+/// attempt open.
+#[doc(hidden)]
+pub struct GatedTransport {
+    gate: CallGate,
+    kind: TransportKind,
+}
+
+impl GatedTransport {
+    /// Build an outbound-WSS transport blocked on `gate`.
+    #[must_use]
+    pub fn new(gate: CallGate) -> Self {
+        Self {
+            gate,
+            kind: TransportKind::OutboundWss,
+        }
+    }
+}
+
+impl NodeTransport for GatedTransport {
+    fn kind(&self) -> TransportKind {
+        self.kind
+    }
+
+    fn call(
+        &self,
+        _method: &str,
+        _params: Value,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, HubError>> + Send + '_>> {
+        let gate = self.gate.clone();
+        Box::pin(async move {
+            gate.wait().await;
+            // The frame never queued on the Node.
+            Ok(None)
+        })
+    }
+
+    fn notify(
+        &self,
+        _method: &str,
+        _params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, HubError>> + Send + '_>> {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+}
+
 /// Scripted Node transport for Hub integration tests: every `call` returns a
 /// fixed JSON-RPC frame (`None` models an unwritable session, i.e. 422).
 ///
@@ -442,6 +539,23 @@ impl ConnectedNodes {
             .await
             .get(host_id)
             .map(|slot| slot.link.kind())
+    }
+
+    /// Test support: take the registry lock and hold it until `release`
+    /// resolves. This parks a command POST at its `kind_of` lookup — AFTER the
+    /// row/merge exist but BEFORE any forward-attempt slot is registered —
+    /// which is exactly the pre-registration window the dispatch marker
+    /// covers (D-055 round 3, item 1).
+    #[doc(hidden)]
+    pub async fn test_hold_lock_until(
+        &self,
+        release: tokio::sync::oneshot::Receiver<()>,
+        acquired: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let _guard = self.inner.lock().await;
+        let _ = acquired.send(());
+        // Resolves when the sender sends OR drops.
+        let _ = release.await;
     }
 
     /// Host ids with a live Node session.

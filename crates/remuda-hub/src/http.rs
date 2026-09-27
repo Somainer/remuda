@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -1994,6 +1995,11 @@ pub async fn post_command(
     if body.operation == "instance.send" {
         crate::objects::validate_send_attachments(&state, &device, &instance, &mut payload).await?;
     }
+    // Mark this client-named command as dispatching BEFORE the row exists, so
+    // a same-id replay landing in the insert→forward-registration gap gets the
+    // in-flight 409. Commands without a client id cannot be replayed before
+    // the response reveals the minted id, so they need no marker.
+    let mut dispatch = body.command_id.as_deref().map(begin_dispatch);
     let (command, created) = state
         .store
         .queue_command(
@@ -2007,6 +2013,15 @@ pub async fn post_command(
         .await
         .map_err(map_store)?;
     if !created {
+        // The insert loser never owns the dispatch window after losing — not
+        // even when IT acquired the pre-insert marker (under multi-thread
+        // scheduling the other task's INSERT can reach the FIFO writer first,
+        // so the loser can be the marker owner while the winner has not claimed
+        // yet). Disarm WITHOUT removing the entry: the winner's merge/forward
+        // window stays covered and any same-id replay keeps getting 409.
+        if let Some(guard) = dispatch.take() {
+            guard.disarm();
+        }
         // Existing row via the idempotency-key path or a serialized
         // lookup/insert race (key identity already enforced inside the store).
         let command = replay_existing_command(
@@ -2021,10 +2036,19 @@ pub async fn post_command(
         .await?;
         return Ok(Json(json!({ "command": command, "replayed": true })));
     }
+    // The insert winner owns the dispatch window. If the serialized writer ran
+    // another task's insert first (it began while our marker was absent), claim
+    // now: that loser was disarmed without touching the entry and can never
+    // clear ours.
+    let _dispatch = match dispatch.take() {
+        Some(guard) if guard.is_owner() => guard,
+        _ => claim_dispatch(&command.command_id),
+    };
     // First POST only: project the configure into the Hub's instance spec
     // before forwarding. A replay never re-enters this merge. On failure the
-    // pre-dispatch rejection is persisted WITH the command so a replay
-    // reproduces the original 500 instead of a do-nothing `replayed:true`.
+    // pre-dispatch rejection is persisted WITH the command — including the
+    // exact HTTP status and body it answered — so a replay reproduces the
+    // original outcome instead of a do-nothing `replayed:true`.
     if command.operation == "instance.configure"
         && let Err(store_error) = state
             .store
@@ -2032,11 +2056,17 @@ pub async fn post_command(
             .await
     {
         let error = map_store(store_error);
+        let (http_status, http_body) = error.status_code_and_body();
         // Persist the pre-dispatch rejection WITH the command so a replay
-        // reproduces this exact outcome instead of a do-nothing success.
+        // reproduces this exact status and body instead of a fresh success.
         let _ = state
             .store
-            .reject_command(command.command_id.clone(), error.to_string())
+            .reject_command_outcome(
+                command.command_id.clone(),
+                error.to_string(),
+                Some(http_status as i64),
+                Some(http_body.to_string()),
+            )
             .await;
         return Err(error);
     }
@@ -2066,23 +2096,76 @@ fn replay_key_matches(incoming: Option<&str>, stored: Option<&str>) -> bool {
     }
 }
 
-/// A `configure` whose spec merge failed before dispatch rests at a
-/// `rejected` settlement with `forwarded=0` — the unique shape of a Hub-side
-/// merge failure (a Node rejection is always recorded after a forward intent).
-fn configure_merge_failed(command: &CommandRecord) -> bool {
-    command.operation == "instance.configure"
-        && command.state == "settled"
-        && command.settlement_outcome.as_deref() == Some("rejected")
-        && !command.forwarded
+/// Replay a terminal (`settled`) `instance.configure` strictly by the stored
+/// outcome: every terminal failure is replayed with its ORIGINAL status and
+/// body, never as a fresh 200 success.
+fn replay_configure_settlement(command: CommandRecord) -> Result<CommandRecord, HubError> {
+    if command.settlement_outcome.as_deref() != Some("rejected") {
+        // `completed` / `cancelled`: the stored row itself is the outcome.
+        return Ok(command);
+    }
+    // The first attempt answered with an error and persisted that exact pair.
+    if let (Some(status), Some(body)) = (
+        command.settlement_http_status,
+        command.settlement_http_body.as_deref(),
+    ) && let Ok(body) = serde_json::from_str::<Value>(body)
+    {
+        return Err(HubError::StoredOutcome {
+            status: status.clamp(100, 599) as u16,
+            body,
+        });
+    }
+    // A post-forward Node rejection whose first answer was 200 (the rejection
+    // lives in the row's settlement) is returned as that 200 row.
+    if command.forwarded {
+        // Legacy pre-round-3 rows carry no persisted outcome. A NODE_BUSY
+        // refusal settled the row rejected+forwarded, yet its first POST
+        // answered 503 — reconstruct that 503 ONLY when the stored reason is
+        // exactly the Hub's own NODE_BUSY display (the string the hub
+        // persisted for HubError::NodeBusy) and the row lacks an outcome. A
+        // mere "node busy…" prefix must not rewrite an explicit Node
+        // rejection whose first POST answered 200 (round 4, item 2).
+        let node_busy_reason = HubError::NodeBusy {
+            retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+        }
+        .to_string();
+        if command.settlement_http_status.is_none()
+            && command.settlement_reason.as_deref() == Some(node_busy_reason.as_str())
+        {
+            return Err(HubError::NodeBusy {
+                retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+            });
+        }
+        // An explicit Node error reply to a non-create command settles the
+        // row but its first POST answered 200: return that 200 row.
+        return Ok(command);
+    }
+    // Legacy pre-round-2 merge failure: reconstruct the original Hub error.
+    let reason = command
+        .settlement_reason
+        .clone()
+        .unwrap_or_else(|| "configure spec merge failed".to_string());
+    Err(HubError::Internal(reason))
 }
 
-/// Operation-specific handling for a replay of an already-stored command. The
-/// incoming row is first settled against any in-flight forward attempt, so the
-/// result is never a stale early snapshot:
-/// - `instance.configure` is read-only and reproduces its ORIGINAL outcome —
-///   the stored row on success, the persisted merge error (500) on failure;
+/// Operation-specific handling for a replay of an already-stored command.
+/// - `instance.configure` is NON-replayable (D-055, 2026-09-25). Its spec
+///   merge runs exactly once, on the first POST; a re-POST only classifies the
+///   stored command by its durable state and never merges, forwards or settles
+///   anything a second time:
+///   * a live forward attempt answers a clear 409 immediately (the peek does
+///     not await the attempt's eventual terminal row);
+///   * `accepted` (the Node is running it) or a `queued` row whose intent is
+///     marked / reconciling is an in-progress command → 409 "still in flight";
+///   * a `queued`, never-forwarded row whose first POST has finished (an
+///     offline queue) is rejected with a clear "issue a new commandId"; while
+///     that POST is still dispatching (pre-registration window) the dispatch
+///     marker forces the in-flight 409 instead;
+///   * a `settled` row is returned by its stored outcome — a persisted failure
+///     reproduces its ORIGINAL status and body, including the pre-dispatch
+///     merge failure's 500 and a post-forward 503/overload refusal;
 /// - `instance.send` re-checks attachment liveness while still unsent and
-///   takes the G1 forward;
+///   settles against the in-flight attempt before taking the G1 forward;
 /// - other queued ops take the G1 forward; terminal rows pass through.
 async fn replay_existing_command(
     state: &AppState,
@@ -2092,28 +2175,87 @@ async fn replay_existing_command(
     existing: CommandRecord,
     payload: &mut Value,
 ) -> Result<CommandRecord, HubError> {
-    let command = settled_command_row(state, existing).await;
     match operation {
         "instance.configure" => {
-            if configure_merge_failed(&command) {
-                let reason = command
-                    .settlement_reason
-                    .clone()
-                    .unwrap_or_else(|| "configure spec merge failed".to_string());
-                return Err(HubError::Internal(reason));
+            // Peek, never await: a live attempt must answer 409 at once, not be
+            // hidden behind the attempt's eventual terminal row.
+            if subscribe_forward_attempt(&existing.command_id).is_some() {
+                return Err(configure_in_flight());
             }
-            Ok(command)
-        }
-        "instance.send" => {
-            // A row that never went out is not "already delivered": its
-            // objects must still be live exactly as a fresh send requires.
-            if !command.forwarded && command.state == "queued" {
-                crate::objects::validate_send_attachments(state, device, instance, payload).await?;
+            // Fresh durable read: the HTTP-level lookup can predate this point.
+            let command = state
+                .store
+                .get_command(existing.command_id.clone())
+                .await?
+                .unwrap_or(existing);
+            match command.state.as_str() {
+                // The Node accepted the configure and it has not settled: it is
+                // still in progress there, so the caller polls.
+                "accepted" => Err(configure_in_flight()),
+                // Stored durable state decides: an in-flight intent vs a row
+                // that never went out (offline queue / pre-registration window).
+                "queued" => {
+                    if command.forwarded
+                        || subscribe_forward_attempt(&command.command_id).is_some()
+                        || dispatch_in_flight(&command.command_id)
+                    {
+                        // Intent marked and RPC running / resting unknown, a
+                        // slot acquired while the read ran, or the first POST
+                        // still between insertion and forward registration:
+                        // in progress.
+                        Err(configure_in_flight())
+                    } else {
+                        // Unfinished, never forwarded, and the first POST has
+                        // finished (host offline). Applying anything again is
+                        // forbidden, and the web outbox replays instance.send
+                        // only, so no client needs a queued configure
+                        // forwarded on replay.
+                        Err(configure_queued_rejected())
+                    }
+                }
+                // Terminal: hand back exactly the outcome the first attempt
+                // produced, with its original status and body.
+                _ => replay_configure_settlement(command),
             }
-            forward_unforwarded_retry(state, command).await
         }
-        _ => forward_unforwarded_retry(state, command).await,
+        other => {
+            let command = settled_command_row(state, existing).await;
+            match other {
+                "instance.send" => {
+                    // A row that never went out is not "already delivered": its
+                    // objects must still be live exactly as a fresh send requires.
+                    if !command.forwarded && command.state == "queued" {
+                        crate::objects::validate_send_attachments(state, device, instance, payload)
+                            .await?;
+                    }
+                    forward_unforwarded_retry(state, command).await
+                }
+                _ => forward_unforwarded_retry(state, command).await,
+            }
+        }
     }
+}
+
+/// Clear 409 for a configure whose first attempt's outcome is not persisted
+/// yet (the forward RPC is running or rests unknown): the caller polls the
+/// command row rather than replaying.
+fn configure_in_flight() -> HubError {
+    HubError::Conflict(
+        "instance.configure is still in flight; poll GET \
+         /v1/instances/{id}/commands/{commandId} for its outcome"
+            .to_string(),
+    )
+}
+
+/// Clear 409 for a configure resting in the queue without ever being
+/// forwarded (host offline, or the first attempt had not registered its
+/// forward yet): replay cannot apply it, so the caller starts a new command.
+fn configure_queued_rejected() -> HubError {
+    HubError::Conflict(
+        "a queued instance.configure cannot be replayed; \
+         issue a new command with a new commandId"
+            .to_string(),
+    )
 }
 
 /// Maximum message text copied into a journal record (the full text still
@@ -2324,6 +2466,114 @@ static FORWARD_ATTEMPTS: LazyLock<
     Mutex<HashMap<String, tokio::sync::broadcast::Sender<CommandRecord>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Monotonic counter bumped (under the same lock that guards
+/// [`FORWARD_ATTEMPTS`]) on every attempt slot insert AND removal. A command
+/// reader samples it alongside the slot, reads the durable row, then samples
+/// it again: an unchanged epoch with no slot proves no intent registered or
+/// released across the read, so a `forwarded=1` the read saw cannot have been
+/// rolled back immediately afterwards (D-055 round 2, item 3). Global rather
+/// than per-key: a bump for an unrelated command only costs one re-read.
+static FORWARD_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// First-POST dispatch markers, keyed by commandId (token = owner). A marker
+/// is acquired immediately BEFORE the command row is inserted and held until
+/// that POST finishes — the configure merge has run (or its rejection been
+/// persisted) and the forward attempt has been registered or the command rests
+/// queued. It closes the pre-registration window in which a same-id replay
+/// could see a `queued`/`forwarded=0` row with no forward-attempt slot yet and
+/// be wrongly told "issue a new commandId" (D-055 round 3, item 1): such a
+/// replay must answer the in-flight 409.
+///
+/// In-memory by design: the window is exactly the handling POST's lifetime.
+/// A Hub crash mid-dispatch leaves the row queued, and boot reconciliation
+/// re-drives it exactly like an offline queue.
+static COMMAND_DISPATCH: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISPATCH_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Ownership of one [`COMMAND_DISPATCH`] entry. An armed, owning guard removes
+/// the entry on drop only while it is still the current owner. A guard can be
+/// **disarmed** without removing the entry: the serialized-insert loser must
+/// always disarm rather than drop, because the writer thread can run the other
+/// task's INSERT first and the loser can therefore be the marker OWNER while
+/// the insert winner has not claimed yet (D-055 round 4, item 1).
+struct DispatchGuard {
+    command_id: String,
+    /// 0 means this task does not own the window: it never registered, or it
+    /// registered but lost the insert and has been disarmed.
+    token: u64,
+}
+
+impl DispatchGuard {
+    fn is_owner(&self) -> bool {
+        self.token != 0
+    }
+
+    /// Give up any participation WITHOUT removing the registry entry. Used by
+    /// the insert loser: the winner owns the window from now on, and a
+    /// same-id replay in the gap must keep seeing the in-flight marker.
+    fn disarm(mut self) {
+        self.token = 0;
+    }
+}
+
+impl Drop for DispatchGuard {
+    fn drop(&mut self) {
+        if self.token == 0 {
+            return;
+        }
+        if let Ok(mut dispatch) = COMMAND_DISPATCH.lock()
+            && dispatch.get(&self.command_id) == Some(&self.token)
+        {
+            dispatch.remove(&self.command_id);
+        }
+    }
+}
+
+/// Join the dispatch registry for a client-named commandId BEFORE its row is
+/// inserted. Returns a non-owning guard when a same-id POST is already
+/// dispatching (that task's marker stays in place).
+fn begin_dispatch(command_id: &str) -> DispatchGuard {
+    let mut dispatch = COMMAND_DISPATCH.lock().expect("dispatch registry lock");
+    if let Some(_token) = dispatch.get(command_id).copied() {
+        return DispatchGuard {
+            command_id: command_id.to_owned(),
+            token: 0, // non-owner: the other task's marker stays in place
+        };
+    }
+    let token = DISPATCH_TOKEN.fetch_add(1, Ordering::Relaxed);
+    dispatch.insert(command_id.to_owned(), token);
+    DispatchGuard {
+        command_id: command_id.to_owned(),
+        token,
+    }
+}
+
+/// Become the dispatch owner unconditionally. Used by the serialized-insert
+/// winner when it did not own the pre-insert marker (the store writer ran the
+/// other task's insert first): the loser's non-owning guard drops without
+/// removing this entry.
+fn claim_dispatch(command_id: &str) -> DispatchGuard {
+    let token = DISPATCH_TOKEN.fetch_add(1, Ordering::Relaxed);
+    COMMAND_DISPATCH
+        .lock()
+        .expect("dispatch registry lock")
+        .insert(command_id.to_owned(), token);
+    DispatchGuard {
+        command_id: command_id.to_owned(),
+        token,
+    }
+}
+
+/// Whether a first POST for `command_id` is still between row insertion and
+/// dispatch completion (configure merge + forward registration).
+fn dispatch_in_flight(command_id: &str) -> bool {
+    COMMAND_DISPATCH
+        .lock()
+        .expect("dispatch registry lock")
+        .contains_key(command_id)
+}
+
 /// RAII registration of one forward attempt. `complete` carries the attempt's
 /// settled row; on drop it is published to every follower BEFORE the slot is
 /// removed, then the sender closes. An attempt that ends on an early `Err`
@@ -2353,6 +2603,10 @@ impl Drop for ForwardAttempt {
                 let _ = tx.send(row);
             }
             attempts.remove(&self.command_id);
+            // Bump after the slot is gone: a reader that observes this epoch
+            // can no longer subscribe to this attempt and must take a durable
+            // read that started after the release committed.
+            FORWARD_EPOCH.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -2366,6 +2620,9 @@ fn acquire_forward_leader(command_id: String) -> Option<ForwardAttempt> {
     }
     let (tx, _rx) = tokio::sync::broadcast::channel(FORWARD_ATTEMPT_FOLLOWERS);
     attempts.insert(command_id.clone(), tx);
+    // Bump while the slot is present: a reader that saw no slot before this
+    // point re-reads instead of trusting a row read across the registration.
+    FORWARD_EPOCH.fetch_add(1, Ordering::AcqRel);
     Some(ForwardAttempt {
         command_id,
         completed: None,
@@ -2382,6 +2639,20 @@ fn subscribe_forward_attempt(
         .expect("forward attempts lock")
         .get(command_id)
         .map(tokio::sync::broadcast::Sender::subscribe)
+}
+
+/// Probe the intent registry under its lock, returning both a subscriber for
+/// any active attempt AND the current [`FORWARD_EPOCH`]. Both are observed in
+/// the same critical section, so they form one consistent witness a durable
+/// read can be validated against.
+fn probe_forward_attempt(
+    command_id: &str,
+) -> (Option<tokio::sync::broadcast::Receiver<CommandRecord>>, u64) {
+    let attempts = FORWARD_ATTEMPTS.lock().expect("forward attempts lock");
+    let rx = attempts
+        .get(command_id)
+        .map(tokio::sync::broadcast::Sender::subscribe);
+    (rx, FORWARD_EPOCH.load(Ordering::Acquire))
 }
 
 /// Wait for the subscribed attempt's settled row. `None` means the leader
@@ -2403,25 +2674,63 @@ async fn await_attempt_result(
     }
 }
 
-/// Settle an existing-row replay against any in-flight forward attempt:
-/// - an active attempt publishes THIS attempt's final row, which is returned
-///   verbatim (so a follower never reports a newer attempt's transient
-///   `forwarded=1`, nor a released intent as forwarded);
-/// - otherwise the durable row is re-read now, so an early-path snapshot that
-///   observed a transient flag cannot outlive the attempt that set it.
+/// Settle a command read (GET, or an existing-row replay) against any in-flight
+/// forward attempt, without ever returning an obsolete intent snapshot:
+/// - an active attempt publishes THIS attempt's final row, which the reader
+///   binds to and returns verbatim (so a follower never reports a newer
+///   attempt's transient `forwarded=1`, nor a released intent as forwarded);
+/// - otherwise the durable row is read BETWEEN two samples of the forward
+///   epoch. The row is accepted only when the epoch is identical before and
+///   after the read and no slot is present — together that proves no attempt
+///   registered or released its intent across the read, so a `forwarded=1`
+///   the read saw cannot have been rolled back immediately afterwards. If the
+///   epoch moved, the read raced an attempt; the reader re-probes and re-reads
+///   after observing the new epoch (same-id attempts are serialized, so this
+///   converges rather than spins).
 async fn settled_command_row(state: &AppState, command: CommandRecord) -> CommandRecord {
-    if let Some(rx) = subscribe_forward_attempt(&command.command_id)
-        && let Some(row) = await_attempt_result(rx).await
-    {
-        return row;
+    let command_id = command.command_id.clone();
+    let mut fallback = command;
+    loop {
+        // Probe under the intent lock: an active slot binds this read.
+        let (rx, epoch_before) = probe_forward_attempt(&command_id);
+        if let Some(rx) = rx
+            && let Some(row) = await_attempt_result(rx).await
+        {
+            return row;
+        }
+        let reloaded = state
+            .store
+            .get_command(command_id.clone())
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| fallback.clone());
+        // Re-probe under the SAME lock that registers and removes intents.
+        let (rx_after, epoch_after) = probe_forward_attempt(&command_id);
+        if epoch_after == epoch_before {
+            // No start/finish crossed the read: this row is a stable snapshot.
+            if let Some(rx) = rx_after
+                && let Some(row) = await_attempt_result(rx).await
+            {
+                // Defensive: a slot at an unchanged epoch can only be one the
+                // first probe already saw; bind rather than trust the read.
+                return row;
+            }
+            return reloaded;
+        }
+        // An intent registered and/or released while the read ran. Bind to a
+        // still-active attempt; otherwise take the next read AFTER observing
+        // the post-transition epoch, which therefore includes the release.
+        if let Some(rx) = rx_after
+            && let Some(row) = await_attempt_result(rx).await
+        {
+            return row;
+        }
+        fallback = reloaded;
+        // The epoch also moves on OTHER commands' attempts; yield so a burst
+        // of unrelated forwards costs a few cooperative re-reads, not a spin.
+        tokio::task::yield_now().await;
     }
-    state
-        .store
-        .get_command(command.command_id.clone())
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(command)
 }
 
 fn journal_text(text: &str) -> String {
@@ -3033,7 +3342,9 @@ pub async fn list_instance_commands(
 /// detail path is not an agent read target) and again here. The row must
 /// belong to the instance named in the path — command ids are a global
 /// ledger, so a mismatch answers 404 rather than leaking another instance's
-/// row.
+/// row. A read while a forward attempt is active binds to THAT attempt's
+/// settled row, so it never returns a transient forward intent a concurrent
+/// release (the frame proved never queued) would walk back.
 pub async fn get_instance_command(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3056,6 +3367,7 @@ pub async fn get_instance_command(
     if command.instance_id.as_deref() != Some(instance_id.as_str()) {
         return Err(HubError::NotFound);
     }
+    let command = settled_command_row(&state, command).await;
     Ok(Json(command))
 }
 
@@ -3280,6 +3592,20 @@ pub(crate) async fn forward_if_online(
                     state
                         .store
                         .fail_instance(instance_id, err.to_string())
+                        .await?;
+                } else if command.operation == "instance.configure" {
+                    // Persist the 503 (and its body) WITH the terminal row: a
+                    // configure is non-replayable, so a same-id retry must
+                    // answer the same refusal instead of a replayed 200.
+                    let (http_status, http_body) = err.status_code_and_body();
+                    state
+                        .store
+                        .reject_command_outcome(
+                            command.command_id.clone(),
+                            err.to_string(),
+                            Some(http_status as i64),
+                            Some(http_body.to_string()),
+                        )
                         .await?;
                 } else {
                     state
@@ -3519,8 +3845,141 @@ mod forward_slot_tests {
             updated_at: "t0".to_string(),
             settlement_outcome: None,
             settlement_reason: None,
+            settlement_http_status: None,
+            settlement_http_body: None,
             settlement: None,
         }
+    }
+
+    /// A rejected configure settlement, with only the columns a row actually
+    /// carries (outcome/reason/forwarded; the round-2/3 HTTP-outcome pair is
+    /// left NULL to model a pre-migration row).
+    fn rejected_configure(forwarded: bool, reason: &str) -> CommandRecord {
+        let mut row = attempt_row("cmd_legacy_cfg", forwarded);
+        row.operation = "instance.configure".to_string();
+        row.state = "settled".to_string();
+        row.resolution = "clear".to_string();
+        row.settlement_outcome = Some("rejected".to_string());
+        row.settlement_reason = Some(reason.to_string());
+        row
+    }
+
+    /// D-055 round 3 item 2 / round 4 item 2: legacy persisted failures (NULL
+    /// outcome columns) replay their ORIGINAL status, not 200 — a pre-forward
+    /// merge failure as 500, a NODE_BUSY refusal as 503; the NODE_BUSY
+    /// backfill matches the Hub's exact NODE_BUSY reason ONLY, so an explicit
+    /// Node rejection whose text merely starts with "node busy" still replays
+    /// its 200 row.
+    #[test]
+    fn legacy_rejected_configure_replays_original_status() {
+        // Legacy NODE_BUSY: forwarded rejection (intent marked before the
+        // pre-send refusal), reason exactly the Hub's NodeBusy display.
+        let busy_reason = HubError::NodeBusy {
+            retry_after_ms: crate::transport::NODE_BUSY_RETRY_AFTER_MS,
+        }
+        .to_string();
+        let busy = rejected_configure(true, &busy_reason);
+        let err = replay_configure_settlement(busy).expect_err("legacy NODE_BUSY is an error");
+        assert!(matches!(err, HubError::NodeBusy { .. }), "{err:?}");
+        assert_eq!(err.status_code_and_body().0, 503);
+
+        // Legacy merge failure: rejected, never forwarded -> 500.
+        let merge = rejected_configure(false, "store: invalid effort");
+        let err = replay_configure_settlement(merge).expect_err("merge failure is an error");
+        assert!(matches!(err, HubError::Internal(_)), "{err:?}");
+        assert_eq!(err.status_code_and_body().0, 500);
+
+        // An explicit Node error reply on a non-create command answered 200.
+        let node_reject = rejected_configure(true, "configure rejected by node policy");
+        let row = replay_configure_settlement(node_reject).expect("200 row passes through");
+        assert!(row.forwarded);
+
+        // Round 4, item 2: a Node-supplied reason that only shares the
+        // "node busy" prefix is NOT the Hub's NODE_BUSY — its 200 row must
+        // survive unchanged instead of being rewritten into a 503.
+        for lookalike in [
+            "node busy",
+            "node busy: scheduler queue full",
+            "node busy: try again later",
+        ] {
+            let row = rejected_configure(true, lookalike);
+            let row = replay_configure_settlement(row)
+                .unwrap_or_else(|err| panic!("{lookalike:?} must replay its 200 row, got {err:?}"));
+            assert!(row.forwarded, "{lookalike:?}");
+        }
+
+        // A row that already carries an outcome is never backfilled, even with
+        // the exact NODE_BUSY reason and a missing/unparseable body.
+        let mut half_outcome = rejected_configure(true, &busy_reason);
+        half_outcome.settlement_http_status = Some(503);
+        let row = replay_configure_settlement(half_outcome)
+            .expect("a row with an outcome is left unchanged");
+        assert!(row.forwarded);
+
+        // A round-2 row with a persisted pair replays that exact status/body.
+        let mut persisted = rejected_configure(true, "node busy");
+        persisted.settlement_http_status = Some(503);
+        persisted.settlement_http_body =
+            Some(json!({ "error": "node busy", "code": "NODE_BUSY" }).to_string());
+        let err = replay_configure_settlement(persisted).expect_err("persisted pair replays");
+        let (status, body) = err.status_code_and_body();
+        assert_eq!(status, 503);
+        assert_eq!(body["code"], json!("NODE_BUSY"));
+    }
+
+    /// D-055 round 3, item 1: the dispatch marker reports in-flight for its
+    /// owner's whole POST; a racing non-owner sees it too but its guard drop
+    /// never clears the owner's marker.
+    #[test]
+    fn dispatch_marker_owner_and_non_owner_drop() {
+        let id = "cmd_dispatch_marker_fixture";
+        assert!(!dispatch_in_flight(id));
+        let owner = begin_dispatch(id);
+        assert!(owner.is_owner());
+        assert!(dispatch_in_flight(id));
+        // A racing POST joins but does not own the window.
+        let racer = begin_dispatch(id);
+        assert!(!racer.is_owner());
+        assert!(dispatch_in_flight(id));
+        drop(racer);
+        assert!(
+            dispatch_in_flight(id),
+            "a non-owner drop must not clear the marker"
+        );
+        drop(owner);
+        assert!(!dispatch_in_flight(id));
+    }
+
+    /// D-055 round 4, item 1: under thread preemption the second POST's INSERT
+    /// can reach the serialized writer first, so the FIRST-to-begin POST (the
+    /// marker OWNER) can lose the insert while the winner has not claimed yet.
+    /// The loser must stand down WITHOUT removing the entry — otherwise a
+    /// third same-id POST landing in that gap is wrongly told "issue a new
+    /// commandId" instead of the in-flight 409.
+    #[test]
+    fn insert_loser_that_owns_the_marker_never_clears_it() {
+        let id = "cmd_dispatch_loser_owner_fixture";
+        // POST A begins first and owns the marker.
+        let loser = begin_dispatch(id);
+        assert!(loser.is_owner());
+        // POST B begins second, before the writer has run either INSERT.
+        let winner_to_be = begin_dispatch(id);
+        assert!(!winner_to_be.is_owner());
+        // The writer runs B's INSERT first, then A's. A loses BEFORE B claims.
+        loser.disarm();
+        assert!(
+            dispatch_in_flight(id),
+            "the owner-loser standing down must keep the winner's window covered"
+        );
+        // A's dropped guard stays a no-op after disarm.
+        // B (the insert winner) now claims ownership for its merge/forward.
+        let winner = claim_dispatch(id);
+        drop(winner_to_be);
+        assert!(dispatch_in_flight(id), "the non-owner join never clears");
+        // A third same-id POST during the winner's merge sees the marker.
+        assert!(dispatch_in_flight(id));
+        drop(winner);
+        assert!(!dispatch_in_flight(id), "the winner closes the window");
     }
 
     /// A follower binds to the specific attempt it waited on: attempt 1 rolls

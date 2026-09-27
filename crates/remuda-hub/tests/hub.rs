@@ -4691,9 +4691,11 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
     assert_eq!(status, 200, "{body}");
 
     // Wait until A is terminal (settled/completed) before replaying it: an
-    // accepted configure is still in flight and answers 409.
+    // accepted configure is still in flight and answers 409. Capture the
+    // settled original to compare the replay against — the first POST's body
+    // may already read settled, or accepted, depending on notification timing.
     let detail_a = format!("{path}/{}", id_x.as_id().as_str());
-    wait_command_state(hub.addr, &cookie, &detail_a, "settled").await?;
+    let settled_a = wait_command_state(hub.addr, &cookie, &detail_a, "settled").await?;
 
     // Replay A: read-only. The stored row X comes back, B's spec survives.
     let (status, _, replay) = http(
@@ -4708,8 +4710,8 @@ async fn configure_replay_is_read_only_and_keeps_newer_configuration() -> Result
     let replay: Value = serde_json::from_str(replay.trim())?;
     assert_eq!(replay["replayed"], json!(true));
     assert_eq!(
-        replay["command"], original["command"],
-        "the replay's complete command outcome equals X's original response"
+        replay["command"], settled_a,
+        "the replay's complete command outcome equals X's settled original"
     );
     let (status, _, instance) = http(
         hub.addr,
@@ -4958,6 +4960,109 @@ async fn configure_replay_while_accepted_is_409_in_flight() -> Result<()> {
         "the accepted configure is forwarded exactly once"
     );
     assert_eq!(sends.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+/// D-055 round 3, item 1: in the window between row insertion/merge and
+/// forward-attempt registration, a same-id replay must answer the in-flight
+/// 409 — not the "issue a new commandId" queued rejection. The Node-registry
+/// lookup (which runs immediately before the attempt registers) is held on a
+/// gate, so the first POST is parked deterministically with the row inserted
+/// and no forward slot yet.
+#[tokio::test]
+async fn configure_replay_before_forward_registration_is_409_in_flight() -> Result<()> {
+    let (hub, bootstrap, _dir) = boot().await?;
+    let (cookie, _, enroll) = device_and_enroll(hub.addr, &bootstrap).await?;
+    let host_id = HostId::new();
+    let sends = Arc::new(AtomicUsize::new(0));
+    let configures = Arc::new(AtomicUsize::new(0));
+    let (node, _token) = open_fake_node(hub.addr, &enroll, &host_id, "cfg-prereg").await?;
+    let _link =
+        drive_settling_configure_node(node, sends.clone(), configures.clone(), Duration::ZERO);
+    let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
+    let path = format!("/v1/instances/{instance_id}/commands");
+
+    // Park every Node-registry lookup AFTER the row/merge exist but BEFORE a
+    // forward slot can register.
+    let (release_lookup, hold_lookup) = tokio::sync::oneshot::channel::<()>();
+    hub.test_hold_node_lookups(hold_lookup).await;
+
+    let command_id = remuda_protocol::CommandId::new();
+    let body = json!({
+        "commandId": command_id.as_id().as_str(),
+        "operation": "instance.configure",
+        "payload": { "model": "opus" }
+    })
+    .to_string();
+
+    let addr = hub.addr;
+    let path1 = path.clone();
+    let cookie1 = cookie.clone();
+    let body1 = body.clone();
+    let first = tokio::spawn(async move {
+        http(addr, "POST", &path1, &[("Cookie", &cookie1)], Some(&body1)).await
+    });
+
+    // Wait until the row exists (GET takes no Node-registry lock).
+    let detail = format!("{path}/{}", command_id.as_id().as_str());
+    let row = loop {
+        let (status, _, row) = http(hub.addr, "GET", &detail, &[("Cookie", &cookie)], None).await?;
+        if status == 200 {
+            break serde_json::from_str::<Value>(row.trim())?;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(row["state"], json!("queued"), "{row}");
+    assert_eq!(row["forwarded"], json!(false), "{row}");
+
+    // The first POST is parked: merge done, forward not registered.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &first)
+            .await
+            .is_err(),
+        "the first POST must stay parked while the registry lookup is held"
+    );
+
+    // A same-id replay in this exact window gets the in-flight 409.
+    let (status, _, conflict) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 409, "{conflict}");
+    let conflict: Value = serde_json::from_str(conflict.trim())?;
+    assert_eq!(conflict["code"], json!("COMMAND_ID_CONFLICT"), "{conflict}");
+    assert!(
+        conflict["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("still in flight"),
+        "pre-registration replay must be in-flight, not a new-command rejection: {conflict}"
+    );
+
+    // Release the lookup: the forward registers once and the configure settles.
+    release_lookup.send(()).expect("holder alive");
+    let (status, _, posted) = first.await??;
+    assert_eq!(status, 200, "{posted}");
+    assert_eq!(
+        serde_json::from_str::<Value>(posted.trim())?["replayed"],
+        json!(false)
+    );
+
+    wait_command_state(hub.addr, &cookie, &detail, "settled").await?;
+    assert_eq!(
+        configures.load(Ordering::Relaxed),
+        1,
+        "the configure forwards exactly once after the window closes"
+    );
+    assert_eq!(sends.load(Ordering::Relaxed), 0);
+
+    // Terminal replay now returns the stored row.
+    let (status, _, replay) =
+        http(hub.addr, "POST", &path, &[("Cookie", &cookie)], Some(&body)).await?;
+    assert_eq!(status, 200, "{replay}");
+    assert_eq!(
+        serde_json::from_str::<Value>(replay.trim())?["replayed"],
+        json!(true)
+    );
+    assert_eq!(configures.load(Ordering::Relaxed), 1);
     Ok(())
 }
 
@@ -5278,12 +5383,12 @@ async fn get_command_during_in_flight_send_reports_the_attempt_outcome() -> Resu
     Ok(())
 }
 
-/// D-055 round 2, item 3: GET on a configure whose forward attempt releases
+/// D-055 round 3, item 3: GET on a configure whose forward attempt releases
 /// its intent and rolls back (`Ok(None)` — the frame never queued on the Node)
 /// must never return an obsolete `forwarded=true` snapshot followed by the
-/// rolled-back `forwarded=false` row. The read binds to the attempt or reads
-/// state and intent under one epoch witness. Unlike the send test above, the
-/// Node here REFUSES the forward rather than accepting it.
+/// rolled-back `forwarded=false` row. The forward attempt is held open with a
+/// GATED transport until the test has GET requests BLOCKED, bound to that
+/// attempt mid-flight; those GETs then all resolve to the released row.
 #[tokio::test]
 async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<()> {
     let (hub, bootstrap, _dir) = boot().await?;
@@ -5291,7 +5396,7 @@ async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<(
     let host_id = HostId::new();
     let sends = Arc::new(AtomicUsize::new(0));
     // A real node long enough to create the instance, then it is replaced by a
-    // live transport that refuses every frame BEFORE queueing (Ok(None)).
+    // gated transport that blocks the forward RPC until this test opens it.
     let (node_token, link) = accepting_node(
         hub.addr,
         &enroll,
@@ -5303,9 +5408,9 @@ async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<(
     let instance_id = create_print_instance(hub.addr, &cookie, host_id.as_id().as_str()).await?;
     link.abort();
     wait_host_online(hub.addr, &cookie, host_id.as_id().as_str(), false).await?;
-    // Host row live, but every RPC reports the frame was never queued.
-    hub.test_set_node_reply(host_id.as_id().as_str(), None)
-        .await;
+    // Host row live; every RPC blocks on the gate, then reports the frame was
+    // never queued.
+    let gate = hub.test_set_node_gated(host_id.as_id().as_str()).await;
 
     let path = format!("/v1/instances/{instance_id}/commands");
     let command_id = remuda_protocol::CommandId::new();
@@ -5324,37 +5429,80 @@ async fn get_configure_during_rolled_back_forward_never_walks_back() -> Result<(
         http(addr, "POST", &path1, &[("Cookie", &cookie1)], Some(&body1)).await
     });
 
-    // Poll through the mark-intent → rollback window. A read must never see
-    // forwarded=true on a queued row, and a forwarded=true must never walk
-    // back to forwarded=false.
     let detail = format!("{path}/{}", command_id.as_id().as_str());
-    let mut saw_intent = false;
-    let mut observations = Vec::new();
-    for _ in 0..40 {
-        if post.is_finished() {
-            break;
+
+    // Probe until a GET stays pending: that is a GET bound to the in-flight
+    // attempt (the attempt published nothing yet). Pre-attempt 200s, if any,
+    // must already show the honest queued/unforwarded shape. A slow pre-window
+    // read is distinguished from a bound one by confirming it is still pending
+    // in a second window.
+    let bound = loop {
+        assert!(
+            !post.is_finished(),
+            "the POST finished before a GET bound to its attempt"
+        );
+        let mut probe = tokio::spawn({
+            let addr = hub.addr;
+            let detail = detail.clone();
+            let cookie = cookie.clone();
+            async move { http(addr, "GET", &detail, &[("Cookie", &cookie)], None).await }
+        });
+        if tokio::time::timeout(Duration::from_millis(400), &mut probe)
+            .await
+            .is_err()
+            && tokio::time::timeout(Duration::from_millis(300), &mut probe)
+                .await
+                .is_err()
+        {
+            // Pending through both windows: bound to the active attempt.
+            break probe;
         }
-        let (status, _, row) = http(hub.addr, "GET", &detail, &[("Cookie", &cookie)], None).await?;
-        if status == 404 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            continue;
+        // It returned: only 404 (pre-insert) or the honest queued row are
+        // allowed before the attempt registers.
+        if let Ok(Ok((status, _, row))) = probe.await? {
+            if status == 404 {
+                continue;
+            }
+            assert_eq!(status, 200, "{row}");
+            let row: Value = serde_json::from_str(row.trim())?;
+            assert_eq!(row["state"], json!("queued"), "pre-window row: {row}");
+            assert_eq!(row["forwarded"], json!(false), "pre-window row: {row}");
         }
+    };
+    // Two more GETs, all bound to the same open attempt.
+    let mut blocked: Vec<tokio::task::JoinHandle<Result<(u16, String, String)>>> = vec![bound];
+    blocked.extend((0..2).map(|_| {
+        tokio::spawn({
+            let addr = hub.addr;
+            let detail = detail.clone();
+            let cookie = cookie.clone();
+            async move { http(addr, "GET", &detail, &[("Cookie", &cookie)], None).await }
+        })
+    }));
+
+    // None of the bound GETs may resolve or show forwarded=true while the
+    // attempt is open.
+    for handle in &mut blocked {
+        let pending = tokio::time::timeout(Duration::from_millis(300), handle)
+            .await
+            .is_err();
+        assert!(pending, "a GET returned while the forward attempt was open");
+    }
+
+    // Release the attempt: the frame never queued, the intent rolls back.
+    gate.open_gate().await;
+
+    // The bound GETs now all resolve to the released row — never an intent
+    // snapshot, never a forwarded=true walk-back.
+    for handle in blocked {
+        let (status, _, row) = handle.await??;
         assert_eq!(status, 200, "{row}");
         let row: Value = serde_json::from_str(row.trim())?;
-        let state = row["state"].as_str().unwrap_or("").to_string();
-        let forwarded = row["forwarded"].as_bool().unwrap_or(false);
-        observations.push((state.clone(), forwarded));
-        assert!(
-            !(state == "queued" && forwarded),
-            "GET exposed the transient forward intent before rollback: {observations:?}"
-        );
-        if forwarded {
-            saw_intent = true;
-        } else if saw_intent {
-            panic!("a rolled-back intent was read after forwarded=true: {observations:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(row["state"], json!("queued"), "{row}");
+        assert_eq!(row["forwarded"], json!(false), "{row}");
+        assert_eq!(row["resolution"], json!("clear"), "{row}");
     }
+
     let (status, _, posted) = post.await??;
     assert_eq!(status, 200, "{posted}");
     let posted: Value = serde_json::from_str(posted.trim())?;

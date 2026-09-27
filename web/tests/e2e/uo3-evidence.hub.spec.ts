@@ -35,6 +35,31 @@ const shotDir = path.resolve(
 const evidence = process.env.REMUDA_EVIDENCE === "1";
 const created: string[] = [];
 
+/**
+ * Isolation token. The hub gate runs the WHOLE suite against one shared Hub,
+ * so earlier specs leave sessions and pending approvals behind. Every UO-3
+ * session carries a unique token in its prompt (which is its initial title):
+ *  - row counts are scoped by filtering the home search to that token
+ *    (QuickFind matches the title; the token appears nowhere else);
+ *  - badge counts are asserted as deltas against the value before setup.
+ */
+function uniqueToken(): string {
+  return `uo3-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36).slice(-4)}`;
+}
+
+/** Global PhoneNav pending badge, or 0 when no badge is rendered. */
+async function badgeCount(page: Page): Promise<number> {
+  const badge = page.getByTestId("phone-inbox-badge");
+  if ((await badge.count()) === 0) return 0;
+  return Number((await badge.textContent())?.trim() ?? "0");
+}
+
+/** Filter the home list to the one session whose title carries the token. */
+async function expectOneScopedRow(page: Page, token: string) {
+  await page.getByTestId("home-search").fill(token);
+  await expect(page.getByTestId("home-row")).toHaveCount(1);
+}
+
 async function shoot(page: Page, name: string): Promise<void> {
   if (!evidence) return;
   await mkdir(shotDir, { recursive: true });
@@ -99,13 +124,24 @@ test("390 iPhone: /m chrome is 52+52 with no chips row and no tab strip, and Pho
 }) => {
   const context = await phoneContext(browser);
   const page = await context.newPage();
+  const token = uniqueToken();
   try {
     await login(page);
-    await createSession(page, "UO-3 chrome blocked");
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
-    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
-    await expect(page.getByTestId("home-row")).toHaveCount(1);
+    const badgeBefore = await badgeCount(page);
+    await createSession(page, `mhome-blocked UO-3 chrome ${token}`);
+    await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    // The badge is a GLOBAL pending count on a shared gate Hub: assert our
+    // one blocked approval raised it by exactly one, never an absolute value.
+    await expect
+      .poll(() => badgeCount(page), { timeout: 15_000 })
+      .toBe(badgeBefore + 1);
+    // Scoped to our unique title token: exactly our one row, regardless of
+    // sessions other specs left behind.
+    await expectOneScopedRow(page, token);
+    await expect(page.getByTestId("home-row")).toHaveAttribute("data-status", "blocked");
 
     const head = page.locator('[data-testid="home-list"] > header');
     await expect(head).toBeVisible();
@@ -306,20 +342,17 @@ test("1440 desktop: /m redirects to /sessions and no phone chrome renders", asyn
 test("both appearances resolve role tokens at 390 and 1440", async ({ browser }) => {
   const context = await phoneContext(browser);
   const desktop = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const token = uniqueToken();
   try {
     const page = await context.newPage();
     await login(page);
-    await createSession(page, "mhome-blocked UO-3 appearances");
+    await createSession(page, `mhome-blocked UO-3 appearances ${token}`);
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
-    await expect(page.getByTestId("home-row")).toHaveCount(1);
-    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
-    // Wait for the instance itself to settle into blocked (badge leads by a
-    // poll): the committed frame shows the ⚠ row and the group's 1 待处理.
-    await expect(page.getByTestId("home-row")).toHaveAttribute("data-status", "blocked", {
-      timeout: 15_000,
-    });
-    await expect(page.getByTestId("home-group")).toHaveAttribute("data-blocked", "1");
+    // Scope to our one blocked session before any count/frame assertion.
+    await expectOneScopedRow(page, token);
+    const scopedRow = page.getByTestId("home-row");
+    await expect(scopedRow).toHaveAttribute("data-status", "blocked", { timeout: 15_000 });
     // Dismiss the install hint so the committed frames show only the 52+52
     // head and the row (the banner is surface chrome above the home, not it).
     const dismiss = page.getByRole("button", { name: "知道了" });
@@ -371,17 +404,27 @@ test("perf: gaining pending bottom-bar interactions never commits HomeList", asy
 }) => {
   const context = await phoneContext(browser);
   const page = await context.newPage();
+  const token = uniqueToken();
+  let instanceId = "";
   try {
     await login(page);
-    // One blocked session (the create flow parks on a pending approval).
-    await createSession(page, "UO-3 perf badge");
+    // One blocked session of OUR OWN (the create flow parks on a pending
+    // approval); every count below is scoped to it because the gate Hub is
+    // shared with the rest of the suite.
+    instanceId = await createSession(page, `mhome-blocked UO-3 perf ${token}`);
     await page.goto("/m?profile=1");
     await expect(page.getByTestId("home-list")).toBeVisible();
-    const badge = page.getByTestId("phone-inbox-badge");
-    await expect(badge).toHaveText("1", { timeout: 15_000 });
+    // Global pending count at the moment our approval has landed: the
+    // measurement asserts deltas from this, never an absolute value.
+    await expect
+      .poll(() => badgeCount(page), { timeout: 15_000 })
+      .toBeGreaterThanOrEqual(1);
+    const baseBadge = await badgeCount(page);
+    // Scope the list to our one row and wait for its live branch + blocked
+    // state so those legitimate commits land before the measurement window.
+    await page.getByTestId("home-search").fill(token);
     await expect(page.getByTestId("home-row")).toHaveCount(1);
-    // Wait for the live git-branch hydration to finish so its one legitimate
-    // commit cannot land inside the badge-only measurement window.
+    await expect(page.getByTestId("home-row")).toHaveAttribute("data-status", "blocked");
     await expect(page.getByTestId("home-group")).toContainText("feat/workbench-g2", {
       timeout: 15_000,
     });
@@ -416,7 +459,9 @@ test("perf: gaining pending bottom-bar interactions never commits HomeList", asy
         )
       ).filter((probe) => probe.kind === "commit:HomeList").length;
 
-    // The interactions list gets `extra` extra pending rows per response.
+    // The interactions list gets `extra` extra pending rows per response, all
+    // cloned from OUR instance's pending interaction (never another spec's
+    // row), so the global badge climbs by exactly `extra`.
     let extra = 0;
     await page.route("**/v1/interactions", async (route) => {
       try {
@@ -427,15 +472,18 @@ test("perf: gaining pending bottom-bar interactions never commits HomeList", asy
         const response = await route.fetch();
         const body = (await response.json()) as { items?: Array<Record<string, unknown>> };
         const items = [...(body.items ?? [])];
-        const first = items.find((item) => item.state === "pending");
-        if (first && extra > 0) {
+        // Clone the pending approval that belongs to the session we created.
+        const mine = items.find(
+          (item) => item.state === "pending" && item.instanceId === instanceId,
+        );
+        if (mine && extra > 0) {
           for (let n = 0; n < extra; n += 1) {
-            const suffix = `_synth_${items.length}_${n}`;
+            const suffix = `_uo3synth_${items.length}_${n}`;
             items.push({
-              ...first,
-              id: `${String(first.id ?? "int")}${suffix}`,
-              interactionId: first.interactionId
-                ? `${String(first.interactionId)}${suffix}`
+              ...mine,
+              id: `${String(mine.id ?? "int")}${suffix}`,
+              interactionId: mine.interactionId
+                ? `${String(mine.interactionId)}${suffix}`
                 : undefined,
             });
           }
@@ -458,27 +506,32 @@ test("perf: gaining pending bottom-bar interactions never commits HomeList", asy
       const { hubStore } = await import("/src/lib/store.ts");
       await hubStore.refresh();
     });
-    await expect(badge).toHaveText("1");
+    await expect
+      .poll(() => badgeCount(page), { timeout: 5_000 })
+      .toBe(baseBadge);
     await page.waitForTimeout(600);
     const baseline = await homeCommits();
     expect(baseline, "HomeList mounted under the profiler").toBeGreaterThan(0);
 
-    // Badge climbs 1→2→3→4 while the single blocked row is pixel-identical;
-    // the cached HomeList slice bails out every time. The 2s poll between
-    // driven refreshes is covered too: replay the frozen instance snapshot
-    // three extra times and assert the counter never drifts.
-    for (const next of [2, 3, 4]) {
-      extra = next - 1;
+    // The global badge climbs by exactly one per synthetic pending on OUR
+    // instance while the single scoped row is pixel-identical; the cached
+    // HomeList slice bails out every time. The 2s poll between driven
+    // refreshes is covered too.
+    for (const k of [1, 2, 3]) {
+      extra = k;
       await page.evaluate(async () => {
         const { hubStore } = await import("/src/lib/store.ts");
         await hubStore.refresh();
       });
-      await expect(badge).toHaveText(String(next), { timeout: 5_000 });
+      await expect
+        .poll(() => badgeCount(page), { timeout: 5_000 })
+        .toBe(baseBadge + k);
       await expect(page.getByTestId("home-row")).toHaveCount(1);
       await page.waitForTimeout(2200);
-      expect(await homeCommits(), `badge ${next - 1}→${next} (+ one 2s poll) does not commit HomeList`).toBe(
-        baseline,
-      );
+      expect(
+        await homeCommits(),
+        `badge +${k} (and one 2s poll) does not commit HomeList`,
+      ).toBe(baseline);
     }
     // Stop intercepting before the context closes so no route.fetch can race
     // cleanup teardown.

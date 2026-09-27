@@ -9,7 +9,7 @@ export type ProbeResult =
 const CLAUDE: HostCli = {
   kind: "claude",
   version: "2.1.268",
-  path: "/home/devuser/.local/bin/claude",
+  path: "/opt/claude/bin/claude",
   auth: "unknown",
 };
 

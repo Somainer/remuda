@@ -1144,7 +1144,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 - 不打包衬线或 CJK webfont；不做阅读字体偏好。
 - 不做调色板选择器、URL 参数外观、顶栏主题开关、阅读模式、检查器。
-- 不做数学排版、交互可视化、成果预览。
+- 不做交互可视化、成果预览（数学排版按所有者 2026-09-24 要求移入范围，见文末 addendum 第 15 条）。
 - 不做新建 Task 的界面；不做 compact 看板分段。
 - 不改路由、wire、端点；不新增轮询；不做第二份 transcript；不做手机专用会话路由。
 - 审批卡不显示 risk、置信度，也不断言会话边界。
@@ -1158,5 +1158,19 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 2. UI 与正文同用系统无衬线字体，不打包衬线或 CJK webfont（2A）；
 3. 只发布「墨」一套调色板，深色、浅色两态（3A）；
 4. 会话有 `instance.taskId` 时 tab 集合是该 Task 的会话，否则是所在 Space 的会话；⌘1..9 跟随眼前的可见编号（4A）。
+
+**Addendum 2026-09-24（所有者，c-math）：数学排版移入范围。** 所有者 2026-09-24 附截图反馈「现在 latex 公式没有渲染」：transcript 里 `$$…$$` 既原样显示又被 markdown 破坏（下划线变强调、反斜杠丢失）。本 addendum 只新增第 15 条并把「不做什么」中的「数学排版」移出，不动其它条文。规则：
+
+15. **Transcript 数学排版（KaTeX）。**
+    - 引擎 KaTeX，`output: htmlAndMathml`（保留 MathML 可达性）、`throwOnError:false`（坏公式以错误样式显示 TeX 源码，绝不炸消息）、`trust:false`（禁 `\href`/`\url`/html 类指令）、`strict:"ignore"`。
+    - 定界符与结构（round-3 定稿）：`$$…$$`/`\[…\]` 为 display，`$…$`/`\(…\)` 为 inline。**代码归属解析器**：用与渲染相同的 remark+gfm（不带 math）解析一次取 `code`/`inlineCode`/`html` 区间，扫描整段跳过（含缩进 `  ~~~` 等形态；带「可能含代码」廉价预检，无代码的对抗输入不碰解析器）。扫描只做单趟线性的就地改写：`\(x\)`→`$x$`、`\[x\]`→`$$x$$` 同行替换，**绝不注入换行/fence、不碰列表 marker/`>`**；`$`/`$$` 的容器/段落/空行交给 remark-math，`- before $$x$$ after`、`> before $$x$$ after`、`- \[x\]` 的公式留在列表项/引用内并由 mdast provenance 标记成 display 块，`    $$x$$` 仍是缩进代码。四个 100 KB 对抗输入 best-of-7 仅 2.9–31ms（`"\(".repeat(50000)`、`"$$x\n\n".repeat(20000)`、`"$1".repeat(50000)`、100 KB 公式）。
+    - 单 `$` 走 pandoc 口径，且**配对即逃逸**：任何不是已接受配对定界符的 `$` 都输出为 `\$`，remark-math 不可能配出与扫描器不同的结果。开 `$` 后非空白、闭 `$` 前非空白且其后非数字：「Cost $5 and $10; use $x$.」只有 x 是数学，「花了 $5 和 $10」、`echo $HOME and $PATH` 保持文本；`$PATH:$HOME` 与 pandoc 一致仍算数学；`\$` 为字面量。
+    - 工作量边界与懒加载：KaTeX（JS+CSS+字体）为独立 chunk，无数学的消息/页面零请求。固定 `maxSize:20em`、`maxExpand:1000`；源码超过 4000 字符直接跳过引擎、中性显示源码（100 KB 钉住）；成功 HTML 按 `(source,display)` 记忆化；chunk 失败不粘性——下一条挂载的组件从 `loading` 重新 import（先 reject 再成功的组件回归）。占位保留到引擎就绪**且** KaTeX 主字面 `document.fonts.load()` 就绪（`.catch` 兜底，配合 `font-display:swap`），不靠定时器、不出现不可见字形；行高变化由 Transcript 既有的 per-row ResizeObserver 重新测量，无需改 Transcript。
+    - 消毒与 provenance：真正的 mdast math 节点由 remark 插件在 `node.data.hProperties.dataMath` 打 `inline`/`display`（flow 在 `<pre>`、同线 `$$`/`$` 在 `<code>`），sanitizer 仅对 `pre`/`code` 放行 `dataMath` 一个属性。` ```mathdisplay `、` ```mathinline `、`~~~math` 围栏无 mdast math 节点，走 CodeBlock 且不加载 KaTeX。KaTeX 输出是生成 HTML，不允许消息原始 HTML 透传。
+    - 流式（G）：消息末尾真正悬空的最后一个 `$$`/`\[`（EOF 前无闭合），其整段尾巴作为**纯 React 文本节点**（`math-literal`）渲染，定界符、反斜杠、`\*`、`_` 原样、不经 markdown、无 `<em>`（`intro \[a *b* + \{c\}` 精确可见文本）；闭合后才整体成为公式。空行（E）：`$$\n\nx\n\n$$y$$\n\n$z$` 第一个坏 run 只杀死自己，`$$y$$` 与 `$z$` 都渲染。
+    - 版式与主题：公式只用 currentColor，深浅两态都正确；display 在阅读列内居中、超宽自身横向滚动、超高被 maxSize 钳制，页面不横向滚动；占位/skip 节点 `max-width:100%` 且自身滚动/换行，transcript 不横滚。inline **不设高度上限**：普通公式（`$x^2$`、`$\frac ab$`、`$\sum$`、`$\sqrt{}$`）段落高度在单行 +2px 内（e2e 钉），显式高公式（`\dfrac`/`\displaystyle`/矩阵）允许撑大所在行（round-3 放宽 J）。
+    - 复制：选中并复制公式得到其 TeX 源码。
+    - fenceBalance（UO-5）：该文件落地后需用与 MarkdownText 相同的 remark 插件（含 remark-math），并以独立提交修复「被无 `>` 空行结束的引用围栏仍被追加闭合」（仅当 code 节点真正到达 EOF 才追加闭合）。
+    - 机械取值见 [visual-system.md](./visual-system.md) §10。许可证（MIT）已入库 `web/LICENSES/KaTeX-MIT.txt` 并登记于根 NOTICE。
 
 **依据**：[visual-system.md](./visual-system.md)（令牌契约与对比度全集）。代码锚点在 `42ccd7ee` 上复核：`web/src/styles/tokens.css:1-196`、`web/src/styles/ui.module.css:10-15,52,323-324,356-372,386-391`、`web/src/features/session/tty/theme.ts:15-68`、`web/src/pages/SessionPage.tsx:95,154,452-596,669`、`web/src/app/Shell.tsx:207-237,337`、`web/index.html:2,9`、`crates/remuda-hub/src/web.rs:1-9,100-107`。

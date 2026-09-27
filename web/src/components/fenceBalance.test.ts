@@ -48,6 +48,26 @@ describe("balanceFences", () => {
   it("leaves indented code that starts with a backtick run alone", () => {
     expect(balanceFences("    ```\n    more")).toBe("    ```\n    more");
   });
+
+  it("does not re-close a quoted fence already ended by an unprefixed blank line", () => {
+    // The blank line ends the blockquote; the parser's code node stops before
+    // it, so no closer belongs on complete text (c-math r3 addendum).
+    const complete = "> ```\n> abc\n\n";
+    expect(balanceFences(complete)).toBe(complete);
+    // Every streaming cut renders exactly as many code blocks as the complete
+    // text — one — whether or not a closer was synthesised mid-stream.
+    const want = shape(complete);
+    expect(want).toEqual(["li0/quote1"]);
+    for (let cut = complete.indexOf("abc"); cut <= complete.length; cut += 1) {
+      expect(shape(balanceFences(complete.slice(0, cut))), `cut ${cut}`).toEqual(want);
+    }
+    // CRLF blank line ends the container the same way.
+    const crlf = "> ```\r\n> abc\r\n\r\n";
+    expect(balanceFences(crlf)).toBe(crlf);
+    // An unquoted whitespace-only line ends it too; a quoted blank does not.
+    expect(balanceFences("> ```\n> abc\n  ")).toBe("> ```\n> abc\n  ");
+    expect(balanceFences("> ```\n> abc\n> \n")).not.toBe("> ```\n> abc\n> \n");
+  });
 });
 
 /**

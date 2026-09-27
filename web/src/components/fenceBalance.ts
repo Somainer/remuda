@@ -16,6 +16,7 @@
  */
 import Markdown, { type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
 type Point = { offset?: number };
 type MdNode = {
@@ -40,7 +41,7 @@ function parse(text: string): MdNode | null {
     tree = root;
     return { type: "root", children: [] };
   };
-  const plugins = [remarkGfm, capture] as NonNullable<Options["remarkPlugins"]>;
+  const plugins = [remarkGfm, remarkMath, capture] as NonNullable<Options["remarkPlugins"]>;
   Markdown({ children: text, remarkPlugins: plugins });
   return tree;
 }
@@ -62,8 +63,13 @@ export function balanceFences(text: string): string {
   const start = code?.position?.start.offset;
   const end = code?.position?.end.offset;
   if (!code || code.type !== "code" || start === undefined || end === undefined) return text;
-  // Only a block that runs to the end of the text can be the open one.
-  if (text.slice(end).trim() !== "") return text;
+  // Only a code node the parser still holds open at EOF gets a closer. The
+  // node reaches EOF when nothing follows it but at most one terminal line
+  // break (mdast excludes the trailing newline, and a quoted blank
+  // continuation `> \n` leaves just `\n`). A second newline — an unprefixed
+  // blank line — already ended the quote/list container, and trailing
+  // whitespace after it is not "still open".
+  if (!/^\r?\n?$/.test(text.slice(end))) return text;
   // A fenced block starts on its fence run; indented code starts on its
   // indent and has no fence to close.
   const opener = OPENER.exec(text.slice(start));

@@ -5,10 +5,7 @@ import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import {
-  COMPACT_WORKBENCH_QUERY,
-  useWorkbenchViewport,
-} from "../../../lib/viewport";
+import { useWorkbenchViewport } from "../../../lib/viewport";
 import { hubStore } from "../../../lib/store";
 import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
@@ -48,6 +45,11 @@ import {
   trackingActive,
 } from "./mouseReports";
 import { createReplayGuard, groupByOrigin, type OutChunk } from "./replayGuard";
+import {
+  createSizeReconciler,
+  type Grid,
+  type SizeReconciler,
+} from "./sizeReconciler";
 import { applyStdinPolicy, stdinPolicy } from "./stdinPolicy";
 import { StaleScreenBadge } from "./StaleScreenBadge";
 import { terminalThemeFor, TERMINAL_FONT_FAMILY } from "./theme";
@@ -56,7 +58,8 @@ import css from "./TerminalView.module.css";
 export type TtyLabHandle = {
   disconnect: () => void;
   reconnect: () => void;
-  /** PTY resize commands sent since the last reset (UO-10 keyboard freeze). */
+  // UO-10: PTY resize accounting, exposed on window.__ttyLab for the keyboard
+  // freeze / rotation / mode-cycle assertions.
   resizeCount: () => number;
   resetResizeCount: () => void;
   /** Full scrollback text (UO-10 live-switch test). */
@@ -69,8 +72,8 @@ export type TtyLabHandle = {
     baseY: number;
     viewportY: number;
   };
-  // UO-10 round-5: grid of the most recent PTY resize (resize-scheduling
-  // tests assert the PTY ends at the final xterm grid).
+  // Grid of the most recent resize actually sent to the PTY (round-6
+  // reconciler tests assert the PTY ends at the final xterm grid).
   lastResize: () => { cols: number; rows: number } | null;
   // UO-10 round-5: drive xterm's scrollback (fires onScroll like the wheel
   // and touch paths) for the frozen-crop re-anchor test.
@@ -307,60 +310,13 @@ export function TerminalView({
     const outQueue: OutChunk[] = [];
     const replayGuard = createReplayGuard();
     let outRaf = 0;
-    let resizeTimer = 0;
-    // UO-10: PTY resize accounting. `sentGrid` is the cols/rows last pushed
-    // to the PTY; fits that yield the same grid do NOT send again (so a
-    // keyboard open/close that changes only the viewport height, never the
-    // fitted grid, produces zero resize commands). `sentCount` is exposed on
-    // window.__ttyLab for the m-realdevice freeze assertion.
-    let sentGrid = { cols: -1, rows: -1 };
-    let sentCount = 0;
-    // Grid of the most recent resize actually sent to the PTY.
-    let lastSent: { cols: number; rows: number } | null = null;
-    const sendPtyResize = (cols: number, rows: number) => {
-      if (sentGrid.cols === cols && sentGrid.rows === rows) return;
-      sentGrid = { cols, rows };
-      sentCount += 1;
-      lastSent = { cols, rows };
-      void sessionRef.current?.resize(cols, rows);
-    };
-    /**
-     * UO-10 round-2 resize gate.
-     *
-     * A keyboard open is a HEIGHT-only shrink: the visual viewport loses
-     * height while the layout width (and therefore the fitted cols) stays
-     * constant. Such transitions must never refit or resize the PTY — the
-     * grid is frozen at its pre-keyboard value.
-     *
-     * A WIDTH change (rotation, split view) is a genuine layout change even
-     * while the keyboard is open: cols really do change, so it must refit and
-     * send exactly one resize.
-     *
-     * Returns:
-     *  - "freeze"  → keyboard height-only transition: skip fit, and restore
-     *               the frozen grid if an intermediate sub-threshold frame
-     *               already resized xterm before data-keyboard was stamped;
-     *  - "defer"   → compact, keyboard in the first <120px of opening: the
-     *               gesture may still reach the freeze threshold, so wait;
-     *  - "fit"     → normal layout change, fit and resize.
-     */
-    let frozenGrid: { cols: number; rows: number } | null = null;
-    // Width at the moment the freeze began; rotation is a width change
-    // relative to this. Refreshed on rotation commit.
-    const frozenClientWidthRef = { current: host.clientWidth };
-    // Kept fresh by the ResizeObserver (which fires before applyFit reads
-    // clientWidth on rotation, so the comparison is not a self-equal).
-    let observedClientWidth = host.clientWidth;
-    // UO-10 round-5: the grid the PTY was last told about, and the grid a
-    // pending 40ms timer is about to send. Scheduling is target-aware:
-    //  - a fit whose final grid already equals sentGrid schedules nothing
-    //    (this also neutralises a W0→W1→W0 bounce: W0 cancels the pending
-    //    W1 and sends nothing);
-    //  - a fit with a new grid replaces the pending timer, so the LAST grid
-    //    computed in a burst (fit→fixed→responsive, repeated refits) always
-    //    produces exactly one resize;
-    //  - a committed rotation refreshes frozenGrid so a later same-width
-    //    keyboard event keeps the new cols instead of rolling them back.
+    // UO-10 round-6: ONE size reconciler owns the grid. It tracks lastSent
+    // (what the PTY was told) and keyboardHold (rows pinned while the soft
+    // keyboard is open), applies every recomputed desired grid to xterm
+    // immediately, and debounces a single PTY send. No freeze/defer/fit gate,
+    // no rotation flag, no frozen snapshot, no per-event cancellation — see
+    // sizeReconciler.ts. Constructed after measureDesired/applyGrid below.
+    let reconciler!: SizeReconciler;
     /**
      * UO-10 round-4 item 4: while frozen, position the pre-keyboard-sized
      * host inside the clipped viewport so the PAINTED cursor row (which
@@ -402,76 +358,6 @@ export function TerminalView({
       );
       host.style.transform = `translateY(${-Math.round(offsetRows * cellH)}px)`;
     };
-    /**
-     * UO-10 round-5: target-aware PTY resize scheduling.
-     *
-     * Guarantees the PTY ends with exactly the FINAL xterm grid after any
-     * burst of fits: identical targets coalesce (and a W0→W1→W0 bounce sends
-     * nothing), distinct targets replace the pending timer. A rotation
-     * (fitted while the keyboard is already open) is allowed to commit even
-     * though data-keyboard stays stamped; a keyboard that OPENS after a fit
-     * was scheduled cancels that resize. On commit the frozen snapshot is
-     * refreshed so subsequent same-width keyboard events keep the new cols.
-     */
-    const schedulePtyResize = (
-      cols: number,
-      rows: number,
-      opts: { rotation: boolean },
-    ) => {
-      // Already at this grid: drop any stale pending timer (this is what
-      // neutralises a bounce back to the committed width).
-      if (sentGrid.cols === cols && sentGrid.rows === rows) {
-        if (resizeTimer) {
-          window.clearTimeout(resizeTimer);
-          resizeTimer = 0;
-        }
-        return;
-      }
-      const keyboardOpenAtSchedule =
-        document.documentElement.dataset.keyboard === "1";
-      window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(() => {
-        resizeTimer = 0;
-        const keyboardOpenNow =
-          document.documentElement.dataset.keyboard === "1";
-        // Keyboard opened AFTER a normal fit was scheduled: drop it (the
-        // freeze path will drive the next resize). A rotation scheduled
-        // while the keyboard was already open commits normally.
-        if (keyboardOpenNow && !keyboardOpenAtSchedule && !opts.rotation) {
-          return;
-        }
-        if (term) sendPtyResize(cols, rows);
-        sentGrid = { cols, rows };
-        // Bug 1 fix: a committed rotation becomes the new frozen baseline so
-        // a later same-width keyboard event does not roll xterm back.
-        if (opts.rotation) {
-          frozenGrid = { cols, rows };
-          frozenClientWidthRef.current = observedClientWidth;
-        }
-      }, 40);
-    };
-    const keyboardState = (): "freeze" | "defer" | "fit" => {
-      const vv = window.visualViewport;
-      if (!vv) return "fit";
-      const isCompact = window.matchMedia(COMPACT_WORKBENCH_QUERY).matches;
-      const heightLoss = window.innerHeight - vv.height;
-      // Genuine rotation: client width changed while the keyboard is open.
-      const widthChanged =
-        document.documentElement.dataset.keyboard === "1" &&
-        frozenGrid !== null &&
-        observedClientWidth !== frozenClientWidthRef.current;
-      if (vv.scale !== 1) return "fit";
-      if (document.documentElement.dataset.keyboard === "1") {
-        // Keyboard fully open. A width change still refits (rotation); the
-        // height shrink alone freezes.
-        return widthChanged ? "fit" : "freeze";
-      }
-      // Intermediate keyboard frames on a compact viewport: loss between 0
-      // and the freeze threshold. Don't commit a grid yet — the gesture may
-      // cross into frozen state on the next frame.
-      if (isCompact && heightLoss > 0 && heightLoss < 120) return "defer";
-      return "fit";
-    };
 
     const flushOut = () => {
       outRaf = 0;
@@ -498,56 +384,18 @@ export function TerminalView({
       }
     };
 
-    const applyFit = () => {
-      if (!termRef.current || !viewportRef.current) return;
-      const gate = keyboardState();
-      // A rotation fit arms this for the scheduled resize; reset on entry.
-      const rotationFit =
-        gate === "fit" && document.documentElement.dataset.keyboard === "1";
-      // UO-10 round-2:
-      //  - freeze: keyboard-only height transition. Cancel any resize a
-      //    sub-threshold frame scheduled; if that frame already changed the
-      //    xterm grid, restore the frozen snapshot. Never fit/resize.
-      //  - defer: compact viewport in the first <120px of keyboard opening.
-      //    Skip entirely so the approach frames cannot commit a grid.
-      if (gate === "freeze" || gate === "defer") {
-        window.clearTimeout(resizeTimer);
-        // A freeze/defer is a keyboard transition; a rotation flag left armed
-        // by a previous fit is consumed or cancelled here.
-        if (gate === "freeze") {
-          if (!frozenGrid) {
-            // First frozen frame: snapshot the grid the PTY currently has.
-            frozenGrid = { cols: term.cols, rows: term.rows };
-            frozenClientWidthRef.current = observedClientWidth;
-          } else if (
-            term.cols !== frozenGrid.cols ||
-            term.rows !== frozenGrid.rows
-          ) {
-            // An intermediate frame resized xterm before data-keyboard was
-            // stamped — roll the client grid back. No PTY resize.
-            term.resize(frozenGrid.cols, frozenGrid.rows);
-            setCols(frozenGrid.cols);
-            setRows(frozenGrid.rows);
-          }
-          updateFreezeCrop();
-        }
-        return;
-      }
-      // Normal layout change (incl. rotation while keyboard open).
-      // UO-10 round-2 item 2: rotation while the keyboard stays open keeps
-      // the FROZEN ROWS (the keyboard still occludes that height) and only
-      // refits COLS to the new width. The frozen snapshot supplies rows;
-      // don't clear it until keyboard close. A normal (non-keyboard) layout
-      // change clears the snapshot and measures the full box.
-      const pinnedRows = rotationFit ? (frozenGrid?.rows ?? null) : null;
-      if (!rotationFit) {
-        frozenGrid = null;
-        host.style.transform = "";
-      }
+    /**
+     * Measure the RAW grid the current container + mode want. This knows nothing
+     * about the keyboard hold: cols always follow the real width and rows follow the
+     * real (possibly keyboard-shrunk) height. The reconciler overrides rows with
+     * keyboardHold while the keyboard is up, and fit/fixed never re-search the
+     * font while held — so a rotation while the keyboard is open changes COLS to
+     * the new width and keeps the held rows, exactly once.
+     */
+    const measureDesired = (): Grid | null => {
+      if (!termRef.current || !viewportRef.current) return null;
       // A4: xterm is mounted in `.host`, which carries 16px/20px padding inside
-      // `.viewport`. Measuring `.viewport` overshot by that padding, so the
-      // bottom row was clipped and `.viewport` grew its own scrollbar.
-      // `clientHeight` still counts padding, so take it off explicitly.
+      // `.viewport`. `clientHeight` counts padding, so take it off explicitly.
       const pad = window.getComputedStyle(host);
       const padX =
         (parseFloat(pad.paddingLeft) || 0) +
@@ -555,48 +403,32 @@ export function TerminalView({
       const padY =
         (parseFloat(pad.paddingTop) || 0) +
         (parseFloat(pad.paddingBottom) || 0);
-      // Rotation with keyboard: height is unconstrained for the fit math —
-      // rows are pinned to the frozen value, so use a large height so the
-      // responsive solver never clips rows; cols derive from real width.
+      const width = Math.max(0, host.clientWidth - padX);
+      const height = Math.max(0, host.clientHeight - padY);
+      const holding = reconciler.holdRows() !== null;
       const bounds = {
-        width: Math.max(0, host.clientWidth - padX),
-        height:
-          pinnedRows !== null
-            ? Number.POSITIVE_INFINITY
-            : Math.max(0, host.clientHeight - padY),
+        width,
+        height,
         dpr: window.devicePixelRatio || 1,
         lineHeight: term.options.lineHeight || 1,
         letterSpacing: term.options.letterSpacing || 0,
       };
+      if (bounds.width <= 0 || bounds.height <= 0) return null;
       if (modeRef.current === "responsive") {
-        const computed = responsiveTerminalSize(
+        return responsiveTerminalSize(
           bounds,
           font.measure,
           BASE_FONT_SIZE,
         );
-        // Rotation keeps the frozen rows; only cols change.
-        const size =
-          pinnedRows !== null && computed
-            ? { cols: computed.cols, rows: pinnedRows }
-            : computed;
-        if (size && (term.cols !== size.cols || term.rows !== size.rows))
-          term.resize(size.cols, size.rows);
-        if (size) {
-          setCols(size.cols);
-          setRows(size.rows);
-          schedulePtyResize(size.cols, size.rows, {
-            rotation: pinnedRows !== null,
-          });
-        }
-        return;
       }
-      if (modeRef.current === "fit") {
-        // Size the font against the grid the box yields at the BASE font, not
-        // against the current grid. `fit.fit()` derives cols/rows from the font
-        // in effect, so feeding those back into the font search is a ratchet:
-        // each pass shrinks the font, which widens the grid, which shrinks the
-        // font again — 13.2px drifted to 1.66px and 1426 columns across a
-        // fullscreen toggle. Anchoring on the base size makes it idempotent.
+      // `fit` is the only mode that re-sizes the FONT. Anchor it against the
+      // grid the box yields at the BASE font, not the current grid:
+      // `proposeDimensions` derives cols/rows from the font in effect, so feeding
+      // those back into the font search is a ratchet (each pass shrinks the
+      // font, widens the grid, shrinks the font again — 13.2px once drifted
+      // to 1.66px). `fixed` keeps whatever font is in effect and only refits
+      // the grid.
+      if (modeRef.current === "fit" && !holding) {
         const target = responsiveTerminalSize(
           bounds,
           font.measure,
@@ -612,24 +444,51 @@ export function TerminalView({
             term.options.fontSize = fitted;
         }
       }
-      fit.fit();
+      const proposal = fit.proposeDimensions();
+      const fallback = responsiveTerminalSize(
+        bounds,
+        font.measure,
+        term.options.fontSize ?? BASE_FONT_SIZE,
+      );
+      let cols = proposal?.cols ?? fallback?.cols ?? term.cols;
+      let rows = proposal?.rows ?? fallback?.rows ?? term.rows;
       // A4: FitAddon derives rows from its own CSS cell estimate, which can
       // round one row larger than the renderer actually paints; that extra row
-      // then overflows `.host` and the bottom line is clipped. Trim against
-      // the painted screen height.
+      // overflows `.host` and the bottom line is clipped. Trim against the
+      // painted screen height.
       const screen = host.querySelector<HTMLElement>(".xterm-screen");
-      if (screen && term.rows > 1) {
+      if (screen && rows > 1) {
         const painted = screen.getBoundingClientRect().height;
-        const cell = painted / term.rows;
-        if (cell > 0 && painted > bounds.height) {
-          const fits = Math.max(3, Math.floor(bounds.height / cell));
-          if (fits < term.rows) term.resize(term.cols, fits);
+        const cell = painted / rows;
+        if (cell > 0 && painted > height) {
+          const fits = Math.max(3, Math.floor(height / cell));
+          if (fits < rows) rows = fits;
         }
       }
-      setCols(term.cols);
-      setRows(term.rows);
-      schedulePtyResize(term.cols, term.rows, { rotation: false });
+      return { cols, rows };
     };
+
+    const applyGrid = (grid: Grid) => {
+      if (term.cols !== grid.cols || term.rows !== grid.rows)
+        term.resize(grid.cols, grid.rows);
+      setCols(grid.cols);
+      setRows(grid.rows);
+      // The crop is visual only; keep it anchored to the freshly applied grid.
+      if (document.documentElement.dataset.keyboard === "1") updateFreezeCrop();
+    };
+
+    reconciler = createSizeReconciler({
+      currentGrid: () => ({ cols: term.cols, rows: term.rows }),
+      measureDesired,
+      applyGrid,
+      sendResize: (grid) => {
+        void sessionRef.current?.resize(grid.cols, grid.rows);
+      },
+    });
+
+    // Every layout signal (ResizeObserver, visualViewport/window resize,
+    // rotation, mode/fullscreen change, font load) goes through this one call.
+    const applyFit = () => reconciler.layoutChanged();
 
     // Gate keyboard and pointer independently. `disableStdin` cannot do this:
     // xterm drops mouse reports on the same flag, which is what made `keys`
@@ -677,6 +536,14 @@ export function TerminalView({
 
     applyFitRef.current = applyFit;
     settleFitRef.current = settleFit;
+    // The terminal can mount while the keyboard is already up (deep-link from a
+    // focused input): open the hold BEFORE the first fit so its rows pin the
+    // pre-keyboard grid (the PTY's initial 80x24 until the first send),
+    // instead of a grid measured from the shrunken band.
+    if (document.documentElement.dataset.keyboard === "1") {
+      reconciler.keyboardOpened();
+      updateFreezeCrop();
+    }
     void whenFontsReady().then(() => applyFitRef.current());
     applyFit();
     // c-mfix: a later WebGL context loss (iOS keyboard/memory pressure is a
@@ -745,15 +612,33 @@ export function TerminalView({
     generationRef.current += 1;
 
     const observer = new ResizeObserver(() => {
-      observedClientWidth = host.clientWidth;
       applyFit();
     });
-    observedClientWidth = host.clientWidth;
     observer.observe(viewport);
     const onViewport = () => {
       if (window.visualViewport && window.visualViewport.scale !== 1) return;
       applyFit();
     };
+    // Soft-keyboard edges: the keyboard detector (lib/viewport) stamps
+    // data-keyboard synchronously on the viewport event, so this microtask runs
+    // before the ResizeObserver delivers the shrunken layout — opening captures the
+    // pre-keyboard rows, closing releases them; either way a normal layoutChanged
+    // follows and the reconciler does the rest.
+    const keyboardObserver = new MutationObserver(() => {
+      if (document.documentElement.dataset.keyboard === "1") {
+        reconciler.keyboardOpened();
+        // Visual only (never touches the grid): re-anchor the cursor crop now,
+        // not only on the next output frame.
+        updateFreezeCrop();
+      } else {
+        reconciler.keyboardClosed();
+        host.style.transform = "";
+      }
+    });
+    keyboardObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-keyboard"],
+    });
     // UO-10 round-5 item 3: native wheel/scrollbar scroll changes the
     // painted rows; re-anchor the frozen crop to the scrolled view.
     const onTermScroll = () => updateFreezeCrop();
@@ -811,18 +696,10 @@ export function TerminalView({
         resetStreamRef.current = true;
         session.reconnectForTest();
       },
-      // UO-10: PTY resize calls since the last reset — the keyboard freeze
-      // test asserts zero across an open/close cycle.
-      resizeCount: () => sentCount,
-      resetResizeCount: () => {
-        // Clear the pending timer too: a test burst counts only resizes its
-        // own fits schedule, not a timer armed just before the reset.
-        sentCount = 0;
-        if (resizeTimer) {
-          window.clearTimeout(resizeTimer);
-          resizeTimer = 0;
-        }
-      },
+      // PTY resize calls since the last reset — the keyboard freeze test asserts
+      // zero across an open/close cycle.
+      resizeCount: () => reconciler.resizeCount(),
+      resetResizeCount: () => reconciler.resetCount(),
       // UO-10 round-4: live-switch test support.
       bufferText: () => {
         const b = term.buffer.active;
@@ -847,7 +724,7 @@ export function TerminalView({
           viewportY: b.viewportY,
         };
       },
-      lastResize: () => lastSent,
+      lastResize: () => reconciler.lastSent(),
       scrollLines: (n: number) => term.scrollLines(n),
       writeRaw: (data: string) => {
         void sessionRef.current?.write(data);
@@ -859,9 +736,10 @@ export function TerminalView({
       delete window.__ttyLab;
       detachTouch();
       observer.disconnect();
+      keyboardObserver.disconnect();
+      reconciler.dispose();
       window.visualViewport?.removeEventListener("resize", onViewport);
       window.removeEventListener("resize", onViewport);
-      window.clearTimeout(resizeTimer);
       host.style.transform = "";
       if (outRaf) cancelAnimationFrame(outRaf);
       inputDisposable.dispose();

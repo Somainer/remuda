@@ -2,7 +2,7 @@ import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { bootstrapToken } from "./hub-auth";
+import { bootstrapToken, login } from "./hub-auth";
 
 /**
  * UO-10 terminal chrome (docs/design/visual-system.md §3.4/§4, D-053 item 4,
@@ -92,6 +92,16 @@ async function createTerminal(page: Page, prompt: string): Promise<string> {
   const id = body.instance.instanceId ?? body.instance.id!;
   created.push(id);
   return id;
+}
+
+/**
+ * Wait out the reconciler's 80ms debounce so the settled initial grid has
+ * actually been sent to the PTY, then zero the resize counter. Two animation
+ * frames are no longer enough (round-6 debounce).
+ */
+async function flushAndResetResize(page: Page) {
+  await page.waitForTimeout(150);
+  await page.evaluate(() => window.__ttyLab?.resetResizeCount());
 }
 
 /** Exact iOS keyboard emulation (m-realdevice): layout viewport untouched. */
@@ -262,20 +272,39 @@ for (const appearance of ["dark", "light"] as const) {
       expect(Math.max(...ink.pillRgb)).toBeLessThan(125);
     }
 
-    // UO-10 round-5 item 4: the progress error fill resolves to a real
-    // colour in both modes (the old dark --tok-red token did not exist).
-    const errorFill = await page.evaluate(() => {
-      const fill = document.createElement("div");
-      fill.className = "x";
-      fill.style.cssText =
-        "background: var(--term-danger-fg); position:absolute;";
-      document.querySelector("[data-tty-lab]")!.appendChild(fill);
-      const c = getComputedStyle(fill).backgroundColor;
-      fill.remove();
+    // UO-10 round-6 item: the error fill resolves to a real colour in both
+    // modes. Activate the REAL progress component by typing the fake harness's OSC
+    // 9;4 error sentinel into xterm (the path native-progress.hub.spec uses)
+    // and read the rendered fill's computed background — no synthetic probe.
+    await page.locator(".xterm-helper-textarea").click();
+    await page.keyboard.type("TTYPROG_ERROR");
+    await page.keyboard.press("Enter");
+    const errorBar = page.locator(
+      '[data-testid="tty-progress-bar"][data-progress-state="error"]',
+    );
+    await expect(errorBar).toBeVisible({ timeout: 15_000 });
+    const errorFill = await errorBar.locator("> div").evaluate((el) =>
+      getComputedStyle(el).backgroundColor,
+    );
+    expect(errorFill, "real OSC 9;4 error fill paints a colour").not.toBe(
+      "rgba(0, 0, 0, 0)",
+    );
+    expect(errorFill).not.toBe("");
+    // The fill is painted with exactly the --term-danger-fg token.
+    const tokenFill = await page.evaluate(() => {
+      const probe = document.createElement("div");
+      probe.style.background = "var(--term-danger-fg)";
+      probe.style.position = "absolute";
+      document.querySelector("[data-tty-lab]")!.appendChild(probe);
+      const c = getComputedStyle(probe).backgroundColor;
+      probe.remove();
       return c;
     });
-    expect(errorFill, "--term-danger-fg resolves").not.toBe("rgba(0, 0, 0, 0)");
-    expect(errorFill).not.toBe("");
+    expect(errorFill).toBe(tokenFill);
+    // Done hides the bar again (clean frame for the evidence shots).
+    await page.keyboard.type("TTYPROG_DONE");
+    await page.keyboard.press("Enter");
+    await expect(errorBar).toHaveCount(0);
 
     if (appearance === "dark") await shot(page, "uo10-terminal-dark-1440.png");
     if (appearance === "light")
@@ -373,20 +402,18 @@ for (const appearance of ["dark", "light"] as const) {
   test(`xterm theme changes live on SYSTEM colour-scheme change (${appearance} start)`, async ({
     browser,
   }) => {
-    // Skip is decided AFTER the dedicated context/page are created (the
-    // shared fixture page has no fake host in this browser-only test).
-    const preflight = await browser.newPage();
-    await preflight.goto("/login");
-    const hasFake = await fakeHostId(preflight);
-    await preflight.close();
-    if (!hasFake) test.skip(true, "fake Node not registered");
+    // The skip check runs on the TEST'S OWN page, inside its dedicated
+    // color-scheme context — never on a throwaway preflight page that skipped before
+    // any terminal (or login) existed.
     const ctx = await browser.newContext({
       viewport: { width: 1440, height: 900 },
       colorScheme: appearance === "dark" ? "dark" : "light",
     });
     const sysPage = await ctx.newPage();
     try {
-      await loginPage(sysPage);
+      await login(sysPage, `uo10-sys-${appearance}`);
+      if (!(await fakeHostId(sysPage)))
+        test.skip(true, "fake Node not registered");
       await sysPage.addInitScript(() => {
         localStorage.setItem("runtime.theme.v1", "system");
       });
@@ -446,17 +473,7 @@ test.describe("390px keyboard band", () => {
     const beforeCols = Number(await lab.getAttribute("data-tty-cols"));
 
     // Reset the PTY resize counter AFTER the initial attach fit settled.
-    await page.evaluate(() => {
-      // Two rafs let the debounced initial resize flush first.
-      return new Promise<void>((resolve) => {
-        requestAnimationFrame(() =>
-          requestAnimationFrame(() => {
-            window.__ttyLab?.resetResizeCount();
-            resolve();
-          }),
-        );
-      });
-    });
+    await flushAndResetResize(page);
 
     // The local input field is 16px (coarse pointer).
     const field = page.locator("input[aria-label='本地输入']").first();
@@ -628,9 +645,19 @@ test.describe("390px keyboard band", () => {
         };
       });
 
-    // (a) cursor near row 1 on the fresh shell.
+    // UO-10 round-6: PUT the cursor on row 1 explicitly — the fake harness
+    // clears the screen and draws a fresh prompt at home, rather than the test
+    // assuming a fresh shell happens to start near the top.
+    await page.evaluate(() =>
+      window.__ttyLab?.writeRaw("__tty_home__\r"),
+    );
+    await expect
+      .poll(async () => (await measureCursorRow()).gridRow, { timeout: 5_000 })
+      .toBe(0);
+
+    // (a) cursor on row 1.
     const firstRow = await measureCursorRow();
-    expect(firstRow.gridRow).toBeLessThan(3);
+    expect(firstRow.gridRow).toBe(0);
     expect(
       firstRow.fullRowInBand,
       `cursor row 1 fully inside band: ${JSON.stringify(firstRow)}`,
@@ -750,17 +777,7 @@ test.describe("390px keyboard band", () => {
       .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
       .toBeGreaterThan(3);
 
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => {
-              window.__ttyLab?.resetResizeCount();
-              resolve();
-            }),
-          );
-        }),
-    );
+    await flushAndResetResize(page);
     const colsBefore = Number(await lab.getAttribute("data-tty-cols"));
     const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
 
@@ -846,17 +863,7 @@ test.describe("390px keyboard band", () => {
         ),
       )
       .toBeGreaterThan(3);
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => {
-              window.__ttyLab?.resetResizeCount();
-              resolve();
-            }),
-          );
-        }),
-    );
+    await flushAndResetResize(page);
     // Keyboard open.
     await raiseKeyboardIosExact(page, 336);
     await page.waitForTimeout(300);
@@ -867,7 +874,7 @@ test.describe("390px keyboard band", () => {
       await page.locator("[data-tty-lab]").getAttribute("data-tty-cols"),
     );
 
-    // W0 → W1 (schedules a resize at +40ms).
+    // W0 → W1 (arms the 80ms debounced send).
     await page.setViewportSize({ width: 700, height: 659 });
     await page.evaluate((kb) => {
       const vv = window.visualViewport;
@@ -883,7 +890,7 @@ test.describe("390px keyboard band", () => {
       vv.dispatchEvent(new Event("resize"));
       window.dispatchEvent(new Event("resize"));
     }, 336);
-    // Immediately W1 → W0 BEFORE the 40ms debounce timer fires.
+    // Immediately W1 → W0 BEFORE the 80ms debounce fires.
     await page.setViewportSize({ width: 393, height: 659 });
     await page.evaluate((kb) => {
       const vv = window.visualViewport;
@@ -899,7 +906,7 @@ test.describe("390px keyboard band", () => {
       vv.dispatchEvent(new Event("resize"));
       window.dispatchEvent(new Event("resize"));
     }, 336);
-    // Wait well past the 40ms debounce.
+    // Wait well past the 80ms debounce.
     await page.waitForTimeout(300);
     // The settled width is back at W0, equal to what the PTY last had: zero
     // resizes for the whole bounce.
@@ -928,17 +935,7 @@ test.describe("390px keyboard band", () => {
     await expect
       .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
       .toBeGreaterThan(3);
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) => {
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => {
-              window.__ttyLab?.resetResizeCount();
-              resolve();
-            }),
-          );
-        }),
-    );
+    await flushAndResetResize(page);
     const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
 
     // Height-only viewport change (same width): the local grid changes. The
@@ -946,20 +943,23 @@ test.describe("390px keyboard band", () => {
     // cycle below) CANCEL the pending timer and arm nothing, so the PTY
     // stayed at the old grid.
     await page.setViewportSize({ width: 1440, height: 640 });
-    // Rapid fit → fixed → responsive cycle (the geo button shows the CURRENT
-    // mode; two clicks on the same button queue the functional state
-    // updaters fit→fixed→responsive even though React renders once). Reset
-    // the resize counter in the SAME task and let the burst land within the
-    // 40ms resize debounce (awaited Playwright clicks are spaced >40ms apart
-    // and would let the timer fire mid-cycle).
-    await page.evaluate(() => {
-      window.__ttyLab?.resetResizeCount();
-      const btn = [...document.querySelectorAll("button")].find((b) =>
-        /^(fit|fixed|responsive)$/.test(b.textContent?.trim() ?? ""),
-      );
-      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
+    // fit → fixed → responsive with a REAL frame between clicks: the
+    // intermediate mode actually renders (its grid is applied to xterm), yet the
+    // whole burst lands inside the 80ms debounce, so exactly ONE resize goes out
+    // at the FINAL grid. (Awaited Playwright clicks are spaced >80ms apart,
+    // so drive the button with dispatched events and a 20ms frame in between.)
+    const clickModeButton = () =>
+      page.evaluate(() => {
+        const btn = [...document.querySelectorAll("button")].find((b) =>
+          /^(fit|fixed|responsive)$/.test(b.textContent?.trim() ?? ""),
+        );
+        btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+    await page.evaluate(() => window.__ttyLab?.resetResizeCount());
+    await clickModeButton();
+    await page.waitForTimeout(20); // intermediate "fixed" frame actually paints
+    await expect(page.getByTestId("tty-io-mode")).toContainText("fixed");
+    await clickModeButton();
     await expect(page.getByTestId("tty-io-mode")).toContainText(
       "responsive",
     );

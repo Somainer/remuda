@@ -568,17 +568,10 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   // bottom-aligns) — no fit, no sessionRef.resize at all.
   const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
   const colsBefore = Number(await lab.getAttribute("data-tty-cols"));
-  await page.evaluate(
-    () =>
-      new Promise<void>((resolve) => {
-        requestAnimationFrame(() =>
-          requestAnimationFrame(() => {
-            window.__ttyLab?.resetResizeCount();
-            resolve();
-          }),
-        );
-      }),
-  );
+  // Round-6 reconciler: wait out the 80ms debounce so the settled grid has
+  // been sent before zeroing the counter.
+  await page.waitForTimeout(150);
+  await page.evaluate(() => window.__ttyLab?.resetResizeCount());
 
   // Keyboard up through a REAL animation (sub-threshold frame first, then
   // the full keyboard): intermediate frames must neither commit a grid nor

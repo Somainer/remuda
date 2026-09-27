@@ -35,7 +35,8 @@ import { login } from "./hub-auth";
  * Screenshots are committed only under REMUDA_EVIDENCE=1 (390 and 1440, dark
  * and light). The WebKit/iPhone real-condition test connects to a
  * `playwright run-server` over PW_TEST_CONNECT_WS_ENDPOINT (the jammy
- * container browser server) and skips on hosts without one.
+ * container browser server), or launches the bundled WebKit when installed;
+ * it skips on hosts with neither.
  */
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const target = path.resolve(root, process.env.CARGO_TARGET_DIR ?? "target");
@@ -297,7 +298,11 @@ test("a thought disclosure carries exactly one marker", async ({ page }) => {
   await page.request.delete(`/v1/instances/${id}?force=1`).catch(() => undefined);
 });
 
-async function bootHarness(page: Page, tag: string): Promise<Harness> {
+async function bootHarness(
+  page: Page,
+  tag: string,
+  opts: { idleMessage?: string } = {},
+): Promise<Harness> {
   const scratch = path.join(root, "target", "hub-e2e");
   await mkdir(scratch, { recursive: true });
   const dir = await realpath(await mkdtemp(path.join(scratch, `uo6b-${tag}-`)));
@@ -322,27 +327,19 @@ async function bootHarness(page: Page, tag: string): Promise<Harness> {
     { mode: 0o700 },
   );
   await writeFile(settingsFile, JSON.stringify({ env: { UO6B: "retained" } }));
+  const turn = (prefix: string, text: string) => ({
+    match_prefix: prefix,
+    text,
+    chunks: 1,
+    idle_notification: true,
+    ...(opts.idleMessage !== undefined ? { idle_notification_message: opts.idleMessage } : {}),
+    stop_reason: "end_turn",
+    usage: { input_tokens: 30, output_tokens: 8 },
+  });
   await writeFile(
     scriptFile,
     JSON.stringify({
-      turns: [
-        {
-          match_prefix: "NOTESTURN",
-          text: "first turn done",
-          chunks: 1,
-          idle_notification: true,
-          stop_reason: "end_turn",
-          usage: { input_tokens: 30, output_tokens: 8 },
-        },
-        {
-          match_prefix: "NOTESTURN",
-          text: "second turn done",
-          chunks: 1,
-          idle_notification: true,
-          stop_reason: "end_turn",
-          usage: { input_tokens: 30, output_tokens: 8 },
-        },
-      ],
+      turns: [turn("NOTESTURN", "first turn done"), turn("NOTESTURN", "second turn done")],
     }),
   );
 
@@ -462,6 +459,13 @@ test("notifications collapse to one quiet row and clear with the session; toast 
     await expect(page.getByTestId("notification-older")).toHaveText("+1", { timeout: 10_000 });
     expect(await page.getByTestId("session-notification").count()).toBe(1);
 
+    // The collapsed dock is exactly ONE 24px row: the +N expander sits inside
+    // the newest row rather than forming a second row above the composer.
+    expect(await page.getByTestId("session-notification-more-row").count()).toBe(0);
+    const panelBox = await page.getByTestId("session-notifications").boundingBox();
+    expect(panelBox, "notification panel must have geometry").toBeTruthy();
+    expect(panelBox!.height, "collapsed notification area must be one 24px row").toBe(24);
+
     // Phone width: the top-anchored toast sits entirely ABOVE the composer.
     await page.setViewportSize({ width: 390, height: 844 });
     await expect.poll(async () => page.getByTestId("notification-toast").isVisible().catch(() => false)).toBe(true);
@@ -516,43 +520,76 @@ test("notifications collapse to one quiet row and clear with the session; toast 
 });
 
 /**
- * Real-condition phone check: WebKit with an iPhone device profile. Requires
- * a `playwright run-server` (the jammy container on focal hosts) exposed over
- * PW_TEST_CONNECT_WS_ENDPOINT; skips explicitly without one.
+ * Real-condition phone check: WebKit with an iPhone device profile (390px).
+ * Prefers a `playwright run-server` (the jammy container on focal hosts) over
+ * PW_TEST_CONNECT_WS_ENDPOINT; otherwise launches the bundled Playwright
+ * WebKit when its browser is installed, and skips on hosts with neither.
  */
-test("iPhone/WebKit: the notification toast never covers the composer", async () => {
-  test.skip(!process.env.PW_TEST_CONNECT_WS_ENDPOINT, "needs a WebKit run-server (PW_TEST_CONNECT_WS_ENDPOINT)");
-  const endpoint = process.env.PW_TEST_CONNECT_WS_ENDPOINT!;
-  // Playwright's run-server multiplexes browser types on one endpoint; the
-  // WebKit client selects its own engine through the connect handshake.
-  const browser: Browser = await webkit.connect(endpoint);
+test("iPhone/WebKit: a 2,000-character CJK toast stays clamped above the composer", async () => {
+  const endpoint = process.env.PW_TEST_CONNECT_WS_ENDPOINT;
+  let browser: Browser;
+  if (endpoint) {
+    // Playwright's run-server multiplexes browser types on one endpoint; the
+    // WebKit client selects its own engine through the connect handshake.
+    browser = await webkit.connect(endpoint);
+  } else {
+    let bundled = true;
+    await access(webkit.executablePath()).catch(() => {
+      bundled = false;
+    });
+    test.skip(!bundled, "needs WebKit (PW_TEST_CONNECT_WS_ENDPOINT or a bundled webkit build)");
+    browser = await webkit.launch();
+  }
   const context: BrowserContext = await browser.newContext({
     ...devices["iPhone 13"],
     baseURL: process.env.HUB_E2E_BASE_URL ?? "http://127.0.0.1:58889",
   });
   const page = await context.newPage();
+  // 2,000 CJK characters: before the clamp this toast grew dozens of lines
+  // straight down over the composer on a 390px phone.
+  const cjkMessage = "通知：等待你的输入，这是一条很长的中文消息".repeat(100).slice(0, 2000);
+  expect(cjkMessage).toHaveLength(2000);
   await login(page, "e2e-uo6b-iphone");
-  const h = await bootHarness(page, "iphone");
+  const h = await bootHarness(page, "iphone", { idleMessage: cjkMessage });
   try {
     await launchPromoted(page, h);
     await rawKeys(page, h.instanceId, "NOTESTURN phone");
     await new Promise((resolve) => setTimeout(resolve, 300));
     await rawKeys(page, h.instanceId, "\r");
     await waitForEventCount(h.eventsFile, "idle_notification", 1, 60_000);
-    await expect(page.getByTestId("notification-toast")).toBeVisible({ timeout: 10_000 });
+    const toast = page.getByTestId("notification-toast");
+    await expect(toast).toBeVisible({ timeout: 10_000 });
     const geometry = await page.evaluate(() => {
-      const rect = (sel: string) => {
-        const el = document.querySelector<HTMLElement>(sel);
-        if (!el) return null;
+      const rect = (el: Element) => {
         const r = el.getBoundingClientRect();
-        return { top: r.top, bottom: r.bottom };
+        return { top: r.top, bottom: r.bottom, height: r.height };
       };
-      return { toast: rect("[data-testid='notification-toast']"), composer: rect("[data-testid='composer']") };
+      const toastEl = document.querySelector<HTMLElement>("[data-testid='notification-toast']");
+      const textEl = toastEl?.querySelector<HTMLElement>("span");
+      const composerEl = document.querySelector<HTMLElement>("[data-testid='composer']");
+      if (!toastEl || !textEl || !composerEl) return null;
+      const lineHeight = parseFloat(getComputedStyle(textEl).lineHeight);
+      return {
+        toast: rect(toastEl),
+        composer: rect(composerEl),
+        lineHeight,
+        textClient: textEl.clientHeight,
+        // A clamped element keeps its full content height in scrollHeight.
+        textScroll: textEl.scrollHeight,
+        viewport: window.innerWidth,
+      };
     });
-    expect(geometry.toast).toBeTruthy();
-    expect(geometry.composer).toBeTruthy();
-    expect(geometry.toast!.bottom).toBeLessThanOrEqual(geometry.composer!.top + 1);
-    await shot(page, "uo6b-toast-iphone-webkit-390-dark.png");
+    expect(geometry).toBeTruthy();
+    expect(geometry!.viewport).toBe(390);
+    expect(geometry!.lineHeight).toBeGreaterThan(0);
+    // The message is long enough that clamping actually bites (3-line cap)…
+    expect(geometry!.textScroll).toBeGreaterThan(geometry!.textClient);
+    // …the text occupies at most three lines and the toast stays bounded…
+    expect(geometry!.textClient).toBeLessThanOrEqual(3 * geometry!.lineHeight + 1);
+    expect(geometry!.toast.height).toBeLessThanOrEqual(3 * geometry!.lineHeight + 24);
+    // …so it sits entirely above the composer instead of covering it.
+    expect(geometry!.toast.bottom).toBeLessThanOrEqual(geometry!.composer.top + 1);
+    await shot(page, "uo6b-toast-cjk-iphone-webkit-390-dark.png");
   } finally {
     await command(page, h.instanceId, "instance.close").catch(() => undefined);
     await stopNode(h.node);

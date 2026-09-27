@@ -104,5 +104,15 @@
 .toastText {
   flex: 1 1 auto;
   min-width: 0;
+  line-height: var(--lh-ui);
   overflow-wrap: anywhere;
+  /* At most three lines even for a very long (e.g. 2,000-character CJK)
+     message: the toast is top-anchored and height-bounded so it can never
+     grow down over the phone composer. -webkit-line-clamp works in WebKit and
+     Blink; the max-height bounds every other engine. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  max-height: calc(3 * var(--lh-ui));
+  overflow: hidden;
 }

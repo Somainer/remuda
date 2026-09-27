@@ -305,13 +305,18 @@ export function LiveStatusStrip({
     [decisionProp, events, nativeRef, hasPending, now],
   );
   // A terminal session always renders an ended turn. The channel that decided
-  // the last live turn keeps its credit when one exists; the end anchor is the
-  // durable session record so the frozen duration never restarts at zero.
+  // the last live turn keeps its credit when one exists. The end anchor is the
+  // turn's OWN end time once the turn had already ended before the session
+  // died: an exit/Node-restart at 12:00 must not overwrite a turn that ended
+  // at 10:01 (the frozen duration would have jumped to time-since-turn-start
+  // measured at the settlement). The settlement timestamp only closes a turn
+  // that was still OPEN when the session ended.
   const decision: TurnDecision = settlement.ended
     ? {
         state: "ended",
         decidedBy: projected.state === "ended" ? projected.decidedBy : null,
-        endedAt: settlement.at ?? (projected.state === "ended" ? projected.endedAt : null),
+        endedAt:
+          projected.state === "ended" && projected.endedAt ? projected.endedAt : settlement.at,
       }
     : projected;
   const silenceReason = useMemo(() => hookSilenceReason(events), [events]);

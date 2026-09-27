@@ -14,45 +14,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { formatClock } from "../../../lib/format";
 import type { Observation } from "../../../types/generated";
-import { selectSessionNotifications, type SessionNotification } from "./selectNotifications";
+import {
+  selectRetiredDialogAdvisories,
+  selectSessionNotifications,
+  type SessionNotification,
+} from "./selectNotifications";
 import { dismissNotification, useDismissedNotifications } from "./dismissed";
 import { sessionSettlement } from "../live/LiveStatusStrip";
 import css from "./notifications.module.css";
 
 const TOAST_MS = 8000;
-
-function seqNum(id: string): bigint {
-  try {
-    return BigInt(id);
-  } catch {
-    return 0n;
-  }
-}
-
-/**
- * Whether a blocking dialog is currently open anywhere on the session, folded
- * from the same journal the notifications come from: a requested interaction
- * stays open until its own answered/expired observation closes it. A
- * permission_prompt notification whose dialog has closed is a stale advisory.
- */
-function dialogIsOpen(events: readonly Observation[]): boolean {
-  const open = new Set<string>();
-  const ordered = [...events].sort((a, b) => {
-    const sa = seqNum(String(a.seq));
-    const sb = seqNum(String(b.seq));
-    return sa < sb ? -1 : sa > sb ? 1 : 0;
-  });
-  for (const ev of ordered) {
-    if (ev.kind === "interaction.requested") {
-      const id = (ev.payload as { interaction?: { id?: string } }).interaction?.id;
-      if (id) open.add(id);
-    } else if (ev.kind === "interaction.answered" || ev.kind === "interaction.expired") {
-      const id = (ev.payload as { interactionId?: string }).interactionId;
-      if (id) open.delete(id);
-    }
-  }
-  return open.size > 0;
-}
 
 export function SessionNotifications({
   instanceId,
@@ -63,15 +34,18 @@ export function SessionNotifications({
 }) {
   const all = useMemo(() => selectSessionNotifications(events), [events]);
   const settlement = useMemo(() => sessionSettlement(events), [events]);
-  const dialogOpen = useMemo(() => dialogIsOpen(events), [events]);
+  // Dialog advisories are retired against THEIR OWN interactions: an answered
+  // permission hint stays hidden even when an unrelated dialog opens later.
+  const retiredDialogs = useMemo(() => selectRetiredDialogAdvisories(events), [events]);
   const dismissedIds = useDismissedNotifications(instanceId);
   const undismissed = all.filter((n) => !dismissedIds.has(n.id));
 
-  // A row is moot when the whole session has ended, or it pointed at a dialog
-  // that has since been answered/expired. On an ended session the single
-  // quiet row remains (as history), just muted and without its dialog link.
+  // A row is moot when it pointed at a dialog that has since been
+  // answered/expired (tracked per interaction, not by "any dialog open"). On
+  // an ended session the single quiet row remains as history, just muted and
+  // without its dialog link.
   const isMoot = (n: SessionNotification) =>
-    !settlement.ended && n.pointsAtDialog && !dialogOpen;
+    !settlement.ended && n.pointsAtDialog && retiredDialogs.has(n.id);
   const rows = settlement.ended ? undismissed : undismissed.filter((n) => !isMoot(n));
   const newest = rows.at(-1) ?? null;
   const older = newest ? rows.slice(0, -1) : [];
@@ -110,9 +84,10 @@ export function SessionNotifications({
   const toastRow = toastId ? all.find((n) => n.id === toastId) ?? null : null;
   useEffect(() => {
     if (toastId === null) return;
-    const moot = toastRow ? !settlement.ended && toastRow.pointsAtDialog && !dialogOpen : false;
+    const moot =
+      toastRow != null && !settlement.ended && toastRow.pointsAtDialog && retiredDialogs.has(toastRow.id);
     if (dismissedIds.has(toastId) || settlement.ended || moot) setToastId(null);
-  }, [toastId, toastRow, dismissedIds, settlement.ended, dialogOpen]);
+  }, [toastId, toastRow, dismissedIds, settlement.ended, retiredDialogs]);
 
   if (shown.length === 0 && toastId === null) return null;
 
@@ -142,6 +117,19 @@ export function SessionNotifications({
                 查看待处理对话
               </button>
             ) : null}
+            {/* The +N expander lives INSIDE the newest row: the collapsed dock
+                is exactly one 24px row, never a second row above the composer. */}
+            {!expanded && n === newest && older.length > 0 ? (
+              <button
+                type="button"
+                className={css.expand}
+                data-testid="notification-older"
+                aria-expanded={false}
+                onClick={() => setExpanded(true)}
+              >
+                +{older.length}
+              </button>
+            ) : null}
             <button
               type="button"
               className={css.dismiss}
@@ -154,19 +142,6 @@ export function SessionNotifications({
             </button>
           </div>
         ))}
-        {!expanded && older.length > 0 ? (
-          <div className={css.row} data-testid="session-notification-more-row">
-            <button
-              type="button"
-              className={css.expand}
-              data-testid="notification-older"
-              aria-expanded={false}
-              onClick={() => setExpanded(true)}
-            >
-              +{older.length}
-            </button>
-          </div>
-        ) : null}
         {expanded && older.length > 0 ? (
           <button
             type="button"

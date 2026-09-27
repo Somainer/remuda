@@ -6,7 +6,7 @@ import { LiveStatusStrip, sessionSettlement } from "./LiveStatusStrip";
 
 function turnLiveEvent(
   seq: number,
-  tags: Record<string, string>,
+  tags: Record<string, unknown>,
   at: string,
   channel: Observation["source"]["channel"] = "hook",
 ): Observation {
@@ -54,7 +54,7 @@ function turnLiveEvent(
   } as unknown as Observation;
 }
 
-function screenStatusEvent(seq: number, tags: Record<string, string>, at = new Date().toISOString()): Observation {
+function screenStatusEvent(seq: number, tags: Record<string, unknown>, at = new Date().toISOString()): Observation {
   return {
     ...turnLiveEvent(seq, tags, at, "pty"),
     completeness: "screen-derived",
@@ -318,6 +318,58 @@ describe("LiveStatusStrip", () => {
     expect(elapsed.getAttribute("data-stale")).toBe("0");
     expect(screen.getByTestId("live-decided-by").getAttribute("data-channel")).toBe("hook");
     expect(screen.queryByTestId("live-interrupt")).toBeNull();
+  });
+
+  it("UO-6b r3: an exit after the turn ended keeps the turn duration, not time-to-exit", () => {
+    // Turn ends 10:01 (exactly one hour after its 09:01 start); the instance
+    // exits much later at 12:00. The settlement timestamp only closes a still
+    // OPEN turn — it must not overwrite the ended turn's own endedAt, or the
+    // frozen duration would jump from 1:00:00 to 2:59:00.
+    const start = "2026-09-16T09:01:00.000Z";
+    const turnEnd = "2026-09-16T10:01:00.000Z";
+    const exit = "2026-09-16T12:00:00.000Z";
+    const events = [
+      turnLiveEvent(1, { phase: "prompt-accepted", since: start }, start),
+      turnLiveEvent(2, { phase: "turn-ended", since: turnEnd, outcome: "completed" }, turnEnd),
+      instanceLifecycleEvent(3, "exited", exit),
+    ];
+    render(<LiveStatusStrip events={events} nativeRef={ref(["hook"])} />);
+    const elapsed = screen.getByTestId("live-elapsed");
+    expect(elapsed.textContent).toBe("1:00:00");
+    expect(elapsed.getAttribute("data-stale")).toBe("0");
+    expect(screen.getByTestId("live-status-strip").getAttribute("data-settled")).toBe("exited");
+  });
+
+  it("UO-6b r3: renders normally when every live.status tag has a malformed runtime type", () => {
+    // End-to-end render regression for the {phrase: 42} crash: nested tag
+    // values of every wrong type are dropped at the projection, so the strip
+    // neither throws nor paints them as React children.
+    const at = new Date().toISOString();
+    const malformedValues: unknown[] = [42, { nested: true }, null, ["thinking"], true];
+    for (const value of malformedValues) {
+      const events = [
+        screenStatusEvent(
+          1,
+          {
+            liveStatus: "1",
+            verb: value,
+            phrase: value,
+            tokensLabel: value,
+            tokensDown: value,
+            elapsedScreen: value,
+            since: value,
+            interruptible: value,
+          },
+          at,
+        ),
+      ];
+      const { unmount } = render(<LiveStatusStrip events={events} nativeRef={null} />);
+      const strip = screen.getByTestId("live-status-strip");
+      expect(strip.getAttribute("data-turn")).not.toBe("ended");
+      expect(screen.queryByTestId("live-phrase")).toBeNull();
+      expect(strip.textContent).not.toContain("[object Object]");
+      unmount();
+    }
   });
 
   it("names a never-materialised expected tier explicitly (D-4), never as silence", () => {

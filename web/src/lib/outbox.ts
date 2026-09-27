@@ -150,6 +150,16 @@ export interface OutboxStorage {
   all(): Promise<OutboxRecord[]>;
   put(rec: OutboxRecord): Promise<void>;
   delete(commandId: Id): Promise<void>;
+  /**
+   * Atomically claim the per-instance delivery lease in ONE readwrite
+   * transaction: read the `__lock__:<instanceId>` row and write `rec` only
+   * when it is absent, carries an EXPIRED lease, or a lease this caller owns;
+   * a LIVE lease owned by another owner makes no write and resolves false.
+   * The check and the write MUST share one transaction — a separate
+   * all()+put() pair lets two lock-less tabs both observe "no lease" and both
+   * run the deliverer (a double POST). A storage failure rejects.
+   */
+  acquireLease(key: Id, rec: OutboxRecord, now: number): Promise<boolean>;
 }
 
 /** Lease lifetime for a delivery; a crashed owner's lease steals after this. */
@@ -234,6 +244,39 @@ class IdbOutboxStorage implements OutboxStorage {
   async delete(commandId: Id) {
     await this.tx("readwrite", (s) => s.delete(commandId));
   }
+
+  /**
+   * The single-deliverer lease claim in ONE readwrite transaction: the get
+   * and the put share `t`, so IndexedDB serializes the check-and-write against
+   * every other readwrite tx on this store. A live FOREIGN lease aborts the
+   * transaction deliberately (contended lock → false), distinguished from a
+   * real abort via `contended`.
+   */
+  async acquireLease(key: Id, rec: OutboxRecord, now: number): Promise<boolean> {
+    return await new Promise<boolean>((resolve, reject) => {
+      const t = this.db.transaction(IDB_STORE, "readwrite");
+      const store = t.objectStore(IDB_STORE);
+      let contended = false;
+      const getReq = store.get(key);
+      getReq.onsuccess = () => {
+        const existing = getReq.result as OutboxRecord | undefined;
+        const lease = existing?.lease;
+        if (lease && rec.lease && lease.owner !== rec.lease.owner && lease.until > now) {
+          contended = true;
+          t.abort();
+          return;
+        }
+        store.put(rec);
+      };
+      getReq.onerror = () => reject(getReq.error);
+      t.oncomplete = () => resolve(true);
+      t.onabort = () => {
+        if (contended) resolve(false);
+        else reject(t.error ?? new Error("IndexedDB lease transaction aborted"));
+      };
+      t.onerror = () => reject(t.error ?? getReq.error);
+    });
+  }
 }
 
 class LocalStorageOutboxStorage implements OutboxStorage {
@@ -264,6 +307,23 @@ class LocalStorageOutboxStorage implements OutboxStorage {
 
   async delete(commandId: Id) {
     this.write(this.read().filter((r) => r.commandId !== commandId));
+  }
+
+  /**
+   * localStorage has no cross-tab transactions, but read-check-write here is
+   * one synchronous turn — atomic WITHIN the supported single-tab degraded
+   * case (two same-tab callers cannot interleave). A crashed owner's lease is
+   * still covered by the TTL steal in {@link Outbox}.
+   */
+  async acquireLease(key: Id, rec: OutboxRecord, now: number): Promise<boolean> {
+    const recs = this.read();
+    const existing = recs.find((r) => r.commandId === key);
+    const lease = existing?.lease;
+    if (lease && rec.lease && lease.owner !== rec.lease.owner && lease.until > now) {
+      return false;
+    }
+    this.write([...recs.filter((r) => r.commandId !== key), rec]);
+    return true;
   }
 }
 
@@ -494,7 +554,12 @@ export class Outbox {
 
   /**
    * Durable lease fallback (no Web Locks). The per-instance lease lives in the
-   * same store; a crashed owner's lease is stealable after {@link LEASE_TTL_MS}.
+   * same store; the claim is a SINGLE atomic readwrite transaction
+   * ({@link OutboxStorage.acquireLease}) — read `__lock__:<instanceId>`, write
+   * only when it is absent/expired/already ours — so two tabs without Web
+   * Locks cannot both pass a check-then-act pair and run two deliverers
+   * (which would double-POST). A live foreign lease parks the caller until the
+   * owner releases or (if it crashed) the lease passes {@link LEASE_TTL_MS}.
    * The owner releases in finally. localStorage has no cross-tab transactions;
    * the single-tab degraded case is the supported one.
    */
@@ -505,20 +570,26 @@ export class Outbox {
     const key = this.leaseKey(instanceId);
     const deadline = Date.now() + LEASE_TTL_MS + 5_000;
     for (;;) {
-      const all = await this.storage.all();
-      const existing = all.find((r) => r.commandId === key);
       const now = Date.now();
-      if (!existing?.lease || existing.lease.owner === this.owner || existing.lease.until <= now) {
-        await this.storage.put({
-          commandId: key,
-          clientRequestId: key,
-          instanceId,
-          prompt: "",
-          createdAt: now,
-          attempts: 0,
-          state: "inflight",
-          lease: { owner: this.owner, until: now + LEASE_TTL_MS },
-        });
+      const leaseRec: OutboxRecord = {
+        commandId: key,
+        clientRequestId: key,
+        instanceId,
+        prompt: "",
+        createdAt: now,
+        attempts: 0,
+        state: "inflight",
+        lease: { owner: this.owner, until: now + LEASE_TTL_MS },
+      };
+      let acquired = false;
+      try {
+        acquired = await this.storage.acquireLease(key, leaseRec, now);
+      } catch {
+        // A storage failure during the claim must never look like a grant:
+        // stay out of delivery and retry within the bounded deadline.
+        acquired = false;
+      }
+      if (acquired) {
         try {
           return await this.runDeliverer(instanceId, fn);
         } finally {

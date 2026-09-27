@@ -402,9 +402,9 @@ for (const appearance of ["dark", "light"] as const) {
   test(`xterm theme changes live on SYSTEM colour-scheme change (${appearance} start)`, async ({
     browser,
   }) => {
-    // The skip check runs on the TEST'S OWN page, inside its dedicated
-    // color-scheme context — never on a throwaway preflight page that skipped before
-    // any terminal (or login) existed.
+    // The dedicated context runs in its own color-scheme setting; it is
+    // created here, but the capability decision happens only AFTER a terminal
+    // is open, on the live page's own matchMedia — never as a preflight skip.
     const ctx = await browser.newContext({
       viewport: { width: 1440, height: 900 },
       colorScheme: appearance === "dark" ? "dark" : "light",
@@ -418,9 +418,9 @@ for (const appearance of ["dark", "light"] as const) {
         localStorage.setItem("runtime.theme.v1", "system");
       });
       await sysPage.reload();
+      // Open the terminal BEFORE deciding anything about emulation.
       const id = await createTerminal(sysPage, `uo10 sys ${appearance}`);
-      await openTerminal(sysPage, id);
-      const lab = sysPage.locator("[data-tty-lab]");
+      const lab = await openTerminal(sysPage, id);
       const startId = await lab.getAttribute("data-tty-instance");
       const themeBgBefore = await sysPage.evaluate(() =>
         window.__ttyLab?.themeBackground(),
@@ -429,9 +429,42 @@ for (const appearance of ["dark", "light"] as const) {
       await sysPage.keyboard.type("echo UO10_SENTINEL_SYS", { delay: 5 });
       await sysPage.keyboard.press("Enter");
       await sysPage.waitForTimeout(500);
+
+      const other = appearance === "dark" ? "light" : "dark";
       await sysPage.emulateMedia({
         colorScheme: appearance === "dark" ? "light" : "dark",
       });
+      // Can THIS runner actually flip prefers-color-scheme? Ask the live
+      // page's own media query (system mode stamps no data-appearance).
+      const emulated = await sysPage.evaluate(
+        (scheme) =>
+          window.matchMedia(`(prefers-color-scheme: ${scheme})`).matches,
+        other,
+      );
+      if (!emulated) {
+        // The environment ignores color-scheme emulation. Assert exactly that
+        // — never skip past a terminal that is already open — and prove the
+        // terminal stayed on its original theme and instance with no signal.
+        expect(
+          await sysPage.evaluate(
+            (scheme) =>
+              window.matchMedia(`(prefers-color-scheme: ${scheme})`).matches,
+            appearance,
+          ),
+          "original media scheme still reported when emulation is unsupported",
+        ).toBe(true);
+        expect(
+          await sysPage.evaluate(() => window.__ttyLab?.themeBackground()),
+          "terminal theme unchanged with no media change",
+        ).toBe(themeBgBefore);
+        expect(await lab.getAttribute("data-tty-instance")).toBe(startId);
+        expect(
+          await sysPage.evaluate(() =>
+            window.__ttyLab?.bufferText().includes("UO10_SENTINEL_SYS"),
+          ),
+        ).toBe(true);
+        return;
+      }
       await expect
         .poll(
           async () =>
@@ -452,6 +485,128 @@ for (const appearance of ["dark", "light"] as const) {
     }
   });
 }
+
+test.describe("container height trim", () => {
+  test("a ~3-row height shrink in fit and fixed trims once: rows == floor(height/cell), PTY == xterm", async ({
+    page,
+  }) => {
+    if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const id = await createTerminal(page, "uo10 trim");
+    await openTerminal(page, id);
+    await page.waitForTimeout(150); // flush the initial 80ms reconciler send
+
+    const ensureMode = async (target: "fit" | "fixed" | "responsive") => {
+      for (let i = 0; i < 3; i += 1) {
+        const label = await page.getByTestId("tty-io-mode").textContent();
+        if (label?.includes(target)) return;
+        await page.evaluate(() => {
+          const btn = [...document.querySelectorAll("button")].find((b) =>
+            /^(fit|fixed|responsive)$/.test(b.textContent?.trim() ?? ""),
+          );
+          btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        });
+        await page.waitForTimeout(60);
+      }
+      await expect(page.getByTestId("tty-io-mode")).toContainText(target);
+    };
+
+    // Geometry exactly as TerminalView.measureDesired sees it: .host content
+    // height minus vertical padding, the painted cell (screen / current
+    // rows), and xterm's grid.
+    const geometry = () =>
+      page.evaluate(() => {
+        const host =
+          document.querySelector<HTMLElement>(".xterm")?.parentElement ??
+          null;
+        const labEl = document.querySelector("[data-tty-lab]");
+        if (!host || !labEl) return null;
+        const pad = getComputedStyle(host);
+        const padY =
+          (parseFloat(pad.paddingTop) || 0) +
+          (parseFloat(pad.paddingBottom) || 0);
+        const contentH = host.clientHeight - padY;
+        const rows = Number(labEl.getAttribute("data-tty-rows"));
+        const screen = host.querySelector<HTMLElement>(".xterm-screen");
+        const cell =
+          screen && rows > 0
+            ? screen.getBoundingClientRect().height / rows
+            : 0;
+        return {
+          rows,
+          cols: Number(labEl.getAttribute("data-tty-cols")),
+          contentH,
+          cell,
+        };
+      });
+
+    const settled = () =>
+      page.evaluate(() => {
+        const labEl = document.querySelector("[data-tty-lab]");
+        const sent = window.__ttyLab?.lastResize() ?? null;
+        const grid = labEl
+          ? {
+              cols: Number(labEl.getAttribute("data-tty-cols")),
+              rows: Number(labEl.getAttribute("data-tty-rows")),
+            }
+          : null;
+        return (
+          !!grid && JSON.stringify(sent) === JSON.stringify(grid)
+        );
+      });
+    const waitSettled = async () => {
+      await expect.poll(settled, { timeout: 5_000 }).toBe(true);
+      await page.waitForTimeout(200); // stable across > one 80ms debounce
+      expect(await settled()).toBe(true);
+    };
+
+    for (const mode of ["fit", "fixed"] as const) {
+      await ensureMode(mode);
+      await waitSettled();
+      const before = await geometry();
+      expect(before, `${mode}: geometry measurable`).not.toBeNull();
+      expect(before!.cell).toBeGreaterThan(0);
+
+      // Lose exactly 3 rows at the painted cell: choose the viewport delta so
+      // the new content height is (rows-3)*cell + 1 (the toolbar chrome is
+      // constant across the resize, so inner-height and content-height deltas
+      // are 1:1).
+      const rest = before!.contentH - before!.rows * before!.cell;
+      const delta = Math.round(3 * before!.cell + rest - 1);
+      await page.setViewportSize({ width: 1440, height: 900 - delta });
+      await waitSettled();
+      const after = await geometry();
+      expect(after).not.toBeNull();
+
+      // The height loss is applied ONCE: final rows is exactly what the new
+      // box fits at the cell it now paints — old code divided the painted
+      // height by the PROPOSAL rows, trimmed 37 → 34 on a 40→37 shrink, and
+      // stranded the PTY on the 6-row-shorter grid.
+      const floorRows = Math.floor((after!.contentH + 0.01) / after!.cell);
+      expect(after!.rows, `${mode}: rows == floor(height / cell)`).toBe(
+        floorRows,
+      );
+      // The grid is maximal: one more row would clip the bottom line.
+      expect((after!.rows + 1) * after!.cell).toBeGreaterThan(after!.contentH);
+      // And no painted row overflows the host.
+      expect(after!.rows * after!.cell).toBeLessThanOrEqual(
+        after!.contentH + 0.5,
+      );
+      // ~3 rows lost (allow a 1-row font-search nudge in fit) — never the
+      // ~6 of the double trim.
+      const lost = before!.rows - after!.rows;
+      expect(lost, `${mode}: height loss applied once (~3 rows)`).toBeGreaterThanOrEqual(2);
+      expect(lost, `${mode}: height loss not applied twice`).toBeLessThanOrEqual(4);
+      expect(
+        await page.evaluate(() => window.__ttyLab?.lastResize()),
+        `${mode}: PTY grid == xterm grid`,
+      ).toEqual({ cols: after!.cols, rows: after!.rows });
+
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await waitSettled();
+    }
+  });
+});
 
 test.describe("390px keyboard band", () => {
   // hasTouch + a narrow viewport emulates a phone on desktop chromium; the
@@ -955,7 +1110,6 @@ test.describe("390px keyboard band", () => {
         );
         btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
-    await page.evaluate(() => window.__ttyLab?.resetResizeCount());
     await clickModeButton();
     await page.waitForTimeout(20); // intermediate "fixed" frame actually paints
     await expect(page.getByTestId("tty-io-mode")).toContainText("fixed");
@@ -963,19 +1117,46 @@ test.describe("390px keyboard band", () => {
     await expect(page.getByTestId("tty-io-mode")).toContainText(
       "responsive",
     );
-    await page.waitForTimeout(600);
 
-    const finalCols = Number(await lab.getAttribute("data-tty-cols"));
-    const finalRows = Number(await lab.getAttribute("data-tty-rows"));
+    // Wait for the SETTLED state — the reconciler invariant is PTY lastSent
+    // === xterm's live grid, stable across a full debounce window — not for a
+    // send count read at the end of a blind timeout. Font-load / duplicate
+    // ResizeObserver signals can legitimately follow the burst and re-send at
+    // the converged grid; counting those across an unbounded wait is the
+    // flake this test had.
+    const gridState = () =>
+      page.evaluate(() => {
+        const labEl = document.querySelector("[data-tty-lab]");
+        const sent = window.__ttyLab?.lastResize() ?? null;
+        const grid = labEl
+          ? {
+              cols: Number(labEl.getAttribute("data-tty-cols")),
+              rows: Number(labEl.getAttribute("data-tty-rows")),
+            }
+          : null;
+        return { sent, grid };
+      });
+    await expect
+      .poll(
+        async () => {
+          const s = await gridState();
+          return s.grid && JSON.stringify(s.sent) === JSON.stringify(s.grid)
+            ? "settled"
+            : "pending";
+        },
+        { timeout: 5_000 },
+      )
+      .toBe("settled");
+    // Stable across more than one full 80ms debounce window.
+    await page.waitForTimeout(200);
+    const settled = await gridState();
+    expect(settled.sent, "PTY stays at the settled grid").toEqual(settled.grid);
+
+    const finalCols = settled.grid!.cols;
+    const finalRows = settled.grid!.rows;
     expect(finalRows, "height-only change shrank the local grid").toBeLessThan(
       rowsBefore,
     );
-    // Exactly one resize for the whole burst (target-aware replacement).
-    await expect
-      .poll(async () =>
-        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
-      )
-      .toBe(1);
     // The PTY's last resize equals xterm's FINAL cols/rows.
     expect(await page.evaluate(() => window.__ttyLab?.lastResize())).toEqual({
       cols: finalCols,

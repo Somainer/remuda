@@ -564,8 +564,8 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   await shot(page, "m-realdevice-2-terminal-390.png");
 
   // UO-10: record the fitted grid and the PTY resize counter, then open the
-  // keyboard. The freeze rule keeps xterm on its current grid (CSS clips and
-  // bottom-aligns) — no fit, no sessionRef.resize at all.
+  // keyboard. The freeze rule keeps xterm on the grid captured at onset (CSS
+  // clips and bottom-aligns) — it never refits to the keyboard band itself.
   const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
   const colsBefore = Number(await lab.getAttribute("data-tty-cols"));
   // Round-6 reconciler: wait out the 80ms debounce so the settled grid has
@@ -573,9 +573,15 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   await page.waitForTimeout(150);
   await page.evaluate(() => window.__ttyLab?.resetResizeCount());
 
-  // Keyboard up through a REAL animation (sub-threshold frame first, then
-  // the full keyboard): intermediate frames must neither commit a grid nor
-  // schedule a resize that later fires while frozen.
+  // Keyboard up through a REAL animation: a sub-threshold 40px frame (no
+  // data-keyboard stamp yet), then the full keyboard 16ms later — both within
+  // the 80ms debounce. UO-10 round-7 contract: the approach frame is a
+  // legitimate resize PENDING at onset, so hold captures THAT grid (25 rows
+  // here), it goes to the PTY exactly once, and xterm freezes on it; the
+  // full-keyboard height change that follows onset is held and never sent.
+  // Round-6 captured lastSent here instead and silently rolled the pending
+  // target back — which also dropped real pending resizes (e.g. a rotation
+  // whose timer had not fired).
   await raiseKeyboardAnimated(page, 308);
   await page.waitForTimeout(300);
   const after = await waitForInBand(page, '[aria-label="终端画面"]', 120);
@@ -584,29 +590,46 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
     after!.height,
     `terminal height after keyboard: ${JSON.stringify(after)}`,
   ).toBeGreaterThan(100);
-  await expect
-    .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
-    .toBeGreaterThan(3);
-  // Grid frozen: identical rows/cols and ZERO resize commands to the PTY.
-  expect(Number(await lab.getAttribute("data-tty-rows"))).toBe(rowsBefore);
+  const rowsHeld = Number(await lab.getAttribute("data-tty-rows"));
+  expect(rowsHeld).toBeGreaterThan(3);
+  // Frozen on the approach-frame pending grid: a couple rows shorter than the
+  // settled grid (40px loss at the phone cell), cols unchanged — NOT the
+  // ~8-row band grid the full keyboard would measure to.
+  expect(rowsHeld).toBeLessThan(rowsBefore);
+  expect(rowsBefore - rowsHeld).toBeLessThanOrEqual(4);
   expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
-  expect(
-    await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
-    "no PTY resize while the keyboard is open",
-  ).toBe(0);
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      { timeout: 3_000 },
+    )
+    .toBe(1);
+  expect(await page.evaluate(() => window.__ttyLab?.lastResize())).toEqual({
+    cols: colsBefore,
+    rows: rowsHeld,
+  });
   await shot(page, "m-realdevice-3-terminal-keyboard-390.png", true);
 
-  // Keyboard closes: fit resumes, but a grid that settles back to the same
-  // cols/rows still sends no resize — the full open/close cycle stays at 0.
+  // Keyboard closes: the hold releases and the restored box fits back to the
+  // original grid. The restore is a genuine post-close resize (the geometry
+  // really changed) — one more send, ending with PTY == xterm == pre-keyboard.
   await lowerKeyboardIosExact(page);
   await expect
     .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
     .toBe(rowsBefore);
   expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
-  expect(
-    await page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
-    "no PTY resize across keyboard open/close",
-  ).toBe(0);
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      { timeout: 3_000 },
+    )
+    .toBe(2);
+  expect(await page.evaluate(() => window.__ttyLab?.lastResize())).toEqual({
+    cols: colsBefore,
+    rows: rowsBefore,
+  });
 });
 
 test("(c) model/effort observations render as change records, never as 未识别事件", async ({

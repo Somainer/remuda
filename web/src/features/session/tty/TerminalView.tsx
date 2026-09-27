@@ -34,6 +34,7 @@ import {
   createFontMeasure,
   fittedTerminalFont,
   responsiveTerminalSize,
+  rowsFittingHeight,
   whenFontsReady,
 } from "./terminalFit";
 import { attachTerminalTouch } from "./terminalTouch";
@@ -454,16 +455,14 @@ export function TerminalView({
       let rows = proposal?.rows ?? fallback?.rows ?? term.rows;
       // A4: FitAddon derives rows from its own CSS cell estimate, which can
       // round one row larger than the renderer actually paints; that extra row
-      // overflows `.host` and the bottom line is clipped. Trim against the
-      // painted screen height.
+      // overflows `.host` and the bottom line is clipped. The cell comes from
+      // the grid CURRENTLY painted (painted / term.rows), never from the new
+      // proposal — painted/proposalRows rescales the cell on a shrink and
+      // applies the height loss twice (see rowsFittingHeight).
       const screen = host.querySelector<HTMLElement>(".xterm-screen");
-      if (screen && rows > 1) {
+      if (screen && term.rows > 0) {
         const painted = screen.getBoundingClientRect().height;
-        const cell = painted / rows;
-        if (cell > 0 && painted > height) {
-          const fits = Math.max(3, Math.floor(height / cell));
-          if (fits < rows) rows = fits;
-        }
+        rows = rowsFittingHeight(rows, painted / term.rows, height);
       }
       return { cols, rows };
     };
@@ -617,13 +616,24 @@ export function TerminalView({
     observer.observe(viewport);
     const onViewport = () => {
       if (window.visualViewport && window.visualViewport.scale !== 1) return;
+      // UO-10 round-7: the keyboard detector (lib/viewport) registered its
+      // listener before this effect's, so on THIS same event it has already
+      // stamped data-keyboard AND applied the shrunken --workbench-height.
+      // Sync the hold BEFORE measuring: onset must capture the grid still on
+      // screen (a legitimate resize pending in the debounce goes out once),
+      // while this event's own height loss is measured immediately after and
+      // gets pinned. Measuring first would capture the keyboard-shrunk grid
+      // and freeze the PTY down to the band (or send it).
+      if (document.documentElement.dataset.keyboard === "1")
+        reconciler.keyboardOpened();
+      else reconciler.keyboardClosed();
       applyFit();
     };
-    // Soft-keyboard edges: the keyboard detector (lib/viewport) stamps
-    // data-keyboard synchronously on the viewport event, so this microtask runs
-    // before the ResizeObserver delivers the shrunken layout — opening captures the
-    // pre-keyboard rows, closing releases them; either way a normal layoutChanged
-    // follows and the reconciler does the rest.
+    // Soft-keyboard edges via attribute transitions not delivered through the
+    // resize handlers above (mount-with-keyboard, focus-only stamps). Opening
+    // captures rows; closing releases them. The viewport path syncs the hold
+    // before its own measure, so this observer's reconcile is redundant there
+    // (both calls are idempotent) and only handles the extra cases.
     const keyboardObserver = new MutationObserver(() => {
       if (document.documentElement.dataset.keyboard === "1") {
         reconciler.keyboardOpened();

@@ -239,24 +239,44 @@ describe("size reconciler", () => {
     assertSettled(h);
   });
 
-  it("sub-threshold keyboard frames settle to ZERO resizes and the original grid", async () => {
-    // m-realdevice raiseKeyboardAnimated: a 40px loss frame (data-keyboard
-    // not yet stamped) lands 16ms BEFORE the full keyboard stamps. The early frame
-    // may resize xterm locally and arm a send, but by settle the hold has
-    // captured the PTY's rows, xterm is rolled back, and nothing is sent.
+  it("a resize pending at keyboard onset sends its target once, then holds every later height change", async () => {
+    // A legitimate resize (here: container change pending in the debounce
+    // window, applied to xterm but not yet sent) must not be swallowed by the
+    // keyboard: onset captures the CURRENT grid's rows, the pending target
+    // (cols AND rows) goes out exactly once, and only later height changes
+    // are held. Zero more sends across the rest of the open/close cycle.
     const h = makeHarness({ w: 393, h: 659 });
     await h.settle();
-    const before = { ...h.xterm };
     h.reconciler.resetCount();
 
-    h.setSize(393, 619); // 40px loss, keyboard not yet "open" to the hold
-    await vi.advanceTimersByTimeAsync(16); // one frame later: keyboard stamps
-    h.keyboardOpen();
+    // Legit pending resize: both dimensions change, timer not yet fired.
+    h.setSize(700, 619);
+    const pending = { ...h.xterm };
+    expect(pending).not.toEqual(h.pty);
+    await vi.advanceTimersByTimeAsync(16); // still inside the 80ms debounce
+    h.keyboardOpen(); // onset mid-debounce: hold = pending rows, not lastSent
     await h.settle();
 
-    expect(h.reconciler.resizeCount()).toBe(0);
-    expect({ cols: h.xterm.cols, rows: h.xterm.rows }).toEqual(before);
-    expect(h.pty).toEqual(before);
+    // Exactly one send — with the PENDING target, rows and cols.
+    expect(h.reconciler.resizeCount()).toBe(1);
+    expect(h.sends.at(-1)).toEqual(pending);
+    expect(h.pty).toEqual(pending);
+    expect({ cols: h.xterm.cols, rows: h.xterm.rows }).toEqual(pending);
+
+    // Keyboard-shrunk height frames keep pinning rows to the pending target.
+    h.reconciler.layoutChanged();
+    await h.settle();
+    expect(h.reconciler.resizeCount()).toBe(1);
+    expect({ cols: h.xterm.cols, rows: h.xterm.rows }).toEqual(pending);
+
+    // Close: the box is the pending size again — zero further sends.
+    h.keyboardClose();
+    await h.settle();
+    expect(
+      h.reconciler.resizeCount(),
+      "no further sends during the open/close cycle",
+    ).toBe(1);
+    assertSettled(h);
   });
 
   it("property: after any random signal burst settles, xterm === lastSent === desired", () => {

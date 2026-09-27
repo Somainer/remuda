@@ -8,7 +8,10 @@
  * is just another layout signal to this single state machine:
  *
  *   lastSent     cols/rows actually sent to the PTY (null before the first).
- *   keyboardHold rows captured when the keyboard started opening; null otherwise.
+ *   keyboardHold rows of the grid ON SCREEN when the keyboard started opening
+ *                — xterm tracks desired synchronously, so a resize still in
+ *                the debounce window is captured as the hold (its pending
+ *                target still goes out once); null otherwise.
  *
  * On every signal it recomputes `desired` — the grid the current container and
  * mode measure to — with ONE override: while a keyboard is held, rows stay on
@@ -31,7 +34,12 @@ export const SIZE_SEND_DEBOUNCE_MS = 80;
 export type SizeReconciler = {
   /** Any layout signal: container resize, viewport resize, rotation, mode, font. */
   layoutChanged: () => void;
-  /** Soft keyboard started opening: pin rows to the pre-keyboard grid. */
+  /**
+   * Soft keyboard started opening: pin rows to the grid on screen at onset.
+   * MUST be invoked BEFORE the onset event's own shrunken layout is measured
+   * (TerminalView syncs the hold at the top of its viewport handler) —
+   * otherwise the captured grid is the keyboard-band grid, not the pending one.
+   */
   keyboardOpened: () => void;
   /** Soft keyboard closed: rows follow the container again. */
   keyboardClosed: () => void;
@@ -127,11 +135,14 @@ export function createSizeReconciler(
     layoutChanged: recompute,
     keyboardOpened: () => {
       if (hold !== null) return;
-      // Prefer the grid the PTY last acknowledged: during an animated keyboard
-      // opening, sub-threshold frames may have already shrunk xterm locally,
-      // but their debounced send has not fired yet, so lastSent is still the
-      // pre-keyboard grid. Fall back to xterm before the first send.
-      hold = sentGrid?.rows ?? options.currentGrid().rows;
+      // Capture rows from the grid ON SCREEN at onset. xterm tracks desired
+      // synchronously, so a legitimate resize still inside the debounce
+      // window is already the current grid: pinning to it lets that pending
+      // target (cols AND rows) go out exactly once, and only height changes
+      // arriving AFTER onset are pinned. lastSent must not be used here — it
+      // is still the pre-pending grid, so it would pair brand-new cols with
+      // stale rows, or cancel a height-only pending resize outright.
+      hold = options.currentGrid().rows;
       recompute();
     },
     keyboardClosed: () => {

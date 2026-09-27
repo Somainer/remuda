@@ -320,7 +320,7 @@ it("ROUND5-1: a live steer whose forward is only unknown does not raise 已打�
   vi.spyOn(api, "instanceSend").mockImplementation(
     (async (_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => ({
       relatedCommandIds: [],
-      ...raw(unknownForwarded(commandId!)),
+      command: unknownForwarded(commandId!),
     })) as Api["instanceSend"],
   );
   // The Hub never learns the Node's verdict inside the bounded window.
@@ -351,7 +351,7 @@ it("ROUND5-1: a restored reconciling row restarts its bounded GET loop after rel
   vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
     ReturnType<Api["hostList"]>
   >);
-  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as ReturnType<Api["deviceList"]>);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
   vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
     ReturnType<Api["passkeyList"]>
   >);

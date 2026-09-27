@@ -33,7 +33,7 @@ it("a foreground resume sees a silently-closed socket (no close event) and reope
   vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
     ReturnType<Api["hostList"]>
   >);
-  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as ReturnType<Api["deviceList"]>);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as Awaited<ReturnType<Api["deviceList"]>>);
   vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
     ReturnType<Api["passkeyList"]>
   >);

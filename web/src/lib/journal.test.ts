@@ -545,7 +545,7 @@ it("ROUND5-2: a resume that joins the fill its generation just invalidated fails
   expect(client.appliedSeq).toBe("1");
   // The resume STARTED A REPLACEMENT fill after the superseded one ended (at
   // least one read beyond the resume read), rather than trusting the join.
-  expect(read.mock.calls.length).toBeGreaterThanOrEqual(3);
+  expect(vi.mocked(read).mock.calls.length).toBeGreaterThanOrEqual(3);
 });
 
 it("a newer resume with a taller gap reuses an in-flight same-generation fill only once it covers its target", async () => {

@@ -507,6 +507,13 @@ pub(crate) async fn handle_node_method(
                     .await?;
             }
             reconcile_lost_instances(state, &host.host_id, &params).await?;
+            // c-deadcards round 3: bind the live transport to the nodeEpoch it
+            // announced, so fenced answer dispatch refuses a frame across a
+            // same-/new-epoch reconnect.
+            let node_epoch = params
+                .get("nodeEpoch")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let generation = state
                 .nodes
                 .insert(
@@ -517,6 +524,7 @@ pub(crate) async fn handle_node_method(
                                 .unwrap_or(TransportKind::OutboundWss),
                         ),
                     ),
+                    node_epoch,
                 )
                 .await;
             *session_generation = Some(generation);

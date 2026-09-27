@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use remuda_hub::{HubConfig, spawn};
+use remuda_hub::{HubConfig, HubError, NodeTransport, TransportKind, spawn};
 use remuda_protocol::HostId;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -789,6 +789,345 @@ async fn late_answer_after_instance_end_is_rejected_and_never_forwarded() -> Res
     );
 
     node.close(None).await.ok();
+    hub.shutdown().await;
+    Ok(())
+}
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
+
+/// An `interaction.answer` call parks until `release()`; records every method
+/// it was asked to send. Models the exact old-generation Node link the answer
+/// was claimed against.
+struct ParkingTransport {
+    gate: Arc<Notify>,
+    released: Arc<AtomicBool>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    reply_ok: bool,
+}
+
+impl NodeTransport for ParkingTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+    fn call(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+        _timeout: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<serde_json::Value>, HubError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let method = method.to_string();
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(method.clone());
+            if method == "interaction.answer" {
+                while !self.released.load(Ordering::SeqCst) {
+                    self.gate.notified().await;
+                }
+                if self.reply_ok {
+                    return Ok(Some(serde_json::json!({
+                        "jsonrpc": "2.0", "id": "1",
+                        "result": {"outcome": "accepted"}
+                    })));
+                }
+            }
+            Ok(None)
+        })
+    }
+    fn notify(
+        &self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, HubError>> + Send + '_>>
+    {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+}
+
+/// The NEW-generation link after a same-epoch reconnect: records methods and
+/// answers everything; the test asserts it is NEVER asked interaction.answer.
+struct RecordingTransport {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl NodeTransport for RecordingTransport {
+    fn kind(&self) -> TransportKind {
+        TransportKind::OutboundWss
+    }
+    fn call(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+        _timeout: std::time::Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<serde_json::Value>, HubError>>
+                + Send
+                + '_,
+        >,
+    > {
+        let method = method.to_string();
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(method);
+            Ok(Some(serde_json::json!({
+                "jsonrpc": "2.0", "id": "1",
+                "result": {"outcome": "accepted"}
+            })))
+        })
+    }
+    fn notify(
+        &self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, HubError>> + Send + '_>>
+    {
+        Box::pin(std::future::ready(Ok(false)))
+    }
+}
+
+/// Seed a ready instance with one pending harness-hook interaction directly
+/// through the store (no WS), bound to an online host announcing `epoch`.
+async fn seed_pending_online(
+    hub: &remuda_hub::RunningHub,
+    host_id: &str,
+    epoch: &str,
+) -> Result<(String, String)> {
+    let store = hub.store().expect("store");
+    hub.test_insert_host(host_id).await?;
+    store
+        .record_node_epoch(host_id.to_owned(), Some(epoch.to_owned()))
+        .await?;
+    let instance = store
+        .ensure_instance(host_id.to_owned(), format!("ins_{}", uuid::Uuid::now_v7()))
+        .await?;
+    store
+        .append_journal(
+            host_id.to_owned(),
+            instance.instance_id.clone(),
+            None,
+            json!({ "kind": "lifecycle", "payload": {
+                "type": "entity", "entityType": "instance", "state": "ready"
+            }}),
+        )
+        .await?;
+    let interaction = format!("int_{}", uuid::Uuid::now_v7());
+    store
+        .append_journal(
+            host_id.to_owned(),
+            instance.instance_id.clone(),
+            None,
+            hook_request_event(&interaction),
+        )
+        .await?;
+    Ok((instance.instance_id, interaction))
+}
+
+/// c-deadcards round 3 (HIGH b): an answer dispatched just before the
+/// host-lost sweep races a SAME-epoch reconnect. The frame is bound to the
+/// old connection; the new link must never receive interaction.answer, and
+/// the late RPC result is rejected once the sweep ended the generation.
+#[tokio::test]
+async fn answer_racing_sweep_and_same_epoch_reconnect_never_reaches_new_node() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut config = HubConfig::for_test(dir.path().join("data"));
+    config.host_lost_grace_ms = 0;
+    let hub = spawn(config).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let epoch = "ep-race";
+    let (instance_id, interaction_wire) = seed_pending_online(&hub, &host_id, epoch).await?;
+
+    // Link 1: the link the answer is claimed against parks the RPC.
+    let gate = Arc::new(Notify::new());
+    let released = Arc::new(AtomicBool::new(false));
+    let old_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let old_link = Arc::new(ParkingTransport {
+        gate: gate.clone(),
+        released: released.clone(),
+        calls: old_calls.clone(),
+        reply_ok: true,
+    });
+    hub.test_set_node_transport_epoched(&host_id, old_link, Some(epoch.into()))
+        .await;
+
+    // Dispatch the answer — it parks inside the fenced call.
+    let command_id = format!("cmd_{}", uuid::Uuid::now_v7());
+    let answer_body =
+        json!({ "commandId": command_id, "answer": serde_json::from_str::<Value>(ALLOW_ANSWER)? })
+            .to_string();
+    let answer_cookie = cookie.clone();
+    let answer_iid = interaction_wire.clone();
+    let answer = tokio::spawn(async move {
+        http(
+            addr,
+            "POST",
+            &format!("/v1/interactions/{answer_iid}/answer"),
+            &answer_cookie,
+            Some(&answer_body),
+        )
+        .await
+    });
+    let answer = Box::pin(answer);
+
+    // Wait until the row is claimed `dispatching` (RPC in flight).
+    let store = hub.store().expect("store");
+    let mut claimed = false;
+    for _ in 0..100 {
+        if let Some(row) = store.get_interaction(interaction_wire.clone()).await?
+            && row.state == "dispatching"
+        {
+            claimed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(claimed, "the answer claimed the card and parked the RPC");
+    assert!(
+        old_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "interaction.answer")
+    );
+
+    // The host is lost; the sweep ends the generation while the RPC is parked,
+    // invalidating the in-flight claim.
+    store.mark_host_offline(host_id.clone()).await?;
+    let swept = store.expire_lost_hosts(0).await?;
+    assert_eq!(swept, 1, "sweep ended the instance");
+    assert_eq!(
+        store
+            .get_instance(instance_id)
+            .await?
+            .expect("row")
+            .lifecycle,
+        "exited"
+    );
+
+    // Same-epoch reconnect: a NEW connection (generation 2) mounts.
+    let new_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let new_link = Arc::new(RecordingTransport {
+        calls: new_calls.clone(),
+    });
+    hub.test_set_node_transport_epoched(&host_id, new_link, Some(epoch.into()))
+        .await;
+
+    // Release the OLD link's parked RPC with an "accepted" result.
+    released.store(true, Ordering::SeqCst);
+    gate.notify_waiters();
+    let (status, body) = answer.await??;
+    assert_eq!(
+        status, 404,
+        "the late RPC result is rejected because the generation ended: {status} {body}"
+    );
+
+    // Give the new link a moment — it must never have been asked anything.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !new_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "interaction.answer"),
+        "an allow must never reach the reconnected same-epoch Node: {:?}",
+        new_calls.lock().unwrap()
+    );
+    // The card stays departed.
+    assert_eq!(
+        store
+            .get_interaction(interaction_wire)
+            .await?
+            .expect("row")
+            .state,
+        "invalidated"
+    );
+
+    hub.shutdown().await;
+    Ok(())
+}
+
+/// c-deadcards round 3 (winner): with the HTTP acknowledgement lost, the
+/// Node's interaction.answered observation (payload.answerCommandId) commits
+/// the winner; the identical retry replays the acknowledgement and forwards
+/// NOTHING to the (newly connected) Node.
+#[tokio::test]
+async fn answered_observation_makes_identical_retry_idempotent_without_forward() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let hub = spawn(HubConfig::for_test(dir.path().join("data"))).await?;
+    let addr = hub.addr;
+    let cookie = login(addr, &hub.bootstrap_token).await?;
+    let host_id = format!("hst_{}", uuid::Uuid::now_v7());
+    let epoch = "ep-obs";
+    let (instance_id, interaction_wire) = seed_pending_online(&hub, &host_id, epoch).await?;
+    let store = hub.store().expect("store");
+
+    let command_id = format!("cmd_{}", uuid::Uuid::now_v7());
+    // The Node already committed and journaled the answer, but the HTTP
+    // response was lost. The observation names the winning command.
+    store
+        .append_journal(
+            host_id.clone(),
+            instance_id.clone(),
+            None,
+            json!({ "kind": "interaction.answered", "payload": {
+                "interactionId": interaction_wire,
+                "requestVersion": "1",
+                "answerCommandId": command_id,
+                "actor": { "kind": "human", "deviceId": "dev_obs" },
+                "answerRef": "obj_obs",
+                "delivery": "written"
+            }}),
+        )
+        .await?;
+
+    // Mount a recording link only AFTER the commit: the retry must be served
+    // from the Hub, never forwarded.
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    hub.test_set_node_transport_epoched(
+        &host_id,
+        Arc::new(RecordingTransport {
+            calls: calls.clone(),
+        }),
+        Some(epoch.into()),
+    )
+    .await;
+
+    let answer_body =
+        json!({ "commandId": command_id, "answer": serde_json::from_str::<Value>(ALLOW_ANSWER)? })
+            .to_string();
+    let (status, body) = http(
+        addr,
+        "POST",
+        &format!("/v1/interactions/{interaction_wire}/answer"),
+        &cookie,
+        Some(&answer_body),
+    )
+    .await?;
+    assert_eq!(
+        status, 200,
+        "identical retry replays the original acknowledgement: {status} {body}"
+    );
+    let ack: Value = serde_json::from_str(body.trim())?;
+    assert_eq!(ack["commandId"], json!(command_id));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m == "interaction.answer"),
+        "the replayed acknowledgement must not be forwarded: {:?}",
+        calls.lock().unwrap()
+    );
+
     hub.shutdown().await;
     Ok(())
 }

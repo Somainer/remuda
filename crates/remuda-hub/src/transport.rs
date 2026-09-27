@@ -355,9 +355,30 @@ impl NodeTransport for StdioTransport {
     }
 }
 
+#[derive(Clone)]
 struct NodeSlot {
     generation: u64,
+    /// nodeEpoch announced by THIS link's `node.hello` (c-deadcards round 3).
+    /// A fenced dispatch only goes out on the exact epoch it validated.
+    node_epoch: Option<String>,
     link: Arc<dyn NodeTransport>,
+}
+
+/// Outcome of a generation-fenced RPC (c-deadcards round 3).
+#[derive(Debug)]
+pub(crate) enum FencedCall {
+    /// The call went out on the validated link; `None` result = link not
+    /// writable (socket gone).
+    Sent(Option<Value>),
+    /// Nothing is connected for this host.
+    NotConnected,
+    /// The connected link is a DIFFERENT generation than the dispatch was
+    /// claimed against (new nodeEpoch, or a reconnect — same epoch but a new
+    /// connection generation) — the frame was refused, never sent.
+    GenerationMismatch {
+        actual_epoch: Option<String>,
+        actual_generation: u64,
+    },
 }
 
 /// Connected Node transports, keyed by host id.
@@ -407,14 +428,72 @@ impl ConnectedNodes {
         link.notify(method, params).await
     }
 
+    /// Snapshot the live link's identity — nodeEpoch and the per-connection
+    /// generation that increments on EVERY reconnect even when the nodeEpoch
+    /// is unchanged (c-deadcards round 3). A dispatch claimed against one link
+    /// is refused on any other.
+    pub async fn current_slot(&self, host_id: &str) -> Option<(Option<String>, u64)> {
+        self.inner
+            .lock()
+            .await
+            .get(host_id)
+            .map(|slot| (slot.node_epoch.clone(), slot.generation))
+    }
+
+    /// c-deadcards round 3: call ONLY when the connected link announces the
+    /// exact nodeEpoch the dispatch claim validated. The epoch check and link
+    /// selection happen under one lock hold, so a reconnect cannot interleave
+    /// a different-generation link between the check and the send; the returned
+    /// Arc is the validated slot's own link (a later replacement leaves this
+    /// Arc pointing at the dead socket, whose call fails without delivering).
+    pub(crate) async fn call_fenced(
+        &self,
+        host_id: &str,
+        expected_epoch: Option<&str>,
+        expected_generation: u64,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> FencedCall {
+        let slot = {
+            let inner = self.inner.lock().await;
+            inner.get(host_id).cloned()
+        };
+        let Some(slot) = slot else {
+            return FencedCall::NotConnected;
+        };
+        if slot.node_epoch.as_deref() != expected_epoch || slot.generation != expected_generation {
+            return FencedCall::GenerationMismatch {
+                actual_epoch: slot.node_epoch,
+                actual_generation: slot.generation,
+            };
+        }
+        match slot.link.call(method, params, timeout).await {
+            Ok(value) => FencedCall::Sent(value),
+            Err(_) => FencedCall::Sent(None),
+        }
+    }
+
     /// Record a live session. Returns a generation used to retire only this session.
-    pub async fn insert(&self, host_id: String, link: Arc<dyn NodeTransport>) -> u64 {
+    pub async fn insert(
+        &self,
+        host_id: String,
+        link: Arc<dyn NodeTransport>,
+        node_epoch: Option<String>,
+    ) -> u64 {
         let mut inner = self.inner.lock().await;
         let generation = inner
             .get(&host_id)
             .map(|slot| slot.generation.wrapping_add(1))
             .unwrap_or(1);
-        inner.insert(host_id, NodeSlot { generation, link });
+        inner.insert(
+            host_id,
+            NodeSlot {
+                generation,
+                node_epoch,
+                link,
+            },
+        );
         generation
     }
 
@@ -704,5 +783,101 @@ mod budget_tests {
             let _ = handle.await;
         }
         assert_eq!(pending_len(&pending), 0);
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    /// c-deadcards round 3: call_fenced refuses a frame on (a) a new nodeEpoch
+    /// and (b) a SAME-epoch reconnect — the per-connection generation
+    /// increments either way.
+    #[tokio::test]
+    async fn same_epoch_reconnect_still_mismatches_the_fence() {
+        let nodes = ConnectedNodes::default();
+        let host = "hst_fence";
+        let link = |n: u64| -> Arc<dyn NodeTransport> {
+            Arc::new(ScriptedTransport::new(Some(json!({
+                "jsonrpc": "2.0", "id": n.to_string(), "result": {"ok": true}
+            }))))
+        };
+
+        // First link announces epoch E, connection generation 1.
+        let gen1 = nodes.insert(host.into(), link(1), Some("E".into())).await;
+        assert_eq!(gen1, 1);
+
+        // A dispatch claimed against link 1 goes out.
+        match nodes
+            .call_fenced(
+                host,
+                Some("E"),
+                gen1,
+                "interaction.answer",
+                json!({}),
+                Duration::from_secs(1),
+            )
+            .await
+        {
+            FencedCall::Sent(Some(frame)) => assert_eq!(frame["id"], json!("1")),
+            other => panic!("expected send on the validated link: {other:?}"),
+        }
+
+        // Same nodeEpoch, NEW socket (the host-lost replay scenario).
+        let gen2 = nodes.insert(host.into(), link(2), Some("E".into())).await;
+        assert_eq!(gen2, 2);
+        match nodes
+            .call_fenced(
+                host,
+                Some("E"),
+                gen1,
+                "interaction.answer",
+                json!({}),
+                Duration::from_secs(1),
+            )
+            .await
+        {
+            FencedCall::GenerationMismatch {
+                actual_epoch,
+                actual_generation,
+            } => {
+                assert_eq!(actual_epoch.as_deref(), Some("E"));
+                assert_eq!(actual_generation, gen2);
+            }
+            other => panic!("same-epoch reconnect must refuse the stale dispatch: {other:?}"),
+        }
+
+        // A genuinely new epoch mismatches on epoch too.
+        let gen3 = nodes.insert(host.into(), link(3), Some("E2".into())).await;
+        assert!(matches!(
+            nodes
+                .call_fenced(
+                    host,
+                    Some("E"),
+                    gen2,
+                    "interaction.answer",
+                    json!({}),
+                    Duration::from_secs(1)
+                )
+                .await,
+            FencedCall::GenerationMismatch { .. }
+        ));
+        let _ = gen3;
+
+        // Nothing connected → NotConnected.
+        nodes.remove(host).await;
+        assert!(matches!(
+            nodes
+                .call_fenced(
+                    host,
+                    Some("E"),
+                    gen3,
+                    "interaction.answer",
+                    json!({}),
+                    Duration::from_secs(1)
+                )
+                .await,
+            FencedCall::NotConnected
+        ));
     }
 }

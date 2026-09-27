@@ -1113,6 +1113,47 @@ pub struct InstanceWatermark {
     pub durable_seq: String,
 }
 
+/// Result of an atomic answer-dispatch claim (c-deadcards round 3).
+#[derive(Debug)]
+pub enum DispatchClaim {
+    /// Claimed: forward `interaction.answer` to this host, and only to a
+    /// transport whose nodeEpoch equals `dispatch_epoch`.
+    Claimed {
+        host_id: String,
+        dispatch_epoch: Option<String>,
+        dispatch_link_generation: u64,
+    },
+    /// The same command is already in flight on this card.
+    InFlight,
+    /// Response may have been lost; the identical command won earlier — replay
+    /// the stored acknowledgement.
+    IdempotentReplay,
+    /// A different command arrived second; carries the winning commandId.
+    Conflict { winner: String },
+    /// The interaction/generation is gone — never forward.
+    Dead,
+    /// No durable interaction row.
+    Missing,
+}
+
+/// What happened when a claimed but incomplete dispatch is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchRelease {
+    /// Same generation still connected: the card returned to `pending`.
+    Pending,
+    /// The generation changed/ended meanwhile: the card stayed departed.
+    Settled,
+}
+
+struct DispatchRow {
+    state: String,
+    instance_id: String,
+    host_id: String,
+    answer_command_id: Option<String>,
+    dispatch_command_id: Option<String>,
+    lifecycle: String,
+}
+
 /// Pending (or resolved) Interaction mirrored for Hub restart.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2057,17 +2098,24 @@ impl Store {
                 let rows = stmt.query_map(params![&now, grace], |row| row.get::<_, String>(0))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            let changed = tx.execute(
-                "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    connectivity = 'disconnected', last_error = 'host-lost', updated_at = ?1
-                 WHERE lifecycle NOT IN ('exited', 'closed') AND host_id IN (
-                    SELECT id FROM hosts WHERE state != 'online' AND
-                    (NOT EXISTS (SELECT 1 FROM ssh_hosts WHERE host_id = hosts.id) OR state = 'daemon-unreachable') AND
-                    (julianday(?1) - julianday(COALESCE(offline_since, last_seen_at, created_at))) * 86400000 >= ?2
-                 )",
-                params![&now, grace],
+            // c-deadcards round 3: ONE terminal writer stamps the ended
+            // generation (the host's current nodeEpoch) and invalidates the
+            // generation's pending cards in the SAME transaction.
+            let changed = settle_terminal_rows(
+                &tx,
+                &lost,
+                "exited",
+                "idle",
+                Some("host-lost"),
+                &now,
             )?;
-            settle_instance_interactions(&tx, &lost, &now)?;
+            // The bulk sweep also flips connectivity for the swept hosts'
+            // rows (terminal absorption keeps lifecycle stable afterwards).
+            tx.execute(
+                "UPDATE instances SET connectivity = 'disconnected', updated_at = ?1
+                 WHERE id IN (SELECT value FROM json_each(?2))",
+                params![&now, serde_json::to_string(&lost).unwrap_or_else(|_| "[]".into())],
+            )?;
             tx.commit()?;
             Ok(changed)
         }).await
@@ -2933,15 +2981,9 @@ impl Store {
                 .filter(|id| !reported.iter().any(|seen| seen == id))
                 .collect();
             let now = now_rfc3339();
-            for id in &lost {
-                tx.execute(
-                    "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                        last_error = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![&reason, &now, id],
-                )?;
-            }
-            // A generation that ended owns no still-answerable request.
-            settle_instance_interactions(&tx, &lost, &now)?;
+            // c-deadcards round 3: shared terminal writer (stamps the ended
+            // nodeEpoch + settles cards in one transaction).
+            settle_terminal_rows(&tx, &lost, "exited", "idle", Some(&reason), &now)?;
             tx.commit()?;
             Ok(lost)
         })
@@ -2971,16 +3013,15 @@ impl Store {
                 .collect::<Result<_, _>>()?;
             drop(stmt);
             let stale_ids: Vec<String> = stale.iter().map(|(id, _)| id.clone()).collect();
-            for id in &stale_ids {
-                tx.execute(
-                    "UPDATE instances SET lifecycle = 'failed', activity = 'idle',
-                        last_error = 'create-never-acknowledged', updated_at = ?1
-                     WHERE id = ?2 AND lifecycle = 'requested'",
-                    params![&now, id],
-                )?;
-            }
-            // c-deadcards: a create that never ran owns no answerable card.
-            settle_instance_interactions(&tx, &stale_ids, &now)?;
+            // c-deadcards round 3: shared terminal writer.
+            settle_terminal_rows(
+                &tx,
+                &stale_ids,
+                "failed",
+                "idle",
+                Some("create-never-acknowledged"),
+                &now,
+            )?;
             tx.commit()?;
             Ok(stale
                 .into_iter()
@@ -3002,20 +3043,31 @@ impl Store {
         self.run_named("settle_instance_exited", move |conn| {
             // c-deadcards: settle the instance and invalidate its still-pending
             // interactions atomically (explicit stop/kill/delete, or a stop for
-            // an instance the Node no longer knows).
+            // an instance the Node no longer knows). Round 3 routes through the
+            // single terminal writer so the ended generation is stamped too.
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
-            let changed = tx.execute(
-                "UPDATE instances SET lifecycle = 'exited', activity = 'idle',
-                    last_error = ?1, updated_at = ?2
-                 WHERE id = ?3 AND lifecycle NOT IN ('exited', 'failed')",
-                params![reason, &now, &instance_id],
-            )?;
-            if changed > 0 {
-                settle_instance_interactions(&tx, std::slice::from_ref(&instance_id), &now)?;
+            let exists: bool = tx
+                .query_row(
+                    "SELECT 1 FROM instances
+                      WHERE id = ?1 AND lifecycle NOT IN ('exited', 'failed')",
+                    params![&instance_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if exists {
+                settle_terminal_rows(
+                    &tx,
+                    std::slice::from_ref(&instance_id),
+                    "exited",
+                    "idle",
+                    Some(&reason),
+                    &now,
+                )?;
             }
             tx.commit()?;
-            Ok(changed > 0)
+            Ok(exists)
         })
         .await
     }
@@ -3351,9 +3403,14 @@ impl Store {
         self.run_named("fail_instance", move |conn| {
             let tx = immediate_tx(conn)?;
             let now = now_rfc3339();
+            // COALESCE keeps the FIRST ended generation on a repeated failure
+            // (terminal is absorbing and must not re-stamp a newer epoch here).
             tx.execute(
                 "UPDATE instances
-                 SET lifecycle = 'failed', last_error = ?1, updated_at = ?2
+                 SET lifecycle = 'failed', last_error = ?1,
+                     ended_epoch = COALESCE(ended_epoch,
+                        (SELECT node_epoch FROM hosts WHERE id = instances.host_id)),
+                     updated_at = ?2
                  WHERE id = ?3",
                 params![last_error, &now, &instance_id],
             )?;
@@ -4065,10 +4122,12 @@ impl Store {
         self.run_named("record_interaction_answer", move |conn| {
             conn.execute(
                 "UPDATE interactions
-                    SET state = CASE WHEN state = 'pending' THEN 'answer-committed' ELSE state END,
+                    SET state = CASE WHEN state IN ('pending', 'dispatching') THEN 'answer-committed' ELSE state END,
                         answer_command_id = COALESCE(answer_command_id, ?3),
+                        dispatch_epoch = NULL, dispatch_command_id = NULL,
+                        dispatch_link_generation = NULL,
                         updated_at = ?1
-                  WHERE id = ?2 AND state IN ('pending', 'answer-committed')",
+                  WHERE id = ?2 AND state IN ('pending', 'dispatching', 'answer-committed')",
                 params![now_rfc3339(), interaction_id, command_id],
             )?;
             Ok(())
@@ -4076,28 +4135,219 @@ impl Store {
         .await
     }
 
-    /// c-deadcards round 2: whether the instance owning a durable interaction
-    /// has an EFFECTIVE terminal lifecycle (its generation ended) — the
-    /// answer-endpoint fence behind the ingestion-time one. `None` when
-    /// either row is missing.
-    pub async fn interaction_instance_terminal(
+    /// Claim a durable interaction for answer dispatch, validating the
+    /// CURRENT generation inside one write transaction (c-deadcards round 3 —
+    /// fenced dispatch). There is no check-then-send window: the row moves
+    /// `pending -> dispatching` carrying the exact live-link identity
+    /// (nodeEpoch + per-connection generation, snapshotted from the transport
+    /// registry by the caller) the RPC may go out on, so a sweep/epoch change
+    /// landing before the RPC commits settles the card, and a competing
+    /// command cannot be forwarded.
+    pub async fn claim_interaction_dispatch(
         &self,
         interaction_id: String,
-    ) -> Result<Option<bool>, StoreError> {
-        self.run_named("interaction_instance_terminal", move |conn| {
-            conn.query_row(
-                "SELECT i2.lifecycle
-                   FROM interactions i
-                   JOIN instances i2 ON i2.id = i.instance_id
-                  WHERE i.id = ?1",
-                params![interaction_id],
-                |row| {
-                    let lifecycle: String = row.get(0)?;
-                    Ok(TERMINAL_INSTANCE_LIFECYCLES.contains(&lifecycle.as_str()))
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        command_id: String,
+        expected_epoch: Option<String>,
+        expected_link_generation: u64,
+    ) -> Result<DispatchClaim, StoreError> {
+        self.run_named("claim_interaction_dispatch", move |conn| {
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let row = tx
+                .query_row(
+                    "SELECT i.state, i.instance_id, i.host_id,
+                            i.answer_command_id, i.dispatch_command_id,
+                            i2.lifecycle
+                       FROM interactions i
+                       JOIN instances i2 ON i2.id = i.instance_id
+                      WHERE i.id = ?1",
+                    params![interaction_id],
+                    |row| {
+                        Ok(DispatchRow {
+                            state: row.get(0)?,
+                            instance_id: row.get(1)?,
+                            host_id: row.get(2)?,
+                            answer_command_id: row.get(3)?,
+                            dispatch_command_id: row.get(4)?,
+                            lifecycle: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(row) = row else {
+                tx.commit()?;
+                return Ok(DispatchClaim::Missing);
+            };
+            let claim = match row.state.as_str() {
+                "expired" | "invalidated" => DispatchClaim::Dead,
+                "answer-committed" | "resolved" => {
+                    if row.answer_command_id.as_deref() == Some(command_id.as_str()) {
+                        DispatchClaim::IdempotentReplay
+                    } else {
+                        DispatchClaim::Conflict {
+                            winner: row.answer_command_id.unwrap_or_default(),
+                        }
+                    }
+                }
+                "dispatching" => {
+                    if row.dispatch_command_id.as_deref() == Some(command_id.as_str()) {
+                        DispatchClaim::InFlight
+                    } else {
+                        DispatchClaim::Conflict {
+                            winner: row.dispatch_command_id.unwrap_or_default(),
+                        }
+                    }
+                }
+                _ => {
+                    // Still nominally pending — re-read the EFFECTIVE
+                    // generation in THIS transaction. A terminal instance
+                    // (sweep landed between list and answer) settles the card;
+                    // the answer is dead and nothing is forwarded.
+                    if TERMINAL_INSTANCE_LIFECYCLES.contains(&row.lifecycle.as_str()) {
+                        settle_instance_interactions(
+                            &tx,
+                            std::slice::from_ref(&row.instance_id),
+                            &now,
+                        )?;
+                        DispatchClaim::Dead
+                    } else {
+                        let changed = tx.execute(
+                            "UPDATE interactions
+                                SET state = 'dispatching', dispatch_epoch = ?4,
+                                    dispatch_link_generation = ?5,
+                                    dispatch_command_id = ?6, updated_at = ?3
+                              WHERE id = ?1 AND state = 'pending'",
+                            params![
+                                interaction_id,
+                                row.instance_id,
+                                now,
+                                expected_epoch,
+                                expected_link_generation,
+                                command_id
+                            ],
+                        )?;
+                        if changed == 0 {
+                            // Lost a concurrent claim race; re-read is overkill
+                            // for the answer path — treat as conflict.
+                            DispatchClaim::Conflict {
+                                winner: String::new(),
+                            }
+                        } else {
+                            DispatchClaim::Claimed {
+                                host_id: row.host_id,
+                                dispatch_epoch: expected_epoch,
+                                dispatch_link_generation: expected_link_generation,
+                            }
+                        }
+                    }
+                }
+            };
+            tx.commit()?;
+            Ok(claim)
+        })
+        .await
+    }
+
+    /// Accept a claimed dispatch's successful RPC result — but ONLY if the
+    /// claim is still live at completion time (c-deadcards round 3). The
+    /// RPC await spans an unbounded window; a host-lost sweep or epoch
+    /// reconciliation landing in that window already invalidated the row
+    /// (settlement matches `dispatching`). Returns false then, and the caller
+    /// answers 404 instead of accepting the allow. Serialized against the
+    /// settlement transaction via BEGIN IMMEDIATE, so either the allow
+    /// demonstrably completed before the end, or it never commits.
+    pub async fn complete_interaction_dispatch(
+        &self,
+        interaction_id: String,
+        command_id: String,
+    ) -> Result<bool, StoreError> {
+        self.run_named("complete_interaction_dispatch", move |conn| {
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let changed = tx.execute(
+                "UPDATE interactions
+                    SET state = 'answer-committed',
+                        answer_command_id = dispatch_command_id,
+                        dispatch_epoch = NULL, dispatch_command_id = NULL,
+                        dispatch_link_generation = NULL, updated_at = ?3
+                  WHERE id = ?1 AND dispatch_command_id = ?2
+                    AND state = 'dispatching'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM instances
+                         WHERE instances.id = interactions.instance_id
+                           AND lifecycle IN ('exited', 'failed', 'closed')
+                    )",
+                params![interaction_id, command_id, now],
+            )?;
+            tx.commit()?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Release a claimed dispatch after the RPC did NOT complete (not
+    /// connected, epoch mismatch, transport error). If the validated
+    /// generation is still the connected one the card returns to `pending` so
+    /// the human can retry; if the epoch changed or the instance is terminal
+    /// meanwhile, the generation ended — the card stays departed.
+    pub async fn release_interaction_dispatch(
+        &self,
+        interaction_id: String,
+        command_id: String,
+    ) -> Result<DispatchRelease, StoreError> {
+        self.run_named("release_interaction_dispatch", move |conn| {
+            let tx = immediate_tx(conn)?;
+            let now = now_rfc3339();
+            let info = tx
+                .query_row(
+                    "SELECT i.dispatch_epoch, i2.lifecycle, h.node_epoch
+                       FROM interactions i
+                       JOIN instances i2 ON i2.id = i.instance_id
+                       LEFT JOIN hosts h ON h.id = i2.host_id
+                      WHERE i.id = ?1",
+                    params![interaction_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let outcome = match info {
+                Some((dispatch_epoch, lifecycle, current_epoch))
+                    if !TERMINAL_INSTANCE_LIFECYCLES.contains(&lifecycle.as_str())
+                        && dispatch_epoch == current_epoch =>
+                {
+                    tx.execute(
+                        "UPDATE interactions
+                            SET state = 'pending', dispatch_epoch = NULL,
+                                dispatch_command_id = NULL,
+                                dispatch_link_generation = NULL, updated_at = ?2
+                          WHERE id = ?1 AND state = 'dispatching'
+                            AND dispatch_command_id = ?3",
+                        params![interaction_id, now, command_id],
+                    )?;
+                    DispatchRelease::Pending
+                }
+                _ => {
+                    // Generation changed/ended: keep the card departed rather
+                    // than revive it pending for a newer Node to answer.
+                    tx.execute(
+                        "UPDATE interactions
+                            SET state = 'invalidated', blocking = 0,
+                                dispatch_epoch = NULL, dispatch_command_id = NULL,
+                                dispatch_link_generation = NULL, updated_at = ?2
+                          WHERE id = ?1 AND state = 'dispatching'
+                            AND dispatch_command_id = ?3",
+                        params![interaction_id, now, command_id],
+                    )?;
+                    DispatchRelease::Settled
+                }
+            };
+            tx.commit()?;
+            Ok(outcome)
         })
         .await
     }
@@ -5258,6 +5508,56 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // command (the Hub replays the original acknowledgement) while a
     // different command still gets 409 with the winner named.
     ensure_column(&conn, "interactions", "answer_command_id", "TEXT")?;
+    // c-deadcards round 3: the generation that ended an instance's life — the
+    // host nodeEpoch (NULL while alive) and the process generation (NULL when
+    // the Hub cannot know it, e.g. a host-lost sweep). Terminal is absorbing:
+    // a later observation revives the row ONLY when it carries a newer
+    // generation (different nodeEpoch, or a greater processGeneration).
+    ensure_column(&conn, "instances", "ended_epoch", "TEXT")?;
+    ensure_column(&conn, "instances", "ended_process_generation", "INTEGER")?;
+    // c-deadcards round 3: fenced answer dispatch. While an interaction.answer
+    // RPC is in flight the row is claimed ('dispatching') with the exact
+    // epoch it was validated against and the commandId that claimed it, so
+    // no other command can be forwarded and a generation change mid-flight
+    // settles the card instead of releasing it pending.
+    ensure_column(&conn, "interactions", "dispatch_epoch", "TEXT")?;
+    ensure_column(&conn, "interactions", "dispatch_command_id", "TEXT")?;
+    // Per-connection generation of the live transport link the RPC was
+    // claimed against (increments on every reconnect even at the same
+    // nodeEpoch) — part of the fence key.
+    ensure_column(&conn, "interactions", "dispatch_link_generation", "INTEGER")?;
+
+    // c-deadcards round 3: one-time backfill of NULL winning commandIds on
+    // already-committed rows from the Node's interaction.answered journal
+    // observations (payload.answerCommandId, §5.4), so an identical retry
+    // after upgrade still receives the original acknowledgement.
+    {
+        let backfilled = conn.execute(
+            "UPDATE interactions
+                SET answer_command_id = (
+                    SELECT json_extract(j.payload_json, '$.payload.answerCommandId')
+                    FROM journal j
+                    WHERE json_extract(j.payload_json, '$.kind')
+                              IN ('interaction.answered', 'interactionAnswered')
+                      AND COALESCE(
+                            json_extract(j.payload_json, '$.payload.interactionId'),
+                            json_extract(j.payload_json, '$.payload.interaction_id'))
+                          = interactions.id
+                      AND json_extract(j.payload_json, '$.payload.answerCommandId') IS NOT NULL
+                    ORDER BY j.seq DESC
+                    LIMIT 1
+                )
+              WHERE state IN ('answer-committed', 'resolved')
+                AND answer_command_id IS NULL",
+            [],
+        )?;
+        if backfilled > 0 {
+            tracing::info!(
+                backfilled,
+                "backfilled answer winner commandIds from journal"
+            );
+        }
+    }
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
     // 2026-09-15: [Image #n] anchor assigned by the send manifest.
@@ -5611,39 +5911,67 @@ fn apply_instance_projection(
                 });
         }
     }
-    if let Some(lifecycle) = lifecycle {
-        // Capture the previous EFFECTIVE lifecycle before this write so the
-        // settlement guard fires on the transition itself. This projection
-        // recognises native terminals (nativeName "exit", severity "error",
-        // prose status) that apply_instance_lifecycle's derivation does not —
-        // c-deadcards round 2: those used to set lifecycle='failed' here while
-        // leaving the generation's pending cards untouched.
-        let previous_lifecycle: Option<String> = conn
-            .query_row(
-                "SELECT lifecycle FROM instances WHERE id = ?1",
-                params![instance_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        conn.execute(
-            "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
-                    last_error = COALESCE(?3, last_error), updated_at = ?4
-             WHERE id = ?5",
-            params![seq, lifecycle, last_error, now, instance_id],
-        )?;
-        settle_on_terminal_transition(
-            conn,
-            instance_id,
-            previous_lifecycle.as_deref(),
-            Some(lifecycle),
-            now,
-        )?;
-        // D-027: a terminal instance can never consume a staged attachment
-        // again, and the Node drops its own copy at the same point.
-        if matches!(lifecycle, "exited" | "failed") {
+    if let Some(candidate) = lifecycle {
+        // c-deadcards round 3: TERMINAL IS ABSORBING — route the projection
+        // write through the single effective-lifecycle decision. A replayed
+        // ready/running for the generation that already ended (same nodeEpoch,
+        // older/equal processGeneration) must NOT revive the row.
+        let Some(current) = load_instance(conn, instance_id)? else {
+            return Ok(());
+        };
+        let decision = effective_lifecycle_for_observation(conn, &current, event, Some(candidate))?;
+        if decision.absorbed {
+            // Bookkeeping only: durable_seq/updated_at advance on every
+            // durable append, but the row stays terminal.
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, updated_at = ?2 WHERE id = ?3",
+                params![seq, now, instance_id],
+            )?;
+            return Ok(());
+        }
+        let observed_pg = parse_process_generation(event);
+        if decision.became_terminal {
+            let (ended_epoch, ended_pg) =
+                terminal_generation_values(conn, &current.host_id, observed_pg)?;
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
+                        last_error = COALESCE(?3, last_error),
+                        ended_epoch = ?6, ended_process_generation = ?7,
+                        updated_at = ?4
+                 WHERE id = ?5",
+                params![
+                    seq,
+                    decision.lifecycle,
+                    last_error,
+                    now,
+                    instance_id,
+                    ended_epoch,
+                    ended_pg
+                ],
+            )?;
+            settle_instance_interactions(conn, &[instance_id.to_string()], now)?;
+            // D-027: a terminal instance can never consume a staged
+            // attachment again, and the Node drops its own copy at the same
+            // point.
             conn.execute(
                 "DELETE FROM objects WHERE instance_id = ?1",
                 params![instance_id],
+            )?;
+        } else if decision.revived {
+            // A newer generation starts a new life: clear the ended markers.
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
+                        ended_epoch = NULL, ended_process_generation = NULL,
+                        updated_at = ?3
+                 WHERE id = ?4",
+                params![seq, decision.lifecycle, now, instance_id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
+                        last_error = COALESCE(?3, last_error), updated_at = ?4
+                 WHERE id = ?5",
+                params![seq, decision.lifecycle, last_error, now, instance_id],
             )?;
         }
     } else {
@@ -7974,6 +8302,267 @@ mod tests {
         store.close().await;
     }
 
+    /// c-deadcards round 3 (HIGH a): TERMINAL IS ABSORBING. After the
+    /// host-lost sweep ends the instance under a recorded nodeEpoch, a
+    /// replayed `ready` on the SAME epoch must not revive it, and a replayed
+    /// interaction.requested must be ingested departed, never answerable.
+    #[tokio::test]
+    async fn replayed_ready_and_request_after_sweep_stay_terminal_and_departed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "deadcards-absorb").await;
+        store
+            .record_node_epoch(host.clone(), Some("ep-1".into()))
+            .await
+            .expect("record epoch");
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let _pending = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+
+        // Host vanishes; the grace sweep ends the generation.
+        store
+            .mark_host_offline(host.clone())
+            .await
+            .expect("offline");
+        let swept = store.expire_lost_hosts(0).await.expect("sweep");
+        assert_eq!(swept, 1);
+        let ended = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(ended.lifecycle, "exited");
+
+        // Replayed ready restatement on the SAME epoch: absorbed.
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"entity","entityType":"instance","state":"ready"
+                }}),
+            )
+            .await
+            .expect("replayed ready append");
+        let still = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            still.lifecycle, "exited",
+            "a same-epoch replayed ready must not revive a swept instance"
+        );
+
+        // The replayed request is ingested departed and cannot be claimed for
+        // answer dispatch.
+        let replayed_id = new_id("int").expect("replayed id");
+        store
+            .append_journal(
+                host,
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"interaction.requested","payload":{
+                    "interactionKind":"approval",
+                    "interaction":{
+                        "id":replayed_id,"kind":"approval","state":"pending",
+                        "blocking":true,"answerable":true,"carrier":"harness-hook",
+                        "deadline":{"state":"unknown"},"resolution":{"state":"unknown"},
+                        "request":{"kind":"approval","title":"Bash","options":[]}
+                    }
+                }}),
+            )
+            .await
+            .expect("replayed request append");
+        let row = store
+            .get_interaction(replayed_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, "invalidated");
+        assert!(matches!(
+            store
+                .claim_interaction_dispatch(replayed_id, "cmd_replay".into(), None, 1)
+                .await
+                .expect("claim"),
+            DispatchClaim::Dead
+        ));
+        store.close().await;
+    }
+
+    /// c-deadcards round 3: a genuinely NEWER generation (greater
+    /// processGeneration observed on the node link) DOES revive an absorbed
+    /// terminal row — absorption binds the ended generation, not the id.
+    #[tokio::test]
+    async fn newer_process_generation_revives_an_absorbed_terminal() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "deadcards-revive").await;
+        store
+            .record_node_epoch(host.clone(), Some("ep-1".into()))
+            .await
+            .expect("record epoch");
+        let instance = seed_acknowledged_instance(&store, &host).await;
+
+        // Generation 1 exits (journaled exit with processGeneration 1).
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","processGeneration":"1","payload":{
+                    "type":"entity","entityType":"instance","state":"exited"
+                }}),
+            )
+            .await
+            .expect("gen1 exit");
+        assert_eq!(
+            store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .expect("get")
+                .expect("row")
+                .lifecycle,
+            "exited"
+        );
+
+        // A same-generation ready is absorbed …
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","processGeneration":"1","payload":{
+                    "type":"entity","entityType":"instance","state":"ready"
+                }}),
+            )
+            .await
+            .expect("gen1 ready");
+        assert_eq!(
+            store
+                .get_instance(instance.instance_id.clone())
+                .await
+                .expect("get")
+                .expect("row")
+                .lifecycle,
+            "exited"
+        );
+
+        // … but processGeneration 2 starting a new run revives it.
+        store
+            .append_journal(
+                host,
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","processGeneration":"2","payload":{
+                    "type":"entity","entityType":"instance","state":"running"
+                }}),
+            )
+            .await
+            .expect("gen2 running");
+        let revived = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            revived.lifecycle, "running",
+            "a newer process generation revives the row"
+        );
+        store.close().await;
+    }
+
+    /// c-deadcards round 3 (winner backfill): an upgraded DB holding an
+    /// answer-committed row with NULL answer_command_id backfills the winner
+    /// from the Node's interaction.answered journal observation on reopen, so
+    /// an identical retry still gets the original acknowledgement.
+    #[tokio::test]
+    async fn null_winner_backfilled_from_answered_journal_on_reopen() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        let instance = new_id("ins").expect("instance");
+        let interaction = new_id("int").expect("interaction");
+        let winner = format!("cmd_{}", uuid::Uuid::now_v7());
+        store.close().await;
+
+        // Fabricate the upgraded shape: committed row with NULL winner plus its
+        // §5.4 answered observation already in the journal.
+        {
+            let conn = Connection::open(dir.path().join("hub.sqlite")).expect("open db");
+            let now = now_rfc3339();
+            conn.execute(
+                "INSERT INTO hosts
+                    (id, label, token_hash, state, node_version, cli_json,
+                     capabilities_json, created_at, transport, labels_json,
+                     resources_json, max_instances)
+                 VALUES (?1,'upgraded','x','online',NULL,'{}','{}',?2,
+                         'outbound-wss','[]','{}',8)",
+                params![host, now],
+            )
+            .expect("host");
+            conn.execute(
+                "INSERT INTO instances
+                    (id, host_id, kind, driver, lifecycle, activity, connectivity,
+                     journal_id, durable_seq, spec_json, created_at, updated_at)
+                 VALUES (?1,?2,'claude','claude-print','exited','idle','disconnected',
+                     ?3,0,'{}',?4,?4)",
+                params![
+                    instance,
+                    host,
+                    new_id("obj").unwrap_or_else(|_| "obj1".into()),
+                    now
+                ],
+            )
+            .expect("instance");
+            conn.execute(
+                "INSERT INTO interactions
+                    (id, instance_id, host_id, kind, state, blocking,
+                     payload_json, answer_command_id, created_at, updated_at)
+                 VALUES (?1,?2,?3,'approval','answer-committed',0,'{}',NULL,?4,?4)",
+                params![interaction, instance, host, now],
+            )
+            .expect("interaction");
+            let event = json!({
+                "kind":"interaction.answered",
+                "payload":{
+                    "interactionId": interaction,
+                    "requestVersion":"1",
+                    "answerCommandId": winner,
+                    "actor":{"kind":"human","deviceId":"dev_x"},
+                    "answerRef":"obj_1","delivery":"written"
+                }
+            });
+            conn.execute(
+                "INSERT INTO journal (instance_id, seq, event_id, payload_json, observed_at)
+                 VALUES (?1, 0, ?2, ?3, ?4)",
+                params![
+                    instance,
+                    new_id("evt").unwrap_or_else(|_| "evt1".into()),
+                    event.to_string(),
+                    now
+                ],
+            )
+            .expect("journal");
+        }
+
+        let store = Store::open(dir.path()).expect("reopen runs backfill");
+        let row = store
+            .get_interaction(interaction)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.state, "answer-committed");
+        assert_eq!(
+            row.answer_command_id.as_deref(),
+            Some(winner.as_str()),
+            "NULL winner backfilled from payload.answerCommandId"
+        );
+        store.close().await;
+    }
+
     /// c-deadcards (never-acknowledged create): a `requested` instance never
     /// journaled a card (journaling interaction.requested transitions it to
     /// running), so the reaper finds no pending interactions — the defensive
@@ -9160,17 +9749,23 @@ fn apply_interaction_event(
         // c-deadcards round 2: remember the winning commandId so a retried
         // answer after a lost response is idempotent on the SAME command (the
         // Hub replays the original acknowledgement) while a different command
-        // still loses first-answer-wins. The Node stamps commandId on its
-        // answered event when it has one.
+        // still loses first-answer-wins.
+        //
+        // Round 3: the protocol's InteractionAnsweredPayload (§5.4) carries
+        // the winner as payload.answerCommandId — read that first; the bare
+        // event/commandId spellings stay as legacy fallbacks. Applies whether
+        // the row is still `pending` (Node observation arrived before the RPC
+        // result) or `dispatching` (the fenced answer RPC is in flight).
         let winner = event
-            .get("commandId")
+            .pointer("/payload/answerCommandId")
             .and_then(Value::as_str)
+            .or_else(|| event.get("commandId").and_then(Value::as_str))
             .or_else(|| event.pointer("/payload/commandId").and_then(Value::as_str));
         conn.execute(
             "UPDATE interactions
                 SET state = ?1, updated_at = ?2,
                     answer_command_id = COALESCE(?4, answer_command_id)
-              WHERE id = ?3 AND state = 'pending'",
+              WHERE id = ?3 AND state IN ('pending', 'dispatching')",
             params![state, now, id, winner],
         )?;
     }
@@ -9215,6 +9810,11 @@ pub(crate) fn immediate_tx(conn: &mut Connection) -> rusqlite::Result<rusqlite::
 ///
 /// Returns the number of interactions settled. Idempotent: rows already in a
 /// non-pending state (answered/resolved/expired/invalidated) are untouched.
+///
+/// c-deadcards round 3: also claims rows mid-`dispatching` — an answer RPC
+/// racing the instance end belongs to the generation that ended and must not
+/// complete against a reconnected Node, so the claim is invalidated and its
+/// dispatch columns cleared.
 pub(crate) fn settle_instance_interactions(
     conn: &Connection,
     instance_ids: &[String],
@@ -9227,7 +9827,7 @@ pub(crate) fn settle_instance_interactions(
     let placeholders = vec!["?"; live.len()].join(",");
     let sql = format!(
         "SELECT id, payload_json FROM interactions
-         WHERE state = 'pending' AND instance_id IN ({placeholders})"
+         WHERE state IN ('pending', 'dispatching') AND instance_id IN ({placeholders})"
     );
     let params: Vec<&dyn rusqlite::types::ToSql> = live
         .iter()
@@ -9246,8 +9846,10 @@ pub(crate) fn settle_instance_interactions(
         invalidate_interaction_payload(&mut event, now);
         let changed = conn.execute(
             "UPDATE interactions
-                SET state = 'invalidated', blocking = 0, payload_json = ?2, updated_at = ?3
-              WHERE id = ?1 AND state = 'pending'",
+                SET state = 'invalidated', blocking = 0, payload_json = ?2,
+                    dispatch_epoch = NULL, dispatch_command_id = NULL,
+                    dispatch_link_generation = NULL, updated_at = ?3
+              WHERE id = ?1 AND state IN ('pending', 'dispatching')",
             params![id, event.to_string(), now],
         )?;
         settled += changed;
@@ -9289,28 +9891,191 @@ pub(crate) fn invalidate_interaction_payload(event: &mut Value, now: &str) {
     }
 }
 
-/// Settle pending interactions exactly once — on the transition in which the
-/// EFFECTIVE stored lifecycle first becomes terminal. Both lifecycle writers
-/// (the native/entity projection in `apply_instance_projection` and the
-/// derived write in `apply_instance_lifecycle`) route through this, so a
-/// native `exit` / severity-error / prose status that only one derivation
-/// recognises still ends the generation: one terminal derivation, one guard.
-/// No-op when the row was already terminal (the transition's own writer did
-/// the settlement) or stays non-terminal.
-fn settle_on_terminal_transition(
+/// c-deadcards round 3 — TERMINAL IS ABSORBING.
+///
+/// The generation that identifies one live execution of an instance is the
+/// pair `(nodeEpoch, processGeneration)`: the Node restart epoch announced on
+/// `node.hello` (persisted on `hosts.node_epoch`) plus the protocol §5.1
+/// `processGeneration` carried by every observation envelope. Once the Hub
+/// settles an instance terminal it records that pair in `ended_epoch` /
+/// `ended_process_generation`, and no later observation may move the row back
+/// to a non-terminal lifecycle UNLESS it proves a NEWER generation:
+///
+/// * a different (new) nodeEpoch — a Node restart that genuinely relaunched;
+/// * or a greater processGeneration — an in-place process restart observed on
+///   the same Node link.
+///
+/// An observation on the SAME epoch at or below the ended process generation
+/// (the common case: a non-daemon WSS Node that survived a disconnect and
+/// replays its journal after the host-lost sweep) is absorbed — the row stays
+/// terminal. So is an observation whose epoch is unknown: never revive on
+/// missing evidence. Terminal→terminal rank progression (exited→failed) is
+/// still applied.
+///
+/// This is the ONE decision every lifecycle projection writer routes through.
+fn parse_process_generation(event: &Value) -> Option<i64> {
+    event
+        .get("processGeneration")
+        .and_then(generation_as_i64)
+        .or_else(|| event.get("process_generation").and_then(generation_as_i64))
+}
+
+fn generation_as_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<i64>().ok()))
+}
+
+struct EffectiveLifecycle {
+    /// Lifecycle the row must carry after this observation.
+    lifecycle: String,
+    /// The observed lifecycle was absorbed because the row is terminal and the
+    /// observation belongs to the ended generation (write durable_seq/updated_at
+    /// bookkeeping, but do not change lifecycle/activity, do not settle).
+    absorbed: bool,
+    /// This observation begins a NEW generation after a terminal row: clear
+    /// the ended-* markers.
+    revived: bool,
+    /// This write transitions a previously non-terminal row INTO terminal.
+    became_terminal: bool,
+}
+
+fn effective_lifecycle_for_observation(
     conn: &Connection,
-    instance_id: &str,
-    previous: Option<&str>,
-    next: Option<&str>,
-    now: &str,
-) -> Result<(), StoreError> {
-    if let Some(next) = next
-        && TERMINAL_INSTANCE_LIFECYCLES.contains(&next)
-        && !previous.is_some_and(|p| TERMINAL_INSTANCE_LIFECYCLES.contains(&p))
-    {
-        settle_instance_interactions(conn, &[instance_id.to_string()], now)?;
+    current: &InstanceRecord,
+    event: &Value,
+    candidate: Option<&str>,
+) -> Result<EffectiveLifecycle, StoreError> {
+    let Some(candidate) = candidate else {
+        return Ok(EffectiveLifecycle {
+            lifecycle: current.lifecycle.clone(),
+            absorbed: false,
+            revived: false,
+            became_terminal: false,
+        });
+    };
+    let currently_terminal = TERMINAL_INSTANCE_LIFECYCLES.contains(&current.lifecycle.as_str());
+    if !currently_terminal {
+        let next = if lifecycle_rank(candidate) >= lifecycle_rank(&current.lifecycle) {
+            candidate
+        } else {
+            current.lifecycle.as_str()
+        };
+        return Ok(EffectiveLifecycle {
+            lifecycle: next.to_string(),
+            absorbed: false,
+            revived: false,
+            became_terminal: TERMINAL_INSTANCE_LIFECYCLES.contains(&next),
+        });
     }
-    Ok(())
+    // Row already terminal. A newer generation may revive it; anything older
+    // (or unproven) is absorbed.
+    let (ended_epoch, ended_pg): (Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT ended_epoch, ended_process_generation FROM instances WHERE id = ?1",
+            params![current.instance_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((None, None));
+    let host_epoch: Option<String> = conn
+        .query_row(
+            "SELECT node_epoch FROM hosts WHERE id = ?1",
+            params![current.host_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let observed_pg = parse_process_generation(event);
+    let newer_epoch = host_epoch
+        .as_deref()
+        .is_some_and(|epoch| ended_epoch.as_deref().is_some_and(|ended| ended != epoch));
+    let newer_pg = match (ended_pg, observed_pg) {
+        (Some(ended), Some(observed)) => observed > ended,
+        _ => false,
+    };
+    let candidate_terminal = TERMINAL_INSTANCE_LIFECYCLES.contains(&candidate);
+    if newer_epoch || newer_pg {
+        // A genuinely new life: take the candidate (a terminal candidate from
+        // the new generation remains terminal and re-stamps below).
+        Ok(EffectiveLifecycle {
+            lifecycle: candidate.to_string(),
+            absorbed: false,
+            revived: !candidate_terminal,
+            became_terminal: candidate_terminal,
+        })
+    } else if candidate_terminal {
+        // Old generation re-asserting a terminal state: keep terminal, allow
+        // exited→failed rank progression, do not touch ended_*.
+        let next = if lifecycle_rank(candidate) >= lifecycle_rank(&current.lifecycle) {
+            candidate
+        } else {
+            current.lifecycle.as_str()
+        };
+        Ok(EffectiveLifecycle {
+            lifecycle: next.to_string(),
+            absorbed: false,
+            revived: false,
+            became_terminal: false,
+        })
+    } else {
+        // Replayed ready/running for the ended generation: absorb.
+        Ok(EffectiveLifecycle {
+            lifecycle: current.lifecycle.clone(),
+            absorbed: true,
+            revived: false,
+            became_terminal: false,
+        })
+    }
+}
+
+/// Stamp the ended-generation markers when a row transitions INTO terminal:
+/// ended_epoch is the host's CURRENT nodeEpoch (the generation that just
+/// ended); ended_process_generation is the observation's processGeneration
+/// when the journal proves it, else NULL (a host-lost sweep never sees one).
+fn terminal_generation_values(
+    conn: &Connection,
+    host_id: &str,
+    observed_pg: Option<i64>,
+) -> Result<(Option<String>, Option<i64>), StoreError> {
+    let epoch: Option<String> = conn
+        .query_row(
+            "SELECT node_epoch FROM hosts WHERE id = ?1",
+            params![host_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok((epoch, observed_pg))
+}
+
+/// Shared terminal writer for the sweep/settle paths: mark the given
+/// non-terminal rows terminal in ONE transaction shape and settle their
+/// pending interactions. Stamps ended_epoch from each row's own host and
+/// ended_process_generation NULL (a sweep observes no process generation).
+fn settle_terminal_rows(
+    tx: &rusqlite::Transaction<'_>,
+    ids: &[String],
+    lifecycle: &str,
+    activity: &str,
+    last_error: Option<&str>,
+    now: &str,
+) -> Result<usize, StoreError> {
+    let mut changed = 0usize;
+    for id in ids {
+        changed += tx.execute(
+            "UPDATE instances
+                SET lifecycle = ?1, activity = ?2,
+                    last_error = COALESCE(?3, last_error),
+                    ended_epoch = (SELECT node_epoch FROM hosts WHERE id = instances.host_id),
+                    ended_process_generation = COALESCE(ended_process_generation, NULL),
+                    updated_at = ?4
+              WHERE id = ?5",
+            params![lifecycle, activity, last_error, now, id],
+        )?;
+    }
+    settle_instance_interactions(tx, ids, now)?;
+    Ok(changed)
 }
 
 fn lifecycle_rank(state: &str) -> i32 {
@@ -9467,35 +10232,53 @@ fn apply_instance_lifecycle(
         next_act = None;
     }
     let now = now_rfc3339();
-    // c-deadcards round 2: a terminal instance has no live activity. Without
-    // this, a late/replayed interaction.requested (derived activity
-    // "blocked") would write activity='blocked' onto an exited/failed row even
-    // though the rank gate keeps its lifecycle terminal — a dead instance
-    // presenting as blocked.
-    if TERMINAL_INSTANCE_LIFECYCLES.contains(&current.lifecycle.as_str()) {
-        next_act = None;
+    // c-deadcards round 3: TERMINAL IS ABSORBING. Route through the same
+    // effective-lifecycle decision as apply_instance_projection. `current`
+    // was read AFTER that projection ran within this append, so a terminal it
+    // already wrote is seen here and a same-generation replayed blocked/ready
+    // derivation is absorbed rather than reviving the row.
+    let decision = effective_lifecycle_for_observation(conn, &current, event, next_life)?;
+    if decision.absorbed {
+        return Ok(());
     }
-    let lifecycle = match next_life {
-        Some(next) if lifecycle_rank(next) >= lifecycle_rank(&current.lifecycle) => next,
-        _ => current.lifecycle.as_str(),
+    // A terminal row has no live activity: a late interaction.requested
+    // derives activity "blocked", but a dead instance never presents blocked.
+    let effective_terminal = TERMINAL_INSTANCE_LIFECYCLES.contains(&decision.lifecycle.as_str());
+    let activity = match next_act {
+        Some(act) if !effective_terminal => act,
+        _ => current.activity.as_str(),
     };
-    let activity = next_act.unwrap_or(current.activity.as_str());
-    conn.execute(
-        "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
-        params![lifecycle, activity, now, instance_id],
-    )?;
-    // c-deadcards round 2: settle through the SAME transition guard the
-    // projection write uses. `current` was read AFTER apply_instance_projection
-    // (it runs earlier in this append), so a terminal the projection already
-    // wrote and settled is a no-op here; a terminal only THIS derivation
-    // recognises (herdr prose status) still settles its generation now.
-    settle_on_terminal_transition(
-        conn,
-        instance_id,
-        Some(current.lifecycle.as_str()),
-        Some(lifecycle),
-        &now,
-    )?;
+    if decision.became_terminal {
+        let observed_pg = parse_process_generation(event);
+        let (ended_epoch, ended_pg) =
+            terminal_generation_values(conn, &current.host_id, observed_pg)?;
+        conn.execute(
+            "UPDATE instances SET lifecycle = ?1, activity = ?2,
+                    ended_epoch = ?5, ended_process_generation = ?6, updated_at = ?3
+             WHERE id = ?4",
+            params![
+                decision.lifecycle,
+                activity,
+                now,
+                instance_id,
+                ended_epoch,
+                ended_pg
+            ],
+        )?;
+        settle_instance_interactions(conn, &[instance_id.to_string()], &now)?;
+    } else if decision.revived {
+        conn.execute(
+            "UPDATE instances SET lifecycle = ?1, activity = ?2,
+                    ended_epoch = NULL, ended_process_generation = NULL, updated_at = ?3
+             WHERE id = ?4",
+            params![decision.lifecycle, activity, now, instance_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
+            params![decision.lifecycle, activity, now, instance_id],
+        )?;
+    }
     Ok(())
 }
 

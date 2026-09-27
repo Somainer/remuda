@@ -549,58 +549,187 @@ pub async fn answer_interaction(
     } else {
         None
     };
-    // c-deadcards: a late answer to a durable card that is no longer pending
-    // gets the SAME well-defined rejection the owner would — never a 500 and
-    // never a forward that could release an allow on a dead generation. This
-    // runs BEFORE the in-memory CAS and BEFORE any Node RPC.
-    if let Some(stored) = &stored {
-        match stored.state.as_str() {
-            "expired" => return Err(HubError::Expired),
-            "invalidated" => {
-                // The generation/instance is gone (generation-ended): the
-                // entity no longer exists for this answer to act on.
+    // c-deadcards round 3 — FENCED DISPATCH. For a durable card the decision
+    // (reject / idempotent / claim) is one write transaction that re-reads the
+    // instance lifecycle AND the host generation, so there is no
+    // check-then-send window in which a sweep or a same-/new-epoch reconnect
+    // could let the frame reach a different generation.
+    let mut params = json!({
+        "interactionId": interaction_id.as_id().as_str(),
+        "commandId": command_id.as_id().as_str(),
+        "byDevice": by_device.as_str(),
+        "answer": body.answer,
+        // D-051 c-deleg2: truthful actor provenance for the Node-committed
+        // ActorRef. `origin` rides the same Hub-stamped field as every other
+        // Hub→Node frame (`crates/remuda-node/src/origin.rs:39` wire_origin);
+        // `byInstanceId` is the Agent device's bound instance (the answering
+        // parent — distinct from the ticket owner on a delegated answer).
+        // Both are resolved from the authenticated device, never from the
+        // answer body, so a caller cannot self-attest a different actor.
+        "origin": json!(origin),
+        "byInstanceId": json!(device.instance_id),
+    });
+    if let Some(relay) = &bot_relay {
+        // Informational only: the Node still authorizes against `byDevice`.
+        // The durable attribution of the human owner lives in the Hub audit row.
+        params["actingOpenId"] = json!(relay.open_id);
+    }
+
+    if stored.is_some() {
+        use crate::store::DispatchClaim;
+        use crate::transport::FencedCall;
+        let audit_target = stored
+            .as_ref()
+            .map(|row| (row.instance_id.clone(), row.kind.clone()));
+        // Snapshot the EXACT live link this dispatch may use BEFORE the claim
+        // txn. The claim records it on the row; call_fenced then refuses the
+        // frame unless the still-connected link is this same one (a same-epoch
+        // reconnect increments the connection generation too).
+        let claimed_host = stored.as_ref().map(|row| row.host_id.clone());
+        let slot = match claimed_host.as_deref() {
+            Some(host_id) => state.nodes.current_slot(host_id).await,
+            None => None,
+        };
+        let (dispatch_epoch, dispatch_generation) = slot.unzip();
+        let dispatch_epoch = dispatch_epoch.flatten();
+        let claim = state
+            .store
+            .claim_interaction_dispatch(
+                interaction_id.as_id().to_string(),
+                command_id.as_id().to_string(),
+                dispatch_epoch,
+                dispatch_generation.unwrap_or(0),
+            )
+            .await?;
+        let (host_id, dispatch_epoch, dispatch_generation) = match claim {
+            // Response lost, or the identical command is already in flight:
+            // replay the same acknowledgement, forward nothing.
+            DispatchClaim::IdempotentReplay | DispatchClaim::InFlight => {
+                return Ok(Json(json!({
+                    "outcome": "idempotent",
+                    "interactionId": interaction_id.as_id().as_str(),
+                    "commandId": command_id.as_id().as_str(),
+                })));
+            }
+            // A different command arrived second: first-answer-wins.
+            DispatchClaim::Conflict { winner } => {
+                return Err(HubError::Superseded { winner });
+            }
+            // Invalidated/expired/missing: dead generation, no frame.
+            DispatchClaim::Dead | DispatchClaim::Missing => return Err(HubError::NotFound),
+            DispatchClaim::Claimed {
+                host_id,
+                dispatch_epoch,
+                dispatch_link_generation,
+            } => (host_id, dispatch_epoch, dispatch_link_generation),
+        };
+        // The RPC carries the generation it was validated against. The Node is
+        // free to ignore unknown fields; the fence is enforced Hub-side.
+        params["dispatchEpoch"] = json!(dispatch_epoch);
+        params["dispatchLinkGeneration"] = json!(dispatch_generation);
+
+        let release = || async {
+            let _ = state
+                .store
+                .release_interaction_dispatch(
+                    interaction_id.as_id().to_string(),
+                    command_id.as_id().to_string(),
+                )
+                .await;
+        };
+        match state
+            .nodes
+            .call_fenced(
+                &host_id,
+                dispatch_epoch.as_deref(),
+                dispatch_generation,
+                "interaction.answer",
+                params,
+                NODE_RPC_TIMEOUT,
+            )
+            .await
+        {
+            // The connected link is a different generation/connection, or
+            // nothing is connected / the socket is unwritable: refuse and
+            // release the claim (it settles departed if the generation ended
+            // meanwhile). No interaction.answer reaches any Node.
+            FencedCall::GenerationMismatch {
+                actual_epoch,
+                actual_generation,
+            } => {
+                tracing::warn!(
+                    %host_id,
+                    expected_epoch = ?dispatch_epoch,
+                    expected_generation = dispatch_generation,
+                    ?actual_epoch,
+                    actual_generation,
+                    "interaction.answer refused: live link differs from validated generation"
+                );
+                release().await;
                 return Err(HubError::NotFound);
             }
-            "answer-committed" | "resolved" => {
-                // c-deadcards round 2: a duplicate answer is idempotent on its
-                // commandId, distinct from a dead-generation rejection. If the
-                // HTTP response to the winning answer was lost, the identical
-                // retry (same commandId) gets the original acknowledgement
-                // replayed from what the Hub persisted — never a 409. A
-                // DIFFERENT command arrived second and loses
-                // first-answer-wins: 409 naming the winner.
-                let retry_command = command_id.as_id().as_str();
-                match stored.answer_command_id.as_deref() {
-                    Some(winner) if winner == retry_command => {
-                        return Ok(Json(json!({
-                            "outcome": "idempotent",
-                            "interactionId": stored.interaction_id,
-                            "commandId": winner,
-                        })));
-                    }
-                    winner => {
-                        return Err(HubError::Superseded {
-                            winner: winner.unwrap_or_default().to_string(),
-                        });
-                    }
-                }
+            FencedCall::NotConnected | FencedCall::Sent(None) => {
+                release().await;
+                return Err(HubError::NotFound);
             }
-            _ => {}
-        }
-        // Belt-and-suspenders behind the ingestion fence: even a row still
-        // marked pending must never be answered once its instance generation
-        // effectively ended (a sweep that landed between list and answer, or
-        // any ordering gap). No frame is forwarded to the Node.
-        if matches!(
-            state
-                .store
-                .interaction_instance_terminal(interaction_id.as_id().to_string())
-                .await?,
-            Some(true)
-        ) {
-            return Err(HubError::NotFound);
+            FencedCall::Sent(Some(frame)) => match rpc_result(frame) {
+                Ok(result) => {
+                    // Commit ONLY if the claim survived the RPC: the await may
+                    // have overlapped a host-lost sweep / reconciliation that
+                    // ended the generation (it settles `dispatching` rows).
+                    // Either the allow completed before the end, or this 404s.
+                    let committed = state
+                        .store
+                        .complete_interaction_dispatch(
+                            interaction_id.as_id().to_string(),
+                            command_id.as_id().to_string(),
+                        )
+                        .await?;
+                    if !committed {
+                        tracing::warn!(
+                            interaction_id = interaction_id.as_id().as_str(),
+                            "interaction.answer RPC returned but the generation ended mid-flight; rejecting"
+                        );
+                        return Err(HubError::NotFound);
+                    }
+                    if let Some((owner_instance, kind)) = &audit_target {
+                        append_answered_audit(
+                            &state,
+                            &device_id,
+                            interaction_id.as_id().as_str(),
+                            owner_instance,
+                            kind,
+                            origin,
+                            device.instance_id.as_deref(),
+                        )
+                        .await;
+                    }
+                    if let Some(relay) = &bot_relay {
+                        settle_bot_relay(
+                            &state,
+                            &device_id,
+                            relay,
+                            interaction_id.as_id().as_str(),
+                            command_id.as_id().as_str(),
+                        )
+                        .await;
+                    }
+                    return Ok(Json(result));
+                }
+                Err(HubError::NotFound) => {
+                    release().await;
+                    return Err(HubError::NotFound);
+                }
+                Err(err) => {
+                    release().await;
+                    return Err(err);
+                }
+            },
         }
     }
+
+    // ----- Live-only interaction (no durable Hub row): in-memory one-shot
+    // approval broker, then fan out to every connected owner Node. -----
     if let Some(result) = state
         .agent_approvals
         .answer(
@@ -611,8 +740,6 @@ pub async fn answer_interaction(
         )
         .await?
     {
-        // D-051 c-deleg2: every successful answer CAS leaves an
-        // `interaction.answered` row; the bot-relay row below stays additive.
         if let Some(owner_instance) = &in_memory_grant_instance {
             append_answered_audit(
                 &state,
@@ -637,39 +764,7 @@ pub async fn answer_interaction(
         }
         return Ok(Json(result));
     }
-    // The chain start/kind for the unconditional answer audit, captured
-    // before `stored` moves into the host fan-out below. A live-only
-    // interaction with no durable Hub row has no Hub-known chain start.
-    let audit_target = stored
-        .as_ref()
-        .map(|row| (row.instance_id.clone(), row.kind.clone()));
-    // Node owns first-answer-wins. Never commit an answer in the Hub before
-    // the owner is reached, and let the Node reconcile same-command retries.
-    let mut params = json!({
-        "interactionId": interaction_id.as_id().as_str(),
-        "commandId": command_id.as_id().as_str(),
-        "byDevice": by_device.as_str(),
-        "answer": body.answer,
-        // D-051 c-deleg2: truthful actor provenance for the Node-committed
-        // ActorRef. `origin` rides the same Hub-stamped field as every other
-        // Hub→Node frame (`crates/remuda-node/src/origin.rs:39` wire_origin);
-        // `byInstanceId` is the Agent device's bound instance (the answering
-        // parent — distinct from the ticket owner on a delegated answer).
-        // Both are resolved from the authenticated device, never from the
-        // answer body, so a caller cannot self-attest a different actor.
-        "origin": json!(origin),
-        "byInstanceId": json!(device.instance_id),
-    });
-    if let Some(relay) = &bot_relay {
-        // Informational only: the Node still authorizes against `byDevice`.
-        // The durable attribution of the human owner lives in the Hub audit row.
-        params["actingOpenId"] = json!(relay.open_id);
-    }
-    let hosts = match stored {
-        Some(row) => vec![row.host_id],
-        None => state.nodes.host_ids().await,
-    };
-    for host_id in hosts {
+    for host_id in state.nodes.host_ids().await {
         match state
             .nodes
             .call(
@@ -682,8 +777,6 @@ pub async fn answer_interaction(
         {
             Ok(Some(frame)) => match rpc_result(frame) {
                 Ok(result) => {
-                    // Mirror the owner's successful CAS immediately; a delayed
-                    // journal flush must not resurrect a just-answered card.
                     state
                         .store
                         .record_interaction_answer(
@@ -691,30 +784,6 @@ pub async fn answer_interaction(
                             command_id.as_id().to_string(),
                         )
                         .await?;
-                    // D-051 c-deleg2: one unconditional `interaction.answered`
-                    // audit row per committed CAS, independent of bot relay.
-                    if let Some((owner_instance, kind)) = &audit_target {
-                        append_answered_audit(
-                            &state,
-                            &device_id,
-                            interaction_id.as_id().as_str(),
-                            owner_instance,
-                            kind,
-                            origin,
-                            device.instance_id.as_deref(),
-                        )
-                        .await;
-                    }
-                    if let Some(relay) = &bot_relay {
-                        settle_bot_relay(
-                            &state,
-                            &device_id,
-                            relay,
-                            interaction_id.as_id().as_str(),
-                            command_id.as_id().as_str(),
-                        )
-                        .await;
-                    }
                     return Ok(Json(result));
                 }
                 Err(HubError::NotFound) => {}

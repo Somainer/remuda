@@ -448,6 +448,7 @@ impl RunningHub {
             .insert(
                 host_id.to_owned(),
                 StdArc::new(crate::transport::ScriptedTransport::new(reply)),
+                None,
             )
             .await;
     }
@@ -460,7 +461,25 @@ impl RunningHub {
         host_id: &str,
         transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
     ) {
-        self.state.nodes.insert(host_id.to_owned(), transport).await;
+        self.state
+            .nodes
+            .insert(host_id.to_owned(), transport, None)
+            .await;
+    }
+
+    /// Test helper: mount a synthetic transport bound to a specific announced
+    /// nodeEpoch (c-deadcards round 3 fenced-dispatch tests).
+    #[doc(hidden)]
+    pub async fn test_set_node_transport_epoched(
+        &self,
+        host_id: &str,
+        transport: std::sync::Arc<dyn crate::transport::NodeTransport>,
+        node_epoch: Option<String>,
+    ) {
+        self.state
+            .nodes
+            .insert(host_id.to_owned(), transport, node_epoch)
+            .await;
     }
 
     /// Test helper: drop the live Node session for `host_id` (host goes offline).

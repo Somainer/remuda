@@ -51,6 +51,34 @@ function held(commandId: string): Command {
   return { ...base(commandId, "queued"), dispatch: "not-dispatched", resolution: "clear" };
 }
 
+/**
+ * The GET endpoint returns the bare CommandRecord (no {command} envelope):
+ * map the rich test fixture onto the ledger shape the store classifies.
+ */
+function raw(c: Command): Awaited<ReturnType<Api["instanceCommandStatus"]>> {
+  return {
+    commandId: c.commandId,
+    instanceId: INSTANCE,
+    hostId: "hst_1",
+    operation: c.operation,
+    state: c.state,
+    resolution: c.resolution,
+    forwarded: c.dispatch === "transport-written" || c.dispatch === "native-acknowledged",
+    idempotencyKey: null,
+    payload: {},
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    ...(c.settlement
+      ? {
+          settlement: {
+            outcome: c.settlement.outcome,
+            ...(c.settlement.reason ? { reason: c.settlement.reason } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 function rejected(commandId: string, reason: string): Command {
   return {
     ...base(commandId, "settled"),
@@ -110,7 +138,7 @@ it("a reconciling forward is confirmed by GET (never re-POSTed) and ends sent", 
     (async (_iid: string, commandId: string) => {
       gets += 1;
       return {
-        command: gets === 1 ? reconciling(commandId) : base(commandId, "accepted"),
+        ...raw(gets === 1 ? reconciling(commandId) : base(commandId, "accepted")),
       };
     }) as Api["instanceCommandStatus"],
   );
@@ -141,7 +169,7 @@ it("a reconciling forward rejected on the GET keeps and surfaces the rejection r
   );
   vi.spyOn(api, "instanceCommandStatus").mockImplementation(
     (async (_iid: string, commandId: string) => ({
-      command: rejected(commandId, "node refused: unsafe tool"),
+      ...raw(rejected(commandId, "node refused: unsafe tool")),
     })) as Api["instanceCommandStatus"],
   );
   hubStore.setConnectionStateForTest("live");
@@ -180,7 +208,7 @@ it("a reconciliation that stays inconclusive for the bounded deadline ends unkno
     })) as Api["instanceSend"],
   );
   vi.spyOn(api, "instanceCommandStatus").mockImplementation(
-    (async (_iid: string, commandId: string) => ({ command: reconciling(commandId) })) as Api["instanceCommandStatus"],
+    (async (_iid: string, commandId: string) => raw(reconciling(commandId))) as Api["instanceCommandStatus"],
   );
   hubStore.setConnectionStateForTest("live");
   await hubStore.send(INSTANCE, "never resolves");
@@ -266,7 +294,7 @@ it("ROUND5-1: a forwarded queued row with resolution unknown is reconciled by GE
   vi.spyOn(api, "instanceCommandStatus").mockImplementation(
     (async (_iid: string, commandId: string) => {
       gets += 1;
-      return { command: gets === 1 ? unknownForwarded(commandId) : base(commandId, "accepted") };
+      return raw(gets === 1 ? unknownForwarded(commandId) : base(commandId, "accepted"));
     }) as Api["instanceCommandStatus"],
   );
   hubStore.setConnectionStateForTest("live");
@@ -292,12 +320,12 @@ it("ROUND5-1: a live steer whose forward is only unknown does not raise 已打�
   vi.spyOn(api, "instanceSend").mockImplementation(
     (async (_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => ({
       relatedCommandIds: [],
-      command: unknownForwarded(commandId!),
+      ...raw(unknownForwarded(commandId!)),
     })) as Api["instanceSend"],
   );
   // The Hub never learns the Node's verdict inside the bounded window.
   vi.spyOn(api, "instanceCommandStatus").mockImplementation(
-    (async (_iid: string, commandId: string) => ({ command: unknownForwarded(commandId) })) as Api["instanceCommandStatus"],
+    (async (_iid: string, commandId: string) => raw(unknownForwarded(commandId))) as Api["instanceCommandStatus"],
   );
   hubStore.setConnectionStateForTest("live");
 
@@ -354,7 +382,7 @@ it("ROUND5-1: a restored reconciling row restarts its bounded GET loop after rel
   vi.spyOn(api, "instanceCommandStatus").mockImplementation(
     (async (_iid: string, commandId: string) => {
       gets += 1;
-      return { command: gets === 1 ? reconciling(commandId) : base(commandId, "accepted") };
+      return raw(gets === 1 ? reconciling(commandId) : base(commandId, "accepted"));
     }) as Api["instanceCommandStatus"],
   );
 

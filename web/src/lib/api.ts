@@ -623,8 +623,6 @@ export type HubApi = {
      */
     commandId?: Id,
   ): Promise<CommandResult>;
-  /** D-055 G2 (Task B): read one command's current state for reconciliation. */
-  instanceCommandStatus(instanceId: Id, commandId: Id): Promise<CommandResult>;
   /** D-028 §5.3: interrupt the current turn; the process and session stay alive. */
   instanceCancel(instanceId: Id): Promise<CommandResult>;
   /** Stage one attachment for a later send (D-027/D-027b). Returns its id. */
@@ -641,6 +639,8 @@ export type HubApi = {
     mediaType: string;
   }>;
   instanceKeys(instanceId: Id, key: PtyKey): Promise<CommandResult>;
+  /** `GET /v1/instances/{id}/commands/{commandId}` authoritative row. */
+  instanceCommandStatus(instanceId: Id, commandId: Id, signal?: AbortSignal): Promise<components["schemas"]["CommandRecord"]>;
   fleetBroadcast(body: FleetBroadcastBody): Promise<FleetBroadcastResult>;
   worktreeList(hostId?: string): Promise<WorktreePage>;
   worktreeCreate(spec: WorktreeCreateSpec): Promise<WorktreeRecord>;
@@ -1004,12 +1004,6 @@ function createMockApi(): HubApi {
       }
       return result;
     },
-    async instanceCommandStatus(instanceId, commandId: Id) {
-      const result = mockSend(instanceId, `reconcile ${commandId}`);
-      result.command.commandId = commandId;
-      result.command.id = commandId;
-      return result;
-    },
     async instanceCancel(instanceId) {
       return mockCancel(instanceId);
     },
@@ -1030,6 +1024,24 @@ function createMockApi(): HubApi {
     },
     async fleetBroadcast(body) {
       return mockFleetBroadcast(body ?? {});
+    },
+    async instanceCommandStatus(instanceId, commandId, _signal?): Promise<components["schemas"]["CommandRecord"]> {
+      const hit = mockDb.instances.find((inst) => inst.id === instanceId);
+      if (!hit) throw new HubHttpError(404, "NOT_FOUND", "command not found");
+      return {
+        commandId: commandId as string,
+        instanceId: instanceId as string,
+        hostId: hit.hostId as string,
+        operation: "instance.send",
+        state: "accepted",
+        resolution: "clear",
+        forwarded: true,
+        idempotencyKey: null,
+        settlement: { outcome: "completed" },
+        payload: {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
     },
     async worktreeList() {
       return {
@@ -1465,18 +1477,6 @@ function createLiveApi(): HubApi {
       titles.set(instance.id, spec.prompt.slice(0, 80) || spec.name || "会话");
       return { instance, command: mapCommand(created.command, instance.id) };
     },
-    /**
-     * `GET /v1/instances/:id/commands/:commandId` (Task B / D-055 G2): read
-     * one command's current state, used to reconcile an outbox row whose POST
-     * ended unknown/reconciling instead of blindly re-POSTing.
-     */
-    async instanceCommandStatus(instanceId: Id, commandId: Id) {
-      // The GET returns a bare CommandRecord (not the POST's {command} envelope).
-      const row = await rest<HubJson<"/v1/instances/{id}/commands/{commandId}", "get">>(
-        `/v1/instances/${instanceId}/commands/${commandId}`,
-      );
-      return { command: mapCommand(row, instanceId), relatedCommandIds: [] };
-    },
     async instanceSend(instanceId, prompt, attachments, mode, commandId) {
       const payload: Record<string, unknown> = { prompt };
       if (attachments?.length) payload.attachments = attachments;
@@ -1539,6 +1539,18 @@ function createLiveApi(): HubApi {
         method: "POST",
         body: JSON.stringify(body),
       });
+    },
+    /**
+     * `GET /v1/instances/:id/commands/:commandId` (D-055 G2 / Task B): the
+     * bare ledger record, used by the outbox reconciler when a POST ended
+     * unknown/reconciling instead of re-POSTing, and by fleet broadcast's
+     * authoritative read. The optional AbortSignal bounds one read.
+     */
+    async instanceCommandStatus(instanceId, commandId, signal) {
+      return rest<components["schemas"]["CommandRecord"]>(
+        `/v1/instances/${encodeURIComponent(instanceId)}/commands/${encodeURIComponent(commandId)}`,
+        signal ? { signal } : undefined,
+      );
     },
     async worktreeList(hostId) {
       const qs = hostId ? `?hostId=${encodeURIComponent(hostId)}` : "";

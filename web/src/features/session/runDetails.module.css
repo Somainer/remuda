@@ -75,3 +75,24 @@
     transform: translateY(-50%);
   }
 }
+
+/* UO-4: migrated from session.module.css */
+
+.meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+  font-family: var(--mono);
+  /* Status meta never goes below 12px, desktop or mobile. */
+  font-size: var(--text-aux);
+  color: var(--mute);
+  padding-left: 0;
+}
+
+@media (max-width: 767px) {
+  .meta {
+    padding-left: 0;
+    gap: 6px;
+  }
+}

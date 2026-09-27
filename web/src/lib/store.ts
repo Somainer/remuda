@@ -2,7 +2,8 @@ import { useSyncExternalStore } from "react";
 
 /** Bounded journal tail the list reads per live instance to project its phrase. */
 const SUMMARY_TAIL = 64;
-import type { Command } from "../types/command";
+import type { Command, CommandSettlementOutcome } from "../types/command";
+import type { components } from "./api.generated";
 import type { Host, Instance } from "../types/instance";
 import type { Interaction, InteractionAnswer } from "../types/interaction";
 import type { Observation } from "../types/observation";
@@ -481,6 +482,125 @@ function mergeInstanceSnapshots(
   return merged;
 }
 
+/**
+ * Merge an authoritative interaction list page with the current projection.
+ *
+ * Terminal state never regresses to `pending`: when an interaction was
+ * locally settled from an answer receipt (`settled` pins the list-request seq
+ * at POST success), a delayed older poll that still returns the pending row
+ * must not re-enable its buttons, nor insert it when a newer page already
+ * removed it. A response whose `reqSeq` is at or before the pin may predate
+ * the answer:
+ *  - a pending copy of the pinned id is dropped (or shadowed by the committed
+ *    local row — never resurrected when the row was already removed);
+ *  - an omitted id keeps its committed local row while this response or any
+ *    older sibling is still in flight (same pin discipline as
+ *    {@link mergeInstanceSnapshots}).
+ * Only a strictly newer response releases the pin (the caller marks it), and
+ * the row is then dropped/confirmed normally.
+ */
+function mergeInteractionSnapshots(
+  incoming: Interaction[],
+  current: Interaction[],
+  settled: ReadonlyMap<Id, { seq: number; confirmedByNewer: boolean }>,
+  reqSeq = Number.POSITIVE_INFINITY,
+  outstanding?: ReadonlySet<number>,
+): Interaction[] {
+  const previous = new Map(current.map((row) => [row.id, row]));
+  const terminalOrder: Record<string, number> = {
+    pending: 0,
+    reconciling: 1,
+    "answer-committed": 2,
+    expired: 3,
+    invalidated: 3,
+    resolved: 3,
+    unknown: 0,
+  };
+  const rank = (state: Interaction["state"]) => terminalOrder[state] ?? 0;
+  const merged: Interaction[] = [];
+  for (const row of incoming) {
+    const pin = settled.get(row.id);
+    const prior = previous.get(row.id);
+    // A page that started at or before the answer commit cannot carry an
+    // authoritative pending copy: keep the committed projection, or swallow
+    // the row entirely (tombstone) when no local row survives.
+    if (pin && reqSeq <= pin.seq && row.state === "pending") {
+      if (prior && rank(prior.state) > rank(row.state)) merged.push(prior);
+      continue;
+    }
+    // Defense in depth for a newer page that still reports pending: terminal
+    // never regresses while the settlement pin is held.
+    if (
+      prior &&
+      settled.has(row.id) &&
+      row.state === "pending" &&
+      rank(prior.state) > rank(row.state)
+    ) {
+      merged.push(prior);
+      continue;
+    }
+    merged.push(row);
+  }
+  if (settled.size) {
+    // Tombstone retention: the committed id is missing from this page. A
+    // request at/before its pin (this one included) may simply predate the
+    // commit, so retain the committed local row until a newer page confirms
+    // settlement and every older request has resolved.
+    const seen = new Set(merged.map((row) => row.id));
+    for (const [id, pin] of settled) {
+      if (seen.has(id)) continue;
+      const committed = previous.get(id);
+      if (!committed) continue;
+      if (Array.from(outstanding ?? [reqSeq]).some((seq) => seq <= pin.seq)) {
+        merged.push(committed);
+      }
+    }
+  }
+  return merged;
+}
+
+/**
+ * The structural facts the outbox classifier needs, shared by the POST
+ * envelope's rich {@link Command} (its `dispatch` states map to the ledger's
+ * forward flag) and the bare GET CommandRecord (which carries `forwarded`).
+ */
+type CommandLikeForClassify = {
+  state: "queued" | "accepted" | "settled" | string;
+  resolution: "clear" | "unknown" | "reconciling" | string;
+  settlement?: { outcome: CommandSettlementOutcome; reason?: string };
+  forwarded: boolean;
+};
+
+/**
+ * Classify a Hub command record into an outbox outcome.
+ *  - rejected: settled with settlement.outcome rejected (real Node reject).
+ *  - held: queued and never forwarded (Node offline); same-id re-POST later.
+ *  - reconciling: FORWARDED but the Hub has no verdict yet — resolution
+ *    "reconciling" OR "unknown". The Hub records the forward intent BEFORE
+ *    awaiting the Node, so a lost POST can read the row back via GET as
+ *    queued+forwarded+unknown; it is NOT proof of acceptance. Settled by a
+ *    bounded GET (never re-forwarded).
+ *  - sent: accepted/settled-completed or a clear forwarded row; reached the
+ *    Hub/Node, await the journal join (never re-POST).
+ */
+function classifyCommandLike(
+  command: CommandLikeForClassify,
+): "sent" | "held" | "reconciling" | "rejected" {
+  if (command.state === "settled" && command.settlement?.outcome === "rejected") {
+    return "rejected";
+  }
+  if (command.state === "queued" && !command.forwarded) {
+    return "held";
+  }
+  if (
+    command.state === "queued" &&
+    (command.resolution === "reconciling" || command.resolution === "unknown")
+  ) {
+    return "reconciling";
+  }
+  return "sent";
+}
+
 class HubStore {
   private state: HubState = initial;
   private listeners = new Set<Listener>();
@@ -506,6 +626,17 @@ class HubStore {
   private listReqSeq = 0;
   private listOutstanding = new Set<number>();
   private pinnedCreates = new Map<Id, { seq: number; confirmedByNewer: boolean }>();
+  /**
+   * Interaction ids locally settled from a successful answer POST, keyed by
+   * the list-request seq captured at POST success. A list response at or
+   * before that seq may predate the commit and is never allowed to resurrect
+   * the pending card (or re-insert it after a newer empty page removed the
+   * row). The pin is released only once a strictly newer list page has
+   * confirmed settlement (id omitted or reported non-pending) AND every older
+   * outstanding request has resolved — the same seq/outstanding discipline as
+   * `pinnedCreates`.
+   */
+  private settledInteractions = new Map<Id, { seq: number; confirmedByNewer: boolean }>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   /**
    * Per-instance monotonic token for `tty.screen` reads: a stale response
@@ -1370,23 +1501,31 @@ class HubStore {
    *    Hub/Node, await the journal join (never re-POST).
    */
   private classifyCommandResult(command: Command): "sent" | "held" | "reconciling" | "rejected" {
-    if (command.state === "settled" && command.settlement?.outcome === "rejected") {
-      return "rejected";
-    }
-    if (
-      command.state === "queued" &&
-      command.dispatch !== "transport-written" &&
-      command.dispatch !== "native-acknowledged"
-    ) {
-      return "held";
-    }
-    if (
-      command.state === "queued" &&
-      (command.resolution === "reconciling" || command.resolution === "unknown")
-    ) {
-      return "reconciling";
-    }
-    return "sent";
+    return classifyCommandLike({
+      state: command.state,
+      resolution: command.resolution,
+      settlement: command.settlement,
+      // The POST envelope's rich dispatch states are the mapped form of the
+      // ledger's `forwarded` flag (see api.ts mapCommand).
+      forwarded: command.dispatch === "transport-written" || command.dispatch === "native-acknowledged",
+    });
+  }
+
+  /** Classify the bare GET ledger record (its forward flag is `forwarded`). */
+  private classifyCommandRecord(
+    record: components["schemas"]["CommandRecord"],
+  ): "sent" | "held" | "reconciling" | "rejected" {
+    return classifyCommandLike({
+      state: record.state,
+      resolution: record.resolution,
+      settlement: record.settlement
+        ? {
+            outcome: record.settlement.outcome as CommandSettlementOutcome,
+            ...(record.settlement.reason ? { reason: record.settlement.reason } : {}),
+          }
+        : undefined,
+      forwarded: record.forwarded,
+    });
   }
 
   private async reconcileCommandViaGet(
@@ -1394,8 +1533,8 @@ class HubStore {
     commandId: Id,
   ): Promise<"sent" | "held" | "reconciling" | "rejected" | null> {
     try {
-      const result = await api.instanceCommandStatus(instanceId, commandId);
-      return this.classifyCommandResult(result.command);
+      const record = await api.instanceCommandStatus(instanceId, commandId);
+      return this.classifyCommandRecord(record);
     } catch {
       return null;
     }
@@ -1435,9 +1574,9 @@ class HubStore {
         const result = await api.instanceCommandStatus(instanceId, commandId).catch(() => null);
         await this.safePatch(commandId, {
           state: "rejected",
-          serverState: result?.command.state,
+          serverState: result?.state,
           gotResponse: true,
-          lastError: result?.command.settlement?.reason ?? "rejected by node",
+          lastError: result?.settlement?.reason ?? "rejected by node",
         });
         return;
       }
@@ -1847,6 +1986,7 @@ class HubStore {
       window.removeEventListener("beforeunload", this.onPageHide);
       this.pageIsUnloading = false;
     }
+    this.settledInteractions.clear();
     this.emit({
       authed: false,
       session: null,
@@ -1924,6 +2064,16 @@ class HubStore {
     try {
       const [instances, interactions] = await Promise.all([api.instanceList(), api.interactionList()]);
       if (epoch !== this.bootGen) return;
+      // An older in-flight poll that returns a still-pending row must not
+      // revert a locally committed review; merge with the same seq/outstanding
+      // pin discipline as the instance list.
+      const mergedInteractions = mergeInteractionSnapshots(
+        interactions,
+        this.state.interactions,
+        this.settledInteractions,
+        reqSeq,
+        this.listOutstanding,
+      );
       this.emit({
         instances: mergeInstanceSnapshots(
           instances.items,
@@ -1932,13 +2082,20 @@ class HubStore {
           reqSeq,
           this.listOutstanding,
         ),
-        interactions,
+        interactions: mergedInteractions,
       });
       // A response newer than a pin proves the server has spoken after the
-      // create. Combined with the in-flight sweep below (every older request
-      // answered), that is when dropping the pin on a missing id is safe.
+      // create/answer. Combined with the in-flight sweep below (every older
+      // request answered), that is when dropping the pin on a missing id is
+      // safe. For an answered interaction, omission from the pending-only
+      // list is the normal settled response, as is a non-pending row.
       for (const pin of this.pinnedCreates.values()) {
         if (reqSeq > pin.seq) pin.confirmedByNewer = true;
+      }
+      for (const [id, pin] of this.settledInteractions) {
+        if (reqSeq <= pin.seq) continue;
+        const row = interactions.find((candidate) => candidate.id === id);
+        if (!row || row.state !== "pending") pin.confirmedByNewer = true;
       }
       this.hydrateEffortEffective(instances.items);
       this.hydrateUsageRollups(instances.items);
@@ -1954,18 +2111,28 @@ class HubStore {
       // control flow in this finally.
       this.listOutstanding.delete(reqSeq);
       if (epoch === this.bootGen) {
-        for (const [id, pin] of this.pinnedCreates) {
-          if (!pin.confirmedByNewer) continue;
-          let olderInFlight = false;
-          for (const seq of this.listOutstanding) {
-            if (seq <= pin.seq) {
-              olderInFlight = true;
-              break;
-            }
-          }
-          if (!olderInFlight) this.pinnedCreates.delete(id);
+        this.reapConfirmedPins(this.pinnedCreates);
+        this.reapConfirmedPins(this.settledInteractions);
+      }
+    }
+  }
+
+  /**
+   * Drop pins a strictly newer response has confirmed once no request at or
+   * before the pin's seq is still outstanding: then no stale response can
+   * resurrect what the newer page omitted.
+   */
+  private reapConfirmedPins(pins: Map<Id, { seq: number; confirmedByNewer: boolean }>) {
+    for (const [id, pin] of pins) {
+      if (!pin.confirmedByNewer) continue;
+      let olderInFlight = false;
+      for (const seq of this.listOutstanding) {
+        if (seq <= pin.seq) {
+          olderInFlight = true;
+          break;
         }
       }
+      if (!olderInFlight) pins.delete(id);
     }
   }
 
@@ -3297,25 +3464,53 @@ class HubStore {
       this.emit({ answering: rest });
       throw error;
     }
+    // Pin the settlement against the list seq captured NOW, before the
+    // follow-up refresh increments it: every list response at or before this
+    // seq may predate the commit. The pin makes the committed card immune to
+    // a stale pending copy AND to an empty newer page followed by that stale
+    // poll (the merge keeps a tombstone until a newer page and the last older
+    // request have both resolved).
+    this.settledInteractions.set(interactionId, {
+      seq: this.listReqSeq,
+      confirmedByNewer: false,
+    });
+    this.markInteractionCommitted(interactionId);
     try {
       await this.refresh();
       const interaction = this.state.interactions.find((i) => i.id === interactionId);
       if (interaction) await this.catchup(interaction.instanceId);
     } catch {
-      // Post-commit sync failure: the broker already accepted the answer.
-      // Leave the card in its submitted/committed state; do not re-enable the
-      // buttons or make the reviewer think the decision was rejected.
-    } finally {
-      const interaction = this.state.interactions.find((i) => i.id === interactionId);
-      const events = interaction ? (this.state.events[interaction.instanceId] ?? []) : [];
-      const answered = events.some(
-        (ev) => ev.kind === "interaction.answered" && (ev.payload as { interactionId?: Id }).interactionId === interactionId,
-      );
-      if (!interaction || interaction.state !== "pending" || answered) {
-        const { [interactionId]: _removed, ...rest } = this.state.answering;
-        this.emit({ answering: rest });
-      }
+      // Post-commit sync failure: the tombstone settles the card
+      // optimistically; the next authoritative list confirms it.
     }
+    // Settle the local projection even if the authoritative refresh failed
+    // or removed the row: the 200 receipt is the commit. The pin keeps any
+    // delayed pending poll from re-enabling approve/deny; it is released in
+    // refresh() once a newer list omits the id (the normal pending-only
+    // response) or reports a non-pending state.
+    this.markInteractionCommitted(interactionId);
+    // Clear the answering marker: the local guard keeps any delayed pending
+    // poll from re-enabling approve/deny even after the marker is gone.
+    {
+      const { [interactionId]: _removed, ...rest } = this.state.answering;
+      this.emit({ answering: rest });
+    }
+  }
+
+  /** Flip a still-pending local interaction row to answer-committed. */
+  private markInteractionCommitted(interactionId: Id) {
+    if (
+      !this.state.interactions.some((row) => row.id === interactionId && row.state === "pending")
+    ) {
+      return;
+    }
+    this.emit({
+      interactions: this.state.interactions.map((row) =>
+        row.id === interactionId
+          ? { ...row, state: "answer-committed" as const }
+          : row,
+      ),
+    });
   }
 
   titleOf(instanceId: Id) {

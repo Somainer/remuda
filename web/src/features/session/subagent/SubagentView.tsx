@@ -18,7 +18,7 @@ import {
   type TranscriptNode,
 } from "../assemble";
 import { ToolCard } from "../ToolCard";
-import sessionCss from "../session.module.css";
+import sessionCss from "../transcript.module.css";
 import { fmtDuration, fmtTokens } from "../workflow/workflowProgress";
 import {
   fetchSubagentTranscript,
@@ -82,6 +82,7 @@ function NodeRow({ node }: { node: TranscriptNode }) {
         result={node.result}
         completeness={node.completeness}
         diffState={node.diffState}
+        foldSettled
       />
     );
     if (!isToolFailure(node)) return card;

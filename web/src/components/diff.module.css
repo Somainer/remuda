@@ -1,0 +1,43 @@
+/* @tokens strict */
+.diff {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-code);
+  background: var(--diff-ctx-bg);
+}
+
+.diffLine {
+  display: flex;
+}
+
+.diffGutter {
+  width: 38px;
+  text-align: right;
+  padding-right: 10px;
+  color: var(--fg-faint);
+  flex: none;
+  user-select: none;
+}
+
+.diffAdd {
+  background: var(--diff-add-bg);
+}
+
+.diffAdd .diffGutter {
+  color: var(--success-fg);
+}
+
+.diffDel {
+  background: var(--diff-del-bg);
+}
+
+.diffDel .diffGutter {
+  color: var(--danger-fg);
+}
+
+.diffBody {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--fg-body);
+}

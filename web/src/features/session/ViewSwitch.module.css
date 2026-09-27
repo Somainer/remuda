@@ -1,0 +1,59 @@
+.viewSwitch {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1px;
+  gap: 1px;
+  flex: none;
+  background: var(--ink-0);
+}
+
+.viewSeg {
+  height: 25px;
+  min-height: 25px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  /* Visual height stays 25px; touch reach comes from a mobile-only
+     44px ::after, never a visual resize (ui-spec.md §3.4, D-039). */
+  position: relative;
+}
+
+.viewSegOn {
+  background: var(--ink-2);
+  color: var(--paper);
+}
+
+@media (max-width: 767px) {
+  .viewSeg::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: var(--touch);
+    height: var(--touch);
+    transform: translate(-50%, -50%);
+  }
+
+  .viewSeg {
+    height: 30px;
+    min-height: 30px;
+    padding: 0 12px;
+  }
+
+  @media (max-width: 640px) {
+    /* Keep each segment >=44px visual so adjacent segment hot zones never
+       overlap (glyph heights and radiogroup semantics unchanged). */
+    .viewSeg {
+      padding: 0 11px;
+    }
+  }
+}

@@ -636,19 +636,61 @@ fn map_broker(err: BrokerError) -> NodeError {
 mod plan_review_node_cas_tests {
     use super::*;
     use crate::MemoryStore;
-    use crate::driver::FakeDriver;
+    use crate::driver::{Driver, DriverRequest};
     use remuda_protocol::{
-        DriverKind, HostId, InstanceLifecycle, Knowledge, PlanReviewRequest, U64 as P64,
-        WorkspaceId,
+        DriverKind, HostId, InstanceLifecycle, InteractionAnswer as ProtocolInteractionAnswer,
+        Knowledge, PlanReviewRequest, U64 as P64, WorkspaceId,
     };
     use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::Mutex;
+
+    /// A driver that records every `RespondInteraction` (the NATIVE interaction
+    /// id the runtime translated to plus the exact answer), so a test can prove
+    /// the Node's native→broker→native round trip delivers what was submitted
+    /// to the right pending permission.
+    #[derive(Clone)]
+    struct RecordingDriver {
+        delivered: Arc<Mutex<Vec<(String, ProtocolInteractionAnswer)>>>,
+    }
+
+    impl RecordingDriver {
+        fn new() -> Self {
+            Self {
+                delivered: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Driver for RecordingDriver {
+        fn kind(&self) -> DriverKind {
+            DriverKind::ClaudePrint
+        }
+        fn execute(&self, request: DriverRequest) -> crate::driver::DriverFuture<'_> {
+            if let DriverRequest::RespondInteraction {
+                interaction_id,
+                answer,
+            } = request
+            {
+                let delivered = self.delivered.clone();
+                Box::pin(async move {
+                    let parsed: ProtocolInteractionAnswer =
+                        serde_json::from_value(answer).expect("recorded answer must parse");
+                    delivered.lock().await.push((interaction_id, parsed));
+                    Ok(Vec::new())
+                })
+            } else {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+        }
+    }
 
     async fn seeded_runtime() -> (
         TempDir,
         Arc<dyn LocalStore>,
         InstanceId,
         Arc<InteractionRuntime>,
+        Arc<Mutex<Vec<(String, ProtocolInteractionAnswer)>>>,
     ) {
         let dir = tempfile::tempdir().expect("tmp");
         // open_journaled opens the dir itself.
@@ -664,13 +706,12 @@ mod plan_review_node_cas_tests {
         .expect("fixture instance");
         instance.lifecycle = InstanceLifecycle::Ready;
         store.insert_instance(instance).expect("instance");
+        let driver = RecordingDriver::new();
+        let delivered = driver.delivered.clone();
         runtime
-            .register_driver(
-                instance_id.clone(),
-                Arc::new(FakeDriver::new(DriverKind::ClaudePrint)),
-            )
+            .register_driver(instance_id.clone(), Arc::new(driver))
             .await;
-        (dir, store, instance_id, runtime)
+        (dir, store, instance_id, runtime, delivered)
     }
 
     fn plan_review_interaction(
@@ -745,39 +786,68 @@ mod plan_review_node_cas_tests {
         }
     }
 
+    /// Build a full `interaction.answer` RPC envelope for an arbitrary answer
+    /// body, so negative tests can send a wrong-kind answer just like the Hub
+    /// would. `origin` is the Hub-stamped frame origin; the agent parent frame
+    /// additionally carries the caller's bound `byInstanceId`.
+    fn answer_rpc(
+        interaction_id: &str,
+        answer: Value,
+        origin: &str,
+        by_instance: Option<&str>,
+    ) -> Value {
+        let mut params = json!({
+            "interactionId": interaction_id,
+            "commandId": CommandId::new().as_id().as_str(),
+            "origin": origin,
+            "answer": answer,
+        });
+        if let Some(id) = by_instance {
+            params["byInstanceId"] = json!(id);
+        }
+        params
+    }
+
+    fn plan_answer_value(option: &str, digest: &str, feedback: Option<&str>) -> Value {
+        json!({
+            "kind": "plan-review",
+            "optionId": option,
+            "planRevision": "1",
+            "planDigest": digest,
+            "feedback": feedback
+        })
+    }
+
     fn answer_json(
         interaction_id: &str,
         option: &str,
         digest: &str,
         feedback: Option<&str>,
     ) -> Value {
-        json!({
-            "interactionId": interaction_id,
-            "commandId": CommandId::new().as_id().as_str(),
-            "origin": "human",
-            "answer": {
-                "kind": "plan-review",
-                "optionId": option,
-                "planRevision": "1",
-                "planDigest": digest,
-                "feedback": feedback
-            }
-        })
+        answer_rpc(
+            interaction_id,
+            plan_answer_value(option, digest, feedback),
+            "human",
+            None,
+        )
     }
 
-    #[tokio::test]
-    async fn a_bad_plan_review_answer_on_claude_control_is_rejected_and_the_ticket_stays_pending() {
-        let (_dir, store, instance_id, runtime) = seeded_runtime().await;
-        let good = format!("sha256:{}", "a".repeat(64));
-        let bad = format!("sha256:{}", "b".repeat(64));
+    /// Append one InteractionRequested plan review for the instance, ingest
+    /// it through the real runtime path, and return its native entity id.
+    async fn seed_pending_plan_review(
+        store: &Arc<dyn LocalStore>,
+        runtime: &Arc<InteractionRuntime>,
+        instance_id: &InstanceId,
+        digest: &str,
+    ) -> InteractionId {
         let interaction = plan_review_interaction(
-            &instance_id,
-            store.get_instance(&instance_id).unwrap().host_id.clone(),
-            &good,
+            instance_id,
+            store.get_instance(instance_id).unwrap().host_id.clone(),
+            digest,
         );
         let obs = store
             .append_observation(
-                &instance_id,
+                instance_id,
                 None,
                 Completeness::Structured,
                 ObservationPayload::InteractionRequested(Box::new(
@@ -786,56 +856,101 @@ mod plan_review_node_cas_tests {
             )
             .expect("append");
         runtime.ingest(&obs).await.expect("ingest");
-        let plan_id = runtime.list(Some(&instance_id), None).await[0]
+        runtime.list(Some(instance_id), None).await[0]
             .interaction_id
-            .clone();
+            .clone()
+    }
 
-        // Wrong digest is rejected before the broker consumes the ticket.
+    #[tokio::test]
+    async fn every_malformed_plan_review_answer_is_rejected_before_the_cas_and_the_ticket_stays_pending()
+     {
+        let (_dir, store, instance_id, runtime, delivered) = seeded_runtime().await;
+        let good = format!("sha256:{}", "a".repeat(64));
+        let bad = format!("sha256:{}", "b".repeat(64));
+        let plan_id = seed_pending_plan_review(&store, &runtime, &instance_id, &good).await;
+        let plan_id = plan_id.as_id().as_str();
+
+        // (1) Wrong digest — rejected before the broker consumes the ticket.
         let err = runtime
             .dispatch_rpc(
                 "interaction.answer",
-                answer_json(plan_id.as_id().as_str(), "approve", &bad, None),
+                answer_json(plan_id, "approve", &bad, None),
             )
             .await
             .expect_err("bad digest must be rejected");
         assert!(matches!(err, NodeError::InvalidRequest(_)), "{err:?}");
 
-        // The ticket survived: it is still listed and a correct answer wins.
-        assert_eq!(runtime.list(Some(&instance_id), None).await.len(), 1);
+        // (2) An option the request never offered.
+        let err = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_json(plan_id, "bogus", &good, None),
+            )
+            .await
+            .expect_err("unoffered option must be rejected");
+        assert!(matches!(err, NodeError::InvalidRequest(_)), "{err:?}");
+
+        // (3) Wrong answer KIND — an approval answer against a plan-review
+        // request. Validation keys off the REQUEST kind (PlanReview is
+        // validated regardless of carrier), so a cross-kind answer cannot
+        // slip past.
+        let err = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_rpc(
+                    plan_id,
+                    json!({
+                        "kind": "approval",
+                        "optionId": "allow",
+                        "inputDigest": good,
+                    }),
+                    "human",
+                    None,
+                ),
+            )
+            .await
+            .expect_err("a cross-kind answer must be rejected");
+        assert!(matches!(err, NodeError::InvalidRequest(_)), "{err:?}");
+
+        // Every rejection happened before the CAS: the ticket is still listed
+        // pending, and nothing was delivered to the driver.
+        assert_eq!(
+            runtime.list(Some(&instance_id), None).await.len(),
+            1,
+            "the review must stay pending after every malformed answer"
+        );
+        assert!(
+            delivered.lock().await.is_empty(),
+            "rejected answers must never reach the driver"
+        );
+
+        // A correct answer can still win afterwards.
         let accepted = runtime
             .dispatch_rpc(
                 "interaction.answer",
-                answer_json(plan_id.as_id().as_str(), "approve", &good, None),
+                answer_json(plan_id, "approve", &good, None),
             )
             .await
             .expect("a correct answer must still win");
         assert_eq!(accepted["outcome"], json!("accepted"));
         assert!(runtime.list(Some(&instance_id), None).await.is_empty());
+        let got = delivered.lock().await;
+        assert_eq!(got.len(), 1);
+        match &got[0].1 {
+            ProtocolInteractionAnswer::PlanReview(plan) => {
+                assert_eq!(plan.option_id, "approve");
+                assert_eq!(plan.plan_revision, P64(1), "the request revision is echoed");
+                assert_eq!(String::from(plan.plan_digest.clone()), good);
+            }
+            other => panic!("expected a plan-review answer, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn approve_with_feedback_is_rejected_for_a_plan_review() {
-        let (_dir, store, instance_id, runtime) = seeded_runtime().await;
+        let (_dir, store, instance_id, runtime, _delivered) = seeded_runtime().await;
         let digest = format!("sha256:{}", "a".repeat(64));
-        let interaction = plan_review_interaction(
-            &instance_id,
-            store.get_instance(&instance_id).unwrap().host_id.clone(),
-            &digest,
-        );
-        let obs = store
-            .append_observation(
-                &instance_id,
-                None,
-                Completeness::Structured,
-                ObservationPayload::InteractionRequested(Box::new(
-                    remuda_protocol::InteractionRequestedPayload { interaction },
-                )),
-            )
-            .expect("append");
-        runtime.ingest(&obs).await.expect("ingest");
-        let plan_id = runtime.list(Some(&instance_id), None).await[0]
-            .interaction_id
-            .clone();
+        let plan_id = seed_pending_plan_review(&store, &runtime, &instance_id, &digest).await;
         let err = runtime
             .dispatch_rpc(
                 "interaction.answer",
@@ -845,5 +960,163 @@ mod plan_review_node_cas_tests {
             .expect_err("approve cannot carry feedback");
         assert!(matches!(err, NodeError::InvalidRequest(_)), "{err:?}");
         assert_eq!(runtime.list(Some(&instance_id), None).await.len(), 1);
+    }
+
+    /// The real Node native→broker→native round trip: answering the listed
+    /// (native) id through `dispatch_rpc` must deliver the DISTINCT native
+    /// request id (the can_use_tool `request_id`, not the broker id) and the
+    /// exact answer to the recording driver, exactly once.
+    #[tokio::test]
+    async fn an_answer_is_delivered_to_the_driver_on_its_native_id_exactly_once() {
+        let (_dir, store, instance_id, runtime, delivered) = seeded_runtime().await;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let interaction = plan_review_interaction(
+            &instance_id,
+            store.get_instance(&instance_id).unwrap().host_id.clone(),
+            &digest,
+        );
+        // The native can_use_tool request id — distinct from any broker id.
+        const NATIVE_REQUEST_ID: &str = "perm-plan";
+        let obs = store
+            .append_observation(
+                &instance_id,
+                None,
+                Completeness::Structured,
+                ObservationPayload::InteractionRequested(Box::new(
+                    remuda_protocol::InteractionRequestedPayload { interaction },
+                )),
+            )
+            .expect("append");
+        runtime.ingest(&obs).await.expect("ingest");
+        let listed = runtime.list(Some(&instance_id), None).await;
+        assert_eq!(listed.len(), 1);
+        let native_id = listed[0].interaction_id.as_id().as_str().to_string();
+        assert!(
+            native_id.starts_with("int_"),
+            "the listed id is the native entity id, got {native_id}"
+        );
+        assert_ne!(
+            native_id, NATIVE_REQUEST_ID,
+            "native entity id is distinct from the can_use_tool RPC request key"
+        );
+
+        let accepted = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_json(&native_id, "approve", &digest, None),
+            )
+            .await
+            .expect("accept");
+        assert_eq!(accepted["outcome"], json!("accepted"));
+
+        // Exactly one driver delivery, on the NATIVE entity id, with the exact
+        // answer; the broker's internal ticket id is never what the driver gets.
+        let got = delivered.lock().await;
+        assert_eq!(got.len(), 1, "exactly one driver delivery");
+        assert_eq!(got[0].0, native_id, "delivered on the native entity id");
+        match &got[0].1 {
+            ProtocolInteractionAnswer::PlanReview(plan) => {
+                assert_eq!(plan.option_id, "approve");
+                assert_eq!(
+                    plan.plan_revision,
+                    P64(1),
+                    "the request's planRevision must be forwarded verbatim"
+                );
+                assert_eq!(String::from(plan.plan_digest.clone()), digest);
+                assert!(plan.feedback.is_none());
+            }
+            other => panic!("expected a plan-review answer, got {other:?}"),
+        }
+        drop(got);
+
+        // A second answer with a fresh command id is Superseded and NOT
+        // delivered again (first-answer-wins, exactly-once).
+        let loser = runtime
+            .dispatch_rpc(
+                "interaction.answer",
+                answer_json(&native_id, "deny", &digest, Some("too late")),
+            )
+            .await
+            .expect_err("second answer must be superseded");
+        assert!(matches!(loser, NodeError::InteractionSuperseded { .. }));
+        assert_eq!(
+            delivered.lock().await.len(),
+            1,
+            "the loser must not be delivered"
+        );
+    }
+
+    /// The human and the agent parent answer the SAME pending plan review
+    /// concurrently through the real `dispatch_rpc` → broker CAS path. Exactly
+    /// one must win and be delivered to the driver on the native id with the
+    /// complete answer (including planRevision); the loser is Superseded and
+    /// nothing is delivered twice.
+    #[tokio::test]
+    async fn a_concurrent_human_and_parent_race_delivers_exactly_one_complete_answer() {
+        let (_dir, store, instance_id, runtime, delivered) = seeded_runtime().await;
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let plan_id = seed_pending_plan_review(&store, &runtime, &instance_id, &digest).await;
+        let native_id = plan_id.as_id().as_str().to_string();
+        let parent_id = InstanceId::new();
+
+        // Distinct commands, distinct callers, fired at the same time.
+        let human_params = answer_rpc(
+            &native_id,
+            plan_answer_value("approve", &digest, None),
+            "human",
+            None,
+        );
+        let parent_params = answer_rpc(
+            &native_id,
+            plan_answer_value("deny", &digest, Some("parent says no")),
+            "agent",
+            Some(parent_id.as_id().as_str()),
+        );
+        let (human_result, parent_result) = tokio::join!(
+            runtime.dispatch_rpc("interaction.answer", human_params),
+            runtime.dispatch_rpc("interaction.answer", parent_params),
+        );
+
+        // Exactly one accepted and one Superseded, in either order.
+        let accepted = [&human_result, &parent_result]
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .is_ok_and(|value| value["outcome"] == json!("accepted"))
+            })
+            .count();
+        let superseded = [&human_result, &parent_result]
+            .iter()
+            .filter(|result| matches!(result, Err(NodeError::InteractionSuperseded { .. })))
+            .count();
+        assert_eq!((accepted, superseded), (1, 1), "one win, one supersede");
+
+        // The broker's first-answer-wins CAS delivered exactly once, on the
+        // native entity id, carrying the complete winning answer.
+        assert!(
+            runtime.list(Some(&instance_id), None).await.is_empty(),
+            "the winning answer consumed the ticket"
+        );
+        let got = delivered.lock().await;
+        assert_eq!(got.len(), 1, "exactly one delivery under the race");
+        assert_eq!(got[0].0, native_id, "delivered on the native entity id");
+        match &got[0].1 {
+            ProtocolInteractionAnswer::PlanReview(plan) => {
+                assert!(
+                    plan.option_id == "approve" || plan.option_id == "deny",
+                    "unexpected winning option {}",
+                    plan.option_id
+                );
+                assert_eq!(plan.plan_revision, P64(1), "revision forwarded verbatim");
+                assert_eq!(String::from(plan.plan_digest.clone()), digest);
+                match plan.option_id.as_str() {
+                    "approve" => assert!(plan.feedback.is_none()),
+                    "deny" => assert_eq!(plan.feedback.as_deref(), Some("parent says no")),
+                    other => panic!("{other}"),
+                }
+            }
+            other => panic!("expected a plan-review answer, got {other:?}"),
+        }
     }
 }

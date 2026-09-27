@@ -50,7 +50,11 @@ import { ContextUsagePopover } from "./ContextUsagePopover";
 import { ComposerConfirmDialog, ComposerOptionsSheet } from "./ComposerOptions";
 import type { UsageRollup } from "./contextUsage";
 import type { AttachmentRef, Attachment } from "../../lib/attachments";
-import css from "./session.module.css";
+// UO-4: import the base popover styles before composer.module.css so its
+// .popover/.popoverCard rules precede composer/contextUsage overrides at the
+// same source order they had inside the old single session.module.css.
+import popover from "./popover.module.css";
+import css from "./composer.module.css";
 import opt from "./composerOptions.module.css";
 
 type MenuId = "effort" | "permission" | "usage" | null;
@@ -1471,7 +1475,7 @@ export function Composer({
         <div
           ref={menuRefs.effort}
           style={effortAnchor.style}
-          className={`${css.popover} ${css.popoverCard}`}
+          className={`${popover.popover} ${popover.popoverCard}`}
           data-testid="effort-menu"
           data-placement={effortAnchor.placement}
         >
@@ -1482,7 +1486,7 @@ export function Composer({
         <div
           ref={menuRefs.permission}
           style={permissionAnchor.style}
-          className={css.popover}
+          className={popover.popover}
           data-testid="permission-menu"
           data-placement={permissionAnchor.placement}
         >

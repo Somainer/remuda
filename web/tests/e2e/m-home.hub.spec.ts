@@ -72,21 +72,31 @@ test.describe("390px phone home", () => {
     }
   });
 
-  test("toolbar controls own the 44px touch target (ui-spec §3.4 / D-039)", async ({ page }) => {
+  test("controls follow the coarse-pointer hit rules: the search paints 44px; the ordering seg paints 26px with a 44px hot band", async ({ page }) => {
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
-    // The search box and both ordering buttons are primary phone controls:
-    // their painted bounding boxes (not just click-through hot zones) must
-    // reach var(--touch) at the 390px viewport.
-    const targets = [
-      page.getByTestId("home-search"),
-      page.getByTestId("home-order-clock"),
-      page.getByTestId("home-order-list"),
-    ];
-    for (const target of targets) {
-      const box = await target.boundingBox();
-      expect(box, `${await target.getAttribute("data-testid")} rendered`).toBeTruthy();
-      expect(box!.height).toBeGreaterThanOrEqual(44);
+    // The search box is a text control: its painted box reaches var(--touch)
+    // at the 390px coarse-pointer viewport.
+    const search = page.getByTestId("home-search");
+    const searchBox = await search.boundingBox();
+    expect(searchBox, "search rendered").toBeTruthy();
+    expect(searchBox!.height).toBeGreaterThanOrEqual(44);
+
+    // The ordering buttons are the shared §8.2 segmented control: 26px
+    // visible items with a vertical-only ::after reserving the 44px band.
+    for (const id of ["home-order-clock", "home-order-list"] as const) {
+      const item = page.getByTestId(id);
+      const box = await item.boundingBox();
+      expect(box, `${id} rendered`).toBeTruthy();
+      expect(Math.round(box!.height)).toBe(26);
+      const x = box!.x + box!.width / 2;
+      for (const y of [box!.y - 8.5, box!.y + box!.height + 8.5]) {
+        const hitTestId = await page.evaluate(
+          (point) => document.elementFromPoint(point.x, point.y)?.closest("button")?.dataset.testid ?? null,
+          { x, y },
+        );
+        expect(hitTestId, `${id} owns its 44px hot band`).toBe(id);
+      }
     }
   });
 

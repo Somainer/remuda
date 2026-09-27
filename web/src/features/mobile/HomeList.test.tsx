@@ -17,10 +17,18 @@ const hub = {
 };
 
 const resumeMock = vi.fn();
+const listeners = new Set<() => void>();
 
 vi.mock("../../lib/store", () => ({
-  useHub: () => hub,
+  // The home reads the store through the cached external-store seam: the mock
+  // offers the same subscribe/getSnapshot surface (no store polling in unit
+  // tests) plus the imperative row helpers the component calls.
   hubStore: {
+    subscribe: (listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    getSnapshot: () => hub,
     titleOf: (id: string) => `title ${id}`,
     hostName: () => "alpha",
     usageRollupOf: () => null,
@@ -33,6 +41,13 @@ vi.mock("../../lib/store", () => ({
 
 vi.mock("../files/filesApi", () => ({
   fetchChanges: vi.fn(() => Promise.reject(new Error("offline"))),
+}));
+
+vi.mock("../tasks/TaskList", () => ({
+  // The task layer is a store/network concern, out of scope for these
+  // component tests; the session rows under test never depend on it.
+  TaskGroups: () => null,
+  useTaskLedger: () => ({ tasks: [], projectName: () => null }),
 }));
 
 function exited(id: string): Instance {

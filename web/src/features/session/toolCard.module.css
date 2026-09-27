@@ -1,0 +1,311 @@
+/* @tokens strict */
+/* The compact-fold button: 「N 次工具 · N 段思考」 on one quiet line. */
+.fold {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-ui);
+  color: var(--fg-muted);
+  background: transparent;
+  border: 0;
+  padding: 0;
+  min-height: 24px;
+  cursor: pointer;
+}
+
+.fold:hover {
+  color: var(--fg-strong);
+}
+
+.tool {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  overflow: hidden;
+  font-size: var(--text-ui);
+  line-height: var(--lh-ui);
+}
+
+.toolPartial {
+  border-style: dashed;
+  border-color: var(--unknown-border);
+}
+
+.toolHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--divider);
+}
+
+.toolTitle {
+  font-size: var(--text-ui);
+  font-weight: 600;
+  color: var(--fg-strong);
+}
+
+.toolStatus {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+}
+
+.runDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--link);
+  flex: none;
+  animation: dim 1.4s ease-in-out infinite;
+}
+
+.okDot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--fg-faint);
+  flex: none;
+}
+
+.cmd {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-code);
+  line-height: var(--lh-code);
+  color: var(--fg-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.stdoutHead {
+  padding: 0 var(--space-3) 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.stdout {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+  line-height: var(--lh-code);
+  border-left: 1px solid var(--divider);
+  margin: 0 var(--space-3) 10px;
+  padding-left: 10px;
+  white-space: pre-wrap;
+  max-height: 180px;
+  overflow: auto;
+}
+
+/* D-045 §6.2 / ui-spec §2.2: screenshot blocks a tool result staged. The
+   bound is a fixed max-height (never the card's), and opening one is a plain
+   link to /v1/objects/{id} — no lightbox, no auto-expand. */
+.toolMedia {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 var(--space-3) 10px;
+}
+
+.toolMediaLink {
+  line-height: 0;
+  border-radius: var(--radius-sm);
+}
+
+.toolThumb {
+  display: block;
+  max-height: 180px;
+  max-width: 100%;
+  width: auto;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+}
+
+/* The text shown when a staged object has expired or fails to load. */
+.toolMediaMissing {
+  display: block;
+  min-height: 48px;
+  max-width: 100%;
+  padding: var(--space-2) 10px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--unknown-border);
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+}
+
+.path {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stat {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+}
+
+.applied,
+.unknown,
+.proposed {
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+  background: transparent;
+  flex: none;
+}
+
+.applied {
+  border-color: var(--success-fg);
+  color: var(--success-fg);
+}
+
+.unknown {
+  border-style: dashed;
+  border-color: var(--unknown-border);
+  color: var(--unknown-fg);
+}
+
+.usage {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 10px;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: var(--lh-meta);
+  color: var(--fg-faint);
+  padding-top: 2px;
+}
+
+.wfPhase {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-body);
+  padding: 0 var(--space-3);
+}
+
+.wfMembers {
+  padding: var(--space-2) var(--space-3) 10px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  list-style: none;
+}
+
+.member {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-left: 18px;
+}
+
+.memberName {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-body);
+  min-width: 120px;
+}
+
+.memberMeta {
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+  flex: 1;
+}
+
+.openBtn {
+  height: 22px;
+  border: 1px solid var(--border-control);
+  border-radius: var(--radius-xs);
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--space-2);
+  font-size: var(--text-meta);
+  color: var(--fg-body);
+  background: transparent;
+  flex: none;
+  cursor: pointer;
+}
+
+.openBtn:hover {
+  background: var(--bg-hover);
+}
+
+@keyframes dim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+   class carries the original declarations. */
+
+.spacer {
+  composes: spacer from "../../chrome/sessionHeader.module.css";
+}
+
+.assistant {
+  composes: assistant from "./transcript.module.css";
+}
+
+.bubble {
+  composes: bubble from "./transcript.module.css";
+}
+
+.cursor {
+  composes: cursor from "./transcript.module.css";
+}
+
+.thought {
+  composes: thought from "./transcript.module.css";
+}
+
+.user {
+  composes: user from "./transcript.module.css";
+}
+
+.you {
+  composes: you from "./transcript.module.css";
+}
+
+.opaque {
+  composes: opaque from "./transcript.module.css";
+}
+
+.changeRow {
+  composes: changeRow from "./transcript.module.css";
+}
+
+.heldRowActions {
+  composes: heldRowActions from "./composer.module.css";
+}

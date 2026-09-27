@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useHub } from "../../lib/store";
-import ui from "../../styles/ui.module.css";
+import css from "./transcript.module.css";
 
 export type JournalUiStatus = "live" | "reconnecting" | "recovering" | "stale" | "gap-backfill" | "readonly-stale";
 
@@ -47,7 +47,7 @@ export function JournalBanner({
 
   if (restored && shown === "live") {
     return (
-      <div className={ui.card} data-testid="journal-banner" data-state="restored" style={{ margin: "8px 12px 0" }}>
+      <div className={css.banner} data-testid="journal-banner" data-state="restored">
         已恢复
       </div>
     );
@@ -55,24 +55,24 @@ export function JournalBanner({
   if (shown === "live" || shown === "stale") return null;
   if (shown === "reconnecting" || shown === "recovering") {
     return (
-      <div className={ui.card} data-testid="journal-banner" data-state="recovering" style={{ margin: "8px 12px 0" }}>
+      <div className={css.banner} data-testid="journal-banner" data-state="recovering">
         正在恢复…
       </div>
     );
   }
   if (shown === "gap-backfill") {
     return (
-      <div className={ui.card} data-testid="journal-banner" data-state="gap-backfill" style={{ margin: "8px 12px 0" }}>
+      <div className={css.banner} data-testid="journal-banner" data-state="gap-backfill">
         正在补事件 · 工具卡暂不结算
       </div>
     );
   }
   if (shown === "readonly-stale") {
     return (
-      <div className={ui.card} data-testid="journal-banner" data-state="readonly-stale" style={{ margin: "8px 12px 0" }}>
+      <div className={css.banner} data-testid="journal-banner" data-state="readonly-stale">
         只读 · 事件可能不完整
         {onRetry ? (
-          <button type="button" className={ui.chip} style={{ marginLeft: 8 }} onClick={onRetry}>
+          <button type="button" className={css.bannerRetry} onClick={onRetry}>
             重试
           </button>
         ) : null}
@@ -81,7 +81,7 @@ export function JournalBanner({
   }
   // offline: inputs still work; the outbox delivers on recovery.
   return (
-    <div className={ui.card} data-testid="journal-banner" data-state="offline" style={{ margin: "8px 12px 0" }}>
+    <div className={css.banner} data-testid="journal-banner" data-state="offline">
       离线 · 可继续输入，恢复后自动发送{pendingCount > 0 ? `（${pendingCount} 条待发）` : ""}
     </div>
   );

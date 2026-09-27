@@ -1,6 +1,6 @@
 import { useRef, type KeyboardEvent } from "react";
 import type { SessionView } from "../../lib/viewPref";
-import css from "./session.module.css";
+import css from "./ViewSwitch.module.css";
 
 const OPTIONS: { id: SessionView; label: string }[] = [
   { id: "tty", label: "终端" },

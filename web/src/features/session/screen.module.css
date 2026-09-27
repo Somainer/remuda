@@ -1,0 +1,42 @@
+/* @tokens strict */
+.screen {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-inset);
+}
+
+.screenMeta {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  color: var(--fg-muted);
+  border-bottom: 1px solid var(--divider);
+}
+
+.screenPre {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 14px var(--space-4);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-meta);
+  line-height: 1.45;
+  color: var(--fg-body);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+   class carries the original declarations. */
+
+.dotSep {
+  composes: dotSep from "../../chrome/sessionPage.module.css";
+}

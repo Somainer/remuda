@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mockDb } from "../../lib/mock";
 import { known, type Id } from "../../types/wire";
 import type { Instance } from "../../types/instance";
+import type { Interaction } from "../../types/interaction";
 import type { Observation } from "../../types/observation";
 import type { UsageRollup } from "../session/contextUsage";
 import {
@@ -13,8 +14,11 @@ import {
 } from "../spaces/store";
 import {
   HOME_ORDER_KEY,
+  arrangeHomeGroups,
   buildHomeGroups,
+  buildHomeRows,
   homeError,
+  homeRowsSignature,
   readHomeOrder,
   writeHomeOrder,
 } from "./homeRows";
@@ -336,5 +340,112 @@ describe("home ordering preference", () => {
     // Unknown/garbage values never silently become list.
     store.set(HOME_ORDER_KEY, "garbage");
     expect(readHomeOrder(storage)).toBe("clock");
+  });
+});
+
+describe("buildHomeRows / arrangeHomeGroups split (commit:HomeList caching seam)", () => {
+  function interaction(instanceId: string, id: string): Interaction {
+    return {
+      instanceId,
+      id,
+      state: "pending",
+      request: { kind: "approval", title: "t", description: "" },
+    } as unknown as Interaction;
+  }
+
+  it("derives one row per instance with a 12px-class relative time label", () => {
+    const instances = [session("ins-a1"), session("ins-b1", { hostId: "host-beta", workspaceId: "wsp-beta" })];
+    const spaces = buildSpaces(workspaces, instances, defaultSpacePrefs());
+    const rows = buildHomeRows({
+      spaces,
+      interactions: [],
+      titleOf: (id) => `${id} title`,
+      rollupOf: () => null,
+      nowMs: Date.parse("2026-09-19T10:00:30.000Z"),
+    });
+    expect([...rows.keys()].sort()).toEqual(["ins-a1", "ins-b1"]);
+    expect(rows.get("ins-a1")?.timeLabel).toBeTruthy();
+  });
+
+  it("arrangeHomeGroups filters the pre-derived rows by the query", () => {
+    const instances = named([session("ins-find")]);
+    const spaces = buildSpaces(workspaces, instances, defaultSpacePrefs());
+    const rows = buildHomeRows({
+      spaces,
+      interactions: [],
+      titleOf: (instanceId) => titles[instanceId] ?? instanceId,
+      rollupOf: () => null,
+    });
+    const titleOf = (instanceId: string) => titles[instanceId] ?? instanceId;
+    const hostNameOf = (hostId?: string) => hostNames[hostId ?? ""] ?? hostId ?? "";
+    expect(
+      arrangeHomeGroups({ spaces, rows, needle: "ins-find title", order: "clock", hostNameOf, titleOf })
+        .flatMap((group) => group.rows),
+    ).toHaveLength(1);
+    expect(
+      arrangeHomeGroups({ spaces, rows, needle: "nothing-here", order: "clock", hostNameOf, titleOf })
+        .flatMap((group) => group.rows),
+    ).toHaveLength(0);
+  });
+
+  it("the display signature is stable when another pending interaction lands on the same blocked instance", () => {
+    const blocked = session("ins-blocked", { activity: known("waiting-interaction") });
+    const spaces = buildSpaces(workspaces, [blocked], defaultSpacePrefs());
+    const titleOf = () => "blocked title";
+    const hostNameOf = () => "alpha-host";
+    const derive = (interactions: ReturnType<typeof interaction>[]) => {
+      const rows = buildHomeRows({
+        spaces,
+        interactions,
+        titleOf,
+        rollupOf: () => null,
+      });
+      return homeRowsSignature(
+        rows,
+        interactions.map((item) => item.instanceId as unknown as string),
+        spaces,
+        hostNameOf,
+      );
+    };
+    const one = derive([interaction("ins-blocked", "int-1")]);
+    const two = derive([interaction("ins-blocked", "int-1"), interaction("ins-blocked", "int-2")]);
+    const three = derive([
+      interaction("ins-blocked", "int-1"),
+      interaction("ins-blocked", "int-2"),
+      interaction("ins-blocked", "int-3"),
+    ]);
+    // The badge climbs 1→2→3 but the instance set and every row pixel are
+    // unchanged: HomeList must keep its cached slice and bail out.
+    expect(two).toBe(one);
+    expect(three).toBe(one);
+  });
+
+  it("the signature changes when a different instance becomes blocked or the body sentence changes", () => {
+    const first = session("ins-blocked", { activity: known("waiting-interaction") });
+    const second = session("ins-idle");
+    const spaces1 = buildSpaces(workspaces, [first, second], defaultSpacePrefs());
+    const titleOf = (instanceId: string) => `${instanceId} title`;
+    const hostNameOf = () => "alpha-host";
+    const sig = (interactions: ReturnType<typeof interaction>[], instances: Instance[]) => {
+      const spaces = buildSpaces(workspaces, instances, defaultSpacePrefs());
+      const rows = buildHomeRows({ spaces, interactions, titleOf, rollupOf: () => null });
+      return homeRowsSignature(
+        rows,
+        interactions.map((item) => item.instanceId as unknown as string),
+        spaces,
+        hostNameOf,
+      );
+    };
+    const baseline = sig([interaction("ins-blocked", "int-1")], [first, second]);
+    const secondBlocked = { ...second, activity: known("waiting-interaction") } as Instance;
+    expect(sig([interaction("ins-blocked", "int-1"), interaction("ins-idle", "int-2")], [first, secondBlocked])).not.toBe(baseline);
+    // A real body change on the same instance changes the signature too.
+    const errored = { ...first, lastError: "boom" } as Instance;
+    const spaces2 = buildSpaces(workspaces, [errored, second], defaultSpacePrefs());
+    const rowsErrored = buildHomeRows({ spaces: spaces2, interactions: [interaction("ins-blocked", "int-1")], titleOf, rollupOf: () => null });
+    const rowsClean = buildHomeRows({ spaces: spaces1, interactions: [interaction("ins-blocked", "int-1")], titleOf, rollupOf: () => null });
+    expect(homeRowsSignature(rowsErrored, ["ins-blocked"], spaces2, hostNameOf)).not.toBe(
+      homeRowsSignature(rowsClean, ["ins-blocked"], spaces1, hostNameOf),
+    );
   });
 });

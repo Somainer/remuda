@@ -457,8 +457,8 @@ async function settleStructuredToolCard(page: Page, timeoutMs: number) {
         const expanded = await groupFold.getAttribute("aria-expanded").catch(() => null);
         if (expanded === "false") await groupFold.click();
       }
-      // A D-041 per-card compact row may still wrap the settled card inside
-      // the opened group; that trigger mounts the exact card.
+      // A settled card is one folded line at every width (D-041, extended to
+      // the desktop column by D-053); that trigger mounts the exact card.
       const cardFold = page.getByTestId("tool-fold-open").first();
       if (await cardFold.isVisible().catch(() => false)) await cardFold.click().catch(() => {});
       // Wait on the terminal state (Final close rendered the exit code), not

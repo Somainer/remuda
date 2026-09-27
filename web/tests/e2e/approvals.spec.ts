@@ -11,11 +11,11 @@ test.describe("approvals center", () => {
     await expect(page.getByTestId("approval-row").filter({ hasText: "主机离线" })).toBeVisible();
     await expect(page.getByTestId("approval-row").filter({ hasText: "实施计划" })).toBeVisible();
 
-    await page.getByRole("button", { name: "提问" }).click();
+    await page.getByRole("radio", { name: "提问" }).click();
     await expect(page.getByTestId("approval-row").filter({ hasText: "AskUserQuestion" })).toBeVisible();
     await expect(page.getByTestId("approval-row").filter({ hasText: "rm -rf" })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "全部" }).click();
+    await page.getByRole("radio", { name: "全部" }).click();
     const bash = page.getByTestId("approval-row").filter({ hasText: "rm -rf /tmp/coord-media" });
     await bash.getByRole("button", { name: "允许一次" }).click();
     await expect(bash).toHaveCount(0);

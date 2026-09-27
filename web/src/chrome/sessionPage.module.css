@@ -1,0 +1,210 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  color: var(--paper);
+}
+
+/* Crowded phones: the two resume buttons cannot share the main row, so the
+   exited session gets a dedicated second header row instead of wrapped,
+   overlapping buttons. */
+.resumeRow {
+  display: none;
+}
+
+.menuBtn {
+  width: 100%;
+  height: 44px;
+  min-height: 44px;
+  justify-content: flex-start;
+}
+
+/* The exited-but-not-resumable fallback link: never wraps the crowded row. */
+.inheritLink {
+  flex: none;
+  white-space: nowrap;
+  font-size: var(--text-aux);
+  color: var(--mute);
+}
+
+.nodeRestart {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin: 8px 0;
+  border: 1px solid var(--danger, #e06c5c);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger, #e06c5c) 10%, transparent);
+  color: var(--paper);
+  font-size: 13px;
+}
+
+.nodeRestartNote {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+/* D-047 §B.5: the proxy host went away mid-session. An error, not a reroute:
+   the route clause above still names the via route that is now down. */
+.routeDown {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  margin: 8px 0;
+  border: 1px solid var(--danger, #e06c5c);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--danger, #e06c5c) 10%, transparent);
+  color: var(--paper);
+  font-size: 13px;
+}
+
+.routeDownTitle {
+  font-weight: 600;
+}
+
+.routeDownDetail {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.dotSep {
+  color: var(--line);
+}
+
+.pane {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.dock {
+  flex: none;
+  border-top: 1px solid var(--line);
+  padding: 12px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.keys {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.keyBtn {
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--mute);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 0 10px;
+}
+
+@media (max-width: 767px) {
+  .dock {
+    padding: 10px 14px;
+    gap: 10px;
+  }
+
+  @media (max-width: 640px) {
+    .resumeRow {
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .resumeRow button {
+      min-height: 44px;
+    }
+  }
+}
+
+/* UO-4 mechanical split: re-exported class stubs so existing importers
+
+   keep a single `css` binding. Empty rules emit no CSS; the composed
+
+   class carries the original declarations. */
+
+.back {
+  composes: back from "./sessionHeader.module.css";
+}
+
+.costChip {
+  composes: costChip from "./sessionHeader.module.css";
+}
+
+.headBadges {
+  composes: headBadges from "./sessionHeader.module.css";
+}
+
+.headBtn {
+  composes: headBtn from "./sessionHeader.module.css";
+}
+
+.headBtnOn {
+  composes: headBtnOn from "./sessionHeader.module.css";
+}
+
+.headBtnActive {
+  composes: headBtnActive from "./sessionHeader.module.css";
+}
+
+.headRow {
+  composes: headRow from "./sessionHeader.module.css";
+}
+
+.headSpaceChip {
+  composes: headSpaceChip from "./sessionHeader.module.css";
+}
+
+.header {
+  composes: header from "./sessionHeader.module.css";
+}
+
+.hostChip {
+  composes: hostChip from "./sessionHeader.module.css";
+}
+
+.metaHost {
+  composes: metaHost from "./sessionHeader.module.css";
+}
+
+.moreBtn {
+  composes: moreBtn from "./sessionHeader.module.css";
+}
+
+.moreMenu {
+  composes: moreMenu from "./sessionHeader.module.css";
+}
+
+.spacer {
+  composes: spacer from "./sessionHeader.module.css";
+}
+
+.status {
+  composes: status from "./sessionHeader.module.css";
+}
+
+.statusWord {
+  composes: statusWord from "./sessionHeader.module.css";
+}
+
+.stopBtn {
+  composes: stopBtn from "./sessionHeader.module.css";
+}
+
+.title {
+  composes: title from "./sessionHeader.module.css";
+}

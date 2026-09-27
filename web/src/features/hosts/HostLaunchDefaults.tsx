@@ -97,7 +97,7 @@ export function HostLaunchDefaults({ args, binaryPath, tui, probedBinaryPath, di
       </p>
       <button
         type="button"
-        className={css.add}
+        className={ui.btn}
         data-testid="host-default-save"
         disabled={disabled || !dirty}
         onClick={() =>

@@ -540,9 +540,17 @@ test("iPhone/WebKit: a 2,000-character CJK toast stays clamped above the compose
     test.skip(!bundled, "needs WebKit (PW_TEST_CONNECT_WS_ENDPOINT or a bundled webkit build)");
     browser = await webkit.launch();
   }
+  // The custom WebKit context must follow the RUNNING origin, never a
+  // hard-coded port: the landing gate runs the hub on non-default ports, and
+  // process.env.HUB_E2E_BASE_URL is unset there. The project use is set from
+  // the configured origin by playwright.hub.config.ts.
+  const baseURL = test.info().project.use.baseURL;
+  if (!baseURL) {
+    throw new Error("iPhone/WebKit case needs a configured project baseURL");
+  }
   const context: BrowserContext = await browser.newContext({
     ...devices["iPhone 13"],
-    baseURL: process.env.HUB_E2E_BASE_URL ?? "http://127.0.0.1:58889",
+    baseURL,
   });
   const page = await context.newPage();
   // 2,000 CJK characters: before the clamp this toast grew dozens of lines

@@ -1131,6 +1131,10 @@ pub struct InteractionRecord {
     pub blocking: bool,
     /// Source event JSON.
     pub payload: Value,
+    /// c-deadcards round 2: commandId that won first-answer-wins (NULL while
+    /// pending), used to distinguish an idempotent same-command retry from a
+    /// competing late answer.
+    pub answer_command_id: Option<String>,
     /// Create-time.
     pub created_at: String,
     /// Update-time.
@@ -3844,6 +3848,13 @@ impl Store {
     }
 
     /// Append a mirrored event. `seq` None assigns durableSeq+1.
+    ///
+    /// c-deadcards round 2: this is the single-event case of
+    /// {@link Store::append_journal_batch} and delegates to it, so the
+    /// instance UPDATE and interaction insert/settlement in
+    /// `append_loaded_event` commit as ONE transaction — the bespoke
+    /// auto-commit path could durably append a terminal projection while
+    /// rolling nothing back if a later statement failed.
     pub async fn append_journal(
         &self,
         host_id: String,
@@ -3851,17 +3862,10 @@ impl Store {
         seq: Option<i64>,
         event: Value,
     ) -> Result<JournalAppend, StoreError> {
-        self.run_named("append_journal", move |conn| {
-            let inst = load_instance(conn, &instance_id)?
-                .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
-            if inst.host_id != host_id {
-                return Err(StoreError::Id("instance belongs to another host".into()));
-            }
-            let durable = inst.durable_seq.parse::<i64>().unwrap_or(0);
-            let mut cursor = AppendCursor::new(durable, seq);
-            append_loaded_event(conn, &host_id, &instance_id, &mut cursor, event)
-        })
-        .await
+        let mut out = self
+            .append_journal_batch(host_id, instance_id, seq, vec![event])
+            .await?;
+        Ok(out.pop().expect("one input event yields one append result"))
     }
 
     /// Append one chunk of a frame's events in a single writer job /
@@ -3885,7 +3889,10 @@ impl Store {
         events: Vec<Value>,
     ) -> Result<Vec<JournalAppend>, StoreError> {
         self.run_named("append_journal_batch", move |conn| {
-            let tx = conn.transaction()?;
+            // BEGIN IMMEDIATE: the append reads the instance row and journal
+            // cursor and then writes; a deferred tx would take SHARED first and
+            // deadlock upgrading to EXCLUSIVE against a pooled reader.
+            let tx = immediate_tx(conn)?;
             let inst = load_instance(&tx, &instance_id)?
                 .ok_or_else(|| StoreError::Id("unknown instance".into()))?;
             if inst.host_id != host_id {
@@ -3943,7 +3950,7 @@ impl Store {
     ) -> Result<Vec<InteractionRecord>, StoreError> {
         self.read("list_interactions", move |conn| {
             let mut sql = String::from(
-                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
+                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at, answer_command_id
                  FROM interactions WHERE 1=1",
             );
             let mut args: Vec<String> = Vec::new();
@@ -3995,7 +4002,7 @@ impl Store {
     ) -> Result<Vec<InteractionRecord>, StoreError> {
         self.read("list_inbox_interactions", move |conn| {
             let mut sql = String::from(
-                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
+                "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at, answer_command_id
                  FROM interactions
                  WHERE (state = 'pending'
                         OR (state IN ('expired', 'invalidated')
@@ -4039,14 +4046,60 @@ impl Store {
     }
 
     /// Mirror a successful Node answer ACK; never decide a winner in the Hub.
+    ///
+    /// Persists the Node-accepted `command_id` alongside the committed state
+    /// (c-deadcards round 2): the answer endpoint replays the stored
+    /// acknowledgement for an identical retry instead of 409-ing, while a
+    /// different command loses first-answer-wins.
+    ///
+    /// The winner is filled with COALESCE even when the row is already
+    /// `answer-committed`: the Node's mirrored `interaction.answered` journal
+    /// frame can reach the Hub ahead of this RPC result, and that event may not
+    /// carry a commandId — without backfilling it here an identical retry
+    /// would regress to a 409 with an empty winner.
     pub async fn record_interaction_answer(
         &self,
         interaction_id: String,
+        command_id: String,
     ) -> Result<(), StoreError> {
         self.run_named("record_interaction_answer", move |conn| {
-            conn.execute("UPDATE interactions SET state = 'answer-committed', updated_at = ?1 WHERE id = ?2 AND state = 'pending'", params![now_rfc3339(), interaction_id])?;
+            conn.execute(
+                "UPDATE interactions
+                    SET state = CASE WHEN state = 'pending' THEN 'answer-committed' ELSE state END,
+                        answer_command_id = COALESCE(answer_command_id, ?3),
+                        updated_at = ?1
+                  WHERE id = ?2 AND state IN ('pending', 'answer-committed')",
+                params![now_rfc3339(), interaction_id, command_id],
+            )?;
             Ok(())
-        }).await
+        })
+        .await
+    }
+
+    /// c-deadcards round 2: whether the instance owning a durable interaction
+    /// has an EFFECTIVE terminal lifecycle (its generation ended) — the
+    /// answer-endpoint fence behind the ingestion-time one. `None` when
+    /// either row is missing.
+    pub async fn interaction_instance_terminal(
+        &self,
+        interaction_id: String,
+    ) -> Result<Option<bool>, StoreError> {
+        self.run_named("interaction_instance_terminal", move |conn| {
+            conn.query_row(
+                "SELECT i2.lifecycle
+                   FROM interactions i
+                   JOIN instances i2 ON i2.id = i.instance_id
+                  WHERE i.id = ?1",
+                params![interaction_id],
+                |row| {
+                    let lifecycle: String = row.get(0)?;
+                    Ok(TERMINAL_INSTANCE_LIFECYCLES.contains(&lifecycle.as_str()))
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+        })
+        .await
     }
 
     /// Bounded journal window on the reader pool.
@@ -5200,6 +5253,11 @@ fn try_open_conn(path: &Path) -> Result<Connection, rusqlite::Error> {
     // Last `nodeEpoch` announced by this host, used to detect a Node restart.
     ensure_column(&conn, "hosts", "node_epoch", "TEXT")?;
     ensure_column(&conn, "hosts", "offline_since", "TEXT")?;
+    // c-deadcards round 2: the commandId that won first-answer-wins, so a
+    // retried answer after a lost HTTP response is idempotent on the SAME
+    // command (the Hub replays the original acknowledgement) while a
+    // different command still gets 409 with the winner named.
+    ensure_column(&conn, "interactions", "answer_command_id", "TEXT")?;
     ensure_column(&conn, "devices", "token_prefix", "TEXT")?;
     ensure_column(&conn, "hosts", "token_prefix", "TEXT")?;
     // 2026-09-15: [Image #n] anchor assigned by the send manifest.
@@ -5554,11 +5612,31 @@ fn apply_instance_projection(
         }
     }
     if let Some(lifecycle) = lifecycle {
+        // Capture the previous EFFECTIVE lifecycle before this write so the
+        // settlement guard fires on the transition itself. This projection
+        // recognises native terminals (nativeName "exit", severity "error",
+        // prose status) that apply_instance_lifecycle's derivation does not —
+        // c-deadcards round 2: those used to set lifecycle='failed' here while
+        // leaving the generation's pending cards untouched.
+        let previous_lifecycle: Option<String> = conn
+            .query_row(
+                "SELECT lifecycle FROM instances WHERE id = ?1",
+                params![instance_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         conn.execute(
             "UPDATE instances SET durable_seq = ?1, lifecycle = ?2,
                     last_error = COALESCE(?3, last_error), updated_at = ?4
              WHERE id = ?5",
             params![seq, lifecycle, last_error, now, instance_id],
+        )?;
+        settle_on_terminal_transition(
+            conn,
+            instance_id,
+            previous_lifecycle.as_deref(),
+            Some(lifecycle),
+            now,
         )?;
         // D-027: a terminal instance can never consume a staged attachment
         // again, and the Node drops its own copy at the same point.
@@ -7785,6 +7863,117 @@ mod tests {
         store.close().await;
     }
 
+    /// c-deadcards round 2 (item 3): a NATIVE terminal projection
+    /// (nativeName "exit" / severity "error", prose status) writes
+    /// lifecycle=failed through apply_instance_projection even though
+    /// derive_instance_state does not derive a lifecycle for that shape. The
+    /// pending card must still be settled on that effective transition.
+    #[tokio::test]
+    async fn native_terminal_projection_invalidates_pending_interactions() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "deadcards-native-fail").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+        let int_id = seed_pending_interaction(&store, &host, &instance.instance_id).await;
+        assert_eq!(instance.lifecycle, "running");
+
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{
+                    "type":"native","nativeName":"exit","severity":"error",
+                    "relatedIds":{"lastError":"boom"}
+                }}),
+            )
+            .await
+            .expect("append native exit");
+
+        let row = store
+            .get_instance(instance.instance_id.clone())
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.lifecycle, "failed",
+            "the native projection fails the instance"
+        );
+        let (state, reason) = interaction_state_and_reason(&store, &int_id).await;
+        assert_eq!(state, "invalidated", "native terminal ends the generation");
+        assert_eq!(reason.as_deref(), Some("generation-ended"));
+        store.close().await;
+    }
+
+    /// c-deadcards round 2 (item 1): an interaction.requested that reaches the
+    /// Hub AFTER the instance is already terminal is ingested departed — never
+    /// a live pending card — on every append path (fresh frame or replay).
+    #[tokio::test]
+    async fn interaction_requested_after_terminal_lifecycle_ingests_departed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let store = Store::open(dir.path()).expect("store");
+        let host = new_id("hst").expect("host");
+        enroll_labeled(&store, host.clone(), "deadcards-late-request").await;
+        let instance = seed_acknowledged_instance(&store, &host).await;
+
+        // The generation ends first (host-lost / operator kill / journaled exit).
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({"kind":"lifecycle","payload":{"type":"entity","entityType":"instance","state":"exited"}}),
+            )
+            .await
+            .expect("append exit");
+
+        // Then the request arrives — as a same-epoch replay would post-sweep.
+        let late_id = new_id("int").expect("late interaction id");
+        store
+            .append_journal(
+                host.clone(),
+                instance.instance_id.clone(),
+                None,
+                json!({
+                    "kind": "interaction.requested",
+                    "payload": {
+                        "interactionKind": "approval",
+                        "interaction": {
+                            "id": late_id, "kind": "approval", "state": "pending",
+                            "blocking": true, "answerable": true,
+                            "carrier": "harness-hook",
+                            "deadline": { "state": "unknown" },
+                            "resolution": { "state": "unknown" },
+                            "request": {"kind": "approval", "title": "Bash", "options": []}
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("late request append");
+
+        let row = store
+            .get_interaction(late_id)
+            .await
+            .expect("get")
+            .expect("row exists — it was ingested, not dropped");
+        assert_eq!(
+            row.state, "invalidated",
+            "late request lands departed, never pending"
+        );
+        assert!(!row.blocking, "a departed card never blocks");
+        // The terminal instance is not revived to activity='blocked'.
+        let inst = store
+            .get_instance(instance.instance_id)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(inst.lifecycle, "exited");
+        assert_ne!(inst.activity, "blocked");
+        store.close().await;
+    }
+
     /// c-deadcards (never-acknowledged create): a `requested` instance never
     /// journaled a card (journaling interaction.requested transitions it to
     /// running), so the reaper finds no pending interactions — the defensive
@@ -8846,6 +9035,7 @@ fn interaction_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Interaction
         state: row.get(4)?,
         blocking: blocking != 0,
         payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+        answer_command_id: row.get(9)?,
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
     })
@@ -8853,7 +9043,7 @@ fn interaction_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Interaction
 
 fn load_interaction(conn: &Connection, id: &str) -> Result<Option<InteractionRecord>, StoreError> {
     conn.query_row(
-        "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at
+        "SELECT id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at, answer_command_id
          FROM interactions WHERE id = ?1",
         params![id],
         interaction_from_row,
@@ -8913,6 +9103,36 @@ fn apply_interaction_event(
                     .and_then(Value::as_str)
             })
             .unwrap_or("permission");
+        // c-deadcards round 2 (security): the generation fence at INGESTION.
+        // A non-daemon WSS Node can survive a disconnect, journal a new hook
+        // request offline, and replay it after reconnecting under the SAME
+        // nodeEpoch (no epoch change → no reconciliation). If the Hub's
+        // host-lost sweep ended the instance in that window, the replayed
+        // request must not come back to life as a `pending` card that a late
+        // answer then releases with an allow: a request for an instance whose
+        // EFFECTIVE stored lifecycle is terminal is stored departed
+        // immediately. This is reached on EVERY append branch — a brand-new
+        // seq and an existing-row replay both run this function — and is the
+        // durable backstop behind the answer-endpoint generation fence.
+        let instance_ended = load_instance(conn, instance_id)?
+            .is_some_and(|inst| TERMINAL_INSTANCE_LIFECYCLES.contains(&inst.lifecycle.as_str()));
+        if instance_ended {
+            let mut departed = event.clone();
+            invalidate_interaction_payload(&mut departed, &now);
+            conn.execute(
+                "INSERT INTO interactions
+                    (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'invalidated', 0, ?5, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    payload_json = excluded.payload_json,
+                    updated_at = excluded.updated_at,
+                    state = CASE WHEN interactions.state = 'pending' THEN 'invalidated' ELSE interactions.state END,
+                    blocking = CASE WHEN interactions.state = 'pending' THEN 0 ELSE interactions.blocking END",
+                params![id, instance_id, host_id, ikind, departed.to_string(), now],
+            )?;
+            // Do not revive the terminal instance to activity='blocked'.
+            return Ok(());
+        }
         conn.execute(
             "INSERT INTO interactions
                 (id, instance_id, host_id, kind, state, blocking, payload_json, created_at, updated_at)
@@ -8937,9 +9157,21 @@ fn apply_interaction_event(
         } else {
             "answer-committed"
         };
+        // c-deadcards round 2: remember the winning commandId so a retried
+        // answer after a lost response is idempotent on the SAME command (the
+        // Hub replays the original acknowledgement) while a different command
+        // still loses first-answer-wins. The Node stamps commandId on its
+        // answered event when it has one.
+        let winner = event
+            .get("commandId")
+            .and_then(Value::as_str)
+            .or_else(|| event.pointer("/payload/commandId").and_then(Value::as_str));
         conn.execute(
-            "UPDATE interactions SET state = ?1, updated_at = ?2 WHERE id = ?3 AND state = 'pending'",
-            params![state, now, id],
+            "UPDATE interactions
+                SET state = ?1, updated_at = ?2,
+                    answer_command_id = COALESCE(?4, answer_command_id)
+              WHERE id = ?3 AND state = 'pending'",
+            params![state, now, id, winner],
         )?;
     }
     Ok(())
@@ -9011,27 +9243,7 @@ pub(crate) fn settle_instance_interactions(
     let mut settled = 0usize;
     for (id, payload_json) in pending {
         let mut event: Value = serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({}));
-        // The durable payload is the original journal event; the full entity
-        // sits at /payload/entity (lifecycle shape) or /payload/interaction
-        // (interaction.requested shape). Update whichever exists.
-        for pointer in ["/payload/entity", "/payload/interaction"] {
-            if let Some(entity) = event.pointer_mut(pointer).and_then(Value::as_object_mut) {
-                entity.insert("state".into(), json!("invalidated"));
-                entity.insert("blocking".into(), json!(false));
-                entity.insert("answerable".into(), json!(false));
-                entity.insert(
-                    "resolution".into(),
-                    json!({
-                        "state": "known",
-                        "value": {
-                            "reason": "generation-ended",
-                            "eventIds": [],
-                        },
-                    }),
-                );
-                entity.insert("updatedAt".into(), json!(now));
-            }
-        }
+        invalidate_interaction_payload(&mut event, now);
         let changed = conn.execute(
             "UPDATE interactions
                 SET state = 'invalidated', blocking = 0, payload_json = ?2, updated_at = ?3
@@ -9041,6 +9253,64 @@ pub(crate) fn settle_instance_interactions(
         settled += changed;
     }
     Ok(settled)
+}
+
+/// c-deadcards round 2: stamp an `interaction.requested` payload as a
+/// generation-ended invalidation. The durable payload is the original journal
+/// event; the full entity sits at /payload/entity (lifecycle shape) or
+/// /payload/interaction (interaction.requested shape) — whichever exists gets
+/// the same terminal markers the list projection reads.
+///
+/// Shared by two writers so the shape can never drift:
+///  * {@link settle_instance_interactions} — rows that were `pending` when the
+///    host-lost sweep / epoch reconciliation / terminal projection ended the
+///    generation;
+///  * ingestion ({@link apply_interaction_event}) — a request (fresh or
+///    replayed) that arrives at the Hub AFTER the effective instance lifecycle
+///    is already terminal is stored departed directly, never pending.
+pub(crate) fn invalidate_interaction_payload(event: &mut Value, now: &str) {
+    for pointer in ["/payload/entity", "/payload/interaction"] {
+        if let Some(entity) = event.pointer_mut(pointer).and_then(Value::as_object_mut) {
+            entity.insert("state".into(), json!("invalidated"));
+            entity.insert("blocking".into(), json!(false));
+            entity.insert("answerable".into(), json!(false));
+            entity.insert(
+                "resolution".into(),
+                json!({
+                    "state": "known",
+                    "value": {
+                        "reason": "generation-ended",
+                        "eventIds": [],
+                    },
+                }),
+            );
+            entity.insert("updatedAt".into(), json!(now));
+        }
+    }
+}
+
+/// Settle pending interactions exactly once — on the transition in which the
+/// EFFECTIVE stored lifecycle first becomes terminal. Both lifecycle writers
+/// (the native/entity projection in `apply_instance_projection` and the
+/// derived write in `apply_instance_lifecycle`) route through this, so a
+/// native `exit` / severity-error / prose status that only one derivation
+/// recognises still ends the generation: one terminal derivation, one guard.
+/// No-op when the row was already terminal (the transition's own writer did
+/// the settlement) or stays non-terminal.
+fn settle_on_terminal_transition(
+    conn: &Connection,
+    instance_id: &str,
+    previous: Option<&str>,
+    next: Option<&str>,
+    now: &str,
+) -> Result<(), StoreError> {
+    if let Some(next) = next
+        && TERMINAL_INSTANCE_LIFECYCLES.contains(&next)
+        && !previous.is_some_and(|p| TERMINAL_INSTANCE_LIFECYCLES.contains(&p))
+    {
+        settle_instance_interactions(conn, &[instance_id.to_string()], now)?;
+    }
+    Ok(())
 }
 
 fn lifecycle_rank(state: &str) -> i32 {
@@ -9197,6 +9467,14 @@ fn apply_instance_lifecycle(
         next_act = None;
     }
     let now = now_rfc3339();
+    // c-deadcards round 2: a terminal instance has no live activity. Without
+    // this, a late/replayed interaction.requested (derived activity
+    // "blocked") would write activity='blocked' onto an exited/failed row even
+    // though the rank gate keeps its lifecycle terminal — a dead instance
+    // presenting as blocked.
+    if TERMINAL_INSTANCE_LIFECYCLES.contains(&current.lifecycle.as_str()) {
+        next_act = None;
+    }
     let lifecycle = match next_life {
         Some(next) if lifecycle_rank(next) >= lifecycle_rank(&current.lifecycle) => next,
         _ => current.lifecycle.as_str(),
@@ -9206,16 +9484,18 @@ fn apply_instance_lifecycle(
         "UPDATE instances SET lifecycle = ?1, activity = ?2, updated_at = ?3 WHERE id = ?4",
         params![lifecycle, activity, now, instance_id],
     )?;
-    // c-deadcards: a journaled terminal lifecycle (exit/kill/fail event)
-    // ends the generation — invalidate still-pending interactions on the
-    // SAME connection the journal append is committing through. Gate on the
-    // DERIVED next lifecycle: apply_instance_projection (which runs earlier
-    // in this append) has already updated the row, so reading `current` here
-    // would see the new value. Idempotency is the interaction UPDATE's own
-    // `state = 'pending'` guard — a replay settles nothing twice.
-    if matches!(next_life, Some(next) if TERMINAL_INSTANCE_LIFECYCLES.contains(&next)) {
-        settle_instance_interactions(conn, &[instance_id.to_string()], &now)?;
-    }
+    // c-deadcards round 2: settle through the SAME transition guard the
+    // projection write uses. `current` was read AFTER apply_instance_projection
+    // (it runs earlier in this append), so a terminal the projection already
+    // wrote and settled is a no-op here; a terminal only THIS derivation
+    // recognises (herdr prose status) still settles its generation now.
+    settle_on_terminal_transition(
+        conn,
+        instance_id,
+        Some(current.lifecycle.as_str()),
+        Some(lifecycle),
+        &now,
+    )?;
     Ok(())
 }
 

@@ -562,11 +562,43 @@ pub async fn answer_interaction(
                 return Err(HubError::NotFound);
             }
             "answer-committed" | "resolved" => {
-                return Err(HubError::Superseded {
-                    winner: String::new(),
-                });
+                // c-deadcards round 2: a duplicate answer is idempotent on its
+                // commandId, distinct from a dead-generation rejection. If the
+                // HTTP response to the winning answer was lost, the identical
+                // retry (same commandId) gets the original acknowledgement
+                // replayed from what the Hub persisted — never a 409. A
+                // DIFFERENT command arrived second and loses
+                // first-answer-wins: 409 naming the winner.
+                let retry_command = command_id.as_id().as_str();
+                match stored.answer_command_id.as_deref() {
+                    Some(winner) if winner == retry_command => {
+                        return Ok(Json(json!({
+                            "outcome": "idempotent",
+                            "interactionId": stored.interaction_id,
+                            "commandId": winner,
+                        })));
+                    }
+                    winner => {
+                        return Err(HubError::Superseded {
+                            winner: winner.unwrap_or_default().to_string(),
+                        });
+                    }
+                }
             }
             _ => {}
+        }
+        // Belt-and-suspenders behind the ingestion fence: even a row still
+        // marked pending must never be answered once its instance generation
+        // effectively ended (a sweep that landed between list and answer, or
+        // any ordering gap). No frame is forwarded to the Node.
+        if matches!(
+            state
+                .store
+                .interaction_instance_terminal(interaction_id.as_id().to_string())
+                .await?,
+            Some(true)
+        ) {
+            return Err(HubError::NotFound);
         }
     }
     if let Some(result) = state
@@ -654,7 +686,10 @@ pub async fn answer_interaction(
                     // journal flush must not resurrect a just-answered card.
                     state
                         .store
-                        .record_interaction_answer(interaction_id.as_id().to_string())
+                        .record_interaction_answer(
+                            interaction_id.as_id().to_string(),
+                            command_id.as_id().to_string(),
+                        )
                         .await?;
                     // D-051 c-deleg2: one unconditional `interaction.answered`
                     // audit row per committed CAS, independent of bot relay.

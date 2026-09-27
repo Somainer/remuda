@@ -17,6 +17,26 @@ describe("prepareMath: accepted math is passed through", () => {
     expect(M("> \\(x^2\\)")).toBe("> $x^2$");
   });
 
+  it("pairs a multi-line display \\[ \\] within one paragraph (round-4 fix 2)", () => {
+    expect(M("\\[\nx^2\n\\]")).toBe("$$\nx^2\n$$");
+    expect(T("\\[\nx^2\n\\]")).toBeNull();
+    // In place inside block quotes and list items: no markers touched.
+    expect(M("> \\[\n> x^2\n> \\]")).toBe("> $$\n> x^2\n> $$");
+    expect(M("- \\[\n  x^2\n  \\]")).toBe("- $$\n  x^2\n  $$");
+  });
+
+  it("never pairs display brackets across a blank line; the opener starts the tail", () => {
+    const src = "\\[\n\nx\n\\]";
+    expect(T(src)).toBe(src);
+    expect(M(src)).toBe("");
+  });
+
+  it("keeps inline \\( … \\) single-line even with a closer later (round-4 fix 2)", () => {
+    const src = "a \\(\nx\n\\) b";
+    expect(T(src)).toBeNull();
+    expect(M(src)).toBe(src);
+  });
+
   it("tokenizes a literal dollar inside a bracket body, restored later", () => {
     expect(M("\\(a$b\\)")).toBe(`$a${MATH_DOLLAR}b$`);
     expect(restoreMathSource(M("\\(a$b\\)"))).toContain("a$b");
@@ -73,6 +93,18 @@ describe("prepareMath: code is parser-owned (A)", () => {
     expect(prepareMath(src).literalTail).toBe(src);
     expect(M(src)).toBe("");
   });
+
+  it("masks indented code nested in block quotes/list continuations (round-4 fix 3)", () => {
+    // 4-space indent lives AFTER the `>` / list marker, never at column 0;
+    // only the parser can tell it opens a code block.
+    expect(M(">     $$x$$\n")).toBe(">     $$x$$\n");
+    expect(M("- a\n\n      $$x$$\n")).toBe("- a\n\n      $$x$$\n");
+  });
+
+  it("does not pair a multi-line \\[ across a fenced block that interrupts the paragraph", () => {
+    const src = "\\[\n```\n$x$\n```\n\\] tail";
+    expect(T(src)).toBe("\\[\n```\n$x$\n```\n\\] tail");
+  });
 });
 
 describe("prepareMath: blank-line display (E)", () => {
@@ -121,6 +153,15 @@ describe("prepareMath: bounded work (B)", () => {
     const input = "\\(".repeat(50_000); // 100 KB
     const dt = minTime(() => prepareMath(input));
     expect(dt).toBeLessThan(250);
+  });
+
+  it('1 MB single line of "\\(" stays well under 100 ms (round-4 fix 1)', () => {
+    const input = "\\(".repeat(500_000); // 1,000,000 chars, one line
+    expect(input.length).toBe(1_000_000);
+    const dt = minTime(() => prepareMath(input), 10);
+    // Measured ~30 ms on the dev box; 80 ms keeps the "well under 100 ms"
+    // contract with headroom for a slower CI runner.
+    expect(dt).toBeLessThan(80);
   });
 
   it('"$$x\\n\\n".repeat(20000) is linear', () => {

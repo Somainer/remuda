@@ -9,10 +9,13 @@
  *  - One linear analysis. A single forward walk (outside code) records bracket
  *    spans, single `$` and `$$` runs; pairing walks those arrays once with no
  *    backtracking. Every source char is examined O(1) times.
- *  - In-place translation only: `\(x\)` -> `$x$`, `\[x\]` -> `$$x$$` on the
- *    same line. No newlines, blank lines or fences are injected; list/quote
- *    markers are never touched. Whether a same-line `$$…$$` renders as a
- *    block is decided by the provenance plugin from its `$$` delimiter.
+ *  - In-place translation only: `\(x\)` -> `$x$`, `\[x\]` -> `$$x$$`.
+ *    Delimiters are replaced two chars for two, so no newlines, blank lines
+ *    or fences are injected; list/quote markers are never touched. A display
+ *    `\[ … \]` pair may span several lines within one paragraph (no blank
+ *    line), like `$$`; an inline `\( … \)` always stays single-line. Whether
+ *    a same-line `$$…$$` renders as a block is decided by the provenance
+ *    plugin from its `$$` delimiter.
  *  - Every unescaped `$` that is not a delimiter of an ACCEPTED pair is
  *    emitted as `\$`, so remark-math can never pair differently from this
  *    scanner.
@@ -27,7 +30,7 @@
  * is literal and the next `$` is retried as an opener.
  */
 
-import { codeMask, codeRanges } from "./mathCodeRanges";
+import { codeMask, codeRanges, type OffsetRange } from "./mathCodeRanges";
 
 /** Stand-in for a literal `$` inside a bracket-translated formula body. */
 export const MATH_DOLLAR = "\uE000";
@@ -64,9 +67,20 @@ export interface PreparedMath {
   literalTail: string | null;
 }
 
-function lineEnd(s: string, from: number): number {
-  const nl = s.indexOf("\n", from);
-  return nl === -1 ? s.length : nl;
+/**
+ * End of the paragraph containing `from`: the index of the first `\n` that,
+ * together with the next line, forms a blank-line separator (`\n[ \t\r]*\n`),
+ * or the end of the source. Mirrors the `$$` pairing rule in pairRuns().
+ */
+function paragraphEnd(s: string, from: number): number {
+  const n = s.length;
+  for (let k = from; k < n; k += 1) {
+    if (s[k] !== "\n") continue;
+    let j = k + 1;
+    while (j < n && (s[j] === " " || s[j] === "\t" || s[j] === "\r")) j += 1;
+    if (s[j] === "\n") return k;
+  }
+  return n;
 }
 
 /** Maps each index to a paragraph id (incremented at every blank line). */
@@ -99,11 +113,7 @@ interface Collected {
 }
 
 /** Single forward walk outside code. */
-function collect(
-  s: string,
-  code: Uint8Array,
-  paragraphOf: (i: number) => number,
-): Collected {
+function collect(s: string, code: Uint8Array, blocks: OffsetRange[]): Collected {
   const n = s.length;
   const singles: Single[] = [];
   const runs: Run[] = [];
@@ -112,6 +122,14 @@ function collect(
   let line = 0;
   let parenScan = 0;
   let bracketScan = 0;
+  // End of the line/paragraph the cursor is on. Each is recomputed only when
+  // the cursor crosses the cached value, so a long line of unmatched openers
+  // costs O(L) total, not O(N x L) (round-4 fix 1).
+  const firstNl = s.indexOf("\n");
+  let le = firstNl === -1 ? n : firstNl;
+  let pe = -1;
+  // Pointer into the sorted block-code ranges; advanced with the cursor.
+  let blockPtr = 0;
 
   for (let i = 0; i < n; i += 1) {
     const ch = s[i]!;
@@ -121,10 +139,28 @@ function collect(
     if (ch === "\\" && (s[i + 1] === "(" || s[i + 1] === "[") && backslashes(s, i) % 2 === 0) {
       const display = s[i + 1] === "[";
       const needle = display ? "\\]" : "\\)";
+      if (i >= le) {
+        const nl = s.indexOf("\n", i);
+        le = nl === -1 ? n : nl;
+      }
+      // Inline \(…\) never crosses a newline. Display \[…\] may span lines
+      // within the same paragraph (no blank line), like $$ (round-4 fix 2).
+      let limit = le;
+      if (display) {
+        if (pe === -1 || i >= pe) pe = paragraphEnd(s, i);
+        limit = pe;
+        // A fenced code block can interrupt the paragraph with no blank line.
+        // Pairing across it would swallow the fence into math, so cap the
+        // closer search at the block and leave the opener unclosed.
+        while (blockPtr < blocks.length && blocks[blockPtr]!.end <= i) blockPtr += 1;
+        if (blockPtr < blocks.length) {
+          const blockStart = blocks[blockPtr]!.start;
+          if (blockStart > i && blockStart < limit) limit = blockStart;
+        }
+      }
       const scan = display ? bracketScan : parenScan;
-      const le = lineEnd(s, i);
       let close = -1;
-      for (let j = Math.max(scan, i + 2); j < le - 1; j += 1) {
+      for (let j = Math.max(scan, i + 2); j < limit - 1; j += 1) {
         if (s.startsWith(needle, j) && code[j] === 0 && backslashes(s, j) % 2 === 0) {
           close = j;
           break;
@@ -137,11 +173,11 @@ function collect(
         i = close + 1;
         continue;
       }
-      // No closer on the rest of this line. A later opener on the same line
-      // cannot close either (its range is a subset), so advance the cursor to
-      // the line end — an unclosed `\(`/`\[` never rescans the tail (design B).
-      if (display) bracketScan = le;
-      else parenScan = le;
+      // No closer in range. A later opener on that same range cannot close
+      // either (its range is a subset), so park the scan cursor at the limit —
+      // an unclosed `\(`/`\[` never rescans the tail (design B).
+      if (display) bracketScan = limit;
+      else parenScan = limit;
       if (display && unclosedDisplay === -1) unclosedDisplay = i;
       continue;
     }
@@ -155,7 +191,7 @@ function collect(
           i += size - 1;
         }
       } else {
-        singles.push({ index: i, paragraph: paragraphOf(i) });
+        singles.push({ index: i, paragraph: 0 });
       }
     }
   }
@@ -213,9 +249,16 @@ function pairRuns(s: string, runs: Run[]): { accepted: Set<number>; tail: number
 export function prepareMath(input: string): PreparedMath {
   if (input.length === 0) return { markdown: input, literalTail: null };
 
-  const code = codeMask(input, codeRanges(input));
-  const paragraphOf = paragraphOfFn(input);
-  const { singles, runs, brackets, unclosedDisplay } = collect(input, code, paragraphOf);
+  const ranges = codeRanges(input);
+  const code = codeMask(input, ranges);
+  const blocks = ranges.filter((range) => range.block);
+  const { singles, runs, brackets, unclosedDisplay } = collect(input, code, blocks);
+  // Paragraph ids are only needed for single-$ pairing; skip the extra pass on
+  // messages without one.
+  if (singles.length > 0) {
+    const paragraphOf = paragraphOfFn(input);
+    for (const single of singles) single.paragraph = paragraphOf(single.index);
+  }
   const acceptedSingles = pairSingles(input, singles);
   const { accepted: acceptedRuns, tail: runTail } = pairRuns(input, runs);
 
@@ -228,36 +271,67 @@ export function prepareMath(input: string): PreparedMath {
     runTail === -1 ? unclosedDisplay : Math.min(runTail, unclosedDisplay === -1 ? runTail : unclosedDisplay);
   const limit = tailStart === -1 ? input.length : tailStart;
 
-  let out = "";
+  // Fast path: no accepted math, no code/HTML, no tail — the only edit is
+  // escaping unescaped `$`. A single regex pass handles it without a million
+  // output segments (covers both currency prose and the `$1$1…` adversarial
+  // line). Backslash escapes (incl. `\$`) are consumed verbatim.
+  if (
+    brackets.length === 0 &&
+    acceptedSingles.size === 0 &&
+    acceptedRuns.size === 0 &&
+    ranges.length === 0 &&
+    tailStart === -1 &&
+    input.indexOf("$") !== -1
+  ) {
+    // No backslash escapes in the source: every `$` is unescaped — a native
+    // global string replace (no per-match callback) handles the `$1$1…` line.
+    if (!/\\/.test(input)) return { markdown: input.replace(/\$/g, "\\$"), literalTail: null };
+    const escaped = input.replace(/\\[\s\S]?|\${1,}/g, (m) =>
+      m[0] === "\\" ? m : "\\$".repeat(m.length),
+    );
+    return { markdown: escaped, literalTail: null };
+  }
+
+  // Verbatim ranges are emitted as slices joined with the replacements; an
+  // unchanged message is one O(1) slice, never a char-by-char string build.
+  const segments: string[] = [];
+  let segStart = 0;
+  const flushVerbatim = (end: number): void => {
+    if (end > segStart) segments.push(input.slice(segStart, end));
+  };
   let i = 0;
   while (i < limit) {
     if (code[i] === 1) {
-      out += input[i]!;
       i += 1;
       continue;
     }
     const bracket = bracketByFrom.get(i);
     if (bracket) {
+      flushVerbatim(i);
       const token = (x: string) => x.replace(/\$/g, MATH_DOLLAR);
       const body = token(input.slice(bracket.bodyFrom, bracket.bodyTo));
-      out += bracket.display ? `$$${body}$$` : `$${body}$`;
+      segments.push(bracket.display ? `$$${body}$$` : `$${body}$`);
       i = bracket.to;
+      segStart = i;
       continue;
     }
     if (input[i] === "$" && backslashes(input, i) % 2 === 0) {
       const run = runAt.get(i);
+      flushVerbatim(i);
       if (run) {
-        out += acceptedRuns.has(i) ? "$".repeat(run.size) : "\\$".repeat(run.size);
+        segments.push(acceptedRuns.has(i) ? "$".repeat(run.size) : "\\$".repeat(run.size));
         i += run.size;
-        continue;
+      } else {
+        segments.push(acceptedSingles.has(i) ? "$" : "\\$");
+        i += 1;
       }
-      out += acceptedSingles.has(i) ? "$" : "\\$";
-      i += 1;
+      segStart = i;
       continue;
     }
-    out += input[i]!;
     i += 1;
   }
+  flushVerbatim(limit);
+  const out = segments.join("");
 
   return { markdown: out, literalTail: tailStart === -1 ? null : input.slice(tailStart) };
 }

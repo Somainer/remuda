@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -54,6 +55,29 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
   }, [engine.status]);
 
   const rootRef = useRef<HTMLElement | null>(null);
+  const [wide, setWide] = useState(false);
+
+  const renderedInline = engine.status === "ready" && fontsReady && !display;
+  useLayoutEffect(() => {
+    if (!renderedInline) return;
+    const el = rootRef.current;
+    if (!el) return;
+    // `overflow-x: clip` reserves no gutter, so scrollWidth/clientWidth tell
+    // the truth: promote to a scroll box only for a genuinely over-wide
+    // formula. The ON/OFF thresholds differ by more than the scrollbar gutter
+    // width, which itself shrinks clientWidth — without that gap a borderline
+    // node would flip back and forth and re-render forever.
+    const measure = (): void => {
+      setWide((prev) => (prev ? el.scrollWidth > el.clientWidth : el.scrollWidth > el.clientWidth + 8));
+    };
+    measure();
+    // Fonts arriving late and viewport/column resizes change the width.
+    const Observer = globalThis.ResizeObserver;
+    if (!Observer) return;
+    const ro = new Observer(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [renderedInline, source]);
   const attach = useCallback((el: HTMLElement | null) => {
     rootRef.current = el;
   }, []);
@@ -112,7 +136,7 @@ export function MathExpression({ source: tokenSource, display }: MathExpressionP
       body = (
         <span
           ref={attach}
-          className={css.inline}
+          className={`${css.inline}${wide ? ` ${css.inlineScroll}` : ""}`}
           data-testid="math-inline"
           data-state="ready"
           onCopy={onCopy}

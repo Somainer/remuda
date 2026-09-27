@@ -60,13 +60,35 @@
  * ordinary formulas ($x^2$, $\frac{a}{b}$, $\sum$, $\sqrt{}$) do not change
  * the line box, while explicitly tall constructs (\dfrac, \displaystyle,
  * matrices) are allowed to grow their line (round-3 ruling J).
+ *
+ * The wrapper is an inline-block so a WIDE formula can scroll inside its own
+ * box instead of widening the transcript (max-width 100%, same contract as
+ * the placeholder). The default is `overflow-x: clip`, deliberately NOT
+ * `auto`: a scroll container reserves its gutter even with no overflow, and
+ * even a 1-2px overflow (e.g. $\sum_i x_i$) would grow the line by the gutter
+ * height. The component measures the rendered node and adds `.inlineScroll`
+ * only when the formula genuinely overflows (round-4 fix 4).
  */
 .inline {
+  display: inline-block;
+  max-width: 100%;
+  overflow-x: clip;
+  vertical-align: baseline;
   color: var(--fg-body);
 }
 
 .inline :global(.katex) {
   font-size: 1.1em;
+  /* Keep the formula on one axis: an over-wide formula scrolls, never wraps
+     onto extra lines (a display `.katex-display` gets this from KaTeX; inline
+     does not). */
+  white-space: nowrap;
+}
+
+.inlineScroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 
 /* Exact streaming source of an unclosed display formula: plain text. */

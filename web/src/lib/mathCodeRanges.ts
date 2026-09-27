@@ -17,6 +17,13 @@ import remarkGfm from "remark-gfm";
 export interface OffsetRange {
   start: number;
   end: number;
+  /**
+   * A block-level construct (fenced/indented `code`), as opposed to a code
+   * span or raw inline HTML. A block code range can interrupt a paragraph
+   * WITHOUT a blank line, so the bracket scanner must never pair a `\[` across
+   * one (round-4 fix 3).
+   */
+  block?: boolean;
 }
 
 type PositionedNode = {
@@ -31,28 +38,25 @@ const parser = unified().use(remarkParse).use(remarkGfm);
 
 /**
  * Cheap pre-filter: could this source possibly contain code? Every code form
- * needs a backtick (fence/span), a tilde fence, an indented/tab line, or a raw
- * `<`. If none is present there is provably no `code`/`inlineCode`/`html`
- * node, so the (relatively expensive) full parse is skipped. This keeps the
- * linear adversarial paths (`$1$1…`, `\(\(…`, giant formulas) off the parser
- * entirely while every message that actually has code is parsed.
+ * needs a backtick (fence/span), a tilde fence, a raw `<`, or indentation
+ * (four spaces / a tab) that can open an indented code block. Indentation is
+ * searched ANYWHERE: an indented block inside a block quote (`>     code`) or
+ * a list continuation (`- a\n\n      code`) never sits at column 0, and only
+ * the parser knows whether the indent actually opens a block there, so we do
+ * not prefilter on line-start column (round-4 fix 3). If none of these
+ * characters is present there is provably no code node, so the (relatively
+ * expensive) full parse is skipped. This keeps the linear adversarial paths
+ * (`$1$1…`, `\(\(…`, giant formulas) off the parser entirely while every
+ * message that actually has code is parsed.
  */
 function mightContainCode(markdown: string): boolean {
-  if (markdown.includes("`") || markdown.includes("~") || markdown.includes("<")) return true;
-  let atLineStart = true;
-  let spaces = 0;
-  for (let i = 0; i < markdown.length; i += 1) {
-    const ch = markdown[i]!;
-    if (atLineStart && ch === "\t") return true;
-    if (atLineStart && ch === " ") {
-      spaces += 1;
-      if (spaces >= 4) return true;
-      continue;
-    }
-    spaces = 0;
-    atLineStart = ch === "\n";
-  }
-  return false;
+  return (
+    markdown.includes("`") ||
+    markdown.includes("~") ||
+    markdown.includes("<") ||
+    markdown.includes("\t") ||
+    markdown.includes("    ")
+  );
 }
 
 /** Sorted, non-overlapping byte ranges that are code/raw-HTML, never math. */
@@ -69,7 +73,7 @@ export function codeRanges(markdown: string): OffsetRange[] {
     if (CODE_TYPES.has(node.type)) {
       const pos = node.position;
       if (pos && typeof pos.start.offset === "number" && typeof pos.end.offset === "number") {
-        ranges.push({ start: pos.start.offset, end: pos.end.offset });
+        ranges.push({ start: pos.start.offset, end: pos.end.offset, block: node.type === "code" });
       }
     }
     for (const child of node.children ?? []) walk(child);

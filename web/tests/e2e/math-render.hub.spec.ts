@@ -106,6 +106,12 @@ async function createReadySession(
   prompt: string,
   mobile = false,
   counts: ReadyCounts = DEFAULT_COUNTS,
+  /**
+   * Invoked after the message is sent but BEFORE the lazy KaTeX chunk is
+   * awaited: lets a test measure the loading-placeholder layout (route-gate
+   * the `/katex/i` requests to keep the placeholders on screen).
+   */
+  beforeSettle?: (page: Page) => Promise<void>,
 ): Promise<string> {
   await page.goto("/sessions/new");
   const hostPicker = page.getByTestId("new-session-host");
@@ -138,6 +144,7 @@ async function createReadySession(
   } else {
     await composer.press("Enter");
   }
+  if (beforeSettle) await beforeSettle(page);
   await expect(page.getByTestId("math-display")).toHaveCount(counts.display, { timeout: 30_000 });
   await expect(page.getByTestId("math-inline")).toHaveCount(counts.inline);
   await expect(page.getByTestId("math-error")).toHaveCount(counts.error);
@@ -375,6 +382,9 @@ test.describe("round-3 redesign", () => {
       "```mathdisplay",
       "fenced^2",
       "```",
+      "r4 引用缩进代码：",
+      "",
+      ">     $$inq$$",
       "r3 超宽规则： $$\\rule{100000em}{100000em}$$",
       "r3 宏炸弹： $\\def\\a{\\a}\\a$",
       `r3 百KB： $$${HUGE}$$`,
@@ -406,6 +416,9 @@ test.describe("round-3 redesign", () => {
     await expect(page.getByTestId("code-block").first()).toBeVisible();
     const codeTexts = await page.getByTestId("code-block").allInnerTexts();
     expect(codeTexts.some((t) => t.includes("$$indented$$"))).toBe(true);
+    // Round-4 fix 3: 4-space-indented code NESTED IN A BLOCKQUOTE (indent after
+    // the `>`, never column 0) is still a code block, not a KaTeX display.
+    expect(codeTexts.some((t) => t.includes("$$inq$$"))).toBe(true);
     expect(codeTexts.some((t) => t.includes("fenced^2"))).toBe(true);
     // A mathdisplay fence is code, never a math node (design F): it renders
     // through CodeBlock with the language class and loads no KaTeX.
@@ -439,16 +452,91 @@ test.describe("round-3 redesign", () => {
 
   test("ordinary inline math keeps the paragraph's line height within 2px (J)", async ({ page }) => {
     const ordinary = "geom $x^2$ and $\\frac{a}{b}$ and $\\sum_i x_i$ and $\\sqrt{x}$ end";
-    await createReadySession(page, ordinary, false, { display: 0, inline: 4, error: 0 });
 
-    // All four ordinary inline formulas are on one paragraph. Ordinary inline
-    // math must not grow the line box: the paragraph height stays within 2px
-    // of a single text line (the .md line-height is 28px).
+    // Hold the lazy KaTeX chunk so the four placeholders stay on screen while
+    // we measure the paragraph BEFORE the lazy render, then release and
+    // re-measure: ordinary inline math must move the line box by <= 2px.
+    let releaseChunk = (): void => {};
+    const chunkGate = new Promise<void>((resolve) => {
+      releaseChunk = resolve;
+    });
+    await page.route(/katex/i, async (route) => {
+      await chunkGate;
+      await route.continue().catch(() => {});
+    });
+
     const para = page.locator('[data-role="assistant"] p').filter({ hasText: "geom" });
-    await expect(para).toBeVisible();
-    const box = await para.boundingBox();
-    expect(box).toBeTruthy();
-    expect(box!.height).toBeLessThanOrEqual(32);
+    let beforeHeight = 0;
+    await createReadySession(
+      page,
+      ordinary,
+      false,
+      { display: 0, inline: 4, error: 0 },
+      async (gatePage) => {
+        await expect(
+          gatePage.locator('[data-role="assistant"] [data-testid="math-loading"]'),
+        ).toHaveCount(4);
+        await expect(para).toBeVisible();
+        beforeHeight = (await para.boundingBox())!.height;
+        releaseChunk();
+      },
+    );
+
+    // createReadySession has already awaited the four rendered nodes and let
+    // the fonts settle; measure the SAME paragraph again.
+    const afterBox = await para.boundingBox();
+    expect(afterBox).toBeTruthy();
+    expect(Math.abs(afterBox!.height - beforeHeight)).toBeLessThanOrEqual(2);
+  });
+
+  test("a closed multi-line \\[ \\] display renders within one paragraph (round-4 fix 2)", async ({
+    page,
+  }) => {
+    const prompt = [
+      "r4 多行括号：",
+      "\\[",
+      "x^2 + y^2",
+      "\\]",
+      "r4 引用多行：",
+      "> \\[",
+      "> z^2",
+      "> \\]",
+    ].join("\n");
+    // Bare and block-quoted multi-line bracket displays (2).
+    await createReadySession(page, prompt, false, { display: 2, inline: 0, error: 0 });
+
+    await expect(page.getByTestId("math-display")).toHaveCount(2);
+    // No unclosed-delimiter literal tail.
+    await expect(page.getByTestId("math-literal")).toHaveCount(0);
+    // The bracket delimiters were consumed, not echoed as text.
+    expect(await rawDelimiterLeak(page)).toBeNull();
+  });
+
+  test("wide INLINE math scrolls inside its box without widening the transcript (round-4 fix 4)", async ({
+    page,
+  }) => {
+    // Single-dollar INLINE formula deliberately wider than the reading column.
+    const wideInline = "$" + Array.from({ length: 80 }, (_, k) => `x_{${k + 1}}`).join("+") + "$";
+    await createReadySession(page, `wide inline ${wideInline} end`, false, {
+      display: 0,
+      inline: 1,
+      error: 0,
+    });
+
+    const inline = page.getByTestId("math-inline");
+    // The component promotes the box to a scroll container only once it has
+    // measured genuine overflow.
+    await expect
+      .poll(async () => inline.evaluate((el) => getComputedStyle(el).overflowX))
+      .toBe("auto");
+    const geometry = await inline.evaluate((el) => ({
+      scrollWidth: el.scrollWidth,
+      clientWidth: el.clientWidth,
+      docWidth: document.documentElement.scrollWidth,
+      winWidth: window.innerWidth,
+    }));
+    expect(geometry.scrollWidth).toBeGreaterThan(geometry.clientWidth + 24);
+    expect(geometry.docWidth).toBeLessThanOrEqual(geometry.winWidth + 1);
   });
 
   test("an explicitly tall inline formula is allowed to grow its line (J)", async ({ page }) => {

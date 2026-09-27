@@ -38,6 +38,15 @@ function reconciling(commandId: string): Command {
   return { ...base(commandId, "queued"), dispatch: "transport-written", resolution: "reconciling" };
 }
 
+/**
+ * A queued row the Hub recorded a forward intent for (transport-written) but
+ * whose resolution is "unknown": the Hub forwards BEFORE awaiting the Node, so
+ * a lost POST can read this exact shape back via GET. It is NOT acceptance.
+ */
+function unknownForwarded(commandId: string): Command {
+  return { ...base(commandId, "queued"), dispatch: "transport-written", resolution: "unknown" };
+}
+
 function held(commandId: string): Command {
   return { ...base(commandId, "queued"), dispatch: "not-dispatched", resolution: "clear" };
 }
@@ -236,4 +245,130 @@ it("a held row (queued, not forwarded) is re-forwarded under the same id when th
   const callIds = vi.mocked(api.instanceSend).mock.calls.map((c) => c[4]);
   expect(callIds[0]).toBe(bubble.commandId);
   expect(callIds[1]).toBe(bubble.commandId);
+});
+
+it("ROUND5-1: a forwarded queued row with resolution unknown is reconciled by GET, never re-POSTed", async () => {
+  // The Hub records the forward intent before awaiting the Node; the POST
+  // response is lost and a GET would read the row back as
+  // queued + transport-written + unknown. That is NOT acceptance: classify it
+  // as unresolved and settle it with the bounded GET loop (no second POST).
+  const { api, hubStore } = await fresh();
+  stubFollow(api);
+  const posts: string[] = [];
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => {
+      posts.push(commandId!);
+      return { relatedCommandIds: [], command: unknownForwarded(commandId!) };
+    }) as Api["instanceSend"],
+  );
+  // GET 1 still unknown; GET 2 reports the Node accepted it.
+  let gets = 0;
+  vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+    (async (_iid: string, commandId: string) => {
+      gets += 1;
+      return { command: gets === 1 ? unknownForwarded(commandId) : base(commandId, "accepted") };
+    }) as Api["instanceCommandStatus"],
+  );
+  hubStore.setConnectionStateForTest("live");
+  await hubStore.send(INSTANCE, "lost response, unknown resolution");
+
+  const bubble = await vi.waitFor(
+    () => {
+      const b = hubStore.getSnapshot().bubbles[0];
+      if (b?.outboxState !== "sent") throw new Error(`state=${b?.outboxState}`);
+      return b;
+    },
+    { timeout: 5_000 },
+  );
+  // Exactly ONE POST: the unknown forward is reconciled via GET, not re-sent.
+  expect(posts).toEqual([bubble.commandId]);
+  expect(gets).toBe(2);
+});
+
+it("ROUND5-1: a live steer whose forward is only unknown does not raise 已打断 until acceptance", async () => {
+  vi.useFakeTimers();
+  const { api, hubStore } = await fresh();
+  stubFollow(api);
+  vi.spyOn(api, "instanceSend").mockImplementation(
+    (async (_iid: string, _p: string, _r?: unknown[], _m?: string, commandId?: string) => ({
+      relatedCommandIds: [],
+      command: unknownForwarded(commandId!),
+    })) as Api["instanceSend"],
+  );
+  // The Hub never learns the Node's verdict inside the bounded window.
+  vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+    (async (_iid: string, commandId: string) => ({ command: unknownForwarded(commandId) })) as Api["instanceCommandStatus"],
+  );
+  hubStore.setConnectionStateForTest("live");
+
+  const landedP = hubStore.send(INSTANCE, "interrupt now", [], [], "steer");
+  // Walk the bounded 1 s GET loop past its 30 s deadline, flushing the
+  // delivery promise's microtasks between timer advances.
+  for (let i = 0; i < 35; i += 1) {
+    await vi.advanceTimersByTimeAsync(1_000);
+  }
+  // No authoritative acceptance (still unknown at the deadline): the steer
+  // reports false so the Composer never raises 已打断.
+  expect(await landedP).toBe(false);
+  expect(hubStore.getSnapshot().bubbles[0]?.outboxState).toBe("unknown");
+  // The forward happened exactly once; uncertainty is settled by GET, never by
+  // a duplicate interrupt POST.
+  expect(vi.mocked(api.instanceSend)).toHaveBeenCalledTimes(1);
+});
+
+it("ROUND5-1: a restored reconciling row restarts its bounded GET loop after reload (no re-POST)", async () => {
+  const { api, hubStore } = await fresh();
+  vi.spyOn(api, "hello").mockResolvedValue({} as Awaited<ReturnType<Api["hello"]>>);
+  vi.spyOn(api, "hasDeviceSession").mockReturnValue(true);
+  vi.spyOn(api, "hostList").mockResolvedValue({ items: [], nextCursor: null } as Awaited<
+    ReturnType<Api["hostList"]>
+  >);
+  vi.spyOn(api, "deviceList").mockResolvedValue({ items: [] } as ReturnType<Api["deviceList"]>);
+  vi.spyOn(api, "passkeyList").mockResolvedValue({ items: [] } as Awaited<
+    ReturnType<Api["passkeyList"]>
+  >);
+  vi.spyOn(api, "hostWorkspaceSubscribe").mockReturnValue(() => undefined);
+  vi.spyOn(hubStore, "startPoll").mockImplementation(() => undefined);
+  vi.spyOn(api, "instanceList").mockResolvedValue({ items: [], nextCursor: null });
+  vi.spyOn(api, "interactionList").mockResolvedValue([]);
+  vi.spyOn(api, "eventsRead").mockResolvedValue({ events: [], durableSeq: "0", windowFromSeq: null, reachedAfterSeq: true });
+  vi.spyOn(api, "screenRead").mockResolvedValue({ lines: [] });
+  const posts = vi.spyOn(api, "instanceSend");
+
+  // The tab closed while this forwarded row was still unresolved; on reload
+  // the durable row comes back as "reconciling".
+  const row = {
+    commandId: "cmd_restored_reconciling",
+    clientRequestId: "local_restored_reconciling",
+    instanceId: INSTANCE,
+    prompt: "forwarded before reload",
+    createdAt: Date.now() - 1_000,
+    attempts: 1,
+    state: "reconciling",
+    gotResponse: true,
+    serverState: "queued",
+  };
+  localStorage.setItem(OUTBOX_LS_KEY, JSON.stringify([row]));
+
+  let gets = 0;
+  vi.spyOn(api, "instanceCommandStatus").mockImplementation(
+    (async (_iid: string, commandId: string) => {
+      gets += 1;
+      return { command: gets === 1 ? reconciling(commandId) : base(commandId, "accepted") };
+    }) as Api["instanceCommandStatus"],
+  );
+
+  await hubStore.bootstrap();
+
+  await vi.waitFor(
+    () => {
+      const b = hubStore.getSnapshot().bubbles[0];
+      if (b?.outboxState !== "sent") throw new Error(`state=${b?.outboxState}`);
+    },
+    { timeout: 5_000 },
+  );
+  // The restored loop reconciled over GET; the Hub already had the forward, so
+  // reload never re-POSTed it.
+  expect(posts).not.toHaveBeenCalled();
+  expect(gets).toBeGreaterThanOrEqual(2);
 });

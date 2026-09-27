@@ -1044,6 +1044,14 @@ class HubStore {
           ...this.state.bubbles,
         ],
       });
+      // A forwarded-but-unresolved row ("reconciling", including a forward
+      // whose response was lost and read back as queued+unknown) is
+      // non-deliverable, so the flush cannot settle it: restart its bounded
+      // GET reconciliation instead of leaving 状态待确认 on the row forever.
+      // Never re-POSTs — the Hub already recorded the forward.
+      for (const r of restored) {
+        if (r.state === "reconciling") this.reconcileReconcilingRow(r.instanceId, r.commandId);
+      }
     }
 
     const machine = new ConnectionMachine({
@@ -1126,8 +1134,14 @@ class HubStore {
     return this.connectionState !== "offline" && this.connectionState !== "recovering";
   }
 
-  /** readyState of the current follow socket (1 = OPEN). */
-  private followReadyState = -1;
+  /**
+   * Probe for the CURRENT follow socket's readyState. The subscription object
+   * keeps the live WebSocket; reading through it at every liveness check means
+   * a socket that silently closed without firing our close handler is still
+   * observed (sampling it once after the promise could leave a cached OPEN
+   * forever — the owner's phone coming out of iOS background).
+   */
+  private followGetReadyState: (() => number) | null = null;
   /** Epoch ms of the last frame (event/tick/snapshot) on the current socket. */
   private lastFollowFrameAt = 0;
 
@@ -1137,14 +1151,14 @@ class HubStore {
    * foreground resume trust a cached "live" instead of reopening.
    */
   private followSocketLive(): boolean {
-    if (this.followReadyState !== 1) return false;
+    if (!this.followGetReadyState || this.followGetReadyState() !== 1) return false;
     if (!this.lastFollowFrameAt) return false;
     return Date.now() - this.lastFollowFrameAt <= LIVE_FRAME_MS;
   }
 
   /** Test-only: force the follow-live verdict (simulates open + fresh frame). */
   setFollowLiveForTest(open: boolean, framed: boolean) {
-    this.followReadyState = open ? 1 : -1;
+    this.followGetReadyState = () => (open ? 1 : -1);
     this.lastFollowFrameAt = framed ? Date.now() : 0;
   }
 
@@ -1346,8 +1360,12 @@ class HubStore {
    * Classify a Hub command record into an outbox outcome.
    *  - rejected: settled with settlement.outcome rejected (real Node reject).
    *  - held: queued and never forwarded (Node offline); same-id re-POST later.
-   *  - reconciling: forwarded but the Hub's resolution is still "reconciling";
-   *    settled by a bounded GET (never re-forwarded).
+   *  - reconciling: FORWARDED to the Node (transport-written / native-
+   *    acknowledged) but the Hub has no verdict yet — resolution "reconciling"
+   *    OR "unknown". The Hub records the forward intent BEFORE awaiting the
+   *    Node, so a lost POST can read the row back via GET as
+   *    queued+forwarded+unknown; it is NOT proof of acceptance. Settled by a
+   *    bounded GET (never re-forwarded).
    *  - sent: accepted/settled-completed or a clear forwarded row; reached the
    *    Hub/Node, await the journal join (never re-POST).
    */
@@ -1362,7 +1380,10 @@ class HubStore {
     ) {
       return "held";
     }
-    if (command.state === "queued" && command.resolution === "reconciling") {
+    if (
+      command.state === "queued" &&
+      (command.resolution === "reconciling" || command.resolution === "unknown")
+    ) {
       return "reconciling";
     }
     return "sent";
@@ -1381,20 +1402,34 @@ class HubStore {
   }
 
   /**
-   * Bounded reconciliation of a "reconciling" row: poll the GET endpoint until
-   * it is accepted/settled (→ sent), rejected, or the deadline passes (→
-   * unknown). NEVER re-POSTs — the Hub already forwarded the command. Runs
-   * OUTSIDE the single-deliverer lock (it can take the whole 30 s deadline and
-   * must not block another row of the instance, e.g. a steer); a reconciling
-   * row is non-deliverable, so no other owner can POST it meanwhile.
+   * Bounded reconciliation of a forwarded-but-unresolved row (resolution
+   * "reconciling" or "unknown"): poll the GET endpoint until it is
+   * accepted/settled (→ sent), rejected, or the deadline passes (→ unknown).
+   * NEVER re-POSTs — the Hub already forwarded the command. Runs OUTSIDE the
+   * single-deliverer lock (it can take the whole 30 s deadline and must not
+   * block another row of the instance, e.g. a steer); such a row is
+   * non-deliverable, so no other owner can POST it meanwhile.
    */
   private reconcileReconcilingRow(instanceId: Id, commandId: Id): void {
-    void this.runReconcileReconcilingRow(instanceId, commandId);
+    // One bounded GET loop per row per page lifetime: a row can be handed here
+    // by both the POST landing and an outbox restore only across a real reload
+    // (different page), but never run two loops concurrently in one page.
+    if (this.reconcilingInFlight.has(commandId)) return;
+    this.reconcilingInFlight.add(commandId);
+    void this.runReconcileReconcilingRow(instanceId, commandId).finally(() => {
+      this.reconcilingInFlight.delete(commandId);
+    });
   }
+
+  private readonly reconcilingInFlight = new Set<Id>();
 
   private async runReconcileReconcilingRow(instanceId: Id, commandId: Id): Promise<void> {
     const deadline = Date.now() + RECONCILE_GET_DEADLINE_MS;
     for (;;) {
+      // Journal evidence is authoritative acceptance (the Node ran the
+      // command): the live/catch-up settleFromJournal already retired the row
+      // to "done". Stop polling and never downgrade it with a GET verdict.
+      if (this.outbox?.get(commandId)?.state === "done") return;
       const verdict = await this.reconcileCommandViaGet(instanceId, commandId);
       if (verdict === "rejected") {
         const result = await api.instanceCommandStatus(instanceId, commandId).catch(() => null);
@@ -2223,24 +2258,27 @@ class HubStore {
           this.connection?.dispatch({ type: "frame" });
         },
         onOpen: () => {
-          // readyState is tracked via getReadyState after the promise
-          // resolves; onOpen only clears a stale frame clock reset.
+          // readyState is read live through getReadyState on every liveness
+          // check; onOpen needs no cached copy.
         },
         // Genuine remote close of the CURRENT socket (eventsSubscribe ignores
         // the close of a socket it intentionally replaced — see api.ts).
         onClose: () => {
-          this.followReadyState = -1;
+          this.followGetReadyState = null;
           this.lastFollowFrameAt = 0;
           this.connection?.dispatch({ type: "close" });
         },
       },
     );
     this.subs.set(instance.journalId, sub.subscriptionId);
-    this.followReadyState = sub.getReadyState();
+    // Hold the subscription's OWN live probe, never a sampled copy: a socket
+    // that dies silently (no close callback, e.g. iOS background expiry) must
+    // be seen as non-OPEN at the next liveness check.
+    this.followGetReadyState = sub.getReadyState;
     // The subscribe SNAPSHOT is the reopen + catch-up certificate: the server
     // answered over this exact socket. Count it as a frame so a resume
     // certifies live even for an idle session with no subsequent events.
-    if (this.followReadyState === 1) {
+    if (sub.getReadyState() === 1) {
       this.lastFollowFrameAt = Date.now();
       this.connection?.dispatch({ type: "frame" });
     }

@@ -18,6 +18,12 @@ import { knowledgeValue } from "../types/command";
  *  - `tone === "failed"` is the ONLY thing a renderer may paint red.
  *    `interrupted` (the process/carrier/Node went away through no fault of
  *    the work) and `ended` (a normal or unattributable close) are neutral.
+ *  - A process killed by a *crash* signal (SIGSEGV/SIGABRT/SIGBUS/SIGILL/
+ *    SIGFPE) is a failure: 「进程崩溃（…）」. SIGINT/SIGTERM/SIGHUP/SIGKILL
+ *    and any other signal read as an externally terminated process —
+ *    interrupted, never red. The driver settles every signal with
+ *    lifecycle `failed` (shell_pty lifecycle.rs), so the signal name — not
+ *    the lifecycle — carries that distinction.
  *  - The machine code never appears in `label`. It survives verbatim in
  *    `detail`, the tooltip/details surface; `detail` is null for a clean exit.
  *  - An unrecognised code is not a failure: neutral 「已结束」 plus the raw
@@ -54,40 +60,76 @@ const ENDED_LABEL = "已结束";
  */
 const TERMINAL: ReadonlySet<Lifecycle> = new Set(["exited", "failed", "closing"]);
 
-/** Exact-match codes: the wire spelling is the whole lastError line. */
-const EXACT: Readonly<Record<string, { label: string; tone: EndTone }>> = {
+/**
+ * Exact-match codes: the wire spelling is the whole lastError line.
+ *
+ * A Map, deliberately: a plain object would answer `constructor` /
+ * `toString` / `__proto__` from Object.prototype (truthy, but not a label)
+ * and hand the renderer an undefined sentence.
+ */
+const EXACT: ReadonlyMap<string, { label: string; tone: EndTone }> = new Map([
   // The Node restarted (or otherwise stopped holding the session). The work
   // was interrupted, not failed — Resume keeps the conversation (D-026).
-  [NODE_EPOCH_CHANGED]: { label: "Node 重启，会话已中断", tone: "interrupted" },
+  [NODE_EPOCH_CHANGED, { label: "Node 重启，会话已中断", tone: "interrupted" }],
   // A stop reached a Node that does not know the instance.
-  "node-lost-instance": { label: "Node 已丢失该会话，会话已中断", tone: "interrupted" },
+  ["node-lost-instance", { label: "Node 已丢失该会话，会话已中断", tone: "interrupted" }],
   // Host connection gone while the row was settling; fate of the process
   // unknown, so never a claimed failure.
-  "host-lost": { label: "主机失联，会话已中断", tone: "interrupted" },
+  ["host-lost", { label: "主机失联，会话已中断", tone: "interrupted" }],
   // Herdr-carried PTY: the carrier socket/server/process the pane lived in is
   // gone. Same human fact as a Node restart — the session was cut short.
-  "herdr-carrier-lost": { label: "终端承载中断，会话已中断", tone: "interrupted" },
-  "carrier-missing": { label: "终端承载中断，会话已中断", tone: "interrupted" },
-  "carrier-shutdown": { label: "终端承载中断，会话已中断", tone: "interrupted" },
-  "startup-orphan": { label: "终端承载中断，会话已中断", tone: "interrupted" },
+  ["herdr-carrier-lost", { label: "终端承载中断，会话已中断", tone: "interrupted" }],
+  ["carrier-missing", { label: "终端承载中断，会话已中断", tone: "interrupted" }],
+  ["carrier-shutdown", { label: "终端承载中断，会话已中断", tone: "interrupted" }],
+  ["startup-orphan", { label: "终端承载中断，会话已中断", tone: "interrupted" }],
   // PTY closed with no wait status.
-  "native-exit-eof": { label: "终端已关闭，会话已中断", tone: "interrupted" },
+  ["native-exit-eof", { label: "终端已关闭，会话已中断", tone: "interrupted" }],
+  // Bare terminal-state words some channels journal. "killed" is a process
+  // stopped from outside (same human fact as SIGKILL); "failed" is an
+  // explicit failure claim, so it DOES paint red.
+  ["killed", { label: "进程被终止，会话已中断", tone: "interrupted" }],
+  ["failed", { label: "运行失败", tone: "failed" }],
   // A launch the Node never acknowledged; the slot is reaped.
-  "create-never-acknowledged": { label: "会话启动未获确认", tone: "failed" },
+  ["create-never-acknowledged", { label: "会话启动未获确认", tone: "failed" }],
   // Driver task ended/panicked or its journal commit failed — the harness
   // itself stopped the session, which IS a failure the owner should notice.
-  "driver-task-exited": { label: "会话驱动已退出", tone: "failed" },
-  "driver-task-panicked": { label: "会话驱动崩溃", tone: "failed" },
-  "native-observation-commit-failed": { label: "会话状态记录失败", tone: "failed" },
+  ["driver-task-exited", { label: "会话驱动已退出", tone: "failed" }],
+  ["driver-task-panicked", { label: "会话驱动崩溃", tone: "failed" }],
+  ["native-observation-commit-failed", { label: "会话状态记录失败", tone: "failed" }],
   // Owner-initiated close and operator delete are ordinary endings.
-  "explicit-close": { label: ENDED_LABEL, tone: "ended" },
-  "native-exit": { label: ENDED_LABEL, tone: "ended" },
-  "deleted-by-operator": { label: "会话已删除", tone: "ended" },
-};
+  ["explicit-close", { label: ENDED_LABEL, tone: "ended" }],
+  ["native-exit", { label: ENDED_LABEL, tone: "ended" }],
+  ["deleted-by-operator", { label: "会话已删除", tone: "ended" }],
+]);
+
+/**
+ * Signals that mean the process itself crashed — a proven failure, red.
+ * Shell-pty settles every signal with lifecycle `failed`, but SIGTERM from a
+ * Stop button is plainly not the same fact as a segfault: only the trap
+ * family below is a crash.
+ */
+const CRASH_SIGNALS: ReadonlySet<string> = new Set([
+  "SIGSEGV",
+  "SIGABRT",
+  "SIGBUS",
+  "SIGILL",
+  "SIGFPE",
+]);
+
+/** Project one signal name (either wire spelling carries the same set). */
+function classifySignal(name: string): { label: string; tone: EndTone } {
+  const signal = name.trim().toUpperCase();
+  if (CRASH_SIGNALS.has(signal)) {
+    return { label: `进程崩溃（${signal}）`, tone: "failed" };
+  }
+  // SIGINT/SIGTERM/SIGHUP/SIGKILL and anything else: the process was stopped
+  // from outside. Interrupted, not a crash — unknown names never paint red.
+  return { label: `进程被终止（${signal}），会话已中断`, tone: "interrupted" };
+}
 
 /** Classify one recognised code line; null when the table does not know it. */
 function classifyCode(code: string): Omit<EndReason, "detail"> | null {
-  const exact = EXACT[code];
+  const exact = EXACT.get(code);
   if (exact) return exact;
   // model_pin_mismatch is journaled as a warning today, but older/other
   // channels surface the suffixed wire form (`model-mismatch: requested …
@@ -104,7 +146,7 @@ function classifyCode(code: string): Omit<EndReason, "detail"> | null {
   }
   m = /^native-exit-signal-(.+)$/.exec(code);
   if (m) {
-    return { label: `进程被终止（${m[1]}），会话已中断`, tone: "interrupted" };
+    return classifySignal(m[1]!);
   }
   return null;
 }
@@ -114,7 +156,7 @@ function classifyExit(exit: Instance["exit"]): Omit<EndReason, "detail"> | null 
   const value = knowledgeValue(exit);
   if (!value) return null;
   if (typeof value.signal === "string" && value.signal.trim()) {
-    return { label: `进程被终止（${value.signal.trim()}），会话已中断`, tone: "interrupted" };
+    return classifySignal(value.signal);
   }
   if (typeof value.code === "number") {
     return value.code === 0

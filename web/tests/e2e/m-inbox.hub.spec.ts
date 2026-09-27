@@ -347,7 +347,7 @@ test.describe("390px phone inbox", () => {
     await expect(page).toHaveURL(/\/m\/inbox$/);
   });
 
-  test("a Node-restarted session leaves 进行中 for a quiet neutral 最近结束 row", async ({
+  test("a Node-restarted session is filtered out of both compact inbox tiers; its session banner is neutral", async ({
     page,
     browser,
   }) => {
@@ -380,64 +380,74 @@ test.describe("390px phone inbox", () => {
     const survivorId = await createRunningPty(desktop);
     await restartNodeFromTty(desktop, instanceId);
     await expectSettledByRestart(desktop, instanceId);
-    void survivorId; // both ids are in created[] and force-deleted by afterEach
     await desktopContext.close().catch(() => undefined);
 
+    // c-endreason r2: ui-spec §4.7 gives the compact inbox TWO tiers and no
+    // third. The ended session is filtered out entirely; the live survivor
+    // still anchors 进行中 · 最近.
     await page.goto("/m/inbox");
     await expect(page.getByTestId("m-inbox")).toBeVisible();
-    // Never under a 进行中 heading.
     await expect(
       page.locator(`[data-testid="m-inbox-recent-row"][data-instance-id="${instanceId}"]`),
     ).toHaveCount(0);
+    // No ended section exists at all — not merely collapsed.
+    await expect(page.getByTestId("m-inbox-ended")).toHaveCount(0);
+    await expect(
+      page.locator(`[data-testid="m-inbox-recent-row"][data-instance-id="${survivorId}"]`),
+    ).toHaveCount(1, { timeout: 15_000 });
+    expect(await page.locator("[data-testid='m-inbox']").innerText()).not.toContain(
+      "node-epoch-changed",
+    );
 
-    // It lands in the quiet, collapsed 最近结束 group.
-    const ended = page.getByTestId("m-inbox-ended");
-    await expect(ended).toBeVisible();
-    const endedRow = ended
-      .locator(`[data-testid="m-inbox-ended-row"][data-instance-id="${instanceId}"]`)
-      .first();
-    await expect(endedRow).toHaveCount(1);
-    await expect(endedRow).toBeHidden();
+    // The session page keeps the restart banner: neutral sentence, neutral
+    // chrome (never the danger border/background role), Resume kept.
+    await page.goto(`/s/${instanceId}`);
+    const banner = page.getByTestId("node-restart-banner");
+    await expect(banner).toContainText("Node 重启，会话已中断", { timeout: 20_000 });
+    expect(await banner.innerText()).not.toContain("node-epoch-changed");
+    await expect(banner).toHaveAttribute("title", "node-epoch-changed");
+    await expect(page.getByTestId("node-restart-resume")).toBeVisible();
 
-    // Expand: the human sentence, the neutral tone, and the raw code nowhere
-    // in visible text — only in the tooltip.
-    await page.getByTestId("m-inbox-ended-summary").click();
-    await expect(endedRow).toBeVisible();
-    await expect(endedRow).toHaveAttribute("data-end-tone", "interrupted");
-    const sentence = endedRow.getByText("Node 重启，会话已中断");
-    await expect(sentence).toBeVisible();
-    expect(endedRow).not.toContainText("node-epoch-changed");
-    await expect(sentence).toHaveAttribute("title", "node-epoch-changed");
-
-    // Neutral colour: interrupted is muted, never the danger red. Compare
-    // resolved rgb() values (the token is a hex/var, not an rgb literal).
-    const colors = await sentence.evaluate((el) => {
-      const probe = document.createElement("span");
-      probe.style.color = "var(--danger-fg)";
-      document.body.appendChild(probe);
-      const danger = getComputedStyle(probe).color;
-      probe.remove();
-      return { actual: getComputedStyle(el).color, danger };
+    const chrome = await banner.evaluate((el) => {
+      const resolve = (value: string, prop: string) => {
+        const probe = document.createElement("div");
+        probe.style.setProperty(prop, value);
+        document.body.appendChild(probe);
+        const resolved = getComputedStyle(probe).getPropertyValue(prop);
+        probe.remove();
+        return resolved;
+      };
+      const cs = getComputedStyle(el);
+      return {
+        border: cs.getPropertyValue("border-top-color"),
+        background: cs.getPropertyValue("background-color"),
+        dangerBorder: resolve("var(--danger-border)", "border-top-color"),
+        dangerBg: resolve("var(--danger-bg)", "background-color"),
+        neutralBorder: resolve("var(--border)", "border-top-color"),
+        neutralBg: resolve("var(--bg-surface)", "background-color"),
+      };
     });
-    expect(colors.danger).not.toBe("");
-    expect(colors.actual).not.toBe(colors.danger);
+    expect(chrome.dangerBorder).not.toBe("");
+    expect(chrome.border).not.toBe(chrome.dangerBorder);
+    expect(chrome.background).not.toBe(chrome.dangerBg);
+    // It is not just "a different red": the banner uses the neutral surface.
+    expect(chrome.border).toBe(chrome.neutralBorder);
+    expect(chrome.background).toBe(chrome.neutralBg);
 
-    // The row opens the session page, which keeps the Resume affordance.
     if (evidence) {
-      await shot(page, "mobile-ui-5-inbox-ended-390.png");
       const evidenceContext = await browser.newContext({
         viewport: { width: 1440, height: 900 },
         hasTouch: false,
         isMobile: false,
       });
-      const desktop = await evidenceContext.newPage();
-      await login(desktop, "m-inbox-ended-evidence");
-      await desktop.goto(`/s/${instanceId}`);
-      await expect(desktop.getByTestId("node-restart-banner")).toContainText(
+      const evidencePage = await evidenceContext.newPage();
+      await login(evidencePage, "m-inbox-ended-evidence");
+      await evidencePage.goto(`/s/${instanceId}`);
+      await expect(evidencePage.getByTestId("node-restart-banner")).toContainText(
         "Node 重启，会话已中断",
         { timeout: 20_000 },
       );
-      await shot(desktop, "desktop-endreason-node-restart-1440.png");
+      await shot(evidencePage, "desktop-endreason-node-restart-1440.png");
       await evidenceContext.close();
     }
   });

@@ -8,27 +8,28 @@ import {
   type InteractionUiState,
 } from "../../lib/interactionStatus";
 import { projectStatus } from "../../lib/status";
-import { endReason, type EndReason } from "../../lib/endReason";
 import type { PushStatus } from "../../lib/push";
 
 /**
  * Pure derivation for the phone inbox (`/m/inbox`, D-049 / ui-spec §2.5,
- * §4.7). Two tiers plus one quiet end group:
+ * §4.7). Two tiers, exactly as §4.7 prescribes (待你处理 / 进行中·最近,
+ * no third tier):
  *
  *  - 待你处理: every non-settled interaction projected to
  *    pending / answering / paused (the same projection ApprovalsPage uses,
  *    so mobile and desktop never disagree about queue membership);
  *  - 进行中 · 最近: working / idle instances, newest activity first,
  *    minus instances already represented by a tier-1 row (a blocked session
- *    is never also advertised as working). A session that is no longer
- *    running can never sit under a heading that says 进行中;
- *  - 最近结束: exited/failed instances, newest first, capped at
- *    {@link MAX_ENDED_ROWS}. The shell renders it collapsed; rows carry the
- *    human {@link EndReason} sentence (red only for a proven failure), never
- *    the raw wire code.
+ *    is never also advertised as working).
  *
- * Expired / superseded interactions are not a fourth tier: the phone inbox
- * deliberately has no 已离队 section (§11.3 observed two tiers, not three).
+ * A session that is no longer running appears NOWHERE here: it can never sit
+ * under a heading that says 进行中, and the compact inbox deliberately has no
+ * ended section (ui-spec §4.7 / §11.3 observed two tiers, not three). Ended
+ * sessions stay reachable from the home list and by their `/s/:id` URL; the
+ * desktop session list keeps its own 已退出 group.
+ *
+ * Expired / superseded interactions are not a tier either: the phone inbox
+ * deliberately has no 已离队 section.
  */
 
 export const INBOX_KINDS = [
@@ -177,12 +178,6 @@ export type InboxInstanceRow = {
   timeLabel: string;
   contextPct: number | null;
   status: UiStatus;
-  /**
-   * Human end reason for 最近结束 rows; null on a live 进行中 row. When set,
-   * `subtitle` is `end.label` and the raw machine code lives only in
-   * `end.detail`; the card paints red iff `end.tone === "failed"`.
-   */
-  end: EndReason | null;
   updatedAt: string;
   /** Deep-equality signature for the memoized recent-row card. */
   sig: string;
@@ -193,12 +188,7 @@ export type InboxRows = {
   pending: InboxInteractionRow[];
   /** 进行中 · 最近 (live working/idle rows only). */
   recent: InboxInstanceRow[];
-  /** 最近结束 (ended rows, newest first, capped at MAX_ENDED_ROWS). */
-  ended: InboxInstanceRow[];
 };
-
-/** At most this many ended rows are offered behind the collapsed 最近结束 group. */
-export const MAX_ENDED_ROWS = 10;
 
 export type InboxSource = {
   interactions: Interaction[];
@@ -342,23 +332,18 @@ export function deriveInboxRows(
   pending.sort(byRecency);
 
   const recent: InboxInstanceRow[] = [];
-  const ended: InboxInstanceRow[] = [];
   for (const instance of source.instances) {
     if (blockedInstanceIds.has(instance.id)) continue;
     const status = projectStatus(instance);
-    const isEnded = status === "exited";
-    // An ended/failed row can never read as 进行中: live working/idle rows
-    // fill the recent tier, terminal rows the quiet 最近结束 group.
-    if (!isEnded && !RECENT_STATUSES.has(status)) continue;
+    // Two tiers only: terminal rows (exited/failed/closing) are filtered out
+    // outright — a session that is no longer running can never sit under a
+    // 进行中 heading, and the compact inbox has no ended section (ui-spec
+    // §4.7). Live working/idle rows fill the tier.
+    if (status === "exited" || !RECENT_STATUSES.has(status)) continue;
     const hostLabel = source.hostName(instance.hostId);
     const workspaceLabel = source.workspaceLabel(instance.workspaceId);
     const title = source.titleOf(instance.id) || "会话";
-    // Ended rows show the shared human sentence; the raw code survives only in
-    // end.detail (the card tooltip). Live rows keep the error/phrase order.
-    const end = isEnded ? endReason(instance) : null;
-    const subtitle = end
-      ? end.label
-      : latestEventText(instance, source.phrases[instance.id]);
+    const subtitle = latestEventText(instance, source.phrases[instance.id]);
     const timeLabel = formatListTime(instance.updatedAt, nowMs);
     const contextPct = contextPctOf(instance, source.rollups);
     const row: InboxInstanceRow = {
@@ -374,7 +359,6 @@ export function deriveInboxRows(
       timeLabel,
       contextPct,
       status,
-      end,
       updatedAt: instance.updatedAt,
       sig: JSON.stringify({
         t: "n",
@@ -389,28 +373,14 @@ export function deriveInboxRows(
           instance.exit,
         ],
         // contextPct also reads source.rollups (a separate store slice).
-        v: [
-          hostLabel,
-          workspaceLabel,
-          title,
-          subtitle,
-          end?.label,
-          end?.detail,
-          end?.tone,
-          timeLabel,
-          contextPct,
-          status,
-        ],
+        v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
       }),
     };
-    (isEnded ? ended : recent).push(row);
+    recent.push(row);
   }
   recent.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));
-  ended.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));
-  // The collapsed group is a quiet glance: cap the rows, newest first.
-  if (ended.length > MAX_ENDED_ROWS) ended.length = MAX_ENDED_ROWS;
 
-  return { pending, recent, ended };
+  return { pending, recent };
 }
 
 /**

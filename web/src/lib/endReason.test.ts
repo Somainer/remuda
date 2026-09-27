@@ -64,16 +64,66 @@ describe("endReason: interrupted (neutral, never red)", () => {
     }
   });
 
-  it("maps signal and EOF exits as interrupted with the signal named", () => {
+  it("maps termination signals and EOF exits as interrupted with the signal named", () => {
     const sig = endReason(input({ lastError: "native-exit-signal-SIGTERM" }))!;
     expect(sig).toEqual({
       label: "进程被终止（SIGTERM），会话已中断",
       detail: "native-exit-signal-SIGTERM",
       tone: "interrupted",
     });
+    // The driver settles lifecycle=failed for every signal death; the
+    // interrupt family still reads neutral even on that lifecycle.
+    for (const name of ["SIGINT", "SIGTERM", "SIGHUP", "SIGKILL"]) {
+      const r = endReason(input({ lifecycle: "failed", lastError: `native-exit-signal-${name}` }))!;
+      expect(r.tone).toBe("interrupted");
+      expect(r.label).toBe(`进程被终止（${name}），会话已中断`);
+    }
     const eof = endReason(input({ lifecycle: "failed", lastError: "native-exit-eof" }))!;
     expect(eof.label).toBe("终端已关闭，会话已中断");
     expect(eof.tone).toBe("interrupted");
+  });
+
+  it("maps a bare killed code to the neutral termination sentence", () => {
+    const r = endReason(input({ lifecycle: "failed", lastError: "killed" }))!;
+    expect(r).toEqual({
+      label: "进程被终止，会话已中断",
+      detail: "killed",
+      tone: "interrupted",
+    });
+  });
+});
+
+describe("endReason: crash signals are failures (string code and structured exit)", () => {
+  const CRASH = ["SIGSEGV", "SIGABRT", "SIGBUS", "SIGILL", "SIGFPE"] as const;
+
+  it("paints the crash signal family red in the native-exit-signal-* wire form", () => {
+    for (const name of CRASH) {
+      const r = endReason(input({ lifecycle: "failed", lastError: `native-exit-signal-${name}` }))!;
+      expect(r.tone).toBe("failed");
+      expect(r.label).toBe(`进程崩溃（${name}）`);
+      expect(r.detail).toBe(`native-exit-signal-${name}`);
+    }
+  });
+
+  it("classifies structured exit evidence the same way as the string codes", () => {
+    const segv = endReason(
+      input({ exit: known({ code: null, signal: "SIGSEGV", observedAt: "2026-09-24T00:00:00Z" }) }),
+    )!;
+    expect(segv.label).toBe("进程崩溃（SIGSEGV）");
+    expect(segv.tone).toBe("failed");
+    expect(segv.detail).toBeNull();
+
+    const term = endReason(
+      input({ exit: known({ code: null, signal: "SIGKILL", observedAt: "2026-09-24T00:00:00Z" }) }),
+    )!;
+    expect(term.label).toBe("进程被终止（SIGKILL），会话已中断");
+    expect(term.tone).toBe("interrupted");
+  });
+
+  it("treats an unrecognised signal name as a termination, never a crash", () => {
+    const r = endReason(input({ lastError: "native-exit-signal-SIGWHATEVER" }))!;
+    expect(r.tone).toBe("interrupted");
+    expect(r.label).toBe("进程被终止（SIGWHATEVER），会话已中断");
   });
 });
 
@@ -106,6 +156,11 @@ describe("endReason: failed (the only red tone)", () => {
       expect(r.tone).toBe("failed");
       expect(r.detail).toBe(code);
     }
+  });
+
+  it("maps the bare word failed to 运行失败", () => {
+    const r = endReason(input({ lifecycle: "failed", lastError: "failed" }))!;
+    expect(r).toEqual({ label: "运行失败", detail: "failed", tone: "failed" });
   });
 
   it("maps a non-zero native exit code as failed and names the code", () => {
@@ -179,12 +234,22 @@ describe("endReason: unknown codes are neutral, raw text only in detail", () => 
     expect(r.detail).toBe("API Error: MHOME_EXIT_SENTINEL (429)");
   });
 
-  it("maps the bare word failed and other unknown codes as neutral", () => {
-    for (const code of ["failed", "turn failed: upstream timeout", "driver exited"]) {
+  it("keeps other bare words and unknown codes neutral", () => {
+    for (const code of ["turn failed: upstream timeout", "driver exited"]) {
       const r = endReason(input({ lifecycle: "failed", lastError: code }))!;
       expect(r.tone).toBe("ended");
       expect(r.label).toBe("已结束");
       expect(r.detail).toBe(code);
+    }
+  });
+
+  it("never resolves Object.prototype names as codes", () => {
+    // A plain-object lookup would return the constructor function / prototype
+    // chain here and render an undefined sentence. All three must fall through
+    // to the neutral unknown-code branch with the input kept as detail.
+    for (const code of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      const r = endReason(input({ lifecycle: "failed", lastError: code }))!;
+      expect(r).toEqual({ label: "已结束", detail: code, tone: "ended" });
     }
   });
 

@@ -262,7 +262,7 @@ describe("buildHomeGroups body text", () => {
     const byId = new Map(groups[0].rows.map((row) => [row.id, row]));
     expect(byId.get("ins-exited")?.canResume).toBe(true);
     expect(byId.get("ins-exited-uncap")?.canResume).toBe(false);
-    expect(byId.get("ins-exited")?.body).toMatch(/已退出/);
+    expect(byId.get("ins-exited")?.body).toMatch(/已结束/);
   });
 });
 

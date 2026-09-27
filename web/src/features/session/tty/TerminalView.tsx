@@ -11,16 +11,32 @@ import type { Instance } from "../../../types/instance";
 import { payloadForStreamWrite, stripAnsi } from "./applyFrame";
 import { AuxKeys } from "./AuxKeys";
 import { PhoneKeyBar } from "./PhoneKeyBar";
-import { clearTtyScrollLine, consumeTtyScrollLine, peekTtyScrollLine } from "./ttyScrollMemory";
+import {
+  clearTtyScrollLine,
+  consumeTtyScrollLine,
+  peekTtyScrollLine,
+} from "./ttyScrollMemory";
 import { TuiModeIndicator } from "./TuiModeIndicator";
 import { TtyProgressBar } from "./TtyProgressBar";
-import { openTtySession, type TtyProgress, type TtySession, type TtyStale, type TtyStatus } from "./client";
+import {
+  openTtySession,
+  type TtyProgress,
+  type TtySession,
+  type TtyStale,
+  type TtyStatus,
+} from "./client";
 import { binaryStringToBytes } from "./ids";
 import { LocalInput } from "./LocalInput";
 import { attachTerminalRenderer, type TerminalRenderer } from "./renderer";
 import { probeRendererSelection } from "./rendererProbe";
 import { profileRegion } from "../../../lib/profileFlags";
-import { createFontMeasure, fittedTerminalFont, responsiveTerminalSize, whenFontsReady } from "./terminalFit";
+import {
+  createFontMeasure,
+  fittedTerminalFont,
+  responsiveTerminalSize,
+  rowsFittingHeight,
+  whenFontsReady,
+} from "./terminalFit";
 import { attachTerminalTouch } from "./terminalTouch";
 import {
   allowInput,
@@ -30,14 +46,43 @@ import {
   trackingActive,
 } from "./mouseReports";
 import { createReplayGuard, groupByOrigin, type OutChunk } from "./replayGuard";
+import {
+  createSizeReconciler,
+  type Grid,
+  type SizeReconciler,
+} from "./sizeReconciler";
 import { applyStdinPolicy, stdinPolicy } from "./stdinPolicy";
 import { StaleScreenBadge } from "./StaleScreenBadge";
-import { NIGHT_CORRAL_THEME, TERMINAL_FONT_FAMILY } from "./theme";
+import { terminalThemeFor, TERMINAL_FONT_FAMILY } from "./theme";
 import css from "./TerminalView.module.css";
 
 export type TtyLabHandle = {
   disconnect: () => void;
   reconnect: () => void;
+  // UO-10: PTY resize accounting, exposed on window.__ttyLab for the keyboard
+  // freeze / rotation / mode-cycle assertions.
+  resizeCount: () => number;
+  resetResizeCount: () => void;
+  /** Full scrollback text (UO-10 live-switch test). */
+  bufferText: () => string;
+  themeBackground: () => string;
+  themeForeground: () => string;
+  rendererName: () => string;
+  bufferActive: () => {
+    cursorY: number;
+    baseY: number;
+    viewportY: number;
+  };
+  // Grid of the most recent resize actually sent to the PTY (round-6
+  // reconciler tests assert the PTY ends at the final xterm grid).
+  lastResize: () => { cols: number; rows: number } | null;
+  // UO-10 round-5: drive xterm's scrollback (fires onScroll like the wheel
+  // and touch paths) for the frozen-crop re-anchor test.
+  scrollLines: (n: number) => void;
+  // UO-10 round-5: send raw bytes straight to the session (tty.write),
+  // bypassing the local/keys input gate — deterministic fake-harness
+  // sentinels without changing the terminal chrome.
+  writeRaw: (data: string) => void;
 };
 
 declare global {
@@ -50,6 +95,48 @@ type DisplayMode = "fit" | "fixed" | "responsive";
 
 /** The font the terminal is built with, and the ceiling every fit measures from. */
 const BASE_FONT_SIZE = 14;
+
+type TerminalAppearance = "dark" | "light";
+
+/**
+ * Current terminal appearance. `data-appearance="light"` (settings choice)
+ * forces light; otherwise ("dark", or absent = system) follow
+ * prefers-color-scheme. Re-renders on settings changes AND system changes,
+ * so the xterm theme can be swapped live without rebuilding the terminal.
+ */
+function useTerminalAppearance(): TerminalAppearance {
+  const [appearance, setAppearance] = useState<TerminalAppearance>(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return "dark";
+    const stamped = document.documentElement.dataset.appearance;
+    if (stamped === "light" || stamped === "dark") return stamped;
+    return window.matchMedia("(prefers-color-scheme: light)").matches
+      ? "light"
+      : "dark";
+  });
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+    const compute = () => {
+      const stamped = document.documentElement.dataset.appearance;
+      if (stamped === "light" || stamped === "dark") {
+        setAppearance(stamped);
+        return;
+      }
+      setAppearance(media.matches ? "light" : "dark");
+    };
+    compute();
+    media.addEventListener("change", compute);
+    const observer = new MutationObserver(compute);
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-appearance"],
+    });
+    return () => {
+      media.removeEventListener("change", compute);
+      observer.disconnect();
+    };
+  }, []);
+  return appearance;
+}
 
 export function TerminalView({
   instance,
@@ -71,7 +158,17 @@ export function TerminalView({
   const localWheelRef = useRef(false);
   const altScreenRef = useRef(false);
   const { mobile, coarsePointer, offsetTop } = useWorkbenchViewport();
-  const [inputOverride, setInputOverride] = useState<{ direct: boolean; mode: DisplayMode } | null>(null);
+  // UO-10 change of direction: the terminal FOLLOWS the workbench appearance.
+  // Resolve "system" live (prefers-color-scheme) and react to explicit
+  // settings changes that stamp data-appearance.
+  const terminalAppearance = useTerminalAppearance();
+  // Ref form for the one-shot mount effect (which must not rebuild the
+  // terminal on appearance change).
+  const terminalAppearanceRef = useRef(terminalAppearance);
+  const [inputOverride, setInputOverride] = useState<{
+    direct: boolean;
+    mode: DisplayMode;
+  } | null>(null);
   const [status, setStatus] = useState<TtyStatus>("connecting");
   // Present only with a `stale` status: how old the painted frame is and why
   // it stopped. Cleared by any live frame.
@@ -106,7 +203,10 @@ export function TerminalView({
   // c-mkeybar: the 史 key fills a chosen previous prompt into the local input
   // strip. A new nonce remounts LocalInput with the text — fill never sends
   // (D-028a write boundary).
-  const [inputFill, setInputFill] = useState<{ text: string; nonce: number } | null>(null);
+  const [inputFill, setInputFill] = useState<{
+    text: string;
+    nonce: number;
+  } | null>(null);
   const [preview, setPreview] = useState("");
   const [rawTail, setRawTail] = useState("");
   const [ready, setReady] = useState(false);
@@ -115,7 +215,8 @@ export function TerminalView({
   // path already makes — `disableStdin` is an all-or-nothing switch, and
   // leaving it on would type into whatever is at the prompt *now* while the
   // operator reads a screen from an hour ago.
-  const frozen = status === "reconnecting" || status === "failed" || status === "stale";
+  const frozen =
+    status === "reconnecting" || status === "failed" || status === "stale";
 
   const send = (data: string | Uint8Array) => {
     void sessionRef.current?.write(data);
@@ -136,11 +237,22 @@ export function TerminalView({
   useEffect(() => {
     frozenRef.current = frozen;
   }, [frozen]);
+  // Live theme switch: assign the palette on the EXISTING Terminal so the
+  // WebGL/canvas renderer repaints in place — no rebuild, no scrollback loss.
+  useEffect(() => {
+    terminalAppearanceRef.current = terminalAppearance;
+    if (termRef.current)
+      termRef.current.options.theme = terminalThemeFor(terminalAppearance);
+  }, [terminalAppearance]);
   useEffect(() => {
     gateRef.current = inputGate({ directInput, frozen, mouseReports });
   }, [directInput, frozen, mouseReports]);
   useEffect(() => {
-    localWheelRef.current = localWheelWanted({ mouseMode, mouseReports, altScreen });
+    localWheelRef.current = localWheelWanted({
+      mouseMode,
+      mouseReports,
+      altScreen,
+    });
     altScreenRef.current = altScreen === true;
   }, [mouseMode, mouseReports, altScreen]);
 
@@ -153,7 +265,10 @@ export function TerminalView({
     // keeps this component mounted), so the stdin policy has to be derived
     // here from the *current* refs — the [directInput, frozen] effect below
     // does not re-run when only the terminal instance changed.
-    const initialStdin = stdinPolicy({ directInput: directRef.current, frozen: frozenRef.current });
+    const initialStdin = stdinPolicy({
+      directInput: directRef.current,
+      frozen: frozenRef.current,
+    });
     const term = new Terminal({
       allowProposedApi: true,
       cursorBlink: true,
@@ -165,7 +280,7 @@ export function TerminalView({
       convertEol: false,
       disableStdin: initialStdin.disableStdin,
       macOptionIsMeta: true,
-      theme: NIGHT_CORRAL_THEME,
+      theme: terminalThemeFor(terminalAppearanceRef.current),
     });
     const fit = new FitAddon();
     const search = new SearchAddon();
@@ -196,7 +311,54 @@ export function TerminalView({
     const outQueue: OutChunk[] = [];
     const replayGuard = createReplayGuard();
     let outRaf = 0;
-    let resizeTimer = 0;
+    // UO-10 round-6: ONE size reconciler owns the grid. It tracks lastSent
+    // (what the PTY was told) and keyboardHold (rows pinned while the soft
+    // keyboard is open), applies every recomputed desired grid to xterm
+    // immediately, and debounces a single PTY send. No freeze/defer/fit gate,
+    // no rotation flag, no frozen snapshot, no per-event cancellation — see
+    // sizeReconciler.ts. Constructed after measureDesired/applyGrid below.
+    let reconciler!: SizeReconciler;
+    /**
+     * UO-10 round-4 item 4: while frozen, position the pre-keyboard-sized
+     * host inside the clipped viewport so the PAINTED cursor row (which
+     * follows the user's scroll position) stays fully visible.
+     *
+     * The painted row is baseY + cursorY - viewportY (the row of the active
+     * line in the on-screen grid); when the user has scrolled back it can
+     * lie outside 0..rows-1, in which case no translate (offset 0) is
+     * applied — the frozen top already shows the scrolled region.
+     *
+     * The translate also accounts for the host's TOP PADDING (12px on
+     * phones): the screen starts padTop inside the host, so a cursor on the
+     * last grid row sits padTop + rows*cellH from the host's top edge and
+     * must be pulled into the viewport including that padding.
+     */
+    const updateFreezeCrop = () => {
+      if (document.documentElement.dataset.keyboard !== "1") {
+        host.style.transform = "";
+        return;
+      }
+      const screen = host.querySelector<HTMLElement>(".xterm-screen");
+      const screenH = screen?.getBoundingClientRect().height ?? 0;
+      const cellH = term.rows > 0 ? screenH / term.rows : 0;
+      const viewportH = viewport.clientHeight;
+      const padTop = parseFloat(getComputedStyle(host).paddingTop) || 0;
+      if (cellH <= 0 || viewportH <= 0) return;
+      const visibleRows = (viewportH - padTop) / cellH;
+      const active = term.buffer.active;
+      const paintedRow = active.baseY + active.cursorY - active.viewportY;
+      // Scrolled back outside the grid window: show the top of the host.
+      if (paintedRow < 0 || paintedRow > term.rows - 1) {
+        host.style.transform = "translateY(0px)";
+        return;
+      }
+      const maxOffset = Math.max(0, term.rows - visibleRows);
+      const offsetRows = Math.min(
+        maxOffset,
+        Math.max(0, paintedRow - visibleRows + 1),
+      );
+      host.style.transform = `translateY(${-Math.round(offsetRows * cellH)}px)`;
+    };
 
     const flushOut = () => {
       outRaf = 0;
@@ -214,78 +376,118 @@ export function TerminalView({
             if (run.replay) replayGuard.leave();
             setReady(true);
             setMouseMode(term.modes.mouseTrackingMode);
+            // UO-10: keep the frozen crop anchored to the cursor as output
+            // arrives while the keyboard is open.
+            if (document.documentElement.dataset.keyboard === "1")
+              updateFreezeCrop();
           });
         });
       }
     };
 
-    const applyFit = () => {
-      if (!termRef.current || !viewportRef.current) return;
+    /**
+     * Measure the RAW grid the current container + mode want. This knows nothing
+     * about the keyboard hold: cols always follow the real width and rows follow the
+     * real (possibly keyboard-shrunk) height. The reconciler overrides rows with
+     * keyboardHold while the keyboard is up, and fit/fixed never re-search the
+     * font while held — so a rotation while the keyboard is open changes COLS to
+     * the new width and keeps the held rows, exactly once.
+     */
+    const measureDesired = (): Grid | null => {
+      if (!termRef.current || !viewportRef.current) return null;
       // A4: xterm is mounted in `.host`, which carries 16px/20px padding inside
-      // `.viewport`. Measuring `.viewport` overshot by that padding, so the
-      // bottom row was clipped and `.viewport` grew its own scrollbar.
-      // `clientHeight` still counts padding, so take it off explicitly.
+      // `.viewport`. `clientHeight` counts padding, so take it off explicitly.
       const pad = window.getComputedStyle(host);
-      const padX = (parseFloat(pad.paddingLeft) || 0) + (parseFloat(pad.paddingRight) || 0);
-      const padY = (parseFloat(pad.paddingTop) || 0) + (parseFloat(pad.paddingBottom) || 0);
+      const padX =
+        (parseFloat(pad.paddingLeft) || 0) +
+        (parseFloat(pad.paddingRight) || 0);
+      const padY =
+        (parseFloat(pad.paddingTop) || 0) +
+        (parseFloat(pad.paddingBottom) || 0);
+      const width = Math.max(0, host.clientWidth - padX);
+      const height = Math.max(0, host.clientHeight - padY);
+      const holding = reconciler.holdRows() !== null;
       const bounds = {
-        width: Math.max(0, host.clientWidth - padX),
-        height: Math.max(0, host.clientHeight - padY),
+        width,
+        height,
         dpr: window.devicePixelRatio || 1,
         lineHeight: term.options.lineHeight || 1,
         letterSpacing: term.options.letterSpacing || 0,
       };
+      if (bounds.width <= 0 || bounds.height <= 0) return null;
       if (modeRef.current === "responsive") {
-        const size = responsiveTerminalSize(bounds, font.measure, BASE_FONT_SIZE);
-        if (size && (term.cols !== size.cols || term.rows !== size.rows)) term.resize(size.cols, size.rows);
-        if (size) {
-          setCols(size.cols);
-          setRows(size.rows);
-          window.clearTimeout(resizeTimer);
-          resizeTimer = window.setTimeout(() => {
-            void sessionRef.current?.resize(size.cols, size.rows);
-          }, 40);
-        }
-        return;
+        return responsiveTerminalSize(
+          bounds,
+          font.measure,
+          BASE_FONT_SIZE,
+        );
       }
-      if (modeRef.current === "fit") {
-        // Size the font against the grid the box yields at the BASE font, not
-        // against the current grid. `fit.fit()` derives cols/rows from the font
-        // in effect, so feeding those back into the font search is a ratchet:
-        // each pass shrinks the font, which widens the grid, which shrinks the
-        // font again — 13.2px drifted to 1.66px and 1426 columns across a
-        // fullscreen toggle. Anchoring on the base size makes it idempotent.
-        const target = responsiveTerminalSize(bounds, font.measure, BASE_FONT_SIZE);
+      // `fit` is the only mode that re-sizes the FONT. Anchor it against the
+      // grid the box yields at the BASE font, not the current grid:
+      // `proposeDimensions` derives cols/rows from the font in effect, so feeding
+      // those back into the font search is a ratchet (each pass shrinks the
+      // font, widens the grid, shrinks the font again — 13.2px once drifted
+      // to 1.66px). `fixed` keeps whatever font is in effect and only refits
+      // the grid.
+      if (modeRef.current === "fit" && !holding) {
+        const target = responsiveTerminalSize(
+          bounds,
+          font.measure,
+          BASE_FONT_SIZE,
+        );
         if (target) {
           const fitted = fittedTerminalFont(
             { ...bounds, cols: target.cols, rows: target.rows },
             font.measure,
             BASE_FONT_SIZE,
           );
-          if (fitted != null && term.options.fontSize !== fitted) term.options.fontSize = fitted;
+          if (fitted != null && term.options.fontSize !== fitted)
+            term.options.fontSize = fitted;
         }
       }
-      fit.fit();
+      const proposal = fit.proposeDimensions();
+      const fallback = responsiveTerminalSize(
+        bounds,
+        font.measure,
+        term.options.fontSize ?? BASE_FONT_SIZE,
+      );
+      let cols = proposal?.cols ?? fallback?.cols ?? term.cols;
+      let rows = proposal?.rows ?? fallback?.rows ?? term.rows;
       // A4: FitAddon derives rows from its own CSS cell estimate, which can
       // round one row larger than the renderer actually paints; that extra row
-      // then overflows `.host` and the bottom line is clipped. Trim against
-      // the painted screen height.
+      // overflows `.host` and the bottom line is clipped. The cell comes from
+      // the grid CURRENTLY painted (painted / term.rows), never from the new
+      // proposal — painted/proposalRows rescales the cell on a shrink and
+      // applies the height loss twice (see rowsFittingHeight).
       const screen = host.querySelector<HTMLElement>(".xterm-screen");
-      if (screen && term.rows > 1) {
+      if (screen && term.rows > 0) {
         const painted = screen.getBoundingClientRect().height;
-        const cell = painted / term.rows;
-        if (cell > 0 && painted > bounds.height) {
-          const fits = Math.max(3, Math.floor(bounds.height / cell));
-          if (fits < term.rows) term.resize(term.cols, fits);
-        }
+        rows = rowsFittingHeight(rows, painted / term.rows, height);
       }
-      setCols(term.cols);
-      setRows(term.rows);
-      window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(() => {
-        void sessionRef.current?.resize(term.cols, term.rows);
-      }, 40);
+      return { cols, rows };
     };
+
+    const applyGrid = (grid: Grid) => {
+      if (term.cols !== grid.cols || term.rows !== grid.rows)
+        term.resize(grid.cols, grid.rows);
+      setCols(grid.cols);
+      setRows(grid.rows);
+      // The crop is visual only; keep it anchored to the freshly applied grid.
+      if (document.documentElement.dataset.keyboard === "1") updateFreezeCrop();
+    };
+
+    reconciler = createSizeReconciler({
+      currentGrid: () => ({ cols: term.cols, rows: term.rows }),
+      measureDesired,
+      applyGrid,
+      sendResize: (grid) => {
+        void sessionRef.current?.resize(grid.cols, grid.rows);
+      },
+    });
+
+    // Every layout signal (ResizeObserver, visualViewport/window resize,
+    // rotation, mode/fullscreen change, font load) goes through this one call.
+    const applyFit = () => reconciler.layoutChanged();
 
     // Gate keyboard and pointer independently. `disableStdin` cannot do this:
     // xterm drops mouse reports on the same flag, which is what made `keys`
@@ -333,6 +535,14 @@ export function TerminalView({
 
     applyFitRef.current = applyFit;
     settleFitRef.current = settleFit;
+    // The terminal can mount while the keyboard is already up (deep-link from a
+    // focused input): open the hold BEFORE the first fit so its rows pin the
+    // pre-keyboard grid (the PTY's initial 80x24 until the first send),
+    // instead of a grid measured from the shrunken band.
+    if (document.documentElement.dataset.keyboard === "1") {
+      reconciler.keyboardOpened();
+      updateFreezeCrop();
+    }
     void whenFontsReady().then(() => applyFitRef.current());
     applyFit();
     // c-mfix: a later WebGL context loss (iOS keyboard/memory pressure is a
@@ -364,10 +574,16 @@ export function TerminalView({
           }
           const bytes = payloadForStreamWrite(payload, false);
           const text = stripAnsi(payload);
-          const latin1 = Array.from(payload, (b) => String.fromCharCode(b)).join("");
+          const latin1 = Array.from(payload, (b) =>
+            String.fromCharCode(b),
+          ).join("");
           // B5: bound the preview like rawTail — an unbounded <pre> wedges long sessions.
-          setPreview((current) => (shouldReset ? text : (current + text).slice(-4000)));
-          setRawTail((current) => (shouldReset ? latin1 : (current + latin1).slice(-4000)));
+          setPreview((current) =>
+            shouldReset ? text : (current + text).slice(-4000),
+          );
+          setRawTail((current) =>
+            shouldReset ? latin1 : (current + latin1).slice(-4000),
+          );
           outQueue.push({ bytes, replay });
           if (!outRaf) outRaf = requestAnimationFrame(flushOut);
         });
@@ -380,7 +596,8 @@ export function TerminalView({
           setAltScreen(undefined);
           setProgress(null);
         }
-        if (next === "failed") failRef.current?.(message ?? "tty follow failed");
+        if (next === "failed")
+          failRef.current?.(message ?? "tty follow failed");
       },
       onAltScreen: (active) => {
         // Undefined explicitly invalidates an older observation when the
@@ -393,12 +610,49 @@ export function TerminalView({
     sessionRef.current = session;
     generationRef.current += 1;
 
-    const observer = new ResizeObserver(() => applyFit());
+    const observer = new ResizeObserver(() => {
+      applyFit();
+    });
     observer.observe(viewport);
     const onViewport = () => {
       if (window.visualViewport && window.visualViewport.scale !== 1) return;
+      // UO-10 round-7: the keyboard detector (lib/viewport) registered its
+      // listener before this effect's, so on THIS same event it has already
+      // stamped data-keyboard AND applied the shrunken --workbench-height.
+      // Sync the hold BEFORE measuring: onset must capture the grid still on
+      // screen (a legitimate resize pending in the debounce goes out once),
+      // while this event's own height loss is measured immediately after and
+      // gets pinned. Measuring first would capture the keyboard-shrunk grid
+      // and freeze the PTY down to the band (or send it).
+      if (document.documentElement.dataset.keyboard === "1")
+        reconciler.keyboardOpened();
+      else reconciler.keyboardClosed();
       applyFit();
     };
+    // Soft-keyboard edges via attribute transitions not delivered through the
+    // resize handlers above (mount-with-keyboard, focus-only stamps). Opening
+    // captures rows; closing releases them. The viewport path syncs the hold
+    // before its own measure, so this observer's reconcile is redundant there
+    // (both calls are idempotent) and only handles the extra cases.
+    const keyboardObserver = new MutationObserver(() => {
+      if (document.documentElement.dataset.keyboard === "1") {
+        reconciler.keyboardOpened();
+        // Visual only (never touches the grid): re-anchor the cursor crop now,
+        // not only on the next output frame.
+        updateFreezeCrop();
+      } else {
+        reconciler.keyboardClosed();
+        host.style.transform = "";
+      }
+    });
+    keyboardObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-keyboard"],
+    });
+    // UO-10 round-5 item 3: native wheel/scrollbar scroll changes the
+    // painted rows; re-anchor the frozen crop to the scrolled view.
+    const onTermScroll = () => updateFreezeCrop();
+    term.onScroll(onTermScroll);
     window.visualViewport?.addEventListener("resize", onViewport);
     window.addEventListener("resize", onViewport);
 
@@ -407,12 +661,20 @@ export function TerminalView({
     // screen element instead — it is renderer-independent.
     const lineHeight = () => {
       const screen = host.querySelector<HTMLElement>(".xterm-screen");
-      const measured = screen && term.rows > 0 ? screen.getBoundingClientRect().height / term.rows : 0;
+      const measured =
+        screen && term.rows > 0
+          ? screen.getBoundingClientRect().height / term.rows
+          : 0;
       return measured > 0 ? measured : 16;
     };
     const scrollPixels = (deltaY: number) => {
       const lines = Math.trunc(deltaY / lineHeight());
-      if (lines) term.scrollLines(lines);
+      if (lines) {
+        term.scrollLines(lines);
+        // UO-10 round-5 item 3: keep the frozen crop anchored to what the
+        // user scrolled to, not the live cursor.
+        updateFreezeCrop();
+      }
     };
 
     const detachTouch = attachTerminalTouch(viewport, {
@@ -423,8 +685,9 @@ export function TerminalView({
       // unless a full-screen TUI owns the display, where there is no
       // scrollback to pan through (§4.6).
       enabled: () =>
-        !altScreenRef.current
-        && (localWheelRef.current || !trackingActive(term.modes.mouseTrackingMode)),
+        !altScreenRef.current &&
+        (localWheelRef.current ||
+          !trackingActive(term.modes.mouseTrackingMode)),
     });
 
     // A2: while the app has tracking on, xterm cancels the local wheel and
@@ -443,6 +706,39 @@ export function TerminalView({
         resetStreamRef.current = true;
         session.reconnectForTest();
       },
+      // PTY resize calls since the last reset — the keyboard freeze test asserts
+      // zero across an open/close cycle.
+      resizeCount: () => reconciler.resizeCount(),
+      resetResizeCount: () => reconciler.resetCount(),
+      // UO-10 round-4: live-switch test support.
+      bufferText: () => {
+        const b = term.buffer.active;
+        let out = "";
+        for (let i = 0; i < b.length; i++) {
+          const line = b.getLine(i);
+          if (line) out += line.translateToString(true) + "\n";
+        }
+        return out;
+      },
+      themeBackground: () => (term.options.theme?.background as string) ?? "",
+      themeForeground: () => (term.options.theme?.foreground as string) ?? "",
+      rendererName: () =>
+        termRef.current?.element?.querySelector("canvas")
+          ? "canvas-or-webgl"
+          : "dom",
+      bufferActive: () => {
+        const b = term.buffer.active;
+        return {
+          cursorY: b.cursorY,
+          baseY: b.baseY,
+          viewportY: b.viewportY,
+        };
+      },
+      lastResize: () => reconciler.lastSent(),
+      scrollLines: (n: number) => term.scrollLines(n),
+      writeRaw: (data: string) => {
+        void sessionRef.current?.write(data);
+      },
     };
 
     return () => {
@@ -450,9 +746,11 @@ export function TerminalView({
       delete window.__ttyLab;
       detachTouch();
       observer.disconnect();
+      keyboardObserver.disconnect();
+      reconciler.dispose();
       window.visualViewport?.removeEventListener("resize", onViewport);
       window.removeEventListener("resize", onViewport);
-      window.clearTimeout(resizeTimer);
+      host.style.transform = "";
       if (outRaf) cancelAnimationFrame(outRaf);
       inputDisposable.dispose();
       binaryDisposable.dispose();
@@ -494,7 +792,11 @@ export function TerminalView({
     const apply = () => {
       const term = termRef.current;
       const line = term
-        ? consumeTtyScrollLine(instance.id, term.buffer.active.length, term.rows)
+        ? consumeTtyScrollLine(
+            instance.id,
+            term.buffer.active.length,
+            term.rows,
+          )
         : null;
       if (line != null) {
         term!.scrollToLine(line);
@@ -518,6 +820,7 @@ export function TerminalView({
     <section
       className={css.lab}
       data-tty-lab="1"
+      data-tty-instance={instance.id}
       data-tty-ready={ready ? "1" : "0"}
       data-tty-status={status}
       data-tty-cols={cols}
@@ -527,7 +830,9 @@ export function TerminalView({
       data-tty-mouse={mouseMode}
       data-tty-mouse-reports={mouseReports ? "1" : "0"}
       data-tty-fullscreen={fullscreen ? "1" : "0"}
-      data-tty-alt-screen={altScreen === undefined ? "unknown" : String(altScreen)}
+      data-tty-alt-screen={
+        altScreen === undefined ? "unknown" : String(altScreen)
+      }
       data-tty-progress={progress ? progress.state : "hidden"}
       style={{ paddingBottom: offsetTop ? 0 : undefined }}
     >
@@ -543,13 +848,20 @@ export function TerminalView({
         {/* The header strip's honesty: a stale frame must say so here, beside
             the renderer pill, and not only in the banner below — 运行中 alone
             over a frozen screen is the failure this batch exists to end. */}
-        {status === "stale" && stale ? <StaleScreenBadge stale={stale} /> : null}
+        {status === "stale" && stale ? (
+          <StaleScreenBadge stale={stale} />
+        ) : null}
         <div className={css.seg}>
           <button
             type="button"
             className={!directInput ? css.segOn : undefined}
             aria-pressed={!directInput}
-            onClick={() => setInputOverride((current) => ({ direct: false, mode: current?.mode ?? mode }))}
+            onClick={() =>
+              setInputOverride((current) => ({
+                direct: false,
+                mode: current?.mode ?? mode,
+              }))
+            }
           >
             本地输入
           </button>
@@ -557,7 +869,12 @@ export function TerminalView({
             type="button"
             className={directInput ? css.segOn : undefined}
             aria-pressed={directInput}
-            onClick={() => setInputOverride((current) => ({ direct: true, mode: current?.mode ?? mode }))}
+            onClick={() =>
+              setInputOverride((current) => ({
+                direct: true,
+                mode: current?.mode ?? mode,
+              }))
+            }
           >
             直连
           </button>
@@ -591,7 +908,9 @@ export function TerminalView({
                 // DECRST back). Sending it on tells an app that *is* still
                 // tracking to stop, so it does not immediately re-arm.
                 const term = termRef.current;
-                term?.write(MOUSE_TRACKING_RESET, () => setMouseMode(term.modes.mouseTrackingMode));
+                term?.write(MOUSE_TRACKING_RESET, () =>
+                  setMouseMode(term.modes.mouseTrackingMode),
+                );
                 send(MOUSE_TRACKING_RESET);
                 setMouseReports(true);
               }}
@@ -600,14 +919,26 @@ export function TerminalView({
             </button>
           </>
         ) : null}
-        {!mobile ? <AuxKeys disabled={frozen} onKey={send} variant="toolbar" /> : null}
+        {!mobile ? (
+          <AuxKeys disabled={frozen} onKey={send} variant="toolbar" />
+        ) : null}
         {!mobile ? (
           <button
             type="button"
             className={css.geo}
             onClick={() =>
               setInputOverride((current) => {
-                const next = mode === "fit" ? "fixed" : mode === "fixed" ? "responsive" : "fit";
+                // Derive from the QUEUED override, not the render-scope
+                // `mode`: two clicks landing in one React batch (or
+                // programmatic dispatches) must cycle twice, not twice
+                // compute from the same stale render.
+                const currentMode = current?.mode ?? mode;
+                const next =
+                  currentMode === "fit"
+                    ? "fixed"
+                    : currentMode === "fixed"
+                      ? "responsive"
+                      : "fit";
                 return { direct: current?.direct ?? directInput, mode: next };
               })
             }
@@ -616,7 +947,12 @@ export function TerminalView({
           </button>
         ) : null}
         {!mobile ? (
-          <button type="button" className={css.geo} aria-pressed={searchOpen} onClick={() => setSearchOpen((open) => !open)}>
+          <button
+            type="button"
+            className={css.geo}
+            aria-pressed={searchOpen}
+            onClick={() => setSearchOpen((open) => !open)}
+          >
             搜索
           </button>
         ) : null}
@@ -637,7 +973,12 @@ export function TerminalView({
               if (searchQuery) searchRef.current?.findNext(searchQuery);
             }}
           >
-            <input aria-label="搜索终端" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
+            <input
+              className={css.searchInput}
+              aria-label="搜索终端"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
             <button
               type="button"
               className={css.geo}
@@ -665,7 +1006,9 @@ export function TerminalView({
               : status === "stale"
                 ? "画面来自 Hub 缓存，不是实时输出"
                 : "终端连接失败"}
-          {status === "reconnecting" || status === "failed" || status === "stale" ? (
+          {status === "reconnecting" ||
+          status === "failed" ||
+          status === "stale" ? (
             <button
               type="button"
               className={css.geo}
@@ -684,7 +1027,12 @@ export function TerminalView({
           ) : null}
         </div>
       ) : null}
-      <div className={css.viewport} ref={viewportRef} role="region" aria-label="终端画面">
+      <div
+        className={css.viewport}
+        ref={viewportRef}
+        role="region"
+        aria-label="终端画面"
+      >
         <div className={css.host} ref={hostRef} />
         <pre className={css.preview} data-testid="tty-ansi-preview">
           {preview}
@@ -722,7 +1070,8 @@ export function TerminalView({
       ) : null}
       {!mobile ? (
         <div className={css.note}>
-          TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一 journal
+          TTY 字节走 `/v1/follow?tty=1` binary envelope · 结构 tab 看同一
+          journal
         </div>
       ) : null}
     </section>

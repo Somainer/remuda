@@ -2280,6 +2280,65 @@ async fn fake_node(
                         .await?;
                         continue;
                     }
+                    // c-uo10r5: `__tty_fill__:N` emits one frame carrying N
+                    // CRLF lines and a fresh prompt, deterministically driving
+                    // the xterm cursor to the last grid row (the cooked-echo
+                    // path above echoes printables but never emits CR/LF).
+                    let fill_n = submitted
+                        .as_deref()
+                        .and_then(|line| line.strip_prefix(TTY_FILL_SENTINEL))
+                        .and_then(|n| n.parse::<usize>().ok());
+                    if let Some(n) = fill_n {
+                        let n = n.clamp(1, 500);
+                        let mut frame = String::from("\r\n");
+                        for i in 1..=n {
+                            frame.push_str(&format!("FILLLINE-{i}\r\n"));
+                        }
+                        frame.push_str("$ ");
+                        let frame = frame.into_bytes();
+                        tty.screen.extend_from_slice(&frame);
+                        ws.send(Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "tty.frame",
+                                "params": {
+                                    "instanceId": instance_id,
+                                    "streamId": tty.stream_id,
+                                    "dataBase64": base64::engine::general_purpose::STANDARD
+                                        .encode(&frame),
+                                },
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?;
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        continue;
+                    }
+                    // c-uo10r6: `__tty_home__` clears the screen and puts the
+                    // cursor on row 1 with a fresh prompt.
+                    if submitted.as_deref() == Some(TTY_HOME_SENTINEL) {
+                        let frame: Vec<u8> = b"\x1b[2J\x1b[H$ ".to_vec();
+                        tty.screen.clear();
+                        tty.screen.extend_from_slice(&frame);
+                        ws.send(Message::Text(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "tty.frame",
+                                "params": {
+                                    "instanceId": instance_id,
+                                    "streamId": tty.stream_id,
+                                    "dataBase64": base64::engine::general_purpose::STANDARD
+                                        .encode(&frame),
+                                },
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await?;
+                        send_rpc_ok(&mut ws, id, json!({ "ok": true })).await?;
+                        continue;
+                    }
                     // `TTYNODE_RESTART` typed into a session makes the fake
                     // Node restart: ack the write, drop the socket, reconnect
                     // under a new epoch, and re-announce an inventory that no
@@ -2688,6 +2747,14 @@ const TTY_PROGRESS_INDET_SENTINEL: &[u8] = b"TTYPROG_INDET";
 const TTY_PROGRESS_PERCENT_SENTINEL: &[u8] = b"TTYPROG_PERCENT";
 const TTY_PROGRESS_ERROR_SENTINEL: &[u8] = b"TTYPROG_ERROR";
 const TTY_PROGRESS_DONE_SENTINEL: &[u8] = b"TTYPROG_DONE";
+/// c-uo10r5: typing this (followed by CR) emits N `FILLLINE-i\r\n` lines and
+/// a fresh `$ ` prompt, driving the xterm cursor to the last grid row for
+/// the keyboard-crop last-row test. Test-only; off every real script path.
+const TTY_FILL_SENTINEL: &str = "__tty_fill__:";
+/// c-uo10r6: typing this (followed by CR) clears the screen and puts a fresh
+/// prompt at row 1 — the keyboard-crop row-1 test must PUT the cursor on row 1
+/// explicitly rather than assume a fresh shell still happens to sit there.
+const TTY_HOME_SENTINEL: &str = "__tty_home__";
 
 impl TtyFake {
     fn new() -> Self {

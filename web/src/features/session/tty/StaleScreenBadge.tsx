@@ -32,27 +32,40 @@ export function formatStaleAge(ageMs: number): string {
  * The header badge for a screen the browser is showing but that is no longer
  * live.
  *
- * 运行中 alone is the bug this exists to prevent: the instance header reads the
- * row's lifecycle, which says `running` right up until the Hub settles it, so a
- * frozen frame used to sit under a live-looking header with nothing to say the
- * process was gone. The badge always states the age, states the reason when it
- * recognises the code, and never claims liveness. An unrecognised code renders
- * the age alone: a wrong reason is worse than none, because "会话已结束" tells
- * an operator to give up on a session that may still be running.
+ * Two evidence shapes (ui-spec §2.3): `node-link-unavailable` is freshness
+ * UNKNOWN and reads 「画面可能过期」 with a dashed neutral mark; the verified
+ * `instance-gone` end state reads 「会话已结束」 in regular frame text, with
+ * no dash or warning colour (the Resume entry sits beside it). An
+ * unrecognised reason keeps the weaker 「画面已停更」 wording: a wrong reason
+ * is worse than none, because "会话已结束" tells an operator to give up on a
+ * session that may still be running.
  */
 export function StaleScreenBadge({ stale }: { stale: TtyStale }) {
-  const reason = stale.reason ? REASON_LABEL[stale.reason] : undefined;
-  const age = stale.ageMs === undefined ? "时间未知" : `${formatStaleAge(stale.ageMs)}前`;
+  const age =
+    stale.ageMs === undefined ? "时间未知" : `${formatStaleAge(stale.ageMs)}前`;
+  let label: string;
+  let title: string;
+  if (stale.reason === "instance-gone") {
+    label = `会话已结束 · ${age}`;
+    title = "Hub 已确证进程结束，可从结构化视图继续";
+  } else if (stale.reason === "node-link-unavailable") {
+    label = `⚠ 画面可能过期 · ${age} · ${REASON_LABEL[stale.reason]}`;
+    title = "Hub 暂时连不上 Node；会话在远端可能仍活着，画面新鲜度未知";
+  } else {
+    label = `画面已停更 · ${age}`;
+    title = "画面来自 Hub 缓存，不是实时输出";
+  }
   return (
     <span
       className={css.staleBadge}
       data-testid="tty-stale"
-      data-stale-age-ms={stale.ageMs === undefined ? "unknown" : String(stale.ageMs)}
+      data-stale-age-ms={
+        stale.ageMs === undefined ? "unknown" : String(stale.ageMs)
+      }
       data-stale-reason={stale.reason ?? "unknown"}
-      title="画面来自 Hub 缓存，不是实时输出"
+      title={title}
     >
-      画面已停更 · {age}
-      {reason ? ` · ${reason}` : ""}
+      {label}
     </span>
   );
 }

@@ -160,7 +160,7 @@ describe("deriveInboxRows tiering", () => {
     expect(rows.pending.map((r) => r.uiState)).toEqual(["paused", "pending", "answering"]);
   });
 
-  it("working/idle/exited instances go to 进行中·最近; starting/unknown/blocked do not", () => {
+  it("working/idle go to 进行中·最近; exited/failed rows appear in no tier", () => {
     const cases: Array<[UiStatus, Instance]> = [
       ["working", inst({ id: "ins_working", updatedAt: T2 })],
       ["idle", inst({ id: "ins_idle", lifecycle: "ready", activity: known("idle"), updatedAt: T1 })],
@@ -174,16 +174,36 @@ describe("deriveInboxRows tiering", () => {
           lastError: null,
         }),
       ],
+      [
+        "exited",
+        inst({
+          id: "ins_restart",
+          lifecycle: "exited",
+          activity: known("idle"),
+          updatedAt: T0,
+          lastError: "node-epoch-changed",
+        }),
+      ],
+      // lifecycle=failed projects to the exited UiStatus too.
+      [
+        "exited",
+        inst({
+          id: "ins_crashed",
+          lifecycle: "failed",
+          activity: known("idle"),
+          updatedAt: T0,
+          lastError: "native-exit-signal-SIGSEGV",
+        }),
+      ],
       ["starting", inst({ id: "ins_starting", lifecycle: "starting", activity: na() })],
       ["unknown", inst({ id: "ins_unknown", connectivity: "disconnected" })],
     ];
     const rows = deriveInboxRows(source({ instances: cases.map(([, i]) => i) }));
-    expect(rows.recent.map((r) => r.instanceId)).toEqual([
-      "ins_working",
-      "ins_idle",
-      "ins_exited",
-    ]);
-    expect(rows.recent.map((r) => r.status)).toEqual(["working", "idle", "exited"]);
+    expect(rows.recent.map((r) => r.instanceId)).toEqual(["ins_working", "ins_idle"]);
+    expect(rows.recent.map((r) => r.status)).toEqual(["working", "idle"]);
+    // c-endreason r2: the compact inbox has two tiers only; ended rows are
+    // filtered out, never parked under a 进行中 heading (ui-spec §4.7).
+    expect("ended" in rows).toBe(false);
   });
 
   it("never shows a blocked instance in both tiers", () => {
@@ -431,20 +451,22 @@ describe("subtitle: latest event text, errors first and verbatim", () => {
     expect(rows.pending[0].subtitle).toBe("rm -rf /tmp/coord-media");
   });
 
-  it("exited rows surface the error verbatim in 进行中·最近", () => {
+  it("hides ended rows even when their lastError would otherwise be a subtitle", () => {
+    // The compact inbox offers no ended surface at all: an exited/failed
+    // instance contributes neither a recent row nor any raw error text.
     const rows = deriveInboxRows(
       source({
         instances: [
           inst({
             id: "ins_1",
-            lifecycle: "exited",
+            lifecycle: "failed",
             activity: known("idle"),
             lastError: "turn failed: upstream timeout",
           }),
         ],
       }),
     );
-    expect(rows.recent[0].subtitle).toBe("turn failed: upstream timeout");
+    expect(rows.recent).toHaveLength(0);
   });
 
   it("exposes latestEventText with null when nothing is known", () => {

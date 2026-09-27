@@ -212,6 +212,54 @@ async function raiseKeyboard(page: Page, keyboardHeight = 308) {
 }
 
 /**
+ * UO-10 round-2: drive a REAL keyboard open ANIMATION — intermediate frames
+ * at sub-threshold heights (loss < 120px) BEFORE the frozen final frame. The
+ * round-1 gate emitted a PTY resize from a timer scheduled during one of
+ * these approach frames; the freeze must now cancel/skip them. Fires each
+ * frame as a separate resize event so listeners observe the transition.
+ */
+async function raiseKeyboardAnimated(
+  page: Page,
+  keyboardHeight: number,
+): Promise<void> {
+  await page.evaluate(async (kb) => {
+    const vv = window.visualViewport;
+    const emit = (height: number) => {
+      const top = window.innerHeight - height;
+      const set = (name: string, value: number) => {
+        const desc: PropertyDescriptor = {
+          configurable: true,
+          get: () => value,
+        };
+        try {
+          Object.defineProperty(vv, name, desc);
+        } catch {
+          let proto: object | null = vv;
+          while (proto) {
+            try {
+              Object.defineProperty(proto, name, desc);
+              break;
+            } catch {
+              proto = Object.getPrototypeOf(proto);
+            }
+          }
+        }
+      };
+      set("height", height);
+      set("offsetTop", top);
+      vv.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new Event("resize"));
+    };
+    // Full → small loss (sub-threshold, must defer) → full keyboard.
+    emit(window.innerHeight - 40);
+    await new Promise((r) => setTimeout(r, 16));
+    emit(window.innerHeight - kb);
+    await new Promise((r) => setTimeout(r, 16));
+  }, keyboardHeight);
+  await page.waitForTimeout(300);
+}
+
+/**
  * The exact soft-keyboard sequence the coordinator's verifier uses on a real
  * iPhone: the LAYOUT viewport keeps its size (innerHeight unchanged), the
  * visual viewport keeps its width with bottom pinned (height shrinks,
@@ -232,6 +280,24 @@ async function raiseKeyboardIosExact(page: Page, kb: number) {
     vv.dispatchEvent(new Event("scroll"));
     window.dispatchEvent(new Event("resize"));
   }, kb);
+  await page.waitForTimeout(300);
+}
+
+/** Restore the full-size visual viewport (keyboard close). */
+async function lowerKeyboardIosExact(page: Page) {
+  await page.evaluate(() => {
+    const vv = window.visualViewport;
+    Object.defineProperty(vv, "height", {
+      configurable: true,
+      get: () => window.innerHeight,
+    });
+    Object.defineProperty(vv, "offsetTop", {
+      configurable: true,
+      get: () => 0,
+    });
+    vv.dispatchEvent(new Event("resize"));
+    window.dispatchEvent(new Event("resize"));
+  });
   await page.waitForTimeout(300);
 }
 
@@ -440,6 +506,10 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   page,
 }, testInfo) => {
   if (!(await fakeHostId(page))) test.skip(true, "fake Node not registered");
+  // UO-10: the keyboard-freeze assertions require the COMPACT layout — the
+  // chromium project defaults to a 1280px desktop viewport where the
+  // keyboard band never engages. Drive every engine at a 393px phone width.
+  await page.setViewportSize({ width: 393, height: 659 });
   const id = await createTerminal(page);
   await page.goto(`/s/${id}/tty`);
   const lab = page.locator("[data-tty-lab]");
@@ -493,19 +563,73 @@ test("(b) terminal renders rows in a non-zero-height container on WebKit", async
   });
   await shot(page, "m-realdevice-2-terminal-390.png");
 
-  // Keyboard up: the terminal keeps its band and refits to the shorter box
-  // instead of collapsing to zero behind the keyboard.
-  await raiseKeyboard(page);
+  // UO-10: record the fitted grid and the PTY resize counter, then open the
+  // keyboard. The freeze rule keeps xterm on the grid captured at onset (CSS
+  // clips and bottom-aligns) — it never refits to the keyboard band itself.
+  const rowsBefore = Number(await lab.getAttribute("data-tty-rows"));
+  const colsBefore = Number(await lab.getAttribute("data-tty-cols"));
+  // Round-6 reconciler: wait out the 80ms debounce so the settled grid has
+  // been sent before zeroing the counter.
+  await page.waitForTimeout(150);
+  await page.evaluate(() => window.__ttyLab?.resetResizeCount());
+
+  // Keyboard up through a REAL animation: a sub-threshold 40px frame (no
+  // data-keyboard stamp yet), then the full keyboard 16ms later — both within
+  // the 80ms debounce. UO-10 round-7 contract: the approach frame is a
+  // legitimate resize PENDING at onset, so hold captures THAT grid (25 rows
+  // here), it goes to the PTY exactly once, and xterm freezes on it; the
+  // full-keyboard height change that follows onset is held and never sent.
+  // Round-6 captured lastSent here instead and silently rolled the pending
+  // target back — which also dropped real pending resizes (e.g. a rotation
+  // whose timer had not fired).
+  await raiseKeyboardAnimated(page, 308);
+  await page.waitForTimeout(300);
   const after = await waitForInBand(page, '[aria-label="终端画面"]', 120);
   expect(after, "terminal viewport after keyboard").not.toBeNull();
   expect(
     after!.height,
     `terminal height after keyboard: ${JSON.stringify(after)}`,
   ).toBeGreaterThan(100);
+  const rowsHeld = Number(await lab.getAttribute("data-tty-rows"));
+  expect(rowsHeld).toBeGreaterThan(3);
+  // Frozen on the approach-frame pending grid: a couple rows shorter than the
+  // settled grid (40px loss at the phone cell), cols unchanged — NOT the
+  // ~8-row band grid the full keyboard would measure to.
+  expect(rowsHeld).toBeLessThan(rowsBefore);
+  expect(rowsBefore - rowsHeld).toBeLessThanOrEqual(4);
+  expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      { timeout: 3_000 },
+    )
+    .toBe(1);
+  expect(await page.evaluate(() => window.__ttyLab?.lastResize())).toEqual({
+    cols: colsBefore,
+    rows: rowsHeld,
+  });
+  await shot(page, "m-realdevice-3-terminal-keyboard-390.png", true);
+
+  // Keyboard closes: the hold releases and the restored box fits back to the
+  // original grid. The restore is a genuine post-close resize (the geometry
+  // really changed) — one more send, ending with PTY == xterm == pre-keyboard.
+  await lowerKeyboardIosExact(page);
   await expect
     .poll(async () => Number(await lab.getAttribute("data-tty-rows")))
-    .toBeGreaterThan(3);
-  await shot(page, "m-realdevice-3-terminal-keyboard-390.png", true);
+    .toBe(rowsBefore);
+  expect(Number(await lab.getAttribute("data-tty-cols"))).toBe(colsBefore);
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => window.__ttyLab?.resizeCount() ?? null),
+      { timeout: 3_000 },
+    )
+    .toBe(2);
+  expect(await page.evaluate(() => window.__ttyLab?.lastResize())).toEqual({
+    cols: colsBefore,
+    rows: rowsBefore,
+  });
 });
 
 test("(c) model/effort observations render as change records, never as 未识别事件", async ({
@@ -920,6 +1044,9 @@ test.describe("(d) keyboard band: composer fully visible and message scroller >=
       await expect(input).toBeEnabled();
       await input.click();
       await expect(input).toBeFocused();
+      // The transcript scroller mounts a beat after navigation; wait for it
+      // before measuring so a slow settle can't read a null scroller.
+      await expect(page.getByTestId("transcript-scroller")).toBeVisible();
 
       await raiseKeyboardIosExact(page, kb);
       const band = await currentBand(page, height, kb);

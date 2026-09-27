@@ -32,7 +32,7 @@
 | D-050 | 2026-09-20 | **Task 优先模型：Task 是 instance 之上的聚合（非第二状态机）；目录绑定 `workspaceBinding{reuse\|pool}` + 唯一新表 `worktree_leases`（`mode`、复合键 `(host_id,workspace_id,dir_key)`、可空 `worktree_name`、`holder_instance_id` attach-lock）；reuse=顺序轮用、归还对目录零操作，pool=detached-HEAD 停放、租借切 `wt/<slot>/<task-slug>`、return-don't-delete（reset/clean/park 仅 pool）；既有回收路径（`remove_record`/`worker.remove_worker`/`delete_instance`/`retire_worker`）必须 lease-aware；看板 8 态→4 列只读投影，failed 按 `placement.is_some()` 归位 + 角标（不存 pre-fail 列），拖卡列→列多跳；门控用 grant 动词（create/set-state=`GrantVerb::Dispatch`、land=`GrantVerb::Land`，持 grant 的协调员 agent 授权，非「agent 一律 403」）；迁移预算=一个增量列 `archived_at`（落 `tasks.rs` migrate）+ 一张新表；批注=composer 草稿（零 wire）；任务空间=文件视图客户端过滤投影（零端点）；参考产品合规护栏（只泛称、开源项目可具名、不引述内部文档、截图只提交 Remuda 渲染） | coordinator（task-model 计划任务 1 t-spec，docs-only） | [task-model.md](./task-model.md) 全文；[ui-spec.md §1.5/§2.9](./ui-spec.md)；[evidence/task-model-1.md](./evidence/task-model-1.md)；D-024/D-033/D-035/D-047/D-049 |
 | D-051 | 2026-09-24 | **委托决策（delegated decisions）：agent 可代人审批，但 plan-review 由 Node 侧 driver 直接铸造。** (1)-(5) Agent 设备经一跳家庭边（self 或直接子实例，`owns()`）可列出/回答非 approval 的交互；approval 永不下放，bypass 双侧排除；开关为 **Hub 进程环境变量**（全局开关 + per-project 覆盖名单，非 driver→Node→Hub 传播、无 wire/schema/create-spec 字段）；actor 真实化（`AnswerCaller` → committed `ActorRef.instance_id`，c-deleg2 审计链）。**(6) 2026-09-24 修正（取代早先 Hub-fold 设计）**：print/sdk 上 driver 把子代理的 `ExitPlanMode` 原生 `can_use_tool` 暂停铸为 `InteractionRequest::PlanReview`（内联 `plan` 正文 ≤ 32 KiB、sha256 digest、approve/deny、allowFeedback），走既有 Node first-answer-wins CAS；仅顶层（非 sub-agent）、有可回复原生暂停时铸，其余回人类 Approval；正文 inline（加性可选 `PlanReviewRequest.plan`，`planRef` 仅占位，**不写对象表/不新增 `AttachmentKind`/零新 wire enum**）；approve 只 allow 原 input 绝不附 `updatedPermissions`/setMode，deny 用 feedback 回喂模型；plan-review 不吃 `owns()` self 边（child 不能列/答自己的 plan）；Node 不论 carrier 先 `validate_answer`（offered option/请求 revision/digest/feedback 规则）再进 CAS。刮屏 carrier（claude-pty、无 hooks 的 shell-pty）不产生 plan-review；shell-pty+hooks 待真录验证（T2）。真实父子 gateway 轮次待协调员验证。 | 用户 + coordinator（D-051 (6) 修正 2026-09-24；c-deleg1/2/3 实跑证据） | [evidence/delegated-decisions-1.md](./evidence/delegated-decisions-1.md)、[-2](./evidence/delegated-decisions-2.md)、[-3](./evidence/delegated-decisions-3.md)；D-017/D-011；`protocol.md §5.4` |
 | D-052 | 2026-09-23 | **provenance-first UI 批次口径（ui-upgrade 批次，docs 先合）**：(a) 本批零新 wire/表/端点，出处读既有 envelope（`seq`/`source`/`completeness`）与既有 `Interaction`，迁移预算零；(b) 审批卡**不显** confidence/risk 分（`ApprovalRequest` 无 `risk`，`web/src/types/generated.ts:98-106`）且**不在 UI 断言会话边界**（`DecisionOption` 无 `destination`，`web/src/types/interaction.ts:4-8`；harness 的 permission suggestions 实测含 `session` 与 `localSettings` 两种 destination）——线框 `risk`/`Always in this cwd` 改为 preview 原文 + carrier + deadline + harness 原范围标签，副文案统一「按 harness 建议的范围持续允许」，引 §3.3；(c) completeness 三值不变、仅活过 `FoldedToolRow` 折叠（interaction 节点/ApprovalCard 需先做 store 连接键调研，批次计划 D11 默认本批不做）；(d) D-041「折叠在 family 判定之后」保留并被回归断言守住；(e) `/board` 路由与三列只读投影已上线，本批只在既有面上 graft、不新建页面/路由，已完成列不暴露 land；(f) ledger 浅色主题由 D-053（任务 15）正式化，D-052 不处理主题；(g) `/approvals` 与 `/m/inbox` 收敛为 InboxShell 单壳，桌面三档/手机两档各自保留；(h) 新增 `--warn`/`--info`/`--text-xl`/`--text-13` 四个 token（双主题各一值、文本对 `--ink-2` ≥ 4.5:1）；(i) stylelint 按文件白名单 opt-in，白名单是带摘除批次的台账，「辅助文本 vs 图形标注」分类口径进 ui-spec §3.4；(j) 参考清单定性「MIT 组件画廊，不声明任何 spacing/type/colour 规则」，证据只用 Remuda 自身 390/1440 渲染 | coordinator（ui-upgrade 计划任务 1 c-uispec2，docs-only） | [ui-spec.md §2.2/§2.5/§2.9/§3.3/§3.4/§4.7](./ui-spec.md)；[evidence/ui-upgrade-1.md](./evidence/ui-upgrade-1.md)；D-002/D-024/D-035/D-038/D-039/D-040/D-041/D-042/D-045/D-046/D-049/D-050 |
-| D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端恒深色**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
+| D-053 | 2026-09-23 | **UI 整体重做：角色颜色令牌 + 深浅双态（默认跟随系统，纯 CSS 解析）+ 同源系统字体与 720 阅读列 + 桌面单侧栏；终端跟随外观（2026-09-24 所有者改定，原恒深色口径废止）**。取代 ui-spec §6「v1 只做 A」、D-052 第 8 条「不新增 z-index / elevation / 阴影 / disabled token」中的阴影部分（z-index/disabled 口径不变）；落实 D-052 第 11 条预留的浅色主题正式化；修订 D-024「内容上方 tabs / 可折叠 Spaces/Sessions 左栏」的面板位置与 tab 条出现范围，并修订 D-024 addendum「侧栏强当前态」的品牌左条（改为 `--bg-selected` 底 + `--fg-strong` 字 + 加粗，关闭语义不变，详见 ui-spec §1.4）与「活动 tab」的品牌下划线（改为 2px `--fg-strong` 下划线 + `--bg-selected` 底 + 加粗，详见 ui-spec §1.4）、D-038 的会话列表宽行默认视口（≥960 单行另显「主机/工作区·分支」与相对时间两列，三维 wire/`ins_`/driver/model 仍退 `session-wire`）、D-040 (1) 的 compact 单芯片形状、旧 ui-spec §2.2（80db05b8 时 `:335`）的运行详情「第二行只有这一个触发器」版式（D-040 (3) 的 disclosure 内容/按设备持久化/`session-meta` 保留）、D-041 的「桌面默认态不变」、ui-spec §4.7 的底栏高度（64→56） | 所有者（重做授权与四项拍板）+ coordinator | [visual-system.md](./visual-system.md)、ui-spec §1/§2/§3.4/§4.6/§4.7/§6 |
 
 ## Cargo workspace 布局（coordinator 定，bootstrap 与计划以此为准）
 
@@ -1075,7 +1075,8 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
    - `data-appearance` 只允许出现在 `:root` 上。组件模块里不得出现任何模式分支；凡是随模式变化的值，一律做成令牌。
    - theme-color 用两个带 `media` 的 meta 标签。
    - 只发布一套调色板「墨」（微暖、低彩）。**本条落实 D-052 第 11 条预留的浅色主题正式化。**
-4. **终端是恒深色的仪器。** 深浅两态下终端相同。xterm 标准 256 色立方不再染色；每个非黑 ANSI 色在终端底上都 ≥ 4.5:1；终端输出的颜色不被改写。
+4. **终端跟随外观。**（2026-09-24 所有者改定，取代原「恒深色仪器」。）终端提供深、浅两套调色板并随外观切换（系统变化或设置选择），切换只设置 `term.options.theme` 让渲染器就地重绘，不重建终端、不丢滚动历史。两套板各自：xterm 标准 256 色立方不染色；16 个 ANSI 命名色在**本板**终端底上都 ≥ 4.5:1；truecolor 与终端输出的颜色不被改写。浅板的 white/brightWhite 用浅灰（#96918a/#a39e96）而非近白，使黑字与默认前景印在其上 ≥4.5:1（htop/dialog/ncurses 把「white」当底色）；它们作为前景字印在浅页面上是被接受的低对比例外，真白仍可由 truecolor/256 立方 231 取得。
+   - *2026-09-24 注（所有者）：终端主题跟随应用主题。*
 5. **字体。**
    - UI 与长文同用平台系统字体栈（含 PingFang SC、微软雅黑、Noto Sans CJK），不打包任何正文 webfont。
    - 等宽只用 IBM Plex Mono（OFL-1.1，许可证文件入库），只用于代码、路径、终端、ID 和需要对齐的数字。
@@ -1136,7 +1137,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 - 从未选过主题、且系统为浅色的设备，第一次会看到浅色，并且首帧就是正确的颜色。
 - 显式选了与系统相反模式的设备，首帧行为与今天相同：在模块脚本执行前可能短暂出现系统色。
 - 移除正文 webfont 后，截断点和虚拟行的估算高度会一次性变化；行高由 ResizeObserver 重新测量。
-- 切换模式只改属性，不触发 React 重渲染，终端不受影响。
+- 切换模式只改属性，不触发页面 React 树重渲染；终端在 2026-09-24 起跟随外观（所有者改定），通过给既有 xterm 实例设置 `term.options.theme` 就地换色，不重建终端、不丢滚动历史。
 - 多处可见文案会变。每个任务在同一个 PR 里更新对应的 e2e。
 - ui-spec 相关章节在本决策的同一个 PR 内改写。
 
@@ -1144,7 +1145,7 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 
 - 不打包衬线或 CJK webfont；不做阅读字体偏好。
 - 不做调色板选择器、URL 参数外观、顶栏主题开关、阅读模式、检查器。
-- 不做数学排版、交互可视化、成果预览。
+- 不做交互可视化、成果预览（数学排版按所有者 2026-09-24 要求移入范围，见文末 addendum 第 15 条）。
 - 不做新建 Task 的界面；不做 compact 看板分段。
 - 不改路由、wire、端点；不新增轮询；不做第二份 transcript；不做手机专用会话路由。
 - 审批卡不显示 risk、置信度，也不断言会话边界。
@@ -1158,6 +1159,20 @@ D-051 让持有 D-051 项目开关的 Agent 设备，在**一跳家庭边**（se
 2. UI 与正文同用系统无衬线字体，不打包衬线或 CJK webfont（2A）；
 3. 只发布「墨」一套调色板，深色、浅色两态（3A）；
 4. 会话有 `instance.taskId` 时 tab 集合是该 Task 的会话，否则是所在 Space 的会话；⌘1..9 跟随眼前的可见编号（4A）。
+
+**Addendum 2026-09-24（所有者，c-math）：数学排版移入范围。** 所有者 2026-09-24 附截图反馈「现在 latex 公式没有渲染」：transcript 里 `$$…$$` 既原样显示又被 markdown 破坏（下划线变强调、反斜杠丢失）。本 addendum 只新增第 15 条并把「不做什么」中的「数学排版」移出，不动其它条文。规则：
+
+15. **Transcript 数学排版（KaTeX）。**
+    - 引擎 KaTeX，`output: htmlAndMathml`（保留 MathML 可达性）、`throwOnError:false`（坏公式以错误样式显示 TeX 源码，绝不炸消息）、`trust:false`（禁 `\href`/`\url`/html 类指令）、`strict:"ignore"`。
+    - 定界符与结构（round-3 定稿）：`$$…$$`/`\[…\]` 为 display，`$…$`/`\(…\)` 为 inline。**代码归属解析器**：用与渲染相同的 remark+gfm（不带 math）解析一次取 `code`/`inlineCode`/`html` 区间，扫描整段跳过（含缩进 `  ~~~` 等形态；带「可能含代码」廉价预检，无代码的对抗输入不碰解析器）。扫描只做单趟线性的就地改写：`\(x\)`→`$x$`、`\[x\]`→`$$x$$` 同行替换，**绝不注入换行/fence、不碰列表 marker/`>`**；`$`/`$$` 的容器/段落/空行交给 remark-math，`- before $$x$$ after`、`> before $$x$$ after`、`- \[x\]` 的公式留在列表项/引用内并由 mdast provenance 标记成 display 块，`    $$x$$` 仍是缩进代码。四个 100 KB 对抗输入 best-of-7 仅 2.9–31ms（`"\(".repeat(50000)`、`"$$x\n\n".repeat(20000)`、`"$1".repeat(50000)`、100 KB 公式）。
+    - 单 `$` 走 pandoc 口径，且**配对即逃逸**：任何不是已接受配对定界符的 `$` 都输出为 `\$`，remark-math 不可能配出与扫描器不同的结果。开 `$` 后非空白、闭 `$` 前非空白且其后非数字：「Cost $5 and $10; use $x$.」只有 x 是数学，「花了 $5 和 $10」、`echo $HOME and $PATH` 保持文本；`$PATH:$HOME` 与 pandoc 一致仍算数学；`\$` 为字面量。
+    - 工作量边界与懒加载：KaTeX（JS+CSS+字体）为独立 chunk，无数学的消息/页面零请求。固定 `maxSize:20em`、`maxExpand:1000`；源码超过 4000 字符直接跳过引擎、中性显示源码（100 KB 钉住）；成功 HTML 按 `(source,display)` 记忆化；chunk 失败不粘性——下一条挂载的组件从 `loading` 重新 import（先 reject 再成功的组件回归）。占位保留到引擎就绪**且** KaTeX 主字面 `document.fonts.load()` 就绪（`.catch` 兜底，配合 `font-display:swap`），不靠定时器、不出现不可见字形；行高变化由 Transcript 既有的 per-row ResizeObserver 重新测量，无需改 Transcript。
+    - 消毒与 provenance：真正的 mdast math 节点由 remark 插件在 `node.data.hProperties.dataMath` 打 `inline`/`display`（flow 在 `<pre>`、同线 `$$`/`$` 在 `<code>`），sanitizer 仅对 `pre`/`code` 放行 `dataMath` 一个属性。` ```mathdisplay `、` ```mathinline `、`~~~math` 围栏无 mdast math 节点，走 CodeBlock 且不加载 KaTeX。KaTeX 输出是生成 HTML，不允许消息原始 HTML 透传。
+    - 流式（G）：消息末尾真正悬空的最后一个 `$$`/`\[`（EOF 前无闭合），其整段尾巴作为**纯 React 文本节点**（`math-literal`）渲染，定界符、反斜杠、`\*`、`_` 原样、不经 markdown、无 `<em>`（`intro \[a *b* + \{c\}` 精确可见文本）；闭合后才整体成为公式。空行（E）：`$$\n\nx\n\n$$y$$\n\n$z$` 第一个坏 run 只杀死自己，`$$y$$` 与 `$z$` 都渲染。
+    - 版式与主题：公式只用 currentColor，深浅两态都正确；display 在阅读列内居中、超宽自身横向滚动、超高被 maxSize 钳制，页面不横向滚动；占位/skip 节点 `max-width:100%` 且自身滚动/换行，transcript 不横滚。inline **不设高度上限**：普通公式（`$x^2$`、`$\frac ab$`、`$\sum$`、`$\sqrt{}$`）段落高度在单行 +2px 内（e2e 钉），显式高公式（`\dfrac`/`\displaystyle`/矩阵）允许撑大所在行（round-3 放宽 J）。
+    - 复制：选中并复制公式得到其 TeX 源码。
+    - fenceBalance（UO-5）：该文件落地后需用与 MarkdownText 相同的 remark 插件（含 remark-math），并以独立提交修复「被无 `>` 空行结束的引用围栏仍被追加闭合」（仅当 code 节点真正到达 EOF 才追加闭合）。
+    - 机械取值见 [visual-system.md](./visual-system.md) §10。许可证（MIT）已入库 `web/LICENSES/KaTeX-MIT.txt` 并登记于根 NOTICE。
 
 **依据**：[visual-system.md](./visual-system.md)（令牌契约与对比度全集）。代码锚点在 `42ccd7ee` 上复核：`web/src/styles/tokens.css:1-196`、`web/src/styles/ui.module.css:10-15,52,323-324,356-372,386-391`、`web/src/features/session/tty/theme.ts:15-68`、`web/src/pages/SessionPage.tsx:95,154,452-596,669`、`web/src/app/Shell.tsx:207-237,337`、`web/index.html:2,9`、`crates/remuda-hub/src/web.rs:1-9,100-107`。
 

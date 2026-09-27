@@ -22,6 +22,7 @@
  * No React, no fetch: every rule is unit-tested in boardModel.test.ts.
  */
 import type { components } from "../../lib/api.generated";
+import { formatListTime } from "../../lib/format";
 import type { BoardColumn, Task, TaskState } from "../../types/generated";
 import { sharedWithTasksLabel } from "./binding";
 import {
@@ -80,6 +81,10 @@ export type BoardCard = {
   failed: boolean;
   archived: boolean;
   blockedReason: string | null;
+  /** Sits in the attention state: a pending human interaction or owner-blocked. */
+  needsHuman: boolean;
+  /** Authoritative gate/land record; null until a real land writes the sha. */
+  landed: BoardLanded | null;
   sessions: CardSession[];
   sessionCount: number;
   /** Placement instance first, then a live session, then the first one. */
@@ -91,6 +96,18 @@ export type BoardCard = {
   /** Current config-reuse profile label; `default` unless a session names one. */
   configLabel: string;
   drops: Record<WorkColumn, DropLegality>;
+  /**
+   * Signature of every input this card paints. A 5s poll that brings an
+   * unchanged projection produces an equal signature, so the memoized
+   * BoardCard skips its commit (perf scenario E, `commit:BoardCard`).
+   */
+  sig: string;
+};
+
+/** A gate/land result the 已合入 signal renders as the short sha. */
+export type BoardLanded = {
+  sha: string;
+  sha7: string;
 };
 
 export type BoardColumnModel = {
@@ -225,15 +242,26 @@ function matchesNeedle(item: BoardItem, needle: string): boolean {
     .includes(needle);
 }
 
+function landedOf(item: BoardItem): BoardLanded | null {
+  const sha = item.landedSha?.trim();
+  return sha ? { sha, sha7: sha.slice(0, 7) } : null;
+}
+
 function buildCard(
   item: BoardItem,
   instances: readonly CardSession[],
   counts: ReadonlyMap<string, number>,
+  pendingInstanceIds: ReadonlySet<string>,
+  nowMs: number,
 ): BoardCard {
   const sessions = cardSessions(item, instances);
   const key = bindingShareKey(item);
   const sharedCount = key ? counts.get(key) ?? 1 : 1;
-  return {
+  const blockedReason = item.blockedReason?.trim() || null;
+  const needsHuman =
+    blockedReason != null || sessions.some((session) => pendingInstanceIds.has(session.id));
+  const landed = landedOf(item);
+  const card: BoardCard = {
     id: item.id,
     item,
     column: item.boardColumn,
@@ -241,7 +269,9 @@ function buildCard(
     title: item.title,
     failed: item.state === "failed",
     archived: item.archivedAt != null,
-    blockedReason: item.blockedReason?.trim() || null,
+    blockedReason,
+    needsHuman,
+    landed,
     sessions,
     sessionCount: sessions.length,
     primarySessionId: primarySession(item, sessions),
@@ -253,7 +283,49 @@ function buildCard(
       "in-progress": dropLegality(item, "in-progress"),
       done: dropLegality(item, "done"),
     },
+    sig: "",
   };
+  card.sig = cardSignature(card, nowMs);
+  return card;
+}
+
+/**
+ * The exact set of values a card paints: placement/state (which fix the
+ * column and drop table), attention/land signals, labels, and the rendered
+ * session rows (two max on the card). The session timestamp contributes its
+ * **rendered relative-time label** (the same formatListTime the row paints),
+ * not the raw ISO value — a poll flips the signature exactly when the
+ * visible label crosses a boundary (45s / minute / day), and never while the
+ * label on screen is unchanged. Equal across polls while the card is
+ * pixel-identical; any rendered change flips it.
+ */
+export function cardSignature(card: BoardCard, nowMs: number = Date.now()): string {
+  const parts: string[] = [
+    card.id,
+    card.item.state,
+    card.item.archivedAt ?? "",
+    card.blockedReason ?? "",
+    card.landed?.sha ?? "",
+    card.title,
+    card.displayKey,
+    card.column,
+    card.item.placement?.instanceId ?? "",
+    card.configLabel,
+    card.sharedLabel ?? "",
+    card.needsHuman ? "1" : "0",
+  ];
+  for (const session of card.sessions) {
+    parts.push(
+      [
+        session.id,
+        session.kind ?? "",
+        session.name ?? "",
+        session.lifecycle ?? "",
+        formatListTime(session.updatedAt, nowMs),
+      ].join("|"),
+    );
+  }
+  return parts.join("");
 }
 
 /**
@@ -265,6 +337,10 @@ function buildCard(
 export function buildBoardModel(input: {
   view: BoardView | null;
   instances?: readonly CardSession[];
+  /** Instance ids with a pending human interaction (the attention signal). */
+  pendingInstanceIds?: ReadonlySet<string>;
+  /** Build time for relative-time labels; Date.now() when omitted. */
+  nowMs?: number;
   query?: string;
 }): BoardModel {
   const groups = input.view?.columns;
@@ -273,9 +349,12 @@ export function buildBoardModel(input: {
     : [];
   const counts = sharedCounts(all);
   const instances = input.instances ?? [];
+  const pendingInstanceIds = input.pendingInstanceIds ?? new Set<string>();
+  const nowMs = input.nowMs ?? Date.now();
   const needle = input.query?.trim().toLowerCase() ?? "";
 
-  const cardOf = (item: BoardItem): BoardCard => buildCard(item, instances, counts);
+  const cardOf = (item: BoardItem): BoardCard =>
+    buildCard(item, instances, counts, pendingInstanceIds, nowMs);
   const visible = (item: BoardItem): boolean => !needle || matchesNeedle(item, needle);
 
   const makeColumn = (column: WorkColumn): BoardColumnModel => ({

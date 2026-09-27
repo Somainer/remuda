@@ -94,6 +94,26 @@ type ScenarioResult = {
   peakJsHeapBytes: number | null;
   terminalRenderer: string | null;
   terminalContextLosses: number;
+  /**
+   * Scenario E (UO-8): board-card commit probes. An unchanged 5s poll tick
+   * must commit zero cards; changing one task commits exactly that card.
+   */
+  boardCard?: {
+    tasks: number;
+    pendingInteractions: number;
+    initialMountCommits: number;
+    initialUpdateCommits: number;
+    initialCommitTotalMs: number;
+    initialCommitMaxMs: number;
+    quietTickCommits: number;
+    /** Quiet-window commits not explained by a relative-time label crossing. */
+    quietUnexplainedCommits: number;
+    changedTickCommits: number;
+    /** Update commits attributed to the one PATCHed card (must be exactly 1). */
+    changedCardCommits: number;
+    /** Wall-clock ms of the closed E-board interval (must be positive). */
+    changeWallMs: number;
+  };
 };
 
 const summaries: ScenarioResult[] = [];
@@ -611,6 +631,289 @@ test("C: 100 pending interactions with inbox scrolling", async ({ page, browser 
       { pending: C_PENDING },
       await readPeakHeap(page),
     );
+    summaries.push(result);
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    await driver.close();
+    await cleanupPage(browser);
+  }
+});
+
+/**
+ * Scenario E (UO-8): 80 board tasks, 40 with a pending human interaction.
+ * The follower opens the real `/board` projection with ?profile=1 and the
+ * `commit:BoardCard` probe proves incremental rendering: an unchanged poll
+ * tick commits zero cards (cards are memoized on their render signature);
+ * changing one task's state commits exactly one card on the next tick.
+ */
+const E_TASKS = 80;
+const E_PENDING = 40;
+
+type BoardCardCommit = { phase: string; actualDuration: number; cardId?: string };
+
+const cardIn = (page: Page, id: string) =>
+  page.locator(`[data-testid="board-card"][data-task-id="${id}"]`);
+
+function boardCardCommits(report: RemudaPerfReport): BoardCardCommit[] {
+  return report.probes
+    .filter((probe) => probe.kind === "commit:BoardCard")
+    .map((probe) => (probe.value ?? {}) as BoardCardCommit);
+}
+
+const cardIdOf = (commit: BoardCardCommit): string => commit.cardId ?? "";
+
+test("E: 80 board tasks with 40 pending interactions — unchanged ticks commit no cards", async ({
+  page,
+  browser,
+}) => {
+  test.setTimeout(300_000);
+  await installHeapSampler(page);
+  await ensureLogin(page, "e2e-perf");
+
+  const driver = await browser.newPage();
+  await ensureLogin(driver, "e2e-perf");
+  try {
+    await patchMaxInstances(driver, Math.max(E_TASKS, 80));
+
+    const fixture = await driver.evaluate(
+      async ({ total, pending }) => {
+        const auth = { credentials: "include" as RequestCredentials };
+        const hosts = (await (await fetch("/v1/hosts", auth)).json()) as {
+          items?: { hostId?: string }[];
+        };
+        const hostId = hosts.items?.find((host) => host.hostId)?.hostId;
+        if (!hostId) throw new Error("fake node host missing");
+
+        const post = async (pathName: string, body: unknown) => {
+          const response = await fetch(pathName, {
+            method: "POST",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) throw new Error(`${pathName} -> ${response.status}`);
+          return response.json();
+        };
+        const patch = async (pathName: string, body: unknown) => {
+          const response = await fetch(pathName, {
+            method: "PATCH",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!response.ok) throw new Error(`${pathName} -> ${response.status}`);
+        };
+
+        const stamp = Date.now().toString(36);
+        const project = (await post("/v1/projects", { name: `perf E ${stamp}` })) as {
+          id: string;
+        };
+        const taskIds: string[] = [];
+        for (let i = 0; i < total; i += 1) {
+          const task = (await post("/v1/tasks", {
+            projectId: project.id,
+            title: `perf E ${i} ${stamp}`,
+            intent: "perf scenario E board load",
+          })) as { id: string };
+          taskIds.push(task.id);
+        }
+        // One parked approval per first N task: each is a distinct instance
+        // owned by its task, exactly like the production attention signal.
+        const instanceIds: string[] = [];
+        for (let i = 0; i < pending; i += 1) {
+          const launched = (await post("/v1/instances", {
+            hostId,
+            workspaceId: "wsp_e2e",
+            kind: "claude",
+            driver: "claude-print",
+            taskId: taskIds[i],
+            prompt: `UO8 perf mhome-blocked approval gate ${i} ${stamp}`,
+          })) as { instance: { instanceId: string } };
+          instanceIds.push(launched.instance.instanceId);
+        }
+        // One plain task advances placed → it stays in the to-do column but
+        // its render signature flips, isolating a single-card commit.
+        await patch(`/v1/tasks/${taskIds[pending + 1]}`, { state: "placed" });
+        return { projectId: project.id, taskIds, instanceIds };
+      },
+      { total: E_TASKS, pending: E_PENDING },
+    );
+
+    // Wait until all 40 approvals are actually pending.
+    await expect
+      .poll(
+        () =>
+          driver.evaluate(async (ids) => {
+            const list = (await (await fetch("/v1/interactions", { credentials: "include" })).json()) as {
+              items?: { instanceId?: string; state?: string }[];
+            };
+            const owned = new Set(ids);
+            return (list.items ?? []).filter(
+              (item) => item.state === "pending" && owned.has(item.instanceId),
+            ).length;
+          }, fixture.instanceIds),
+        { timeout: 120_000, intervals: [1_000, 2_000] },
+      )
+      .toBeGreaterThanOrEqual(E_PENDING);
+
+    await page.goto(`/board?project=${fixture.projectId}&profile=1`);
+    await expect(page.getByTestId("board-card")).toHaveCount(E_TASKS, { timeout: 60_000 });
+    await expect
+      .poll(
+        () => page.locator('[data-testid="board-signal"][data-kind="needs-human"]').count(),
+        { timeout: 60_000, intervals: [1_000, 2_000] },
+      )
+      .toBeGreaterThanOrEqual(E_PENDING);
+    // Let the mount-time data streams settle before measuring tick commits.
+    await page.waitForTimeout(7_000);
+
+    // Initial load: record every BoardCard commit since the page mounted.
+    const initial = boardCardCommits(await getReport(page));
+    const initialPhases = initial.reduce(
+      (acc, commit) => {
+        acc[commit.phase] = (acc[commit.phase] ?? 0) + 1;
+        return acc;
+      },
+      {} as Record<string, number>,
+    );
+
+    // Quiet window: one full /v1/board poll tick with nothing changing. A
+    // card MAY commit when a relative-time label crosses a boundary (45s /
+    // minute) — that is the one allowed reason; read every card's visible
+    // session-time labels before/after and require that every commit be a
+    // card whose label actually changed (and no other card committed).
+    const cardTimeLabels = async (): Promise<Record<string, string>> =>
+      page.evaluate(() => {
+        const out: Record<string, string> = {};
+        document
+          .querySelectorAll<HTMLElement>('[data-testid="board-card"]')
+          .forEach((card) => {
+            const id = card.getAttribute("data-task-id") ?? "";
+            const times = [...card.querySelectorAll<HTMLElement>('[data-testid="board-session"]')]
+              .map((row) => row.querySelector("span:last-child")?.textContent?.trim() ?? "")
+              .join(",");
+            out[id] = times;
+          });
+        return out;
+      });
+
+    await page.evaluate(() => window.__remudaPerf?.reset());
+    await markScenario(page, "E-quiet-tick");
+    const labelsBefore = await cardTimeLabels();
+    await page.waitForTimeout(7_000);
+    const labelsAfter = await cardTimeLabels();
+    const labelFlipIds = new Set(
+      Object.keys(labelsAfter).filter((id) => labelsAfter[id] !== labelsBefore[id]),
+    );
+    const quietCommitsAll = boardCardCommits(await getReport(page));
+    const quietCommits = quietCommitsAll.length;
+    const quietUnexplained = quietCommitsAll.filter(
+      (commit) => !labelFlipIds.has(cardIdOf(commit)),
+    );
+    expect(
+      quietUnexplained.length,
+      "an unchanged tick commits nothing except cards whose time label changed",
+    ).toBe(0);
+    await markScenario(page, null);
+
+    // One task changes state. Open the measurement window BEFORE the PATCH,
+    // check the response, then wait for that exact card's new state rather
+    // than counting commits, and attribute the commit to the card id.
+    const changedTaskId = fixture.taskIds[E_PENDING + 2];
+    const labelsBeforeChange = await cardTimeLabels();
+    await page.evaluate(() => window.__remudaPerf?.reset());
+    await markScenario(page, "E-board");
+
+    const patchStatus = await driver.evaluate(async (id) => {
+      const response = await fetch(`/v1/tasks/${id}`, {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ state: "placed" }),
+      });
+      return response.status;
+    }, changedTaskId);
+    expect(patchStatus, "the state change PATCH succeeds").toBe(200);
+
+    // Wait for THIS card to paint its new state (the poll projects placed).
+    await expect
+      .poll(
+        () =>
+          cardIn(page, changedTaskId).getAttribute("data-state"),
+        { timeout: 20_000, intervals: [500, 1_000] },
+      )
+      .toBe("placed");
+    // Let the tick settle so concurrent label flips are captured.
+    await page.waitForTimeout(1_000);
+
+    const labelsAfterChange = await cardTimeLabels();
+    const changeLabelFlipIds = new Set(
+      Object.keys(labelsAfterChange).filter(
+        (id) => labelsAfterChange[id] !== labelsBeforeChange[id],
+      ),
+    );
+    const changeReport = await getReport(page);
+    const changedCommits = boardCardCommits(changeReport).filter(
+      (commit) => commit.phase === "update",
+    );
+    const targetCommits = changedCommits.filter(
+      (commit) => cardIdOf(commit) === changedTaskId,
+    );
+    const unexplainedCommits = changedCommits.filter(
+      (commit) => cardIdOf(commit) !== changedTaskId && !changeLabelFlipIds.has(cardIdOf(commit)),
+    );
+
+    // The changed card commits exactly once; any other commit must be a
+    // crossing relative-time label, never another card's data.
+    if (targetCommits.length !== 1 || unexplainedCommits.length !== 0) {
+      console.log(
+        "SCENARIO_E_DEBUG " +
+          JSON.stringify({
+            changedTaskId,
+            changedCommitValues: changedCommits,
+            changeLabelFlipIds: [...changeLabelFlipIds],
+          }),
+      );
+    }
+    expect(targetCommits.length, "the changed card commits exactly once").toBe(1);
+    expect(
+      unexplainedCommits.length,
+      "no card commits except the changed one and time-label crossings",
+    ).toBe(0);
+
+    // Close the measurement interval BEFORE reading the report, otherwise
+    // summarise finds no closed E-board interval and reports wallMs 0 (which
+    // zeroes the long-task rate too).
+    await markScenario(page, null);
+    const closedReport = await getReport(page);
+    const closedInterval = closedReport.scenarios
+      .filter((s) => s.name === "E-board")
+      .at(-1);
+    expect(closedInterval?.end, "the E-board scenario interval is closed").toBeTruthy();
+    const changeWallMs = (closedInterval?.end ?? 0) - (closedInterval?.start ?? 0);
+    expect(changeWallMs, "scenario wallMs is positive").toBeGreaterThan(0);
+
+    const result = summarise(
+      closedReport,
+      browser.browserType().name(),
+      "E-board",
+      { tasks: E_TASKS, pendingInteractions: E_PENDING },
+      await readPeakHeap(page),
+    );
+    expect(result.wallMs, "summarised wallMs is positive").toBeGreaterThan(0);
+    result.boardCard = {
+      tasks: E_TASKS,
+      pendingInteractions: E_PENDING,
+      initialMountCommits: initialPhases.mount ?? 0,
+      initialUpdateCommits: initialPhases.update ?? 0,
+      initialCommitTotalMs: Math.round(initial.reduce((sum, c) => sum + c.actualDuration, 0) * 100) / 100,
+      initialCommitMaxMs: Math.round(Math.max(0, ...initial.map((c) => c.actualDuration)) * 100) / 100,
+      quietTickCommits: quietCommits,
+      quietUnexplainedCommits: quietUnexplained.length,
+      changedTickCommits: changedCommits.length,
+      changedCardCommits: targetCommits.length,
+      changeWallMs,
+    };
     summaries.push(result);
     console.log(JSON.stringify(result, null, 2));
   } finally {

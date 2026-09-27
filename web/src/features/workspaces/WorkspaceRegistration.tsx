@@ -13,7 +13,7 @@ export function WorkspaceRegistration({ hostId, disabled, onRegistered }: {
   const register = async () => {
     const absolutePath = path.trim();
     if (!absolutePath.startsWith("/")) {
-      setError("请输入这台主机上的绝对路径，例如 /home/dev/projects/app");
+      setError("请输入这台主机上的绝对路径，例如 /opt/projects/app");
       return;
     }
     setBusy(true);
@@ -39,7 +39,7 @@ export function WorkspaceRegistration({ hostId, disabled, onRegistered }: {
         <label className={css.field}>
           主机上的绝对路径
           <input className={css.input} data-testid="workspace-register-path" value={path}
-            placeholder="/home/dev/projects/app" disabled={busy} autoFocus
+            placeholder="/opt/projects/app" disabled={busy} autoFocus
             onChange={(event) => setPath(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "Enter" && !event.nativeEvent.isComposing) {

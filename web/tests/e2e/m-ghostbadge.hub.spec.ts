@@ -2,19 +2,21 @@ import { expect, test, type Page } from "@playwright/test";
 import { login } from "./hub-auth";
 
 /**
- * c-ghostbadge round 2: the badge must count exactly the rows the inbox shows
- * as 待你处理 — including across a REAL instance death and a deadline crossing
- * with no page reload.
+ * The badge must count exactly the rows the inbox shows as 待你处理 —
+ * including across a REAL instance death with no page reload.
  *
  * The fake node `ghostbadge-live` sentinel creates a genuinely live hook
- * approval (durable interaction.requested journal + live broker) carrying a
- * short known deadline: badge 1 / inbox 1. Then `GHOSTNODE_RESTART` via
- * instance.send drops the socket and reconnects under a new epoch that omits
- * the instance, so the Hub's reconcile_reported_instances settles it exited
- * and the new process serves no interaction.list for it. The durable row is
- * still state='pending' until the deadline crosses; the shared deadline
- * clock then flips the projection to expired in place — badge 0 / 待你处理
- * (0), observed on the already-mounted /m and /m/inbox pages (no reload).
+ * approval (durable interaction.requested journal + live broker): badge 1 /
+ * inbox 1. Then `GHOSTNODE_RESTART` via instance.send drops the socket and
+ * reconnects under a new epoch that omits the instance, so the Hub's
+ * reconcile_reported_instances settles it exited. c-deadcards: that same
+ * settlement invalidates the card in the Hub transaction (generation-ended),
+ * for BOTH known- and unknown-deadline rows — the client deadline clock
+ * (c-ghostbadge r2/r3) remains only a defence for a deadline crossing while an
+ * instance is still live. The mounted PhoneShell badge and inbox tier drop to
+ * 0/0 in place on the next 2 s interaction.list poll (no reload, in-shell
+ * client navigation only) and stay 0 after a real reload; desktop shows the
+ * row in 已离队.
  */
 test.describe.configure({ mode: "serial" });
 
@@ -129,6 +131,7 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
     await page.goto("/m/inbox");
     await expect(page.getByTestId("m-inbox")).toBeVisible();
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1");
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toBeVisible();
 
     // --- End the instance for real: a new-epoch node hello that omits it.
@@ -142,15 +145,27 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
       .poll(() => interactionState(page, interactionId), { timeout: 20_000 })
       .toBe("invalidated");
 
-    // Badge and tier reflect the Hub settlement; on the mounted inbox the
-    // next poll drops it (the client deadline clock remains a defence for a
-    // deadline crossing while an instance is still live).
-    await page.goto("/m/inbox");
+    // Badge and tier reflect the Hub settlement with NO reload and no
+    // navigation: the page has stayed on /m/inbox since the card was pinned at
+    // 1, and the next 2 s interaction.list poll (a store emission) drops it —
+    // the exact badge element pinned above disappears in place. (The client
+    // deadline clock remains a defence for a deadline crossing while an
+    // instance is still live.)
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
       timeout: 15_000,
     });
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
 
+    // In-shell client navigation keeps the same PhoneShell mounted; the badge
+    // stays 0 on /m.
+    await page.getByTestId("phone-nav-home").click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
+
+    // A genuine reload afterwards keeps it 0 — the 0 is the durable Hub
+    // settlement, not live-frame-only state.
     await page.goto("/m");
     await expect(page.getByTestId("home-list")).toBeVisible();
     await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
@@ -171,7 +186,9 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
     await expect(page.getByTestId("home-list")).toBeVisible();
     await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1", { timeout: 15_000 });
     await page.goto("/m/inbox");
+    await expect(page.getByTestId("m-inbox")).toBeVisible();
     await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (1)");
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveText("1");
 
     // End the instance for real via a new-epoch node hello omitting it.
     await postCommand(page, instanceId, "GHOSTNODE_RESTART");
@@ -185,13 +202,25 @@ test.describe("390px ghost badge across a real node restart and deadline", () =>
       .poll(() => interactionState(page, interactionId), { timeout: 20_000 })
       .toBe("invalidated");
 
-    // Badge 0 and the card is gone from 待你处理, observed on the mounted
-    // pages (the 2 s poll picks the Hub-settled row; no deadline crossing).
-    await page.goto("/m");
-    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0, { timeout: 15_000 });
-    await page.goto("/m/inbox");
-    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)");
+    // Nothing client-side could retire this card (no deadline exists), yet the
+    // badge pinned at 1 on this same mounted page disappears in place when the
+    // 2 s poll picks up the Hub-settled row — no reload, no navigation.
+    await expect(page.getByTestId("m-inbox-tier-pending")).toHaveText("待你处理 (0)", {
+      timeout: 15_000,
+    });
     await expect(page.locator(`[data-interaction-id="${interactionId}"]`)).toHaveCount(0);
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
+
+    // In-shell client navigation keeps the same PhoneShell mounted; 0 on /m.
+    await page.getByTestId("phone-nav-home").click();
+    await expect(page).toHaveURL(/\/m$/);
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
+
+    // A genuine reload afterwards keeps it 0.
+    await page.goto("/m");
+    await expect(page.getByTestId("home-list")).toBeVisible();
+    await expect(page.getByTestId("phone-inbox-badge")).toHaveCount(0);
   });
 });
 

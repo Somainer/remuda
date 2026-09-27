@@ -12,7 +12,7 @@
  * live in the pure projection; this file renders, owns the one-second hand,
  * and forwards dismiss/undismiss.
  */
-import { Fragment, useEffect, useId, useMemo, useRef, useState } from "react";
+import { Fragment, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type {
   WorkflowMemberPayload,
@@ -22,8 +22,7 @@ import type {
 import type { SubagentRef } from "../assemble";
 import { ToolCard } from "../ToolCard";
 import { isToolFailure } from "../assemble";
-import sessionCss from "../toolCard.module.css";
-import { subagentHref } from "../subagent/SubagentRows";
+import { nestedCardExpansion, nestedFoldKey, NestedToolContext, subagentHref, useNestedFold } from "../subagent/SubagentRows";
 import {
   agentClocks,
   fmtDuration,
@@ -165,9 +164,11 @@ function Chip({ status }: { status: WfStatus }) {
   );
 }
 
-/** Inline fold of a member's live tool calls. */
+/** Inline fold of a member's live tool calls. Open state and card expansion
+ * live in the transcript's shared set; a search hit forces its list open and
+ * its card expanded (same rule as the Task subagent folds). */
 function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
-  const [open, setOpen] = useState(false);
+  const { open, toggle, hitId, state } = useNestedFold(nestedFoldKey("member", subagent.agentId), subagent.nodes);
   if (!subagent.nodes.length) return null;
   return (
     <div className={css.memberTools}>
@@ -175,7 +176,8 @@ function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
         type="button"
         className={css.memberToolsToggle}
         aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
+        data-testid="workflow-member-tools-toggle"
+        onClick={toggle}
       >
         {open ? "▾" : "▸"} {subagent.nodes.length} tool calls
       </button>
@@ -200,6 +202,8 @@ function MemberToolFold({ subagent }: { subagent: SubagentRef }) {
                 result={node.result}
                 completeness={node.completeness}
                 diffState={node.diffState}
+                foldSettled
+                {...nestedCardExpansion(node, hitId, state)}
               />
             ),
           )}
@@ -261,6 +265,8 @@ function AgentRow({
   const { instanceId = "" } = useParams();
   const clocks = agentClocks(agent, launchedAtMs, nowMs);
   const running = agent.state === "running";
+  // The whole row is the open target: one link, focusable, with the ghost
+  // 「打开」 revealed on hover/focus (always on a coarse pointer).
   return (
     <li
       className={css.agent}
@@ -269,16 +275,16 @@ function AgentRow({
       data-agent-id={agent.id}
       id={rowId}
     >
-      <span className={css.state}>
-        <StateGlyph state={agent.state} />
-        <span className={css.sr}>{STATE_WORD[agent.state]}</span>
-      </span>
       <Link
         className={css.agentOpen}
         to={subagentHref(instanceId, agent.id)}
-        data-testid="workflow-agent-open"
+        data-testid="workflow-agent-open-btn"
         title="打开子会话"
       >
+        <span className={css.state}>
+          <StateGlyph state={agent.state} />
+          <span className={css.sr}>{STATE_WORD[agent.state]}</span>
+        </span>
         <span className={css.agentLabel} title={agent.label}>
           <span className={css.agentName}>{agent.label}</span>
           {agent.attempt && agent.attempt > 1 ? (
@@ -288,7 +294,7 @@ function AgentRow({
           ) : null}
         </span>
         <span className={css.agentMeta}>
-          {model ? <span className={`${css.model} ${css.soft}`}>{model}</span> : null}
+          {model ? <span className={`${css.model} ${css.soft}`} title={agent.model}>{model}</span> : null}
           {starting ? <span className={css.soft}>启动中</span> : null}
           {!starting && agent.latestTool ? <span className={`${css.tool} ${css.soft}`}>{agent.latestTool}</span> : null}
           {!starting ? (
@@ -326,16 +332,10 @@ function AgentRow({
             title={agent.tokens === undefined ? missingTitle(T_TOKENS, "tokens（agent transcript 暂无 usage）") : T_TOKENS}
           />
         </span>
-      </Link>
-      <span className={css.agentOpenBtn}>
-        <Link
-          className={sessionCss.openBtn}
-          to={subagentHref(instanceId, agent.id)}
-          data-testid="workflow-agent-open-btn"
-        >
+        <span className={css.agentOpenHint} aria-hidden="true">
           打开
-        </Link>
-      </span>
+        </span>
+      </Link>
       {memberRef ? <MemberToolFold subagent={memberRef} /> : null}
     </li>
   );
@@ -381,10 +381,17 @@ function PhaseBlock({
   // Following the prop matters because the phase head mounts before members
   // stream in: an initializer would lock it to "0 agents → collapsed" forever.
   const [toggled, setToggled] = useState<boolean | null>(null);
-  const open = toggled ?? phase.expandedByDefault;
-  const [showFolded, setShowFolded] = useState(false);
+  const [showFoldedLocal, setShowFolded] = useState(false);
   const bodyId = useMemo(() => `wf-phase-${phase.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`, [phase.id]);
   const laid = useMemo(() => layoutRows(phase.agents), [phase]);
+  // A search hit on a member's tool row opens this phase, and the 「还有 N 个」
+  // list too when the member sits in it, so the hit is on screen.
+  const hitId = useContext(NestedToolContext)?.openChildId ?? null;
+  const holdsHit = (agent: WfAgent) =>
+    Boolean(hitId && refsByAgent.get(agent.id)?.nodes.some((node) => node.id === hitId));
+  const hitHere = phase.agents.some(holdsHit);
+  const open = hitHere || (toggled ?? phase.expandedByDefault);
+  const showFolded = showFoldedLocal || laid.folded.some(holdsHit);
 
   const onKey = (event: React.KeyboardEvent) => {
     // Only a button the user is focused on can collapse; keys sent to an
@@ -397,6 +404,8 @@ function PhaseBlock({
   };
 
   return (
+    // Members sit in one column at every width; the projection's grid hint
+    // only marks the phase (data-grid), so names never split the row.
     <div className={css.phase} data-testid="workflow-phase" data-grid={phase.grid ? "1" : "0"}>
       <button
         type="button"
@@ -412,7 +421,7 @@ function PhaseBlock({
         <span className={css.phaseMeta}>{phase.metaText}</span>
       </button>
       {open ? (
-        <ul className={`${css.agents} ${phase.grid ? css.agentsGrid : ""}`} id={bodyId}>
+        <ul className={css.agents} id={bodyId}>
           {laid.rows.map((agent, index) => (
             <Fragment key={agent.id}>
               {laid.foldIndex === index ? <FoldToggle key="fold" phaseId={phase.id} folded={laid.folded} open={showFolded} onToggle={() => setShowFolded(!showFolded)} /> : null}
@@ -565,7 +574,7 @@ function DetailedCard({
             </p>
           ) : null}
           {!running && card.summary ? (
-            <p className={css.live}>
+            <p className={`${css.live} ${css.result}`}>
               <b>结果</b>
               <span>{card.summary}</span>
             </p>

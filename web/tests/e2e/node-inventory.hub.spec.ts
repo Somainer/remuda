@@ -168,7 +168,7 @@ test("a Node restart settles the instance it lost and frees its slot", async ({ 
   await typeIntoTerminal(page, "TTYNODE_RESTART");
 
   // The row settles with the settled vocabulary, not a bare "gone": the web
-  // renders this exact string as 「Node 重启，会话已结束」 plus Resume.
+  // renders this exact string as 「Node 重启，会话已中断」 plus Resume.
   await expect
     .poll(async () => (await instanceRow(page, lost)).lifecycle, { timeout: 30_000 })
     .toBe("exited");
@@ -189,7 +189,7 @@ test("a Node restart settles the instance it lost and frees its slot", async ({ 
   // renders from `lastError: node-epoch-changed`.
   await page.goto(`/s/${lost}`);
   await expect(page.getByTestId("session-status-label")).toHaveText("已退出", { timeout: 20_000 });
-  await expect(page.getByTestId("node-restart-banner")).toContainText("Node 重启，会话已结束", {
+  await expect(page.getByTestId("node-restart-banner")).toContainText("Node 重启，会话已中断", {
     timeout: 20_000,
   });
 });

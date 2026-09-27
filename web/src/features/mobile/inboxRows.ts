@@ -12,17 +12,24 @@ import type { PushStatus } from "../../lib/push";
 
 /**
  * Pure derivation for the phone inbox (`/m/inbox`, D-049 / ui-spec §2.5,
- * §4.7). Two tiers and nothing else:
+ * §4.7). Two tiers, exactly as §4.7 prescribes (待你处理 / 进行中·最近,
+ * no third tier):
  *
  *  - 待你处理: every non-settled interaction projected to
  *    pending / answering / paused (the same projection ApprovalsPage uses,
  *    so mobile and desktop never disagree about queue membership);
- *  - 进行中 · 最近: working / idle / exited instances, newest activity first,
+ *  - 进行中 · 最近: working / idle instances, newest activity first,
  *    minus instances already represented by a tier-1 row (a blocked session
  *    is never also advertised as working).
  *
- * Expired / superseded interactions are not a third tier: the phone inbox
- * deliberately has no 已离队 section (§11.3 observed two tiers, not three).
+ * A session that is no longer running appears NOWHERE here: it can never sit
+ * under a heading that says 进行中, and the compact inbox deliberately has no
+ * ended section (ui-spec §4.7 / §11.3 observed two tiers, not three). Ended
+ * sessions stay reachable from the home list and by their `/s/:id` URL; the
+ * desktop session list keeps its own 已退出 group.
+ *
+ * Expired / superseded interactions are not a tier either: the phone inbox
+ * deliberately has no 已离队 section.
  */
 
 export const INBOX_KINDS = [
@@ -179,7 +186,7 @@ export type InboxInstanceRow = {
 export type InboxRows = {
   /** 待你处理 */
   pending: InboxInteractionRow[];
-  /** 进行中 · 最近 */
+  /** 进行中 · 最近 (live working/idle rows only). */
   recent: InboxInstanceRow[];
 };
 
@@ -234,7 +241,10 @@ export type InboxQueueItem = {
   uiState: Extract<InteractionUiState, "pending" | "answering" | "paused">;
 };
 
-const RECENT_STATUSES: ReadonlySet<UiStatus> = new Set(["working", "idle", "exited"]);
+// c-endreason r2: only live rows fill 进行中 · 最近; terminal rows (exited
+// projected from exited/failed/closing) are filtered explicitly below — the
+// compact inbox has no ended tier (ui-spec §4.7).
+const RECENT_STATUSES: ReadonlySet<UiStatus> = new Set(["working", "idle"]);
 const ACTIVE_INTERACTION_STATES: ReadonlySet<InteractionUiState> = new Set([
   "pending",
   "answering",
@@ -387,14 +397,18 @@ export function deriveInboxRows(
   for (const instance of source.instances) {
     if (blockedInstanceIds.has(instance.id)) continue;
     const status = projectStatus(instance);
-    if (!RECENT_STATUSES.has(status)) continue;
+    // Two tiers only: terminal rows (exited/failed/closing) are filtered out
+    // outright — a session that is no longer running can never sit under a
+    // 进行中 heading, and the compact inbox has no ended section (ui-spec
+    // §4.7). Live working/idle rows fill the tier.
+    if (status === "exited" || !RECENT_STATUSES.has(status)) continue;
     const hostLabel = source.hostName(instance.hostId);
     const workspaceLabel = source.workspaceLabel(instance.workspaceId);
     const title = source.titleOf(instance.id) || "会话";
     const subtitle = latestEventText(instance, source.phrases[instance.id]);
     const timeLabel = formatListTime(instance.updatedAt, nowMs);
     const contextPct = contextPctOf(instance, source.rollups);
-    recent.push({
+    const row: InboxInstanceRow = {
       rowType: "instance",
       rowId: instance.id,
       instanceId: instance.id,
@@ -418,11 +432,13 @@ export function deriveInboxRows(
           instance.lastError,
           instance.usageRollup,
           instance.updatedAt,
+          instance.exit,
         ],
         // contextPct also reads source.rollups (a separate store slice).
         v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
       }),
-    });
+    };
+    recent.push(row);
   }
   recent.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));
 

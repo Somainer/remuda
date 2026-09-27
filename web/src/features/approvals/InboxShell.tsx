@@ -320,10 +320,7 @@ const RecentRowCard = memo(
           <ContextRing pct={row.contextPct} />
         </div>
         {row.subtitle ? (
-          <p
-            className={`${compactCss.subtitle} ${row.status === "exited" ? compactCss.subtitleError : ""}`}
-            title={row.subtitle}
-          >
+          <p className={compactCss.subtitle} title={row.subtitle}>
             {row.subtitle}
           </p>
         ) : null}
@@ -725,6 +722,7 @@ function CompactInbox({
         {rows.recent.slice(0, recentLimit).map((row) => (
           <RecentRowCard key={row.instanceId} row={row} />
         ))}
+        {rows.recent.length === 0 ? <p className={compactCss.tierEmpty}>这里没有进行中的会话</p> : null}
       </section>
     </div>
   );

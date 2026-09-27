@@ -1019,8 +1019,8 @@ async fn reconcile_lost_instances(
 ///
 /// `remuda_node::reclaim::NODE_EPOCH_CHANGED` is the same string, but the Hub
 /// must not depend on the Node crate for it; the web turns exactly this
-/// spelling into 「Node 重启，会话已结束」 plus Resume
-/// (`web/src/lib/commandStatus.ts`), so a new spelling would silently lose
+/// spelling into 「Node 重启，会话已中断」 plus Resume
+/// (`web/src/lib/endReason.ts`), so a new spelling would silently lose
 /// both the sentence and the affordance.
 pub(crate) const NODE_EPOCH_CHANGED: &str = "node-epoch-changed";
 

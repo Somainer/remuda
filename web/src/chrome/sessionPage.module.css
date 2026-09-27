@@ -29,6 +29,9 @@
   color: var(--mute);
 }
 
+/* A Node restart is an interruption, not a failure (c-endreason): the text is
+   neutral and so is the chrome — ordinary surface tokens, never the danger
+   role. Resume stays; routeDown below keeps the red because that IS an error. */
 .nodeRestart {
   display: flex;
   align-items: center;
@@ -36,9 +39,9 @@
   flex-wrap: wrap;
   padding: 10px 14px;
   margin: 8px 0;
-  border: 1px solid var(--danger, #e06c5c);
+  border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: color-mix(in srgb, var(--danger, #e06c5c) 10%, transparent);
+  background: var(--bg-surface);
   color: var(--paper);
   font-size: 13px;
 }

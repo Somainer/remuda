@@ -5,6 +5,7 @@ import { known, na, unknownKnowledge, type Id } from "../../types/wire";
 import type { InboxSource } from "./inboxRows";
 import {
   contextRingLabel,
+  deriveInboxQueue,
   deriveInboxRows,
   derivePushBanner,
   interactionHeadline,
@@ -159,7 +160,7 @@ describe("deriveInboxRows tiering", () => {
     expect(rows.pending.map((r) => r.uiState)).toEqual(["paused", "pending", "answering"]);
   });
 
-  it("working/idle/exited instances go to 进行中·最近; starting/unknown/blocked do not", () => {
+  it("working/idle go to 进行中·最近; exited/failed rows appear in no tier", () => {
     const cases: Array<[UiStatus, Instance]> = [
       ["working", inst({ id: "ins_working", updatedAt: T2 })],
       ["idle", inst({ id: "ins_idle", lifecycle: "ready", activity: known("idle"), updatedAt: T1 })],
@@ -173,16 +174,36 @@ describe("deriveInboxRows tiering", () => {
           lastError: null,
         }),
       ],
+      [
+        "exited",
+        inst({
+          id: "ins_restart",
+          lifecycle: "exited",
+          activity: known("idle"),
+          updatedAt: T0,
+          lastError: "node-epoch-changed",
+        }),
+      ],
+      // lifecycle=failed projects to the exited UiStatus too.
+      [
+        "exited",
+        inst({
+          id: "ins_crashed",
+          lifecycle: "failed",
+          activity: known("idle"),
+          updatedAt: T0,
+          lastError: "native-exit-signal-SIGSEGV",
+        }),
+      ],
       ["starting", inst({ id: "ins_starting", lifecycle: "starting", activity: na() })],
       ["unknown", inst({ id: "ins_unknown", connectivity: "disconnected" })],
     ];
     const rows = deriveInboxRows(source({ instances: cases.map(([, i]) => i) }));
-    expect(rows.recent.map((r) => r.instanceId)).toEqual([
-      "ins_working",
-      "ins_idle",
-      "ins_exited",
-    ]);
-    expect(rows.recent.map((r) => r.status)).toEqual(["working", "idle", "exited"]);
+    expect(rows.recent.map((r) => r.instanceId)).toEqual(["ins_working", "ins_idle"]);
+    expect(rows.recent.map((r) => r.status)).toEqual(["working", "idle"]);
+    // c-endreason r2: the compact inbox has two tiers only; ended rows are
+    // filtered out, never parked under a 进行中 heading (ui-spec §4.7).
+    expect("ended" in rows).toBe(false);
   });
 
   it("never shows a blocked instance in both tiers", () => {
@@ -219,6 +240,138 @@ describe("deriveInboxRows tiering", () => {
     );
     expect(rows.pending).toHaveLength(0);
     expect(rows.recent).toHaveLength(0);
+  });
+});
+
+describe("deriveInboxQueue: the badge/inbox single source of truth (c-ghostbadge)", () => {
+  it("counts pending/answering/paused and nothing settled, expired or superseded", () => {
+    const queue = deriveInboxQueue(
+      source({
+        interactions: [
+          interaction({ id: "int_pending", instanceId: "ins_pending" }),
+          interaction({ id: "int_answering", instanceId: "ins_answering" }),
+          interaction({
+            id: "int_paused",
+            instanceId: "ins_paused",
+            hostId: "hst_off",
+          }),
+          interaction({ id: "int_expired", instanceId: "ins_expired", state: "expired" }),
+          interaction({ id: "int_invalid", instanceId: "ins_invalid", state: "invalidated" }),
+          interaction({
+            id: "int_settled",
+            instanceId: "ins_settled",
+            state: "resolved",
+            answer: {
+              state: "known",
+              value: {
+                commandId: "cmd_1",
+                actor: { principalId: "p", type: "human", deviceId: "dev_1", instanceId: null },
+                value: { kind: "approval", optionId: "allow-once", inputDigest: "sha256:abab" },
+                committedAt: T1,
+              },
+            },
+          }),
+        ],
+        instances: [
+          inst({ id: "ins_pending" }),
+          inst({ id: "ins_answering" }),
+          inst({ id: "ins_paused", hostId: "hst_off" }),
+        ],
+        hosts: [host({ id: "hst_1" }), host({ id: "hst_off", state: "offline" })],
+        answering: { int_answering: true },
+      }),
+    );
+    expect(queue.map((q) => q.item.id)).toEqual(["int_pending", "int_answering", "int_paused"]);
+    expect(queue.map((q) => q.uiState)).toEqual(["pending", "answering", "paused"]);
+  });
+
+  it("excludes a raw-pending card whose known deadline has passed — the ghost badge case", () => {
+    // The Hub leaves a dead instance's interaction row at state='pending'
+    // forever; hook cards carry a 15-min known deadline (remuda-signal
+    // BLOCKING_WAIT). Once that deadline passes the inbox projects it
+    // "expired"; the badge used to count raw state='pending' anyway.
+    // nowMs is T2; a deadline of T1 is in the past.
+    const queue = deriveInboxQueue(
+      source({
+        interactions: [
+          interaction({
+            id: "int_ghost",
+            instanceId: "ins_ghost",
+            deadline: known(T1),
+            deadlineSource: "runtime-policy",
+          }),
+        ],
+        instances: [
+          inst({ id: "ins_ghost", lifecycle: "exited", activity: known("idle") }),
+        ],
+      }),
+    );
+    expect(queue).toHaveLength(0);
+  });
+
+  it("still counts a raw-pending card on a dead instance while its deadline is open", () => {
+    // No known deadline (deadline.state='unknown'): a dead instance does not
+    // retire the card by itself, so both badge and inbox keep showing it —
+    // they must agree at 1.
+    const src = source({
+      interactions: [interaction({ id: "int_alive", instanceId: "ins_dead" })],
+      instances: [inst({ id: "ins_dead", lifecycle: "exited", activity: known("idle") })],
+    });
+    const queue = deriveInboxQueue(src);
+    expect(queue).toHaveLength(1);
+    expect(queue[0]!.uiState).toBe("pending");
+    expect(deriveInboxRows(src).pending).toHaveLength(1);
+  });
+
+  it("agrees with the compact inbox's 待你处理 tier on every projection shape", () => {
+    const src = source({
+      interactions: [
+        // Counts: pending (open deadline), answering (local POST), paused
+        // (offline host), pending-on-exited-instance (unknown deadline).
+        interaction({ id: "int_pending", instanceId: "ins_pending" }),
+        interaction({ id: "int_answering", instanceId: "ins_answering" }),
+        interaction({ id: "int_paused", instanceId: "ins_paused", hostId: "hst_off" }),
+        interaction({ id: "int_dead", instanceId: "ins_dead" }),
+        // Ghost: raw pending, deadline elapsed.
+        interaction({
+          id: "int_ghost",
+          instanceId: "ins_ghost",
+          deadline: known(T0),
+          deadlineSource: "runtime-policy",
+        }),
+        // Settled on this device and invalidated: neither counts.
+        interaction({
+          id: "int_settled",
+          instanceId: "ins_settled",
+          state: "answer-committed",
+          answer: {
+            state: "known",
+            value: {
+              commandId: "cmd_1",
+              actor: { principalId: "p", type: "human", deviceId: "dev_1", instanceId: null },
+              value: { kind: "approval", optionId: "allow-once", inputDigest: "sha256:abab" },
+              committedAt: T1,
+            },
+          },
+        }),
+        interaction({ id: "int_invalid", instanceId: "ins_invalid", state: "invalidated" }),
+      ],
+      instances: [
+        inst({ id: "ins_pending" }),
+        inst({ id: "ins_answering" }),
+        inst({ id: "ins_paused", hostId: "hst_off" }),
+        inst({ id: "ins_dead", lifecycle: "exited", activity: known("idle") }),
+        inst({ id: "ins_ghost", lifecycle: "exited", activity: known("idle") }),
+        inst({ id: "ins_settled" }),
+        inst({ id: "ins_invalid" }),
+      ],
+      hosts: [host({ id: "hst_1" }), host({ id: "hst_off", state: "offline" })],
+      answering: { int_answering: true },
+    });
+    const queueIds = deriveInboxQueue(src).map((q) => q.item.id).sort();
+    const rowIds = deriveInboxRows(src).pending.map((r) => r.interactionId).sort();
+    expect(queueIds).toEqual(rowIds);
+    expect(queueIds).toEqual(["int_answering", "int_dead", "int_paused", "int_pending"]);
   });
 });
 
@@ -298,20 +451,22 @@ describe("subtitle: latest event text, errors first and verbatim", () => {
     expect(rows.pending[0].subtitle).toBe("rm -rf /tmp/coord-media");
   });
 
-  it("exited rows surface the error verbatim in 进行中·最近", () => {
+  it("hides ended rows even when their lastError would otherwise be a subtitle", () => {
+    // The compact inbox offers no ended surface at all: an exited/failed
+    // instance contributes neither a recent row nor any raw error text.
     const rows = deriveInboxRows(
       source({
         instances: [
           inst({
             id: "ins_1",
-            lifecycle: "exited",
+            lifecycle: "failed",
             activity: known("idle"),
             lastError: "turn failed: upstream timeout",
           }),
         ],
       }),
     );
-    expect(rows.recent[0].subtitle).toBe("turn failed: upstream timeout");
+    expect(rows.recent).toHaveLength(0);
   });
 
   it("exposes latestEventText with null when nothing is known", () => {

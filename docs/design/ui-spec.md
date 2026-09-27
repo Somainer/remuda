@@ -4,6 +4,8 @@
 产品定位：unified remote agent runtime 的遥控面（产品名已定 **Remuda**：UI 文案、窗口标题与 manifest 均用 Remuda，D-001/D-053）。
 **不是** harness，**不造** agent loop。界面只观察 + 下发控制；resume 权威是原生会话。
 
+**v0.2.4 changelog（2026-09-25，c-ghostbadge 角标一致性）**：收件箱角标（compact 底栏、桌面侧栏、OS Badging API）与 `/m/inbox`、`/approvals` 的「待你处理」队列是同一个派生结果（`deriveInboxQueue`），不再有第二处 `state==="pending"` 计数——一张 durable 仍是 `pending` 但已知 deadline 已过（投影为 expired）的卡在角标与列表里同时消失。deadline 跨越由共享的客户端时钟在到期瞬间驱动重算：store 无变化（如主机离线）时，角标、列表与 OS 角标也在同一刻翻牌，无需刷新或下一次轮询。桌面 `/approvals` 的队列档与 compact 同源；「已离队」档仍只在桌面。状态机本身不变（下表 pending=「`status=pending` 且未过期」）。
+
 **v0.2.3 changelog（2026-09-20，task 优先模型，见 D-050）**：新增 §1.5「Task 层」（Task 是 instance 之上的聚合而非第二状态机；看板列只读投影；目录绑定 reuse\|pool 与 attach-lock；任务空间=文件视图过滤投影；批注=composer 草稿；工作台多 session 用 tab 不分屏；/m 任务分组）与 §2.9「任务列表与看板 `/board`」（三列+已归档过滤、failed 角标按 placement 归位、拖卡多跳、`SE-nn` 派生 key、父子嵌套、「需要你」首组、只读预览、任务/项目空间面板、批注徽标、项目切换器）；§1.1 projects 行与「项目」段改为采纳 Hub `Project` 实体（Space 键不放松，D-024）；§1.2 路由表新增 `/board`；§1.3 映射表补看板 compact 落点；§4.7 `/m` 子树补任务分组与看板单列过滤。机械细节（表结构、RPC/路由形状、迁移预算、grant 门控）以 [task-model.md](./task-model.md) 为准。
 
 **v0.2.2 changelog（2026-09-19，手机优先路由树，见 D-049）**：§1.2 路由表新增 `/m` 与 `/m/inbox`，并写明 compact/桌面双向重定向与 query 保留（`/s/:id` 永不重定向）；§1.3 手机线框区分「首页级屏」与「会话路由」两套铬（compact 主行含状态点：返回 / space 芯片 / 标题 / 状态点 / 分段 / Stop / ⋯），会话路由 compact 不渲染 app 底部导航栏，§1.4 的 chips 行折成单芯片、tabs 行整行收起（两条 compact 例外分别挂 D-040 / D-049，列表路由不变）；compact 主行的 host 芯片与 cost 折进「运行详情」（仅 compact，D-040 的桌面主行规则不变）；§4.5 补应用角标（badge）与推送权限横幅的位置；新增 §4.7「手机优先路由树与铬预算」（一条顶栏 `--top-mobile` + 一条底栏 `--bar`、正文 ≥ 60% 视口、截断优先级、`终端|结构` 分段与 Stop 永不截断/进溢出）与 §4.8「语音输入」（平台听写优先、先成文再发送、Web Speech API 仅增强且默认关、不做云转写、iOS Safari 无 `SpeechRecognition`、终端段不提供语音）；§4.6 PWA `start_url` 从 `/sessions` 改为 `/`。依据 [workbench-ux-improvement-2026-09.md](./workbench-ux-improvement-2026-09.md) §5 / §6 / §7.1 / §9 / §10-19 / §10-23 / §11.2 / §11.3 / §11.4 / §11.5。
@@ -540,14 +542,14 @@ pty-backed 会话（kind `terminal` / driver `shell-pty` / `generic-pty` / `clau
 
 **真·全屏**：隐藏 chrome，`position:fixed; inset:0; height:100dvh`，`env(safe-area-inset-*)`。
 
-**恒深色仪器（D-053）**：终端在深浅两态下相同，不订阅外观变化。pane 与 viewport 背景都用 `var(--term-bg)`，`TerminalView.module.css` 不保留色值字面量；xterm 用 `TERMINAL_THEME`（基础色、16 ANSI 与对比度见 [visual-system.md](./visual-system.md) §3.4/§4：background `#1a1917`、foreground `#e4dfd6`，每个非黑 ANSI 色 ≥ 4.5:1）；标准 256 色立方不再染色，终端输出的颜色不改写。
+**终端跟随外观（D-053，2026-09-24 所有者改定）**：终端有深、浅两套调色板并随外观切换；切换只设置 `term.options.theme`，WebGL/canvas 渲染器就地重绘，不重建终端、不丢滚动历史。pane 与 viewport 背景都用当前态的 `var(--term-bg)`，外框（工具栏、key bar、本地输入、历史面板、搜索框、stale 徽章、进度条）全部使用当前态的 terminal 角色（`--term-*`，两态各一值），`TerminalView.module.css` 不保留色值字面量。xterm 用 `DARK_TERMINAL_THEME` / `LIGHT_TERMINAL_THEME`（对比度见 [visual-system.md](./visual-system.md) §3.4/§4：两板各自每个非黑 ANSI 色 ≥ 4.5:1；浅板 white/brightWhite 为浅灰 #96918a/#a39e96，黑字/默认字印其上 ≥4.5:1，作为前景字为已记录例外）；标准 256 色立方不染色，truecolor 与终端输出不改写。
 
 **从 herdrx 抄交互与 viewport 算法，重接 runtime API**（不要搬 herdr snapshot 绑定）
 
 | 能力 | 算法来源 | 接到 |
 |---|---|---|
 | xterm + fit + WebGL/canvas + Search/Unicode11/WebLinks | `TerminalPane.tsx` | Hub `/v1/follow?tty=1` binary `tty.frame` |
-| 恒深色调色板 | `tty/theme.ts` `TERMINAL_THEME`（标准 256 色立方） | xterm `ITheme` |
+| 跟随外观的深浅调色板 | `tty/theme.ts` `DARK_TERMINAL_THEME` / `LIGHT_TERMINAL_THEME`（标准 256 色立方） | xterm `ITheme`，`term.options.theme` 在线切换 |
 | 手机默认 keys、桌面默认 raw | `WorkbenchPage.tsx` | follow 输入 channel |
 | IME 安全发送 | xterm composition + `composing()` | raw onData 不拆候选 |
 | 鼠标 | xterm mouse tracking (`onData` + `onBinary`) | 应用 DECSET 1000/1002/1003/1006 时转发 |
@@ -1190,7 +1192,7 @@ web/
 
 - **角色颜色**：颜色只按角色引用（背景 / 文字 / 线条 / 链接与焦点 / 状态 / 主按钮 / 终端与代码专用域），不按色相命名；十六进制字面量只允许出现在 `tokens.css`、`tty/theme.ts`、`index.html`、`manifest.webmanifest` 四处。
 - **「墨」一套调色板，深浅两态**：默认外观跟随系统，由纯 CSS 媒体查询解析，无阻塞脚本；偏好取 `system | dark | light`——只有显式选了 `dark` / `light` 时 `main.tsx` 才在挂载前写 `:root[data-appearance]`，选 `system`（及键缺失）时**不写属性**、完全交给 `@media (prefers-color-scheme: light)`；旧值 `night` / `ledger` 分别读作 `dark` / `light`。两态各自调校、不做反相。状态色有纪律：琥珀=需要你，红=失败/破坏，绿=权威确认（idle、在线、已连接不用绿），未知=中性虚线+文字。主按钮是中性反色填充，不用状态色。
-- **终端恒深色**：深浅两态终端相同；标准 256 色立方不再染色，每个非黑 ANSI 色 ≥ 4.5:1。
+- **终端跟随外观**：深、浅两套调色板随外观在线切换（不重建终端、不丢滚动历史）；两板各自每个非黑 ANSI 色 ≥ 4.5:1；浅板 white/brightWhite 用浅灰 #96918a/#a39e96（黑字/默认字印其上 ≥4.5:1；它们作为前景字印在浅页面上是已记录的低对比例外）；标准 256 色立方不染色，truecolor 与终端输出不改写。
 - **字体**：UI 与长文同用平台系统无衬线字体栈（含 PingFang SC、微软雅黑、Noto Sans CJK），不打包正文 webfont；等宽只保留 IBM Plex Mono（OFL-1.1，许可入库），用于代码、路径、终端、ID 与对齐数字。
 - **度量**：正文 16px/28px；阅读列上限 720px，页边距 32 / 24 / 16；composer、live 行、结束条都与阅读列对齐。
 - **字号下限**：承载信息的文字 ≥ 12px，辅助文字 `--text-meta` 所有宽度都是 12px（D-039）；11px 只用于徽标数字与 kbd 这类图形标注（D-052 第 9 条）；coarse 指针下输入 16px。

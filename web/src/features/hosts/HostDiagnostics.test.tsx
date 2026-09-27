@@ -29,6 +29,20 @@ it("reports failed diagnostics and does not probe an offline Node", async () => 
   expect(screen.queryByText("主机检查通过")).not.toBeInTheDocument();
 });
 
+it("paints a warning check as attention, not failure red (D-053 §2)", async () => {
+  vi.spyOn(api, "fetchHostDoctor").mockResolvedValue({
+    exitCode: 0,
+    checks: [{ name: "workspace.access", status: "warning", message: "部分目录权限受限" }],
+  });
+  render(<HostDiagnostics hostId={"host-fixture" as Id} online />);
+  const warning = await screen.findByText("部分目录权限受限");
+  // A warning is a status (not an alert) styled with the attention class,
+  // never the failure-red sshError class.
+  expect(warning).toHaveAttribute("role", "status");
+  expect(warning.className).toMatch(/sshWarning/);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
 it("shows an explicit error for a successful HTTP response without doctor checks", async () => {
   const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
   vi.stubGlobal("fetch", fetch);

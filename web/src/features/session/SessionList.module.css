@@ -395,6 +395,18 @@
   color: var(--dust);
 }
 
+/* c-endreason: ended rows carry the shared EndTone. Only a proven failure
+   paints red; an interruption (Node restart / terminated process) and an
+   ordinary close stay the same muted colour as every other quiet row. */
+.nextStep[data-tone="failed"] {
+  color: var(--danger-fg);
+}
+
+.nextStep[data-tone="interrupted"],
+.nextStep[data-tone="ended"] {
+  color: var(--mute);
+}
+
 /* The single primary action a blocked row keeps outside the overflow sheet. */
 .goHandle {
   flex: none;

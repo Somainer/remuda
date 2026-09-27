@@ -5,7 +5,12 @@ import { fileURLToPath } from "node:url";
 const TTY_LAB = "ins_01993ab0-0000-7000-8000-00000000aa01";
 const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "__screenshots__");
 
+// Committed goldens: write only under the evidence opt-in so a plain gate
+// run never dirties the tracked screenshot tree.
+const capture = process.env.REMUDA_EVIDENCE === "1";
+
 async function shot(page: Page, name: string) {
+  if (!capture) return;
   await page.screenshot({ path: path.join(dir, name), animations: "disabled" });
 }
 

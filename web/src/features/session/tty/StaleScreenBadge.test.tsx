@@ -4,7 +4,11 @@ import { formatStaleAge, StaleScreenBadge } from "./StaleScreenBadge";
 
 describe("stale screen badge", () => {
   it("reads the age and the reason, and never claims the session is live", () => {
-    render(<StaleScreenBadge stale={{ ageMs: 26 * 60 * 1000, reason: "instance-gone" }} />);
+    render(
+      <StaleScreenBadge
+        stale={{ ageMs: 26 * 60 * 1000, reason: "instance-gone" }}
+      />,
+    );
     const badge = screen.getByTestId("tty-stale");
     expect(badge).toHaveTextContent("26 分钟前");
     expect(badge).toHaveTextContent("会话已结束");
@@ -19,14 +23,19 @@ describe("stale screen badge", () => {
     const badge = screen.getByTestId("tty-stale");
     expect(badge).toHaveTextContent("时间未知");
     expect(badge).toHaveAttribute("data-stale-age-ms", "unknown");
+    // Freshness UNKNOWN, not a verified end: 「画面可能过期」, never 「会话已结束」.
+    expect(badge).toHaveTextContent("画面可能过期");
     expect(badge).toHaveTextContent("Node 连接不可用");
+    expect(badge).not.toHaveTextContent("会话已结束");
   });
 
   it("makes no claim about a reason code it does not know", () => {
     // An unrecognised code must never be rendered as "the session ended" —
     // that would tell an operator to give up on a session that may still be
     // alive. Rendering nothing for it is the safe half of that rule.
-    render(<StaleScreenBadge stale={{ ageMs: 1000, reason: "some-future-code" }} />);
+    render(
+      <StaleScreenBadge stale={{ ageMs: 1000, reason: "some-future-code" }} />,
+    );
     const badge = screen.getByTestId("tty-stale");
     expect(badge).not.toHaveTextContent("会话已结束");
     expect(badge).not.toHaveTextContent("Node 连接不可用");

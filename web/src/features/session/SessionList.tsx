@@ -657,8 +657,14 @@ export function SessionList({
                     </div>
                     {/* ui-spec.md D-038 (§2.1): the row is dot + title + one
                         next-step sentence. Wire triples and ids live in the
-                        disclosure. */}
-                    <div className={css.nextStep} data-testid="session-next-step" data-tone={step.tone} title={step.text}>
+                        disclosure. An ended row's raw machine code is a
+                        second tooltip line, never visible text (c-endreason). */}
+                    <div
+                      className={css.nextStep}
+                      data-testid="session-next-step"
+                      data-tone={step.tone}
+                      title={step.detail && step.detail !== step.text ? `${step.text}\n${step.detail}` : step.text}
+                    >
                       {step.text}
                     </div>
                   </Link>

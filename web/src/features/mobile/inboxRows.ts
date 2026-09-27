@@ -12,17 +12,24 @@ import type { PushStatus } from "../../lib/push";
 
 /**
  * Pure derivation for the phone inbox (`/m/inbox`, D-049 / ui-spec §2.5,
- * §4.7). Two tiers and nothing else:
+ * §4.7). Two tiers, exactly as §4.7 prescribes (待你处理 / 进行中·最近,
+ * no third tier):
  *
  *  - 待你处理: every non-settled interaction projected to
  *    pending / answering / paused (the same projection ApprovalsPage uses,
  *    so mobile and desktop never disagree about queue membership);
- *  - 进行中 · 最近: working / idle / exited instances, newest activity first,
+ *  - 进行中 · 最近: working / idle instances, newest activity first,
  *    minus instances already represented by a tier-1 row (a blocked session
  *    is never also advertised as working).
  *
- * Expired / superseded interactions are not a third tier: the phone inbox
- * deliberately has no 已离队 section (§11.3 observed two tiers, not three).
+ * A session that is no longer running appears NOWHERE here: it can never sit
+ * under a heading that says 进行中, and the compact inbox deliberately has no
+ * ended section (ui-spec §4.7 / §11.3 observed two tiers, not three). Ended
+ * sessions stay reachable from the home list and by their `/s/:id` URL; the
+ * desktop session list keeps its own 已退出 group.
+ *
+ * Expired / superseded interactions are not a tier either: the phone inbox
+ * deliberately has no 已离队 section.
  */
 
 export const INBOX_KINDS = [
@@ -179,11 +186,18 @@ export type InboxInstanceRow = {
 export type InboxRows = {
   /** 待你处理 */
   pending: InboxInteractionRow[];
-  /** 进行中 · 最近 */
+  /** 进行中 · 最近 (live working/idle rows only). */
   recent: InboxInstanceRow[];
 };
 
 export type InboxSource = {
+  /**
+   * Pending-interaction queue inputs, shared verbatim with
+   * [`deriveInboxQueue`]. The phone-nav badge derives its count from that
+   * projection with these same slices (c-ghostbadge: the badge must never
+   * count a card — e.g. a raw-pending row whose deadline has passed — that
+   * the 待你处理 tier does not show).
+   */
   interactions: Interaction[];
   instances: Instance[];
   hosts: Host[];
@@ -200,7 +214,37 @@ export type InboxSource = {
   nowMs?: number;
 };
 
-const RECENT_STATUSES: ReadonlySet<UiStatus> = new Set(["working", "idle", "exited"]);
+/**
+ * The queue membership inputs every 待你处理 projection shares. A strict
+ * subset of {@link InboxSource}: callers that only need the count (the phone
+ * nav badge) supply just these fields.
+ */
+export type InboxQueueSource = Pick<
+  InboxSource,
+  "interactions" | "instances" | "hosts" | "answering" | "deviceId"
+> & {
+  /** Clock injection (c-ghostbadge round 2); defaults to the wall clock. */
+  nowMs?: number;
+};
+
+/**
+ * One interaction the 待你处理 queue shows. This is the SINGLE projection both
+ * surfaces read: the compact inbox builds its tier-1 rows from it, and the
+ * phone-nav badge is `deriveInboxQueue(...).length`. Never re-derive queue
+ * membership at a call site (c-ghostbadge: a raw `state === "pending"` count
+ * diverges from this once a row projects expired/paused/settled).
+ */
+export type InboxQueueItem = {
+  item: Interaction;
+  instance: Instance | undefined;
+  host: Host | undefined;
+  uiState: Extract<InteractionUiState, "pending" | "answering" | "paused">;
+};
+
+// c-endreason r2: only live rows fill 进行中 · 最近; terminal rows (exited
+// projected from exited/failed/closing) are filtered explicitly below — the
+// compact inbox has no ended tier (ui-spec §4.7).
+const RECENT_STATUSES: ReadonlySet<UiStatus> = new Set(["working", "idle"]);
 const ACTIVE_INTERACTION_STATES: ReadonlySet<InteractionUiState> = new Set([
   "pending",
   "answering",
@@ -211,6 +255,37 @@ function isActiveUiState(
   state: InteractionUiState,
 ): state is Extract<InteractionUiState, "pending" | "answering" | "paused"> {
   return ACTIVE_INTERACTION_STATES.has(state);
+}
+
+/**
+ * Project every interaction exactly once and return those the 待你处理 queue
+ * shows (pending / answering / paused — the same projection ApprovalsPage
+ * uses). Pure and join-based; no kind filter (the queue count is the
+ * unfiltered 待你处理 total; callers rendering a filtered tier apply the kind
+ * filter themselves).
+ *
+ * This is the ONE source of truth shared by the compact inbox rows and the
+ * phone-nav badge count (c-ghostbadge).
+ */
+export function deriveInboxQueue(source: InboxQueueSource): InboxQueueItem[] {
+  const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
+  const hostById = new Map(source.hosts.map((host) => [host.id, host]));
+  const nowMs = source.nowMs ?? Date.now();
+  const queue: InboxQueueItem[] = [];
+  for (const item of source.interactions) {
+    const instance = instanceById.get(item.instanceId);
+    const host = hostById.get(item.hostId);
+    const uiState = projectInteraction(item, {
+      answering: Boolean(source.answering[item.id]),
+      host,
+      connectivity: instance?.connectivity,
+      deviceId: source.deviceId,
+      nowMs,
+    });
+    if (!isActiveUiState(uiState)) continue;
+    queue.push({ item, instance, host, uiState });
+  }
+  return queue;
 }
 
 function byRecency(a: { createdAt: string; rowId: string }, b: { createdAt: string; rowId: string }): number {
@@ -237,25 +312,19 @@ export function deriveInboxRows(
   const kind = opts.kind ?? "all";
   const focus = opts.focus ?? null;
   const nowMs = source.nowMs ?? Date.now();
-  const instanceById = new Map(source.instances.map((instance) => [instance.id, instance]));
-  const hostById = new Map(source.hosts.map((host) => [host.id, host]));
+
+  // Single membership projection, shared with the phone-nav badge
+  // (deriveInboxQueue). The kind filter is applied only while building tier-1
+  // rows below.
+  const queue = deriveInboxQueue(source);
 
   const pending: InboxInteractionRow[] = [];
   // A blocked instance already has a row in the interaction tier (kind
-  // filtering can hide it; it is still blocked — never advertise it as
-  // working or idle).
+  // filtering can hide it; the instance is still blocked — never
+  // advertise it as working or idle).
   const blockedInstanceIds = new Set<Id>();
 
-  for (const item of source.interactions) {
-    const instance = instanceById.get(item.instanceId);
-    const host = hostById.get(item.hostId);
-    const uiState = projectInteraction(item, {
-      answering: Boolean(source.answering[item.id]),
-      host,
-      connectivity: instance?.connectivity,
-      deviceId: source.deviceId,
-    });
-    if (!isActiveUiState(uiState)) continue;
+  for (const { item, instance, uiState } of queue) {
     // A blocked instance already has a row in the interaction tier (kind
     // filtering can hide the row; the instance is still blocked — never
     // advertise it as working or idle).
@@ -328,14 +397,18 @@ export function deriveInboxRows(
   for (const instance of source.instances) {
     if (blockedInstanceIds.has(instance.id)) continue;
     const status = projectStatus(instance);
-    if (!RECENT_STATUSES.has(status)) continue;
+    // Two tiers only: terminal rows (exited/failed/closing) are filtered out
+    // outright — a session that is no longer running can never sit under a
+    // 进行中 heading, and the compact inbox has no ended section (ui-spec
+    // §4.7). Live working/idle rows fill the tier.
+    if (status === "exited" || !RECENT_STATUSES.has(status)) continue;
     const hostLabel = source.hostName(instance.hostId);
     const workspaceLabel = source.workspaceLabel(instance.workspaceId);
     const title = source.titleOf(instance.id) || "会话";
     const subtitle = latestEventText(instance, source.phrases[instance.id]);
     const timeLabel = formatListTime(instance.updatedAt, nowMs);
     const contextPct = contextPctOf(instance, source.rollups);
-    recent.push({
+    const row: InboxInstanceRow = {
       rowType: "instance",
       rowId: instance.id,
       instanceId: instance.id,
@@ -359,11 +432,13 @@ export function deriveInboxRows(
           instance.lastError,
           instance.usageRollup,
           instance.updatedAt,
+          instance.exit,
         ],
         // contextPct also reads source.rollups (a separate store slice).
         v: [hostLabel, workspaceLabel, title, subtitle, timeLabel, contextPct, status],
       }),
-    });
+    };
+    recent.push(row);
   }
   recent.sort((a, b) => byRecency({ createdAt: a.updatedAt, rowId: a.rowId }, { createdAt: b.updatedAt, rowId: b.rowId }));
 

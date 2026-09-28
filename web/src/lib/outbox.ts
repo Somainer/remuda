@@ -548,6 +548,16 @@ export class Outbox {
     return durable;
   }
 
+  /**
+   * Re-read the durable store and merge into the cache. A surviving tab's
+   * cache only knows rows it loaded/enqueued itself; another tab can persist
+   * rows after this tab loaded, and delivery picks its instance locks from the
+   * result, so the foreign rows (and their instances) are discovered.
+   */
+  async refreshDurable(): Promise<OutboxRecord[]> {
+    return await this.refreshFromStorage();
+  }
+
   private leaseKey(instanceId: Id): Id {
     return `__lock__:${instanceId}`;
   }

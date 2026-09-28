@@ -1340,6 +1340,8 @@ class HubStore {
     // Stop any pending live-retry timer so it cannot POST during teardown.
     for (const [, t] of this.outboxRetryTimer) clearTimeout(t);
     this.outboxRetryTimer.clear();
+    for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
+    this.leaseWakeupTimer.clear();
     // beforeunload can be CANCELLED (the user stays on the page); pagehide
     // only fires when navigation actually proceeds. A beforeunload that does
     // not lead to a real unload must not latch delivery off forever: reset
@@ -1439,7 +1441,18 @@ class HubStore {
     // interleave.
     for (let pass = 0; pass < MAX_FLUSH_PASSES; pass += 1) {
       if (this.pageIsUnloading) return;
-      const instances = [...new Set(box.pending().map((r) => r.instanceId))];
+      // Pick the instance locks from FRESH durable rows, not the load-time
+      // cache: another tab can persist a row after this tab loaded, and a
+      // cache-only enumeration would never even attempt its instance lock.
+      const now = Date.now();
+      const durable = await box.refreshDurable();
+      const instances = [
+        ...new Set(durable.filter((r) => isDeliverableOutbox(r, now)).map((r) => r.instanceId)),
+      ];
+      // Rows owned in flight by another (possibly crashed) tab are not
+      // deliverable until their lease expires; arm a wakeup at the earliest
+      // expiry so this tab delivers them without an unrelated UI event.
+      this.scheduleLeaseExpiryWakeup(durable, now, box.ownerId);
       let deliveredNew = false;
       for (const instanceId of instances) {
         if (this.pageIsUnloading) return;
@@ -2004,6 +2017,8 @@ class HubStore {
     for (const [, t] of this.heldRetryTimer) clearTimeout(t);
     this.heldRetryTimer.clear();
     this.heldRetryAttempt.clear();
+    for (const [, t] of this.leaseWakeupTimer) clearTimeout(t);
+    this.leaseWakeupTimer.clear();
     if (this.unloadClearTimer) {
       clearTimeout(this.unloadClearTimer);
       this.unloadClearTimer = null;
@@ -3145,6 +3160,13 @@ class HubStore {
   private heldRetryTimer = new Map<Id, ReturnType<typeof setTimeout>>();
   private heldRetryAttempt = new Map<Id, number>();
   /**
+   * Wakeup armed at another tab's in-flight lease expiry. A row another tab
+   * owns in flight is non-deliverable until the lease passes; if that tab
+   * crashed, nothing else re-triggers a flush here, so the wakeup fires
+   * exactly when the row becomes stealable.
+   */
+  private leaseWakeupTimer = new Map<Id, ReturnType<typeof setTimeout>>();
+  /**
    * In-flight/outbox-keyed conversion of a held bubble, keyed by
    * clientRequestId. A held prompt gets exactly ONE commandId for its
    * lifetime: a turn-end `flushHeld` racing a `steerHeld` of the same row
@@ -3190,6 +3212,30 @@ class HubStore {
     if (t) clearTimeout(t);
     this.outboxRetryTimer.delete(instanceId);
     this.outboxRetryAttempt.delete(instanceId);
+  }
+
+  /**
+   * Arm one wakeup per instance at the earliest FOREIGN in-flight lease
+   * expiry. Rows with no live foreign lease need nothing (they are
+   * deliverable now or owned by this tab). An already-armed timer is kept only
+   * when it fires no later than the newly seen expiry (never pushed out).
+   */
+  private scheduleLeaseExpiryWakeup(durable: OutboxRecord[], now: number, owner: Id) {
+    const earliest = new Map<Id, number>();
+    for (const r of durable) {
+      if (r.state !== "inflight" || !r.lease) continue;
+      if (r.lease.owner === owner || r.lease.until <= now) continue;
+      const prev = earliest.get(r.instanceId);
+      if (prev === undefined || r.lease.until < prev) earliest.set(r.instanceId, r.lease.until);
+    }
+    for (const [instanceId, until] of earliest) {
+      if (this.leaseWakeupTimer.has(instanceId)) continue;
+      const timer = setTimeout(() => {
+        this.leaseWakeupTimer.delete(instanceId);
+        void this.flushAllOutbox();
+      }, Math.max(0, until - Date.now()));
+      this.leaseWakeupTimer.set(instanceId, timer);
+    }
   }
 
   private chainReconcile(instanceId: Id, job: () => Promise<unknown>): Promise<unknown> {

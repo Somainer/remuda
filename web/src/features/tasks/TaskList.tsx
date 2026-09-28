@@ -209,6 +209,23 @@ export function TaskGroups({
   );
 }
 
+/** Whether id is this row itself or one of its nested descendants. */
+function rowTreeHasId(row: TaskRow, id: string | null): boolean {
+  if (id == null) return false;
+  if (row.id === id) return true;
+  return row.children.some((child) => rowTreeHasId(child, id));
+}
+
+/**
+ * The selected id inside this row's subtree: the row's own id when it is the
+ * selection, a descendant id when one is selected, null otherwise.
+ */
+function selectedWithinTree(row: TaskRow, id: string | null): string | null {
+  if (id == null) return null;
+  if (row.id === id) return row.id;
+  return row.children.some((child) => rowTreeHasId(child, id)) ? id : null;
+}
+
 const TaskRowView = memo(
   function TaskRowView({
     row,
@@ -322,9 +339,14 @@ const TaskRowView = memo(
   // Compare THIS row's own painted state: a selection change commits only the
   // deselected and selected rows, not the whole rail. The signature is
   // recursive, so a changed child always flips its parent's comparison.
+  // Selection is a SUBTREE id, not own-row only: a parent renders its
+  // descendants, so when the selection enters, leaves, or moves WITHIN its
+  // tree it must re-render — otherwise a child keeps its selected paint after
+  // the selection moves elsewhere (c-perffu r2).
   (prev, next) =>
     taskRowSignature(prev.row) === taskRowSignature(next.row) &&
     prev.variant === next.variant &&
-    (prev.selectedId === prev.row.id) === (next.selectedId === next.row.id) &&
+    selectedWithinTree(prev.row, prev.selectedId) ===
+      selectedWithinTree(next.row, next.selectedId) &&
     prev.onSelect === next.onSelect,
 );
